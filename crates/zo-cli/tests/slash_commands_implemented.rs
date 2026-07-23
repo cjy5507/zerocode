@@ -377,7 +377,12 @@ fn slash_command_desktop_uses_opener_stub() {
     let bin_dir = temp_dir.join("bin");
     fs::create_dir_all(&bin_dir).expect("bin dir");
     let capture_path = temp_dir.join("opened.txt");
-    let script_path = bin_dir.join("open");
+    let opener_command = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let script_path = bin_dir.join(opener_command);
     fs::write(
         &script_path,
         format!(
@@ -385,7 +390,7 @@ fn slash_command_desktop_uses_opener_stub() {
             capture_path.display()
         ),
     )
-    .expect("write open stub");
+    .expect("write opener stub");
     let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&script_path, perms).expect("chmod");

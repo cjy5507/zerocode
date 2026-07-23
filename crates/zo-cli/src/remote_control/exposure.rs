@@ -940,13 +940,15 @@ mod tests {
 
     #[cfg(unix)]
     fn write_executable(path: &Path, script: &str) {
-        std::fs::write(path, script).expect("write fake Tailscale executable");
-        let mut permissions = std::fs::metadata(path)
-            .expect("read fake Tailscale metadata")
+        let staging = path.with_extension("tmp");
+        std::fs::write(&staging, script).expect("write staged fake Tailscale executable");
+        let mut permissions = std::fs::metadata(&staging)
+            .expect("read staged fake Tailscale metadata")
             .permissions();
         permissions.set_mode(0o700);
-        std::fs::set_permissions(path, permissions)
-            .expect("make fake Tailscale executable");
+        std::fs::set_permissions(&staging, permissions)
+            .expect("make staged fake Tailscale executable");
+        std::fs::rename(staging, path).expect("publish fake Tailscale executable");
     }
 
     #[cfg(unix)]
