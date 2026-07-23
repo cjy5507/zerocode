@@ -905,41 +905,111 @@ fn whitespace_tolerant_replace(
     Ok(Some(result_lines.join("\n")))
 }
 
+const MAX_GLOB_BRACE_EXPANSIONS: usize = 128;
+
+fn expand_glob_braces(pattern: &str) -> io::Result<Vec<String>> {
+    let mut pending = vec![pattern.to_owned()];
+    let mut expanded = Vec::new();
+
+    while let Some(candidate) = pending.pop() {
+        let Some((open, close, alternatives)) = next_brace_group(&candidate) else {
+            expanded.push(candidate);
+            continue;
+        };
+
+        for alternative in alternatives.into_iter().rev() {
+            if Path::new(alternative).components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "glob brace alternatives cannot escape the search root",
+                ));
+            }
+            if pending.len().saturating_add(expanded.len()) >= MAX_GLOB_BRACE_EXPANSIONS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "glob brace expansion exceeds the {MAX_GLOB_BRACE_EXPANSIONS}-pattern limit"
+                    ),
+                ));
+            }
+            pending.push(format!(
+                "{}{}{}",
+                &candidate[..open],
+                alternative,
+                &candidate[close + 1..]
+            ));
+        }
+    }
+
+    Ok(expanded)
+}
+
+fn next_brace_group(pattern: &str) -> Option<(usize, usize, Vec<&str>)> {
+    let mut offset = 0usize;
+    while let Some(relative_open) = pattern[offset..].find('{') {
+        let open = offset + relative_open;
+        let relative_close = pattern[open + 1..].find('}')?;
+        let close = open + 1 + relative_close;
+        let alternatives = pattern[open + 1..close].split(',').collect::<Vec<_>>();
+        if alternatives.len() > 1 {
+            return Some((open, close, alternatives));
+        }
+        offset = close + 1;
+    }
+    None
+}
+
 /// Expands a glob pattern and returns matching filenames.
 pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
-    let base_dir = path
-        .map(normalize_path)
-        .transpose()?
-        .unwrap_or(std::env::current_dir()?);
+    let base_dir = match path {
+        Some(path) if path.chars().any(|character| "*?[{".contains(character)) => {
+            normalize_path_allow_missing(path)?
+        }
+        Some(path) => normalize_path(path)?,
+        None => std::env::current_dir()?,
+    };
     let search_pattern = if Path::new(pattern).is_absolute() {
         pattern.to_owned()
     } else {
         base_dir.join(pattern).to_string_lossy().into_owned()
     };
 
-    let glob_matcher = Pattern::new(&search_pattern)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-
-    // Walk from the pattern's literal (non-wildcard) prefix with the standard
-    // ignore filters applied, then keep paths matching the glob. `glob::glob`
-    // would otherwise expand `**` straight into `target/` and other ignored
-    // directories.
     let mut matches = Vec::new();
-    for entry in WalkBuilder::new(glob_literal_root(&search_pattern))
-        .standard_filters(true)
-        .build()
-    {
-        let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
-        if entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
-            && glob_matcher.matches_path(entry.path())
-        {
-            matches.push(entry.path().to_path_buf());
+    for expanded_pattern in expand_glob_braces(&search_pattern)? {
+        let glob_matcher = Pattern::new(&expanded_pattern)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let literal_root = glob_literal_root(&expanded_pattern);
+        match fs::symlink_metadata(&literal_root) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+
+        // Walk from each expanded pattern's literal prefix with the standard
+        // ignore filters applied. Missing brace alternatives behave like shell
+        // globs and contribute no matches instead of failing the whole search.
+        for entry in WalkBuilder::new(literal_root).standard_filters(true).build() {
+            let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
+            if entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+                && glob_matcher.matches_path(entry.path())
+            {
+                matches.push(entry.path().to_path_buf());
+            }
         }
     }
 
+    matches.sort();
+    matches.dedup();
     matches.sort_by_key(|path| {
         fs::metadata(path)
             .and_then(|metadata| metadata.modified())
@@ -2069,6 +2139,72 @@ mod tests {
         })
         .expect("grep should succeed");
         assert!(grep_output.content.unwrap_or_default().contains("hello"));
+    }
+
+    #[test]
+    fn glob_search_expands_braced_paths_and_filenames() {
+        let dir = temp_path("glob-braces");
+        let fixtures = [
+            ("core", "balancesheetDrilldown2.sql"),
+            ("database", "AccountStatementDAO.cs"),
+            ("mobile", "SubLedger.aspx.cs"),
+            ("kftc", "Payments.csproj"),
+        ];
+        for (subdir, filename) in fixtures {
+            let subdir = dir.join(subdir);
+            std::fs::create_dir_all(&subdir).expect("brace fixture directory");
+            std::fs::write(subdir.join(filename), "fixture\n").expect("brace fixture file");
+        }
+
+        let output = glob_search(
+            "{core,database,mobile,kftc,missing}/**/{balancesheetDrilldown2.sql,AccountStatementDAO.cs,SubLedger.aspx.cs,*.csproj}",
+            Some(dir.to_string_lossy().as_ref()),
+        )
+        .expect("braced glob should succeed");
+        assert_eq!(output.num_files, 4);
+        for expected in [
+            "balancesheetDrilldown2.sql",
+            "AccountStatementDAO.cs",
+            "SubLedger.aspx.cs",
+            "Payments.csproj",
+        ] {
+            assert!(
+                output.filenames.iter().any(|path| path.ends_with(expected)),
+                "missing {expected}: {:?}",
+                output.filenames
+            );
+        }
+
+        let braced_path = dir.join("{core,database,mobile,kftc,missing}");
+        let path_output = glob_search(
+            "**/{balancesheetDrilldown2.sql,AccountStatementDAO.cs,SubLedger.aspx.cs,*.csproj}",
+            Some(braced_path.to_string_lossy().as_ref()),
+        )
+        .expect("braces in the path argument should succeed");
+        assert_eq!(path_output.num_files, 4);
+        for expected in [
+            "balancesheetDrilldown2.sql",
+            "AccountStatementDAO.cs",
+            "SubLedger.aspx.cs",
+            "Payments.csproj",
+        ] {
+            assert!(
+                path_output
+                    .filenames
+                    .iter()
+                    .any(|path| path.ends_with(expected)),
+                "path-brace search missing {expected}: {:?}",
+                path_output.filenames
+            );
+        }
+
+        let error = glob_search(
+            "{core,../../outside}/**/*",
+            Some(dir.to_string_lossy().as_ref()),
+        )
+        .expect_err("brace alternatives cannot escape the search root");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

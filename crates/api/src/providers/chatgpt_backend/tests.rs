@@ -2679,6 +2679,83 @@ async fn mid_stream_restart_invokes_retry_notice_callback() {
     assert_eq!(seen[0], (1, 3), "first restart is attempt 1 of max_retries 3");
 }
 
+#[tokio::test]
+async fn default_retry_budget_recovers_on_eighth_attempt() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_hits = hits.clone();
+    let server = tokio::spawn(async move {
+        for attempt in 1..=8 {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            server_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut request = [0u8; 4096];
+            let _ = connection.read(&mut request).await;
+            let body = if attempt < 8 {
+                "data: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"retry\"}\n\n"
+            } else {
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r8\"}}\n\n",
+                    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,",
+                    "\"item\":{\"type\":\"message\"}}\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,",
+                    "\"delta\":\"recovered\"}\n\n",
+                    "data: {\"type\":\"response.output_item.done\",\"output_index\":0}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"usage\":",
+                    "{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+                )
+            };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            );
+            connection.write_all(head.as_bytes()).await.unwrap();
+            connection.write_all(body.as_bytes()).await.unwrap();
+            connection.flush().await.unwrap();
+        }
+    });
+
+    let mut client = super::ChatGptBackendClient::new("token", None)
+        .with_base_url(format!("http://{addr}"));
+    client.initial_backoff = std::time::Duration::from_millis(1);
+    client.max_backoff = std::time::Duration::from_millis(2);
+    let request = MessageRequest {
+        messages: vec![InputMessage::user_text("hi")],
+        ..request(vec![], None, None)
+    };
+    let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = notices.clone();
+    let mut stream = client
+        .stream_message(&request)
+        .await
+        .expect("initial stream opens")
+        .with_retry_notice_callback(move |notice| {
+            sink.lock()
+                .unwrap()
+                .push((notice.attempt, notice.max_attempts));
+        });
+
+    let mut text = String::new();
+    while let Some(event) = stream.next_event().await.expect("eighth attempt recovers") {
+        if let StreamEvent::ContentBlockDelta(delta) = event {
+            if let ContentBlockDelta::TextDelta { text: chunk } = delta.delta {
+                text.push_str(&chunk);
+            }
+        }
+    }
+    server.await.unwrap();
+
+    assert_eq!(text, "recovered");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 8);
+    assert_eq!(
+        notices.lock().unwrap().as_slice(),
+        [(1, 7), (2, 7), (3, 7), (4, 7), (5, 7), (6, 7), (7, 7)]
+    );
+}
+
 // A large frame split across many small chunks parses exactly once and the
 // separator search stays linear (the GPT `encrypted_content` shape that
 // used to pin a core and freeze the TUI). See `ResponsesSseParser::scanned`.

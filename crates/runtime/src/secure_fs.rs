@@ -578,7 +578,7 @@ impl RetainedDir {
         validate_opened_regular_file(&parent, &file_name, &fd, Some(owner))?;
         let file = fs::File::from(fd);
         match file.try_lock() {
-            Ok(()) => Ok(Some(ExclusiveFileLock { _file: file })),
+            Ok(()) => Ok(Some(ExclusiveFileLock { file })),
             Err(error) => {
                 let error = io::Error::from(error);
                 if error.kind() == io::ErrorKind::WouldBlock {
@@ -784,10 +784,18 @@ fn renameat_noreplace(
 }
 
 /// An exclusive owner-only advisory lock. Its lock file is intentionally
-/// persistent: closing the file releases the advisory lock without creating an
-/// unlink/recreate race or leaving a crash-stale existence lock.
+/// persistent, avoiding an unlink/recreate race or crash-stale existence lock.
 pub struct ExclusiveFileLock {
-    _file: fs::File,
+    file: fs::File,
+}
+
+impl Drop for ExclusiveFileLock {
+    fn drop(&mut self) {
+        // On Linux, `flock` follows the open file description. Explicitly
+        // unlock before close so a descriptor briefly duplicated by subprocess
+        // creation cannot prolong the lock after this capability is dropped.
+        let _ = self.file.unlock();
+    }
 }
 
 /// Acquire an exclusive owner-only advisory lock below `root`. `Ok(None)`
@@ -1806,9 +1814,14 @@ mod tests {
         assert_eq!(fs::metadata(&lock_path).unwrap().mode() & 0o777, 0o600);
         assert!(try_lock_owner_only(root.path(), relative).unwrap().is_none());
 
+        let duplicated_descriptor = first.file.try_clone().unwrap();
         drop(first);
         assert!(lock_path.exists());
-        assert!(try_lock_owner_only(root.path(), relative).unwrap().is_some());
+        assert!(
+            try_lock_owner_only(root.path(), relative).unwrap().is_some(),
+            "dropping the capability must explicitly unlock even while a duplicated descriptor is open"
+        );
+        drop(duplicated_descriptor);
     }
 
     #[cfg(unix)]

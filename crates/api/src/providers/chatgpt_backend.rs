@@ -1304,10 +1304,10 @@ fn usage_field(usage: Option<&Value>, key: &str) -> u32 {
         .unwrap_or(0)
 }
 
-/// Default cap on transparent mid-stream restarts (mirrors the Anthropic
-/// connection-retry budget so both backends behave the same under transient
-/// faults).
-const DEFAULT_STREAM_MAX_RETRIES: u32 = 5;
+/// Default cap on transparent mid-stream restarts. Seven bounded restarts give
+/// a transient failure eight total attempts while [`MAX_RESTART_WALLCLOCK`]
+/// still caps a slow or silent reconnect storm by elapsed time.
+const DEFAULT_STREAM_MAX_RETRIES: u32 = 7;
 const DEFAULT_STREAM_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
 const DEFAULT_STREAM_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
