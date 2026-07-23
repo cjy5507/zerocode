@@ -2227,6 +2227,7 @@ fn help_documents_output_and_input_formats() {
 
 #[test]
 fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
+    let _env_guard = env_lock();
     let _guard = cwd_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2268,6 +2269,7 @@ fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
 
 #[test]
 fn latest_session_alias_resolves_most_recent_managed_session() {
+    let _env_guard = env_lock();
     let _guard = cwd_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
