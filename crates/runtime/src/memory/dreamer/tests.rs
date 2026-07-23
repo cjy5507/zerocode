@@ -1591,12 +1591,33 @@ fn quarantine_patch_runner_isolates_artifacts_and_manual_apply_gate() {
     assert_eq!(run.base_commit, base);
     assert_eq!(run.changed_paths, vec!["file.txt"]);
     assert_eq!(run.check_results.len(), 1);
-    assert!(
-        run.check_results[0].success,
-        "unexpected check result: {:?}",
-        run.check_results[0]
-    );
     assert_eq!(fs::read_to_string(cwd.join("file.txt")).unwrap(), "old\n");
+
+    let check_result = &run.check_results[0];
+    if check_result.stderr == "strict_filesystem_network_isolation_unavailable" {
+        assert!(!check_result.success);
+        assert_eq!(check_result.exit_code, None);
+        let rejected = evaluate_manual_apply_gate(
+            cwd,
+            &ManualApplyGateRequest {
+                approved_by_user: true,
+                run: run.clone(),
+                allowed_paths: vec!["file.txt".to_string()],
+                reviewer_accepted: true,
+            },
+        );
+        assert!(!rejected.eligible);
+        assert!(
+            rejected
+                .reasons
+                .contains(&"focused_checks_not_green".to_string())
+        );
+        return;
+    }
+    assert!(
+        check_result.success,
+        "unexpected check result: {check_result:?}"
+    );
     let run_dir = super::quarantine_run_dir(cwd, &run.run_id);
     assert!(fs::read_to_string(run_dir.join("patch.diff"))
         .unwrap()
