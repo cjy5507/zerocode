@@ -13,6 +13,9 @@
 //! expected-exit policy) are intentionally deferred — adding them before a caller
 //! needs them would be speculative.
 
+use std::env;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -81,6 +84,102 @@ pub struct ProcessOutcome {
     pub duration_ms: u128,
 }
 
+fn ensure_wrapped_binary_exists(binary: &str, cwd: &Path) -> io::Result<()> {
+    if binary.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "process binary is empty",
+        ));
+    }
+
+    let path = Path::new(binary);
+    if path.components().count() > 1 {
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+        return executable_file(&candidate).then_some(()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("executable `{binary}` was not found"),
+            )
+        });
+    }
+
+    let paths = env::var_os("PATH").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("executable `{binary}` was not found because PATH is unset"),
+        )
+    })?;
+    let found = env::split_paths(&paths).any(|dir| {
+        let dir = if dir.as_os_str().is_empty() {
+            cwd.to_path_buf()
+        } else if dir.is_absolute() {
+            dir
+        } else {
+            cwd.join(dir)
+        };
+        executable_in_dir(&dir, binary)
+    });
+    found.then_some(()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("executable `{binary}` was not found in PATH"),
+        )
+    })
+}
+
+#[cfg(not(windows))]
+fn executable_in_dir(dir: &Path, binary: &str) -> bool {
+    executable_file(&dir.join(binary))
+}
+
+#[cfg(windows)]
+fn executable_in_dir(dir: &Path, binary: &str) -> bool {
+    let direct = dir.join(binary);
+    if direct.extension().is_some() && executable_file(&direct) {
+        return true;
+    }
+
+    let pathext = env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+    pathext
+        .to_string_lossy()
+        .split(';')
+        .filter_map(|extension| {
+            let extension = extension.trim();
+            if extension.is_empty() {
+                return None;
+            }
+            Some(if extension.starts_with('.') {
+                format!("{binary}{extension}")
+            } else {
+                format!("{binary}.{extension}")
+            })
+        })
+        .any(|candidate| executable_file(&dir.join(candidate)))
+}
+
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_file() && executable_metadata(&metadata)
+}
+
+#[cfg(unix)]
+fn executable_metadata(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn executable_metadata(_metadata: &fs::Metadata) -> bool {
+    true
+}
+
 /// Run a [`ProcessSpec`] with bounded capture and a hard timeout. Never invokes a
 /// shell: `binary` + `args` are handed to the OS as-is. A timeout is reported as
 /// a structured `timed_out` outcome (not an error) so callers can branch on it;
@@ -98,12 +197,23 @@ pub fn run_process_spec(spec: &ProcessSpec) -> Result<ProcessOutcome, ToolError>
         .unwrap_or_else(|| PathBuf::from("."));
     let status =
         runtime::sandbox::resolve_sandbox_status(&runtime::sandbox::SandboxConfig::default(), &cwd);
-    let (program, args, env) =
+    let (program, args, sandbox_env) =
         runtime::sandbox::sandbox_wrap_argv(&spec.binary, &spec.args, &cwd, &status);
+    let sandbox_wrapped =
+        program != spec.binary || args != spec.args || !sandbox_env.is_empty();
+    if sandbox_wrapped {
+        ensure_wrapped_binary_exists(&spec.binary, &cwd).map_err(|error| {
+            ToolError::Execution(format!(
+                "failed to start `{}` (is it installed and on PATH?): {error}",
+                spec.binary
+            ))
+        })?;
+    }
+
     let mut command = Command::new(&program);
     command
         .args(&args)
-        .envs(env)
+        .envs(sandbox_env)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -387,6 +497,14 @@ mod tests {
         let spec = ProcessSpec::new("zo-no-such-binary-xyz", vec![]);
         let err = run_process_spec(&spec).expect_err("missing binary fails to start");
         assert!(matches!(err, ToolError::Execution(_)));
+    }
+
+    #[test]
+    fn wrapped_binary_preflight_reports_missing_binary() {
+        let cwd = std::env::current_dir().expect("current directory");
+        let error = ensure_wrapped_binary_exists("zo-no-such-binary-xyz", &cwd)
+            .expect_err("missing wrapped binary must fail before the launcher starts");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
