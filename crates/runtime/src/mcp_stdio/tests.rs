@@ -3016,10 +3016,9 @@ fn reattach_after_failed_discovery_leaves_routes_untouched() {
 
 #[test]
 fn concurrent_discovery_does_not_serialize_a_slow_server_behind_a_fast_one() {
-    // The core fix: discovering a slow server (long tools/list delay) and a fast
-    // server concurrently completes in roughly the slow server's own time, NOT
-    // the sum — proving they do not run serially. Each detached unit owns its
-    // process, so `buffer_unordered` interleaves their handshakes.
+    // Six independent 100ms tools/list delays take at least 600ms when run
+    // serially. Detached ownership lets `buffer_unordered` overlap them while
+    // keeping every request comfortably below the 300ms test RPC timeout.
     let runtime = Builder::new_current_thread()
         .enable_all()
         .build()
@@ -3029,40 +3028,42 @@ fn concurrent_discovery_does_not_serialize_a_slow_server_behind_a_fast_one() {
 
         let script_path = write_manager_mcp_server_script();
         let parent = script_path.parent().expect("script parent");
+        let names = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
 
         let mut servers = BTreeMap::new();
-        servers.insert(
-            "fast".to_string(),
-            manager_server_config_with_env(
-                &script_path,
-                "fast",
-                &parent.join("fast.log"),
-                BTreeMap::from([("MCP_LIST_TOOLS_DELAY_MS".to_string(), "200".to_string())]),
-            ),
-        );
-        servers.insert(
-            "slow".to_string(),
-            manager_server_config_with_env(
-                &script_path,
-                "slow",
-                &parent.join("slow.log"),
-                // Kept under the test-mode tools/list timeout (300ms) so the
-                // server itself succeeds; the point is concurrency, not timeout.
-                BTreeMap::from([("MCP_LIST_TOOLS_DELAY_MS".to_string(), "200".to_string())]),
-            ),
-        );
+        for name in names {
+            servers.insert(
+                name.to_string(),
+                manager_server_config_with_env(
+                    &script_path,
+                    name,
+                    &parent.join(format!("{name}.log")),
+                    BTreeMap::from([(
+                        "MCP_LIST_TOOLS_DELAY_MS".to_string(),
+                        "100".to_string(),
+                    )]),
+                ),
+            );
+        }
         let mut manager = McpServerManager::from_servers(&servers);
+        manager.set_discover_server_timeout_ms(1_000);
 
-        let fast_unit = manager.detach_for_discovery("fast").expect("detach fast");
-        let slow_unit = manager.detach_for_discovery("slow").expect("detach slow");
+        let mut units = names
+            .into_iter()
+            .map(|name| {
+                let unit = manager
+                    .detach_for_discovery(name)
+                    .unwrap_or_else(|| panic!("detach {name}"));
+                (name, unit)
+            })
+            .collect::<Vec<_>>();
 
         let started = std::time::Instant::now();
-        let mut units = vec![("fast", fast_unit), ("slow", slow_unit)];
         let results = stream::iter(units.drain(..).map(|(name, mut unit)| async move {
             let fresh = unit.refresh_server_tools(name).await;
             (name, unit, fresh)
         }))
-        .buffer_unordered(3)
+        .buffer_unordered(names.len())
         .collect::<Vec<_>>()
         .await;
         let elapsed = started.elapsed();
@@ -3072,13 +3073,9 @@ fn concurrent_discovery_does_not_serialize_a_slow_server_behind_a_fast_one() {
             let _ = unit.shutdown().await;
         }
 
-        // Each server delays tools/list by 200ms. Serial would be ~400ms;
-        // concurrent overlaps them, so the batch finishes far below the sum. A
-        // generous ceiling keeps the test non-flaky on a busy CI box while still
-        // proving the two handshakes did not run one-after-the-other.
         assert!(
-            elapsed < std::time::Duration::from_millis(360),
-            "concurrent discovery took {elapsed:?}; expected it not to serialize the two servers"
+            elapsed < std::time::Duration::from_millis(500),
+            "concurrent discovery took {elapsed:?}; expected it not to serialize six servers"
         );
 
         manager.shutdown().await.expect("shutdown");

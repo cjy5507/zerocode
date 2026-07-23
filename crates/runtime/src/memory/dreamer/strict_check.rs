@@ -1084,7 +1084,20 @@ mod macos_tests {
         )));
         assert!(profile.contains(&format!("(subpath {})", sbpl_quote(&worktree))));
         assert!(profile.contains(&format!("(subpath {})", sbpl_quote(&check_state))));
-        assert!(profile.contains("(subpath \"/Applications/Xcode.app\")"));
+        for developer_root in [
+            Path::new("/Applications/Xcode.app"),
+            Path::new("/Library/Developer/CommandLineTools"),
+        ]
+        .into_iter()
+        .filter(|root| root.exists())
+        {
+            let developer_root = fs::canonicalize(developer_root).unwrap();
+            assert!(
+                profile.contains(&format!("(subpath {})", sbpl_quote(&developer_root))),
+                "missing canonical developer root {}: {profile}",
+                developer_root.display()
+            );
+        }
         let writable = profile
             .split("(allow file-write*\n")
             .nth(1)
@@ -1139,9 +1152,16 @@ mod macos_tests {
             .expect("git is available through the system toolchain");
 
         assert_ne!(program, PathBuf::from("/usr/bin/git"));
+        let trusted_roots = [
+            Path::new("/Applications/Xcode.app/Contents/Developer"),
+            Path::new("/Library/Developer/CommandLineTools"),
+        ]
+        .into_iter()
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .collect::<Vec<_>>();
+        assert!(!trusted_roots.is_empty(), "no trusted developer root found");
         assert!(
-            program.starts_with("/Applications/Xcode.app/Contents/Developer")
-                || program.starts_with("/Library/Developer/CommandLineTools"),
+            trusted_roots.iter().any(|root| program.starts_with(root)),
             "unexpected direct git path: {}",
             program.display()
         );
