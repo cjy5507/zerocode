@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -14,6 +14,8 @@ pub(crate) const DEFAULT_REMOTE_PORT: u16 = 8_788;
 const LAST_REMOTE_PORT: u16 = 8_797;
 const AUTO_SERVE_ENV: &str = "ZO_REMOTE_AUTO_SERVE";
 const DEV_MODE_ENV: &str = "ZO_REMOTE_DEV";
+const EXECUTABLE_BUSY_RETRIES: u32 = 5;
+const EXECUTABLE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 const ONBOARDING_TIMING: OnboardingTiming = OnboardingTiming {
     silent_window: Duration::from_millis(500),
     poll_interval: Duration::from_secs(3),
@@ -327,6 +329,25 @@ fn tailscale_executables() -> Vec<PathBuf> {
     }
 }
 
+async fn output_with_executable_busy_retry(
+    executable: &PathBuf,
+    args: &[&str],
+) -> std::io::Result<Output> {
+    let mut retries = 0;
+    loop {
+        match Command::new(executable).args(args).output().await {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && retries < EXECUTABLE_BUSY_RETRIES =>
+            {
+                retries += 1;
+                tokio::time::sleep(EXECUTABLE_BUSY_RETRY_DELAY * retries).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 async fn run_json_with_executables(
     args: &[&str],
     source: &'static str,
@@ -335,7 +356,7 @@ async fn run_json_with_executables(
     let command = format!("tailscale {}", args.join(" "));
     let mut last_not_found = None;
     for executable in executables {
-        let output = match Command::new(executable).args(args).output().await {
+        let output = match output_with_executable_busy_retry(executable, args).await {
             Ok(output) => output,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 last_not_found = Some(error);
@@ -378,7 +399,7 @@ async fn run_with_executables(
     let command = format!("tailscale {}", args.join(" "));
     let mut last_not_found = None;
     for executable in executables {
-        let output = match Command::new(executable).args(args).output().await {
+        let output = match output_with_executable_busy_retry(executable, args).await {
             Ok(output) => output,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 last_not_found = Some(error);
@@ -453,7 +474,7 @@ async fn configure_serve(
     timing: OnboardingTiming,
 ) -> Result<Exposure, ExposureError> {
     let target = format!("http://127.0.0.1:{port}");
-    let (mut child, command) = spawn_serve(executables, mount_path, &target)?;
+    let (mut child, command) = spawn_serve(executables, mount_path, &target).await?;
     let (output_tx, mut output_rx) = mpsc::unbounded_channel();
     let mut stdout_task = pump_output(
         child
@@ -588,7 +609,7 @@ where
     true
 }
 
-fn spawn_serve(
+async fn spawn_serve(
     executables: &[PathBuf],
     mount_path: &str,
     target: &str,
@@ -597,22 +618,33 @@ fn spawn_serve(
     let command = format!("tailscale {}", args.join(" "));
     let mut last_not_found = None;
     for executable in executables {
-        let mut candidate = Command::new(executable);
-        candidate
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        match candidate.spawn() {
-            Ok(child) => return Ok((child, command)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                last_not_found = Some(error);
-            }
-            Err(error) => {
-                return Err(ExposureError::Command {
-                    command,
-                    message: error.to_string(),
-                });
+        let mut retries = 0;
+        loop {
+            let mut candidate = Command::new(executable);
+            candidate
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            match candidate.spawn() {
+                Ok(child) => return Ok((child, command)),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && retries < EXECUTABLE_BUSY_RETRIES =>
+                {
+                    retries += 1;
+                    tokio::time::sleep(EXECUTABLE_BUSY_RETRY_DELAY * retries).await;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    last_not_found = Some(error);
+                    break;
+                }
+                Err(error) => {
+                    return Err(ExposureError::Command {
+                        command,
+                        message: error.to_string(),
+                    });
+                }
             }
         }
     }
@@ -1038,6 +1070,37 @@ https://login.tailscale.com/f/serve?node=node-name-abc123\n\
 
         assert_eq!(
             result.expect("fallback executable should return JSON"),
+            json!({ "BackendState": "Running" })
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn retries_executable_file_busy_until_writer_closes() {
+        let test_dir = TestDir::new("executable-busy");
+        let executable = test_dir.path.join("tailscale");
+        write_executable(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' '{\"BackendState\":\"Running\"}'\n",
+        );
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .expect("hold fake Tailscale executable open for writing");
+        let executable_for_run = executable.clone();
+        let run = tokio::spawn(async move {
+            let executables = [executable_for_run];
+            run_json_with_executables(&["status", "--json"], "status", &executables).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!run.is_finished(), "ETXTBSY should still be retrying");
+        drop(writer);
+
+        assert_eq!(
+            run.await
+                .expect("join Tailscale status task")
+                .expect("retry Tailscale after ETXTBSY"),
             json!({ "BackendState": "Running" })
         );
     }
