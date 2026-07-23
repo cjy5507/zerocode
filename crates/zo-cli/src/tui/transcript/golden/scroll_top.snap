@@ -1,0 +1,26 @@
+=== width 70 height 12 ===
+|┃  You                                                               ▲|
+  0-5[fg=Indexed(111),mod=BOLD] 6-68[fg=Indexed(253)] 69-69[fg=Indexed(245),mod=DIM]
+|┃  list the dependency layers                                        █|
+  0-2[fg=Indexed(111),mod=BOLD] 3-68[fg=Indexed(253)] 69-69[fg=Indexed(245)]
+|                                                                     █|
+  69-69[fg=Indexed(245)]
+|─────────────────────────────────────────────────────────────────────█|
+  0-68[fg=Indexed(237)] 69-69[fg=Indexed(245)]
+|◆  Layer 00: a dependency-graph entry occupying one row.             █|
+  0-0[fg=Indexed(111),mod=BOLD] 3-55[fg=Indexed(255)] 56-68[fg=Indexed(253)] 69-69[fg=Indexed(245)]
+|                                                                     ░|
+  69-69[fg=Indexed(240)]
+|   Layer 01: a dependency-graph entry occupying one row.             ░|
+  3-68[fg=Indexed(253)] 69-69[fg=Indexed(240)]
+|                                                                     ░|
+  69-69[fg=Indexed(240)]
+|   Layer 02: a dependency-graph entry occupying one row.             ░|
+  3-68[fg=Indexed(253)] 69-69[fg=Indexed(240)]
+|                                                                     ░|
+  69-69[fg=Indexed(240)]
+|   Layer 03: a dependency-graph entry occupying one row.             ░|
+  3-68[fg=Indexed(253)] 69-69[fg=Indexed(240)]
+|                                                                     ▼|
+  69-69[fg=Indexed(245),mod=DIM]
+

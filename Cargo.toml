@@ -1,0 +1,98 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+
+# Async runtime / HTTP
+# Base feature set is empty — each crate enables only the tokio features
+# it actually uses via additive `features = [...]`. Same pattern for reqwest:
+# `json` + `rustls-tls` is the shared baseline; `stream` is enabled only
+# where streaming responses are consumed (e.g. runtime SSE).
+tokio = { version = "1" }
+tokio-util = { version = "0.7", features = ["rt"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["limit", "sensitive-headers", "trace"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+futures-util = "0.3"
+
+# Crypto
+sha2 = "0.10"
+qrcode = { version = "0.14", default-features = false }
+rand = "0.9"
+# Both already in the tree via rustls (its default provider), so making them
+# direct deps costs no new compilation: `ring` signs the Vertex
+# service-account JWT (RS256); `base64` encodes JWT segments / decodes PEM.
+ring = "0.17"
+base64 = "0.22"
+
+# Storage — Phase-6 SQLite event/artifact store. `bundled` compiles SQLite from
+# source so there is no system libsqlite3 dependency (portable release builds).
+# Pinned to 0.32 (libsqlite3-sys 0.28): newer libsqlite3-sys build scripts use
+# the still-unstable `cfg_select!`, which the 1.94 toolchain rejects.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Host-side workspace freshness. `gix` is intentionally limited to the status
+# stack; `parallel` is required for its status iterator to honor interrupt flags.
+gix = { version = "=0.84.0", default-features = false, features = ["status", "sha1", "parallel"] }
+notify = "=8.2.0"
+
+# Benchmark harness (native runner work tree)
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"
+
+[profile.dev]
+opt-level = 1
+# This workspace's all-target test matrix can otherwise retain tens of GiB of
+# stale incremental objects across agent runs. Prefer deterministic cold units
+# and let Cargo reuse dependency artifacts under target/debug/deps.
+incremental = false
+
+[profile.test]
+incremental = false
+
+[profile.fast-release]
+inherits = "release"
+lto = "thin"
+codegen-units = 8
+strip = "symbols"
+opt-level = 2
+
+# Diagnostic-only profile: an optimized build that KEEPS symbols + line tables
+# so a freeze stack sample (`sample`/`atos`) resolves to function names instead
+# of bare `0x…` offsets. Inherits `fast-release` (thin LTO, opt-level 2) for a
+# quick build, but overrides `strip` so the symbol table survives. Not for
+# distribution — use `release` for that.
+[profile.release-debug]
+inherits = "fast-release"
+strip = "none"
+debug = "line-tables-only"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3
+# `unwind` (not `abort`): lets the spawn.rs `catch_unwind` isolate a panicking
+# sub-agent as a `failed` completion instead of aborting the whole process.
+panic = "unwind"

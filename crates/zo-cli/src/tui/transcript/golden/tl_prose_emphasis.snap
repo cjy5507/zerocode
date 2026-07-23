@@ -1,0 +1,162 @@
+=== stage: prefix ===
+|◆  The value                                                                    |
+  0-0[fg=Indexed(111),mod=BOLD] 3-11[fg=Indexed(255)] 12-79[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+
+=== stage: open-bold ===
+|◆  The value bo                                                                 |
+  0-0[fg=Indexed(111),mod=BOLD] 3-12[fg=Indexed(255)] 13-14[fg=Indexed(255),mod=BOLD] 15-79[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+
+=== stage: close-bold-open-code ===
+|◆  The value bold and co                                                        |
+  0-0[fg=Indexed(111),mod=BOLD] 3-12[fg=Indexed(255)] 13-16[fg=Indexed(255),mod=BOLD] 17-21[fg=Indexed(255)] 22-23[fg=Indexed(117),bg=Indexed(235)] 24-79[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+
+=== stage: close-code-open-ital ===
+|◆  The value bold and code plus ital                                            |
+  0-0[fg=Indexed(111),mod=BOLD] 3-12[fg=Indexed(255)] 13-16[fg=Indexed(255),mod=BOLD] 17-21[fg=Indexed(255)] 22-25[fg=Indexed(117),bg=Indexed(235)] 26-31[fg=Indexed(255)] 32-35[fg=Indexed(255),mod=ITALIC] 36-79[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+
+=== stage: close-ital-tail ===
+|◆  The value bold and code plus italic tail.                                    |
+  0-0[fg=Indexed(111),mod=BOLD] 3-12[fg=Indexed(255)] 13-16[fg=Indexed(255),mod=BOLD] 17-21[fg=Indexed(255)] 22-25[fg=Indexed(117),bg=Indexed(235)] 26-31[fg=Indexed(255)] 32-37[fg=Indexed(255),mod=ITALIC] 38-43[fg=Indexed(255)] 44-79[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+
+=== stage: settle ===
+|◆  The value bold and code plus italic tail.                                    |
+  0-0[fg=Indexed(111),mod=BOLD] 3-12[fg=Indexed(255)] 13-16[fg=Indexed(255),mod=BOLD] 17-21[fg=Indexed(255)] 22-25[fg=Indexed(117),bg=Indexed(235)] 26-31[fg=Indexed(255)] 32-37[fg=Indexed(255),mod=ITALIC] 38-43[fg=Indexed(255)] 44-79[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+

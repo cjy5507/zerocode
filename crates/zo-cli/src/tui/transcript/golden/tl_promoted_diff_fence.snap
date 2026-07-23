@@ -1,0 +1,162 @@
+=== stage: small-open ===
+|◆                                                                              ▲|
+  0-0[fg=Indexed(111),mod=BOLD] 3-78[fg=Indexed(253)] 79-79[fg=Indexed(245),mod=DIM]
+|     ╭─ diff +/- ───────────────────────────────────────────────────────────── █|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(179),mod=BOLD] 17-77[fg=Indexed(240)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|     │ + added widget 1 with extra payload text                                █|
+  3-6[fg=Indexed(240)] 7-46[fg=Indexed(114),bg=Indexed(235)] 47-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|     │ - removed widget 2 with extra payload text                              █|
+  3-6[fg=Indexed(240)] 7-48[fg=Indexed(203),bg=Indexed(235)] 49-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|     │   context row 3 keeps surrounding code visible                          █|
+  3-6[fg=Indexed(240)] 7-52[fg=Indexed(245),bg=Indexed(235)] 53-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|     │ @@ -4,4 +4,4 @@ hunk marker row                                         █|
+  3-6[fg=Indexed(240)] 7-37[fg=Indexed(141),bg=Indexed(235),mod=BOLD] 38-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|     │         4 + added widget 5 with extra payload text                      █|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-56[fg=Indexed(114),bg=Indexed(235)] 57-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|     │    4      - removed widget 6 with extra payload text                    █|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-58[fg=Indexed(203),bg=Indexed(235)] 59-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|     │    5    5   context row 7 keeps surrounding code visible                █|
+  3-6[fg=Indexed(240)] 7-62[fg=Indexed(245),bg=Indexed(235)] 63-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|     │ @@ -8,4 +8,4 @@ hunk marker row                                         █|
+  3-6[fg=Indexed(240)] 7-37[fg=Indexed(141),bg=Indexed(235),mod=BOLD] 38-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|     │         8 + added widget 9 with extra payload text                      █|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-56[fg=Indexed(114),bg=Indexed(235)] 57-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|     │    8      - removed widget 10 with extra payload text                   █|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-59[fg=Indexed(203),bg=Indexed(235)] 60-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|     │    9    9   context row 11 keeps surrounding code visible               █|
+  3-6[fg=Indexed(240)] 7-63[fg=Indexed(245),bg=Indexed(235)] 64-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|     │ @@ -12,4 +12,4 @@ hunk marker row                                       █|
+  3-6[fg=Indexed(240)] 7-39[fg=Indexed(141),bg=Indexed(235),mod=BOLD] 40-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|     │        12 + added widget 13 with extra payload text                     █|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-57[fg=Indexed(114),bg=Indexed(235)] 58-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|     │   12      - removed widget 14 with extra payload text                   ░|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-59[fg=Indexed(203),bg=Indexed(235)] 60-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │   13   13   context row 15 keeps surrounding code visible               ░|
+  3-6[fg=Indexed(240)] 7-63[fg=Indexed(245),bg=Indexed(235)] 64-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │ @@ -16,4 +16,4 @@ hunk marker row                                       ░|
+  3-6[fg=Indexed(240)] 7-39[fg=Indexed(141),bg=Indexed(235),mod=BOLD] 40-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │        16 + added widget 17 with extra payload text                     ░|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-57[fg=Indexed(114),bg=Indexed(235)] 58-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │   16      - removed widget 18 with extra payload text                   ░|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-59[fg=Indexed(203),bg=Indexed(235)] 60-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │   17   17   context row 19 keeps surrounding code visible               ░|
+  3-6[fg=Indexed(240)] 7-63[fg=Indexed(245),bg=Indexed(235)] 64-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │ @@ -20,4 +20,4 @@ hunk marker row                                       ░|
+  3-6[fg=Indexed(240)] 7-39[fg=Indexed(141),bg=Indexed(235),mod=BOLD] 40-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │        20 + added widget 21 with extra payload text                     ░|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-57[fg=Indexed(114),bg=Indexed(235)] 58-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │   20      - removed widget 22 with extra payload text                   ░|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-59[fg=Indexed(203),bg=Indexed(235)] 60-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │   21   21   context row 23 keeps surrounding code visible               ░|
+  3-6[fg=Indexed(240)] 7-63[fg=Indexed(245),bg=Indexed(235)] 64-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │ @@ -24,4 +24,4 @@ hunk marker row                                       ▼|
+  3-6[fg=Indexed(240)] 7-39[fg=Indexed(141),bg=Indexed(235),mod=BOLD] 40-78[fg=Indexed(253)] 79-79[fg=Indexed(245),mod=DIM]
+
+=== stage: promoted ===
+|◆  + added widget 1 with extra payload text                                    ▲|
+  0-0[fg=Indexed(111),mod=BOLD] 3-42[fg=Indexed(117),bg=Indexed(235)] 43-78[fg=Indexed(253)] 79-79[fg=Indexed(245),mod=DIM]
+|   - removed widget 2 with extra payload text                                  █|
+  3-44[fg=Indexed(117),bg=Indexed(235)] 45-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|     context row 3 keeps surrounding code visible                              ░|
+  3-48[fg=Indexed(117),bg=Indexed(235)] 49-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   @@ -4,4 +4,4 @@ hunk marker row                                             ░|
+  3-33[fg=Indexed(117),bg=Indexed(235)] 34-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   + added widget 5 with extra payload text                                    ░|
+  3-42[fg=Indexed(117),bg=Indexed(235)] 43-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   - removed widget 6 with extra payload text                                  ░|
+  3-44[fg=Indexed(117),bg=Indexed(235)] 45-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     context row 7 keeps surrounding code visible                              ░|
+  3-48[fg=Indexed(117),bg=Indexed(235)] 49-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   @@ -8,4 +8,4 @@ hunk marker row                                             ░|
+  3-33[fg=Indexed(117),bg=Indexed(235)] 34-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   + added widget 9 with extra payload text                                    ░|
+  3-42[fg=Indexed(117),bg=Indexed(235)] 43-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   - removed widget 10 with extra payload text                                 ░|
+  3-45[fg=Indexed(117),bg=Indexed(235)] 46-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     context row 11 keeps surrounding code visible                             ░|
+  3-49[fg=Indexed(117),bg=Indexed(235)] 50-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   @@ -12,4 +12,4 @@ hunk marker row                                           ░|
+  3-35[fg=Indexed(117),bg=Indexed(235)] 36-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   + added widget 13 with extra payload text                                   ░|
+  3-43[fg=Indexed(117),bg=Indexed(235)] 44-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   - removed widget 14 with extra payload text                                 ░|
+  3-45[fg=Indexed(117),bg=Indexed(235)] 46-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     context row 15 keeps surrounding code visible                             ░|
+  3-49[fg=Indexed(117),bg=Indexed(235)] 50-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   @@ -16,4 +16,4 @@ hunk marker row                                           ░|
+  3-35[fg=Indexed(117),bg=Indexed(235)] 36-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   + added widget 17 with extra payload text                                   ░|
+  3-43[fg=Indexed(117),bg=Indexed(235)] 44-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   - removed widget 18 with extra payload text                                 ░|
+  3-45[fg=Indexed(117),bg=Indexed(235)] 46-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     context row 19 keeps surrounding code visible                             ░|
+  3-49[fg=Indexed(117),bg=Indexed(235)] 50-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   @@ -20,4 +20,4 @@ hunk marker row                                           ░|
+  3-35[fg=Indexed(117),bg=Indexed(235)] 36-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   + added widget 21 with extra payload text                                   ░|
+  3-43[fg=Indexed(117),bg=Indexed(235)] 44-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   - removed widget 22 with extra payload text                                 ░|
+  3-45[fg=Indexed(117),bg=Indexed(235)] 46-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     context row 23 keeps surrounding code visible                             ░|
+  3-49[fg=Indexed(117),bg=Indexed(235)] 50-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   @@ -24,4 +24,4 @@ hunk marker row                                           ░|
+  3-35[fg=Indexed(117),bg=Indexed(235)] 36-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   + added widget 25 with extra payload text                                   ░|
+  3-43[fg=Indexed(117),bg=Indexed(235)] 44-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   - removed widget 26 with extra payload text                                 ▼|
+  3-45[fg=Indexed(117),bg=Indexed(235)] 46-78[fg=Indexed(253)] 79-79[fg=Indexed(245),mod=DIM]
+
+=== stage: settle ===
+|◆                                                                              ▲|
+  0-0[fg=Indexed(111),mod=BOLD] 3-78[fg=Indexed(253)] 79-79[fg=Indexed(245),mod=DIM]
+|     ╭─ diff +/- ───────────────────────────────────────────────────────────── █|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(179),mod=BOLD] 17-77[fg=Indexed(240)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|     │ + added widget 1 with extra payload text                                ░|
+  3-6[fg=Indexed(240)] 7-46[fg=Indexed(114),bg=Indexed(235)] 47-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │ - removed widget 2 with extra payload text                              ░|
+  3-6[fg=Indexed(240)] 7-48[fg=Indexed(203),bg=Indexed(235)] 49-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │   context row 3 keeps surrounding code visible                          ░|
+  3-6[fg=Indexed(240)] 7-52[fg=Indexed(245),bg=Indexed(235)] 53-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │ @@ -4,4 +4,4 @@ hunk marker row                                         ░|
+  3-6[fg=Indexed(240)] 7-37[fg=Indexed(141),bg=Indexed(235),mod=BOLD] 38-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │         4 + added widget 5 with extra payload text                      ░|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-56[fg=Indexed(114),bg=Indexed(235)] 57-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │    4      - removed widget 6 with extra payload text                    ░|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-58[fg=Indexed(203),bg=Indexed(235)] 59-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │    5    5   context row 7 keeps surrounding code visible                ░|
+  3-6[fg=Indexed(240)] 7-62[fg=Indexed(245),bg=Indexed(235)] 63-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │ @@ -8,4 +8,4 @@ hunk marker row                                         ░|
+  3-6[fg=Indexed(240)] 7-37[fg=Indexed(141),bg=Indexed(235),mod=BOLD] 38-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │         8 + added widget 9 with extra payload text                      ░|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-56[fg=Indexed(114),bg=Indexed(235)] 57-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │    8      - removed widget 10 with extra payload text                   ░|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-59[fg=Indexed(203),bg=Indexed(235)] 60-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │    9    9   context row 11 keeps surrounding code visible               ░|
+  3-6[fg=Indexed(240)] 7-63[fg=Indexed(245),bg=Indexed(235)] 64-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │ @@ -12,4 +12,4 @@ hunk marker row                                       ░|
+  3-6[fg=Indexed(240)] 7-39[fg=Indexed(141),bg=Indexed(235),mod=BOLD] 40-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │        12 + added widget 13 with extra payload text                     ░|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-57[fg=Indexed(114),bg=Indexed(235)] 58-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │   12      - removed widget 14 with extra payload text                   ░|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-59[fg=Indexed(203),bg=Indexed(235)] 60-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │   13   13   context row 15 keeps surrounding code visible               ░|
+  3-6[fg=Indexed(240)] 7-63[fg=Indexed(245),bg=Indexed(235)] 64-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │ @@ -16,4 +16,4 @@ hunk marker row                                       ░|
+  3-6[fg=Indexed(240)] 7-39[fg=Indexed(141),bg=Indexed(235),mod=BOLD] 40-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │        16 + added widget 17 with extra payload text                     ░|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-57[fg=Indexed(114),bg=Indexed(235)] 58-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │   16      - removed widget 18 with extra payload text                   ░|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-59[fg=Indexed(203),bg=Indexed(235)] 60-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │   17   17   context row 19 keeps surrounding code visible               ░|
+  3-6[fg=Indexed(240)] 7-63[fg=Indexed(245),bg=Indexed(235)] 64-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │ @@ -20,4 +20,4 @@ hunk marker row                                       ░|
+  3-6[fg=Indexed(240)] 7-39[fg=Indexed(141),bg=Indexed(235),mod=BOLD] 40-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │        20 + added widget 21 with extra payload text                     ░|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-57[fg=Indexed(114),bg=Indexed(235)] 58-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │   20      - removed widget 22 with extra payload text                   ░|
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(245),bg=Indexed(235)] 17-59[fg=Indexed(203),bg=Indexed(235)] 60-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │   21   21   context row 23 keeps surrounding code visible               ░|
+  3-6[fg=Indexed(240)] 7-63[fg=Indexed(245),bg=Indexed(235)] 64-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|     │ @@ -24,4 +24,4 @@ hunk marker row                                       ▼|
+  3-6[fg=Indexed(240)] 7-39[fg=Indexed(141),bg=Indexed(235),mod=BOLD] 40-78[fg=Indexed(253)] 79-79[fg=Indexed(245),mod=DIM]
+

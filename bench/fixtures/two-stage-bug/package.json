@@ -1,0 +1,8 @@
+{
+  "name": "bench-two-stage-bug",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test"
+  }
+}

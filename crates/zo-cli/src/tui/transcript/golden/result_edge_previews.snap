@@ -1,0 +1,90 @@
+=== width 60 height 30 ===
+|× Ran cargo test · error                                    |
+  0-4[fg=Indexed(203),mod=BOLD] 5-15[fg=Indexed(253)] 16-18[fg=Indexed(245)] 19-23[fg=Indexed(203),mod=BOLD] 24-59[fg=Indexed(253)]
+|  └ running 3 tests · x error                               |
+  0-3[fg=Indexed(245)] 4-18[fg=Indexed(203)] 19-21[fg=Indexed(245)] 22-28[fg=Indexed(203),mod=BOLD]
+|                                                            |
+|◆  Tests failed; reading the file.                          |
+  0-0[fg=Indexed(111),mod=BOLD] 3-33[fg=Indexed(255)] 34-59[fg=Indexed(253)]
+|                                                            |
+|✓ Explored src/big.rs                                       |
+  0-1[fg=Indexed(114)] 2-9[fg=Indexed(253),mod=BOLD] 10-59[fg=Indexed(253)]
+|  └ ▸ Read: src/big.rs · 25 lines                           |
+  0-3[fg=Indexed(245)] 4-11[fg=Indexed(245),mod=BOLD] 12-32[fg=Indexed(253)]
+|                                                            |
+|◆  Fetching the reference page.                             |
+  0-0[fg=Indexed(111),mod=BOLD] 3-30[fg=Indexed(255)] 31-59[fg=Indexed(253)]
+|                                                            |
+|✓ Called web_fetch(https://example.com)                     |
+  0-1[fg=Indexed(114)] 2-7[fg=Indexed(253),mod=BOLD] 8-59[fg=Indexed(253)]
+|  └ ▾ Result: # Example Domain                              |
+  0-3[fg=Indexed(245)] 4-13[fg=Indexed(245),mod=BOLD] 14-29[fg=Indexed(253)]
+|  │ █ Example Domain                                        |
+  0-3[fg=Indexed(245)] 4-19[fg=Indexed(255),mod=BOLD]
+|  │                                                         |
+  0-3[fg=Indexed(245)]
+|  │ This domain is for illustrative use.                    |
+  0-3[fg=Indexed(245)] 4-22[fg=Indexed(253)] 23-34[fg=Indexed(255),mod=BOLD] 35-39[fg=Indexed(253)]
+|  │                                                         |
+  0-3[fg=Indexed(245)]
+|  │                                                         |
+  0-3[fg=Indexed(245)]
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+
+=== width 80 height 30 ===
+|× Ran cargo test · error                                                        |
+  0-4[fg=Indexed(203),mod=BOLD] 5-15[fg=Indexed(253)] 16-18[fg=Indexed(245)] 19-23[fg=Indexed(203),mod=BOLD] 24-79[fg=Indexed(253)]
+|  └ running 3 tests · x error                                                   |
+  0-3[fg=Indexed(245)] 4-18[fg=Indexed(203)] 19-21[fg=Indexed(245)] 22-28[fg=Indexed(203),mod=BOLD]
+|                                                                                |
+|◆  Tests failed; reading the file.                                              |
+  0-0[fg=Indexed(111),mod=BOLD] 3-33[fg=Indexed(255)] 34-79[fg=Indexed(253)]
+|                                                                                |
+|✓ Explored src/big.rs                                                           |
+  0-1[fg=Indexed(114)] 2-9[fg=Indexed(253),mod=BOLD] 10-79[fg=Indexed(253)]
+|  └ ▸ Read: src/big.rs · 25 lines                                               |
+  0-3[fg=Indexed(245)] 4-11[fg=Indexed(245),mod=BOLD] 12-32[fg=Indexed(253)]
+|                                                                                |
+|◆  Fetching the reference page.                                                 |
+  0-0[fg=Indexed(111),mod=BOLD] 3-30[fg=Indexed(255)] 31-79[fg=Indexed(253)]
+|                                                                                |
+|✓ Called web_fetch(https://example.com)                                         |
+  0-1[fg=Indexed(114)] 2-7[fg=Indexed(253),mod=BOLD] 8-79[fg=Indexed(253)]
+|  └ ▾ Result: # Example Domain                                                  |
+  0-3[fg=Indexed(245)] 4-13[fg=Indexed(245),mod=BOLD] 14-29[fg=Indexed(253)]
+|  │ █ Example Domain                                                            |
+  0-3[fg=Indexed(245)] 4-19[fg=Indexed(255),mod=BOLD]
+|  │                                                                             |
+  0-3[fg=Indexed(245)]
+|  │ This domain is for illustrative use.                                        |
+  0-3[fg=Indexed(245)] 4-22[fg=Indexed(253)] 23-34[fg=Indexed(255),mod=BOLD] 35-39[fg=Indexed(253)]
+|  │                                                                             |
+  0-3[fg=Indexed(245)]
+|  │                                                                             |
+  0-3[fg=Indexed(245)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+

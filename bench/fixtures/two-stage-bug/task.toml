@@ -1,0 +1,9 @@
+# Self-describing benchmark task. See bench/lanes.toml for the lane policy.
+schema_version = "1.0"
+id = "two-stage-bug"
+lane = "deep"
+difficulty = "medium"
+prompt = "Tests in test/parser.test.js fail. Fix the parser in src/parser.js so it trims keys and values, coerces primitive values, supports quoted strings containing equals signs, ignores blank/comment-only lines, and still rejects malformed non-empty lines."
+test_command = "node --test"
+coverage_tags = ["general-deep-loop", "multi-stage-debug", "js-unit-test"]
+intended_paths = ["src/parser.js"]

@@ -1,0 +1,62 @@
+# Zo CI — keep main green.
+#
+# Design notes (deliberate, do not "fix" casually):
+# * Primary job runs on macOS because zo is developed and fully tested on
+#   darwin (Seatbelt sandbox, keychain auth paths). The full workspace suite is
+#   known-green there, so this job is the gate.
+# * Linux is also a required gate for the hermetic workspace test suite: sandbox
+#   and process-isolation paths are platform-specific, so portability regressions
+#   must fail PRs instead of being hidden as informational noise.
+# * `cargo fmt --check` is intentionally absent: the tree is not fmt-clean and
+#   bulk-reformat is forbidden by repo policy.
+# * Clippy gates with `-D warnings` (backlog cleared to 0 on 2026-06-10, W8).
+#   If a pinned-toolchain bump introduces new lints, fix or justify them —
+#   don't flip this step back to informational.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test-macos:
+    name: test (macos)
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check (all targets)
+        run: cargo check --workspace --all-targets --locked
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Build CLI (fast release smoke)
+        run: cargo build -p zo-cli --profile fast-release --locked
+      - name: CLI smoke (--help)
+        run: cargo run -p zo-cli --locked -- --help
+      - name: CLI smoke (--version)
+        run: cargo run -p zo-cli --locked -- --version
+      - name: Clippy (gate)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test-linux:
+    name: test (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --locked

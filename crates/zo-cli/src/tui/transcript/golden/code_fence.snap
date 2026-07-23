@@ -1,0 +1,66 @@
+=== width 60 height 20 ===
+|┃  You                                                      |
+  0-5[fg=Indexed(111),mod=BOLD] 6-59[fg=Indexed(253)]
+|┃  show a hello world                                       |
+  0-2[fg=Indexed(111),mod=BOLD] 3-59[fg=Indexed(253)]
+|                                                            |
+|────────────────────────────────────────────────────────────|
+  0-59[fg=Indexed(237)]
+|◆  Here it is:                                              |
+  0-0[fg=Indexed(111),mod=BOLD] 3-13[fg=Indexed(255)] 14-59[fg=Indexed(253)]
+|                                                            |
+  3-59[fg=Indexed(253)]
+|                                                            |
+  3-59[fg=Indexed(253)]
+|     ╭─ rust ────────────────────────────────────────────── |
+  3-6[fg=Indexed(240)] 7-12[fg=Indexed(245),mod=ITALIC] 13-58[fg=Indexed(240)] 59-59[fg=Indexed(253)]
+|     │ fn main() {                                          |
+  3-6[fg=Indexed(240)] 7-8[fg=Indexed(141),bg=Indexed(235)] 9-9[fg=Indexed(253),bg=Indexed(235)] 10-13[fg=Indexed(117),bg=Indexed(235)] 14-17[fg=Indexed(253),bg=Indexed(235)] 18-59[fg=Indexed(253)]
+|     │     println!("hello");                               |
+  3-6[fg=Indexed(240)] 7-10[fg=Indexed(253),bg=Indexed(235)] 11-18[fg=Indexed(117),bg=Indexed(235)] 19-19[fg=Indexed(253),bg=Indexed(235)] 20-26[fg=Indexed(109),bg=Indexed(235)] 27-28[fg=Indexed(253),bg=Indexed(235)] 29-59[fg=Indexed(253)]
+|     │ }                                                    |
+  3-6[fg=Indexed(240)] 7-7[fg=Indexed(253),bg=Indexed(235)] 8-59[fg=Indexed(253)]
+|     ╰────────────────────────────────────────────────────  |
+  3-57[fg=Indexed(240)] 58-59[fg=Indexed(253)]
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+
+=== width 80 height 20 ===
+|┃  You                                                                          |
+  0-5[fg=Indexed(111),mod=BOLD] 6-79[fg=Indexed(253)]
+|┃  show a hello world                                                           |
+  0-2[fg=Indexed(111),mod=BOLD] 3-79[fg=Indexed(253)]
+|                                                                                |
+|────────────────────────────────────────────────────────────────────────────────|
+  0-79[fg=Indexed(237)]
+|◆  Here it is:                                                                  |
+  0-0[fg=Indexed(111),mod=BOLD] 3-13[fg=Indexed(255)] 14-79[fg=Indexed(253)]
+|                                                                                |
+  3-79[fg=Indexed(253)]
+|                                                                                |
+  3-79[fg=Indexed(253)]
+|     ╭─ rust ────────────────────────────────────────────────────────────────── |
+  3-6[fg=Indexed(240)] 7-12[fg=Indexed(245),mod=ITALIC] 13-78[fg=Indexed(240)] 79-79[fg=Indexed(253)]
+|     │ fn main() {                                                              |
+  3-6[fg=Indexed(240)] 7-8[fg=Indexed(141),bg=Indexed(235)] 9-9[fg=Indexed(253),bg=Indexed(235)] 10-13[fg=Indexed(117),bg=Indexed(235)] 14-17[fg=Indexed(253),bg=Indexed(235)] 18-79[fg=Indexed(253)]
+|     │     println!("hello");                                                   |
+  3-6[fg=Indexed(240)] 7-10[fg=Indexed(253),bg=Indexed(235)] 11-18[fg=Indexed(117),bg=Indexed(235)] 19-19[fg=Indexed(253),bg=Indexed(235)] 20-26[fg=Indexed(109),bg=Indexed(235)] 27-28[fg=Indexed(253),bg=Indexed(235)] 29-79[fg=Indexed(253)]
+|     │ }                                                                        |
+  3-6[fg=Indexed(240)] 7-7[fg=Indexed(253),bg=Indexed(235)] 8-79[fg=Indexed(253)]
+|     ╰────────────────────────────────────────────────────────────────────────  |
+  3-77[fg=Indexed(240)] 78-79[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+

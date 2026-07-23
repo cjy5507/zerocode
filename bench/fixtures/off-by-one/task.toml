@@ -1,0 +1,11 @@
+# Self-describing benchmark task. The harness discovers this file, so the lane,
+# prompt, test command, and intended paths live here — not in a runbook or CLI
+# flags. See bench/lanes.toml for the lane policy.
+schema_version = "1.0"
+id = "off-by-one"
+lane = "fast"
+difficulty = "easy"
+prompt = "A test in test/range.test.js fails. Fix the bug in src/range.js."
+test_command = "node --test"
+coverage_tags = ["general-fast-loop", "js-unit-test", "edge-case"]
+intended_paths = ["src/range.js"]

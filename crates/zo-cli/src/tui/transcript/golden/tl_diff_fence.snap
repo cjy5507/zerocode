@@ -1,0 +1,128 @@
+=== stage: open-diff ===
+|◆                                                                               |
+  0-0[fg=Indexed(111),mod=BOLD] 3-79[fg=Indexed(253)]
+|     ╭─ diff +/- ────────────────────────────────────────────────────────────── |
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(179),mod=BOLD] 17-78[fg=Indexed(240)] 79-79[fg=Indexed(253)]
+|     │ + added line                                                             |
+  3-6[fg=Indexed(240)] 7-18[fg=Indexed(114),bg=Indexed(235)] 19-79[fg=Indexed(253)]
+|     ╰────────────────────────────────────────────────────────────────────────  |
+  3-77[fg=Indexed(240)] 78-79[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+
+=== stage: hunk-context ===
+|◆                                                                               |
+  0-0[fg=Indexed(111),mod=BOLD] 3-79[fg=Indexed(253)]
+|     ╭─ diff +/- ────────────────────────────────────────────────────────────── |
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(179),mod=BOLD] 17-78[fg=Indexed(240)] 79-79[fg=Indexed(253)]
+|     │ + added line                                                             |
+  3-6[fg=Indexed(240)] 7-18[fg=Indexed(114),bg=Indexed(235)] 19-79[fg=Indexed(253)]
+|     │ - removed line                                                           |
+  3-6[fg=Indexed(240)] 7-20[fg=Indexed(203),bg=Indexed(235)] 21-79[fg=Indexed(253)]
+|     │ @@ -1,2 +1,2 @@                                                          |
+  3-6[fg=Indexed(240)] 7-21[fg=Indexed(141),bg=Indexed(235),mod=BOLD] 22-79[fg=Indexed(253)]
+|     ╰────────────────────────────────────────────────────────────────────────  |
+  3-77[fg=Indexed(240)] 78-79[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+
+=== stage: close-fence ===
+|◆                                                                               |
+  0-0[fg=Indexed(111),mod=BOLD] 3-79[fg=Indexed(253)]
+|     ╭─ diff +/- ────────────────────────────────────────────────────────────── |
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(179),mod=BOLD] 17-78[fg=Indexed(240)] 79-79[fg=Indexed(253)]
+|     │ + added line                                                             |
+  3-6[fg=Indexed(240)] 7-18[fg=Indexed(114),bg=Indexed(235)] 19-79[fg=Indexed(253)]
+|     │ - removed line                                                           |
+  3-6[fg=Indexed(240)] 7-20[fg=Indexed(203),bg=Indexed(235)] 21-79[fg=Indexed(253)]
+|     │ @@ -1,2 +1,2 @@                                                          |
+  3-6[fg=Indexed(240)] 7-21[fg=Indexed(141),bg=Indexed(235),mod=BOLD] 22-79[fg=Indexed(253)]
+|     │    1    1  context                                                       |
+  3-6[fg=Indexed(240)] 7-24[fg=Indexed(245),bg=Indexed(235)] 25-79[fg=Indexed(253)]
+|     ╰────────────────────────────────────────────────────────────────────────  |
+  3-77[fg=Indexed(240)] 78-79[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+
+=== stage: settle ===
+|◆                                                                               |
+  0-0[fg=Indexed(111),mod=BOLD] 3-79[fg=Indexed(253)]
+|     ╭─ diff +/- ────────────────────────────────────────────────────────────── |
+  3-6[fg=Indexed(240)] 7-16[fg=Indexed(179),mod=BOLD] 17-78[fg=Indexed(240)] 79-79[fg=Indexed(253)]
+|     │ + added line                                                             |
+  3-6[fg=Indexed(240)] 7-18[fg=Indexed(114),bg=Indexed(235)] 19-79[fg=Indexed(253)]
+|     │ - removed line                                                           |
+  3-6[fg=Indexed(240)] 7-20[fg=Indexed(203),bg=Indexed(235)] 21-79[fg=Indexed(253)]
+|     │ @@ -1,2 +1,2 @@                                                          |
+  3-6[fg=Indexed(240)] 7-21[fg=Indexed(141),bg=Indexed(235),mod=BOLD] 22-79[fg=Indexed(253)]
+|     │    1    1  context                                                       |
+  3-6[fg=Indexed(240)] 7-24[fg=Indexed(245),bg=Indexed(235)] 25-79[fg=Indexed(253)]
+|     ╰────────────────────────────────────────────────────────────────────────  |
+  3-77[fg=Indexed(240)] 78-79[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+

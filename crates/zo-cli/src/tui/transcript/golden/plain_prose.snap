@@ -1,0 +1,81 @@
+=== width 60 height 20 ===
+|┃  You                                                      |
+  0-5[fg=Indexed(111),mod=BOLD] 6-59[fg=Indexed(253)]
+|┃  draw the zo architecture                                 |
+  0-2[fg=Indexed(111),mod=BOLD] 3-59[fg=Indexed(253)]
+|                                                            |
+|────────────────────────────────────────────────────────────|
+  0-59[fg=Indexed(237)]
+|◆  Mapped every dependency. Organizing it into layers now.  |
+  0-0[fg=Indexed(111),mod=BOLD] 3-57[fg=Indexed(255)] 58-59[fg=Indexed(253)]
+|                                                            |
+|   The core flows top-to-bottom with no dependency cycles.  |
+  3-59[fg=Indexed(253)]
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+
+=== width 80 height 20 ===
+|┃  You                                                                          |
+  0-5[fg=Indexed(111),mod=BOLD] 6-79[fg=Indexed(253)]
+|┃  draw the zo architecture                                                     |
+  0-2[fg=Indexed(111),mod=BOLD] 3-79[fg=Indexed(253)]
+|                                                                                |
+|────────────────────────────────────────────────────────────────────────────────|
+  0-79[fg=Indexed(237)]
+|◆  Mapped every dependency. Organizing it into layers now.                      |
+  0-0[fg=Indexed(111),mod=BOLD] 3-57[fg=Indexed(255)] 58-79[fg=Indexed(253)]
+|                                                                                |
+|   The core flows top-to-bottom with no dependency cycles.                      |
+  3-79[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+
+=== width 120 height 20 ===
+|┃  You                                                                                                                  |
+  0-5[fg=Indexed(111),mod=BOLD] 6-119[fg=Indexed(253)]
+|┃  draw the zo architecture                                                                                             |
+  0-2[fg=Indexed(111),mod=BOLD] 3-112[fg=Indexed(253)]
+|                                                                                                                        |
+|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+  0-119[fg=Indexed(237)]
+|◆  Mapped every dependency. Organizing it into layers now.                                                              |
+  0-0[fg=Indexed(111),mod=BOLD] 3-57[fg=Indexed(255)] 58-112[fg=Indexed(253)]
+|                                                                                                                        |
+|   The core flows top-to-bottom with no dependency cycles.                                                              |
+  3-112[fg=Indexed(253)]
+|                                                                                                                        |
+|                                                                                                                        |
+|                                                                                                                        |
+|                                                                                                                        |
+|                                                                                                                        |
+|                                                                                                                        |
+|                                                                                                                        |
+|                                                                                                                        |
+|                                                                                                                        |
+|                                                                                                                        |
+|                                                                                                                        |
+|                                                                                                                        |
+|                                                                                                                        |
+

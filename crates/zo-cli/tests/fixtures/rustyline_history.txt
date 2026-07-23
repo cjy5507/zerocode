@@ -1,0 +1,6 @@
+#V2
+hello world
+explain this repo
+write a haiku about cats\nand dogs
+c:\\path\\to\\file
+how do I use /model

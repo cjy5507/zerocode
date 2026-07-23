@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1F1E1D" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#FAF9F5" media="(prefers-color-scheme: light)">
+  <meta name="referrer" content="no-referrer">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="zo">
+  <title>Zo Remote</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="apple-touch-icon" href="./apple-touch-icon.png">
+  <link rel="stylesheet" href="./styles.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <main class="shell">
+    <section id="pair-view" class="pair-view" aria-labelledby="pair-title">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" role="img"><path d="M16 2 27 8v16l-11 6L5 24V8l11-6Zm0 5.1L9.5 10.7v10.6L16 24.9l6.5-3.6V10.7L16 7.1Z"/></svg>
+      </div>
+      <p class="eyebrow">TAILNET DIRECT</p>
+      <h1 id="pair-title">Continue your Zo session</h1>
+      <p class="lede">Your code and model credentials stay on the computer running Zo. This phone connects directly through your Tailscale network.</p>
+
+      <form id="pair-form" class="pair-card">
+        <label for="device-name">Device name</label>
+        <input id="device-name" name="device-name" type="text" maxlength="48" autocomplete="off" value="My phone" required>
+        <button id="pair-button" class="button button-primary" type="submit">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V8a5 5 0 0 1 10 0v2h1a2 2 0 0 1 2 2v8H4v-8a2 2 0 0 1 2-2h1Zm3 0h4V8a2 2 0 1 0-4 0v2Z"/></svg>
+          Connect this device
+        </button>
+        <p id="pair-error" class="form-error" role="alert" hidden></p>
+      </form>
+
+      <section id="approval-card" class="approval-card" hidden aria-labelledby="approval-title">
+        <span class="approval-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+        <div>
+          <h2 id="approval-title">Approve in your terminal</h2>
+          <p>Confirm that both screens show this code, then run:</p>
+          <strong id="comparison-code" class="comparison-code"></strong>
+          <code id="approval-command"></code>
+        </div>
+      </section>
+      <div id="install-affordances" class="install-affordances" hidden>
+        <button id="install-button" class="button button-secondary install-chip" type="button" hidden>Install app</button>
+        <p id="ios-install-hint" class="install-hint" hidden>
+          <span>Share → Add to Home Screen</span>
+          <button id="dismiss-install-hint" class="install-hint-dismiss" type="button">Dismiss</button>
+        </p>
+      </div>
+      <p class="security-note">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 4 5v6c0 5.1 3.4 9.9 8 11 4.6-1.1 8-5.9 8-11V5l-8-3Zm0 4 4 1.5V11c0 3.1-1.8 6.2-4 7.3-2.2-1.1-4-4.2-4-7.3V7.5L12 6Z"/></svg>
+        No cloud relay · Local approval required · Access ends with this Zo process
+      </p>
+    </section>
+
+    <section id="remote-view" class="remote-view" hidden aria-label="Zo remote session">
+      <header class="topbar">
+        <div class="session-heading">
+          <span id="connection-dot" class="status-dot" aria-hidden="true"></span>
+          <div>
+            <h1 id="session-title">Zo session</h1>
+            <p id="connection-label" class="visually-hidden">Connecting</p>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <span id="role-badge" class="role-badge">Observer</span>
+          <button id="push-toggle" class="icon-button push-toggle" type="button" aria-label="Notifications off" aria-pressed="false" title="Enable notifications" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9Zm-8 11a2 2 0 0 0 4 0h-4Z"/></svg>
+          </button>
+          <button id="request-control" class="icon-button" type="button" aria-label="Request control" title="Request control">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a5 5 0 0 0-5 5v3H5a2 2 0 0 0-2 2v8h18v-8a2 2 0 0 0-2-2h-2V7a5 5 0 0 0-5-5Zm-2 8V7a2 2 0 1 1 4 0v3h-4Z"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <div id="connection-banner" class="connection-banner" role="status" hidden>
+        <span class="connection-pulse" aria-hidden="true"></span>
+        <span id="connection-message">Reconnecting to Zo…</span>
+      </div>
+
+      <section id="transcript" class="transcript" aria-label="Session transcript" tabindex="0"></section>
+      <button id="new-items" class="new-items" type="button" hidden>
+        <span class="new-items-label">New activity</span>
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3v12m-5-5 5 5 5-5"/></svg>
+      </button>
+
+      <footer class="composer-wrap">
+        <div id="observer-panel" class="observer-panel" hidden>
+          <div>
+            <strong>Watch-only mode</strong>
+            <p>Request control to send prompts from this device.</p>
+          </div>
+          <button id="observer-control" class="button button-primary" type="button">Request control</button>
+        </div>
+        <form id="composer" class="composer">
+          <div class="composer-running-controls">
+            <div id="mode-switch" class="mode-switch" role="group" aria-label="Message behavior" hidden>
+              <button type="button" class="mode-option is-active" data-mode="queue" aria-pressed="true">Queue</button>
+              <button type="button" class="mode-option" data-mode="steer" aria-pressed="false">Steer</button>
+            </div>
+            <button id="cancel-turn" class="text-button danger" type="button" hidden>Stop</button>
+          </div>
+          <label for="prompt" class="composer-label visually-hidden">Message Zo</label>
+          <div class="composer-input-row">
+            <span class="prompt-marker" aria-hidden="true">❯</span>
+            <textarea id="prompt" rows="1" maxlength="32768" placeholder="Message Zo…" enterkeyhint="send"></textarea>
+            <button id="send-button" class="send-button" type="submit" aria-label="Send message">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 4 17 8-17 8 3-7 8-1-8-1-3-7Z"/></svg>
+            </button>
+          </div>
+          <div class="composer-meta">
+            <span id="composer-hint">Send a new request</span>
+          </div>
+        </form>
+      </footer>
+    </section>
+  </main>
+
+  <dialog id="cancel-dialog" class="confirm-dialog">
+    <form method="dialog">
+      <h2>Stop the current turn?</h2>
+      <p>Zo will keep the output produced so far.</p>
+      <div class="dialog-actions">
+        <button class="button button-secondary" value="cancel">Keep running</button>
+        <button id="confirm-cancel" class="button button-danger" value="confirm">Stop turn</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="announcer" class="visually-hidden" aria-live="polite"></div>
+</body>
+</html>

@@ -1,0 +1,138 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal --component clippy
+          rustup default 1.94.0
+      - name: Verify tag matches workspace version
+        run: |
+          version="$(awk '
+            /^\[workspace.package\]$/ { in_workspace_package=1; next }
+            /^\[/ { in_workspace_package=0 }
+            in_workspace_package && /^version = / {
+              gsub(/^version = "/, ""); gsub(/"$/, ""); print; exit
+            }
+          ' Cargo.toml)"
+          test -n "$version"
+          test "$GITHUB_REF_NAME" = "v${version}"
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
+      - name: Clippy gate
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-14
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain and target
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal --target "${{ matrix.target }}"
+          rustup default 1.94.0
+      - name: Build stable release asset
+        env:
+          ZO_RELEASE_CHANNEL: stable
+        run: cargo build -p zo-cli --profile fast-release --locked --target "${{ matrix.target }}"
+      - name: Stage release asset
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/fast-release/zo" \
+            "dist/zo-${GITHUB_REF_NAME}-${{ matrix.target }}"
+      - name: Attest binary build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: "dist/zo-${{ github.ref_name }}-${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: "zo-${{ matrix.target }}"
+          path: "dist/zo-${{ github.ref_name }}-${{ matrix.target }}"
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: zo-*
+          path: dist
+          merge-multiple: true
+      - name: Generate deterministic manifest and checksums
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          base="https://github.com/cjy5507/zerocode/releases/download/${GITHUB_REF_NAME}"
+          targets=(
+            aarch64-apple-darwin
+            x86_64-apple-darwin
+            x86_64-unknown-linux-gnu
+          )
+          cp install.sh dist/install.sh
+          {
+            printf 'schema=1\n'
+            printf 'version=%s\n' "$version"
+            printf 'base=%s\n' "$base"
+            for target in "${targets[@]}"; do
+              asset="zo-${GITHUB_REF_NAME}-${target}"
+              hash="$(sha256sum "dist/${asset}" | awk '{print $1}')"
+              size="$(stat -c '%s' "dist/${asset}")"
+              printf 'asset=%s|%s|%s|%s\n' "$target" "$asset" "$hash" "$size"
+            done
+          } > dist/manifest.txt
+          (cd dist && sha256sum zo-* install.sh manifest.txt | LC_ALL=C sort -k2) > dist/SHA256SUMS
+      - name: Attest release metadata provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/install.sh
+            dist/manifest.txt
+            dist/SHA256SUMS
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/zo-* dist/install.sh dist/manifest.txt dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

@@ -1,0 +1,11 @@
+# Self-describing benchmark task. See bench/lanes.toml for the lane policy.
+# The prompt does not spell out the ordering/id-reuse invariants — they are
+# enforced by existing assertions, which is the point of this fixture.
+schema_version = "1.0"
+id = "hidden-invariant"
+lane = "deep"
+difficulty = "medium"
+prompt = "Add a remove(id) method to src/registry.js. It should delete exactly one item, return true when an item was removed and false otherwise, preserve the existing priority ordering of remaining items, keep ids from being reused, and keep list() defensive."
+test_command = "node --test"
+coverage_tags = ["general-deep-loop", "hidden-invariant", "js-unit-test"]
+intended_paths = ["src/registry.js"]

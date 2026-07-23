@@ -1,0 +1,104 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "provider": "openai",
+      "ids": [
+        "gpt-5.6-sol"
+      ],
+      "context_window": 258000,
+      "max_output_tokens": 128000,
+      "class": "frontier",
+      "source": "User-directed 2026-07-14: GPT-family effective context capped at 258k (matching gpt-5.5) — sessions past ~256k showed degraded behavior on the Codex backend, so the declared 353k (Codex cache 372k at 95%) is not treated as usable. Prior: Official Codex model cache fetched 2026-07-09: 372k context at 95% effective; rounded down to 353k. Declared 'Latest frontier agentic coding model', priority 1 — supersedes gpt-5.5 as the top rung."
+    },
+    {
+      "provider": "openai",
+      "ids": [
+        "gpt-5.6-terra"
+      ],
+      "context_window": 258000,
+      "max_output_tokens": 128000,
+      "class": "balanced",
+      "source": "User-directed 2026-07-14: GPT-family effective context capped at 258k (matching gpt-5.5) — sessions past ~256k showed degraded behavior on the Codex backend, so the declared 353k (Codex cache 372k at 95%) is not treated as usable. Prior: Official Codex model cache fetched 2026-07-09: 372k context at 95% effective; rounded down to 353k. Declared 'Balanced agentic coding model for everyday work', priority 2."
+    },
+    {
+      "provider": "openai",
+      "ids": [
+        "gpt-5.6-luna"
+      ],
+      "context_window": 258000,
+      "max_output_tokens": 128000,
+      "class": "fast",
+      "source": "User-directed 2026-07-14: GPT-family effective context capped at 258k (matching gpt-5.5) — sessions past ~256k showed degraded behavior on the Codex backend, so the declared 353k (Codex cache 372k at 95%) is not treated as usable. Prior: Official Codex model cache fetched 2026-07-09: 372k context at 95% effective; rounded down to 353k. Declared 'Fast and affordable agentic coding model', priority 3."
+    },
+    {
+      "provider": "openai",
+      "ids": [
+        "gpt",
+        "gpt-5.5",
+        "gpt-5.5-fast",
+        "gpt-5.5-2026-04-23"
+      ],
+      "context_window": 258000,
+      "max_output_tokens": 128000,
+      "class": "balanced",
+      "source": "User-confirmed GPT and GPT-5.5 effective context window: 258k tokens. Superseded as frontier by gpt-5.6-sol (Codex model cache 2026-07-09 declares sol 'Latest frontier agentic coding model', priority 1); gpt-5.5 was the prior default ('Frontier', priority 0)."
+    },
+    {
+      "provider": "openai",
+      "ids": [
+        "gpt-5.3-codex-spark"
+      ],
+      "context_window": 122000,
+      "source": "User-confirmed Codex Spark context window: 122k tokens."
+    },
+    {
+      "provider": "deepseek",
+      "ids": [
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "deepseek-chat",
+        "deepseek-reasoner"
+      ],
+      "context_window": 1000000,
+      "max_output_tokens": 384000,
+      "source": "DeepSeek pricing (api-docs.deepseek.com/quick_start/pricing): V4 Pro/Flash 1M context, 384K max output. Legacy deepseek-chat/deepseek-reasoner are v4-flash modes (deprecated 2026/07/24)."
+    },
+    {
+      "provider": "anthropic",
+      "ids": [
+        "claude-fable-5"
+      ],
+      "context_window": 1000000,
+      "class": "frontier",
+      "source": "Anthropic public positioning: Fable-5 is the Mythos-class tier, positioned above Opus. context_window/max_output_tokens are informational only here — Anthropic windows resolve via the hardcoded claude-family rule in providers/mod.rs (context_window_for_canonical / max_output_tokens_for_model_id); this entry's sole live effect is the declared class."
+    },
+    {
+      "provider": "anthropic",
+      "ids": [
+        "claude-opus-4-8"
+      ],
+      "context_window": 1000000,
+      "class": "balanced",
+      "source": "Superseded flagship: Fable-5 supersedes Opus as Anthropic's frontier tier; Opus is repositioned as an executor model per the user-declared hierarchy (frontier = fable-5/gpt-5.6-sol; executors = opus/sonnet/terra/everything else). context_window/max_output_tokens are informational only — see claude-fable-5 entry note."
+    },
+    {
+      "provider": "anthropic",
+      "ids": [
+        "claude-sonnet-5"
+      ],
+      "context_window": 1000000,
+      "class": "balanced",
+      "source": "Executor tier per the user-declared hierarchy (frontier = fable-5/gpt-5.6-sol; executors = opus/sonnet/terra/everything else). context_window/max_output_tokens are informational only — see claude-fable-5 entry note."
+    },
+    {
+      "provider": "anthropic",
+      "ids": [
+        "claude-haiku-4-5-20251001"
+      ],
+      "context_window": 258000,
+      "class": "fast",
+      "source": "Executor tier per the user-declared hierarchy. context_window/max_output_tokens are informational only — see claude-fable-5 entry note."
+    }
+  ]
+}

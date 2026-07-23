@@ -1,0 +1,59 @@
+/target
+*.swp
+*.swo
+.DS_Store
+.sandbox-tmp/
+.sandbox-home/
+**/.zo/wakeups/
+**/.zo-todos.json
+**/.zo/sessions/
+**/.zo/session-prefs/
+**/.zo/projects/
+**/.zo/settings.local.json
+**/.zo/trusted_workspaces.json
+**/.zo/trusted-mcp-servers.json
+**/.zo/registries/
+**/.zo/cost/
+**/.zo/contracts/
+**/.zo/tasks/
+**/.zo/design/
+**/.zo/artifacts/
+**/.zo/automation/
+**/.zo/memory/.embcache.bin
+**/.zo/workflows/
+**/.zo/plans/
+**/.zo/tool-state/
+**/.zo/cache/
+**/.zo/state.json
+**/.zo/runtime.json
+**/.zo/read-counts.json
+.idea/
+
+# 런타임 전용 — git 추적 대상 아님
+**/.zo/worktrees/
+**/.zo/cargo-space.lock/
+# turn-trace / dream 산물 (zo 가 실행된 cwd 마다 생성 — 루트·crate 공통)
+**/.zo/turns/
+**/.zo/dream/
+**/.zo/artifacts/
+**/.zo/automation/
+# 옛 per-session automation 영속 경로 오염 (현재는 .zo/automation/state.json 사용)
+/automation/
+/crates/zo-cli/automation/
+
+# Legacy Forge runtime state may still exist after upgrading. Keep every
+# descendant private so `git add -A` cannot expose transcripts or artifacts.
+**/.forge/
+
+# Zo 개인 로컬 설정과 벤치 산출물 — 커밋 금지
+/bench/
+# zo local artifacts
+.playwright-mcp/
+
+# Internal engineering context is not part of the public zerocode repository.
+/.zo/
+/context.md
+/DESIGN.md
+/docs/
+/zo-design/
+/crates/zo-cli/src/tui/styles.md

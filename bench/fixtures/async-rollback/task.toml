@@ -1,0 +1,9 @@
+# Self-describing benchmark task. See bench/lanes.toml for the lane policy.
+schema_version = "1.0"
+id = "async-rollback"
+lane = "deep"
+difficulty = "hard"
+prompt = "Implement transactional rollback for async batch operations. applyBatch must commit all operations in order when every handler succeeds, but if any handler is missing or rejects, prior writes and deletes must be rolled back and a BatchError with operationIndex, operation, and cause must be thrown."
+test_command = "node --test"
+coverage_tags = ["general-deep-loop", "async-rollback", "js-unit-test"]
+intended_paths = ["src/"]

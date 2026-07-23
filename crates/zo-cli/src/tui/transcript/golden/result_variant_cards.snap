@@ -1,0 +1,96 @@
+=== width 60 height 30 ===
+|✓ Edited src/lib.rs                                         |
+  0-1[fg=Indexed(114)] 2-7[fg=Indexed(255),mod=BOLD] 8-59[fg=Indexed(253)]
+|  └ src/lib.rs (+1 -1)                                      |
+  0-3[fg=Indexed(245)] 4-15[fg=Indexed(253)] 16-17[fg=Indexed(114),mod=BOLD] 18-18[fg=Indexed(253)] 19-20[fg=Indexed(203),mod=BOLD] 21-21[fg=Indexed(253)]
+|  │ 1   fn main() {                                         |
+  0-7[fg=Indexed(245)] 8-9[fg=Indexed(141)] 10-10[fg=Indexed(253)] 11-14[fg=Indexed(117)] 15-18[fg=Indexed(253)]
+|  │ 2 -     println!("old");                                |
+  0-3[fg=Indexed(245)] 4-5[fg=Indexed(245),bg=Indexed(52)] 6-6[fg=Indexed(203),bg=Indexed(52)] 7-7[fg=Indexed(245),bg=Indexed(52)] 8-11[fg=Indexed(253),bg=Indexed(52)] 12-19[fg=Indexed(117),bg=Indexed(52)] 20-20[fg=Indexed(253),bg=Indexed(52)] 21-21[fg=Indexed(109),bg=Indexed(52)] 22-24[fg=Indexed(109),bg=Indexed(88)] 25-25[fg=Indexed(109),bg=Indexed(52)] 26-27[fg=Indexed(253),bg=Indexed(52)] 28-59[bg=Indexed(52)]
+|  │ 2 +     println!("new");                                |
+  0-3[fg=Indexed(245)] 4-5[fg=Indexed(245),bg=Indexed(22)] 6-6[fg=Indexed(114),bg=Indexed(22)] 7-7[fg=Indexed(245),bg=Indexed(22)] 8-11[fg=Indexed(253),bg=Indexed(22)] 12-19[fg=Indexed(117),bg=Indexed(22)] 20-20[fg=Indexed(253),bg=Indexed(22)] 21-21[fg=Indexed(109),bg=Indexed(22)] 22-24[fg=Indexed(109),bg=Indexed(28)] 25-25[fg=Indexed(109),bg=Indexed(22)] 26-27[fg=Indexed(253),bg=Indexed(22)] 28-59[bg=Indexed(22)]
+|  │ 3   }                                                   |
+  0-7[fg=Indexed(245)] 8-8[fg=Indexed(253)]
+|                                                            |
+|◆  Edit applied.                                            |
+  0-0[fg=Indexed(111),mod=BOLD] 3-15[fg=Indexed(255)] 16-59[fg=Indexed(253)]
+|                                                            |
+|                                                            |
+  0-59[fg=Indexed(253)]
+|╭ Updated Plan  ·  1/3 done ╮                               |
+  0-1[fg=Indexed(245)] 2-13[fg=Indexed(245),mod=BOLD] 14-28[fg=Indexed(245)]
+|│ ☑ Write the parser        │                               |
+  0-1[fg=Indexed(245)] 2-2[fg=Indexed(114)] 4-19[fg=Indexed(245),mod=CROSSED_OUT] 20-28[fg=Indexed(245)]
+|│ ◐ Wiring the renderer     │                               |
+  0-1[fg=Indexed(245)] 2-2[fg=Indexed(179)] 4-22[fg=Indexed(253),mod=BOLD] 23-28[fg=Indexed(245)]
+|│ ☐ Add golden tests        │                               |
+  0-2[fg=Indexed(245)] 4-19[fg=Indexed(253)] 20-28[fg=Indexed(245)]
+|╰───────────────────────────╯                               |
+  0-28[fg=Indexed(245)]
+|                                                            |
+|◆  Checklist updated.                                       |
+  0-0[fg=Indexed(111),mod=BOLD] 3-20[fg=Indexed(255)] 21-59[fg=Indexed(253)]
+|                                                            |
+|✓ Explored grep fn main                                     |
+  0-1[fg=Indexed(114)] 2-9[fg=Indexed(253),mod=BOLD] 10-59[fg=Indexed(253)]
+|  └ 3 entries · src/main.rs                                 |
+  0-3[fg=Indexed(245)] 4-26[fg=Indexed(253)]
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+
+=== width 80 height 30 ===
+|✓ Edited src/lib.rs                                                             |
+  0-1[fg=Indexed(114)] 2-7[fg=Indexed(255),mod=BOLD] 8-79[fg=Indexed(253)]
+|  └ src/lib.rs (+1 -1)                                                          |
+  0-3[fg=Indexed(245)] 4-15[fg=Indexed(253)] 16-17[fg=Indexed(114),mod=BOLD] 18-18[fg=Indexed(253)] 19-20[fg=Indexed(203),mod=BOLD] 21-21[fg=Indexed(253)]
+|  │ 1   fn main() {                                                             |
+  0-7[fg=Indexed(245)] 8-9[fg=Indexed(141)] 10-10[fg=Indexed(253)] 11-14[fg=Indexed(117)] 15-18[fg=Indexed(253)]
+|  │ 2 -     println!("old");                                                    |
+  0-3[fg=Indexed(245)] 4-5[fg=Indexed(245),bg=Indexed(52)] 6-6[fg=Indexed(203),bg=Indexed(52)] 7-7[fg=Indexed(245),bg=Indexed(52)] 8-11[fg=Indexed(253),bg=Indexed(52)] 12-19[fg=Indexed(117),bg=Indexed(52)] 20-20[fg=Indexed(253),bg=Indexed(52)] 21-21[fg=Indexed(109),bg=Indexed(52)] 22-24[fg=Indexed(109),bg=Indexed(88)] 25-25[fg=Indexed(109),bg=Indexed(52)] 26-27[fg=Indexed(253),bg=Indexed(52)] 28-79[bg=Indexed(52)]
+|  │ 2 +     println!("new");                                                    |
+  0-3[fg=Indexed(245)] 4-5[fg=Indexed(245),bg=Indexed(22)] 6-6[fg=Indexed(114),bg=Indexed(22)] 7-7[fg=Indexed(245),bg=Indexed(22)] 8-11[fg=Indexed(253),bg=Indexed(22)] 12-19[fg=Indexed(117),bg=Indexed(22)] 20-20[fg=Indexed(253),bg=Indexed(22)] 21-21[fg=Indexed(109),bg=Indexed(22)] 22-24[fg=Indexed(109),bg=Indexed(28)] 25-25[fg=Indexed(109),bg=Indexed(22)] 26-27[fg=Indexed(253),bg=Indexed(22)] 28-79[bg=Indexed(22)]
+|  │ 3   }                                                                       |
+  0-7[fg=Indexed(245)] 8-8[fg=Indexed(253)]
+|                                                                                |
+|◆  Edit applied.                                                                |
+  0-0[fg=Indexed(111),mod=BOLD] 3-15[fg=Indexed(255)] 16-79[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+  0-79[fg=Indexed(253)]
+|╭ Updated Plan  ·  1/3 done ╮                                                   |
+  0-1[fg=Indexed(245)] 2-13[fg=Indexed(245),mod=BOLD] 14-28[fg=Indexed(245)]
+|│ ☑ Write the parser        │                                                   |
+  0-1[fg=Indexed(245)] 2-2[fg=Indexed(114)] 4-19[fg=Indexed(245),mod=CROSSED_OUT] 20-28[fg=Indexed(245)]
+|│ ◐ Wiring the renderer     │                                                   |
+  0-1[fg=Indexed(245)] 2-2[fg=Indexed(179)] 4-22[fg=Indexed(253),mod=BOLD] 23-28[fg=Indexed(245)]
+|│ ☐ Add golden tests        │                                                   |
+  0-2[fg=Indexed(245)] 4-19[fg=Indexed(253)] 20-28[fg=Indexed(245)]
+|╰───────────────────────────╯                                                   |
+  0-28[fg=Indexed(245)]
+|                                                                                |
+|◆  Checklist updated.                                                           |
+  0-0[fg=Indexed(111),mod=BOLD] 3-20[fg=Indexed(255)] 21-79[fg=Indexed(253)]
+|                                                                                |
+|✓ Explored grep fn main                                                         |
+  0-1[fg=Indexed(114)] 2-9[fg=Indexed(253),mod=BOLD] 10-79[fg=Indexed(253)]
+|  └ 3 entries · src/main.rs                                                     |
+  0-3[fg=Indexed(245)] 4-26[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+

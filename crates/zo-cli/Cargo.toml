@@ -1,0 +1,87 @@
+[package]
+name = "zo-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+default-run = "zo"
+
+[lib]
+name = "zo_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zo"
+path = "src/main.rs"
+
+[dependencies]
+acp = { path = "../acp" }
+thiserror.workspace = true
+axum.workspace = true
+base64 = "0.22"
+api = { path = "../api" }
+commands = { path = "../commands" }
+core-types = { path = "../core-types" }
+compat-harness = { path = "../compat-harness" }
+decision-core = { path = "../decision-core" }
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util.workspace = true
+gix.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
+qrcode.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+ring.workspace = true
+sha2.workspace = true
+ignore = "0.4"
+notify.workspace = true
+pulldown-cmark = "0.13"
+# `unstable-rendered-line-info` exposes `Paragraph::line_count`, which measures
+# wrapped height with the *same* `WordWrapper` the renderer uses. Height
+# measurement and draw must share one wrap engine, or the cached layout disagrees
+# with what is painted and a block gains/loses a row until a re-layout (the
+# "extra line until you scroll" glitch).
+ratatui = { version = "0.30", features = [
+    "crossterm_0_28",
+    "unstable-rendered-line-info",
+] }
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+terminal-colorsaurus = "1.0.3"
+rustyline = "15"
+runtime = { path = "../runtime" }
+plugins = { path = "../plugins" }
+serde.workspace = true
+serde_json.workspace = true
+# `net` + `io-util` + `io-std` + `macros` + `sync` back the `zo serve`/`zo
+# attach` TCP session protocol (TcpListener, line framing, async stdin, `join!`,
+# mpsc/Mutex).
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "signal",
+    "time",
+    "net",
+    "io-util",
+    "io-std",
+    "macros",
+    "process",
+    "sync",
+] }
+tokio-util.workspace = true
+tower-http.workspace = true
+tools = { path = "../tools" }
+# 마크다운 표/wrap 의 셀 폭 계산을 ratatui(Line::width) 와 동일한
+# unicode-width 기반으로 통일 — CJK(한국어) 폭 하드코딩 제거.
+unicode-width = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+# stderr fd redirect 시 dup/dup2/close 를 safe 하게 호출하기 위해 사용.
+# workspace 정책이 `unsafe_code = "forbid"` 이므로 libc 직접 호출은 불가.
+nix = { version = "0.29", features = ["fs"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+mock-anthropic-service = { path = "../mock-anthropic-service" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }

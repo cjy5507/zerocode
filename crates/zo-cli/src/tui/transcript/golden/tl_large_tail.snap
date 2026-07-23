@@ -1,0 +1,186 @@
+=== stage: half-1 ===
+|◆  prose opener carries a bold run to route the tail prose line 2 keeps the    ▲|
+  0-0[fg=Indexed(111),mod=BOLD] 3-25[fg=Indexed(255)] 26-29[fg=Indexed(255),mod=BOLD] 30-51[fg=Indexed(255)] 52-52[fg=Indexed(253)] 53-74[fg=Indexed(255)] 75-78[fg=Indexed(253)] 79-79[fg=Indexed(245),mod=DIM]
+|   paragraph growing without blank lines prose line 3 keeps the paragraph      █|
+  3-39[fg=Indexed(255)] 40-40[fg=Indexed(253)] 41-72[fg=Indexed(255)] 73-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|   growing without blank lines prose line 4 keeps the paragraph growing without█|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-78[fg=Indexed(255)] 79-79[fg=Indexed(245)]
+|   blank lines prose 5 holds 2 * 3 and 4 * 5 as spaced stars prose line 6 keeps█|
+  3-13[fg=Indexed(255)] 14-14[fg=Indexed(253)] 15-59[fg=Indexed(255)] 60-60[fg=Indexed(253)] 61-78[fg=Indexed(255)] 79-79[fg=Indexed(245)]
+|   the paragraph growing without blank lines prose line 7 keeps the paragraph  █|
+  3-43[fg=Indexed(255)] 44-44[fg=Indexed(253)] 45-76[fg=Indexed(255)] 77-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|   growing without blank lines prose line 8 keeps the paragraph growing without█|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-78[fg=Indexed(255)] 79-79[fg=Indexed(245)]
+|   blank lines prose line 9 keeps the paragraph growing without blank lines    █|
+  3-13[fg=Indexed(255)] 14-14[fg=Indexed(253)] 15-74[fg=Indexed(255)] 75-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|   prose line 10 keeps the paragraph growing without blank lines prose line 11 ░|
+  3-63[fg=Indexed(255)] 64-64[fg=Indexed(253)] 65-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   keeps the paragraph growing without blank lines prose 12 holds              ░|
+  3-49[fg=Indexed(255)] 50-50[fg=Indexed(253)] 51-64[fg=Indexed(255)] 65-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   snake_case_word intraword underscores prose line 13 keeps the paragraph     ░|
+  3-39[fg=Indexed(255)] 40-40[fg=Indexed(253)] 41-73[fg=Indexed(255)] 74-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   growing without blank lines prose line 14 keeps the paragraph growing       ░|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-71[fg=Indexed(255)] 72-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   without blank lines prose line 15 keeps the paragraph growing without blank ░|
+  3-21[fg=Indexed(255)] 22-22[fg=Indexed(253)] 23-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   lines prose line 16 keeps the paragraph growing without blank lines prose   ░|
+  3-7[fg=Indexed(255)] 8-8[fg=Indexed(253)] 9-69[fg=Indexed(255)] 70-70[fg=Indexed(253)] 71-75[fg=Indexed(255)] 76-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   line 17 keeps the paragraph growing without blank lines prose line 18 keeps ░|
+  3-57[fg=Indexed(255)] 58-58[fg=Indexed(253)] 59-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   the paragraph growing without blank lines prose line 19 keeps the paragraph ░|
+  3-43[fg=Indexed(255)] 44-44[fg=Indexed(253)] 45-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   growing without blank lines prose line 20 keeps the paragraph growing       ░|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-71[fg=Indexed(255)] 72-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   without blank lines prose line 21 keeps the paragraph growing without blank ░|
+  3-21[fg=Indexed(255)] 22-22[fg=Indexed(253)] 23-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   lines prose line 22 keeps the paragraph growing without blank lines prose   ░|
+  3-7[fg=Indexed(255)] 8-8[fg=Indexed(253)] 9-69[fg=Indexed(255)] 70-70[fg=Indexed(253)] 71-75[fg=Indexed(255)] 76-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   line 23 keeps the paragraph growing without blank lines prose line 24 keeps ░|
+  3-57[fg=Indexed(255)] 58-58[fg=Indexed(253)] 59-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   the paragraph growing without blank lines prose line 25 keeps the paragraph ░|
+  3-43[fg=Indexed(255)] 44-44[fg=Indexed(253)] 45-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   growing without blank lines prose line 26 keeps the paragraph growing       ░|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-71[fg=Indexed(255)] 72-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   without blank lines prose line 27 keeps the paragraph growing without blank ░|
+  3-21[fg=Indexed(255)] 22-22[fg=Indexed(253)] 23-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   lines prose line 28 keeps the paragraph growing without blank lines prose   ░|
+  3-7[fg=Indexed(255)] 8-8[fg=Indexed(253)] 9-69[fg=Indexed(255)] 70-70[fg=Indexed(253)] 71-75[fg=Indexed(255)] 76-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   line 29 keeps the paragraph growing without blank lines prose line 30 keeps ░|
+  3-57[fg=Indexed(255)] 58-58[fg=Indexed(253)] 59-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   the paragraph growing without blank lines prose line 31 keeps the paragraph ░|
+  3-43[fg=Indexed(255)] 44-44[fg=Indexed(253)] 45-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   growing without blank lines prose line 32 keeps the paragraph growing       ░|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-71[fg=Indexed(255)] 72-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   without blank lines prose line 33 keeps the paragraph growing without blank ░|
+  3-21[fg=Indexed(255)] 22-22[fg=Indexed(253)] 23-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   lines prose line 34 keeps the paragraph growing without blank lines prose   ░|
+  3-7[fg=Indexed(255)] 8-8[fg=Indexed(253)] 9-69[fg=Indexed(255)] 70-70[fg=Indexed(253)] 71-75[fg=Indexed(255)] 76-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   line 35 keeps the paragraph growing without blank lines prose line 36 keeps ░|
+  3-57[fg=Indexed(255)] 58-58[fg=Indexed(253)] 59-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   the paragraph growing without blank lines prose line 37 keeps the paragraph ▼|
+  3-43[fg=Indexed(255)] 44-44[fg=Indexed(253)] 45-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(245),mod=DIM]
+
+=== stage: half-2 ===
+|◆  prose opener carries a bold run to route the tail prose line 2 keeps the    ▲|
+  0-0[fg=Indexed(111),mod=BOLD] 3-25[fg=Indexed(255)] 26-29[fg=Indexed(255),mod=BOLD] 30-51[fg=Indexed(255)] 52-52[fg=Indexed(253)] 53-74[fg=Indexed(255)] 75-78[fg=Indexed(253)] 79-79[fg=Indexed(245),mod=DIM]
+|   paragraph growing without blank lines prose line 3 keeps the paragraph      █|
+  3-39[fg=Indexed(255)] 40-40[fg=Indexed(253)] 41-72[fg=Indexed(255)] 73-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|   growing without blank lines prose line 4 keeps the paragraph growing without█|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-78[fg=Indexed(255)] 79-79[fg=Indexed(245)]
+|   blank lines prose 5 holds 2 * 3 and 4 * 5 as spaced stars prose line 6 keeps█|
+  3-13[fg=Indexed(255)] 14-14[fg=Indexed(253)] 15-59[fg=Indexed(255)] 60-60[fg=Indexed(253)] 61-78[fg=Indexed(255)] 79-79[fg=Indexed(245)]
+|   the paragraph growing without blank lines prose line 7 keeps the paragraph  ░|
+  3-43[fg=Indexed(255)] 44-44[fg=Indexed(253)] 45-76[fg=Indexed(255)] 77-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   growing without blank lines prose line 8 keeps the paragraph growing without░|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-78[fg=Indexed(255)] 79-79[fg=Indexed(240)]
+|   blank lines prose line 9 keeps the paragraph growing without blank lines    ░|
+  3-13[fg=Indexed(255)] 14-14[fg=Indexed(253)] 15-74[fg=Indexed(255)] 75-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   prose line 10 keeps the paragraph growing without blank lines prose line 11 ░|
+  3-63[fg=Indexed(255)] 64-64[fg=Indexed(253)] 65-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   keeps the paragraph growing without blank lines prose 12 holds              ░|
+  3-49[fg=Indexed(255)] 50-50[fg=Indexed(253)] 51-64[fg=Indexed(255)] 65-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   snake_case_word intraword underscores prose line 13 keeps the paragraph     ░|
+  3-39[fg=Indexed(255)] 40-40[fg=Indexed(253)] 41-73[fg=Indexed(255)] 74-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   growing without blank lines prose line 14 keeps the paragraph growing       ░|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-71[fg=Indexed(255)] 72-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   without blank lines prose line 15 keeps the paragraph growing without blank ░|
+  3-21[fg=Indexed(255)] 22-22[fg=Indexed(253)] 23-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   lines prose line 16 keeps the paragraph growing without blank lines prose   ░|
+  3-7[fg=Indexed(255)] 8-8[fg=Indexed(253)] 9-69[fg=Indexed(255)] 70-70[fg=Indexed(253)] 71-75[fg=Indexed(255)] 76-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   line 17 keeps the paragraph growing without blank lines prose line 18 keeps ░|
+  3-57[fg=Indexed(255)] 58-58[fg=Indexed(253)] 59-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   the paragraph growing without blank lines prose line 19 keeps the paragraph ░|
+  3-43[fg=Indexed(255)] 44-44[fg=Indexed(253)] 45-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   growing without blank lines prose line 20 keeps the paragraph growing       ░|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-71[fg=Indexed(255)] 72-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   without blank lines prose line 21 keeps the paragraph growing without blank ░|
+  3-21[fg=Indexed(255)] 22-22[fg=Indexed(253)] 23-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   lines prose line 22 keeps the paragraph growing without blank lines prose   ░|
+  3-7[fg=Indexed(255)] 8-8[fg=Indexed(253)] 9-69[fg=Indexed(255)] 70-70[fg=Indexed(253)] 71-75[fg=Indexed(255)] 76-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   line 23 keeps the paragraph growing without blank lines prose line 24 keeps ░|
+  3-57[fg=Indexed(255)] 58-58[fg=Indexed(253)] 59-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   the paragraph growing without blank lines prose line 25 keeps the paragraph ░|
+  3-43[fg=Indexed(255)] 44-44[fg=Indexed(253)] 45-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   growing without blank lines prose line 26 keeps the paragraph growing       ░|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-71[fg=Indexed(255)] 72-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   without blank lines prose line 27 keeps the paragraph growing without blank ░|
+  3-21[fg=Indexed(255)] 22-22[fg=Indexed(253)] 23-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   lines prose line 28 keeps the paragraph growing without blank lines prose   ░|
+  3-7[fg=Indexed(255)] 8-8[fg=Indexed(253)] 9-69[fg=Indexed(255)] 70-70[fg=Indexed(253)] 71-75[fg=Indexed(255)] 76-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   line 29 keeps the paragraph growing without blank lines prose line 30 keeps ░|
+  3-57[fg=Indexed(255)] 58-58[fg=Indexed(253)] 59-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   the paragraph growing without blank lines prose line 31 keeps the paragraph ░|
+  3-43[fg=Indexed(255)] 44-44[fg=Indexed(253)] 45-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   growing without blank lines prose line 32 keeps the paragraph growing       ░|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-71[fg=Indexed(255)] 72-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   without blank lines prose line 33 keeps the paragraph growing without blank ░|
+  3-21[fg=Indexed(255)] 22-22[fg=Indexed(253)] 23-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   lines prose line 34 keeps the paragraph growing without blank lines prose   ░|
+  3-7[fg=Indexed(255)] 8-8[fg=Indexed(253)] 9-69[fg=Indexed(255)] 70-70[fg=Indexed(253)] 71-75[fg=Indexed(255)] 76-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   line 35 keeps the paragraph growing without blank lines prose line 36 keeps ░|
+  3-57[fg=Indexed(255)] 58-58[fg=Indexed(253)] 59-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   the paragraph growing without blank lines prose line 37 keeps the paragraph ▼|
+  3-43[fg=Indexed(255)] 44-44[fg=Indexed(253)] 45-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(245),mod=DIM]
+
+=== stage: settle ===
+|◆  prose opener carries a bold run to route the tail prose line 2 keeps the    ▲|
+  0-0[fg=Indexed(111),mod=BOLD] 3-25[fg=Indexed(255)] 26-29[fg=Indexed(255),mod=BOLD] 30-51[fg=Indexed(255)] 52-52[fg=Indexed(253)] 53-74[fg=Indexed(255)] 75-78[fg=Indexed(253)] 79-79[fg=Indexed(245),mod=DIM]
+|   paragraph growing without blank lines prose line 3 keeps the paragraph      █|
+  3-39[fg=Indexed(255)] 40-40[fg=Indexed(253)] 41-72[fg=Indexed(255)] 73-78[fg=Indexed(253)] 79-79[fg=Indexed(245)]
+|   growing without blank lines prose line 4 keeps the paragraph growing without█|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-78[fg=Indexed(255)] 79-79[fg=Indexed(245)]
+|   blank lines prose 5 holds 2 * 3 and 4 * 5 as spaced stars prose line 6 keeps█|
+  3-13[fg=Indexed(255)] 14-14[fg=Indexed(253)] 15-59[fg=Indexed(255)] 60-60[fg=Indexed(253)] 61-78[fg=Indexed(255)] 79-79[fg=Indexed(245)]
+|   the paragraph growing without blank lines prose line 7 keeps the paragraph  ░|
+  3-43[fg=Indexed(255)] 44-44[fg=Indexed(253)] 45-76[fg=Indexed(255)] 77-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   growing without blank lines prose line 8 keeps the paragraph growing without░|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-78[fg=Indexed(255)] 79-79[fg=Indexed(240)]
+|   blank lines prose line 9 keeps the paragraph growing without blank lines    ░|
+  3-13[fg=Indexed(255)] 14-14[fg=Indexed(253)] 15-74[fg=Indexed(255)] 75-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   prose line 10 keeps the paragraph growing without blank lines prose line 11 ░|
+  3-63[fg=Indexed(255)] 64-64[fg=Indexed(253)] 65-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   keeps the paragraph growing without blank lines prose 12 holds              ░|
+  3-49[fg=Indexed(255)] 50-50[fg=Indexed(253)] 51-64[fg=Indexed(255)] 65-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   snake_case_word intraword underscores prose line 13 keeps the paragraph     ░|
+  3-39[fg=Indexed(255)] 40-40[fg=Indexed(253)] 41-73[fg=Indexed(255)] 74-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   growing without blank lines prose line 14 keeps the paragraph growing       ░|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-71[fg=Indexed(255)] 72-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   without blank lines prose line 15 keeps the paragraph growing without blank ░|
+  3-21[fg=Indexed(255)] 22-22[fg=Indexed(253)] 23-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   lines prose line 16 keeps the paragraph growing without blank lines prose   ░|
+  3-7[fg=Indexed(255)] 8-8[fg=Indexed(253)] 9-69[fg=Indexed(255)] 70-70[fg=Indexed(253)] 71-75[fg=Indexed(255)] 76-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   line 17 keeps the paragraph growing without blank lines prose line 18 keeps ░|
+  3-57[fg=Indexed(255)] 58-58[fg=Indexed(253)] 59-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   the paragraph growing without blank lines prose line 19 keeps the paragraph ░|
+  3-43[fg=Indexed(255)] 44-44[fg=Indexed(253)] 45-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   growing without blank lines prose line 20 keeps the paragraph growing       ░|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-71[fg=Indexed(255)] 72-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   without blank lines prose line 21 keeps the paragraph growing without blank ░|
+  3-21[fg=Indexed(255)] 22-22[fg=Indexed(253)] 23-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   lines prose line 22 keeps the paragraph growing without blank lines prose   ░|
+  3-7[fg=Indexed(255)] 8-8[fg=Indexed(253)] 9-69[fg=Indexed(255)] 70-70[fg=Indexed(253)] 71-75[fg=Indexed(255)] 76-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   line 23 keeps the paragraph growing without blank lines prose line 24 keeps ░|
+  3-57[fg=Indexed(255)] 58-58[fg=Indexed(253)] 59-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   the paragraph growing without blank lines prose line 25 keeps the paragraph ░|
+  3-43[fg=Indexed(255)] 44-44[fg=Indexed(253)] 45-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   growing without blank lines prose line 26 keeps the paragraph growing       ░|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-71[fg=Indexed(255)] 72-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   without blank lines prose line 27 keeps the paragraph growing without blank ░|
+  3-21[fg=Indexed(255)] 22-22[fg=Indexed(253)] 23-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   lines prose line 28 keeps the paragraph growing without blank lines prose   ░|
+  3-7[fg=Indexed(255)] 8-8[fg=Indexed(253)] 9-69[fg=Indexed(255)] 70-70[fg=Indexed(253)] 71-75[fg=Indexed(255)] 76-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   line 29 keeps the paragraph growing without blank lines prose line 30 keeps ░|
+  3-57[fg=Indexed(255)] 58-58[fg=Indexed(253)] 59-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   the paragraph growing without blank lines prose line 31 keeps the paragraph ░|
+  3-43[fg=Indexed(255)] 44-44[fg=Indexed(253)] 45-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   growing without blank lines prose line 32 keeps the paragraph growing       ░|
+  3-29[fg=Indexed(255)] 30-30[fg=Indexed(253)] 31-71[fg=Indexed(255)] 72-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   without blank lines prose line 33 keeps the paragraph growing without blank ░|
+  3-21[fg=Indexed(255)] 22-22[fg=Indexed(253)] 23-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   lines prose line 34 keeps the paragraph growing without blank lines prose   ░|
+  3-7[fg=Indexed(255)] 8-8[fg=Indexed(253)] 9-69[fg=Indexed(255)] 70-70[fg=Indexed(253)] 71-75[fg=Indexed(255)] 76-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   line 35 keeps the paragraph growing without blank lines prose line 36 keeps ░|
+  3-57[fg=Indexed(255)] 58-58[fg=Indexed(253)] 59-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(240)]
+|   the paragraph growing without blank lines prose line 37 keeps the paragraph ▼|
+  3-43[fg=Indexed(255)] 44-44[fg=Indexed(253)] 45-77[fg=Indexed(255)] 78-78[fg=Indexed(253)] 79-79[fg=Indexed(245),mod=DIM]
+

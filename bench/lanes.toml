@@ -1,0 +1,71 @@
+# Benchmark lane catalog — the single source of truth for which lanes are
+# active and each lane's scoring policy. A lane is benchmarkable exactly when it
+# appears here AND has at least one fixture declaring `lane = "<name>"`.
+#
+# Adding or retuning a lane is a data change: edit this file, no recompile. The
+# lane *names* are fixed by core_types::decision::BenchmarkLane; this file binds
+# each name to a policy. Never average results across lanes (spec).
+#
+#   objective_gate   how the objective gate is computed
+#   verifier_policy  none | strict | salvage_allowed
+#   retry_budget     deep-loop attempt cap (total plan/exec/verify attempts, floored to 1; 2 = at most one retry)
+#   diff_policy      intended_paths_only | any
+#   timeout_seconds  default per-task timeout (a task may override)
+
+schema_version = "1.0"
+
+# Single-shot small features and bug fixes. No verifier, no retries — a fast
+# task is meant to pass or fail in one shot, and the objective gate decides it.
+[lanes.fast]
+objective_gate = "test_and_diff"
+verifier_policy = "none"
+retry_budget = 0
+diff_policy = "intended_paths_only"
+timeout_seconds = 120
+
+# Complex changes that need the forced plan → execute → verify → retry loop with
+# a strict JSON verifier. The five deep fixtures (wide-rename, schema-
+# propagation, hidden-invariant, streaming-csv, async-rollback) exercise this.
+[lanes.deep]
+objective_gate = "test_and_diff"
+verifier_policy = "strict"
+retry_budget = 2
+diff_policy = "intended_paths_only"
+timeout_seconds = 300
+
+# Behavior-preserving large refactors. Same loop as deep, but the diff policy is
+# the point: a refactor that touches unrelated files fails even if tests pass.
+# No fixture yet — add one declaring `lane = "risky-refactor"` to activate.
+[lanes.risky-refactor]
+objective_gate = "test_and_diff"
+verifier_policy = "strict"
+retry_budget = 2
+diff_policy = "intended_paths_only"
+timeout_seconds = 300
+
+# Reproduce-then-fix: a failing test must go green. More retry budget because
+# the first fix often surfaces a second failure. No fixture yet.
+[lanes.debug]
+objective_gate = "test_and_diff"
+verifier_policy = "strict"
+retry_budget = 3
+diff_policy = "intended_paths_only"
+timeout_seconds = 240
+
+# Large mechanical moves / sweeping changes across many files. Longest timeout
+# because breadth costs wall time. No fixture yet.
+[lanes.migration]
+objective_gate = "test_and_diff"
+verifier_policy = "strict"
+retry_budget = 2
+diff_policy = "intended_paths_only"
+timeout_seconds = 420
+
+# Code review tasks where the edit may be minimal or absent; the diff policy is
+# relaxed and the verifier carries the judgment. No fixture yet.
+[lanes.review]
+objective_gate = "verifier_only"
+verifier_policy = "strict"
+retry_budget = 1
+diff_policy = "any"
+timeout_seconds = 180
