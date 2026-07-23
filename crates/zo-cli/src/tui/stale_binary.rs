@@ -252,6 +252,12 @@ mod tests {
         fs::write(path, contents).expect("write temp binary stand-in");
     }
 
+    fn replace_file(path: &Path, contents: &str) {
+        let replacement = path.with_extension("replacement");
+        write_file(&replacement, contents);
+        fs::rename(replacement, path).expect("atomically replace temp binary stand-in");
+    }
+
     /// A watch whose baseline is injected directly, so [`StaleWatch::observe`]
     /// can be driven with hand-built identities — the path is never read.
     fn watch_with_baseline(baseline: BinaryIdentity) -> StaleWatch {
@@ -324,8 +330,7 @@ mod tests {
         let mut watch =
             StaleWatch::capture(path.clone(), Duration::from_secs(0)).expect("baseline captured");
         assert_eq!(watch.check_at(Instant::now()), None);
-        fs::remove_file(&path).expect("unlink old");
-        write_file(&path, "new build");
+        replace_file(&path, "new build");
         let stale = watch
             .check_at(Instant::now())
             .expect("a replaced inode must read as stale");
@@ -355,8 +360,7 @@ mod tests {
         // First check performs the stat (no prior check to throttle against).
         assert_eq!(watch.check_at(t0), None);
         // Replace the file so a fresh stat *would* see a new inode.
-        fs::remove_file(&path).expect("unlink");
-        write_file(&path, "v2");
+        replace_file(&path, "v2");
         // Within the throttle window the stat is skipped, so the change is not
         // yet observed — this is the load-bearing throttle behavior.
         assert_eq!(
@@ -405,8 +409,7 @@ mod tests {
             StaleWatch::capture(path.clone(), Duration::from_secs(0)).expect("baseline captured");
         // Not stale yet → nothing to report.
         assert_eq!(watch.take_newly_stale_at(Instant::now()), None);
-        fs::remove_file(&path).expect("unlink old");
-        write_file(&path, "new build");
+        replace_file(&path, "new build");
         let info = watch
             .take_newly_stale_at(Instant::now())
             .expect("first call after replacement reports");

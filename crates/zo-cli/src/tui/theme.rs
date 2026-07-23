@@ -3198,28 +3198,27 @@ mod tests {
             let mut f = std::fs::File::create(&tmp).expect("write temp tokens");
             f.write_all(json.as_bytes()).expect("write tokens body");
         }
-        let loaded = Theme::load(&tmp).expect("tokens load");
+        let loaded = Theme::load_canonical(&tmp).expect("canonical tokens load");
         let _ = std::fs::remove_file(&tmp);
 
-        // NO_COLOR neutralizes the palette; skip the equality assertion in
-        // that environment (the loader is still exercised above).
-        if std::env::var_os("NO_COLOR").is_none() {
-            assert_eq!(loaded.palette.accent, zo.palette.accent);
-            assert_eq!(loaded.palette.accent_dim, zo.palette.accent_dim);
-            assert_eq!(loaded.palette.cyan, zo.palette.cyan);
-            assert_eq!(loaded.palette.violet, zo.palette.violet);
-            assert_eq!(loaded.palette.teal, zo.palette.teal);
-            assert_eq!(loaded.palette.fg, zo.palette.fg);
-            assert_eq!(loaded.palette.bright, zo.palette.bright);
-            assert_eq!(loaded.palette.dim, zo.palette.dim);
-            assert_eq!(loaded.palette.muted, zo.palette.muted);
-            assert_eq!(loaded.palette.faint, zo.palette.faint);
-            assert_eq!(loaded.palette.code_bg, zo.palette.code_bg);
-            assert_eq!(loaded.palette.success, zo.palette.success);
-            assert_eq!(loaded.palette.warn, zo.palette.warn);
-            assert_eq!(loaded.palette.error, zo.palette.error);
-            assert_eq!(loaded.palette.info, zo.palette.info);
-        }
+        // Terminal capability quantization is covered separately; this test
+        // compares the canonical token palette before environment-dependent
+        // ANSI/NO_COLOR projection.
+        assert_eq!(loaded.palette.accent, zo.palette.accent);
+        assert_eq!(loaded.palette.accent_dim, zo.palette.accent_dim);
+        assert_eq!(loaded.palette.cyan, zo.palette.cyan);
+        assert_eq!(loaded.palette.violet, zo.palette.violet);
+        assert_eq!(loaded.palette.teal, zo.palette.teal);
+        assert_eq!(loaded.palette.fg, zo.palette.fg);
+        assert_eq!(loaded.palette.bright, zo.palette.bright);
+        assert_eq!(loaded.palette.dim, zo.palette.dim);
+        assert_eq!(loaded.palette.muted, zo.palette.muted);
+        assert_eq!(loaded.palette.faint, zo.palette.faint);
+        assert_eq!(loaded.palette.code_bg, zo.palette.code_bg);
+        assert_eq!(loaded.palette.success, zo.palette.success);
+        assert_eq!(loaded.palette.warn, zo.palette.warn);
+        assert_eq!(loaded.palette.error, zo.palette.error);
+        assert_eq!(loaded.palette.info, zo.palette.info);
     }
 
     /// The brand accent is reserved for the user rail, focus borders, and

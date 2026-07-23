@@ -48,7 +48,6 @@ jobs:
         run: cargo test --workspace --locked
 
   build:
-    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -92,7 +91,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [verify, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
