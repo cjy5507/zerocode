@@ -324,7 +324,11 @@ async fn initialize_advertises_only_v1_baseline_capabilities() {
                             "auth": {}
                         },
                         "authMethods": [],
-                        "agentInfo": {"name": "zo", "title": "zo", "version": "0.1.0"}
+                        "agentInfo": {
+                            "name": "zo",
+                            "title": "zo",
+                            "version": env!("CARGO_PKG_VERSION")
+                        }
                     }
                 })
             );
