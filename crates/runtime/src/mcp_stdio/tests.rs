@@ -1263,36 +1263,25 @@ fn discover_tools_best_effort_attempts_local_with_partial_remaining_budget() {
     runtime.block_on(async {
         let script_path = write_manager_mcp_server_script();
         let parent = script_path.parent().expect("script parent");
-        let log_a = parent.join("a-slow.log");
         let log_b = parent.join("b-fast.log");
 
         let mut servers = BTreeMap::new();
-        servers.insert(
-            "a-slow".to_string(),
-            manager_server_config_with_env(
-                &script_path,
-                "a-slow",
-                &log_a,
-                BTreeMap::from([("MCP_LIST_TOOLS_DELAY_MS".to_string(), "250".to_string())]),
-            ),
-        );
         servers.insert(
             "b-fast".to_string(),
             manager_server_config(&script_path, "b-fast", &log_b),
         );
         let mut manager = McpServerManager::from_servers(&servers);
         manager
-            .ensure_server_ready("a-slow")
-            .await
-            .expect("pre-initialize slow server");
-        manager
             .ensure_server_ready("b-fast")
             .await
             .expect("pre-initialize fast server");
-        // Pre-initializing removes process-spawn variance. The 250 ms first
-        // listing leaves at most 190 ms of this 440 ms budget, below the local
-        // 200 ms initialize allowance but ample for the live fast process.
-        manager.set_discover_total_timeout_ms(440);
+        // Keep the live process so this integration test measures the scheduler
+        // decision rather than process startup. The injected total is already
+        // below the server's conservative initialize allowance, so a scheduler
+        // that pre-skips local stdio under a partial budget still fails here.
+        let partial_budget_ms = super::MCP_INITIALIZE_TIMEOUT_MS - 10;
+        assert!(partial_budget_ms < manager.initialize_timeout_ms_for("b-fast"));
+        manager.set_discover_total_timeout_ms(partial_budget_ms);
 
         let report = manager.discover_tools_best_effort().await;
         let fast_echo = mcp_tool_name("b-fast", "echo");
