@@ -538,12 +538,7 @@ fn linux_script_arguments(
 }
 
 #[cfg(target_os = "linux")]
-fn strict_linux_command(
-    worktree: &Path,
-    check_state: &Path,
-    check: &QuarantineCheckCommand,
-) -> Result<Command, String> {
-    const SCRIPT: &str = r#"
+const LINUX_STRICT_CHECK_SCRIPT: &str = r#"
 set -eu
 root=$1
 workspace=$2
@@ -606,6 +601,14 @@ exec chroot "$root" /bin/sh -c 'cd /workspace && exec "$@"' zo-check \
   "/check-bin/$program_name" "$@"
 "#;
 
+#[cfg(target_os = "linux")]
+fn strict_linux_command(
+    worktree: &Path,
+    check_state: &Path,
+    check: &QuarantineCheckCommand,
+) -> Result<Command, String> {
+    const SCRIPT: &str = LINUX_STRICT_CHECK_SCRIPT;
+
     let request = crate::sandbox::SandboxRequest {
         enabled: true,
         namespace_restrictions: true,
@@ -622,11 +625,9 @@ exec chroot "$root" /bin/sh -c 'cd /workspace && exec "$@"' zo-check \
         .find_map(|path| canonical_trusted_file(worktree, path).ok())
         .ok_or_else(|| "strict_filesystem_network_isolation_unavailable".to_string())?;
     let program = trusted_check_program(worktree, &check.program)?;
-    let toolchain = trusted_toolchain_root(worktree, &program);
     let metadata_git = trusted_git_binary(worktree)?;
     let git_metadata = trusted_git_metadata_paths(worktree, &metadata_git)?;
     let cargo_home = trusted_state_root(worktree, "CARGO_HOME", ".cargo");
-    let rustup_home = trusted_state_root(worktree, "RUSTUP_HOME", ".rustup");
     let cargo_registry = trusted_cache_child(cargo_home.as_deref(), "registry").unwrap_or_default();
     let cargo_git = trusted_cache_child(cargo_home.as_deref(), "git").unwrap_or_default();
     let toolchain = trusted_toolchain_root(worktree, &program).unwrap_or_default();
