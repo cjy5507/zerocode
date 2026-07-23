@@ -25,11 +25,10 @@ const RECENT_LABEL_CELLS: usize = 40;
 pub(crate) fn resident_memory_kb() -> u64 {
     #[cfg(target_os = "linux")]
     {
-        return std::fs::read_to_string("/proc/self/statm")
+        std::fs::read_to_string("/proc/self/statm")
             .ok()
             .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-            .map(|pages| pages * 4)
-            .unwrap_or(0);
+            .map_or(0, |pages| pages * 4)
     }
     #[cfg(target_os = "macos")]
     {
