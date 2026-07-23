@@ -319,12 +319,17 @@ fn slash_command_copy_last_uses_clipboard_helper() {
     let bin_dir = temp_dir.join("bin");
     fs::create_dir_all(&bin_dir).expect("bin dir");
     let capture_path = temp_dir.join("clipboard.txt");
-    let script_path = bin_dir.join("pbcopy");
+    let clipboard_command = if cfg!(target_os = "macos") {
+        "pbcopy"
+    } else {
+        "wl-copy"
+    };
+    let script_path = bin_dir.join(clipboard_command);
     fs::write(
         &script_path,
         format!("#!/bin/sh\ncat > \"{}\"\n", capture_path.display()),
     )
-    .expect("write pbcopy stub");
+    .expect("write clipboard stub");
     let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&script_path, perms).expect("chmod");

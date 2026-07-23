@@ -1835,11 +1835,19 @@ mod tests {
                 Some(WorkflowEventKind::Started { name, .. }) if name == "demo"),
             "first event is the run start"
         );
-        assert!(
-            events.iter().any(|e| matches!(&e.event,
-                WorkflowEventKind::AgentsSpawned { phase_id, agent_ids }
-                    if phase_id == "only" && agent_ids.len() == 2)),
-            "the fan-out's two agents are recorded against phase `only`"
+        let spawned_agents = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                WorkflowEventKind::AgentsSpawned {
+                    phase_id,
+                    agent_ids,
+                } if phase_id == "only" => Some(agent_ids.len()),
+                _ => None,
+            })
+            .sum::<usize>();
+        assert_eq!(
+            spawned_agents, 2,
+            "the fan-out's two agents are recorded against phase `only` across all concurrency batches"
         );
         assert!(
             matches!(events.last().map(|e| &e.event),
