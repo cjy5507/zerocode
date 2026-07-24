@@ -289,6 +289,14 @@ impl App {
                             // terminal fed at a rate it can actually paint.
                             if frame_gate.on_stream_update(Instant::now()).draws_now() {
                                 self.draw(terminal)?;
+                                // Re-stamp to draw *completion*, exactly like the
+                                // stream arm below: `on_stream_update` marks
+                                // draw-start, so without this a slow-terminal draw
+                                // that itself exceeds the frame interval would let
+                                // the very next keystroke measure "elapsed ≥
+                                // interval" and draw again — collapsing back to
+                                // one redraw per keystroke (the input-lag case).
+                                frame_gate.note_stream_draw(Instant::now());
                                 dirty = false;
                             } else {
                                 dirty = true;
@@ -302,6 +310,7 @@ impl App {
                             // terminal with full repaints.
                             if frame_gate.on_stream_update(Instant::now()).draws_now() {
                                 self.draw(terminal)?;
+                                frame_gate.note_stream_draw(Instant::now());
                                 dirty = false;
                             } else {
                                 dirty = true;

@@ -8961,6 +8961,167 @@ fn provider_agnostic_stream_and_turn_ticks_share_frame_budget() {
     }
 }
 
+/// A `Backend` whose `draw` paints slowly (longer than `STREAM_FRAME_INTERVAL`)
+/// and counts every paint. This is the load-bearing piece of the input-lag
+/// regression below: `StreamFrameGate::on_stream_update` stamps the gate at
+/// draw-*start*, so a slow paint without the trailing `note_stream_draw`
+/// re-stamp lets the next keystroke measure "elapsed ≥ interval" and redraw
+/// again — collapsing back to one full redraw per keystroke. With the re-stamp
+/// the gate is pinned to draw-*completion* and a keystroke burst coalesces to a
+/// handful of frame repaints.
+struct SlowBackend {
+    inner: TestBackend,
+    draw_count: usize,
+    paint_delay: std::time::Duration,
+}
+
+impl SlowBackend {
+    fn new(width: u16, height: u16) -> Self {
+        Self {
+            inner: TestBackend::new(width, height),
+            draw_count: 0,
+            // Longer than STREAM_FRAME_INTERVAL (16 ms) so a single paint
+            // spans more than one frame budget — the premise that turns the
+            // missing re-stamp into a per-keystroke redraw.
+            paint_delay: std::time::Duration::from_millis(20),
+        }
+    }
+}
+
+impl Backend for SlowBackend {
+    type Error = core::convert::Infallible;
+
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        std::thread::sleep(self.paint_delay);
+        self.draw_count += 1;
+        self.inner.draw(content)
+    }
+
+    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> Result<(), Self::Error> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
+        self.inner.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+        &mut self,
+        position: P,
+    ) -> Result<(), Self::Error> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> Result<(), Self::Error> {
+        self.inner.clear()
+    }
+
+    fn clear_region(
+        &mut self,
+        clear_type: ratatui::backend::ClearType,
+    ) -> Result<(), Self::Error> {
+        self.inner.clear_region(clear_type)
+    }
+
+    fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
+        self.inner.size()
+    }
+
+    fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+        self.inner.window_size()
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.inner.flush()
+    }
+}
+
+/// Regression for the input-lag class the key/paste arms introduced on slow
+/// terminals (Apple Terminal.app). Before the fix, `run_with_events` drew
+/// unconditionally after every `Event::Key` and `Event::Paste` — a full
+/// widget-tree redraw per keystroke — while the scroll and stream arms already
+/// coalesced through `StreamFrameGate`. On terminals that paint slower than zo
+/// redraws, that flood read as input lag (and on a faster CPU that feeds the
+/// flood faster, the lag gets *worse*, not better). The fix routes the key and
+/// paste draws through the same `on_stream_update` coalescing the scroll/stream
+/// arms use, and — critically — re-stamps the gate to draw-*completion* via
+/// `note_stream_draw` so a slow paint does not collapse the coalescing back to
+/// one redraw per keystroke.
+///
+/// This drives the real `run_with_events` loop against a `SlowBackend` whose
+/// paint (20 ms) outlasts the 16 ms frame interval. Without the `note_stream_draw`
+/// re-stamp, every keystroke in a 40-key burst redraws (~41 paints); with the
+/// re-stamp the burst coalesces to ~2 paints. The bound below fails first
+/// against the un-patched key arm.
+#[tokio::test]
+async fn keystroke_burst_redraws_share_frame_budget() {
+    use crate::tui::render_schedule::STREAM_FRAME_INTERVAL;
+
+    let (_block_tx, block_rx) = mpsc::channel::<RenderBlock>(16);
+    let (cmd_tx, _cmd_rx) = mpsc::channel::<AgentCommand>(16);
+    let mut app = App::new(Theme::no_color(), block_rx, cmd_tx);
+    app.enable_input();
+    let mut terminal = Terminal::new(SlowBackend::new(80, 24)).expect("slow test terminal");
+
+    // Sanity: the slow-paint premise of this regression must hold.
+    assert!(
+        terminal.backend().paint_delay > STREAM_FRAME_INTERVAL,
+        "slow backend must paint slower than the stream frame interval"
+    );
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<std::io::Result<Event>>();
+    let mut events = futures_util::stream::poll_fn(move |cx| event_rx.poll_recv(cx));
+
+    // A 40-keystroke burst, well inside human typing speed.
+    for _ in 0..40 {
+        event_tx
+            .send(Ok(Event::Key(press(KeyCode::Char('a')))))
+            .expect("queue keystroke");
+    }
+    // Submit the typed text so run_with_events returns cleanly.
+    event_tx
+        .send(Ok(Event::Key(press(KeyCode::Enter))))
+        .expect("queue submit");
+
+    let action = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        app.run_with_events(&mut terminal, &mut events),
+    )
+    .await
+    .expect("keystroke burst must not hang the event loop")
+    .expect("run must succeed");
+
+    // The burst must have reached the composer before submit — proving the
+    // 40 keys were actually processed by the key arm, not swallowed.
+    let submitted = match action {
+        AppAction::Submit(text) => text,
+        other => panic!("expected submit after keystroke burst, got {other:?}"),
+    };
+    assert_eq!(
+        submitted.chars().filter(|c| *c == 'a').count(),
+        40,
+        "the 40-keystroke burst must reach the composer before submit"
+    );
+
+    let draws = terminal.backend().draw_count;
+    // Initial draw + the first keystroke + at most a couple of tick-recovered
+    // frames. Without the `note_stream_draw` re-stamp the slow-paint backend
+    // (20 ms > 16 ms) makes every keystroke redraw — ~41 draws — so this bound
+    // fails first against the un-patched key arm.
+    assert!(
+        draws <= 8,
+        "a keystroke burst must coalesce to a handful of frame redraws on a slow-paint terminal, got {draws}"
+    );
+    assert!(draws >= 1, "the loop must perform its initial draw");
+}
+
 /// Regression: the drip clock must stay fresh across an inter-delta idle gap.
 ///
 /// Before the fix, `last_drip` froze at the last actual reveal while the pacer
