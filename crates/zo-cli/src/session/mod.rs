@@ -31,6 +31,7 @@ mod session_preferences;
 pub(crate) mod smart_settings;
 pub(crate) mod slash_dispatch;
 pub(crate) mod socket_permission;
+mod startup_loader;
 mod startup_snapshot;
 pub(crate) mod status_line;
 mod tool_toggles;
@@ -94,16 +95,19 @@ pub(crate) fn run_repl(
     {
         model = persisted_model;
     }
-    let mut cli = LiveCli::new_scoped_with_mcp_config_and_session_id(
-        model,
-        true,
-        allowed_tools,
-        permission_mode,
-        crate::session_registry::SessionScope::Project,
-        mcp_config,
-        None,
-        crate::runtime_support::StartupAuthPolicy::AllowUnauthenticated,
-    )?;
+    let mut cli = {
+        let _startup_loader = startup_loader::StartupLoader::start();
+        LiveCli::new_scoped_with_mcp_config_and_session_id(
+            model,
+            true,
+            allowed_tools,
+            permission_mode,
+            crate::session_registry::SessionScope::Project,
+            mcp_config,
+            None,
+            crate::runtime_support::StartupAuthPolicy::AllowUnauthenticated,
+        )?
+    };
     cli.set_model_user_pinned(model_pinned);
     if let Some(path) = &boot_resume {
         // Swap the fresh empty session for the persisted transcript. The fast
