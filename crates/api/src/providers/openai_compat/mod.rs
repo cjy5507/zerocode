@@ -25,6 +25,26 @@ const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_RETRIES: u32 = 2;
 
+/// `User-Agent` presented by OpenAI's Codex CLI. Gateways that only accept a
+/// whitelisted client wire image (rejecting a generic client with a 401
+/// `unauthorized_client_error`) match on this fingerprint; a custom provider
+/// opts in with `"client_fingerprint": "codex"`.
+const CODEX_CLIENT_USER_AGENT: &str = "codex_cli_rs/0.144.1 (Mac OS; arm64)";
+/// `User-Agent` presented by Anthropic's Claude Code CLI, for
+/// `"client_fingerprint": "claude-code"`.
+const CLAUDE_CODE_CLIENT_USER_AGENT: &str = "claude-cli/1.0.44 (external, cli)";
+
+/// Resolve a named client-fingerprint preset to the `User-Agent` that client
+/// presents. Unknown names yield `None` so a typo degrades to no override
+/// rather than a silently wrong fingerprint.
+fn client_fingerprint_user_agent(name: &str) -> Option<&'static str> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "codex" | "codex-cli" | "codex_cli_rs" => Some(CODEX_CLIENT_USER_AGENT),
+        "claude-code" | "claude" | "claude-cli" => Some(CLAUDE_CODE_CLIENT_USER_AGENT),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
     pub provider_name: &'static str,
@@ -54,6 +74,15 @@ pub struct OpenAiCompatConfig {
     /// endpoints set this `true`; self-hosted and custom providers default off
     /// and opt in via [`CustomProviderConfig::supports_vision`].
     pub supports_vision: bool,
+    /// Optional `User-Agent` override. Some gateways only accept requests whose
+    /// wire image matches a whitelisted client (Codex CLI / Claude Code), so a
+    /// custom provider presents that client's fingerprint via
+    /// [`CustomProviderConfig::client_fingerprint`] / `user_agent`. `None`
+    /// leaves the default client image unchanged for built-in providers.
+    pub user_agent: Option<&'static str>,
+    /// Extra request headers applied verbatim, for gateways that gate on a
+    /// client fingerprint beyond the `User-Agent`. Empty for built-in providers.
+    pub client_headers: &'static [(&'static str, &'static str)],
 }
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
@@ -74,6 +103,8 @@ impl OpenAiCompatConfig {
             supports_cache_tokens: false,
             prompt_cache_strategy: PromptCacheStrategy::NoRequestControls,
             supports_vision: true,
+            user_agent: None,
+            client_headers: &[],
         }
     }
 
@@ -89,6 +120,8 @@ impl OpenAiCompatConfig {
             supports_cache_tokens: true,
             prompt_cache_strategy: PromptCacheStrategy::OpenAiPromptCacheKey,
             supports_vision: true,
+            user_agent: None,
+            client_headers: &[],
         }
     }
     #[must_use]
@@ -103,6 +136,8 @@ impl OpenAiCompatConfig {
             supports_cache_tokens: false,
             prompt_cache_strategy: PromptCacheStrategy::NoRequestControls,
             supports_vision: true,
+            user_agent: None,
+            client_headers: &[],
         }
     }
 
@@ -118,6 +153,8 @@ impl OpenAiCompatConfig {
             supports_cache_tokens: false,
             prompt_cache_strategy: PromptCacheStrategy::NoRequestControls,
             supports_vision: false,
+            user_agent: None,
+            client_headers: &[],
         }
     }
 
@@ -148,6 +185,8 @@ impl OpenAiCompatConfig {
             // endpoint opts back in via [`CustomProviderConfig::supports_vision`]
             // (applied in [`CustomProviderConfig::to_static_config`]).
             supports_vision: false,
+            user_agent: None,
+            client_headers: &[],
         }
     }
 
@@ -229,6 +268,20 @@ pub struct CustomProviderConfig {
     /// `Q4_K_M`. Ignored when no estimate is present.
     #[serde(default)]
     pub quantization: Option<String>,
+    /// Named client-fingerprint preset. `"codex"` or `"claude-code"` make zo
+    /// present that client's `User-Agent`, for gateways that only accept a
+    /// whitelisted client wire image (a 401 `unauthorized_client_error`
+    /// otherwise). A raw [`Self::user_agent`] overrides the preset.
+    #[serde(default)]
+    pub client_fingerprint: Option<String>,
+    /// Raw `User-Agent` override, sent verbatim. Wins over
+    /// [`Self::client_fingerprint`] when both are set.
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    /// Extra request headers sent verbatim, for gateways that gate on more than
+    /// the `User-Agent`.
+    #[serde(default)]
+    pub headers: Option<BTreeMap<String, String>>,
 }
 
 const fn default_requires_auth() -> bool {
@@ -268,7 +321,43 @@ impl CustomProviderConfig {
         // Operator opt-in: a vision-capable custom endpoint re-enables `image_url`
         // parts that `from_user` conservatively disabled.
         config.supports_vision = self.supports_vision;
+        config.user_agent = self.resolve_user_agent();
+        config.client_headers = self.resolve_client_headers();
         config
+    }
+
+    /// Resolve the effective `User-Agent`: a raw [`Self::user_agent`] wins, then
+    /// a named [`Self::client_fingerprint`] preset, else `None`.
+    fn resolve_user_agent(&self) -> Option<&'static str> {
+        if let Some(user_agent) = self
+            .user_agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(leak(user_agent));
+        }
+        self.client_fingerprint
+            .as_deref()
+            .and_then(client_fingerprint_user_agent)
+    }
+
+    /// Leak the operator-declared extra headers into the process-lifetime slice
+    /// the client sends. Header names are trimmed; blank names are dropped.
+    fn resolve_client_headers(&self) -> &'static [(&'static str, &'static str)] {
+        let Some(headers) = self.headers.as_ref() else {
+            return &[];
+        };
+        let pairs: Vec<(&'static str, &'static str)> = headers
+            .iter()
+            .filter(|(name, _)| !name.trim().is_empty())
+            .map(|(name, value)| (leak(name.trim()), leak(value.as_str())))
+            .collect();
+        if pairs.is_empty() {
+            &[]
+        } else {
+            Box::leak(pairs.into_boxed_slice())
+        }
     }
 
     #[must_use]
@@ -460,8 +549,22 @@ impl OpenAiCompatClient {
             .post(&request_url)
             .header("content-type", "application/json")
             .json(&build_chat_completion_request(request, config));
+        let builder = self.apply_client_identity(builder);
         let builder = self.apply_auth(builder).await?;
         builder.send().await.map_err(ApiError::from)
+    }
+
+    /// Present the operator-configured client fingerprint (`User-Agent` and any
+    /// extra headers) so gateways that whitelist a specific client wire image
+    /// accept the request. A no-op for built-in providers, which carry none.
+    fn apply_client_identity(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(user_agent) = self.config.user_agent {
+            builder = builder.header("user-agent", user_agent);
+        }
+        for (name, value) in self.config.client_headers {
+            builder = builder.header(*name, *value);
+        }
+        builder
     }
 
     async fn apply_auth(

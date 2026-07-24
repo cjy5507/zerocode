@@ -1493,6 +1493,96 @@ async fn openai_compat_restart_budget_exhausted_surfaces_error() {
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
+/// Send one streaming request through a custom provider built from `provider`
+/// JSON and return the raw HTTP request bytes the endpoint received.
+async fn capture_custom_provider_request(provider: serde_json::Value) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let n = conn.read(&mut buf).await.unwrap();
+        let captured = String::from_utf8_lossy(&buf[..n]).into_owned();
+        conn.write_all(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n\
+              data: {\"id\":\"c1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        )
+        .await
+        .unwrap();
+        conn.flush().await.unwrap();
+        captured
+    });
+
+    let config: super::CustomProviderConfig = serde_json::from_value(provider).unwrap();
+    let client = OpenAiCompatClient::new("token", config.to_static_config())
+        .with_base_url(format!("http://{addr}/v1"));
+    let _ = client
+        .stream_message(&streaming_request())
+        .await
+        .expect("stream opens");
+    server.await.unwrap()
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn custom_provider_presents_configured_client_fingerprint() {
+    let _guard = env_lock();
+
+    // Named preset resolves to the Codex CLI User-Agent so a gateway that
+    // whitelists that client wire image accepts the request.
+    let codex = capture_custom_provider_request(json!({
+        "name": "AgentRouter",
+        "base_url": "http://unused/v1",
+        "models": ["gpt-5.6-sol"],
+        "requires_auth": false,
+        "client_fingerprint": "codex"
+    }))
+    .await
+    .to_ascii_lowercase();
+    assert!(
+        codex.contains("user-agent: codex_cli_rs/0.144.1 (mac os; arm64)"),
+        "codex fingerprint UA missing: {codex}"
+    );
+
+    // A raw user_agent overrides the named preset entirely.
+    let raw = capture_custom_provider_request(json!({
+        "name": "AgentRouter",
+        "base_url": "http://unused/v1",
+        "models": ["gpt-5.6-sol"],
+        "requires_auth": false,
+        "client_fingerprint": "codex",
+        "user_agent": "claude-cli/9.9.9 (external, cli)"
+    }))
+    .await
+    .to_ascii_lowercase();
+    assert!(
+        raw.contains("user-agent: claude-cli/9.9.9 (external, cli)"),
+        "raw user_agent override missing: {raw}"
+    );
+    assert!(
+        !raw.contains("codex_cli_rs"),
+        "raw override must replace the preset UA: {raw}"
+    );
+
+    // Extra headers ride along verbatim for gateways that gate on more than UA.
+    let headers = capture_custom_provider_request(json!({
+        "name": "AgentRouter",
+        "base_url": "http://unused/v1",
+        "models": ["gpt-5.6-sol"],
+        "requires_auth": false,
+        "headers": { "X-Client-Id": "codex-desktop" }
+    }))
+    .await
+    .to_ascii_lowercase();
+    assert!(
+        headers.contains("x-client-id: codex-desktop"),
+        "custom header missing: {headers}"
+    );
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn openai_compat_committed_stream_propagates_instead_of_restarting() {
