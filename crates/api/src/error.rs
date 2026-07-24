@@ -492,7 +492,7 @@ impl Display for ApiError {
                         // sending the user in a login loop.
                         write!(
                             f,
-                            "\n\n  This provider rejected zo as an unauthorized client — not an expired credential. Re-running /login will not help.\n  The endpoint only accepts requests whose wire image matches a whitelisted client (User-Agent / SDK headers). Use a provider that accepts generic API clients, or ask the provider to allow zo."
+                            "\n\n  This provider rejected zo as an unauthorized client — not an expired credential. Re-running /login will not help.\n  The endpoint only accepts requests whose wire image matches a whitelisted client (User-Agent / SDK headers).\n  Fix: give this provider a client fingerprint in settings.json — add \"client_fingerprint\": \"codex\" (or \"claude-code\") to its providers[] entry, or set a raw \"user_agent\". If the endpoint accepts generic API clients instead, no fingerprint is needed."
                         )?;
                     } else {
                         // Provider-neutral: a 401 can come from any backend (Claude,
@@ -856,6 +856,10 @@ mod tests {
         assert!(
             !rendered.contains("zo login [provider]"),
             "must not send the user into a futile re-login loop: {rendered}"
+        );
+        assert!(
+            rendered.contains("client_fingerprint") && rendered.contains("codex"),
+            "message must point at the actual fix — a client_fingerprint preset — not a dead end: {rendered}"
         );
     }
 
