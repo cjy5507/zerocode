@@ -40,12 +40,26 @@ impl SnapshotStack {
 
     pub fn capture(&mut self, turn_number: usize) -> Result<(), io::Error> {
         let tree_hash = write_worktree_tree(&self.git_root)?;
+        self.adopt_capture(tree_hash, turn_number);
+        Ok(())
+    }
+
+    /// Workspace root this stack snapshots — lets callers run
+    /// [`compute_worktree_tree`] for it off-thread.
+    #[must_use]
+    pub fn git_root(&self) -> &Path {
+        &self.git_root
+    }
+
+    /// Adopt a tree computed by [`compute_worktree_tree`] as the checkpoint
+    /// for `turn_number` — the bookkeeping half of [`Self::capture`], split
+    /// out so the expensive hash can run on a worker thread.
+    pub fn adopt_capture(&mut self, tree_hash: String, turn_number: usize) {
         self.snapshots.push(GitSnapshot {
             tree_hash,
             turn_number,
         });
         self.redo_stack.clear();
-        Ok(())
     }
 
     pub fn undo(&mut self) -> Result<UndoResult, io::Error> {
@@ -335,6 +349,15 @@ fn git_output(git_root: &Path, args: &[&str]) -> Result<Vec<u8>, io::Error> {
         )));
     }
     Ok(output.stdout)
+}
+
+/// The blocking half of [`SnapshotStack::capture`]: hash the current worktree
+/// into a git tree without touching any stack state. Forks `git add`/`git
+/// write-tree` over the whole worktree — seconds on a large or cold repo — so
+/// latency-sensitive callers run it on a worker thread and hand the result to
+/// [`SnapshotStack::adopt_capture`].
+pub fn compute_worktree_tree(git_root: &Path) -> Result<String, io::Error> {
+    write_worktree_tree(git_root)
 }
 
 fn write_worktree_tree(git_root: &Path) -> Result<String, io::Error> {

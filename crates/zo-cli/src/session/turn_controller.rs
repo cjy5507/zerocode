@@ -1756,7 +1756,14 @@ where
                         // frames. Throttled by the shared frame gate so a fast
                         // burst can't redraw faster than the emulator paints.
                         app.drip_stream();
+                        let draw_started = std::time::Instant::now();
                         app.draw_frame(terminal)?;
+                        // Feed the measured draw cost back into the gate: on a
+                        // terminal that paints slower than the frame grid
+                        // (Apple Terminal.app), the stream cadence stretches so
+                        // this loop keeps most of its time for the input arms
+                        // instead of saturating on blocked tty writes.
+                        frame_gate.note_draw_cost(draw_started.elapsed());
                         frame_gate.note_stream_draw(std::time::Instant::now());
                         if profile_turn {
                             last_render_tick = std::time::Instant::now();
@@ -1869,11 +1876,31 @@ where
                                 | AppAction::None => {}
                             }
                         }
-                        app.draw_frame(terminal)?;
+                        // Coalesce keystroke echoes through the shared frame
+                        // gate, mirroring the idle loop. Mid-turn every draw is
+                        // at its heaviest (streaming transcript + HUD), and a
+                        // terminal that paints slower than keys repeat backed
+                        // the event queue up behind unconditional per-key full
+                        // draws — the "typing hangs while streaming" input lag.
+                        // A deferred echo lands on the next render tick.
+                        if frame_gate.on_stream_update(std::time::Instant::now()).draws_now() {
+                            let draw_started = std::time::Instant::now();
+                            app.draw_frame(terminal)?;
+                            frame_gate.note_draw_cost(draw_started.elapsed());
+                            frame_gate.note_stream_draw(std::time::Instant::now());
+                        }
                     }
                     Some(Ok(Event::Paste(text))) => {
                         app.handle_paste_owned(text);
-                        app.draw_frame(terminal)?;
+                        // Same coalescing as keystrokes: the pasted text lands
+                        // in state immediately, the repaint shares the frame
+                        // budget.
+                        if frame_gate.on_stream_update(std::time::Instant::now()).draws_now() {
+                            let draw_started = std::time::Instant::now();
+                            app.draw_frame(terminal)?;
+                            frame_gate.note_draw_cost(draw_started.elapsed());
+                            frame_gate.note_stream_draw(std::time::Instant::now());
+                        }
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
                         // Only redraw for scroll events; ignore mouse
@@ -1909,7 +1936,9 @@ where
                             // once per the shared stream frame interval; `render_tick`
                             // lands the final frame.
                             if frame_gate.on_stream_update(std::time::Instant::now()).draws_now() {
+                                let draw_started = std::time::Instant::now();
                                 app.draw_frame(terminal)?;
+                                frame_gate.note_draw_cost(draw_started.elapsed());
                             }
                         }
                     }
@@ -1921,7 +1950,9 @@ where
                         // re-highlight), so drawing every event tears the UI
                         // mid-stream. `render_tick` lands the final geometry.
                         if frame_gate.on_stream_update(std::time::Instant::now()).draws_now() {
+                            let draw_started = std::time::Instant::now();
                             app.draw_frame(terminal)?;
+                            frame_gate.note_draw_cost(draw_started.elapsed());
                         }
                     }
                     Some(Ok(_)) => {
@@ -2208,7 +2239,9 @@ where
                     frame_gate.on_tick(tick_now, tick_has_work)
                 };
                 if decision.draws_now() {
+                    let draw_started = std::time::Instant::now();
                     app.draw_frame(terminal)?;
+                    frame_gate.note_draw_cost(draw_started.elapsed());
                     if app.turn_activity().is_some() || app.stream_pending() {
                         frame_gate.note_stream_draw(std::time::Instant::now());
                     }

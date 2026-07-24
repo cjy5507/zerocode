@@ -534,6 +534,29 @@ fn settle_attached_turn(app: &mut App, outcome: &Result<(), AttachError>) {
     }
 }
 
+/// Gate-throttled streamed-frame repaint for the socket loop: drip + draw when
+/// the shared frame budget allows — feeding the measured draw cost back so the
+/// cadence adapts to slow emulators — otherwise defer to the next tick via
+/// `dirty`.
+fn draw_streamed_socket_frame(
+    app: &mut App,
+    terminal: &mut TuiTerminal,
+    frame_gate: &mut StreamFrameGate,
+    dirty: &mut bool,
+) -> Result<(), AttachError> {
+    if frame_gate.on_stream_update(Instant::now()).draws_now() {
+        app.drip_stream();
+        let draw_started = Instant::now();
+        app.draw_frame(terminal).map_err(tui_err)?;
+        frame_gate.note_draw_cost(draw_started.elapsed());
+        frame_gate.note_stream_draw(Instant::now());
+        *dirty = false;
+    } else {
+        *dirty = true;
+    }
+    Ok(())
+}
+
 /// Drive one turn over the socket: send `session.run_turn`, decode streamed
 /// render frames into the App, animate the spinner on the tick, and return when
 /// the terminal response arrives.
@@ -603,14 +626,7 @@ async fn socket_run_turn(
                     // local REPL so fast remote streams do not alternate socket-
                     // driven full redraws with tick-driven redraws.
                     app.push_block(block);
-                    if frame_gate.on_stream_update(Instant::now()).draws_now() {
-                        app.drip_stream();
-                        app.draw_frame(terminal).map_err(tui_err)?;
-                        frame_gate.note_stream_draw(Instant::now());
-                        dirty = false;
-                    } else {
-                        dirty = true;
-                    }
+                    draw_streamed_socket_frame(app, terminal, &mut frame_gate, &mut dirty)?;
                 }
             }
             _ = interval.tick() => {

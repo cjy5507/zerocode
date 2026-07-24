@@ -1166,6 +1166,10 @@ pub(crate) mod tests {
 
     #[test]
     #[should_panic(expected = "route-outcome recorder doctrine violation")]
+    // The doctrine guard is a `debug_assert!`, which compiles out under
+    // `--release`; without this gate a release-mode test run fails on "did
+    // not panic as expected" even though the guard works as designed.
+    #[cfg(debug_assertions)]
     fn record_route_outcome_debug_asserts_on_non_terminal_status() {
         let root = tempfile::tempdir().expect("tempdir");
         let record = RouteOutcomeRecord::new("subagent", "agent", "model-a", "still_running");

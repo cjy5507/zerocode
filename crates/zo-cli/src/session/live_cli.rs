@@ -341,6 +341,14 @@ pub(crate) struct LiveCli {
     pub(crate) effort: Option<Effort>,
     /// Git snapshot stack for /undo /redo (None if not in a git repo).
     pub(crate) snapshot_stack: Option<runtime::git_snapshot::SnapshotStack>,
+    /// In-flight post-turn checkpoint: the worktree tree hash is computed on a
+    /// worker thread (`git add`/`write-tree` take seconds on big or cold
+    /// repos, and running them inline stalled the TUI loop at every turn
+    /// boundary — the watchdog's "post-turn (persist/checkpoint)" freezes).
+    /// Carries the turn number the tree belongs to;
+    /// [`Self::settle_code_checkpoint`] adopts it before anything reads or
+    /// mutates the stack.
+    pending_code_checkpoint: Option<(usize, std::thread::JoinHandle<Option<String>>)>,
     /// Where sessions spawned by this CLI are persisted. Interactive REPLs
     /// are project-scoped; one-shot `-p` / headless runs are ephemeral so
     /// they never pollute the target repo. Inherited by `/new` and `/fork`.
@@ -956,6 +964,19 @@ impl LiveCli {
         )
     }
 
+    // Session-start effort/thinking defaults: explicit project preferences
+    // win; otherwise both fall back to `DEFAULT_EFFORT`.
+    fn session_start_effort_defaults(
+        preferences: &SessionPreferences,
+    ) -> (Option<Effort>, Option<u32>) {
+        let (preferred_effort, preferred_budget) = effort_from_preferences(preferences);
+        if has_effort_preference(preferences) {
+            (preferred_effort, preferred_budget)
+        } else {
+            (Some(DEFAULT_EFFORT), Some(DEFAULT_EFFORT.budget()))
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_scoped_with_mcp_config_and_session_id_at(
         model: String,
@@ -1001,18 +1022,7 @@ impl LiveCli {
         } else {
             model
         };
-        let (preferred_effort, preferred_budget) = effort_from_preferences(&preferences);
-        let has_effort_preference = has_effort_preference(&preferences);
-        let effort = if has_effort_preference {
-            preferred_effort
-        } else {
-            Some(DEFAULT_EFFORT)
-        };
-        let thinking_budget = if has_effort_preference {
-            preferred_budget
-        } else {
-            Some(DEFAULT_EFFORT.budget())
-        };
+        let (effort, thinking_budget) = Self::session_start_effort_defaults(&preferences);
         let tasks = Arc::new(runtime::task_registry::TaskRegistry::new());
         let mut runtime = build_runtime_with_optional_mcp_config(
             &cwd,
@@ -1039,6 +1049,7 @@ impl LiveCli {
         ));
         let mut cli = Self {
             snapshot_stack: runtime::git_snapshot::SnapshotStack::try_new_at(&cwd),
+            pending_code_checkpoint: None,
             cwd,
             model,
             model_user_pinned: false,
@@ -1115,18 +1126,7 @@ impl LiveCli {
         } else {
             model
         };
-        let (preferred_effort, preferred_budget) = effort_from_preferences(&preferences);
-        let has_effort_preference = has_effort_preference(&preferences);
-        let effort = if has_effort_preference {
-            preferred_effort
-        } else {
-            Some(DEFAULT_EFFORT)
-        };
-        let thinking_budget = if has_effort_preference {
-            preferred_budget
-        } else {
-            Some(DEFAULT_EFFORT.budget())
-        };
+        let (effort, thinking_budget) = Self::session_start_effort_defaults(&preferences);
         // /goal은 세션 헤더에 영속된다(resume 복원) — 빌더로 move되기 전에 캡처.
         let restored_session_goal = session_state.session_goal.clone();
         let tasks = Arc::new(runtime::task_registry::TaskRegistry::new());
@@ -1165,6 +1165,7 @@ impl LiveCli {
             thinking_budget,
             effort,
             snapshot_stack: runtime::git_snapshot::SnapshotStack::try_new(),
+            pending_code_checkpoint: None,
             session_scope: scope,
             mcp_config: None,
             session_goal: restored_session_goal,
@@ -2982,9 +2983,38 @@ impl LiveCli {
     }
 
     pub(crate) fn capture_code_checkpoint(&mut self) {
+        // Adopt any previous in-flight capture first so stack order matches
+        // turn order even under back-to-back turns.
+        self.settle_code_checkpoint();
         let turn_number = self.runtime.session().messages.len();
-        if let Some(stack) = self.snapshot_stack.as_mut() {
-            let _ = stack.capture(turn_number);
+        let Some(stack) = self.snapshot_stack.as_ref() else {
+            return;
+        };
+        // The tree hash forks `git add`/`write-tree` over the whole worktree —
+        // seconds on big or cold repos — so it runs on a worker; the TUI loop
+        // stays responsive at the turn boundary. Failures drop the checkpoint,
+        // matching the old best-effort `let _ = stack.capture(..)`.
+        let git_root = stack.git_root().to_path_buf();
+        self.pending_code_checkpoint = Some((
+            turn_number,
+            std::thread::spawn(move || {
+                runtime::git_snapshot::compute_worktree_tree(&git_root).ok()
+            }),
+        ));
+    }
+
+    /// Adopt the in-flight post-turn checkpoint, waiting for the tree hash
+    /// when it is still being computed. Must run before the snapshot stack is
+    /// read or mutated (rewind preview/apply, the next capture) and before a
+    /// new turn may edit files — a tree still being hashed would otherwise
+    /// smear next-turn edits into the previous turn's snapshot.
+    pub(crate) fn settle_code_checkpoint(&mut self) {
+        let Some((turn_number, handle)) = self.pending_code_checkpoint.take() else {
+            return;
+        };
+        let tree_hash = handle.join().ok().flatten();
+        if let (Some(stack), Some(tree_hash)) = (self.snapshot_stack.as_mut(), tree_hash) {
+            stack.adopt_capture(tree_hash, turn_number);
         }
     }
 
@@ -2992,6 +3022,7 @@ impl LiveCli {
         &mut self,
         action: &commands::WorkspaceRewindAction,
     ) -> Result<String, String> {
+        self.settle_code_checkpoint();
         let Some(runtime) = self.runtime.try_runtime_mut() else {
             return Err("runtime is not available".to_string());
         };
@@ -3017,6 +3048,9 @@ impl LiveCli {
     /// independently so a partial outcome (e.g. code restore blocked by a
     /// user edit) is surfaced truthfully rather than silently dropped.
     pub(crate) fn rewind_last_checkpoint(&mut self) -> RewindCheckpointReport {
+        // The newest checkpoint may still be in flight from the turn that just
+        // ended; adopt it first or the undo would target the wrong turn.
+        self.settle_code_checkpoint();
         let removed = self.runtime.rewind_turns(1);
 
         let code = match self.snapshot_stack.as_mut() {

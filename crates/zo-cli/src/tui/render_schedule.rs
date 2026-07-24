@@ -19,6 +19,17 @@ pub const STREAM_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// without racing the stream gate on a mismatched cadence.
 pub const ANIMATION_TICK_INTERVAL: Duration = Duration::from_millis(33);
 
+/// Ceiling for the adaptive stream interval: even the slowest terminal keeps
+/// at least ~4 fps, so a throttled stream still visibly moves.
+pub const MAX_STREAM_FRAME_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Multiple of the measured draw cost reserved for non-draw work.
+///
+/// 3× bounds draw time to ~25% of the loop under sustained streaming; the
+/// remaining time keeps input/event handling responsive on terminals whose
+/// paint is slower than the configured frame grid.
+const DRAW_COST_HEADROOM: u32 = 3;
+
 /// The outcome of a render scheduling decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DrawDecision {
@@ -42,18 +53,50 @@ pub struct StreamFrameGate {
     min_interval: Duration,
     last_stream_draw: Instant,
     deferred_stream_frame: bool,
+    /// Smoothed wall-clock cost of recent `draw()` calls, fed by
+    /// [`Self::note_draw_cost`]. Zero until the first measurement, which keeps
+    /// the configured `min_interval` in charge on fast terminals.
+    draw_cost_ewma: Duration,
 }
 
 impl StreamFrameGate {
     /// Create a gate whose first stream event can draw immediately.
     #[must_use]
     pub fn new_ready(now: Instant, min_interval: Duration) -> Self {
-        let last_stream_draw = now.checked_sub(min_interval).unwrap_or(now);
+        let ceiling = MAX_STREAM_FRAME_INTERVAL.max(min_interval);
+        let last_stream_draw = now.checked_sub(ceiling).unwrap_or(now);
         Self {
             min_interval,
             last_stream_draw,
             deferred_stream_frame: false,
+            draw_cost_ewma: Duration::ZERO,
         }
+    }
+
+    /// Feed the measured wall-clock cost of a completed draw back into the
+    /// gate.
+    ///
+    /// On a fast terminal the cost is a millisecond or two and the gate keeps
+    /// its configured cadence. When the terminal itself is the bottleneck
+    /// (Apple Terminal.app painting a full frame in 50–200 ms — the `write`
+    /// blocks once the tty buffer fills), the effective interval stretches to
+    /// [`DRAW_COST_HEADROOM`]× the smoothed cost: a fast stream then degrades
+    /// frame rate instead of input latency, because the loop spends a bounded
+    /// fraction of its time inside `draw()`.
+    pub fn note_draw_cost(&mut self, cost: Duration) {
+        // EWMA (70% old, 30% new): smooths one-off spikes (resize, first
+        // paint) while converging within a few frames on a regime change.
+        let blended = (self.draw_cost_ewma.as_micros() * 7 + cost.as_micros() * 3) / 10;
+        self.draw_cost_ewma = Duration::from_micros(u64::try_from(blended).unwrap_or(u64::MAX));
+    }
+
+    /// Effective minimum gap between stream draws: the configured interval,
+    /// stretched by measured draw cost, capped so streams never look frozen.
+    fn current_interval(&self) -> Duration {
+        let ceiling = MAX_STREAM_FRAME_INTERVAL.max(self.min_interval);
+        self.draw_cost_ewma
+            .saturating_mul(DRAW_COST_HEADROOM)
+            .clamp(self.min_interval, ceiling)
     }
 
     /// Decide whether a stream-like event should repaint now.
@@ -62,7 +105,7 @@ impl StreamFrameGate {
     /// both mutate visible state quickly and should be capped to terminal frame
     /// cadence while still landing their final frame on the next tick.
     pub fn on_stream_update(&mut self, now: Instant) -> DrawDecision {
-        if now.duration_since(self.last_stream_draw) >= self.min_interval {
+        if now.duration_since(self.last_stream_draw) >= self.current_interval() {
             self.mark_stream_drawn(now);
             DrawDecision::DrawNow
         } else {
@@ -79,7 +122,7 @@ impl StreamFrameGate {
     /// still respects the stream frame interval.
     pub fn on_tick(&mut self, now: Instant, has_tick_work: bool) -> DrawDecision {
         if self.deferred_stream_frame {
-            if now.duration_since(self.last_stream_draw) >= self.min_interval {
+            if now.duration_since(self.last_stream_draw) >= self.current_interval() {
                 self.mark_stream_drawn(now);
                 DrawDecision::DrawNow
             } else {
@@ -102,7 +145,7 @@ impl StreamFrameGate {
         if !has_tick_work {
             return DrawDecision::DeferToTick;
         }
-        if now.duration_since(self.last_stream_draw) >= self.min_interval {
+        if now.duration_since(self.last_stream_draw) >= self.current_interval() {
             self.mark_stream_drawn(now);
             DrawDecision::DrawNow
         } else {
@@ -248,6 +291,88 @@ mod tests {
         let mut gate = StreamFrameGate::new_ready(start, STREAM_FRAME_INTERVAL);
 
         assert_eq!(gate.on_stream_tick(start, false), DrawDecision::DeferToTick);
+    }
+
+    #[test]
+    fn fast_terminal_keeps_configured_cadence() {
+        let start = Instant::now();
+        let mut gate = StreamFrameGate::new_ready(start, STREAM_FRAME_INTERVAL);
+
+        // Millisecond-class draws (fast emulator): the adaptive interval must
+        // stay pinned at the configured frame grid.
+        for _ in 0..10 {
+            gate.note_draw_cost(Duration::from_millis(1));
+        }
+        assert_eq!(gate.on_stream_update(start), DrawDecision::DrawNow);
+        assert_eq!(
+            gate.on_stream_update(start + STREAM_FRAME_INTERVAL),
+            DrawDecision::DrawNow,
+            "cheap draws must not stretch the interval past the frame grid"
+        );
+    }
+
+    #[test]
+    fn slow_terminal_stretches_interval_to_bound_draw_share() {
+        let start = Instant::now();
+        let mut gate = StreamFrameGate::new_ready(start, STREAM_FRAME_INTERVAL);
+
+        // Sustained 100ms draws (Apple Terminal.app class): the EWMA converges
+        // near 100ms, so the effective interval approaches 300ms — the loop
+        // keeps ~2/3 of its time free for input instead of saturating on draws.
+        for _ in 0..20 {
+            gate.note_draw_cost(Duration::from_millis(100));
+        }
+        assert_eq!(gate.on_stream_update(start), DrawDecision::DrawNow);
+        assert_eq!(
+            gate.on_stream_update(start + Duration::from_millis(100)),
+            DrawDecision::DeferToTick,
+            "a stream burst must not repaint while the terminal is still the bottleneck"
+        );
+        assert_eq!(
+            gate.on_stream_update(start + Duration::from_millis(249)),
+            DrawDecision::DeferToTick
+        );
+        assert_eq!(
+            gate.on_stream_update(start + Duration::from_millis(251)),
+            DrawDecision::DrawNow
+        );
+    }
+
+    #[test]
+    fn adaptive_interval_recovers_when_terminal_speeds_up() {
+        let start = Instant::now();
+        let mut gate = StreamFrameGate::new_ready(start, STREAM_FRAME_INTERVAL);
+
+        for _ in 0..20 {
+            gate.note_draw_cost(Duration::from_millis(100));
+        }
+        // Regime change back to a fast terminal (window shrunk, alt screen):
+        // cheap draws pull the EWMA — and the interval — back down.
+        for _ in 0..20 {
+            gate.note_draw_cost(Duration::from_millis(1));
+        }
+        assert_eq!(gate.on_stream_update(start), DrawDecision::DrawNow);
+        assert_eq!(
+            gate.on_stream_update(start + Duration::from_millis(33)),
+            DrawDecision::DrawNow,
+            "the interval must recover once draws are cheap again"
+        );
+    }
+
+    #[test]
+    fn adaptive_interval_is_capped_so_streams_never_look_frozen() {
+        let start = Instant::now();
+        let mut gate = StreamFrameGate::new_ready(start, STREAM_FRAME_INTERVAL);
+
+        for _ in 0..30 {
+            gate.note_draw_cost(Duration::from_secs(1));
+        }
+        assert_eq!(gate.on_stream_update(start), DrawDecision::DrawNow);
+        assert_eq!(
+            gate.on_stream_update(start + MAX_STREAM_FRAME_INTERVAL),
+            DrawDecision::DrawNow,
+            "even pathological draw costs must keep at least the capped cadence"
+        );
     }
 
     #[test]

@@ -78,7 +78,14 @@ impl App {
         let mut frame_gate = StreamFrameGate::new_ready(Instant::now(), STREAM_FRAME_INTERVAL);
         let mut cooling_active = self.cooling_active_at(Instant::now());
 
+        // Every gate-driven draw below reports its wall-clock cost back to the
+        // gate (`note_draw_cost`): on terminals that paint slower than the
+        // frame grid (Apple Terminal.app), the stream cadence stretches so the
+        // loop keeps most of its time for input instead of saturating on
+        // blocked tty writes. The first paint seeds that measurement.
+        let draw_started = Instant::now();
         self.draw(terminal)?;
+        frame_gate.note_draw_cost(draw_started.elapsed());
 
         let mut workflow_view_snapshot = None;
         let mut agents_rows_snapshot: Option<
@@ -199,7 +206,9 @@ impl App {
                     };
                     if decision.draws_now() {
                         self.advance_tick();
+                        let draw_started = Instant::now();
                         self.draw(terminal)?;
+                        frame_gate.note_draw_cost(draw_started.elapsed());
                         if tick_stream_work {
                             frame_gate.note_stream_draw(Instant::now());
                         }
@@ -288,7 +297,9 @@ impl App {
                             // ≤33ms tick — imperceptible to the user but keeps the
                             // terminal fed at a rate it can actually paint.
                             if frame_gate.on_stream_update(Instant::now()).draws_now() {
+                                let draw_started = Instant::now();
                                 self.draw(terminal)?;
+                                frame_gate.note_draw_cost(draw_started.elapsed());
                                 // Re-stamp to draw *completion*, exactly like the
                                 // stream arm below: `on_stream_update` marks
                                 // draw-start, so without this a slow-terminal draw
@@ -309,7 +320,9 @@ impl App {
                             // shares the frame budget instead of flooding the
                             // terminal with full repaints.
                             if frame_gate.on_stream_update(Instant::now()).draws_now() {
+                                let draw_started = Instant::now();
                                 self.draw(terminal)?;
+                                frame_gate.note_draw_cost(draw_started.elapsed());
                                 frame_gate.note_stream_draw(Instant::now());
                                 dirty = false;
                             } else {
@@ -337,7 +350,9 @@ impl App {
                                 return Ok(action);
                             }
                             if matches!(action, AppAction::Redraw) {
+                                let draw_started = Instant::now();
                                 self.draw(terminal)?;
+                                frame_gate.note_draw_cost(draw_started.elapsed());
                                 dirty = false;
                             } else if is_scroll {
                                 // Coalesce wheel repaints the same way streamed
@@ -353,7 +368,9 @@ impl App {
                                 // let the tick arm land the final frame via
                                 // `dirty`.
                                 if frame_gate.on_stream_update(Instant::now()).draws_now() {
+                                    let draw_started = Instant::now();
                                     self.draw(terminal)?;
+                                    frame_gate.note_draw_cost(draw_started.elapsed());
                                     dirty = false;
                                 } else {
                                     dirty = true;
@@ -383,7 +400,9 @@ impl App {
                             // so a fast burst can't redraw faster than the frame
                             // grid; otherwise defer to the next tick (`dirty`).
                             if frame_gate.on_stream_update(Instant::now()).draws_now() {
+                                let draw_started = Instant::now();
                                 self.draw(terminal)?;
+                                frame_gate.note_draw_cost(draw_started.elapsed());
                                 frame_gate.note_stream_draw(Instant::now());
                                 dirty = false;
                             } else {

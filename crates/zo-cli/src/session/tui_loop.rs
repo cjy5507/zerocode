@@ -1111,6 +1111,11 @@ async fn run_session_loop(
                             app.push_block(block);
                         }
                         app.draw_frame(terminal)?;
+                        // Adopt any in-flight post-turn checkpoint before this
+                        // turn's tools may edit files — a tree still being
+                        // hashed would otherwise smear the new edits into the
+                        // previous turn's snapshot.
+                        cli.settle_code_checkpoint();
                         let loop_gate_restore = install_automation_plan_gate(cli, &trimmed);
                         // Turn-scoped read-only + propose-only gate for an
                         // unattended `/loop`/`/goal` schedule turn (a user-typed or
@@ -1406,6 +1411,10 @@ async fn run_session_loop(
                 // could otherwise silently discard the latest turn's code
                 // edits and conversation. Show what would be reverted and wait
                 // for confirmation — the rewind itself runs on ConfirmRewind.
+                // Adopt the (possibly in-flight) checkpoint of the turn that
+                // just ended, so the preview shows the state Esc-Esc would
+                // actually restore.
+                cli.settle_code_checkpoint();
                 let files = cli.preview_rewind();
                 app.open_rewind_confirm(rewind_confirm_lines(&files));
                 app.draw_frame(terminal)?;
