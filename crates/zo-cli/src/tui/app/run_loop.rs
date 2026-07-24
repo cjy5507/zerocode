@@ -278,11 +278,34 @@ impl App {
                                 }
                                 AppAction::Redraw | AppAction::None => {}
                             }
-                            self.draw(terminal)?;
+                            // Coalesce keystroke repaints to the shared frame
+                            // cadence, mirroring the scroll/stream arms. A full
+                            // widget-tree redraw on every keystroke floods slower
+                            // terminals (Apple Terminal.app) faster than they
+                            // paint, which reads as input lag. The first keystroke
+                            // still draws immediately (the gate starts ready); a
+                            // burst within the frame interval defers to the next
+                            // ≤33ms tick — imperceptible to the user but keeps the
+                            // terminal fed at a rate it can actually paint.
+                            if frame_gate.on_stream_update(Instant::now()).draws_now() {
+                                self.draw(terminal)?;
+                                dirty = false;
+                            } else {
+                                dirty = true;
+                            }
                         }
                         Some(Ok(Event::Paste(text))) => {
                             self.handle_paste_owned(text);
-                            self.draw(terminal)?;
+                            // Same frame coalescing as keystrokes: a paste lands
+                            // immediately, but a rapid paste/keystroke burst
+                            // shares the frame budget instead of flooding the
+                            // terminal with full repaints.
+                            if frame_gate.on_stream_update(Instant::now()).draws_now() {
+                                self.draw(terminal)?;
+                                dirty = false;
+                            } else {
+                                dirty = true;
+                            }
                         }
                         Some(Ok(Event::Mouse(mouse))) => {
                             // Only repaint for scroll events; ignore raw mouse
