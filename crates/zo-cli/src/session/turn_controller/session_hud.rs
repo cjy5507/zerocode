@@ -46,7 +46,7 @@ pub(super) struct LiveHudSnapshot {
 /// own runtime guarantees they always have a worker, no matter how saturated the
 /// main pool is. It carries a small blocking pool of its own; the work is light
 /// (a directory scan and a `git status`) and self-throttled by the caller.
-pub(super) fn hud_runtime() -> &'static tokio::runtime::Runtime {
+pub(crate) fn hud_runtime() -> &'static tokio::runtime::Runtime {
     static HUD_RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     HUD_RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()

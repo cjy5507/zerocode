@@ -1095,6 +1095,10 @@ fn spawn_orphaned_agent_reap() {
     });
 }
 
+/// Boot-time delay for the retention sweep so its store-wide walk never
+/// competes with the interactive warm-up for disk/CPU on low-spec machines.
+const STARTUP_SWEEP_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn spawn_session_retention_cleanup(config: &runtime::RuntimeConfig) {
     use std::sync::OnceLock;
     static ONCE: OnceLock<()> = OnceLock::new();
@@ -1103,6 +1107,11 @@ fn spawn_session_retention_cleanup(config: &runtime::RuntimeConfig) {
     };
     ONCE.get_or_init(|| {
         std::thread::spawn(move || {
+            // The sweep walks every project's session store — real IO on a
+            // cold or low-spec machine. Hold it back until the interactive
+            // warm-up (first paint, first prompt) is past; a session shorter
+            // than the delay simply defers the sweep to the next boot.
+            std::thread::sleep(STARTUP_SWEEP_DELAY);
             let report = runtime::session_control::cleanup_expired_sessions(days);
             if !report.is_empty() {
                 // Boot-time stderr reaches zo.log on the TUI path and the
@@ -1371,6 +1380,9 @@ fn resolve_claude_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Er
 /// crossed expiry otherwise 401s every request until the process restarts.
 pub(crate) async fn refresh_claude_oauth() -> Option<AuthSource> {
     tokio::task::spawn_blocking(|| {
+        // Recovery path: the memoized keychain session is exactly what just
+        // lapsed/401'd, so drop it before re-resolving.
+        api::invalidate_claude_code_keychain_cache();
         let resolved = api::resolve_claude_auth_fresh_detailed()?;
         update_cached_claude_auth(
             &resolved.auth,

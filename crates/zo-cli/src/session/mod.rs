@@ -69,6 +69,61 @@ pub(crate) use request_types::{
 };
 pub(crate) use slash_dispatch::handle_commit_push_pr_at;
 
+/// Boot-time background sweeps (Dreamer curation, self-improve preflight) wait
+/// this long before touching the disk. They were already off the boot path,
+/// but their IO/CPU burst landed exactly while the user types the first
+/// prompt — on a low-core machine that competition reads as input lag. Both
+/// passes are interval-throttled, so deferring them costs nothing.
+const STARTUP_SWEEP_DELAY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Fire-and-forget boot sweeps, each held back by [`STARTUP_SWEEP_DELAY`].
+///
+/// Dreamer curation: between-sessions memory curation, throttled to one pass
+/// per `DEFAULT_AUTO_DREAM_INTERVAL` so frequent relaunches coalesce; it only
+/// promotes lessons repeated across distinct sessions *and* verified, so a
+/// background pass can never pollute memory. Self-improve preflight: off
+/// (default) it runs only the safe read-only scheduler preflight; the opt-in
+/// `autoImproveProposalsEnabled` additionally parks a gated proposal —
+/// applying always stays an explicit `/improve apply`. Both are best-effort
+/// filesystem passes: failures are persisted as diagnostics, never surfaced
+/// into the boot path.
+fn spawn_startup_sweeps(tokio_rt: &tokio::runtime::Runtime, cli: &LiveCli) {
+    if should_run_startup_auto_dream(&cli.runtime.feature_config) {
+        let dream_cwd = cli.cwd.clone();
+        tokio_rt.spawn(async move {
+            tokio::time::sleep(STARTUP_SWEEP_DELAY).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(error) = runtime::maybe_auto_dream(
+                    &dream_cwd,
+                    runtime::memory::DEFAULT_AUTO_DREAM_INTERVAL,
+                ) {
+                    let _ = runtime::record_auto_dream_failure(&dream_cwd, &error);
+                }
+            })
+            .await;
+        });
+    }
+
+    if should_run_startup_auto_self_improve(&cli.runtime.feature_config) {
+        let improve_cwd = cli.cwd.clone();
+        let auto_propose = cli
+            .runtime
+            .feature_config
+            .auto_improve_proposals_enabled();
+        tokio_rt.spawn(async move {
+            tokio::time::sleep(STARTUP_SWEEP_DELAY).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(error) =
+                    self_improve::maybe_auto_self_improve_preflight(&improve_cwd, auto_propose)
+                {
+                    self_improve::record_auto_self_improve_failure(&improve_cwd, &error);
+                }
+            })
+            .await;
+        });
+    }
+}
+
 pub(crate) fn run_repl(
     mut model: String,
     model_pinned: bool,
@@ -95,19 +150,22 @@ pub(crate) fn run_repl(
     {
         model = persisted_model;
     }
-    let mut cli = {
-        let _startup_loader = startup_loader::StartupLoader::start();
-        LiveCli::new_scoped_with_mcp_config_and_session_id(
-            model,
-            true,
-            allowed_tools,
-            permission_mode,
-            crate::session_registry::SessionScope::Project,
-            mcp_config,
-            None,
-            crate::runtime_support::StartupAuthPolicy::AllowUnauthenticated,
-        )?
-    };
+    // The loader's spinner covers every blocking pre-TUI phase below — the
+    // runtime build, the resume swap, the turn-0 rewind checkpoint, and the
+    // boot screen's workspace snapshot. The latter two fork `git`; running
+    // them at TUI-loop start instead blocked the first frames for their
+    // duration (the freeze watchdog's `beat=0` stalls).
+    let startup_loader = startup_loader::StartupLoader::start();
+    let mut cli = LiveCli::new_scoped_with_mcp_config_and_session_id(
+        model,
+        true,
+        allowed_tools,
+        permission_mode,
+        crate::session_registry::SessionScope::Project,
+        mcp_config,
+        None,
+        crate::runtime_support::StartupAuthPolicy::AllowUnauthenticated,
+    )?;
     cli.set_model_user_pinned(model_pinned);
     if let Some(path) = &boot_resume {
         // Swap the fresh empty session for the persisted transcript. The fast
@@ -135,6 +193,13 @@ pub(crate) fn run_repl(
             ),
         }
     }
+    // Baseline ("turn 0") code checkpoint so the very first turn's Esc-Esc has
+    // a pristine worktree to rewind to. Runs after the resume swap so the
+    // checkpoint's turn number matches the session it belongs to, and under
+    // the loader so its `git add`/`write-tree` forks never stall the TUI.
+    cli.capture_code_checkpoint();
+    let startup_status = crate::status_context(Some(&cli.session.path)).ok();
+    drop(startup_loader);
     let startup_elapsed = startup_start.elapsed();
     // Use a multi-thread runtime so that the synchronous tool runtimes
     // (bash, mcp_runtime, lsp_runtime, agent_tools, …) — each of which
@@ -182,48 +247,7 @@ pub(crate) fn run_repl(
     // on a code-heavy reply). Loading it here makes the first render a cache hit.
     tokio_rt.spawn_blocking(zo_cli::tui::markdown::prewarm_syntect_assets);
 
-    // Fire-and-forget: run the Dreamer's between-sessions memory curation
-    // automatically at startup (no slash command needed). It is throttled to at
-    // most one pass per `DEFAULT_AUTO_DREAM_INTERVAL`, so frequent relaunches
-    // coalesce, and it only promotes lessons that were repeated across distinct
-    // sessions *and* verified — so a background pass can never pollute memory.
-    // Runs on a blocking thread (it is filesystem IO) and never blocks startup.
-    if should_run_startup_auto_dream(&cli.runtime.feature_config) {
-        let dream_cwd = cli.cwd.clone();
-        tokio_rt.spawn_blocking(move || {
-            // Background, best-effort: a failed or empty pass must never disrupt
-            // startup. Persist a tiny diagnostic so automatic failures are
-            // observable without adding TUI noise. Successful promotions are
-            // visible in memory recall on later sessions.
-            if let Err(error) =
-                runtime::maybe_auto_dream(&dream_cwd, runtime::memory::DEFAULT_AUTO_DREAM_INTERVAL)
-            {
-                let _ = runtime::record_auto_dream_failure(&dream_cwd, &error);
-            }
-        });
-    }
-
-    if should_run_startup_auto_self_improve(&cli.runtime.feature_config) {
-        let improve_cwd = cli.cwd.clone();
-        // Opt-in `autoImproveProposalsEnabled` (default off): when on, the
-        // preflight also runs the headless generator and parks a gated proposal
-        // automatically. Applying always stays an explicit `/improve apply`.
-        let auto_propose = cli
-            .runtime
-            .feature_config
-            .auto_improve_proposals_enabled();
-        tokio_rt.spawn_blocking(move || {
-            // Background, best-effort: a failed pass must never disrupt startup.
-            // Off (default) it runs only the safe read-only scheduler preflight;
-            // on, it may spend a minutes-long generator turn here, off the boot
-            // path. Either way `/improve apply` remains a human gate.
-            if let Err(error) =
-                self_improve::maybe_auto_self_improve_preflight(&improve_cwd, auto_propose)
-            {
-                self_improve::record_auto_self_improve_failure(&improve_cwd, &error);
-            }
-        });
-    }
+    spawn_startup_sweeps(&tokio_rt, &cli);
 
     let terminal_mode = zo_cli::tui::TerminalMode::from_inline(
         inline || cli.runtime.feature_config.tui_inline_mode(),
@@ -232,6 +256,7 @@ pub(crate) fn run_repl(
         &mut cli,
         startup_elapsed,
         terminal_mode,
+        startup_status,
     ));
 
     // `/restart` set a re-exec plan and quit the loop cleanly. By here

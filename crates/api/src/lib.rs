@@ -22,8 +22,8 @@ pub use prompt_cache::{
     PromptCacheStats,
 };
 pub use providers::anthropic::keychain::{
-    KeychainSession, claude_code_oauth_config, read_claude_code_keychain_session,
-    read_claude_code_keychain_token,
+    KeychainSession, claude_code_oauth_config, invalidate_claude_code_keychain_cache,
+    read_claude_code_keychain_session, read_claude_code_keychain_token,
 };
 pub use providers::anthropic::latest_claude_auth_origin;
 pub use providers::anthropic::{

@@ -6,8 +6,8 @@ use runtime::PermissionMode;
 use zo_cli::tui::{RecentSession, StartupAuthState, StartupScreen};
 
 #[cfg(test)]
-use crate::resolve_model_alias;
-use crate::{format_session_modified_age, status_context, VERSION};
+use crate::{resolve_model_alias, status_context};
+use crate::{format_session_modified_age, VERSION};
 
 /// Number of prior sessions surfaced on the launchpad splash.
 const RECENT_SESSION_LIMIT: usize = 3;
@@ -94,24 +94,25 @@ pub(crate) fn build_startup_banner(
     )
 }
 
+/// `status` is the boot-time workspace snapshot, gathered by the caller while
+/// the startup loader is still covering the blocking phase. Building it here
+/// used to fork `git` and re-discover the whole config chain on the TUI
+/// thread's first frames — the freeze watchdog's `beat=0` stalls.
 pub(crate) fn build_startup_screen(
     model: &str,
     permissions: &str,
     session_id: &str,
     session_path: &Path,
     startup_elapsed: Option<Duration>,
+    status: Option<&crate::StatusContext>,
 ) -> StartupScreen {
     let cwd = crate::current_cli_cwd().unwrap_or_else(|_| PathBuf::from("."));
-    let status = status_context(Some(session_path)).ok();
-    let workspace = status.as_ref().map_or_else(
+    let workspace = status.map_or_else(
         || "unknown".to_string(),
         |context| context.git_summary.headline(),
     );
-    let project_root = status
-        .as_ref()
-        .and_then(|context| context.project_root.clone());
+    let project_root = status.and_then(|context| context.project_root.clone());
     let branch = status
-        .as_ref()
         .and_then(|context| context.git_branch.clone())
         .unwrap_or_else(|| "unknown".to_string());
     let mem_kb = resident_memory_kb();

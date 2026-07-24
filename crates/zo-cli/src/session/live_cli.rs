@@ -1529,6 +1529,7 @@ impl LiveCli {
     pub(crate) fn startup_screen(
         &self,
         startup_elapsed: Option<std::time::Duration>,
+        status: Option<&crate::StatusContext>,
     ) -> zo_cli::tui::StartupScreen {
         startup_snapshot::build_startup_screen(
             &self.model,
@@ -1536,6 +1537,7 @@ impl LiveCli {
             &self.session.id,
             &self.session.path,
             startup_elapsed,
+            status,
         )
     }
 

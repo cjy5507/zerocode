@@ -54,7 +54,7 @@ use zo_cli::tui::modals::workflow_viewer::WorkflowView;
 use zo_cli::tui::workflow_progress::AgentRowsSnapshot;
 use zo_cli::tui::{AgentCommand, App};
 
-mod session_hud;
+pub(crate) mod session_hud;
 
 use session_hud::{
     apply_live_hud_snapshot, load_live_hud_snapshot, read_live_hud_snapshot,

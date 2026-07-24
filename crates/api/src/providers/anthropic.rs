@@ -1435,6 +1435,9 @@ pub fn refresh_claude_auth_after_unauthorized(stale_bearer: Option<&str>) -> Opt
             return Some(cached);
         }
     }
+    // The keychain memo may still hold the bearer that just 401'd; force the
+    // resolution below through to a real keychain read.
+    keychain::invalidate_claude_code_keychain_cache();
     let fresh = resolve_claude_auth_fresh()?;
     if stale_bearer.is_some() && fresh.bearer_token() == stale_bearer {
         return None;

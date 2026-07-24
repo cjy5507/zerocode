@@ -82,6 +82,110 @@ pub struct KeychainSession {
     pub expires_at_ms: Option<u64>,
 }
 
+/// Process-wide memo of the last real keychain read.
+///
+/// Every credential lookup previously forked `security(1)` — at startup, on
+/// every model swap's binding rebuild, once per turn while auth sat in
+/// fallback, and from the model picker on the TUI thread. Each fork is a
+/// synchronous child-process round-trip that can stall for seconds when
+/// `securityd` is slow (first access from a freshly deployed binary re-runs
+/// ACL evaluation; a pending keychain authorization prompt blocks
+/// indefinitely) — the main-thread `posix_spawn`/`poll` stacks the freeze
+/// watchdog kept capturing. The memo serves repeat lookups in-process:
+/// - a usable session is reused until its recorded expiry enters the
+///   proactive refresh buffer (sessions without a recorded expiry are re-read
+///   on a fixed cadence);
+/// - a miss (absent blob, missing scope, failed refresh) is negative-cached
+///   briefly so a machine without Claude Code credentials doesn't re-fork per
+///   turn;
+/// - [`invalidate_claude_code_keychain_cache`] forces the next lookup through
+///   to the keychain (401 recovery must never be served a cached bearer).
+struct KeychainCacheEntry {
+    session: Option<KeychainSession>,
+    read_at: Instant,
+}
+
+static KEYCHAIN_SESSION_CACHE: Mutex<Option<KeychainCacheEntry>> = Mutex::new(None);
+/// Single-flight for the `security` fork + optional network refresh: parallel
+/// resolvers (turn boundary, model picker, sub-agent spawn) coalesce on one
+/// read instead of forking a `security` process each.
+static KEYCHAIN_READ_FLIGHT: Mutex<()> = Mutex::new(());
+
+/// How long a *miss* is trusted before the keychain is consulted again. The
+/// fallback auth path re-probes the keychain every turn to recover without a
+/// restart; this bounds that recovery latency while capping the fork rate.
+const KEYCHAIN_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
+/// Re-read cadence for a usable session whose blob records no `expiresAt`:
+/// trust it, but notice an external rotation within this window.
+const KEYCHAIN_NO_EXPIRY_RECHECK: Duration = Duration::from_secs(15 * 60);
+
+/// Shape of a cache entry as the freshness rule sees it.
+enum CachedSessionShape {
+    /// The keychain had no usable session at the last read.
+    Miss,
+    /// A usable session whose blob records `expiresAt` (Unix ms).
+    ExpiringAt(u64),
+    /// A usable session without a recorded expiry.
+    NoExpiry,
+}
+
+/// What a cache lookup produced: a fresh answer (which may itself be a cached
+/// miss), or nothing servable — the keychain must actually be read.
+#[derive(Debug, PartialEq, Eq)]
+enum KeychainCacheLookup {
+    Fresh(Option<KeychainSession>),
+    Stale,
+}
+
+/// Pure freshness rule for the cache entry — split out for unit tests.
+fn keychain_cache_entry_fresh(shape: &CachedSessionShape, age: Duration, now_ms: u64) -> bool {
+    match shape {
+        CachedSessionShape::Miss => age < KEYCHAIN_NEGATIVE_CACHE_TTL,
+        // Usable session with a recorded expiry: serve it until the proactive
+        // buffer would refresh it anyway, so refresh timing is unchanged.
+        CachedSessionShape::ExpiringAt(expires_at_ms) => {
+            now_ms.saturating_add(KEYCHAIN_EXPIRY_BUFFER_MS) <= *expires_at_ms
+        }
+        CachedSessionShape::NoExpiry => age < KEYCHAIN_NO_EXPIRY_RECHECK,
+    }
+}
+
+/// Drop the memo so the next lookup reads the keychain again.
+pub fn invalidate_claude_code_keychain_cache() {
+    *KEYCHAIN_SESSION_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+fn cached_keychain_session() -> KeychainCacheLookup {
+    let guard = KEYCHAIN_SESSION_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(entry) = guard.as_ref() else {
+        return KeychainCacheLookup::Stale;
+    };
+    let shape = match &entry.session {
+        None => CachedSessionShape::Miss,
+        Some(session) => session
+            .expires_at_ms
+            .map_or(CachedSessionShape::NoExpiry, CachedSessionShape::ExpiringAt),
+    };
+    if keychain_cache_entry_fresh(&shape, entry.read_at.elapsed(), now_unix_millis()) {
+        KeychainCacheLookup::Fresh(entry.session.clone())
+    } else {
+        KeychainCacheLookup::Stale
+    }
+}
+
+fn store_keychain_session(session: Option<&KeychainSession>) {
+    *KEYCHAIN_SESSION_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(KeychainCacheEntry {
+        session: session.cloned(),
+        read_at: Instant::now(),
+    });
+}
+
 /// Result of inspecting a Claude Code keychain credential blob.
 #[derive(Debug, PartialEq, Eq)]
 enum KeychainOutcome {
@@ -137,6 +241,23 @@ pub fn read_claude_code_keychain_session() -> Option<KeychainSession> {
     if std::env::var_os(DISABLE_KEYCHAIN_ENV).is_some() {
         return None;
     }
+    if let KeychainCacheLookup::Fresh(cached) = cached_keychain_session() {
+        return cached;
+    }
+    let _flight = KEYCHAIN_READ_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A resolver that lost the flight race finds the winner's result here
+    // instead of forking a second `security` process.
+    if let KeychainCacheLookup::Fresh(cached) = cached_keychain_session() {
+        return cached;
+    }
+    let session = read_claude_code_keychain_session_uncached();
+    store_keychain_session(session.as_ref());
+    session
+}
+
+fn read_claude_code_keychain_session_uncached() -> Option<KeychainSession> {
     let blob = read_keychain_blob()?;
     let now_ms = now_unix_millis();
     match evaluate_keychain_credentials(&blob, now_ms) {
@@ -604,6 +725,70 @@ mod tests {
         assert_eq!(oauth["refreshToken"], "old-refresh");
         assert_eq!(oauth["expiresAt"], 1_111_u64);
         assert_eq!(oauth["scopes"], serde_json::json!(["user:inference"]));
+    }
+
+    #[test]
+    fn keychain_cache_freshness_rules() {
+        use super::{
+            CachedSessionShape, KEYCHAIN_NEGATIVE_CACHE_TTL, KEYCHAIN_NO_EXPIRY_RECHECK,
+            keychain_cache_entry_fresh,
+        };
+        // Cached miss: trusted only inside the negative TTL, so a machine
+        // without credentials stops forking `security` per turn but still
+        // recovers within a minute of a login.
+        assert!(keychain_cache_entry_fresh(
+            &CachedSessionShape::Miss,
+            Duration::ZERO,
+            NOW_MS
+        ));
+        assert!(!keychain_cache_entry_fresh(
+            &CachedSessionShape::Miss,
+            KEYCHAIN_NEGATIVE_CACHE_TTL,
+            NOW_MS
+        ));
+        // Session with a recorded expiry: served regardless of age until the
+        // proactive buffer window — refresh timing is unchanged by the cache.
+        assert!(keychain_cache_entry_fresh(
+            &CachedSessionShape::ExpiringAt(FUTURE_MS),
+            Duration::from_secs(86_400),
+            NOW_MS
+        ));
+        assert!(!keychain_cache_entry_fresh(
+            &CachedSessionShape::ExpiringAt(NOW_MS + KEYCHAIN_EXPIRY_BUFFER_MS - 1),
+            Duration::ZERO,
+            NOW_MS
+        ));
+        // Session without an expiry: re-read on the fixed cadence.
+        assert!(keychain_cache_entry_fresh(
+            &CachedSessionShape::NoExpiry,
+            Duration::ZERO,
+            NOW_MS
+        ));
+        assert!(!keychain_cache_entry_fresh(
+            &CachedSessionShape::NoExpiry,
+            KEYCHAIN_NO_EXPIRY_RECHECK,
+            NOW_MS
+        ));
+    }
+
+    #[test]
+    fn keychain_cache_store_serve_invalidate_roundtrip() {
+        let session = Some(super::KeychainSession {
+            access_token: "sk-ant-oat01-cache".to_string(),
+            expires_at_ms: Some(u64::MAX),
+        });
+        super::store_keychain_session(session.as_ref());
+        assert_eq!(
+            super::cached_keychain_session(),
+            super::KeychainCacheLookup::Fresh(session)
+        );
+        // 401 recovery invalidates the memo: the next lookup must go through
+        // to the keychain instead of re-serving the stale bearer.
+        super::invalidate_claude_code_keychain_cache();
+        assert_eq!(
+            super::cached_keychain_session(),
+            super::KeychainCacheLookup::Stale
+        );
     }
 
     #[test]

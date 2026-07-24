@@ -1392,7 +1392,7 @@ fn startup_screen_and_input_label_preserve_core_session_fields() {
         .expect("cli should initialize");
         let session_id = cli.session.id.clone();
         (
-            cli.startup_screen(Some(std::time::Duration::from_millis(42))),
+            cli.startup_screen(Some(std::time::Duration::from_millis(42)), None),
             cli.input_box_label(),
             session_id,
         )

@@ -24,7 +24,6 @@ use tokio::sync::mpsc;
 use super::LiveCli;
 use crate::formatting::format_auto_compaction_notice;
 use crate::remote_control::{PromptMode, RemoteInbox, RemoteManager, TurnPhase};
-use crate::status_context;
 #[cfg(test)]
 use zo_cli::tui::TodoChecklistStatus;
 use zo_cli::tui::modals::{DeepTierView, RemoteOnboardingView, RemotePendingPair};
@@ -316,12 +315,28 @@ pub async fn run_repl_session(
     cli: &mut LiveCli,
     startup_elapsed: Duration,
     terminal_mode: TerminalMode,
+    // Boot-time workspace snapshot for the startup screen, gathered by
+    // `run_repl` under the startup loader — building it here would fork `git`
+    // and re-walk the config chain on the TUI thread's first frames.
+    startup_status: Option<crate::StatusContext>,
 ) -> Result<(), TuiLoopError> {
     let (render_tx, render_rx) = mpsc::channel::<RenderBlock>(RENDER_CHANNEL_CAPACITY);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<AgentCommand>(COMMAND_CHANNEL_CAPACITY);
     let mut agent_rx = tools::register_agent_completion_channel();
     let freshness_watcher = FreshnessWatcher::start(&cli.cwd);
     let freshness = SessionFreshness::new(&freshness_watcher, &cli.cwd);
+    // Capture the pre-session git baseline before the terminal (and the freeze
+    // watchdog) exist: the snapshot forks `git`, and on a slow or contended
+    // repo that stall would otherwise land on the TUI loop's first beats. The
+    // Changes panel diffs against this so it only shows files modified during
+    // this session, not pre-existing dirt.
+    let sidebar_baseline = crate::current_cli_cwd().ok().and_then(|cwd| {
+        let _ = freshness.begin_scan(FreshnessDomain::Workspace, Instant::now());
+        freshness
+            .workspace_status()
+            .snapshot(&cwd, Arc::new(AtomicBool::new(false)))
+            .ok()
+    });
     // Fail-open background probe before raw mode: any failure keeps the existing theme.
     let terminal_background = zo_cli::tui::term::detect_background();
     // `_stderr_guard` must stay alive for the whole session so stderr remains
@@ -397,18 +412,10 @@ pub async fn run_repl_session(
     load_input_frecency(&mut app, &cli.cwd);
 
     app.enable_input();
-    app.set_startup_screen(cli.startup_screen(Some(startup_elapsed)));
+    app.set_startup_screen(cli.startup_screen(Some(startup_elapsed), startup_status.as_ref()));
     dismiss_startup_for_terminal_mode(&mut app, terminal_mode);
-    // Capture pre-session git baseline so the Changes panel only shows
-    // files modified during this session, not pre-existing dirt.
-    if let Ok(cwd) = crate::current_cli_cwd() {
-        let _ = freshness.begin_scan(FreshnessDomain::Workspace, Instant::now());
-        if let Ok(snapshot) = freshness
-            .workspace_status()
-            .snapshot(&cwd, Arc::new(AtomicBool::new(false)))
-        {
-            app.capture_sidebar_baseline(&snapshot);
-        }
+    if let Some(snapshot) = &sidebar_baseline {
+        app.capture_sidebar_baseline(snapshot);
     }
     sync_app_context(cli, &mut app);
     // One-time (per user, marker-file backed) smart-AUTO default banner: shown
@@ -514,10 +521,9 @@ async fn run_session_loop(
     // crossterm EventStream wakes its background reader without joining it, so
     // recreating one whenever an outer select arm wins can race the replacement.
     let mut events = crossterm::event::EventStream::new();
-    // Baseline code checkpoint so the very first turn's Esc-Esc has a
-    // pristine worktree to rewind to. Snapshots are post-state captures
-    // (see `LiveCli::capture_code_checkpoint`); this is "turn 0".
-    cli.capture_code_checkpoint();
+    // The turn-0 rewind checkpoint used to be captured here; it forks `git`
+    // and stalled the loop's first beats, so `run_repl` now captures it under
+    // the startup loader before the TUI exists.
 
     // Pin the running binary's on-disk identity NOW, before any redeploy can
     // race the first HUD build. Later HUD builds compare against this baseline
@@ -2326,8 +2332,7 @@ fn build_hud_state(cli: &LiveCli) -> HudState {
             PermissionMode::All
         }
     };
-    let status = status_context(Some(&cli.session.path)).ok();
-    let (git_branch, changed_files) = hud_git_status(status.as_ref());
+    let (git_branch, changed_files) = hud_git_snapshot(cli.cwd.as_path());
     let sandbox_status =
         runtime::resolve_sandbox_status(cli.runtime.feature_config.sandbox(), cli.cwd.as_path());
     let security_posture = security_posture_from_sandbox(&sandbox_status);
@@ -2486,10 +2491,112 @@ fn hud_context_usage(ctx_estimate: u64, usage: runtime::TokenUsage) -> HudContex
     }
 }
 
-fn hud_git_status(status: Option<&crate::StatusContext>) -> (Option<String>, usize) {
-    status.map_or((None, 0), |ctx| {
-        (ctx.git_branch.clone(), ctx.git_summary.changed_files)
+/// Cached branch + changed-file count for the HUD, refreshed off-thread.
+///
+/// `build_hud_state` runs on the TUI select! thread at loop entry and on every
+/// context resync (each loop iteration, turn boundaries, modal actions). It
+/// used to call `status_context` — a full config re-discovery plus
+/// `ProjectContext::discover_with_git`, i.e. blocking `git` subprocesses and an
+/// instruction-file walk on the render thread. When `git status` stalled
+/// (index lock held by a concurrent session/build, cold disk on a low-spec
+/// machine) the whole event loop froze for the duration — the main-thread
+/// `posix_spawn`/`poll`/`pthread_join` stacks the freeze watchdog kept
+/// capturing. The HUD needs exactly two facts (branch, changed count), so they
+/// are served from this snapshot and refreshed on the dedicated HUD runtime;
+/// the render thread never forks `git`.
+struct HudGitSnapshot {
+    /// Workspace the snapshot was taken in; a mismatch (session moved cwd)
+    /// invalidates it rather than showing another workspace's branch.
+    cwd: PathBuf,
+    branch: Option<String>,
+    changed_files: usize,
+    refreshed_at: Instant,
+}
+
+static HUD_GIT_SNAPSHOT: std::sync::Mutex<Option<HudGitSnapshot>> = std::sync::Mutex::new(None);
+/// One refresh in flight at a time: a slow `git status` must coalesce
+/// followers, not stack duplicate forks behind itself.
+static HUD_GIT_REFRESH_INFLIGHT: AtomicBool = AtomicBool::new(false);
+/// Steady-state staleness bound for the HUD facts. Resyncs inside the window
+/// reuse the snapshot; the first one past it triggers a background refresh.
+const HUD_GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+
+fn hud_git_snapshot(cwd: &Path) -> (Option<String>, usize) {
+    let cached = {
+        let guard = HUD_GIT_SNAPSHOT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.as_ref().and_then(|snapshot| {
+            (snapshot.cwd == cwd).then(|| {
+                (
+                    snapshot.branch.clone(),
+                    snapshot.changed_files,
+                    snapshot.refreshed_at,
+                )
+            })
+        })
+    };
+    let refresh_due = cached
+        .as_ref()
+        .is_none_or(|(_, _, refreshed_at)| refreshed_at.elapsed() >= HUD_GIT_REFRESH_INTERVAL);
+    if refresh_due
+        && !HUD_GIT_REFRESH_INFLIGHT.swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        let cwd = cwd.to_path_buf();
+        super::turn_controller::session_hud::hud_runtime().spawn_blocking(move || {
+            /// Clears the in-flight flag on every exit path (including an
+            /// unwind out of the parsers) so one failed refresh can never
+            /// freeze the snapshot forever.
+            struct InflightReset;
+            impl Drop for InflightReset {
+                fn drop(&mut self) {
+                    HUD_GIT_REFRESH_INFLIGHT.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let _reset = InflightReset;
+            let status = read_hud_git_status(&cwd);
+            let (_, branch) = crate::git_helpers::parse_git_status_metadata(status.as_deref());
+            let changed_files =
+                crate::git_helpers::parse_git_workspace_summary(status.as_deref()).changed_files;
+            *HUD_GIT_SNAPSHOT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HudGitSnapshot {
+                cwd,
+                branch,
+                changed_files,
+                refreshed_at: Instant::now(),
+            });
+        });
+    }
+    cached.map_or((None, 0), |(branch, changed_files, _)| {
+        (branch, changed_files)
     })
+}
+
+/// The same bounded `git status` read the system-prompt discovery uses,
+/// `--no-optional-locks` included so the HUD poll can never contend on an
+/// index lock a real git operation holds.
+fn read_hud_git_status(cwd: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args([
+            "--no-optional-locks",
+            "status",
+            "--short",
+            "--branch",
+            "--",
+            ":(exclude)target",
+            ":(exclude)node_modules",
+            ":(exclude).build",
+        ])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let trimmed = stdout.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn security_posture_from_sandbox(status: &runtime::SandboxStatus) -> SecurityPosture {
