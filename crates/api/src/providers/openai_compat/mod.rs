@@ -1079,10 +1079,26 @@ impl ToolCallState {
     }
 }
 
+/// Deserialize a field that some OpenAI-compatible gateways send as an explicit
+/// `null` when empty. GLM / agentrouter emit `"tool_calls": null` (and even
+/// `"choices": null`) instead of omitting the field. `#[serde(default)]` only
+/// covers an *absent* field; an explicit `null` still reaches the typed
+/// deserializer and aborts the whole stream with
+/// `invalid type: null, expected a sequence`. Mapping `null` to the type's
+/// default keeps these providers working.
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     id: String,
     model: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     choices: Vec<ChatChoice>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
@@ -1100,7 +1116,7 @@ struct ChatMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     tool_calls: Vec<ResponseToolCall>,
 }
 
@@ -1158,7 +1174,7 @@ struct ChatCompletionChunk {
     id: String,
     #[serde(default)]
     model: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     choices: Vec<ChunkChoice>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
@@ -1182,7 +1198,7 @@ struct ChunkDelta {
     /// non-reasoning providers (`None` → no behavior change).
     #[serde(default)]
     reasoning_content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     tool_calls: Vec<DeltaToolCall>,
 }
 

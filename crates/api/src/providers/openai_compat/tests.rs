@@ -1040,6 +1040,34 @@ fn parse_sse_frame_ignores_comments_and_joins_data_lines() {
     assert!(parsed.is_some());
 }
 
+/// GLM / agentrouter-style gateways emit an explicit `null` for empty arrays
+/// (`"tool_calls": null`, and even `"choices": null`) instead of omitting the
+/// field. `#[serde(default)]` only covers an *absent* field, so before the
+/// null-tolerant deserializer the stream aborted with
+/// `invalid type: null, expected a sequence`. Both must degrade to empty.
+#[test]
+fn parse_sse_frame_tolerates_null_arrays_from_openai_compat_gateways() {
+    let with_null_tool_calls =
+        "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\",\"tool_calls\":null}}]}\n";
+    let parsed = parse_sse_frame(with_null_tool_calls)
+        .expect("null delta.tool_calls must parse, not abort the stream")
+        .expect("frame yields a chunk");
+    assert_eq!(parsed.choices.len(), 1);
+    assert!(
+        parsed.choices[0].delta.tool_calls.is_empty(),
+        "null tool_calls must degrade to no tool calls"
+    );
+
+    let with_null_choices = "data: {\"id\":\"c1\",\"choices\":null}\n";
+    let parsed = parse_sse_frame(with_null_choices)
+        .expect("null choices must parse, not abort the stream")
+        .expect("frame yields a chunk");
+    assert!(
+        parsed.choices.is_empty(),
+        "null choices must degrade to an empty list"
+    );
+}
+
 #[test]
 fn sse_parser_large_frame_split_across_many_chunks_parses_once() {
     let big = "x".repeat(512 * 1024);
