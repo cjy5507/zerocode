@@ -306,6 +306,41 @@ fn dismiss_startup_for_terminal_mode(app: &mut App, mode: TerminalMode) {
     }
 }
 
+/// Boot-phase wall-clock timings captured in `run_repl` and carried into the
+/// TUI loop, where the one-line `[boot]` summary is emitted only *after* the
+/// stderr redirect is live (an earlier `eprintln!` would paint over the
+/// terminal instead of landing in `~/.zo/logs/zo.log`).
+///
+/// `started` anchors the total; the two `Duration`s are the notable pre-TUI
+/// sub-phases and need not sum to the total — the runtime build also spans
+/// resume/checkpoint work the summary does not itemize, and the total includes
+/// the tokio-runtime build between the two capture points.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BootPhaseTimings {
+    pub started: Instant,
+    pub runtime_build: Duration,
+    pub status_context: Duration,
+}
+
+/// Format the single boot-timing log line. Pure (no clock reads, no output) so
+/// it is unit-tested directly; the caller supplies `to_first_frame` / `total` from
+/// its own [`Instant`]s and emits the result via `eprintln!` once stderr is
+/// redirected to the log file.
+fn format_boot_timing_line(
+    runtime_build: Duration,
+    status_context: Duration,
+    to_first_frame: Duration,
+    total: Duration,
+) -> String {
+    format!(
+        "[boot] runtime_build={}ms status_context={}ms to_first_frame={}ms total={}ms",
+        runtime_build.as_millis(),
+        status_context.as_millis(),
+        to_first_frame.as_millis(),
+        total.as_millis(),
+    )
+}
+
 /// Drive the full interactive REPL inside one persistent TUI session.
 // Top-level orchestration entry point (channels, terminal init, watchdog, event
 // loop) already at the line limit; the fail-open background probe adds one
@@ -319,7 +354,12 @@ pub async fn run_repl_session(
     // `run_repl` under the startup loader — building it here would fork `git`
     // and re-walk the config chain on the TUI thread's first frames.
     startup_status: Option<crate::StatusContext>,
+    boot: BootPhaseTimings,
 ) -> Result<(), TuiLoopError> {
+    // Anchor `to_first_frame` at the loop's entry so it measures the TUI-side
+    // latency (terminal init + app build + first draw) distinctly from the
+    // pre-TUI phases `boot` already carries.
+    let repl_entry = Instant::now();
     let (render_tx, render_rx) = mpsc::channel::<RenderBlock>(RENDER_CHANNEL_CAPACITY);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<AgentCommand>(COMMAND_CHANNEL_CAPACITY);
     let mut agent_rx = tools::register_agent_completion_channel();
@@ -429,6 +469,20 @@ pub async fn run_repl_session(
     }
     app.finalize_inline_transcript();
     app.draw_frame(&mut terminal)?;
+
+    // One boot-timing summary, emitted here because the stderr redirect (inside
+    // `init_terminal` above) is now live, so the line lands in `~/.zo/logs/zo.log`
+    // rather than painting over the freshly drawn first frame. This is the first
+    // moment `to_first_frame` and `total` are both known.
+    eprintln!(
+        "{}",
+        format_boot_timing_line(
+            boot.runtime_build,
+            boot.status_context,
+            repl_entry.elapsed(),
+            boot.started.elapsed(),
+        )
+    );
 
     // CC parity: SessionStart fires once per interactive session, before the
     // first prompt is accepted (and SessionEnd below, after the loop exits).

@@ -2535,6 +2535,125 @@ fn invalidate_render_cache_drops_entries_without_desync() {
     );
 }
 
+/// Render `t` once to a `width`x`height` `TestBackend`, driving the full
+/// layout + draw path (and therefore the per-block render-cache measurement
+/// that feeds the hit/miss tallies).
+fn draw_for_cache_probe(t: &mut Transcript, width: u16, height: u16, theme: &Theme) {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("backend");
+    terminal
+        .draw(|f| t.draw(f, Rect::new(0, 0, width, height), theme, 0, ImageProtocol::None))
+        .expect("draw");
+}
+
+/// (a) An unchanged block re-measured at the same width + theme reuses its
+/// cached lines (hit) instead of re-running markdown/syntect/wrap. The layout
+/// cache is dropped between draws (what a scroll-geometry or scrollbar re-probe
+/// does) so the per-block key is actually consulted rather than the whole pass
+/// short-circuiting.
+#[test]
+fn render_cache_hits_unchanged_block_same_width() {
+    let theme = Theme::default_dark();
+    let mut t = Transcript::new();
+    t.push(RenderBlock::TextDelta {
+        id: id(),
+        text: "**bold** body with `code` and a [link](x)".to_string(),
+        done: true,
+    });
+    draw_for_cache_probe(&mut t, 48, 12, &theme);
+    let hits_before = t.render_cache_hits();
+    t.invalidate_layout_cache();
+    draw_for_cache_probe(&mut t, 48, 12, &theme);
+    assert!(
+        t.render_cache_hits() > hits_before,
+        "same content+width+theme must hit the render cache (hits {hits_before} -> {})",
+        t.render_cache_hits(),
+    );
+}
+
+/// (b) A width change is a miss: cached lines were wrapped for the old width
+/// and must be recomputed.
+#[test]
+fn render_cache_misses_on_width_change() {
+    let theme = Theme::default_dark();
+    let mut t = Transcript::new();
+    t.push(RenderBlock::TextDelta {
+        id: id(),
+        text: "some assistant prose that is long enough to matter here".to_string(),
+        done: true,
+    });
+    draw_for_cache_probe(&mut t, 40, 12, &theme);
+    let misses_before = t.render_cache_misses();
+    draw_for_cache_probe(&mut t, 64, 12, &theme);
+    assert!(
+        t.render_cache_misses() > misses_before,
+        "a width change must miss and recompute (misses {misses_before} -> {})",
+        t.render_cache_misses(),
+    );
+}
+
+/// (c) A content change (a streamed token merged into the same block) bumps
+/// the block's render version, so the next measurement misses.
+#[test]
+fn render_cache_misses_on_content_change() {
+    let theme = Theme::default_dark();
+    let mut t = Transcript::new();
+    let bid = BlockId(90_001);
+    t.push(RenderBlock::TextDelta {
+        id: bid,
+        text: "first chunk".to_string(),
+        done: false,
+    });
+    draw_for_cache_probe(&mut t, 48, 12, &theme);
+    let misses_before = t.render_cache_misses();
+    // Same id → merges into the tail and grows its text (a streamed token),
+    // rather than appending a new block.
+    t.push(RenderBlock::TextDelta {
+        id: bid,
+        text: " second chunk".to_string(),
+        done: false,
+    });
+    assert_eq!(t.blocks.len(), 1, "same-id delta must merge, not append");
+    draw_for_cache_probe(&mut t, 48, 12, &theme);
+    assert!(
+        t.render_cache_misses() > misses_before,
+        "changed block content must miss (misses {misses_before} -> {})",
+        t.render_cache_misses(),
+    );
+}
+
+/// (d) A theme switch is a miss even at identical content + width: the theme
+/// fingerprint is part of the key, so lines styled for the old palette are
+/// never reused. Exercised WITHOUT `invalidate_render_cache`, so the miss is
+/// caused purely by the theme-identity key, then a same-theme re-measure hits
+/// — proving the new fingerprint round-trips into the key rather than being a
+/// one-way clear.
+#[test]
+fn render_cache_misses_on_theme_change() {
+    let mut t = Transcript::new();
+    t.push(RenderBlock::TextDelta {
+        id: id(),
+        text: "**bold** body with `code`".to_string(),
+        done: true,
+    });
+    draw_for_cache_probe(&mut t, 48, 12, &Theme::default_dark());
+    let misses_before = t.render_cache_misses();
+    draw_for_cache_probe(&mut t, 48, 12, &Theme::default_light());
+    assert!(
+        t.render_cache_misses() > misses_before,
+        "a theme change must miss and re-render under the new palette (misses {misses_before} -> {})",
+        t.render_cache_misses(),
+    );
+    let hits_before = t.render_cache_hits();
+    t.invalidate_layout_cache();
+    draw_for_cache_probe(&mut t, 48, 12, &Theme::default_light());
+    assert!(
+        t.render_cache_hits() > hits_before,
+        "re-measure under the same (new) theme must hit (hits {hits_before} -> {})",
+        t.render_cache_hits(),
+    );
+}
+
 #[test]
 fn transcript_clears_preexisting_cells_in_its_region() {
     let theme = Theme::default_dark();

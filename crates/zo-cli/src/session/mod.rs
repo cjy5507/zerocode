@@ -156,6 +156,7 @@ pub(crate) fn run_repl(
     // them at TUI-loop start instead blocked the first frames for their
     // duration (the freeze watchdog's `beat=0` stalls).
     let startup_loader = startup_loader::StartupLoader::start();
+    let runtime_build_start = Instant::now();
     let mut cli = LiveCli::new_scoped_with_mcp_config_and_session_id(
         model,
         true,
@@ -166,6 +167,7 @@ pub(crate) fn run_repl(
         None,
         crate::runtime_support::StartupAuthPolicy::AllowUnauthenticated,
     )?;
+    let runtime_build = runtime_build_start.elapsed();
     cli.set_model_user_pinned(model_pinned);
     if let Some(path) = &boot_resume {
         // Swap the fresh empty session for the persisted transcript. The fast
@@ -198,9 +200,16 @@ pub(crate) fn run_repl(
     // checkpoint's turn number matches the session it belongs to, and under
     // the loader so its `git add`/`write-tree` forks never stall the TUI.
     cli.capture_code_checkpoint();
+    let status_context_start = Instant::now();
     let startup_status = crate::status_context(Some(&cli.session.path)).ok();
+    let status_context_elapsed = status_context_start.elapsed();
     drop(startup_loader);
     let startup_elapsed = startup_start.elapsed();
+    let boot_timings = tui_loop::BootPhaseTimings {
+        started: startup_start,
+        runtime_build,
+        status_context: status_context_elapsed,
+    };
     // Use a multi-thread runtime so that the synchronous tool runtimes
     // (bash, mcp_runtime, lsp_runtime, agent_tools, …) — each of which
     // builds its own private current-thread runtime and calls
@@ -257,6 +266,7 @@ pub(crate) fn run_repl(
         startup_elapsed,
         terminal_mode,
         startup_status,
+        boot_timings,
     ));
 
     // `/restart` set a re-exec plan and quit the loop cleanly. By here

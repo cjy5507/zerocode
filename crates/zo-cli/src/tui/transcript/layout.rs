@@ -67,30 +67,41 @@ impl Transcript {
         // header in the bullet grammar — the `◆` bullet rides the first body
         // row, so it adds no height.
         let header_row: u16 = u16::from(is_user_msg);
-        if let Some(RenderCache::Text {
-            content_version: cached_version,
-            width: cached_w,
-            done: cached_done,
-            preserves,
-            lines,
-            row_prefix,
-            ..
-        }) = &self.rendered_cache[idx]
-        {
-            if *cached_version == content_version && *cached_w == cache_width && *cached_done == done {
-                // O(1): the cached row prefix already carries the wrapped
-                // height — re-running `wrapped_rows` over every line here made
-                // each layout refresh O(total message) while streaming.
-                let body = if *preserves {
+        let theme_fp = self.render_cache_theme_fp;
+        // O(1) hit: the cached row prefix already carries the wrapped height —
+        // re-running `wrapped_rows` over every line here made each layout
+        // refresh O(total message) while streaming. Computed into a local so
+        // the hit tally can be recorded after the `rendered_cache` borrow ends.
+        let cached_body = match &self.rendered_cache[idx] {
+            Some(RenderCache::Text {
+                content_version: cached_version,
+                theme_fp: cached_theme_fp,
+                width: cached_w,
+                done: cached_done,
+                preserves,
+                lines,
+                row_prefix,
+                ..
+            }) if *cached_version == content_version
+                && *cached_theme_fp == theme_fp
+                && *cached_w == cache_width
+                && *cached_done == done =>
+            {
+                Some(if *preserves {
                     u16::try_from(lines.len()).unwrap_or(u16::MAX).max(1)
                 } else {
                     u16::try_from(row_prefix.last().copied().unwrap_or(0))
                         .unwrap_or(u16::MAX)
                         .max(1)
-                };
-                return Some(body.saturating_add(header_row));
+                })
             }
+            _ => None,
+        };
+        if let Some(body) = cached_body {
+            self.render_cache_hits = self.render_cache_hits.saturating_add(1);
+            return Some(body.saturating_add(header_row));
         }
+        self.render_cache_misses = self.render_cache_misses.saturating_add(1);
         // Cache miss. While streaming, reuse the previously-styled stable prefix
         // (moved out — zero copy) so completed blocks are styled exactly once;
         // only the small open tail is re-rendered per frame. On completion, very
@@ -100,6 +111,7 @@ impl Transcript {
         let mut done_incremental_seed = None;
         let (prev_lines, prev_rows, prev_stable_len, prev_stable_count, prev_scan) = match previous {
             Some(RenderCache::Text {
+                theme_fp: prev_theme_fp,
                 width: prev_w,
                 done: prev_done,
                 lines: prev_lines,
@@ -108,7 +120,7 @@ impl Transcript {
                 stable_line_count,
                 scan,
                 ..
-            }) if prev_w == cache_width && !prev_done => {
+            }) if prev_theme_fp == theme_fp && prev_w == cache_width && !prev_done => {
                 if done && should_keep_incremental_done_cache(text) {
                     done_incremental_seed =
                         Some((prev_lines, prev_rows, stable_len, stable_line_count));
@@ -174,6 +186,7 @@ impl Transcript {
         };
         self.rendered_cache[idx] = Some(RenderCache::Text {
             content_version,
+            theme_fp,
             width: cache_width,
             done,
             preserves,
@@ -234,30 +247,39 @@ impl Transcript {
         if self.rendered_cache.len() <= idx {
             self.rendered_cache.resize_with(self.blocks.len(), || None);
         }
-        if let Some(RenderCache::Group {
-            leader_block_id: cached_id,
-            width: cached_width,
-            span_len: cached_span,
-            err_count: cached_err,
-            span_versions: cached_versions,
-            height,
-            ..
-        }) = &self.rendered_cache[idx]
-        {
-            if *cached_id == leader_block_id
+        let theme_fp = self.render_cache_theme_fp;
+        let cached_height = match &self.rendered_cache[idx] {
+            Some(RenderCache::Group {
+                leader_block_id: cached_id,
+                theme_fp: cached_theme_fp,
+                width: cached_width,
+                span_len: cached_span,
+                err_count: cached_err,
+                span_versions: cached_versions,
+                height,
+                ..
+            }) if *cached_id == leader_block_id
+                && *cached_theme_fp == theme_fp
                 && *cached_width == width
                 && *cached_span == span_len
                 && *cached_err == err_count
-                && *cached_versions == span_versions
+                && *cached_versions == span_versions =>
             {
-                return *height;
+                Some(*height)
             }
+            _ => None,
+        };
+        if let Some(height) = cached_height {
+            self.render_cache_hits = self.render_cache_hits.saturating_add(1);
+            return height;
         }
+        self.render_cache_misses = self.render_cache_misses.saturating_add(1);
         let height = collapsed_summary_height(&self.blocks, &self.tool_groups, idx);
         let lines =
             collapsed_tool_detail_lines(&self.blocks, &self.tool_groups, idx, err_count, theme, width);
         self.rendered_cache[idx] = Some(RenderCache::Group {
             leader_block_id,
+            theme_fp,
             width,
             span_len,
             err_count,
@@ -334,27 +356,35 @@ impl Transcript {
             if self.rendered_cache.len() <= idx {
                 self.rendered_cache.resize_with(self.blocks.len(), || None);
             }
-            if let Some(RenderCache::Tool {
-                block_id,
-                width: cached_w,
-                focused: cached_focused,
-                expanded: cached_expanded,
-                row_prefix,
-                ..
-            }) = &self.rendered_cache[idx]
-            {
-                if *block_id == block_id_val
+            let theme_fp = self.render_cache_theme_fp;
+            // O(1) from the cached prefix-sum instead of re-wrapping the whole
+            // tool body every frame (`row_prefix.last()` == the old
+            // `wrapped_rows`; see `wrapped_row_prefix_matches_wrapped_rows`).
+            // Computed into a local so the hit tally records after the borrow.
+            let cached_height = match &self.rendered_cache[idx] {
+                Some(RenderCache::Tool {
+                    block_id,
+                    theme_fp: cached_theme_fp,
+                    width: cached_w,
+                    focused: cached_focused,
+                    expanded: cached_expanded,
+                    row_prefix,
+                    ..
+                }) if *block_id == block_id_val
+                    && *cached_theme_fp == theme_fp
                     && *cached_w == width
                     && *cached_focused == focused
-                    && *cached_expanded == expanded
+                    && *cached_expanded == expanded =>
                 {
-                    // O(1) from the cached prefix-sum instead of re-wrapping the
-                    // whole tool body every frame (`row_prefix.last()` == the old
-                    // `wrapped_rows`; see `wrapped_row_prefix_matches_wrapped_rows`).
-                    return u16::try_from(row_prefix.last().copied().unwrap_or(0))
-                        .unwrap_or(u16::MAX);
+                    Some(u16::try_from(row_prefix.last().copied().unwrap_or(0)).unwrap_or(u16::MAX))
                 }
+                _ => None,
+            };
+            if let Some(height) = cached_height {
+                self.render_cache_hits = self.render_cache_hits.saturating_add(1);
+                return height;
             }
+            self.render_cache_misses = self.render_cache_misses.saturating_add(1);
             let rendered = blocks::tool_result::rendered_lines_for_width(
                 is_error_val,
                 body,
@@ -372,6 +402,7 @@ impl Transcript {
                 u16::try_from(row_prefix.last().copied().unwrap_or(0)).unwrap_or(u16::MAX);
             self.rendered_cache[idx] = Some(RenderCache::Tool {
                 block_id: block_id_val,
+                theme_fp,
                 width,
                 focused,
                 expanded,
@@ -464,6 +495,19 @@ impl Transcript {
         // mutation above the char-selection shifts the content rows it is
         // anchored to, so the gesture must drop rather than wash shifted text.
         self.drop_char_selection_on_layout_shift(width);
+        // Theme identity is part of every per-block render-cache key. Refresh
+        // the tracked fingerprint here (once per pass, not per block); a change
+        // — a live `/theme` switch — drops the layout cache so the pass below
+        // takes the full-rebuild path and each per-block key then misses on the
+        // new fingerprint and re-renders under the new palette. Placed after
+        // the char-selection check so a palette-only switch (same width) does
+        // not read as a width shift. Heights are palette-independent, so the
+        // rebuilt geometry is identical.
+        let theme_fp = theme.render_cache_fingerprint();
+        if self.render_cache_theme_fp != theme_fp {
+            self.render_cache_theme_fp = theme_fp;
+            self.invalidate_layout_cache();
+        }
         let same_width = self.cached_layout_width == width;
         let same_count = self.cached_layout_block_count == self.blocks.len();
         let has_cache = !self.cached_layout.is_empty();

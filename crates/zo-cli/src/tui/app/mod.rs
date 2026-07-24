@@ -2347,10 +2347,12 @@ impl App {
 
     /// Replace the active theme. The next draw picks up the new styles.
     ///
-    /// Cached transcript lines bake in the previous theme's colors and are
-    /// keyed only by content/width, so the cache must be dropped explicitly
-    /// or a live `/theme` switch would leave already-rendered blocks showing
-    /// the old palette until their content or the width changes.
+    /// The per-block render cache is keyed on a theme-identity fingerprint
+    /// (the transcript's layout pass re-keys on a `/theme` switch), so a stale
+    /// palette can no longer survive a hit. This explicit drop stays as a fast
+    /// path: it also discards any mid-stream incremental prefix so an in-flight
+    /// answer repaints in the new palette on the very next frame rather than
+    /// after the stream settles.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
         self.transcript.invalidate_render_cache();

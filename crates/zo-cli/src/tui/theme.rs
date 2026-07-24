@@ -120,7 +120,7 @@ struct TokensBreakpointRange {
 /// `Color::Reset` when the tokens file does not carry an `ansi256`
 /// index for a given role; this keeps the TUI renderable on minimal
 /// terminals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Palette {
     /// Brand accent (prompt glyphs, focus underlines, primary borders).
     pub accent: Color,
@@ -376,7 +376,7 @@ pub enum SyntaxRole {
 /// space a resolved palette is quantized into, so a truecolor palette still
 /// looks right on a 256-color or 16-color terminal instead of being sent RGB
 /// the terminal will mangle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ColorTier {
     /// 24-bit RGB. Palettes render verbatim.
     TrueColor,
@@ -909,6 +909,34 @@ impl Theme {
             info: Color::Indexed(25),
         };
         Self::from_named_palette("light", palette)
+    }
+
+    /// Stable identity of every theme attribute that changes rendered
+    /// transcript output, folded into one `u64` so the per-block render cache
+    /// (`crate::tui::transcript`) can key on it in `O(1)`. A live `/theme`
+    /// switch changes this value, turning every cached block into a natural
+    /// miss that re-renders under the new palette instead of repainting the
+    /// old colors.
+    ///
+    /// Inputs are `name`, `palette`, `no_color`, and `tier`. `typography` is a
+    /// pure function of `palette` (`Typography::from_palette`) and `heat` is a
+    /// boot-time palette derivation, so both are already implied — hashing
+    /// them would only cost cycles and risk over-invalidation. Layout tokens
+    /// (`spacing`, `borders`, breakpoints) never bake into a cached line's
+    /// styles, and wrap width is already a separate cache-key component.
+    #[must_use]
+    pub fn render_cache_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        // Only ever compared within one process lifetime (cached entry vs the
+        // live theme), never persisted or compared across runs, so
+        // `DefaultHasher`'s deterministic-within-a-process guarantee is all this
+        // needs.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.name.hash(&mut hasher);
+        self.palette.hash(&mut hasher);
+        self.no_color.hash(&mut hasher);
+        self.tier.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// OpenCode-inspired neutral theme: low-chrome surfaces with one

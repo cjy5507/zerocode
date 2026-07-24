@@ -67,6 +67,12 @@ use tool_groups::{ToolGroupState, collapsed_summary_height, collapsed_tool_detai
 enum RenderCache {
     Text {
         content_version: u64,
+        /// Theme-identity fingerprint (see
+        /// [`crate::tui::theme::Theme::render_cache_fingerprint`]) baked into
+        /// `lines`. Part of the key on every variant so a live `/theme` switch
+        /// is a natural miss that re-renders under the new palette rather than
+        /// a hit that repaints the previous colors.
+        theme_fp: u64,
         width: u16,
         /// Whether the stream that produced `lines` had finished. While a
         /// turn streams (`done == false`) `lines` hold the incrementally
@@ -102,6 +108,8 @@ enum RenderCache {
     },
     Tool {
         block_id: u64,
+        /// Theme fingerprint baked into `lines`; see [`RenderCache::Text`].
+        theme_fp: u64,
         width: u16,
         focused: bool,
         expanded: bool,
@@ -133,6 +141,8 @@ enum RenderCache {
     /// re-leads the settled run as live.
     Group {
         leader_block_id: u64,
+        /// Theme fingerprint baked into `lines`; see [`RenderCache::Text`].
+        theme_fp: u64,
         width: u16,
         span_len: usize,
         err_count: u16,
@@ -143,12 +153,16 @@ enum RenderCache {
     },
     Diff {
         block_id: u64,
+        /// Theme fingerprint baked into `lines`; see [`RenderCache::Text`].
+        theme_fp: u64,
         width: u16,
         expanded: bool,
         lines: Vec<Line<'static>>,
     },
     Reasoning {
         text_hash: u64,
+        /// Theme fingerprint baked into `lines`; see [`RenderCache::Text`].
+        theme_fp: u64,
         width: u16,
         expanded: bool,
         lines: Vec<Line<'static>>,
@@ -309,6 +323,16 @@ pub struct Transcript {
     layout_dirty_from: Option<usize>,
     /// Per-block rendered lines cache. See [`RenderCache`] for the per-
     /// variant key policy. `None` means cache-miss for that slot.
+    ///
+    /// Memory bound: this Vec is a parallel table of `blocks` — one slot per
+    /// block, grown only by [`Self::push_entry`] and front-drained in lockstep
+    /// by [`Self::drain_entries_front`]. So its length can never exceed
+    /// `blocks.len()`, which [`Self::enforce_block_limit`] caps at
+    /// `MAX_TRANSCRIPT_BLOCKS` (+ one `TRANSCRIPT_PRUNE_CHUNK` of headroom): a
+    /// marathon session prunes its oldest blocks and their cached lines
+    /// together, so the cache cannot grow without bound. The retained-lines
+    /// footprint is therefore bounded by that block cap times each block's own
+    /// (already length-limited) rendered body.
     rendered_cache: Vec<Option<RenderCache>>,
     /// Per-block content/render version. Incremented at the exact mutation
     /// sites that can make a content-keyed render cache stale, so cache lookup
@@ -376,6 +400,23 @@ pub struct Transcript {
     /// render at height 0 so a finished plan is deleted from the visible TUI
     /// instead of leaving an old `Updated Plan` block behind.
     superseded_todo_block_ids: HashSet<u64>,
+    /// Theme-identity fingerprint the per-block render cache is currently keyed
+    /// to (see [`crate::tui::theme::Theme::render_cache_fingerprint`]).
+    /// [`Self::ensure_layout`] refreshes it every pass; a change (a live
+    /// `/theme` switch) drops the layout cache so each block re-renders under
+    /// the new palette instead of serving a stale-color cache hit. Block
+    /// heights are palette-independent, so the re-measured geometry is
+    /// identical — only the baked-in `Style`s differ.
+    render_cache_theme_fp: u64,
+    /// Cumulative per-block render-cache hits: a layout-measurement pass reused
+    /// a block's cached lines instead of re-running markdown/syntect/wrap.
+    /// Test/observability only (see [`Self::render_cache_hits`]); never read by
+    /// production rendering. `saturating_add` so a marathon session cannot
+    /// panic on overflow.
+    render_cache_hits: u64,
+    /// Cumulative per-block render-cache misses (a measurement pass had to
+    /// recompute a block's lines). Pairs with `render_cache_hits`.
+    render_cache_misses: u64,
 }
 
 fn todo_items_all_completed(items: &[TodoResultItem]) -> bool {
@@ -1172,6 +1213,22 @@ impl Transcript {
     #[must_use]
     pub fn rendered_cache_len(&self) -> usize {
         self.rendered_cache.len()
+    }
+
+    /// Cumulative per-block render-cache hits (a measured layout pass reused
+    /// cached lines instead of re-running markdown/syntect/wrap). Paired with
+    /// [`Self::render_cache_misses`]; an observability/test hook, not read by
+    /// production rendering.
+    #[must_use]
+    pub fn render_cache_hits(&self) -> u64 {
+        self.render_cache_hits
+    }
+
+    /// Cumulative per-block render-cache misses (a measured layout pass had to
+    /// recompute a block's lines). See [`Self::render_cache_hits`].
+    #[must_use]
+    pub fn render_cache_misses(&self) -> u64 {
+        self.render_cache_misses
     }
 
     /// `true` if the transcript is empty.

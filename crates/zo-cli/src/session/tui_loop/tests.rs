@@ -1797,3 +1797,18 @@ fn persistent_slash_report_command_opens_popup_and_leaves_transcript_clean() {
         "closing the popup must leave no report residue in the transcript: {rendered}"
     );
 }
+
+#[test]
+fn boot_timing_line_formats_all_phases_in_ms() {
+    use std::time::Duration;
+    let line = format_boot_timing_line(
+        Duration::from_millis(128),
+        Duration::from_millis(7),
+        Duration::from_millis(15),
+        Duration::from_millis(163),
+    );
+    assert_eq!(
+        line,
+        "[boot] runtime_build=128ms status_context=7ms to_first_frame=15ms total=163ms"
+    );
+}
