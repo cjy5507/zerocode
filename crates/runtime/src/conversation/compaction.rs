@@ -1244,6 +1244,10 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
         }
 
         self.session = result.compacted_session;
+        // The summary just erased the persisted recall injections, so the
+        // session-scope dedup must forget them: a re-recalled entry needs its
+        // full body again, not a pointer at nothing.
+        self.recalled_memory_slugs.clear();
         // Full compaction summarized the transcript, breaking any microcompact
         // thrash cycle: reset the streak so the escape re-arms cleanly.
         self.consecutive_microcompacts = 0;

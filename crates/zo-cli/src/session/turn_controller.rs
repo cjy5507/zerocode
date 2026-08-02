@@ -1528,10 +1528,12 @@ pub(crate) async fn run_live_turn_with_images(
             super::grind_escalation::GRIND_ESCALATION_REMINDER_PREFIX,
             grind_reminder.as_deref(),
         );
-        // Confidence-cascade slots, all set-or-cleared per turn: the standing
-        // marker contract (present while the cascade is enabled), the
-        // escalated turn's directive, and the Deep wire-model escalation.
-        runtime.replace_transient_system_reminder_by_prefix(
+        // Confidence-cascade slots: the standing marker contract is taught
+        // only until its persisted transcript copy exists (~700 constant chars
+        // re-billed every turn otherwise; compaction erasing the copy re-arms
+        // teaching), while the escalated turn's directive and the Deep
+        // wire-model escalation stay set-or-cleared per turn.
+        runtime.install_reminder_until_persisted(
             super::confidence_cascade::CONFIDENCE_CONTRACT_REMINDER_PREFIX,
             cascade_enabled
                 .then(super::confidence_cascade::contract_reminder)

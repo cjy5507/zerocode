@@ -243,6 +243,24 @@ where
     C: ApiClient,
     T: ToolExecutor,
 {
+    /// Teach a standing reminder only until a persisted `System` copy exists
+    /// in the transcript, then stop re-sending it: the persisted copy already
+    /// rides every request at a stable position, so re-installing the same
+    /// transient each turn only re-billed a constant text block. A full
+    /// compaction summarizes the persisted copy away — the persistence scan
+    /// failing right then is the re-teach signal, so no extra state is
+    /// needed. `None` still clears any standing transient copy.
+    pub fn install_reminder_until_persisted(&mut self, prefix: &str, body: Option<&str>) {
+        let persisted = self.session.messages.iter().any(|message| {
+            message.role == crate::session::MessageRole::System
+                && message.blocks.iter().any(|block| {
+                    matches!(block, crate::ContentBlock::Text { text } if text.contains(prefix))
+                })
+        });
+        let effective = if persisted { None } else { body };
+        self.replace_transient_system_reminder_by_prefix(prefix, effective);
+    }
+
     /// Persist this request's reminder set into the transcript as a trailing
     /// `System` message, one pre-wrapped text block per reminder.
     ///
@@ -276,16 +294,20 @@ where
             // wire role "user" content ahead of the actual first user turn.
             return;
         }
-        let blocks: Vec<crate::ContentBlock> = reminders
+        let raw_blocks: Vec<crate::ContentBlock> = reminders
             .iter()
             .filter(|reminder| !reminder.trim().is_empty())
             .map(|reminder| crate::ContentBlock::Text {
                 text: crate::convert_messages::wrap_reminder(reminder),
             })
             .collect();
-        if blocks.is_empty() {
+        if raw_blocks.is_empty() {
             return;
         }
+        // The duplicate check runs on the UNCOLLAPSED set first: an unchanged
+        // set within the window persists nothing at all (the mid-turn cadence
+        // guarantee), so the recall collapse below must not turn that free
+        // case into a fresh pointer-only copy.
         let duplicate = self
             .session
             .messages
@@ -293,11 +315,30 @@ where
             .rev()
             .take(PERSISTED_REMINDER_DEDUPE_WINDOW)
             .any(|message| {
-                message.role == crate::session::MessageRole::System && message.blocks == blocks
+                message.role == crate::session::MessageRole::System && message.blocks == raw_blocks
             });
         if duplicate {
             return;
         }
+        // A genuinely new set is about to persist: session-scope recall dedup
+        // at the one choke point both the sync and streaming paths share. A
+        // re-appearing memory entry collapses to a pointer line (its full body
+        // already sits in the transcript); non-recall reminders pass through
+        // untouched, and the pre-absorb renders stay pure and byte-identical
+        // across both paths.
+        let blocks: Vec<crate::ContentBlock> = reminders
+            .iter()
+            .filter(|reminder| !reminder.trim().is_empty())
+            .map(|reminder| {
+                let reminder = crate::memory::recall::dedup_recalled_section_for_session(
+                    reminder,
+                    &mut self.recalled_memory_slugs,
+                );
+                crate::ContentBlock::Text {
+                    text: crate::convert_messages::wrap_reminder(&reminder),
+                }
+            })
+            .collect();
         let message = crate::ConversationMessage {
             role: crate::session::MessageRole::System,
             blocks,

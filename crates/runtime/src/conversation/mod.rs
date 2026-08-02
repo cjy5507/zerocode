@@ -529,6 +529,12 @@ pub struct ConversationRuntime<C, T> {
     /// re-billed the entire history (`system_changed`) each time a reminder
     /// refreshed.
     transient_reminders: Vec<String>,
+    /// Slugs of memory entries already persisted into this session's transcript
+    /// by a recall injection. A re-appearing entry collapses to a pointer line
+    /// at the absorb seam (the full body is already in context); cleared by a
+    /// full compaction, whose summary just erased those earlier copies — the
+    /// exact moment an entry must re-seed in full.
+    recalled_memory_slugs: std::collections::HashSet<String>,
     /// Query-aware persistent-memory retriever. Recalled entries are appended
     /// to the outgoing request's wire reminders only, so the base prompt and
     /// cacheable static prefix do not accumulate stale per-turn memory.
@@ -1279,6 +1285,7 @@ where
             permission_policy,
             system_prompt: Arc::from(system_prompt),
             transient_reminders,
+            recalled_memory_slugs: std::collections::HashSet::new(),
             memory_retriever: None,
             max_iterations: default_max_iterations(),
             deadline: None,

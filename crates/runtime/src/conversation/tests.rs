@@ -6666,6 +6666,160 @@ fn recall_reminder_section_async_matches_sync_path() {
     );
 }
 
+/// B4: a memory entry recalled twice in one session must persist in FULL only
+/// once; the re-appearance collapses to a pointer line at the absorb seam, and
+/// a full compaction — which summarizes the earlier full copy away — reseeds
+/// it. Guards the ~1.5-3k chars/turn a repeated entry re-billed every turn.
+#[test]
+fn recalled_entry_reappearance_is_absorbed_pointer_only_until_compaction_reseeds() {
+    fn last_system_text(session: &Session) -> String {
+        session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::System)
+            .map(|message| {
+                message
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>()
+            })
+            .expect("a persisted reminder message")
+    }
+
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        NoopApiClient,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        vec!["base prompt".to_string()],
+    );
+    runtime.set_memory_retriever(Some(std::sync::Arc::new(
+        LexicalMemoryRetriever::from_index_markdown(
+            "# Zo memory\n\n- [parsers](parsers.md) — recall me about parser bugs\n",
+        ),
+    )));
+    runtime
+        .session
+        .push_user_text("tell me about parser bugs")
+        .expect("user message");
+
+    let first = runtime.request_wire_reminders();
+    runtime.absorb_wire_reminders_into_session(&first);
+    let first_text = last_system_text(&runtime.session);
+    assert!(
+        first_text.contains("recall me about parser bugs"),
+        "first appearance persists in full: {first_text}"
+    );
+
+    // A changed transient pushes the second set past the identical-set dedupe.
+    runtime.replace_transient_system_reminder_by_prefix("[zo:test-shift]", Some("[zo:test-shift] a"));
+    runtime
+        .session
+        .push_user_text("more parser bugs please")
+        .expect("second query");
+    let second = runtime.request_wire_reminders();
+    runtime.absorb_wire_reminders_into_session(&second);
+    let second_text = last_system_text(&runtime.session);
+    assert!(second_text.contains("[zo:test-shift]"));
+    assert!(
+        second_text.contains("already recalled this session"),
+        "re-appearance must collapse to a pointer: {second_text}"
+    );
+    assert!(
+        !second_text.contains("recall me about parser bugs"),
+        "the summary must not be re-billed on re-appearance: {second_text}"
+    );
+
+    // Full compaction erased the earlier full copy → the entry reseeds in full.
+    runtime.apply_manual_compaction(CompactionResult {
+        summary: "compacted".to_string(),
+        formatted_summary: "compacted".to_string(),
+        compacted_session: {
+            let mut compacted = Session::new();
+            compacted.push_user_text("carry on").expect("seed");
+            compacted
+        },
+        removed_message_count: 1,
+    });
+    runtime
+        .session
+        .push_user_text("parser bugs again")
+        .expect("post-compaction query");
+    let third = runtime.request_wire_reminders();
+    runtime.absorb_wire_reminders_into_session(&third);
+    let third_text = last_system_text(&runtime.session);
+    assert!(
+        third_text.contains("recall me about parser bugs"),
+        "compaction must reseed the full entry: {third_text}"
+    );
+}
+
+/// B3: a standing contract reminder is taught until its persisted `System`
+/// copy exists, then stops re-riding every turn; compaction erasing the copy
+/// re-arms teaching. Guards the ~700 chars/turn the confidence contract
+/// re-billed as a fresh transient each turn.
+#[test]
+fn reminder_until_persisted_teaches_once_and_rearms_after_compaction() {
+    const PREFIX: &str = "[zo:test-standing-contract]";
+    let body = format!("{PREFIX} <system-reminder>standing contract body</system-reminder>");
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        NoopApiClient,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        vec!["base prompt".to_string()],
+    );
+    runtime.session.push_user_text("hello").expect("seed message");
+
+    runtime.install_reminder_until_persisted(PREFIX, Some(&body));
+    assert!(
+        runtime
+            .transient_reminders
+            .iter()
+            .any(|reminder| reminder.starts_with(PREFIX)),
+        "first install teaches the contract"
+    );
+    let reminders = runtime.request_wire_reminders();
+    runtime.absorb_wire_reminders_into_session(&reminders);
+
+    runtime.install_reminder_until_persisted(PREFIX, Some(&body));
+    assert!(
+        runtime
+            .transient_reminders
+            .iter()
+            .all(|reminder| !reminder.starts_with(PREFIX)),
+        "a persisted contract must not be re-taught every turn"
+    );
+
+    // Compaction summarizes the persisted copy away → teaching re-arms.
+    runtime.apply_manual_compaction(CompactionResult {
+        summary: "compacted".to_string(),
+        formatted_summary: "compacted".to_string(),
+        compacted_session: Session::new(),
+        removed_message_count: 1,
+    });
+    runtime.install_reminder_until_persisted(PREFIX, Some(&body));
+    assert!(
+        runtime
+            .transient_reminders
+            .iter()
+            .any(|reminder| reminder.starts_with(PREFIX)),
+        "compaction erasing the copy re-arms teaching"
+    );
+
+    // `None` still clears a standing transient copy.
+    runtime.install_reminder_until_persisted(PREFIX, None);
+    assert!(runtime
+        .transient_reminders
+        .iter()
+        .all(|reminder| !reminder.starts_with(PREFIX)));
+}
+
 #[test]
 fn recall_panic_degrades_and_reports_to_tracer() {
     // Q3d: when the off-thread recall task panics, recall_reminder_section must

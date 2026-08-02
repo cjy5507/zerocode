@@ -309,6 +309,62 @@ pub fn render_recalled_memory_section(hits: &[MemoryHit]) -> Option<String> {
     Some(section)
 }
 
+/// Collapse entries already injected earlier this session to pointer-only
+/// lines, keeping first appearances (and their snippets) intact. Runs at the
+/// absorb choke point both turn paths share, so the sync and streaming
+/// renders stay byte-identical before absorption. `seen` is session-scoped
+/// and cleared by a full compaction: the summary just erased the earlier full
+/// copies, which is exactly when an entry must re-seed in full.
+///
+/// Text-shape coupling: this walks the section
+/// [`render_recalled_memory_section`] produced — entry lines start with
+/// `- [`, and indented lines under an entry belong to it. The co-located test
+/// locks that round-trip so a renderer format change fails here, not silently
+/// in live sessions. A pointer line is strictly shorter than the full entry it
+/// replaces, so the preflight reserve bound still holds.
+#[must_use]
+// The only caller is the runtime's session-scoped set; a hasher type
+// parameter would generalize an internal seam nobody instantiates twice.
+#[allow(clippy::implicit_hasher)]
+pub fn dedup_recalled_section_for_session(
+    section: &str,
+    seen: &mut std::collections::HashSet<String>,
+) -> String {
+    let Some(body) = section.strip_prefix(RECALL_SECTION_HEADER) else {
+        return section.to_string();
+    };
+    let mut out = String::from(RECALL_SECTION_HEADER);
+    let mut skip_entry_body = false;
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("- [") {
+            let (slug, path) = rest.find("](").map_or(("", ""), |end| {
+                let after = &rest[end + 2..];
+                (&rest[..end], after.split(')').next().unwrap_or(""))
+            });
+            if !slug.is_empty() && !seen.insert(slug.to_string()) {
+                // Re-appearance: the full body already sits in the transcript.
+                out.push_str("- [");
+                out.push_str(slug);
+                out.push_str("](");
+                out.push_str(path);
+                out.push_str(") — already recalled this session\n");
+                skip_entry_body = true;
+            } else {
+                out.push_str(line);
+                out.push('\n');
+                skip_entry_body = false;
+            }
+        } else if skip_entry_body && (line.starts_with(' ') || line.is_empty()) {
+            // Indented snippet/continuation lines of a collapsed entry.
+        } else {
+            out.push_str(line);
+            out.push('\n');
+            skip_entry_body = false;
+        }
+    }
+    out
+}
+
 /// Upper bound — in [`estimate_system_prompt_tokens`](crate::conversation) units
 /// (`chars/4 + 1`) — on the rendered "# Recalled memory" section.
 ///
@@ -673,6 +729,36 @@ mod tests {
 - [opencode-ui-parity](opencode-ui-parity.md) — opencode to zo TUI parity work and command palette UX
 - [utf8-byte-slice-panic](utf8-byte-slice-panic.md) — String byte slice truncation panic on non-ASCII output
 ";
+
+    #[test]
+    fn dedup_recalled_section_collapses_repeats_and_keeps_first_appearances() {
+        let mut seen = std::collections::HashSet::new();
+        let section = format!(
+            "{header}- [alpha](/m/alpha.md) — first summary\n  snippet (untrusted excerpt):\n  > secret detail line\n- [beta](/m/beta.md) — beta summary\n",
+            header = super::RECALL_SECTION_HEADER
+        );
+        let first = super::dedup_recalled_section_for_session(&section, &mut seen);
+        assert_eq!(first, section, "first appearance passes through untouched");
+
+        let second = super::dedup_recalled_section_for_session(&section, &mut seen);
+        assert!(second.contains("- [alpha](/m/alpha.md) — already recalled this session"));
+        assert!(
+            !second.contains("secret detail line"),
+            "snippet must be dropped on re-appearance: {second}"
+        );
+        assert!(
+            !second.contains("first summary"),
+            "summary must be dropped on re-appearance: {second}"
+        );
+        assert!(second.contains("- [beta](/m/beta.md) — already recalled this session"));
+
+        // Non-recall reminders pass through untouched.
+        let other = "[zo:route-hint] hi";
+        assert_eq!(
+            super::dedup_recalled_section_for_session(other, &mut seen),
+            other
+        );
+    }
 
     #[test]
     fn parses_markdown_pointer_lines() {
