@@ -1,0 +1,48 @@
+=== width 60 height 20 ===
+|✓ bash  cargo build                                         |
+  0-1[fg=Indexed(114),mod=BOLD] 2-7[fg=Indexed(245)] 8-18[fg=Indexed(253)]
+|  read  src/main.rs                                         |
+  0-7[fg=Indexed(245)] 8-18[fg=Indexed(253)]
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+|                                                            |
+
+=== width 80 height 20 ===
+|✓ bash  cargo build                                                             |
+  0-1[fg=Indexed(114),mod=BOLD] 2-7[fg=Indexed(245)] 8-18[fg=Indexed(253)]
+|  read  src/main.rs                                                             |
+  0-7[fg=Indexed(245)] 8-18[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+

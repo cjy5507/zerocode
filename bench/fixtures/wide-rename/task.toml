@@ -1,0 +1,9 @@
+# Self-describing benchmark task. See bench/lanes.toml for the lane policy.
+schema_version = "1.0"
+id = "wide-rename"
+lane = "deep"
+difficulty = "hard"
+prompt = "Rename Repository.fetch(id) to Repository.load(id, opts) and thread opts through every caller."
+test_command = "node --test"
+coverage_tags = ["general-deep-loop", "cross-file-rename", "js-unit-test"]
+intended_paths = ["src/"]

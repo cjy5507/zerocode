@@ -1,0 +1,9 @@
+# Self-describing benchmark task. See bench/lanes.toml for the lane policy.
+schema_version = "1.0"
+id = "streaming-csv"
+lane = "deep"
+difficulty = "hard"
+prompt = "Support quoted CSV fields in the streaming parser without changing existing unquoted behavior. The parser must handle quoted commas, escaped double quotes, CRLF record boundaries split across chunks, and CRLF characters inside quoted fields. Keep the tokenizer/parser boundary understandable."
+test_command = "node --test"
+coverage_tags = ["general-deep-loop", "streaming-parser", "js-unit-test"]
+intended_paths = ["src/"]

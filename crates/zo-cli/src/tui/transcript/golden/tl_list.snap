@@ -1,0 +1,100 @@
+=== stage: first-items ===
+|◆  Steps:                                                                       |
+  0-0[fg=Indexed(111),mod=BOLD] 3-8[fg=Indexed(255)] 9-79[fg=Indexed(253)]
+|                                                                                |
+  3-79[fg=Indexed(253)]
+|   • alpha                                                                      |
+  3-4[fg=Indexed(245)] 5-79[fg=Indexed(253)]
+|                                                                                |
+  3-79[fg=Indexed(253)]
+|                                                                                |
+  3-79[fg=Indexed(253)]
+|   • bra                                                                        |
+  3-4[fg=Indexed(245)] 5-79[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+
+=== stage: rest ===
+|◆  Steps:                                                                       |
+  0-0[fg=Indexed(111),mod=BOLD] 3-8[fg=Indexed(255)] 9-79[fg=Indexed(253)]
+|                                                                                |
+  3-79[fg=Indexed(253)]
+|   • alpha                                                                      |
+  3-4[fg=Indexed(245)] 5-79[fg=Indexed(253)]
+|                                                                                |
+  3-79[fg=Indexed(253)]
+|                                                                                |
+  3-79[fg=Indexed(253)]
+|   • bravo                                                                      |
+  3-4[fg=Indexed(245)] 5-79[fg=Indexed(253)]
+|   • charlie                                                                    |
+  3-4[fg=Indexed(245)] 5-79[fg=Indexed(253)]
+|                                                                                |
+  3-79[fg=Indexed(253)]
+|                                                                                |
+  3-79[fg=Indexed(253)]
+|   • delta                                                                      |
+  3-4[fg=Indexed(245)] 5-79[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+
+=== stage: settle ===
+|◆  Steps:                                                                       |
+  0-0[fg=Indexed(111),mod=BOLD] 3-8[fg=Indexed(255)] 9-79[fg=Indexed(253)]
+|                                                                                |
+  3-79[fg=Indexed(253)]
+|   • alpha                                                                      |
+  3-4[fg=Indexed(245)] 5-79[fg=Indexed(253)]
+|   • bravo                                                                      |
+  3-4[fg=Indexed(245)] 5-79[fg=Indexed(253)]
+|   • charlie                                                                    |
+  3-4[fg=Indexed(245)] 5-79[fg=Indexed(253)]
+|   • delta                                                                      |
+  3-4[fg=Indexed(245)] 5-79[fg=Indexed(253)]
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+

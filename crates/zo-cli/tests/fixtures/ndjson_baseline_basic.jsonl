@@ -1,0 +1,4 @@
+{"type":"system","id":0,"level":"info","text":"session start · model sonnet"}
+{"type":"text_delta","id":1,"text":"Hello from the byte-equivalence fixture.","done":true}
+{"type":"system","id":2,"level":"info","text":"Compacted conversation · 4 messages summarized"}
+{"duration_ms":0,"estimated_cost":"$0.0002","is_error":false,"iterations":1,"model":"sonnet","num_turns":1,"result":"Hello from the byte-equivalence fixture.","session_id":"test-session","subtype":"success","total_cost_usd":0.00015375000000000002,"type":"result","usage":{"cache_creation_input_tokens":3,"cache_read_input_tokens":5,"input_tokens":12,"output_tokens":7}}

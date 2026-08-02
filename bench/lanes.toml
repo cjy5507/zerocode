@@ -1,0 +1,117 @@
+# Benchmark lane catalog — the single source of truth for which lanes are
+# active and each lane's scoring policy. A lane is benchmarkable exactly when it
+# appears here AND has at least one fixture declaring `lane = "<name>"`.
+#
+# Adding or retuning a lane is a data change: edit this file, no recompile. The
+# lane *names* are fixed by core_types::decision::BenchmarkLane; this file binds
+# each name to a policy. Never average results across lanes (spec).
+#
+#   objective_gate   how the objective gate is computed
+#   verifier_policy  none | strict | salvage_allowed
+#   retry_budget     deep-loop attempt cap (total plan/exec/verify attempts, floored to 1; 2 = at most one retry)
+#   diff_policy      intended_paths_only | any
+#   timeout_seconds  default per-task timeout (a task may override)
+#
+# A lane may also carry an optional `[lanes.<name>.phase_budget]` table splitting
+# that timeout across the deep loop's phases, in seconds. Every unspecified key
+# keeps the value the harness used while these were compile-time constants, so a
+# lane omitting the table behaves exactly as it did before the table existed.
+# Only `deep` overrides anything today, and only its planning cap. Unknown keys
+# are rejected, so a typo cannot silently leave the default in place.
+#
+#   plan_cap_seconds                        25  planning turn
+#   exec_cap_seconds                       150  implementation turn
+#   smart_first_exec_cap_seconds           240  implementation turn, smart-first tasks
+#   verify_cap_seconds                      30  verifier turn
+#   verify_retry_cap_seconds                15  verifier's compact retry
+#   objective_validation_reserve_seconds    60  held back so the objective gate can run
+#   smart_first_validation_reserve_seconds  60  the same, on the smart-first path
+#   final_result_test_reserve_seconds       60  held back for the final result test
+#   verify_retry_reserve_seconds             5  held back from the retry turn
+#
+# The loop skips the compact retry when the budget it computes falls to its spawn
+# floor or below. That floor is a third of `verify_retry_cap_seconds`, capped at 5
+# seconds — so lowering the cap shortens the retry rather than switching it off, and
+# raising the cap never demands more time than the harness asked for before these
+# budgets were configurable.
+
+schema_version = "1.0"
+
+# Single-shot small features and bug fixes. No verifier, no retries — a fast
+# task is meant to pass or fail in one shot, and the objective gate decides it.
+[lanes.fast]
+objective_gate = "test_and_diff"
+verifier_policy = "none"
+retry_budget = 0
+diff_policy = "intended_paths_only"
+timeout_seconds = 120
+
+# Complex changes that need the forced plan → execute → verify → retry loop with
+# a strict JSON verifier. The five deep fixtures (wide-rename, schema-
+# propagation, hidden-invariant, streaming-csv, async-rollback) exercise this.
+[lanes.deep]
+objective_gate = "test_and_diff"
+verifier_policy = "strict"
+retry_budget = 2
+diff_policy = "intended_paths_only"
+# 335, not 300, because the planning cap below grew by 35s. Phase budgets are
+# drawn from the parent's REMAINING time (`remaining - reserve, capped`), so a
+# longer plan is subtracted from every phase after it. At 300s the four headline
+# allocations would have summed to exactly the budget — 60 plan + 150 exec + 30
+# verify + 60 reserve — leaving nothing for the baseline test, the per-attempt
+# test, or context assembly, and verify would fall below 30s for any non-zero
+# overhead. Adding back the same 35s restores the downstream arithmetic exactly:
+# exec stays min(215 - B, 150) and verify stays min(65 - B - T, 30), the values
+# they had at the 25s cap.
+timeout_seconds = 335
+
+# The planner needs more than the legacy 25s. Across five recorded deep runs of
+# `schema-propagation`, four sat at 25,079–25,091ms — a 12ms spread over runs weeks
+# apart, so the cap rather than variance — and fell back to the deterministic plan.
+# The fifth finished a live plan in 20,832ms and used it. 25s therefore sits inside
+# this planner's latency: it usually wastes the turn, and because a killed phase
+# reports no usage it also withholds the whole run's token total.
+#
+# Every other phase keeps the allocation it had, which is what the raised
+# `timeout_seconds` above pays for. Plans may still differ from the 25s cohort, so
+# results from here are a separate methodology cohort — do not aggregate their
+# tokens, wall time, or pass rates with earlier runs.
+[lanes.deep.phase_budget]
+plan_cap_seconds = 60
+
+# Behavior-preserving large refactors. Same loop as deep, but the diff policy is
+# the point: a refactor that touches unrelated files fails even if tests pass.
+# No fixture yet — add one declaring `lane = "risky-refactor"` to activate.
+[lanes.risky-refactor]
+objective_gate = "test_and_diff"
+verifier_policy = "strict"
+retry_budget = 2
+diff_policy = "intended_paths_only"
+timeout_seconds = 300
+
+# Reproduce-then-fix: a failing test must go green. More retry budget because
+# the first fix often surfaces a second failure. No fixture yet.
+[lanes.debug]
+objective_gate = "test_and_diff"
+verifier_policy = "strict"
+retry_budget = 3
+diff_policy = "intended_paths_only"
+timeout_seconds = 240
+
+# Large mechanical moves / sweeping changes across many files. Longest timeout
+# because breadth costs wall time. No fixture yet.
+[lanes.migration]
+objective_gate = "test_and_diff"
+verifier_policy = "strict"
+retry_budget = 2
+diff_policy = "intended_paths_only"
+timeout_seconds = 420
+
+# Code review tasks where the edit may be minimal or absent; the diff policy is
+# relaxed and the verifier carries the judgment. No fixture yet.
+[lanes.review]
+objective_gate = "verifier_only"
+verifier_policy = "strict"
+retry_budget = 1
+diff_policy = "any"
+timeout_seconds = 180

@@ -1,0 +1,9 @@
+# Self-describing benchmark task. See bench/lanes.toml for the lane policy.
+schema_version = "1.0"
+id = "schema-propagation"
+lane = "deep"
+difficulty = "hard"
+prompt = "Add a required 'currency' field to Money and propagate it through serialize, validate, and the API DTO."
+test_command = "node --test"
+coverage_tags = ["general-deep-loop", "schema-propagation", "js-unit-test"]
+intended_paths = ["src/model.js", "src/serialize.js", "src/validate.js", "src/dto.js"]
