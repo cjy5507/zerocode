@@ -98,8 +98,8 @@ const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
 /// `timeout: 10` (ms — almost always a ms/s unit slip, `10` meaning *seconds*)
 /// would otherwise SIGKILL every command before it can even spawn, turning each
 /// tool call into a silent retry loop. Sub-second values are treated as bogus
-/// and fall back to the default, mirroring `default_bash_timeout_ms`'s
-/// "0 must not instant-timeout" rule.
+/// and fall back to the default in [`resolve_bash_timeout_ms`], mirroring
+/// `default_bash_timeout_ms`'s "0 must not instant-timeout" rule.
 const MIN_BASH_TIMEOUT_MS: u64 = 1_000;
 
 /// Resolve the default bash timeout, honoring a `ZO_BASH_TIMEOUT_MS`
@@ -111,6 +111,19 @@ fn default_bash_timeout_ms() -> u64 {
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|&ms| ms > 0)
         .unwrap_or(DEFAULT_BASH_TIMEOUT_MS)
+}
+
+/// Resolve the effective foreground deadline from the model-supplied
+/// `timeout` (milliseconds). `None` falls back to the env-overridable
+/// default; an explicit plausible value is authoritative and uncapped. A
+/// sub-second value — almost always a seconds/ms unit slip — falls back to
+/// the default rather than being reinterpreted: rescaling would stretch a
+/// genuine explicit `999` (ms) into 999 s, far past even the fallback, so the
+/// unit contract lives in the tool schema instead ("always milliseconds").
+fn resolve_bash_timeout_ms(requested: Option<u64>) -> u64 {
+    requested
+        .filter(|&ms| ms >= MIN_BASH_TIMEOUT_MS)
+        .unwrap_or_else(default_bash_timeout_ms)
 }
 
 /// Polling slice for the background-task watcher: how quickly a `TaskStop`
@@ -705,16 +718,14 @@ async fn execute_bash_async(
         Ok::<_, io::Error>((out?, err?, status?))
     });
 
-    // The deadline is unconditional: a model-supplied `timeout` stays
+    // The deadline is unconditional: a model-supplied `timeout` (ms) stays
     // authoritative, but its absence — or an implausibly small value, almost
     // always a ms/s unit slip like `timeout: 10` that would SIGKILL the command
     // before it spawns — falls back to the default instead of an instant or
-    // unbounded await, so neither a slow-but-alive child nor a bogus deadline can
-    // wedge the run. `run_in_background` commands early-return above and stay exempt.
-    let effective_timeout_ms = input
-        .timeout
-        .filter(|&ms| ms >= MIN_BASH_TIMEOUT_MS)
-        .unwrap_or_else(default_bash_timeout_ms);
+    // unbounded await, so neither a slow-but-alive child nor a bogus deadline
+    // can wedge the run. `run_in_background` commands early-return above and
+    // stay exempt.
+    let effective_timeout_ms = resolve_bash_timeout_ms(input.timeout);
     let output_result = if let Ok(result) =
         timeout(Duration::from_millis(effective_timeout_ms), collect_all).await
     {
@@ -1379,6 +1390,34 @@ mod tests {
         assert_eq!(default_bash_timeout_ms(), DEFAULT_BASH_TIMEOUT_MS);
 
         std::env::remove_var("ZO_BASH_TIMEOUT_MS");
+    }
+
+    #[test]
+    fn explicit_timeout_is_honored_in_ms_without_cap() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ZO_BASH_TIMEOUT_MS");
+        assert_eq!(super::resolve_bash_timeout_ms(None), DEFAULT_BASH_TIMEOUT_MS);
+        assert_eq!(super::resolve_bash_timeout_ms(Some(1_000)), 1_000);
+        assert_eq!(super::resolve_bash_timeout_ms(Some(920_000)), 920_000);
+        assert_eq!(super::resolve_bash_timeout_ms(Some(3_600_000)), 3_600_000);
+        assert_eq!(
+            super::resolve_bash_timeout_ms(Some(0)),
+            DEFAULT_BASH_TIMEOUT_MS,
+            "0 must not instant-timeout"
+        );
+    }
+
+    #[test]
+    fn sub_second_timeout_falls_back_to_default() {
+        // Observed live, twice: `timeout: 920` meant 920 s but arrived as
+        // 920 ms. A slip is discarded for the default — NOT rescaled to
+        // seconds, which would stretch a genuine explicit 999 ms into 999 s.
+        // The unit contract is carried by the tool schema description instead.
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ZO_BASH_TIMEOUT_MS");
+        assert_eq!(super::resolve_bash_timeout_ms(Some(920)), DEFAULT_BASH_TIMEOUT_MS);
+        assert_eq!(super::resolve_bash_timeout_ms(Some(1)), DEFAULT_BASH_TIMEOUT_MS);
+        assert_eq!(super::resolve_bash_timeout_ms(Some(999)), DEFAULT_BASH_TIMEOUT_MS);
     }
 
     #[test]

@@ -187,6 +187,44 @@ fn read_file_fingerprint_preserves_line_window() {
     assert_eq!(a, reordered, "JSON key order must not change the fingerprint");
 }
 
+/// Pin `ZO_TODO_STORE` to a unique, absent path for a test's whole body, so
+/// `reinject_todo_progress_reminder` resolves an empty plan regardless of any
+/// live todo list on the host or a store path inherited from the harness
+/// (a pending item there lands as an extra trailing `System` message after the
+/// tool batch and breaks message-shape assertions). The process env lock is
+/// held for the guard's lifetime: the store is re-read mid-`run_turn` after
+/// every tool batch, so a scoped set/restore around setup would not cover the
+/// reads that matter.
+struct HermeticTodoStore {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior: Option<std::ffi::OsString>,
+}
+
+impl HermeticTodoStore {
+    fn pin() -> Self {
+        let lock = crate::test_env_lock();
+        let prior = std::env::var_os("ZO_TODO_STORE");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::set_var(
+            "ZO_TODO_STORE",
+            std::env::temp_dir().join(format!("zo-hermetic-conversation-todos-{nanos}.json")),
+        );
+        Self { _lock: lock, prior }
+    }
+}
+
+impl Drop for HermeticTodoStore {
+    fn drop(&mut self) {
+        match self.prior.take() {
+            Some(value) => std::env::set_var("ZO_TODO_STORE", value),
+            None => std::env::remove_var("ZO_TODO_STORE"),
+        }
+    }
+}
+
 struct ScriptedApiClient {
     call_count: usize,
 }
@@ -3063,6 +3101,7 @@ fn state_distill_escapes_transcript_delimiters_before_system_reminder_injection(
 
 #[test]
 fn runs_user_to_tool_to_result_loop_end_to_end_and_tracks_usage() {
+    let _todo_store = HermeticTodoStore::pin();
     let api_client = ScriptedApiClient { call_count: 0 };
     let tool_executor = StaticToolExecutor::new().register("add", |input| {
         let total = input
@@ -3124,6 +3163,7 @@ fn runs_user_to_tool_to_result_loop_end_to_end_and_tracks_usage() {
 /// `delivered: true` yet never reached the model.
 #[test]
 fn sync_run_turn_folds_steering_into_the_tool_result_boundary() {
+    let _todo_store = HermeticTodoStore::pin();
     let api_client = ScriptedApiClient { call_count: 0 };
     let tool_executor = StaticToolExecutor::new().register("add", |input| {
         let total = input
@@ -3185,6 +3225,7 @@ fn sync_run_turn_folds_steering_into_the_tool_result_boundary() {
 /// of their completion without ending its turn (CC task-notification parity).
 #[test]
 fn sync_run_turn_folds_agent_notification_into_the_tool_result_boundary() {
+    let _todo_store = HermeticTodoStore::pin();
     let api_client = ScriptedApiClient { call_count: 0 };
     let tool_executor = StaticToolExecutor::new().register("add", |input| {
         let total = input
@@ -3247,6 +3288,7 @@ fn sync_run_turn_folds_agent_notification_into_the_tool_result_boundary() {
 /// it with the completion preamble would tell the model the agent finished.
 #[test]
 fn sync_run_turn_folds_an_agent_message_without_the_completion_preamble() {
+    let _todo_store = HermeticTodoStore::pin();
     let api_client = ScriptedApiClient { call_count: 0 };
     let tool_executor = StaticToolExecutor::new().register("add", |input| {
         let total = input
@@ -4825,6 +4867,7 @@ fn turn_end_hook_context_includes_review_pace_metrics() {
 
 #[test]
 fn records_runtime_session_trace_events() {
+    let _todo_store = HermeticTodoStore::pin();
     let sink = Arc::new(MemoryTelemetrySink::default());
     let tracer = SessionTracer::new("session-runtime", sink.clone());
     let mut runtime = ConversationRuntime::new(

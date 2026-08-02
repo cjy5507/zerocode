@@ -54,7 +54,7 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 1 },
+                    "timeout": { "type": "integer", "minimum": 1, "description": "Deadline in MILLISECONDS (default 120000); an explicit value of 1000 or more is honored uncapped. Values below 1000 are treated as a seconds/ms unit slip and fall back to the default — always pass milliseconds." },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" },
                     "dangerouslyDisableSandbox": { "type": "boolean" },

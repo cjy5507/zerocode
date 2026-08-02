@@ -219,16 +219,21 @@ pub(crate) fn finish_successful_tool_output(
     let mut content = truncated.content;
     // CCR retrieve half: tell the model how to get the cut bytes back. Only
     // when the artifact actually persisted — a store failure must not
-    // advertise an id that cannot be resolved. For compressed-only artifacts we
-    // keep JSON outputs parseable by embedding the same notice as a structured
-    // field; the model-facing compression seam extracts and appends it after
-    // rewriting the body.
+    // advertise an id that cannot be resolved — and only when bytes were
+    // actually withheld (`was_truncated || oversized`). The oversized-but-not-
+    // truncated case (read_file's JSON envelope is exempt from raw truncation)
+    // keeps JSON parseable by embedding the notice as a structured field; the
+    // model-facing compression seam extracts and appends it after rewriting
+    // the body. A compression-only artifact lost nothing the model can miss,
+    // so it stays stored (recoverable via invocation metadata) but silent —
+    // advertising it put ~180 chars of retrieval instructions on every small
+    // bash result.
     if let Some(artifact_ref) = &artifact {
         let notice = recovery_notice(&artifact_ref.sha256);
         if truncated.was_truncated {
             content.push('\n');
             content.push_str(&notice);
-        } else {
+        } else if oversized {
             content = embed_recovery_notice(content, &notice);
         }
     }
@@ -899,6 +904,48 @@ mod auto_format_guard_tests {
         assert!(content.contains("retrieve_tool_output"));
         let sha = extract_notice_sha(&content);
         assert!(artifact_dir.join(sha).exists(), "artifact notice must resolve");
+    }
+
+    /// A small, complete output loses no bytes to compression, so the model
+    /// must not pay ~180 chars of recovery instructions for it — while the
+    /// artifact itself stays stored (recovery remains possible through the
+    /// invocation metadata, it is just not advertised).
+    #[test]
+    fn small_bash_dispatch_stores_artifact_without_advertising_recovery() {
+        use runtime::context_compression::{wire_tool_output, WireRewrite};
+
+        let artifact_dir = unique_temp_path("bash-small-artifacts");
+        std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+        let ctx = ToolContext::new();
+        let input = serde_json::json!({ "command": "echo waited", "timeout": 20000 });
+
+        let content = super::execute_tool_with_context_and_artifact_dir(
+            &ctx,
+            None,
+            "bash",
+            &input,
+            Some(&artifact_dir),
+        )
+        .expect("bash dispatch succeeds");
+
+        assert!(content.contains("waited"));
+        assert!(
+            !content.contains("retrieve_tool_output"),
+            "compression-only result must not advertise recovery: {content}"
+        );
+        let model_view = wire_tool_output(&content, "bash", false, WireRewrite::Full);
+        assert!(
+            !model_view.contains("retrieve_tool_output"),
+            "wire view must not resurface a compression-only notice: {model_view}"
+        );
+        let artifacts: Vec<_> = std::fs::read_dir(&artifact_dir)
+            .expect("read artifact dir")
+            .collect();
+        assert_eq!(
+            artifacts.len(),
+            1,
+            "compression-only artifact must still be stored"
+        );
     }
 
     #[test]

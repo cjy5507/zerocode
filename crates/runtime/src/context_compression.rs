@@ -664,8 +664,18 @@ fn compress_bash(raw: &str) -> CompressionOutcome {
         header_notes.push(format!("safety: {warning}"));
     }
     if let Some(status) = &parsed.sandbox_status {
-        if let Ok(rendered) = serde_json::to_string(status) {
-            header_notes.push(format!("sandbox: {rendered}"));
+        // An inactive, unrequested, undegraded status is the session-invariant
+        // common case (macOS: sandbox unsupported) — ~430 chars of identical
+        // JSON on every bash result. Render the note only when it carries
+        // signal: sandboxing is on, was asked for, or degraded with a reason.
+        let carries_signal = status.enabled
+            || status.active
+            || status.requested.enabled
+            || status.fallback_reason.is_some();
+        if carries_signal {
+            if let Ok(rendered) = serde_json::to_string(status) {
+                header_notes.push(format!("sandbox: {rendered}"));
+            }
         }
     }
 
@@ -1366,6 +1376,72 @@ mod tests {
         .unwrap();
         let out = compress_tool_output(&raw, "bash", None);
         assert!(!out.was_compressed, "structured content must pass through");
+    }
+
+    /// Envelope carrying a real serialized [`crate::sandbox::SandboxStatus`],
+    /// so the fixture can never drift from the struct's serde shape (a
+    /// hand-written status with wrong field names fails envelope parsing and
+    /// silently tests nothing).
+    fn bash_envelope_with_sandbox(status: &crate::sandbox::SandboxStatus) -> String {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "stdout": "ok\n".repeat(40),
+            "stderr": "",
+            "rawOutputPath": null,
+            "interrupted": false,
+            "isImage": null,
+            "backgroundTaskId": null,
+            "backgroundedByUser": null,
+            "assistantAutoBackgrounded": null,
+            "dangerouslyDisableSandbox": null,
+            "returnCodeInterpretation": null,
+            "noOutputExpected": null,
+            "structuredContent": null,
+            "persistedOutputPath": null,
+            "persistedOutputSize": null,
+            "sandboxStatus": serde_json::to_value(status).expect("status serializes"),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn bash_omits_inactive_sandbox_status_but_keeps_signal() {
+        // The default status is the session-invariant common case: nothing
+        // requested, nothing active, no degradation — pure noise per call.
+        let inactive = bash_envelope_with_sandbox(&crate::sandbox::SandboxStatus::default());
+        let inactive_out = compress_tool_output(&inactive, "bash", None);
+        assert!(inactive_out.was_compressed);
+        assert!(!inactive_out.content.contains("sandbox:"));
+
+        // Any of active / enabled / requested / degraded is signal and must
+        // still render.
+        for signal in [
+            crate::sandbox::SandboxStatus {
+                active: true,
+                ..Default::default()
+            },
+            crate::sandbox::SandboxStatus {
+                enabled: true,
+                ..Default::default()
+            },
+            crate::sandbox::SandboxStatus {
+                requested: crate::sandbox::SandboxRequest {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            crate::sandbox::SandboxStatus {
+                fallback_reason: Some("namespace isolation unavailable".to_string()),
+                ..Default::default()
+            },
+        ] {
+            let out = compress_tool_output(&bash_envelope_with_sandbox(&signal), "bash", None);
+            assert!(out.was_compressed);
+            assert!(
+                out.content.contains("sandbox:"),
+                "signal-bearing status must render: {signal:?}"
+            );
+        }
     }
 
     #[test]
