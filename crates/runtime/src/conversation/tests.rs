@@ -6820,6 +6820,229 @@ fn reminder_until_persisted_teaches_once_and_rearms_after_compaction() {
         .all(|reminder| !reminder.starts_with(PREFIX)));
 }
 
+/// Newest persisted reminder message, flattened — shared by the recall
+/// session-lifecycle tests below.
+fn last_system_reminder_text(session: &Session) -> String {
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::System)
+        .map(|message| {
+            message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        })
+        .expect("a persisted reminder message")
+}
+
+fn recall_runtime() -> ConversationRuntime<NoopApiClient, StaticToolExecutor> {
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        NoopApiClient,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        vec!["base prompt".to_string()],
+    );
+    runtime.set_memory_retriever(Some(std::sync::Arc::new(
+        LexicalMemoryRetriever::from_index_markdown(
+            "# Zo memory\n\n- [parsers](parsers.md) — recall me about parser bugs\n",
+        ),
+    )));
+    runtime
+}
+
+/// A cold `/resume` builds a fresh runtime over an existing transcript. The
+/// bodies it already persisted are still in context, so the dedup state must be
+/// reconstructed from that transcript rather than restarting empty.
+#[test]
+fn a_resumed_session_does_not_reinject_recall_it_already_persisted() {
+    let mut first = recall_runtime();
+    first
+        .session
+        .push_user_text("tell me about parser bugs")
+        .expect("user message");
+    let reminders = first.request_wire_reminders();
+    first.absorb_wire_reminders_into_session(&reminders);
+    assert!(last_system_reminder_text(&first.session).contains("recall me about parser bugs"));
+
+    let mut resumed = ConversationRuntime::new(
+        first.session.clone(),
+        NoopApiClient,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        vec!["base prompt".to_string()],
+    );
+    resumed.set_memory_retriever(Some(std::sync::Arc::new(
+        LexicalMemoryRetriever::from_index_markdown(
+            "# Zo memory\n\n- [parsers](parsers.md) — recall me about parser bugs\n",
+        ),
+    )));
+    resumed
+        .replace_transient_system_reminder_by_prefix("[zo:test-shift]", Some("[zo:test-shift] a"));
+    resumed
+        .session
+        .push_user_text("more parser bugs")
+        .expect("second query");
+    let reminders = resumed.request_wire_reminders();
+    resumed.absorb_wire_reminders_into_session(&reminders);
+    let text = last_system_reminder_text(&resumed.session);
+    assert!(
+        text.contains("already recalled this session"),
+        "a resumed transcript already carries the body: {text}"
+    );
+    assert!(!text.contains("recall me about parser bugs"));
+}
+
+/// `/new`, fast resume and session switching swap the session in place. The
+/// incoming transcript never carried the body, so a pointer there would point
+/// at nothing — the dedup state must follow the session, not the process.
+#[test]
+fn replace_session_recomputes_recall_dedup_against_the_new_transcript() {
+    let mut runtime = recall_runtime();
+    runtime
+        .session
+        .push_user_text("tell me about parser bugs")
+        .expect("user message");
+    let reminders = runtime.request_wire_reminders();
+    runtime.absorb_wire_reminders_into_session(&reminders);
+    assert!(runtime.recalled_memory_slugs.contains("parsers"));
+
+    let mut fresh = Session::new();
+    fresh
+        .push_user_text("parser bugs in the new session")
+        .expect("user message");
+    runtime.replace_session(fresh);
+    let reminders = runtime.request_wire_reminders();
+    runtime.absorb_wire_reminders_into_session(&reminders);
+    let text = last_system_reminder_text(&runtime.session);
+    assert!(
+        text.contains("recall me about parser bugs"),
+        "a transcript with no persisted body must get the full entry: {text}"
+    );
+    assert!(!text.contains("already recalled this session"));
+}
+
+/// Compaction preserves a recent tail. A body that survived there is still in
+/// context, so that entry stays collapsed — only bodies the summary actually
+/// erased may reseed (the sibling case
+/// `recalled_entry_reappearance_is_absorbed_pointer_only_until_compaction_reseeds`).
+#[test]
+fn compaction_that_preserves_the_recall_body_does_not_reseed_it() {
+    let mut runtime = recall_runtime();
+    runtime
+        .session
+        .push_user_text("tell me about parser bugs")
+        .expect("user message");
+    let reminders = runtime.request_wire_reminders();
+    runtime.absorb_wire_reminders_into_session(&reminders);
+
+    let mut compacted = Session::new();
+    for message in runtime.session.messages.iter() {
+        compacted
+            .push_message(message.clone())
+            .expect("carry the preserved tail");
+    }
+    runtime.apply_manual_compaction(CompactionResult {
+        summary: "compacted".to_string(),
+        formatted_summary: "compacted".to_string(),
+        compacted_session: compacted,
+        removed_message_count: 1,
+    });
+    runtime
+        .replace_transient_system_reminder_by_prefix("[zo:test-shift]", Some("[zo:test-shift] a"));
+    runtime
+        .session
+        .push_user_text("parser bugs again")
+        .expect("post-compaction query");
+    let reminders = runtime.request_wire_reminders();
+    runtime.absorb_wire_reminders_into_session(&reminders);
+    let text = last_system_reminder_text(&runtime.session);
+    assert!(
+        text.contains("already recalled this session"),
+        "a body still in the preserved tail must not be re-injected: {text}"
+    );
+}
+
+/// The mid-turn cadence re-absorbs the same reminder set after every tool
+/// batch. Once a set has persisted in collapsed form the unchanged-set dedupe
+/// must recognize it: comparing only against the uncollapsed render made every
+/// later iteration look new and appended another pointer message.
+#[test]
+fn a_repeated_collapsed_reminder_set_appends_nothing() {
+    let mut runtime = recall_runtime();
+    runtime
+        .session
+        .push_user_text("tell me about parser bugs")
+        .expect("user message");
+    let first = runtime.request_wire_reminders();
+    runtime.absorb_wire_reminders_into_session(&first);
+
+    runtime
+        .replace_transient_system_reminder_by_prefix("[zo:test-shift]", Some("[zo:test-shift] a"));
+    let second = runtime.request_wire_reminders();
+    runtime.absorb_wire_reminders_into_session(&second);
+    let after_collapse = runtime.session.messages.len();
+    assert!(last_system_reminder_text(&runtime.session).contains("already recalled this session"));
+
+    for _ in 0..3 {
+        let again = runtime.request_wire_reminders();
+        runtime.absorb_wire_reminders_into_session(&again);
+    }
+    assert_eq!(
+        runtime.session.messages.len(),
+        after_collapse,
+        "an unchanged collapsed set must not re-persist on every iteration"
+    );
+}
+
+/// The persisted-copy scan decides whether a standing contract still needs
+/// teaching. Recalled memory and hook context ride the transcript as `System`
+/// reminder blocks and are low-trust, so a mere MENTION of the marker inside
+/// one must not be mistaken for the contract's own copy.
+#[test]
+fn a_spoofed_contract_prefix_in_low_trust_text_does_not_suppress_teaching() {
+    const PREFIX: &str = "[zo:test-standing-contract]";
+    let body = format!("{PREFIX} <system-reminder>standing contract body</system-reminder>");
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        NoopApiClient,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        vec!["base prompt".to_string()],
+    );
+    runtime.session.push_user_text("hello").expect("seed message");
+    runtime
+        .session
+        .push_message(ConversationMessage {
+            role: MessageRole::System,
+            blocks: vec![ContentBlock::Text {
+                text: format!(
+                    "<system-reminder>\n# Recalled memory\n  > a note about {PREFIX} handling\n</system-reminder>"
+                ),
+            }],
+            usage: None,
+            thought_signature: None,
+            reasoning_replay: None,
+            model: None,
+        })
+        .expect("low-trust reminder");
+
+    runtime.install_reminder_until_persisted(PREFIX, Some(&body));
+    assert!(
+        runtime
+            .transient_reminders
+            .iter()
+            .any(|reminder| reminder.starts_with(PREFIX)),
+        "a mention inside low-trust text must not suppress the contract"
+    );
+}
+
 #[test]
 fn recall_panic_degrades_and_reports_to_tracer() {
     // Q3d: when the off-thread recall task panics, recall_reminder_section must

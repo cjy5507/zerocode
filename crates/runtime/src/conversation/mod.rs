@@ -529,12 +529,13 @@ pub struct ConversationRuntime<C, T> {
     /// re-billed the entire history (`system_changed`) each time a reminder
     /// refreshed.
     transient_reminders: Vec<String>,
-    /// Slugs of memory entries already persisted into this session's transcript
-    /// by a recall injection. A re-appearing entry collapses to a pointer line
-    /// at the absorb seam (the full body is already in context); cleared by a
-    /// full compaction, whose summary just erased those earlier copies — the
-    /// exact moment an entry must re-seed in full.
-    recalled_memory_slugs: std::collections::HashSet<String>,
+    /// Slugs of memory entries whose full body is already persisted in this
+    /// session's transcript. A re-appearing entry collapses to a pointer line
+    /// at the absorb seam, since its body is still in context. Derived from
+    /// the transcript by [`recalled_slugs_from_session`] — at construction, on
+    /// a session swap, and after a compaction — so an entry reseeds in full
+    /// exactly when its body stops being there.
+    recalled_memory_slugs: HashSet<String>,
     /// Query-aware persistent-memory retriever. Recalled entries are appended
     /// to the outgoing request's wire reminders only, so the base prompt and
     /// cacheable static prefix do not accumulate stale per-turn memory.
@@ -1103,6 +1104,31 @@ fn resume_compaction_reminders(session: &Session) -> Vec<String> {
     }
 }
 
+/// Rebuild the recall dedup state from a transcript: the slugs whose FULL
+/// body is persisted in it.
+///
+/// The state has to be derived rather than carried, because a runtime outlives
+/// the session it was built with. A cold `/resume` builds a new runtime over a
+/// transcript that already holds its bodies (starting empty would re-inject
+/// them), while `/new`, fast resume and session switching swap a transcript
+/// holding none into a live runtime (keeping the old set would leave a pointer
+/// aimed at a body no longer in context). Reading the transcript answers both,
+/// and answers compaction too: whatever the preserved tail kept is still there.
+fn recalled_slugs_from_session(session: &Session) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    for message in session.messages.iter() {
+        if message.role != MessageRole::System {
+            continue;
+        }
+        for block in &message.blocks {
+            if let ContentBlock::Text { text } = block {
+                crate::memory::recall::collect_recalled_full_entry_slugs(text, &mut seen);
+            }
+        }
+    }
+    seen
+}
+
 fn is_edit_or_write_tool(tool_name: &str) -> bool {
     // Single source of truth shared with the microcompact trim
     // (`compact::is_edit_result_tool`): both layers must agree on exactly which
@@ -1264,6 +1290,9 @@ where
     /// can pass the correct value instead of relying on
     /// `feature_config.model()` which may be `None`.
     #[must_use]
+    // The length is a flat field list, not branching logic: every line is one
+    // slot of a struct whose fields are independent feature gates.
+    #[allow(clippy::too_many_lines)]
     pub fn new_with_context_window(
         session: Session,
         api_client: C,
@@ -1278,6 +1307,7 @@ where
         let context_policy = ContextPolicy::for_model(feature_config.model())
             .with_full_compaction_override(full_compaction_override_percent);
         let transient_reminders = resume_compaction_reminders(&session);
+        let recalled_memory_slugs = recalled_slugs_from_session(&session);
         Self {
             session,
             api_client,
@@ -1285,7 +1315,7 @@ where
             permission_policy,
             system_prompt: Arc::from(system_prompt),
             transient_reminders,
-            recalled_memory_slugs: std::collections::HashSet::new(),
+            recalled_memory_slugs,
             memory_retriever: None,
             max_iterations: default_max_iterations(),
             deadline: None,

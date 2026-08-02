@@ -309,50 +309,98 @@ pub fn render_recalled_memory_section(hits: &[MemoryHit]) -> Option<String> {
     Some(section)
 }
 
+/// Separator between an entry's link and its summary in a rendered section.
+const RECALL_SUMMARY_SEPARATOR: &str = " — ";
+
+/// Summary text that marks a collapsed entry: the pointer left where a body
+/// already sitting in the transcript would otherwise be repeated.
+const RECALL_POINTER_SUMMARY: &str = "already recalled this session";
+
+/// Split a rendered entry line — `- [slug](path) — summary` — into its parts.
+/// Every delimiter is required, so prose that merely opens with `- [` is not
+/// mistaken for an entry.
+fn parse_recall_entry_line(line: &str) -> Option<(&str, &str, &str)> {
+    let rest = line.strip_prefix("- [")?;
+    let link_end = rest.find("](")?;
+    let slug = &rest[..link_end];
+    let after = &rest[link_end + 2..];
+    let path_end = after.find(')')?;
+    let summary = after[path_end + 1..].strip_prefix(RECALL_SUMMARY_SEPARATOR)?;
+    (!slug.is_empty()).then_some((slug, &after[..path_end], summary))
+}
+
+/// Record the slugs whose FULL entry is present in `text`, a persisted
+/// reminder block. Pointer lines are deliberately skipped: they carry no body,
+/// so an entry surviving only as a pointer must be free to reseed in full.
+///
+/// This is how the dedup state follows the SESSION rather than the process —
+/// a resumed transcript already holds its bodies, and a swapped-in one holds
+/// none, so both are answered by reading the transcript itself.
+// The only callers are the runtime's session-scoped set; a hasher type
+// parameter would generalize an internal seam nobody instantiates twice.
+#[allow(clippy::implicit_hasher)]
+pub fn collect_recalled_full_entry_slugs(
+    text: &str,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    let Some(start) = text.find(RECALL_SECTION_HEADER) else {
+        return;
+    };
+    for line in text[start + RECALL_SECTION_HEADER.len()..].lines() {
+        if let Some((slug, _path, summary)) = parse_recall_entry_line(line) {
+            if summary != RECALL_POINTER_SUMMARY {
+                seen.insert(slug.to_string());
+            }
+        }
+    }
+}
+
 /// Collapse entries already injected earlier this session to pointer-only
 /// lines, keeping first appearances (and their snippets) intact. Runs at the
 /// absorb choke point both turn paths share, so the sync and streaming
-/// renders stay byte-identical before absorption. `seen` is session-scoped
-/// and cleared by a full compaction: the summary just erased the earlier full
-/// copies, which is exactly when an entry must re-seed in full.
+/// renders stay byte-identical before absorption.
+///
+/// Returns the collapsed section plus the slugs this call newly marked as
+/// seen. The caller needs that list because collapsing must be undone when it
+/// then decides not to persist the result — otherwise an entry would be
+/// recorded as delivered by a message that never reached the transcript.
 ///
 /// Text-shape coupling: this walks the section
-/// [`render_recalled_memory_section`] produced — entry lines start with
-/// `- [`, and indented lines under an entry belong to it. The co-located test
-/// locks that round-trip so a renderer format change fails here, not silently
-/// in live sessions. A pointer line is strictly shorter than the full entry it
-/// replaces, so the preflight reserve bound still holds.
+/// [`render_recalled_memory_section`] produced, via
+/// [`parse_recall_entry_line`]; indented lines under an entry belong to it.
+/// The co-located test locks that round-trip so a renderer format change fails
+/// here, not silently in live sessions. A pointer line is strictly shorter
+/// than the full entry it replaces, so the preflight reserve bound still holds.
 #[must_use]
-// The only caller is the runtime's session-scoped set; a hasher type
-// parameter would generalize an internal seam nobody instantiates twice.
 #[allow(clippy::implicit_hasher)]
 pub fn dedup_recalled_section_for_session(
     section: &str,
     seen: &mut std::collections::HashSet<String>,
-) -> String {
+) -> (String, Vec<String>) {
     let Some(body) = section.strip_prefix(RECALL_SECTION_HEADER) else {
-        return section.to_string();
+        return (section.to_string(), Vec::new());
     };
     let mut out = String::from(RECALL_SECTION_HEADER);
+    let mut newly_seen = Vec::new();
     let mut skip_entry_body = false;
     for line in body.lines() {
-        if let Some(rest) = line.strip_prefix("- [") {
-            let (slug, path) = rest.find("](").map_or(("", ""), |end| {
-                let after = &rest[end + 2..];
-                (&rest[..end], after.split(')').next().unwrap_or(""))
-            });
-            if !slug.is_empty() && !seen.insert(slug.to_string()) {
+        if let Some((slug, path, _summary)) = parse_recall_entry_line(line) {
+            if seen.insert(slug.to_string()) {
+                newly_seen.push(slug.to_string());
+                out.push_str(line);
+                out.push('\n');
+                skip_entry_body = false;
+            } else {
                 // Re-appearance: the full body already sits in the transcript.
                 out.push_str("- [");
                 out.push_str(slug);
                 out.push_str("](");
                 out.push_str(path);
-                out.push_str(") — already recalled this session\n");
-                skip_entry_body = true;
-            } else {
-                out.push_str(line);
+                out.push(')');
+                out.push_str(RECALL_SUMMARY_SEPARATOR);
+                out.push_str(RECALL_POINTER_SUMMARY);
                 out.push('\n');
-                skip_entry_body = false;
+                skip_entry_body = true;
             }
         } else if skip_entry_body && (line.starts_with(' ') || line.is_empty()) {
             // Indented snippet/continuation lines of a collapsed entry.
@@ -362,7 +410,7 @@ pub fn dedup_recalled_section_for_session(
             skip_entry_body = false;
         }
     }
-    out
+    (out, newly_seen)
 }
 
 /// Upper bound — in [`estimate_system_prompt_tokens`](crate::conversation) units
@@ -737,10 +785,15 @@ mod tests {
             "{header}- [alpha](/m/alpha.md) — first summary\n  snippet (untrusted excerpt):\n  > secret detail line\n- [beta](/m/beta.md) — beta summary\n",
             header = super::RECALL_SECTION_HEADER
         );
-        let first = super::dedup_recalled_section_for_session(&section, &mut seen);
+        let (first, newly_seen) = super::dedup_recalled_section_for_session(&section, &mut seen);
         assert_eq!(first, section, "first appearance passes through untouched");
+        assert_eq!(
+            newly_seen,
+            vec!["alpha".to_string(), "beta".to_string()],
+            "a first appearance reports the slugs it marked, so the caller can undo them"
+        );
 
-        let second = super::dedup_recalled_section_for_session(&section, &mut seen);
+        let (second, newly_seen) = super::dedup_recalled_section_for_session(&section, &mut seen);
         assert!(second.contains("- [alpha](/m/alpha.md) — already recalled this session"));
         assert!(
             !second.contains("secret detail line"),
@@ -751,12 +804,40 @@ mod tests {
             "summary must be dropped on re-appearance: {second}"
         );
         assert!(second.contains("- [beta](/m/beta.md) — already recalled this session"));
+        assert!(
+            newly_seen.is_empty(),
+            "a re-appearance marks nothing new: {newly_seen:?}"
+        );
+
+        // A collapsed section reads back as pointers, never as bodies — this is
+        // what lets a resumed or compacted transcript be re-scanned for state.
+        let mut reseeded = std::collections::HashSet::new();
+        super::collect_recalled_full_entry_slugs(&second, &mut reseeded);
+        assert!(
+            reseeded.is_empty(),
+            "pointer lines carry no body, so they must not count as seen: {reseeded:?}"
+        );
+        super::collect_recalled_full_entry_slugs(&first, &mut reseeded);
+        assert_eq!(
+            reseeded,
+            ["alpha".to_string(), "beta".to_string()].into_iter().collect(),
+            "a full section reads back as both bodies"
+        );
 
         // Non-recall reminders pass through untouched.
         let other = "[zo:route-hint] hi";
+        let (passthrough, newly_seen) =
+            super::dedup_recalled_section_for_session(other, &mut seen);
+        assert_eq!(passthrough, other);
+        assert!(newly_seen.is_empty());
+
+        // Prose that merely opens like an entry is not one: every delimiter is
+        // required, so a stray bullet cannot be collapsed or counted.
+        assert_eq!(super::parse_recall_entry_line("- [not a link"), None);
+        assert_eq!(super::parse_recall_entry_line("- [slug](path) no dash"), None);
         assert_eq!(
-            super::dedup_recalled_section_for_session(other, &mut seen),
-            other
+            super::parse_recall_entry_line("- [slug](path) — text"),
+            Some(("slug", "path", "text"))
         );
     }
 

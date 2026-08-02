@@ -238,6 +238,23 @@ pub(super) fn build_user_prompt_hook_context_reminder(messages: &[String]) -> Op
     ))
 }
 
+/// Whether a persisted `System` text block IS the reminder owning `prefix`,
+/// as opposed to merely mentioning it.
+///
+/// The distinction matters because recalled memory and hook context ride the
+/// transcript as `System` reminder blocks and are low-trust: a note that
+/// happens to quote a marker must not be mistaken for the harness having
+/// already taught it. A producer's own block always leads with its prefix,
+/// either bare or just inside the wrapper [`crate::wrap_reminder`] adds, so
+/// anchoring there separates the two. Being too strict only costs one extra
+/// re-teach; being too loose silently drops the reminder.
+fn reminder_block_declares_prefix(text: &str, prefix: &str) -> bool {
+    let body = text
+        .strip_prefix(crate::session::REMINDER_TAG_OPEN)
+        .map_or(text, |rest| rest.trim_start_matches('\n'));
+    body.starts_with(prefix)
+}
+
 impl<C, T> ConversationRuntime<C, T>
 where
     C: ApiClient,
@@ -254,7 +271,8 @@ where
         let persisted = self.session.messages.iter().any(|message| {
             message.role == crate::session::MessageRole::System
                 && message.blocks.iter().any(|block| {
-                    matches!(block, crate::ContentBlock::Text { text } if text.contains(prefix))
+                    matches!(block, crate::ContentBlock::Text { text }
+                        if reminder_block_declares_prefix(text, prefix))
                 })
         });
         let effective = if persisted { None } else { body };
@@ -304,10 +322,32 @@ where
         if raw_blocks.is_empty() {
             return;
         }
-        // The duplicate check runs on the UNCOLLAPSED set first: an unchanged
-        // set within the window persists nothing at all (the mid-turn cadence
-        // guarantee), so the recall collapse below must not turn that free
-        // case into a fresh pointer-only copy.
+        // Session-scope recall dedup at the one choke point both the sync and
+        // streaming paths share: a re-appearing memory entry collapses to a
+        // pointer line, its full body already being in the transcript.
+        // Non-recall reminders pass through untouched, and the pre-absorb
+        // renders stay pure and byte-identical across both paths.
+        let mut newly_seen: Vec<String> = Vec::new();
+        let blocks: Vec<crate::ContentBlock> = reminders
+            .iter()
+            .filter(|reminder| !reminder.trim().is_empty())
+            .map(|reminder| {
+                let (reminder, marked) = crate::memory::recall::dedup_recalled_section_for_session(
+                    reminder,
+                    &mut self.recalled_memory_slugs,
+                );
+                newly_seen.extend(marked);
+                crate::ContentBlock::Text {
+                    text: crate::convert_messages::wrap_reminder(&reminder),
+                }
+            })
+            .collect();
+        // An unchanged set within the window persists nothing at all (the
+        // mid-turn cadence guarantee). BOTH forms have to be recognized: the
+        // uncollapsed one so a first appearance stays free, and the collapsed
+        // one so the every-iteration re-absorb after a collapse does too —
+        // matching only the uncollapsed render made each later iteration look
+        // new and appended another pointer message.
         let duplicate = self
             .session
             .messages
@@ -315,30 +355,17 @@ where
             .rev()
             .take(PERSISTED_REMINDER_DEDUPE_WINDOW)
             .any(|message| {
-                message.role == crate::session::MessageRole::System && message.blocks == raw_blocks
+                message.role == crate::session::MessageRole::System
+                    && (message.blocks == raw_blocks || message.blocks == blocks)
             });
         if duplicate {
+            // Nothing is persisted, so nothing was delivered: undo exactly the
+            // marks this call made, leaving marks from earlier calls alone.
+            for slug in newly_seen {
+                self.recalled_memory_slugs.remove(&slug);
+            }
             return;
         }
-        // A genuinely new set is about to persist: session-scope recall dedup
-        // at the one choke point both the sync and streaming paths share. A
-        // re-appearing memory entry collapses to a pointer line (its full body
-        // already sits in the transcript); non-recall reminders pass through
-        // untouched, and the pre-absorb renders stay pure and byte-identical
-        // across both paths.
-        let blocks: Vec<crate::ContentBlock> = reminders
-            .iter()
-            .filter(|reminder| !reminder.trim().is_empty())
-            .map(|reminder| {
-                let reminder = crate::memory::recall::dedup_recalled_section_for_session(
-                    reminder,
-                    &mut self.recalled_memory_slugs,
-                );
-                crate::ContentBlock::Text {
-                    text: crate::convert_messages::wrap_reminder(&reminder),
-                }
-            })
-            .collect();
         let message = crate::ConversationMessage {
             role: crate::session::MessageRole::System,
             blocks,

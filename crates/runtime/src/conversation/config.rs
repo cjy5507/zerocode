@@ -882,6 +882,11 @@ where
     /// the previous session either.
     pub fn replace_session(&mut self, session: Session) {
         self.session.release_writer_lease();
+        // Recall dedup is a property of the TRANSCRIPT, not the process: the
+        // incoming one has its own persisted bodies (usually none, on `/new`),
+        // and carrying the outgoing session's set would collapse an entry to a
+        // pointer aimed at a body that is not in this context.
+        self.recalled_memory_slugs = super::recalled_slugs_from_session(&session);
         self.session = session;
     }
 
