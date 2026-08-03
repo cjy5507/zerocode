@@ -870,20 +870,31 @@ pub(crate) fn open_add_provider_picker(app: &mut zo_cli::tui::App) {
     open_provider_modal_on(app, "connect");
 }
 
-/// Which OAuth providers already have a credential on disk.
+/// Which providers have a credential saved in zo's own store.
 ///
-/// Read ONCE per modal open, never per frame: the Anthropic arm reaches the
-/// system keychain, which is far too slow to sit on the render path. The result
-/// only says a credential exists — nothing here contacts the provider or checks
-/// expiry, which is why the badge reads `saved` rather than `connected`.
+/// Every arm is a plain read of the credential file. Opening a picker is a
+/// glance at state, so this must not stall the UI or change anything, and two
+/// tempting probes are deliberately absent:
+///
+/// * The Claude Code keychain. [`api::read_claude_code_keychain_session`] forks
+///   `security`, and on an expired blob it runs a token refresh with a
+///   30-second budget, writes the result back to the keychain, and mirrors it
+///   into zo's store — an authentication lifecycle, not a status read, on the
+///   thread painting the frame. A Claude Code-only session therefore shows no
+///   badge; under-claiming beats freezing the UI and rotating tokens.
+/// * `GOOGLE_ACCESS_TOKEN`. A transient shell export is not a saved
+///   credential, and counting it badged Gemini `[saved]` for someone who had
+///   never logged in.
+///
+/// The badge reads `saved`, not `connected`, for the same reason: nothing here
+/// contacts the provider or checks expiry.
 fn saved_oauth_providers() -> [bool; 3] {
     let anthropic = api::oauth_store::load_oauth_credentials()
         .ok()
         .flatten()
-        .is_some()
-        || api::read_claude_code_keychain_session().is_some();
+        .is_some();
     let openai = api::oauth_store::load_openai_oauth().ok().flatten().is_some();
-    let google = api::google_code_assist_oauth_present() || api::google_gemini_oauth_available();
+    let google = api::google_code_assist_oauth_present();
     [anthropic, openai, google]
 }
 
@@ -1025,7 +1036,8 @@ mod tests {
     use super::{
         ConnectReport, CustomProviderRequest, ProviderTokenLimits, SmokeTestResult,
         connect_custom_provider, connect_preset,
-        provider_name_from_url, smoke_test_custom_provider, write_user_provider_with_options,
+        provider_name_from_url, saved_oauth_providers, smoke_test_custom_provider,
+        write_user_provider_with_options,
     };
 
     struct EnvVarGuard {
@@ -1081,6 +1093,24 @@ mod tests {
     fn read_settings(path: &std::path::Path) -> serde_json::Value {
         serde_json::from_str(&std::fs::read_to_string(path).expect("settings written"))
             .expect("settings json")
+    }
+
+    /// The badge claims a credential is *saved*, so the probe must read saved
+    /// state only. `GOOGLE_ACCESS_TOKEN` is a transient process env var — a
+    /// shell export with nothing on disk — and counting it badged Gemini
+    /// `[saved]` for someone who had never logged in.
+    #[test]
+    fn a_transient_google_access_token_is_not_a_saved_credential() {
+        let _lock = crate::test_env_lock();
+        let (_guards, _settings) = isolated_config_home("saved-google-env");
+        let _token = EnvVarGuard::set("GOOGLE_ACCESS_TOKEN", Some("ya29.transient-export"));
+
+        let [_anthropic, _openai, google] = saved_oauth_providers();
+
+        assert!(
+            !google,
+            "an env-var access token is not a saved credential, so it must not badge Gemini"
+        );
     }
 
     #[test]
