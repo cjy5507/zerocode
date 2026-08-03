@@ -40,7 +40,14 @@ const BRAILLE_DOTS: [[u8; 2]; 4] = [
     [0x40, 0x80],
 ];
 
-/// Filled-area chart of `series` over `width` × `height` character cells.
+/// Stroked line chart of `series` over `width` × `height` character cells.
+///
+/// A **stroke, not a fill.** Filling the area under the curve spends every cell
+/// below the value, so on a wide pane the chart reads as a block of colour and
+/// the eye has nothing to follow; the shape is carried entirely by the top
+/// edge, which is the only part worth drawing. Vertical runs are bridged
+/// between adjacent columns so a steep climb stays one continuous line rather
+/// than a dotted stair.
 ///
 /// `max` is supplied rather than derived so a caller can share one denominator
 /// with the table beneath the chart; deriving it here would let the band and
@@ -50,7 +57,7 @@ const BRAILLE_DOTS: [[u8; 2]; 4] = [
 /// every bucket is zero — a flat baseline would read as "a little usage", which
 /// is a shape the data does not have.
 #[must_use]
-pub fn braille_area_chart(
+pub fn braille_line_chart(
     series: &[u64],
     max: u64,
     width: u16,
@@ -80,18 +87,28 @@ pub fn braille_area_chart(
         ))];
     }
     if theme.no_color {
-        return ascii_area_chart(series, max, cells_w, cells_h);
+        return ascii_line_chart(series, max, cells_w, cells_h);
     }
 
     let dot_cols = cells_w * 2;
     let dot_rows = cells_h * 4;
     let mut cells = vec![0u8; cells_w * cells_h];
+    let mut previous: Option<usize> = None;
     for dx in 0..dot_cols {
         let filled = fill_levels(sample(series, dx, dot_cols), max, dot_rows);
-        for level in 0..filled {
-            let dy = dot_rows - 1 - level;
-            cells[(dy / 4) * cells_w + dx / 2] |= BRAILLE_DOTS[dy % 4][dx % 2];
+        let dy = dot_rows - filled.max(1);
+        // Bridge the gap to the previous column so a jump between buckets draws
+        // as one line. Without it a steep step leaves two disconnected dots and
+        // the series reads as scattered points rather than a path.
+        let (top, bottom) = match previous {
+            Some(prior) if prior < dy => (prior + 1, dy),
+            Some(prior) if prior > dy => (dy, prior - 1),
+            _ => (dy, dy),
+        };
+        for row in top..=bottom {
+            cells[(row / 4) * cells_w + dx / 2] |= BRAILLE_DOTS[row % 4][dx % 2];
         }
+        previous = Some(dy);
     }
     (0..cells_h)
         .map(|row| {
@@ -299,22 +316,26 @@ fn percent(value: u64, total: u64) -> u64 {
     u64::try_from((u128::from(value) * 200 / u128::from(total)).div_ceil(2)).unwrap_or(100)
 }
 
-/// `NO_COLOR` fallback: one cell per column, filled up to the column's height.
-/// Coarser than braille by a factor of eight, but the shape still reads without
-/// a single colour — the chart degrades rather than disappearing.
-fn ascii_area_chart(
+/// `NO_COLOR` fallback: the same stroke at one level per cell instead of eight.
+/// Coarser than braille by a factor of four vertically, but it is the same
+/// picture — a traced top edge, not a filled block — so the chart degrades
+/// rather than changing shape.
+fn ascii_line_chart(
     series: &[u64],
     max: u64,
     cells_w: usize,
     cells_h: usize,
 ) -> Vec<Line<'static>> {
+    let levels: Vec<usize> = (0..cells_w)
+        .map(|col| fill_levels(sample(series, col, cells_w), max, cells_h).max(1))
+        .collect();
     (0..cells_h)
         .map(|row| {
             let level_from_bottom = cells_h - row;
-            let text: String = (0..cells_w)
-                .map(|col| {
-                    let filled = fill_levels(sample(series, col, cells_w), max, cells_h);
-                    if filled >= level_from_bottom {
+            let text: String = levels
+                .iter()
+                .map(|level| {
+                    if *level == level_from_bottom {
                         glyphs::BRAILLE_FILL_NC
                     } else {
                         glyphs::BRAILLE_EMPTY_NC
@@ -349,7 +370,7 @@ mod tests {
     #[test]
     fn every_chart_glyph_is_one_cell_under_wide_ambiguous() {
         let theme = Theme::zo();
-        let lines = braille_area_chart(&[1, 5, 3, 9, 2], 9, 12, 4, theme.palette.bright, &theme);
+        let lines = braille_line_chart(&[1, 5, 3, 9, 2], 9, 12, 4, theme.palette.bright, &theme);
         assert_eq!(lines.len(), 4);
         for row in text_of(&lines) {
             assert_eq!(
@@ -369,7 +390,7 @@ mod tests {
     #[test]
     fn the_peak_reaches_the_top_row_and_the_trough_does_not() {
         let theme = Theme::zo();
-        let lines = braille_area_chart(&[0, 100], 100, 8, 4, theme.palette.bright, &theme);
+        let lines = braille_line_chart(&[0, 100], 100, 8, 4, theme.palette.bright, &theme);
         let rows = text_of(&lines);
 
         let top_ink = rows[0].chars().any(|ch| ch != glyphs::BRAILLE_BLANK);
@@ -394,18 +415,18 @@ mod tests {
     #[test]
     fn degenerate_series_never_panic() {
         let theme = Theme::zo();
-        assert!(braille_area_chart(&[], 0, 20, 4, theme.palette.bright, &theme).is_empty());
-        assert!(braille_area_chart(&[5], 5, 0, 4, theme.palette.bright, &theme).is_empty());
-        assert!(braille_area_chart(&[5], 5, 20, 0, theme.palette.bright, &theme).is_empty());
+        assert!(braille_line_chart(&[], 0, 20, 4, theme.palette.bright, &theme).is_empty());
+        assert!(braille_line_chart(&[5], 5, 0, 4, theme.palette.bright, &theme).is_empty());
+        assert!(braille_line_chart(&[5], 5, 20, 0, theme.palette.bright, &theme).is_empty());
 
         // All-zero says so in words rather than drawing a floor that reads as
         // a small amount of usage.
-        let flat = braille_area_chart(&[0, 0, 0], 0, 20, 4, theme.palette.bright, &theme);
+        let flat = braille_line_chart(&[0, 0, 0], 0, 20, 4, theme.palette.bright, &theme);
         assert_eq!(text_of(&flat), vec!["no usage in this range".to_string()]);
 
         // A single sample is a legitimate first day, and it must not become a
         // solid rectangle: normalized against itself every cell would fill.
-        let single = text_of(&braille_area_chart(
+        let single = text_of(&braille_line_chart(
             &[7],
             7,
             6,
@@ -425,7 +446,7 @@ mod tests {
     #[test]
     fn no_color_degrades_to_ascii_without_leaking_braille() {
         let theme = Theme::no_color();
-        let rows = text_of(&braille_area_chart(
+        let rows = text_of(&braille_line_chart(
             &[1, 4, 2],
             4,
             9,

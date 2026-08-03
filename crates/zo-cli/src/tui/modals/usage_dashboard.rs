@@ -43,6 +43,14 @@ const MIN_HEIGHT_WITH_CHART: u16 = 17;
 /// hiding entries — a coloured run whose name is off-screen is a key the reader
 /// cannot use, so the band goes instead and the table keeps every figure.
 const MIN_WIDTH_WITH_CHART: u16 = 56;
+/// Cells one bucket may claim on the time axis.
+///
+/// Without a ceiling the band divides the whole pane between however many
+/// buckets exist, so four days on a 220-column terminal painted 55-cell steps:
+/// a colour field, not a trend — and it grew uglier the wider the terminal got,
+/// which is backwards. Capped, a short series draws a small chart and leaves
+/// the rest of the row as margin.
+const MAX_CELLS_PER_BUCKET: u16 = 8;
 
 /// User action emitted by [`UsageDashboardModal::handle_key`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,21 +324,23 @@ fn period_chart(
     // The same denominator `render_period_rows` gives its trend gauges, so the
     // band and the table underneath cannot disagree about the tall bucket.
     let max = series.iter().copied().max().unwrap_or(0);
-    let mut lines = charts::braille_area_chart(
+    // The axis takes only the room its buckets earn; the rest of the row is
+    // margin. See `MAX_CELLS_PER_BUCKET`.
+    let plotted = u16::try_from(series.len())
+        .unwrap_or(u16::MAX)
+        .saturating_mul(MAX_CELLS_PER_BUCKET)
+        .min(area.width);
+    let mut lines = charts::braille_line_chart(
         &series,
         max,
-        area.width,
+        plotted,
         area.height.saturating_sub(1),
         theme.palette.bright,
         theme,
     );
-    lines.push(chart_caption(
-        &chronological,
-        title,
-        max,
-        area.width,
-        theme,
-    ));
+    // The caption is text, not plot, so it keeps the full row even when the
+    // axis above it is short.
+    lines.push(chart_caption(&chronological, title, max, area.width, theme));
     lines
 }
 
@@ -352,20 +362,18 @@ fn chart_caption(
         _ => String::new(),
     };
     let left = format!("{title} · peak {}", compact_tokens(max));
-    // A date cut in half is a different date. When the row cannot seat both
-    // halves the range goes whole and the peak stays, since the peak is the
-    // number the reader came for.
-    if left.chars().count() + range.chars().count() + 1 > usize::from(width) {
+    if range.is_empty() {
         return Line::from(Span::styled(left, theme.typography.dim));
     }
-    let pad = usize::from(width)
-        .saturating_sub(left.chars().count())
-        .saturating_sub(range.chars().count());
-    Line::from(vec![
-        Span::styled(left, theme.typography.dim),
-        Span::styled(" ".repeat(pad), theme.typography.dim),
-        Span::styled(range, theme.typography.dim),
-    ])
+    // One run of text rather than the two halves pushed to opposite edges. The
+    // axis is now only as wide as its buckets earn, so a right-aligned range
+    // would float far from the chart it labels — and a date cut in half by the
+    // edge is a different date, so it goes whole or not at all.
+    let joined = format!("{left} · {range}");
+    if joined.chars().count() > usize::from(width) {
+        return Line::from(Span::styled(left, theme.typography.dim));
+    }
+    Line::from(Span::styled(joined, theme.typography.dim))
 }
 
 fn model_mix_chart(rows: &[UsageModelRow], area: Rect, theme: &Theme) -> Vec<Line<'static>> {
@@ -1181,6 +1189,28 @@ mod tests {
         assert!(
             left && !right,
             "the older, taller bucket belongs on the left: {top:?}"
+        );
+    }
+
+    /// A handful of buckets stretched over a wide pane stops being a trend and
+    /// becomes a colour field. Four days on a 200-column terminal painted
+    /// 50-cell steps — a wall, and it got worse the wider the terminal grew,
+    /// which is the opposite of how a chart should scale.
+    #[test]
+    fn a_few_buckets_do_not_stretch_into_a_wall() {
+        let theme = Theme::zo();
+        let rows = period_rows_newest_first(&[
+            ("2026-08-03", 8_700_000),
+            ("2026-07-20", 33_600_000),
+            ("2026-07-14", 6_200_000),
+            ("2026-07-03", 1_300_000),
+        ]);
+
+        let lines = period_chart(&rows, "Tokens per day", Rect::new(0, 0, 200, 5), &theme);
+        let painted = flat(&lines[..1]).trim_end().chars().count();
+        assert!(
+            painted <= 4 * usize::from(MAX_CELLS_PER_BUCKET),
+            "four buckets must not span the whole pane, painted {painted} cells"
         );
     }
 
