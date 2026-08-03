@@ -38,6 +38,13 @@ const CHART_ROWS: u16 = 5;
 /// a usable scroll window. Below it the band is dropped whole rather than
 /// squeezed, because a two-row chart is decoration and the table is the data.
 const MIN_HEIGHT_WITH_CHART: u16 = 17;
+/// Rows the daily activity calendar claims: a month header, seven weekday rows,
+/// and the ramp legend.
+const HEATMAP_ROWS: u16 = 9;
+/// Inner height at which Daily upgrades from the trend line to the calendar.
+/// The calendar is four rows taller, so below this it would leave the table a
+/// scroll window too small to use — and the line already says how much.
+const MIN_HEIGHT_WITH_HEATMAP: u16 = 23;
 /// Smallest inner width that can seat a composition legend whole. The Savings
 /// legend is the widest at roughly fifty cells, and below that the band starts
 /// hiding entries — a coloured run whose name is off-screen is a key the reader
@@ -235,8 +242,11 @@ fn render_dashboard(
     // The band is optional on purpose: it is the first thing to go when the
     // terminal is short, since the table carries the numbers and the chart only
     // carries their shape.
-    let chart_rows = if inner.height >= MIN_HEIGHT_WITH_CHART && inner.width >= MIN_WIDTH_WITH_CHART
-    {
+    let chart_rows = if inner.width < MIN_WIDTH_WITH_CHART {
+        0
+    } else if inner.height >= MIN_HEIGHT_WITH_HEATMAP && modal.tab == UsageDashboardTab::Daily {
+        HEATMAP_ROWS
+    } else if inner.height >= MIN_HEIGHT_WITH_CHART {
         CHART_ROWS
     } else {
         0
@@ -297,6 +307,9 @@ fn render_chart_band(
     theme: &Theme,
 ) {
     let lines = match modal.tab {
+        UsageDashboardTab::Daily if area.height >= HEATMAP_ROWS => {
+            daily_calendar(&modal.snapshot.daily, area, theme)
+        }
         UsageDashboardTab::Daily => {
             period_chart(&modal.snapshot.daily, "Tokens per day", area, theme)
         }
@@ -307,6 +320,40 @@ fn render_chart_band(
         UsageDashboardTab::Savings => savings_chart(&modal.snapshot.savings, area, theme),
     };
     frame.render_widget(Paragraph::new(super::fit_body_rows(lines, area.width)), area);
+}
+
+/// The daily view as an activity calendar rather than a trend line.
+///
+/// Both answer different questions and the calendar answers the one people
+/// actually open this screen with: *which days did I work.* Streaks, quiet
+/// weekends and a week away are shapes a line hides, and only the calendar
+/// shows a day with no usage at all — the trend line plots recorded buckets, so
+/// an idle fortnight silently collapses to one step between two points.
+///
+/// Falls back to the line when the labels are not dates. Monthly labels are
+/// `YYYY-MM`, and a month has no weekday to sit on.
+fn daily_calendar(rows: &[UsagePeriodRow], area: Rect, theme: &Theme) -> Vec<Line<'static>> {
+    let days: Vec<(i64, u64)> = rows
+        .iter()
+        .filter_map(|row| {
+            core_types::date::unix_days_from_date_label(&row.label).map(|day| (day, row.tokens))
+        })
+        .collect();
+    let Some(last_day) = days.iter().map(|(day, _)| *day).max() else {
+        return period_chart(rows, "Tokens per day", area, theme);
+    };
+    // The grid spans the history that exists, not a fixed year: a month of use
+    // drawn on a year of columns is mostly empty cells, which reads as a long
+    // absence rather than a short history. Capped at a year, and never wider
+    // than the pane.
+    let first_day = days.iter().map(|(day, _)| *day).min().unwrap_or(last_day);
+    let span = usize::try_from((last_day - first_day) / 7 + 2).unwrap_or(4);
+    let weeks = span
+        .clamp(4, 53)
+        .min(usize::from(area.width.saturating_sub(4)).max(1));
+    let mut lines = charts::activity_heatmap(&days, last_day, weeks, theme.palette.bright, theme);
+    lines.push(charts::heatmap_legend(theme.palette.bright, theme));
+    lines
 }
 
 fn period_chart(
@@ -1189,6 +1236,79 @@ mod tests {
         assert!(
             left && !right,
             "the older, taller bucket belongs on the left: {top:?}"
+        );
+    }
+
+    /// Daily buckets spanning `days` back from 2026-08-03, newest first — the
+    /// order the snapshot produces.
+    fn recent_days(days: i64) -> Vec<UsagePeriodRow> {
+        let today = core_types::date::unix_days_from_date_label("2026-08-03").expect("a real date");
+        (0..days)
+            .filter(|offset| offset % 3 != 0)
+            .map(|offset| UsagePeriodRow {
+                label: core_types::date::utc_date_from_unix_secs(
+                    u64::try_from(today - offset).expect("post-epoch") * 86_400,
+                ),
+                tokens: 1_000_000 * u64::try_from(offset % 8 + 1).expect("small"),
+                cost_usd: 0.01,
+                saved_usd: 0.0,
+                top_model: "gpt-5.5".to_string(),
+            })
+            .collect()
+    }
+
+    /// On a tall pane Daily is a calendar, not a line: rows are weekdays, so a
+    /// Monday always sits on the Monday row and a gap is a day with no usage
+    /// rather than a step between two recorded buckets.
+    #[test]
+    fn a_tall_pane_paints_the_activity_calendar_with_its_key() {
+        let theme = Theme::zo();
+        let mut snap = snapshot();
+        snap.daily = recent_days(70);
+
+        let rows = painted_rows(&UsageDashboardModal::new(snap), &theme, 120, 30);
+        let text = rows.join("\n");
+
+        assert!(
+            rows.iter().any(|row| row.starts_with("Mon ")),
+            "weekday rows are labelled:\n{text}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Less") && row.contains("More")),
+            "the ramp needs a key — a terminal has no tooltips:\n{text}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("Aug")),
+            "the newest month is named:\n{text}"
+        );
+        // Seven weekday rows carry the grid itself.
+        let grid = rows
+            .iter()
+            .filter(|row| row.chars().any(is_braille))
+            .count();
+        assert!(grid >= 7, "seven weekday rows paint cells:\n{text}");
+    }
+
+    /// A pane too short for the calendar keeps the trend line rather than
+    /// dropping the band: the line is four rows cheaper and still answers
+    /// "how much, when".
+    #[test]
+    fn a_medium_pane_falls_back_from_calendar_to_trend_line() {
+        let theme = Theme::zo();
+        let mut snap = snapshot();
+        snap.daily = recent_days(70);
+
+        let rows = painted_rows(&UsageDashboardModal::new(snap), &theme, 120, 22);
+        let text = rows.join("\n");
+
+        assert!(
+            !rows.iter().any(|row| row.starts_with("Mon ")),
+            "no calendar on a short pane:\n{text}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("peak")),
+            "the trend line stands in for it:\n{text}"
         );
     }
 

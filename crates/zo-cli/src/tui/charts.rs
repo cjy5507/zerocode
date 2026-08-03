@@ -121,6 +121,169 @@ pub fn braille_line_chart(
         .collect()
 }
 
+/// Weekday rows in a calendar grid, Sunday first.
+const WEEKDAYS: usize = 7;
+
+/// Gutter holding the `Mon`/`Wed`/`Fri` weekday labels.
+const WEEKDAY_GUTTER: &str = "    ";
+
+/// Dot masks for the five activity levels, thinnest first. Colour carries most
+/// of the reading, but density has to carry it alone on a 16-colour terminal or
+/// under a colour-blind eye, so the ramp is shape as well as hue.
+const HEAT_RAMP: [u8; 5] = [0x00, 0x04, 0x24, 0xb6, 0xff];
+
+/// Month abbreviations for the calendar's header row.
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// A GitHub-style activity calendar: one column per week, one row per weekday,
+/// ending on the week that contains `last_day`.
+///
+/// This is the shape a trend line cannot show. A line answers "how much, when";
+/// the calendar answers "which days did I work at all" — the streaks, the quiet
+/// weekends, the fortnight away — and it stays legible across a year, where a
+/// line would have one column per day and read as noise.
+///
+/// `days` is `(day since the Unix epoch, value)` in any order. A missing day is
+/// genuinely no activity and draws as the empty step, which is exactly the fact
+/// a bar chart of only the recorded days cannot state.
+#[must_use]
+pub fn activity_heatmap(
+    days: &[(i64, u64)],
+    last_day: i64,
+    weeks: usize,
+    color: Color,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    if weeks == 0 {
+        return Vec::new();
+    }
+    let max = days.iter().map(|(_, value)| *value).max().unwrap_or(0);
+    // Anchored to whole weeks so every column is one Sunday-to-Saturday run;
+    // ending mid-week would slide every weekday off its own row.
+    let last_sunday = last_day - weekday_index(last_day);
+    let first_sunday = last_sunday - (i64::try_from(weeks).unwrap_or(0) - 1) * 7;
+
+    let mut lines = Vec::with_capacity(WEEKDAYS + 1);
+    lines.push(month_header(first_sunday, weeks, theme));
+    for weekday in 0..WEEKDAYS {
+        let mut spans = Vec::with_capacity(weeks + 1);
+        spans.push(Span::styled(
+            match weekday {
+                1 => "Mon ",
+                3 => "Wed ",
+                5 => "Fri ",
+                _ => WEEKDAY_GUTTER,
+            },
+            theme.typography.dim,
+        ));
+        for week in 0..weeks {
+            let day = first_sunday
+                + i64::try_from(week).unwrap_or(0) * 7
+                + i64::try_from(weekday).unwrap_or(0);
+            // Cells past today are future, not idle; drawing them at the empty
+            // step would read as a slump that has not happened.
+            let value = (day <= last_day).then(|| lookup(days, day));
+            spans.push(heat_cell(value, max, color, theme));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// Legend pairing the ramp with what it means. A terminal has no tooltips, so
+/// the key has to sit on the screen.
+#[must_use]
+pub fn heatmap_legend(color: Color, theme: &Theme) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(WEEKDAY_GUTTER, theme.typography.dim),
+        Span::styled("Less ", theme.typography.dim),
+    ];
+    for level in 0..HEAT_RAMP.len() {
+        spans.push(heat_span(level, color, theme));
+    }
+    spans.push(Span::styled(" More", theme.typography.dim));
+    Line::from(spans)
+}
+
+/// One calendar cell. `None` is a day that has not happened yet.
+fn heat_cell(value: Option<u64>, max: u64, color: Color, theme: &Theme) -> Span<'static> {
+    value.map_or_else(
+        || Span::styled(" ", theme.typography.dim),
+        |value| heat_span(heat_level(value, max), color, theme),
+    )
+}
+
+/// Paint one ramp step. The lowest recedes to `faint`: an idle day is the
+/// background the streaks read against, not data in its own right.
+fn heat_span(level: usize, color: Color, theme: &Theme) -> Span<'static> {
+    let level = level.min(HEAT_RAMP.len() - 1);
+    let style = if level == 0 {
+        Style::new().fg(theme.palette.faint)
+    } else {
+        Style::new().fg(color)
+    };
+    Span::styled(glyphs::braille_cell(HEAT_RAMP[level]).to_string(), style)
+}
+
+/// Ramp step for `value` against the busiest day. Any activity at all clears
+/// the empty step: "I worked a little" and "I never opened it" are different
+/// facts, and telling them apart is what the grid is for.
+fn heat_level(value: u64, max: u64) -> usize {
+    if value == 0 || max == 0 {
+        return 0;
+    }
+    let top = HEAT_RAMP.len() - 1;
+    scaled_len(value, max, top).clamp(1, top)
+}
+
+/// Value recorded for `day`, or zero.
+fn lookup(days: &[(i64, u64)], day: i64) -> u64 {
+    days.iter()
+        .find(|(candidate, _)| *candidate == day)
+        .map_or(0, |(_, value)| *value)
+}
+
+/// Weekday of `day` with Sunday at zero. The Unix epoch was a Thursday.
+fn weekday_index(day: i64) -> i64 {
+    (day + 4).rem_euclid(7)
+}
+
+/// Header row placing each month's abbreviation over the week its first day
+/// falls in, written once per month and only while three cells remain free.
+fn month_header(first_sunday: i64, weeks: usize, theme: &Theme) -> Line<'static> {
+    let mut text = String::from(WEEKDAY_GUTTER);
+    let mut last_month: Option<usize> = None;
+    for week in 0..weeks {
+        let column = WEEKDAY_GUTTER.len() + week;
+        let (_, month, _) = core_types::date::civil_from_unix_days(
+            first_sunday + i64::try_from(week).unwrap_or(0) * 7,
+        );
+        let index = usize::try_from(month.saturating_sub(1))
+            .unwrap_or(0)
+            .min(MONTHS.len() - 1);
+        if last_month == Some(index) {
+            continue;
+        }
+        // A month whose column is already covered by the previous label keeps
+        // its turn rather than shoving that label out of alignment; it simply
+        // goes unnamed, which the grid below still reads fine without.
+        if text.len() <= column {
+            while text.len() < column {
+                text.push(' ');
+            }
+            // The header may end up two cells past the grid's last column; it
+            // is a text row and the pane trims it, whereas refusing to write
+            // the newest month would leave the busiest end of the calendar
+            // unlabelled — the one label a reader most needs.
+            text.push_str(MONTHS[index]);
+        }
+        last_month = Some(index);
+    }
+    Line::from(Span::styled(text, theme.typography.dim))
+}
+
 /// One horizontal bar whose runs are proportional to `segments`, plus a legend
 /// row naming each run and its share.
 ///

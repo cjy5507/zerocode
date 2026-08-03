@@ -90,9 +90,75 @@ pub fn civil_from_unix_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
     )
 }
 
+/// Days since the Unix epoch (1970-01-01) for a civil (proleptic Gregorian)
+/// `(year, month, day)` — Howard Hinnant's `days_from_civil`, the exact inverse
+/// of [`civil_from_unix_days`].
+///
+/// This is what puts a date on a weekday, which a calendar grid needs and a
+/// `YYYY-MM-DD` string alone cannot give: the epoch was a Thursday, so
+/// `(days + 4).rem_euclid(7)` is the weekday with Sunday at zero.
+#[must_use]
+pub fn unix_days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let shifted_year = i64::from(year) - i64::from(month <= 2);
+    let era = if shifted_year >= 0 {
+        shifted_year
+    } else {
+        shifted_year - 399
+    } / 400;
+    let year_of_era = shifted_year - era * 400;
+    let month = i64::from(month);
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Days since the Unix epoch for a `YYYY-MM-DD` label, or `None` when the text
+/// is not that shape.
+///
+/// The usage dashboard's daily labels are produced by
+/// [`utc_date_from_unix_secs`], so this is the trip back — a monthly `YYYY-MM`
+/// label is deliberately rejected rather than guessed at.
+#[must_use]
+pub fn unix_days_from_date_label(label: &str) -> Option<i64> {
+    let bytes = label.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let year: i32 = label.get(0..4)?.parse().ok()?;
+    let month: u32 = label.get(5..7)?.parse().ok()?;
+    let day: u32 = label.get(8..10)?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(unix_days_from_civil(year, month, day))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The inverse has to be exact, or a calendar grid puts days in the wrong
+    /// column and the whole picture lies about which weekday was busy.
+    #[test]
+    fn unix_days_invert_civil_and_land_on_the_right_weekday() {
+        for label in ["1970-01-01", "2000-02-29", "2025-07-05", "2026-08-03"] {
+            let days = unix_days_from_date_label(label).expect("a well-formed label parses");
+            let secs = u64::try_from(days).expect("post-epoch") * 86_400;
+            assert_eq!(utc_date_from_unix_secs(secs), label, "round trip {label}");
+        }
+        assert_eq!(unix_days_from_date_label("1970-01-01"), Some(0));
+
+        // The epoch was a Thursday; 2026-08-03 is a Monday. Sunday is zero.
+        let epoch = unix_days_from_date_label("1970-01-01").expect("parses");
+        assert_eq!((epoch + 4).rem_euclid(7), 4, "1970-01-01 was a Thursday");
+        let monday = unix_days_from_date_label("2026-08-03").expect("parses");
+        assert_eq!((monday + 4).rem_euclid(7), 1, "2026-08-03 is a Monday");
+
+        // A monthly label is not a day and must not be guessed at.
+        assert_eq!(unix_days_from_date_label("2026-08"), None);
+        assert_eq!(unix_days_from_date_label("not-a-date"), None);
+        assert_eq!(unix_days_from_date_label("2026-13-01"), None);
+    }
 
     #[test]
     fn civil_conversion_matches_known_fixtures() {
