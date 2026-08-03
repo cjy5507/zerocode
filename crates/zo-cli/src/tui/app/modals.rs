@@ -1,6 +1,8 @@
 //! Modal lifecycle: every `open_*` entry point, modal exit, and the
 //! workflow/rewind viewer surfaces.
 
+use crate::tui::modals::ChoiceRow;
+
 use super::types::AppMode;
 use super::{
     AgentsViewerModal, ApiKeyConnectInfo, ApiKeyModal, App, AppAction, ChoicePickerModal,
@@ -101,6 +103,24 @@ impl App {
         // Set after `set_active_modal`, which clears the choice side-lists via
         // `exit_modal`; the parallel `login_provider_ids` back the picker's
         // indices (each is a `command:provider` token).
+        self.choice_modals.login_provider_ids = ids;
+    }
+
+    /// [`Self::open_login_modal`] with structured rows — descriptions, status
+    /// badges and section headers instead of one hand-padded label string.
+    ///
+    /// `rows` and `ids` stay index-parallel, and the picker reports the
+    /// unfiltered index, so type-ahead cannot desynchronize the two.
+    pub fn open_login_modal_rows(
+        &mut self,
+        title: impl Into<String>,
+        rows: Vec<ChoiceRow>,
+        ids: Vec<String>,
+    ) {
+        self.set_active_modal(
+            Box::new(ChoicePickerModal::with_rows(title, rows)),
+            AppMode::ModalLogin,
+        );
         self.choice_modals.login_provider_ids = ids;
     }
 

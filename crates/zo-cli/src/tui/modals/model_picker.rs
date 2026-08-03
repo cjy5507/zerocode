@@ -472,6 +472,15 @@ impl ModelPickerModal {
             )));
         }
 
+        // A query that matches nothing used to paint an empty box: no rows, no
+        // explanation, and no hint that the list is intact behind the filter.
+        if self.filtered.is_empty() && !self.entries.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  no match — Backspace to widen",
+                Style::new().fg(theme.palette.muted),
+            )));
+        }
+
         let first_provider = self
             .filtered
             .first()

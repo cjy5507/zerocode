@@ -59,7 +59,7 @@ pub mod workflow_viewer;
 
 pub use agents_viewer::{AgentsViewerAction, AgentsViewerModal};
 pub use api_key::{ApiKeyConnectInfo, ApiKeyModal};
-pub use choice_picker::ChoicePickerModal;
+pub use choice_picker::{ChoiceBadge, ChoicePickerModal, ChoiceRow};
 pub use custom_provider::{CustomProviderDraft, CustomProviderPrefill, CustomProviderWizardModal};
 pub use deep_tier::{DeepTierModal, DeepTierView};
 pub use diff_viewer::{DiffViewerAction, DiffViewerModal};
@@ -224,19 +224,21 @@ impl Modal for ChoicePickerModal {
     }
 
     fn desired_size(&self, area: Rect, _theme: &Theme) -> (u16, u16) {
-        // Anchored list picker. Byte-parity with the old `modal_size_for_mode`
-        // Session/Login/ArgPick branches: width clamped to the area, height =
-        // option rows + 6 (borders + blank spacer + key-hint footer), then the
-        // shared (6, 18) clamp bounded by the available height.
+        // Anchored list picker. Height comes from the rows actually painted
+        // (`visual_rows` already counts the blank spacer, the key-hint footer,
+        // group headers and the filter line) plus the two rules — sizing from
+        // the option count alone clipped a grouped `/connect` list. The ceiling
+        // is raised to 22 for the same reason; the modal still windows to what
+        // the area can give, so the selection stays visible either way.
         let width = area
             .width
             .clamp(36, 64)
             .min(area.width.saturating_sub(4).max(24));
-        let content = u16::try_from(self.len())
+        let content = u16::try_from(self.visual_rows())
             .unwrap_or(u16::MAX)
-            .saturating_add(6);
+            .saturating_add(2);
         let height = content
-            .clamp(6, 18)
+            .clamp(6, 22)
             .min(area.height.saturating_sub(2).max(6));
         (width, height)
     }

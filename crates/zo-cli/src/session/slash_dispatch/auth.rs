@@ -870,12 +870,47 @@ pub(crate) fn open_add_provider_picker(app: &mut zo_cli::tui::App) {
     open_provider_modal_on(app, "connect");
 }
 
+/// Which OAuth providers already have a credential on disk.
+///
+/// Read ONCE per modal open, never per frame: the Anthropic arm reaches the
+/// system keychain, which is far too slow to sit on the render path. The result
+/// only says a credential exists — nothing here contacts the provider or checks
+/// expiry, which is why the badge reads `saved` rather than `connected`.
+fn saved_oauth_providers() -> [bool; 3] {
+    let anthropic = api::oauth_store::load_oauth_credentials()
+        .ok()
+        .flatten()
+        .is_some()
+        || api::read_claude_code_keychain_session().is_some();
+    let openai = api::oauth_store::load_openai_oauth().ok().flatten().is_some();
+    let google = api::google_code_assist_oauth_present() || api::google_gemini_oauth_available();
+    [anthropic, openai, google]
+}
+
 fn open_provider_modal_on(app: &mut zo_cli::tui::App, command: &str) {
-    let mut labels = vec![
-        "Claude   —  Anthropic OAuth".to_string(),
-        "ChatGPT  —  OpenAI subscription".to_string(),
-        "Gemini   —  Google OAuth".to_string(),
-    ];
+    use zo_cli::tui::modals::{ChoiceBadge, ChoiceRow};
+
+    const SIGN_IN: &str = "Sign in";
+    const API_KEY: &str = "API key";
+    const ON_MACHINE: &str = "On this machine";
+
+    let saved = saved_oauth_providers();
+    let mut rows: Vec<ChoiceRow> = [
+        ("Claude", "Anthropic OAuth"),
+        ("ChatGPT", "OpenAI subscription"),
+        ("Gemini", "Google OAuth"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (label, description))| {
+        let row = ChoiceRow::new(label).describe(description).in_group(SIGN_IN);
+        if saved[index] {
+            row.with_badge(ChoiceBadge::Saved)
+        } else {
+            row
+        }
+    })
+    .collect();
     let mut ids: Vec<String> = ["claude", "openai", "google"]
         .into_iter()
         .map(|provider| format!("{command}:{provider}"))
@@ -884,32 +919,43 @@ fn open_provider_modal_on(app: &mut zo_cli::tui::App, command: &str) {
     // so they are discoverable without typing the alias. Each re-dispatches as
     // `/connect <id>` through the same selection path.
     if command == "connect" {
-        for (id, label) in [
-            ("nvidia", "NVIDIA  —  NIM free endpoint (API key)"),
-            ("openrouter", "OpenRouter — OpenAI-compatible router (API key)"),
-            ("deepseek", "DeepSeek  —  cloud (models + API key)"),
-            ("kimi", "Kimi      —  Moonshot (models + API key)"),
-            ("qwen", "Qwen      —  DashScope (models + API key)"),
+        for (id, label, description) in [
+            ("nvidia", "NVIDIA", "NIM free endpoint"),
+            ("openrouter", "OpenRouter", "OpenAI-compatible router"),
+            ("deepseek", "DeepSeek", "cloud models"),
+            ("kimi", "Kimi", "Moonshot"),
+            ("qwen", "Qwen", "DashScope"),
         ] {
             ids.push(format!("connect-key:{id}"));
-            labels.push(label.to_string());
+            rows.push(
+                ChoiceRow::new(label)
+                    .describe(description)
+                    .with_badge(ChoiceBadge::NeedsKey)
+                    .in_group(API_KEY),
+            );
         }
-        for (id, label) in [
-            ("ollama", "Ollama    —  local (auto-discovered)"),
-            ("lmstudio", "LM Studio —  local (auto-discovered)"),
-        ] {
+        for (id, label) in [("ollama", "Ollama"), ("lmstudio", "LM Studio")] {
             ids.push(format!("connect:{id}"));
-            labels.push(label.to_string());
+            rows.push(
+                ChoiceRow::new(label)
+                    .describe("auto-discovered")
+                    .with_badge(ChoiceBadge::Local)
+                    .in_group(ON_MACHINE),
+            );
         }
         ids.push("connect-custom:openai-compatible".to_string());
-        labels.push("Custom   —  OpenAI-compatible endpoint wizard".to_string());
+        rows.push(
+            ChoiceRow::new("Custom")
+                .describe("OpenAI-compatible endpoint wizard")
+                .in_group(API_KEY),
+        );
     }
     let title = if command == "connect" {
         "Connect — select provider"
     } else {
         "Log in — select provider"
     };
-    app.open_login_modal(title, labels, ids);
+    app.open_login_modal_rows(title, rows, ids);
 }
 
 pub(super) fn login(ctx: &mut DispatchCtx<'_>, provider: Option<&str>) -> CommandOutput {

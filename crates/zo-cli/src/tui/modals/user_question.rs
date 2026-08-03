@@ -16,8 +16,8 @@ use unicode_width::UnicodeWidthStr;
 
 use super::super::theme::Theme;
 use super::{
-    ModalResult, ModalSelection, blank_marker, cursor_marker, key_hint_footer_reflowing,
-    key_hint_footer_with_separator, selected_style,
+    FooterSegment, ModalResult, ModalSelection, blank_marker, cursor_marker,
+    key_hint_footer_reflowing, key_hint_footer_with_separator, modal_footer, selected_style,
 };
 
 /// Narrowest inner width that still fits an option list and a preview pane
@@ -319,6 +319,11 @@ impl UserQuestionModal {
         }
     }
 
+    /// How many options are currently checked (multi-select only).
+    fn checked_count(&self) -> usize {
+        self.checked.iter().filter(|checked| **checked).count()
+    }
+
     /// Flip the checkbox for the option under the cursor (multi-select only).
     fn toggle_current(&mut self) {
         if let Some(slot) = self.checked.get_mut(self.cursor) {
@@ -371,14 +376,22 @@ impl UserQuestionModal {
             );
         }
         if self.multi_select {
-            key_hint_footer_reflowing(
+            // Enter with nothing checked is a no-op, so the tally is the only
+            // thing telling the reader why the modal is not closing — and with
+            // the list windowed, checked rows can sit off-screen. It is a
+            // status label, not a key hint, so it takes the dim `Label` segment
+            // rather than being faked as a hint with an empty action.
+            let checked = format!("{} selected", self.checked_count());
+            modal_footer(
                 theme,
                 &[
-                    ("↑↓", "move"),
-                    ("Space", "toggle"),
-                    ("Enter", "confirm"),
-                    ("Esc", "cancel"),
+                    FooterSegment::hint("↑↓", "move"),
+                    FooterSegment::hint("Space", "toggle"),
+                    FooterSegment::hint("Enter", "confirm"),
+                    FooterSegment::hint("Esc", "cancel"),
+                    FooterSegment::label(checked.as_str()),
                 ],
+                " · ",
             )
         } else {
             let pick = format!("1–{}", self.options.len() + 1);
