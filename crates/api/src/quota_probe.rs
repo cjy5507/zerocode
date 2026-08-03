@@ -90,7 +90,15 @@ pub fn refresh_measured_quotas_soon() {
 /// endpoint is part of the subscription OAuth surface, not the public API, and
 /// it refuses the request without them.
 async fn probe_anthropic() -> Option<MeasuredQuota> {
-    let token = crate::providers::anthropic::keychain::read_claude_code_keychain_token()?;
+    // Off the async worker: this forks a `security` process to reach the
+    // keychain, and blocking a current-thread runtime here would stall the very
+    // UI the figure is for.
+    let token = tokio::task::spawn_blocking(
+        crate::providers::anthropic::keychain::read_claude_code_keychain_token,
+    )
+    .await
+    .ok()
+    .flatten()?;
     let response = crate::providers::shared_http_client()
         .get("https://api.anthropic.com/api/oauth/usage")
         .bearer_auth(token)
@@ -114,7 +122,9 @@ async fn probe_anthropic() -> Option<MeasuredQuota> {
 
 /// The ChatGPT backend's usage endpoint, which Codex plans bill against.
 async fn probe_codex() -> Option<MeasuredQuota> {
-    let auth = CodexAuth::load()?;
+    // Same reasoning as the Anthropic probe: a filesystem read is short but it
+    // is still blocking, and the cost of being wrong is a frozen frame.
+    let auth = tokio::task::spawn_blocking(CodexAuth::load).await.ok().flatten()?;
     let mut request = crate::providers::shared_http_client()
         .get("https://chatgpt.com/backend-api/wham/usage")
         .bearer_auth(&auth.access_token)

@@ -959,6 +959,7 @@ fn compose_impl(
         },
         status_spans(&view, theme),
         context_usage_spans(state, &view.context, theme, cols),
+        quota_headroom_spans(state, theme),
         if ledger_visible {
             Vec::new()
         } else {
@@ -1028,7 +1029,7 @@ fn joined_width(fields: &[Vec<Span<'static>>], theme: &Theme) -> usize {
 
 /// Anchor-row fields, least important first: spend goes before window pressure,
 /// which goes before the permission mode, and the model is given up last.
-const FIELD_DROP_ORDER: [usize; 4] = [3, 2, 1, 0];
+const FIELD_DROP_ORDER: [usize; 5] = [4, 3, 2, 1, 0];
 
 /// Join `fields` into one left-aligned run, dropping whole fields — least
 /// important first, per `drop_order` — until it fits `budget`.
@@ -1869,6 +1870,42 @@ fn context_usage_spans(
         Style::new().fg(color),
     ));
     spans
+}
+
+/// The tightest quota window, stated the way the context gauge is.
+///
+/// The rail lists every window; this row has space for one, so it shows the one
+/// that will stop the session first — a comfortable weekly allowance is not the
+/// fact worth a footer slot when the five-hour window is nearly spent.
+///
+/// Worded `NN% left` deliberately. Providers report consumption and this shows
+/// headroom, and a bare percent next to a model name gives the reader no way to
+/// tell which — the word is what makes the number unambiguous.
+fn quota_headroom_spans(state: &HudState, theme: &Theme) -> Vec<Span<'static>> {
+    let Some(view) = state
+        .provider_quotas
+        .iter()
+        .filter(|view| view.remaining_percent.is_some())
+        .min_by_key(|view| view.remaining_percent.unwrap_or(u8::MAX))
+    else {
+        return Vec::new();
+    };
+    let Some(remaining) = view.remaining_percent else {
+        return Vec::new();
+    };
+    // Colour keys off consumption, matching the rail and the context gauge.
+    let used = 100u8.saturating_sub(remaining);
+    let approx = if view.estimated { "~" } else { "" };
+    vec![
+        Span::styled(
+            format!("{} {} ", view.provider.rate_limit_key(), view.window_label),
+            Style::new().fg(theme.palette.dim),
+        ),
+        Span::styled(
+            format!("{approx}{remaining}% left"),
+            Style::new().fg(ctx_gauge_color(f64::from(used) / 100.0, theme)),
+        ),
+    ]
 }
 
 /// Canonical live context pressure for every TUI surface. Prefer occupancy of
@@ -3119,6 +3156,48 @@ mod tests {
         let narrow = line_text(&compose(&state, &theme, CTX_GAUGE_MIN_COLS - 1, false));
         assert!(narrow.contains("62% left"), "{narrow:?}");
         assert!(!narrow.contains('▰'), "gauge dropped when it does not fit: {narrow:?}");
+    }
+
+    /// The footer carries one quota window — the tightest — worded the same
+    /// way the context gauge is, because a bare percent beside a model name
+    /// gives the reader no way to tell headroom from consumption.
+    #[test]
+    fn hud_shows_the_tightest_quota_window_as_headroom() {
+        let theme = Theme::default_dark();
+        let mut state = sample_state();
+        state.provider_quotas = vec![
+            api::quota::ProviderQuotaView {
+                provider: api::ProviderKind::Anthropic,
+                window_label: "7d".to_string(),
+                remaining_percent: Some(61),
+                resets_at_unix: None,
+                estimated: false,
+            },
+            api::quota::ProviderQuotaView {
+                provider: api::ProviderKind::Anthropic,
+                window_label: "5h".to_string(),
+                remaining_percent: Some(12),
+                resets_at_unix: None,
+                estimated: false,
+            },
+            api::quota::ProviderQuotaView {
+                provider: api::ProviderKind::OpenAi,
+                window_label: "7d".to_string(),
+                remaining_percent: Some(85),
+                resets_at_unix: None,
+                estimated: false,
+            },
+        ];
+
+        let text = line_text(&compose(&state, &theme, 200, false));
+        assert!(
+            text.contains("anthropic 5h 12% left"),
+            "the window nearest exhaustion is the one shown: {text:?}"
+        );
+        assert!(
+            !text.contains("85% left") && !text.contains("61% left"),
+            "the roomier windows stay on the rail: {text:?}"
+        );
     }
 
     #[test]
