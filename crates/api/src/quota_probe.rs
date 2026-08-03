@@ -42,6 +42,48 @@ pub async fn refresh_measured_quotas() {
     }
 }
 
+/// How often a background refresh may run.
+///
+/// Quota windows move over hours, so this is not about freshness — it is about
+/// not turning a per-frame HUD rebuild into a per-frame HTTP request.
+const REFRESH_CADENCE: Duration = Duration::from_secs(60);
+
+/// Unix millis of the last refresh kick, so the cadence survives across the
+/// many places a HUD rebuild can originate.
+static LAST_REFRESH_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Kick a refresh in the background if one is due, and return immediately.
+///
+/// Safe to call from a render path: it never blocks, never awaits, and drops
+/// the request entirely when no async runtime is running. The cadence gate is
+/// claimed before spawning, so two threads racing here produce one probe.
+pub fn refresh_measured_quotas_soon() {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX));
+    let last = LAST_REFRESH_MS.load(std::sync::atomic::Ordering::Relaxed);
+    let cadence_ms = u64::try_from(REFRESH_CADENCE.as_millis()).unwrap_or(u64::MAX);
+    if last != 0 && now.saturating_sub(last) < cadence_ms {
+        return;
+    }
+    // Claim the slot before spawning so a burst of rebuilds yields one probe.
+    if LAST_REFRESH_MS
+        .compare_exchange(
+            last,
+            now,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+    handle.spawn(refresh_measured_quotas());
+}
+
 /// Anthropic's OAuth usage endpoint.
 ///
 /// The beta header and the Claude Code user agent are both load-bearing: the

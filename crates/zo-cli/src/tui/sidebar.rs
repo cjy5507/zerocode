@@ -12,7 +12,6 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph};
 
-use core_types::RateLimitSnapshot;
 
 use super::app::WakeSource;
 use super::glyphs;
@@ -504,12 +503,10 @@ fn push_session_section(
         // Context pressure is the HUD's alone (see `push_context_use_line`).
         push_cache_split_lines(lines, hud, theme, styles, true);
         push_compact_ceiling_line(lines, hud, theme, styles);
-        if let Some(rl) = hud.rate_limit {
-            lines.extend(rate_limit_gauges(rl, theme, styles.muted));
-        }
-        // Estimated rows render even without a measured Anthropic snapshot —
-        // a non-Anthropic main model has no `rate_limit` but can be throttled.
-        lines.extend(estimated_quota_gauges(&hud.provider_quotas, theme, styles.muted));
+        // One source: `provider_quota_views` already prefers a measured
+        // reading, falls back to the response headers, and only then guesses
+        // from 429s, so rendering it alone cannot show one window twice.
+        lines.extend(quota_gauges(&hud.provider_quotas, theme, styles.muted));
         push_auth_line(lines, hud, theme, styles);
         push_build_line(lines, width, theme, styles);
         push_cost_mode_line(lines, width, hud, theme, styles);
@@ -519,12 +516,8 @@ fn push_session_section(
     // Context pressure is the HUD's alone (see `push_context_use_line`).
     push_cache_split_lines(lines, hud, theme, styles, false);
     push_compact_ceiling_line(lines, hud, theme, styles);
-    if let Some(rl) = hud.rate_limit {
-        lines.extend(rate_limit_gauges(rl, theme, styles.muted));
-    }
-    // Estimated rows render even without a measured Anthropic snapshot — a
-    // non-Anthropic main model has no `rate_limit` but can be throttled.
-    lines.extend(estimated_quota_gauges(&hud.provider_quotas, theme, styles.muted));
+    // See the narrow branch: `provider_quota_views` is the single source.
+    lines.extend(quota_gauges(&hud.provider_quotas, theme, styles.muted));
     push_auth_line(lines, hud, theme, styles);
     push_build_line(lines, width, theme, styles);
     push_cost_mode_line(lines, width, hud, theme, styles);
@@ -2419,42 +2412,18 @@ fn section_heading_span(title: &str, theme: &Theme) -> Span<'static> {
     )
 }
 
-/// Build the 5h/7d rate-limit gauge lines — one per present window.
-fn rate_limit_gauges(rl: RateLimitSnapshot, theme: &Theme, muted: Style) -> Vec<Line<'static>> {
-    let now = now_unix();
-    let mut lines = Vec::new();
-    for (label, window) in [("5h", rl.five_hour), ("7d", rl.seven_day)] {
-        let Some(w) = window else {
-            continue;
-        };
-        let pct = w.used_percent();
-        let bar_style = Style::new().fg(gauge_color(pct, theme));
-        let mut spans = vec![
-            Span::styled(indent_glyph(theme), muted),
-            Span::styled(format!("{label}  "), muted),
-            Span::styled(gauge_bar(w.utilization, CONTEXT_GAUGE_CELLS, theme), bar_style),
-            Span::styled(format!(" {pct}%"), gauge_percent_style(u64::from(pct), theme)),
-        ];
-        if let Some(reset) = w.resets_at_unix {
-            spans.push(Span::styled(
-                format!("  ↺ {}", format_reset(now, reset)),
-                muted,
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
-    lines
-}
 
-/// Build the 429-estimated quota rows for throttled providers — the
-/// cross-provider stack under the measured 5h/7d gauge. One line per estimated
-/// view row: the provider's rate-limit key, a used-style bar, `~NN%` (the `~`
-/// plus a trailing `est` marker say "inferred from 429s, not measured"), and
-/// the cool-down countdown when known. Measured (non-estimated) rows are
-/// skipped here: the Anthropic windows already render from the streamed
-/// snapshot above, and duplicating them would show the same window twice.
-/// Rows without a remaining figure are omitted — never a fabricated bar.
-fn estimated_quota_gauges(
+/// Build the per-provider quota rows: the account's remaining headroom, one
+/// line per window.
+///
+/// Rows are stated as headroom, matching the context gauge — a bar beside a
+/// bare percent is ambiguous, and two gauges on one rail answering in opposite
+/// directions is worse than either choice. The bar drains as the window fills.
+///
+/// A measured row is the provider's own answer and reads plainly; an inferred
+/// one wears `~` and a trailing `est` so a guess never passes for a reading.
+/// Rows without a figure are omitted — never a fabricated bar.
+fn quota_gauges(
     views: &[api::quota::ProviderQuotaView],
     theme: &Theme,
     muted: Style,
@@ -2462,24 +2431,33 @@ fn estimated_quota_gauges(
     let now = now_unix();
     let mut lines = Vec::new();
     for view in views {
-        if !view.estimated {
-            continue;
-        }
         let Some(remaining) = view.remaining_percent else {
             continue;
         };
+        // Colour keys off consumption while the bar measures headroom, so the
+        // two channels agree about danger and differ only in which end they
+        // measure from.
         let used = 100u8.saturating_sub(remaining);
         let bar_style = Style::new().fg(gauge_color(used, theme));
+        let approx = if view.estimated { "~" } else { "" };
         let mut spans = vec![
             Span::styled(indent_glyph(theme), muted),
-            Span::styled(format!("{} ", view.provider.rate_limit_key()), muted),
             Span::styled(
-                gauge_bar(f64::from(used) / 100.0, CONTEXT_GAUGE_CELLS, theme),
+                format!("{} {} ", view.provider.rate_limit_key(), view.window_label),
+                muted,
+            ),
+            Span::styled(
+                gauge_bar(f64::from(remaining) / 100.0, CONTEXT_GAUGE_CELLS, theme),
                 bar_style,
             ),
-            Span::styled(format!(" ~{used}%"), gauge_percent_style(u64::from(used), theme)),
-            Span::styled(" est", muted),
+            Span::styled(
+                format!(" {approx}{remaining}% left"),
+                gauge_percent_style(u64::from(used), theme),
+            ),
         ];
+        if view.estimated {
+            spans.push(Span::styled(" est", muted));
+        }
         if let Some(reset) = view.resets_at_unix {
             spans.push(Span::styled(
                 format!("  ↺ {}", format_reset(now, reset)),

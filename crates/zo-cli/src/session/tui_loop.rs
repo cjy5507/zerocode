@@ -2634,12 +2634,21 @@ fn build_hud_state(cli: &LiveCli) -> HudState {
         ),
         last_tool: None,
         rate_limit: None,
-        // Cross-provider quota rows (measured Anthropic + 429-estimated
-        // others), re-derived from the process-global `api::quota` state on
-        // every rebuild — atomics plus one small mutex read, cheap enough for
-        // the HUD cadence. The sidebar renders the estimated rows from this;
-        // the measured Anthropic gauge still rides the streamed `rate_limit`.
-        provider_quotas: api::quota::provider_quota_views(),
+        // Cross-provider quota rows, re-derived from the process-global
+        // `api::quota` state on every rebuild — atomics plus one small mutex
+        // read, cheap enough for the HUD cadence. This is the sidebar's single
+        // source: it already prefers a measured reading over the response
+        // headers over a 429 guess.
+        //
+        // The kick below is what fills the measured half. It is throttled to a
+        // cadence inside `quota_probe` and never awaits, so calling it from a
+        // rebuild path costs an atomic load in the common case; without it the
+        // account's real headroom is only ever known after a request has
+        // already been spent.
+        provider_quotas: {
+            api::quota_probe::refresh_measured_quotas_soon();
+            api::quota::provider_quota_views()
+        },
         auth_origin: api::latest_claude_auth_origin(),
         status_line: cli.status_line.current(),
         team_inbox_unread: runtime::team_inbox_unread_count(&cli.cwd, &cli.session.id),

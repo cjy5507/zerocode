@@ -79,13 +79,12 @@ fn sidebar_gauges_stay_one_cell_under_wide_ambiguous() {
     }
 }
 
-/// The estimated cross-provider stack renders ONLY `estimated` rows with a
-/// known remaining figure: measured Anthropic windows stay on the 5h/7d gauge
-/// (no duplicate), and an unknown remaining renders nothing rather than a
-/// fabricated bar. The row carries the provider key, the `~NN%` used figure,
-/// the `est` marker, and the cool-down countdown.
+/// Every provider row renders, measured or inferred, because the rail is now
+/// the single place quota is shown. A measured row reads plainly; an inferred
+/// one wears `~` and `est` so a guess never passes for a reading. A row with no
+/// figure is omitted rather than drawn as an empty bar.
 #[test]
-fn estimated_quota_gauges_render_only_estimated_rows() {
+fn quota_gauges_render_measured_and_estimated_rows() {
     let theme = Theme::default_dark();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -114,25 +113,35 @@ fn estimated_quota_gauges_render_only_estimated_rows() {
             estimated: true,
         },
     ];
-    let lines = estimated_quota_gauges(
-        &views,
-        &theme,
-        Style::default(),
-    );
-    assert_eq!(lines.len(), 1, "only the estimated row with a known figure renders");
-    let text: String = lines[0]
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect();
-    assert!(text.contains("openai"), "{text}");
-    assert!(text.contains("~90%"), "{text}");
-    assert!(text.contains("est"), "{text}");
-    assert!(text.contains("↺"), "{text}");
-    assert!(!text.contains("anthropic") && !text.contains("google"), "{text}");
+
+    let lines = quota_gauges(&views, &theme, Style::default());
+    let text = |index: usize| -> String {
+        lines[index]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    };
+
+    assert_eq!(lines.len(), 2, "the row without a figure is dropped");
+
+    let measured = text(0);
+    assert!(measured.contains("anthropic"), "{measured}");
+    assert!(measured.contains("5h"), "{measured}");
+    // Headroom, matching the context gauge — not the 60% consumed.
+    assert!(measured.contains("40% left"), "{measured}");
+    assert!(!measured.contains("est"), "a measured row is not hedged: {measured}");
+    assert!(measured.contains("↺"), "{measured}");
+
+    let estimated = text(1);
+    assert!(estimated.contains("openai"), "{estimated}");
+    assert!(estimated.contains("~10% left"), "{estimated}");
+    assert!(estimated.contains("est"), "{estimated}");
+
+    assert!(!measured.contains("google") && !estimated.contains("google"));
 
     // No views at all → no lines (the stack simply doesn't appear).
-    assert!(estimated_quota_gauges(&[], &theme, Style::default()).is_empty());
+    assert!(quota_gauges(&[], &theme, Style::default()).is_empty());
 }
 
 #[test]
