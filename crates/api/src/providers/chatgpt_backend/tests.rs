@@ -2524,6 +2524,385 @@ async fn restart_budget_exhaustion_is_structural() {
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
+/// The real terminal frame a Codex refusal that names no reason takes: per the
+/// Responses schema `ResponseError` carries `code` AND `message` together, or is
+/// `null`, so `"error": null` is the only legal shape for "refused, no reason".
+const UNATTRIBUTED_FAILURE_FRAME: &str = concat!(
+    "data: {\"type\":\"response.failed\",",
+    "\"response\":{\"id\":\"resp_x\",\"status\":\"failed\",\"error\":null}}\n\n",
+);
+
+const SHED_RECOVERY_FRAMES: &str = concat!(
+    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"recovered after shed\"}\n\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r_shed\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
+);
+
+/// Read one whole HTTP request (headers + `content-length` body) so a test can
+/// assert on what was actually sent — a single `read` would truncate the
+/// multi-megabyte image body these tests are about.
+async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let mut raw = Vec::new();
+    let mut chunk = vec![0u8; 16 * 1024];
+    let mut header_end = None;
+    while header_end.is_none() {
+        let read = socket.read(&mut chunk).await.unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        raw.extend_from_slice(&chunk[..read]);
+        header_end = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4);
+    }
+    if let Some(start) = header_end {
+        let head = String::from_utf8_lossy(&raw[..start]).to_ascii_lowercase();
+        let length = head
+            .split("content-length:")
+            .nth(1)
+            .and_then(|rest| rest.split("\r\n").next())
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while raw.len() - start < length {
+            let read = socket.read(&mut chunk).await.unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..read]);
+        }
+    }
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// Serve one scripted SSE body per successive connection, recording every
+/// request body. `None` drops the connection unanswered — the shape a refused
+/// request takes, and what makes the de-escalated recovery fail.
+async fn scripted_responses_backend(
+    listener: tokio::net::TcpListener,
+    script: Vec<Option<&'static str>>,
+    bodies: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    for reply in script {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let request = read_http_request(&mut socket).await;
+        bodies.lock().expect("bodies lock").push(request);
+        let Some(body) = reply else {
+            drop(socket);
+            continue;
+        };
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(head.as_bytes()).await.unwrap();
+        socket.write_all(body.as_bytes()).await.unwrap();
+        socket.flush().await.unwrap();
+        drop(socket);
+    }
+}
+
+/// Drive one turn against a scripted backend.
+///
+/// Returns the events the caller actually received, the error that ended the
+/// turn (if any), and the raw request bodies the backend saw. Events and error
+/// are returned SEPARATELY on purpose: a turn that surfaces text and then fails
+/// must be distinguishable from one that swallows the text, and a `Result`
+/// return would discard exactly that evidence.
+async fn drive_scripted_turn(
+    messages: Vec<InputMessage>,
+    script: Vec<Option<&'static str>>,
+) -> (Vec<StreamEvent>, Option<ApiError>, Vec<String>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = tokio::spawn(scripted_responses_backend(
+        listener,
+        script,
+        bodies.clone(),
+    ));
+
+    // No restarts: the connection sequence is then exactly the initial stream,
+    // the de-escalated one-shot recovery, and any shed retry.
+    let client = super::ChatGptBackendClient::new("token", None)
+        .with_base_url(format!("http://{addr}"))
+        .with_retry_policy(
+            0,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(1),
+        );
+    let request = MessageRequest {
+        messages,
+        ..request(vec![], None, None)
+    };
+    let mut stream = client.stream_message(&request).await.expect("open stream");
+
+    let mut events = Vec::new();
+    let failure = loop {
+        match stream.next_event().await {
+            Ok(Some(event)) => events.push(event),
+            Ok(None) => break None,
+            Err(error) => break Some(error),
+        }
+    };
+    server.abort();
+    let captured = bodies.lock().expect("bodies lock").clone();
+    (events, failure, captured)
+}
+
+/// Whether the turn surfaced `text` as a streamed text delta.
+fn surfaced_text(events: &[StreamEvent], text: &str) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::TextDelta { text: delta },
+                ..
+            }) if delta == text
+        )
+    })
+}
+
+/// A tool result carrying `bytes` of staged screenshot, the shape a browser/MCP
+/// screenshot tool produces and every later request then replays.
+fn screenshot_tool_result(bytes: usize) -> InputMessage {
+    InputMessage {
+        role: "user".to_string(),
+        content: vec![InputContentBlock::ToolResult {
+            tool_use_id: "call_screenshot".to_string(),
+            content: vec![
+                crate::types::ToolResultContentBlock::Text {
+                    text: "screenshot captured".to_string(),
+                },
+                crate::types::ToolResultContentBlock::Image {
+                    source: ImageSource {
+                        kind: "base64".to_string(),
+                        media_type: "image/png".to_string(),
+                        data: format!("SHEDMARKER{}", "A".repeat(bytes)),
+                    },
+                },
+            ],
+            is_error: false,
+            cache_control: None,
+        }],
+        thought_signature: None,
+        reasoning_replay: None,
+    }
+}
+
+/// Reproduction of the reported browser/MCP screenshot failure, end to end: the
+/// backend refuses with `"error": null`, the de-escalated recovery re-sends the
+/// same bytes and is refused too, and the ladder is spent.
+///
+/// Every attempt so far carried the identical payload, so the turn may not die
+/// there: the accumulated screenshot is shed once and the retry — the first
+/// request whose bytes actually differ — completes. The shed body must keep the
+/// `[image image/png]` placeholder (the model still learns an image was there)
+/// while carrying none of the pixels.
+#[tokio::test]
+async fn image_heavy_refusal_sheds_the_screenshot_and_recovers() {
+    let (events, failure, bodies) = drive_scripted_turn(
+        vec![screenshot_tool_result(1_200_000)],
+        vec![
+            Some(UNATTRIBUTED_FAILURE_FRAME),
+            None,
+            Some(SHED_RECOVERY_FRAMES),
+        ],
+    )
+    .await;
+
+    assert!(failure.is_none(), "the shed retry must recover the turn");
+    assert!(
+        surfaced_text(&events, "recovered after shed"),
+        "recovered text was not surfaced: {events:?}"
+    );
+
+    assert_eq!(bodies.len(), 3, "initial stream, recovery, then the shed retry");
+    assert!(
+        bodies[0].contains("SHEDMARKER"),
+        "the first request must carry the screenshot"
+    );
+    assert!(
+        !bodies[2].contains("SHEDMARKER"),
+        "the shed retry must carry none of the image bytes"
+    );
+    assert!(
+        bodies[2].contains("[image image/png]"),
+        "the shed retry must keep the placeholder: {}",
+        &bodies[2][..bodies[2].len().min(2000)]
+    );
+}
+
+/// The shape a real browser/MCP session has: every screenshot is stored beside
+/// a much larger TEXT artifact (accessibility snapshot, DOM dump, network
+/// listing), so the session that motivated this carries more text than pixels.
+///
+/// Requiring the images to be an outright majority would decline exactly this
+/// case and let the turn die, which is why the gate asks for a third instead.
+#[tokio::test]
+async fn screenshot_beside_bigger_snapshot_text_is_still_shed() {
+    let snapshot_text = InputMessage {
+        role: "user".to_string(),
+        content: vec![InputContentBlock::ToolResult {
+            tool_use_id: "call_snapshot".to_string(),
+            content: vec![crate::types::ToolResultContentBlock::Text {
+                text: "a11y-node ".repeat(200_000),
+            }],
+            is_error: false,
+            cache_control: None,
+        }],
+        thought_signature: None,
+        reasoning_replay: None,
+    };
+
+    // Images are the minority (1.2 MB against 2 MB of snapshot text) but still a
+    // leading term, so shedding is the move that can plausibly rescue the turn.
+    let (events, failure, bodies) = drive_scripted_turn(
+        vec![screenshot_tool_result(1_200_000), snapshot_text],
+        vec![
+            Some(UNATTRIBUTED_FAILURE_FRAME),
+            None,
+            Some(SHED_RECOVERY_FRAMES),
+        ],
+    )
+    .await;
+
+    assert!(
+        failure.is_none(),
+        "a text-heavy browser session must still get its shed retry: {failure:?}"
+    );
+    assert!(surfaced_text(&events, "recovered after shed"), "{events:?}");
+    assert_eq!(bodies.len(), 3, "the shed retry must be spent");
+    assert!(
+        !bodies[2].contains("SHEDMARKER"),
+        "the shed retry must carry none of the image bytes"
+    );
+    assert!(
+        bodies[2].contains("a11y-node"),
+        "only the pixels are shed; the text artifact stays"
+    );
+}
+
+/// One small image is not evidence of a size problem. The identical wire
+/// failure must spend no extra request and surface exactly as before —
+/// `RetriesExhausted` wrapping a `Transient` fault, so the ordinary retry /
+/// model-fallback path is untouched.
+#[tokio::test]
+async fn small_image_refusal_is_not_shed() {
+    let (_events, failure, bodies) = drive_scripted_turn(
+        vec![screenshot_tool_result(64)],
+        vec![Some(UNATTRIBUTED_FAILURE_FRAME), None, Some(SHED_RECOVERY_FRAMES)],
+    )
+    .await;
+
+    let error = failure.expect("a small-image refusal must still surface");
+    assert!(matches!(error, ApiError::RetriesExhausted { .. }), "{error}");
+    assert_eq!(
+        error.provider_error_class(),
+        crate::error::ProviderErrorClass::Transient,
+        "classification must be untouched: {error}"
+    );
+    assert_eq!(bodies.len(), 2, "no shed retry may be spent: {bodies:?}");
+}
+
+/// A text-only turn has nothing to shed, so the refusal surfaces unchanged.
+#[tokio::test]
+async fn text_only_refusal_is_not_shed() {
+    let (_events, failure, bodies) = drive_scripted_turn(
+        vec![InputMessage::user_text("hi")],
+        vec![Some(UNATTRIBUTED_FAILURE_FRAME), None, Some(SHED_RECOVERY_FRAMES)],
+    )
+    .await;
+
+    let error = failure.expect("a text-only refusal must still surface");
+    assert!(matches!(error, ApiError::RetriesExhausted { .. }), "{error}");
+    assert_eq!(
+        error.provider_error_class(),
+        crate::error::ProviderErrorClass::Transient,
+        "{error}"
+    );
+    assert_eq!(bodies.len(), 2, "no shed retry may be spent: {bodies:?}");
+}
+
+/// One transport chunk can carry visible text AND the terminal failure frame.
+///
+/// Three things must all hold for that chunk. The text the backend already
+/// produced must reach the caller — it is valid output, and swallowing it is a
+/// silent loss. It must be delivered exactly once, never re-sent behind a
+/// recovered response. And because it crossed the commit boundary on its way
+/// out, the turn may not be replayed afterwards: no shed, no restart, no
+/// non-streaming recovery, so the backend is contacted exactly once.
+#[tokio::test]
+async fn same_chunk_text_and_failure_surfaces_text_then_the_error() {
+    const COMMITTED_THEN_FAILED: &str = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"already streamed\"}\n\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":null}}\n\n",
+    );
+
+    let (events, failure, bodies) = drive_scripted_turn(
+        vec![screenshot_tool_result(1_200_000)],
+        vec![Some(COMMITTED_THEN_FAILED), Some(SHED_RECOVERY_FRAMES)],
+    )
+    .await;
+
+    assert!(
+        surfaced_text(&events, "already streamed"),
+        "text decoded before the failure must still reach the caller: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    delta: ContentBlockDelta::TextDelta { .. },
+                    ..
+                })
+            ))
+            .count(),
+        1,
+        "and exactly once — a recovered response must not repeat it: {events:?}"
+    );
+
+    let error = failure.expect("a committed failure must still propagate");
+    assert!(
+        matches!(error, ApiError::StreamApi { .. }),
+        "a committed failure is not wrapped as exhausted: {error}"
+    );
+    assert_eq!(bodies.len(), 1, "a committed turn must not re-open: {bodies:?}");
+}
+
+/// When the shed retry is refused too, the turn surfaces the original exhausted
+/// error and stops — the one-shot flag must not let a second shed run.
+#[tokio::test]
+async fn shed_retry_failure_surfaces_the_original_error_once() {
+    let (_events, failure, bodies) = drive_scripted_turn(
+        vec![screenshot_tool_result(1_200_000)],
+        vec![
+            Some(UNATTRIBUTED_FAILURE_FRAME),
+            None,
+            Some(UNATTRIBUTED_FAILURE_FRAME),
+            None,
+            Some(SHED_RECOVERY_FRAMES),
+        ],
+    )
+    .await;
+
+    let error = failure.expect("a twice-refused turn must surface");
+    assert!(matches!(error, ApiError::RetriesExhausted { .. }), "{error}");
+    assert_eq!(
+        bodies.len(),
+        4,
+        "exactly one shed retry (plus its own recovery attempt): {}",
+        bodies.len()
+    );
+}
+
 #[tokio::test]
 async fn terminal_failure_before_commit_falls_back_to_non_stream_response() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3004,6 +3383,70 @@ fn failed_event_surfaces_as_stream_error_not_empty_stream() {
     assert!(
         !failure.is_retryable(),
         "invalid-request class is not retryable"
+    );
+}
+
+/// A terminal frame naming neither a code nor a message must still carry enough
+/// detail to tell a refused request from a transient fault — while keeping the
+/// substring the retry classifier and the pre-commit recovery both key on.
+///
+/// The frame is provider-controlled, so the digest is an allowlisted projection
+/// of scalar diagnostic fields: no member outside that list — known content
+/// (prompts, model output), nested error payloads, or a field this build has
+/// never seen — may reach an error string that is displayed, logged, and
+/// persisted to the session transcript.
+#[test]
+fn message_less_failure_frame_carries_bounded_digest() {
+    let mut state = ResponsesStreamState::new("gpt-5.5".to_string());
+    state.ingest(&json!({
+        "type": "response.failed",
+        "unknown_top_level": "UNKNOWN TOP SECRET",
+        // An allowlisted pointer holding a non-scalar must be skipped whole.
+        "param": {"nested": "OBJECT PARAM SECRET"},
+        "response": {
+            "id": "resp_1",
+            "status": "failed",
+            "error": {"details": ["NESTED DETAIL SECRET"]},
+            "instructions": "SYSTEM PROMPT TEXT",
+            "output": [{"type": "message", "content": "MODEL OUTPUT TEXT"}],
+            "unknown_member": "UNKNOWN RESPONSE SECRET",
+        },
+    }));
+    let failure = state.take_failure().expect("failure must be recorded");
+    let text = failure.to_string();
+    assert!(
+        text.contains("backend reported a terminal stream failure"),
+        "{text}"
+    );
+    assert!(text.contains("type=\"response.failed\""), "{text}");
+    assert!(text.contains("status=\"failed\""), "{text}");
+    for secret in [
+        "SYSTEM PROMPT TEXT",
+        "MODEL OUTPUT TEXT",
+        "NESTED DETAIL SECRET",
+        "UNKNOWN TOP SECRET",
+        "UNKNOWN RESPONSE SECRET",
+        "OBJECT PARAM SECRET",
+    ] {
+        assert!(!text.contains(secret), "{secret} leaked into {text}");
+    }
+    assert!(failure.is_retryable(), "an uncoded fault stays retryable");
+    assert!(super::is_terminal_stream_failure(&failure), "{text}");
+
+    // A long allowlisted value is truncated rather than pasted in whole.
+    let mut state = ResponsesStreamState::new("gpt-5.5".to_string());
+    state.ingest(&json!({"type": "error", "param": "p".repeat(500)}));
+    let failure = state.take_failure().expect("failure must be recorded");
+    let text = failure.to_string();
+    assert!(text.contains('…'), "{text}");
+    assert!(text.len() < 300, "digest must stay bounded: {text}");
+
+    let mut state = ResponsesStreamState::new("gpt-5.5".to_string());
+    state.ingest(&json!({"type": "error"}));
+    let failure = state.take_failure().expect("failure must be recorded");
+    assert_eq!(
+        failure.to_string(),
+        "api stream error: backend reported a terminal stream failure (type=\"error\")"
     );
 }
 

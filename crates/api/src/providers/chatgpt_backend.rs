@@ -1022,11 +1022,12 @@ impl ResponsesStreamState {
                 self.record_failure(
                     event.pointer("/response/error/code"),
                     event.pointer("/response/error/message"),
+                    event,
                 );
                 Vec::new()
             }
             "error" => {
-                self.record_failure(event.get("code"), event.get("message"));
+                self.record_failure(event.get("code"), event.get("message"), event);
                 Vec::new()
             }
             _ => Vec::new(),
@@ -1036,15 +1037,18 @@ impl ResponsesStreamState {
     /// Record a terminal backend failure (`response.failed` / `error`).
     /// Server-side faults and throttles are retryable (the pre-commit restart
     /// path re-issues the request); invalid-request class codes are not.
-    fn record_failure(&mut self, code: Option<&Value>, message: Option<&Value>) {
+    fn record_failure(&mut self, code: Option<&Value>, message: Option<&Value>, event: &Value) {
         if self.finished || self.failure.is_some() {
             return;
         }
         let code = code.and_then(Value::as_str).unwrap_or_default().to_string();
-        let message = message
-            .and_then(Value::as_str)
-            .unwrap_or("backend reported a terminal stream failure")
-            .to_string();
+        let message = match message.and_then(Value::as_str) {
+            Some(text) => text.to_string(),
+            None => match failure_frame_digest(event) {
+                Some(digest) => format!("{TERMINAL_STREAM_FAILURE} ({digest})"),
+                None => TERMINAL_STREAM_FAILURE.to_string(),
+            },
+        };
         let retryable = matches!(
             code.as_str(),
             "server_error" | "rate_limit_exceeded" | "overloaded" | "slow_down" | ""
@@ -2063,6 +2067,22 @@ impl ChatGptStream {
                 }
                 return Ok(Some(event));
             }
+            // A terminal `response.failed` / `error` frame surfaces as a real
+            // error (restartable pre-commit) — never as a silent zero-event
+            // end-of-stream the runtime would misread as an empty assistant
+            // turn. It is handled only once the queue above is drained: one
+            // chunk can carry visible text AND the terminal frame, and that
+            // text is valid output the caller must still receive. Draining
+            // first also means `observe_startup_event` has already set the
+            // commit boundary for it, so the replay decision below sees a
+            // committed turn without a second mechanism to keep in sync.
+            if let Some(failure) = self.state.take_failure() {
+                self.recover_or_restart_precommit(failure).await?;
+                quiet_chunks = 0;
+                quiet_since = None;
+                quiet_notified = false;
+                continue;
+            }
             if self.done {
                 return Ok(None);
             }
@@ -2104,15 +2124,6 @@ impl ChatGptStream {
                         let events = self.state.ingest(&value);
                         emitted |= !events.is_empty();
                         self.pending.extend(events);
-                    }
-                    // A terminal `response.failed` / `error` frame surfaces as a
-                    // real error (restartable pre-commit) — never as a silent
-                    // zero-event end-of-stream the runtime would misread as an
-                    // empty assistant turn.
-                    if let Some(failure) = self.state.take_failure() {
-                        self.recover_or_restart_precommit(failure).await?;
-                        quiet_chunks = 0;
-                        continue;
                     }
                     if emitted {
                         quiet_chunks = 0;
@@ -2165,6 +2176,12 @@ impl ChatGptStream {
         }
         if self.can_restart(&error) {
             self.restart(error).await?;
+            return Ok(());
+        }
+        // The ladder is spent and every attempt re-sent the same bytes. Changing
+        // the request is the only lever left, so try shedding the image bulk
+        // once before giving the turn up.
+        if is_terminal_stream_failure(&error) && self.recover_by_shedding_images().await? {
             return Ok(());
         }
         Err(self.wrap_restart_exhaustion(error))
@@ -2291,6 +2308,55 @@ impl ChatGptStream {
         }
     }
 
+    /// Last resort before a dead turn: re-open the stream once with the image
+    /// bulk stripped out of the request.
+    ///
+    /// Every attempt the ladder just spent re-sent the *identical* bytes — both
+    /// `restart` and [`deescalated_recovery_request`] change only the reasoning
+    /// tier — so exhaustion proves replay cannot help. This is the one move that
+    /// changes what is actually sent. It fires only when the images dominate the
+    /// payload ([`shed_image_payload`]) and stays pre-commit (a committed turn
+    /// must never replay), so a failure that had nothing to do with size costs
+    /// one extra request and then surfaces the original error unchanged.
+    ///
+    /// It is inherently once-per-stream, with no flag to keep in sync: a shed
+    /// request carries placeholders instead of pixels, so the very next
+    /// [`shed_image_payload`] on it finds nothing left to shed and declines.
+    ///
+    /// Dropping the re-attached image items shortens the `input` array, so this
+    /// request misses the prompt cache and re-bills the whole prefix. That is the
+    /// price of the last attempt before a dead turn, and it is why the gate is
+    /// deliberately narrow rather than opportunistic.
+    ///
+    /// Returns `true` when the caller should resume its event loop on the
+    /// re-opened, lighter stream.
+    async fn recover_by_shedding_images(&mut self) -> Result<bool, ApiError> {
+        if self.committed {
+            return Ok(false);
+        }
+        let Some(request) = shed_image_payload(&self.request) else {
+            return Ok(false);
+        };
+        let Ok(response) = self.client.open_stream_response(&request).await else {
+            return Ok(false);
+        };
+        eprintln!(
+            "[zo] gpt stream refused with no reason {} times; retrying once without the \
+             {} image bytes it was carrying",
+            self.restart_attempts.saturating_add(1),
+            image_payload_bytes(&self.request),
+        );
+        self.request = request;
+        self.response = response;
+        self.parser = ResponsesSseParser::new();
+        self.state = ResponsesStreamState::new(self.request.model.clone())
+            .with_session_id(self.client.cache_scope().to_string());
+        self.pending.clear();
+        self.done = false;
+        self.reset_startup_watchdog();
+        Ok(true)
+    }
+
     /// Re-open the stream after a pre-commit fault: back off (jittered), then
     /// replace the live response and parser/state so the loop resumes from a
     /// clean turn. Any partial bytes buffered in the old parser are discarded
@@ -2330,6 +2396,192 @@ impl ChatGptStream {
         self.reset_startup_watchdog();
         Ok(())
     }
+}
+
+/// Stand-in text for a terminal failure frame that carried no message. The
+/// `terminal stream failure` substring is load-bearing: [`is_terminal_stream_failure`]
+/// keys the pre-commit recovery on it, and `core_types::retry_signal` classifies
+/// it as transient. Anything appended must keep it contiguous.
+const TERMINAL_STREAM_FAILURE: &str = "backend reported a terminal stream failure";
+
+/// Diagnostic fields lifted into [`failure_frame_digest`], as display label and
+/// the `serde_json` pointer each is read from. Strictly allowlisted: a terminal
+/// failure frame is provider-controlled, so a denylist can never prove that
+/// prompts, model output, tool payloads, or nested error details stay out of an
+/// error string that gets displayed, logged, and persisted to the transcript.
+const FAILURE_FRAME_DIGEST_FIELDS: [(&str, &str); 8] = [
+    ("type", "/type"),
+    ("code", "/code"),
+    ("param", "/param"),
+    ("status", "/response/status"),
+    ("error.code", "/response/error/code"),
+    ("error.type", "/response/error/type"),
+    ("error.param", "/response/error/param"),
+    ("incomplete", "/response/incomplete_details/reason"),
+];
+
+/// Longest rendered value kept per [`FAILURE_FRAME_DIGEST_FIELDS`] entry. With a
+/// fixed field count this bounds the whole digest.
+const FAILURE_FRAME_FIELD_MAX_LEN: usize = 80;
+
+/// Digest of a terminal failure frame, used only when the backend named neither
+/// an error code nor a message — without it the turn dies with a bare
+/// [`TERMINAL_STREAM_FAILURE`] and nothing to tell a refused request from a
+/// transient fault.
+fn failure_frame_digest(event: &Value) -> Option<String> {
+    let parts: Vec<String> = FAILURE_FRAME_DIGEST_FIELDS
+        .iter()
+        .filter_map(|(label, pointer)| {
+            let value = event.pointer(pointer)?;
+            // Scalars only. An object or array under an allowlisted pointer is
+            // still provider-controlled content, and rendering it whole would
+            // reopen the leak the allowlist exists to close.
+            if !matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_)) {
+                return None;
+            }
+            // `to_string` quotes and escapes, so a value carrying newlines or
+            // control bytes cannot break out of the digest.
+            Some(format!("{label}={}", truncate_digest_value(&value.to_string())))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn truncate_digest_value(rendered: &str) -> String {
+    if rendered.len() <= FAILURE_FRAME_FIELD_MAX_LEN {
+        return rendered.to_string();
+    }
+    let cut = (0..=FAILURE_FRAME_FIELD_MAX_LEN)
+        .rev()
+        .find(|index| rendered.is_char_boundary(*index))
+        .unwrap_or(0);
+    format!("{}…", &rendered[..cut])
+}
+
+/// Smallest image payload worth shedding, in base64 bytes.
+///
+/// Anchored to what a real screenshot actually weighs rather than to a round
+/// number: the wire-lowering guard clamps every image to 2000px per side
+/// (`runtime::image_guard::IMAGE_CLAMP_DIMENSION`), and a clamped full-page PNG
+/// capture lands in the high hundreds of kilobytes once base64 inflates it by
+/// 4/3. One megabyte therefore means "more than a single screenshot's worth of
+/// pixels is riding along" — the accumulation case this exists for — while a
+/// pasted avatar, an icon, or one small capture stays far below it and can never
+/// trigger a shed.
+const IMAGE_SHED_MIN_BYTES: usize = 1024 * 1024;
+
+/// Base64 bytes the request spends on images, counting both directly attached
+/// images and the ones staged inside tool results (where browser/MCP screenshot
+/// tools put them, and from where every later request replays them).
+fn image_payload_bytes(request: &MessageRequest) -> usize {
+    payload_split(request).0
+}
+
+/// `(image bytes, everything else)` for the request, both measured in the units
+/// that actually reach the wire: base64 for images, UTF-8 for text.
+fn payload_split(request: &MessageRequest) -> (usize, usize) {
+    use crate::types::ToolResultContentBlock;
+
+    let mut images = 0usize;
+    let mut other = request
+        .system
+        .iter()
+        .flatten()
+        .map(|block| match block {
+            crate::types::SystemBlock::Text { text, .. } => text.len(),
+        })
+        .sum::<usize>();
+    for message in &request.messages {
+        for block in &message.content {
+            match block {
+                InputContentBlock::Image { source, .. } => images += source.data.len(),
+                InputContentBlock::Text { text, .. } => other += text.len(),
+                InputContentBlock::ToolUse { input, .. } => other += input.to_string().len(),
+                InputContentBlock::ToolResult { content, .. } => {
+                    for block in content {
+                        match block {
+                            ToolResultContentBlock::Image { source } => images += source.data.len(),
+                            ToolResultContentBlock::Text { text } => other += text.len(),
+                            ToolResultContentBlock::Json { value } => {
+                                other += value.to_string().len();
+                            }
+                        }
+                    }
+                }
+                InputContentBlock::Document { .. }
+                | InputContentBlock::Thinking { .. }
+                | InputContentBlock::RedactedThinking { .. } => {}
+            }
+        }
+    }
+    (images, other)
+}
+
+/// The request with its image pixels replaced by the same `[image <type>]`
+/// placeholder [`super::flatten_tool_result_content`] already renders, or `None`
+/// when shedding cannot plausibly be what the backend was refusing.
+///
+/// Two conditions must hold together, because either alone is a guess: the
+/// images must clear [`IMAGE_SHED_MIN_BYTES`] in absolute terms, AND they must
+/// be at least a third of the request. A turn whose bulk is prose or tool output
+/// is not one that shrinking images can rescue, so it keeps the ordinary failure
+/// path instead.
+///
+/// A third, not a half: a browser/MCP session stores a big *text* artifact
+/// beside each screenshot (accessibility snapshot, DOM dump, network listing),
+/// so the very sessions this exists for routinely carry more text than pixels.
+/// Demanding an outright majority would decline exactly the case that motivated
+/// it. A third still means the images are a leading term, and the cost of being
+/// wrong is bounded — one extra request, then the original error.
+///
+/// Blocks are REPLACED, never removed: item count and order, `call_id` pairing,
+/// and the flattened `function_call_output` text all stay byte-identical, so the
+/// Responses `input` array a shed request builds differs from the original in
+/// exactly one way — the `input_image` items are gone. The model still reads
+/// that an image was there.
+fn shed_image_payload(request: &MessageRequest) -> Option<MessageRequest> {
+    use crate::types::ToolResultContentBlock;
+
+    let (images, other) = payload_split(request);
+    // `images >= (images + other) / 3`, written so it cannot overflow.
+    if images < IMAGE_SHED_MIN_BYTES || images.saturating_mul(2) < other {
+        return None;
+    }
+    let mut next = request.clone();
+    for message in &mut next.messages {
+        for block in &mut message.content {
+            match block {
+                InputContentBlock::Image { source, .. } => {
+                    *block = InputContentBlock::Text {
+                        text: image_placeholder(&source.media_type),
+                        cache_control: None,
+                    };
+                }
+                InputContentBlock::ToolResult { content, .. } => {
+                    for block in content.iter_mut() {
+                        if let ToolResultContentBlock::Image { source } = block {
+                            *block = ToolResultContentBlock::Text {
+                                text: image_placeholder(&source.media_type),
+                            };
+                        }
+                    }
+                }
+                InputContentBlock::Text { .. }
+                | InputContentBlock::Document { .. }
+                | InputContentBlock::ToolUse { .. }
+                | InputContentBlock::Thinking { .. }
+                | InputContentBlock::RedactedThinking { .. } => {}
+            }
+        }
+    }
+    Some(next)
+}
+
+/// The placeholder an image degrades to. Byte-identical to what
+/// [`super::flatten_tool_result_content`] writes for an image block, so a shed
+/// tool result flattens to the same `function_call_output` string as before.
+fn image_placeholder(media_type: &str) -> String {
+    format!("[image {media_type}]")
 }
 
 fn is_terminal_stream_failure(error: &ApiError) -> bool {
