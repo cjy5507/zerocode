@@ -472,15 +472,6 @@ impl ModelPickerModal {
             )));
         }
 
-        // A query that matches nothing used to paint an empty box: no rows, no
-        // explanation, and no hint that the list is intact behind the filter.
-        if self.filtered.is_empty() && !self.entries.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "  no match — Backspace to widen",
-                Style::new().fg(theme.palette.muted),
-            )));
-        }
-
         let first_provider = self
             .filtered
             .first()
@@ -601,9 +592,13 @@ impl ModelPickerModal {
 
             lines.push(Line::from(spans));
         }
+        // A query that matches nothing painted a bare "No models match" — true,
+        // but it left the reader without the one thing they need next. Say how
+        // to get back. Exactly one notice: a second line in the same state
+        // reads as a second, different problem.
         if self.filtered.is_empty() && !self.query.is_empty() {
             lines.push(Line::from(Span::styled(
-                "  No models match",
+                "  No models match — Backspace to widen",
                 Style::new().fg(theme.palette.dim),
             )));
         }
@@ -1440,6 +1435,29 @@ mod tests {
             }
             other => panic!("expected sonnet selection, got {other:?}"),
         }
+    }
+
+    /// A query that matches nothing has to explain itself exactly once. Two
+    /// notices stacked in the same state read as two separate problems, and
+    /// the pair only appears together — filtered-empty with a live query — so
+    /// neither notice alone reveals it.
+    #[test]
+    fn an_unmatched_filter_shows_exactly_one_notice() {
+        let mut modal = ModelPickerModal::new(registry());
+        for ch in "zzzzz".chars() {
+            modal.handle_key(press(KeyCode::Char(ch)));
+        }
+        assert!(modal.is_empty(), "the query matches nothing");
+        let rendered: Vec<String> = modal
+            .render_lines(&Theme::default_dark())
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect();
+        let notices = rendered
+            .iter()
+            .filter(|row| row.to_lowercase().contains("match"))
+            .count();
+        assert_eq!(notices, 1, "one no-match notice, not two: {rendered:?}");
     }
 
     #[test]

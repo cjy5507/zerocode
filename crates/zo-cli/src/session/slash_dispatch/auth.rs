@@ -934,6 +934,15 @@ fn open_provider_modal_on(app: &mut zo_cli::tui::App, command: &str) {
                     .in_group(API_KEY),
             );
         }
+        // The wizard closes the API-key section it belongs to. Appending it
+        // after the local providers would leave the list ordered
+        // API key → On this machine → API key.
+        ids.push("connect-custom:openai-compatible".to_string());
+        rows.push(
+            ChoiceRow::new("Custom")
+                .describe("OpenAI-compatible endpoint wizard")
+                .in_group(API_KEY),
+        );
         for (id, label) in [("ollama", "Ollama"), ("lmstudio", "LM Studio")] {
             ids.push(format!("connect:{id}"));
             rows.push(
@@ -943,12 +952,6 @@ fn open_provider_modal_on(app: &mut zo_cli::tui::App, command: &str) {
                     .in_group(ON_MACHINE),
             );
         }
-        ids.push("connect-custom:openai-compatible".to_string());
-        rows.push(
-            ChoiceRow::new("Custom")
-                .describe("OpenAI-compatible endpoint wizard")
-                .in_group(API_KEY),
-        );
     }
     let title = if command == "connect" {
         "Connect — select provider"

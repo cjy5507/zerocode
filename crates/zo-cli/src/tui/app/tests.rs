@@ -8657,6 +8657,35 @@ fn session_picker_esc_cancels() {
     assert!(app.active_modal.is_none());
 }
 
+/// The provider list filters as you type, so it has to receive the text that
+/// arrives as a paste rather than as keystrokes — a bracketed clipboard paste,
+/// and in several terminals every IME-composed syllable. Without this the
+/// filter is simply dead for Hangul.
+#[test]
+fn login_picker_filter_accepts_pasted_and_ime_committed_text() {
+    let mut app = test_app();
+    app.open_login_modal(
+        "/connect",
+        vec!["Claude".to_string(), "Ollama".to_string()],
+        vec!["connect:claude".to_string(), "connect:ollama".to_string()],
+    );
+
+    app.handle_paste("oll");
+
+    let modal = app
+        .active_modal_as::<crate::tui::ChoicePickerModal>()
+        .expect("the login picker is on the slot");
+    assert_eq!(modal.query(), "oll", "paste reaches the type-ahead filter");
+    assert_eq!(modal.len(), 1, "and narrows the list");
+
+    // The narrowed pick still resolves through the unfiltered side-list.
+    let action = app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(
+        matches!(action, AppAction::Submit(ref t) if t == "/connect ollama"),
+        "expected `/connect ollama`, got {action:?}"
+    );
+}
+
 #[test]
 fn login_picker_resubmits_provider_command() {
     // A non-`connect-key` token re-enters the text path as `/<command> <provider>`

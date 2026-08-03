@@ -2692,6 +2692,20 @@ impl App {
             }
             return;
         }
+        // The list pickers (`/login`, `/connect`, `/resume`, slash arg-pickers)
+        // filter as you type, so text arriving as a paste has to reach the same
+        // type-ahead keystrokes do — including every IME-composed syllable,
+        // which several terminals deliver as a paste. Without this the filter
+        // is simply dead for Hangul.
+        if matches!(
+            self.mode,
+            AppMode::ModalLogin | AppMode::ModalSession | AppMode::ModalArgPick
+        ) {
+            if let Some(modal) = self.active_modal_as::<ChoicePickerModal>() {
+                modal.paste_text(text);
+            }
+            return;
+        }
         // Agents-viewer message box: IME-committed text (e.g. a composed
         // Hangul syllable) reaches the TUI as a paste in several terminals,
         // so dropping it here made the box look Korean-dead.

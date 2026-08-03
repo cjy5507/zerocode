@@ -120,7 +120,8 @@ pub struct ChoicePickerModal {
     /// Live type-ahead query, matched as a fuzzy subsequence against a row's
     /// label, description, and group.
     query: String,
-    /// Indices into `rows` surviving `query`, in registry order.
+    /// Indices into `rows` surviving `query`: sections contiguous in
+    /// first-appearance order, registry order preserved inside each section.
     ///
     /// Selection reports the ORIGINAL index taken from here. The host indexes
     /// parallel side-lists with it (`login_provider_ids`, `session_ids` in
@@ -142,14 +143,17 @@ impl ChoicePickerModal {
     /// Construct a modal from structured rows (descriptions, badges, groups).
     #[must_use]
     pub fn with_rows(title: impl Into<String>, rows: Vec<ChoiceRow>) -> Self {
-        let filtered = (0..rows.len()).collect();
-        Self {
+        let mut modal = Self {
             title: title.into(),
             rows,
             query: String::new(),
-            filtered,
+            filtered: Vec::new(),
             cursor: 0,
-        }
+        };
+        // Through `refilter` even with an empty query, so the initial view is
+        // section-ordered by the same rule every later view uses.
+        modal.refilter();
+        modal
     }
 
     /// Title displayed in the modal border.
@@ -216,6 +220,24 @@ impl ChoicePickerModal {
             })
             .map(|(index, _)| index)
             .collect();
+        // Keep each section contiguous, ordered by where it first appears.
+        // Rows keep their registry order inside a section, so only whole
+        // sections move. Without this a caller that appends a row belonging to
+        // an earlier section — easy, since rows and their parallel id list are
+        // built by pushing — reopens that section further down, printing the
+        // same heading twice.
+        let mut sections: Vec<&str> = Vec::new();
+        let mut ranked: Vec<(usize, usize)> = Vec::with_capacity(self.filtered.len());
+        for &index in &self.filtered {
+            let group = self.rows[index].group.as_deref().unwrap_or_default();
+            let rank = sections.iter().position(|seen| *seen == group).unwrap_or_else(|| {
+                sections.push(group);
+                sections.len() - 1
+            });
+            ranked.push((rank, index));
+        }
+        ranked.sort_by_key(|(rank, _)| *rank);
+        self.filtered = ranked.into_iter().map(|(_, index)| index).collect();
         if self.cursor >= self.filtered.len() {
             self.cursor = self.filtered.len().saturating_sub(1);
         }
@@ -824,6 +846,55 @@ mod tests {
         assert!(
             claude.trim_end().ends_with("[saved]"),
             "the badge closes the row: {claude}"
+        );
+    }
+
+    /// A section is one contiguous block with one heading. A caller that
+    /// appends a row belonging to an earlier section — easy to do, since the
+    /// rows and their parallel id list are built by pushing — must not reopen
+    /// that section further down: the same heading printed twice reads as two
+    /// different sections, and the reader cannot tell which is which.
+    #[test]
+    fn a_section_is_rendered_once_even_when_its_rows_are_appended_late() {
+        let rows = vec![
+            ChoiceRow::new("alpha").in_group("First"),
+            ChoiceRow::new("beta").in_group("Second"),
+            ChoiceRow::new("gamma").in_group("First"),
+        ];
+        let modal = ChoicePickerModal::with_rows("pick", rows);
+        let rendered: Vec<String> = modal
+            .render_lines(&Theme::zo(), 60)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert_eq!(
+            rendered.iter().filter(|row| row.trim() == "First").count(),
+            1,
+            "one heading per section: {rendered:?}"
+        );
+        // The late row joins its own section rather than being stranded under
+        // whichever heading happened to precede it.
+        let first = rendered
+            .iter()
+            .position(|row| row.trim() == "First")
+            .expect("First heading");
+        let second = rendered
+            .iter()
+            .position(|row| row.trim() == "Second")
+            .expect("Second heading");
+        let gamma = rendered
+            .iter()
+            .position(|row| row.contains("gamma"))
+            .expect("gamma row");
+        assert!(
+            first < gamma && gamma < second,
+            "gamma sits under First: {rendered:?}"
         );
     }
 
