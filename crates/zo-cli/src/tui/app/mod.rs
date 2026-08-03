@@ -2265,11 +2265,9 @@ impl App {
                         self.hud_state.todo_items[step.index - 1].content
                     ),
                     format!(
-                        "{}{}/{} {}",
+                        "{}{}",
                         crate::tui::blocks::system::PLAN_CHAPTER_PREFIX,
-                        step.index,
-                        step.total,
-                        step.text
+                        crate::tui::hud::now_step_label(&step)
                     ),
                 )
             })

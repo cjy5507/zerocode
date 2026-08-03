@@ -212,6 +212,23 @@ pub(crate) fn now_step(items: &[TodoChecklistItem]) -> Option<NowStep<'_>> {
     })
 }
 
+/// The NOW phrase both live surfaces print: `step 3/7 <sentence>`.
+///
+/// The coordinate is labeled on purpose. It shares a screen with the plan
+/// card's `N/M done` tally, and two bare `N/M` counters of the same shape read
+/// as one number contradicting itself — this one is a *position*, that one a
+/// *completion count*. They legitimately disagree: a plan whose active step is
+/// listed first while five others are finished shows position 1 against 5
+/// done, which without the word reads as progress running backwards.
+///
+/// Owned here rather than formatted at each call site, for the reason
+/// [`step_sentence`] is: the activity line and the transcript chapter must not
+/// be able to word the same step differently.
+#[must_use]
+pub(crate) fn now_step_label(step: &NowStep<'_>) -> String {
+    format!("step {}/{} {}", step.index, step.total, step.text)
+}
+
 /// A Todo item ready for TUI rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TodoChecklistItem {
@@ -2049,6 +2066,25 @@ mod tests {
         assert_eq!(now.index, 2, "1-based position of the first in-progress item");
         assert_eq!(now.total, 4);
         assert_eq!(now.text, "Verifying parser");
+    }
+
+    /// The label has to name its number, because the plan card beside it shows
+    /// a same-shaped `N/M done` tally that counts something else — and the two
+    /// legitimately disagree, as here: position 1 while 2 of 3 are finished.
+    #[test]
+    fn the_now_label_names_its_number_a_step_position() {
+        let items = vec![
+            step("Ship it", "Shipping it", TodoChecklistStatus::InProgress),
+            step("Write parser", "Writing parser", TodoChecklistStatus::Completed),
+            step("Verify parser", "Verifying parser", TodoChecklistStatus::Completed),
+        ];
+        let now = now_step(&items).expect("an in-progress step exists");
+
+        assert_eq!(now_step_label(&now), "step 1/3 Shipping it");
+        assert!(
+            !now_step_label(&now).starts_with("1/3"),
+            "a bare coordinate reads as the plan card's done-tally"
+        );
     }
 
     #[test]

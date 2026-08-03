@@ -2551,6 +2551,25 @@ fn an_active_plan_step_pushes_one_chapter_notice() {
     );
 }
 
+/// The plan card sitting beside this line reads `N/M done` — a completion
+/// tally. The chapter's `N/M` is a *position*, and two bare counters of the
+/// same shape on one screen read as one number contradicting itself: a plan
+/// whose active step is first while five others are done rendered `1/6` next
+/// to `5/6 done`, which looks like progress running backwards.
+#[test]
+fn a_chapter_labels_its_coordinate_as_a_step_position() {
+    let mut app = test_app();
+    app.begin_turn_with_generation(0);
+    app.push_block(todo_step_result(74, "todo-chapter-label"));
+
+    let chapters = plan_chapters(&app);
+    assert_eq!(chapters.len(), 1, "{chapters:?}");
+    assert!(
+        chapters[0].contains("step 1/2"),
+        "the coordinate must name itself a step, not pass as a done-tally: {chapters:?}"
+    );
+}
+
 #[test]
 fn re_applying_the_same_active_step_pushes_no_second_chapter() {
     // `TodoWrite` lands repeatedly within a turn (a status flip elsewhere in the

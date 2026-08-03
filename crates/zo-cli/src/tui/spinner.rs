@@ -172,7 +172,7 @@ impl ActivityContext {
         let ctx_percent = crate::tui::hud::context_pressure_percent(state)
             .map(|pct| u8::try_from(pct).unwrap_or(100));
         let now = crate::tui::hud::now_step(&state.todo_items)
-            .map(|step| format!("{}/{} {}", step.index, step.total, step.text));
+            .map(|step| crate::tui::hud::now_step_label(&step));
         Self {
             model: non_empty_label(&view.model),
             workflow: view.workflow.as_deref().and_then(non_empty_label),
