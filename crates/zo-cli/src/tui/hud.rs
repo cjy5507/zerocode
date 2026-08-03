@@ -1924,6 +1924,14 @@ fn quota_headroom_spans(state: &HudState, theme: &Theme) -> Vec<Span<'static>> {
             format!("{approx}{remaining}% left"),
             Style::new().fg(ctx_gauge_color(f64::from(used) / 100.0, theme)),
         ));
+        // When it comes back, in the same clock language the rail uses. A
+        // percentage says how bad it is; only this says how long it lasts.
+        if let Some(reset) = view.resets_at_unix.and_then(|at| i64::try_from(at).ok()) {
+            spans.push(Span::styled(
+                format!(" ↺{}", core_types::date::local_weekday_clock(reset)),
+                Style::new().fg(theme.palette.faint),
+            ));
+        }
     }
     spans
 }
@@ -3214,7 +3222,7 @@ mod tests {
                 provider: api::ProviderKind::Anthropic,
                 window_label: "5h".to_string(),
                 remaining_percent: Some(12),
-                resets_at_unix: None,
+                resets_at_unix: Some(1_786_240_800),
                 estimated: false,
             },
             api::quota::ProviderQuotaView {
@@ -3238,6 +3246,11 @@ mod tests {
         assert!(
             !text.contains("61% left"),
             "the roomier window of a provider already shown stays on the rail: {text:?}"
+        );
+        // A percentage says how bad it is; the instant says how long it lasts.
+        assert!(
+            text.contains('↺') && text.contains(':'),
+            "the footer says when the window comes back: {text:?}"
         );
     }
 

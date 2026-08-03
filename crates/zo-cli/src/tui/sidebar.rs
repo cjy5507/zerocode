@@ -2429,8 +2429,23 @@ fn quota_gauges(
     muted: Style,
 ) -> Vec<Line<'static>> {
     let now = now_unix();
-    let mut lines = Vec::new();
+    // One row per provider — its nearest window. Listing every window stacked
+    // four rows into a rail that has to share its height with everything else,
+    // and the roomier window of a provider is never the fact that stops work.
+    let mut tightest: Vec<&api::quota::ProviderQuotaView> = Vec::new();
     for view in views {
+        if view.remaining_percent.is_none() {
+            continue;
+        }
+        match tightest.iter_mut().find(|kept| kept.provider == view.provider) {
+            Some(kept) if view.remaining_percent < kept.remaining_percent => *kept = view,
+            Some(_) => {}
+            None => tightest.push(view),
+        }
+    }
+
+    let mut lines = Vec::new();
+    for view in tightest {
         let Some(remaining) = view.remaining_percent else {
             continue;
         };
@@ -2512,21 +2527,16 @@ fn format_reset(now: u64, resets_at: u64) -> String {
     if resets_at <= now {
         return "now".to_string();
     }
+    // One language for every reset on screen. Mixing a countdown for the near
+    // ones with a clock time for the far ones put "2h20m" and "Sun 11:00" in
+    // the same column, which reads as two different kinds of fact — and the
+    // countdown is the one that cannot be checked against what the user already
+    // knows about when their window comes back.
     let mins = (resets_at - now) / 60;
-    // Past a day a countdown stops being checkable. "5d" cannot be compared
-    // with what the user already knows — that the weekly window comes back
-    // Sunday morning — and it is their own clock they know it in, not UTC. So a
-    // distant reset is named, and only a near one counts down, where "3h12m" is
-    // the more useful of the two.
-    if mins >= 1440 {
-        return i64::try_from(resets_at)
-            .map_or_else(|_| format!("{}d", mins / 1440), core_types::date::local_weekday_clock);
-    }
-    if mins >= 60 {
-        format!("{}h{:02}m", mins / 60, mins % 60)
-    } else {
-        format!("{mins}m")
-    }
+    i64::try_from(resets_at).map_or_else(
+        |_| format!("{mins}m"),
+        core_types::date::local_weekday_clock,
+    )
 }
 
 fn now_unix() -> u64 {

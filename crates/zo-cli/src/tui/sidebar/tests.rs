@@ -147,16 +147,16 @@ fn quota_gauges_render_measured_and_estimated_rows() {
 #[test]
 fn format_reset_compact_forms() {
     assert_eq!(format_reset(100, 100), "now");
-    assert_eq!(format_reset(0, 45 * 60), "45m");
-    assert_eq!(format_reset(0, 2 * 3600 + 11 * 60), "2h11m");
-    // Past a day the countdown gives way to the wall-clock instant, because a
-    // "3d" cannot be checked against what the user already knows about when
-    // their weekly window comes back.
-    let distant = format_reset(0, 3 * 86_400);
-    assert!(
-        distant.contains(':') && distant.len() >= 8,
-        "a distant reset names its local weekday and time: {distant}"
-    );
+
+    // Every future reset is a wall-clock instant, near or far, so the column
+    // never mixes a countdown with a clock time.
+    for ahead in [45 * 60, 2 * 3600 + 11 * 60, 3 * 86_400] {
+        let label = format_reset(0, ahead);
+        assert!(
+            label.contains(':') && label.len() >= 8,
+            "a reset names its local weekday and time: {label}"
+        );
+    }
 }
 
 fn sample_hud() -> HudState {
