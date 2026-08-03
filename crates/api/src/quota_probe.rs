@@ -33,12 +33,16 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// case. Failures are per-provider — one signed-out account never suppresses
 /// the others.
 pub async fn refresh_measured_quotas() {
-    let (anthropic, codex) = tokio::join!(probe_anthropic(), probe_codex());
+    let (anthropic, codex, google) =
+        tokio::join!(probe_anthropic(), probe_codex(), probe_google());
     if let Some(quota) = anthropic {
         record_measured_quota(ProviderKind::Anthropic, quota);
     }
     if let Some(quota) = codex {
         record_measured_quota(ProviderKind::OpenAi, quota);
+    }
+    if let Some(quota) = google {
+        record_measured_quota(ProviderKind::Google, quota);
     }
 }
 
@@ -144,6 +148,89 @@ async fn probe_codex() -> Option<MeasuredQuota> {
         windows: usage.windows(),
         account: usage.email,
     })
+}
+
+/// Gemini Code Assist's quota endpoint, which the Antigravity sign-in bills
+/// against.
+///
+/// Unlike the other two this reports headroom directly, per model bucket, as a
+/// fraction. The worst bucket is the provider's standing: a model that is out
+/// is out regardless of how much room its siblings have.
+async fn probe_google() -> Option<MeasuredQuota> {
+    // `load_fresh_oauth` may refresh against the network, so it is blocking.
+    let tokens = tokio::task::spawn_blocking(
+        crate::providers::gemini_code_assist::load_fresh_oauth,
+    )
+    .await
+    .ok()
+    .flatten()?;
+    let response = crate::providers::shared_http_client()
+        .post("https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota")
+        .bearer_auth(&tokens.access_token)
+        .json(&serde_json::json!({}))
+        .timeout(PROBE_TIMEOUT)
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let quota: GoogleQuota = response.json().await.ok()?;
+    let windows = quota.windows();
+    if windows.is_empty() {
+        return None;
+    }
+    Some(MeasuredQuota {
+        windows,
+        account: None,
+    })
+}
+
+/// Gemini's quota payload: either a bare array of buckets or one wrapped in
+/// `buckets`, which is why both shapes are accepted.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum GoogleQuota {
+    Wrapped { buckets: Vec<GoogleBucket> },
+    Bare(Vec<GoogleBucket>),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleBucket {
+    /// Headroom as a fraction of the allowance, already the direction we want.
+    remaining_fraction: f64,
+    reset_time: Option<String>,
+}
+
+impl GoogleQuota {
+    fn windows(&self) -> Vec<QuotaWindow> {
+        let (Self::Wrapped { buckets } | Self::Bare(buckets)) = self;
+        // The tightest bucket is the account's real standing; listing every
+        // model would bury it and none of them are separately actionable here.
+        let Some(worst) = buckets
+            .iter()
+            .filter(|bucket| bucket.remaining_fraction.is_finite())
+            .min_by(|left, right| {
+                left.remaining_fraction
+                    .partial_cmp(&right.remaining_fraction)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        else {
+            return Vec::new();
+        };
+        vec![QuotaWindow {
+            label: "quota".to_string(),
+            remaining_percent: remaining_from_utilization(
+                100.0 - worst.remaining_fraction.clamp(0.0, 1.0) * 100.0,
+            ),
+            resets_at_unix: worst
+                .reset_time
+                .as_deref()
+                .and_then(core_types::date::unix_secs_from_rfc3339)
+                .and_then(|secs| u64::try_from(secs).ok()),
+        }]
+    }
 }
 
 /// Codex credentials as the Codex CLI writes them.

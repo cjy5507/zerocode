@@ -2513,15 +2513,16 @@ fn format_reset(now: u64, resets_at: u64) -> String {
         return "now".to_string();
     }
     let mins = (resets_at - now) / 60;
+    // Past a day a countdown stops being checkable. "5d" cannot be compared
+    // with what the user already knows — that the weekly window comes back
+    // Sunday morning — and it is their own clock they know it in, not UTC. So a
+    // distant reset is named, and only a near one counts down, where "3h12m" is
+    // the more useful of the two.
     if mins >= 1440 {
-        let days = mins / 1440;
-        let hours = (mins % 1440) / 60;
-        if hours > 0 {
-            format!("{days}d{hours}h")
-        } else {
-            format!("{days}d")
-        }
-    } else if mins >= 60 {
+        return i64::try_from(resets_at)
+            .map_or_else(|_| format!("{}d", mins / 1440), core_types::date::local_weekday_clock);
+    }
+    if mins >= 60 {
         format!("{}h{:02}m", mins / 60, mins % 60)
     } else {
         format!("{mins}m")

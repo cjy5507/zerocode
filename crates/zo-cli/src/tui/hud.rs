@@ -1872,40 +1872,77 @@ fn context_usage_spans(
     spans
 }
 
-/// The tightest quota window, stated the way the context gauge is.
+/// Every signed-in provider's tightest window, stated the way the context
+/// gauge is.
 ///
-/// The rail lists every window; this row has space for one, so it shows the one
-/// that will stop the session first — a comfortable weekly allowance is not the
-/// fact worth a footer slot when the five-hour window is nearly spent.
+/// One row per provider, not one row overall: the account that stops working
+/// first is not always the one being spent right now, and a session that hops
+/// between models needs to see all of them without looking away from the
+/// footer. Within a provider only the nearest window shows — a comfortable
+/// weekly allowance is not worth a slot while the five-hour window empties.
 ///
-/// Worded `NN% left` deliberately. Providers report consumption and this shows
-/// headroom, and a bare percent next to a model name gives the reader no way to
-/// tell which — the word is what makes the number unambiguous.
+/// Worded `NN% left` deliberately. Providers report consumption and every
+/// surface here shows headroom; a bare percent beside a provider name gives the
+/// reader no way to tell which direction it runs.
 fn quota_headroom_spans(state: &HudState, theme: &Theme) -> Vec<Span<'static>> {
-    let Some(view) = state
-        .provider_quotas
-        .iter()
-        .filter(|view| view.remaining_percent.is_some())
-        .min_by_key(|view| view.remaining_percent.unwrap_or(u8::MAX))
-    else {
+    let mut tightest: Vec<&api::quota::ProviderQuotaView> = Vec::new();
+    for view in &state.provider_quotas {
+        if view.remaining_percent.is_none() {
+            continue;
+        }
+        match tightest
+            .iter_mut()
+            .find(|kept| kept.provider == view.provider)
+        {
+            Some(kept) if view.remaining_percent < kept.remaining_percent => *kept = view,
+            Some(_) => {}
+            None => tightest.push(view),
+        }
+    }
+    if tightest.is_empty() {
         return Vec::new();
-    };
-    let Some(remaining) = view.remaining_percent else {
-        return Vec::new();
-    };
-    // Colour keys off consumption, matching the rail and the context gauge.
-    let used = 100u8.saturating_sub(remaining);
-    let approx = if view.estimated { "~" } else { "" };
-    vec![
-        Span::styled(
-            format!("{} {} ", view.provider.rate_limit_key(), view.window_label),
-            Style::new().fg(theme.palette.dim),
-        ),
-        Span::styled(
+    }
+
+    let mut spans = Vec::with_capacity(tightest.len() * 3);
+    for view in tightest {
+        let Some(remaining) = view.remaining_percent else {
+            continue;
+        };
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", Style::new().fg(theme.palette.faint)));
+        }
+        // Colour keys off consumption, matching the rail and the context gauge.
+        let used = 100u8.saturating_sub(remaining);
+        let approx = if view.estimated { "~" } else { "" };
+        spans.push(Span::styled(
+            format!("{} ", view.provider.rate_limit_key()),
+            Style::new()
+                .fg(provider_tint(view.provider, theme))
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
             format!("{approx}{remaining}% left"),
             Style::new().fg(ctx_gauge_color(f64::from(used) / 100.0, theme)),
-        ),
-    ]
+        ));
+    }
+    spans
+}
+
+/// A stable hue per provider, so three quota figures on one row separate at a
+/// glance instead of reading as one run of dim text.
+///
+/// The hue names *which account*; the percent beside it keeps the health ramp
+/// (green through red). Two colour jobs on one row only work because they sit
+/// on different words — the name never changes colour as the quota drains, and
+/// the number never carries brand.
+fn provider_tint(kind: api::ProviderKind, theme: &Theme) -> Color {
+    match kind {
+        api::ProviderKind::Anthropic => theme.palette.accent,
+        api::ProviderKind::OpenAi => theme.palette.teal,
+        api::ProviderKind::Google => theme.palette.info,
+        api::ProviderKind::Xai => theme.palette.violet,
+        api::ProviderKind::Ollama => theme.palette.muted,
+    }
 }
 
 /// Canonical live context pressure for every TUI surface. Prefer occupancy of
@@ -3191,12 +3228,16 @@ mod tests {
 
         let text = line_text(&compose(&state, &theme, 200, false));
         assert!(
-            text.contains("anthropic 5h 12% left"),
-            "the window nearest exhaustion is the one shown: {text:?}"
+            text.contains("anthropic 12% left"),
+            "each provider shows its nearest window: {text:?}"
         );
         assert!(
-            !text.contains("85% left") && !text.contains("61% left"),
-            "the roomier windows stay on the rail: {text:?}"
+            text.contains("openai 85% left"),
+            "a second signed-in provider is shown too: {text:?}"
+        );
+        assert!(
+            !text.contains("61% left"),
+            "the roomier window of a provider already shown stays on the rail: {text:?}"
         );
     }
 

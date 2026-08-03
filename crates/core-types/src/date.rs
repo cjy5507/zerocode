@@ -43,6 +43,62 @@ fn local_date_from_date_utility() -> Option<String> {
     }
 }
 
+/// Seconds the local zone sits ahead of UTC, e.g. `32_400` for KST.
+///
+/// Same constraint as [`current_local_date`]: no timezone database in `std`, no
+/// `unsafe`, no heavy date dependency — so the POSIX `date` utility answers it.
+/// Cached for the process because a render path asks on every frame and forking
+/// `date` that often would cost more than the label is worth. A zone that
+/// changes mid-session (a DST boundary) is off by an hour until restart, which
+/// is a fair trade for not forking per frame.
+#[must_use]
+pub fn local_utc_offset_secs() -> i64 {
+    static OFFSET: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *OFFSET.get_or_init(|| offset_from_date_utility().unwrap_or(0))
+}
+
+fn offset_from_date_utility() -> Option<i64> {
+    let output = std::process::Command::new("date").arg("+%z").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let raw = text.trim();
+    // `+0900` / `-0500`: sign, two hour digits, two minute digits.
+    if raw.len() != 5 || !raw[1..].bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let sign = match raw.as_bytes()[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let hours: i64 = raw.get(1..3)?.parse().ok()?;
+    let minutes: i64 = raw.get(3..5)?.parse().ok()?;
+    if hours > 14 || minutes >= 60 {
+        return None;
+    }
+    Some(sign * (hours * 3_600 + minutes * 60))
+}
+
+/// A reset instant as the local weekday and clock time, e.g. `Sun 11:00`.
+///
+/// A countdown ("5d") cannot be checked against what a user already knows — the
+/// weekly window rolls over at a wall-clock time they remember, and in their own
+/// zone, not UTC. This is the form that can be compared.
+#[must_use]
+pub fn local_weekday_clock(unix_secs: i64) -> String {
+    /// Sunday-first, matching [`local_weekday_clock`]'s epoch arithmetic below.
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+    let local = unix_secs + local_utc_offset_secs();
+    let days = local.div_euclid(86_400);
+    let seconds = local.rem_euclid(86_400);
+    // The Unix epoch was a Thursday.
+    let weekday = WEEKDAYS[usize::try_from((days + 4).rem_euclid(7)).unwrap_or(0)];
+    format!("{weekday} {:02}:{:02}", seconds / 3_600, (seconds % 3_600) / 60)
+}
+
 /// Current UTC date as `YYYY-MM-DD`, from the system clock.
 ///
 /// Clock-before-epoch (or otherwise unreadable) degrades to the epoch date
@@ -242,6 +298,37 @@ mod tests {
         assert_eq!(unix_secs_from_rfc3339("2026-08-09"), None);
         assert_eq!(unix_secs_from_rfc3339("2026-08-09T25:00:00Z"), None);
         assert_eq!(unix_secs_from_rfc3339("not a timestamp"), None);
+    }
+
+    /// The live Anthropic reset, checked against what a KST user sees on their
+    /// own clock — the whole point of the label is that it can be compared to
+    /// what they already know.
+    #[test]
+    fn a_reset_instant_reads_as_a_local_weekday_and_clock() {
+        // 2026-08-09T02:00:00Z, the seven-day window's actual rollover.
+        let reset = unix_secs_from_rfc3339("2026-08-09T02:00:00+00:00").expect("parses");
+        assert_eq!(reset, 1_786_240_800);
+
+        // Rendered against a fixed offset rather than the host's, so the
+        // assertion holds wherever this runs.
+        let kst = reset + 9 * 3_600;
+        let days = kst.div_euclid(86_400);
+        assert_eq!((days + 4).rem_euclid(7), 0, "that instant is a Sunday in KST");
+        assert_eq!(kst.rem_euclid(86_400) / 3_600, 11, "at 11:00 KST");
+
+        // UTC hosts get the same instant, named in their own zone.
+        assert_eq!(local_weekday_clock(0), {
+            let offset = local_utc_offset_secs();
+            let days = offset.div_euclid(86_400);
+            let secs = offset.rem_euclid(86_400);
+            let names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+            format!(
+                "{} {:02}:{:02}",
+                names[usize::try_from((days + 4).rem_euclid(7)).unwrap_or(0)],
+                secs / 3_600,
+                (secs % 3_600) / 60
+            )
+        });
     }
 
     #[test]

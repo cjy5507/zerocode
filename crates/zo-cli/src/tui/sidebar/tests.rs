@@ -149,8 +149,14 @@ fn format_reset_compact_forms() {
     assert_eq!(format_reset(100, 100), "now");
     assert_eq!(format_reset(0, 45 * 60), "45m");
     assert_eq!(format_reset(0, 2 * 3600 + 11 * 60), "2h11m");
-    assert_eq!(format_reset(0, 3 * 86_400), "3d");
-    assert_eq!(format_reset(0, 3 * 86_400 + 5 * 3600), "3d5h");
+    // Past a day the countdown gives way to the wall-clock instant, because a
+    // "3d" cannot be checked against what the user already knows about when
+    // their weekly window comes back.
+    let distant = format_reset(0, 3 * 86_400);
+    assert!(
+        distant.contains(':') && distant.len() >= 8,
+        "a distant reset names its local weekday and time: {distant}"
+    );
 }
 
 fn sample_hud() -> HudState {
