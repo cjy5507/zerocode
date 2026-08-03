@@ -1818,6 +1818,10 @@ fn context_usage_spans(
     let color = percent.map_or(theme.palette.faint, |percent| {
         ctx_gauge_color(f64::from(u32::try_from(percent).unwrap_or(100)) / 100.0, theme)
     });
+    // Shown as headroom rather than consumption. "70%" beside a context bar is
+    // genuinely ambiguous — half of readers take it for what is left — and the
+    // number people act on is how much room remains before compaction.
+    let remaining = percent.map(|percent| 100u64.saturating_sub(percent));
 
     // Spelled out when there is room: a bare `ctx` in front of a bar reads as
     // chrome, `Context` reads as a label for the number beside it.
@@ -1831,10 +1835,12 @@ fn context_usage_spans(
         let rich = !theme.no_color;
         let fill = glyphs::pick(rich, glyphs::GAUGE_HUD_FILL, glyphs::GAUGE_HUD_FILL_NC);
         let empty = glyphs::pick(rich, glyphs::GAUGE_HUD_EMPTY, glyphs::GAUGE_HUD_EMPTY_NC);
-        // Round up so a context that is used at all always shows one lit cell,
-        // and one that is nearly full never shows a gap.
-        let filled = percent.map_or(0, |percent| {
-            usize::try_from(percent)
+        // The bar measures what is LEFT, so it drains as the session fills —
+        // the direction every fuel gauge trains people to read. Rounding up
+        // keeps one lit cell while any headroom survives, so "nearly out" and
+        // "actually out" stay distinguishable.
+        let filled = remaining.map_or(0, |remaining| {
+            usize::try_from(remaining)
                 .unwrap_or(100)
                 .saturating_mul(CTX_GAUGE_CELLS)
                 .div_ceil(100)
@@ -1853,7 +1859,12 @@ fn context_usage_spans(
             // it bare; here the label is already drawn, so strip it rather than
             // printing "Context ctx —".
             || fallback.trim().trim_start_matches("ctx ").trim().to_string(),
-            |percent| format!("{percent}%"),
+            |_| {
+                format!(
+                    "{}% left",
+                    remaining.unwrap_or_default()
+                )
+            },
         ),
         Style::new().fg(color),
     ));
@@ -2580,7 +2591,7 @@ mod tests {
         let state = sample_state();
         let text = line_text(&compose(&state, &theme, 120, false));
         assert!(
-            text.contains("2%"),
+            text.contains("98% left"),
             "HUD is the single authority; must show context pressure: {text:?}"
         );
         assert!(
@@ -2732,8 +2743,12 @@ mod tests {
             wide.contains("25%"),
             "workflow progress percentage missing: {wide:?}"
         );
+        // Scoped to the workflow badge: the context gauge legitimately reads
+        // "N% left" now, and an unscoped search would catch it instead of the
+        // duplicated progress half this guards.
+        let workflow = wide.split("$0.08").nth(1).unwrap_or_default();
         assert!(
-            !wide.contains("% left"),
+            !workflow.contains("% left"),
             "the redundant '% left' half must no longer be shown: {wide:?}"
         );
         assert!(
@@ -3065,7 +3080,7 @@ mod tests {
         let line = compose(&state, &theme, 120, false);
         let text = line_text(&line);
 
-        assert!(text.contains("38%"), "the exact value survives: {text:?}");
+        assert!(text.contains("62% left"), "the exact value survives: {text:?}");
         assert!(text.contains('▰') && text.contains('▱'), "gauge is drawn: {text:?}");
 
         let span = |content: &str| {
@@ -3076,7 +3091,7 @@ mod tests {
         };
         // Under 75% of the compaction ceiling there is still room, so the gauge
         // reads as healthy rather than as a warning.
-        assert_eq!(span("38%").style.fg, Some(theme.palette.success));
+        assert_eq!(span("62% left").style.fg, Some(theme.palette.success));
         assert_eq!(span("$0.08").style.fg, Some(theme.palette.violet));
         assert_eq!(span("workspace-write").style.fg, Some(theme.palette.muted));
         // The model leads the run in the brand accent and is the only bold field.
@@ -3102,7 +3117,7 @@ mod tests {
         state.compact_threshold = 450_000;
 
         let narrow = line_text(&compose(&state, &theme, CTX_GAUGE_MIN_COLS - 1, false));
-        assert!(narrow.contains("38%"), "{narrow:?}");
+        assert!(narrow.contains("62% left"), "{narrow:?}");
         assert!(!narrow.contains('▰'), "gauge dropped when it does not fit: {narrow:?}");
     }
 
@@ -3116,7 +3131,7 @@ mod tests {
         let line = compose(&state, &theme, 120, true);
         let text = line_text(&line);
         assert!(
-            text.contains("Context ") && text.contains("38%"),
+            text.contains("Context ") && text.contains("62% left"),
             "the abbreviated HUD retains context pressure: {text:?}"
         );
         assert!(
@@ -3126,7 +3141,7 @@ mod tests {
         let context = line
             .spans
             .iter()
-            .find(|span| span.content == "38%")
+            .find(|span| span.content == "62% left")
             .expect("context percentage span");
         // 38% of the compaction ceiling still leaves room, so it reads healthy.
         assert_eq!(context.style.fg, Some(theme.palette.success));

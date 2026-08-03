@@ -5871,7 +5871,7 @@ fn live_activity_context_collapses_bottom_hud_duplicates() {
         "top activity row should own live context: {activity:?}"
     );
     assert!(
-        activity.contains("40% ctx"),
+        activity.contains("60 ctx left"),
         "activity row uses auto-compaction pressure: {activity:?}"
     );
     assert!(
@@ -5885,7 +5885,7 @@ fn live_activity_context_collapses_bottom_hud_duplicates() {
     assert!(
         // The ribbon footer dropped the literal `Context ` label — the gauge
         // segment plus its percent carry the pressure reading now.
-        hud.contains("40%"),
+        hud.contains("60% left"),
         "bottom HUD uses the same auto-compaction pressure: {hud:?}"
     );
     assert!(
@@ -6693,9 +6693,10 @@ fn full_frame_keeps_sidebar_chat_and_activity_in_sync_for_agents() {
         // `sidebar::tests::rail_leaves_context_pressure_to_the_hud`), so the
         // live-usage check reads the footer gauge's percent rather than a
         // `ctx <used> / <limit>` row the rail no longer draws. The point of the
-        // assertion is unchanged: a running turn must report real usage, not 0.
-        dump.contains("1%") || dump.contains("2%"),
-        "footer should show non-zero live context pressure, not 0%:\n{dump}"
+        // assertion is unchanged: a running turn must report real usage, so the
+        // window must read as partly spent rather than untouched.
+        dump.contains("98% left") || dump.contains("99% left"),
+        "footer should show non-zero live context pressure, not a full window:\n{dump}"
     );
     assert!(
         dump.contains("cost $0.43"),

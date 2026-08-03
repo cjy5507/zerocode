@@ -883,11 +883,14 @@ fn activity_context_label(context: Option<&ActivityContext>, width: u16) -> Opti
         }
     }
 
-    // Context-window fill % is the primary "am I near the limit?" signal. Keep
-    // it last (it's short) and only on panes wide enough to spare the cells.
+    // Headroom is the primary "am I near the limit?" signal. Stated as what is
+    // LEFT, matching the footer gauge — a bare percent beside a context bar is
+    // ambiguous, and two surfaces answering it in opposite directions on one
+    // screen is worse than either choice. Keep it last (it is short) and only
+    // on panes wide enough to spare the cells.
     if width >= 90 {
         if let Some(pct) = context.ctx_percent {
-            parts.push(format!("{pct}% ctx"));
+            parts.push(format!("{} ctx left", 100u8.saturating_sub(pct)));
         }
     }
 
@@ -1949,7 +1952,7 @@ mod tests {
         };
         let label = activity_context_label(Some(&context), 120).expect("context label");
         assert!(
-            label.contains("73% ctx"),
+            label.contains("27 ctx left"),
             "ctx fill must surface: {label:?}"
         );
     }
