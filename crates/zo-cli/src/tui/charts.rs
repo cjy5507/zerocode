@@ -148,7 +148,6 @@ pub fn activity_heatmap(
     days: &[(i64, u64)],
     last_day: i64,
     weeks: usize,
-    color: Color,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     if weeks == 0 {
@@ -179,7 +178,7 @@ pub fn activity_heatmap(
             // Cells past today are future, not idle; drawing them at the empty
             // step would read as a slump that has not happened.
             let value = (day <= last_day).then(|| lookup(days, day));
-            spans.push(heat_cell(value, max, color, theme));
+            spans.push(heat_cell(value, max, theme));
         }
         lines.push(Line::from(spans));
     }
@@ -189,36 +188,54 @@ pub fn activity_heatmap(
 /// Legend pairing the ramp with what it means. A terminal has no tooltips, so
 /// the key has to sit on the screen.
 #[must_use]
-pub fn heatmap_legend(color: Color, theme: &Theme) -> Line<'static> {
+pub fn heatmap_legend(theme: &Theme) -> Line<'static> {
     let mut spans = vec![
         Span::styled(WEEKDAY_GUTTER, theme.typography.dim),
         Span::styled("Less ", theme.typography.dim),
     ];
     for level in 0..HEAT_RAMP.len() {
-        spans.push(heat_span(level, color, theme));
+        spans.push(heat_span(level, theme));
     }
     spans.push(Span::styled(" More", theme.typography.dim));
     Line::from(spans)
 }
 
 /// One calendar cell. `None` is a day that has not happened yet.
-fn heat_cell(value: Option<u64>, max: u64, color: Color, theme: &Theme) -> Span<'static> {
+fn heat_cell(value: Option<u64>, max: u64, theme: &Theme) -> Span<'static> {
     value.map_or_else(
         || Span::styled(" ", theme.typography.dim),
-        |value| heat_span(heat_level(value, max), color, theme),
+        |value| heat_span(heat_level(value, max), theme),
     )
 }
 
-/// Paint one ramp step. The lowest recedes to `faint`: an idle day is the
-/// background the streaks read against, not data in its own right.
-fn heat_span(level: usize, color: Color, theme: &Theme) -> Span<'static> {
-    let level = level.min(HEAT_RAMP.len() - 1);
+/// Paint one ramp step.
+///
+/// Density alone was not enough to read: one colour with more dots in it left a
+/// quiet day as a pale speck the eye slid straight past. The steps ride
+/// [`Theme::metric_color`] — the same success→warn→error ramp the HUD context
+/// gauge and this dashboard's own trend bars use — so a hot cell means the same
+/// thing everywhere on screen instead of inventing a second colour language.
+/// The empty step still recedes to `faint`: an idle day is the background the
+/// streaks read against, not data in its own right.
+fn heat_span(level: usize, theme: &Theme) -> Span<'static> {
+    let top = HEAT_RAMP.len() - 1;
+    let level = level.min(top);
     let style = if level == 0 {
         Style::new().fg(theme.palette.faint)
     } else {
-        Style::new().fg(color)
+        Style::new().fg(theme.metric_color(ramp_ratio(level, top)))
     };
     Span::styled(glyphs::braille_cell(HEAT_RAMP[level]).to_string(), style)
+}
+
+/// `level / top` for the metric ramp, in integer-safe arithmetic.
+fn ramp_ratio(level: usize, top: usize) -> f64 {
+    if top == 0 {
+        return 0.0;
+    }
+    let level = u32::try_from(level).unwrap_or(u32::MAX);
+    let top = u32::try_from(top).unwrap_or(1);
+    f64::from(level) / f64::from(top)
 }
 
 /// Ramp step for `value` against the busiest day. Any activity at all clears

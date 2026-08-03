@@ -362,8 +362,8 @@ fn daily_calendar(rows: &[UsagePeriodRow], area: Rect, theme: &Theme) -> Vec<Lin
         .min(53)
         .min(usize::from(area.width.saturating_sub(4)).max(1));
 
-    let mut lines = charts::activity_heatmap(&days, last_day, weeks, theme.palette.bright, theme);
-    lines.push(charts::heatmap_legend(theme.palette.bright, theme));
+    let mut lines = charts::activity_heatmap(&days, last_day, weeks, theme);
+    lines.push(charts::heatmap_legend(theme));
     // A month header cannot work at one column per week: `Jul` is three cells
     // wide and swallows the two months beside it, which is how the grid came to
     // read "Jun Aug". The range goes in a caption instead, where it has room.
