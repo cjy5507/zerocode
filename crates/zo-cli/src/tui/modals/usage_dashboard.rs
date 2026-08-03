@@ -397,22 +397,15 @@ fn model_mix_chart(rows: &[UsageModelRow], area: Rect, theme: &Theme) -> Vec<Lin
 }
 
 fn savings_chart(savings: &UsageSavingsSummary, area: Rect, theme: &Theme) -> Vec<Line<'static>> {
+    let weights = weigh_split([
+        savings.actual_cost_usd,
+        savings.cache_savings_usd,
+        savings.model_mix_savings_usd,
+    ]);
     let segments = vec![
-        (
-            "spent".to_string(),
-            micro_usd(savings.actual_cost_usd),
-            theme.palette.violet,
-        ),
-        (
-            "cache saved".to_string(),
-            micro_usd(savings.cache_savings_usd),
-            theme.palette.success,
-        ),
-        (
-            "mix saved".to_string(),
-            micro_usd(savings.model_mix_savings_usd),
-            theme.palette.teal,
-        ),
+        ("spent".to_string(), weights[0], theme.palette.violet),
+        ("cache saved".to_string(), weights[1], theme.palette.success),
+        ("mix saved".to_string(), weights[2], theme.palette.teal),
     ];
     let mut lines = vec![Line::from(Span::styled(
         "Baseline cost, split by where it went",
@@ -422,28 +415,38 @@ fn savings_chart(savings: &UsageSavingsSummary, area: Rect, theme: &Theme) -> Ve
     lines
 }
 
-/// USD as whole millionths so the composition bar can weigh segments with the
-/// integer arithmetic it uses everywhere else.
+/// Weigh a money split in integer units the composition bar can divide.
 ///
-/// Cents were the obvious unit and the wrong one: a session that has spent
-/// four tenths of a cent is real usage, but rounding each figure to whole
-/// cents zeroed every segment and the bar disappeared — the screen then read
-/// "nothing saved" when the truth was "a little". Millionths keep a sub-cent
-/// split proportional. Negative and non-finite input is clamped to zero rather
-/// than inverting a run; the upper bound is `f64`'s exactly-representable
-/// integer ceiling, past which the unit stops being the unit.
+/// Every *fixed* unit has a floor and silently erases whatever lives below it.
+/// Whole cents lost four tenths of a cent. Millionths still lost a first-turn
+/// session, whose entire split can be a few ten-millionths — one cache-read
+/// token at `$0.07/M` costs `$0.00000007` — and the bar vanished, so the screen
+/// read "nothing saved" when the truth was "a little".
+///
+/// The bar only ever needs the *ratio* between these figures, so they are
+/// normalized against the largest of them: a split of `$0.0000004` draws
+/// exactly like a split of `$400`. A positive figure never weighs nothing.
+/// Non-finite and negative input is dropped rather than inverting a run.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn micro_usd(usd: f64) -> u64 {
-    /// Largest integer an `f64` still represents exactly (2^53).
-    const EXACT_F64_LIMIT: f64 = 9_007_199_254_740_992.0;
-    if !usd.is_finite() || usd <= 0.0 {
-        return 0;
+fn weigh_split(values: [f64; 3]) -> [u64; 3] {
+    /// Units the largest figure maps to — fine enough that a thousandth of it
+    /// still lands on its own integer, small enough to stay `f64`-exact.
+    const SCALE: f64 = 1_000_000.0;
+    let max = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(0.0_f64, f64::max);
+    if max <= 0.0 {
+        return [0; 3];
     }
-    let scaled = (usd * 1_000_000.0).round();
-    if scaled >= EXACT_F64_LIMIT {
-        return EXACT_F64_LIMIT as u64;
-    }
-    scaled as u64
+    values.map(|value| {
+        if !value.is_finite() || value <= 0.0 {
+            return 0;
+        }
+        // The clamp is the whole point: money that exists must outweigh zero.
+        ((value / max) * SCALE).round().max(1.0) as u64
+    })
 }
 
 fn render_kpis(snapshot: &UsageDashboardSnapshot, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -1093,7 +1096,6 @@ mod tests {
     fn a_tall_pane_paints_the_chart_band_above_the_table() {
         let theme = Theme::zo();
         let rows = painted_rows(&UsageDashboardModal::new(week_snapshot()), &theme, 100, 24);
-
         let ink = rows
             .iter()
             .position(|row| row.chars().any(is_braille))
@@ -1200,6 +1202,34 @@ mod tests {
         assert!(
             text.contains(glyphs::GAUGE_FILL),
             "sub-cent money is still money: {text:?}"
+        );
+    }
+
+    /// Any fixed money unit has a floor, and a floor erases real data below it.
+    /// One cache-read token at `$0.07/M` costs `$0.00000007` — under a
+    /// millionth, which is exactly where the previous unit still rounded a
+    /// first-turn session's whole split to nothing and blanked the chart.
+    #[test]
+    fn a_split_of_fractional_micro_dollars_still_draws_its_bar() {
+        let theme = Theme::zo();
+        let savings = UsageSavingsSummary {
+            actual_cost_usd: 0.000_000_21,
+            baseline_cost_usd: 0.000_000_28,
+            cache_savings_usd: 0.000_000_07,
+            model_mix_savings_usd: 0.000_000_07,
+            total_savings_usd: 0.000_000_14,
+        };
+
+        let text = flat(&savings_chart(&savings, Rect::new(0, 0, 60, 5), &theme));
+        assert!(
+            text.contains(glyphs::GAUGE_FILL),
+            "a fraction of a cent is still money: {text:?}"
+        );
+        // The split is 3:1:1, and the bar must report that ratio rather than
+        // whatever the absolute magnitude happened to round to.
+        assert!(
+            text.contains("spent 60%"),
+            "the ratio survives the scale: {text:?}"
         );
     }
 

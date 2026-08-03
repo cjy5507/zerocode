@@ -175,40 +175,77 @@ pub fn stacked_composition_bar(
         ));
     }
 
-    // The legend is dropped whole entry by whole entry once the row is spent.
-    // Cutting instead leaves half a model name beside a run, which pairs the
-    // eye with the wrong thing — worse than admitting the entry is not shown.
-    let mut legend: Vec<Span<'static>> = Vec::with_capacity(segments.len() * 3);
-    let mut used = 0usize;
-    let mut shown = 0usize;
-    let mut hidden = 0usize;
-    for (idx, (label, value, color)) in segments.iter().enumerate() {
-        if *value == 0 {
-            continue;
+    // The legend is dropped whole entry by whole entry once the row is spent —
+    // cutting instead leaves half a model name beside a run and pairs the eye
+    // with the wrong thing. The `+N more` tail is text on that same row, so it
+    // is budgeted like an entry: appended blind it overran the row and the
+    // renderer cut it to `+2 mo`, the exact fragment the tail exists to
+    // prevent. Reserving the tail can push one more entry out and lengthen the
+    // tail in turn, so the fit is iterated to a fixed point — it terminates
+    // because the fitted count only ever falls.
+    let entries: Vec<(usize, String)> = segments
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, value, _))| *value > 0)
+        .map(|(idx, (label, value, _))| (idx, format!("{label} {}%", percent(*value, total))))
+        .collect();
+    let mark_width = display_width(fill);
+    let mut shown = entries.len();
+    loop {
+        let reserve = match entries.len() - shown {
+            0 => 0,
+            hidden => display_width(&format!("  +{hidden} more")),
+        };
+        let fits = legend_entries_that_fit(&entries, cells, reserve, mark_width);
+        if fits >= shown {
+            break;
         }
-        let mark = segment_mark(idx, fill, theme);
-        let text = format!("{label} {}%", percent(*value, total));
-        let gap = if shown > 0 { 2 } else { 0 };
-        let entry = gap + display_width(mark) + 1 + display_width(&text);
-        if shown > 0 && used + entry > cells {
-            hidden += 1;
-            continue;
-        }
-        if gap > 0 {
+        shown = fits;
+    }
+    let hidden = entries.len() - shown;
+
+    let mut legend: Vec<Span<'static>> = Vec::with_capacity(shown * 3 + 1);
+    for (position, (idx, text)) in entries.iter().take(shown).enumerate() {
+        if position > 0 {
             legend.push(Span::styled("  ", theme.typography.dim));
         }
-        legend.push(Span::styled(format!("{mark} "), Style::new().fg(*color)));
-        legend.push(Span::styled(text, theme.typography.dim));
-        used += entry;
-        shown += 1;
+        legend.push(Span::styled(
+            format!("{} ", segment_mark(*idx, fill, theme)),
+            Style::new().fg(segments[*idx].2),
+        ));
+        legend.push(Span::styled(text.clone(), theme.typography.dim));
     }
-    if hidden > 0 {
+    // A row too narrow for even one name gets no legend at all. A bare
+    // "+3 more" names nothing, and a truncated first entry is the fragment
+    // this whole path is avoiding; the bar still carries the proportions.
+    if hidden > 0 && shown > 0 {
         legend.push(Span::styled(
             format!("  +{hidden} more"),
             theme.typography.dim,
         ));
     }
     vec![Line::from(spans), Line::from(legend)]
+}
+
+/// Legend entries that fit in `cells` while holding `reserve` cells back for
+/// the `+N more` tail. Each entry costs its two-space separator (after the
+/// first), its mark, the space behind it, and its own text.
+fn legend_entries_that_fit(
+    entries: &[(usize, String)],
+    cells: usize,
+    reserve: usize,
+    mark_width: usize,
+) -> usize {
+    let mut used = 0usize;
+    for (position, (_, text)) in entries.iter().enumerate() {
+        let gap = if position > 0 { 2 } else { 0 };
+        let entry = gap + mark_width + 1 + display_width(text);
+        if used + entry + reserve > cells {
+            return position;
+        }
+        used += entry;
+    }
+    entries.len()
 }
 
 /// The glyph one run is drawn with.
@@ -430,6 +467,27 @@ mod tests {
             assert!(
                 rows[1].contains(mark),
                 "the legend repeats the mark it names: {rows:?}"
+            );
+        }
+    }
+
+    /// The `+N more` tail is itself text on the row, so it has to be budgeted
+    /// like an entry. Appended blind it overran the row and the renderer cut it
+    /// to `+2 mo` — the same unreadable fragment the tail exists to prevent.
+    #[test]
+    fn the_legend_never_overruns_its_row_at_any_width() {
+        let theme = Theme::zo();
+        let segments = vec![
+            ("alpha-model".to_string(), 40_u64, theme.palette.violet),
+            ("beta-model".to_string(), 30, theme.palette.success),
+            ("gamma-model".to_string(), 30, theme.palette.teal),
+        ];
+
+        for width in 8..=60u16 {
+            let rows = text_of(&stacked_composition_bar(&segments, width, &theme));
+            assert!(
+                UnicodeWidthStr::width_cjk(rows[1].as_str()) <= usize::from(width),
+                "legend overruns at width {width}: {rows:?}"
             );
         }
     }
