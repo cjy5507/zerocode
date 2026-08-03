@@ -38,6 +38,11 @@ const CHART_ROWS: u16 = 5;
 /// a usable scroll window. Below it the band is dropped whole rather than
 /// squeezed, because a two-row chart is decoration and the table is the data.
 const MIN_HEIGHT_WITH_CHART: u16 = 17;
+/// Smallest inner width that can seat a composition legend whole. The Savings
+/// legend is the widest at roughly fifty cells, and below that the band starts
+/// hiding entries — a coloured run whose name is off-screen is a key the reader
+/// cannot use, so the band goes instead and the table keeps every figure.
+const MIN_WIDTH_WITH_CHART: u16 = 56;
 
 /// User action emitted by [`UsageDashboardModal::handle_key`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,7 +227,8 @@ fn render_dashboard(
     // The band is optional on purpose: it is the first thing to go when the
     // terminal is short, since the table carries the numbers and the chart only
     // carries their shape.
-    let chart_rows = if inner.height >= MIN_HEIGHT_WITH_CHART {
+    let chart_rows = if inner.height >= MIN_HEIGHT_WITH_CHART && inner.width >= MIN_WIDTH_WITH_CHART
+    {
         CHART_ROWS
     } else {
         0
@@ -301,7 +307,12 @@ fn period_chart(
     area: Rect,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
-    let series: Vec<u64> = rows.iter().map(|row| row.tokens).collect();
+    // The snapshot orders period rows newest-first, which is what the table
+    // below wants — today on top — and the reverse of what a time axis needs.
+    // Plotted in that order the week runs right-to-left and every trend reads
+    // backwards: a week of rising spend draws as a decline.
+    let chronological: Vec<&UsagePeriodRow> = rows.iter().rev().collect();
+    let series: Vec<u64> = chronological.iter().map(|row| row.tokens).collect();
     // The same denominator `render_period_rows` gives its trend gauges, so the
     // band and the table underneath cannot disagree about the tall bucket.
     let max = series.iter().copied().max().unwrap_or(0);
@@ -313,7 +324,13 @@ fn period_chart(
         theme.palette.bright,
         theme,
     );
-    lines.push(chart_caption(rows, title, max, area.width, theme));
+    lines.push(chart_caption(
+        &chronological,
+        title,
+        max,
+        area.width,
+        theme,
+    ));
     lines
 }
 
@@ -321,7 +338,7 @@ fn period_chart(
 /// band honest on a terminal whose font has no braille: the numbers still read
 /// even when the shape above them does not render.
 fn chart_caption(
-    rows: &[UsagePeriodRow],
+    rows: &[&UsagePeriodRow],
     title: &str,
     max: u64,
     width: u16,
@@ -335,6 +352,12 @@ fn chart_caption(
         _ => String::new(),
     };
     let left = format!("{title} · peak {}", compact_tokens(max));
+    // A date cut in half is a different date. When the row cannot seat both
+    // halves the range goes whole and the peak stays, since the peak is the
+    // number the reader came for.
+    if left.chars().count() + range.chars().count() + 1 > usize::from(width) {
+        return Line::from(Span::styled(left, theme.typography.dim));
+    }
     let pad = usize::from(width)
         .saturating_sub(left.chars().count())
         .saturating_sub(range.chars().count());
@@ -377,17 +400,17 @@ fn savings_chart(savings: &UsageSavingsSummary, area: Rect, theme: &Theme) -> Ve
     let segments = vec![
         (
             "spent".to_string(),
-            cents(savings.actual_cost_usd),
+            micro_usd(savings.actual_cost_usd),
             theme.palette.violet,
         ),
         (
             "cache saved".to_string(),
-            cents(savings.cache_savings_usd),
+            micro_usd(savings.cache_savings_usd),
             theme.palette.success,
         ),
         (
             "mix saved".to_string(),
-            cents(savings.model_mix_savings_usd),
+            micro_usd(savings.model_mix_savings_usd),
             theme.palette.teal,
         ),
     ];
@@ -399,18 +422,24 @@ fn savings_chart(savings: &UsageSavingsSummary, area: Rect, theme: &Theme) -> Ve
     lines
 }
 
-/// USD as whole cents so the composition bar can weigh segments with the
-/// integer arithmetic it uses everywhere else. Negative and non-finite input is
-/// clamped to zero rather than inverting a run; the upper bound is `f64`'s
-/// exactly-representable integer ceiling, past which cents stop being cents.
+/// USD as whole millionths so the composition bar can weigh segments with the
+/// integer arithmetic it uses everywhere else.
+///
+/// Cents were the obvious unit and the wrong one: a session that has spent
+/// four tenths of a cent is real usage, but rounding each figure to whole
+/// cents zeroed every segment and the bar disappeared — the screen then read
+/// "nothing saved" when the truth was "a little". Millionths keep a sub-cent
+/// split proportional. Negative and non-finite input is clamped to zero rather
+/// than inverting a run; the upper bound is `f64`'s exactly-representable
+/// integer ceiling, past which the unit stops being the unit.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn cents(usd: f64) -> u64 {
+fn micro_usd(usd: f64) -> u64 {
     /// Largest integer an `f64` still represents exactly (2^53).
     const EXACT_F64_LIMIT: f64 = 9_007_199_254_740_992.0;
     if !usd.is_finite() || usd <= 0.0 {
         return 0;
     }
-    let scaled = (usd * 100.0).round();
+    let scaled = (usd * 1_000_000.0).round();
     if scaled >= EXACT_F64_LIMIT {
         return EXACT_F64_LIMIT as u64;
     }
@@ -1031,14 +1060,17 @@ mod tests {
     /// trend, so it cannot exercise the chart.
     fn week_snapshot() -> UsageDashboardSnapshot {
         let mut snap = snapshot();
+        // Newest first, the order `UsageDashboardSnapshot` actually produces.
+        // Listing it oldest-first read naturally and was a lie about the input,
+        // and it hid a band that plotted the whole week backwards.
         snap.daily = [
-            ("2026-07-28", 4_000_u64),
-            ("2026-07-29", 31_000),
-            ("2026-07-30", 12_000),
-            ("2026-07-31", 26_000),
-            ("2026-08-01", 3_000),
+            ("2026-08-03", 9_000_u64),
             ("2026-08-02", 18_000),
-            ("2026-08-03", 9_000),
+            ("2026-08-01", 3_000),
+            ("2026-07-31", 26_000),
+            ("2026-07-30", 12_000),
+            ("2026-07-29", 31_000),
+            ("2026-07-28", 4_000),
         ]
         .into_iter()
         .map(|(label, tokens)| UsagePeriodRow {
@@ -1080,6 +1112,12 @@ mod tests {
             "the caption keeps the band readable without braille:\n{}",
             rows.join("\n")
         );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("2026-07-28 → 2026-08-03")),
+            "the painted axis runs oldest → newest:\n{}",
+            rows.join("\n")
+        );
         // Scoped to the band's own rows: the card border is box-drawing, which
         // is EAW-Ambiguous by design here (see `glyphs::ANVIL_LINE`) and which
         // target terminals force narrow. The data ink is what must never widen.
@@ -1090,6 +1128,95 @@ mod tests {
                 "a wide-ambiguous locale must not widen the chart band: {row:?}"
             );
         }
+    }
+
+    fn flat(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn period_rows_newest_first(rows: &[(&str, u64)]) -> Vec<UsagePeriodRow> {
+        rows.iter()
+            .map(|(label, tokens)| UsagePeriodRow {
+                label: (*label).to_string(),
+                tokens: *tokens,
+                cost_usd: 0.01,
+                saved_usd: 0.0,
+                top_model: "gpt-5.5".to_string(),
+            })
+            .collect()
+    }
+
+    /// `UsageDashboardSnapshot` sorts period rows newest-first, which is right
+    /// for the table (today on top) and wrong for a time axis. Plotted as
+    /// given, the week runs right-to-left and every trend reads inverted — a
+    /// rise looks like a fall.
+    #[test]
+    fn the_band_plots_time_left_to_right_though_the_table_is_newest_first() {
+        let theme = Theme::zo();
+        // Newest first, exactly the order the snapshot hands over.
+        let rows = period_rows_newest_first(&[
+            ("2026-08-04", 1_000),
+            ("2026-08-03", 1_000),
+            ("2026-08-02", 1_000),
+            ("2026-08-01", 50_000),
+        ]);
+        let lines = period_chart(&rows, "Tokens per day", Rect::new(0, 0, 60, 5), &theme);
+
+        let caption = flat(&lines[lines.len() - 1..]);
+        assert!(
+            caption.contains("2026-08-01 → 2026-08-04"),
+            "the axis caption runs oldest → newest: {caption:?}"
+        );
+
+        let top: Vec<char> = flat(&lines[..1]).chars().collect();
+        let half = top.len() / 2;
+        let left = top[..half].iter().any(|ch| *ch != '\u{2800}');
+        let right = top[half..].iter().any(|ch| *ch != '\u{2800}');
+        assert!(
+            left && !right,
+            "the older, taller bucket belongs on the left: {top:?}"
+        );
+    }
+
+    /// Rounding each figure to whole cents erased money that exists: a
+    /// sub-cent split summed to zero and the bar vanished entirely, which
+    /// reads as "no savings" rather than "a small amount".
+    #[test]
+    fn a_sub_cent_savings_split_still_draws_its_bar() {
+        let theme = Theme::zo();
+        let savings = UsageSavingsSummary {
+            actual_cost_usd: 0.004,
+            baseline_cost_usd: 0.006,
+            cache_savings_usd: 0.001,
+            model_mix_savings_usd: 0.001,
+            total_savings_usd: 0.002,
+        };
+
+        let text = flat(&savings_chart(&savings, Rect::new(0, 0, 60, 5), &theme));
+        assert!(
+            text.contains(glyphs::GAUGE_FILL),
+            "sub-cent money is still money: {text:?}"
+        );
+    }
+
+    /// A pane too narrow to seat a legend drops the band whole. Cutting it
+    /// instead leaves a colour run whose name is off-screen — a key the reader
+    /// cannot use, which is worse than no chart.
+    #[test]
+    fn a_narrow_pane_drops_the_band_rather_than_cutting_its_legend() {
+        let theme = Theme::zo();
+        let rows = painted_rows(&UsageDashboardModal::new(week_snapshot()), &theme, 40, 24);
+        let text = rows.join("\n");
+
+        assert!(
+            !text.chars().any(is_braille),
+            "no half-legible band in a narrow pane:\n{text}"
+        );
+        assert!(text.contains("Period"), "the table survives:\n{text}");
     }
 
     /// A short terminal drops the band whole. Squeezing it would spend the

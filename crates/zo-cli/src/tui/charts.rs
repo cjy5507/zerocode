@@ -20,10 +20,14 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use crate::tui::glyphs;
+use crate::tui::text_metrics::display_width;
 use crate::tui::theme::Theme;
 
 /// Buckets needed before a trend is a shape rather than a single level.
 const MIN_TREND_POINTS: usize = 2;
+
+/// Marks that stand in for hue when a run has none. See [`segment_mark`].
+const PLAIN_SEGMENT_MARKS: [&str; 5] = ["#", "=", "+", "~", ":"];
 
 /// Dot bit for `[row][column]` within one braille cell. The Unicode braille
 /// block numbers the top three rows down each column first and appends the
@@ -166,26 +170,60 @@ pub fn stacked_composition_bar(
             continue;
         }
         spans.push(Span::styled(
-            fill.repeat(runs[idx]),
+            segment_mark(idx, fill, theme).repeat(runs[idx]),
             Style::new().fg(*color),
         ));
     }
 
-    let mut legend = Vec::with_capacity(segments.len() * 3);
+    // The legend is dropped whole entry by whole entry once the row is spent.
+    // Cutting instead leaves half a model name beside a run, which pairs the
+    // eye with the wrong thing — worse than admitting the entry is not shown.
+    let mut legend: Vec<Span<'static>> = Vec::with_capacity(segments.len() * 3);
+    let mut used = 0usize;
+    let mut shown = 0usize;
+    let mut hidden = 0usize;
     for (idx, (label, value, color)) in segments.iter().enumerate() {
         if *value == 0 {
             continue;
         }
-        if idx > 0 && !legend.is_empty() {
+        let mark = segment_mark(idx, fill, theme);
+        let text = format!("{label} {}%", percent(*value, total));
+        let gap = if shown > 0 { 2 } else { 0 };
+        let entry = gap + display_width(mark) + 1 + display_width(&text);
+        if shown > 0 && used + entry > cells {
+            hidden += 1;
+            continue;
+        }
+        if gap > 0 {
             legend.push(Span::styled("  ", theme.typography.dim));
         }
-        legend.push(Span::styled(format!("{fill} "), Style::new().fg(*color)));
+        legend.push(Span::styled(format!("{mark} "), Style::new().fg(*color)));
+        legend.push(Span::styled(text, theme.typography.dim));
+        used += entry;
+        shown += 1;
+    }
+    if hidden > 0 {
         legend.push(Span::styled(
-            format!("{label} {}%", percent(*value, total)),
+            format!("  +{hidden} more"),
             theme.typography.dim,
         ));
     }
     vec![Line::from(spans), Line::from(legend)]
+}
+
+/// The glyph one run is drawn with.
+///
+/// Colour carries the distinction when there is colour. Under `NO_COLOR` every
+/// palette slot resolves to `Color::Reset`, so a single glyph paints the whole
+/// bar as one undivided run and the legend's swatches name nothing — the
+/// composition becomes unreadable exactly where colour cannot rescue it. ASCII
+/// marks are EAW-Neutral by construction, so the width contract still holds.
+fn segment_mark(index: usize, fill: &'static str, theme: &Theme) -> &'static str {
+    if theme.no_color {
+        PLAIN_SEGMENT_MARKS[index % PLAIN_SEGMENT_MARKS.len()]
+    } else {
+        fill
+    }
 }
 
 /// Value under horizontal position `at` of `steps` sample points.
@@ -365,6 +403,34 @@ mod tests {
         );
         for row in &rows {
             assert!(row.is_ascii(), "no braille under NO_COLOR: {row:?}");
+        }
+    }
+
+    /// Without colour every run is the same glyph in the same `Color::Reset`,
+    /// so the composition reads as one undivided bar and the legend's marks
+    /// pair with nothing. Each run needs its own mark to survive `NO_COLOR`.
+    #[test]
+    fn plain_mode_tells_the_runs_apart_without_colour() {
+        let theme = Theme::no_color();
+        let segments = vec![
+            ("alpha".to_string(), 40_u64, theme.palette.violet),
+            ("beta".to_string(), 30, theme.palette.success),
+            ("gamma".to_string(), 30, theme.palette.teal),
+        ];
+        // Wide enough to seat all three legend entries: the pairing between a
+        // run and its name is only defined for entries the legend shows.
+        let rows = text_of(&stacked_composition_bar(&segments, 44, &theme));
+
+        let marks: std::collections::BTreeSet<char> = rows[0].chars().collect();
+        assert!(
+            marks.len() >= 3,
+            "each run carries its own mark without colour: {rows:?}"
+        );
+        for mark in marks {
+            assert!(
+                rows[1].contains(mark),
+                "the legend repeats the mark it names: {rows:?}"
+            );
         }
     }
 
