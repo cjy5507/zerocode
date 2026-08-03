@@ -249,10 +249,11 @@ fn hud_shows_window_pressure_when_compaction_threshold_is_unknown() {
     let state = sample_state();
     let out = render_buffer(80, &state, &theme);
     // All live ctx surfaces use the canonical percentage helper. With no
-    // compaction threshold, 42k of a 200k nominal window falls back to 21%.
-    // The label is "ctx" or "Context" depending on whether the terminal is wide
-    // enough for the gauge, so only the value is asserted here.
-    assert!(out.contains("21%"), "context pressure missing: {out}");
+    // compaction threshold, 42k of a 200k nominal window is 21% spent, which
+    // the footer states as the headroom that leaves. The label is "ctx" or
+    // "Context" depending on whether the terminal is wide enough for the gauge,
+    // so only the value is asserted here.
+    assert!(out.contains("79% left"), "context pressure missing: {out}");
     assert!(
         !out.contains("ctx ~42.0k") && !out.contains("tokens"),
         "HUD must not restore the retired token-count format: {out}"
@@ -296,8 +297,8 @@ fn hud_caps_over_limit_context_pressure_at_one_hundred_percent() {
 
     let out = render_buffer(120, &state, &theme);
     assert!(
-        out.contains("100%"),
-        "over-limit context pressure should saturate at 100%: {out}"
+        out.contains("0% left"),
+        "over-limit context pressure should saturate at no headroom: {out}"
     );
     assert!(
         !out.contains("ctx ~1.0M+") && !out.contains("1.4M"),
