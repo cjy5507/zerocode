@@ -112,6 +112,65 @@ pub fn unix_days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
+/// Unix seconds for an RFC 3339 timestamp, or `None` when the text is not one.
+///
+/// Provider usage endpoints date their reset instants this way
+/// (`2026-08-09T02:00:00.447469+00:00`), and a quota window is only actionable
+/// with the clock time it rolls over. Fractional seconds are dropped: a window
+/// resetting within the same second is not a distinction any caller can act on.
+#[must_use]
+pub fn unix_secs_from_rfc3339(text: &str) -> Option<i64> {
+    let (date, rest) = text.split_once(['T', 't'])?;
+    let days = unix_days_from_date_label(date)?;
+
+    // The offset sign is the only '-' that can appear after the date, so
+    // searching from the right cannot catch a date dash.
+    let split_at = rest
+        .find(['Z', 'z', '+'])
+        .or_else(|| rest.rfind('-'))
+        .unwrap_or(rest.len());
+    let (clock, offset) = rest.split_at(split_at);
+
+    let mut parts = clock.split(':');
+    let hours: i64 = parts.next()?.parse().ok()?;
+    let minutes: i64 = parts.next().unwrap_or("0").parse().ok()?;
+    let seconds: i64 = parts
+        .next()
+        .unwrap_or("0")
+        .split('.')
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .ok()?;
+    // A leap second is a real 60; anything past that is a malformed stamp.
+    if !(0..24).contains(&hours) || !(0..60).contains(&minutes) || !(0..=60).contains(&seconds) {
+        return None;
+    }
+
+    let local = days * 86_400 + hours * 3_600 + minutes * 60 + seconds;
+    Some(local - rfc3339_offset_secs(offset)?)
+}
+
+/// Seconds an RFC 3339 offset suffix (`Z`, `+09:00`, `-05:00`) sits ahead of UTC.
+fn rfc3339_offset_secs(offset: &str) -> Option<i64> {
+    if offset.is_empty() || offset.eq_ignore_ascii_case("z") {
+        return Some(0);
+    }
+    let (sign, rest) = offset.split_at(1);
+    let sign = match sign {
+        "+" => 1,
+        "-" => -1,
+        _ => return None,
+    };
+    let (hours, minutes) = rest.split_once(':').unwrap_or((rest, "0"));
+    let hours: i64 = hours.parse().ok()?;
+    let minutes: i64 = minutes.parse().ok()?;
+    if !(0..=14).contains(&hours) || !(0..60).contains(&minutes) {
+        return None;
+    }
+    Some(sign * (hours * 3_600 + minutes * 60))
+}
+
 /// Days since the Unix epoch for a `YYYY-MM-DD` label, or `None` when the text
 /// is not that shape.
 ///
@@ -158,6 +217,31 @@ mod tests {
         assert_eq!(unix_days_from_date_label("2026-08"), None);
         assert_eq!(unix_days_from_date_label("not-a-date"), None);
         assert_eq!(unix_days_from_date_label("2026-13-01"), None);
+    }
+
+    /// Shapes the provider usage endpoints actually return, plus the offset
+    /// handling that decides whether a reset reads hours early or late.
+    #[test]
+    fn rfc3339_stamps_convert_to_unix_seconds() {
+        // The exact shape Anthropic's usage endpoint returns.
+        let anthropic = unix_secs_from_rfc3339("2026-08-09T02:00:00.447469+00:00")
+            .expect("a fractional-second UTC stamp parses");
+        assert_eq!(anthropic, 1_786_240_800);
+        assert_eq!(unix_secs_from_rfc3339("1970-01-01T00:00:00Z"), Some(0));
+
+        // An offset is subtracted, not added: 09:00+09:00 is midnight UTC.
+        assert_eq!(
+            unix_secs_from_rfc3339("2026-08-09T09:00:00+09:00"),
+            unix_secs_from_rfc3339("2026-08-09T00:00:00Z")
+        );
+        assert_eq!(
+            unix_secs_from_rfc3339("2026-08-08T19:00:00-05:00"),
+            unix_secs_from_rfc3339("2026-08-09T00:00:00Z")
+        );
+
+        assert_eq!(unix_secs_from_rfc3339("2026-08-09"), None);
+        assert_eq!(unix_secs_from_rfc3339("2026-08-09T25:00:00Z"), None);
+        assert_eq!(unix_secs_from_rfc3339("not a timestamp"), None);
     }
 
     #[test]

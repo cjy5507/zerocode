@@ -5,6 +5,7 @@ pub mod otlp;
 mod prompt_cache;
 mod providers;
 pub mod quota;
+pub mod quota_probe;
 mod quota_shared;
 mod sse;
 pub mod sync_bridge;
