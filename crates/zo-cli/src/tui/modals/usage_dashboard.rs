@@ -45,6 +45,12 @@ const HEATMAP_ROWS: u16 = 9;
 /// The calendar is four rows taller, so below this it would leave the table a
 /// scroll window too small to use — and the line already says how much.
 const MIN_HEIGHT_WITH_HEATMAP: u16 = 23;
+/// Weeks of history the calendar needs before it beats the trend line.
+///
+/// One column per week means a month of use is six columns — too few to read as
+/// a grid, and the weekday rows then say nothing the table above them does not.
+/// A quarter is where the streaks and the gaps start being the picture.
+const MIN_WEEKS_FOR_CALENDAR: usize = 13;
 /// Smallest inner width that can seat a composition legend whole. The Savings
 /// legend is the widest at roughly fifty cells, and below that the band starts
 /// hiding entries — a coloured run whose name is off-screen is a key the reader
@@ -342,17 +348,34 @@ fn daily_calendar(rows: &[UsagePeriodRow], area: Rect, theme: &Theme) -> Vec<Lin
     let Some(last_day) = days.iter().map(|(day, _)| *day).max() else {
         return period_chart(rows, "Tokens per day", area, theme);
     };
-    // The grid spans the history that exists, not a fixed year: a month of use
-    // drawn on a year of columns is mostly empty cells, which reads as a long
-    // absence rather than a short history. Capped at a year, and never wider
-    // than the pane.
+    // One column per week, so a month of history is six columns — a grid too
+    // small to read as one, and small enough that the weekday rows say nothing
+    // the table above them does not. Below a quarter the line is the honest
+    // picture; the calendar earns its rows only once there is a year-ish shape
+    // to see.
     let first_day = days.iter().map(|(day, _)| *day).min().unwrap_or(last_day);
-    let span = usize::try_from((last_day - first_day) / 7 + 2).unwrap_or(4);
+    let span = usize::try_from((last_day - first_day) / 7 + 2).unwrap_or(0);
+    if span < MIN_WEEKS_FOR_CALENDAR {
+        return period_chart(rows, "Tokens per day", area, theme);
+    }
     let weeks = span
-        .clamp(4, 53)
+        .min(53)
         .min(usize::from(area.width.saturating_sub(4)).max(1));
+
     let mut lines = charts::activity_heatmap(&days, last_day, weeks, theme.palette.bright, theme);
     lines.push(charts::heatmap_legend(theme.palette.bright, theme));
+    // A month header cannot work at one column per week: `Jul` is three cells
+    // wide and swallows the two months beside it, which is how the grid came to
+    // read "Jun Aug". The range goes in a caption instead, where it has room.
+    let chronological: Vec<&UsagePeriodRow> = rows.iter().rev().collect();
+    let peak = days.iter().map(|(_, value)| *value).max().unwrap_or(0);
+    lines.push(chart_caption(
+        &chronological,
+        "Tokens per day",
+        peak,
+        area.width,
+        theme,
+    ));
     lines
 }
 
@@ -1264,7 +1287,7 @@ mod tests {
     fn a_tall_pane_paints_the_activity_calendar_with_its_key() {
         let theme = Theme::zo();
         let mut snap = snapshot();
-        snap.daily = recent_days(70);
+        snap.daily = recent_days(200);
 
         let rows = painted_rows(&UsageDashboardModal::new(snap), &theme, 120, 30);
         let text = rows.join("\n");
@@ -1279,8 +1302,8 @@ mod tests {
             "the ramp needs a key — a terminal has no tooltips:\n{text}"
         );
         assert!(
-            rows.iter().any(|row| row.contains("Aug")),
-            "the newest month is named:\n{text}"
+            rows.iter().any(|row| row.contains("peak") && row.contains('→')),
+            "the caption dates the range the grid covers:\n{text}"
         );
         // Seven weekday rows carry the grid itself.
         let grid = rows
@@ -1297,7 +1320,7 @@ mod tests {
     fn a_medium_pane_falls_back_from_calendar_to_trend_line() {
         let theme = Theme::zo();
         let mut snap = snapshot();
-        snap.daily = recent_days(70);
+        snap.daily = recent_days(200);
 
         let rows = painted_rows(&UsageDashboardModal::new(snap), &theme, 120, 22);
         let text = rows.join("\n");
@@ -1309,6 +1332,28 @@ mod tests {
         assert!(
             rows.iter().any(|row| row.contains("peak")),
             "the trend line stands in for it:\n{text}"
+        );
+    }
+
+    /// A month of history is six weekly columns. That is not a calendar — it is
+    /// a scatter of dots that says less than the table under it, which is
+    /// exactly what shipped and looked broken on a real account.
+    #[test]
+    fn a_short_history_keeps_the_line_instead_of_a_six_column_grid() {
+        let theme = Theme::zo();
+        let mut snap = snapshot();
+        snap.daily = recent_days(31);
+
+        let rows = painted_rows(&UsageDashboardModal::new(snap), &theme, 120, 30);
+        let text = rows.join("\n");
+
+        assert!(
+            !rows.iter().any(|row| row.starts_with("Mon ")),
+            "a month of history is too little for a grid:\n{text}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("peak")),
+            "the trend line covers it:\n{text}"
         );
     }
 

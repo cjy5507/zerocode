@@ -132,11 +132,6 @@ const WEEKDAY_GUTTER: &str = "    ";
 /// under a colour-blind eye, so the ramp is shape as well as hue.
 const HEAT_RAMP: [u8; 5] = [0x00, 0x04, 0x24, 0xb6, 0xff];
 
-/// Month abbreviations for the calendar's header row.
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
 /// A GitHub-style activity calendar: one column per week, one row per weekday,
 /// ending on the week that contains `last_day`.
 ///
@@ -165,8 +160,7 @@ pub fn activity_heatmap(
     let last_sunday = last_day - weekday_index(last_day);
     let first_sunday = last_sunday - (i64::try_from(weeks).unwrap_or(0) - 1) * 7;
 
-    let mut lines = Vec::with_capacity(WEEKDAYS + 1);
-    lines.push(month_header(first_sunday, weeks, theme));
+    let mut lines = Vec::with_capacity(WEEKDAYS);
     for weekday in 0..WEEKDAYS {
         let mut spans = Vec::with_capacity(weeks + 1);
         spans.push(Span::styled(
@@ -250,39 +244,6 @@ fn weekday_index(day: i64) -> i64 {
     (day + 4).rem_euclid(7)
 }
 
-/// Header row placing each month's abbreviation over the week its first day
-/// falls in, written once per month and only while three cells remain free.
-fn month_header(first_sunday: i64, weeks: usize, theme: &Theme) -> Line<'static> {
-    let mut text = String::from(WEEKDAY_GUTTER);
-    let mut last_month: Option<usize> = None;
-    for week in 0..weeks {
-        let column = WEEKDAY_GUTTER.len() + week;
-        let (_, month, _) = core_types::date::civil_from_unix_days(
-            first_sunday + i64::try_from(week).unwrap_or(0) * 7,
-        );
-        let index = usize::try_from(month.saturating_sub(1))
-            .unwrap_or(0)
-            .min(MONTHS.len() - 1);
-        if last_month == Some(index) {
-            continue;
-        }
-        // A month whose column is already covered by the previous label keeps
-        // its turn rather than shoving that label out of alignment; it simply
-        // goes unnamed, which the grid below still reads fine without.
-        if text.len() <= column {
-            while text.len() < column {
-                text.push(' ');
-            }
-            // The header may end up two cells past the grid's last column; it
-            // is a text row and the pane trims it, whereas refusing to write
-            // the newest month would leave the busiest end of the calendar
-            // unlabelled — the one label a reader most needs.
-            text.push_str(MONTHS[index]);
-        }
-        last_month = Some(index);
-    }
-    Line::from(Span::styled(text, theme.typography.dim))
-}
 
 /// One horizontal bar whose runs are proportional to `segments`, plus a legend
 /// row naming each run and its share.
