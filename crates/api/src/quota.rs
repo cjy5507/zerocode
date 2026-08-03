@@ -52,6 +52,80 @@ pub fn record_rate_limit_snapshot(snapshot: RateLimitSnapshot) {
     *lock_recovered(&LATEST_RATE_LIMIT) = Some((snapshot, Instant::now()));
 }
 
+/// One quota window a provider reports about itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaWindow {
+    /// Short window name as the provider frames it (`"5h"`, `"7d"`, `"weekly"`).
+    pub label: String,
+    /// Remaining headroom percent (`0..=100`), NOT utilization — the same
+    /// direction [`ProviderQuotaView`] uses, converted once at the edge.
+    pub remaining_percent: u8,
+    /// Absolute clock time this window rolls over, when the provider says.
+    pub resets_at_unix: Option<u64>,
+}
+
+/// A provider's quota as *it* reports it, rather than as we infer it.
+///
+/// The 429-derived rows in [`estimated_quota_view`] are a lagging guess: they
+/// only exist once the account is already throttled, and they cannot say how
+/// much headroom is left before that. Every subscription provider we speak to
+/// exposes its own usage endpoint, and this is what one of those answers maps
+/// to — so a freshly opened session knows its standing without having spent a
+/// request to learn it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeasuredQuota {
+    /// Windows the provider reports, in the order it lists them. Empty means
+    /// "the account has no limits worth showing", which is not the same as
+    /// "unknown" — an unknown provider records nothing at all.
+    pub windows: Vec<QuotaWindow>,
+    /// Signed-in account for this provider, when its credential carries one.
+    /// Held here because the credential read that yields the quota is the same
+    /// one that identifies the account; splitting them would read it twice.
+    pub account: Option<String>,
+}
+
+/// Latest measured quota per provider, with the instant it was observed.
+///
+/// Poison policy matches [`LATEST_RATE_LIMIT`]: recover. A write replaces one
+/// slot wholesale, so the array is consistent at every panic point.
+static MEASURED_QUOTA: Mutex<[Option<(MeasuredQuota, Instant)>; PROVIDER_SLOTS]> =
+    Mutex::new([const { None }; PROVIDER_SLOTS]);
+
+/// Age past which a measured reading stops being reported.
+///
+/// A quota window moves on the order of hours, so a reading minutes old is
+/// still true. What this guards is the opposite failure: a poller that died
+/// leaves its last answer sitting in the slot forever, and a stale "80%
+/// remaining" is worse than no figure at all because it invites spending
+/// against headroom that is gone.
+const MEASURED_QUOTA_FRESH: Duration = Duration::from_secs(15 * 60);
+
+/// Record a provider's own reading of its quota. See [`MeasuredQuota`].
+pub fn record_measured_quota(kind: ProviderKind, quota: MeasuredQuota) {
+    lock_recovered(&MEASURED_QUOTA)[provider_slot(kind)] = Some((quota, Instant::now()));
+}
+
+/// The most recent measured reading for `kind` and its age, if one was recorded
+/// this process lifetime. Staleness is the caller's to judge — the age is
+/// returned rather than applied, matching [`latest_rate_limit_snapshot`].
+#[must_use]
+pub fn latest_measured_quota(kind: ProviderKind) -> Option<(MeasuredQuota, Duration)> {
+    lock_recovered(&MEASURED_QUOTA)[provider_slot(kind)]
+        .as_ref()
+        .map(|(quota, at)| (quota.clone(), at.elapsed()))
+}
+
+/// Signed-in account for `kind`, when a measured reading carried one.
+///
+/// Only the *active* model's provider is ever shown, so this answers one
+/// provider at a time rather than handing out the whole set: three accounts on
+/// screen is three chances to leak an address in a screenshot for two of them
+/// that nobody is currently spending.
+#[must_use]
+pub fn provider_account(kind: ProviderKind) -> Option<String> {
+    latest_measured_quota(kind).and_then(|(quota, _)| quota.account)
+}
+
 /// The most recent unified snapshot and its age, if any response carried one
 /// this process lifetime.
 #[must_use]
@@ -516,18 +590,37 @@ pub struct ProviderQuotaView {
 #[must_use]
 pub fn provider_quota_views() -> Vec<ProviderQuotaView> {
     let now_mono = now_monotonic_millis();
-    let mut views = latest_rate_limit_snapshot()
-        .map(|(snapshot, age)| anthropic_quota_views(snapshot, age, now_unix_secs()))
-        .unwrap_or_default();
-    // Non-Anthropic providers have no remaining-headroom header, so their view
-    // is estimated from the shared 429 state. Anthropic is intentionally absent
-    // here: its authoritative signal is the measured unified windows above.
+    let now_unix = now_unix_secs();
+    let mut views = Vec::new();
     for kind in [
+        ProviderKind::Anthropic,
         ProviderKind::Xai,
         ProviderKind::OpenAi,
         ProviderKind::Google,
         ProviderKind::Ollama,
     ] {
+        // Best signal first. A reading the provider gave us beats both the
+        // response headers (which only exist after a request) and the 429
+        // guess (which only exists after the damage), so it wins outright
+        // rather than being merged with them into two rows saying different
+        // things about one window.
+        let measured = latest_measured_quota(kind)
+            .map(|(quota, age)| measured_quota_views(kind, &quota, age, now_unix))
+            .unwrap_or_default();
+        if !measured.is_empty() {
+            views.extend(measured);
+            continue;
+        }
+        if kind == ProviderKind::Anthropic {
+            // Anthropic alone carries remaining headroom on every response, so
+            // it has a second real signal to fall back to before guessing.
+            views.extend(
+                latest_rate_limit_snapshot()
+                    .map(|(snapshot, age)| anthropic_quota_views(snapshot, age, now_unix))
+                    .unwrap_or_default(),
+            );
+            continue;
+        }
         let slot = provider_slot(kind);
         if let Some(view) = estimated_quota_view(
             kind,
@@ -540,6 +633,37 @@ pub fn provider_quota_views() -> Vec<ProviderQuotaView> {
         }
     }
     views
+}
+
+/// Pure core of the measured rows: drop a stale reading wholesale, and drop any
+/// single window that has already rolled over — a reading still fresh by age
+/// can carry a window whose reset passed seconds ago, and its old percentage
+/// describes a window that no longer exists.
+fn measured_quota_views(
+    kind: ProviderKind,
+    quota: &MeasuredQuota,
+    age: Duration,
+    now_unix: u64,
+) -> Vec<ProviderQuotaView> {
+    if age > MEASURED_QUOTA_FRESH {
+        return Vec::new();
+    }
+    quota
+        .windows
+        .iter()
+        .filter(|window| {
+            window
+                .resets_at_unix
+                .is_none_or(|reset| reset > now_unix)
+        })
+        .map(|window| ProviderQuotaView {
+            provider: kind,
+            window_label: window.label.clone(),
+            remaining_percent: Some(window.remaining_percent.min(100)),
+            resets_at_unix: window.resets_at_unix,
+            estimated: false,
+        })
+        .collect()
 }
 
 /// Pure core of the Anthropic measured rows: normalize each present unified
@@ -676,10 +800,11 @@ mod tests {
     use super::{
         anthropic_quota_views, binding_window, cooldown_wait_ms, estimated_quota_view,
         headroom_low_at, headroom_low_for_kind_at, mark_rate_limit_cooldown,
-        mark_rate_limit_cooldown_from, provider_quota_views, rate_limit_backoff_ms,
-        rate_limit_cooldown_remaining_ms, quota_fallback_permitted_at,
-        reset_wait_within_band_for, window_pressure_at, ProviderQuotaView, QUOTA_SNAPSHOT_FRESH,
-        RATE_LIMIT_HEADROOM_WINDOW_MS, RESET_WAIT_GRACE,
+        mark_rate_limit_cooldown_from, measured_quota_views, provider_quota_views,
+        rate_limit_backoff_ms, rate_limit_cooldown_remaining_ms, quota_fallback_permitted_at,
+        reset_wait_within_band_for, window_pressure_at, MeasuredQuota, ProviderQuotaView,
+        QuotaWindow, MEASURED_QUOTA_FRESH, QUOTA_SNAPSHOT_FRESH, RATE_LIMIT_HEADROOM_WINDOW_MS,
+        RESET_WAIT_GRACE,
     };
     use crate::ProviderKind;
     use core_types::{RateLimitSnapshot, RateLimitWindow, RateLimitWindowKind};
@@ -922,6 +1047,87 @@ mod tests {
             snapshot,
             QUOTA_SNAPSHOT_FRESH + Duration::from_secs(1),
             now_unix
+        )
+        .is_empty());
+    }
+
+    /// A measured reading is the provider's own answer, so it must survive as
+    /// `estimated: false` — the sidebar keys its `est` tag off exactly that
+    /// flag, and a real figure wearing a guess's label teaches the wrong thing.
+    #[test]
+    fn measured_views_carry_the_provider_figure_unestimated() {
+        let now_unix = 1_000_000;
+        let quota = MeasuredQuota {
+            windows: vec![
+                QuotaWindow {
+                    label: "5h".to_string(),
+                    remaining_percent: 58,
+                    resets_at_unix: Some(now_unix + 3_600),
+                },
+                QuotaWindow {
+                    label: "7d".to_string(),
+                    remaining_percent: 91,
+                    resets_at_unix: None,
+                },
+            ],
+            account: Some("someone@example.com".to_string()),
+        };
+
+        let views = measured_quota_views(
+            ProviderKind::OpenAi,
+            &quota,
+            Duration::from_secs(30),
+            now_unix,
+        );
+
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].window_label, "5h");
+        assert_eq!(views[0].remaining_percent, Some(58));
+        assert_eq!(views[0].resets_at_unix, Some(now_unix + 3_600));
+        assert!(views.iter().all(|view| !view.estimated));
+        assert!(views
+            .iter()
+            .all(|view| view.provider == ProviderKind::OpenAi));
+    }
+
+    /// Two ways a reading stops describing reality: the poller died and left it
+    /// behind, or one window rolled over while the rest stayed valid. Reporting
+    /// either invites spending against headroom that is already gone.
+    #[test]
+    fn measured_views_drop_stale_readings_and_rolled_over_windows() {
+        let now_unix = 1_000_000;
+        let quota = MeasuredQuota {
+            windows: vec![
+                QuotaWindow {
+                    label: "5h".to_string(),
+                    remaining_percent: 12,
+                    resets_at_unix: Some(now_unix - 1),
+                },
+                QuotaWindow {
+                    label: "7d".to_string(),
+                    remaining_percent: 40,
+                    resets_at_unix: Some(now_unix + 60),
+                },
+            ],
+            account: None,
+        };
+
+        // The expired window goes; its sibling stays.
+        let fresh = measured_quota_views(
+            ProviderKind::Google,
+            &quota,
+            Duration::from_secs(1),
+            now_unix,
+        );
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].window_label, "7d");
+
+        // A reading nobody has refreshed is dropped whole.
+        assert!(measured_quota_views(
+            ProviderKind::Google,
+            &quota,
+            MEASURED_QUOTA_FRESH + Duration::from_secs(1),
+            now_unix,
         )
         .is_empty());
     }
