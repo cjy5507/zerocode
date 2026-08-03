@@ -253,6 +253,23 @@ pub const CARD_GAUGE_FILL_NC: &str = "#";
 pub const CARD_GAUGE_EMPTY: &str = "\u{2591}"; // ░
 pub const CARD_GAUGE_EMPTY_NC: &str = "-";
 
+// ── Chart ink ──────────────────────────────────────────────────
+// Braille (U+2800–U+28FF) is East-Asian **Neutral** (`width_cjk() == 1`), so a
+// `ko_KR` wide-ambiguous tmux still paints one column per cell and a chart
+// cannot double its own width. That is the whole reason charts draw with
+// braille instead of the familiar ramp `▁▂▃▄▅▆▇█` (U+2580–U+259F), which is
+// **Ambiguous** — the same trap documented for the gauge glyphs above. Each
+// cell carries 2×4 dots, buying eight vertical levels out of one text row.
+pub const BRAILLE_BLANK: char = '\u{2800}';
+pub const BRAILLE_FILL_NC: char = '#';
+pub const BRAILLE_EMPTY_NC: char = ' ';
+
+/// Braille cell for a dot bitmask; `0x00` is the blank cell `⠀`.
+#[must_use]
+pub fn braille_cell(bits: u8) -> char {
+    char::from_u32(BRAILLE_BLANK as u32 + u32::from(bits)).unwrap_or(BRAILLE_BLANK)
+}
+
 // ── Scroll ──────────────────────────────────────────────────────
 
 pub const SCROLL_UP: &str = "\u{25b2}";

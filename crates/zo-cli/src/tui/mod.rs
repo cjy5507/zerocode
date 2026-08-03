@@ -43,6 +43,7 @@ pub mod app;
 pub mod blocks;
 pub mod build_identity;
 pub mod cards;
+pub mod charts;
 pub mod command_history;
 pub mod fuzzy;
 pub mod glyphs;

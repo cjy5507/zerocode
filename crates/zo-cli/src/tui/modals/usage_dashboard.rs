@@ -4,7 +4,9 @@
 //! precomputed snapshot. It performs no file I/O and does not mutate runtime
 //! usage counters, so drawing stays deterministic and cheap.
 
-use core_types::{UsageDashboardSnapshot, UsageModelRow, UsagePeriodRow, format_usd};
+use core_types::{
+    UsageDashboardSnapshot, UsageModelRow, UsagePeriodRow, UsageSavingsSummary, format_usd,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -15,6 +17,7 @@ use ratatui::widgets::{Paragraph};
 use super::super::cards::{CardFrame, SurfaceKind};
 
 use super::{key_hint_footer_reflowing, selected_style};
+use crate::tui::charts;
 use crate::tui::glyphs;
 use crate::tui::theme::Theme;
 
@@ -28,6 +31,13 @@ const TREND_CELLS: usize = 16;
 const SHARE_CELLS: usize = 13;
 /// Cells in the savings comparison bar, which owns the rest of its row.
 const SAVINGS_CELLS: usize = 22;
+/// Rows the chart band claims: four braille rows — 32 vertical levels — plus a
+/// caption naming the peak and the range it covers.
+const CHART_ROWS: u16 = 5;
+/// Smallest inner height that can seat the chart band and still leave the table
+/// a usable scroll window. Below it the band is dropped whole rather than
+/// squeezed, because a two-row chart is decoration and the table is the data.
+const MIN_HEIGHT_WITH_CHART: u16 = 17;
 
 /// User action emitted by [`UsageDashboardModal::handle_key`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,11 +219,20 @@ fn render_dashboard(
         return;
     }
 
+    // The band is optional on purpose: it is the first thing to go when the
+    // terminal is short, since the table carries the numbers and the chart only
+    // carries their shape.
+    let chart_rows = if inner.height >= MIN_HEIGHT_WITH_CHART {
+        CHART_ROWS
+    } else {
+        0
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4),
             Constraint::Length(2),
+            Constraint::Length(chart_rows),
             Constraint::Min(3),
             Constraint::Length(3),
         ])
@@ -221,13 +240,16 @@ fn render_dashboard(
 
     render_kpis(&modal.snapshot, frame, chunks[0], theme);
     render_tabs(modal.tab, frame, chunks[1], theme);
+    if chart_rows > 0 {
+        render_chart_band(modal, frame, chunks[2], theme);
+    }
     match modal.tab {
         UsageDashboardTab::Daily => render_period_rows(
             "Daily estimate",
             &modal.snapshot.daily,
             modal.selected,
             frame,
-            chunks[2],
+            chunks[3],
             theme,
         ),
         UsageDashboardTab::Monthly => render_period_rows(
@@ -235,19 +257,164 @@ fn render_dashboard(
             &modal.snapshot.monthly,
             modal.selected,
             frame,
-            chunks[2],
+            chunks[3],
             theme,
         ),
         UsageDashboardTab::Models => render_model_rows(
             &modal.snapshot.models,
             modal.selected,
             frame,
-            chunks[2],
+            chunks[3],
             theme,
         ),
-        UsageDashboardTab::Savings => render_savings(&modal.snapshot, frame, chunks[2], theme),
+        UsageDashboardTab::Savings => render_savings(&modal.snapshot, frame, chunks[3], theme),
     }
-    render_footer(&modal.snapshot.note, frame, chunks[3], theme);
+    render_footer(&modal.snapshot.note, frame, chunks[4], theme);
+}
+
+/// The dashboard's one loud element: a band above the table showing the SHAPE
+/// of spending, which the per-row gauges cannot — they rank rows against each
+/// other, never the run of time across them. Everything else on this screen
+/// stays deliberately quiet so this is what the eye lands on.
+fn render_chart_band(
+    modal: &UsageDashboardModal,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: &Theme,
+) {
+    let lines = match modal.tab {
+        UsageDashboardTab::Daily => {
+            period_chart(&modal.snapshot.daily, "Tokens per day", area, theme)
+        }
+        UsageDashboardTab::Monthly => {
+            period_chart(&modal.snapshot.monthly, "Tokens per month", area, theme)
+        }
+        UsageDashboardTab::Models => model_mix_chart(&modal.snapshot.models, area, theme),
+        UsageDashboardTab::Savings => savings_chart(&modal.snapshot.savings, area, theme),
+    };
+    frame.render_widget(Paragraph::new(super::fit_body_rows(lines, area.width)), area);
+}
+
+fn period_chart(
+    rows: &[UsagePeriodRow],
+    title: &str,
+    area: Rect,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let series: Vec<u64> = rows.iter().map(|row| row.tokens).collect();
+    // The same denominator `render_period_rows` gives its trend gauges, so the
+    // band and the table underneath cannot disagree about the tall bucket.
+    let max = series.iter().copied().max().unwrap_or(0);
+    let mut lines = charts::braille_area_chart(
+        &series,
+        max,
+        area.width,
+        area.height.saturating_sub(1),
+        theme.palette.bright,
+        theme,
+    );
+    lines.push(chart_caption(rows, title, max, area.width, theme));
+    lines
+}
+
+/// Peak on the left, covered range on the right. The caption is what keeps the
+/// band honest on a terminal whose font has no braille: the numbers still read
+/// even when the shape above them does not render.
+fn chart_caption(
+    rows: &[UsagePeriodRow],
+    title: &str,
+    max: u64,
+    width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    let range = match (rows.first(), rows.last()) {
+        (Some(first), Some(last)) if rows.len() > 1 => {
+            format!("{} → {}", first.label, last.label)
+        }
+        (Some(only), _) => only.label.clone(),
+        _ => String::new(),
+    };
+    let left = format!("{title} · peak {}", compact_tokens(max));
+    let pad = usize::from(width)
+        .saturating_sub(left.chars().count())
+        .saturating_sub(range.chars().count());
+    Line::from(vec![
+        Span::styled(left, theme.typography.dim),
+        Span::styled(" ".repeat(pad), theme.typography.dim),
+        Span::styled(range, theme.typography.dim),
+    ])
+}
+
+fn model_mix_chart(rows: &[UsageModelRow], area: Rect, theme: &Theme) -> Vec<Line<'static>> {
+    // Four hues is the ceiling: past that the legend stops being readable and
+    // the runs stop being tellable apart. The rest folds into one honest
+    // "other" so the bar still sums to the whole.
+    let palette = [
+        theme.palette.bright,
+        theme.palette.violet,
+        theme.palette.cyan,
+        theme.palette.teal,
+    ];
+    let mut segments: Vec<(String, u64, Color)> = rows
+        .iter()
+        .take(palette.len())
+        .enumerate()
+        .map(|(idx, row)| (truncate(&row.model, 14), row.tokens, palette[idx]))
+        .collect();
+    let rest: u64 = rows.iter().skip(palette.len()).map(|row| row.tokens).sum();
+    if rest > 0 {
+        segments.push(("other".to_string(), rest, theme.palette.muted));
+    }
+    let mut lines = vec![Line::from(Span::styled(
+        "Token share by model",
+        theme.typography.bold,
+    ))];
+    lines.extend(charts::stacked_composition_bar(&segments, area.width, theme));
+    lines
+}
+
+fn savings_chart(savings: &UsageSavingsSummary, area: Rect, theme: &Theme) -> Vec<Line<'static>> {
+    let segments = vec![
+        (
+            "spent".to_string(),
+            cents(savings.actual_cost_usd),
+            theme.palette.violet,
+        ),
+        (
+            "cache saved".to_string(),
+            cents(savings.cache_savings_usd),
+            theme.palette.success,
+        ),
+        (
+            "mix saved".to_string(),
+            cents(savings.model_mix_savings_usd),
+            theme.palette.teal,
+        ),
+    ];
+    let mut lines = vec![Line::from(Span::styled(
+        "Baseline cost, split by where it went",
+        theme.typography.bold,
+    ))];
+    lines.extend(charts::stacked_composition_bar(&segments, area.width, theme));
+    lines
+}
+
+/// USD as whole cents so the composition bar can weigh segments with the
+/// integer arithmetic it uses everywhere else. Negative and non-finite input is
+/// clamped to zero rather than inverting a run; the upper bound is `f64`'s
+/// exactly-representable integer ceiling, past which cents stop being cents.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn cents(usd: f64) -> u64 {
+    /// Largest integer an `f64` still represents exactly (2^53).
+    const EXACT_F64_LIMIT: f64 = 9_007_199_254_740_992.0;
+    if !usd.is_finite() || usd <= 0.0 {
+        return 0;
+    }
+    let scaled = (usd * 100.0).round();
+    if scaled >= EXACT_F64_LIMIT {
+        return EXACT_F64_LIMIT as u64;
+    }
+    scaled as u64
 }
 
 fn render_kpis(snapshot: &UsageDashboardSnapshot, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -749,6 +916,26 @@ mod tests {
     use core_types::TokenUsage;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use unicode_width::UnicodeWidthStr;
+
+    fn is_braille(ch: char) -> bool {
+        ('\u{2800}'..='\u{28ff}').contains(&ch)
+    }
+
+    fn painted_rows(modal: &UsageDashboardModal, theme: &Theme, w: u16, h: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|frame| modal.draw(frame, frame.area(), theme))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (buffer.area.y..buffer.area.y + buffer.area.height)
+            .map(|y| {
+                (buffer.area.x..buffer.area.x + buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
 
     fn snapshot() -> UsageDashboardSnapshot {
         UsageDashboardSnapshot::from_session(
@@ -837,6 +1024,87 @@ mod tests {
             modal.handle_key(KeyEvent::from(KeyCode::Esc)),
             Some(UsageDashboardAction::Close)
         );
+    }
+
+    /// A week of daily buckets — the shape the band exists to show. The
+    /// single-session `snapshot()` has one bucket and deliberately plots no
+    /// trend, so it cannot exercise the chart.
+    fn week_snapshot() -> UsageDashboardSnapshot {
+        let mut snap = snapshot();
+        snap.daily = [
+            ("2026-07-28", 4_000_u64),
+            ("2026-07-29", 31_000),
+            ("2026-07-30", 12_000),
+            ("2026-07-31", 26_000),
+            ("2026-08-01", 3_000),
+            ("2026-08-02", 18_000),
+            ("2026-08-03", 9_000),
+        ]
+        .into_iter()
+        .map(|(label, tokens)| UsagePeriodRow {
+            label: label.to_string(),
+            tokens,
+            cost_usd: 0.02,
+            saved_usd: 0.01,
+            top_model: "gpt-5.5".to_string(),
+        })
+        .collect();
+        snap
+    }
+
+    /// Paint the modal and read the cells back, so the band is judged as the
+    /// user sees it. Braille is the one thing here the row model cannot check
+    /// for us: a span-level assertion passes happily on a chart that never
+    /// reached the pane — and it passed on a solid block that only a look
+    /// revealed.
+    #[test]
+    fn a_tall_pane_paints_the_chart_band_above_the_table() {
+        let theme = Theme::zo();
+        let rows = painted_rows(&UsageDashboardModal::new(week_snapshot()), &theme, 100, 24);
+
+        let ink = rows
+            .iter()
+            .position(|row| row.chars().any(is_braille))
+            .expect("the chart band paints braille ink");
+        let table = rows
+            .iter()
+            .position(|row| row.contains("Period"))
+            .expect("the table header still paints");
+        assert!(
+            ink < table,
+            "the band reads above the table it summarizes:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("peak")),
+            "the caption keeps the band readable without braille:\n{}",
+            rows.join("\n")
+        );
+        // Scoped to the band's own rows: the card border is box-drawing, which
+        // is EAW-Ambiguous by design here (see `glyphs::ANVIL_LINE`) and which
+        // target terminals force narrow. The data ink is what must never widen.
+        for row in rows.iter().filter(|row| row.chars().any(is_braille)) {
+            assert_eq!(
+                UnicodeWidthStr::width_cjk(row.as_str()),
+                100,
+                "a wide-ambiguous locale must not widen the chart band: {row:?}"
+            );
+        }
+    }
+
+    /// A short terminal drops the band whole. Squeezing it would spend the
+    /// table's scroll window on a chart too short to read.
+    #[test]
+    fn a_short_pane_drops_the_band_and_keeps_the_table() {
+        let theme = Theme::zo();
+        let rows = painted_rows(&UsageDashboardModal::new(snapshot()), &theme, 100, 14);
+        let text = rows.join("\n");
+
+        assert!(
+            !text.chars().any(is_braille),
+            "no band on a short pane:\n{text}"
+        );
+        assert!(text.contains("Period"), "the table survives:\n{text}");
     }
 
     #[test]
