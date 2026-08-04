@@ -68,6 +68,24 @@ const REFUSAL_DRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs
 const QUOTA_FALLBACK_DEFAULT_COOLDOWN: std::time::Duration =
     std::time::Duration::from_secs(15 * 60);
 
+/// Ceiling on a provider-supplied `retry_after` when it sets the pre-arm
+/// window. One hour, against a 15-minute default.
+///
+/// Once it elapses the session simply tries the main model again; if the wall
+/// is still up that 429 re-arms with a fresh hint. So the cost of a ceiling
+/// that is too short is one probe request per hour, while the cost of no
+/// ceiling is a whole session spent on a model the user did not choose. `api`
+/// bounds every other provider-hinted window for the same reason — a garbage
+/// or weekly-scale hint must not mute a provider for the process lifetime.
+const QUOTA_FALLBACK_MAX_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// How long the session pre-arms onto the fallback after a quota escape.
+fn quota_fallback_cooldown(retry_after: Option<std::time::Duration>) -> std::time::Duration {
+    retry_after.map_or(QUOTA_FALLBACK_DEFAULT_COOLDOWN, |hint| {
+        hint.min(QUOTA_FALLBACK_MAX_COOLDOWN)
+    })
+}
+
 /// Loud warn line for the mid-turn quota swap: the main model's quota window is
 /// exhausted, so this turn continues on the cross-provider fallback and the
 /// session returns to the main model once the recorded cooldown clears.
@@ -687,7 +705,7 @@ where
         // the cross-provider fallback client (assemble_request also guards
         // on `quota_fallback_active` — this keeps the state itself honest).
         self.escalation_model_override = None;
-        let cooldown = retry_after.unwrap_or(QUOTA_FALLBACK_DEFAULT_COOLDOWN);
+        let cooldown = quota_fallback_cooldown(retry_after);
         self.quota_dry_until = Some(std::time::Instant::now() + cooldown);
         QuotaEscape::Fallback(model)
     }
@@ -756,6 +774,41 @@ mod tests {
         assert!(
             bare.contains("the main model is still cooling down") && !bare.contains("left)"),
             "got {bare:?}"
+        );
+    }
+
+    use super::{
+        quota_fallback_cooldown, QUOTA_FALLBACK_DEFAULT_COOLDOWN, QUOTA_FALLBACK_MAX_COOLDOWN,
+    };
+
+    /// [`QUOTA_FALLBACK_DEFAULT_COOLDOWN`]'s contract is that a quota escape
+    /// never parks the session off its configured model for the rest of the
+    /// day. That held only while the provider stayed silent: a `retry_after`
+    /// hint was applied verbatim, so a single weekly-limit 429 advertising many
+    /// hours pre-armed every following turn onto the fallback model for that
+    /// whole time. The hint is trusted for its shape, not for its size.
+    #[test]
+    fn a_provider_retry_hint_cannot_park_the_session_past_the_ceiling() {
+        use std::time::Duration;
+
+        assert_eq!(
+            quota_fallback_cooldown(None),
+            QUOTA_FALLBACK_DEFAULT_COOLDOWN,
+            "no hint keeps the default window"
+        );
+
+        let modest = Duration::from_secs(90);
+        assert_eq!(
+            quota_fallback_cooldown(Some(modest)),
+            modest,
+            "a hint inside the ceiling is honored verbatim"
+        );
+
+        let weekly_limit = Duration::from_secs(9 * 60 * 60);
+        assert_eq!(
+            quota_fallback_cooldown(Some(weekly_limit)),
+            QUOTA_FALLBACK_MAX_COOLDOWN,
+            "an hours-long hint is bounded so the session can probe the main model again"
         );
     }
 }
