@@ -2462,6 +2462,89 @@ async fn stalled_precommit_stream_restarts_and_recovers() {
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
+/// A response body that terminates before its declared length makes reqwest fail
+/// while reading `Response::chunk`, not while opening the response. It must be
+/// retried before a text or tool-argument commit exactly like a stalled stream.
+#[tokio::test]
+async fn truncated_precommit_response_body_restarts_and_recovers() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_hits = hits.clone();
+
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        server_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut scratch = [0u8; 4096];
+        let _ = first.read(&mut scratch).await;
+        // The content length deliberately exceeds the actual SSE payload. A
+        // peer close after this write therefore becomes reqwest's body-decode
+        // error on the next `Response::chunk()` call.
+        let incomplete = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n";
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+            incomplete.len() + 64
+        );
+        first.write_all(head.as_bytes()).await.unwrap();
+        first.write_all(incomplete.as_bytes()).await.unwrap();
+        first.flush().await.unwrap();
+        drop(first);
+
+        let (mut second, _) = listener.accept().await.unwrap();
+        server_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = second.read(&mut scratch).await;
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r2\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,",
+            "\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,",
+            "\"delta\":\"recovered after truncated body\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":",
+            "{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        second.write_all(head.as_bytes()).await.unwrap();
+        second.write_all(body.as_bytes()).await.unwrap();
+        second.flush().await.unwrap();
+    });
+
+    let client = super::ChatGptBackendClient::new("token", None)
+        .with_base_url(format!("http://{addr}"))
+        .with_retry_policy(
+            1,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(1),
+        );
+    let mut stream = client
+        .stream_message(&request(vec![InputMessage::user_text("hi")], None, None))
+        .await
+        .expect("open initial stream");
+
+    let mut text = String::new();
+    while let Some(event) = stream
+        .next_event()
+        .await
+        .expect("truncated pre-commit body should restart")
+    {
+        if let StreamEvent::ContentBlockDelta(delta) = event {
+            if let ContentBlockDelta::TextDelta { text: chunk } = delta.delta {
+                text.push_str(&chunk);
+            }
+        }
+    }
+    server.await.unwrap();
+
+    assert_eq!(text, "recovered after truncated body");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn restart_budget_exhaustion_is_structural() {

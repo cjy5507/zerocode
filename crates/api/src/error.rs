@@ -63,6 +63,27 @@ pub enum ProviderErrorClass {
     NonRetryable,
 }
 
+/// Whether a `reqwest` failure is a transport hiccup rather than a verdict the
+/// provider actually delivered.
+///
+/// `is_body`/`is_decode` are the ones that were missing, and the ones that bite:
+/// they fire when the response opened cleanly and then failed part-way through
+/// the body — a reset mid-SSE-stream, a chunked body that ends short. That
+/// surfaces as `error decoding response body`, and treating it as permanent
+/// killed sub-agents that had already done dozens of tool calls. A failure that
+/// happened in transit is no more final than a connect or timeout failure, so
+/// it retries alongside them.
+///
+/// One predicate, consulted by both the class mapping and the retry test, so the
+/// two can never drift into disagreeing about what is worth retrying.
+fn is_transient_transport_error(error: &reqwest::Error) -> bool {
+    error.is_connect()
+        || error.is_timeout()
+        || error.is_request()
+        || error.is_body()
+        || error.is_decode()
+}
+
 impl ApiError {
     #[must_use]
     pub const fn missing_credentials(
@@ -236,7 +257,7 @@ impl ApiError {
                     ProviderErrorClass::NonRetryable
                 }
             }
-            Self::Http(error) if error.is_connect() || error.is_timeout() || error.is_request() => {
+            Self::Http(error) if is_transient_transport_error(error) => {
                 ProviderErrorClass::Transient
             }
             Self::RetriesExhausted { last_error, .. } => last_error.provider_error_class(),
@@ -296,7 +317,7 @@ impl ApiError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
+            Self::Http(error) => is_transient_transport_error(error),
             Self::Api { retryable, .. } | Self::StreamApi { retryable, .. } => {
                 *retryable
                     && !matches!(self.provider_error_class(), ProviderErrorClass::ContextOverflow)
