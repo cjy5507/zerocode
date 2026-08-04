@@ -358,7 +358,14 @@ pub(super) fn format_hook_message(result: &HookRunResult, fallback: &str) -> Str
     if result.messages().is_empty() {
         fallback.to_string()
     } else {
-        result.messages().join("\n")
+        // Same ceiling as the feedback append below, and for the same reason:
+        // on the deny path this string becomes the tool result's whole body, so
+        // a blocking hook that prints its diagnostics to stdout would otherwise
+        // write them into the transcript at full size. On that path this
+        // message IS the whole refusal — nothing else carries it — which is
+        // exactly why the cut keeps the head: a hook says what it refused
+        // before it starts listing why.
+        bound_hook_feedback(result.messages().join("\n"))
     }
 }
 
@@ -376,8 +383,42 @@ pub(super) fn merge_hook_feedback(messages: &[String], output: String, is_error:
     } else {
         "Hook feedback"
     };
-    sections.push(format!("{label}:\n{}", messages.join("\n")));
+    sections.push(format!(
+        "{label}:\n{}",
+        bound_hook_feedback(messages.join("\n"))
+    ));
     sections.join("\n\n")
+}
+
+/// Ceiling on the hook feedback appended to one tool result.
+///
+/// A hook's stdout is captured with no size bound, and output that is not JSON
+/// becomes a feedback message verbatim, so a chatty `PostToolUse` hook — a
+/// linter, a test runner, anything that prints — had its entire output spliced
+/// onto the tool result. A tool result is not re-compressed once written, so
+/// that text then rode every later request at full size until a full
+/// compaction round evicted it.
+///
+/// Smaller than the tool-output cap because feedback annotates a result rather
+/// than being one. What a hook is doing shows in its first lines and its
+/// verdict in its last, so both ends survive the cut.
+const HOOK_FEEDBACK_MAX_CHARS: usize = 4_000;
+
+fn bound_hook_feedback(text: String) -> String {
+    let total = text.chars().count();
+    if total <= HOOK_FEEDBACK_MAX_CHARS {
+        return text;
+    }
+    // The marker comes out of the same budget, so the cap bounds the whole
+    // replacement rather than only the slices it keeps.
+    let marker = format!("\n[… {total} characters of hook output omitted …]\n");
+    let budget = HOOK_FEEDBACK_MAX_CHARS.saturating_sub(marker.chars().count());
+    let head_len = budget * 2 / 3;
+    let tail_len = budget - head_len;
+    let head: String = text.chars().take(head_len).collect();
+    let tail: String = text.chars().skip(total - tail_len).collect();
+    let omitted = total - head_len - tail_len;
+    format!("{head}\n[… {omitted} characters of hook output omitted …]\n{tail}")
 }
 
 /// Parse a tool's raw output string into a JSON value, falling back to a
@@ -700,5 +741,95 @@ mod ask_input_tests {
             error.contains("`options` was a string"),
             "error should name the double-encoding: {error}"
         );
+    }
+
+    /// A hook's stdout is captured with no size bound (`hooks::run_hook`), and
+    /// output that is not JSON becomes a feedback message verbatim
+    /// (`parse_hook_output`). So a chatty `PostToolUse` hook — a linter, a test
+    /// runner, anything that prints — had its entire output appended to the
+    /// tool result. Tool results are not re-compressed once written, so that
+    /// text then rode every later request until a full compaction round.
+    #[test]
+    fn hook_feedback_is_capped_before_it_joins_a_tool_result() {
+        use crate::conversation::merge_hook_feedback;
+
+        let noisy = format!(
+            "FIRST-HOOK-LINE\n{}LAST-HOOK-LINE",
+            "lint: some/file.rs:1 warning\n".repeat(20_000)
+        );
+        let merged =
+            merge_hook_feedback(std::slice::from_ref(&noisy), "tool ok".to_string(), false);
+
+        // An absolute ceiling, not a ratio: a ratio bound passes even if the cap
+        // regresses by an order of magnitude. The slack covers the tool output
+        // and the "Hook feedback:" label, which are not part of the cap.
+        assert!(
+            merged.chars().count() <= super::HOOK_FEEDBACK_MAX_CHARS + 64,
+            "hook feedback must stay under its ceiling, got {} chars",
+            merged.chars().count()
+        );
+        assert!(
+            merged.starts_with("tool ok"),
+            "the tool's own output stays first and intact"
+        );
+        assert!(
+            merged.contains("Hook feedback"),
+            "the feedback is still labelled"
+        );
+        assert!(
+            merged.contains("FIRST-HOOK-LINE"),
+            "the head survives so the hook is still legible"
+        );
+        // The doc rests the design on a hook's verdict landing last, so the tail
+        // needs its own pin — head-only truncation would pass everything above.
+        assert!(
+            merged.contains("LAST-HOOK-LINE"),
+            "the tail survives so the hook's verdict is still readable"
+        );
+        assert!(
+            merged.contains("omitted"),
+            "the cut is disclosed rather than silent"
+        );
+    }
+
+    /// The deny path does not go through `merge_hook_feedback`: the formatted
+    /// message becomes the tool result's whole body. Capping only the feedback
+    /// copy left the original unbounded, so a blocking hook that printed its
+    /// diagnostics still wrote them into the transcript at full size.
+    #[test]
+    fn a_blocking_hook_message_is_capped_before_it_becomes_a_result_body() {
+        use crate::hooks::HookRunResult;
+
+        let noisy = format!(
+            "REFUSED-BECAUSE\n{}FINAL-VERDICT",
+            "policy: some/file.rs:1 violation\n".repeat(20_000)
+        );
+        let result = HookRunResult::allow(vec![noisy]);
+
+        let message = super::format_hook_message(&result, "hook denied the call");
+
+        assert!(
+            message.chars().count() <= super::HOOK_FEEDBACK_MAX_CHARS,
+            "a hook message bound for a result body must stay under the ceiling, got {} chars",
+            message.chars().count()
+        );
+        assert!(
+            message.contains("REFUSED-BECAUSE"),
+            "why it refused must survive"
+        );
+        assert!(
+            message.contains("FINAL-VERDICT"),
+            "the verdict at the tail must survive"
+        );
+    }
+
+    /// An empty hook result still falls back verbatim — the cap must not touch
+    /// the short, caller-supplied default.
+    #[test]
+    fn an_empty_hook_result_still_returns_the_fallback_untouched() {
+        use crate::hooks::HookRunResult;
+
+        let message = super::format_hook_message(&HookRunResult::empty(), "hook denied the call");
+        assert_eq!(message, "hook denied the call");
     }
 }
