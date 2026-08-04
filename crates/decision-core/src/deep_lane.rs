@@ -697,20 +697,37 @@ fn normalized_issue_set(issues: &[String]) -> std::collections::BTreeSet<String>
 
 /// Whether a verifier verdict is strong enough to satisfy the verifier gate.
 ///
-/// Strict JSON acceptances always pass. A salvaged rejection is not allowed to
-/// overturn an objectively green attempt because the verifier already violated
-/// the output contract, making false negatives too likely. Strict JSON
-/// rejections, empty output, and unparseable output still block acceptance.
+/// Strict JSON acceptances always pass. A rejection needs to state SOME reason
+/// to veto an objectively green attempt; a verdict that rejects while naming
+/// nothing at all is a malformed verdict, not a finding an implementer could
+/// act on — and forcing another edit pass against it is how a green change gets
+/// ground into a zero-progress retry loop. Salvaged rejections remain
+/// non-blocking when the objective is green. Empty output and unparseable
+/// output still block acceptance.
+///
+/// `has_reasons` deliberately spans BOTH `issues` and `evidence`: a verifier
+/// that writes its objection into the wrong field has still objected, and
+/// dropping that would trade a retry loop for silently discarding a real
+/// finding. Only a verdict that is reason-less everywhere gets relaxed.
+///
+/// Scope worth naming: `objective_ok` is not always a positive observation. A
+/// session with no configured check command reports green vacuously, and a run
+/// whose baseline was already red is treated as green so pre-existing breakage
+/// cannot pin the lane. In those two cases this relaxation rests on nothing
+/// having *contradicted* the change rather than on evidence it is sound.
 #[must_use]
 pub const fn verifier_gate_accepts(
     objective_ok: bool,
     verifier_accepted: bool,
     parse: VerifierParse,
+    has_reasons: bool,
 ) -> bool {
     if verifier_accepted {
         true
     } else {
-        objective_ok && matches!(parse, VerifierParse::Salvaged)
+        objective_ok
+            && (matches!(parse, VerifierParse::Salvaged)
+                || (matches!(parse, VerifierParse::Json) && !has_reasons))
     }
 }
 
@@ -725,7 +742,16 @@ pub fn fold_verification_attempt(
     verifier: &VerifierVerdict,
     previous_issues: &[String],
 ) -> VerificationAttempt {
-    let gate_accepted = verifier_gate_accepts(objective_ok, verifier.accepted, verifier.parse);
+    // A reason can land in either field: `issues` is where the contract asks
+    // for it, but a verifier that explained itself in `evidence` has still
+    // named something, and waving that through would discard a real finding.
+    let has_reasons = !verifier.issues.is_empty()
+        || verifier
+            .evidence
+            .as_deref()
+            .is_some_and(|evidence| !evidence.trim().is_empty());
+    let gate_accepted =
+        verifier_gate_accepts(objective_ok, verifier.accepted, verifier.parse, has_reasons);
     let stalled = !gate_accepted && failures_match(previous_issues, &verifier.issues);
     let decision =
         decide_with_progress(attempt, max_attempts, objective_ok, gate_accepted, stalled);
@@ -1007,6 +1033,61 @@ TODO
     }
 
     #[test]
+    fn lens_rejection_without_issues_does_not_retry_a_green_attempt() {
+        let verdict = parse_lens_verifier(
+            r#"{"spec": false, "regression": true, "security": true, "issues": []}"#,
+        );
+        let folded = fold_verification_attempt(1, 2, true, &verdict, &[]);
+
+        assert_eq!(folded.decision, DeepDecision::Accept);
+    }
+
+    /// Omitting `issues` entirely parses to the same empty vec through serde's
+    /// default, so it must reach the same decision as spelling out `[]`.
+    #[test]
+    fn lens_rejection_omitting_the_issues_field_is_treated_the_same() {
+        let verdict =
+            parse_lens_verifier(r#"{"spec": false, "regression": true, "security": true}"#);
+        let folded = fold_verification_attempt(1, 2, true, &verdict, &[]);
+
+        assert_eq!(folded.decision, DeepDecision::Accept);
+    }
+
+    /// A rejection that states its objection in `evidence` rather than `issues`
+    /// is a real finding, not the reason-less malformed verdict the relaxation
+    /// exists for. Treating it as malformed would silently discard what the
+    /// verifier actually caught — the exact failure the relaxation must not
+    /// trade for.
+    #[test]
+    fn lens_rejection_reasoned_only_in_evidence_still_blocks() {
+        let verdict = parse_lens_verifier(
+            r#"{"spec": false, "regression": true, "security": true, "issues": [], "evidence": "spec requires the retry cap to apply per host, but the diff applies it globally"}"#,
+        );
+        let folded = fold_verification_attempt(1, 2, true, &verdict, &[]);
+
+        assert_eq!(folded.decision, DeepDecision::Retry);
+    }
+
+    /// The relaxation is scoped to an objectively green attempt. With the
+    /// objective check red there is nothing vouching for the change, so a
+    /// reason-less rejection must not be waved through.
+    #[test]
+    fn reason_less_rejection_still_blocks_when_the_objective_check_is_red() {
+        assert!(!verifier_gate_accepts(
+            false,
+            false,
+            VerifierParse::Json,
+            false,
+        ));
+        assert!(!verifier_gate_accepts(
+            false,
+            false,
+            VerifierParse::Salvaged,
+            false,
+        ));
+    }
+
+    #[test]
     fn lens_verifier_incomplete_response_falls_back_not_accepts() {
         // An incomplete lens response (a lens omitted) must NOT pass — otherwise a
         // model could earn acceptance by omitting the hard lens it would fail.
@@ -1189,17 +1270,23 @@ TODO
 
     #[test]
     fn verifier_gate_accepts_salvaged_rejection_only_when_objective_is_green() {
-        assert!(verifier_gate_accepts(true, false, VerifierParse::Salvaged));
+        assert!(verifier_gate_accepts(
+            true,
+            false,
+            VerifierParse::Salvaged,
+            true,
+        ));
         assert!(!verifier_gate_accepts(
             false,
             false,
-            VerifierParse::Salvaged
+            VerifierParse::Salvaged,
+            true,
         ));
     }
 
     #[test]
-    fn verifier_gate_keeps_strict_json_rejection_blocking() {
-        assert!(!verifier_gate_accepts(true, false, VerifierParse::Json));
-        assert!(verifier_gate_accepts(false, true, VerifierParse::Json));
+    fn verifier_gate_keeps_itemized_strict_json_rejection_blocking() {
+        assert!(!verifier_gate_accepts(true, false, VerifierParse::Json, true));
+        assert!(verifier_gate_accepts(false, true, VerifierParse::Json, false));
     }
 }
