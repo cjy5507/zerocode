@@ -598,8 +598,14 @@ impl GlobalToolRegistry {
         // that call no tool at all — against ~20 tools and ~20 KB elsewhere,
         // and the loudest schemas in that surface are the orchestration
         // families, which biases plain requests toward over-orchestration.
-        // Activation is session-sticky, so deferring costs at most one prefix
-        // change per session rather than a permanent per-turn tax.
+        // Activation is session-sticky and only ever grows, so the cost is one
+        // prefix change per `ToolSearch` that matches something new — not the
+        // permanent per-turn tax of front-loading, and not (as this comment
+        // once claimed) a single change per session. It cannot be deferred to a
+        // turn boundary to batch those changes: activation is what lets a
+        // strict function-calling provider emit the call the model just
+        // searched for, so a tool the model loads must be advertised on the
+        // very next request or it cannot be used in the turn that loaded it.
         let runtime: Vec<api::ToolDefinition> = self
             .runtime_tools
             .lock()
