@@ -2011,3 +2011,41 @@ fn pretrim_for_summary_elides_oversized_results_and_images_only() {
     };
     assert_eq!(output.chars().count(), 20_000);
 }
+
+/// `plan_superseded_reminders` walks every `System` message, and a compaction
+/// continuation is a `System` message whose summary prose can quote both the
+/// reminder tag and the recall header — this audit produced such summaries.
+/// Classifying the lineage by substring would sort that summary into the recall
+/// family and, being older than the next real recall section, reclaim it: the
+/// compressed history of the conversation, replaced by a placeholder.
+#[test]
+fn a_summary_quoting_the_recall_header_is_not_reclaimed_as_a_recall_section() {
+    let mut session = Session::new();
+    session.push_user_text("start").expect("message");
+
+    let quoting_summary = format!(
+        "<system-reminder>\n[zo:compaction-continuation]\nEarlier work covered the \
+         `# Recalled memory` section and its `<system-reminder>` wrapper.\n{}\n</system-reminder>",
+        "detail ".repeat(400)
+    );
+    session
+        .push_message(reminder_message(&quoting_summary))
+        .expect("continuation summary");
+    session.push_user_text("work").expect("message");
+
+    let real_recall = format!(
+        "<system-reminder>\n# Recalled memory\nentry: {}\n</system-reminder>",
+        "detail ".repeat(400)
+    );
+    session
+        .push_message(reminder_message(&real_recall))
+        .expect("recall section");
+    session.push_user_text("work").expect("message");
+
+    let cleared = microcompact_session(&mut session, 0, 1)
+        .map_or(0, |event| event.cleared_superseded_reminders);
+    assert_eq!(
+        cleared, 0,
+        "a summary that merely quotes the header is not a recall section"
+    );
+}

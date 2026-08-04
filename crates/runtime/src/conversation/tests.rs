@@ -6759,6 +6759,94 @@ fn recalled_entry_reappearance_is_absorbed_pointer_only_until_compaction_reseeds
     );
 }
 
+#[test]
+fn recalled_entry_reseeds_after_microcompact_reclaims_older_full_section() {
+    fn last_system_text(session: &Session) -> String {
+        session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::System)
+            .map(|message| {
+                message
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>()
+            })
+            .expect("a persisted reminder message")
+    }
+
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        NoopApiClient,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        vec!["base prompt".to_string()],
+    );
+    runtime.set_memory_retriever(Some(std::sync::Arc::new(
+        LexicalMemoryRetriever::from_index_markdown(
+            "# Zo memory\n\n- [parsers](parsers.md) — recall me about parser bugs\n",
+        ),
+    )));
+    runtime
+        .session
+        .push_user_text("tell me about parser bugs")
+        .expect("user message");
+
+    let first = runtime.request_wire_reminders();
+    runtime.absorb_wire_reminders_into_session(&first);
+    assert!(last_system_text(&runtime.session).contains("recall me about parser bugs"));
+
+    for k in 0..11 {
+        runtime
+            .session
+            .push_message(ConversationMessage::tool_result(
+                format!("recall-microcompact-{k}"),
+                "read_file",
+                "x".repeat(400),
+                false,
+            ))
+            .expect("bulky result");
+    }
+    runtime.replace_transient_system_reminder_by_prefix(
+        "[zo:test-shift]",
+        Some("[zo:test-shift] a"),
+    );
+    runtime
+        .session
+        .push_user_text("more parser bugs please")
+        .expect("second query");
+    let second = runtime.request_wire_reminders();
+    runtime.absorb_wire_reminders_into_session(&second);
+    assert!(
+        last_system_text(&runtime.session).contains("already recalled this session"),
+        "second appearance must collapse to a pointer"
+    );
+
+    let precompaction = runtime.precompaction_input_tokens_threshold();
+    let event = runtime
+        .maybe_microcompact_for_tokens(precompaction)
+        .expect("pressure valve must fire microcompact");
+    assert_eq!(event.cleared_results, 1);
+    assert_eq!(event.cleared_superseded_reminders, 1);
+
+    runtime
+        .session
+        .push_user_text("parser bugs after microcompact")
+        .expect("post-microcompact query");
+    let third = runtime.request_wire_reminders();
+    runtime.absorb_wire_reminders_into_session(&third);
+    let third_text = last_system_text(&runtime.session);
+    assert!(
+        third_text.contains("recall me about parser bugs"),
+        "microcompact must reseed the reclaimed full entry: {third_text}"
+    );
+}
+
 /// B3: a standing contract reminder is taught until its persisted `System`
 /// copy exists, then stops re-riding every turn; compaction erasing the copy
 /// re-arms teaching. Guards the ~700 chars/turn the confidence contract

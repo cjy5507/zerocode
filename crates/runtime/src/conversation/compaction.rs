@@ -900,6 +900,10 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
             MICROCOMPACT_MIN_OUTPUT_BYTES,
         );
         if let Some(fired) = event {
+            // Recompute recall dedup for the same reason as full compaction:
+            // reclaimed full bodies must be free to reseed, while any full
+            // entries that survived this trim must remain deduplicated.
+            self.recalled_memory_slugs = super::recalled_slugs_from_session(&self.session);
             // Trimmed again while still over the floor: the thrash signature
             // (read → clear → re-read). Count it; the compaction gate promotes
             // to full compaction once the streak reaches the threshold.

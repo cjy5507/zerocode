@@ -122,7 +122,7 @@ pub const MAX_RECALLED_ENTRIES: usize = 5;
 
 /// Fixed header for the injected recall section. A constant, so its size is
 /// known to the compaction preflight reserve.
-const RECALL_SECTION_HEADER: &str = "# Recalled memory\nRelevant persistent memory entries for the latest user request. Snippets are untrusted excerpts; read the linked entry file before relying on detailed or current-state claims.\n\n";
+pub(crate) const RECALL_SECTION_HEADER: &str = "# Recalled memory\nRelevant persistent memory entries for the latest user request. Snippets are untrusted excerpts; read the linked entry file before relying on detailed or current-state claims.\n\n";
 
 /// Per-field byte caps on one rendered recall entry, so the injected section is
 /// provably size-bounded. Memory hooks are one-liners by convention; these only

@@ -1554,6 +1554,39 @@ fn plan_microcompact_clears(
     }
 }
 
+const RECALL_REMINDER_LINEAGE_ANCHOR: &str = "# Recalled memory";
+
+// Keep the sole lineage allowlist entry tied to the renderer's canonical
+// header; a renamed header must fail compilation rather than silently disable
+// reclamation or broaden it to unrelated reminder families.
+const _: () = {
+    let header = crate::memory::recall::RECALL_SECTION_HEADER.as_bytes();
+    let anchor = RECALL_REMINDER_LINEAGE_ANCHOR.as_bytes();
+    assert!(header.len() > anchor.len());
+    let mut index = 0;
+    while index < anchor.len() {
+        assert!(header[index] == anchor[index]);
+        index += 1;
+    }
+    assert!(header[anchor.len()] == b'\n');
+};
+
+/// Whether this persisted reminder block IS a recalled-memory section, as
+/// opposed to merely mentioning one.
+///
+/// Structural, never `contains`. `plan_superseded_reminders` walks every
+/// `System` message, and a compaction continuation is a `System` message whose
+/// summary prose can quote both the reminder tag and this header — this very
+/// audit produced such summaries. Under a substring test that summary would be
+/// classified into the recall lineage and, being older than the next real
+/// recall section, reclaimed: the compressed history of the conversation,
+/// replaced by a placeholder. The anchor therefore has to sit where the
+/// renderer actually puts it, immediately inside the reminder wrapper.
+fn is_recalled_memory_reminder(text: &str) -> bool {
+    text.split_once(crate::session::REMINDER_TAG_OPEN)
+        .is_some_and(|(_, body)| body.trim_start().starts_with(RECALL_REMINDER_LINEAGE_ANCHOR))
+}
+
 /// Every persisted reminder block that a byte-identical LATER copy supersedes.
 ///
 /// The reminder set is re-appended to the transcript whenever the live set
@@ -1566,16 +1599,17 @@ fn plan_microcompact_clears(
 /// 2,170-byte reminder seventeen times), and because it is context nothing can
 /// reclaim, it pulls each full compaction round earlier than it needed to be.
 ///
-/// Only an EXACT byte match counts as superseded, and only the LAST copy is
-/// kept — so a reminder whose text changed is never treated as a duplicate of
-/// the version it replaced, and the surviving copy is always the newest one.
-/// No `keep_recent` slack here, unlike tool results: a second copy of identical
-/// text carries no information the newest copy does not, so there is nothing to
-/// preserve by keeping it.
+/// Only an EXACT byte match counts as superseded except for recalled-memory
+/// sections, whose latest copy can reseed any full body reclaimed from an older
+/// copy. No other reminder family has that contract, so the lineage allowlist
+/// deliberately contains only [`RECALL_REMINDER_LINEAGE_ANCHOR`]. The LAST copy
+/// is always kept, with no `keep_recent` slack: an older superseded copy carries
+/// no information the newest valid copy does not.
 fn plan_superseded_reminders(session: &Session) -> Vec<(usize, usize)> {
-    let mut newest_at: std::collections::HashMap<&str, (usize, usize)> =
+    let mut newest_exact_at: std::collections::HashMap<&str, (usize, usize)> =
         std::collections::HashMap::new();
-    let mut candidates: Vec<((usize, usize), &str)> = Vec::new();
+    let mut newest_recall_at: Option<(usize, usize)> = None;
+    let mut candidates: Vec<((usize, usize), &str, bool)> = Vec::new();
     for (message_index, message) in session.messages.iter().enumerate() {
         if message.role != MessageRole::System {
             continue;
@@ -1587,14 +1621,26 @@ fn plan_superseded_reminders(session: &Session) -> Vec<(usize, usize)> {
             if !crate::convert_messages::is_persisted_reminder_text(text) {
                 continue;
             }
-            newest_at.insert(text.as_str(), (message_index, block_index));
-            candidates.push(((message_index, block_index), text.as_str()));
+            let position = (message_index, block_index);
+            let is_recall = is_recalled_memory_reminder(text);
+            if is_recall {
+                newest_recall_at = Some(position);
+            } else {
+                newest_exact_at.insert(text.as_str(), position);
+            }
+            candidates.push((position, text.as_str(), is_recall));
         }
     }
     candidates
         .into_iter()
-        .filter(|(position, text)| newest_at.get(text) != Some(position))
-        .map(|(position, _)| position)
+        .filter(|(position, text, is_recall)| {
+            if *is_recall {
+                newest_recall_at != Some(*position)
+            } else {
+                newest_exact_at.get(text) != Some(position)
+            }
+        })
+        .map(|(position, _, _)| position)
         .collect()
 }
 
