@@ -126,6 +126,63 @@ fn resolve_bash_timeout_ms(requested: Option<u64>) -> u64 {
         .unwrap_or_else(default_bash_timeout_ms)
 }
 
+/// The shared, tool-agnostic half of the `stderr` a caller gets when its
+/// command outlived the deadline.
+///
+/// Says only what the host can actually guarantee. Termination is *requested*,
+/// not confirmed: the process-group sweep in [`terminate_process_group`] is
+/// `#[cfg(unix)]`, both `kill` results there are discarded, the branch returns
+/// without awaiting exit, and `kill_on_drop` schedules a kill rather than
+/// synchronously reaping. On a non-Unix host only the direct `sh` child is
+/// signalled, so a descendant can outlive the request — claiming the command
+/// "was killed" would overstate all of that.
+///
+/// Recovery advice is deliberately NOT here: it differs per tool, and only the
+/// registry-backed bash path can honestly promise a pollable task.
+#[must_use]
+pub fn timeout_stderr(effective_timeout_ms: u64) -> String {
+    format!("Command exceeded timeout of {effective_timeout_ms} ms; termination was requested.")
+}
+
+/// [`timeout_stderr`] plus the recovery route that actually exists on the
+/// calling path.
+///
+/// The deadline discards the output and tears down the command, which is
+/// exactly wrong for anything that never returns on its own. Naming
+/// `run_in_background` is the only guidance zo can give without guessing which
+/// command this was — the host cannot tell a server from a slow build by its
+/// name, but the caller can, and the kill is the moment that distinction
+/// becomes actionable.
+///
+/// `output_is_pollable` decides *which* promise is honest, and it is not a
+/// property of the tool but of the caller's wiring. Only
+/// [`execute_bash_with_tasks`] **with a registry in scope** turns a background
+/// run into a real task whose log `TaskOutput` can read. Without one — plain
+/// [`execute_bash`], and the `PowerShell` runner in the `tools` crate — the
+/// background branch detaches with both streams on `Stdio::null()` and hands
+/// back a bare OS pid, so promising a pollable task there would name a route
+/// that does not exist.
+#[must_use]
+pub fn timeout_stderr_with_background_advice(
+    effective_timeout_ms: u64,
+    output_is_pollable: bool,
+) -> String {
+    let shared = timeout_stderr(effective_timeout_ms);
+    if output_is_pollable {
+        format!(
+            "{shared} If it is not expected to exit on its own, re-run it with \
+             `run_in_background: true` — it then keeps running and its output \
+             stays readable with TaskOutput(task_id)."
+        )
+    } else {
+        format!(
+            "{shared} If it is not expected to exit on its own, re-run it with \
+             `run_in_background: true` — it then keeps running, but its output \
+             is not captured."
+        )
+    }
+}
+
 /// Polling slice for the background-task watcher: how quickly a `TaskStop`
 /// kills the process and how promptly the terminal status lands.
 const BACKGROUND_WATCH_SLICE: Duration = Duration::from_millis(200);
@@ -519,6 +576,11 @@ pub fn execute_bash_with_tasks(
     let low_disk = low_disk_warning(&cwd);
     refuse_when_disk_critical(&cwd)?;
 
+    // Captured before the background branch consumes `tasks`: the foreground
+    // timeout reply below may only name `TaskOutput` when a registry is what
+    // a background re-run would land in.
+    let registry_backed = tasks.is_some();
+
     if input.run_in_background.unwrap_or(false) {
         let mut command = prepare_command(&input.command, &cwd, &sandbox_status, false)?;
 
@@ -629,6 +691,7 @@ pub fn execute_bash_with_tasks(
                     sandbox_status,
                     cwd,
                     live_writer,
+                    registry_backed,
                 ))
             })
             .join()
@@ -640,6 +703,7 @@ pub fn execute_bash_with_tasks(
                     sandbox_status,
                     cwd,
                     live_writer,
+                    registry_backed,
                 ))
             })
         };
@@ -653,15 +717,22 @@ pub fn execute_bash_with_tasks(
             sandbox_status,
             cwd,
             live_writer,
+            registry_backed,
         ))
         .map(|output| attach_disk_warning(output, low_disk))
 }
 
+/// `registry_backed` records whether the caller reached here through
+/// [`execute_bash_with_tasks`] **with** a task registry. It changes no
+/// execution, only what the timeout reply may promise: without a registry a
+/// re-run with `run_in_background` detaches and discards its output, so naming
+/// `TaskOutput` there would be false.
 async fn execute_bash_async(
     input: BashCommandInput,
     sandbox_status: SandboxStatus,
     cwd: std::path::PathBuf,
     live_output: crate::live_output::LiveOutputWriter,
+    registry_backed: bool,
 ) -> io::Result<BashCommandOutput> {
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true)?;
 
@@ -739,7 +810,7 @@ async fn execute_bash_async(
         terminate_process_group(child_pid);
         return Ok(BashCommandOutput {
             stdout: String::new(),
-            stderr: format!("Command exceeded timeout of {effective_timeout_ms} ms"),
+            stderr: timeout_stderr_with_background_advice(effective_timeout_ms, registry_backed),
             raw_output_path: None,
             interrupted: true,
             is_image: None,
@@ -1320,6 +1391,119 @@ mod tests {
         assert_eq!(
             output.return_code_interpretation.as_deref(),
             Some("timeout")
+        );
+    }
+
+    /// A killed command must say what the caller can do about it. The deadline
+    /// discards the output and kills the process group, so for anything that
+    /// never exits on its own that verdict is useless on its own — the reply
+    /// has to name `run_in_background` and how to read the output afterwards.
+    #[test]
+    fn a_killed_command_points_the_caller_at_the_background_option() {
+        let shared = super::timeout_stderr(1_000);
+        // The existing `contains("Command exceeded timeout")` contract holds.
+        assert!(
+            shared.starts_with("Command exceeded timeout of 1000 ms"),
+            "{shared}"
+        );
+        // Termination is requested, never confirmed: the process-group sweep is
+        // Unix-only, both `kill` results are discarded, and this branch returns
+        // without awaiting exit. Claiming the command "was killed" would promise
+        // a guarantee the implementation does not make.
+        assert!(
+            !shared.contains("was killed"),
+            "must not overstate termination: {shared}"
+        );
+        assert!(
+            shared.contains("termination was requested"),
+            "{shared}"
+        );
+        // The shared half carries no recovery route, because the route differs
+        // per tool — only the registry-backed bash path has a pollable task.
+        assert!(
+            !shared.contains("run_in_background"),
+            "tool-specific advice must not leak into the shared half: {shared}"
+        );
+
+        // Both variants keep the shared verdict and name the one lever the
+        // caller actually has.
+        for pollable in [true, false] {
+            let advised = super::timeout_stderr_with_background_advice(1_000, pollable);
+            assert!(advised.starts_with(&shared), "{advised}");
+            assert!(
+                advised.contains("run_in_background: true"),
+                "the caller must be told how to keep it alive: {advised}"
+            );
+        }
+
+        // Registry in scope: a background re-run becomes a real task, so the
+        // pollable promise is honest.
+        let pollable = super::timeout_stderr_with_background_advice(1_000, true);
+        assert!(
+            pollable.contains("TaskOutput(task_id)"),
+            "a registry-backed re-run IS pollable: {pollable}"
+        );
+
+        // No registry: the background branch detaches with `Stdio::null()` and
+        // returns a bare pid, so naming `TaskOutput` would send the caller to a
+        // route that does not exist.
+        let detached = super::timeout_stderr_with_background_advice(1_000, false);
+        assert!(
+            !detached.contains("TaskOutput"),
+            "must not promise a task lookup that cannot resolve: {detached}"
+        );
+        assert!(
+            detached.contains("its output is not captured"),
+            "the caller must learn the output is lost, not just that it survives: {detached}"
+        );
+    }
+
+    /// The advice must track the caller's actual wiring, not the tool name.
+    /// `execute_bash` passes no registry, so its background branch is the
+    /// fire-and-forget one — a timeout reply promising `TaskOutput` there would
+    /// name a route that call site cannot reach.
+    #[test]
+    fn a_registry_less_caller_is_not_promised_a_pollable_task() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ZO_BASH_TIMEOUT_MS", "250");
+        let output = execute_bash(input("sleep 5", None)).expect("bash command should execute");
+        std::env::remove_var("ZO_BASH_TIMEOUT_MS");
+
+        assert!(output.interrupted, "the deadline must fire");
+        assert!(
+            output.stderr.starts_with("Command exceeded timeout"),
+            "{}",
+            output.stderr
+        );
+        assert!(
+            !output.stderr.contains("TaskOutput"),
+            "execute_bash has no registry, so its background route is not pollable: {}",
+            output.stderr
+        );
+        assert!(
+            output.stderr.contains("its output is not captured"),
+            "{}",
+            output.stderr
+        );
+    }
+
+    /// The registry-backed dispatch — what the bash tool actually uses — may
+    /// make the stronger promise, because its background branch creates a real
+    /// task whose log `TaskOutput` reads.
+    #[test]
+    fn a_registry_backed_caller_is_pointed_at_task_output() {
+        let registry = TaskRegistry::new_in_memory();
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ZO_BASH_TIMEOUT_MS", "250");
+        let output = execute_bash_with_tasks(input("sleep 5", None), Some(&registry), Some("s"))
+            .expect("bash command should execute");
+        std::env::remove_var("ZO_BASH_TIMEOUT_MS");
+
+        assert!(output.interrupted, "the deadline must fire");
+        assert!(
+            output.stderr.contains("TaskOutput(task_id)"),
+            "a registry-backed re-run is pollable: {}",
+            output.stderr
         );
     }
 

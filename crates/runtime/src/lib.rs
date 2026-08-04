@@ -71,7 +71,10 @@ pub use core_types::session;
 pub use core_types::sse;
 pub use core_types::usage;
 
-pub use bash::{execute_bash, execute_bash_with_tasks, BashCommandInput, BashCommandOutput};
+pub use bash::{
+    execute_bash, execute_bash_with_tasks, timeout_stderr,
+    timeout_stderr_with_background_advice, BashCommandInput, BashCommandOutput,
+};
 
 #[must_use]
 pub fn available_disk_bytes(dir: &std::path::Path) -> Option<u64> {

@@ -557,7 +557,11 @@ fn completed_command_output(output: &Output, sandbox_status: SandboxStatus) -> B
 fn timed_out_command_output(timeout_ms: u64, sandbox_status: SandboxStatus) -> BashCommandOutput {
     BashCommandOutput {
         stdout: String::new(),
-        stderr: format!("Command exceeded timeout of {timeout_ms} ms"),
+        // `false`: this path's background mode detaches with both streams on
+        // `Stdio::null()` and hands back a bare OS pid rather than a registry
+        // task id (`backgrounded_command_output`), so it must not promise a
+        // pollable `TaskOutput` — that route does not exist here.
+        stderr: runtime::timeout_stderr_with_background_advice(timeout_ms, false),
         raw_output_path: None,
         interrupted: true,
         is_image: None,
@@ -882,6 +886,42 @@ mod tests {
         assert_eq!(
             runtime::live_output::sanitize_live_output(raw),
             "진행 · 2%\nnext"
+        );
+    }
+
+    /// The `PowerShell` timeout reply must not inherit bash's recovery route.
+    /// `execute_shell_command`'s background branch pipes both streams to
+    /// `Stdio::null()` and returns `child.id()` — a bare OS pid, never a
+    /// registry `task_…` — so `TaskOutput` could not resolve it and there would
+    /// be no captured output to resolve to.
+    #[test]
+    fn powershell_timeout_advice_never_promises_a_task_lookup() {
+        let sandbox_status =
+            resolve_sandbox_status(&SandboxConfig::default(), Path::new("."));
+        let output = timed_out_command_output(1_000, sandbox_status);
+
+        assert!(output.interrupted);
+        assert_eq!(output.return_code_interpretation.as_deref(), Some("timeout"));
+        // The checked-in `contains("Command exceeded timeout")` contract.
+        assert!(
+            output.stderr.starts_with("Command exceeded timeout of 1000 ms"),
+            "{}",
+            output.stderr
+        );
+        assert!(
+            !output.stderr.contains("TaskOutput"),
+            "PowerShell background is detached and unregistered, so a task lookup must not be advertised: {}",
+            output.stderr
+        );
+        assert!(
+            output.stderr.contains("run_in_background: true"),
+            "the caller still needs the lever that keeps it alive: {}",
+            output.stderr
+        );
+        assert!(
+            output.stderr.contains("its output is not captured"),
+            "the caller must learn the output is discarded: {}",
+            output.stderr
         );
     }
 
