@@ -676,6 +676,84 @@ mod tests {
         );
     }
 
+    /// Builds a genuine `reqwest::Error` from a response that declares more
+    /// body than it sends. `reqwest::Error` has no public constructor, and the
+    /// distinction being tested — a response that opened cleanly and then died
+    /// mid-body — only exists once a real transport is involved.
+    async fn body_read_failure() -> reqwest::Error {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 1024];
+            let _ = socket.read(&mut scratch).await;
+            let body = "half";
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len() + 32
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect("the response head arrives intact");
+        let error = response
+            .text()
+            .await
+            .expect_err("a body shorter than its content-length must fail while being read");
+        server.await.unwrap();
+        error
+    }
+
+    /// A response that dies part-way through its body is a transport hiccup, not
+    /// a verdict from the provider: nothing about it says the same request would
+    /// fail again. Classifying it as permanent killed sub-agents mid-run with
+    /// `error decoding response body` after they had already done real work.
+    #[tokio::test]
+    async fn a_body_that_fails_mid_read_is_transient_and_retryable() {
+        let error = body_read_failure().await;
+        assert!(
+            error.is_body() || error.is_decode(),
+            "the fixture must produce a body-read failure, got {error:?}"
+        );
+
+        let api_error = ApiError::Http(error);
+        assert!(
+            api_error.is_retryable(),
+            "a failure that happened in transit must be retried: {api_error}"
+        );
+        assert_eq!(
+            api_error.provider_error_class(),
+            ProviderErrorClass::Transient,
+            "and it must classify alongside connect/timeout failures"
+        );
+    }
+
+    /// The two entry points must never disagree about what is worth retrying —
+    /// they read the same predicate precisely so they cannot drift apart.
+    #[tokio::test]
+    async fn transport_retry_classification_agrees_across_both_entry_points() {
+        let api_error = ApiError::Http(body_read_failure().await);
+        assert_eq!(
+            api_error.is_retryable(),
+            matches!(
+                api_error.provider_error_class(),
+                ProviderErrorClass::Transient
+            )
+        );
+    }
+
     #[test]
     fn stream_idle_timeout_is_retryable() {
         let err = ApiError::stream_idle_timeout(Duration::from_secs(90));
