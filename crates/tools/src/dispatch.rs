@@ -131,6 +131,90 @@ fn global_truncation_config() -> &'static TruncationConfig {
     CONFIG.get_or_init(TruncationConfig::default)
 }
 
+/// Hard ceiling on a tool FAILURE's message.
+///
+/// Successful output is capped here and its full bytes sealed as an artifact,
+/// but a failure returns before that seam, and the historical wire compression
+/// passes errors through verbatim on purpose so the model keeps reading the
+/// real diagnosis (`runtime::context_compression::wire_tool_output`). Together
+/// that left the one tool output with no upper bound anywhere: an MCP or plugin
+/// failure carrying a response body, a stack dump, or a diagnostics blob stayed
+/// in the transcript at full size until a full compaction round evicted it.
+///
+/// Smaller than the 30,000-char success cap on purpose. Output is the payload a
+/// tool was called for; an error is diagnosis, and what diagnoses is the head
+/// (what was attempted) and the tail (what actually went wrong) — which is
+/// exactly what survives below.
+const MAX_TOOL_ERROR_CHARS: usize = 4_000;
+
+/// Cap an over-long tool error, keeping its head and tail and pointing at the
+/// full text in the artifact store.
+///
+/// Only the variants that carry free-form text are bounded, and only when they
+/// are actually over the cap — everything else is returned untouched, same
+/// variant, same bytes, so `failed_result`'s error classification and every
+/// caller matching on the variant are unaffected. Arbitrary strings reach
+/// `ToolError` through `Execution` (see the `From<String>` impl in
+/// `crate::error`), which is why `Io`/`Json` are left alone: their `Display` is
+/// bounded by the OS and serde messages, not by tool output.
+#[must_use]
+pub fn bound_tool_error(error: ToolError, artifact_dir: Option<&Path>) -> ToolError {
+    match error {
+        ToolError::Execution(text) => ToolError::Execution(bound_tool_error_text(text, artifact_dir)),
+        ToolError::InvalidInput(text) => {
+            ToolError::InvalidInput(bound_tool_error_text(text, artifact_dir))
+        }
+        ToolError::PermissionDenied { tool, reason } => ToolError::PermissionDenied {
+            tool,
+            reason: bound_tool_error_text(reason, artifact_dir),
+        },
+        // The name comes from the model, so it is provider-controlled and free
+        // to be enormous.
+        ToolError::NotFound(text) => ToolError::NotFound(bound_tool_error_text(text, artifact_dir)),
+        other => other,
+    }
+}
+
+/// Cap a bare error string the same way [`bound_tool_error`] caps a `ToolError`.
+///
+/// Public because the choke point is not one type: the plugin branch of
+/// [`crate::registry::GlobalToolRegistry`] and the main session's MCP path build
+/// their failures without ever entering `dispatch_tool_inner`, and the MCP one
+/// carries a different `ToolError` type entirely (`runtime::ToolError`). Those
+/// two are where the biggest errors actually come from — an MCP server's
+/// JSON-RPC `error.message` and a plugin's stderr — so they need the same cap
+/// applied at their own return sites.
+#[must_use]
+pub fn bound_tool_error_text(text: String, artifact_dir: Option<&Path>) -> String {
+    let total = text.chars().count();
+    if total <= MAX_TOOL_ERROR_CHARS {
+        return text;
+    }
+    // Store before cutting: the notice below is only worth emitting if the full
+    // text actually persisted, and a store failure must not advertise an id
+    // that cannot be resolved.
+    let artifact = crate::artifacts::store_transformed(artifact_dir, &text, false, true);
+    let notice = artifact
+        .as_ref()
+        .map(|artifact| format!("\n{}", recovery_notice(&artifact.sha256)))
+        .unwrap_or_default();
+    // The cap is a ceiling on the WHOLE replacement, not just on the surviving
+    // slices, so the marker and the recovery notice come out of the same budget
+    // rather than being added on top of it.
+    let marker = format!("\n[… {total} characters of this error omitted …]\n");
+    let overhead = marker.chars().count() + notice.chars().count();
+    let budget = MAX_TOOL_ERROR_CHARS.saturating_sub(overhead);
+    // Two thirds head, one third tail. A failure names what it was doing first
+    // and why it failed last, and the tail is where a cause chain or a panic
+    // message lands, so neither end can be dropped.
+    let head_len = budget * 2 / 3;
+    let tail_len = budget - head_len;
+    let head: String = text.chars().take(head_len).collect();
+    let tail: String = text.chars().skip(total - tail_len).collect();
+    let omitted = total - head_len - tail_len;
+    format!("{head}\n[… {omitted} characters of this error omitted …]\n{tail}{notice}")
+}
+
 pub(crate) fn execute_tool_with_context(
     ctx: &ToolContext,
     enforcer: Option<&PermissionEnforcer>,
@@ -162,6 +246,9 @@ fn execute_tool_with_context_and_artifact_dir(
     let raw = match dispatch_tool_inner(ctx, enforcer, canonical_ref, input) {
         Ok(raw) => raw,
         Err(error) => {
+            // Bound BEFORE the audit record, so the invocation log does not
+            // keep the full text either.
+            let error = bound_tool_error(error, artifact_dir);
             ctx.record_tool_invocation(
                 invocation.finish(failed_result(&error), gateway::epoch_millis_now()),
             );
@@ -992,4 +1079,145 @@ mod auto_format_guard_tests {
         assert!(artifact_dir.join(sha).exists(), "artifact notice must resolve");
     }
 
+    /// A tool FAILURE took an early return that skipped the cap and the
+    /// artifact seal a success gets, and the historical wire compression
+    /// deliberately passes errors through verbatim — so an oversized error had
+    /// no upper bound anywhere and rode every later request until a full
+    /// compaction. `read_image` embeds the requested path in its failure, which
+    /// makes an unbounded error reachable from ordinary input.
+    #[test]
+    fn oversized_tool_error_is_capped_and_kept_recoverable() {
+        let artifact_dir = unique_temp_path("tool-error-artifacts");
+        std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+        let ctx = ToolContext::new();
+        let huge_path = format!("/nonexistent-zo-test/{}.png", "p".repeat(40_000));
+        let input = serde_json::json!({ "path": huge_path });
+
+        let error = super::execute_tool_with_context_and_artifact_dir(
+            &ctx,
+            None,
+            "read_image",
+            &input,
+            Some(&artifact_dir),
+        )
+        .expect_err("read_image on a missing path must fail");
+
+        let text = error.to_string();
+        let length = text.chars().count();
+        // The cap bounds the message; `to_string` adds the variant's short
+        // Display prefix ("execution error: ") on top of it.
+        assert!(
+            length <= super::MAX_TOOL_ERROR_CHARS + 32,
+            "an oversized tool error must be capped, got {length} chars"
+        );
+        assert!(
+            text.contains("retrieve_tool_output"),
+            "a capped error must say how to recover the full text: {text}"
+        );
+        assert!(
+            text.starts_with("execution error: read_image:"),
+            "the head of the error must survive so the failure is still legible: {text}"
+        );
+        // The whole point of keeping a tail is that the cause lands at the end.
+        // Drop the tail slice and the head assertion above still passes, so this
+        // is the only thing pinning it.
+        assert!(
+            text.contains("(os error"),
+            "the tail must survive so the actual cause is still readable: {text}"
+        );
+        let sha = extract_notice_sha(&text);
+        let stored = std::fs::read_to_string(artifact_dir.join(sha))
+            .expect("the full error must be recoverable from the artifact store");
+        assert!(
+            stored.chars().count() > length,
+            "the artifact must hold more than the capped message"
+        );
+        let _ = std::fs::remove_dir_all(&artifact_dir);
+    }
+
+    /// An error that already fits must come back untouched — same variant, same
+    /// bytes, and no artifact written for it.
+    #[test]
+    fn ordinary_tool_error_is_left_exactly_as_it_was() {
+        let artifact_dir = unique_temp_path("tool-error-small");
+        std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+        let ctx = ToolContext::new();
+        let input = serde_json::json!({ "path": "/nonexistent-zo-test/missing.png" });
+
+        let error = super::execute_tool_with_context_and_artifact_dir(
+            &ctx,
+            None,
+            "read_image",
+            &input,
+            Some(&artifact_dir),
+        )
+        .expect_err("read_image on a missing path must fail");
+
+        let text = error.to_string();
+        assert!(matches!(error, crate::error::ToolError::Execution(_)));
+        assert!(
+            !text.contains("retrieve_tool_output"),
+            "a small error must not advertise recovery: {text}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&artifact_dir)
+                .expect("read artifact dir")
+                .count(),
+            0,
+            "a small error must not write an artifact"
+        );
+        let _ = std::fs::remove_dir_all(&artifact_dir);
+    }
+
+    /// Boundary table for the cap itself. The cap is a ceiling on the WHOLE
+    /// replacement — marker and recovery notice included — not just on the
+    /// slices it keeps, and both ends of the original must survive.
+    #[test]
+    fn error_cap_boundaries_hold_for_ascii_and_multibyte() {
+        let artifact_dir = unique_temp_path("tool-error-boundaries");
+        std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+        let cap = super::MAX_TOOL_ERROR_CHARS;
+
+        for (label, total) in [
+            ("under", cap - 1),
+            ("exact", cap),
+            ("over-by-one", cap + 1),
+            ("far-over", cap * 9),
+        ] {
+            for (kind, unit) in [("ascii", "x"), ("multibyte", "\u{ac00}")] {
+                let filler = unit.repeat(total - 8);
+                let text = format!("HEAD{filler}TAIL");
+                assert_eq!(text.chars().count(), total, "{label}/{kind} setup");
+
+                let bounded = super::bound_tool_error_text(text.clone(), Some(&artifact_dir));
+                let length = bounded.chars().count();
+
+                if total <= cap {
+                    assert_eq!(bounded, text, "{label}/{kind} must pass through untouched");
+                    continue;
+                }
+                assert!(
+                    length <= cap,
+                    "{label}/{kind} must not exceed the cap, got {length}"
+                );
+                assert!(
+                    bounded.starts_with("HEAD"),
+                    "{label}/{kind} must keep the head"
+                );
+                assert!(
+                    bounded.contains("TAIL"),
+                    "{label}/{kind} must keep the tail"
+                );
+                assert!(
+                    bounded.contains("characters of this error omitted"),
+                    "{label}/{kind} must say that it cut"
+                );
+                assert!(
+                    bounded.contains("retrieve_tool_output"),
+                    "{label}/{kind} must stay recoverable"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&artifact_dir);
+    }
 }

@@ -53,7 +53,9 @@ pub use artifacts::{
     prune_artifact_files_older_than, read_artifact, store_artifact, ArtifactKind, ArtifactRef,
 };
 pub use context::{SubagentIdentity, ToolContext, TurnAgentPolicy, UserQuestionChannel};
-pub use dispatch::{enforce_permission_check, execute_tool};
+pub use dispatch::{
+    bound_tool_error, bound_tool_error_text, enforce_permission_check, execute_tool,
+};
 pub use error::ToolError;
 pub use fanout::{
     clarify_intent, decompose_for_fanout, decompose_for_fanout_with_timeout,

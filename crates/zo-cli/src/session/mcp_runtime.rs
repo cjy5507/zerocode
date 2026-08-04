@@ -155,7 +155,7 @@ fn run_mcp_call_bounded<T>(
     // it is only ever created under the runtime `run_blocking` enters, never on a
     // bare sync thread with no time driver registered.
     run_blocking(async move { tokio::time::timeout(budget, call).await }).map_err(|_elapsed| {
-        runtime::ToolError::new(mcp_tool_call_timeout_message(qualified_tool_name, budget))
+        bounded_tool_error(mcp_tool_call_timeout_message(qualified_tool_name, budget))
     })
 }
 
@@ -320,7 +320,7 @@ impl RuntimeMcpState {
         arguments: Option<serde_json::Value>,
     ) -> Result<runtime::McpGetPromptResult, runtime::ToolError> {
         run_blocking(self.manager.get_prompt(server, prompt_name, arguments))
-            .map_err(|error| runtime::ToolError::new(error.to_string()))
+            .map_err(|error| bounded_tool_error(error.to_string()))
     }
 
     pub(crate) fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -590,7 +590,7 @@ impl RuntimeMcpState {
     fn resolve_mcp_tool_request_name(&self, requested: &str) -> Result<String, runtime::ToolError> {
         let requested = requested.trim();
         if requested.is_empty() {
-            return Err(runtime::ToolError::new(
+            return Err(bounded_tool_error(
                 "missing required field `qualifiedName`".to_string(),
             ));
         }
@@ -609,14 +609,14 @@ impl RuntimeMcpState {
             [single] => Ok(single.clone()),
             [] => {
                 if let Some(server) = self.pending_server_for_requested_tool(requested) {
-                    return Err(runtime::ToolError::new(format!(
+                    return Err(bounded_tool_error(format!(
                         "MCP server `{server}` is still discovering tools; `{requested}` is not available yet. Canonical MCP tool names use `mcp__{}__<tool>` after discovery completes.",
                         runtime::normalize_name_for_mcp(&server)
                     )));
                 }
                 Ok(requested.to_string())
             }
-            many => Err(runtime::ToolError::new(format!(
+            many => Err(bounded_tool_error(format!(
                 "MCP tool name `{requested}` is ambiguous; use one of: {}",
                 many.join(", ")
             ))),
@@ -634,7 +634,7 @@ impl RuntimeMcpState {
                     return Err(error);
                 };
                 if let Err(refresh_error) = self.refresh_server_tools(&server) {
-                    return Err(runtime::ToolError::new(format!(
+                    return Err(bounded_tool_error(format!(
                         "MCP server `{server}` could not finish tool discovery for `{requested}`: {refresh_error}"
                     )));
                 }
@@ -660,10 +660,10 @@ impl RuntimeMcpState {
         match tool_name {
             "MCPTool" => {
                 let input: McpToolRequest = serde_json::from_value(value).map_err(|error| {
-                    runtime::ToolError::new(format!("invalid tool input JSON: {error}"))
+                    bounded_tool_error(format!("invalid tool input JSON: {error}"))
                 })?;
                 let requested_name = input.qualified_name.or(input.tool).ok_or_else(|| {
-                    runtime::ToolError::new("missing required field `qualifiedName`")
+                    bounded_tool_error("missing required field `qualifiedName`")
                 })?;
                 let qualified_name =
                     self.resolve_mcp_tool_request_name_with_refresh(&requested_name)?;
@@ -672,7 +672,7 @@ impl RuntimeMcpState {
             "ListMcpResourcesTool" => {
                 let input: ListMcpResourcesRequest =
                     serde_json::from_value(value).map_err(|error| {
-                        runtime::ToolError::new(format!("invalid tool input JSON: {error}"))
+                        bounded_tool_error(format!("invalid tool input JSON: {error}"))
                     })?;
                 match input.server {
                     Some(server_name) => self.list_resources_for_server(&server_name),
@@ -682,7 +682,7 @@ impl RuntimeMcpState {
             "ReadMcpResourceTool" => {
                 let input: ReadMcpResourceRequest =
                     serde_json::from_value(value).map_err(|error| {
-                        runtime::ToolError::new(format!("invalid tool input JSON: {error}"))
+                        bounded_tool_error(format!("invalid tool input JSON: {error}"))
                     })?;
                 self.read_resource(&input.server, &input.uri)
             }
@@ -699,16 +699,16 @@ impl RuntimeMcpState {
             qualified_tool_name,
             self.manager.call_tool(qualified_tool_name, arguments),
         )?
-        .map_err(|error| runtime::ToolError::new(error.to_string()))?;
+        .map_err(|error| bounded_tool_error(error.to_string()))?;
         if let Some(error) = response.error {
-            return Err(runtime::ToolError::new(format!(
+            return Err(bounded_tool_error(format!(
                 "MCP tool `{qualified_tool_name}` returned JSON-RPC error: {} ({})",
                 error.message, error.code
             )));
         }
 
         let mut result = response.result.ok_or_else(|| {
-            runtime::ToolError::new(format!(
+            bounded_tool_error(format!(
                 "MCP tool `{qualified_tool_name}` returned no result payload"
             ))
         })?;
@@ -746,17 +746,17 @@ impl RuntimeMcpState {
     ) -> Result<String, runtime::ToolError> {
         if !self.manager.server_names().iter().any(|name| name == server_name) {
             if let Some(message) = self.server_unavailable_message(server_name) {
-                return Err(runtime::ToolError::new(message));
+                return Err(bounded_tool_error(message));
             }
         }
 
         let result = run_blocking(self.manager.list_resources(server_name))
-            .map_err(|error| runtime::ToolError::new(error.to_string()))?;
+            .map_err(|error| bounded_tool_error(error.to_string()))?;
         serde_json::to_string_pretty(&json!({
             "server": server_name,
             "resources": result.resources,
         }))
-        .map_err(|error| runtime::ToolError::new(error.to_string()))
+        .map_err(|error| bounded_tool_error(error.to_string()))
     }
 
     pub(crate) fn list_resources_for_all_servers(&mut self) -> Result<String, runtime::ToolError> {
@@ -793,14 +793,14 @@ impl RuntimeMcpState {
                 .filter_map(|failure| failure.get("error").and_then(serde_json::Value::as_str))
                 .collect::<Vec<_>>()
                 .join("; ");
-            return Err(runtime::ToolError::new(message));
+            return Err(bounded_tool_error(message));
         }
 
         serde_json::to_string_pretty(&json!({
             "resources": resources,
             "failures": failures,
         }))
-        .map_err(|error| runtime::ToolError::new(error.to_string()))
+        .map_err(|error| bounded_tool_error(error.to_string()))
     }
 
     pub(crate) fn read_resource(
@@ -810,17 +810,17 @@ impl RuntimeMcpState {
     ) -> Result<String, runtime::ToolError> {
         if !self.manager.server_names().iter().any(|name| name == server_name) {
             if let Some(message) = self.server_unavailable_message(server_name) {
-                return Err(runtime::ToolError::new(message));
+                return Err(bounded_tool_error(message));
             }
         }
 
         let result = run_blocking(self.manager.read_resource(server_name, uri))
-            .map_err(|error| runtime::ToolError::new(error.to_string()))?;
+            .map_err(|error| bounded_tool_error(error.to_string()))?;
         serde_json::to_string_pretty(&json!({
             "server": server_name,
             "contents": result.contents,
         }))
-        .map_err(|error| runtime::ToolError::new(error.to_string()))
+        .map_err(|error| bounded_tool_error(error.to_string()))
     }
 
     /// Drain buffered inbound MCP events and return the unique servers that
@@ -855,7 +855,7 @@ impl RuntimeMcpState {
             }
             Err(error) => {
                 let failure = DiscoveryFailure::classify(&error, &self.manager, server);
-                let tool_error = runtime::ToolError::new(failure.message.clone());
+                let tool_error = bounded_tool_error(failure.message.clone());
                 self.record_discovery_failure(server, failure);
                 Err(tool_error)
             }
@@ -999,14 +999,37 @@ fn render_tool_call_result(
     result: &runtime::McpToolCallResult,
 ) -> Result<String, runtime::ToolError> {
     let rendered = serde_json::to_string_pretty(result)
-        .map_err(|error| runtime::ToolError::new(error.to_string()))?;
+        .map_err(|error| bounded_tool_error(error.to_string()))?;
     if result.is_error == Some(true) {
+        // The common MCP failure shape: a perfectly valid JSON-RPC response
+        // whose *result* says `isError`. `detail` is whatever the server wrote
+        // there, so it needs the same cap as the JSON-RPC error branch.
         let detail = mcp_tool_result_text(result).unwrap_or(rendered);
-        return Err(runtime::ToolError::new(format!(
+        return Err(bounded_tool_error(format!(
             "MCP tool `{qualified_tool_name}` reported an error: {detail}"
         )));
     }
     Ok(rendered)
+}
+
+/// The module's only tool-error constructor: caps the message and leaves the
+/// full text recoverable from the artifact store.
+///
+/// The main session reaches MCP through this module, not through the tool
+/// dispatch seam that caps builtin failures, so every error leaving here has to
+/// apply the cap itself. Several shapes are server-controlled and bounded only
+/// by the 32 MiB transport limit — a JSON-RPC `error.message`, the more common
+/// case of a valid response whose result carries `isError`, a stored discovery
+/// failure, and the joined per-server messages of a resource listing — and an
+/// error tool result is exempt from historical wire compression, so uncapped
+/// any of them would ride every later request at full size.
+///
+/// Every error return in this module goes through here rather than a selected
+/// few, because "which of these strings can a server grow?" is exactly the
+/// question that goes stale. Text already under the cap passes through
+/// unchanged, so routing the fixed-message cases through it costs nothing.
+fn bounded_tool_error(message: impl Into<String>) -> runtime::ToolError {
+    runtime::ToolError::new(tools::bound_tool_error_text(message.into(), None))
 }
 
 /// Placeholder left in the text view of a tool result where an image's base64
@@ -2555,6 +2578,40 @@ mod tests {
         assert!(
             message.contains("disk is full"),
             "the tool's own text is surfaced as the error detail, got: {message}"
+        );
+    }
+
+    /// The main session reaches MCP here rather than through the tool dispatch
+    /// seam that caps builtin failures, and an error tool result is exempt from
+    /// historical wire compression — so an uncapped server error would sit at
+    /// full size in every later request until a full compaction.
+    #[test]
+    fn render_tool_call_result_caps_a_huge_tool_level_error() {
+        let head = "SERVER-ERROR-HEAD";
+        let tail = "SERVER-ERROR-TAIL";
+        let detail = format!("{head}{}{tail}", "x".repeat(200_000));
+        let result = tool_result(vec![text_content(&detail)], Some(true));
+
+        let error = render_tool_call_result("mcp__srv__write", &result)
+            .expect_err("isError: true maps to Err");
+        let message = error.to_string();
+        let length = message.chars().count();
+
+        assert!(
+            length < detail.chars().count() / 10,
+            "a 200k-char server error must not ride the transcript whole, got {length} chars"
+        );
+        assert!(
+            message.contains(head),
+            "the head must survive so the failure stays legible: {message}"
+        );
+        assert!(
+            message.contains(tail),
+            "the tail must survive so the cause stays readable"
+        );
+        assert!(
+            message.contains("retrieve_tool_output"),
+            "the full server error must stay recoverable"
         );
     }
 

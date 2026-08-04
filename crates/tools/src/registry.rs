@@ -909,7 +909,12 @@ impl GlobalToolRegistry {
             .iter()
             .find(|tool| tool.definition().name == canonical_ref)
         else {
-            return Err(self.unknown_tool_error(name));
+            // The name is whatever the model emitted, so cap it here too — this
+            // early return is outside the dispatch seam.
+            return Err(crate::dispatch::bound_tool_error(
+                self.unknown_tool_error(name),
+                None,
+            ));
         };
         let invocation =
             gateway::begin_tool_invocation(name, canonical_ref, input, self.enforcer.as_ref())
@@ -936,7 +941,13 @@ impl GlobalToolRegistry {
                 Ok(output)
             }
             Err(error) => {
-                let error = ToolError::Execution(error.to_string());
+                // This branch never enters `dispatch_tool_inner`, so it applies
+                // the error cap itself. A plugin's stderr rides this string up
+                // to `MAX_PLUGIN_OUTPUT_BYTES` (1 MiB), and an error result is
+                // exempt from historical wire compression, so uncapped it would
+                // sit at full size in every later request.
+                let error =
+                    crate::dispatch::bound_tool_error(ToolError::Execution(error.to_string()), None);
                 self.context.record_tool_invocation(
                     invocation.finish(failed_result(&error), gateway::epoch_millis_now()),
                 );
