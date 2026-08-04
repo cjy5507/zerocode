@@ -245,32 +245,16 @@ const ESCALATION_EFFORT_BUDGET: u32 = 16_000;
 /// loop runs exactly once, so this is inert unless a Stop hook opts in.
 const DEFAULT_MAX_STOP_LOOPS: usize = 10;
 
-/// Last-resort hard cap on turn-loop iterations for the persistent interactive
-/// runtime. Without it the interactive runtime defaulted to `usize::MAX` and a
-/// no-progress tool-call loop (the microcompact-thrashing loop: read files →
-/// microcompact clears the bodies → the model re-reads the same files, forever)
-/// could only be broken with Ctrl+C. This is the *backstop*, not the primary
-/// fix: the microcompact→full-compaction promotion breaks thrashing within a
-/// few iterations and normalized repetition detection catches re-reads sooner.
-/// Set high enough that no legitimate interactive turn reaches it — even a large
-/// multi-file refactor rarely exceeds a few dozen model round-trips — while
-/// still bounding a runaway loop. Headless (`prepare_turn_runtime`, when
-/// `--max-turns` is set) and spawned sub-agents (`spawn.rs`, cap 64) override
-/// this with their own explicit, tighter caps; the interactive persistent
-/// runtime never called `set_max_iterations`, so it now inherits this default.
-const DEFAULT_MAX_ITERATIONS: usize = 200;
-
-/// The interactive turn-loop iteration cap, honouring a `ZO_MAX_ITERATIONS`
-/// env override (positive integer) so an operator running an unusually long
-/// autonomous single-turn task can raise the backstop without a rebuild — the
-/// escape hatch analogous to `ZO_DISABLE_MICROCOMPACT` on the trim path.
-/// Falls back to [`DEFAULT_MAX_ITERATIONS`] when unset, empty, non-numeric, or 0.
+/// The turn-loop iteration cap. Persistent interactive turns are unbounded by
+/// default because a human can interrupt them and the repetition guard already
+/// stops identical tool-call thrash. Unattended callers install their own finite
+/// caps; `ZO_MAX_ITERATIONS` remains an explicit operator override.
 fn default_max_iterations() -> usize {
     std::env::var("ZO_MAX_ITERATIONS")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_MAX_ITERATIONS)
+        .unwrap_or(usize::MAX)
 }
 
 /// System message injected into the session after automatic compaction so

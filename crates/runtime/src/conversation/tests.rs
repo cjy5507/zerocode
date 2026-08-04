@@ -11565,6 +11565,89 @@ fn run_turn_preserves_work_when_max_iterations_is_exceeded() {
 }
 
 #[test]
+fn default_interactive_runtime_continues_past_legacy_iteration_backstop() {
+    const TOOL_ITERATIONS: usize = 200;
+
+    struct LongRunningApi {
+        call_count: usize,
+    }
+
+    impl ApiClient for LongRunningApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.call_count += 1;
+            if self.call_count <= TOOL_ITERATIONS {
+                return Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: format!("tool-{}", self.call_count),
+                        name: "echo".to_string(),
+                        input: format!("payload-{}", self.call_count),
+                    },
+                    AssistantEvent::MessageStop,
+                ]);
+            }
+            Ok(vec![
+                AssistantEvent::TextDelta("finished".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    let _env_lock = crate::test_env_lock();
+    let _max_iterations = EnvVarGuard::unset("ZO_MAX_ITERATIONS");
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        LongRunningApi { call_count: 0 },
+        StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+
+    let summary = runtime
+        .run_turn("keep working", None)
+        .expect("the observed interactive turn should reach the model's natural stop");
+
+    assert_eq!(summary.iterations, TOOL_ITERATIONS + 1);
+    assert_eq!(summary.budget_exhausted, None);
+}
+
+#[test]
+fn repeated_successful_read_gets_one_grace_round_before_thrashing_turn_stops() {
+    struct RepeatingReadApi {
+        call_count: usize,
+    }
+
+    impl ApiClient for RepeatingReadApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.call_count += 1;
+            Ok(vec![
+                AssistantEvent::ToolUse {
+                    id: format!("read-{}", self.call_count),
+                    name: "read_file".to_string(),
+                    input: r#"{"path":"same.rs","offset":1,"limit":100}"#.to_string(),
+                },
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        RepeatingReadApi { call_count: 0 },
+        StaticToolExecutor::new().register("read_file", |_| Ok("same contents".to_string())),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    )
+    .with_max_iterations(6);
+
+    let summary = runtime
+        .run_turn("keep reading", None)
+        .expect("repetition is a graceful turn stop");
+
+    assert_eq!(summary.iterations, TOOL_REPETITION_THRESHOLD + 2);
+    assert_eq!(summary.budget_exhausted, None);
+}
+
+#[test]
 fn run_turn_exits_when_abort_signal_is_set_before_next_iteration() {
     struct NeverCalledApi;
 

@@ -55,11 +55,10 @@ pub(crate) enum ToolRepetition {
     /// - `true` for mutations, error results, and cross-turn no-progress loops.
     ///   Those cannot make progress by definition, so the turn ends after the
     ///   batch.
-    /// - `false` for a successful read-only `read_file` exact repeat: a later
-    ///   identical call is skipped in the same armed batch, but a normal
-    ///   workflow that re-reads a short or truncated file mid-turn is NOT
-    ///   force-ended. The outer iteration cap (`DEFAULT_MAX_ITERATIONS`) still
-    ///   bounds any genuine infinite read loop.
+    /// - `false` for the first successful read-only `read_file` exact repeat: a
+    ///   later identical call is skipped in the same armed batch, but a normal
+    ///   workflow that re-reads a short or truncated file gets one model round
+    ///   to recover. Ignoring that notice and repeating again ends the turn.
     HardStop { notice: String, terminates: bool },
 }
 /// Stable fingerprint of a `(tool_name, input)` pair. Uses `DefaultHasher`
@@ -592,11 +591,12 @@ where
     /// Predict, before executing the next identical call, whether it would trip
     /// a hard stop — and whether that stop ends the turn. Returns the notice to
     /// fold into the synthetic tool result plus a `terminates` flag mirroring
-    /// [`ToolRepetition::HardStop`]: `false` for a successful read-only
-    /// `read_file` exact repeat (skip the redundant read, but keep the turn
-    /// alive), `true` for mutations, cross-turn loops, and any other tool.
+    /// [`ToolRepetition::HardStop`]. A successful repeated `read_file` gets one
+    /// non-terminating skipped round; repeating after seeing that notice ends
+    /// the turn. Mutations, cross-turn loops, and every other tool end at the
+    /// first armed hard stop.
     pub(super) fn next_tool_repetition_hard_stop_notice(
-        &self,
+        &mut self,
         tool_name: &str,
         input: &str,
     ) -> Option<(String, bool)> {
@@ -614,10 +614,14 @@ where
         if next_count >= TOOL_REPETITION_HARD_STOP
             && self.tool_repetition_hard_stop_fps.contains(&fp)
         {
-            // A re-execution here would return the cached same result (never a
-            // fresh error), so the terminates test collapses to the read-only
-            // `read_file` carve-out, matching `note_tool_repetition`.
-            let terminates = is_mutation || tool_name != "read_file";
+            // Count the skipped round so a successful repeated read gets one
+            // chance to recover after seeing the advisory, but cannot request
+            // the same cached result forever now that interactive turns have no
+            // generic iteration ceiling.
+            self.tool_fingerprint_counts.insert(fp, next_count);
+            let terminates = is_mutation
+                || tool_name != "read_file"
+                || next_count > TOOL_REPETITION_HARD_STOP;
             let notice = if terminates {
                 per_turn_tool_repetition_hard_stop_notice(tool_name, next_count)
             } else {

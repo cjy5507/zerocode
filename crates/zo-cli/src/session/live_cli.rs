@@ -43,6 +43,27 @@ use super::session_preferences::{
     save_project_preferences, save_session_preferences,
 };
 
+/// Iteration backstop for a headless `-p` run that did not pass `--max-turns`.
+///
+/// The interactive runtime defaults to unbounded on purpose: a person is
+/// watching and can interrupt, and a hard iteration cap that fires mid-task is
+/// worse than a long turn. Headless is the inverse case — nobody is there — so
+/// it keeps the old backstop instead of inheriting the TUI's default. The
+/// wall-clock deadline and token budgets still apply on top of this.
+const HEADLESS_DEFAULT_MAX_ITERATIONS: usize = 200;
+
+/// The iteration cap a headless turn installs for a given `--max-turns`.
+///
+/// One named decision rather than an `unwrap_or` buried at the call site: the
+/// whole point is that headless must NOT inherit the interactive default, and
+/// an inlined fallback is exactly what a later edit drops without noticing.
+const fn headless_max_iterations(max_turns: Option<usize>) -> usize {
+    match max_turns {
+        Some(explicit) => explicit,
+        None => HEADLESS_DEFAULT_MAX_ITERATIONS,
+    }
+}
+
 /// Token ceiling for the one-shot rubric grader reply — a small JSON object, so
 /// generous but bounded. No extended thinking is requested.
 const RUBRIC_GRADER_MAX_TOKENS: u32 = 2048;
@@ -416,9 +437,9 @@ pub(crate) struct LiveCli {
     /// agents even though no current turn spawned them.
     pub(crate) agent_manifest_started_after: u64,
     /// Optional cap on the agentic tool-use loop per turn, from `--max-turns`
-    /// on the headless `-p` path. `None` inherits the runtime's
-    /// `DEFAULT_MAX_ITERATIONS` backstop; setting it caps worst-case cost lower
-    /// on a one-shot run.
+    /// on the headless `-p` path. `None` falls back to
+    /// [`HEADLESS_DEFAULT_MAX_ITERATIONS`]; setting it caps worst-case cost
+    /// lower on a one-shot run.
     pub(crate) max_turns: Option<usize>,
     /// Optional cap on model-requested tool calls per turn, from
     /// `--max-tool-calls` on the headless `-p` path. This bounds parallel
@@ -1413,8 +1434,8 @@ impl LiveCli {
         self.effort_preference_persist_warning()
     }
 
-    /// Bound the per-turn agentic loop (headless `--max-turns`). `None` inherits
-    /// the runtime's `DEFAULT_MAX_ITERATIONS` backstop; applied to each turn's
+    /// Bound the per-turn agentic loop (headless `--max-turns`). `None` falls
+    /// back to [`HEADLESS_DEFAULT_MAX_ITERATIONS`]; applied to each turn's
     /// runtime in `prepare_turn_runtime`.
     pub(crate) fn set_max_turns(&mut self, max_turns: Option<usize>) {
         self.max_turns = max_turns;
@@ -2368,10 +2389,15 @@ impl LiveCli {
         Self::discover_mcp_tools_for_headless_turn(&mut runtime);
         // `--max-turns` (headless) caps the agentic loop on the per-turn
         // runtime. The runtime is rebuilt each turn, so apply it here rather
-        // than once at construction. `None` inherits the runtime's
-        // `DEFAULT_MAX_ITERATIONS` backstop (no longer unbounded).
-        if let (Some(max_turns), Some(inner)) = (self.max_turns, runtime.try_runtime_mut()) {
-            inner.set_max_iterations(max_turns);
+        // than once at construction.
+        //
+        // Unset installs `HEADLESS_DEFAULT_MAX_ITERATIONS` rather than
+        // inheriting the runtime default. The interactive default is unbounded
+        // on purpose — someone is watching and can interrupt — and a headless
+        // run is precisely the case with nobody there to do it, so it keeps a
+        // backstop of its own instead of silently following the TUI.
+        if let Some(inner) = runtime.try_runtime_mut() {
+            inner.set_max_iterations(headless_max_iterations(self.max_turns));
         }
         if let (Some(max_tool_calls), Some(inner)) =
             (self.max_tool_calls, runtime.try_runtime_mut())
@@ -4999,4 +5025,24 @@ mod spawn_context_tests {
 
         std::fs::remove_dir_all(temp_dir).ok();
     }
+
+    /// The interactive runtime is deliberately unbounded — a person is watching
+    /// and can interrupt — but a headless `-p` run is the one case with nobody
+    /// there. It must not inherit that default: an unset `--max-turns` still
+    /// installs a finite backstop, and an explicit value still wins.
+    #[test]
+    fn headless_turns_keep_a_finite_iteration_backstop_when_max_turns_is_unset() {
+        let unset = super::headless_max_iterations(None);
+        assert!(
+            unset < usize::MAX,
+            "headless must not inherit the unbounded interactive default, got {unset}"
+        );
+        assert_eq!(unset, super::HEADLESS_DEFAULT_MAX_ITERATIONS);
+        assert_eq!(
+            super::headless_max_iterations(Some(7)),
+            7,
+            "an explicit --max-turns still wins"
+        );
+    }
+
 }
