@@ -1120,7 +1120,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let mut total_matches = 0usize;
 
     visit_search_files(&base_path, |file_path| {
-        if !matches_optional_filters(file_path, glob_filter.as_ref(), file_type) {
+        if !matches_optional_filters(file_path, &base_path, glob_filter.as_ref(), file_type) {
             return Ok(true);
         }
 
@@ -1284,14 +1284,32 @@ fn grep_window_reached(seen: usize, stop_after: Option<usize>) -> bool {
     stop_after.is_some_and(|stop_after| seen >= stop_after)
 }
 
+/// Whether `path` satisfies a caller-supplied `glob`.
+///
+/// The walk yields absolute paths, so a pattern anchored at the search root —
+/// the shape callers actually write, and the one `rg --glob` accepts
+/// (`crates/**/*.rs`) — could never match: it starts at `crates/` while the
+/// candidate starts at `/`. Such a glob silently selected zero files, which
+/// reads as "no matches in the repo" rather than "your filter matched nothing".
+/// Testing the root-relative path first gives those patterns ripgrep's
+/// behavior; the absolute forms stay as fallbacks so patterns that already
+/// worked (`**/*.rs`, or a genuinely absolute prefix) keep matching.
+fn glob_matches_candidate(pattern: &Pattern, path: &Path, base_path: &Path) -> bool {
+    let relative = path.strip_prefix(base_path).unwrap_or(path);
+    pattern.matches_path(relative)
+        || pattern.matches(&relative.to_string_lossy())
+        || pattern.matches_path(path)
+        || pattern.matches(&path.to_string_lossy())
+}
+
 fn matches_optional_filters(
     path: &Path,
+    base_path: &Path,
     glob_filter: Option<&Pattern>,
     file_type: Option<&str>,
 ) -> bool {
     if let Some(pattern) = glob_filter {
-        let path_string = path.to_string_lossy();
-        if !pattern.matches(&path_string) && !pattern.matches_path(path) {
+        if !glob_matches_candidate(pattern, path, base_path) {
             return false;
         }
     }
@@ -2261,6 +2279,52 @@ mod tests {
         })
         .expect("grep should succeed");
         assert!(grep_output.content.unwrap_or_default().contains("hello"));
+    }
+
+    /// A glob anchored at the search root (`crates/**/*.rs`) is what callers
+    /// write and what `rg --glob` accepts. Matching it against the walk's
+    /// absolute paths made it select nothing, so the search reported "no
+    /// matches" for code that was plainly there.
+    #[test]
+    fn grep_glob_anchored_at_search_root_matches_like_ripgrep() {
+        let dir = temp_path("grep-rooted-glob");
+        let nested = dir.join("crates").join("tools").join("src");
+        std::fs::create_dir_all(&nested).expect("directory should be created");
+        write_file(
+            nested.join("bash_tools.rs").to_string_lossy().as_ref(),
+            "pub run_in_background: Option<bool>,\n",
+        )
+        .expect("file write should succeed");
+
+        let grep = |glob: &str| {
+            grep_search(&GrepSearchInput {
+                pattern: String::from("run_in_background"),
+                path: Some(dir.to_string_lossy().into_owned()),
+                glob: Some(String::from(glob)),
+                output_mode: Some(String::from("files_with_matches")),
+                before: None,
+                after: None,
+                context_short: None,
+                context: None,
+                line_numbers: Some(false),
+                case_insensitive: Some(false),
+                file_type: None,
+                head_limit: None,
+                offset: Some(0),
+                multiline: Some(false),
+            })
+            .expect("grep should succeed")
+            .num_files
+        };
+
+        assert_eq!(grep("crates/**/*.rs"), 1, "root-anchored glob must match");
+        assert_eq!(grep("crates/tools/**/*.rs"), 1, "deeper anchor must match");
+        assert_eq!(grep("**/*.rs"), 1, "unanchored glob must keep working");
+        assert_eq!(
+            grep("crates/**/*.toml"),
+            0,
+            "a glob that genuinely matches nothing must still filter everything out"
+        );
     }
 
     #[test]
