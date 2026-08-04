@@ -839,6 +839,25 @@ pub fn route_model(request: &RouteRequest, inventory: &ModelInventory) -> RouteD
     main_decision(request, inventory, RouteDecisionSource::MainModelFallback, "main model fallback")
 }
 
+/// Identity key for comparing routed model ids: the model, with the one
+/// serving-tier suffix the router synthesizes removed.
+///
+/// Deliberately narrower than `model_inventory::strip_service_tier_suffix`,
+/// which drops everything after the first `[`. That looseness is fine for the
+/// capability and size classification it was written for and wrong for
+/// identity: custom provider model ids arrive from user config unvalidated, so
+/// `acme[blue]` and `acme[green]` are two different models and collapsing them
+/// here would silently drop a real fallback.
+///
+/// `[fast]` is the only *suffix* the live router synthesizes (`api::providers`
+/// `openai_fast_tier_model`), so it is the only one stripped. The retired
+/// GPT-5.5 family expressed the same idea as a separate id (`gpt-5.5-fast`)
+/// rather than a suffix; that pair is two distinct catalog entries here, which
+/// is why it is not folded in. Extend this alongside any new tier notation.
+fn model_identity(id: &str) -> &str {
+    id.strip_suffix("[fast]").unwrap_or(id)
+}
+
 /// Ranked model fallbacks for a route decision, excluding the model that was
 /// already selected. This is intentionally a *routing* fallback list, not a
 /// provider retry budget: callers can try these when the selected provider is
@@ -861,11 +880,28 @@ pub fn route_model_fallback_candidates(
     }
 
     let ranked = ranked_route_candidates(request, inventory);
-    let selected = selected_model.trim();
-    let mut fallbacks = Vec::new();
+    // Exclude the selected model by its BARE id. An OpenAI terra pick is
+    // promoted to a bracketed serving-tier id (`X[fast]`) after the decision is
+    // made, and that promoted id is what arrives here while the inventory still
+    // holds the bare `X`. Comparing the two as exact strings never matched, so
+    // the model just selected came back as its own first fallback — a
+    // "fallback" that retries the same model on the same throttled provider and
+    // spends a candidate slot doing it.
+    let selected = model_identity(selected_model.trim());
+    let mut fallbacks: Vec<String> = Vec::new();
     for candidate in ranked {
         let id = candidate.model.id();
-        if id == selected || fallbacks.iter().any(|existing| existing == id) {
+        let identity = model_identity(id);
+        // Both halves of the exclusion compare identities, not raw strings.
+        // Normalizing only against `selected` would still let the bare and
+        // bracketed forms of one model occupy two slots of `limit` and push a
+        // genuinely different alternate off the end — the same wasted-slot
+        // failure this exclusion exists to prevent.
+        if identity == selected
+            || fallbacks
+                .iter()
+                .any(|existing| model_identity(existing) == identity)
+        {
             continue;
         }
         fallbacks.push(id.to_string());
@@ -2131,5 +2167,126 @@ mod headroom_penalty_tests {
         let default = RoutePolicyContext::default();
         assert_eq!(default.headroom_penalty_for("openai"), 0);
         assert_eq!(default.headroom_penalty_for("anthropic"), 0);
+    }
+
+    /// The router promotes an OpenAI terra pick to a bracketed serving-tier id
+    /// (`gpt-5.6-terra[fast]`) AFTER the decision is made, and that promoted id
+    /// is what the fallback list is then computed against. Excluding the
+    /// selected model by exact string match never fires across that suffix, so
+    /// the model just selected came back as its own first fallback — a
+    /// "fallback" that retries the same model on the same throttled provider
+    /// and spends a candidate slot doing it.
+    ///
+    /// `model_inventory::strip_service_tier_suffix` already states the rule
+    /// this violated: the bracket is a wire-level serving hint, and every
+    /// classification decision belongs on the bare id.
+    #[test]
+    fn fallback_candidates_exclude_the_selected_model_across_a_service_tier_suffix() {
+        use crate::model_router::{RouteRole, RouteRequest, RoutingTarget};
+        use crate::{model_inventory_from_authorized_providers, route_model_fallback_candidates};
+
+        let selected = "gpt-5.6-terra";
+        let inventory = model_inventory_from_authorized_providers(
+            selected,
+            &[api::ProviderKind::OpenAi],
+            &[],
+        );
+        let request = RouteRequest::for_target(
+            RoutingTarget::RoleFallback(RouteRole::Default),
+            RouteRole::Default,
+            selected,
+        );
+
+        let bare = route_model_fallback_candidates(&request, &inventory, selected, 4);
+        assert!(
+            !bare.is_empty(),
+            "the catalog must offer alternates for this to mean anything"
+        );
+        assert!(
+            !bare.iter().any(|candidate| candidate == selected),
+            "sanity: a bare selected id is already excluded"
+        );
+
+        let promoted =
+            route_model_fallback_candidates(&request, &inventory, "gpt-5.6-terra[fast]", 4);
+        assert!(
+            !promoted.iter().any(|candidate| candidate == selected),
+            "the selected model must not return as its own fallback under a tier suffix: {promoted:?}"
+        );
+    }
+
+    /// The bare and bracketed forms of one model must not both occupy a slot.
+    /// `ModelInventory` dedupes ids by exact string, so a catalog can genuinely
+    /// hold `X` and `X[fast]` at once; normalizing only against the selected
+    /// model would let that pair spend two of `limit` and push a genuinely
+    /// different alternate off the end.
+    #[test]
+    fn fallback_candidates_do_not_spend_two_slots_on_one_model_family() {
+        use crate::model_router::{RouteRole, RouteRequest, RoutingTarget};
+        use crate::{model_inventory_from_authorized_providers, route_model_fallback_candidates};
+
+        let selected = "gpt-5.6-terra";
+        let inventory = model_inventory_from_authorized_providers(
+            selected,
+            &[api::ProviderKind::OpenAi],
+            &[("openai".to_string(), vec!["gpt-5.6-sol[fast]".to_string()])],
+        );
+        let request = RouteRequest::for_target(
+            RoutingTarget::RoleFallback(RouteRole::Default),
+            RouteRole::Default,
+            selected,
+        );
+
+        let candidates = route_model_fallback_candidates(&request, &inventory, selected, 8);
+        let sol_forms = candidates
+            .iter()
+            .filter(|candidate| candidate.starts_with("gpt-5.6-sol"))
+            .count();
+        assert!(
+            sol_forms <= 1,
+            "one model family must not hold two fallback slots: {candidates:?}"
+        );
+        // The point of not spending the slot is that a genuinely different
+        // model gets it, so check the freed room actually went somewhere.
+        let distinct_families = candidates
+            .iter()
+            .map(|candidate| candidate.split('[').next().unwrap_or(candidate))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            distinct_families.len(),
+            candidates.len(),
+            "every fallback slot must hold a different model family: {candidates:?}"
+        );
+    }
+
+    /// Identity normalization must strip only the serving tier the router
+    /// actually produces. Custom provider ids are user config, unvalidated, so
+    /// two differently-bracketed customs are two different models and neither
+    /// may be dropped as a duplicate of the other.
+    #[test]
+    fn fallback_candidates_keep_distinct_bracketed_custom_models() {
+        use crate::model_router::{RouteRole, RouteRequest, RoutingTarget};
+        use crate::{model_inventory_from_authorized_providers, route_model_fallback_candidates};
+
+        let selected = "acme-house[blue]";
+        let inventory = model_inventory_from_authorized_providers(
+            "gpt-5.6-terra",
+            &[api::ProviderKind::OpenAi],
+            &[(
+                "openai".to_string(),
+                vec![selected.to_string(), "acme-house[green]".to_string()],
+            )],
+        );
+        let request = RouteRequest::for_target(
+            RoutingTarget::RoleFallback(RouteRole::Default),
+            RouteRole::Default,
+            "gpt-5.6-terra",
+        );
+
+        let candidates = route_model_fallback_candidates(&request, &inventory, selected, 64);
+        assert!(
+            candidates.iter().any(|candidate| candidate == "acme-house[green]"),
+            "a differently-bracketed custom model is a different model, not a duplicate: {candidates:?}"
+        );
     }
 }
