@@ -74,20 +74,127 @@ impl FileFingerprint {
 
     /// Fingerprint the current on-disk file. `Ok(None)` when the file is absent
     /// (a legitimate "no prior state" that a first writer expects).
+    ///
+    /// Reads and digests the WHOLE file, so every call costs O(transcript). The
+    /// per-message append path must not reach this in its steady state — see
+    /// [`FileFingerprint::extended_with`] and [`FileIdentity`].
     fn of_path(path: &Path) -> std::io::Result<Option<Self>> {
+        #[cfg(test)]
+        FULL_FILE_READS.with(|count| count.set(count.get() + 1));
         match std::fs::read(path) {
             Ok(bytes) => Ok(Some(Self::of_bytes(&bytes))),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
     }
+
+    /// The fingerprint this one becomes once `appended` is added to the end of
+    /// the file, computed WITHOUT re-reading anything.
+    ///
+    /// Exact, not approximate: `digest_bytes` is FNV-1a, a left fold seeded by
+    /// the offset basis, so folding `appended` onto the digest of the prefix
+    /// yields bit-for-bit what digesting `prefix || appended` would. Chaining
+    /// two calls is likewise identical to one call over the concatenation,
+    /// which is how the appended line and its trailing newline are folded in
+    /// without allocating a joined buffer.
+    fn extended_with(&self, appended: &[u8]) -> Self {
+        Self {
+            len: self.len.saturating_add(appended.len() as u64),
+            digest: digest_bytes_from(self.digest, appended),
+        }
+    }
 }
+
+#[cfg(test)]
+thread_local! {
+    /// Whole-file fingerprint reads performed on THIS thread, so a test can
+    /// count its own appends without other tests' writes racing the tally.
+    /// Lets tests pin that the steady-state append path stays O(appended bytes)
+    /// instead of O(transcript).
+    pub(crate) static FULL_FILE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Cheap "is this still the exact file I last wrote?" stamp. Unix only — see
+/// [`WriterState::file_is_untouched_since_our_write`] for why.
+///
+/// Only ever recorded immediately after THIS writer published bytes, while
+/// holding both the writer mutex and the advisory lock, and only when the
+/// observed length matches the length we just published. Any mismatch —
+/// including a stat that cannot be read — falls back to the full-file compare,
+/// which is exactly the pre-existing behavior.
+///
+/// What makes a match trustworthy is `changed`, the inode change time. Unlike
+/// `modified` it is not settable from userspace: `utimensat` (and so
+/// `File::set_times`) rewrites mtime/atime but bumps ctime as a side effect.
+/// So an in-place edit that keeps the length and restores the old mtime — the
+/// one rewrite a length-and-mtime stamp would miss — still shows up here.
+/// `inode` covers the other direction: every full-rewrite path in this module
+/// publishes through a temp file plus rename, which always lands a new inode
+/// even when the byte length is unchanged.
+///
+/// Scope, stated plainly: a writer that respects the advisory lock cannot get
+/// between two of our writes at all, and a rename-published rewrite is caught
+/// by `inode` on any filesystem. What this stamp does NOT promise is detecting
+/// a writer that ignores the lock, edits in place keeping the exact byte
+/// length, restores the old mtime, AND runs on a filesystem whose ctime is too
+/// coarse to separate the two events (some network and FUSE mounts). The
+/// whole-file compare this replaces did catch that; the trade buys back a cost
+/// that grew with the square of the session's length.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    modified: SystemTime,
+    inode: u64,
+    device: u64,
+    changed: (i64, i64),
+}
+
+#[cfg(unix)]
+impl FileIdentity {
+    /// Stamp the file at `path`, or `None` when it cannot be stat'ed. Uses
+    /// `symlink_metadata` so a path swapped for a symlink reads as a different
+    /// identity rather than silently following the link.
+    fn of_path(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = fs::symlink_metadata(path).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok()?,
+            inode: metadata.ino(),
+            device: metadata.dev(),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+
+    /// Stamp the file we just published, but only accept it when the file is
+    /// exactly as long as the bytes we wrote. A different length means someone
+    /// wrote behind us between the write and the stat, so we refuse to arm the
+    /// fast path and the next append re-reads the file.
+    fn of_published(path: &Path, published_len: u64) -> Option<Self> {
+        Self::of_path(path).filter(|identity| identity.len == published_len)
+    }
+}
+
+/// FNV-1a offset basis — the seed a digest over a whole file starts from.
+const DIGEST_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// Stable 64-bit content digest (`FNV-1a`). Not cryptographic — it only needs to
 /// catch concurrent rewrites, and collisions merely weaken (never falsely
 /// trigger) the stale-write check.
 fn digest_bytes(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    digest_bytes_from(DIGEST_OFFSET_BASIS, bytes)
+}
+
+/// Continue an FNV-1a digest from `seed`. Folding the tail of a file onto the
+/// digest of its head is what lets an append refresh the fingerprint without
+/// re-reading the head.
+fn digest_bytes_from(seed: u64, bytes: &[u8]) -> u64 {
+    let mut hash = seed;
     for &byte in bytes {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
@@ -121,6 +228,14 @@ struct WriterState {
     /// Whether `expected` has been initialized (distinguishes "absent file"
     /// from "never looked").
     expected_captured: bool,
+    /// Identity of the file as it stood immediately after THIS writer last
+    /// published to it. `Some` means `expected` may be trusted without
+    /// re-reading the transcript, provided the file still stamps identically.
+    /// Cleared whenever this writer stops being the last known author — a
+    /// released lease, a rebind, a refused write, or a write we could not
+    /// confirm.
+    #[cfg(unix)]
+    observed_identity: Option<FileIdentity>,
     /// Header/compaction state written by the most recent full snapshot. The
     /// per-message append stream carries `updated_at_ms`, so that hot counter is
     /// intentionally excluded.
@@ -134,6 +249,59 @@ struct WriterState {
     /// Dropping the `Flock` releases the OS lock.
     #[cfg(unix)]
     lock: Option<nix::fcntl::Flock<std::fs::File>>,
+}
+
+impl WriterState {
+    /// Whether `path` still stamps exactly as it did right after this writer's
+    /// own last publish — i.e. nobody has written it since, so `expected` is
+    /// still accurate and re-reading the file would only confirm what we know.
+    ///
+    /// Deliberately conservative: a missing stamp, an unreadable stat, or any
+    /// difference answers `false` and sends the caller to the full-file
+    /// compare. The stamp is only ever armed while holding this writer's mutex
+    /// and advisory lock, and only when the published length was confirmed.
+    ///
+    /// Non-Unix builds always answer `false`. There is no advisory lock there
+    /// (see [`acquire_writer_lock`]), which leaves the optimistic content
+    /// compare as the *only* thing keeping two processes from clobbering each
+    /// other — so nothing on that platform may skip it, whatever the stat says.
+    fn file_is_untouched_since_our_write(&self, path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            let Some(recorded) = self.observed_identity else {
+                return false;
+            };
+            FileIdentity::of_path(path).is_some_and(|current| current == recorded)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            false
+        }
+    }
+
+    /// Arm the stamp after publishing `published_len` bytes to `path`. Records
+    /// nothing when the file does not read back at exactly that length, which
+    /// keeps the next append on the full-compare path.
+    fn arm_identity_after_publish(&mut self, path: &Path, published_len: u64) {
+        #[cfg(unix)]
+        {
+            self.observed_identity = FileIdentity::of_published(path, published_len);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, published_len);
+        }
+    }
+
+    /// Forget the stamp. Called wherever this writer can no longer prove it is
+    /// the file's last author, so the next append re-reads and compares.
+    fn disarm_identity(&mut self) {
+        #[cfg(unix)]
+        {
+            self.observed_identity = None;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +435,12 @@ impl Session {
             return;
         };
         if let Ok(mut state) = persistence.writer.lock() {
+            // Handing the lease back means another writer may now legitimately
+            // publish, so this writer is no longer the file's last known
+            // author: drop the stamp that would let a later append skip the
+            // freshness re-read. The fingerprint itself stays, exactly as the
+            // doc above promises.
+            state.disarm_identity();
             #[cfg(unix)]
             {
                 state.lock = None;
@@ -470,12 +644,20 @@ impl Session {
             .map_err(|_| SessionError::Conflict("session writer lease poisoned".to_string()))?;
         acquire_writer_lock(path, &mut state)?;
 
-        let on_disk = FileFingerprint::of_path(path).map_err(SessionError::Io)?;
-        if state.expected_captured && on_disk != state.expected {
-            return Err(SessionError::Conflict(format!(
-                "session file {} changed on disk since this writer last observed it; refusing to accept stale append state",
-                path.display()
-            )));
+        // Same freshness recheck as the append path, and the same reason to
+        // skip its cost. A turn ends here, so leaving the whole-transcript read
+        // in place would have kept one O(transcript) read per turn — the very
+        // growth the per-message path just shed, only counted in turns instead
+        // of messages.
+        if !(state.expected_captured && state.file_is_untouched_since_our_write(path)) {
+            state.disarm_identity();
+            let on_disk = FileFingerprint::of_path(path).map_err(SessionError::Io)?;
+            if state.expected_captured && on_disk != state.expected {
+                return Err(SessionError::Conflict(format!(
+                    "session file {} changed on disk since this writer last observed it; refusing to accept stale append state",
+                    path.display()
+                )));
+            }
         }
         let nonempty_file = if state.expected.is_some() {
             if secure {
@@ -587,7 +769,11 @@ impl Session {
 
         acquire_writer_lock(path, &mut state)?;
 
-        // Freshness recheck under the lock: compare disk to expected.
+        // Freshness recheck under the lock: compare disk to expected. A full
+        // snapshot replaces the file, so whatever this writer stamped is about
+        // to stop describing it either way — drop it now so a refusal cannot
+        // leave a stamp behind that outlived its proof.
+        state.disarm_identity();
         let on_disk = FileFingerprint::of_path(path)
             .map_err(SessionError::Io)?;
         if state.expected_captured && on_disk != state.expected {
@@ -602,6 +788,10 @@ impl Session {
         // Publish succeeded: the file now holds exactly `published_bytes`.
         state.expected = Some(FileFingerprint::of_bytes(published_bytes));
         state.expected_captured = true;
+        // A snapshot publishes through temp+rename, so the file the next append
+        // will stat is a different inode than the one before it. Re-arm from
+        // what we just published or the stamp would describe a replaced file.
+        state.arm_identity_after_publish(path, published_bytes.len() as u64);
         state.full_snapshot_state = Some(self.full_snapshot_state());
         state.transcript_dirty = false;
         Ok(())
@@ -1265,6 +1455,9 @@ impl Session {
 
         if needs_bootstrap {
             let snapshot = self.render_jsonl_snapshot()?;
+            // The file is absent or empty, so it is not the one we stamped;
+            // the publish below re-arms from the snapshot it writes.
+            state.disarm_identity();
             if state.expected_captured {
                 let on_disk = FileFingerprint::of_path(&path).map_err(SessionError::Io)?;
                 if on_disk != state.expected {
@@ -1281,14 +1474,33 @@ impl Session {
             }
             state.expected = Some(FileFingerprint::of_bytes(snapshot.as_bytes()));
             state.expected_captured = true;
+            state.arm_identity_after_publish(&path, snapshot.len() as u64);
             state.full_snapshot_state = Some(self.full_snapshot_state());
             state.transcript_dirty = false;
             return Ok(());
         }
 
         // Non-bootstrap append: recheck the file has not been rewritten out from
-        // under us, then append one line and re-fingerprint the whole file.
-        if state.expected_captured {
+        // under us, then append one line and extend the fingerprint by exactly
+        // the bytes written.
+        //
+        // The recheck used to read and digest the whole transcript on EVERY
+        // append, which made a session's total persistence cost quadratic in
+        // its own length — a 37 MB transcript re-read 37 MB per message, twice
+        // counting the refresh below, synchronously on the streaming turn. When
+        // the file still stamps exactly as it did right after our own last
+        // write, nothing can have changed and `expected` is already correct, so
+        // the read is pure waste. Any other outcome — a different stamp, no
+        // stamp, an unreadable stat — falls through to the original full
+        // compare, so the guard's verdict is unchanged in every case it used to
+        // catch.
+        if state.expected_captured && !state.file_is_untouched_since_our_write(&path) {
+            // Something about the file no longer matches our own last publish,
+            // so this writer can no longer claim to be its last author. Drop
+            // the stamp before deciding: whether the compare below refuses the
+            // write or clears it, a stamp that outlived its proof must never
+            // authorize a later append to skip the re-read.
+            state.disarm_identity();
             let on_disk = FileFingerprint::of_path(&path).map_err(SessionError::Io)?;
             if on_disk != state.expected {
                 return Err(SessionError::Conflict(format!(
@@ -1309,8 +1521,23 @@ impl Session {
             let _ = crate::paths::restrict_permissions_owner_only(&path);
             writeln!(file, "{line}")?;
         }
-        state.expected = FileFingerprint::of_path(&path).map_err(SessionError::Io)?;
+        // `writeln!` published exactly `line` followed by one newline, and a
+        // short write would have surfaced as an error above, so the new
+        // fingerprint follows from the old one without touching the file.
+        // Folding the line and the newline in two chained calls is identical to
+        // digesting their concatenation, and avoids joining them into a buffer.
+        state.expected = match state.expected.as_ref() {
+            Some(previous) => Some(previous.extended_with(line.as_bytes()).extended_with(b"\n")),
+            // No prior fingerprint to extend (we never observed the file), so
+            // there is nothing to do but read it.
+            None => FileFingerprint::of_path(&path).map_err(SessionError::Io)?,
+        };
         state.expected_captured = true;
+        let published_len = state.expected.as_ref().map(|expected| expected.len);
+        match published_len {
+            Some(len) => state.arm_identity_after_publish(&path, len),
+            None => state.disarm_identity(),
+        }
         Ok(())
     }
 

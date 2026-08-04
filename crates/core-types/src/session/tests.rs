@@ -2394,3 +2394,323 @@ fn rewind_pops_persisted_reminder_annotations_with_their_turn() {
     assert_eq!(removed_again, 0);
     assert_eq!(session.messages.len(), 1);
 }
+
+// --- append fingerprint stays O(appended bytes) -----------------------------
+
+fn expected_fingerprint(session: &Session) -> Option<super::FileFingerprint> {
+    let persistence = session.persistence.as_ref()?;
+    let state = persistence.writer.lock().ok()?;
+    state.expected.clone()
+}
+
+fn full_file_reads() -> u64 {
+    super::FULL_FILE_READS.with(std::cell::Cell::get)
+}
+
+fn cleanup_session_file(path: &Path) {
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(super::lock_sibling_path(path));
+}
+
+/// Every `push_message` used to read and digest the ENTIRE transcript twice —
+/// once to recheck the writer guard and once to refresh it — so a session's
+/// total persistence cost grew quadratically with its own length. Steady-state
+/// appends must now touch only the bytes they add.
+///
+/// Unix only: the identity stamp that makes the skip safe needs an inode, and
+/// without an advisory lock to lean on the other platforms deliberately keep
+/// paying for the full compare.
+#[cfg(unix)]
+#[test]
+fn steady_state_appends_never_re_read_the_whole_transcript() {
+    let path = temp_session_path("append-no-full-reads");
+    let mut session = Session::new().with_persistence_path(path.clone());
+    // Bootstrap and the first append are allowed to look at the file; what must
+    // stay O(appended bytes) is the steady state that follows.
+    push_text(&mut session, "seed").expect("seed append");
+    push_text(&mut session, "arm the writer guard").expect("second append");
+
+    let before = full_file_reads();
+    for turn in 0..16 {
+        push_text(&mut session, &format!("steady turn {turn}")).expect("steady append");
+    }
+    let reads = full_file_reads() - before;
+
+    assert_eq!(
+        reads, 0,
+        "16 steady-state appends must not re-read the transcript, but performed {reads} whole-file reads"
+    );
+    cleanup_session_file(&path);
+}
+
+/// The incremental fingerprint is an optimization only if it is exact: it must
+/// equal, bit for bit, what re-reading and digesting the file would produce.
+#[test]
+fn incremental_append_fingerprint_equals_a_full_re_read() {
+    let path = temp_session_path("append-fingerprint-equivalence");
+    let mut session = Session::new().with_persistence_path(path.clone());
+    for turn in 0..20 {
+        // Vary the payload length so a byte-count slip cannot cancel out.
+        let payload = "payload ".repeat(turn % 7 + 1);
+        push_text(&mut session, payload.trim_end()).expect("append should persist");
+        let tracked = expected_fingerprint(&session).expect("writer tracks a fingerprint");
+        let on_disk = super::FileFingerprint::of_path(&path)
+            .expect("session file should be readable")
+            .expect("session file should exist");
+        assert_eq!(
+            tracked, on_disk,
+            "incremental fingerprint diverged from the file after append {turn}"
+        );
+    }
+    cleanup_session_file(&path);
+}
+
+/// The fast path must never swallow a peer rewrite. An in-place overwrite
+/// changes the length; a temp-file-plus-rename replacement (what every rewrite
+/// path in this module actually does) changes the inode. Both must still be
+/// refused with `Conflict`.
+#[test]
+fn peer_rewrite_between_appends_still_conflicts() {
+    let in_place = temp_session_path("append-guard-in-place");
+    let mut session = Session::new().with_persistence_path(in_place.clone());
+    push_text(&mut session, "durable before peer rewrite").expect("seed append");
+    push_text(&mut session, "second append arms the fast path").expect("second append");
+    fs::write(&in_place, "peer replaced this session\n").expect("simulate in-place peer rewrite");
+    assert!(
+        is_conflict(&push_text(&mut session, "after peer rewrite")),
+        "an in-place peer rewrite must still be refused"
+    );
+    cleanup_session_file(&in_place);
+
+    let renamed = temp_session_path("append-guard-rename");
+    let mut session = Session::new().with_persistence_path(renamed.clone());
+    push_text(&mut session, "durable before peer swap").expect("seed append");
+    push_text(&mut session, "second append arms the fast path").expect("second append");
+    let original = fs::read(&renamed).expect("read the transcript we just wrote");
+    // Same byte length, different content, published by rename — so only the
+    // inode betrays the swap.
+    let swapped = {
+        let mut bytes = original.clone();
+        let last = bytes.len() - 1;
+        bytes[..last].iter_mut().for_each(|byte| *byte = b'x');
+        bytes
+    };
+    assert_eq!(swapped.len(), original.len());
+    assert_ne!(swapped, original);
+    let staging = renamed.with_extension("peer-staging");
+    fs::write(&staging, &swapped).expect("stage the peer replacement");
+    fs::rename(&staging, &renamed).expect("publish the peer replacement by rename");
+    assert!(
+        is_conflict(&push_text(&mut session, "after peer swap")),
+        "a same-length rename-published peer rewrite must still be refused"
+    );
+    cleanup_session_file(&renamed);
+}
+
+/// A full snapshot replaces the file underneath the writer. The identity stamp
+/// must be re-armed from the snapshot, not left pointing at the pre-snapshot
+/// file, or the next append would trust a fingerprint for a file that is gone.
+#[test]
+fn append_after_a_full_snapshot_keeps_the_fingerprint_exact() {
+    let path = temp_session_path("append-after-snapshot");
+    let mut session = Session::new().with_persistence_path(path.clone());
+    push_text(&mut session, "before snapshot").expect("seed append");
+
+    session.name = Some("forces a full snapshot".to_string());
+    session.save_to_path(&path).expect("full snapshot should publish");
+
+    push_text(&mut session, "after snapshot").expect("append after snapshot should persist");
+    let tracked = expected_fingerprint(&session).expect("writer tracks a fingerprint");
+    let on_disk = super::FileFingerprint::of_path(&path)
+        .expect("session file should be readable")
+        .expect("session file should exist");
+    assert_eq!(
+        tracked, on_disk,
+        "the fingerprint must stay exact across a snapshot boundary"
+    );
+
+    let reloaded = Session::load_from_path(&path).expect("snapshot + append must reload");
+    assert_eq!(reloaded.messages.len(), 2);
+    cleanup_session_file(&path);
+}
+
+/// Adversarial review's sharpest case: an in-place rewrite that keeps the byte
+/// length AND restores the original mtime. Length, inode and mtime all read
+/// back unchanged, so a stamp built from those three alone would wave it
+/// through and append onto a transcript that is no longer ours. `ctime` is the
+/// backstop — `utimensat` can forge mtime but bumps ctime doing it — so the
+/// guard must still refuse.
+#[cfg(unix)]
+#[test]
+fn same_length_in_place_rewrite_with_restored_mtime_still_conflicts() {
+    let path = temp_session_path("append-guard-forged-mtime");
+    let mut session = Session::new().with_persistence_path(path.clone());
+    push_text(&mut session, "durable before forged rewrite").expect("seed append");
+    push_text(&mut session, "second append arms the fast path").expect("second append");
+
+    let before = fs::metadata(&path).expect("stat the transcript we wrote");
+    let original_modified = before.modified().expect("mtime should be readable");
+    let original_accessed = before.accessed().expect("atime should be readable");
+    let original_inode = std::os::unix::fs::MetadataExt::ino(&before);
+
+    let original = fs::read(&path).expect("read the transcript we wrote");
+    let mut forged = original.clone();
+    let last = forged.len() - 1;
+    forged[..last].iter_mut().for_each(|byte| *byte = b'z');
+    assert_eq!(forged.len(), original.len(), "the forgery must keep the length");
+    assert_ne!(forged, original);
+    // Truncate-and-write in place, so the inode is preserved.
+    fs::write(&path, &forged).expect("rewrite in place");
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .expect("reopen to restore times")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(original_modified)
+                .set_accessed(original_accessed),
+        )
+        .expect("restore the original mtime");
+
+    let after = fs::metadata(&path).expect("stat the forged transcript");
+    assert_eq!(after.len(), before.len(), "length must be indistinguishable");
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&after),
+        original_inode,
+        "inode must be indistinguishable"
+    );
+    assert_eq!(
+        after.modified().expect("mtime"),
+        original_modified,
+        "mtime must be indistinguishable"
+    );
+
+    assert!(
+        is_conflict(&push_text(&mut session, "after forged rewrite")),
+        "a same-length, mtime-restored in-place rewrite must still be refused"
+    );
+    cleanup_session_file(&path);
+}
+
+/// Handing the writer lease back means someone else may legitimately publish,
+/// so the fast path must stand down: the next append has to pay for the full
+/// freshness compare again.
+#[cfg(unix)]
+#[test]
+fn releasing_the_writer_lease_forces_the_next_append_to_re_read() {
+    let path = temp_session_path("append-lease-release-disarms");
+    let mut session = Session::new().with_persistence_path(path.clone());
+    push_text(&mut session, "seed").expect("seed append");
+    push_text(&mut session, "arm the fast path").expect("second append");
+
+    let armed_before = full_file_reads();
+    push_text(&mut session, "still armed").expect("third append");
+    assert_eq!(
+        full_file_reads() - armed_before,
+        0,
+        "an armed writer must not re-read the transcript"
+    );
+
+    session.release_writer_lease();
+    let released_before = full_file_reads();
+    push_text(&mut session, "after lease release").expect("append after lease release");
+    assert!(
+        full_file_reads() - released_before > 0,
+        "after handing the lease back the next append must re-verify the file"
+    );
+    cleanup_session_file(&path);
+}
+
+/// The secure persistence mode takes a different write branch (descriptor
+/// validated open plus `sync_all`), so its incremental fingerprint needs its
+/// own proof that it tracks the bytes actually written. Unix only for the same
+/// reason as the plain steady-state test.
+#[cfg(unix)]
+#[test]
+fn secure_persistence_appends_keep_the_fingerprint_exact_without_re_reading() {
+    let path = temp_session_path("append-secure-incremental");
+    let mut session = Session::new().with_secure_persistence_path(path.clone());
+    push_text(&mut session, "secure seed").expect("seed append");
+    push_text(&mut session, "secure arm").expect("second append");
+
+    let before = full_file_reads();
+    for turn in 0..8 {
+        let payload = "secure payload ".repeat(turn % 5 + 1);
+        push_text(&mut session, payload.trim_end()).expect("secure append should persist");
+    }
+    assert_eq!(
+        full_file_reads() - before,
+        0,
+        "secure appends must not re-read the transcript either"
+    );
+
+    let tracked = expected_fingerprint(&session).expect("writer tracks a fingerprint");
+    let on_disk = super::FileFingerprint::of_path(&path)
+        .expect("session file should be readable")
+        .expect("session file should exist");
+    assert_eq!(
+        tracked, on_disk,
+        "the secure branch's incremental fingerprint must match the file"
+    );
+    cleanup_session_file(&path);
+}
+
+/// A real ordinary turn is `push_message` for each new message AND one
+/// `persist_appended_state_to_path` to close the turn. Measuring only the
+/// appends would have hidden a whole-transcript read still sitting on the
+/// turn-final call, which grows with the session exactly like the one the
+/// append path just shed — only counted in turns.
+#[cfg(unix)]
+#[test]
+fn whole_ordinary_turns_never_re_read_the_whole_transcript() {
+    let path = temp_session_path("ordinary-turn-no-full-reads");
+    let mut session = Session::new().with_persistence_path(path.clone());
+    session.push_user_text("seed the store").expect("seed append");
+    session
+        .persist_appended_state_to_path(&path)
+        .expect("seed turn should persist");
+
+    let before = full_file_reads();
+    for turn in 0..8 {
+        session
+            .push_user_text(format!("user turn {turn}"))
+            .expect("user append");
+        session
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: format!("assistant turn {turn}"),
+            }]))
+            .expect("assistant append");
+        session
+            .persist_appended_state_to_path(&path)
+            .expect("ordinary turn should persist");
+    }
+    let reads = full_file_reads() - before;
+
+    assert_eq!(
+        reads, 0,
+        "8 whole ordinary turns must not re-read the transcript, but performed {reads} whole-file reads"
+    );
+    cleanup_session_file(&path);
+}
+
+/// Pins the snapshot re-arm itself, not just the fingerprint it leaves behind:
+/// drop `arm_identity_after_publish` from the guarded write and the append
+/// after a snapshot silently falls back to the whole-file compare.
+#[cfg(unix)]
+#[test]
+fn a_full_snapshot_re_arms_the_fast_path_for_the_next_append() {
+    let path = temp_session_path("snapshot-re-arms-fast-path");
+    let mut session = Session::new().with_persistence_path(path.clone());
+    push_text(&mut session, "before snapshot").expect("seed append");
+    session.name = Some("forces a full snapshot".to_string());
+    session.save_to_path(&path).expect("full snapshot should publish");
+
+    let before = full_file_reads();
+    push_text(&mut session, "after snapshot").expect("append after snapshot should persist");
+    assert_eq!(
+        full_file_reads() - before,
+        0,
+        "a snapshot must re-arm the stamp so the next append still skips the re-read"
+    );
+    cleanup_session_file(&path);
+}
