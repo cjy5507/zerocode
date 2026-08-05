@@ -603,8 +603,12 @@ enum CallbackPage {
 }
 
 impl CallbackPage {
+    /// A redirect carrying no authorization code did not sign anyone in, whether
+    /// or not the provider bothered to say `error=`. Keying the page on the
+    /// `error` parameter alone told the user "Signed in" while the terminal
+    /// reported a failure.
     fn for_outcome(callback: &runtime::OAuthCallbackParams) -> Self {
-        if callback.error.is_some() {
+        if callback.error.is_some() || callback.code.is_none() {
             Self::Failed
         } else {
             Self::Succeeded
