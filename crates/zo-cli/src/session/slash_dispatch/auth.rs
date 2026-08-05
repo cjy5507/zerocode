@@ -43,10 +43,21 @@ impl ProviderConnection {
             Self::Env { env_key } => {
                 env_non_empty(env_key) || api::load_openai_compat_api_key(env_key).ok().flatten().is_some()
             }
-            Self::Anthropic => api::oauth_store::load_oauth_credentials()
-                .ok()
-                .flatten()
-                .is_some(),
+            // Saved OAuth is not the only way Claude is connected: an
+            // environment key works, and so does a Claude Code keychain session
+            // (which the manager must never *probe* — forking `security` and
+            // running a refresh is an authentication lifecycle, not a status
+            // read — but `latest_claude_auth_origin` is a free in-process read of
+            // whichever rung already answered this session).
+            Self::Anthropic => {
+                api::oauth_store::load_oauth_credentials()
+                    .ok()
+                    .flatten()
+                    .is_some()
+                    || env_non_empty("ANTHROPIC_API_KEY")
+                    || env_non_empty("ANTHROPIC_AUTH_TOKEN")
+                    || api::latest_claude_auth_origin().is_some()
+            }
             Self::OpenAi => env_non_empty("OPENAI_API_KEY") || openai_oauth_present(),
             Self::Google => {
                 api::google_code_assist_oauth_present()
@@ -59,7 +70,9 @@ impl ProviderConnection {
     fn connected_detail(self) -> &'static str {
         match self {
             Self::Env { env_key } => env_key,
-            Self::Anthropic => "saved Anthropic OAuth",
+            Self::Anthropic => {
+                "saved Anthropic OAuth, ANTHROPIC_API_KEY, or Claude Code session credentials"
+            }
             Self::OpenAi => "OPENAI_API_KEY or saved ChatGPT OAuth",
             Self::Google => "saved Gemini OAuth, GOOGLE_API_KEY, or Google ADC",
         }
@@ -815,6 +828,73 @@ impl Provider {
     }
 }
 
+/// Report what Claude is actually authenticated with.
+///
+/// This used to be a fixed string — "Claude: connected via OAuth" — printed
+/// without consulting anything, so it said "connected" on a machine with no
+/// Claude credential at all while every turn failed on auth. Every other
+/// provider goes through a real check, and so does this one now.
+///
+/// Nothing here forks `security` or refreshes a token: `/connect` is a glance at
+/// state on the render thread (see [`saved_oauth_providers`] for the same rule).
+/// [`api::latest_claude_auth_origin`] is a plain in-process read of the rung that
+/// most recently satisfied a resolution, which is exactly the fact worth
+/// reporting — including the keychain, without touching it.
+fn claude_connection_status() -> CommandOutput {
+    let saved = api::oauth_store::load_oauth_credentials()
+        .ok()
+        .flatten()
+        .is_some();
+    let env_key = env_non_empty("ANTHROPIC_API_KEY") || env_non_empty("ANTHROPIC_AUTH_TOKEN");
+    match claude_connection(api::latest_claude_auth_origin(), saved, env_key) {
+        ClaudeConnection::Resolved(origin) => CommandOutput::info(format!(
+            "Claude: ✓ connected via {origin}\nUse /login claude to re-authenticate, /providers to manage accounts."
+        )),
+        ClaudeConnection::CredentialOnHand => CommandOutput::info(
+            "Claude: credential available (saved OAuth or environment key); not exercised yet this session.\nUse /login claude to re-authenticate.",
+        ),
+        ClaudeConnection::Missing => CommandOutput::warn(
+            "Claude: ✗ not connected\n\nRun `/login claude` for Anthropic OAuth, or set:\n  export ANTHROPIC_API_KEY=your-key-here",
+        ),
+    }
+}
+
+/// What can honestly be said about Claude's connection.
+#[derive(Debug, PartialEq, Eq)]
+enum ClaudeConnection {
+    /// A rung already answered a resolution this process; it is named.
+    Resolved(&'static str),
+    /// A credential exists but nothing has used it yet this session.
+    CredentialOnHand,
+    /// Nothing to authenticate with.
+    Missing,
+}
+
+/// Pure decision, so the three answers are testable without process-global auth
+/// state — the fixed "connected via OAuth" string this replaced had no inputs at
+/// all, which is precisely how it came to be wrong.
+fn claude_connection(
+    origin: Option<api::ClaudeAuthOrigin>,
+    saved: bool,
+    env_key: bool,
+) -> ClaudeConnection {
+    match origin {
+        Some(api::ClaudeAuthOrigin::Keychain) => {
+            ClaudeConnection::Resolved("Claude Code session credentials (keychain)")
+        }
+        Some(api::ClaudeAuthOrigin::SavedOauth) => {
+            ClaudeConnection::Resolved("saved Zo OAuth login")
+        }
+        Some(api::ClaudeAuthOrigin::Env) => {
+            ClaudeConnection::Resolved("ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN")
+        }
+        // Nothing has resolved yet (no Anthropic turn so far). Report the
+        // credential on hand rather than guessing which rung will win it.
+        None if saved || env_key => ClaudeConnection::CredentialOnHand,
+        None => ClaudeConnection::Missing,
+    }
+}
+
 pub(super) fn connect(ctx: &mut DispatchCtx<'_>, provider: Option<&str>) -> CommandOutput {
     // `/connect`, `/login`, `/logout` and `/providers` all answer one question,
     // so with no argument they all open the one manager. The argument forms are
@@ -824,7 +904,7 @@ pub(super) fn connect(ctx: &mut DispatchCtx<'_>, provider: Option<&str>) -> Comm
     };
     let lower = prov.to_ascii_lowercase();
     if matches!(lower.as_str(), "claude" | "anthropic") {
-        return CommandOutput::info("Claude: connected via OAuth. Use /login to re-authenticate.");
+        return claude_connection_status();
     }
     if matches!(lower.as_str(), "custom" | "openai-compatible" | "openai-compatible-custom") {
         ctx.app.open_custom_provider_modal();
@@ -982,22 +1062,42 @@ fn open_provider_modal_on(app: &mut zo_cli::tui::App, command: &str) {
     app.open_login_modal_rows(title, rows, ids);
 }
 
+/// Hand the provider's OAuth sign-in to the host loop and return immediately.
+///
+/// The flow binds a loopback listener, opens a browser, and then *waits* for the
+/// redirect — up to three minutes of human time. Running it here ran it on the
+/// render thread: the spinner and elapsed clock froze, keystrokes queued
+/// unpainted, and the freeze watchdog fired, so a sign-in that was working
+/// looked like a hang and a sign-in that failed looked identical to one that
+/// succeeded. The host drains [`zo_cli::tui::App::take_pending_oauth_login`],
+/// runs the flow off-thread, and reports the outcome when it lands.
 pub(super) fn login(ctx: &mut DispatchCtx<'_>, provider: Option<&str>) -> CommandOutput {
     let Some(prov) = provider else {
         return super::providers::providers(ctx);
     };
-    let opening = format!("Login — Opening browser for {prov} OAuth...");
-    let output = match crate::auth::run_login_provider(prov) {
-        Ok(()) => CommandOutput::info(opening).and_report(
+    ctx.app.request_oauth_login(prov.to_string());
+    // The manager is deliberately *not* reopened here: it would paint the
+    // pre-sign-in state while the browser round-trip is still outstanding. The
+    // host reopens it when the outcome lands, so the list shows the new account.
+    CommandOutput::info(format!(
+        "Login — opening browser for {prov} OAuth...\n  Finish in the browser; this session stays usable."
+    ))
+}
+
+/// Message for a finished background sign-in, rendered by the host loop.
+pub(crate) fn login_outcome_report(
+    provider: &str,
+    result: &Result<(), String>,
+) -> (SystemLevel, String) {
+    match result {
+        Ok(()) => (
             SystemLevel::Success,
             format!(
-                "{prov} OAuth login successful!\n\n  Use /model to switch models.\n\n  Manage every connection: /providers"
+                "{provider} OAuth login successful!\n\n  Use /model to switch models.\n\n  Manage every connection: /providers"
             ),
         ),
-        Err(e) => CommandOutput::info(opening)
-            .and_report(SystemLevel::Error, format!("Login failed: {e}")),
-    };
-    reopen_manager_if_requested(ctx, output)
+        Err(error) => (SystemLevel::Error, format!("Login failed: {error}")),
+    }
 }
 
 /// Land back on the manager when this flow was started from it, so adding two
@@ -1044,11 +1144,38 @@ fn logout_all() -> CommandOutput {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectReport, CustomProviderRequest, ProviderTokenLimits, SmokeTestResult,
-        connect_custom_provider, connect_preset,
+        ClaudeConnection, ConnectReport, CustomProviderRequest, ProviderTokenLimits,
+        SmokeTestResult, claude_connection, connect_custom_provider, connect_preset,
         provider_name_from_url, saved_oauth_providers, sign_in_row_ids,
         smoke_test_custom_provider, write_user_provider_with_options,
     };
+
+    /// `/connect claude` used to print "connected via OAuth" without consulting
+    /// anything, so it said connected on a machine holding no Claude credential
+    /// at all — while every turn failed on auth. Each answer must follow from an
+    /// input.
+    #[test]
+    fn connect_claude_reports_the_credential_it_actually_has() {
+        assert_eq!(
+            claude_connection(Some(api::ClaudeAuthOrigin::Keychain), false, false),
+            ClaudeConnection::Resolved("Claude Code session credentials (keychain)"),
+            "a keychain session is a real connection even with nothing in zo's own store"
+        );
+        assert_eq!(
+            claude_connection(Some(api::ClaudeAuthOrigin::Env), false, false),
+            ClaudeConnection::Resolved("ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN")
+        );
+        assert_eq!(
+            claude_connection(None, true, false),
+            ClaudeConnection::CredentialOnHand,
+            "a saved login that has not been exercised is not yet proof of a working account"
+        );
+        assert_eq!(
+            claude_connection(None, false, false),
+            ClaudeConnection::Missing,
+            "nothing to authenticate with must never read as connected"
+        );
+    }
 
     /// The "Sign in" rows must reach `/login` from the `/connect` picker too.
     /// `connect` has no OAuth branch — `claude` returns a fixed string and

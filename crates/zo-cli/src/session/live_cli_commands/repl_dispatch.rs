@@ -823,7 +823,15 @@ impl LiveCli {
                 self.handle_plugins_command(action.as_deref(), target.as_deref())?
             }
             SlashCommand::Login { provider } => {
-                crate::auth::run_login_provider(provider.as_deref().unwrap_or("claude"))?;
+                // A failed sign-in is the user's problem to retry, not grounds
+                // for tearing the REPL down: propagating here ended the session
+                // on a browser that was simply closed, or on the 3-minute
+                // callback timeout.
+                if let Err(error) =
+                    crate::auth::run_login_provider(provider.as_deref().unwrap_or("claude"))
+                {
+                    eprintln!("Login failed: {error}");
+                }
                 false
             }
             SlashCommand::Logout { scope } => {

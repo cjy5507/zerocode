@@ -587,6 +587,12 @@ async fn run_session_loop(
     // pushes it once `run` is dropped and `app` is borrowable. Bounded so a burst
     // of rapid turns cannot grow it without limit.
     let (verify_tx, mut verify_rx) = mpsc::channel::<String>(8);
+    // `/login <provider>` runs its browser round-trip on a plain thread (no
+    // ambient runtime, so the flow's own `block_on` stays safe) and reports the
+    // outcome here. The provider is carried alongside the result because the
+    // report names it and the thread outlives the dispatch that started it.
+    // One slot: a second sign-in cannot start while one holds the callback port.
+    let (login_tx, mut login_rx) = mpsc::channel::<(String, Result<(), String>)>(1);
     // A single slot deliberately collapses repeated copy actions until the
     // native helper has completed. Never replace a live operation: dropping its
     // JoinHandle would detach an already-running `pbcopy` process.
@@ -654,6 +660,8 @@ async fn run_session_loop(
         let mut woke_completion: Option<AgentCompletion> = None;
         // A spawned post-turn verify panel's warning that woke the idle `select!`.
         let mut woke_verify: Option<String> = None;
+        // A background `/login` that finished while the prompt sat idle.
+        let mut woke_login: Option<(String, Result<(), String>)> = None;
         // A remote prompt or local-only pairing notice that woke the idle prompt.
         // It is handled only after `app.run` is dropped so the App borrow is free.
         let mut woke_remote: Option<RemoteInbox> = None;
@@ -753,6 +761,14 @@ async fn run_session_loop(
                         woke_verify = Some(warning);
                         break AppAction::Redraw;
                     }
+                    Some(outcome) = login_rx.recv() => {
+                        // A background `/login` finished. Without this arm the
+                        // result would sit in the channel until the next
+                        // keystroke, which is exactly the "browser came back but
+                        // zo says nothing" report.
+                        woke_login = Some(outcome);
+                        break AppAction::Redraw;
+                    }
                     Some(inbox) = remote.next_inbox() => {
                         // Remote prompts use the bounded session-local inbox;
                         // pairing notices use the render channel so they also
@@ -794,6 +810,38 @@ async fn run_session_loop(
         // `run` is dropped now, so `app` is borrowable — push it.
         if let Some(warning) = woke_verify.take() {
             push_report(app, ids, SystemLevel::Warn, warning);
+            app.draw_frame(terminal)?;
+        }
+        // A background `/login` landed while the prompt was idle. The credential
+        // chain caches per process, so a fresh sign-in only takes effect once the
+        // bindings are rebuilt — `sync_app_context` is what makes the new
+        // account usable without a restart.
+        if let Some((provider, result)) = woke_login.take() {
+            let (level, message) =
+                crate::session::slash_dispatch::login_outcome_report(&provider, &result);
+            app.follow_latest();
+            push_report(app, ids, level, message);
+            sync_app_context(cli, app);
+            // A sign-in started from the provider manager lands back on it, now
+            // that the list has something new to show.
+            if app.take_provider_manager_return() {
+                use crate::session::slash_dispatch::{
+                    account_rows, manager_rows, settings_path_display,
+                };
+                match manager_rows() {
+                    Ok(rows) => app.open_provider_manager_modal(
+                        account_rows(),
+                        rows,
+                        settings_path_display(),
+                    ),
+                    Err(error) => push_report(
+                        app,
+                        ids,
+                        SystemLevel::Warn,
+                        format!("Providers: failed to re-read settings: {error}"),
+                    ),
+                }
+            }
             app.draw_frame(terminal)?;
         }
         // Process a completion that woke the idle `select!` (consumed from the
@@ -1200,6 +1248,23 @@ async fn run_session_loop(
                             } else {
                                 run_pager_on_path(terminal, &view.path).await;
                             }
+                        }
+                        // `/login <provider>` records a sign-in to run. A plain
+                        // thread, not `spawn_blocking`: the flow calls
+                        // `block_on` internally and an ambient runtime handle
+                        // would make that a nested-runtime hazard. The UI keeps
+                        // painting while the browser round-trip is outstanding.
+                        if let Some(provider) = app.take_pending_oauth_login() {
+                            let tx = login_tx.clone();
+                            std::thread::spawn(move || {
+                                let result = crate::auth::run_login_provider(&provider)
+                                    .map_err(|error| error.to_string());
+                                // Blocking send from a non-async thread; the
+                                // single slot is free unless a previous outcome
+                                // is still unread, in which case waiting is
+                                // right — the report must not be dropped.
+                                let _ = tx.blocking_send((provider, result));
+                            });
                         }
                         if should_quit {
                             // A restart returns `should_quit` too, but with a

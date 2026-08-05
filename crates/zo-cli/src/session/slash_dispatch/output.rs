@@ -94,19 +94,6 @@ impl CommandOutput {
             blocks: vec![OutputBlock::Card(card)],
         }
     }
-
-    /// Append another report, enabling multi-block handlers (e.g. login)
-    /// to chain without hand-building a `Vec`.
-    #[must_use]
-    pub(super) fn and_report(mut self, level: SystemLevel, text: impl Into<String>) -> Self {
-        match &mut self {
-            Self::Blocks(blocks) | Self::Popup { blocks, .. } => {
-                blocks.push(OutputBlock::Report(level, text.into()));
-            }
-            Self::Quiet | Self::Exit | Self::RestartRequested => {}
-        }
-        self
-    }
 }
 
 /// The single funnel: project a [`CommandOutput`] onto the transcript or the
@@ -187,31 +174,11 @@ mod tests {
     }
 
     #[test]
-    fn and_report_appends_in_order() {
-        let output = CommandOutput::info("first").and_report(SystemLevel::Warn, "second");
-        match output {
-            CommandOutput::Blocks(blocks) => {
-                assert_eq!(blocks.len(), 2);
-                match (&blocks[0], &blocks[1]) {
-                    (OutputBlock::Report(_, a), OutputBlock::Report(_, b)) => {
-                        assert_eq!(a, "first");
-                        assert_eq!(b, "second");
-                    }
-                    _ => panic!("expected two reports"),
-                }
-            }
-            _ => panic!("expected Blocks"),
-        }
-    }
-
-    #[test]
-    fn and_report_extends_popup_blocks_and_titles_from_card() {
-        let output =
-            CommandOutput::popup_card(CardModel::new(" /x ")).and_report(SystemLevel::Info, "y");
-        match output {
+    fn a_popup_takes_its_title_from_the_card() {
+        match CommandOutput::popup_card(CardModel::new(" /x ")) {
             CommandOutput::Popup { title, blocks } => {
                 assert_eq!(title, "/x", "popup title derives from the trimmed card title");
-                assert_eq!(blocks.len(), 2);
+                assert_eq!(blocks.len(), 1);
             }
             _ => panic!("expected Popup"),
         }

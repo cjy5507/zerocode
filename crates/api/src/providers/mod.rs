@@ -13,6 +13,7 @@ pub mod gemini_code_assist;
 pub(crate) mod google_auth;
 pub mod openai_compat;
 pub mod openai_oauth;
+pub(crate) mod refresh_gate;
 mod retry_backoff;
 
 pub const EXPERIMENTAL_PROVIDERS_ENV: &str = "ZO_EXPERIMENTAL_PROVIDERS";

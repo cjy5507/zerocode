@@ -211,6 +211,77 @@ fn resolve_saved_oauth_token_refreshes_expired_credentials() {
     cleanup_temp_config_home(&config_home);
 }
 
+/// A refresh token the endpoint has already rejected can never mint another
+/// access token — the rotating family moved on. Retrying it spent a doomed
+/// round-trip on every credential resolution, i.e. once per turn for the whole
+/// session, and each one printed the same unactionable 400.
+#[test]
+fn a_rejected_refresh_branch_is_not_spent_again() {
+    let _guard = env_lock();
+    let config_home = temp_config_home();
+    std::env::set_var("ZO_CONFIG_HOME", &config_home);
+    std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+    std::env::remove_var("ANTHROPIC_API_KEY");
+    let config = sample_oauth_config("https://console.test/oauth/token".to_string());
+    let expired = || OAuthTokenSet {
+        access_token: "expired-access-token".to_string(),
+        refresh_token: Some("superseded-branch".to_string()),
+        expires_at: Some(1),
+        scopes: vec!["scope:a".to_string()],
+    };
+    let invalid_grant = || ApiError::Api {
+        status: reqwest::StatusCode::BAD_REQUEST,
+        error_type: None,
+        message: None,
+        body: r#"{"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}"#
+            .to_string(),
+        retryable: false,
+        retry_after: None,
+    };
+
+    let first =
+        resolve_saved_oauth_token_set_with(&config, expired(), |_config, _request| {
+            Err(invalid_grant())
+        })
+        .expect_err("a rejected grant fails the resolution");
+    assert!(
+        matches!(first, ApiError::Api { status, .. } if status.as_u16() == 400),
+        "the first attempt surfaces the endpoint's own answer: {first}"
+    );
+
+    // Second attempt: the closure must never run.
+    let second = resolve_saved_oauth_token_set_with(&config, expired(), |_config, _request| {
+        panic!("a retired branch must not reach the token endpoint again")
+    })
+    .expect_err("a retired branch still fails, just without the round-trip");
+    assert!(
+        matches!(&second, ApiError::Auth(message) if message.contains("zo login claude")),
+        "the failure has to name the way out: {second}"
+    );
+
+    // A different token is a different branch: a fresh sign-in is never blocked
+    // by the death of the one it replaced.
+    let fresh = OAuthTokenSet {
+        refresh_token: Some("freshly-signed-in".to_string()),
+        ..expired()
+    };
+    let resolved = resolve_saved_oauth_token_set_with(&config, fresh, |_config, request| {
+        assert_eq!(request.refresh_token, "freshly-signed-in");
+        Ok(OAuthTokenSet {
+            access_token: "new-access-token".to_string(),
+            refresh_token: Some("rotated".to_string()),
+            expires_at: Some(9_999_999_999),
+            scopes: request.scopes,
+        })
+    })
+    .expect("an unrelated branch refreshes normally");
+    assert_eq!(resolved.access_token, "new-access-token");
+
+    clear_oauth_credentials().expect("clear credentials");
+    std::env::remove_var("ZO_CONFIG_HOME");
+    cleanup_temp_config_home(&config_home);
+}
+
 #[test]
 fn resolve_startup_auth_source_uses_saved_oauth_without_loading_config() {
     let _guard = env_lock();

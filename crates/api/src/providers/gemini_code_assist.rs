@@ -408,19 +408,38 @@ pub fn load_fresh_oauth() -> Option<OAuthTokenSet> {
     // Backoff: if a recent auto-refresh failed or timed out, don't retry yet —
     // serve the (expired) token so one hung refresh doesn't re-stall every turn
     // with a doomed retry. A genuine expiry still surfaces downstream as a 401.
-    if refresh_in_backoff() {
+    // The shared gate additionally retires a branch the endpoint *rejected*: a
+    // revoked Google grant never recovers, so retrying it once a minute forever
+    // is pure latency on the credential path.
+    if refresh_in_backoff() || crate::providers::refresh_gate::refresh_blocked(&refresh_token).is_some()
+    {
         return Some(tokens);
     }
-    if let Ok(mut refreshed) = crate::sync_bridge::run_blocking(refresh_tokens(&refresh_token)) {
-        clear_refresh_failure();
-        if refreshed.refresh_token.is_none() {
-            refreshed.refresh_token = tokens.refresh_token;
+    match crate::sync_bridge::run_blocking(refresh_tokens(&refresh_token)) {
+        Ok(mut refreshed) => {
+            clear_refresh_failure();
+            crate::providers::refresh_gate::record_success(&refresh_token);
+            if refreshed.refresh_token.is_none() {
+                refreshed.refresh_token = tokens.refresh_token;
+            }
+            if let Err(error) = crate::oauth_store::save_google_code_assist_oauth(&refreshed) {
+                eprintln!(
+                    "\x1b[33mwarning: refreshed Gemini token could not be saved ({error}); \
+                     run `zo login google` if the next request fails.\x1b[0m"
+                );
+            }
+            Some(refreshed)
         }
-        let _ = crate::oauth_store::save_google_code_assist_oauth(&refreshed);
-        Some(refreshed)
-    } else {
-        mark_refresh_failure();
-        Some(tokens)
+        Err(error) => {
+            mark_refresh_failure();
+            if crate::providers::refresh_gate::record_failure(&refresh_token, &error) {
+                eprintln!(
+                    "\x1b[33mGemini login can no longer be refreshed ({error}).\n  \
+                     Run `zo login google` (or /login google) to reconnect.\x1b[0m"
+                );
+            }
+            Some(tokens)
+        }
     }
 }
 

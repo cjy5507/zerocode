@@ -105,7 +105,8 @@ pub use oauth_store::{
     load_google_code_assist_oauth, load_oauth_credentials,
     load_openai_compat_api_key, loopback_redirect_uri, save_google_code_assist_oauth,
     save_oauth_credentials, save_openai_compat_api_key, saved_oauth_present,
-    saved_oauth_present_effective, SavedOAuthProvider,
+    saved_oauth_liveness_effective, saved_oauth_present_effective, SavedOAuthLiveness,
+    SavedOAuthProvider,
 };
 
 pub use telemetry::{

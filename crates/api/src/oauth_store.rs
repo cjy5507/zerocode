@@ -404,6 +404,43 @@ pub fn saved_oauth_present_effective(
     provider: SavedOAuthProvider,
     read_file: &dyn Fn(&Path) -> io::Result<Option<String>>,
 ) -> io::Result<bool> {
+    Ok(saved_oauth_liveness_effective(provider, read_file)?.is_some())
+}
+
+/// What a diagnostic can say about a saved credential without contacting anyone.
+///
+/// Scalars only — never a token, and never a hash of one. `expires_at` is the
+/// stored Unix-second expiry; `has_refresh_token` is whether a renewal is even
+/// possible. Together they separate "expired, refreshes on next use" (routine)
+/// from "expired with nothing to refresh from" (a dead credential that only a
+/// new sign-in fixes), which a presence-only probe reported identically — as a
+/// clean `PASS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SavedOAuthLiveness {
+    pub expires_at: Option<u64>,
+    pub has_refresh_token: bool,
+}
+
+impl SavedOAuthLiveness {
+    /// Whether the stored access token is past its recorded expiry.
+    #[must_use]
+    pub fn expired_at(self, now_unix: u64) -> bool {
+        self.expires_at.is_some_and(|expires_at| expires_at <= now_unix)
+    }
+
+    /// Expired with no way to renew: nothing short of a new sign-in helps.
+    #[must_use]
+    pub fn unusable_at(self, now_unix: u64) -> bool {
+        self.expired_at(now_unix) && !self.has_refresh_token
+    }
+}
+
+/// [`saved_oauth_present_effective`] with the non-secret liveness fields the
+/// caller needs to say something useful. `None` when no credential is present.
+pub fn saved_oauth_liveness_effective(
+    provider: SavedOAuthProvider,
+    read_file: &dyn Fn(&Path) -> io::Result<Option<String>>,
+) -> io::Result<Option<SavedOAuthLiveness>> {
     // Layer low-to-high so the highest-priority root wins, mirroring
     // `read_lower_roots` + primary. `null` acts as a tombstone via `apply_root`.
     let mut effective = Map::new();
@@ -429,9 +466,19 @@ pub fn saved_oauth_present_effective(
     }
     // `apply_root` already drops `null` tombstones, so a present entry here is a
     // live credential.
-    Ok(effective
+    let Some(entry) = effective
         .get(provider.key())
-        .is_some_and(|entry| !entry.is_null()))
+        .filter(|entry| !entry.is_null())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(SavedOAuthLiveness {
+        expires_at: entry.get("expiresAt").and_then(Value::as_u64),
+        has_refresh_token: entry
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .is_some_and(|token| !token.is_empty()),
+    }))
 }
 
 /// Whether `root` carries a non-null saved-OAuth entry for `provider`.
@@ -838,12 +885,14 @@ mod tests {
         credentials_path, load_google_code_assist_oauth, load_oauth_credentials,
         load_openai_compat_api_key, load_openai_oauth, read_one_credentials_root,
         save_oauth_credentials, save_openai_compat_api_key, save_openai_oauth,
-        update_credentials_root, write_credentials_root, CredentialFileLock, OAUTH_KEY,
+        saved_oauth_liveness_effective, update_credentials_root, write_credentials_root,
+        CredentialFileLock, OAUTH_KEY, SavedOAuthProvider,
     };
     use core_types::{OAuthTokenSet, OpenAiOAuthTokens};
     use serde_json::Value;
     use std::fs;
-    use std::path::PathBuf;
+    use std::io;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn unique_config_home() -> PathBuf {
@@ -1034,6 +1083,76 @@ mod tests {
             Some(anthropic)
         );
 
+        std::env::remove_var("ZO_CONFIG_HOME");
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    /// A presence probe cannot tell a working credential from a dead one, and
+    /// reported both as healthy. The liveness probe separates the two without
+    /// reading a token value: an expired entry that still carries a refresh token
+    /// renews itself on next use, while an expired entry with none can only be
+    /// fixed by signing in again.
+    #[test]
+    fn liveness_separates_a_renewable_credential_from_a_dead_one() {
+        let _env_lock = crate::test_env_lock();
+        let config_home = unique_config_home();
+        fs::create_dir_all(&config_home).expect("config home should exist");
+        std::env::set_var("ZO_CONFIG_HOME", &config_home);
+        let read_file = |path: &Path| -> io::Result<Option<String>> {
+            match fs::read_to_string(path) {
+                Ok(contents) => Ok(Some(contents)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            }
+        };
+        let now = 1_000_000_u64;
+
+        // Renewable: expired access token, refresh token on hand.
+        save_oauth_credentials(&OAuthTokenSet {
+            access_token: "expired".into(),
+            refresh_token: Some("renewable".into()),
+            expires_at: Some(now - 1),
+            scopes: Vec::new(),
+        })
+        .expect("save renewable credentials");
+        let liveness = saved_oauth_liveness_effective(SavedOAuthProvider::Anthropic, &read_file)
+            .expect("probe")
+            .expect("present");
+        assert!(liveness.expired_at(now));
+        assert!(liveness.has_refresh_token);
+        assert!(
+            !liveness.unusable_at(now),
+            "an expired token with a refresh token is routine, not a fault"
+        );
+
+        // Dead: expired with nothing to refresh from.
+        save_oauth_credentials(&OAuthTokenSet {
+            access_token: "expired".into(),
+            refresh_token: None,
+            expires_at: Some(now - 1),
+            scopes: Vec::new(),
+        })
+        .expect("save dead credentials");
+        let liveness = saved_oauth_liveness_effective(SavedOAuthProvider::Anthropic, &read_file)
+            .expect("probe")
+            .expect("present");
+        assert!(liveness.unusable_at(now), "this one needs a new sign-in");
+
+        // A logged-out entry stays absent rather than reporting a fabricated
+        // liveness. Written directly: this is the `null` tombstone shape a logout
+        // leaves behind, and the probe must read it as "nothing here".
+        fs::write(
+            config_home.join("credentials.json"),
+            format!("{{\"{OAUTH_KEY}\":null}}\n"),
+        )
+        .expect("write a tombstoned entry");
+        assert_eq!(
+            saved_oauth_liveness_effective(SavedOAuthProvider::Anthropic, &read_file)
+                .expect("probe"),
+            None
+        );
+
+        clear_oauth_credentials().expect("clear");
         std::env::remove_var("ZO_CONFIG_HOME");
         let _ = fs::remove_dir_all(config_home);
     }

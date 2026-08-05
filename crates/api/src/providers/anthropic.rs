@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, SessionTracer};
 
-use super::read_env_non_empty;
+use super::{read_env_non_empty, refresh_gate};
 use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
@@ -1364,6 +1364,16 @@ where
             "saved OAuth token is expired; runtime OAuth config is missing".to_string(),
         ));
     };
+    // A refresh failure here surfaces as-is, and that is now worth something: the
+    // refresh gate turns a rejected branch into "run `zo login claude`" instead of
+    // a bare `invalid_grant` 400 body. The caller decides whether an
+    // unauthenticated start is acceptable ([`StartupAuthPolicy`]); this only has
+    // to say why, in words that name the fix.
+    //
+    // Deliberately *not* falling back to the keychain here: this function is only
+    // reached once the shared chain — which tries the keychain first — has already
+    // come up empty, so a keychain probe at this point could only repeat that
+    // answer.
     Ok(AuthSource::from(resolve_saved_oauth_token_set(
         &config, token_set,
     )?))
@@ -1435,6 +1445,11 @@ fn resolve_claude_auth_fresh_inner() -> Option<ResolvedClaudeAuth> {
         });
     }
     let config = keychain::claude_code_oauth_config();
+    // Falling through on failure is deliberate — the env rung may still answer —
+    // but it is no longer *silent*: `resolve_saved_oauth_token_set_with` reports
+    // a dead branch once, with the re-authentication route. Before that, a user
+    // whose saved login had been superseded saw only a downstream 401 and no hint
+    // that `zo login claude` was the fix.
     if let Ok(Some(token_set)) = resolve_saved_oauth_token_any_context(&config) {
         let expires_at_ms = token_set.expires_at.map(|secs| secs.saturating_mul(1000));
         return Some(ResolvedClaudeAuth {
@@ -1531,15 +1546,37 @@ where
     let Some(saved_refresh_token) = token_set.refresh_token.take() else {
         return Err(ApiError::ExpiredOAuthToken);
     };
+    // A branch the endpoint already rejected cannot be revived by trying again.
+    // Without this the saved rung spent a doomed round-trip on every credential
+    // resolution — the keychain rung has had this guard from the start.
+    if let Some(block) = refresh_gate::refresh_blocked(&saved_refresh_token) {
+        return Err(saved_refresh_unavailable(block));
+    }
     let requested_scopes = std::mem::take(&mut token_set.scopes);
-    let refreshed = refresh(
+    let refreshed = match refresh(
         config,
         OAuthRefreshRequest::from_config(
             config,
             saved_refresh_token.clone(),
             Some(requested_scopes),
         ),
-    )?;
+    ) {
+        Ok(refreshed) => {
+            refresh_gate::record_success(&saved_refresh_token);
+            refreshed
+        }
+        Err(error) => {
+            if refresh_gate::record_failure(&saved_refresh_token, &error) {
+                // Once per dead branch, not once per turn: the operator needs the
+                // route out, and the raw 400 body does not carry one.
+                eprintln!(
+                    "\x1b[33mZo's saved Claude login can no longer be refreshed ({error}).\n  \
+                     Run `zo login claude` (or /login claude) to reconnect this account.\x1b[0m"
+                );
+            }
+            return Err(error);
+        }
+    };
     let resolved = OAuthTokenSet {
         access_token: refreshed.access_token,
         refresh_token: refreshed.refresh_token.or(Some(saved_refresh_token)),
@@ -1554,6 +1591,21 @@ where
     })
     .map_err(ApiError::from)?;
     Ok(resolved)
+}
+
+/// Why the saved rung declined to try, phrased for whoever reads the failure.
+fn saved_refresh_unavailable(block: refresh_gate::RefreshBlock) -> ApiError {
+    match block {
+        refresh_gate::RefreshBlock::Retired => ApiError::Auth(
+            "zo's saved Claude login was rejected by the token endpoint and cannot be \
+             refreshed — run `zo login claude` to reconnect"
+                .to_string(),
+        ),
+        refresh_gate::RefreshBlock::CoolingDown => ApiError::Auth(
+            "zo's saved Claude login could not be refreshed a moment ago; retrying shortly"
+                .to_string(),
+        ),
+    }
 }
 
 fn client_runtime_block_on<F, T>(future: F) -> Result<T, ApiError>

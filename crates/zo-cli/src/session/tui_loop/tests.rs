@@ -1895,3 +1895,43 @@ fn boot_timing_line_formats_all_phases_in_ms() {
         "[boot] runtime_build=128ms status_context=7ms to_first_frame=15ms total=163ms"
     );
 }
+
+/// `/login <provider>` must hand the sign-in to the host and return, not run it.
+///
+/// The flow binds a loopback listener, opens a browser, and waits up to three
+/// minutes for the redirect. Running that inside dispatch ran it on the render
+/// thread — this very assertion would have opened a browser and blocked the test
+/// for the full callback timeout, which is exactly what the UI did to the user.
+#[test]
+fn login_hands_the_oauth_flow_to_the_host_instead_of_blocking_dispatch() {
+    let _lock = crate::test_env_lock();
+    let mut cli = test_live_cli_with_env_lock_held();
+    let mut app = new_test_app();
+
+    let started = std::time::Instant::now();
+    let should_quit = handle_persistent_slash(
+        &mut cli,
+        &mut app,
+        &BlockIdGen::default(),
+        SlashCommand::Login {
+            provider: Some("claude".to_string()),
+        },
+    )
+    .expect("login dispatch reports its own failures, it never errors");
+
+    assert!(!should_quit);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "dispatch must not wait on the browser round-trip"
+    );
+    assert_eq!(
+        app.take_pending_oauth_login().as_deref(),
+        Some("claude"),
+        "the host drains this slot and runs the flow off the render thread"
+    );
+    let rendered = render_app_buffer(&mut app);
+    assert!(
+        rendered.contains("opening browser"),
+        "the user has to be told where the sign-in went: {rendered}"
+    );
+}

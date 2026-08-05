@@ -15,7 +15,9 @@ mod view;
 pub(crate) use auth::{
     ConnectReport, connect_custom_provider, connect_preset, connect_preset_with_api_key,
 };
-pub(crate) use auth::{CustomProviderRequest, account_rows, open_add_provider_picker};
+pub(crate) use auth::{
+    CustomProviderRequest, account_rows, login_outcome_report, open_add_provider_picker,
+};
 pub(crate) use provider_store::ProviderTokenLimits;
 pub(crate) use providers::{
     apply as apply_provider_action, edit_prefill, manager_rows,

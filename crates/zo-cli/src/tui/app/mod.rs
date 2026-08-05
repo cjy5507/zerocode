@@ -561,6 +561,11 @@ pub struct App {
     /// (or `$EDITOR` for `/dump edit`). Same contract as
     /// [`Self::pending_editor_file`]: recorded here, drained by the loop.
     pending_transcript_view: Option<TranscriptViewRequest>,
+    /// Provider whose OAuth sign-in `/login` asked the host to run. Same
+    /// contract as [`Self::pending_editor_file`], and for a sharper reason: the
+    /// flow waits on a browser round-trip for up to three minutes, so running it
+    /// inside the command froze the whole UI until the user finished signing in.
+    pending_oauth_login: Option<String>,
     /// Frecency tracker for slash command usage.
     command_history: CommandHistory,
     /// Prevent repeated non-fatal history persistence failures from flooding the
@@ -782,6 +787,7 @@ impl App {
             pending_agent_result: None,
             pending_editor_file: None,
             pending_transcript_view: None,
+            pending_oauth_login: None,
             // Inert default: reads empty, writes discard. The session loop
             // attaches the real per-user history via `set_command_history`
             // once the data directory is known (see `tui_loop`).

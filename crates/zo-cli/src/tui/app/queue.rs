@@ -313,6 +313,21 @@ impl App {
         self.pending_transcript_view.take()
     }
 
+    /// Record that `/login <provider>` wants the host to run that provider's
+    /// OAuth sign-in. The host drains this with
+    /// [`Self::take_pending_oauth_login`] after slash dispatch and runs the flow
+    /// off the render thread — it blocks on a browser round-trip, so running it
+    /// where the command is dispatched stopped the spinner, the elapsed clock,
+    /// and the input pump for as long as the user spent signing in.
+    pub fn request_oauth_login(&mut self, provider: String) {
+        self.pending_oauth_login = Some(provider);
+    }
+
+    /// Drain a pending OAuth sign-in request, if any.
+    pub fn take_pending_oauth_login(&mut self) -> Option<String> {
+        self.pending_oauth_login.take()
+    }
+
     /// Re-derive the composer's image badge from the attachments actually staged.
     ///
     /// The badge is a count inside the input widget while the attachments live on

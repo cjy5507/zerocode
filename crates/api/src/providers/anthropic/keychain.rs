@@ -26,6 +26,7 @@ use serde_json::Value;
 
 use super::{AnthropicClient, AuthSource, OAuthTokenSet, read_base_url};
 use crate::error::ApiError;
+use crate::providers::refresh_gate;
 
 /// Keychain service name Claude Code stores its OAuth bundle under.
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
@@ -35,12 +36,6 @@ const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// Milliseconds because the keychain's `expiresAt` is Unix ms; mirrors the
 /// 60-second `OAUTH_EXPIRY_BUFFER_SECS` used for zo-saved tokens.
 const KEYCHAIN_EXPIRY_BUFFER_MS: u64 = 60_000;
-
-/// After a refresh attempt fails (network down, refresh token revoked), don't
-/// re-attempt the network round-trip for this long. The read path runs at every
-/// turn boundary while auth is in fallback, so an unguarded failure would
-/// hammer the token endpoint once per turn.
-const REFRESH_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Kill switch: set `ZO_DISABLE_KEYCHAIN=1` to skip the Claude Code keychain
 /// entirely (also keeps unit tests hermetic on developer machines where the
@@ -263,6 +258,7 @@ fn read_claude_code_keychain_session_uncached() -> Option<KeychainSession> {
     match evaluate_keychain_credentials(&blob, now_ms) {
         KeychainOutcome::Usable(access_token) => {
             eprintln!("\x1b[2mUsing Claude Code session credentials.\x1b[0m");
+            mirror_keychain_into_zo_store(&blob);
             let expires_at_ms = blob
                 .get("claudeAiOauth")
                 .and_then(|oauth| oauth.get("expiresAt"))
@@ -300,6 +296,71 @@ pub fn read_claude_code_keychain_token() -> Option<String> {
     read_claude_code_keychain_session().map(|session| session.access_token)
 }
 
+/// Keep zo's own credential entry in step with the keychain whenever a usable
+/// session is read.
+///
+/// Both stores hold the *same* rotating subscription grant, and only one copy of
+/// it can be live: the token endpoint replaces a refresh token the moment it is
+/// spent and forgets the predecessor. Zo's copy was written only when zo itself
+/// refreshed, so every refresh Claude Code performed left the mirror one branch
+/// behind — and a superseded branch is worse than no fallback at all, because it
+/// still looks like a credential and can only ever answer `invalid_grant`.
+///
+/// Measured on a real machine: the keychain and the mirror carried different
+/// refresh tokens, and startup credential resolution died on the mirror's dead
+/// branch while a valid keychain session sat one rung above it.
+///
+/// The `oauth` entry is the keychain identity's mirror, by the same policy the
+/// refresh path already applied when it overwrote that entry after every
+/// keychain refresh; this only makes the mirror track the branch it is supposed
+/// to be mirroring instead of drifting until the next refresh happened to run.
+/// Nothing is written unless the mirror is actually stale, so a steady state
+/// costs one small file read.
+fn mirror_keychain_into_zo_store(blob: &Value) {
+    let Some(oauth) = blob.get("claudeAiOauth") else {
+        return;
+    };
+    let field = |name: &str| {
+        oauth
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let Some(access_token) = field("accessToken") else {
+        return;
+    };
+    let refresh_token = field("refreshToken");
+    let mirrored = crate::oauth_store::load_oauth_credentials().ok().flatten();
+    if mirrored.as_ref().is_some_and(|saved| {
+        saved.access_token == access_token && saved.refresh_token == refresh_token
+    }) {
+        return;
+    }
+    // Unix seconds on the way out; the blob records milliseconds.
+    let expires_at = oauth
+        .get("expiresAt")
+        .and_then(Value::as_u64)
+        .map(|ms| ms / 1000);
+    let scopes = oauth
+        .get("scopes")
+        .and_then(Value::as_array)
+        .map(|scopes| {
+            scopes
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let _ = crate::oauth_store::save_oauth_credentials(&core_types::OAuthTokenSet {
+        access_token,
+        refresh_token,
+        expires_at,
+        scopes,
+    });
+}
+
 /// Refresh an expired keychain blob via its `refreshToken`, persist the result
 /// (keychain write-back + zo credential mirror), and return the fresh
 /// session. `None` when the blob has no refresh token, a recent attempt already
@@ -312,7 +373,11 @@ fn refresh_expired_keychain_blob(blob: &Value) -> Option<KeychainSession> {
         .filter(|token| !token.is_empty())?
         .to_string();
 
-    if refresh_failure_cooldown_active() {
+    // Keyed on the token, not on the clock: a branch the endpoint has already
+    // rejected is retired outright (nothing but a new sign-in revives it), while
+    // a transient failure only cools down. The old process-wide timestamp could
+    // not tell those apart and blocked a healthy branch for a minute either way.
+    if refresh_gate::refresh_blocked(&refresh_token).is_some() {
         return None;
     }
 
@@ -338,10 +403,22 @@ fn refresh_expired_keychain_blob(blob: &Value) -> Option<KeychainSession> {
     );
 
     let refreshed = match refresh_token_set_on_own_thread(&config, &request) {
-        Ok(refreshed) => refreshed,
+        Ok(refreshed) => {
+            refresh_gate::record_success(&refresh_token);
+            refreshed
+        }
         Err(error) => {
-            mark_refresh_failure();
+            let retired = refresh_gate::record_failure(&refresh_token, &error);
             eprintln!("\x1b[33mClaude Code OAuth refresh failed: {error}\x1b[0m");
+            if retired {
+                // The grant itself was rejected, so neither zo nor Claude Code
+                // can recover without a sign-in. Say so — the bare 400 body sent
+                // people looking for a network problem.
+                eprintln!(
+                    "\x1b[33m  This refresh token has been superseded or revoked. \
+                     Sign in again (`claude` or `zo login claude`).\x1b[0m"
+                );
+            }
             return None;
         }
     };
@@ -515,21 +592,6 @@ fn write_keychain_blob(account: &str, blob: &Value) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-static LAST_REFRESH_FAILURE: Mutex<Option<Instant>> = Mutex::new(None);
-
-fn refresh_failure_cooldown_active() -> bool {
-    LAST_REFRESH_FAILURE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_some_and(|at| at.elapsed() < REFRESH_FAILURE_COOLDOWN)
-}
-
-fn mark_refresh_failure() {
-    *LAST_REFRESH_FAILURE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
-}
-
 fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -542,8 +604,8 @@ fn now_unix_millis() -> u64 {
 mod tests {
     use super::{
         KEYCHAIN_EXPIRY_BUFFER_MS, KeychainOutcome, REFRESH_CONNECT_TIMEOUT, REFRESH_TOTAL_TIMEOUT,
-        claude_code_oauth_config, evaluate_keychain_credentials, parse_keychain_account,
-        updated_keychain_blob,
+        claude_code_oauth_config, evaluate_keychain_credentials, mirror_keychain_into_zo_store,
+        parse_keychain_account, updated_keychain_blob,
     };
     use crate::providers::anthropic::OAuthTokenSet;
     use std::time::Duration;
@@ -814,6 +876,76 @@ mod tests {
             None
         );
         assert_eq!(parse_keychain_account("    \"acct\"<blob>=\"\"\n"), None);
+    }
+
+    /// The mirror and the keychain hold the same rotating grant, so a mirror
+    /// that is only written when *zo* refreshes falls behind every refresh
+    /// Claude Code performs — and a superseded refresh token still looks like a
+    /// credential while being able to answer nothing but `invalid_grant`. Reading
+    /// a usable session has to bring the mirror along.
+    #[test]
+    fn reading_a_usable_session_brings_the_zo_mirror_along() {
+        let _guard = crate::test_env_lock();
+        let config_home = std::env::temp_dir().join(format!(
+            "api-keychain-mirror-{}-{}",
+            std::process::id(),
+            super::now_unix_millis()
+        ));
+        std::fs::create_dir_all(&config_home).expect("temp config home");
+        std::env::set_var("ZO_CONFIG_HOME", &config_home);
+
+        // Stale mirror: the branch zo last saw, two rotations ago.
+        crate::oauth_store::save_oauth_credentials(&core_types::OAuthTokenSet {
+            access_token: "stale-access".to_string(),
+            refresh_token: Some("superseded-branch".to_string()),
+            expires_at: Some(1),
+            scopes: vec!["user:inference".to_string()],
+        })
+        .expect("seed the stale mirror");
+
+        let blob = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "live-access",
+                "refreshToken": "live-branch",
+                "expiresAt": 2_000_000_000_000_u64,
+                "scopes": ["user:inference", "user:profile"],
+                "subscriptionType": "team",
+            }
+        });
+        mirror_keychain_into_zo_store(&blob);
+
+        let mirrored = crate::oauth_store::load_oauth_credentials()
+            .expect("read the mirror")
+            .expect("the mirror exists");
+        assert_eq!(mirrored.access_token, "live-access");
+        assert_eq!(
+            mirrored.refresh_token.as_deref(),
+            Some("live-branch"),
+            "the fallback rung must hold the live branch, not a spent one"
+        );
+        assert_eq!(
+            mirrored.expires_at,
+            Some(2_000_000_000),
+            "the blob records milliseconds; the store records seconds"
+        );
+        assert!(mirrored.scopes.iter().any(|scope| scope == "user:inference"));
+
+        // Already in step: nothing to do, and nothing written.
+        let before = std::fs::metadata(config_home.join("credentials.json"))
+            .and_then(|meta| meta.modified())
+            .expect("mirror mtime");
+        mirror_keychain_into_zo_store(&blob);
+        let after = std::fs::metadata(config_home.join("credentials.json"))
+            .and_then(|meta| meta.modified())
+            .expect("mirror mtime");
+        assert_eq!(
+            before, after,
+            "a steady state must not rewrite the credential file on every read"
+        );
+
+        crate::oauth_store::clear_oauth_credentials().expect("clear the mirror");
+        std::env::remove_var("ZO_CONFIG_HOME");
+        std::fs::remove_dir_all(&config_home).ok();
     }
 
     #[test]

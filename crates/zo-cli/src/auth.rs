@@ -13,8 +13,24 @@ use runtime::{
 use crate::DEFAULT_OAUTH_CALLBACK_PORT;
 
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
-const OAUTH_CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for reading one HTTP request off a single accepted socket — not the
+/// login's deadline, which stays [`OAUTH_CALLBACK_TIMEOUT`].
+///
+/// Browsers open sockets to the callback origin that carry no request at all
+/// (Chrome preconnects to the redirect target), and those are indistinguishable
+/// from the real redirect until the bytes do or do not arrive. This bounds how
+/// long one silent socket can hold the sign-in up before the wait goes back to
+/// accepting; on loopback a real request lands in microseconds.
+const OAUTH_CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(3);
 const OAUTH_CALLBACK_ACCEPT_POLL: Duration = Duration::from_millis(50);
+/// Cap on the request bytes read from one callback connection. A redirect is a
+/// single GET line plus a few headers; anything larger is not the callback.
+const OAUTH_CALLBACK_REQUEST_CAP: usize = 16 * 1024;
+/// How long the response write waits for the browser to close its half after
+/// the page has been sent. Draining is what makes the delivery reliable: on
+/// BSD-derived hosts (macOS) closing a socket that still holds unread bytes
+/// sends an RST, which discards the response the browser is waiting to render.
+const OAUTH_CALLBACK_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// The Claude Code subscription OAuth application — single definition lives in
 /// the api crate ([`api::claude_code_oauth_config`]) so the login flow, the
@@ -479,14 +495,46 @@ impl OAuthCallbackListeners {
     }
 
     /// Read the redirect off whichever stack the browser reached.
+    ///
+    /// Every accepted connection is a *candidate*, not the callback: a browser
+    /// opens speculative sockets to the redirect origin, asks for
+    /// `/favicon.ico` once the page renders, and may probe with `HEAD`. Treating
+    /// the first connection as the redirect meant any of those killed the
+    /// sign-in outright — a preconnect burned the read budget and reported a
+    /// bogus timeout, and a favicon request failed the strict path check with
+    /// "unexpected callback path" while the real code sat unread in the
+    /// backlog. So each connection is answered on its own merits and the wait
+    /// continues until the redirect actually arrives or
+    /// [`OAUTH_CALLBACK_TIMEOUT`] expires.
     pub(crate) fn wait(self) -> Result<runtime::OAuthCallbackParams, Box<dyn std::error::Error>> {
         let started = Instant::now();
-        let mut stream = 'accept: loop {
+        loop {
+            let mut stream = self.accept_before_deadline(started)?;
+            let Some(target) = read_request_target(&mut stream) else {
+                // Silent, truncated, or unreadable: not the redirect.
+                continue;
+            };
+            match parse_oauth_callback_request_target(&target) {
+                Ok(callback) => {
+                    // The page is written before returning, because the page is
+                    // what closes the browser tab.
+                    answer(&mut stream, &CallbackPage::for_outcome(&callback));
+                    return Ok(callback);
+                }
+                Err(_) => answer(&mut stream, &CallbackPage::NotFound),
+            }
+        }
+    }
+
+    /// Poll every bound stack for one connection, bounded by the sign-in
+    /// deadline measured from `started`.
+    fn accept_before_deadline(&self, started: Instant) -> io::Result<std::net::TcpStream> {
+        loop {
             for listener in &self.listeners {
                 match listener.accept() {
-                    Ok((stream, _)) => break 'accept stream,
+                    Ok((stream, _)) => return Ok(stream),
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(error) => return Err(error.into()),
+                    Err(error) => return Err(error),
                 }
             }
             if started.elapsed() >= OAUTH_CALLBACK_TIMEOUT {
@@ -496,66 +544,160 @@ impl OAuthCallbackListeners {
                         "oauth callback timed out after {}s",
                         OAUTH_CALLBACK_TIMEOUT.as_secs()
                     ),
-                )
-                .into());
+                ));
             }
             std::thread::sleep(OAUTH_CALLBACK_ACCEPT_POLL);
-        };
-        // The listeners poll for `accept`, and on BSD-derived hosts (macOS) the
-        // accepted socket inherits their `O_NONBLOCK`. Left that way, the read
-        // below returns `WouldBlock` the moment the request bytes have not landed
-        // yet and the mapping turns that into a bogus "timed out after 10s" —
-        // instantly, without ever waiting. Blocking mode is what makes
-        // `set_read_timeout` the real deadline.
-        stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(OAUTH_CALLBACK_READ_TIMEOUT))?;
-        let mut buffer = [0_u8; 4096];
-        let bytes_read = stream.read(&mut buffer).map_err(|error| {
-            if matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ) {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "oauth callback request read timed out after {}s",
-                        OAUTH_CALLBACK_READ_TIMEOUT.as_secs()
-                    ),
-                )
-            } else {
-                error
+        }
+    }
+}
+
+/// Read one HTTP request off an accepted callback connection and return its
+/// request target, or `None` when this connection carried no readable request.
+///
+/// Reads through the end of the headers rather than stopping at the request
+/// line: a GET has no body, so consuming the headers leaves the receive buffer
+/// empty and the response can be delivered without the close racing an RST.
+fn read_request_target(stream: &mut std::net::TcpStream) -> Option<String> {
+    // The listeners poll for `accept`, and on BSD-derived hosts (macOS) the
+    // accepted socket inherits their `O_NONBLOCK`. Left that way, the read below
+    // returns `WouldBlock` the moment the request bytes have not landed yet —
+    // instantly, without ever waiting. Blocking mode is what makes
+    // `set_read_timeout` the real deadline.
+    stream.set_nonblocking(false).ok()?;
+    stream
+        .set_read_timeout(Some(OAUTH_CALLBACK_READ_TIMEOUT))
+        .ok()?;
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(bytes_read) => {
+                request.extend_from_slice(&buffer[..bytes_read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n")
+                    || request.len() >= OAUTH_CALLBACK_REQUEST_CAP
+                {
+                    break;
+                }
             }
-        })?;
-        let request = String::from_utf8_lossy(&buffer[..bytes_read]);
-        let request_line = request.lines().next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "missing callback request line")
-        })?;
-        let target = request_line.split_whitespace().nth(1).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "missing callback request target",
-            )
-        })?;
-        let callback = parse_oauth_callback_request_target(target)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let body = if callback.error.is_some() {
-            "Zo OAuth login failed. You can close this window."
+            // A timed-out or interrupted read leaves whatever arrived; the
+            // request line alone is enough to classify the connection.
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    let request = String::from_utf8_lossy(&request);
+    let request_line = request.lines().next()?;
+    request_line
+        .split_whitespace()
+        .nth(1)
+        .map(ToString::to_string)
+}
+
+/// What to serve one accepted callback connection.
+enum CallbackPage {
+    Succeeded,
+    Failed,
+    /// Anything that is not the redirect (favicon, probe, stray path).
+    NotFound,
+}
+
+impl CallbackPage {
+    fn for_outcome(callback: &runtime::OAuthCallbackParams) -> Self {
+        if callback.error.is_some() {
+            Self::Failed
         } else {
-            "Zo OAuth login succeeded. You can close this window."
-        };
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes())?;
-        Ok(callback)
+            Self::Succeeded
+        }
+    }
+
+    fn status(&self) -> &'static str {
+        match self {
+            Self::Succeeded | Self::Failed => "200 OK",
+            Self::NotFound => "404 Not Found",
+        }
+    }
+
+    /// The redirect gets an HTML page — plain text can neither close the tab nor
+    /// look like anything. A probe gets the shortest honest answer.
+    fn body(&self) -> String {
+        match self {
+            Self::Succeeded => callback_page("Signed in", "Zo is authenticated. This tab can be closed."),
+            Self::Failed => callback_page(
+                "Sign-in failed",
+                "Zo did not receive an authorization code. Return to the terminal and try again.",
+            ),
+            Self::NotFound => "not the oauth callback\n".to_string(),
+        }
+    }
+
+    fn content_type(&self) -> &'static str {
+        match self {
+            Self::Succeeded | Self::Failed => "text/html; charset=utf-8",
+            Self::NotFound => "text/plain; charset=utf-8",
+        }
+    }
+}
+
+/// The page the browser lands on after the redirect.
+///
+/// `window.close()` is attempted first, which is the whole point: the old
+/// `text/plain` "You can close this window." had no way to close anything, so
+/// every sign-in left an orphaned tab behind. A tab that a script did not open
+/// cannot be closed by one, so the styled body below is what remains visible
+/// when the browser refuses — the message has to stand on its own.
+fn callback_page(heading: &str, detail: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<meta name=\"color-scheme\" content=\"light dark\">\
+<title>Zo — {heading}</title><style>\
+:root{{color-scheme:light dark}}\
+body{{margin:0;min-height:100vh;display:grid;place-items:center;\
+font:15px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;\
+background:#fbfbfa;color:#1f1f1d}}\
+main{{text-align:center;padding:2.5rem 2rem;max-width:26rem}}\
+h1{{margin:0 0 .5rem;font-size:1.15rem;font-weight:600;letter-spacing:-.01em}}\
+p{{margin:0;opacity:.66}}\
+@media(prefers-color-scheme:dark){{body{{background:#191918;color:#ededec}}}}\
+</style></head><body><main><h1>{heading}</h1><p>{detail}</p></main>\
+<script>window.close()</script></body></html>"
+    )
+}
+
+/// Write one response and hand the connection back cleanly.
+///
+/// Best-effort throughout: the browser may already have gone away, and a
+/// sign-in that reached this point must not fail over an undeliverable page.
+fn answer(stream: &mut std::net::TcpStream, page: &CallbackPage) {
+    let body = page.body();
+    let response = format!(
+        "HTTP/1.1 {}\r\ncontent-type: {}\r\ncontent-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n{}",
+        page.status(),
+        page.content_type(),
+        body.len(),
+        body
+    );
+    if stream.write_all(response.as_bytes()).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+    // FIN, then wait briefly for the peer's close. Dropping the socket straight
+    // after the write can reset a connection that still holds unread bytes,
+    // which discards the page the browser was about to render.
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(OAUTH_CALLBACK_DRAIN_TIMEOUT));
+    let mut drain = [0_u8; 512];
+    while let Ok(bytes_read) = stream.read(&mut drain) {
+        if bytes_read == 0 {
+            break;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
+    use std::io::{Read as _, Write as _};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
 
     use super::{
@@ -791,6 +933,97 @@ mod tests {
         );
 
         drop(squatter);
+    }
+
+    /// A browser does not open exactly one socket to the redirect origin: it
+    /// preconnects, and it asks for `/favicon.ico` as soon as a page renders.
+    /// Treating the first connection as the redirect made either of those abort
+    /// the whole sign-in — the authorization code was still queued in the
+    /// backlog, unread. The wait has to answer the probe and keep listening.
+    #[test]
+    fn a_probe_connection_does_not_abort_the_sign_in() {
+        let _guard = socket_test_lock();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind a callback listener");
+        listener
+            .set_nonblocking(true)
+            .expect("listeners poll for accept, exactly as bind leaves them");
+        let address = listener.local_addr().expect("listener address");
+        let listeners = OAuthCallbackListeners {
+            listeners: vec![listener],
+        };
+
+        // Ordered: the probe is accepted first, so it is what the old
+        // single-shot read consumed instead of the redirect below.
+        let mut probe = TcpStream::connect(address).expect("probe connects");
+        probe
+            .write_all(b"GET /favicon.ico HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .expect("probe sends");
+        let mut redirect = TcpStream::connect(address).expect("browser connects");
+        redirect
+            .write_all(
+                b"GET /callback?code=real-code&state=real-state HTTP/1.1\r\nhost: localhost\r\n\r\n",
+            )
+            .expect("browser sends the redirect");
+
+        let callback = listeners
+            .wait()
+            .expect("a probe must not consume the sign-in");
+        assert_eq!(callback.code.as_deref(), Some("real-code"));
+        assert_eq!(callback.state.as_deref(), Some("real-state"));
+
+        let mut probe_response = String::new();
+        probe.read_to_string(&mut probe_response).ok();
+        assert!(
+            probe_response.starts_with("HTTP/1.1 404 "),
+            "a non-callback request must be answered, not left hanging: {probe_response}"
+        );
+    }
+
+    /// The redirect page is the only thing that can close the tab the sign-in
+    /// opened. `text/plain` prose asking the user to close it themselves is what
+    /// left an orphaned tab behind every login.
+    #[test]
+    fn the_redirect_is_answered_with_a_self_closing_html_page() {
+        let _guard = socket_test_lock();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind a callback listener");
+        listener
+            .set_nonblocking(true)
+            .expect("listeners poll for accept");
+        let address = listener.local_addr().expect("listener address");
+        let listeners = OAuthCallbackListeners {
+            listeners: vec![listener],
+        };
+
+        let mut redirect = TcpStream::connect(address).expect("browser connects");
+        redirect
+            .write_all(b"GET /callback?code=c&state=s HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .expect("browser sends the redirect");
+        listeners.wait().expect("the redirect is read");
+
+        let mut response = String::new();
+        redirect.read_to_string(&mut response).ok();
+        assert!(
+            response.contains("content-type: text/html"),
+            "the page must be HTML to run anything: {response}"
+        );
+        assert!(
+            response.contains("window.close()"),
+            "the page must try to close the tab it was opened in: {response}"
+        );
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or_default();
+        let declared = response
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .expect("the response declares a content length");
+        assert_eq!(
+            declared,
+            body.len(),
+            "a mismatched content-length leaves the browser waiting on a page that never completes"
+        );
     }
 
     /// inference scope 부재만 경고하고, 보유·미보고(빈 목록)는 침묵한다.

@@ -543,16 +543,18 @@ fn check_config(
     }
 }
 
-/// Auth presence across every supported provider: Anthropic, OpenAI, Google,
-/// and xAI. Missing auth is an actionable `WARN`, never a crash, and no
-/// credential value is ever printed — only provider names and presence.
+/// Auth across every supported provider: Anthropic, OpenAI, Google, and xAI.
+/// Missing auth is an actionable `WARN`, never a crash, and no credential value
+/// is ever printed — only provider names, presence, and renewability.
 ///
 /// Environment API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 /// `GOOGLE_API_KEY`, `XAI_API_KEY`) are read for presence only. Saved OAuth for
-/// Anthropic, OpenAI (ChatGPT), and Google Code Assist is detected through a
-/// no-follow, secret-safe presence probe over the shared `credentials.json`; no
-/// token is parsed, refreshed, minted, printed, or written, and no credential
-/// helper or network call runs.
+/// Anthropic, OpenAI (ChatGPT), and Google Code Assist is read through a
+/// no-follow, secret-safe probe over the shared `credentials.json`: no token
+/// *value* is read, printed, refreshed, minted, or written, and no credential
+/// helper or network call runs. Two non-secret scalars are read — the recorded
+/// expiry and whether a refresh token exists — because presence alone could not
+/// tell a working credential from a dead one, and reported both as `PASS`.
 ///
 /// The credentials store is first validated no-follow: a symlinked or otherwise
 /// unsafe `credentials.json` is a `FAIL` and no saved OAuth is read — this holds
@@ -600,18 +602,45 @@ fn check_auth(findings: &mut Vec<Finding>, home: Option<&Path>) {
 
     // Saved OAuth is only probed with a resolvable persistent home so `--check`
     // never fabricates one. The probe is no-follow across the full effective
-    // credential chain and reports presence only. An unsafe/unreadable store
-    // surfaces as an error here and is a `FAIL`, never silently masked by an env
-    // key that happens to be set.
+    // credential chain. An unsafe/unreadable store surfaces as an error here and
+    // is a `FAIL`, never silently masked by an env key that happens to be set.
+    //
+    // Each entry is reported with its expiry state, and an entry that cannot be
+    // renewed at all escalates to `WARN`: presence alone reported an expired,
+    // unrenewable credential as a clean `PASS`, so the diagnostic said "Healthy"
+    // on a machine where every Anthropic turn failed on auth.
+    let mut unusable: Vec<String> = Vec::new();
+    let mut saved: Vec<String> = Vec::new();
     if home.is_some() {
-        for (label, provider) in [
-            ("Anthropic OAuth", api::SavedOAuthProvider::Anthropic),
-            ("OpenAI OAuth", api::SavedOAuthProvider::OpenAi),
-            ("Google OAuth", api::SavedOAuthProvider::GoogleCodeAssist),
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        for (label, provider, relogin) in [
+            (
+                "Anthropic OAuth",
+                api::SavedOAuthProvider::Anthropic,
+                "zo login claude",
+            ),
+            (
+                "OpenAI OAuth",
+                api::SavedOAuthProvider::OpenAi,
+                "zo login openai",
+            ),
+            (
+                "Google OAuth",
+                api::SavedOAuthProvider::GoogleCodeAssist,
+                "zo login google",
+            ),
         ] {
-            match saved_oauth_present_no_follow(provider) {
-                Ok(true) => providers.push(label),
-                Ok(false) => {}
+            match saved_oauth_liveness_no_follow(provider) {
+                Ok(Some(liveness)) => {
+                    providers.push(label);
+                    saved.push(format!("{label} {}", token_lifetime(liveness, now_unix)));
+                    if liveness.unusable_at(now_unix) {
+                        unusable.push(format!("{label} (expired, no refresh token — {relogin})"));
+                    }
+                }
+                Ok(None) => {}
                 Err(_) => {
                     findings.push(Finding::new(
                         "auth",
@@ -630,12 +659,60 @@ fn check_auth(findings: &mut Vec<Finding>, home: Option<&Path>) {
             Severity::Warn,
             "no provider API key or OAuth credentials found; run `zo login` or set a provider API key",
         ));
-    } else {
+    } else if unusable.is_empty() {
+        // The saved entries carry their expiry so an operator can see *why* a turn
+        // is about to refresh — the state that used to be invisible.
+        let detail = if saved.is_empty() {
+            providers.join(", ")
+        } else {
+            saved.join(", ")
+        };
         findings.push(Finding::new(
             "auth",
             Severity::Pass,
-            format!("credentials present for {}", providers.join(", ")),
+            format!("credentials present for {detail}"),
         ));
+    } else {
+        // An expired token that still carries a refresh token is routine — the
+        // provider path renews it on next use — so only the unrenewable ones warn.
+        findings.push(Finding::new(
+            "auth",
+            Severity::Warn,
+            format!(
+                "credentials present for {}, but re-authentication is required: {}",
+                providers.join(", "),
+                unusable.join(", ")
+            ),
+        ));
+    }
+}
+
+/// How long a saved token has left, phrased for a diagnostic line. Never a token
+/// value — only the recorded expiry, relative to now, plus whether a renewal is
+/// possible. An expired token that can refresh is routine, so it says so rather
+/// than looking like a fault.
+fn token_lifetime(liveness: api::SavedOAuthLiveness, now_unix: u64) -> String {
+    let Some(expires_at) = liveness.expires_at else {
+        return "(no recorded expiry)".to_string();
+    };
+    if expires_at > now_unix {
+        return format!("(valid {})", approximate_duration(expires_at - now_unix));
+    }
+    let ago = approximate_duration(now_unix - expires_at);
+    if liveness.has_refresh_token {
+        format!("(expired {ago} ago, refreshes on next use)")
+    } else {
+        format!("(expired {ago} ago, no refresh token)")
+    }
+}
+
+/// Coarse human duration: a diagnostic wants "2h", not "7384s".
+fn approximate_duration(seconds: u64) -> String {
+    match seconds {
+        0..=90 => format!("{seconds}s"),
+        91..=5399 => format!("{}m", (seconds + 30) / 60),
+        5400..=172_799 => format!("{}h", (seconds + 1800) / 3600),
+        _ => format!("{}d", (seconds + 43_200) / 86_400),
     }
 }
 
@@ -670,8 +747,14 @@ fn credentials_store_is_safe() -> bool {
 /// rather than being followed. Returns presence only — no token value is ever
 /// exposed. An unsafe/unreadable root propagates as `Err` (mapped to `FAIL` by
 /// the caller), never silently discarded.
-fn saved_oauth_present_no_follow(provider: api::SavedOAuthProvider) -> std::io::Result<bool> {
-    api::saved_oauth_present_effective(provider, &|path| {
+/// [`saved_oauth_present_no_follow`] plus the non-secret liveness scalars
+/// (`expiresAt`, whether a refresh token exists). Still no token value, still no
+/// network, still no refresh — the same secret-safe contract, now able to tell an
+/// expired credential from a working one.
+fn saved_oauth_liveness_no_follow(
+    provider: api::SavedOAuthProvider,
+) -> std::io::Result<Option<api::SavedOAuthLiveness>> {
+    api::saved_oauth_liveness_effective(provider, &|path| {
         runtime::secure_fs::read_regular_file_absolute_no_follow(path)
     })
 }
@@ -1833,5 +1916,49 @@ mod tests {
             "a future stamp (clock skew) saturates to zero hours"
         );
         assert_eq!(sweep_age_hours(now_nanos - 3 * 3_600_000_000_000), Some(3));
+    }
+
+
+    /// The auth line's whole job is to make credential state visible. Presence
+    /// alone reported an expired, unrenewable token as a clean `PASS`, so each
+    /// state has to read differently — and none of them may leak a token.
+    #[test]
+    fn token_lifetime_distinguishes_valid_renewable_and_dead() {
+        let now = 1_000_000_u64;
+        let valid = api::SavedOAuthLiveness {
+            expires_at: Some(now + 3 * 3600),
+            has_refresh_token: true,
+        };
+        assert_eq!(token_lifetime(valid, now), "(valid 3h)");
+
+        let renewable = api::SavedOAuthLiveness {
+            expires_at: Some(now - 600),
+            has_refresh_token: true,
+        };
+        let rendered = token_lifetime(renewable, now);
+        assert!(
+            rendered.contains("expired") && rendered.contains("refreshes on next use"),
+            "an expired token that can renew is routine, and must say so: {rendered}"
+        );
+
+        let dead = api::SavedOAuthLiveness {
+            expires_at: Some(now - 600),
+            has_refresh_token: false,
+        };
+        assert_eq!(token_lifetime(dead, now), "(expired 10m ago, no refresh token)");
+
+        let unknown = api::SavedOAuthLiveness {
+            expires_at: None,
+            has_refresh_token: true,
+        };
+        assert_eq!(token_lifetime(unknown, now), "(no recorded expiry)");
+    }
+
+    #[test]
+    fn approximate_duration_is_coarse_enough_to_read() {
+        assert_eq!(approximate_duration(45), "45s");
+        assert_eq!(approximate_duration(600), "10m");
+        assert_eq!(approximate_duration(3 * 3600), "3h");
+        assert_eq!(approximate_duration(5 * 86_400), "5d");
     }
 }

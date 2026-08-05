@@ -597,17 +597,43 @@ fn load_fresh_openai_oauth() -> Option<OpenAiOAuthTokens> {
     let Some(refresh_token) = tokens.refresh_token.clone() else {
         return Some(tokens);
     };
+    // ChatGPT rotates refresh tokens exactly as Anthropic does, so a branch the
+    // endpoint has rejected stays rejected. Without this gate an expired ChatGPT
+    // login cost a doomed token round-trip on every request build — silently,
+    // since the failure arm here deliberately serves the stale token so the call
+    // surfaces one clear 401 instead of a confusing api-key downgrade.
+    if crate::providers::refresh_gate::refresh_blocked(&refresh_token).is_some() {
+        return Some(tokens);
+    }
     match run_blocking(crate::providers::openai_oauth::refresh_openai_tokens(
         &refresh_token,
     )) {
         Ok(mut refreshed) => {
+            crate::providers::refresh_gate::record_success(&refresh_token);
             if refreshed.account_id.is_none() {
                 refreshed.account_id = tokens.account_id;
             }
-            let _ = crate::oauth_store::save_openai_oauth(&refreshed);
+            if let Err(error) = crate::oauth_store::save_openai_oauth(&refreshed) {
+                // A refresh that cannot be persisted is the worst outcome of all:
+                // the rotation already happened server-side, so the token still on
+                // disk is now the dead branch and the next process refreshes with
+                // it. Say so rather than discarding the error.
+                eprintln!(
+                    "\x1b[33mwarning: refreshed ChatGPT token could not be saved ({error}); \
+                     run `zo login openai` if the next request fails.\x1b[0m"
+                );
+            }
             Some(refreshed)
         }
-        Err(_) => Some(tokens),
+        Err(error) => {
+            if crate::providers::refresh_gate::record_failure(&refresh_token, &error) {
+                eprintln!(
+                    "\x1b[33mChatGPT login can no longer be refreshed ({error}).\n  \
+                     Run `zo login openai` (or /login openai) to reconnect.\x1b[0m"
+                );
+            }
+            Some(tokens)
+        }
     }
 }
 
