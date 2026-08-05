@@ -1076,9 +1076,16 @@ pub(super) fn login(ctx: &mut DispatchCtx<'_>, provider: Option<&str>) -> Comman
         return super::providers::providers(ctx);
     };
     ctx.app.request_oauth_login(prov.to_string());
-    // The manager is deliberately *not* reopened here: it would paint the
-    // pre-sign-in state while the browser round-trip is still outstanding. The
-    // host reopens it when the outcome lands, so the list shows the new account.
+    // Drop the "return to the manager afterwards" flag rather than honoring it.
+    //
+    // It is set when the sign-in was started from the provider manager, and while
+    // the flow was synchronous, reopening the list *was* the sign-in's last visible
+    // step. Asynchronously it is a modal that pops open by itself minutes later,
+    // after the user has already dismissed the picker and moved on — so the
+    // dismissal appears not to have taken and the modal has to be closed a second
+    // time. The completion report carries the outcome; `/providers` is one keystroke
+    // away when the list is what the user actually wants.
+    let _ = ctx.app.take_provider_manager_return();
     CommandOutput::info(format!(
         "Login — opening browser for {prov} OAuth...\n  Finish in the browser; this session stays usable."
     ))

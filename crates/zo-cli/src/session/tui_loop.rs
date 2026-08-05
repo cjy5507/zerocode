@@ -835,26 +835,12 @@ async fn run_session_loop(
             app.follow_latest();
             push_report(app, ids, level, message);
             sync_app_context(cli, app);
-            // A sign-in started from the provider manager lands back on it, now
-            // that the list has something new to show.
-            if app.take_provider_manager_return() {
-                use crate::session::slash_dispatch::{
-                    account_rows, manager_rows, settings_path_display,
-                };
-                match manager_rows() {
-                    Ok(rows) => app.open_provider_manager_modal(
-                        account_rows(),
-                        rows,
-                        settings_path_display(),
-                    ),
-                    Err(error) => push_report(
-                        app,
-                        ids,
-                        SystemLevel::Warn,
-                        format!("Providers: failed to re-read settings: {error}"),
-                    ),
-                }
-            }
+            // No modal is opened here on purpose. Reopening the provider manager
+            // when the sign-in lands means a modal appears by itself long after
+            // the user dismissed the one they were in — it reads as a dismissal
+            // that did not take, and the modal has to be closed twice. The report
+            // above is the outcome; `/providers` shows the refreshed list on
+            // demand. (`login` drops the return flag for the same reason.)
             app.draw_frame(terminal)?;
         }
         // Process a completion that woke the idle `select!` (consumed from the

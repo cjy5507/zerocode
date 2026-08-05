@@ -1908,6 +1908,10 @@ fn login_hands_the_oauth_flow_to_the_host_instead_of_blocking_dispatch() {
     let mut cli = test_live_cli_with_env_lock_held();
     let mut app = new_test_app();
 
+    // Exactly how the provider manager starts a sign-in: it arms "come back to
+    // the list afterwards" and re-enters the text path.
+    app.mark_provider_manager_return();
+
     let started = std::time::Instant::now();
     let should_quit = handle_persistent_slash(
         &mut cli,
@@ -1928,6 +1932,20 @@ fn login_hands_the_oauth_flow_to_the_host_instead_of_blocking_dispatch() {
         app.take_pending_oauth_login().as_deref(),
         Some("claude"),
         "the host drains this slot and runs the flow off the render thread"
+    );
+    // A sign-in started from the provider manager must NOT leave the
+    // "reopen the list afterwards" flag armed: the flow now finishes minutes
+    // later, so honoring it popped a modal open by itself long after the user
+    // dismissed the picker — the dismissal read as ignored and the modal had to
+    // be closed a second time.
+    assert!(
+        !app.take_provider_manager_return(),
+        "an asynchronous sign-in must not arm a modal to reopen after it lands"
+    );
+    assert_eq!(
+        app.mode(),
+        AppMode::Normal,
+        "handing the sign-in off must leave no modal on screen"
     );
     let rendered = render_app_buffer(&mut app);
     assert!(
