@@ -2,6 +2,11 @@ use std::env::VarError;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
+// Every human-facing recovery hint below is emitted after this marker, and the
+// shared classifier stops reading there. Same symbol on both sides so the
+// producer and the reader cannot drift — see its docs for what drifting cost.
+use core_types::retry_signal::HINT_SEPARATOR;
+
 #[derive(Debug)]
 pub enum ApiError {
     MissingCredentials {
@@ -549,18 +554,20 @@ fn classify_provider_error_text<'a>(
     None
 }
 
-/// Explanation appended to every provider-capacity refusal (HTTP 529 and the
-/// `overloaded_error` SSE frame), shared by both [`Display`] arms so the two
-/// surfaces describing one wall can never word it differently.
+/// Body of the explanation appended to every provider-capacity refusal (HTTP 529
+/// and the `overloaded_error` SSE frame), shared by both [`Display`] arms so the
+/// two surfaces describing one wall can never word it differently.
 ///
 /// The wording names the *scope* on purpose: the reflex on seeing this line was
 /// "my rate limit", and the measurement said otherwise (2 % of the account
 /// window used while every Opus request was shed). Reaching this text also means
 /// the automatic recovery is spent — the stream re-opened itself pre-commit and,
 /// if a fallback model is configured, the turn already tried escaping to it.
-const PROVIDER_CAPACITY_HINT: &str = "
-
-  Provider capacity issue — the PROVIDER shed this request. This is NOT your account's rate limit (it fires with the window nearly empty) and NOT a local permission or workspace-trust failure.
+///
+/// Emitted **after** [`HINT_SEPARATOR`], never inline: this prose contains the
+/// phrase "rate limit", and a classifier reading it re-derived "account
+/// throttle" from the very sentence denying it.
+const PROVIDER_CAPACITY_HINT_BODY: &str = "Provider capacity issue — the PROVIDER shed this request. This is NOT your account's rate limit (it fires with the window nearly empty) and NOT a local permission or workspace-trust failure.
   zo already re-opened the stream and, when a fallback model is configured, tried escaping to it. The fastest way through is a lighter model (/model sonnet) or a lower /effort; capacity usually frees up within seconds to minutes.";
 
 impl Display for ApiError {
@@ -664,7 +671,7 @@ impl Display for ApiError {
                 // const — the two arms describing the same wall differently is
                 // how a user learns to distrust the message.
                 if status.as_u16() == 529 {
-                    write!(f, "{PROVIDER_CAPACITY_HINT}")?;
+                    write!(f, "{HINT_SEPARATOR}{PROVIDER_CAPACITY_HINT_BODY}")?;
                 }
                 // A 413 rejects the request's BYTE size, which is a different
                 // ceiling from the model's context window — a turn can sit well
@@ -689,7 +696,7 @@ impl Display for ApiError {
                 (Some(error_type), Some(message)) => {
                     write!(f, "api stream error ({error_type}): {message}")?;
                     if error_type == "overloaded_error" {
-                        write!(f, "{PROVIDER_CAPACITY_HINT}")?;
+                        write!(f, "{HINT_SEPARATOR}{PROVIDER_CAPACITY_HINT_BODY}")?;
                     }
                     Ok(())
                 }
@@ -1123,6 +1130,83 @@ mod tests {
             )
             .provider_error_class()
             .is_provider_overload()
+        );
+    }
+
+    /// Every human-facing hint must be invisible to the retry classifier.
+    ///
+    /// This is the regression the unit tests missed and a live-fire run caught: the
+    /// 529 hint says "this is NOT your account's rate limit", the classifier
+    /// matched `rate limit` inside that denial, and the whole scope split
+    /// collapsed back to Account — 300 s of retries plus a 120 s account cool-down
+    /// on a 2 %-utilized window. The retry-exhaustion hint ("Rate limited. Try: …")
+    /// carried the same hazard before the split existed.
+    ///
+    /// Asserted over the FULL `Display` output of each hint-carrying error, since
+    /// classifying the bare head is exactly what hid it.
+    #[test]
+    fn recovery_hints_never_change_the_retry_classification() {
+        use core_types::retry_signal::{classify_error_text, RetrySignal};
+
+        let streamed_overload = ApiError::StreamApi {
+            error_type: Some("overloaded_error".to_string()),
+            message: Some("Overloaded".to_string()),
+            body: String::new(),
+            retryable: true,
+        };
+        let status_overload = api_error(
+            StatusCode::from_u16(529).unwrap(),
+            Some("overloaded_error"),
+            Some("Overloaded"),
+            "",
+            true,
+        );
+        let exhausted_overload = ApiError::RetriesExhausted {
+            attempts: 6,
+            last_error: Box::new(api_error(
+                StatusCode::from_u16(529).unwrap(),
+                Some("overloaded_error"),
+                Some("Overloaded"),
+                "",
+                true,
+            )),
+        };
+        for error in [&streamed_overload, &status_overload, &exhausted_overload] {
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(HINT_SEPARATOR),
+                "this fixture is supposed to carry a hint: {rendered}"
+            );
+            assert_eq!(
+                classify_error_text(&rendered),
+                RetrySignal::Overloaded,
+                "a hint must not turn a provider overload into an account throttle: {rendered}"
+            );
+        }
+
+        // The account side must stay Account with its own hint attached, so the
+        // separator is not silently swallowing the real signal either.
+        let throttled = ApiError::RetriesExhausted {
+            attempts: 6,
+            last_error: Box::new(api_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                Some("rate_limit_error"),
+                Some("This request would exceed your account's rate limit"),
+                "",
+                true,
+            )),
+        };
+        assert_eq!(
+            classify_error_text(&throttled.to_string()),
+            RetrySignal::RateLimit
+        );
+
+        // And a hint-carrying auth failure stays fatal rather than being read as
+        // capacity because its prose mentions retrying.
+        let unauthorized = api_error(StatusCode::UNAUTHORIZED, None, None, "", false);
+        assert_eq!(
+            classify_error_text(&unauthorized.to_string()),
+            RetrySignal::Fatal
         );
     }
 

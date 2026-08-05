@@ -710,11 +710,31 @@ impl MessageStream {
                 Err(error) => return Err(error),
             };
             match chunk {
-                Some(chunk) => {
-                    for parsed in self.parser.push(&chunk)? {
-                        self.pending.extend(self.state.ingest_chunk(parsed)?);
+                // A decoded frame can itself BE the failure: a gateway that dies
+                // after the response headers are out sends `{"error": {...}}` where
+                // a chunk belongs ([`parse_stream_error_frame`], which already
+                // computes `retryable` from the shared capacity vocabulary). That
+                // error surfaces from the parser rather than the body read, so a
+                // bare `?` here skipped the restart gate entirely and a recoverable
+                // pre-commit capacity refusal became a turn-level failure — the same
+                // defect the Anthropic lane carried. The gate itself decides: it
+                // demands `error.is_retryable()` and `!committed`, so a
+                // malformed-payload or context-length failure still propagates, and
+                // a frame arriving after visible output still propagates rather than
+                // duplicating it. `ingest_chunk` keeps its `?`: the state machine
+                // only ever fails on protocol shape, never on capacity, so routing
+                // it through a gate that demands retryability would be dead code.
+                Some(chunk) => match self.parser.push(&chunk) {
+                    Ok(parsed) => {
+                        for parsed in parsed {
+                            self.pending.extend(self.state.ingest_chunk(parsed)?);
+                        }
                     }
-                }
+                    Err(error) if self.can_restart(&error) => {
+                        self.restart(&error).await?;
+                    }
+                    Err(error) => return Err(error),
+                },
                 None => {
                     self.done = true;
                 }

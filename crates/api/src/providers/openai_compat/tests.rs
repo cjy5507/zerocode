@@ -1632,6 +1632,100 @@ async fn openai_compat_stalled_precommit_stream_restarts_and_recovers() {
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
+/// A pre-commit `{"error": {...}}` frame must be re-opened, not surfaced.
+///
+/// This is the sibling of the Anthropic defect: a gateway that dies after the
+/// response headers are out sends the error where a chunk belongs, so the failure
+/// arrives from the SSE parser rather than the body read — and the parser's `?`
+/// used to bypass the restart gate that exists for exactly this case. The lane
+/// matters because it is where a quota escape LANDS (gpt-5.6 and every custom
+/// provider), so a capacity dip there would have killed the very turn the escape
+/// was rescuing.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn openai_compat_precommit_error_frame_restarts_and_recovers() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let _guard = env_lock();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_hits = hits.clone();
+
+    let server = tokio::spawn(async move {
+        let mut scratch = [0u8; 1024];
+        // First attempt: a capacity error frame on an HTTP 200 stream, before any
+        // content — the shape the restart gate is supposed to absorb invisibly.
+        let (mut first, _) = listener.accept().await.unwrap();
+        server_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = first.read(&mut scratch).await;
+        let error_body =
+            "data: {\"error\":{\"message\":\"upstream is overloaded\",\"type\":\"rate_limit_exceeded\"}}\n\n";
+        // `connection: close` matters: a COMPLETE response (content-length met)
+        // would otherwise go back into reqwest's pool and the re-open would reuse
+        // that socket instead of dialing, so the server's next `accept` would never
+        // fire and the reopen would stall out its whole budget.
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            error_body.len()
+        );
+        first.write_all(head.as_bytes()).await.unwrap();
+        first.write_all(error_body.as_bytes()).await.unwrap();
+        first.flush().await.unwrap();
+
+        let (mut second, _) = listener.accept().await.unwrap();
+        server_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = second.read(&mut scratch).await;
+        let body = concat!(
+            "data: {\"id\":\"c2\",\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\n",
+            "data: {\"id\":\"c2\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n"
+        );
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        second.write_all(head.as_bytes()).await.unwrap();
+        second.write_all(body.as_bytes()).await.unwrap();
+        second.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    });
+
+    let client = OpenAiCompatClient::new("token", OpenAiCompatConfig::openai())
+        .with_base_url(format!("http://{addr}/v1"))
+        .with_retry_policy(
+            3,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(50),
+        );
+    let mut stream = client
+        .stream_message(&streaming_request())
+        .await
+        .expect("open stream");
+
+    let mut text = String::new();
+    while let Some(event) = stream
+        .next_event()
+        .await
+        .expect("a pre-commit error frame must be re-opened, not surfaced")
+    {
+        if let StreamEvent::ContentBlockDelta(delta) = &event {
+            if let ContentBlockDelta::TextDelta { text: chunk } = &delta.delta {
+                text.push_str(chunk);
+            }
+        }
+    }
+    server.await.unwrap();
+
+    assert_eq!(text, "recovered");
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the error frame must cost exactly one transparent re-open"
+    );
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn openai_compat_restart_budget_exhausted_surfaces_error() {

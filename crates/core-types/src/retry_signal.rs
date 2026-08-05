@@ -204,10 +204,37 @@ pub fn is_transient_text(lower: &str) -> bool {
         || lower.contains("backend reported a terminal stream failure")
 }
 
+/// Marker that separates the machine-readable head of an error string from the
+/// human-facing recovery hint appended after it: a blank line plus a two-space
+/// indent.
+///
+/// Load-bearing in **both** directions. `api::ApiError`'s `Display` emits every
+/// hint with this exact prefix, and [`classify_error_text`] classifies only the
+/// text before the first occurrence — because a hint is prose written for a
+/// person and inevitably contains the very vocabulary this module matches on.
+/// That is not hypothetical: the 529 hint explains "this is NOT your account's
+/// rate limit", and matching it re-read a provider overload as an account
+/// throttle, restoring the 300 s budget and the 120 s account cool-down the
+/// scope split exists to prevent (caught by live-firing the real binary, not by
+/// the unit tests, which classified the bare head). The retry-exhaustion hint
+/// ("Rate limited. Try: …") carried the same hazard before that.
+pub const HINT_SEPARATOR: &str = "\n\n  ";
+
+/// The machine-readable head of an error string: everything before the first
+/// [`HINT_SEPARATOR`]. Callers that match error *vocabulary* must classify this,
+/// never the whole `Display` output.
+#[must_use]
+pub fn machine_readable_head(error_message: &str) -> &str {
+    error_message
+        .split_once(HINT_SEPARATOR)
+        .map_or(error_message, |(head, _)| head)
+}
+
 /// Classify a raw (not yet lowercased) provider error string into a
-/// [`RetrySignal`]. Lowercases once, then applies the shared vocabulary:
-/// capacity signals win over generic transient signals, and anything matching
-/// neither is [`RetrySignal::Fatal`].
+/// [`RetrySignal`]. Strips any human-facing hint ([`HINT_SEPARATOR`]),
+/// lowercases once, then applies the shared vocabulary: capacity signals win
+/// over generic transient signals, and anything matching neither is
+/// [`RetrySignal::Fatal`].
 ///
 /// Within the capacity arms the **account** window wins over the overload
 /// wording when a message somehow carries both. That direction is deliberate:
@@ -216,7 +243,7 @@ pub fn is_transient_text(lower: &str) -> bool {
 /// reverse mistake only costs one extra same-model retry.
 #[must_use]
 pub fn classify_error_text(error_message: &str) -> RetrySignal {
-    let lower = error_message.to_ascii_lowercase();
+    let lower = machine_readable_head(error_message).to_ascii_lowercase();
     // A body that was refused for its SIZE is deterministic: the same bytes
     // will be refused again, so this must never fall through to the transient
     // or rate-limit arms and burn a retry budget on an identical request. The
@@ -463,6 +490,31 @@ mod tests {
                 "{msg:?} must be fatal (fail fast)"
             );
         }
+    }
+
+    /// A human-facing hint appended after [`HINT_SEPARATOR`] must not reach the
+    /// vocabulary match. The hint that broke this said "this is NOT your account's
+    /// rate limit" — prose denying the account scope, from which the classifier
+    /// derived the account scope.
+    #[test]
+    fn hints_after_the_separator_are_not_classified() {
+        use super::{machine_readable_head, HINT_SEPARATOR};
+
+        let head = "api stream error (overloaded_error): Overloaded";
+        let rendered = format!(
+            "{head}{HINT_SEPARATOR}Provider capacity issue — this is NOT your account's rate limit."
+        );
+        assert_eq!(machine_readable_head(&rendered), head);
+        assert_eq!(classify_error_text(&rendered), RetrySignal::Overloaded);
+
+        // A string with no hint is returned whole — the split must not eat a
+        // machine-readable body that happens to contain blank lines elsewhere.
+        let bodied = "api returned 400: {\n\n\"error\": \"bad\"}";
+        assert_eq!(machine_readable_head(bodied), bodied);
+
+        // And the separator does not hide a REAL signal that sits in the head.
+        let throttled = format!("api returned 429 Too Many Requests{HINT_SEPARATOR}Rate limited.");
+        assert_eq!(classify_error_text(&throttled), RetrySignal::RateLimit);
     }
 
     #[test]
