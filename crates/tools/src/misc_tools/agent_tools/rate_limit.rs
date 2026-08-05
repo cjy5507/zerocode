@@ -538,6 +538,12 @@ mod tests {
 
     #[tokio::test]
     async fn cancellable_cooldown_wakes_on_cancel_flag() {
+        // Isolate first: `api`'s `cfg!(test)` guard is FALSE when it is compiled as a
+        // dependency of THIS crate's test binary, so an un-isolated mark writes a real
+        // cool-down into the account-global `~/.zo/rate/*.v1` that every running zo
+        // reads — measured: a 60 s park plus a 5-minute "recently throttled" penalty
+        // stamped on the developer's live sessions by `cargo test`.
+        api::quota::isolate_rate_limit_state_for_tests();
         // Engage a long cool-down, then cancel: a pre-set cancel flag makes the
         // very first poll short-circuit, so the wait returns `false` (cut short)
         // immediately rather than sleeping the whole 60s window.
@@ -558,6 +564,12 @@ mod tests {
 
     #[test]
     fn cooldown_from_prefers_larger_retry_after_over_backoff() {
+        // Isolate first: `api`'s `cfg!(test)` guard is FALSE when it is compiled as a
+        // dependency of THIS crate's test binary, so an un-isolated mark writes a real
+        // cool-down into the account-global `~/.zo/rate/*.v1` that every running zo
+        // reads — measured: a 60 s park plus a 5-minute "recently throttled" penalty
+        // stamped on the developer's live sessions by `cargo test`.
+        api::quota::isolate_rate_limit_state_for_tests();
         // `rate_limit_backoff_ms(0)` is the 15s floor; a 60s Retry-After should
         // win. We can't read the private cool-down deadline, but the helper's
         // selection logic is `max(server_hint, backoff)` — assert the inputs.

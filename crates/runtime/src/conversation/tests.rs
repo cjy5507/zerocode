@@ -1936,6 +1936,9 @@ fn deep_verify_rate_limit_does_not_arm_the_main_turn_quota_fallback() {
         api::detect_provider_kind("gpt-5.6-sol"),
         "a verifier 429 must not be attributed to the GPT main model"
     );
+    // Same isolation reason as `retry::tests`: an un-isolated mark from a test
+    // binary lands in the real account-global quota file.
+    api::quota::isolate_rate_limit_state_for_tests();
     crate::retry::mark_foreground_capacity_stall(
         rate_limit_model,
         "HTTP 429 Too Many Requests",

@@ -687,6 +687,12 @@ mod tests {
     /// marks the cool-down state, so the slot is clean.
     #[test]
     fn foreground_rate_limit_marks_provider_cooldown() {
+        // Isolate first: `api`'s `cfg!(test)` guard is FALSE when it is compiled as a
+        // dependency of THIS crate's test binary, so an un-isolated mark writes a real
+        // cool-down into the account-global `~/.zo/rate/*.v1` that every running zo
+        // reads — measured: a 60 s park plus a 5-minute "recently throttled" penalty
+        // stamped on the developer's live sessions by `cargo test`.
+        api::quota::isolate_rate_limit_state_for_tests();
         let model = "claude-sonnet-4-5";
         let kind = api::detect_provider_kind(model);
         // A generic 5xx is not a capacity signal → it must NOT open a cool-down.
