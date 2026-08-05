@@ -773,7 +773,42 @@ where
             // request's tail bytes every iteration, re-billing the prior tool
             // batch as uncached input. Runs after the compaction preflights so
             // a freshly-persisted reminder is never immediately compacted away.
+            // Rollback target for a request that never reaches the provider, read
+            // AFTER the compaction preflight above and BEFORE the absorb below.
+            // `message_count_before` (turn start) cannot be used here: compaction
+            // swaps in a summarized, usually SHORTER session, so truncating to a
+            // turn-start index is a no-op on exactly the long sessions that
+            // overflow — leaving the undelivered user message in the transcript.
+            // The two stream-failure paths further down still use
+            // `message_count_before`; they are pre-existing behavior and are
+            // deliberately left alone by this repair.
+            let undispatched_from = self.session.messages.len();
             self.absorb_wire_reminders_into_session(&wire_reminders);
+            if let Err(error) = self.ensure_request_context_budget(&[]) {
+                self.clear_empty_retry_reminder(empty_retries);
+                self.record_turn_failed(iterations, &error);
+                // Always drop the reminder message the absorb may have appended
+                // for this undispatched request — `clear_empty_retry_reminder`
+                // only touches the transient list, never the transcript. On the
+                // first iteration the orphaned user message goes with it; on a
+                // later one the tail is delivered work that must survive.
+                let rollback_to = if iterations == 1 {
+                    undispatched_from.saturating_sub(1)
+                } else {
+                    undispatched_from
+                };
+                if self.session.messages.len() > rollback_to {
+                    Arc::make_mut(&mut self.session.messages).truncate(rollback_to);
+                    self.session.mark_transcript_dirty();
+                    // Recall dedup is a property of the TRANSCRIPT, so re-derive it
+                    // the same way compaction and `replace_session` do. The absorb
+                    // above marked every recalled slug it persisted; those bodies
+                    // are gone now, and a surviving mark would collapse the next
+                    // attempt to a pointer aimed at a body that is not in context.
+                    self.recalled_memory_slugs = super::recalled_slugs_from_session(&self.session);
+                }
+                return Err(StreamingTurnError::from(error));
+            }
             let request = self.assemble_request(Arc::from(Vec::new()), None);
             // The compaction/resume status reminder has now ridden this request;
             // drop it so it does not re-instruct `session_recall` on every later

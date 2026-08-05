@@ -898,6 +898,19 @@ fn saved_oauth_providers() -> [bool; 3] {
     [anthropic, openai, google]
 }
 
+/// Row ids for the three OAuth accounts that head both provider pickers.
+///
+/// They stay `login:*` even in the picker opened by `/connect`, because
+/// `connect` has no OAuth path of its own: it answers `claude` with a fixed
+/// string and `openai`/`google` with a status read. Keying these rows off the
+/// opening command left the whole "Sign in" section unable to reach a browser.
+fn sign_in_row_ids() -> Vec<String> {
+    ["claude", "openai", "google"]
+        .into_iter()
+        .map(|provider| format!("login:{provider}"))
+        .collect()
+}
+
 fn open_provider_modal_on(app: &mut zo_cli::tui::App, command: &str) {
     use zo_cli::tui::modals::{ChoiceBadge, ChoiceRow};
 
@@ -922,10 +935,7 @@ fn open_provider_modal_on(app: &mut zo_cli::tui::App, command: &str) {
         }
     })
     .collect();
-    let mut ids: Vec<String> = ["claude", "openai", "google"]
-        .into_iter()
-        .map(|provider| format!("{command}:{provider}"))
-        .collect();
+    let mut ids: Vec<String> = sign_in_row_ids();
     // `/connect` also sets up OpenAI-compatible local/cloud providers; list them
     // so they are discoverable without typing the alias. Each re-dispatches as
     // `/connect <id>` through the same selection path.
@@ -1036,9 +1046,25 @@ mod tests {
     use super::{
         ConnectReport, CustomProviderRequest, ProviderTokenLimits, SmokeTestResult,
         connect_custom_provider, connect_preset,
-        provider_name_from_url, saved_oauth_providers, smoke_test_custom_provider,
-        write_user_provider_with_options,
+        provider_name_from_url, saved_oauth_providers, sign_in_row_ids,
+        smoke_test_custom_provider, write_user_provider_with_options,
     };
+
+    /// The "Sign in" rows must reach `/login` from the `/connect` picker too.
+    /// `connect` has no OAuth branch — `claude` returns a fixed string and
+    /// `openai`/`google` fall through to a status read — so a `connect:` id
+    /// here means selecting an account never opens a browser.
+    #[test]
+    fn sign_in_rows_route_to_the_login_handler() {
+        assert_eq!(
+            sign_in_row_ids(),
+            ["login:claude", "login:openai", "login:google"]
+        );
+        assert!(
+            connect_preset("openai").is_none() && connect_preset("google").is_none(),
+            "no OAuth provider is a writable /connect preset, so `connect:` ids are dead ends"
+        );
+    }
 
     struct EnvVarGuard {
         key: &'static str,

@@ -173,7 +173,10 @@ where
         Some(latest)
     }
 
-    pub(super) fn build_request(&mut self, tool_choice: Option<::api::ToolChoice>) -> ApiRequest {
+    pub(super) fn build_request(
+        &mut self,
+        tool_choice: Option<::api::ToolChoice>,
+    ) -> Result<ApiRequest, RuntimeError> {
         let wire_reminders = self.request_wire_reminders();
         // Persist the reminder set into the transcript BEFORE the overflow
         // guard, so the guard's session estimate covers it, and pass an empty
@@ -181,8 +184,8 @@ where
         // a trailing System message with a stable position (the wire-only
         // injection re-billed the previous request's tail every turn).
         self.absorb_wire_reminders_into_session(&wire_reminders);
-        self.enforce_request_overflow_guard(&[]);
-        self.assemble_request(Arc::from(Vec::new()), tool_choice)
+        self.enforce_request_overflow_guard(&[])?;
+        Ok(self.assemble_request(Arc::from(Vec::new()), tool_choice))
     }
 
     /// Emergency context-overflow guard: if the estimated payload exceeds the
@@ -196,15 +199,15 @@ where
     /// preflight) still call it through [`Self::build_request`]. Split out of
     /// `build_request` so the two responsibilities — mutate-to-fit vs. assemble
     /// a snapshot — read separately (SRP).
-    pub(super) fn enforce_request_overflow_guard(&mut self, wire_reminders: &[String]) {
+    pub(super) fn enforce_request_overflow_guard(
+        &mut self,
+        wire_reminders: &[String],
+    ) -> Result<(), RuntimeError> {
         let profile = crate::turn_profiling_enabled();
-        let headroom = DEFAULT_MAX_OUTPUT_TOKENS;
-        let budget = self.context_window.saturating_sub(headroom);
-        let system_prompt_tokens = estimate_system_prompt_tokens(&self.system_prompt)
-            + estimate_system_prompt_tokens(wire_reminders);
-        let estimated = estimate_session_tokens(&self.session) as u64 + system_prompt_tokens;
+        let budget = self.request_context_budget();
+        let estimated = self.estimated_request_context_with_reminders(wire_reminders);
         if estimated <= budget {
-            return;
+            return Ok(());
         }
         let guard_t = profile.then(std::time::Instant::now);
         // Emergency overflow compaction is not user-directed: no focus.
@@ -220,10 +223,12 @@ where
         }
 
         // Re-check after compaction — if still over budget, aggressively
-        // trim preserved messages down to the most recent pair to avoid
-        // sending an oversized payload that the API will reject.
-        let after_compaction = estimate_session_tokens(&self.session) as u64 + system_prompt_tokens;
-        if after_compaction > budget && self.session.messages.len() > 2 {
+        // trim preserved messages down to the most recent pair. A pair can
+        // still itself be enormous, so a final check below rejects it locally
+        // rather than sending a provider-bound request that must 400.
+        if self.estimated_request_context_with_reminders(wire_reminders) > budget
+            && self.session.messages.len() > 2
+        {
             let result = self.compact_with_api_fallback(
                 CompactionConfig {
                     max_estimated_tokens: 0,
@@ -238,6 +243,31 @@ where
         if let Some(t) = guard_t {
             log_build_segment("overflow_guard_compaction (BLOCKING LLM)", t);
         }
+        self.ensure_request_context_budget(wire_reminders)
+    }
+
+    pub(super) fn ensure_request_context_budget(
+        &self,
+        wire_reminders: &[String],
+    ) -> Result<(), RuntimeError> {
+        let budget = self.request_context_budget();
+        let estimated = self.estimated_request_context_with_reminders(wire_reminders);
+        if estimated <= budget {
+            return Ok(());
+        }
+        Err(RuntimeError::new(format!(
+            "request remains over the context budget after compaction ({estimated} estimated tokens > {budget} token budget); reduce the latest tool result or start a new session before retrying"
+        )))
+    }
+
+    fn request_context_budget(&self) -> u64 {
+        self.context_window.saturating_sub(DEFAULT_MAX_OUTPUT_TOKENS)
+    }
+
+    fn estimated_request_context_with_reminders(&self, wire_reminders: &[String]) -> u64 {
+        estimate_session_tokens(&self.session) as u64
+            + estimate_system_prompt_tokens(&self.system_prompt)
+            + estimate_system_prompt_tokens(wire_reminders)
     }
 
     /// Assemble the request snapshot from current state. Pure and cheap — no

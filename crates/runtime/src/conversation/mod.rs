@@ -1672,7 +1672,10 @@ where
         if already_called {
             return;
         }
-        let request = self.build_request(Some(::api::ToolChoice::Tool { name: tool_name }));
+        let Ok(request) = self.build_request(Some(::api::ToolChoice::Tool { name: tool_name }))
+        else {
+            return;
+        };
         if let Ok(events) = self.api_client.stream(request) {
             if let AssistantTurn::Content { message, usage, .. } =
                 build_assistant_message(normalize_empty_assistant_stream(events))
@@ -1878,7 +1881,14 @@ where
                 eprintln!("[zo] {REFUSAL_DRY_PREARM_WARN}");
             }
 
-            let request = self.build_request(None);
+            let request = match self.build_request(None) {
+                Ok(request) => request,
+                Err(error) => {
+                    self.clear_empty_retry_reminder(empty_retries);
+                    self.record_turn_failed(iterations, &error);
+                    return Err(error);
+                }
+            };
             let events = match self.sync_stream_events(request) {
                 Ok(events) => events,
                 Err(error) => {

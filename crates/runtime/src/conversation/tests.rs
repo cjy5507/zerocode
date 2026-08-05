@@ -6329,8 +6329,8 @@ fn build_request_shares_session_messages_arc_without_deep_clone() {
         PermissionPolicy::new(PermissionMode::WorkspaceWrite),
         vec!["sys".to_string()],
     );
-    let first = runtime.build_request(None);
-    let second = runtime.build_request(None);
+    let first = runtime.build_request(None).expect("request");
+    let second = runtime.build_request(None).expect("request");
     assert!(
         Arc::ptr_eq(&first.messages, &second.messages),
         "build_request must share the session Arc (no per-request deep clone)"
@@ -6372,7 +6372,7 @@ fn profile_build_request_large_context() {
 
     let t = Instant::now();
     for _ in 0..50 {
-        let _ = runtime.build_request(None);
+        let _ = runtime.build_request(None).expect("request");
     }
     let total = t.elapsed().as_millis();
     eprintln!(
@@ -6415,7 +6415,7 @@ fn assemble_request_matches_build_request_and_does_not_mutate_session() {
     );
 
     // Equivalent to the combined entry point when below the overflow budget.
-    let built = runtime.build_request(None);
+    let built = runtime.build_request(None).expect("request");
     assert_eq!(assembled.system_prompt, built.system_prompt);
     assert_eq!(assembled.wire_reminders, built.wire_reminders);
     assert_eq!(assembled.messages, built.messages);
@@ -6444,7 +6444,7 @@ fn persisted_reminders_keep_request_history_append_only() {
         .expect("user message");
     runtime.set_transient_system_reminder("[zo:todo-progress] item A in progress", true);
 
-    let first = runtime.build_request(None);
+    let first = runtime.build_request(None).expect("request");
     assert!(first.wire_reminders.is_empty());
     let first_last = first.messages.last().expect("first request has messages");
     assert_eq!(first_last.role, MessageRole::System);
@@ -6455,7 +6455,7 @@ fn persisted_reminders_keep_request_history_append_only() {
     ));
 
     // Identical set on the next iteration: deduped, nothing appended.
-    let second = runtime.build_request(None);
+    let second = runtime.build_request(None).expect("request");
     assert_eq!(second.messages.len(), first.messages.len());
 
     // The turn advances (assistant + tool exchange), the reminder content
@@ -6469,7 +6469,7 @@ fn persisted_reminders_keep_request_history_append_only() {
     runtime.set_transient_system_reminder("[zo:todo-progress] item A in progress", false);
     runtime.set_transient_system_reminder("[zo:todo-progress] item B in progress", true);
 
-    let third = runtime.build_request(None);
+    let third = runtime.build_request(None).expect("request");
     assert_eq!(
         &third.messages[..first.messages.len()],
         first.messages.as_slice(),
@@ -6504,7 +6504,7 @@ fn build_request_injects_recalled_memory_without_mutating_base_prompt() {
         .push_user_text("권한 거부 거짓양성 재현 확인")
         .expect("user message");
 
-    let request = runtime.build_request(None);
+    let request = runtime.build_request(None).expect("request");
 
     assert_eq!(runtime.system_prompt.as_ref(), &["base prompt".to_string()]);
     // Cache preservation: recall must NEVER reach the system prompt — a system
@@ -6547,7 +6547,7 @@ fn build_request_injects_recalled_memory_without_mutating_base_prompt() {
         "irrelevant memory must not be injected into the top-k recall section"
     );
 
-    let second = runtime.build_request(None);
+    let second = runtime.build_request(None).expect("request");
     assert_eq!(
         runtime.system_prompt.as_ref(),
         &["base prompt".to_string()],
@@ -7188,7 +7188,7 @@ fn build_request_reuses_base_system_prompt_when_memory_has_no_hits() {
         .push_user_text("completely unrelated request")
         .expect("user message");
 
-    let request = runtime.build_request(None);
+    let request = runtime.build_request(None).expect("request");
 
     assert!(
         Arc::ptr_eq(&request.system_prompt, &runtime.system_prompt),
@@ -10534,6 +10534,552 @@ fn auto_compaction_disabled_still_post_turn_compacts_over_context_window() {
         .auto_compaction
         .expect("over-full live context should trigger emergency post-turn compaction");
     assert!(event.removed_message_count > 0);
+}
+
+#[test]
+fn overflow_guard_rejects_an_oversized_preserved_tail_before_dispatch() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Clone)]
+    struct CountingApi {
+        calls: Rc<RefCell<usize>>,
+    }
+
+    impl ApiClient for CountingApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            *self.calls.borrow_mut() += 1;
+            Ok(vec![
+                AssistantEvent::TextDelta("done".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    let calls = Rc::new(RefCell::new(0));
+    let mut session = Session::new();
+    session.messages = Arc::new(vec![
+        ConversationMessage::user_text("old context"),
+        ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: "x".repeat(8_000),
+        }]),
+        ConversationMessage::user_text("y".repeat(8_000)),
+        ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: "z".repeat(8_000),
+        }]),
+    ]);
+    let mut runtime = ConversationRuntime::new(
+        session,
+        CountingApi {
+            calls: Rc::clone(&calls),
+        },
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    runtime.set_context_window(10_000);
+
+    let error = runtime
+        .run_turn("continue", None)
+        .expect_err("an over-budget preserved tail must not be sent to the provider");
+
+    assert!(
+        error.to_string().contains("remains over the context budget after compaction"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        *calls.borrow(),
+        2,
+        "only the two bounded compaction summaries may be requested"
+    );
+}
+
+/// Streaming sibling of the guard above. The async loop assembles its request
+/// on its own path, so the budget rejection there needs its own coverage — and
+/// since nothing was dispatched, the orphaned user message plus the reminder
+/// System message absorbed just before the check must come back off the
+/// session, exactly as a first-iteration stream failure does. Leaving them
+/// behind makes `/resume` replay a turn the provider never saw.
+#[test]
+fn streaming_overflow_guard_rejects_and_rolls_back_before_dispatch() {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use crate::permission::{
+        PermissionDecision as AsyncPermissionDecision, PermissionError,
+        PermissionPrompter as AsyncPermissionPrompter,
+        PermissionRequest as AsyncPermissionRequest,
+    };
+
+    struct AllowAsyncPrompter;
+    impl AsyncPermissionPrompter for AllowAsyncPrompter {
+        fn decide<'a>(
+            &'a self,
+            _request: AsyncPermissionRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<AsyncPermissionDecision, PermissionError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(AsyncPermissionDecision::Allow) })
+        }
+    }
+
+    struct CountingApi {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ApiClient for CountingApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![
+                AssistantEvent::TextDelta("done".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut session = Session::new();
+    session.messages = Arc::new(vec![
+        ConversationMessage::user_text("old context"),
+        ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: "x".repeat(8_000),
+        }]),
+        ConversationMessage::user_text("y".repeat(8_000)),
+        ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: "z".repeat(8_000),
+        }]),
+    ]);
+    let messages_before = session.messages.len();
+    let mut runtime = ConversationRuntime::new(
+        session,
+        CountingApi {
+            calls: Arc::clone(&calls),
+        },
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    runtime.set_context_window(10_000);
+
+    let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let error = tokio_runtime.block_on(async {
+        let (render_tx, _render_rx) = tokio::sync::mpsc::channel(64);
+        let prompter: Arc<dyn AsyncPermissionPrompter> = Arc::new(AllowAsyncPrompter);
+        runtime
+            .run_turn_streaming_with_images("continue", Vec::new(), render_tx, prompter)
+            .await
+            .expect_err("an over-budget request must not be dispatched")
+    });
+
+    assert!(
+        error
+            .to_string()
+            .contains("remains over the context budget after compaction"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        runtime.session().messages.len(),
+        messages_before,
+        "a rejection before dispatch must leave neither the user message nor the absorbed reminder"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) <= 2,
+        "only the bounded compaction summaries may reach the provider: {}",
+        calls.load(Ordering::SeqCst)
+    );
+}
+
+/// A streaming permission-allowing prompter for the overflow-guard tests below.
+struct AllowAsyncPrompterForOverflow;
+
+impl crate::permission::PermissionPrompter for AllowAsyncPrompterForOverflow {
+    fn decide<'a>(
+        &'a self,
+        _request: crate::permission::PermissionRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        crate::permission::PermissionDecision,
+                        crate::permission::PermissionError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(crate::permission::PermissionDecision::Allow) })
+    }
+}
+
+/// A transcript long enough that the preflight compaction can summarize it down
+/// to fewer messages than it started with, while every surviving message is
+/// still far too large for the tiny window under test.
+fn overflow_guard_long_session(user_marker: &str) -> Session {
+    let mut session = Session::new();
+    let mut messages = Vec::new();
+    for turn in 0..8 {
+        messages.push(ConversationMessage::user_text(format!(
+            "old user {turn} {}",
+            "y".repeat(8_000)
+        )));
+        messages.push(ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: format!("old assistant {turn} {}", "z".repeat(8_000)),
+        }]));
+    }
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message_contains_text(message, user_marker)),
+        "the fixture must not already contain the undispatched marker"
+    );
+    session.messages = Arc::new(messages);
+    session
+}
+
+fn message_contains_text(message: &ConversationMessage, needle: &str) -> bool {
+    message.blocks.iter().any(|block| {
+        matches!(block, ContentBlock::Text { text } if text.contains(needle))
+    })
+}
+
+/// The rollback index must be re-derived AFTER the preflight compaction, not
+/// carried from turn start. Compaction swaps in a shorter session, so a
+/// `truncate(count_before_the_user_push)` is a plain no-op on any long session —
+/// leaving the undelivered user message (and the reminder absorbed right before
+/// the guard) in a transcript the provider never saw.
+#[test]
+fn streaming_overflow_guard_rolls_back_even_when_preflight_compacted_the_session() {
+    struct CompactingApi;
+
+    impl ApiClient for CompactingApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            Ok(vec![
+                AssistantEvent::TextDelta("<summary>compacted</summary>".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    const MARKER: &str = "undispatched-after-compaction";
+
+    let session = overflow_guard_long_session(MARKER);
+    let messages_before = session.messages.len();
+    let mut runtime = ConversationRuntime::new(
+        session,
+        CompactingApi,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    runtime.set_context_window(10_000);
+
+    let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let error = tokio_runtime.block_on(async {
+        let (render_tx, _render_rx) = tokio::sync::mpsc::channel(64);
+        let prompter: Arc<dyn crate::permission::PermissionPrompter> = Arc::new(AllowAsyncPrompterForOverflow);
+        runtime
+            .run_turn_streaming_with_images(MARKER, Vec::new(), render_tx, prompter)
+            .await
+            .expect_err("an over-budget request must not be dispatched")
+    });
+
+    assert!(
+        error
+            .to_string()
+            .contains("remains over the context budget after compaction"),
+        "unexpected error: {error}"
+    );
+    // Precondition: without this the old turn-start index would still have been
+    // a valid truncation point and the test would prove nothing.
+    assert!(
+        runtime.session().messages.len() < messages_before,
+        "the preflight compaction must shrink the session below the turn-start count \
+         ({} vs {messages_before})",
+        runtime.session().messages.len()
+    );
+    assert!(
+        !runtime
+            .session()
+            .messages
+            .iter()
+            .any(|message| message_contains_text(message, MARKER)),
+        "the undelivered user message must not survive in the transcript"
+    );
+    assert!(
+        !runtime
+            .session()
+            .messages
+            .iter()
+            .any(|message| message_contains_text(message, "[zo:")),
+        "the reminder absorbed just before the rejection must not survive either"
+    );
+}
+
+/// The transcript rollback has to reach the bound JSONL too. `push_message`
+/// already appended the undelivered user line, so only the `mark_transcript_dirty`
+/// healing snapshot keeps `/resume` from replaying a turn the provider never saw.
+#[test]
+fn streaming_overflow_guard_rejection_is_not_replayable_after_resume() {
+    struct CompactingApi;
+
+    impl ApiClient for CompactingApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            Ok(vec![
+                AssistantEvent::TextDelta("<summary>compacted</summary>".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    const MARKER: &str = "undispatched-never-resumable";
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let path = std::env::temp_dir().join(format!(
+        "zo-runtime-overflow-resume-{}-{nanos}.jsonl",
+        std::process::id()
+    ));
+
+    let session = overflow_guard_long_session(MARKER).with_persistence_path(path.clone());
+    let mut runtime = ConversationRuntime::new(
+        session,
+        CompactingApi,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    runtime.set_context_window(10_000);
+
+    let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let error = tokio_runtime.block_on(async {
+        let (render_tx, _render_rx) = tokio::sync::mpsc::channel(64);
+        let prompter: Arc<dyn crate::permission::PermissionPrompter> = Arc::new(AllowAsyncPrompterForOverflow);
+        runtime
+            .run_turn_streaming_with_images(MARKER, Vec::new(), render_tx, prompter)
+            .await
+            .expect_err("an over-budget request must not be dispatched")
+    });
+    assert!(
+        error
+            .to_string()
+            .contains("remains over the context budget after compaction"),
+        "unexpected error: {error}"
+    );
+
+    runtime
+        .session()
+        .persist_appended_state_to_path(&path)
+        .expect("the rejected turn must still persist cleanly");
+    let reloaded = Session::load_from_path(&path).expect("reload the persisted transcript");
+    let replayed = reloaded
+        .messages
+        .iter()
+        .any(|message| message_contains_text(message, MARKER));
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("jsonl.lock"));
+
+    assert!(
+        !replayed,
+        "a turn the provider never saw must not come back on /resume"
+    );
+}
+
+/// On a later iteration the delivered work must survive — only the reminder
+/// absorbed for the request that was never sent may be removed. Subtracting the
+/// user message here would destroy a real tool-result exchange.
+#[test]
+fn streaming_overflow_guard_on_a_later_iteration_keeps_work_but_drops_the_absorbed_reminder() {
+    struct ToolThenOverflowApi {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ApiClient for ToolThenOverflowApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "bulk".to_string(),
+                        input: "go".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ]);
+            }
+            Ok(vec![
+                AssistantEvent::TextDelta("<summary>compacted</summary>".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut session = Session::new();
+    session.messages = Arc::new(vec![
+        ConversationMessage::user_text("seed"),
+        ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: "ack".to_string(),
+        }]),
+    ]);
+    let mut runtime = ConversationRuntime::new(
+        session,
+        ToolThenOverflowApi {
+            calls: Arc::clone(&calls),
+        },
+        StaticToolExecutor::new().register("bulk", |_input| Ok("b".repeat(200_000))),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    runtime.set_context_window(20_000);
+    runtime.set_auto_compaction_enabled(false);
+
+    let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let error = tokio_runtime.block_on(async {
+        let (render_tx, _render_rx) = tokio::sync::mpsc::channel(64);
+        let prompter: Arc<dyn crate::permission::PermissionPrompter> = Arc::new(AllowAsyncPrompterForOverflow);
+        runtime
+            .run_turn_streaming_with_images("start", Vec::new(), render_tx, prompter)
+            .await
+            .expect_err("the second iteration must not dispatch an over-budget request")
+    });
+
+    assert!(
+        error
+            .to_string()
+            .contains("remains over the context budget after compaction"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) >= 1,
+        "the first iteration must have been dispatched"
+    );
+    assert!(
+        runtime
+            .session()
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Assistant),
+        "the delivered first-iteration work must be preserved"
+    );
+    let last = runtime
+        .session()
+        .messages
+        .last()
+        .expect("the session keeps its delivered messages");
+    assert!(
+        !(last.role == MessageRole::System && message_contains_text(last, "[zo:")),
+        "the reminder absorbed for the undispatched request must be removed: {last:?}"
+    );
+}
+
+/// Recall dedup state is derived from the TRANSCRIPT, not the process — that is
+/// why compaction and `replace_session` both recompute it. Rolling the absorbed
+/// reminder back out therefore has to release the marks that absorb just made:
+/// a mark left behind for a body that was never delivered collapses the next
+/// attempt to a bare "already recalled this session" pointer aimed at nothing.
+#[test]
+fn streaming_overflow_guard_rollback_releases_recall_dedup_marks() {
+    struct CompactingApi;
+
+    impl ApiClient for CompactingApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            Ok(vec![
+                AssistantEvent::TextDelta("<summary>compacted</summary>".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    // The user input doubles as the recall query, so the turn really does absorb
+    // a full recalled-memory body before the guard rejects the request.
+    const MARKER: &str = "parser bugs undispatched-recall";
+
+    let session = overflow_guard_long_session(MARKER);
+    let mut runtime = ConversationRuntime::new(
+        session,
+        CompactingApi,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    runtime.set_context_window(10_000);
+    runtime.set_memory_retriever(Some(std::sync::Arc::new(
+        LexicalMemoryRetriever::from_index_markdown(
+            "# Zo memory\n\n- [parsers](parsers.md) — recall me about parser bugs\n",
+        ),
+    )));
+
+    let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let error = tokio_runtime.block_on(async {
+        let (render_tx, _render_rx) = tokio::sync::mpsc::channel(64);
+        let prompter: Arc<dyn crate::permission::PermissionPrompter> =
+            Arc::new(AllowAsyncPrompterForOverflow);
+        runtime
+            .run_turn_streaming_with_images(MARKER, Vec::new(), render_tx, prompter)
+            .await
+            .expect_err("an over-budget request must not be dispatched")
+    });
+    assert!(
+        error
+            .to_string()
+            .contains("remains over the context budget after compaction"),
+        "unexpected error: {error}"
+    );
+
+    assert!(
+        runtime.recalled_memory_slugs.is_empty(),
+        "a rolled-back reminder must leave no recall dedup mark: {:?}",
+        runtime.recalled_memory_slugs
+    );
+
+    // The observable consequence: the next attempt reseeds the FULL body.
+    runtime
+        .session
+        .push_user_text("parser bugs again")
+        .expect("follow-up query");
+    let reminders = runtime.request_wire_reminders();
+    runtime.absorb_wire_reminders_into_session(&reminders);
+    let reminder_text = runtime
+        .session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::System)
+        .map(|message| {
+            message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        })
+        .expect("a persisted reminder message");
+    assert!(
+        reminder_text.contains("recall me about parser bugs"),
+        "a body that was never delivered must reseed in full: {reminder_text}"
+    );
+    assert!(
+        !reminder_text.contains("already recalled this session"),
+        "the pointer would aim at a body that is not in this context: {reminder_text}"
+    );
 }
 
 #[test]
