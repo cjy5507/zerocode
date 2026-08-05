@@ -138,6 +138,16 @@ fn human_wait(wait: std::time::Duration) -> String {
 /// Loud warn line for holding the turn on the main model instead of falling
 /// back: the quota window lifts within the configured wait band, so the turn
 /// waits it out rather than switching providers.
+/// Warn line for a turn the provider shed, continuing on a lighter tier of the
+/// same provider. Names both models: the user chose the heavier one, and a silent
+/// swap would make the reply's quality look like the model they picked.
+pub(super) fn overload_demotion_warn(shed: &str, lighter: &str) -> String {
+    format!(
+        "Provider capacity refused {shed} (not your rate limit — the window is not the wall), \
+         so this turn continues on {lighter}. The next turn starts on {shed} again."
+    )
+}
+
 pub(super) fn quota_wait_hold_warn(model: &str, wait: std::time::Duration) -> String {
     let human = human_wait(wait);
     // Starts with the shared prefix so the TUI can flip the spinner into the
@@ -158,6 +168,16 @@ pub(super) enum QuotaEscape {
     Wait(std::time::Duration),
     /// Swap this turn onto the cross-provider fallback (`model`) and re-request.
     Fallback(String),
+    /// Re-request this turn on a lighter model of the SAME provider (`model`),
+    /// because the provider is shedding the heavier one.
+    ///
+    /// Preferred over [`Self::Fallback`] for a provider overload: it is the
+    /// smaller change (same provider, same credentials, same tool surface), and
+    /// the evidence says the tier is the wall — every Opus request was refused
+    /// while Haiku on the same account answered in the same second. Costs one
+    /// demotion per turn; a lighter tier that is shed too escalates to the
+    /// cross-provider fallback on the next refusal.
+    Lighter(String),
     /// Neither applies — the caller fails the turn as it did before the feature.
     None,
 }
@@ -408,8 +428,12 @@ where
                 return Some(model.as_str());
             }
         }
-        self.refusal_fallback_model
+        // Same precedence as `assemble_request`'s `model_override`, so "which
+        // model is on the wire" has ONE answer: a demoted turn judges refusals —
+        // and reports its model — against the tier it actually ran on.
+        self.overload_demotion_model
             .as_deref()
+            .or(self.refusal_fallback_model.as_deref())
             .or(self.escalation_model_override.as_deref())
             .or(self.context_model.as_deref())
     }
@@ -576,6 +600,12 @@ where
     {
         // The wait-band one-shot is per turn: a fresh turn may wait again.
         self.quota_waited_this_turn = false;
+        // So is the overload demotion. A new turn starts on the model the user
+        // chose; carrying a previous turn's demotion forward would silently pin
+        // the session to a lighter tier after one capacity dip.
+        self.overload_demoted_this_turn = false;
+        self.overload_demotion_model = None;
+
         if self
             .quota_dry_until
             .is_some_and(|until| std::time::Instant::now() >= until)
@@ -708,6 +738,27 @@ where
                     self.quota_waited_this_turn = true;
                     return QuotaEscape::Wait(wait);
                 }
+            }
+        }
+        // A provider that is shedding refused THIS REQUEST SHAPE, so the cheapest
+        // recovery is a lighter shape — one tier down the same provider's ladder,
+        // once per turn. Tried before the cross-provider swap because it is the
+        // smaller change (same credentials, same tool surface, no session cooldown
+        // armed) and because the measurement says the tier is the wall. Without
+        // this, a session with no cross-provider fallback configured had NO
+        // recovery at all: it rode the budget out on the exact shape being
+        // refused and then died.
+        if !account_window && !self.overload_demoted_this_turn {
+            let shed = self
+                .effective_request_model()
+                .or(self.context_model.as_deref())
+                .unwrap_or_default()
+                .to_string();
+            if let Some(lighter) = ::api::starvation_demotion_model(&shed) {
+                let lighter = ::api::resolve_model_alias(lighter);
+                self.overload_demoted_this_turn = true;
+                self.overload_demotion_model = Some(lighter.clone());
+                return QuotaEscape::Lighter(lighter);
             }
         }
         // A blocked swap gets at most the one bounded wait above. If that wait

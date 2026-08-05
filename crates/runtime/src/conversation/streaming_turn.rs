@@ -19,7 +19,8 @@ use super::{
     is_refusal_stop_reason, is_truncation_stop_reason, is_verify_class_tool, merge_hook_feedback,
     normalize_empty_assistant_stream,
     parallel_safe_tool_indices, pre_hook_denial_outcome,
-    quota_fallback_swap_warn, quota_wait_hold_warn, refusal_surfaced_message,
+    overload_demotion_warn, quota_fallback_swap_warn, quota_wait_hold_warn,
+    refusal_surfaced_message,
     sleep_tool_execution_input,
     agent_notification_text, steering_message, tool_execution_input,
     take_truncation_continuation, tool_preview_from,
@@ -938,6 +939,24 @@ where
                                         .await;
                                     continue 'outer;
                                 }
+                                // The provider shed this tier: re-request the same
+                                // turn one tier down, same provider. The override is
+                                // already recorded, so the retry picks it up through
+                                // `assemble_request`.
+                                QuotaEscape::Lighter(model) => {
+                                    let shed = self
+                                        .context_model
+                                        .clone()
+                                        .unwrap_or_else(|| "the main model".to_string());
+                                    let _ = render_tx
+                                        .send(RenderBlock::System {
+                                            id: id_gen.next(),
+                                            level: SystemLevel::Warn,
+                                            text: overload_demotion_warn(&shed, &model),
+                                        })
+                                        .await;
+                                    continue 'outer;
+                                }
                                 QuotaEscape::None => {}
                             }
                             self.clear_empty_retry_reminder(empty_retries);
@@ -1000,6 +1019,24 @@ where
                                             id: id_gen.next(),
                                             level: SystemLevel::Warn,
                                             text: quota_fallback_swap_warn(&model),
+                                        })
+                                        .await;
+                                    continue 'outer;
+                                }
+                                // The provider shed this tier: re-request the same
+                                // turn one tier down, same provider. The override is
+                                // already recorded, so the retry picks it up through
+                                // `assemble_request`.
+                                QuotaEscape::Lighter(model) => {
+                                    let shed = self
+                                        .context_model
+                                        .clone()
+                                        .unwrap_or_else(|| "the main model".to_string());
+                                    let _ = render_tx
+                                        .send(RenderBlock::System {
+                                            id: id_gen.next(),
+                                            level: SystemLevel::Warn,
+                                            text: overload_demotion_warn(&shed, &model),
                                         })
                                         .await;
                                     continue 'outer;

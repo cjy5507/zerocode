@@ -316,8 +316,15 @@ where
             {
                 None
             } else {
-                self.refusal_fallback_model
+                // Precedence is recency: an overload demotion is the newest and
+                // most specific verdict available — the provider just refused the
+                // model the other two overrides would select — so it wins. It is
+                // same-provider by construction (`api::starvation_demotion_model`
+                // walks one provider's ladder), so it cannot smuggle a foreign
+                // model id onto the bound client.
+                self.overload_demotion_model
                     .clone()
+                    .or_else(|| self.refusal_fallback_model.clone())
                     .or_else(|| self.escalation_model_override.clone())
             },
         }

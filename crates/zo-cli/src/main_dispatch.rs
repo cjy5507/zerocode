@@ -821,26 +821,31 @@ fn turn_error_warrants_model_fallback(error: &(dyn std::error::Error + 'static))
     error_warrants_model_fallback(&error.to_string())
 }
 
+/// Whether `--fallback-model` should re-run a failed headless turn on the
+/// fallback: capacity or transient pressure yes, an auth/validation verdict no
+/// (the fallback would fail identically).
+///
+/// Classified through `core_types::retry_signal`, the same vocabulary the retry
+/// schedule and the quota escape read, rather than a private copy of the
+/// substring list. The copy was a second classifier that could drift from the
+/// first — and it read the WHOLE `Display` string, hint included, which is
+/// exactly how a hint's prose ("this is NOT your account's rate limit") taught
+/// the retry layer the opposite of what it says.
+///
+/// The auth veto stays local: `RetrySignal` folds every non-retryable cause into
+/// `Fatal`, and this site needs the narrower "was it credentials?" answer to keep
+/// a 401 from being read as capacity by a relay that words it loosely.
 fn error_warrants_model_fallback(error: &str) -> bool {
-    let normalized = error.to_ascii_lowercase();
-    if normalized.contains("401")
-        || normalized.contains("unauthorized")
-        || normalized.contains("invalid api key")
-        || normalized.contains("auth failed")
-        || normalized.contains("authentication")
+    let head = core_types::retry_signal::machine_readable_head(error).to_ascii_lowercase();
+    if head.contains("401")
+        || head.contains("unauthorized")
+        || head.contains("invalid api key")
+        || head.contains("auth failed")
+        || head.contains("authentication")
     {
         return false;
     }
-    normalized.contains("429")
-        || normalized.contains("rate limit")
-        || normalized.contains("rate_limit")
-        || normalized.contains("overloaded")
-        || normalized.contains("529")
-        || normalized.contains("500")
-        || normalized.contains("502")
-        || normalized.contains("503")
-        || normalized.contains("timed out")
-        || normalized.contains("timeout")
+    core_types::retry_signal::classify_error_text(error).is_retryable()
 }
 
 #[cfg(test)]
@@ -869,6 +874,20 @@ mod unapplied_flag_tests {
         assert!(!error_warrants_model_fallback(
             "invalid request: prompt too long"
         ));
+        // Reading the human hint instead of the machine head is how a 529 taught
+        // the retry layer "account throttle"; this predicate must be immune too.
+        let overload_with_hint = api::ApiError::StreamApi {
+            error_type: Some("overloaded_error".to_string()),
+            message: Some("Overloaded".to_string()),
+            body: String::new(),
+            retryable: true,
+        }
+        .to_string();
+        assert!(error_warrants_model_fallback(&overload_with_hint));
+        // And an auth failure keeps its veto even though its own hint says
+        // "retry" — the fallback would fail identically on the same credential.
+        let auth_with_hint = api::ApiError::Auth("invalid api key".to_string()).to_string();
+        assert!(!error_warrants_model_fallback(&auth_with_hint));
     }
 
     #[test]

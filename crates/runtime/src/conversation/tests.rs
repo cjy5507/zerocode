@@ -2048,6 +2048,13 @@ fn provider_overload_escapes_to_fallback_even_below_the_utilization_gate() {
         api::ProviderErrorClass::provider_overloaded(None),
     );
 
+    // The tier ladder comes first (see
+    // `provider_overload_demotes_one_tier_before_swapping_providers`); what this
+    // test pins is that the closed 95 %-utilization gate never blocks the escape.
+    assert!(matches!(
+        runtime.decide_quota_escape_with_gate(&overloaded, |_| false),
+        QuotaEscape::Lighter(_)
+    ));
     assert!(
         matches!(
             runtime.decide_quota_escape_with_gate(&overloaded, |_| false),
@@ -2091,6 +2098,135 @@ fn provider_overload_escapes_to_fallback_even_below_the_utilization_gate() {
         QuotaEscape::None
     ));
     assert!(!throttled_runtime.quota_fallback_active);
+}
+
+/// A provider overload demotes to a lighter tier of the SAME provider before
+/// reaching for a cross-provider swap — and works even when no fallback client
+/// exists at all, which used to mean the turn simply died.
+///
+/// The tier is the wall: measured on the reported failure, every Opus request was
+/// shed while Haiku on the same account answered in the same second. So the
+/// recovery is a lighter request, tried once per turn.
+#[test]
+fn provider_overload_demotes_one_tier_before_swapping_providers() {
+    let overloaded = || {
+        RuntimeError::with_provider_error_class(
+            "api stream error (overloaded_error): Overloaded",
+            api::ProviderErrorClass::provider_overloaded(None),
+        )
+    };
+
+    // No cross-provider fallback installed: the demotion is the ONLY recovery.
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        NoopApiClient,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    runtime.set_context_model("claude-opus-5");
+    assert!(
+        matches!(
+            runtime.decide_quota_escape_with_gate(&overloaded(), |_| false),
+            QuotaEscape::Lighter(ref model) if model.contains("sonnet")
+        ),
+        "an Opus overload must continue on Sonnet, not kill the turn"
+    );
+    // The demotion rides the turn's requests as a wire-model override, and
+    // "which model is on the wire" agrees with it.
+    let demoted = runtime
+        .overload_demotion_model
+        .clone()
+        .expect("the demotion is recorded for the rest of the turn");
+    assert!(demoted.contains("sonnet"), "demoted onto {demoted}");
+    assert_eq!(runtime.effective_request_model(), Some(demoted.as_str()));
+
+    // One per turn: a lighter tier that is ALSO shed escalates instead of walking
+    // the ladder to nothing inside a single turn. With no fallback client there is
+    // genuinely nowhere left to go.
+    assert!(matches!(
+        runtime.decide_quota_escape_with_gate(&overloaded(), |_| false),
+        QuotaEscape::None
+    ));
+
+    // With a fallback client installed, the second refusal escapes cross-provider.
+    let mut with_fallback = ConversationRuntime::new(
+        Session::new(),
+        NoopApiClient,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    with_fallback.set_context_model("claude-opus-5");
+    with_fallback.set_quota_fallback_client(Some((
+        Arc::new(NoopAsyncApiClient),
+        "gpt-5.6-sol".to_string(),
+    )));
+    assert!(matches!(
+        with_fallback.decide_quota_escape_with_gate(&overloaded(), |_| false),
+        QuotaEscape::Lighter(_)
+    ));
+    assert!(
+        matches!(
+            with_fallback.decide_quota_escape_with_gate(&overloaded(), |_| false),
+            QuotaEscape::Fallback(ref model) if model == "gpt-5.6-sol"
+        ),
+        "the tier ladder is spent, so the next refusal changes provider"
+    );
+
+    // An ACCOUNT 429 must NOT demote: every model on the provider shares that
+    // window, so a lighter tier hits the same wall.
+    let mut throttled = ConversationRuntime::new(
+        Session::new(),
+        NoopApiClient,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    throttled.set_context_model("claude-opus-5");
+    assert!(matches!(
+        throttled.decide_quota_escape_with_gate(
+            &RuntimeError::with_provider_error_class(
+                "api returned 429 Too Many Requests (rate_limit_error)",
+                api::ProviderErrorClass::account_rate_limit(None),
+            ),
+            |_| false,
+        ),
+        QuotaEscape::None
+    ));
+    assert!(throttled.overload_demotion_model.is_none());
+}
+
+/// The demotion is scoped to the turn that needed it: a later turn starts on the
+/// model the user actually chose.
+#[test]
+fn overload_demotion_does_not_leak_into_the_next_turn() {
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        NoopApiClient,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    runtime.set_context_model("claude-opus-5");
+    assert!(matches!(
+        runtime.decide_quota_escape_with_gate(
+            &RuntimeError::with_provider_error_class(
+                "api stream error (overloaded_error): Overloaded",
+                api::ProviderErrorClass::provider_overloaded(None),
+            ),
+            |_| false,
+        ),
+        QuotaEscape::Lighter(_)
+    ));
+    assert!(runtime.overload_demotion_model.is_some());
+
+    runtime.begin_turn_quota_fallback_with_gate(|_| true);
+    assert!(
+        runtime.overload_demotion_model.is_none(),
+        "a new turn must not silently run on last turn's lighter tier"
+    );
+    assert!(!runtime.overload_demoted_this_turn);
 }
 
 /// Inert async client for escape-decision tests: the decision never dispatches.

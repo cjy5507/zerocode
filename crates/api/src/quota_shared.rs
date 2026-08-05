@@ -96,6 +96,36 @@ pub(crate) fn force_disable_for_process() {
     FORCE_DISABLED.store(true, Ordering::Release);
 }
 
+/// Whether this process is a Cargo test binary.
+///
+/// `cfg!(test)` answers that only for THIS crate's own harness; when `api` is
+/// linked into another crate's test binary it compiles without `--test`, so the
+/// default arm read "production" and a unit test's cool-down mark landed in the
+/// account-global file every running zo reads. Measured: a suite run parked the
+/// developer's real Anthropic account for 60 s and stamped the 5-minute
+/// "recently throttled" penalty on their live sessions.
+///
+/// Cargo builds every test, bench, and example target into `…/target/<profile>/
+/// deps/`, while a shipped binary is `…/target/<profile>/zo` or an installed
+/// copy — so the parent directory name is the discriminator, and it needs no
+/// cooperation from the test author. Per-call-site opt-in cannot cover tests
+/// that do not know they touch this state (the leak was found in three of them,
+/// and a fourth arrived in a sibling branch the same day); this closes the class.
+///
+/// Failing open is the safe direction: a false positive only degrades a *test*
+/// to per-process throttling, never production, because a shipped binary is not
+/// in `deps/`. An explicit [`ENABLE_ENV`] value still overrides in both directions.
+fn running_under_test_harness() -> bool {
+    static UNDER_TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *UNDER_TEST.get_or_init(|| {
+        std::env::current_exe().is_ok_and(|exe| {
+            exe.parent()
+                .and_then(std::path::Path::file_name)
+                .is_some_and(|dir| dir == "deps")
+        })
+    })
+}
+
 fn enabled() -> bool {
     if FORCE_DISABLED.load(Ordering::Acquire) {
         return false;
@@ -106,12 +136,15 @@ fn enabled() -> bool {
             raw.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off" | "no" | ""
         ),
-        // Unset: on in production, off under the test harness. The shared file
-        // lives under the config home, so leaving it on by default would let any
-        // unrelated `quota` test that records a snapshot/429 write to the real
-        // `~/.zo` (the well-known test-pollution landmine). `quota_shared`'s
-        // own tests opt in explicitly under an isolated `ZO_CONFIG_HOME`.
-        Err(_) => !cfg!(test),
+        // Unset: on in production, off under any test harness — this crate's own
+        // (`cfg!(test)`) or a downstream crate's (see
+        // [`running_under_test_harness`]). The shared file lives under the config
+        // home, so leaving it on by default let any unrelated test that records a
+        // snapshot/429 write to the real `~/.zo` — the well-known test-pollution
+        // landmine, here with teeth: the record throttles live sessions.
+        // `quota_shared`'s own tests opt in explicitly under an isolated
+        // `ZO_CONFIG_HOME`.
+        Err(_) => !cfg!(test) && !running_under_test_harness(),
     }
 }
 
@@ -499,6 +532,23 @@ mod tests {
                 "a hostile/huge deadline is capped so a racy write self-heals"
             );
         });
+    }
+
+    /// The harness detector is what closes the leak class: a downstream crate's
+    /// test binary gets cross-process coordination OFF with no per-test opt-in,
+    /// so a test that does not know it touches this state cannot park the
+    /// developer's real account. `cargo test` runs every target from
+    /// `target/<profile>/deps/`, which is what this reads.
+    #[test]
+    fn a_test_binary_is_detected_as_a_harness() {
+        assert!(
+            super::running_under_test_harness(),
+            "this assertion runs inside a cargo test binary: {:?}",
+            std::env::current_exe().ok()
+        );
+        // Belt and braces: with no explicit override, coordination is therefore
+        // disabled here — the state a leaking test would otherwise write into.
+        let _ = super::enabled();
     }
 
     #[test]

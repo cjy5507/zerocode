@@ -75,7 +75,8 @@ use repetition::{ReadFileRange, ToolBatchRepetitionHardStops};
 use verify_treadmill::is_verify_class_tool;
 // Refusal/quota-fallback items the sync + streaming turn loops still reference.
 use fallback::{
-    is_refusal_stop_reason, quota_fallback_swap_warn, quota_wait_hold_warn,
+    is_refusal_stop_reason, overload_demotion_warn, quota_fallback_swap_warn,
+    quota_wait_hold_warn,
     refusal_surfaced_message, QuotaEscape, RefusalDecision,
     REFUSAL_DRY_PREARM_WARN, REFUSAL_FALLBACK_WARN, REFUSAL_SURFACED_NOTICE,
 };
@@ -878,6 +879,22 @@ pub struct ConversationRuntime<C, T> {
     /// or a still-rolling window) falls through to the fallback instead of
     /// looping the wait forever. Reset at turn start.
     quota_waited_this_turn: bool,
+    /// Lighter same-provider model this turn was demoted onto after the provider
+    /// shed the heavier one (HTTP 529 / `overloaded_error`). Highest-precedence
+    /// wire-model override for the rest of the turn — see
+    /// [`Self::assemble_request`]'s `model_override`.
+    ///
+    /// Capacity shedding is tier-shaped, not account-shaped: measured on the
+    /// reported failure, every Opus request was refused while a Haiku sub-agent on
+    /// the SAME account succeeded in the same second. So the request that gets
+    /// through is a lighter one, which is exactly what the error's own hint
+    /// advises and what no layer used to do — the turn just died instead.
+    overload_demotion_model: Option<String>,
+    /// One-shot cap for [`Self::overload_demotion_model`]: one demotion per turn,
+    /// so a lighter tier that is ALSO shed escalates to the cross-provider
+    /// fallback rather than walking the ladder to nothing inside one turn.
+    /// Reset at turn start.
+    overload_demoted_this_turn: bool,
     /// True while a deep-gate VERIFY leg has swapped [`Self::async_api_client`]
     /// to a cross-model deep-lane client (see the
     /// `DeepSubturnPermissionGuard`). The verifier and planner run on their own
@@ -1372,6 +1389,8 @@ where
             quota_prearm_notice_pending: false,
             quota_wait_band: std::time::Duration::ZERO,
             quota_waited_this_turn: false,
+            overload_demotion_model: None,
+            overload_demoted_this_turn: false,
             deep_verify_leg_active: false,
             deep_verify_candidates: Vec::new(),
             deep_verify_candidate_idx: 0,
@@ -1917,6 +1936,16 @@ where
                         }
                         QuotaEscape::Fallback(model) => {
                             eprintln!("[zo] {}", quota_fallback_swap_warn(&model));
+                            continue;
+                        }
+                        // Provider shed this tier: re-request one tier down on the
+                        // same provider (the override is already recorded).
+                        QuotaEscape::Lighter(model) => {
+                            let shed = self
+                                .context_model
+                                .clone()
+                                .unwrap_or_else(|| "the main model".to_string());
+                            eprintln!("[zo] {}", overload_demotion_warn(&shed, &model));
                             continue;
                         }
                         QuotaEscape::None => {}

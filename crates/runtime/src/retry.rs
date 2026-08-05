@@ -42,17 +42,22 @@ const RATE_LIMIT_MAX_ELAPSED: Duration = Duration::from_secs(300);
 /// Wall-clock budget for riding out a **provider overload** (529 /
 /// `overloaded_error`), as opposed to this account's window.
 ///
-/// Deliberately a fraction of [`RATE_LIMIT_MAX_ELAPSED`], because the two walls
-/// clear differently and reward opposite reactions. Measured on the reported
-/// turn: twelve whole-request attempts across the full 300 s account budget, all
-/// shed, while a Haiku sub-agent on the *same account* succeeded in the same
-/// second — the account was 2 % utilized. Re-sending the shed request shape is
-/// what does not work; a lighter model is what does, so the budget only has to
-/// outlast a genuine blip before handing over to the quota escape
-/// (`decide_quota_escape`, which for this scope may swap immediately). With the
-/// stream layer now re-opening pre-commit faults itself, each attempt inside
-/// this window is already several provider round-trips.
-const OVERLOAD_MAX_ELAPSED: Duration = Duration::from_secs(90);
+/// A small fraction of [`RATE_LIMIT_MAX_ELAPSED`], because the two walls clear
+/// differently and reward opposite reactions. Measured on the reported turn:
+/// twelve whole-request attempts across the full 300 s account budget, all shed,
+/// while a Haiku sub-agent on the *same account* succeeded in the same second —
+/// the account was 2 % utilized. Re-sending the shed request shape is what does
+/// not work; a lighter one is what does.
+///
+/// Sized against what happens *when it expires*, which is the part that changed:
+/// the escape is no longer "swap providers or die" but a one-tier demotion on the
+/// same provider (`QuotaEscape::Lighter`), announced and reverted next turn. Once
+/// the fallback is productive, extra insistence on the chosen model buys nothing
+/// but a longer freeze — a live run measured 109 s of spinner before a demotion
+/// that then succeeded on the first try. This budget still spends ~12 real
+/// attempts on the user's model first (each L2 attempt is 1 + up to 5 transparent
+/// stream re-opens), which is ample patience for a blip.
+const OVERLOAD_MAX_ELAPSED: Duration = Duration::from_secs(30);
 
 /// Env override (milliseconds) for the capacity wall-clock budgets. `0` opts out
 /// of wall-clock mode entirely and falls back to the bounded [`MAX_RETRIES`]
@@ -744,9 +749,10 @@ mod tests {
         let past_overload = OVERLOAD_MAX_ELAPSED + Duration::from_secs(1);
 
         // Inside its own budget an overload still retries — a genuine blip is
-        // absorbed without disturbing the turn.
+        // absorbed without disturbing the turn. Derived from the const, not a
+        // literal, so retuning the budget cannot silently un-test this arm.
         assert!(matches!(
-            classify_for_retry(overload, 3, Duration::from_secs(30)),
+            classify_for_retry(overload, 3, OVERLOAD_MAX_ELAPSED / 2),
             RetryVerdict::Retry { .. }
         ));
         // Past it, the retry layer hands over instead of grinding.
