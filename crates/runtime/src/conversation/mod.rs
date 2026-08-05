@@ -1916,6 +1916,14 @@ where
                             == Some(crate::ProviderErrorClass::ContextOverflow)
                     {
                         provider_overflow_recovery_attempted = true;
+                        // Learn the wire's real ceiling before compacting, so this
+                        // session's thresholds stop being derived from a window the
+                        // provider does not honor.
+                        if let Some(ceiling) =
+                            ::api::context_overflow_ceiling_tokens(&error.to_string())
+                        {
+                            self.adopt_provider_context_ceiling(ceiling);
+                        }
                         if let Some(event) = self.recover_provider_context_overflow() {
                             auto_compaction.get_or_insert(event);
                             continue;

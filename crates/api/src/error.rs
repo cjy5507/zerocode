@@ -258,6 +258,27 @@ impl ApiError {
         }
     }
 
+    /// The prompt-token ceiling this error named, when it named one.
+    ///
+    /// See [`context_overflow_ceiling_tokens`]: the provider's own number is the
+    /// only authority on what the wire allows, and a client window guessed above
+    /// it disables every compaction threshold derived from it.
+    #[must_use]
+    pub fn context_overflow_ceiling(&self) -> Option<u64> {
+        match self {
+            Self::Api { message, body, .. } => message
+                .as_deref()
+                .and_then(context_overflow_ceiling_tokens)
+                .or_else(|| context_overflow_ceiling_tokens(body)),
+            Self::StreamApi { message, body, .. } => message
+                .as_deref()
+                .and_then(context_overflow_ceiling_tokens)
+                .or_else(|| context_overflow_ceiling_tokens(body)),
+            Self::RetriesExhausted { last_error, .. } => last_error.context_overflow_ceiling(),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub fn provider_error_class(&self) -> ProviderErrorClass {
         match self {
@@ -503,6 +524,40 @@ fn is_client_rejection_text<'a>(parts: impl IntoIterator<Item = &'a str>) -> boo
     })
 }
 
+/// The ceiling a provider named while rejecting an oversized prompt, in tokens.
+///
+/// Anthropic states it outright — `prompt is too long: 211352 tokens > 200000
+/// maximum` — and that number is the only trustworthy statement of what the wire
+/// actually allows. A client-side window comes from a catalog or a name-shape
+/// guess and cannot know that an account, tier, or route serves less; when it
+/// guesses high, *every* compaction threshold derived from it sits above the real
+/// ceiling and nothing fires until the request 400s. Learning the number from the
+/// rejection turns a recurring wall into a one-time correction.
+///
+/// `None` when the message names no ceiling — the caller keeps its own window.
+#[must_use]
+pub fn context_overflow_ceiling_tokens(text: &str) -> Option<u64> {
+    // `… > 200000 maximum` — anchored on the comparison so a token count from
+    // elsewhere in the message (the offending size, itself larger) cannot be
+    // mistaken for the limit.
+    let (_, after) = text.split_once('>')?;
+    let digits: String = after
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let ceiling = digits.parse::<u64>().ok()?;
+    let rest = after.trim_start()[digits.len()..].trim_start();
+    // Require the limit wording so an unrelated `>` in a message body cannot
+    // silently shrink the session's window.
+    rest.starts_with("maximum")
+        .then_some(ceiling)
+        .filter(|&ceiling| ceiling > 0)
+}
+
 fn classify_provider_error_text<'a>(
     parts: impl IntoIterator<Item = &'a str>,
 ) -> Option<ProviderErrorClass> {
@@ -527,6 +582,16 @@ fn classify_provider_error_text<'a>(
         || text.contains("too many tokens")
         || text.contains("token limit")
         || text.contains("exceeds the context")
+        // Anthropic's own wording, verbatim: `prompt is too long: 211352 tokens
+        // > 200000 maximum`. It matches none of the phrases above, so the single
+        // most common overflow error in the product classified as `NonRetryable`
+        // — the compact-and-resend recovery existed and never once fired for it,
+        // and the turn simply died. Sub-agents hit it constantly: they grind
+        // through tool output for up to 64 iterations with nobody watching, and
+        // the client-side budget cannot see a wire ceiling below its own.
+        || text.contains("prompt is too long")
+        || text.contains("input is too long")
+        || text.contains("messages too long")
     {
         return Some(ProviderErrorClass::ContextOverflow);
     }
@@ -1356,6 +1421,66 @@ mod tests {
             .provider_error_class(),
             ProviderErrorClass::ContextOverflow
         );
+    }
+
+    /// Anthropic's *actual* context-overflow wording, verbatim from a live 400.
+    ///
+    /// The test above pinned invented phrasing ("context length exceeded",
+    /// "maximum context window exceeded") that Anthropic never sends, so the one
+    /// message the overflow recovery exists to handle fell through every branch
+    /// to `NonRetryable`: no compaction, no re-send, the turn just died. A
+    /// sub-agent grinding through tool output hit it constantly while Claude Code
+    /// compacted and carried on.
+    #[test]
+    fn anthropic_prompt_too_long_is_context_overflow() {
+        let error = api_error(
+            StatusCode::BAD_REQUEST,
+            Some("invalid_request_error"),
+            Some("prompt is too long: 211352 tokens > 200000 maximum"),
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 211352 tokens > 200000 maximum"}}"#,
+            false,
+        );
+        assert_eq!(
+            error.provider_error_class(),
+            ProviderErrorClass::ContextOverflow,
+            "the provider's own overflow message must reach the compact-and-resend path"
+        );
+    }
+
+    /// The provider's stated ceiling is the only authority on what the wire
+    /// accepts, so it has to be read exactly — and never guessed from an
+    /// unrelated number in the message (the offending size is the *larger* one
+    /// and sits on the other side of the `>`).
+    #[test]
+    fn the_stated_ceiling_is_read_from_the_overflow_message() {
+        assert_eq!(
+            context_overflow_ceiling_tokens("prompt is too long: 211352 tokens > 200000 maximum"),
+            Some(200_000)
+        );
+        assert_eq!(
+            api_error(
+                StatusCode::BAD_REQUEST,
+                Some("invalid_request_error"),
+                Some("prompt is too long: 2082664 tokens > 200000 maximum"),
+                "",
+                false,
+            )
+            .context_overflow_ceiling(),
+            Some(200_000)
+        );
+        // No ceiling stated → the caller keeps its own window rather than
+        // adopting a number that was never claimed.
+        assert_eq!(
+            context_overflow_ceiling_tokens("context length exceeded"),
+            None
+        );
+        assert_eq!(context_overflow_ceiling_tokens("a > b maximum"), None);
+        assert_eq!(
+            context_overflow_ceiling_tokens("saw 5 > 3 results"),
+            None,
+            "a bare comparison must not be mistaken for a token ceiling"
+        );
+        assert_eq!(context_overflow_ceiling_tokens("> 0 maximum"), None);
     }
 
     #[test]

@@ -528,6 +528,14 @@ struct SessionLoopChannels<'a> {
     agent_rx: &'a mut mpsc::UnboundedReceiver<AgentCompletion>,
 }
 
+/// An OAuth sign-in still waiting on the browser, and the handle needed to
+/// retire it when the user starts another one. Held only so a second `/login`
+/// can free the callback port the first one owns.
+struct PendingLogin {
+    cancel: crate::auth::LoginCancel,
+    handle: std::thread::JoinHandle<()>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SubmissionOrigin {
     Local,
@@ -593,6 +601,11 @@ async fn run_session_loop(
     // report names it and the thread outlives the dispatch that started it.
     // One slot: a second sign-in cannot start while one holds the callback port.
     let (login_tx, mut login_rx) = mpsc::channel::<(String, Result<(), String>)>(1);
+    // The sign-in that currently owns the loopback callback port, if any. A
+    // second `/login` cancels it rather than failing on "callback port is
+    // already in use" — an abandoned browser round-trip otherwise held the port
+    // for the full three-minute deadline.
+    let mut pending_login: Option<PendingLogin> = None;
     // A single slot deliberately collapses repeated copy actions until the
     // native helper has completed. Never replace a live operation: dropping its
     // JoinHandle would detach an already-running `pbcopy` process.
@@ -1256,15 +1269,33 @@ async fn run_session_loop(
                         // painting while the browser round-trip is outstanding.
                         if let Some(provider) = app.take_pending_oauth_login() {
                             let tx = login_tx.clone();
-                            std::thread::spawn(move || {
-                                let result = crate::auth::run_login_provider(&provider)
+                            // Retiring the previous sign-in happens on the NEW
+                            // thread, never here: signalling is instant but the
+                            // old wait may be mid-token-exchange, and joining it
+                            // on the render thread would reintroduce exactly the
+                            // freeze this design removed.
+                            let superseded = pending_login.take();
+                            let cancel = crate::auth::LoginCancel::default();
+                            let handle = std::thread::spawn({
+                                let cancel = cancel.clone();
+                                move || {
+                                    if let Some(superseded) = superseded {
+                                        superseded.cancel.cancel();
+                                        let _ = superseded.handle.join();
+                                    }
+                                    let result = crate::auth::run_login_provider_cancellable(
+                                        &provider, &cancel,
+                                    )
                                     .map_err(|error| error.to_string());
-                                // Blocking send from a non-async thread; the
-                                // single slot is free unless a previous outcome
-                                // is still unread, in which case waiting is
-                                // right — the report must not be dropped.
-                                let _ = tx.blocking_send((provider, result));
+                                    // Blocking send from a non-async thread; the
+                                    // single slot is free unless a previous
+                                    // outcome is still unread, in which case
+                                    // waiting is right — the report must not be
+                                    // dropped.
+                                    let _ = tx.blocking_send((provider, result));
+                                }
                             });
+                            pending_login = Some(PendingLogin { cancel, handle });
                         }
                         if should_quit {
                             // A restart returns `should_quit` too, but with a

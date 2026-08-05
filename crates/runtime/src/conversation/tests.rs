@@ -2365,6 +2365,46 @@ fn runtime_context_window_tracks_feature_config_model() {
 }
 
 #[test]
+fn adopting_a_provider_ceiling_shrinks_every_threshold_and_never_grows_them() {
+    let _env = crate::test_env_lock();
+    let restore = std::env::var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS").ok();
+    std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS");
+
+    // An Opus session: 1M declared window → 80% full-compaction threshold.
+    let mut runtime = ConversationRuntime::new_with_features(
+        Session::new(),
+        NoopApiClient,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["base prompt".to_string()],
+        &RuntimeFeatureConfig::default().with_model("opus"),
+    );
+    assert_eq!(runtime.context_window(), 1_000_000);
+    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 800_000);
+
+    // The provider then rejects a 211k prompt with `> 200000 maximum`. Every
+    // threshold was derived from a window five times the real ceiling, so
+    // nothing could ever have compacted before the wall — adopting the stated
+    // number is what re-arms them.
+    assert!(runtime.adopt_provider_context_ceiling(200_000));
+    assert_eq!(runtime.context_window(), 200_000);
+    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 160_000);
+
+    // Shrink-only: a provider (or a proxy) reporting a larger ceiling must never
+    // talk this session back into overflowing, and re-reporting the same one is
+    // not a change.
+    assert!(!runtime.adopt_provider_context_ceiling(1_000_000));
+    assert!(!runtime.adopt_provider_context_ceiling(200_000));
+    assert!(!runtime.adopt_provider_context_ceiling(0));
+    assert_eq!(runtime.context_window(), 200_000);
+
+    match restore {
+        Some(value) => std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", value),
+        None => std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS"),
+    }
+}
+
+#[test]
 fn set_context_window_redrives_compaction_threshold_on_model_switch() {
     let _env = crate::test_env_lock();
     let restore = std::env::var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS").ok();

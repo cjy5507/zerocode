@@ -40,7 +40,63 @@ pub(crate) fn default_oauth_config() -> OAuthConfig {
     api::claude_code_oauth_config()
 }
 
+/// Cancellation for a sign-in that is still waiting on the browser.
+///
+/// One sign-in owns the loopback callback port for as long as it waits — up to
+/// [`OAUTH_CALLBACK_TIMEOUT`]. Asking for another one while the first is
+/// outstanding used to fail the *new* attempt with "callback port is already in
+/// use": the abandoned wait held the port and the user had to sit out three
+/// minutes. Pressing sign-in again means "I gave up on that one", so the host
+/// cancels the previous wait and the port comes free.
+#[derive(Clone, Default)]
+pub(crate) struct LoginCancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl LoginCancel {
+    pub(crate) fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 pub(crate) fn run_login_provider(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
+    run_login_provider_cancellable(provider, &LoginCancel::default())
+}
+
+/// [`run_login_provider`] whose callback wait can be abandoned by the host.
+pub(crate) fn run_login_provider_cancellable(
+    provider: &str,
+    cancel: &LoginCancel,
+) -> Result<(), Box<dyn std::error::Error>> {
+    CURRENT_LOGIN_CANCEL.with(|slot| *slot.borrow_mut() = Some(cancel.clone()));
+    let result = dispatch_login_provider(provider);
+    CURRENT_LOGIN_CANCEL.with(|slot| *slot.borrow_mut() = None);
+    result
+}
+
+thread_local! {
+    /// The cancellation token for the sign-in running on THIS thread.
+    ///
+    /// Thread-local rather than a parameter threaded through five provider
+    /// flows and their token exchanges: each sign-in runs start-to-finish on one
+    /// thread, so the token's scope is exactly this thread's call stack — and a
+    /// parameter would have to be carried past four functions that have no other
+    /// reason to know about cancellation.
+    static CURRENT_LOGIN_CANCEL: std::cell::RefCell<Option<LoginCancel>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn login_cancelled() -> bool {
+    CURRENT_LOGIN_CANCEL.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(LoginCancel::is_cancelled)
+    })
+}
+
+fn dispatch_login_provider(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
     match provider {
         "claude" | "anthropic" => run_login_claude(),
         "openai" | "gpt" | "codex" => run_login_openai_oauth(),
@@ -537,6 +593,15 @@ impl OAuthCallbackListeners {
                     Err(error) => return Err(error),
                 }
             }
+            // The host asked for a newer sign-in. Return now so the listeners
+            // drop and the callback port is free for it, instead of squatting
+            // the port for the rest of the deadline.
+            if login_cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "oauth sign-in superseded by a newer one",
+                ));
+            }
             if started.elapsed() >= OAUTH_CALLBACK_TIMEOUT {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -1027,6 +1092,44 @@ mod tests {
             declared,
             body.len(),
             "a mismatched content-length leaves the browser waiting on a page that never completes"
+        );
+    }
+
+    /// A sign-in owns the callback port for the whole three-minute deadline, so
+    /// starting another one used to fail with "callback port is already in use"
+    /// — the user had to wait out an attempt they had already abandoned.
+    /// Cancelling has to return promptly AND release the port.
+    #[test]
+    fn a_cancelled_sign_in_releases_the_callback_port() {
+        let _guard = socket_test_lock();
+        let cancel = super::LoginCancel::default();
+        cancel.cancel();
+        super::CURRENT_LOGIN_CANCEL.with(|slot| *slot.borrow_mut() = Some(cancel));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind a callback listener");
+        listener.set_nonblocking(true).expect("poll for accept");
+        let port = listener.local_addr().expect("listener address").port();
+        let listeners = OAuthCallbackListeners {
+            listeners: vec![listener],
+        };
+
+        let started = std::time::Instant::now();
+        let error = listeners
+            .wait()
+            .expect_err("a cancelled sign-in must stop waiting");
+        super::CURRENT_LOGIN_CANCEL.with(|slot| *slot.borrow_mut() = None);
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "cancellation must not wait out the callback deadline"
+        );
+        assert!(
+            error.to_string().contains("superseded"),
+            "the reason has to distinguish this from a real timeout: {error}"
+        );
+        assert!(
+            TcpListener::bind(("127.0.0.1", port)).is_ok(),
+            "the newer sign-in has to be able to take the port"
         );
     }
 

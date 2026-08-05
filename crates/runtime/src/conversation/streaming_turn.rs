@@ -901,6 +901,16 @@ where
                                     == Some(crate::ProviderErrorClass::ContextOverflow)
                             {
                                 provider_overflow_recovery_attempted = true;
+                                // Learn the wire's real ceiling before compacting
+                                // (see `adopt_provider_context_ceiling`): this
+                                // session's thresholds are otherwise derived from
+                                // a window the provider does not honor, and the
+                                // next turn rebuilds to the same oversized shape.
+                                if let Some(ceiling) =
+                                    ::api::context_overflow_ceiling_tokens(&error.to_string())
+                                {
+                                    self.adopt_provider_context_ceiling(ceiling);
+                                }
                                 if let Some(event) = self
                                     .recover_provider_context_overflow_streaming(
                                         &render_tx, &id_gen,
@@ -986,6 +996,16 @@ where
                                     == Some(crate::ProviderErrorClass::ContextOverflow)
                             {
                                 provider_overflow_recovery_attempted = true;
+                                // Learn the wire's real ceiling before compacting
+                                // (see `adopt_provider_context_ceiling`): this
+                                // session's thresholds are otherwise derived from
+                                // a window the provider does not honor, and the
+                                // next turn rebuilds to the same oversized shape.
+                                if let Some(ceiling) =
+                                    ::api::context_overflow_ceiling_tokens(&error.to_string())
+                                {
+                                    self.adopt_provider_context_ceiling(ceiling);
+                                }
                                 if let Some(event) = self
                                     .recover_provider_context_overflow_streaming(
                                         &render_tx, &id_gen,

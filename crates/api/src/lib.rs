@@ -16,7 +16,7 @@ pub use client::{
     read_xai_base_url, resolve_saved_oauth_token, resolve_startup_auth_source,
 };
 pub use core_types::{RateLimitSnapshot, RateLimitWindow, RateLimitWindowKind};
-pub use error::{ApiError, CapacityScope, ProviderErrorClass};
+pub use error::{ApiError, CapacityScope, ProviderErrorClass, context_overflow_ceiling_tokens};
 pub use prompt_cache::{
     doctor_cache_summary, read_break_ledger, read_sweep_marker, CacheBreakEvent,
     CacheBreakLedgerRow, NoAxisBreakCause, PromptCache, PromptCacheConfig,

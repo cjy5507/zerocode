@@ -827,6 +827,36 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
         self.apply_auto_compaction(config)
     }
 
+    /// Adopt a prompt ceiling the provider stated while rejecting a request, when
+    /// it is smaller than the window this session was configured with.
+    ///
+    /// The configured window comes from a catalog row or a name-shape guess, and
+    /// neither can know that an account, tier, or route serves less. When it
+    /// guesses high, EVERY threshold derived from it — microcompact, state
+    /// distillation, precompaction, full compaction, the hard ceiling — sits above
+    /// what the wire will accept, so nothing fires proactively and the only signal
+    /// is a 400. Measured: a sub-agent on a model declared at 1M was rejected at
+    /// 211,352 tokens with `> 200000 maximum`, i.e. a wall at 20% of the window
+    /// every threshold was computed from.
+    ///
+    /// Recovering from the rejection is not enough on its own: without adopting the
+    /// number, the very next turn rebuilds to the same oversized shape and pays the
+    /// same round-trip. Learning it once turns a recurring wall into a one-time
+    /// correction — and it only ever shrinks, so a provider that reports a *larger*
+    /// ceiling can never talk this session into overflowing.
+    pub(super) fn adopt_provider_context_ceiling(&mut self, ceiling: u64) -> bool {
+        if ceiling == 0 || (self.context_window > 0 && self.context_window <= ceiling) {
+            return false;
+        }
+        let previous = self.context_window;
+        self.set_context_window(ceiling);
+        eprintln!(
+            "[zo] provider capped the prompt at {ceiling} tokens (this session assumed {previous}); \
+             compaction thresholds re-derived from the real ceiling."
+        );
+        true
+    }
+
     pub(super) fn maybe_auto_compact_preflight(&mut self) -> Option<AutoCompactionEvent> {
         let config = self.auto_compaction_config_if_preflight_ready()?;
         self.apply_auto_compaction(config)
