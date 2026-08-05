@@ -850,7 +850,7 @@ where
                         verifier_rate_limit_retry_cap,
                         |attempt, error: &RuntimeError| {
                             if let Some(model) = rate_limit_model.as_deref() {
-                                crate::retry::mark_foreground_rate_limit(
+                                crate::retry::mark_foreground_capacity_stall(
                                     model,
                                     &error.to_string(),
                                     attempt,

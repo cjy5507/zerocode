@@ -1283,6 +1283,13 @@ async fn run_session_loop(
                         let perm_gate = install_automation_permission_gate(cli, &trimmed);
                         let remote_approval = remote.approval_shared();
                         let turn_generation = remote.set_turn(TurnPhase::Running);
+                        // Kept for the failure path below: a first-iteration turn
+                        // failure rolls the undelivered user message back out of the
+                        // transcript (the runtime cannot leave an orphan message the
+                        // next request would re-send), so without this the text is
+                        // simply gone — and the failures most likely to land here are
+                        // exactly the ones worth resubmitting (a capacity refusal).
+                        let submitted_text = trimmed.clone();
                         let outcome = Box::pin(run_live_turn_with_images(
                             cli,
                             app,
@@ -1334,6 +1341,14 @@ async fn run_session_loop(
                                 // mis-attribute it to the goal.
                                 cli.goal_turn_pending = false;
                                 push_report(app, ids, SystemLevel::Error, format!("{err}"));
+                                // Put the prompt back in the composer so a failure
+                                // the user can act on (switch model, wait, retry)
+                                // costs one keypress instead of retyping. Only when
+                                // the composer is empty: anything typed while the
+                                // turn ran is newer and must not be clobbered.
+                                if app.input_text().trim().is_empty() {
+                                    app.set_input_text(&submitted_text);
+                                }
                                 app.draw_frame(terminal)?;
                                 continue;
                             }

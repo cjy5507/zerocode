@@ -55,7 +55,19 @@ pub fn provider_error_class_metadata(
     provider_error_class: api::ProviderErrorClass,
 ) -> serde_json::Value {
     let label = match provider_error_class {
-        api::ProviderErrorClass::RateLimit { .. } => "rateLimit",
+        // The scope rides the label so the parent can tell a sub-agent's account
+        // throttle (ride it out) from a provider overload (escape to a lighter
+        // model). A pre-scope `"rateLimit"` from an older peer still decodes, as
+        // the account case — the conservative direction, since reading a 429 as an
+        // overload would swap models on a window every model here shares.
+        api::ProviderErrorClass::RateLimit {
+            scope: api::CapacityScope::Account,
+            ..
+        } => "rateLimit",
+        api::ProviderErrorClass::RateLimit {
+            scope: api::CapacityScope::Provider,
+            ..
+        } => "providerOverloaded",
         api::ProviderErrorClass::Transient => "transient",
         api::ProviderErrorClass::AuthExpired => "authExpired",
         api::ProviderErrorClass::ContextOverflow => "contextOverflow",
@@ -77,7 +89,8 @@ pub fn provider_error_class_from_completion(
         .get(PROVIDER_ERROR_CLASS_FIELD)?
         .as_str()?;
     match value {
-        "rateLimit" => Some(api::ProviderErrorClass::RateLimit { retry_after: None }),
+        "rateLimit" => Some(api::ProviderErrorClass::account_rate_limit(None)),
+        "providerOverloaded" => Some(api::ProviderErrorClass::provider_overloaded(None)),
         "transient" => Some(api::ProviderErrorClass::Transient),
         "authExpired" => Some(api::ProviderErrorClass::AuthExpired),
         "contextOverflow" => Some(api::ProviderErrorClass::ContextOverflow),
@@ -86,6 +99,58 @@ pub fn provider_error_class_from_completion(
         "safetyBlocked" => Some(api::ProviderErrorClass::SafetyBlocked),
         "nonRetryable" => Some(api::ProviderErrorClass::NonRetryable),
         _ => None,
+    }
+}
+
+/// The sub-agent → parent wire label must round-trip the capacity **scope**.
+///
+/// The parent reacts to these two capacity classes in opposite ways (ride the
+/// window out vs escape to a lighter model), so collapsing both onto `"rateLimit"`
+/// would silently downgrade every sub-agent overload into an account throttle at
+/// the process boundary.
+#[cfg(test)]
+mod provider_error_class_wire_tests {
+    use super::{
+        provider_error_class_from_completion, provider_error_class_metadata, AgentCompletion,
+    };
+
+    fn completion_with(structured: serde_json::Value) -> AgentCompletion {
+        AgentCompletion {
+            agent_id: "agent-1".to_string(),
+            name: "probe".to_string(),
+            status: "failed".to_string(),
+            result: None,
+            structured: Some(structured),
+            error: None,
+            output_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn capacity_scope_round_trips_through_the_completion_metadata() {
+        for class in [
+            api::ProviderErrorClass::account_rate_limit(None),
+            api::ProviderErrorClass::provider_overloaded(None),
+            api::ProviderErrorClass::Transient,
+            api::ProviderErrorClass::NonRetryable,
+        ] {
+            let encoded = provider_error_class_metadata(class);
+            let decoded = provider_error_class_from_completion(&completion_with(encoded))
+                .expect("every emitted label must decode");
+            assert_eq!(decoded, class, "round-trip lost information for {class:?}");
+        }
+    }
+
+    /// Forward compatibility in the safe direction: a peer built before the split
+    /// emits the bare `"rateLimit"`, which decodes as the account scope. Guessing
+    /// "overload" there would swap models on a window they all share.
+    #[test]
+    fn legacy_rate_limit_label_decodes_as_the_account_scope() {
+        let decoded = provider_error_class_from_completion(&completion_with(
+            serde_json::json!({ "providerErrorClass": "rateLimit" }),
+        ))
+        .expect("legacy label still decodes");
+        assert_eq!(decoded, api::ProviderErrorClass::account_rate_limit(None));
     }
 }
 

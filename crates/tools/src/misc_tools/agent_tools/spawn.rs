@@ -2293,7 +2293,7 @@ mod tests {
     fn spawned_agent_provider_error_metadata_preserves_partial_payload() {
         let structured = completion_structured_with_provider_error_class(
             Some(serde_json::json!({"partial": "preserved"})),
-            Some(api::ProviderErrorClass::RateLimit { retry_after: None }),
+            Some(api::ProviderErrorClass::account_rate_limit(None)),
         )
         .expect("provider metadata should be attached");
 

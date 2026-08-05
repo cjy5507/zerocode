@@ -2508,9 +2508,7 @@ mod oauth_refresh_tests {
         assert!(runtime_error_is_retryable(
             &RuntimeError::with_provider_error_class(
                 "429",
-                api::ProviderErrorClass::RateLimit {
-                    retry_after: Some(Duration::from_secs(2)),
-                },
+                api::ProviderErrorClass::account_rate_limit(Some(Duration::from_secs(2))),
             )
         ));
         assert!(runtime_error_is_retryable(
@@ -2602,9 +2600,7 @@ mod oauth_refresh_tests {
 
         let error = RuntimeError::with_provider_error_class(
             "429 rate limited",
-            api::ProviderErrorClass::RateLimit {
-                retry_after: Some(Duration::from_secs(3)),
-            },
+            api::ProviderErrorClass::account_rate_limit(Some(Duration::from_secs(3))),
         );
         let outcome = NeutralRequestOutcome::Failed {
             error: error.to_string(),

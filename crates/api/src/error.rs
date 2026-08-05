@@ -51,9 +51,35 @@ pub enum ApiError {
     },
 }
 
+/// Whose capacity ran out behind a [`ProviderErrorClass::RateLimit`].
+///
+/// The two answers demand opposite recoveries, so every layer that reacts to a
+/// capacity stall has to be able to tell them apart. See
+/// [`core_types::retry_signal::RetrySignal`] for the same distinction on the
+/// flattened-display path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityScope {
+    /// **This account's** window is exhausted — HTTP 429 / `rate_limit_error`.
+    /// Only time lifts it, and every model on this provider shares the window,
+    /// so a swap inside the provider just moves the 429.
+    Account,
+    /// **The provider** shed the request for its own capacity — HTTP 529 /
+    /// `overloaded_error`. Independent of the account window (it fires at 2 %
+    /// utilization), usually clears in seconds, and a lighter model or another
+    /// provider is the recovery that actually works.
+    Provider,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderErrorClass {
-    RateLimit { retry_after: Option<Duration> },
+    /// A capacity refusal. `scope` decides the recovery: ride the window out
+    /// ([`CapacityScope::Account`]) or escape to another model
+    /// ([`CapacityScope::Provider`]). Existing `RateLimit { .. }` matches keep
+    /// working — they only ask "was this capacity?", which both scopes answer.
+    RateLimit {
+        retry_after: Option<Duration>,
+        scope: CapacityScope,
+    },
     Transient,
     AuthExpired,
     ContextOverflow,
@@ -61,6 +87,54 @@ pub enum ProviderErrorClass {
     InvalidToolSchema,
     SafetyBlocked,
     NonRetryable,
+}
+
+impl ProviderErrorClass {
+    /// Convenience constructor for an account-window refusal (429).
+    #[must_use]
+    pub const fn account_rate_limit(retry_after: Option<Duration>) -> Self {
+        Self::RateLimit {
+            retry_after,
+            scope: CapacityScope::Account,
+        }
+    }
+
+    /// Convenience constructor for a provider-capacity refusal (529).
+    #[must_use]
+    pub const fn provider_overloaded(retry_after: Option<Duration>) -> Self {
+        Self::RateLimit {
+            retry_after,
+            scope: CapacityScope::Provider,
+        }
+    }
+
+    /// Whose capacity ran out, or `None` when this is not a capacity refusal.
+    #[must_use]
+    pub const fn capacity_scope(self) -> Option<CapacityScope> {
+        match self {
+            Self::RateLimit { scope, .. } => Some(scope),
+            Self::Transient
+            | Self::AuthExpired
+            | Self::ContextOverflow
+            | Self::InvalidToolProtocol
+            | Self::InvalidToolSchema
+            | Self::SafetyBlocked
+            | Self::NonRetryable => None,
+        }
+    }
+
+    /// True when the refusal is the *provider* shedding load rather than this
+    /// account's window being spent.
+    #[must_use]
+    pub const fn is_provider_overload(self) -> bool {
+        matches!(
+            self,
+            Self::RateLimit {
+                scope: CapacityScope::Provider,
+                ..
+            }
+        )
+    }
 }
 
 /// Whether a `reqwest` failure is a transport hiccup rather than a verdict the
@@ -205,12 +279,14 @@ impl ApiError {
                     }
                     return ProviderErrorClass::AuthExpired;
                 }
-                if status.as_u16() == 429
-                    || status.as_u16() == 529
-                    || parts.iter().flatten().any(|part| is_rate_limit_part(part))
+                // Status first, wording second: 429 and 529 are unambiguous about
+                // whose capacity ran out, and only a status-less relay error has
+                // to be read from prose.
+                if let Some(scope) = capacity_scope_of(Some(status.as_u16()), parts.iter().copied())
                 {
                     return ProviderErrorClass::RateLimit {
                         retry_after: *retry_after,
+                        scope,
                     };
                 }
                 // 413 by STATUS, ahead of the text classifier: the body is the
@@ -245,8 +321,15 @@ impl ApiError {
                     message.as_deref(),
                     Some(body.as_str()),
                 ];
-                if parts.iter().flatten().any(|part| is_rate_limit_part(part)) {
-                    return ProviderErrorClass::RateLimit { retry_after: None };
+                // An SSE `error` frame rides an HTTP 200, so there is no status to
+                // read: the frame's own `type` (`overloaded_error` vs
+                // `rate_limit_error`) is the scope evidence. This is the seam the
+                // "hi 쳤는데 Overloaded" turn came through.
+                if let Some(scope) = capacity_scope_of(None, parts.iter().copied()) {
+                    return ProviderErrorClass::RateLimit {
+                        retry_after: None,
+                        scope,
+                    };
                 }
                 if let Some(class) = classify_provider_error_text(parts.into_iter().flatten()) {
                     return class;
@@ -306,7 +389,7 @@ impl ApiError {
                 // wording is recognised everywhere at once. The structured `Api`
                 // arm above still classifies from the HTTP status code directly.
                 haystack.into_iter().any(|part| {
-                    core_types::retry_signal::is_rate_limit_text(&part.to_ascii_lowercase())
+                    core_types::retry_signal::is_capacity_text(&part.to_ascii_lowercase())
                 })
             }
             Self::RetriesExhausted { last_error, .. } => last_error.is_rate_limit(),
@@ -368,8 +451,34 @@ impl ApiError {
     }
 }
 
-fn is_rate_limit_part(part: &str) -> bool {
-    core_types::retry_signal::is_rate_limit_text(&part.to_ascii_lowercase())
+/// Classify a refusal into a [`CapacityScope`], or `None` when it is not a
+/// capacity refusal at all.
+///
+/// `status` is the HTTP status when one exists (the non-stream path); an SSE
+/// `error` frame has none, so it passes `None` and is judged purely on the
+/// frame's `type`/`message`/`body` wording. The account arm is checked first for
+/// the same reason [`core_types::retry_signal::classify_error_text`] does it:
+/// reading a real 429 as an overload would swap models on an exhausted account,
+/// where the swap target shares the window and 429s too.
+fn capacity_scope_of<'a>(
+    status: Option<u16>,
+    parts: impl IntoIterator<Item = Option<&'a str>>,
+) -> Option<CapacityScope> {
+    if status == Some(429) {
+        return Some(CapacityScope::Account);
+    }
+    if status == Some(529) {
+        return Some(CapacityScope::Provider);
+    }
+    let mut overloaded = false;
+    for part in parts.into_iter().flatten() {
+        let lower = part.to_ascii_lowercase();
+        if core_types::retry_signal::is_account_rate_limit_text(&lower) {
+            return Some(CapacityScope::Account);
+        }
+        overloaded = overloaded || core_types::retry_signal::is_overloaded_text(&lower);
+    }
+    overloaded.then_some(CapacityScope::Provider)
 }
 
 /// True when a 401 body signals that the *client itself* was rejected — the
@@ -439,6 +548,20 @@ fn classify_provider_error_text<'a>(
     }
     None
 }
+
+/// Explanation appended to every provider-capacity refusal (HTTP 529 and the
+/// `overloaded_error` SSE frame), shared by both [`Display`] arms so the two
+/// surfaces describing one wall can never word it differently.
+///
+/// The wording names the *scope* on purpose: the reflex on seeing this line was
+/// "my rate limit", and the measurement said otherwise (2 % of the account
+/// window used while every Opus request was shed). Reaching this text also means
+/// the automatic recovery is spent — the stream re-opened itself pre-commit and,
+/// if a fallback model is configured, the turn already tried escaping to it.
+const PROVIDER_CAPACITY_HINT: &str = "
+
+  Provider capacity issue — the PROVIDER shed this request. This is NOT your account's rate limit (it fires with the window nearly empty) and NOT a local permission or workspace-trust failure.
+  zo already re-opened the stream and, when a fallback model is configured, tried escaping to it. The fastest way through is a lighter model (/model sonnet) or a lower /effort; capacity usually frees up within seconds to minutes.";
 
 impl Display for ApiError {
     #[allow(
@@ -536,6 +659,13 @@ impl Display for ApiError {
                         )?;
                     }
                 }
+                // A 529 is the provider shedding load. The same explanation the
+                // streaming arm gives applies verbatim, so both read from one
+                // const — the two arms describing the same wall differently is
+                // how a user learns to distrust the message.
+                if status.as_u16() == 529 {
+                    write!(f, "{PROVIDER_CAPACITY_HINT}")?;
+                }
                 // A 413 rejects the request's BYTE size, which is a different
                 // ceiling from the model's context window — a turn can sit well
                 // inside its token budget and still be refused. Reaching this
@@ -559,12 +689,7 @@ impl Display for ApiError {
                 (Some(error_type), Some(message)) => {
                     write!(f, "api stream error ({error_type}): {message}")?;
                     if error_type == "overloaded_error" {
-                        write!(
-                            f,
-                            "
-
-  Provider capacity issue — this is not a local permission or workspace-trust failure. Wait and retry, or switch to a lighter/fallback model."
-                        )?;
+                        write!(f, "{PROVIDER_CAPACITY_HINT}")?;
                     }
                     Ok(())
                 }
@@ -912,8 +1037,12 @@ mod tests {
         };
         let rendered = error.to_string();
         assert!(rendered.contains("Provider capacity issue"));
-        assert!(rendered.contains("not a local permission or workspace-trust failure"));
+        // The message has to name the SCOPE, not just the symptom: the reflex on
+        // reading it was "my rate limit", while the account window was 2 % used.
+        assert!(rendered.contains("NOT your account's rate limit"));
+        assert!(rendered.contains("workspace-trust failure"));
         assert!(error.is_retryable());
+        assert!(error.provider_error_class().is_provider_overload());
     }
 
     #[test]
@@ -955,8 +1084,12 @@ mod tests {
         }
     }
 
+    /// Both statuses are capacity refusals, but they name **different** windows:
+    /// 429 is this account's, 529 is the provider's. Every downstream reaction
+    /// (cool-down ladder, wall-clock budget, 95 %-utilization swap gate) branches
+    /// on that scope, so the classifier must not collapse them.
     #[test]
-    fn provider_error_classifies_429_and_529_as_rate_limit() {
+    fn provider_error_scopes_429_to_the_account_and_529_to_the_provider() {
         let rate_limit = ApiError::Api {
             status: StatusCode::TOO_MANY_REQUESTS,
             error_type: Some("rate_limit_error".to_string()),
@@ -967,9 +1100,7 @@ mod tests {
         };
         assert_eq!(
             rate_limit.provider_error_class(),
-            ProviderErrorClass::RateLimit {
-                retry_after: Some(Duration::from_secs(7)),
-            }
+            ProviderErrorClass::account_rate_limit(Some(Duration::from_secs(7)))
         );
         assert_eq!(
             api_error(
@@ -980,7 +1111,50 @@ mod tests {
                 true,
             )
             .provider_error_class(),
-            ProviderErrorClass::RateLimit { retry_after: None }
+            ProviderErrorClass::provider_overloaded(None)
+        );
+        assert!(
+            api_error(
+                StatusCode::from_u16(529).unwrap(),
+                Some("overloaded_error"),
+                Some("busy"),
+                "",
+                true,
+            )
+            .provider_error_class()
+            .is_provider_overload()
+        );
+    }
+
+    /// The reported failure: an `overloaded_error` SSE frame on an HTTP 200
+    /// stream, where there is no status to read and the frame's own type is the
+    /// only scope evidence. Mis-scoping it to the account is what let the
+    /// 95 %-utilization gate refuse the model swap that recovers the turn.
+    #[test]
+    fn streamed_overload_frame_scopes_to_the_provider() {
+        let streamed = ApiError::StreamApi {
+            error_type: Some("overloaded_error".to_string()),
+            message: Some("Overloaded".to_string()),
+            body: r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#
+                .to_string(),
+            retryable: true,
+        };
+        assert_eq!(
+            streamed.provider_error_class(),
+            ProviderErrorClass::provider_overloaded(None)
+        );
+        // Still a capacity signal for everything that only asks that much.
+        assert!(streamed.is_rate_limit());
+
+        let streamed_429 = ApiError::StreamApi {
+            error_type: Some("rate_limit_error".to_string()),
+            message: Some("This request would exceed your account's rate limit".to_string()),
+            body: String::new(),
+            retryable: true,
+        };
+        assert_eq!(
+            streamed_429.provider_error_class(),
+            ProviderErrorClass::account_rate_limit(None)
         );
     }
 
@@ -999,9 +1173,7 @@ mod tests {
         };
         assert_eq!(
             wrapped.provider_error_class(),
-            ProviderErrorClass::RateLimit {
-                retry_after: Some(Duration::from_secs(42)),
-            }
+            ProviderErrorClass::account_rate_limit(Some(Duration::from_secs(42)))
         );
     }
 

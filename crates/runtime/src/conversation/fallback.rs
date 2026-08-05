@@ -644,6 +644,20 @@ where
     ///    onto the fallback client whose own target model is correct).
     /// 3. **None** — no band match, fallback is below the Anthropic 95% gate,
     ///    or no fallback client is installed.
+    ///
+    /// Both account-scoped steps are **skipped for a provider overload**
+    /// ([`api::CapacityScope::Provider`]), because both ask a question about the
+    /// account's window that a 529 does not answer:
+    ///
+    /// * waiting for the window to reset is waiting on the wrong clock — capacity
+    ///   shedding is unrelated to it (and at low utilization the reset is hours
+    ///   away, so the band never matches anyway);
+    /// * the 95 %-utilization gate exists so a 429 at low utilization is read as
+    ///   burst pressure rather than an exhausted plan — correct for a throttle,
+    ///   exactly inverted for an overload. Measured on the reported turn: 2 %
+    ///   utilization, so the gate refused the swap and returned `None`, killing a
+    ///   turn whose own error text advised switching models. A lighter model on
+    ///   another provider was available and succeeded seconds later.
     pub(super) fn decide_quota_escape(&mut self, error: &RuntimeError) -> QuotaEscape {
         self.decide_quota_escape_with_gate(error, ::api::quota::quota_fallback_permitted)
     }
@@ -666,17 +680,25 @@ where
         if self.quota_fallback_active {
             return QuotaEscape::None;
         }
-        let Some(::api::ProviderErrorClass::RateLimit { retry_after }) =
-            error.provider_error_class()
+        let Some(::api::ProviderErrorClass::RateLimit {
+            retry_after,
+            scope,
+        }) = error.provider_error_class()
         else {
             return QuotaEscape::None;
         };
+        // Whose capacity ran out decides which of the two account-scoped steps
+        // below still make sense. See this function's doc comment: for a provider
+        // overload the answer is "neither" — the account window is not the wall,
+        // so waiting on its reset and gating on its utilization are both asking
+        // about the wrong thing, and the swap they block is the only recovery.
+        let account_window = matches!(scope, ::api::CapacityScope::Account);
         let main_provider = self
             .context_model
             .as_deref()
             .map(::api::detect_provider_kind);
         // Prefer holding on the main model when its wall lifts within the band.
-        if !self.quota_waited_this_turn && !self.quota_wait_band.is_zero() {
+        if account_window && !self.quota_waited_this_turn && !self.quota_wait_band.is_zero() {
             if let Some(provider) = main_provider {
                 if let Some(wait) = ::api::quota::reset_wait_within_band(
                     provider,
@@ -691,7 +713,7 @@ where
         // A blocked swap gets at most the one bounded wait above. If that wait
         // was unavailable or has already been consumed, end the turn normally
         // instead of creating an unbounded same-model retry loop.
-        if main_provider.is_some_and(|provider| !fallback_permitted(provider)) {
+        if account_window && main_provider.is_some_and(|provider| !fallback_permitted(provider)) {
             return QuotaEscape::None;
         }
         let Some((_, model)) = self.quota_fallback_client.as_ref() else {

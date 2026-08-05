@@ -152,16 +152,12 @@ mod tests {
     fn runtime_error_preserves_provider_error_class_without_changing_display() {
         let err = RuntimeError::with_provider_error_class(
             "api returned 429",
-            ProviderErrorClass::RateLimit {
-                retry_after: Some(Duration::from_secs(3)),
-            },
+            ProviderErrorClass::account_rate_limit(Some(Duration::from_secs(3))),
         );
         assert_eq!(err.to_string(), "api returned 429");
         assert_eq!(
             err.provider_error_class(),
-            Some(ProviderErrorClass::RateLimit {
-                retry_after: Some(Duration::from_secs(3)),
-            })
+            Some(ProviderErrorClass::account_rate_limit(Some(Duration::from_secs(3))))
         );
     }
 
@@ -181,12 +177,12 @@ mod tests {
     fn streaming_turn_error_keeps_existing_display_for_classified_runtime_error() {
         let err = StreamingTurnError::from(RuntimeError::with_provider_error_class(
             "provider transport: overloaded",
-            ProviderErrorClass::RateLimit { retry_after: None },
+            ProviderErrorClass::account_rate_limit(None),
         ));
         assert_eq!(err.to_string(), "runtime: provider transport: overloaded");
         assert_eq!(
             err.provider_error_class(),
-            Some(ProviderErrorClass::RateLimit { retry_after: None })
+            Some(ProviderErrorClass::account_rate_limit(None))
         );
     }
 }

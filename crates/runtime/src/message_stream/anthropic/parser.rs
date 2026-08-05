@@ -16,7 +16,7 @@ use api::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     MessageDeltaEvent, MessageStartEvent, OutputContentBlock, StreamEvent,
 };
-use core_types::retry_signal::is_rate_limit_text;
+use core_types::retry_signal::is_capacity_text;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -147,7 +147,7 @@ fn is_provider_emitted_error(msg: &str) -> bool {
     // vocabulary (`overloaded` / `rate limit` / 429 / 529) is shared with the
     // retry layer via `core_types::retry_signal` so a new overload wording is
     // recognised here and in the backoff classifier at the same time.
-    lower.contains("api stream error") || is_rate_limit_text(&lower)
+    lower.contains("api stream error") || is_capacity_text(&lower)
 }
 
 pub async fn parse_stream_async<S: EventSource>(

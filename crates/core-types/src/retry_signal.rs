@@ -25,15 +25,39 @@
 
 /// How a stringified provider error should be treated by a retry layer.
 ///
-/// Ordering is by escalation, not severity: a [`RateLimit`](Self::RateLimit)
-/// capacity stall is "more transient" than a generic [`Transient`](Self::Transient)
-/// blip in that it wants a *longer* backoff, while [`Fatal`](Self::Fatal) must
-/// fail fast (auth / validation errors that retrying can never fix).
+/// Ordering is by escalation, not severity: a capacity stall
+/// ([`RateLimit`](Self::RateLimit) / [`Overloaded`](Self::Overloaded)) is "more
+/// transient" than a generic [`Transient`](Self::Transient) blip in that it
+/// wants a *longer* backoff, while [`Fatal`](Self::Fatal) must fail fast
+/// (auth / validation errors that retrying can never fix).
+///
+/// The two capacity variants exist because **whose** capacity ran out decides
+/// what actually recovers the turn, and the two answers are opposites:
+///
+/// * [`RateLimit`](Self::RateLimit) — *this account's* window is squeezed
+///   (HTTP 429 / `rate_limit_error`). Only time helps; the same request on a
+///   different model of the same provider hits the same wall, so the honest
+///   move is to ride the window out.
+/// * [`Overloaded`](Self::Overloaded) — *the provider* shed the request
+///   (HTTP 529 / `overloaded_error`). The account's window is irrelevant — this
+///   fires at 2 % utilization — the window is seconds-to-minutes rather than the
+///   plan's hours, and a lighter model or another provider usually succeeds
+///   immediately. Riding it out on the same model is the one thing that does
+///   not work.
+///
+/// Collapsing them into one signal is what let a five-second provider hiccup
+/// spend a five-minute account-throttle budget and then refuse the model swap
+/// that would have worked (the "hi 쳤는데 Overloaded" turn death).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetrySignal {
-    /// A provider capacity signal — HTTP 429/529, an `overloaded_error`, or any
-    /// "rate limit" / "overloaded" wording. Retryable on the *longer* schedule.
+    /// This account's rate-limit window is exhausted — HTTP 429, a
+    /// `rate_limit_error`, or "too many requests" / "rate limit" wording.
+    /// Retryable on the *longer* schedule, and only time lifts it.
     RateLimit,
+    /// The provider shed the request for its own capacity — HTTP 529 or an
+    /// `overloaded_error`. Retryable on the *longer* schedule, but briefly:
+    /// switching to a lighter model or another provider is the real recovery.
+    Overloaded,
     /// A transient non-capacity failure — a 5xx or a connection/timeout drop.
     /// Retryable on the *standard* backoff schedule.
     Transient,
@@ -42,32 +66,71 @@ pub enum RetrySignal {
 }
 
 impl RetrySignal {
-    /// True when the signal warrants a retry at all (rate-limit or transient).
+    /// True when the signal warrants a retry at all (capacity or transient).
     #[must_use]
     pub const fn is_retryable(self) -> bool {
-        matches!(self, Self::RateLimit | Self::Transient)
+        matches!(self, Self::RateLimit | Self::Overloaded | Self::Transient)
     }
 
-    /// True for a provider capacity signal (429 / 529 / overloaded / rate limit).
+    /// True for any provider capacity signal (429 / 529 / overloaded / rate
+    /// limit) — i.e. "back off on the longer schedule". Callers that must know
+    /// *whose* capacity ran out use [`Self::is_rate_limit`] /
+    /// [`Self::is_overloaded`] instead.
+    #[must_use]
+    pub const fn is_capacity(self) -> bool {
+        matches!(self, Self::RateLimit | Self::Overloaded)
+    }
+
+    /// True only for an **account-window** stall (429). Deliberately false for
+    /// [`Self::Overloaded`]: a provider overload must not stamp this account's
+    /// throttle state or wait out its window.
     #[must_use]
     pub const fn is_rate_limit(self) -> bool {
         matches!(self, Self::RateLimit)
     }
+
+    /// True only for a **provider-capacity** stall (529 / `overloaded_error`).
+    #[must_use]
+    pub const fn is_overloaded(self) -> bool {
+        matches!(self, Self::Overloaded)
+    }
 }
 
-/// True when the lowercased error text carries a provider *capacity* signal:
-/// HTTP 429 or 529, or any "overloaded" / "rate limit" wording.
+/// True when the lowercased error text says **this account's** window is
+/// squeezed: HTTP 429, or "rate limit" / "too many requests" wording.
+///
+/// Deliberately excludes 529 / "overloaded" — see [`is_overloaded_text`].
 ///
 /// `lower` MUST already be ASCII-lowercased by the caller (see
 /// [`classify_error_text`], which lowercases once and reuses the result).
 #[must_use]
-pub fn is_rate_limit_text(lower: &str) -> bool {
+pub fn is_account_rate_limit_text(lower: &str) -> bool {
     lower.contains("429")
-        || lower.contains("529")
         || lower.contains("rate limit")
         || lower.contains("rate_limit")
         || lower.contains("too many requests")
-        || lower.contains("overloaded")
+}
+
+/// True when the lowercased error text says **the provider** shed the request
+/// for its own capacity: HTTP 529 or an `overloaded_error` / "overloaded".
+///
+/// `lower` MUST already be ASCII-lowercased by the caller.
+#[must_use]
+pub fn is_overloaded_text(lower: &str) -> bool {
+    lower.contains("529") || lower.contains("overloaded")
+}
+
+/// True when the lowercased error text carries *either* capacity signal — the
+/// umbrella predicate for "back off longer / this is not a hard failure".
+///
+/// Use this where only "is it capacity?" matters (backoff schedule, provider-
+/// emitted-frame detection). Where the *scope* changes the recovery, classify
+/// with [`classify_error_text`] and branch on the variant instead.
+///
+/// `lower` MUST already be ASCII-lowercased by the caller.
+#[must_use]
+pub fn is_capacity_text(lower: &str) -> bool {
+    is_account_rate_limit_text(lower) || is_overloaded_text(lower)
 }
 
 /// True when a lowercased error says the request BODY was too big to accept —
@@ -145,6 +208,12 @@ pub fn is_transient_text(lower: &str) -> bool {
 /// [`RetrySignal`]. Lowercases once, then applies the shared vocabulary:
 /// capacity signals win over generic transient signals, and anything matching
 /// neither is [`RetrySignal::Fatal`].
+///
+/// Within the capacity arms the **account** window wins over the overload
+/// wording when a message somehow carries both. That direction is deliberate:
+/// mis-reading a real 429 as an overload would swap models on an exhausted
+/// account (the swap target shares the account and 429s too), whereas the
+/// reverse mistake only costs one extra same-model retry.
 #[must_use]
 pub fn classify_error_text(error_message: &str) -> RetrySignal {
     let lower = error_message.to_ascii_lowercase();
@@ -156,8 +225,10 @@ pub fn classify_error_text(error_message: &str) -> RetrySignal {
     // so `Fatal` is the honest answer.
     if is_request_too_large_text(&lower) {
         RetrySignal::Fatal
-    } else if is_rate_limit_text(&lower) {
+    } else if is_account_rate_limit_text(&lower) {
         RetrySignal::RateLimit
+    } else if is_overloaded_text(&lower) {
+        RetrySignal::Overloaded
     } else if is_transient_text(&lower) {
         RetrySignal::Transient
     } else {
@@ -257,13 +328,15 @@ pub fn parse_quota_fallback_model(text: &str) -> Option<&str> {
 /// wording in the same file as the classifier so it never drifts out of sync.
 #[must_use]
 pub fn retry_notice_label(error_message: &str) -> &'static str {
-    let lower = error_message.to_ascii_lowercase();
-    if lower.contains("overloaded") {
-        "provider overloaded"
-    } else if is_rate_limit_text(&lower) {
-        "rate limited"
-    } else {
-        "transient provider error"
+    match classify_error_text(error_message) {
+        RetrySignal::Overloaded => "provider overloaded",
+        RetrySignal::RateLimit => "rate limited",
+        // A fatal error never reaches a "retrying in Ns" row, so the remaining
+        // wording only has to cover the retryable non-capacity case. Deriving
+        // every label from the one classifier is what keeps the notice honest:
+        // the old independent `contains("overloaded")` here disagreed with the
+        // backoff arm the moment either list changed.
+        RetrySignal::Transient | RetrySignal::Fatal => "transient provider error",
     }
 }
 
@@ -274,22 +347,59 @@ mod tests {
         REFUSAL_FALLBACK_WARN, RetrySignal, classify_error_text, parse_quota_fallback_model,
     };
 
+    /// An **account-window** stall: only time lifts it, so it keeps the long
+    /// ride-it-out budget and must never trigger a same-account model swap.
     #[test]
-    fn capacity_signals_classify_as_rate_limit() {
+    fn account_window_signals_classify_as_rate_limit() {
         for msg in [
             "HTTP 429 Too Many Requests",
-            "overloaded_error: Overloaded",
             "rate_limit_error: rate limit exceeded",
-            "upstream OVERLOADED",
-            "api stream error (529)",
             "Too Many Requests",
+            "api returned 429 Too Many Requests (rate_limit_error): This request would exceed your account's rate limit.",
         ] {
             assert_eq!(
                 classify_error_text(msg),
                 RetrySignal::RateLimit,
-                "{msg:?} must be a rate-limit signal"
+                "{msg:?} must be an account rate-limit signal"
+            );
+            assert!(classify_error_text(msg).is_capacity());
+        }
+    }
+
+    /// A **provider-capacity** stall: the account window is irrelevant (this
+    /// fires at 2 % utilization), so it gets its own signal and, downstream, its
+    /// own short budget plus an immediate escape to a lighter model.
+    #[test]
+    fn provider_capacity_signals_classify_as_overloaded() {
+        for msg in [
+            "overloaded_error: Overloaded",
+            "upstream OVERLOADED",
+            "api stream error (529)",
+            "api stream error (overloaded_error): Overloaded",
+            "api returned 529 <unknown status code> (overloaded_error): Overloaded",
+        ] {
+            assert_eq!(
+                classify_error_text(msg),
+                RetrySignal::Overloaded,
+                "{msg:?} must be a provider-overload signal"
+            );
+            let signal = classify_error_text(msg);
+            assert!(signal.is_capacity(), "{msg:?} must back off on the long schedule");
+            assert!(
+                !signal.is_rate_limit(),
+                "{msg:?} must not be charged to this account's window"
             );
         }
+    }
+
+    /// Both vocabularies in one string resolves to the account window: swapping
+    /// models on an exhausted account only moves the 429 to the swap target.
+    #[test]
+    fn account_window_wins_when_both_vocabularies_appear() {
+        assert_eq!(
+            classify_error_text("api returned 429 Too Many Requests: upstream overloaded"),
+            RetrySignal::RateLimit
+        );
     }
 
     /// A body refused for its SIZE is deterministic — the same bytes fail
@@ -360,17 +470,28 @@ mod tests {
         // A 529 alongside a 503-looking body is still a capacity stall.
         assert_eq!(
             classify_error_text("api stream error 529 (503 backend)"),
-            RetrySignal::RateLimit
+            RetrySignal::Overloaded
         );
     }
 
     #[test]
     fn retryability_helpers_agree_with_variant() {
         assert!(RetrySignal::RateLimit.is_retryable());
+        assert!(RetrySignal::RateLimit.is_capacity());
         assert!(RetrySignal::RateLimit.is_rate_limit());
+        assert!(!RetrySignal::RateLimit.is_overloaded());
+        assert!(RetrySignal::Overloaded.is_retryable());
+        assert!(RetrySignal::Overloaded.is_capacity());
+        assert!(RetrySignal::Overloaded.is_overloaded());
+        // The load-bearing asymmetry: an overload is capacity pressure but is
+        // NOT this account's throttle, so every account-scoped consequence
+        // (window wait, cool-down stamp, 95 %-utilization swap gate) skips it.
+        assert!(!RetrySignal::Overloaded.is_rate_limit());
         assert!(RetrySignal::Transient.is_retryable());
+        assert!(!RetrySignal::Transient.is_capacity());
         assert!(!RetrySignal::Transient.is_rate_limit());
         assert!(!RetrySignal::Fatal.is_retryable());
+        assert!(!RetrySignal::Fatal.is_capacity());
         assert!(!RetrySignal::Fatal.is_rate_limit());
     }
 

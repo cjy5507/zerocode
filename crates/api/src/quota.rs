@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use core_types::{RateLimitSnapshot, RateLimitWindow, RateLimitWindowKind};
 
 use crate::sync_bridge::lock_recovered;
-use crate::ProviderKind;
+use crate::{CapacityScope, ProviderKind};
 
 /// Latest snapshot with the instant it was observed. Poison policy: recover —
 /// the only write is a single `Copy` assignment, so the value is consistent
@@ -153,14 +153,16 @@ pub fn isolate_rate_limit_state_for_tests() {
     // shared file underneath a test that has already isolated itself.
     crate::quota_shared::force_disable_for_process();
     *lock_recovered(&LATEST_RATE_LIMIT) = None;
-    for ((cooldown, cooldown_unix), last_seen) in RATE_LIMIT_COOLDOWN_UNTIL_MS
+    for (((cooldown, cooldown_unix), last_seen), overload) in RATE_LIMIT_COOLDOWN_UNTIL_MS
         .iter()
         .zip(RATE_LIMIT_COOLDOWN_UNTIL_UNIX_MS.iter())
         .zip(LAST_RATE_LIMIT_AT_MS.iter())
+        .zip(OVERLOAD_PAUSE_UNTIL_MS.iter())
     {
         cooldown.store(0, Ordering::SeqCst);
         cooldown_unix.store(0, Ordering::SeqCst);
         last_seen.store(0, Ordering::SeqCst);
+        overload.store(0, Ordering::SeqCst);
     }
     for exhausted in &PROVIDER_QUOTA_EXHAUSTED_UNTIL_MS {
         exhausted.store(0, Ordering::SeqCst);
@@ -217,6 +219,22 @@ static RATE_LIMIT_COOLDOWN_UNTIL_UNIX_MS: [AtomicU64; PROVIDER_SLOTS] =
 static LAST_RATE_LIMIT_AT_MS: [AtomicU64; PROVIDER_SLOTS] =
     [const { AtomicU64::new(0) }; PROVIDER_SLOTS];
 
+/// Per-provider monotonic deadline (ms) for a **provider-overload** pause
+/// (529 / `overloaded_error`), kept apart from the account cool-down above.
+///
+/// Both mean "hold requests to this provider for a moment", and
+/// [`rate_limit_cooldown_remaining_ms`] unions them for exactly that question.
+/// What must NOT be unioned is everything else the account arrays imply — how
+/// much of the plan's quota is left ([`provider_quota_views`]), whether this
+/// account was recently throttled ([`LAST_RATE_LIMIT_AT_MS`]), and the
+/// cross-process account park. A 529 answers none of those: it fired here with
+/// the account window at 2 % utilization, and folding it into the account state
+/// wrote a 120 s park plus a five-minute "throttled" penalty onto a healthy plan.
+/// Separate arrays make that mistake unrepresentable rather than merely
+/// discouraged.
+static OVERLOAD_PAUSE_UNTIL_MS: [AtomicU64; PROVIDER_SLOTS] =
+    [const { AtomicU64::new(0) }; PROVIDER_SLOTS];
+
 /// Per-provider monotonic deadline (ms) until which the provider's quota is
 /// *known* exhausted, taken from a 429's own `Retry-After` without the
 /// [`RATE_LIMIT_COOLDOWN_MAX_MS`] clamp. `0` = nothing known.
@@ -244,6 +262,15 @@ const RATE_LIMIT_COOLDOWN_INITIAL_MS: u64 = 15_000;
 /// Hard ceiling on the cool-down window so a hostile provider hint
 /// can't stall the caller indefinitely.
 const RATE_LIMIT_COOLDOWN_MAX_MS: u64 = 120_000;
+/// Ceiling on a **provider-overload** cool-down (529 / `overloaded_error`).
+///
+/// Much lower than [`RATE_LIMIT_COOLDOWN_MAX_MS`] because the two windows are
+/// different animals: an account throttle lasts as long as the plan's window,
+/// while capacity shedding clears in seconds. Letting an overload climb the
+/// account ladder parked a *healthy* account — measured: `utilization = 2 %`
+/// with a 120 s park written to the shared file — which then depressed
+/// sub-agent admission and router headroom for every concurrent process.
+const OVERLOAD_COOLDOWN_MAX_MS: u64 = 15_000;
 /// How long after the last 429 the process still counts as "throttled" for
 /// the spawn headroom gate. 5 minutes: long enough to cover the minute-bucket
 /// token-rate windows that caused the 2026-06-10 starvation incident, short
@@ -359,29 +386,49 @@ pub fn rate_limit_backoff_ms(attempt: u32) -> u64 {
 /// forward — they never shorten an existing window, and never touch a sibling
 /// provider's window.
 pub fn mark_rate_limit_cooldown(kind: ProviderKind, extra_ms: u64) {
+    mark_cooldown(kind, extra_ms, CapacityScope::Account);
+}
+
+/// Shared core of the cool-down entry points. `scope` selects the ceiling and
+/// which account-level state the mark is allowed to touch.
+///
+/// A [`CapacityScope::Provider`] mark still pauses this provider briefly — do not
+/// hammer a backend that is shedding — but writes neither the "this account was
+/// throttled" stamp (which pins a 5-minute headroom penalty and a lagging
+/// `~10 % remaining` estimate onto a healthy window) nor the cross-process
+/// account park. Both of those describe the *account's* window, and a 529 says
+/// nothing about it: the measured utilization was 2 % while every request was
+/// being shed.
+fn mark_cooldown(kind: ProviderKind, extra_ms: u64, scope: CapacityScope) {
     let slot = provider_slot(kind);
-    let capped = extra_ms.min(RATE_LIMIT_COOLDOWN_MAX_MS);
     let now = now_monotonic_millis();
-    LAST_RATE_LIMIT_AT_MS[slot].store(now, Ordering::Relaxed);
-    // Wall-clock reset deadline for the display views — same instant/window as
-    // the monotonic deadline below, ratcheted forward independently. Because
-    // both clocks advance together, a mark that fails to advance the monotonic
-    // deadline (a longer cool-down already active) also fails to advance this
-    // one, so they never diverge.
-    let unix_until = now_unix_millis().saturating_add(capped);
-    RATE_LIMIT_COOLDOWN_UNTIL_UNIX_MS[slot].fetch_max(unix_until, Ordering::SeqCst);
-    // Cross-process: park EVERY zo process on this shared account window, not
-    // only the one that hit the 429. This is what stops five concurrent sessions
-    // from each re-discovering the same wall. No-op for non-account-shared
-    // providers and when coordination is disabled (see `quota_shared`).
-    crate::quota_shared::record_cooldown(kind, unix_until);
+    let (deadlines, ceiling) = match scope {
+        CapacityScope::Account => (&RATE_LIMIT_COOLDOWN_UNTIL_MS, RATE_LIMIT_COOLDOWN_MAX_MS),
+        CapacityScope::Provider => (&OVERLOAD_PAUSE_UNTIL_MS, OVERLOAD_COOLDOWN_MAX_MS),
+    };
+    let capped = extra_ms.min(ceiling);
+    if matches!(scope, CapacityScope::Account) {
+        LAST_RATE_LIMIT_AT_MS[slot].store(now, Ordering::Relaxed);
+        // Wall-clock reset deadline for the display views — same instant/window as
+        // the monotonic deadline below, ratcheted forward independently. Because
+        // both clocks advance together, a mark that fails to advance the monotonic
+        // deadline (a longer cool-down already active) also fails to advance this
+        // one, so they never diverge.
+        let unix_until = now_unix_millis().saturating_add(capped);
+        RATE_LIMIT_COOLDOWN_UNTIL_UNIX_MS[slot].fetch_max(unix_until, Ordering::SeqCst);
+        // Cross-process: park EVERY zo process on this shared account window, not
+        // only the one that hit the 429. This is what stops five concurrent sessions
+        // from each re-discovering the same wall. No-op for non-account-shared
+        // providers and when coordination is disabled (see `quota_shared`).
+        crate::quota_shared::record_cooldown(kind, unix_until);
+    }
     let until = now.saturating_add(capped);
-    let mut current = RATE_LIMIT_COOLDOWN_UNTIL_MS[slot].load(Ordering::Relaxed);
+    let mut current = deadlines[slot].load(Ordering::Relaxed);
     loop {
         if until <= current {
             return;
         }
-        match RATE_LIMIT_COOLDOWN_UNTIL_MS[slot].compare_exchange_weak(
+        match deadlines[slot].compare_exchange_weak(
             current,
             until,
             Ordering::SeqCst,
@@ -393,14 +440,42 @@ pub fn mark_rate_limit_cooldown(kind: ProviderKind, extra_ms: u64) {
     }
 }
 
-/// Engage `kind`'s cool-down window from a structured error.
-pub fn mark_rate_limit_cooldown_from(
+/// Engage `kind`'s cool-down from a structured capacity error, routed by
+/// [`CapacityScope`].
+///
+/// One entry point for both walls so a caller cannot accidentally charge a
+/// provider overload to the account's window — the mistake that wrote a 120 s
+/// account park while the measured utilization was 2 %. `attempt` drives the
+/// exponential ladder for an account throttle; an overload ignores it beyond
+/// [`OVERLOAD_COOLDOWN_MAX_MS`], since escalating a window that clears in
+/// seconds only delays the recovery.
+pub fn mark_capacity_stall_from(
     kind: ProviderKind,
+    scope: CapacityScope,
     retry_after: Option<Duration>,
     attempt: u32,
 ) {
-    mark_rate_limit_cooldown(kind, cooldown_wait_ms(retry_after, attempt));
-    mark_provider_quota_exhausted(kind, retry_after);
+    match scope {
+        CapacityScope::Account => {
+            mark_cooldown(
+                kind,
+                cooldown_wait_ms(retry_after, attempt),
+                CapacityScope::Account,
+            );
+            // Only an account 429 can report how long ITS window stays shut, so
+            // only it may mute the provider for provider-choice decisions.
+            mark_provider_quota_exhausted(kind, retry_after);
+        }
+        CapacityScope::Provider => mark_cooldown(
+            kind,
+            // A server hint still wins when present; the ladder never applies.
+            retry_after
+                .and_then(|hint| u64::try_from(hint.as_millis()).ok())
+                .filter(|&ms| ms > 0)
+                .unwrap_or(OVERLOAD_COOLDOWN_MAX_MS),
+            CapacityScope::Provider,
+        ),
+    }
 }
 
 /// Record the unclamped horizon a 429 reported, for provider-choice decisions
@@ -457,9 +532,15 @@ fn cooldown_wait_ms(retry_after: Option<Duration>, attempt: u32) -> u64 {
 /// cancellable cool-down wait in the `tools` crate.
 #[must_use]
 pub fn rate_limit_cooldown_remaining_ms(kind: ProviderKind) -> u64 {
-    let local = RATE_LIMIT_COOLDOWN_UNTIL_MS[provider_slot(kind)]
+    let slot = provider_slot(kind);
+    let now = now_monotonic_millis();
+    // "Hold requests to this provider" is the one question both windows answer,
+    // so this is the one place they are unioned — an account throttle and a
+    // provider overload park a caller just the same.
+    let local = RATE_LIMIT_COOLDOWN_UNTIL_MS[slot]
         .load(Ordering::Relaxed)
-        .saturating_sub(now_monotonic_millis());
+        .max(OVERLOAD_PAUSE_UNTIL_MS[slot].load(Ordering::Relaxed))
+        .saturating_sub(now);
     // Whichever window is longer wins: another process's shared 429 can park
     // this one even when its own monotonic window is clear.
     local.max(crate::quota_shared::cooldown_remaining_ms(kind))
@@ -478,7 +559,13 @@ pub fn rate_limit_headroom_low(kind: ProviderKind) -> bool {
     headroom_low_for_kind_at(
         kind,
         now_monotonic_millis(),
-        RATE_LIMIT_COOLDOWN_UNTIL_MS[slot].load(Ordering::Relaxed),
+        // Admission is a "send now?" question, so an active overload pause counts
+        // here (do not fan eight sub-agents into a shedding backend) — unlike the
+        // quota *view*, which must not read a 529 as spent account quota. The
+        // 5-minute post-throttle penalty still comes only from a real 429.
+        RATE_LIMIT_COOLDOWN_UNTIL_MS[slot]
+            .load(Ordering::Relaxed)
+            .max(OVERLOAD_PAUSE_UNTIL_MS[slot].load(Ordering::Relaxed)),
         LAST_RATE_LIMIT_AT_MS[slot].load(Ordering::Relaxed),
         latest_rate_limit_snapshot(),
     )
@@ -712,6 +799,12 @@ fn estimated_quota_view(
     cooldown_reset_unix_ms: u64,
     last_rate_limit_at_mono: u64,
 ) -> Option<ProviderQuotaView> {
+    // `cooldown_until_mono` here is the ACCOUNT window's deadline only. A
+    // provider overload parks its own separate deadline
+    // ([`OVERLOAD_PAUSE_UNTIL_MS`]) precisely so it cannot reach this view:
+    // reporting a 529 as "429 · 0 % remaining" would claim an exhausted plan on a
+    // window measured at 2 %, and every consumer here (HUD gauge, router headroom
+    // penalty, binding-window wait) would inherit the false figure.
     if cooldown_until_mono > now_mono {
         return Some(ProviderQuotaView {
             provider: kind,
@@ -800,13 +893,14 @@ mod tests {
     use super::{
         anthropic_quota_views, binding_window, cooldown_wait_ms, estimated_quota_view,
         headroom_low_at, headroom_low_for_kind_at, mark_rate_limit_cooldown,
-        mark_rate_limit_cooldown_from, measured_quota_views, provider_quota_views,
+        mark_capacity_stall_from, measured_quota_views, provider_quota_views,
         rate_limit_backoff_ms, rate_limit_cooldown_remaining_ms, quota_fallback_permitted_at,
+        OVERLOAD_COOLDOWN_MAX_MS,
         reset_wait_within_band_for, window_pressure_at, MeasuredQuota, ProviderQuotaView,
         QuotaWindow, MEASURED_QUOTA_FRESH, QUOTA_SNAPSHOT_FRESH, RATE_LIMIT_HEADROOM_WINDOW_MS,
         RESET_WAIT_GRACE,
     };
-    use crate::ProviderKind;
+    use crate::{CapacityScope, ProviderKind};
     use core_types::{RateLimitSnapshot, RateLimitWindow, RateLimitWindowKind};
     use std::time::Duration;
 
@@ -1192,8 +1286,45 @@ mod tests {
     #[test]
     fn cooldown_from_prefers_server_hint_and_marks_without_panic() {
         assert_eq!(rate_limit_backoff_ms(0), 15_000);
-        mark_rate_limit_cooldown_from(ProviderKind::Xai, Some(Duration::from_secs(60)), 0);
+        mark_capacity_stall_from(
+            ProviderKind::Xai,
+            CapacityScope::Account,
+            Some(Duration::from_secs(60)),
+            0,
+        );
         assert!(rate_limit_cooldown_remaining_ms(ProviderKind::Xai) > 1_000);
+    }
+
+    /// A provider overload pauses briefly and leaves the ACCOUNT's window alone.
+    ///
+    /// The account ladder would have escalated this same attempt index to the
+    /// 120 s ceiling and stamped "recently throttled" — which is what parked a
+    /// 2 %-utilized account for two minutes and depressed sub-agent admission for
+    /// five. Google slot only (isolated from the other cases here).
+    #[test]
+    fn overload_cooldown_is_short_and_never_charged_to_the_account() {
+        // Deep into the ladder, where an account 429 would sit at the 120 s cap.
+        let deep_attempt = 6;
+        assert_eq!(rate_limit_backoff_ms(deep_attempt), 120_000);
+
+        mark_capacity_stall_from(ProviderKind::Google, CapacityScope::Provider, None, deep_attempt);
+
+        let remaining = rate_limit_cooldown_remaining_ms(ProviderKind::Google);
+        assert!(remaining > 0, "a shedding provider still gets a brief pause");
+        assert!(
+            remaining <= OVERLOAD_COOLDOWN_MAX_MS,
+            "overload cool-down must not climb the account ladder: {remaining}ms"
+        );
+        // The estimated view answers "how much of the ACCOUNT's quota is left,
+        // inferred from 429s". A provider overload contributes nothing to that,
+        // so it must not synthesize a `429 · 0 % remaining` row — the figure the
+        // HUD gauge and the router headroom penalty would then believe.
+        assert!(
+            !provider_quota_views()
+                .iter()
+                .any(|view| view.provider == ProviderKind::Google),
+            "a provider overload must not claim the account is out of quota"
+        );
     }
 
     fn view(

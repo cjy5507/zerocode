@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use core_types::retry_signal::classify_error_text;
+use core_types::retry_signal::{classify_error_text, RetrySignal};
 
 /// Maximum number of retry attempts (excluding the initial attempt).
 const MAX_RETRIES: u32 = 4;
@@ -39,22 +39,47 @@ const MAX_DELAY: Duration = Duration::from_secs(30);
 /// any point regardless.
 const RATE_LIMIT_MAX_ELAPSED: Duration = Duration::from_secs(300);
 
-/// Env override (milliseconds) for [`RATE_LIMIT_MAX_ELAPSED`]. `0` opts out of
-/// the wall-clock budget and falls back to the bounded [`MAX_RETRIES`] attempt
-/// count (the pre-wall-clock behaviour); a bad value uses the default.
+/// Wall-clock budget for riding out a **provider overload** (529 /
+/// `overloaded_error`), as opposed to this account's window.
+///
+/// Deliberately a fraction of [`RATE_LIMIT_MAX_ELAPSED`], because the two walls
+/// clear differently and reward opposite reactions. Measured on the reported
+/// turn: twelve whole-request attempts across the full 300 s account budget, all
+/// shed, while a Haiku sub-agent on the *same account* succeeded in the same
+/// second — the account was 2 % utilized. Re-sending the shed request shape is
+/// what does not work; a lighter model is what does, so the budget only has to
+/// outlast a genuine blip before handing over to the quota escape
+/// (`decide_quota_escape`, which for this scope may swap immediately). With the
+/// stream layer now re-opening pre-commit faults itself, each attempt inside
+/// this window is already several provider round-trips.
+const OVERLOAD_MAX_ELAPSED: Duration = Duration::from_secs(90);
+
+/// Env override (milliseconds) for the capacity wall-clock budgets. `0` opts out
+/// of wall-clock mode entirely and falls back to the bounded [`MAX_RETRIES`]
+/// attempt count (the pre-wall-clock behaviour); a bad value uses the defaults.
+///
+/// A set value replaces the account budget verbatim and clamps the overload
+/// budget to it, so one knob can only ever *shorten* the wait — there is no way
+/// to configure "wait longer on an overload than on a throttle", which would be
+/// backwards.
 const RATE_LIMIT_MAX_ELAPSED_ENV: &str = "ZO_RATE_LIMIT_MAX_WAIT_MS";
 
-/// Resolve the rate-limit wall-clock budget. `None` means "no wall-clock budget"
-/// (env opt-out), in which case rate-limit errors fall back to the bounded
+/// Resolve the wall-clock budget for `signal`. `None` means "no wall-clock
+/// budget" (env opt-out), in which case capacity errors fall back to the bounded
 /// attempt schedule.
-fn rate_limit_max_elapsed() -> Option<Duration> {
+fn capacity_max_elapsed(signal: RetrySignal) -> Option<Duration> {
+    let default = if signal.is_overloaded() {
+        OVERLOAD_MAX_ELAPSED
+    } else {
+        RATE_LIMIT_MAX_ELAPSED
+    };
     match std::env::var(RATE_LIMIT_MAX_ELAPSED_ENV) {
         Ok(raw) => match raw.trim().parse::<u64>() {
             Ok(0) => None,
-            Ok(ms) => Some(Duration::from_millis(ms)),
-            Err(_) => Some(RATE_LIMIT_MAX_ELAPSED),
+            Ok(ms) => Some(Duration::from_millis(ms).min(default)),
+            Err(_) => Some(default),
         },
-        Err(_) => Some(RATE_LIMIT_MAX_ELAPSED),
+        Err(_) => Some(default),
     }
 }
 
@@ -103,8 +128,13 @@ pub fn classify_for_retry(error_message: &str, attempt: u32, elapsed: Duration) 
     // re-issue "continue" into a still-throttled limit. Riding it out on the
     // 30 s-capped rate-limit backoff lets the turn resume by itself the moment
     // capacity frees up. The caller's cancel flag still aborts the wait.
-    if signal.is_rate_limit() {
-        match rate_limit_max_elapsed() {
+    //
+    // The budget depends on WHOSE capacity ran out — see [`OVERLOAD_MAX_ELAPSED`]:
+    // an account window is worth waiting minutes for, a provider shedding load is
+    // not (the escape hatch is a different model, and the caller runs it as soon
+    // as this returns `Fail`).
+    if signal.is_capacity() {
+        match capacity_max_elapsed(signal) {
             Some(budget) if elapsed < budget => {
                 return RetryVerdict::Retry {
                     delay: rate_limit_backoff(attempt),
@@ -116,12 +146,12 @@ pub fn classify_for_retry(error_message: &str, attempt: u32, elapsed: Duration) 
         }
     }
 
-    // Generic transient blips (and rate-limit when the wall-clock budget is
+    // Generic transient blips (and capacity stalls when the wall-clock budget is
     // disabled) use the bounded attempt schedule.
     if attempt >= MAX_RETRIES {
         return RetryVerdict::Fail;
     }
-    let delay = if signal.is_rate_limit() {
+    let delay = if signal.is_capacity() {
         rate_limit_backoff(attempt)
     } else {
         backoff_delay(attempt)
@@ -136,19 +166,47 @@ pub fn classify_for_retry(error_message: &str, attempt: u32, elapsed: Duration) 
 /// foreground `retry_async` path here previously rode out the window without
 /// ever marking the shared state).
 ///
-/// Fires only for genuine rate-limit / overload signals — classified from the
-/// same `core_types::retry_signal` vocabulary this module's backoff classifier
-/// uses, so a generic 5xx / timeout blip (which does not consume provider
-/// quota) is ignored. `attempt` is 0-indexed (the just-failed attempt), matching
-/// [`api::quota::mark_rate_limit_cooldown_from`]'s exponential ladder. No
-/// structured `Retry-After` is available at this `Display`-only error seam, so
-/// the ladder drives the window (`None`); the migrated helper still honors a
-/// present server hint verbatim wherever one IS available (the sub-agent path).
-pub fn mark_foreground_rate_limit(model: &str, error_message: &str, attempt: u32) {
-    if !classify_error_text(error_message).is_rate_limit() {
+/// Fires only for capacity signals — classified from the same
+/// `core_types::retry_signal` vocabulary this module's backoff classifier uses,
+/// so a generic 5xx / timeout blip (which does not consume provider quota) is
+/// ignored — and routes each one by **scope**:
+///
+/// * an account 429 climbs the exponential cool-down ladder and stamps this
+///   account as throttled, exactly as before;
+/// * a provider overload takes a short, flat pause and stamps *nothing about
+///   the account*. Charging it to the account ladder is what wrote a 120 s
+///   cross-process park (plus a 5-minute headroom penalty and a lagging
+///   "~10 % remaining" estimate) onto a window measured at 2 % utilization.
+///
+/// `attempt` is 0-indexed (the just-failed attempt) and drives the account
+/// ladder only. No structured `Retry-After` is available at this `Display`-only
+/// error seam, so `None` is passed; the shared helper still honors a present
+/// server hint wherever one IS available (the sub-agent path).
+pub fn mark_foreground_capacity_stall(model: &str, error_message: &str, attempt: u32) {
+    let Some(scope) = capacity_scope(classify_error_text(error_message)) else {
         return;
+    };
+    api::quota::mark_capacity_stall_from(
+        api::detect_provider_kind(model),
+        scope,
+        None,
+        attempt,
+    );
+}
+
+/// Map a flattened-text [`RetrySignal`] onto the structured
+/// [`api::CapacityScope`], or `None` when the signal is not capacity pressure.
+///
+/// The two enums are deliberately separate — one is the text fallback, the other
+/// travels with a structured error — and this is the single place they are joined
+/// so they cannot drift into disagreeing about which wall was hit.
+#[must_use]
+pub fn capacity_scope(signal: RetrySignal) -> Option<api::CapacityScope> {
+    match signal {
+        RetrySignal::RateLimit => Some(api::CapacityScope::Account),
+        RetrySignal::Overloaded => Some(api::CapacityScope::Provider),
+        RetrySignal::Transient | RetrySignal::Fatal => None,
     }
-    api::quota::mark_rate_limit_cooldown_from(api::detect_provider_kind(model), None, attempt);
 }
 
 /// Longer backoff for rate-limit (429) errors.
@@ -255,9 +313,13 @@ where
             Err(error) => {
                 on_error(attempt, &error);
                 let error_text = error.to_string();
-                let is_rate_limit = classify_error_text(&error_text).is_rate_limit();
-                let capped = is_rate_limit
-                    && rate_limit_retry_cap.is_some_and(|cap| rate_limit_retries >= cap);
+                // The cap counts *capacity* retries of either scope: its purpose
+                // is "hand over to a higher-level failover instead of absorbing
+                // the wall here", and a provider overload has a failover to hand
+                // to just as much as a 429 does.
+                let is_capacity = classify_error_text(&error_text).is_capacity();
+                let capped =
+                    is_capacity && rate_limit_retry_cap.is_some_and(|cap| rate_limit_retries >= cap);
                 let verdict = if capped {
                     RetryVerdict::Fail
                 } else {
@@ -265,7 +327,7 @@ where
                 };
                 match verdict {
                     RetryVerdict::Retry { delay } => {
-                        if is_rate_limit {
+                        if is_capacity {
                             rate_limit_retries += 1;
                         }
                         on_retry(attempt + 1, delay, &error);
@@ -482,7 +544,7 @@ mod tests {
             Some(0),
             |attempt, error: &String| {
                 observed_errors.set(observed_errors.get() + 1);
-                mark_foreground_rate_limit(model, error, attempt);
+                mark_foreground_capacity_stall(model, error, attempt);
             },
             |_, _, _| notices.set(notices.get() + 1),
             |attempt| {
@@ -629,17 +691,69 @@ mod tests {
         let kind = api::detect_provider_kind(model);
         // A generic 5xx is not a capacity signal → it must NOT open a cool-down.
         let before = api::quota::rate_limit_cooldown_remaining_ms(kind);
-        mark_foreground_rate_limit(model, "HTTP 500 Internal Server Error", 0);
+        mark_foreground_capacity_stall(model, "HTTP 500 Internal Server Error", 0);
         assert_eq!(
             api::quota::rate_limit_cooldown_remaining_ms(kind),
             before,
             "a 5xx blip must not mark a rate-limit cool-down"
         );
         // A 429 is a capacity stall → it must open the provider's cool-down.
-        mark_foreground_rate_limit(model, "HTTP 429 Too Many Requests", 0);
+        mark_foreground_capacity_stall(model, "HTTP 429 Too Many Requests", 0);
         assert!(
             api::quota::rate_limit_cooldown_remaining_ms(kind) > 0,
             "a foreground 429 must open the provider cool-down the router/spawn gate reads"
         );
+    }
+
+    /// A flattened error string maps to the same scope the structured class
+    /// carries, so the text-only seams (this module) and the class-carrying seams
+    /// (`decide_quota_escape`) can never disagree about which wall was hit.
+    #[test]
+    fn capacity_scope_matches_the_structured_class() {
+        assert_eq!(
+            capacity_scope(classify_error_text("HTTP 429 Too Many Requests")),
+            Some(api::CapacityScope::Account)
+        );
+        assert_eq!(
+            capacity_scope(classify_error_text(
+                "api stream error (overloaded_error): Overloaded"
+            )),
+            Some(api::CapacityScope::Provider)
+        );
+        assert_eq!(
+            capacity_scope(classify_error_text("HTTP 500 Internal Server Error")),
+            None
+        );
+    }
+
+    /// A provider overload gets a much shorter ride than an account throttle.
+    ///
+    /// The measured failure spent the full 300 s account budget on ~12 whole-request
+    /// retries of a request shape the provider was shedding, then died. The overload
+    /// budget exists so that time is spent on the escape (a lighter model) instead.
+    #[test]
+    fn overload_budget_is_shorter_than_the_account_budget() {
+        let overload = "api stream error (overloaded_error): Overloaded";
+        let throttle = "api returned 429 Too Many Requests (rate_limit_error)";
+        let past_overload = OVERLOAD_MAX_ELAPSED + Duration::from_secs(1);
+
+        // Inside its own budget an overload still retries — a genuine blip is
+        // absorbed without disturbing the turn.
+        assert!(matches!(
+            classify_for_retry(overload, 3, Duration::from_secs(30)),
+            RetryVerdict::Retry { .. }
+        ));
+        // Past it, the retry layer hands over instead of grinding.
+        assert_eq!(
+            classify_for_retry(overload, 3, past_overload),
+            RetryVerdict::Fail
+        );
+        // The account throttle is unchanged at that same elapsed time: only time
+        // lifts its window, so riding it out is still the best available move.
+        assert!(matches!(
+            classify_for_retry(throttle, 3, past_overload),
+            RetryVerdict::Retry { .. }
+        ));
+        assert!(OVERLOAD_MAX_ELAPSED < RATE_LIMIT_MAX_ELAPSED);
     }
 }

@@ -5867,7 +5867,7 @@ mod tests {
                         ]),
                         Outcome::RateLimit => Err(RuntimeError::with_provider_error_class(
                             "verifier rate-limited",
-                            api::ProviderErrorClass::RateLimit { retry_after: None },
+                            api::ProviderErrorClass::account_rate_limit(None),
                         )),
                     }
                 })

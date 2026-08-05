@@ -5287,6 +5287,12 @@ mod tests {
 
     #[test]
     fn scan_learned_shadow_stamps_reads_manifest_route_reason() {
+        // `ZO_AGENT_STORE` is process-global, and this test points it at a store
+        // containing a STAMPED manifest. Without the crate-wide lock the sibling
+        // `..._reports_empty_state` test can observe that store and fail its
+        // "no stamps found" assertion — a real intermittent red (seen under a
+        // loaded `--workspace` run, invisible when the target runs alone).
+        let _guard = crate::test_env_lock();
         let dir = std::env::temp_dir().join(format!(
             "zo-smart-doctor-shadow-{}-{}",
             std::process::id(),
@@ -5351,7 +5357,29 @@ mod tests {
 
     #[test]
     fn smart_doctor_learned_shadow_section_reports_empty_state() {
+        // Same lock as the writer above: this asserts the ABSENCE of stamps, so it
+        // must not run while a sibling has `ZO_AGENT_STORE` pointed at a stamped
+        // fixture store. The store is then pinned at an EMPTY temp dir rather than
+        // trusting the ambient one, so the assertion cannot depend on which agent
+        // manifests this machine happens to have written.
+        let _guard = crate::test_env_lock();
+        let empty_store = std::env::temp_dir().join(format!(
+            "zo-smart-doctor-empty-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&empty_store).expect("temp dir");
+        let prior = std::env::var("ZO_AGENT_STORE").ok();
+        std::env::set_var("ZO_AGENT_STORE", &empty_store);
         let rendered = smart_doctor_learned_shadow_section(&[], None);
+        match prior {
+            Some(value) => std::env::set_var("ZO_AGENT_STORE", value),
+            None => std::env::remove_var("ZO_AGENT_STORE"),
+        }
+        let _ = fs::remove_dir_all(&empty_store);
         assert!(rendered.contains("Mode: unknown"), "{rendered}");
         assert!(rendered.contains("No `learned-shadow-differs"), "{rendered}");
         assert!(rendered.contains("No learned-specialty entries yet"), "{rendered}");

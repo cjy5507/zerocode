@@ -19,7 +19,7 @@ use super::manifest::{
 };
 use super::rate_limit::{
     QUOTA_SNAPSHOT_FRESH, RateGovernor, agent_rate_governor, binding_window,
-    mark_rate_limit_cooldown_from, rate_limit_cooldown_remaining_ms, rate_limit_headroom_low,
+    mark_capacity_stall_from, rate_limit_cooldown_remaining_ms, rate_limit_headroom_low,
     shared_agent_runtime, wait_for_rate_limit_cooldown_cancellable, workflow_rate_governor,
 };
 use super::subagent_profile::starvation_demotion;
@@ -938,7 +938,7 @@ impl ApiClient for ProviderRuntimeClient {
                              quota window to reset",
                             self.model,
                         ),
-                        api::ProviderErrorClass::RateLimit { retry_after: None },
+                        api::ProviderErrorClass::account_rate_limit(None),
                     ));
                 }
                 // Live visibility: a parked agent must read as alive. Stamp the
@@ -1029,13 +1029,15 @@ impl ApiClient for ProviderRuntimeClient {
                 let stream = match self.client.stream_message(&message_request).await {
                     Ok(stream) => stream,
                     Err(error) => {
-                        if error.is_rate_limit() {
+                        if let Some(scope) = error.provider_error_class().capacity_scope() {
                             // Absorb: tighten concurrency, engage the cool-down
-                            // (honoring `Retry-After`), and retry without
+                            // (honoring `Retry-After`, and scoped to whichever
+                            // window actually refused), and retry without
                             // spending the transient budget.
                             self.governor().on_rate_limit();
-                            mark_rate_limit_cooldown_from(
+                            mark_capacity_stall_from(
                                 self.provider_kind(),
+                                scope,
                                 error.retry_after(),
                                 rl_backoff_step,
                             );
@@ -1108,10 +1110,14 @@ impl ApiClient for ProviderRuntimeClient {
                 let mut saw_provider_event = false;
                 let mut saw_task_action = false;
                 let mut last_reasoning_flush: Option<std::time::Instant> = None;
-                // (error, is_rate_limit, retry_after, retryable)
+                // (error, capacity_scope, retry_after, retryable). The scope is
+                // carried instead of a bare `is_rate_limit` flag so the cool-down
+                // this records lands on the right window: an account 429 climbs
+                // the ladder, a provider overload takes a short flat pause and
+                // leaves the account's throttle history untouched.
                 let mut mid_stream_error: Option<(
                     RuntimeError,
-                    bool,
+                    Option<api::CapacityScope>,
                     Option<std::time::Duration>,
                     bool,
                 )> = None;
@@ -1121,7 +1127,7 @@ impl ApiClient for ProviderRuntimeClient {
                         Ok(Some(event)) => event,
                         Ok(None) => break,
                         Err(error) => {
-                            let is_rl = error.is_rate_limit();
+                            let capacity = error.provider_error_class().capacity_scope();
                             let retry_after = error.retry_after();
                             let retryable = error.is_retryable();
                             // 429 면 재시도한다 — 일부 출력이 스트리밍된 뒤 발생한
@@ -1132,7 +1138,7 @@ impl ApiClient for ProviderRuntimeClient {
                             // 예산을 쓴다.
                             mid_stream_error = Some((
                                 RuntimeError::from_api_error(&error),
-                                is_rl,
+                                capacity,
                                 retry_after,
                                 retryable,
                             ));
@@ -1281,18 +1287,19 @@ impl ApiClient for ProviderRuntimeClient {
                     }
                 }
 
-                if let Some((error, is_rl, retry_after, retryable)) = mid_stream_error {
-                    if is_rl {
+                if let Some((error, capacity, retry_after, retryable)) = mid_stream_error {
+                    if let Some(scope) = capacity {
                         // A retry restarts the turn from scratch, so remove this
                         // attempt's live tail (buffered and already-flushed). The
                         // restart re-streams the same text and would otherwise
                         // duplicate partial prose in the viewer.
                         tail.discard_attempt_tail();
-                        // Mid-stream rate-limit: absorb indefinitely, exactly
+                        // Mid-stream capacity refusal: absorb indefinitely, exactly
                         // like the stream-open case.
                         self.governor().on_rate_limit();
-                        mark_rate_limit_cooldown_from(
+                        mark_capacity_stall_from(
                             self.provider_kind(),
+                            scope,
                             retry_after,
                             rl_backoff_step,
                         );
@@ -1397,10 +1404,11 @@ impl ApiClient for ProviderRuntimeClient {
                 {
                     Ok(response) => response,
                     Err(error) => {
-                        if error.is_rate_limit() {
+                        if let Some(scope) = error.provider_error_class().capacity_scope() {
                             self.governor().on_rate_limit();
-                            mark_rate_limit_cooldown_from(
+                            mark_capacity_stall_from(
                                 self.provider_kind(),
+                                scope,
                                 error.retry_after(),
                                 rl_backoff_step,
                             );
@@ -1888,9 +1896,7 @@ mod tests {
         let runtime_error = RuntimeError::from_api_error(&api_error);
         assert_eq!(
             runtime_error.provider_error_class(),
-            Some(api::ProviderErrorClass::RateLimit {
-                retry_after: Some(std::time::Duration::from_secs(9)),
-            })
+            Some(api::ProviderErrorClass::account_rate_limit(Some(std::time::Duration::from_secs(9))))
         );
         assert_eq!(STARVATION_GIVE_UP_BOTTOM_429S, 5);
     }
@@ -1899,11 +1905,11 @@ mod tests {
     fn terminal_starvation_runtime_error_keeps_rate_limit_class() {
         let err = RuntimeError::with_provider_error_class(
             "rate-limit starvation: gave up after retries",
-            api::ProviderErrorClass::RateLimit { retry_after: None },
+            api::ProviderErrorClass::account_rate_limit(None),
         );
         assert_eq!(
             err.provider_error_class(),
-            Some(api::ProviderErrorClass::RateLimit { retry_after: None })
+            Some(api::ProviderErrorClass::account_rate_limit(None))
         );
     }
 

@@ -674,7 +674,7 @@ mod tests {
         let rate_limit = classified_completion(
             "failed",
             Some("401 stale auth diagnostic in provider body"),
-            ProviderErrorClass::RateLimit { retry_after: None },
+            ProviderErrorClass::account_rate_limit(None),
         );
         assert!(agent_completion_is_rate_limit_failure(&rate_limit));
         assert!(!agent_completion_is_auth_failure(&rate_limit));
@@ -693,7 +693,7 @@ mod tests {
         let rate_limit = classified_completion(
             "failed",
             Some("401 stale auth diagnostic in provider body"),
-            ProviderErrorClass::RateLimit { retry_after: None },
+            ProviderErrorClass::account_rate_limit(None),
         );
         let (_, text) = format_agent_completion(&rate_limit);
         assert!(text.contains("rate limited"));

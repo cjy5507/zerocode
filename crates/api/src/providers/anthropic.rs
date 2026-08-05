@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use core_types::{
     OAuthConfig, OAuthRefreshRequest, OAuthTokenExchangeRequest, RateLimitSnapshot,
@@ -433,11 +433,20 @@ fn context_edit_analytics_event(
 
 /// Notification emitted just before the Anthropic client parks for a retry.
 #[derive(Debug, Clone)]
+/// One "retrying in Ns" row, raised whenever this client backs off — both at
+/// establish time (the `send_with_retry` ladder) and mid-stream (a transparent
+/// pre-commit re-open).
+///
+/// Carries the flattened `error` rather than a pre-chewed `rate_limited` flag:
+/// the renderer labels it through `core_types::retry_signal::retry_notice_label`,
+/// the same classifier the backoff schedule uses. The old boolean was a second,
+/// coarser classifier that could not say "provider overloaded" at all, so an
+/// overload rendered as "transient provider error" while the retry layer called
+/// it capacity pressure.
 pub struct AnthropicRetryNotice {
     pub attempt: u32,
     pub max_attempts: u32,
     pub delay: Duration,
-    pub rate_limited: bool,
     pub error: String,
 }
 
@@ -866,6 +875,7 @@ impl AnthropicClient {
             client: self.clone(),
             committed: false,
             restart_attempts: 0,
+            restart_started_at: None,
         })
     }
 
@@ -997,7 +1007,6 @@ impl AnthropicClient {
                     attempt: attempts,
                     max_attempts: self.max_retries + 1,
                     delay: capped,
-                    rate_limited: error.is_rate_limit(),
                     error: error.to_string(),
                 });
             }
@@ -1728,6 +1737,12 @@ pub struct MessageStream {
     committed: bool,
     /// Transparent restarts spent so far, bounded by `client.max_retries`.
     restart_attempts: u32,
+    /// When the current restart sequence began, so the whole sequence is bounded
+    /// by wall clock and not only by attempt count. `None` until the first
+    /// restart. Without it, `max_retries` idle-timeouts (or overload backoffs)
+    /// could hold a turn for minutes with nothing on screen — the ceiling the
+    /// other streaming backends already carry.
+    restart_started_at: Option<Instant>,
 }
 
 impl MessageStream {
@@ -1759,7 +1774,16 @@ impl MessageStream {
             }
 
             if self.done {
-                let remaining = self.parser.finish()?;
+                let remaining = match self.parser.finish() {
+                    Ok(remaining) => remaining,
+                    // A trailing frame can carry the provider's error envelope
+                    // just as a mid-body one can, so it takes the same gate.
+                    Err(error) if self.can_restart(&error) => {
+                        self.restart(&error).await?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 self.pending.extend(remaining);
                 if self.pending.is_empty() {
                     return Ok(None);
@@ -1785,16 +1809,39 @@ impl MessageStream {
                 // After the commit point we cannot restart without duplicating
                 // output, so propagate.
                 Err(error) if self.can_restart(&error) => {
-                    self.restart().await?;
+                    self.restart(&error).await?;
                     continue;
                 }
                 Err(error) => return Err(error),
             };
             match chunk {
-                Some(chunk) => {
-                    self.parser.push_into(&chunk, &mut self.scratch)?;
-                    self.pending.extend(self.scratch.drain(..));
-                }
+                // A decoded frame can itself BE the failure: Anthropic sheds a
+                // streaming request by answering HTTP 200 and then sending
+                // `event: error {"type":"overloaded_error"}`, usually before
+                // `message_start`. That error surfaces from the parser, not from
+                // the body read, so a bare `?` here skipped the restart gate
+                // entirely and a recoverable pre-commit overload was promoted
+                // into a turn-level failure — five minutes of whole-request
+                // retries and, at the end, a dead turn. Route it through the
+                // SAME gate as a dropped connection: `can_restart` already
+                // demands `error.is_retryable()` (true only for the provider's
+                // `overloaded_error` / `rate_limit_error` / `api_error` frames)
+                // and `!committed`, so a malformed-JSON or buffer-guard failure
+                // still propagates, and a frame that arrives after visible
+                // output still propagates rather than duplicating it.
+                Some(chunk) => match self.parser.push_into(&chunk, &mut self.scratch) {
+                    Ok(()) => self.pending.extend(self.scratch.drain(..)),
+                    Err(error) if self.can_restart(&error) => {
+                        // Events parsed out of this chunk before the error frame
+                        // were never handed to the caller (they are still in
+                        // `scratch`, not `pending`), which is exactly why
+                        // `committed` is still false — `restart` clears both.
+                        // No `continue` needed: this match is the tail of the loop
+                        // body, so the fresh stream is polled on the next pass.
+                        self.restart(&error).await?;
+                    }
+                    Err(error) => return Err(error),
+                },
                 None => {
                     self.done = true;
                 }
@@ -1804,25 +1851,48 @@ impl MessageStream {
 
     /// Whether `error` qualifies for a transparent restart: a retryable transport
     /// / stream fault, with no output yet surfaced and the restart budget intact.
+    ///
+    /// Bounded by wall clock as well as attempt count: each restart can wait an
+    /// idle-timeout or a capacity backoff, so `max_retries` alone let a silent or
+    /// shedding backend hold the turn for minutes with nothing on screen. The
+    /// ceiling is the same one the OpenAI-compatible and Gemini streams use.
     fn can_restart(&self, error: &ApiError) -> bool {
-        super::should_restart(
+        super::should_restart_within_budget(
             self.committed,
             error.is_retryable(),
             self.restart_attempts,
             self.client.max_retries,
+            self.restart_started_at.as_ref().map(Instant::elapsed),
+            super::DEFAULT_MAX_RESTART_WALLCLOCK,
         )
     }
 
     /// Re-open the stream after a pre-commit fault: jittered backoff, then a fresh
     /// `messages` request whose response/parser replace the dead ones so the loop
     /// resumes from a clean turn. Any partial bytes in the old parser are dropped
-    /// with it — safe because nothing has been surfaced. Deliberately silent (no
-    /// `eprintln!`): a transparent recovery should not write to the TUI's stderr
-    /// (see `expect_success` for the alt-screen "staircase" rationale).
-    async fn restart(&mut self) -> Result<(), ApiError> {
+    /// with it — safe because nothing has been surfaced.
+    ///
+    /// Still silent on stderr — writing there while the TUI holds an alt-screen
+    /// produces the "staircase" (see `expect_success`) — but no longer silent to
+    /// the *user*: the installed retry-notice callback gets the same row the
+    /// establish-time ladder emits, so a multi-second reconnect reads as
+    /// "provider overloaded; retrying in 2s" instead of a frozen spinner.
+    async fn restart(&mut self, cause: &ApiError) -> Result<(), ApiError> {
         self.restart_attempts += 1;
         let base = self.client.backoff_for_attempt(self.restart_attempts)?;
         let delay = super::retry_backoff::spread_backoff(base);
+        if let Some(callback) = &self.client.retry_notice {
+            callback(AnthropicRetryNotice {
+                attempt: self.restart_attempts,
+                max_attempts: self.client.max_retries,
+                delay,
+                error: cause.to_string(),
+            });
+        }
+        // Start the wall-clock budget at the FIRST restart of the sequence; a
+        // successful event resets neither (a stream that keeps faulting after
+        // partial progress is exactly the case the ceiling exists for).
+        self.restart_started_at.get_or_insert_with(Instant::now);
         tokio::time::sleep(delay).await;
         let response = self
             .client

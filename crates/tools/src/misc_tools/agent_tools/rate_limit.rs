@@ -13,7 +13,7 @@ use api::ProviderKind;
 use api::quota::{provider_slot, HEADROOM_UTIL_THRESHOLD, PROVIDER_SLOTS};
 pub(crate) use api::quota::rate_limit_headroom_low;
 pub(super) use api::quota::{
-    binding_window, mark_rate_limit_cooldown_from, rate_limit_cooldown_remaining_ms,
+    binding_window, mark_capacity_stall_from, rate_limit_cooldown_remaining_ms,
     QUOTA_SNAPSHOT_FRESH,
 };
 
@@ -419,7 +419,7 @@ mod tests {
     // tests stay green unchanged. The pure cool-down/headroom-arithmetic tests
     // that exercised the migrated *private* helpers moved to `api::quota`.
     use super::{
-        adaptive_seed_at, agent_rate_governor, mark_rate_limit_cooldown_from,
+        adaptive_seed_at, agent_rate_governor, mark_capacity_stall_from,
         parse_agent_api_concurrency_limit, rate_limit_cooldown_remaining_ms, rate_limit_headroom_low,
         seed_snapshot_for, wait_for_rate_limit_cooldown_cancellable, RateGovernor,
         DEFAULT_AGENT_MAX_CONCURRENCY, GOVERNOR_SUCCESSES_PER_INCREASE,
@@ -541,7 +541,12 @@ mod tests {
         // Engage a long cool-down, then cancel: a pre-set cancel flag makes the
         // very first poll short-circuit, so the wait returns `false` (cut short)
         // immediately rather than sleeping the whole 60s window.
-        mark_rate_limit_cooldown_from(ProviderKind::Anthropic, Some(Duration::from_secs(60)), 0);
+        mark_capacity_stall_from(
+            ProviderKind::Anthropic,
+            api::CapacityScope::Account,
+            Some(Duration::from_secs(60)),
+            0,
+        );
         let cancel = AtomicBool::new(true);
         let finished =
             wait_for_rate_limit_cooldown_cancellable(ProviderKind::Anthropic, Some(&cancel)).await;
@@ -560,7 +565,12 @@ mod tests {
         assert_eq!(backoff, 15_000);
         // A 60s server hint exceeds the 15s backoff floor → server wins.
         // (Exercised indirectly: mark with a large hint, must not panic.)
-        mark_rate_limit_cooldown_from(ProviderKind::Anthropic, Some(Duration::from_secs(60)), 0);
+        mark_capacity_stall_from(
+            ProviderKind::Anthropic,
+            api::CapacityScope::Account,
+            Some(Duration::from_secs(60)),
+            0,
+        );
     }
 
     #[test]

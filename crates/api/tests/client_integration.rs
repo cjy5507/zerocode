@@ -766,48 +766,133 @@ async fn stream_message_from_env_uses_local_base_url_smoke() {
     assert!(request.body.contains("\"stream\":true"));
 }
 
+/// A **pre-commit** provider-emitted error frame must be recovered by the same
+/// transparent restart a dropped connection gets — not surfaced.
+///
+/// Anthropic sheds a streaming request by answering HTTP 200 and then sending
+/// `event: error {"type":"overloaded_error"}`, normally before `message_start`.
+/// That failure arrives from the SSE parser rather than the body read, and the
+/// parser's `?` used to bypass the restart gate entirely, so a recoverable
+/// hiccup with nothing yet on screen became a turn-level error: ~12 whole-request
+/// retries over the 5-minute account budget and then a dead turn. The frame even
+/// self-labels `retryable: true` — the flag simply had no reader on this path.
 #[tokio::test]
-async fn stream_message_surfaces_sse_error_payload() {
+async fn stream_message_restarts_on_precommit_overload_frame() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let Some(server) = spawn_server(
-        state,
-        vec![http_response_with_headers(
-            "200 OK",
-            "text/event-stream",
-            concat!(
-                "event: error\n",
-                "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n"
+        state.clone(),
+        vec![
+            http_response_with_headers(
+                "200 OK",
+                "text/event-stream",
+                concat!(
+                    "event: error\n",
+                    "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"
+                ),
+                &[("request-id", "req_stream_err_1")],
             ),
-            &[("request-id", "req_stream_err_1")],
-        )],
+            http_response_with_headers(
+                "200 OK",
+                "text/event-stream",
+                concat!(
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_after_restart\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":8,\"output_tokens\":0}}}\n\n"
+                ),
+                &[("request-id", "req_stream_ok_2")],
+            ),
+        ],
     )
     .await else {
         return;
     };
 
-    let client = ApiClient::new("test-key").with_base_url(server.base_url());
+    let client = ApiClient::new("test-key")
+        .with_base_url(server.base_url())
+        .with_retry_policy(2, Duration::from_millis(1), Duration::from_millis(2));
     let mut stream = client
         .stream_message(&sample_request(true))
         .await
         .expect("stream should start");
 
-    let error = stream
+    let event = stream
         .next_event()
         .await
-        .expect_err("error event should surface as api error");
-    match error {
-        ApiError::StreamApi {
-            error_type,
-            message,
-            retryable,
-            ..
-        } => {
-            assert_eq!(error_type.as_deref(), Some("overloaded_error"));
-            assert_eq!(message.as_deref(), Some("busy"));
-            assert!(retryable);
+        .expect("a pre-commit overload must be re-opened, not surfaced")
+        .expect("the restarted stream delivers its first frame");
+    assert!(
+        matches!(event, api::StreamEvent::MessageStart(_)),
+        "expected the restarted turn's message_start, got {event:?}"
+    );
+    assert_eq!(
+        state.lock().await.len(),
+        2,
+        "the overload frame must cost exactly one transparent re-open"
+    );
+}
+
+/// The restart must never duplicate output. When text and the error frame land in
+/// the SAME chunk, the text was parsed but not yet handed to the caller — so it is
+/// discarded with the dead attempt and only the fresh turn's text is delivered.
+///
+/// (The complementary case — an error frame arriving *after* text was surfaced,
+/// where restarting WOULD duplicate and the error must propagate — is decided by
+/// `should_restart` / `crosses_restart_commit_boundary` and unit-tested with them;
+/// it cannot be provoked from here because one queued response is written as a
+/// single chunk.)
+#[tokio::test]
+async fn stream_restart_discards_the_dead_attempts_unseen_text() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let Some(server) = spawn_server(
+        state.clone(),
+        vec![
+            http_response_with_headers(
+                "200 OK",
+                "text/event-stream",
+                concat!(
+                    "event: content_block_delta\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"discarded\"}}\n\n",
+                    "event: error\n",
+                    "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"
+                ),
+                &[("request-id", "req_stream_err_1")],
+            ),
+            http_response_with_headers(
+                "200 OK",
+                "text/event-stream",
+                concat!(
+                    "event: content_block_delta\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"delivered\"}}\n\n"
+                ),
+                &[("request-id", "req_stream_ok_2")],
+            ),
+        ],
+    )
+    .await else {
+        return;
+    };
+
+    let client = ApiClient::new("test-key")
+        .with_base_url(server.base_url())
+        .with_retry_policy(2, Duration::from_millis(1), Duration::from_millis(2));
+    let mut stream = client
+        .stream_message(&sample_request(true))
+        .await
+        .expect("stream should start");
+
+    let mut texts = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("no error should surface") {
+        if let api::StreamEvent::ContentBlockDelta(delta) = event {
+            if let api::ContentBlockDelta::TextDelta { text } = delta.delta {
+                texts.push(text);
+            }
         }
-        other => panic!("expected stream api error, got {other:?}"),
     }
+    assert_eq!(
+        texts,
+        vec!["delivered".to_string()],
+        "the aborted attempt's unseen text must not reach the caller"
+    );
+    assert_eq!(state.lock().await.len(), 2, "exactly one re-open");
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

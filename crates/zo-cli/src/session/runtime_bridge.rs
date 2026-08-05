@@ -397,11 +397,11 @@ impl AsyncApiClient for LiveAsyncApiClient {
                 .client
                 .clone()
                 .with_anthropic_retry_notice_callback(move |notice| {
-                    let label = if notice.rate_limited {
-                        "rate limited"
-                    } else {
-                        "transient provider error"
-                    };
+                    // One classifier for the label, the backoff schedule, and the
+                    // quota-escape decision: a row that says "rate limited" while
+                    // the retry layer is treating the same error as a provider
+                    // overload teaches the user to distrust both.
+                    let label = core_types::retry_signal::retry_notice_label(&notice.error);
                     // Surface the underlying cause: a bare "retrying" row left
                     // users unable to tell a 429 from an overload or a network
                     // drop during multi-attempt ladders.

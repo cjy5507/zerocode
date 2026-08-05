@@ -1766,7 +1766,7 @@ fn parse_stream_error_frame(payload: &str) -> Option<ApiError> {
     let retryable = [error_type.as_deref(), envelope.error.message.as_deref()]
         .into_iter()
         .flatten()
-        .any(|part| core_types::retry_signal::is_rate_limit_text(&part.to_ascii_lowercase()));
+        .any(|part| core_types::retry_signal::is_capacity_text(&part.to_ascii_lowercase()));
     Some(ApiError::StreamApi {
         error_type,
         message: envelope.error.message,

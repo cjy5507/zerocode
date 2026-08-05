@@ -624,7 +624,15 @@ fn add_status_to_bucket(
 /// model-quality signal), instead of two independently-maintained copies of
 /// the same literal set.
 fn is_infra_provider_error(provider_error_class: Option<&str>) -> bool {
-    matches!(provider_error_class, Some("rateLimit" | "transient" | "authExpired"))
+    // `providerOverloaded` is the capacity label a sub-agent reports when the
+    // PROVIDER shed the request (429's sibling — see `api::CapacityScope`). It is
+    // infrastructure noise for exactly the same reason `rateLimit` is: the model
+    // never got to answer, so counting it as a quality loss would demote whichever
+    // model happened to be routed during a capacity dip.
+    matches!(
+        provider_error_class,
+        Some("rateLimit" | "providerOverloaded" | "transient" | "authExpired")
+    )
 }
 
 /// Whether a record is a decisive win (`Some(true)`), a decisive loss

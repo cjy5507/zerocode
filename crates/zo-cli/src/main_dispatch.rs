@@ -882,7 +882,7 @@ mod unapplied_flag_tests {
     fn model_fallback_uses_structured_rate_limit_class() {
         let rate_limit = runtime::RuntimeError::with_provider_error_class(
             "401 text appears in stale diagnostics",
-            ProviderErrorClass::RateLimit { retry_after: None },
+            ProviderErrorClass::account_rate_limit(None),
         );
         assert!(runtime_error_warrants_model_fallback(&rate_limit));
 

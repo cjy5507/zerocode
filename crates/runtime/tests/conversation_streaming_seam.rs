@@ -1082,9 +1082,7 @@ impl AsyncApiClient for RateLimitingAsyncApi {
             if call < self.fail_until {
                 return Err(RuntimeError::with_provider_error_class(
                     "simulated quota exhaustion (test)",
-                    ProviderErrorClass::RateLimit {
-                        retry_after: self.retry_after,
-                    },
+                    ProviderErrorClass::account_rate_limit(self.retry_after),
                 ));
             }
             render_tx
@@ -1361,7 +1359,7 @@ fn sync_run_turn_swaps_to_quota_fallback() {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Err(RuntimeError::with_provider_error_class(
                 "simulated quota exhaustion (test)",
-                ProviderErrorClass::RateLimit { retry_after: None },
+                ProviderErrorClass::account_rate_limit(None),
             ))
         }
     }

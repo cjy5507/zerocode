@@ -1936,7 +1936,7 @@ fn deep_verify_rate_limit_does_not_arm_the_main_turn_quota_fallback() {
         api::detect_provider_kind("gpt-5.6-sol"),
         "a verifier 429 must not be attributed to the GPT main model"
     );
-    crate::retry::mark_foreground_rate_limit(
+    crate::retry::mark_foreground_capacity_stall(
         rate_limit_model,
         "HTTP 429 Too Many Requests",
         0,
@@ -1949,7 +1949,7 @@ fn deep_verify_rate_limit_does_not_arm_the_main_turn_quota_fallback() {
 
     let rate_limit = RuntimeError::with_provider_error_class(
         "Fable quota exhausted",
-        api::ProviderErrorClass::RateLimit { retry_after: None },
+        api::ProviderErrorClass::account_rate_limit(None),
     );
 
     assert!(matches!(
@@ -1999,9 +1999,7 @@ fn main_quota_escape_waits_once_then_surfaces_when_fallback_gate_is_closed() {
     )));
     let rate_limit = RuntimeError::with_provider_error_class(
         "Anthropic burst limit",
-        api::ProviderErrorClass::RateLimit {
-            retry_after: Some(Duration::from_secs(2)),
-        },
+        api::ProviderErrorClass::account_rate_limit(Some(Duration::from_secs(2))),
     );
 
     assert!(matches!(
@@ -2014,6 +2012,98 @@ fn main_quota_escape_waits_once_then_surfaces_when_fallback_gate_is_closed() {
     ));
     assert!(!runtime.quota_fallback_active);
     assert!(runtime.quota_dry_until.is_none());
+}
+
+/// A **provider overload** must escape to the fallback model immediately, even
+/// though the account-utilization gate is shut.
+///
+/// This is the turn-death from the report: Anthropic shed every Opus request while
+/// the account window sat at 2 % utilization, so `quota_fallback_permitted` (which
+/// asks "is the ACCOUNT's window ≥95 % spent?") said no and the escape returned
+/// `None` — killing a turn whose own error text advised switching models, with a
+/// working GPT candidate installed. The gate is right for a 429 and inverted for a
+/// 529, so the scope now decides whether it is consulted at all.
+#[test]
+fn provider_overload_escapes_to_fallback_even_below_the_utilization_gate() {
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        NoopApiClient,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    runtime.set_context_model("claude-opus-5");
+    // A generous wait band, to prove the overload path does not sit in it: waiting
+    // for the ACCOUNT window to reset is waiting on a clock the 529 never mentioned.
+    runtime.set_quota_wait_band(Duration::from_secs(15 * 60));
+    runtime.set_quota_fallback_client(Some((
+        Arc::new(NoopAsyncApiClient),
+        "gpt-5.6-sol".to_string(),
+    )));
+    let overloaded = RuntimeError::with_provider_error_class(
+        "provider stream: transport error: api stream error (overloaded_error): Overloaded",
+        api::ProviderErrorClass::provider_overloaded(None),
+    );
+
+    assert!(
+        matches!(
+            runtime.decide_quota_escape_with_gate(&overloaded, |_| false),
+            QuotaEscape::Fallback(model) if model == "gpt-5.6-sol"
+        ),
+        "a shedding provider must hand the turn to the fallback model"
+    );
+    assert!(runtime.quota_fallback_active);
+    assert!(runtime.quota_dry_until.is_some());
+    assert!(
+        !runtime.quota_waited_this_turn,
+        "the account-window wait must not be consumed by a provider overload"
+    );
+
+    // Same closed gate, same wait band, an ACCOUNT 429 instead: the pre-existing
+    // policy is untouched — one bounded wait, then end the turn rather than swap
+    // on a window that is only under burst pressure.
+    let mut throttled_runtime = ConversationRuntime::new(
+        Session::new(),
+        NoopApiClient,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    throttled_runtime.set_context_model("claude-opus-5");
+    throttled_runtime.set_quota_wait_band(Duration::from_secs(15 * 60));
+    throttled_runtime.set_quota_fallback_client(Some((
+        Arc::new(NoopAsyncApiClient),
+        "gpt-5.6-sol".to_string(),
+    )));
+    let throttled = RuntimeError::with_provider_error_class(
+        "api returned 429 Too Many Requests (rate_limit_error)",
+        api::ProviderErrorClass::account_rate_limit(Some(Duration::from_secs(2))),
+    );
+    assert!(matches!(
+        throttled_runtime.decide_quota_escape_with_gate(&throttled, |_| false),
+        QuotaEscape::Wait(_)
+    ));
+    assert!(matches!(
+        throttled_runtime.decide_quota_escape_with_gate(&throttled, |_| false),
+        QuotaEscape::None
+    ));
+    assert!(!throttled_runtime.quota_fallback_active);
+}
+
+/// Inert async client for escape-decision tests: the decision never dispatches.
+struct NoopAsyncApiClient;
+
+impl AsyncApiClient for NoopAsyncApiClient {
+    fn stream_async<'a>(
+        &'a self,
+        _request: ApiRequest,
+        _render_tx: tokio::sync::mpsc::Sender<crate::message_stream::types::RenderBlock>,
+        _text_block_id: crate::message_stream::types::BlockId,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<AssistantEvent>, RuntimeError>> + Send + 'a>,
+    > {
+        Box::pin(async { panic!("deciding an escape must not dispatch a request") })
+    }
 }
 
 /// A fresh measured reading below the swap threshold proves the main

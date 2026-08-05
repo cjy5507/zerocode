@@ -2577,6 +2577,14 @@ impl App {
         self.mode = mode;
     }
 
+    /// Current composer contents. Used to decide whether a restore may write
+    /// into it (see the turn-failure path in `session::tui_loop`): text typed
+    /// while a turn was running is newer than anything being restored.
+    #[must_use]
+    pub fn input_text(&self) -> String {
+        self.input.text()
+    }
+
     pub fn set_input_text(&mut self, text: &str) {
         self.hints.slash_hidden_for = None;
         self.hints.mention_hidden_for = None;

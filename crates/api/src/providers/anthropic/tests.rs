@@ -680,7 +680,7 @@ async fn retry_notice_fires_before_stream_establish_sleep() {
             seen.lock().unwrap().push((
                 notice.attempt,
                 notice.max_attempts,
-                notice.rate_limited,
+                core_types::retry_signal::retry_notice_label(&notice.error),
                 notice.delay,
             ));
         });
@@ -696,7 +696,10 @@ async fn retry_notice_fires_before_stream_establish_sleep() {
     assert_eq!(notices.len(), 1, "one 429 retry notice");
     assert_eq!(notices[0].0, 1);
     assert_eq!(notices[0].1, 2);
-    assert!(notices[0].2, "429 must be marked rate-limited");
+    // The notice carries the flattened error and the renderer labels it through
+    // the shared classifier, so the row can name the exact wall — a 429 here, a
+    // "provider overloaded" for a 529 — instead of the old boolean's two buckets.
+    assert_eq!(notices[0].2, "rate limited");
 }
 
 #[tokio::test]
