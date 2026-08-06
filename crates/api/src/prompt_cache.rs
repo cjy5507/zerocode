@@ -173,6 +173,148 @@ pub struct PromptCacheStats {
     pub low_cache_hit_streak_tokens: u64,
 }
 
+/// What one wire message IS, without its text: enough to name a prefix rewrite
+/// without storing (or ever logging) prompt content.
+///
+/// The per-message hashes answer *where* history diverged; they cannot answer
+/// *what* changed there, and that gap cost a full investigation: a ledger full
+/// of "history diverged at message 275/1142" rows, five of them at the same
+/// index, with no way to tell an in-memory microcompact clear from a
+/// tool-history rewrite from a re-truncated result. A role, the block kinds,
+/// and a byte count separate those three on sight.
+/// Wire form: `"role|kinds|bytes"`, one line instead of six.
+///
+/// Not cosmetic. `session-state.json` is rewritten on every request and holds
+/// one entry per message — 1,157 on a real session — and the shared writer
+/// pretty-prints. As a struct that is ~170 kB re-written per request; as a
+/// string it is ~40 kB. A diagnostic must not cost a gigabyte of disk writes a
+/// day.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireMessageShape {
+    /// Wire role — `"user"` or `"assistant"`.
+    pub role: String,
+    /// Block kinds in wire order, comma-joined, tool blocks named
+    /// (`"tool_use:Agent,text"`). Truncated past
+    /// [`MAX_SHAPE_KINDS`] blocks with a `"+N"` tail, since a coalesced tool
+    /// run can carry dozens and the tail adds nothing to the diagnosis.
+    pub kinds: String,
+    /// Serialized bytes with `cache_control` stripped — the same form the
+    /// hashes are taken over, so a size change here is exactly a change the
+    /// provider's cache would see.
+    pub bytes: u32,
+}
+
+/// Block kinds kept in [`WireMessageShape::kinds`] before summarizing the rest.
+const MAX_SHAPE_KINDS: usize = 6;
+
+impl Serialize for WireMessageShape {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&format_args!("{}|{}|{}", self.role, self.kinds, self.bytes))
+    }
+}
+
+impl<'de> Deserialize<'de> for WireMessageShape {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        // Split the byte count off the RIGHT and the role off the LEFT, so the
+        // middle field is free to hold anything without a `|`.
+        let (head, bytes) = raw
+            .rsplit_once('|')
+            .ok_or_else(|| serde::de::Error::custom("expected role|kinds|bytes"))?;
+        let (role, kinds) = head
+            .split_once('|')
+            .ok_or_else(|| serde::de::Error::custom("expected role|kinds|bytes"))?;
+        Ok(Self {
+            role: role.to_string(),
+            kinds: kinds.to_string(),
+            bytes: bytes
+                .parse()
+                .map_err(|_| serde::de::Error::custom("shape byte count must be a u32"))?,
+        })
+    }
+}
+
+impl WireMessageShape {
+    /// Build a shape from one already-`cache_control`-stripped message value.
+    fn from_stripped(value: &serde_json::Value) -> Self {
+        let role = value
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+            .to_string();
+        let blocks = value.get("content").and_then(serde_json::Value::as_array);
+        let kinds = blocks.map_or_else(String::new, |blocks| {
+            let mut rendered: Vec<String> = blocks
+                .iter()
+                .take(MAX_SHAPE_KINDS)
+                .map(Self::block_kind)
+                .collect();
+            if blocks.len() > MAX_SHAPE_KINDS {
+                rendered.push(format!("+{}", blocks.len() - MAX_SHAPE_KINDS));
+            }
+            rendered.join(",")
+        });
+        Self {
+            role,
+            kinds,
+            bytes: u32::try_from(
+                serde_json::to_string(value).map_or(0, |serialized| serialized.len()),
+            )
+            .unwrap_or(u32::MAX),
+        }
+    }
+
+    /// One block's kind, with the tool name appended for `tool_use` — naming
+    /// the tool is what turns "a tool block changed" into "the `Agent` call was
+    /// rewritten", which is the whole point of recording shapes.
+    fn block_kind(block: &serde_json::Value) -> String {
+        let kind = block
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        match block.get("name").and_then(serde_json::Value::as_str) {
+            Some(name) => format!("{kind}:{name}"),
+            None => kind.to_string(),
+        }
+    }
+
+    /// `"user [tool_result] 12.4kB -> 96B"` — the one-line form the break
+    /// reason carries.
+    fn describe_change(previous: &Self, current: &Self) -> String {
+        let role = if previous.role == current.role {
+            previous.role.clone()
+        } else {
+            format!("{} -> {}", previous.role, current.role)
+        };
+        let kinds = if previous.kinds == current.kinds {
+            format!("[{}]", previous.kinds)
+        } else {
+            format!("[{}] -> [{}]", previous.kinds, current.kinds)
+        };
+        format!(
+            "{role} {kinds} {} -> {}",
+            format_bytes(previous.bytes),
+            format_bytes(current.bytes)
+        )
+    }
+}
+
+fn format_bytes(bytes: u32) -> String {
+    if bytes >= 1024 {
+        format!("{:.1}kB", f64::from(bytes) / 1024.0)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+/// The message a prefix rewrite happened at, in both its old and new shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DivergedWireMessage {
+    pub index: usize,
+    pub previous: WireMessageShape,
+    pub current: WireMessageShape,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 // The four axis flags mirror the four independent request-fingerprint hashes
 // (model/system/tools/messages) — any subset can change together, so they are
@@ -208,6 +350,19 @@ pub struct CacheBreakEvent {
     /// for the all-axes-stable case.
     #[serde(default)]
     pub elapsed_secs: u64,
+    /// What changed at the divergence, when there was one and both requests
+    /// recorded a shape for that index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diverged_message: Option<DivergedWireMessage>,
+    /// Tool names this request advertises that the previous one did not, and
+    /// vice versa. Both empty on a `tools_changed` break means the NAMES are
+    /// identical and something else about the definitions moved (order, a
+    /// description, a schema) — a different defect with a different fix, and
+    /// previously indistinguishable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_added: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_removed: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,6 +554,9 @@ impl PromptCache {
                     cache_creation: usage.cache_creation_input_tokens,
                     token_drop: event.token_drop,
                     elapsed_secs: event.elapsed_secs,
+                    diverged_message: event.diverged_message.clone(),
+                    tools_added: event.tools_added.clone(),
+                    tools_removed: event.tools_removed.clone(),
                 },
             );
         }
@@ -471,6 +629,18 @@ struct TrackedPromptState {
     /// upgrade, then resumes normally, rather than failing to load at all.
     #[serde(default)]
     message_hashes: Vec<u64>,
+    /// Per-message shape, parallel to [`Self::message_hashes`]. Persisted for
+    /// the same reason the hashes are (the non-Anthropic path rebuilds
+    /// `PromptCache` per request, so in-memory state would never see a
+    /// previous), and `#[serde(default)]` so a state file written before this
+    /// field existed still loads — the first break after an upgrade simply
+    /// reports no shape.
+    #[serde(default)]
+    message_shapes: Vec<WireMessageShape>,
+    /// Advertised tool names in wire order. Turns a `tools_changed` break from
+    /// "some hash moved" into a name-level diff.
+    #[serde(default)]
+    tool_names: Vec<String>,
 }
 
 impl TrackedPromptState {
@@ -489,6 +659,8 @@ impl TrackedPromptState {
             messages_hash: hashes.messages,
             cache_read_input_tokens: usage.cache_read_input_tokens,
             message_hashes: hashes.message_hashes.clone(),
+            message_shapes: hashes.message_shapes.clone(),
+            tool_names: hashes.tool_names.clone(),
         }
     }
 }
@@ -509,31 +681,38 @@ struct RequestFingerprints {
     /// [`first_divergence`] — this is the piece the aggregate `messages` hash
     /// cannot answer ("which message changed", not just "something changed").
     message_hashes: Vec<u64>,
+    /// Per-message shape, parallel to `message_hashes` — answers "what changed
+    /// there", the piece a hash cannot.
+    message_shapes: Vec<WireMessageShape>,
+    /// Advertised tool names in wire order.
+    tool_names: Vec<String>,
 }
 
 impl RequestFingerprints {
     fn from_request(request: &MessageRequest) -> Self {
+        // Strip ONCE and derive all three message-side fingerprints from the
+        // same values: the aggregate hash, the per-message hashes, and the
+        // shapes. Serializing a 1,000-message history is not free, and the
+        // three must agree about what they describe.
+        let stripped = strip_message_cache_markers(&request.messages);
         Self {
             model: hash_serializable(&request.model),
             system: hash_serializable(&request.system),
             tools: hash_serializable(&request.tools),
-            messages: hash_serializable(&strip_message_cache_markers(&request.messages)),
-            message_hashes: hash_messages(&request.messages),
+            messages: hash_serializable(&stripped),
+            message_hashes: stripped.iter().map(hash_serializable).collect(),
+            message_shapes: stripped
+                .iter()
+                .map(WireMessageShape::from_stripped)
+                .collect(),
+            tool_names: request
+                .tools
+                .iter()
+                .flatten()
+                .map(|tool| tool.name.clone())
+                .collect(),
         }
     }
-}
-
-/// Per-message FNV hash, one entry per element of `messages`, in order, with
-/// `cache_control` markers stripped before hashing (see
-/// [`strip_message_cache_markers`]). Reuses [`hash_serializable`] (the same
-/// stable FNV hasher the aggregate request fingerprint uses) so a given
-/// message hashes identically whether it's hashed alone or as part of the
-/// whole array.
-fn hash_messages(messages: &[InputMessage]) -> Vec<u64> {
-    strip_message_cache_markers(messages)
-        .iter()
-        .map(hash_serializable)
-        .collect()
 }
 
 /// Lower `messages` to JSON with every `cache_control` key removed, for
@@ -598,6 +777,108 @@ fn first_divergence(previous: Option<&[u64]>, current: &[u64]) -> (Option<usize>
     }
 }
 
+/// The `fingerprint version changed` break: our own schema moved, so nothing
+/// about the request can be compared across it. Split out of
+/// [`detect_cache_break`] to keep that function readable, not because it varies.
+fn fingerprint_bump_break(
+    previous: &TrackedPromptState,
+    current: &TrackedPromptState,
+    elapsed: u64,
+) -> CacheBreakEvent {
+    CacheBreakEvent {
+        unexpected: false,
+        reason: format!(
+            "fingerprint version changed (v{} -> v{})",
+            previous.fingerprint_version, current.fingerprint_version
+        ),
+        previous_cache_read_input_tokens: previous.cache_read_input_tokens,
+        current_cache_read_input_tokens: current.cache_read_input_tokens,
+        token_drop: previous
+            .cache_read_input_tokens
+            .saturating_sub(current.cache_read_input_tokens),
+        model_changed: false,
+        system_changed: false,
+        tools_changed: false,
+        messages_changed: false,
+        messages_truncated: false,
+        elapsed_secs: elapsed,
+        diverged_message: None,
+        tools_added: Vec::new(),
+        tools_removed: Vec::new(),
+    }
+}
+
+/// Which fingerprint axes moved — the four independent hashes plus the shrink
+/// flag, grouped so the reason builder takes one argument instead of five
+/// booleans in a row.
+#[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools, reason = "one flag per independent fingerprint axis")]
+struct BreakAxes {
+    model_changed: bool,
+    system_changed: bool,
+    tools_changed: bool,
+    messages_changed: bool,
+    messages_truncated: bool,
+}
+
+/// Wire message counts on either side of the break.
+#[derive(Debug, Clone, Copy)]
+struct MessageCounts {
+    previous: usize,
+    current: usize,
+}
+
+/// One human-readable clause per changed axis, in fingerprint order. Empty when
+/// nothing our side controls moved — the caller reads that as "provider-side or
+/// TTL".
+fn break_reasons(
+    axes: BreakAxes,
+    tools_added: &[String],
+    tools_removed: &[String],
+    diverged_message: Option<&DivergedWireMessage>,
+    counts: MessageCounts,
+    first_divergence_index: Option<usize>,
+) -> Vec<String> {
+    let mut reasons: Vec<String> = Vec::new();
+    if axes.model_changed {
+        reasons.push("model changed".to_string());
+    }
+    if axes.system_changed {
+        reasons.push("system prompt changed".to_string());
+    }
+    if axes.tools_changed {
+        reasons.push(format!(
+            "tool definitions changed{}",
+            format_tool_diff(tools_added, tools_removed)
+        ));
+    }
+    if axes.messages_changed {
+        // Enrich with *where* the history diverged, and with what changed there
+        // — the pieces the old "message payload changed" wording could never
+        // answer, so every ordinary tail-append turn (which also changes the
+        // aggregate hash) looked identical to an actual mid-history edit.
+        let current_message_count = counts.current;
+        let detail = match first_divergence_index {
+            Some(index) => {
+                let shape = diverged_message.map_or_else(String::new, |diverged| {
+                    format!(
+                        " ({})",
+                        WireMessageShape::describe_change(&diverged.previous, &diverged.current)
+                    )
+                });
+                format!("history diverged at message {index}/{current_message_count}{shape}")
+            }
+            None if axes.messages_truncated => format!(
+                "history truncated ({} -> {current_message_count} messages, shared prefix intact)",
+                counts.previous
+            ),
+            None => "append-only, no earlier message changed".to_string(),
+        };
+        reasons.push(format!("message payload changed ({detail})"));
+    }
+    reasons
+}
+
 fn detect_cache_break(
     config: &PromptCacheConfig,
     previous: Option<&TrackedPromptState>,
@@ -610,24 +891,7 @@ fn detect_cache_break(
         .observed_at_unix_secs
         .saturating_sub(previous.observed_at_unix_secs);
     if previous.fingerprint_version != current.fingerprint_version {
-        return Some(CacheBreakEvent {
-            unexpected: false,
-            reason: format!(
-                "fingerprint version changed (v{} -> v{})",
-                previous.fingerprint_version, current.fingerprint_version
-            ),
-            previous_cache_read_input_tokens: previous.cache_read_input_tokens,
-            current_cache_read_input_tokens: current.cache_read_input_tokens,
-            token_drop: previous
-                .cache_read_input_tokens
-                .saturating_sub(current.cache_read_input_tokens),
-            model_changed: false,
-            system_changed: false,
-            tools_changed: false,
-            messages_changed: false,
-            messages_truncated: false,
-            elapsed_secs: elapsed,
-        });
+        return Some(fingerprint_bump_break(previous, current, elapsed));
     }
     let token_drop = previous
         .cache_read_input_tokens
@@ -649,31 +913,40 @@ fn detect_cache_break(
     let messages_truncated =
         messages_changed && current_message_count < previous.message_hashes.len();
 
-    let mut reasons: Vec<String> = Vec::new();
-    if model_changed {
-        reasons.push("model changed".to_string());
-    }
-    if system_changed {
-        reasons.push("system prompt changed".to_string());
-    }
-    if tools_changed {
-        reasons.push("tool definitions changed".to_string());
-    }
-    if messages_changed {
-        // Enrich with *where* the history diverged — the piece the old
-        // "message payload changed" wording could never answer, so every
-        // ordinary tail-append turn (which also changes the aggregate hash)
-        // looked identical to an actual mid-history edit in `last_break_reason`.
-        let detail = match first_divergence_index {
-            Some(index) => format!("history diverged at message {index}/{current_message_count}"),
-            None if messages_truncated => format!(
-                "history truncated ({} -> {current_message_count} messages, shared prefix intact)",
-                previous.message_hashes.len()
-            ),
-            None => "append-only, no earlier message changed".to_string(),
-        };
-        reasons.push(format!("message payload changed ({detail})"));
-    }
+    // Name the tools that came and went. A tool set that oscillates within one
+    // conversation strands the entire prefix on every flip (the definitions sit
+    // in front of the messages), and the axis flag alone never said which tools
+    // — so the fix could only be guessed at.
+    let (tools_added, tools_removed) = if tools_changed {
+        tool_name_diff(&previous.tool_names, &current.tool_names)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let diverged_message = first_divergence_index.and_then(|index| {
+        Some(DivergedWireMessage {
+            index,
+            previous: previous.message_shapes.get(index)?.clone(),
+            current: current.message_shapes.get(index)?.clone(),
+        })
+    });
+
+    let reasons = break_reasons(
+        BreakAxes {
+            model_changed,
+            system_changed,
+            tools_changed,
+            messages_changed,
+            messages_truncated,
+        },
+        &tools_added,
+        &tools_removed,
+        diverged_message.as_ref(),
+        MessageCounts {
+            previous: previous.message_hashes.len(),
+            current: current_message_count,
+        },
+        first_divergence_index,
+    );
 
     let (unexpected, reason) = if reasons.is_empty() {
         if elapsed > config.prompt_ttl.as_secs() {
@@ -703,7 +976,43 @@ fn detect_cache_break(
         messages_changed,
         messages_truncated,
         elapsed_secs: elapsed,
+        diverged_message,
+        tools_added,
+        tools_removed,
     })
+}
+
+/// Names present in exactly one of the two advertised tool lists, as
+/// `(added, removed)`. Set semantics on purpose: a pure reordering yields two
+/// empty vectors, which is itself the finding (the names are the same, so
+/// something else about the definitions moved).
+fn tool_name_diff(previous: &[String], current: &[String]) -> (Vec<String>, Vec<String>) {
+    let before: std::collections::BTreeSet<&str> =
+        previous.iter().map(String::as_str).collect();
+    let after: std::collections::BTreeSet<&str> = current.iter().map(String::as_str).collect();
+    let added = after
+        .difference(&before)
+        .map(|name| (*name).to_string())
+        .collect();
+    let removed = before
+        .difference(&after)
+        .map(|name| (*name).to_string())
+        .collect();
+    (added, removed)
+}
+
+/// `" (-Agent, -Workflow)"` / `" (+ToolSearch)"` / `" (same names; order or
+/// definition changed)"` — the parenthetical the break reason appends.
+fn format_tool_diff(added: &[String], removed: &[String]) -> String {
+    if added.is_empty() && removed.is_empty() {
+        return " (same names; order or definition changed)".to_string();
+    }
+    let names: Vec<String> = removed
+        .iter()
+        .map(|name| format!("-{name}"))
+        .chain(added.iter().map(|name| format!("+{name}")))
+        .collect();
+    format!(" ({})", names.join(", "))
 }
 
 /// Ratio-based cache-efficiency streak tracker (spec item B). Updates
@@ -1242,6 +1551,16 @@ pub struct CacheBreakLedgerRow {
     pub token_drop: u32,
     /// Seconds since the previous tracked request (TTL-expiry evidence).
     pub elapsed_secs: u64,
+    /// What the diverging message looked like before and after — the field that
+    /// makes a rewrite attributable without a re-investigation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diverged_message: Option<DivergedWireMessage>,
+    /// Name-level tool diff for a `tools_changed` break; both empty means the
+    /// names matched and the definitions themselves moved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_added: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_removed: Vec<String>,
 }
 
 /// Cause of a break whose axis flags are all `false` (the request fingerprint
@@ -1478,6 +1797,185 @@ mod tests {
                 .expect("break should be detected");
         assert!(event.unexpected);
         assert!(event.reason.contains("stable"));
+    }
+
+    /// A `tools_changed` break must name the tools. Without this the ledger says
+    /// only "tool definitions changed", which is where a real investigation had
+    /// to start over from measurement: 41% of one day's cache-write came from
+    /// this axis with no record of which tools moved.
+    #[test]
+    fn a_tools_changed_break_names_the_tools_that_came_and_went() {
+        let with = |names: &[&str]| {
+            let mut request = sample_request("same prompt");
+            request.tools = Some(
+                names
+                    .iter()
+                    .map(|name| crate::types::ToolDefinition {
+                        name: (*name).to_string(),
+                        description: None,
+                        input_schema: serde_json::json!({"type": "object"}),
+                    })
+                    .collect(),
+            );
+            request
+        };
+        let state = |request: &MessageRequest, cache_read: u32| {
+            TrackedPromptState::from_usage(
+                request,
+                &Usage {
+                    input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: cache_read,
+                    output_tokens: 0,
+                },
+            )
+        };
+
+        // A deep leg dropping its delegation tools, then the main lane restoring
+        // them — the exact oscillation that stranded whole prefixes.
+        let full = state(&with(&["read_file", "Agent", "Workflow"]), 200_000);
+        let leg = state(&with(&["read_file"]), 0);
+        let event = detect_cache_break(&PromptCacheConfig::default(), Some(&full), &leg, None, 1)
+            .expect("break");
+        assert!(event.tools_changed);
+        assert_eq!(event.tools_removed, vec!["Agent", "Workflow"]);
+        assert!(event.tools_added.is_empty());
+        assert!(
+            event.reason.contains("(-Agent, -Workflow)"),
+            "reason must name them: {}",
+            event.reason
+        );
+
+        // An identical tool set is not a tools_changed break at all — whatever
+        // else the request did, this axis stays quiet and names nothing.
+        let back = state(&with(&["read_file", "Agent", "Workflow"]), 0);
+        let event = detect_cache_break(&PromptCacheConfig::default(), Some(&full), &back, None, 1)
+            .expect("the token drop alone is still a break");
+        assert!(!event.tools_changed);
+        assert!(event.tools_added.is_empty() && event.tools_removed.is_empty());
+
+        // Same names in a different order: both diffs empty, and the reason says
+        // so rather than implying a membership change.
+        let reordered = state(&with(&["Agent", "Workflow", "read_file"]), 0);
+        let event =
+            detect_cache_break(&PromptCacheConfig::default(), Some(&full), &reordered, None, 1)
+                .expect("break");
+        assert!(event.tools_changed);
+        assert!(event.tools_added.is_empty() && event.tools_removed.is_empty());
+        assert!(
+            event.reason.contains("same names; order or definition changed"),
+            "{}",
+            event.reason
+        );
+    }
+
+    /// A mid-prefix rewrite must say WHAT changed at the divergence, not only
+    /// where. Five identical "diverged at message 275/1142" rows could not tell
+    /// an in-memory context trim from a tool-history rewrite; a role, the block
+    /// kinds and a byte count do.
+    #[test]
+    fn a_mid_prefix_rewrite_describes_the_message_that_changed() {
+        let long_body = "x".repeat(4_000);
+        let previous_request = sample_request_with_messages(&[&long_body, "keep going"]);
+        let current_request = sample_request_with_messages(&["[context trimmed]", "keep going"]);
+        let state = |request: &MessageRequest, cache_read: u32| {
+            TrackedPromptState::from_usage(
+                request,
+                &Usage {
+                    input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: cache_read,
+                    output_tokens: 0,
+                },
+            )
+        };
+        let event = detect_cache_break(
+            &PromptCacheConfig::default(),
+            Some(&state(&previous_request, 200_000)),
+            &state(&current_request, 0),
+            Some(0),
+            2,
+        )
+        .expect("break");
+
+        let diverged = event.diverged_message.as_ref().expect("shape recorded");
+        assert_eq!(diverged.index, 0);
+        assert_eq!(diverged.previous.role, "user");
+        assert_eq!(diverged.previous.kinds, "text");
+        assert!(
+            diverged.previous.bytes > 4_000 && diverged.current.bytes < 100,
+            "the shrink is the whole signal: {diverged:?}"
+        );
+        assert!(
+            event.reason.contains("history diverged at message 0/2 (user [text] "),
+            "{}",
+            event.reason
+        );
+        assert!(
+            event.reason.contains("kB -> ") && event.reason.contains('B'),
+            "the reason must carry both sizes: {}",
+            event.reason
+        );
+    }
+
+    /// The compact wire form must round-trip, including a `kinds` field that
+    /// itself carries separators (`tool_use:Agent,text`) and the `+N` tail.
+    #[test]
+    fn a_message_shape_round_trips_through_its_compact_string_form() {
+        let shape = super::WireMessageShape {
+            role: "user".to_string(),
+            kinds: "tool_use:Agent,text,+12".to_string(),
+            bytes: 12_431,
+        };
+        let json = serde_json::to_string(&shape).expect("serialize");
+        assert_eq!(json, "\"user|tool_use:Agent,text,+12|12431\"");
+        assert_eq!(
+            serde_json::from_str::<super::WireMessageShape>(&json).expect("deserialize"),
+            shape
+        );
+        // A malformed entry must fail loudly rather than deserialize to zeros.
+        assert!(serde_json::from_str::<super::WireMessageShape>("\"user|text\"").is_err());
+        assert!(serde_json::from_str::<super::WireMessageShape>("\"user|text|huge\"").is_err());
+    }
+
+    /// The shapes must survive the same upgrade path the hashes did: a state
+    /// file written before the field existed still loads, and the break it
+    /// produces simply carries no shape rather than failing.
+    #[test]
+    fn a_state_file_without_shapes_still_loads_and_breaks_without_one() {
+        let old_json = serde_json::json!({
+            "observed_at_unix_secs": 1_000_000,
+            "fingerprint_version": super::current_fingerprint_version(),
+            "model_hash": 1,
+            "system_hash": 2,
+            "tools_hash": 3,
+            "messages_hash": 4,
+            "cache_read_input_tokens": 200_000,
+            "message_hashes": [11, 22],
+        })
+        .to_string();
+        let previous: TrackedPromptState =
+            serde_json::from_str(&old_json).expect("pre-shape state must still deserialize");
+        assert!(previous.message_shapes.is_empty());
+
+        let current = TrackedPromptState::from_usage(
+            &sample_request_with_messages(&["changed", "tail"]),
+            &Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 0,
+            },
+        );
+        let event =
+            detect_cache_break(&PromptCacheConfig::default(), Some(&previous), &current, Some(0), 2)
+                .expect("break");
+        assert!(event.diverged_message.is_none());
+        assert!(
+            event.reason.contains("history diverged at message 0/2"),
+            "{}",
+            event.reason
+        );
     }
 
     #[test]
@@ -1880,6 +2378,8 @@ mod tests {
             messages_hash: 4,
             cache_read_input_tokens: 50_000,
             message_hashes: vec![11, 22],
+            message_shapes: Vec::new(),
+            tool_names: Vec::new(),
         };
         let row_for = |event: &super::CacheBreakEvent| CacheBreakLedgerRow {
             seq: 1,
@@ -1900,6 +2400,9 @@ mod tests {
             cache_creation: 0,
             token_drop: event.token_drop,
             elapsed_secs: event.elapsed_secs,
+            diverged_message: event.diverged_message.clone(),
+            tools_added: event.tools_added.clone(),
+            tools_removed: event.tools_removed.clone(),
         };
 
         // Provider-side: byte-stable fingerprint, inside the TTL, reads drop.

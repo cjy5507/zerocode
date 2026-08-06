@@ -306,12 +306,36 @@ fn describe_break_row(row: &::api::CacheBreakLedgerRow) -> String {
         axes.push("system".to_string());
     }
     if row.tools_changed {
-        axes.push("tools".to_string());
+        // Name the tools when the ledger recorded them. "tools" alone sent a
+        // real investigation back to raw measurement to find out WHICH tools
+        // were oscillating; `tools(-Agent,-Workflow)` answers it in the report.
+        let mut names: Vec<String> = row
+            .tools_removed
+            .iter()
+            .map(|name| format!("-{name}"))
+            .collect();
+        names.extend(row.tools_added.iter().map(|name| format!("+{name}")));
+        if names.is_empty() {
+            axes.push("tools".to_string());
+        } else {
+            axes.push(format!("tools({})", names.join(",")));
+        }
     }
     if row.messages_truncated {
         axes.push("messages(truncated)".to_string());
     } else if row.messages_changed {
-        axes.push("messages".to_string());
+        // A mid-prefix rewrite is the expensive kind: say which message and how
+        // its shape moved, so the cause is attributable from the report alone.
+        match &row.diverged_message {
+            Some(diverged) => axes.push(format!(
+                "messages(@{} {} {}B->{}B)",
+                diverged.index,
+                diverged.current.kinds,
+                diverged.previous.bytes,
+                diverged.current.bytes
+            )),
+            None => axes.push("messages".to_string()),
+        }
     }
     if axes.is_empty() {
         axes.push(match row.no_axis_cause() {
@@ -1769,6 +1793,9 @@ mod tests {
             cache_creation: 0,
             token_drop: 0,
             elapsed_secs: 0,
+            diverged_message: None,
+            tools_added: Vec::new(),
+            tools_removed: Vec::new(),
         }
     }
 
@@ -1840,6 +1867,30 @@ mod tests {
         axis.messages_changed = true;
         axis.token_drop = 180_000;
         assert_eq!(describe_break_row(&axis), "req9 tools+messages -180k");
+
+        // With the ledger's name-level detail present, the label says WHICH
+        // tools left and WHERE the history was rewritten — the two questions
+        // the bare axis names could not answer.
+        let mut named = axis.clone();
+        named.tools_removed = vec!["Agent".to_string(), "Workflow".to_string()];
+        named.first_divergence_index = Some(275);
+        named.diverged_message = Some(::api::DivergedWireMessage {
+            index: 275,
+            previous: ::api::WireMessageShape {
+                role: "user".to_string(),
+                kinds: "tool_result".to_string(),
+                bytes: 12_431,
+            },
+            current: ::api::WireMessageShape {
+                role: "user".to_string(),
+                kinds: "tool_result".to_string(),
+                bytes: 96,
+            },
+        });
+        assert_eq!(
+            describe_break_row(&named),
+            "req9 tools(-Agent,-Workflow)+messages(@275 tool_result 12431B->96B) -180k"
+        );
 
         let mut truncated = cache_break_row();
         truncated.messages_changed = true;
