@@ -1493,6 +1493,21 @@ where
         render_tx: mpsc::Sender<RenderBlock>,
         prompter: Arc<dyn AsyncPermissionPrompter>,
     ) -> Result<DeepSubturnResult, StreamingTurnError> {
+        // A VERIFY leg is an internal judge: on resume its whole turn is
+        // policy-hidden (`seed_user_visibility` → `HideTurn`), but the live
+        // stream used to disagree and dump the judge's reasoning, tool rows,
+        // and raw verdict JSON into the transcript. Live now matches the
+        // resume policy — the leg streams into a drain, while the gate's own
+        // `auto: verifying…` notices narrate progress and permission prompts
+        // ride the separate prompter channel. PLAN/EXEC keep streaming: their
+        // output is user-facing work, and resume hides only their prompts.
+        let render_tx = if matches!(self.phase, DeepSubturnPhase::Verify) {
+            let (drain_tx, mut drain_rx) = mpsc::channel(64);
+            tokio::spawn(async move { while drain_rx.recv().await.is_some() {} });
+            drain_tx
+        } else {
+            render_tx
+        };
         let summary = self
             .runtime
             .run_internal_subturn_streaming_with_images(prompt, images, render_tx, prompter)

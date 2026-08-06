@@ -6320,6 +6320,155 @@ fn user_prompt_submit_deep_gate_turn_end_followup_runs_hook_again() {
     );
 }
 
+/// The VERIFY leg is an internal judge: resume policy hides its whole turn
+/// (`seed_user_visibility` → `HideTurn`), and the live stream must agree. A
+/// scripted client plays a main turn that edits a file (arming the reactive
+/// gate) and then answers the verify leg with a distinctive delta — which
+/// must never reach the caller's render channel, while the main turn's own
+/// blocks still do (the positive control that keeps this test non-vacuous).
+#[test]
+#[allow(clippy::too_many_lines)]
+fn verify_leg_stream_never_reaches_the_caller_render_channel() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::process::Command;
+
+    use crate::message_stream::types::{BlockId, RenderBlock};
+    use crate::permission::{
+        PermissionDecision as AsyncPermissionDecision, PermissionError,
+        PermissionPrompter as AsyncPermissionPrompter,
+        PermissionRequest as AsyncPermissionRequest,
+    };
+
+    struct AllowAsyncPrompter;
+    impl AsyncPermissionPrompter for AllowAsyncPrompter {
+        fn decide<'a>(
+            &'a self,
+            _request: AsyncPermissionRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<AsyncPermissionDecision, PermissionError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(AsyncPermissionDecision::Allow) })
+        }
+    }
+
+    struct EditThenVerifyClient;
+    impl AsyncApiClient for EditThenVerifyClient {
+        fn stream_async<'a>(
+            &'a self,
+            request: ApiRequest,
+            _render_tx: tokio::sync::mpsc::Sender<RenderBlock>,
+            _text_block_id: BlockId,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<AssistantEvent>, RuntimeError>> + Send + 'a>>
+        {
+            let is_verify_leg = request.messages.iter().any(|message| {
+                message.role == MessageRole::User
+                    && message.blocks.iter().any(|block| {
+                        matches!(
+                            block,
+                            ContentBlock::Text { text }
+                                if text.trim_start().starts_with(super::deep_gate::DEEP_VERIFY_MARKER)
+                        )
+                    })
+            });
+            let has_tool_results = request
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Tool);
+            Box::pin(async move {
+                if is_verify_leg {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("VERIFY-NOISE internal verdict".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                if has_tool_results {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("MAIN-DONE".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "edit-1".to_string(),
+                        name: "edit_file".to_string(),
+                        input: r#"{"path":"lib.rs"}"#.to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            })
+        }
+    }
+
+    // A real (tiny) git repo: the verify prompt harvests the turn diff, and a
+    // bare temp dir would exercise the no-repo degradation path instead of the
+    // leg this test is about.
+    let cwd = temp_workspace("verify-leg-drain");
+    fs::create_dir_all(&cwd).expect("cwd");
+    for args in [
+        &["init", "--quiet"][..],
+        &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-q", "-m", "seed"][..],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&cwd)
+            .status()
+            .expect("git available");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        NoopApiClient,
+        StaticToolExecutor::new().register("edit_file", |_| Ok("edited".to_string())),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    )
+    .with_async_api_client(Arc::new(EditThenVerifyClient));
+    runtime.set_workspace_cwd(cwd.clone());
+    runtime.set_deep_gate(Some(DeepGateConfig {
+        mode: DeepMode::Reactive,
+        check_command: None,
+        max_attempts: 1,
+    }));
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let rendered = rt.block_on(async {
+        let (render_tx, mut render_rx) = tokio::sync::mpsc::channel(64);
+        // Collect concurrently: a bounded channel left unread would
+        // backpressure the turn into a deadlock.
+        let collector = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Some(block) = render_rx.recv().await {
+                seen.push(format!("{block:?}"));
+            }
+            seen
+        });
+        let prompter: Arc<dyn AsyncPermissionPrompter> = Arc::new(AllowAsyncPrompter);
+        runtime
+            .run_turn_streaming_maybe_deep("fix the bug", Vec::new(), render_tx, prompter)
+            .await
+            .expect("deep streaming turn should proceed");
+        collector.await.expect("collector task")
+    });
+
+    let all = rendered.join("\n");
+    assert!(
+        all.contains("edit-1"),
+        "positive control: the main turn's own blocks must still render: {all}"
+    );
+    assert!(
+        !all.contains("VERIFY-NOISE"),
+        "the verify leg's stream leaked into the caller's render channel: {all}"
+    );
+
+    let _ = fs::remove_dir_all(cwd);
+}
+
 #[test]
 fn user_prompt_submit_deep_gate_denial_aborts_before_subturn_message() {
     use std::future::Future;
