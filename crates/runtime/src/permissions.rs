@@ -93,6 +93,9 @@ pub struct PermissionPolicy {
     /// Lets mode-based denial text name the phase clamp instead of
     /// misattributing the restriction to the user's permission mode.
     phase_clamp_base: Option<PermissionMode>,
+    /// Tools the active sub-turn phase forbids outright, regardless of mode or
+    /// rules (see [`Self::begin_phase_tool_block`]).
+    phase_blocked_tools: Vec<String>,
     tool_requirements: BTreeMap<String, PermissionMode>,
     allow_rules: Vec<PermissionRule>,
     deny_rules: Vec<PermissionRule>,
@@ -111,6 +114,7 @@ impl PermissionPolicy {
         Self {
             active_mode,
             phase_clamp_base: None,
+            phase_blocked_tools: Vec::new(),
             tool_requirements: BTreeMap::new(),
             allow_rules: Vec::new(),
             deny_rules: Vec::new(),
@@ -267,6 +271,53 @@ impl PermissionPolicy {
         self.phase_clamp_base = None;
     }
 
+    /// Forbid `tools` outright for the duration of a sub-turn phase, returning
+    /// the prior list for [`Self::end_phase_tool_block`] (so nested phases
+    /// restore rather than clear).
+    ///
+    /// This is the phase's *execution* gate, and it exists because the
+    /// alternative — dropping those tools from the advertised set for the leg —
+    /// is paid for in prompt cache. Tool definitions sit in front of the
+    /// messages, so a tool set that changes between two requests of the same
+    /// conversation invalidates the whole prefix behind it: measured at 41% of
+    /// one day's cache-write, every occurrence a fully cold re-read. Blocking at
+    /// authorize time keeps the advertised set byte-identical all session while
+    /// enforcing exactly the same rule, and the model learns the boundary from
+    /// a refusal it can act on instead of from a silently missing tool.
+    ///
+    /// Mode-independent by design: the tools this blocks
+    /// (`Agent`/`SpawnMultiAgent`/`Workflow`) only require `ReadOnly`, so the
+    /// phase's read-only clamp does not stop them.
+    pub fn begin_phase_tool_block(&mut self, tools: &[&str]) -> Vec<String> {
+        std::mem::replace(
+            &mut self.phase_blocked_tools,
+            tools.iter().map(|tool| (*tool).to_string()).collect(),
+        )
+    }
+
+    /// Restore the list saved by [`Self::begin_phase_tool_block`].
+    pub fn end_phase_tool_block(&mut self, saved: Vec<String>) {
+        self.phase_blocked_tools = saved;
+    }
+
+    /// The phase-block denial for `tool_name`, if the active phase forbids it.
+    /// Case-insensitive: the registry accepts aliases that differ only in case,
+    /// and a block that a rename of case could slip past would not be a block.
+    fn phase_tool_block_reason(&self, tool_name: &str) -> Option<String> {
+        self.phase_blocked_tools
+            .iter()
+            .any(|blocked| blocked.eq_ignore_ascii_case(tool_name))
+            .then(|| {
+                format!(
+                    "tool '{tool_name}' is unavailable during this architect phase: the \
+                     PLAN/VERIFY legs must reason for themselves and must not delegate. \
+                     Permission audit: this is a phase restriction, NOT the session \
+                     permission mode — do the work inline in this turn instead of spawning \
+                     anything, and it becomes available again once the phase ends."
+                )
+            })
+    }
+
     #[must_use]
     pub fn required_mode_for(&self, tool_name: &str) -> PermissionMode {
         self.tool_requirements
@@ -302,6 +353,12 @@ impl PermissionPolicy {
     /// would produce.
     #[must_use]
     pub fn deny_reason(&self, tool_name: &str, input: &str) -> Option<String> {
+        // A phase block is as unconditional as an operator deny, so the
+        // enforcement layer must see it here too — otherwise Prompt mode would
+        // defer the call to the interactive prompter and let it through.
+        if let Some(reason) = self.phase_tool_block_reason(tool_name) {
+            return Some(reason);
+        }
         self.rule_signals(tool_name, input).deny.map(|reason| {
             permission_audit_reason(
                 reason,
@@ -332,6 +389,13 @@ impl PermissionPolicy {
         context: &PermissionContext,
         prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
+        // Before rules, modes, and hook overrides: a phase block is structural.
+        // A `PreToolUse` hook returning Allow must not resurrect a delegation
+        // call inside a PLAN/VERIFY leg, which is exactly what checking this
+        // after the override arm would do.
+        if let Some(reason) = self.phase_tool_block_reason(tool_name) {
+            return PermissionOutcome::Deny { reason };
+        }
         let signals = self.rule_signals(tool_name, input);
         let current_mode = self.active_mode();
         let required_mode = self.required_mode_for_input(tool_name, input);

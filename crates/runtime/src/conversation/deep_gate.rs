@@ -1177,6 +1177,20 @@ pub const DEEP_EXEC_MARKER: &str = "[deep:EXEC]";
 pub const DEEP_VERIFY_MARKER: &str = "[deep:VERIFY]";
 pub const AUTO_RETRY_MARKER: &str = "[auto:RETRY]";
 
+/// Delegation tools a bounded PLAN/VERIFY leg may not call — the single
+/// authority for both sides of that rule: the leg prompts name these tools in
+/// prose, and [`PermissionPolicy::begin_phase_tool_block`] enforces the same
+/// list at authorize time.
+///
+/// It is a list of names rather than a permission mode because these tools only
+/// require `ReadOnly`, so the phase's read-only clamp does not reach them. It is
+/// enforced at execution rather than by narrowing the leg's advertised tools
+/// because the advertised set is part of the cached prompt prefix: dropping four
+/// definitions for one leg and restoring them on the next turn re-bills the
+/// entire conversation behind them, twice per leg.
+pub const DEEP_LEG_DELEGATION_TOOLS: &[&str] =
+    &["Agent", "SpawnMultiAgent", "Workflow", "SendMessage"];
+
 /// The reactive retry prompt: restate the failure repair contract and the
 /// current request context so the next attempt fixes the rejected change.
 fn reactive_retry_prompt(task: &str, repair: &str) -> String {
@@ -1341,6 +1355,10 @@ struct DeepSubturnPermissionGuard<'a, C, T> {
     /// Stashed before Drop restores/splices the session, then moved into
     /// [`DeepSubturnResult`].
     verify_images: Vec<(String, String)>,
+    /// `Some(prior_list)` when this phase installed the delegation block
+    /// ([`DEEP_LEG_DELEGATION_TOOLS`]); Drop restores the prior list so a
+    /// nested phase cannot clear an outer one's block.
+    saved_phase_tool_block: Option<Vec<String>>,
 }
 
 impl<'a, C, T> DeepSubturnPermissionGuard<'a, C, T> {
@@ -1416,6 +1434,21 @@ impl<'a, C, T> DeepSubturnPermissionGuard<'a, C, T> {
             }
             runtime.async_api_client.replace(client_arc)
         });
+        // PLAN and VERIFY must reason for themselves; EXEC is the leg that is
+        // allowed to fan work out. Enforced here, at authorize time, rather than
+        // by hiding the tools from the leg's advertised set: see
+        // `begin_phase_tool_block` for what the hidden-tools version cost in
+        // prompt cache. Both dispatch paths (sync and streaming) authorize
+        // through the same policy, so one install covers both.
+        let saved_phase_tool_block = matches!(
+            phase,
+            DeepSubturnPhase::Plan | DeepSubturnPhase::Verify
+        )
+        .then(|| {
+            runtime
+                .permission_policy
+                .begin_phase_tool_block(DEEP_LEG_DELEGATION_TOOLS)
+        });
         Self {
             runtime,
             saved_mode,
@@ -1427,6 +1460,7 @@ impl<'a, C, T> DeepSubturnPermissionGuard<'a, C, T> {
             phase,
             message_start,
             verify_images: Vec::new(),
+            saved_phase_tool_block,
         }
     }
 }
@@ -1485,6 +1519,11 @@ impl<C, T> Drop for DeepSubturnPermissionGuard<'_, C, T> {
         }
         if self.native_exec_leg {
             self.runtime.exec_native_leg_active = false;
+        }
+        if let Some(saved) = self.saved_phase_tool_block.take() {
+            self.runtime
+                .permission_policy
+                .end_phase_tool_block(saved);
         }
         self.runtime
             .permission_policy
@@ -3741,6 +3780,105 @@ mod tests {
         let diff =
             "--- a/src/lib.rs\n+++ b/src/lib.rs\n-old\n+new\n----deleted\n++++added\n context\n";
         assert_eq!(diff_line_churn(diff), 4);
+    }
+
+    /// The PLAN/VERIFY delegation ban is an execution gate, not a wire edit.
+    ///
+    /// The four tools it names only require `ReadOnly`, so the phase's read-only
+    /// clamp does NOT reach them — a bounded leg could call `Agent` and really
+    /// spawn a sub-agent, which is what the old advertise-time exclusion existed
+    /// to prevent. This pins the replacement: denied while the phase owns the
+    /// policy, allowed again the moment it does not, and never at the cost of a
+    /// tool definition moving on the wire.
+    #[test]
+    fn deep_leg_phase_blocks_delegation_tools_without_touching_the_wire() {
+        use crate::permissions::PermissionOutcome;
+
+        let mut policy = crate::PermissionPolicy::new(crate::PermissionMode::ReadOnly)
+            .with_tool_requirement("Agent", crate::PermissionMode::ReadOnly)
+            .with_tool_requirement("SpawnMultiAgent", crate::PermissionMode::ReadOnly)
+            .with_tool_requirement("Workflow", crate::PermissionMode::ReadOnly)
+            .with_tool_requirement("read_file", crate::PermissionMode::ReadOnly);
+
+        // Premise: the read-only clamp alone lets all three through, so the
+        // block is doing work no mode could do.
+        for tool in ["Agent", "SpawnMultiAgent", "Workflow"] {
+            assert_eq!(
+                policy.authorize(tool, "{}", None),
+                PermissionOutcome::Allow,
+                "premise: {tool} needs only read-only"
+            );
+        }
+
+        let saved = policy.begin_phase_tool_block(DEEP_LEG_DELEGATION_TOOLS);
+        for tool in DEEP_LEG_DELEGATION_TOOLS {
+            let outcome = policy.authorize(tool, "{}", None);
+            let PermissionOutcome::Deny { reason } = outcome else {
+                panic!("{tool} must be denied during a bounded leg, got {outcome:?}");
+            };
+            assert!(
+                reason.contains("architect phase") && reason.contains("must not delegate"),
+                "the denial must name the phase, not the permission mode: {reason}"
+            );
+        }
+        // Case cannot slip the block, and the enforcement layer's unconditional
+        // path sees it too (otherwise Prompt mode would defer to the prompter).
+        assert!(matches!(
+            policy.authorize("agent", "{}", None),
+            PermissionOutcome::Deny { .. }
+        ));
+        assert!(policy.deny_reason("Workflow", "{}").is_some());
+        // Unrelated tools are untouched — this is a named list, not a clamp.
+        assert_eq!(policy.authorize("read_file", "{}", None), PermissionOutcome::Allow);
+
+        policy.end_phase_tool_block(saved);
+        for tool in DEEP_LEG_DELEGATION_TOOLS.iter().take(3) {
+            assert_eq!(
+                policy.authorize(tool, "{}", None),
+                PermissionOutcome::Allow,
+                "{tool} must be available again once the phase ends"
+            );
+        }
+        assert!(policy.deny_reason("Workflow", "{}").is_none());
+    }
+
+    /// Both sides of the delegation ban must name the same tools. The prompts
+    /// tell the model what not to call, in prose; the phase block enforces it.
+    /// A tool added to the enforced list but not to the prompts would be denied
+    /// mid-leg with no warning, which reads to the model as a broken tool — so
+    /// the list is pinned against the prompts that must mention it.
+    #[test]
+    fn every_blocked_delegation_tool_is_named_in_the_leg_prompts() {
+        let plan = plan_prompt("do the thing", None, &[]);
+        for tool in DEEP_LEG_DELEGATION_TOOLS {
+            assert!(
+                plan.contains(tool),
+                "the PLAN prompt must tell the model {tool} is off limits"
+            );
+        }
+    }
+
+    /// Nested phases must restore, not clear: a VERIFY leg opened inside another
+    /// blocked phase used to be able to hand delegation back to the outer one.
+    #[test]
+    fn a_nested_phase_block_restores_the_outer_block() {
+        use crate::permissions::PermissionOutcome;
+
+        let mut policy = crate::PermissionPolicy::new(crate::PermissionMode::ReadOnly)
+            .with_tool_requirement("Agent", crate::PermissionMode::ReadOnly);
+
+        let outer = policy.begin_phase_tool_block(DEEP_LEG_DELEGATION_TOOLS);
+        let inner = policy.begin_phase_tool_block(DEEP_LEG_DELEGATION_TOOLS);
+        policy.end_phase_tool_block(inner);
+        assert!(
+            matches!(
+                policy.authorize("Agent", "{}", None),
+                PermissionOutcome::Deny { .. }
+            ),
+            "the outer phase still forbids delegation"
+        );
+        policy.end_phase_tool_block(outer);
+        assert_eq!(policy.authorize("Agent", "{}", None), PermissionOutcome::Allow);
     }
 
     #[test]

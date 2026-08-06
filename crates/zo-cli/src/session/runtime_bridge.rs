@@ -45,32 +45,6 @@ use crate::{
     convert_messages, filter_tool_specs, mark_conversation_cache_breakpoints, max_tokens_for_model,
 };
 
-const DEEP_LEG_ORCHESTRATION_TOOLS: &[&str] =
-    &["Agent", "SpawnMultiAgent", "Workflow", "SendMessage"];
-
-fn is_bounded_deep_leg(request: &ApiRequest) -> bool {
-    request
-        .messages
-        .iter()
-        .rev()
-        .find_map(|message| {
-            if message.role != runtime::MessageRole::User {
-                return None;
-            }
-            message.blocks.iter().rev().find_map(|block| match block {
-                runtime::ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-        })
-        .is_some_and(|text| {
-            let text = text.trim_start();
-            // Same marker constants the prompt builders emit — a free literal
-            // here would keep gating a marker no prompt produces any more.
-            text.starts_with(runtime::DEEP_PLAN_MARKER)
-                || text.starts_with(runtime::DEEP_VERIFY_MARKER)
-        })
-}
-
 /// Errors surfaced by the live streaming bridge.
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeBridgeError {
@@ -157,13 +131,13 @@ pub fn build_message_request(
     // unchanged (the fallback target is Anthropic, same as the refused Fable).
     let selected_model = request.model_override.as_deref().unwrap_or(model);
     let wire_model = api::wire_model_id(selected_model);
-    let tools = enable_tools.then(|| {
-        let mut tools = filter_tool_specs(tool_registry, allowed_tools);
-        if is_bounded_deep_leg(request) {
-            tools.retain(|tool| !DEEP_LEG_ORCHESTRATION_TOOLS.contains(&tool.name.as_str()));
-        }
-        tools
-    });
+    // The advertised set must not depend on which leg of a turn this is: tool
+    // definitions sit in front of the messages in the cached prefix, so a set
+    // that changes between two requests of one conversation re-bills the entire
+    // history behind it. A bounded PLAN/VERIFY leg still may not delegate — that
+    // rule is enforced at authorize time by `DEEP_LEG_DELEGATION_TOOLS`, which
+    // costs a refused call instead of a cold prefix.
+    let tools = enable_tools.then(|| filter_tool_specs(tool_registry, allowed_tools));
     // Reconcile history against the tools we are actually advertising: a stored
     // tool_use naming a tool no longer in this set (e.g. an MCP server dropped or
     // allowed_tools narrowed) would hard-400 the OpenAI-compatible path.
@@ -601,43 +575,50 @@ mod tests {
             .collect()
     }
 
+    /// The advertised tool set must not move when a deep leg runs.
+    ///
+    /// It used to: a PLAN or VERIFY leg dropped the four delegation tools from
+    /// the wire, and the next ordinary turn put them back. Tool definitions sit
+    /// in front of the messages in the cached prefix, so each flip re-billed the
+    /// whole conversation behind them — measured at 41% of one day's cache-write,
+    /// every occurrence a fully cold read. The leg still may not delegate; that
+    /// is now `DEEP_LEG_DELEGATION_TOOLS` denying the call at authorize time
+    /// (see `deep_leg_phase_blocks_delegation_tools_without_touching_the_wire`
+    /// in the runtime crate), which costs one refused call instead.
     #[test]
-    fn deep_plan_and_verify_requests_hide_orchestration_tools_only_for_the_leg() {
+    fn a_deep_leg_prompt_does_not_change_the_advertised_tool_set() {
         let registry = GlobalToolRegistry::builtin();
-        let forbidden = ["Agent", "SpawnMultiAgent", "Workflow", "SendMessage"];
+        let delegation = ["Agent", "SpawnMultiAgent", "Workflow", "SendMessage"];
 
-        // Activate them first. All four are deferred, and the claim under test
-        // is that the deep-leg suppression is scoped to the leg — which is only
-        // observable once the tools would otherwise be on the wire.
+        // Activate them first. All four are deferred, so the claim is only
+        // observable once they would otherwise be on the wire.
         let activated = registry.search(
             "select:Agent,SpawnMultiAgent,Workflow,SendMessage",
             8,
             None,
             None,
         );
-        assert_eq!(activated.matches.len(), forbidden.len());
+        assert_eq!(activated.matches.len(), delegation.len());
+
+        let ordinary = advertised_tool_names_for_messages(
+            &registry,
+            "gpt-5.6-sol",
+            vec![runtime::ConversationMessage::user_text("implement the next change")],
+        );
+        for name in delegation {
+            assert!(ordinary.contains(name), "premise: {name} is on the wire");
+        }
 
         for marker in ["[deep:PLAN] inspect and plan", "[deep:VERIFY] judge the diff"] {
-            let deep = advertised_tool_names_for_messages(
+            let leg = advertised_tool_names_for_messages(
                 &registry,
                 "gpt-5.6-sol",
                 vec![runtime::ConversationMessage::user_text(marker)],
             );
-            for name in forbidden {
-                assert!(!deep.contains(name), "{marker} advertised {name}");
-            }
-        }
-
-        let normal = advertised_tool_names_for_messages(
-            &registry,
-            "gpt-5.6-sol",
-            vec![
-                runtime::ConversationMessage::user_text("[deep:VERIFY] old leg"),
-                runtime::ConversationMessage::user_text("implement the next change"),
-            ],
-        );
-        for name in forbidden {
-            assert!(normal.contains(name), "normal turn must still advertise {name}");
+            assert_eq!(
+                leg, ordinary,
+                "{marker} changed the advertised set — that strands the whole prefix"
+            );
         }
     }
 
