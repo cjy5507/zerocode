@@ -13,7 +13,7 @@ use runtime::{ConfigLoader, PermissionMode, ResolvedPermissionMode};
 use crate::current_cli_cwd;
 
 /// Map a CLI/label string to a [`PermissionMode`], warning and defaulting to
-/// `workspace-write` on an unrecognised label.
+/// `read-only` on an unrecognised label.
 pub(crate) fn permission_mode_from_label(mode: &str) -> PermissionMode {
     match mode {
         "read-only" => PermissionMode::ReadOnly,
@@ -21,9 +21,9 @@ pub(crate) fn permission_mode_from_label(mode: &str) -> PermissionMode {
         "danger-full-access" => PermissionMode::DangerFullAccess,
         other => {
             eprintln!(
-                "warning: unsupported permission mode '{other}', falling back to workspace-write"
+                "warning: unsupported permission mode '{other}', falling back to read-only"
             );
-            PermissionMode::WorkspaceWrite
+            PermissionMode::ReadOnly
         }
     }
 }
@@ -115,20 +115,21 @@ fn fallback_permission_mode_for_cwd(cwd: &Path) -> PermissionMode {
     }
 }
 
-/// Canonicalise a permission-mode label, or `None` when it is not one of the
-/// three supported modes.
+/// Canonicalise a permission-mode label, including Claude Code-compatible
+/// aliases, or return `None` when the label is unsupported.
 pub(crate) fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
     match mode.trim() {
-        "read-only" => Some("read-only"),
-        "workspace-write" => Some("workspace-write"),
-        "danger-full-access" => Some("danger-full-access"),
+        "read-only" | "plan" => Some("read-only"),
+        "workspace-write" | "default" | "acceptEdits" => Some("workspace-write"),
+        "danger-full-access" | "bypassPermissions" => Some("danger-full-access"),
         _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_permission_mode;
+    use super::{normalize_permission_mode, permission_mode_from_label};
+    use runtime::PermissionMode;
 
     #[test]
     fn normalize_permission_mode_accepts_supported_modes() {
@@ -146,5 +147,22 @@ mod tests {
             Some("read-only")
         );
         assert_eq!(normalize_permission_mode("unknown"), None);
+    }
+
+    #[test]
+    fn normalize_permission_mode_accepts_claude_code_aliases() {
+        assert_eq!(normalize_permission_mode("default"), Some("workspace-write"));
+        assert_eq!(normalize_permission_mode("acceptEdits"), Some("workspace-write"));
+        assert_eq!(normalize_permission_mode("plan"), Some("read-only"));
+        assert_eq!(
+            normalize_permission_mode("bypassPermissions"),
+            Some("danger-full-access")
+        );
+        assert_eq!(normalize_permission_mode("acceptedits"), None);
+    }
+
+    #[test]
+    fn permission_mode_from_unknown_label_fails_safe() {
+        assert_eq!(permission_mode_from_label("future-mode"), PermissionMode::ReadOnly);
     }
 }

@@ -863,6 +863,35 @@ fn parses_permission_mode_flag() {
 }
 
 #[test]
+fn parses_claude_code_permission_mode_aliases() {
+    for (alias, expected) in [
+        ("default", PermissionMode::WorkspaceWrite),
+        ("acceptEdits", PermissionMode::WorkspaceWrite),
+        ("plan", PermissionMode::ReadOnly),
+        ("bypassPermissions", PermissionMode::DangerFullAccess),
+    ] {
+        let action = parse_args(&[format!("--permission-mode={alias}")])
+            .unwrap_or_else(|error| panic!("alias {alias} should parse: {error}"));
+        assert!(matches!(
+            action,
+            CliAction::Repl {
+                permission_mode,
+                ..
+            } if permission_mode == expected
+        ));
+    }
+}
+
+#[test]
+fn permission_mode_error_lists_claude_code_aliases() {
+    let error = parse_args(&["--permission-mode=unknown".to_string()])
+        .expect_err("unknown mode should fail");
+    for accepted in ["default", "acceptEdits", "plan", "bypassPermissions"] {
+        assert!(error.contains(accepted), "missing alias {accepted}: {error}");
+    }
+}
+
+#[test]
 fn parses_allowed_tools_flags_with_aliases_and_lists() {
     let _guard = env_lock();
     std::env::remove_var("ZO_PERMISSION_MODE");
@@ -923,6 +952,37 @@ fn rejects_unknown_allowed_tools() {
     let error = parse_args(&["--allowedTools".to_string(), "teleport".to_string()])
         .expect_err("tool should be rejected");
     assert!(error.contains("unsupported tool in --allowedTools: teleport"));
+}
+
+#[test]
+fn disallowed_tools_use_registry_normalization() {
+    let action = parse_args(&[
+        "--disallowedTools".to_string(),
+        "Bash(git commit *)".to_string(),
+        "--disallowed-tools=read,write_file".to_string(),
+    ])
+    .expect("disallowed tool specs should normalize");
+    let CliAction::Repl {
+        disallowed_tools: Some(disallowed),
+        ..
+    } = action
+    else {
+        panic!("expected repl with disallowed tools");
+    };
+    assert_eq!(
+        disallowed,
+        ["bash", "read_file", "write_file"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+}
+
+#[test]
+fn rejects_unknown_disallowed_tools() {
+    let error = parse_args(&["--disallowedTools".to_string(), "teleport".to_string()])
+        .expect_err("unknown denied tool should be rejected");
+    assert!(error.contains("unsupported tool in --disallowedTools: teleport"));
 }
 
 #[test]
@@ -1137,9 +1197,31 @@ fn parses_resume_flag_with_slash_command() {
         CliAction::ResumeSession {
             session_path: PathBuf::from("session.jsonl"),
             from_turn: None,
+            fork_session: false,
             commands: vec!["/compact".to_string()],
         }
     );
+}
+
+#[test]
+fn parses_fork_session_only_with_resume() {
+    let action = parse_args(&[
+        "--fork-session".to_string(),
+        "--resume".to_string(),
+        "session.jsonl".to_string(),
+    ])
+    .expect("forked resume should parse");
+    assert!(matches!(
+        action,
+        CliAction::ResumeSession {
+            fork_session: true,
+            ..
+        }
+    ));
+
+    let error = parse_args(&["--fork-session".to_string()])
+        .expect_err("fork-session without resume should fail");
+    assert!(error.contains("requires --resume"));
 }
 
 #[test]
@@ -1149,6 +1231,7 @@ fn parses_resume_flag_without_path_as_latest_session() {
         CliAction::ResumeSession {
             session_path: PathBuf::from("latest"),
             from_turn: None,
+            fork_session: false,
             commands: vec![],
         }
     );
@@ -1158,6 +1241,7 @@ fn parses_resume_flag_without_path_as_latest_session() {
         CliAction::ResumeSession {
             session_path: PathBuf::from("latest"),
             from_turn: None,
+            fork_session: false,
             commands: vec!["/status".to_string()],
         }
     );
@@ -1177,6 +1261,7 @@ fn parses_resume_flag_with_multiple_slash_commands() {
         CliAction::ResumeSession {
             session_path: PathBuf::from("session.jsonl"),
             from_turn: None,
+            fork_session: false,
             commands: vec![
                 "/status".to_string(),
                 "/compact".to_string(),
@@ -1209,6 +1294,7 @@ fn parses_resume_flag_with_slash_command_arguments() {
         CliAction::ResumeSession {
             session_path: PathBuf::from("session.jsonl"),
             from_turn: None,
+            fork_session: false,
             commands: vec![
                 "/export notes.txt".to_string(),
                 "/clear --confirm".to_string(),
@@ -1231,6 +1317,7 @@ fn parses_resume_flag_with_absolute_export_path() {
         CliAction::ResumeSession {
             session_path: PathBuf::from("session.jsonl"),
             from_turn: None,
+            fork_session: false,
             commands: vec!["/export /tmp/notes.txt".to_string(), "/status".to_string()],
         }
     );
@@ -2804,6 +2891,7 @@ fn build_runtime_plugin_state_discovers_mcp_tools_and_surfaces_pending_servers()
 
     let mut executor = CliToolExecutor::new(
         None,
+        None,
         false,
         state.tool_registry.clone(),
         state.mcp_state.clone(),
@@ -3198,6 +3286,7 @@ fn build_runtime_plugin_state_surfaces_degraded_mcp_servers_structurally() {
         build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config, None)
         .expect("runtime plugin state should load");
     let mut executor = CliToolExecutor::new(
+        None,
         None,
         false,
         state.tool_registry.clone(),

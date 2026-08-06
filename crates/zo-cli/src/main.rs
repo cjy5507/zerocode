@@ -85,7 +85,7 @@ use tools::GlobalToolRegistry;
 
 #[cfg(test)]
 use crate::cli_args::resolve_model_alias;
-use crate::cli_args::{AllowedToolSet, parse_args};
+use crate::cli_args::{AllowedToolSet, DisallowedToolSet, parse_args};
 #[cfg(test)]
 pub(crate) use crate::cli_support::print_help_to;
 pub(crate) use crate::cli_support::{print_help, render_version_line, render_version_report};

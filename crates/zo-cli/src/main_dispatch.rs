@@ -1,7 +1,8 @@
 use crate::auth::{run_login_provider, run_logout};
 use std::io::{self, BufRead, IsTerminal};
 
-use crate::cli_args::{CliAction, CliInputFormat, CliOutputFormat, DisallowedToolSet};
+use crate::cli_args::{CliAction, CliInputFormat, CliOutputFormat};
+use runtime::Session;
 use crate::resume::resume_session;
 use crate::session::{run_repl, LiveCli};
 use crate::session_registry::SessionScope;
@@ -69,6 +70,24 @@ fn redirect_workflow_cache_off_tree() {
     }
 }
 
+fn fork_resumed_session(
+    session_path: &std::path::Path,
+    from_turn: Option<u32>,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let resolved_path = if session_path.exists() {
+        session_path.to_path_buf()
+    } else {
+        crate::resolve_session_reference(&session_path.display().to_string())?.path
+    };
+    let source = Session::load_from_path_from_turn(&resolved_path, from_turn)?;
+    let forked = source.fork(None);
+    let handle = crate::create_managed_session_handle(&forked.session_id, SessionScope::Project)?;
+    forked
+        .with_persistence_path(handle.path.clone())
+        .save_to_path(&handle.path)?;
+    Ok(handle.path)
+}
+
 // A flat dispatch over every `CliAction` variant; one arm per subcommand reads
 // more clearly than splitting it across helpers.
 #[allow(clippy::too_many_lines)] // flat CliAction dispatch, one arm per action
@@ -98,8 +117,16 @@ pub(crate) fn run_action(action: CliAction) -> Result<(), Box<dyn std::error::Er
         CliAction::ResumeSession {
             session_path,
             from_turn,
+            fork_session,
             commands,
-        } => resume_session(&session_path, from_turn, &commands),
+        } => {
+            if fork_session {
+                let fork_path = fork_resumed_session(&session_path, from_turn)?;
+                resume_session(&fork_path, None, &commands);
+            } else {
+                resume_session(&session_path, from_turn, &commands);
+            }
+        }
         CliAction::Status {
             model,
             permission_mode,
@@ -125,7 +152,13 @@ pub(crate) fn run_action(action: CliAction) -> Result<(), Box<dyn std::error::Er
             session_id,
             fallback_model,
         } => {
-            warn_unapplied_prompt_flags(disallowed_tools.as_ref(), verbose, no_follow);
+            warn_unapplied_prompt_flags(verbose, no_follow);
+            crate::runtime_support::install_cli_runtime_overrides(
+                crate::runtime_support::CliRuntimeOverrides {
+                    disallowed_tools,
+                    ..crate::runtime_support::CliRuntimeOverrides::default()
+                },
+            );
             let full_prompt = match prefill {
                 Some(pre) => format!("{pre}\n\n{prompt}"),
                 None => prompt,
@@ -231,25 +264,37 @@ pub(crate) fn run_action(action: CliAction) -> Result<(), Box<dyn std::error::Er
             model,
             model_pinned,
             allowed_tools,
-            disallowed_tools: _,
+            disallowed_tools,
             permission_mode,
-            max_turns: _,
-            max_tool_calls: _,
-            system_prompt: _,
-            append_system_prompt: _,
-            verbose: _,
+            max_turns,
+            max_tool_calls,
+            system_prompt,
+            append_system_prompt,
+            verbose,
             mcp_config,
             inline,
             fullscreen,
-        } => run_repl(
-            model,
-            model_pinned,
-            allowed_tools,
-            permission_mode,
-            mcp_config,
-            inline,
-            fullscreen,
-        )?,
+        } => {
+            warn_unapplied_repl_flags(verbose);
+            crate::runtime_support::install_cli_runtime_overrides(
+                crate::runtime_support::CliRuntimeOverrides {
+                    disallowed_tools,
+                    max_turns,
+                    max_tool_calls,
+                    system_prompt,
+                    append_system_prompt,
+                },
+            );
+            run_repl(
+                model,
+                model_pinned,
+                allowed_tools,
+                permission_mode,
+                mcp_config,
+                inline,
+                fullscreen,
+            )?;
+        }
         CliAction::Help => print_help(),
         CliAction::HelpText(text) => println!("{text}"),
         CliAction::SlashCommand {
@@ -726,13 +771,10 @@ const COMPLEX_MARKERS: &[&str] = &[
 
 /// Which optional `-p` flags were present. Grouped into a struct so the
 /// predicate fn stays under clippy's bool-parameter limit and every field is
-/// named at the call site. These are five independent presence bits — any
-/// subset can be set at once — so they're genuinely bools, not a state machine
-/// that `struct_excessive_bools` would want modelled as an enum.
-#[allow(clippy::struct_excessive_bools)]
+/// named at the call site. These are independent presence bits — any subset can
+/// be set at once — so they're genuinely bools, not a state machine.
 #[derive(Clone, Copy, Default)]
 struct PromptFlagPresence {
-    disallowed_tools: bool,
     verbose: bool,
     no_follow: bool,
 }
@@ -741,9 +783,6 @@ struct PromptFlagPresence {
 /// so the operator note lists exactly what was ignored. Pure for unit testing.
 fn unapplied_prompt_flags(present: PromptFlagPresence) -> Vec<&'static str> {
     let mut flags = Vec::new();
-    if present.disallowed_tools {
-        flags.push("--disallowed-tools");
-    }
     if present.verbose {
         flags.push("--verbose");
     }
@@ -757,23 +796,26 @@ fn unapplied_prompt_flags(present: PromptFlagPresence) -> Vec<&'static str> {
 /// runtime, so they fail visibly instead of being silently dropped — the same
 /// honesty contract `--input-format` already follows. `--system-prompt`,
 /// `--append-system-prompt`, and `--allowedTools` *are* applied and are never
-/// listed here.
-fn warn_unapplied_prompt_flags(
-    disallowed_tools: Option<&DisallowedToolSet>,
-    verbose: bool,
-    no_follow: bool,
-) {
-    let flags = unapplied_prompt_flags(PromptFlagPresence {
-        disallowed_tools: disallowed_tools.is_some(),
-        verbose,
-        no_follow,
-    });
+/// listed here. `--disallowed-tools` is enforced at execution time and is not
+/// an unapplied flag.
+fn warn_unapplied_prompt_flags(verbose: bool, no_follow: bool) {
+    let flags = unapplied_prompt_flags(PromptFlagPresence { verbose, no_follow });
     if !flags.is_empty() {
         eprintln!(
             "[zo] note: {} parsed but not yet applied in -p mode (honored: \
-             --system-prompt, --append-system-prompt, --allowedTools, --max-turns, \
-             --max-tool-calls).",
+             --system-prompt, --append-system-prompt, --allowedTools, --disallowed-tools, \
+             --max-turns, --max-tool-calls).",
             flags.join(", ")
+        );
+    }
+}
+
+fn warn_unapplied_repl_flags(verbose: bool) {
+    if verbose {
+        eprintln!(
+            "[zo] note: --verbose parsed but not yet applied in interactive mode (honored: \
+             --system-prompt, --append-system-prompt, --allowedTools, --disallowed-tools, \
+             --max-turns, --max-tool-calls)."
         );
     }
 }
@@ -1174,13 +1216,23 @@ mod unapplied_flag_tests {
     #[test]
     fn lists_only_set_flags_in_surface_order() {
         let present = PromptFlagPresence {
-            disallowed_tools: true,
             verbose: true,
             no_follow: true,
         };
         assert_eq!(
             unapplied_prompt_flags(present),
-            vec!["--disallowed-tools", "--verbose", "--no-follow"]
+            vec!["--verbose", "--no-follow"]
+        );
+    }
+
+    #[test]
+    fn enforced_disallowed_tools_are_not_reported_unapplied() {
+        assert!(
+            !unapplied_prompt_flags(PromptFlagPresence {
+                verbose: true,
+                no_follow: true,
+            })
+            .contains(&"--disallowed-tools")
         );
     }
 
@@ -1192,13 +1244,12 @@ mod unapplied_flag_tests {
     #[test]
     fn all_flags_listed_in_surface_order() {
         let present = PromptFlagPresence {
-            disallowed_tools: true,
             verbose: true,
             no_follow: true,
         };
         assert_eq!(
             unapplied_prompt_flags(present),
-            vec!["--disallowed-tools", "--verbose", "--no-follow"]
+            vec!["--verbose", "--no-follow"]
         );
     }
 }

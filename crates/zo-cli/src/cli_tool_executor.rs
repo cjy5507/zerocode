@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use runtime::{ToolError, ToolExecutor};
 use tools::GlobalToolRegistry;
 
-use crate::cli_args::AllowedToolSet;
+use crate::cli_args::{AllowedToolSet, DisallowedToolSet};
 use crate::render::TerminalRenderer;
 use crate::session::{PendingMcpImages, RuntimeMcpState, ToolSearchRequest};
 use crate::{format_tool_result, tui_active};
@@ -34,6 +34,7 @@ pub(crate) struct CliToolExecutor {
     renderer: TerminalRenderer,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
+    disallowed_tools: Option<DisallowedToolSet>,
     turn_allowed_tools: SharedTurnAllowedTools,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
@@ -43,6 +44,7 @@ pub(crate) struct CliToolExecutor {
 impl CliToolExecutor {
     pub(crate) fn new(
         allowed_tools: Option<AllowedToolSet>,
+        disallowed_tools: Option<DisallowedToolSet>,
         emit_output: bool,
         tool_registry: GlobalToolRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
@@ -54,6 +56,7 @@ impl CliToolExecutor {
             renderer: TerminalRenderer::new(),
             emit_output,
             allowed_tools,
+            disallowed_tools,
             turn_allowed_tools: Arc::new(Mutex::new(None)),
             tool_registry,
             mcp_state,
@@ -217,8 +220,23 @@ pub(crate) fn check_turn_allowed_tools(
     Ok(())
 }
 
+/// Session-wide operator deny gate. Call this before every allow-list gate so
+/// a tool present in both sets is denied deterministically.
+pub(crate) fn check_disallowed_tools(
+    disallowed: Option<&DisallowedToolSet>,
+    tool_name: &str,
+) -> Result<(), ToolError> {
+    if disallowed.is_some_and(|tools| tools.contains(tool_name)) {
+        return Err(ToolError::new(format!(
+            "tool `{tool_name}` was disallowed by the operator via --disallowedTools; it cannot be executed in this session"
+        )));
+    }
+    Ok(())
+}
+
 impl ToolExecutor for CliToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        check_disallowed_tools(self.disallowed_tools.as_ref(), tool_name)?;
         if self
             .allowed_tools
             .as_ref()
@@ -307,8 +325,36 @@ mod tests {
     use serde_json::Value;
     use tools::GlobalToolRegistry;
 
-    use super::{parse_tool_input_json, CliToolExecutor};
+    use super::{check_disallowed_tools, parse_tool_input_json, CliToolExecutor};
+    use crate::cli_args::AllowedToolSet;
     use crate::session::RuntimeMcpState;
+
+    #[test]
+    fn disallowed_tools_win_over_allowed_tools_before_execution() {
+        let tools: AllowedToolSet = ["read_file".to_string()].into_iter().collect();
+        let mut executor = CliToolExecutor::new(
+            Some(tools.clone()),
+            Some(tools),
+            false,
+            GlobalToolRegistry::builtin(),
+            None,
+        );
+
+        let error = executor
+            .execute("read_file", r#"{"path":"Cargo.toml"}"#)
+            .expect_err("operator deny must override the allow list");
+        let message = error.to_string();
+        assert!(message.contains("disallowed by the operator"));
+        assert!(message.contains("cannot be executed in this session"));
+    }
+
+    #[test]
+    fn concurrent_disallowed_gate_returns_actionable_operator_denial() {
+        let denied = ["grep_search".to_string()].into_iter().collect();
+        let error = check_disallowed_tools(Some(&denied), "grep_search")
+            .expect_err("concurrent dispatch must enforce the same deny set");
+        assert!(error.to_string().contains("disallowed by the operator"));
+    }
 
     #[test]
     fn parse_tool_input_json_reports_retriable_truncated_arguments() {
@@ -365,7 +411,7 @@ mod tests {
         }
 
         let mut executor =
-            CliToolExecutor::new(None, false, registry, Some(Arc::clone(&mcp_state)));
+            CliToolExecutor::new(None, None, false, registry, Some(Arc::clone(&mcp_state)));
         assert!(
             executor.mcp_pending_images.is_some(),
             "executor should cache the MCP image sink before background discovery can contend"
@@ -409,6 +455,7 @@ mod tests {
             state.pending_servers = vec!["slow-server".to_string()];
         }
         let mut executor = CliToolExecutor::new(
+            None,
             None,
             false,
             GlobalToolRegistry::builtin(),

@@ -29,6 +29,7 @@ pub(crate) const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--disallowedTools",
     "--disallowed-tools",
     "--resume",
+    "--fork-session",
     "--continue",
     "--print",
     "-p",
@@ -89,6 +90,7 @@ pub(crate) enum CliAction {
     ResumeSession {
         session_path: PathBuf,
         from_turn: Option<u32>,
+        fork_session: bool,
         commands: Vec<String>,
     },
     Status {
@@ -332,6 +334,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut fullscreen = false;
     let mut session_id_override: Option<String> = None;
     let mut fallback_model: Option<String> = None;
+    let mut fork_session = false;
     let mut _cwd_override: Option<PathBuf> = None;
     let mut rest = Vec::new();
     let mut index = 0;
@@ -402,6 +405,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             "-p" => {
+                if fork_session {
+                    return Err("--fork-session requires --resume".to_string());
+                }
                 if inline {
                     return Err(
                         "--inline is only supported by the main interactive command".to_string(),
@@ -471,7 +477,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     model_pinned,
                     output_format,
                     allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
-                    disallowed_tools: normalize_disallowed_tools(&disallowed_tool_values),
+                    disallowed_tools: normalize_disallowed_tools(&disallowed_tool_values)?,
                     permission_mode: permission_mode_override
                         .unwrap_or_else(default_permission_mode),
                     max_turns,
@@ -494,6 +500,10 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--resume" if rest.is_empty() => {
                 rest.push("--resume".to_string());
+                index += 1;
+            }
+            "--fork-session" => {
+                fork_session = true;
                 index += 1;
             }
             flag if rest.is_empty() && flag.starts_with("--resume=") => {
@@ -647,9 +657,12 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }
 
     let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
-    let disallowed_tools = normalize_disallowed_tools(&disallowed_tool_values);
+    let disallowed_tools = normalize_disallowed_tools(&disallowed_tool_values)?;
 
     if rest.is_empty() {
+        if fork_session {
+            return Err("--fork-session requires --resume".to_string());
+        }
         // The bare `zo` entry is the interactive TUI: route the cwd fallback
         // through the trust gate so a first visit to an untrusted folder is
         // asked about (CC parity). An explicit `--permission-mode`/env override
@@ -680,7 +693,10 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
         return Err("--fullscreen is only supported by the main interactive command".to_string());
     }
     if rest.first().map(String::as_str) == Some("--resume") {
-        return parse_resume_args(&rest[1..]);
+        return parse_resume_args(&rest[1..], fork_session);
+    }
+    if fork_session {
+        return Err("--fork-session requires --resume".to_string());
     }
     if let Some(action) = parse_single_word_command_alias(&rest, &model, permission_mode_override) {
         return action;
@@ -1200,30 +1216,30 @@ pub(crate) fn normalize_allowed_tools(values: &[String]) -> Result<Option<Allowe
         .map_err(|e| e.to_string())
 }
 
-pub(crate) fn normalize_disallowed_tools(values: &[String]) -> Option<DisallowedToolSet> {
+pub(crate) fn normalize_disallowed_tools(
+    values: &[String],
+) -> Result<Option<DisallowedToolSet>, String> {
     if values.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let mut set = DisallowedToolSet::new();
-    for value in values {
-        for tool in value.split(',') {
-            let trimmed = tool.trim();
-            if !trimmed.is_empty() {
-                set.insert(trimmed.to_string());
-            }
-        }
-    }
-    Some(set)
+    crate::current_tool_registry()?
+        .normalize_allowed_tools(values)
+        .map_err(|error| error.to_string().replace("--allowedTools", "--disallowedTools"))
 }
 
 pub(crate) fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
-    crate::normalize_permission_mode(value)
-        .ok_or_else(|| {
-            format!(
-                "unsupported permission mode '{value}'. Use read-only, workspace-write, or danger-full-access."
-            )
-        })
-        .map(crate::permission_mode_from_label)
+    let normalized = crate::normalize_permission_mode(value).ok_or_else(|| {
+        format!(
+            "unsupported permission mode '{value}'. Use read-only, workspace-write, danger-full-access, default, acceptEdits, plan, or bypassPermissions."
+        )
+    })?;
+    if normalized != value.trim() {
+        eprintln!(
+            "[zo] permission mode '{}' maps to '{normalized}'",
+            value.trim()
+        );
+    }
+    Ok(crate::permission_mode_from_label(normalized))
 }
 
 /// `model` is the globally parsed `--model` (already alias-resolved), or `None`
@@ -1256,7 +1272,10 @@ pub(crate) fn parse_system_prompt_args(
     Ok(CliAction::PrintSystemPrompt { cwd, date, model })
 }
 
-pub(crate) fn parse_resume_args(args: &[String]) -> Result<CliAction, String> {
+pub(crate) fn parse_resume_args(
+    args: &[String],
+    fork_session: bool,
+) -> Result<CliAction, String> {
     let mut from_turn = None;
     let mut filtered = Vec::with_capacity(args.len());
     let mut index = 0;
@@ -1320,6 +1339,7 @@ pub(crate) fn parse_resume_args(args: &[String]) -> Result<CliAction, String> {
     Ok(CliAction::ResumeSession {
         session_path,
         from_turn,
+        fork_session,
         commands,
     })
 }

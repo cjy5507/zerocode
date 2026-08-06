@@ -20,8 +20,9 @@ use crate::render::{MarkdownStreamState, TerminalRenderer};
 use crate::response_events::{push_output_block, push_prompt_cache_record, response_to_events};
 use crate::tool_formatting::format_tool_call_start;
 use crate::{
-    AllowedToolSet, BuiltRuntime, CliToolExecutor, RuntimePluginState,
-    cli_tool_executor::parse_tool_input_json, session::build_runtime_plugin_state_with_loader,
+    AllowedToolSet, BuiltRuntime, CliToolExecutor, DisallowedToolSet, RuntimePluginState,
+    cli_tool_executor::{check_disallowed_tools, parse_tool_input_json},
+    session::build_runtime_plugin_state_with_loader,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,35 @@ impl StartupAuthPolicy {
     const fn allows_unauthenticated(self) -> bool {
         matches!(self, Self::AllowUnauthenticated)
     }
+}
+
+/// Process-lifetime flags installed before the CLI runtime is built. Interactive
+/// runtime rebuilds read the same snapshot, so startup restrictions cannot
+/// disappear after a model, permission, or context change.
+#[derive(Clone, Default)]
+pub(crate) struct CliRuntimeOverrides {
+    pub(crate) disallowed_tools: Option<DisallowedToolSet>,
+    pub(crate) max_turns: Option<usize>,
+    pub(crate) max_tool_calls: Option<usize>,
+    pub(crate) system_prompt: Option<String>,
+    pub(crate) append_system_prompt: Option<String>,
+}
+
+static CLI_RUNTIME_OVERRIDES: OnceLock<Mutex<CliRuntimeOverrides>> = OnceLock::new();
+
+pub(crate) fn install_cli_runtime_overrides(overrides: CliRuntimeOverrides) {
+    *CLI_RUNTIME_OVERRIDES
+        .get_or_init(|| Mutex::new(CliRuntimeOverrides::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = overrides;
+}
+
+fn cli_runtime_overrides() -> CliRuntimeOverrides {
+    CLI_RUNTIME_OVERRIDES
+        .get_or_init(|| Mutex::new(CliRuntimeOverrides::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// Build a runtime and apply an extended-thinking budget to its API client.
@@ -175,6 +205,15 @@ pub(crate) fn build_runtime_with_plugin_state_auth_policy(
         mcp_state,
         lsp_state,
     } = runtime_plugin_state;
+    let overrides = cli_runtime_overrides();
+    let mut system_prompt = overrides
+        .system_prompt
+        .clone()
+        .map_or(system_prompt, |replacement| vec![replacement]);
+    if let Some(addition) = overrides.append_system_prompt.clone() {
+        system_prompt.push(addition);
+    }
+    let disallowed_tools = overrides.disallowed_tools.clone();
     tool_registry.context().set_active_model(&model);
     tool_registry.context().set_session_id(session_id);
     // Record the session permission mode on the shared context so the file-tool
@@ -195,6 +234,7 @@ pub(crate) fn build_runtime_with_plugin_state_auth_policy(
     let effective_context_window = api::context_window_for_model(&selected_model);
     let tool_executor = CliToolExecutor::new(
         allowed_tools.clone(),
+        disallowed_tools.clone(),
         emit_output,
         tool_registry.clone(),
         mcp_state.clone(),
@@ -225,6 +265,12 @@ pub(crate) fn build_runtime_with_plugin_state_auth_policy(
         effective_context_window,
     );
     runtime.set_context_model(&selected_model);
+    if let Some(max_turns) = overrides.max_turns {
+        runtime.set_max_iterations(max_turns);
+    }
+    if let Some(max_tool_calls) = overrides.max_tool_calls {
+        runtime.set_max_tool_calls(max_tool_calls);
+    }
     // Turn-level events (turn_completed with token counts, tool execution
     // audits) flow to the same global OTLP exporter as the HTTP events.
     if let Some(tracer) = api::otlp::session_tracer_from_env(session_id) {
@@ -236,9 +282,11 @@ pub(crate) fn build_runtime_with_plugin_state_auth_policy(
     // Glob, Grep, …) will run via spawn_blocking instead of serially.
     let dispatch_registry = tool_registry.clone();
     let dispatch_allowed = allowed_tools;
+    let dispatch_disallowed = disallowed_tools;
     let dispatch_mcp = mcp_state.clone();
     let concurrent_dispatch: ConcurrentDispatchFn =
         std::sync::Arc::new(move |tool_name: &str, input: &str| {
+            check_disallowed_tools(dispatch_disallowed.as_ref(), tool_name)?;
             if let Some(ref allowed) = dispatch_allowed {
                 if !allowed.contains(tool_name) {
                     return Err(runtime::ToolError::new(format!(
