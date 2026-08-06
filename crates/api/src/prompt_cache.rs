@@ -363,6 +363,13 @@ pub struct CacheBreakEvent {
     pub tools_added: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools_removed: Vec<String>,
+    /// Wire model id of the request that broke, and its provider family. See
+    /// [`CacheBreakLedgerRow::model`] for what they are for and how the family
+    /// is derived — the row is the persisted copy, this is the live one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -516,6 +523,7 @@ impl PromptCache {
             &current,
             first_divergence_index,
             current_message_count,
+            &request.model,
         );
 
         inner.stats.tracked_requests += 1;
@@ -557,6 +565,11 @@ impl PromptCache {
                     diverged_message: event.diverged_message.clone(),
                     tools_added: event.tools_added.clone(),
                     tools_removed: event.tools_removed.clone(),
+                    // Copied from the event rather than re-derived from
+                    // `request` so the live event a caller surfaces and the
+                    // persisted row can never disagree about which model broke.
+                    model: event.model.clone(),
+                    provider: event.provider.clone(),
                 },
             );
         }
@@ -777,6 +790,25 @@ fn first_divergence(previous: Option<&[u64]>, current: &[u64]) -> (Option<usize>
     }
 }
 
+/// Provider family for a wire model id, as
+/// [`crate::ProviderKind::rate_limit_key`].
+///
+/// Reuses the provider registry's own classification (`metadata_for_model`,
+/// which resolves aliases and `provider/model` refs on the way) instead of
+/// prefix-matching model ids here — a second taxonomy would drift from the one
+/// that actually routes requests, and this value is only useful if it agrees
+/// with it. `""` when the id belongs to no known family (an unknown or
+/// custom-only id), which the row then omits entirely.
+///
+/// Registry-only: no I/O and no auth probing (`detect_provider_kind`'s
+/// credential fallbacks are deliberately NOT used — a row must describe the
+/// request, not the machine's current logins). Called only when a break has
+/// already been detected, so its allocations are off the per-request path.
+fn provider_family_for_model(model: &str) -> &'static str {
+    crate::providers::metadata_for_model(model)
+        .map_or("", |metadata| metadata.provider.rate_limit_key())
+}
+
 /// The `fingerprint version changed` break: our own schema moved, so nothing
 /// about the request can be compared across it. Split out of
 /// [`detect_cache_break`] to keep that function readable, not because it varies.
@@ -784,6 +816,7 @@ fn fingerprint_bump_break(
     previous: &TrackedPromptState,
     current: &TrackedPromptState,
     elapsed: u64,
+    model: &str,
 ) -> CacheBreakEvent {
     CacheBreakEvent {
         unexpected: false,
@@ -805,6 +838,8 @@ fn fingerprint_bump_break(
         diverged_message: None,
         tools_added: Vec::new(),
         tools_removed: Vec::new(),
+        model: model.to_string(),
+        provider: provider_family_for_model(model).to_string(),
     }
 }
 
@@ -879,19 +914,23 @@ fn break_reasons(
     reasons
 }
 
+/// `model` is the wire model id of the request being recorded — the one thing
+/// the tracked state cannot supply (it keeps only a hash of the model, so a
+/// break row could name the axis that moved but never the model it moved on).
 fn detect_cache_break(
     config: &PromptCacheConfig,
     previous: Option<&TrackedPromptState>,
     current: &TrackedPromptState,
     first_divergence_index: Option<usize>,
     current_message_count: usize,
+    model: &str,
 ) -> Option<CacheBreakEvent> {
     let previous = previous?;
     let elapsed = current
         .observed_at_unix_secs
         .saturating_sub(previous.observed_at_unix_secs);
     if previous.fingerprint_version != current.fingerprint_version {
-        return Some(fingerprint_bump_break(previous, current, elapsed));
+        return Some(fingerprint_bump_break(previous, current, elapsed, model));
     }
     let token_drop = previous
         .cache_read_input_tokens
@@ -979,6 +1018,8 @@ fn detect_cache_break(
         diverged_message,
         tools_added,
         tools_removed,
+        model: model.to_string(),
+        provider: provider_family_for_model(model).to_string(),
     })
 }
 
@@ -1519,6 +1560,15 @@ pub fn doctor_cache_summary() -> Option<PromptCacheDoctorSummary> {
 /// intact (compaction/rewind/elision — the common legitimate full-prefix
 /// rewrite); all axis flags `false` with `unexpected: true` = our payload was
 /// byte-stable yet reads dropped (provider-side miss / eviction).
+///
+/// Deliberately NOT recorded: how many tokens a microcompact cleared between
+/// the previous request and this one. That is the missing third column for
+/// pricing a firing — a row says what got re-billed, never what the trim
+/// bought — but the figure is produced by the compaction planner in `runtime`,
+/// which depends on this crate and cannot be called back into. Recording it
+/// means a new value threaded through `record_usage` / `record_response` at
+/// every provider call site, so it belongs to its own change rather than being
+/// half-wired here with a field nothing fills.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 // Same rationale as `CacheBreakEvent`: the axis flags are independent
 // fingerprint dimensions, not mutually exclusive states.
@@ -1561,6 +1611,39 @@ pub struct CacheBreakLedgerRow {
     pub tools_added: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools_removed: Vec<String>,
+    /// Wire model id this request was sent with, verbatim.
+    ///
+    /// WHY: a break's cost is provider-specific (cache-write premium, whether
+    /// `cache_creation` is even reported), and the store holds rows from every
+    /// provider a machine touched — foreground sessions and subagent scopes
+    /// sit side by side under one root. Nothing in a row said which, so
+    /// attributing cost meant inferring the provider from arithmetic
+    /// artifacts. A real investigation did exactly that: it separated the
+    /// populations by `cache_creation == 0` (the OpenAI-compat and Gemini
+    /// paths hardcode it — see [`PromptCacheStats::total_input_tokens`]) and
+    /// by `cache_read` being divisible by 128 (120/120 non-Anthropic rows
+    /// were, 0/56 Anthropic rows were), and its headline median was quoted
+    /// over the MIXED population before that split was found. Naming the
+    /// model and family in the row ends that class of mistake.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// Provider family for [`Self::model`], as
+    /// [`crate::ProviderKind::rate_limit_key`] (`anthropic` / `openai` /
+    /// `google` / `xai` / `ollama`) — the repo's existing stable telemetry
+    /// namespace, deliberately not a second taxonomy invented here.
+    ///
+    /// Derived from the wire model id, which is all `PromptCache` is handed:
+    /// a custom OpenAI-compatible provider serving a Claude-named model
+    /// therefore reads as `anthropic`. Threading the routed `ProviderKind` in
+    /// instead would add an argument to `record_usage`/`record_response` at
+    /// every call site in `runtime`/`tools`/`zo-cli`, and the model id already
+    /// answers the question the ledger gets asked (which family's cache
+    /// semantics and pricing apply to this row). Empty when the id matches no
+    /// known family, and empty on rows written by builds before this field —
+    /// which is what `skip_serializing_if` is for: old rows still load, and a
+    /// row costs no bytes for a field it cannot fill.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider: String,
 }
 
 /// Cause of a break whose axis flags are all `false` (the request fingerprint
@@ -1792,9 +1875,15 @@ mod tests {
                 output_tokens: 0,
             },
         );
-        let event =
-            detect_cache_break(&PromptCacheConfig::default(), Some(&previous), &current, None, 1)
-                .expect("break should be detected");
+        let event = detect_cache_break(
+            &PromptCacheConfig::default(),
+            Some(&previous),
+            &current,
+            None,
+            1,
+            TEST_MODEL,
+        )
+        .expect("break should be detected");
         assert!(event.unexpected);
         assert!(event.reason.contains("stable"));
     }
@@ -1835,8 +1924,15 @@ mod tests {
         // them — the exact oscillation that stranded whole prefixes.
         let full = state(&with(&["read_file", "Agent", "Workflow"]), 200_000);
         let leg = state(&with(&["read_file"]), 0);
-        let event = detect_cache_break(&PromptCacheConfig::default(), Some(&full), &leg, None, 1)
-            .expect("break");
+        let event = detect_cache_break(
+            &PromptCacheConfig::default(),
+            Some(&full),
+            &leg,
+            None,
+            1,
+            TEST_MODEL,
+        )
+        .expect("break");
         assert!(event.tools_changed);
         assert_eq!(event.tools_removed, vec!["Agent", "Workflow"]);
         assert!(event.tools_added.is_empty());
@@ -1849,17 +1945,30 @@ mod tests {
         // An identical tool set is not a tools_changed break at all — whatever
         // else the request did, this axis stays quiet and names nothing.
         let back = state(&with(&["read_file", "Agent", "Workflow"]), 0);
-        let event = detect_cache_break(&PromptCacheConfig::default(), Some(&full), &back, None, 1)
-            .expect("the token drop alone is still a break");
+        let event = detect_cache_break(
+            &PromptCacheConfig::default(),
+            Some(&full),
+            &back,
+            None,
+            1,
+            TEST_MODEL,
+        )
+        .expect("the token drop alone is still a break");
         assert!(!event.tools_changed);
         assert!(event.tools_added.is_empty() && event.tools_removed.is_empty());
 
         // Same names in a different order: both diffs empty, and the reason says
         // so rather than implying a membership change.
         let reordered = state(&with(&["Agent", "Workflow", "read_file"]), 0);
-        let event =
-            detect_cache_break(&PromptCacheConfig::default(), Some(&full), &reordered, None, 1)
-                .expect("break");
+        let event = detect_cache_break(
+            &PromptCacheConfig::default(),
+            Some(&full),
+            &reordered,
+            None,
+            1,
+            TEST_MODEL,
+        )
+        .expect("break");
         assert!(event.tools_changed);
         assert!(event.tools_added.is_empty() && event.tools_removed.is_empty());
         assert!(
@@ -1895,6 +2004,7 @@ mod tests {
             &state(&current_request, 0),
             Some(0),
             2,
+            TEST_MODEL,
         )
         .expect("break");
 
@@ -1967,9 +2077,15 @@ mod tests {
                 output_tokens: 0,
             },
         );
-        let event =
-            detect_cache_break(&PromptCacheConfig::default(), Some(&previous), &current, Some(0), 2)
-                .expect("break");
+        let event = detect_cache_break(
+            &PromptCacheConfig::default(),
+            Some(&previous),
+            &current,
+            Some(0),
+            2,
+            TEST_MODEL,
+        )
+        .expect("break");
         assert!(event.diverged_message.is_none());
         assert!(
             event.reason.contains("history diverged at message 0/2"),
@@ -2004,9 +2120,15 @@ mod tests {
         // what `first_divergence` would compute for this exact pair — passed
         // explicitly here since this test drives `detect_cache_break` directly
         // rather than through `PromptCache::record_usage`.
-        let event =
-            detect_cache_break(&PromptCacheConfig::default(), Some(&previous), &current, Some(0), 1)
-                .expect("break should be detected");
+        let event = detect_cache_break(
+            &PromptCacheConfig::default(),
+            Some(&previous),
+            &current,
+            Some(0),
+            1,
+            TEST_MODEL,
+        )
+        .expect("break should be detected");
         assert!(!event.unexpected);
         assert!(event.reason.contains("message payload changed"));
         assert!(event.reason.contains("history diverged at message 0/1"));
@@ -2130,6 +2252,149 @@ mod tests {
 
         std::env::remove_var("ZO_CONFIG_HOME");
         let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    /// A row must name the model the break happened on and that model's
+    /// provider family. One store holds rows from every provider a machine
+    /// touched, and until the fields existed the family could only be INFERRED
+    /// from arithmetic artifacts (`cache_creation == 0`, `cache_read` divisible
+    /// by 128) — an inference a real cost investigation got wrong, quoting a
+    /// median over the mixed population before it found the split. Two
+    /// providers inside one scope here, because that is the case that used to
+    /// be unreadable.
+    #[test]
+    fn a_break_row_names_the_wire_model_and_provider_family_that_broke() {
+        let _guard = test_env_lock();
+        let temp_root = std::env::temp_dir().join(format!(
+            "prompt-cache-attribution-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::env::set_var("ZO_CONFIG_HOME", &temp_root);
+        let cache = PromptCache::new("break-attribution-session");
+        let warm = |cr: u32| Usage {
+            input_tokens: 10,
+            cache_creation_input_tokens: 100,
+            cache_read_input_tokens: cr,
+            output_tokens: 5,
+        };
+
+        // Anthropic leg: a warm request, then a byte-stable read collapse.
+        let claude = sample_request("attribute me");
+        assert!(cache.record_usage(&claude, &warm(6_000)).cache_break.is_none());
+        let event = cache
+            .record_usage(&claude, &warm(0))
+            .cache_break
+            .expect("a byte-stable read collapse is a break");
+        assert_eq!(event.model, TEST_MODEL);
+        assert_eq!(event.provider, "anthropic");
+
+        // Same scope, other provider. The model switch itself is not the break
+        // under test — it recovers cache reads, so the row lands on the next
+        // collapse, exactly as a real provider hand-off would.
+        let mut gemini = claude.clone();
+        gemini.model = "gemini-2.5-pro".to_string();
+        assert!(cache.record_usage(&gemini, &warm(6_000)).cache_break.is_none());
+        let event = cache
+            .record_usage(&gemini, &warm(0))
+            .cache_break
+            .expect("second collapse is a break");
+        assert_eq!(event.model, "gemini-2.5-pro");
+        assert_eq!(event.provider, "google");
+
+        let rows = super::read_break_ledger(&cache.paths().breaks_path);
+        assert_eq!(rows.len(), 2, "one row per break: {rows:?}");
+        assert_eq!(
+            (rows[0].model.as_str(), rows[0].provider.as_str()),
+            (TEST_MODEL, "anthropic")
+        );
+        assert_eq!(
+            (rows[1].model.as_str(), rows[1].provider.as_str()),
+            ("gemini-2.5-pro", "google"),
+            "a mixed-provider scope must read without inference: {rows:?}"
+        );
+
+        std::env::remove_var("ZO_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    /// Attribution is additive in both directions: a row written before the
+    /// fields existed still loads, and a row that cannot fill them does not pay
+    /// bytes for them (the ledger gains a line per break for the life of every
+    /// session, so an always-present empty key is a permanent tax).
+    #[test]
+    fn a_row_written_before_attribution_still_loads_and_empty_fields_stay_off_the_wire() {
+        let old_line = serde_json::json!({
+            "seq": 7,
+            "ts_unix_secs": 1_000,
+            "unexpected": false,
+            "reason": "tool definitions changed",
+            "model_changed": false,
+            "system_changed": false,
+            "tools_changed": true,
+            "messages_changed": false,
+            "first_divergence_index": serde_json::Value::Null,
+            "prev_message_count": 40,
+            "message_count": 41,
+            "prev_cache_read": 700_000,
+            "cache_read": 24_000,
+            "cache_creation": 690_000,
+            "token_drop": 676_000,
+            "elapsed_secs": 12,
+        })
+        .to_string();
+        let dir = tempfile::TempDir::new().expect("mkdir ledger dir");
+        let path = dir.path().join("breaks.jsonl");
+        std::fs::write(&path, format!("{old_line}\n")).expect("write pre-attribution ledger");
+
+        let rows = super::read_break_ledger(&path);
+        assert_eq!(rows.len(), 1, "an old row must still parse: {rows:?}");
+        assert!(rows[0].tools_changed, "the rest of the row must survive too");
+        assert!(
+            rows[0].model.is_empty() && rows[0].provider.is_empty(),
+            "an old row carries no attribution rather than failing to load"
+        );
+
+        let line = serde_json::to_string(&rows[0]).expect("serialize unfilled row");
+        assert!(!line.contains("\"model\":"), "unfilled model must be omitted: {line}");
+        assert!(!line.contains("\"provider\":"), "unfilled provider must be omitted: {line}");
+
+        // The two assertions above are only meaningful if a FILLED row does
+        // write the keys — otherwise they would pass on a field that never
+        // serializes at all.
+        let mut filled = rows[0].clone();
+        filled.model = TEST_MODEL.to_string();
+        filled.provider = "anthropic".to_string();
+        let line = serde_json::to_string(&filled).expect("serialize filled row");
+        assert!(line.contains("\"model\":\"claude-3-7-sonnet-latest\""), "{line}");
+        assert!(line.contains("\"provider\":\"anthropic\""), "{line}");
+    }
+
+    /// The family string is the provider registry's own bucket key, not a
+    /// second taxonomy invented next to it — if the two disagree the ledger
+    /// misattributes cost, which is the whole failure the field exists to stop.
+    #[test]
+    fn the_recorded_provider_family_is_the_registrys_own_key() {
+        let _guard = test_env_lock();
+        assert_eq!(
+            super::provider_family_for_model(TEST_MODEL),
+            crate::ProviderKind::Anthropic.rate_limit_key()
+        );
+        assert_eq!(super::provider_family_for_model("gpt-5.5"), "openai");
+        assert_eq!(super::provider_family_for_model("gemini-2.5-pro"), "google");
+
+        // An id no family claims records nothing rather than guessing, so the
+        // row omits the key. (`OLLAMA_BASE_URL` in the environment makes the
+        // REGISTRY claim unknown ids for Ollama — that is its documented
+        // behavior, not this helper's, so allow it instead of pretending.)
+        let unknown = super::provider_family_for_model("not-a-real-model-family");
+        assert!(
+            unknown.is_empty() || unknown == "ollama",
+            "an unknown id must not be attributed to a first-party family: {unknown}"
+        );
     }
 
     /// A fresh private store root that cleans itself up on drop — including
@@ -2403,13 +2668,15 @@ mod tests {
             diverged_message: event.diverged_message.clone(),
             tools_added: event.tools_added.clone(),
             tools_removed: event.tools_removed.clone(),
+            model: event.model.clone(),
+            provider: event.provider.clone(),
         };
 
         // Provider-side: byte-stable fingerprint, inside the TTL, reads drop.
         let mut cold = base.clone();
         cold.observed_at_unix_secs += 10;
         cold.cache_read_input_tokens = 0;
-        let event = super::detect_cache_break(&config, Some(&base), &cold, None, 2)
+        let event = super::detect_cache_break(&config, Some(&base), &cold, None, 2, TEST_MODEL)
             .expect("provider-side break");
         assert!(event.unexpected);
         assert_eq!(
@@ -2422,7 +2689,7 @@ mod tests {
         expired.observed_at_unix_secs = base.observed_at_unix_secs
             + config.prompt_ttl.as_secs()
             + 60;
-        let event = super::detect_cache_break(&config, Some(&base), &expired, None, 2)
+        let event = super::detect_cache_break(&config, Some(&base), &expired, None, 2, TEST_MODEL)
             .expect("ttl break");
         assert!(!event.unexpected);
         assert_eq!(
@@ -2433,7 +2700,7 @@ mod tests {
         // Fingerprint bump: our own schema version changed.
         let mut bumped = cold.clone();
         bumped.fingerprint_version = base.fingerprint_version + 1;
-        let event = super::detect_cache_break(&config, Some(&base), &bumped, None, 2)
+        let event = super::detect_cache_break(&config, Some(&base), &bumped, None, 2, TEST_MODEL)
             .expect("fingerprint break");
         assert!(!event.unexpected);
         assert_eq!(
@@ -2444,7 +2711,7 @@ mod tests {
         // An axis break carries its own explanation — no cause classification.
         let mut retooled = cold.clone();
         retooled.tools_hash = 99;
-        let event = super::detect_cache_break(&config, Some(&base), &retooled, None, 2)
+        let event = super::detect_cache_break(&config, Some(&base), &retooled, None, 2, TEST_MODEL)
             .expect("tools break");
         assert!(event.tools_changed);
         assert_eq!(row_for(&event).no_axis_cause(), None);
@@ -3059,9 +3326,14 @@ mod tests {
         std::env::remove_var("ZO_CONFIG_HOME");
     }
 
+    /// Model id every fixture in this module sends. Shared with the direct
+    /// [`detect_cache_break`] calls so the attribution fields under test always
+    /// describe the same request the fixtures build.
+    const TEST_MODEL: &str = "claude-3-7-sonnet-latest";
+
     fn sample_request_with_messages(texts: &[&str]) -> MessageRequest {
         MessageRequest {
-            model: "claude-3-7-sonnet-latest".to_string(),
+            model: TEST_MODEL.to_string(),
             max_tokens: 64,
             messages: texts.iter().map(|text| InputMessage::user_text(*text)).collect(),
             system: Some(crate::types::system_from_string("system")),
@@ -3095,7 +3367,7 @@ mod tests {
 
     fn sample_request(text: &str) -> MessageRequest {
         MessageRequest {
-            model: "claude-3-7-sonnet-latest".to_string(),
+            model: TEST_MODEL.to_string(),
             max_tokens: 64,
             messages: vec![InputMessage::user_text(text)],
             system: Some(crate::types::system_from_string("system")),

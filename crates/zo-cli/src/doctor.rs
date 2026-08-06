@@ -353,7 +353,18 @@ fn describe_break_row(row: &::api::CacheBreakLedgerRow) -> String {
     } else {
         format!("-{}k", row.token_drop / 1_000)
     };
-    format!("req{} {} {drop}", row.seq, axes.join("+"))
+    // Name the provider family when the row carries it. One store holds rows
+    // from every provider a machine touched, and the same drop costs different
+    // money per family — a bare `req9 messages -180k` cannot be priced without
+    // it. Appended only when present, so rows written before the ledger
+    // recorded attribution keep their exact old label instead of growing an
+    // empty separator.
+    let family = if row.provider.is_empty() {
+        String::new()
+    } else {
+        format!("/{}", row.provider)
+    };
+    format!("req{}{family} {} {drop}", row.seq, axes.join("+"))
 }
 
 /// Store-wide retention finding: directory count and oldest age, paired with
@@ -1796,6 +1807,8 @@ mod tests {
             diverged_message: None,
             tools_added: Vec::new(),
             tools_removed: Vec::new(),
+            model: String::new(),
+            provider: String::new(),
         }
     }
 
@@ -1919,6 +1932,15 @@ mod tests {
         ttl.elapsed_secs = 4200;
         ttl.token_drop = 95_000;
         assert_eq!(describe_break_row(&ttl), "req9 ttl-expiry(4200s) -95k");
+
+        // A row that names its provider family says so in the label — the same
+        // drop is priced differently per family, and one store mixes them. Rows
+        // from before the ledger recorded it (every assertion above) must keep
+        // their old label exactly, which is why the suffix is conditional.
+        let mut attributed = axis.clone();
+        attributed.provider = "google".to_string();
+        attributed.model = "gemini-2.5-pro".to_string();
+        assert_eq!(describe_break_row(&attributed), "req9/google tools+messages -180k");
     }
 
     /// The store finding surfaces the janitor's attested outcome, and warns

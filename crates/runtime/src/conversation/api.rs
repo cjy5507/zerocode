@@ -745,6 +745,8 @@ mod helper_tests {
                 diverged_message: None,
                 tools_added: Vec::new(),
                 tools_removed: Vec::new(),
+                model: "claude-sonnet-4-5".to_string(),
+                provider: "anthropic".to_string(),
             }),
             stats: ::api::PromptCacheStats::default(),
             low_cache_hit_warning: Some("prompt cache degraded: 3 consecutive requests re-billed ~180k tokens".to_string()),
