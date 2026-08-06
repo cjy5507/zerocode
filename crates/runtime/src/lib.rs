@@ -274,7 +274,17 @@ pub use worker_boot::{
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    LOCK.get_or_init(|| {
+        // Compaction-tier assertions must measure the model's window, not the
+        // host's. A zo test run launched from inside a Claude Code session
+        // inherits `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (Claude Code sets it to
+        // 650000 for a 1M-context session), which silently rescales every tier
+        // and fails two dozen threshold tests for a reason that is nowhere in
+        // the test. Cleared once, here, so hermeticity is a property of the lock
+        // rather than something each test has to remember.
+        std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW");
+        std::sync::Mutex::new(())
+    })
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

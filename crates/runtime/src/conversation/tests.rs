@@ -2365,6 +2365,69 @@ fn runtime_context_window_tracks_feature_config_model() {
 }
 
 #[test]
+fn claude_codes_auto_compact_window_overrides_the_model_window_for_the_tiers() {
+    let _env = crate::test_env_lock();
+    let restore_threshold = std::env::var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS").ok();
+    let restore_window = std::env::var("CLAUDE_CODE_AUTO_COMPACT_WINDOW").ok();
+    std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS");
+    std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW");
+
+    let opus = || {
+        ConversationRuntime::new_with_features(
+            Session::new(),
+            NoopApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["base prompt".to_string()],
+            &RuntimeFeatureConfig::default().with_model("opus"),
+        )
+    };
+
+    // Unset: the model's own window, i.e. the deliberate late-ceiling policy is
+    // untouched. This variable adds a way to say otherwise; it does not change
+    // what zo does by default.
+    assert_eq!(opus().auto_compaction_input_tokens_threshold(), 800_000);
+
+    // Claude Code sets exactly this for a 1M-context Opus session — it does not
+    // scale its tiers to the full window — and zo ignored the instruction.
+    std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "650000");
+    let capped = opus();
+    assert_eq!(
+        capped.context_window(),
+        1_000_000,
+        "the real window is untouched: the provider-limit guards depend on it"
+    );
+    assert_eq!(capped.auto_compaction_input_tokens_threshold(), 520_000);
+    assert_eq!(capped.microcompact_input_tokens_threshold(), 416_000);
+    assert!(
+        capped.precompaction_input_tokens_threshold()
+            < u64::from(capped.auto_compaction_input_tokens_threshold()),
+        "the tier order must survive the override"
+    );
+
+    // Garbage and zero fall back to the model window rather than disabling
+    // compaction outright.
+    for bogus in ["0", "", "abc", "-5"] {
+        std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW", bogus);
+        assert_eq!(
+            opus().auto_compaction_input_tokens_threshold(),
+            800_000,
+            "unusable value {bogus:?} must not change the tiers"
+        );
+    }
+    std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW");
+
+    match restore_threshold {
+        Some(value) => std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", value),
+        None => std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS"),
+    }
+    match restore_window {
+        Some(value) => std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW", value),
+        None => std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
+    }
+}
+
+#[test]
 fn adopting_a_provider_ceiling_shrinks_every_threshold_and_never_grows_them() {
     let _env = crate::test_env_lock();
     let restore = std::env::var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS").ok();

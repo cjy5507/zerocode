@@ -1328,11 +1328,12 @@ where
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env_or_policy(
-                context_window,
+                compaction::auto_compaction_window(context_window),
                 context_policy,
             ),
             precompaction_input_tokens_threshold: context_policy.precompaction_threshold(
-                context_window.max(u64::from(FALLBACK_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)),
+                compaction::auto_compaction_window(context_window)
+                    .max(u64::from(FALLBACK_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)),
             ),
             context_policy,
             full_compaction_override_percent,

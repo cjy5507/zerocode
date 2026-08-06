@@ -676,13 +676,23 @@ where
     #[must_use]
     pub fn microcompact_input_tokens_threshold(&self) -> u64 {
         self.context_policy
-            .microcompact_threshold(self.context_window)
+            .microcompact_threshold(self.auto_compaction_window())
+    }
+
+    /// The window the compaction tiers are measured against — the model's real
+    /// window capped (or Claude Code's explicit
+    /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW`). Deliberately *not* `context_window`:
+    /// see [`super::compaction::auto_compaction_window`] for why riding a
+    /// percentage of a 1M window makes every cache break cost half a million
+    /// tokens. Provider-limit guards keep using the real window.
+    fn auto_compaction_window(&self) -> u64 {
+        super::compaction::auto_compaction_window(self.context_window)
     }
 
     #[must_use]
     pub fn state_distill_input_tokens_threshold(&self) -> u64 {
         self.context_policy
-            .state_distill_threshold(self.context_window)
+            .state_distill_threshold(self.auto_compaction_window())
     }
 
     #[must_use]
@@ -700,10 +710,11 @@ where
     /// exactly as the constructor does.
     pub fn set_context_window(&mut self, context_window: u64) {
         self.context_window = context_window;
+        let compaction_window = self.auto_compaction_window();
         self.auto_compaction_input_tokens_threshold =
-            auto_compaction_threshold_from_env_or_policy(context_window, self.context_policy);
+            auto_compaction_threshold_from_env_or_policy(compaction_window, self.context_policy);
         self.precompaction_input_tokens_threshold = self.context_policy.precompaction_threshold(
-            context_window.max(u64::from(FALLBACK_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)),
+            compaction_window.max(u64::from(FALLBACK_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)),
         );
     }
 

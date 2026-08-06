@@ -18,6 +18,39 @@ use super::PromptCacheEvent;
 
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 
+/// Claude Code's own knob for the window auto-compaction is measured against.
+///
+/// Distinct from [`AUTO_COMPACTION_THRESHOLD_ENV_VAR`], which sets the absolute
+/// *threshold*: this sets the window every tier is a percentage of. Zo ignored
+/// it, so a session Claude Code had told to compact against 650k instead
+/// measured its tiers against the model's full window.
+const AUTO_COMPACT_WINDOW_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+
+/// The window the compaction tiers are percentages of.
+///
+/// Normally the model's own window: the late-ceiling policy
+/// ([`AUTO_COMPACTION_CONTEXT_WINDOW_PERCENT`]) is a deliberate trade — a long
+/// unchanged prefix re-reads at cached rates, while every compaction invalidates
+/// that cache wholesale — and this must not quietly undo it.
+///
+/// [`AUTO_COMPACT_WINDOW_ENV_VAR`] overrides it outright, which is what makes
+/// this worth having: Claude Code sets that variable to 650000 for a 1M-context
+/// Opus session, i.e. it does not scale its tiers to the full window, and zo
+/// ignored the instruction. An operator who has measured their own sessions can
+/// now say so in the same terms.
+///
+/// Whatever it returns, it only moves the *compaction* tiers. The provider-limit
+/// guards — the hard context ceiling and the per-request budget — stay on the
+/// model's real window, because those answer "will this be rejected", not "what
+/// does this cost".
+pub(super) fn auto_compaction_window(context_window: u64) -> u64 {
+    std::env::var(AUTO_COMPACT_WINDOW_ENV_VAR)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|window| *window > 0)
+        .unwrap_or(context_window)
+}
+
 /// Preserved-tail token budget as a share of the context window, and its
 /// absolute cap. 12% of a 258k GPT window ≈ 31k tokens; the 40k cap keeps a
 /// 1M-window Claude session from carrying a 120k tail into every request.
@@ -449,7 +482,10 @@ pub(super) fn auto_compaction_threshold_from_env_or_policy(
 /// so HUD callers with a runtime in hand should prefer that.
 #[must_use]
 pub fn auto_compaction_threshold_for_model(model: Option<&str>, context_window: u64) -> u32 {
-    auto_compaction_threshold_from_env_or_policy(context_window, ContextPolicy::for_model(model))
+    auto_compaction_threshold_from_env_or_policy(
+        auto_compaction_window(context_window),
+        ContextPolicy::for_model(model),
+    )
 }
 
 /// Legacy entry point that uses the static fallback when no model is known.
