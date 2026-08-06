@@ -120,9 +120,7 @@ pub(crate) fn build_startup_screen(
         |context| context.git_summary.headline(),
     );
     let project_root = status.and_then(|context| context.project_root.clone());
-    let branch = status
-        .and_then(|context| context.git_branch.clone())
-        .unwrap_or_else(|| "unknown".to_string());
+    let branch = status.and_then(|context| context.git_branch.clone());
     let mem_kb = resident_memory_kb();
     let recent_sessions = recent_sessions_for_launchpad(session_id);
     let auth = StartupAuthState {

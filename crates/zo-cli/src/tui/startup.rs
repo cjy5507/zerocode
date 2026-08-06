@@ -87,7 +87,9 @@ pub struct StartupScreen {
     pub version: String,
     pub model: String,
     pub permissions: String,
-    pub branch: String,
+    /// Current git branch, or `None` outside a repository — the info row
+    /// omits its git segment entirely rather than printing a placeholder.
+    pub branch: Option<String>,
     pub workspace: String,
     pub directory: PathBuf,
     pub project_root: Option<PathBuf>,
@@ -574,10 +576,14 @@ fn info_line(startup: &StartupScreen, theme: &Theme) -> Line<'static> {
         Span::styled(" \u{00b7} ", sep),
         Span::styled(format!("{lock_icon} "), style(theme.palette.accent, false)),
         Span::styled(permission.to_string(), style(theme.palette.accent, true)),
-        Span::styled(" \u{00b7} ", sep),
-        Span::styled(format!("{git_icon} "), style(theme.palette.dim, false)),
-        Span::styled(startup.branch.clone(), style(theme.palette.dim, false)),
     ];
+    // Outside a git repository the segment disappears — a literal "unknown"
+    // in the identity row reads as a rendering defect, not as information.
+    if let Some(branch) = &startup.branch {
+        spans.push(Span::styled(" \u{00b7} ", sep));
+        spans.push(Span::styled(format!("{git_icon} "), style(theme.palette.dim, false)));
+        spans.push(Span::styled(branch.clone(), style(theme.palette.dim, false)));
+    }
     if let Some(ms) = startup.startup_ms {
         spans.push(Span::styled(" \u{00b7} ", sep_faint));
         spans.push(Span::styled(format!("{ms}ms"), sep_faint));
@@ -842,19 +848,38 @@ fn render_returning_dense_lines(
         vec![Span::styled("Start fast".to_string(), style(theme.palette.accent, true))],
     ));
 
-    let mut sessions = startup.recent_sessions.iter();
-    let first = sessions.next().map_or_else(
-        || vec![Span::styled("No recent sessions".to_string(), dim_label(theme))],
-        |session| recent_session_spans(session, theme),
-    );
-    let second = sessions.next().map_or_else(
-        || resume_hint_spans(theme),
-        |session| recent_session_spans(session, theme),
-    );
+    // Left column, top to bottom: up to two recent sessions, then the
+    // `/resume` hint exactly once, then a fresh-start hint if rows remain.
+    // Building the list first (instead of hardcoding one hint per row) is what
+    // keeps a single-session launchpad from printing the resume hint twice.
+    let mut left_rows: Vec<Vec<Span<'static>>> = startup
+        .recent_sessions
+        .iter()
+        .take(2)
+        .map(|session| recent_session_spans(session, theme))
+        .collect();
+    if left_rows.is_empty() {
+        left_rows.push(vec![Span::styled(
+            "No recent sessions".to_string(),
+            dim_label(theme),
+        )]);
+    }
+    left_rows.push(resume_hint_spans(theme));
+    while left_rows.len() < 3 {
+        left_rows.push(vec![Span::styled(
+            "Type a task or pick a prompt".to_string(),
+            dim_label(theme),
+        )]);
+    }
 
-    lines.push(two_column_line(width, first, summarize_action_spans(theme)));
-    lines.push(two_column_line(width, second, action_spans("review my diff", theme)));
-    lines.push(two_column_line(width, resume_hint_spans(theme), action_spans("find failing tests", theme)));
+    let right_rows = [
+        summarize_action_spans(theme),
+        action_spans("review my diff", theme),
+        action_spans("find failing tests", theme),
+    ];
+    for (left, right) in left_rows.into_iter().zip(right_rows) {
+        lines.push(two_column_line(width, left, right));
+    }
 }
 
 fn render_ready_dense_lines(
@@ -996,11 +1021,15 @@ fn muted_label(theme: &Theme) -> Style {
 // Label helpers.
 // ============================================================================
 
+/// Map a parser-spelling permission mode to the display label every surface
+/// shows (the same vocabulary as the trust dialog and the HUD's
+/// `PermissionMode::label`): the id `danger-full-access` renders as
+/// "full access" — the warn styling carries the caution, not an alarm prefix.
 fn permission_label_for_display(mode: &str) -> &'static str {
     match mode {
         "read-only" => "read-only",
         "workspace-write" => "workspace-write",
-        "danger-full-access" => "danger-full-access",
+        "danger-full-access" => "full access",
         other if other.eq_ignore_ascii_case("prompt") => "prompt",
         _ => "unknown-mode",
     }
@@ -1054,7 +1083,7 @@ mod tests {
             version: "0.1.0".to_string(),
             model: "claude-opus-4-8".to_string(),
             permissions: "danger-full-access".to_string(),
-            branch: "main".to_string(),
+            branch: Some("main".to_string()),
             workspace: "zo".to_string(),
             directory: PathBuf::from("/tmp/zo"),
             project_root: Some(PathBuf::from("/tmp/zo")),
@@ -1197,7 +1226,7 @@ mod tests {
             "{dumped}"
         );
         assert!(dumped.contains("Opus 4.8"), "{dumped}");
-        assert!(dumped.contains("danger-full-access"), "{dumped}");
+        assert!(dumped.contains("full access"), "{dumped}");
         assert!(dumped.contains("Alt+S"), "wide launchpad should expose quick actions: {dumped}");
         assert!(dumped.contains("────────────────"), "wide divider should make the launchpad feel anchored: {dumped}");
         assert!(!dumped.contains("████"), "blocky FIGlet logo must stay gone: {dumped}");
@@ -1267,7 +1296,7 @@ mod tests {
             "in the zone — AI pair-programming for this repo",
             "────────────────",
             "Opus 4.8",
-            "danger-full-access",
+            "full access",
             "@ main",
             "/tmp/zo",
             "1297ms",

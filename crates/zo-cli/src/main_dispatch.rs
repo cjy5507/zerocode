@@ -13,46 +13,15 @@ use crate::status_actions::{
 use crate::{print_help, run_init, DEFAULT_MODEL};
 use zo_cli::tui::modals::Effort;
 
+// No difficulty *label* rides along: the budget is one continuous score with
+// two visible inputs (effort + prompt shape), and any single band word over
+// that sum misattributes one input to the other — `-p "안녕"` under smart
+// effort printed "(complex prompt)" purely because of the effort term. The
+// operator note shows the effort token and the derived numbers instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HeadlessExecutionBudget {
     max_turns: usize,
     max_tool_calls: usize,
-    complexity: PromptComplexity,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PromptComplexity {
-    Simple,
-    Standard,
-    Complex,
-    Workflow,
-}
-
-impl PromptComplexity {
-    /// Band the continuous work score into a coarse label for the operator
-    /// note. Purely cosmetic — the budget numbers come from the score itself,
-    /// not from this band.
-    fn from_work(work: f64) -> Self {
-        if work >= 40.0 {
-            Self::Workflow
-        } else if work >= 24.0 {
-            Self::Complex
-        } else if work >= 14.0 {
-            Self::Standard
-        } else {
-            Self::Simple
-        }
-    }
-
-    /// Lower-case tag for the auto-budget operator note.
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Simple => "simple",
-            Self::Standard => "standard",
-            Self::Complex => "complex",
-            Self::Workflow => "workflow",
-        }
-    }
 }
 
 /// Point the `Workflow` tool's resume cache out-of-tree for a one-shot run, so
@@ -203,10 +172,9 @@ pub(crate) fn run_action(action: CliAction) -> Result<(), Box<dyn std::error::Er
             // how to lift it. Skipped when both bounds were passed explicitly.
             if max_turns.is_none() || max_tool_calls.is_none() {
                 eprintln!(
-                    "[zo] effort {} | auto budget ({} prompt): --max-turns {} / \
+                    "[zo] effort {} | auto budget: --max-turns {} / \
                      --max-tool-calls {} — pass either flag to override.",
                     effort_token(effort),
-                    budget.complexity.label(),
                     budget.max_turns,
                     budget.max_tool_calls,
                 );
@@ -535,7 +503,6 @@ fn headless_execution_budget(
     HeadlessExecutionBudget {
         max_turns: explicit_max_turns.unwrap_or(turns),
         max_tool_calls: explicit_max_tool_calls.unwrap_or(tool_calls),
-        complexity: PromptComplexity::from_work(work),
     }
 }
 
@@ -896,7 +863,7 @@ mod unapplied_flag_tests {
         auto_effort_for_prompt, count_path_mentions, error_warrants_model_fallback,
         headless_execution_budget, is_coding_task, parse_headless_effort, prompt_is_coding_task,
         resolve_headless_effort, runtime_error_warrants_model_fallback,
-        turn_error_warrants_model_fallback, unapplied_prompt_flags, Effort, PromptComplexity,
+        turn_error_warrants_model_fallback, unapplied_prompt_flags, Effort,
         PromptFlagPresence, MAX_TOOL_CALLS, MAX_TURNS, MIN_TOOL_CALLS, MIN_TURNS,
     };
     use api::ProviderErrorClass;
@@ -1098,11 +1065,9 @@ mod unapplied_flag_tests {
             Some(5),
         );
 
-        // Explicit flags win outright; the label still reflects the prompt's
-        // intrinsic difficulty, not the override.
+        // Explicit flags win outright.
         assert_eq!(budget.max_turns, 3);
         assert_eq!(budget.max_tool_calls, 5);
-        assert_eq!(budget.complexity, PromptComplexity::Workflow);
     }
 
     #[test]
@@ -1132,11 +1097,6 @@ mod unapplied_flag_tests {
             "{complex:?} should not exceed {workflow:?}"
         );
         assert!(simple.max_tool_calls < complex.max_tool_calls);
-
-        // Labels band the score sensibly for the operator note.
-        assert_eq!(simple.complexity, PromptComplexity::Simple);
-        assert_eq!(complex.complexity, PromptComplexity::Complex);
-        assert_eq!(workflow.complexity, PromptComplexity::Workflow);
     }
 
     #[test]

@@ -368,7 +368,7 @@ fn hud_compose_returns_line_with_spans() {
 fn hud_permission_mode_labels() {
     assert_eq!(HudPermissionMode::ReadOnly.label(), "read-only");
     assert_eq!(HudPermissionMode::Workspace.label(), "workspace-write");
-    assert_eq!(HudPermissionMode::All.label(), "danger-full-access");
+    assert_eq!(HudPermissionMode::All.label(), "full access");
 }
 
 #[test]

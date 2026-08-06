@@ -22,6 +22,11 @@ use super::AppMode;
 
 const SLASH_HINT_LABEL_WIDTH: usize = 14;
 pub(super) const SLASH_HINT_LIMIT: usize = 10;
+/// Readable ceiling for a hint row's content. The popup *surface* spans the
+/// full input width (so no transcript text peeks through beside it), but a
+/// summary line longer than this stops aiding scanning, so content is capped
+/// independently of the surface.
+const SLASH_HINT_CONTENT_MAX_CELLS: usize = 88;
 const PROMPT_COMMAND_RISK: &str = "Medium: effect depends on the prompt body and available tools";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,10 +82,10 @@ pub(super) fn draw_slash_hint(
         return;
     }
 
-    // Match the input-box width so the popup fully covers the input
-    // row beneath it and lines up visually with the prompt below.
-    // On very wide terminals we still cap at 90 columns to keep
-    // summaries readable.
+    // Match the input-box width so the popup fully covers the rows beneath it
+    // and lines up visually with the prompt below. A narrower surface leaves a
+    // strip of live transcript text beside every row, which reads as render
+    // bleed; readability is preserved by capping the *content* width instead.
     let Some(mut popup_area) = slash_hint_popup_area(input_area, suggestions.len()) else {
         return;
     };
@@ -90,7 +95,7 @@ pub(super) fn draw_slash_hint(
         };
         popup_area = bounded;
     }
-    let line_width = usize::from(popup_area.width.saturating_sub(2));
+    let line_width = usize::from(popup_area.width.saturating_sub(2)).min(SLASH_HINT_CONTENT_MAX_CELLS);
 
     // Dynamic label width: check the maximum length of suggested commands
     // and clamp it between 14 and 24 to keep things clean.
@@ -333,12 +338,12 @@ fn prompt_suggestion(
     }
 }
 
+/// The popup surface always spans the full input width: any narrower and the
+/// uncovered strip beside it keeps showing live transcript text, which reads
+/// as bleed-through. Content stays readable via
+/// [`SLASH_HINT_CONTENT_MAX_CELLS`], not by shrinking the surface.
 fn popup_width_for(input_width: u16) -> u16 {
-    if input_width < 32 {
-        input_width
-    } else {
-        input_width.min(90)
-    }
+    input_width
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -367,7 +372,10 @@ fn render_slash_hint_line<'a>(
         .saturating_sub(risk_width)
         .saturating_sub(accel_width);
     let label = pad_or_truncate_cells(suggestion, label_width);
-    let summary = truncate_cells(summary, summary_width);
+    // Pad the summary to its full column so the risk badge and accelerator
+    // land in fixed columns; a badge floating right after a variably-truncated
+    // summary reads as stray text, not as metadata.
+    let summary = pad_or_truncate_cells(summary, summary_width);
     let summary_w = UnicodeWidthStr::width(summary.as_str());
 
     let (indicator_style, label_style, summary_style) = if is_selected {
@@ -417,16 +425,21 @@ fn render_slash_hint_line<'a>(
         spans.push(Span::styled(badge.text, badge.style(theme, is_selected)));
     }
     if let Some(accel) = accel {
-        // Pad to the right edge so every accelerator lines up in a column.
+        // Pad to the right edge so every accelerator lines up in a column. The
+        // pad carries the row style so a selected row's wash stays unbroken.
         let used = indicator_w + label_width + 1 + summary_w + risk_width;
         let pad = width.saturating_sub(used).saturating_sub(accel_width);
         if pad > 0 {
-            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(" ".repeat(pad), summary_style));
         }
-        spans.push(Span::styled(
-            format!(" {accel}"),
-            Style::default().fg(theme.palette.dim),
-        ));
+        let accel_style = if is_selected {
+            Style::default()
+                .fg(theme.palette.dim)
+                .bg(theme.palette.faint)
+        } else {
+            Style::default().fg(theme.palette.dim)
+        };
+        spans.push(Span::styled(format!(" {accel}"), accel_style));
     }
     Line::from(spans)
 }
@@ -715,6 +728,47 @@ mod tests {
     }
 
     #[test]
+    fn slash_hint_risk_badge_lands_in_a_fixed_column() {
+        let theme = Theme::no_color();
+        let width = 72;
+
+        // Same width, same risk, very different summary lengths: the badge
+        // must start at the same column in both rows. A badge floating right
+        // after a variably-truncated summary reads as stray text.
+        let short = render_slash_hint_line(
+            "/model",
+            &[],
+            "Switch model",
+            Some("Medium: changes subsequent model/provider behavior"),
+            None,
+            width,
+            &theme,
+            false,
+            SLASH_HINT_LABEL_WIDTH,
+        );
+        let long = render_slash_hint_line(
+            "/providers",
+            &[],
+            "Every account and registered provider in one screen (add, edit, delete)",
+            Some("Medium: mutates the provider registry"),
+            None,
+            width,
+            &theme,
+            false,
+            SLASH_HINT_LABEL_WIDTH,
+        );
+
+        // Compare display cells, not byte offsets: the truncated summary ends
+        // in a multi-byte `…` that occupies one cell.
+        let column = |line: &Line<'_>| {
+            let text = line_text(line);
+            let index = text.rfind(" med").expect("badge present");
+            UnicodeWidthStr::width(&text[..index])
+        };
+        assert_eq!(column(&short), column(&long));
+    }
+
+    #[test]
     fn slash_hint_line_omits_low_risk_badge() {
         let theme = Theme::no_color();
         let line = render_slash_hint_line(
@@ -811,10 +865,13 @@ mod tests {
     }
 
     #[test]
-    fn popup_width_matches_input_or_wide_cap() {
+    fn popup_surface_always_spans_the_input_width() {
         assert_eq!(popup_width_for(20), 20);
         assert_eq!(popup_width_for(60), 60);
-        assert_eq!(popup_width_for(140), 90);
+        // A wide terminal keeps the full-width surface (content is capped
+        // separately) — a narrower surface would leave live transcript text
+        // visible beside the popup rows.
+        assert_eq!(popup_width_for(140), 140);
     }
 
     #[test]

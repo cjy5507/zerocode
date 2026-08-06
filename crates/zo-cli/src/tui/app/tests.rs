@@ -957,7 +957,7 @@ fn startup_screen_for_shortcut() -> StartupScreen {
         version: "0.1.0".to_string(),
         model: "claude-opus-4-8".to_string(),
         permissions: "workspace-write".to_string(),
-        branch: "main".to_string(),
+        branch: Some("main".to_string()),
         workspace: "zo".to_string(),
         directory: PathBuf::from("/tmp/zo"),
         project_root: Some(PathBuf::from("/tmp/zo")),
@@ -5901,7 +5901,7 @@ fn live_activity_context_collapses_bottom_hud_duplicates() {
     // session HUD even though both context labels now share one calculation.
     for duplicate in [
         "phase 2/4",
-        "danger-full-access",
+        "full access",
         "workspace-write",
         "$6.20",
         "tokens",

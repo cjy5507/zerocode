@@ -1266,12 +1266,15 @@ pub fn short_model(model: &str) -> String {
     model_id_token(&lower).unwrap_or_else(|| model.to_string())
 }
 
-/// Whether a short model label is just a family alias (e.g. `gpt`, `opus`)
-/// rather than a concrete resolved model id. Shared with the HUD badge so both
-/// agree on when to prefer a resolved display name over the alias.
+/// Whether a short model label is just a family alias (e.g. `gpt`, `opus`) or
+/// a rolling vendor alias (e.g. `anthropic-latest`) rather than a concrete
+/// resolved model id. Shared with the HUD badge so both agree on when to
+/// prefer a resolved display name over the alias — a config alias is a
+/// pointer, not a model, and must never render as the session's model name.
 #[must_use]
 pub fn is_generic_model_alias(label: &str) -> bool {
-    matches!(label, "opus" | "sonnet" | "haiku" | "gpt")
+    matches!(label, "opus" | "sonnet" | "haiku" | "gpt" | "latest")
+        || label.ends_with("-latest")
 }
 
 fn model_id_token(text: &str) -> Option<String> {

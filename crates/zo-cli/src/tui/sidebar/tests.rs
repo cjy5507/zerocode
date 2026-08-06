@@ -1632,7 +1632,7 @@ fn draw_surfaces_readable_opencode_plus_metadata() {
 
     let dumped = dump(&terminal);
     for expected in [
-        "danger-full-access",
+        "full access",
         "zo",
         "main",
         "SESSION",
@@ -1662,7 +1662,7 @@ fn draw_surfaces_readable_opencode_plus_metadata() {
         "new_provider.rs",
         "old_snapshot.rs",
         "-7",
-        "danger-full-access",
+        "full access",
     ] {
         assert!(dumped.contains(expected), "missing {expected}: {dumped}");
     }
@@ -1799,7 +1799,7 @@ fn draw_pins_keybinding_legend_to_bottom_when_tall_enough() {
     assert!(!dumped.contains("^T"), "removed mouse toggle leaked into footer");
     // The rail head still renders — footer reserves space, doesn't replace.
     assert!(
-        dumped.contains("danger-full-access"),
+        dumped.contains("full access"),
         "ledger head still shown: {dumped}"
     );
     // The footer rule degrades to ASCII under NO_COLOR (no box-drawing ─).

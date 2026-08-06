@@ -76,17 +76,20 @@ pub enum PermissionMode {
 }
 
 impl PermissionMode {
-    /// Canonical user-facing permission mode label. Keep this in sync with the
-    /// config/parser spelling (`read-only`, `workspace-write`,
-    /// `danger-full-access`) so HUD, sidebar, and bottom statusline never show
-    /// different names for the same mode.
+    /// Canonical user-facing permission mode label, shared by HUD, sidebar,
+    /// and bottom statusline so no surface shows a different name for the
+    /// same mode. Display labels, not parser ids: the config/CLI spelling
+    /// (`danger-full-access`) stays what commands accept, while every screen
+    /// shows the same vocabulary the trust dialog used ("Full access") — the
+    /// caution is carried by the mode's warn styling, not by an alarm prefix
+    /// echoed at the user for a choice they already made.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
             Self::ReadOnly => "read-only",
             Self::Plan => "plan",
             Self::Workspace => "workspace-write",
-            Self::All => "danger-full-access",
+            Self::All => "full access",
         }
     }
 }
@@ -2489,7 +2492,7 @@ mod tests {
         state.perm_mode = PermissionMode::All;
         let full_access = line_text(&compose(&state, &theme, 120, true));
         assert!(
-            full_access.contains("danger-full-access"),
+            full_access.contains("full access"),
             "{full_access:?}"
         );
         assert!(!full_access.contains("status"), "{full_access:?}");
@@ -2659,7 +2662,7 @@ mod tests {
         let permission = line
             .spans
             .iter()
-            .find(|span| span.content == "danger-full-access")
+            .find(|span| span.content == "full access")
             .expect("running workflow must not hide permission mode");
         assert_eq!(
             permission.style.fg,

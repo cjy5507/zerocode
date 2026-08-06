@@ -655,6 +655,11 @@ fn split_activity_once(action: &str, separator: char) -> Option<ActivityParts<'_
     })
 }
 
+/// Fewest cells a truncated detail may occupy before it is dropped instead: a
+/// three-letter stump like `cho…` communicates nothing and reads as a render
+/// glitch, so below this the phase stands alone.
+const MIN_READABLE_DETAIL_CELLS: usize = 8;
+
 fn truncate_activity_parts(
     phase: &str,
     detail: Option<&str>,
@@ -673,10 +678,16 @@ fn truncate_activity_parts(
         return (truncate_status(phase, limit), None);
     }
     if display_width(detail) > detail_limit {
+        // A compact progress coordinate (`3/7`) survives any budget it fits in.
         if let Some(progress) = progress_detail_prefix(detail) {
             if display_width(&progress) <= detail_limit {
                 return (phase.to_string(), Some(progress));
             }
+        }
+        // Otherwise a too-small budget drops the detail: the phase alone beats
+        // an unreadable stump.
+        if detail_limit < MIN_READABLE_DETAIL_CELLS {
+            return (truncate_status(phase, limit), None);
         }
     }
     (
@@ -1850,6 +1861,23 @@ mod tests {
             truncate_activity_parts("Reading tool output", Some("choosing next step"), 30);
         assert_eq!(phase, "Reading tool output");
         assert_eq!(detail.as_deref(), Some("choosin…"));
+    }
+
+    #[test]
+    fn activity_detail_drops_below_readable_budget_instead_of_stumping() {
+        // detail_limit lands at 4 cells here: "choosing next step" would render
+        // as the meaningless stump "cho…", so the phase stands alone.
+        let (phase, detail) =
+            truncate_activity_parts("Reading tool output", Some("choosing next step"), 26);
+        assert_eq!(phase, "Reading tool output");
+        assert_eq!(detail, None);
+
+        // The same tiny budget with no recoverable progress prefix also drops
+        // cleanly rather than stumping.
+        let (phase, detail) =
+            truncate_activity_parts("Delegating", Some("2/4 complete · long tail here"), 18);
+        assert_eq!(phase, "Delegating");
+        assert_eq!(detail, None);
     }
 
     #[test]
