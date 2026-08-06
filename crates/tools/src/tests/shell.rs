@@ -252,16 +252,26 @@ fn bash_targeted_tests_skip_branch_preflight() {
 }
 
 #[test]
-fn repl_executes_python_code() {
+fn repl_executes_python_code_in_a_persistent_kernel() {
     let result = run_tool(
         "REPL",
-        &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 2000}),
+        &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 20000}),
     )
     .expect("REPL should succeed");
     let output: serde_json::Value = serde_json::from_str(&result).expect("json");
     assert_eq!(output["language"], "python");
-    assert_eq!(output["exitCode"], 0);
+    assert_eq!(output["ok"], true);
+    assert_eq!(output["kernel"]["persistent"], true);
     assert!(output["stdout"].as_str().expect("stdout").contains('2'));
+
+    // The whole point of the kernel: dispatch-level calls share one namespace,
+    // so a variable from an earlier call answers a later expression.
+    run_tool("REPL", &json!({"language": "python", "code": "seen = 123"}))
+        .expect("assignment should succeed");
+    let result = run_tool("REPL", &json!({"language": "python", "code": "seen + 1"}))
+        .expect("follow-up should succeed");
+    let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+    assert_eq!(output["value"], "124");
 }
 
 #[test]
@@ -294,9 +304,17 @@ fn given_timeout_ms_when_repl_blocks_then_returns_timeout_error() {
     );
 
     let error = result.expect_err("timed out REPL execution should fail");
-    assert!(error
-        .to_string()
-        .contains("REPL execution exceeded timeout of 10 ms"));
+    let message = error.to_string();
+    assert!(
+        message.contains("exceeded timeout of 10 ms"),
+        "timeout wording expected: {message}"
+    );
+    // The persistent kernel is discarded on timeout and the model is told its
+    // state is gone — the honest half of the persistence contract.
+    assert!(
+        message.contains("variables are lost"),
+        "state-loss notice expected: {message}"
+    );
 }
 
 #[test]

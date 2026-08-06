@@ -36,6 +36,7 @@ mod model_json;
 mod plan_mode_v2;
 mod preflight;
 mod registry;
+mod repl_kernel;
 mod task_tools;
 mod team_inbox_store;
 mod team_tools;

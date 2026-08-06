@@ -19,6 +19,9 @@ pub(crate) struct ReplInput {
     pub code: String,
     pub language: String,
     pub timeout_ms: Option<u64>,
+    /// Python only: discard the session's persistent kernel (and every
+    /// variable in it) and start fresh before running `code`.
+    pub reset: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,13 +73,14 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "REPL",
-            description: "Execute code in a REPL-like subprocess.",
+            description: "Execute code in a REPL. Python runs in a SESSION-PERSISTENT kernel: variables, imports, functions, and parsed data survive across calls and across context compaction — assign intermediate results to variables and reuse them in later calls instead of re-reading files or re-deriving state. A trailing expression's value is returned like a REPL prompt; exceptions return a traceback while the kernel (and its variables) stays alive. Pass reset:true to discard the kernel and start clean. Other languages (js, sh) run one-shot per call with no persistent state.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "code": { "type": "string" },
                     "language": { "type": "string" },
-                    "timeout_ms": { "type": "integer", "minimum": 1 }
+                    "timeout_ms": { "type": "integer", "minimum": 1 },
+                    "reset": { "type": "boolean", "description": "Python only: drop the persistent kernel and its variables, then run code in a fresh one." }
                 },
                 "required": ["code", "language"],
                 "additionalProperties": false
@@ -145,7 +149,11 @@ pub(crate) fn dispatch(
         "REPL" => Some(
             maybe_enforce_permission_check(enforcer, name, input).and_then(|()| {
                 // REPL has no background mode, so it creates no task to session-stamp.
-                from_value::<ReplInput>(input).and_then(|inp| run_repl(inp, cwd))
+                // The session id scopes the persistent Python kernel: concurrent
+                // sessions and sub-agents each get their own namespace.
+                let session_id = ctx.session_id();
+                from_value::<ReplInput>(input)
+                    .and_then(|inp| run_repl(inp, cwd, session_id.as_deref()))
             }),
         ),
         "PowerShell" => Some(
@@ -212,8 +220,62 @@ pub(crate) fn run_bash(
     Ok(serde_json::to_string_pretty(&output)?)
 }
 
-pub(crate) fn run_repl(input: ReplInput, cwd: Option<&Path>) -> Result<String, ToolError> {
+pub(crate) fn run_repl(
+    input: ReplInput,
+    cwd: Option<&Path>,
+    session_id: Option<&str>,
+) -> Result<String, ToolError> {
+    if input.code.trim().is_empty() {
+        return Err(ToolError::InvalidInput("code must not be empty".into()));
+    }
+    if let Some(reason) = repl_catastrophic_reason(&input.code) {
+        return Err(ToolError::Execution(format!(
+            "refused to run a catastrophic command — {reason}"
+        )));
+    }
+    if is_python_language(&input.language) {
+        return run_persistent_python(&input, cwd, session_id);
+    }
     to_pretty_json(execute_repl(input, cwd)?)
+}
+
+fn is_python_language(language: &str) -> bool {
+    matches!(language.trim().to_ascii_lowercase().as_str(), "python" | "py")
+}
+
+/// Persistent-kernel path for Python. The kernel is scoped to the session id
+/// (or a process-wide scope when no session exists, e.g. bare headless
+/// dispatch) so state survives across calls without ever crossing sessions.
+fn run_persistent_python(
+    input: &ReplInput,
+    cwd: Option<&Path>,
+    session_id: Option<&str>,
+) -> Result<String, ToolError> {
+    let program = detect_first_command(&["python3", "python"])
+        .ok_or_else(|| ToolError::Execution("python runtime not found".into()))?;
+    let scope = session_id.map_or_else(|| "process".to_string(), str::to_string);
+    let output = super::repl_kernel::execute_persistent_python(
+        &scope,
+        &input.code,
+        program,
+        cwd,
+        input.timeout_ms.map(Duration::from_millis),
+        input.reset.unwrap_or(false),
+    )?;
+    to_pretty_json(json!({
+        "language": "python",
+        "ok": output.ok,
+        "value": output.value,
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+        "error": output.error,
+        "durationMs": output.duration_ms,
+        "kernel": {
+            "persistent": true,
+            "fresh": output.fresh_kernel,
+            "uptimeSecs": output.kernel_uptime_secs,
+        },
+    }))
 }
 
 pub(crate) fn run_powershell(
@@ -362,7 +424,7 @@ fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, ToolError> {
     }
 }
 
-fn detect_first_command(commands: &[&'static str]) -> Option<&'static str> {
+pub(crate) fn detect_first_command(commands: &[&'static str]) -> Option<&'static str> {
     commands
         .iter()
         .copied()
@@ -1211,6 +1273,7 @@ mod tests {
                     code: code.to_string(),
                     language: language.to_string(),
                     timeout_ms: None,
+                    reset: None,
                 },
                 None,
             )
@@ -1238,6 +1301,7 @@ mod tests {
                     code: code.to_string(),
                     language: language.to_string(),
                     timeout_ms: Some(5_000),
+                    reset: None,
                 },
                 None,
             );
@@ -1264,6 +1328,7 @@ mod tests {
                 code: r#"printf '%s' "${ZO_TODO_STORE:-STRIPPED}""#.to_string(),
                 language: "shell".to_string(),
                 timeout_ms: Some(10_000),
+                reset: None,
             },
             None,
         );
