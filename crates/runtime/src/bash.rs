@@ -12,8 +12,8 @@ use tokio::runtime::Builder;
 use tokio::time::timeout;
 
 use crate::sandbox::{
-    resolve_sandbox_status_for_request, sandbox_scratch_dirs, wrap_sandbox_command,
-    FilesystemIsolationMode, SandboxConfig, SandboxStatus,
+    resolve_sandbox_status_for_request_with_macos_seatbelt, sandbox_scratch_dirs,
+    wrap_sandbox_command, FilesystemIsolationMode, SandboxConfig, SandboxStatus,
 };
 use crate::ConfigLoader;
 
@@ -881,7 +881,11 @@ fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> 
         input.filesystem_mode,
         input.allowed_mounts.clone(),
     );
-    resolve_sandbox_status_for_request(&request, cwd)
+    resolve_sandbox_status_for_request_with_macos_seatbelt(
+        &request,
+        cwd,
+        config.macos_seatbelt.unwrap_or(false),
+    )
 }
 
 /// User-declared `settings.env`, cached once per process exactly like
@@ -968,7 +972,7 @@ fn prepare_command(
     } else {
         let mut prepared = Command::new("sh");
         prepared.arg("-lc").arg(command).current_dir(cwd);
-        if sandbox_status.filesystem_active {
+        if sandbox_status.home_tmp_redirected {
             let (home, tmp) = sandbox_scratch_dirs(cwd);
             prepared.env("HOME", home);
             prepared.env("TMPDIR", tmp);
@@ -1009,7 +1013,7 @@ fn prepare_tokio_command(
     } else {
         let mut prepared = TokioCommand::new("sh");
         prepared.arg("-lc").arg(command).current_dir(cwd);
-        if sandbox_status.filesystem_active {
+        if sandbox_status.home_tmp_redirected {
             let (home, tmp) = sandbox_scratch_dirs(cwd);
             prepared.env("HOME", home);
             prepared.env("TMPDIR", tmp);
@@ -1067,7 +1071,7 @@ fn terminate_process_group(pid: Option<u32>) {
 fn fail_closed_if_sandbox_unavailable(sandbox_status: &SandboxStatus) -> io::Result<()> {
     // The per-platform policy lives in `sandbox::current_sandbox_unavailability`
     // (WI-E): a Linux host whose `unshare` is genuinely broken — or macOS with
-    // `ZO_MACOS_SEATBELT` opted in but `sandbox-exec` missing — is a real,
+    // Seatbelt opted in by settings/env but `sandbox-exec` missing — is a real,
     // fixable failure and fails closed. The default macOS/Windows path has no
     // native isolation to fail on, so it degrades to filesystem-scratch isolation
     // instead (failing closed there would reject every command on a dev machine —

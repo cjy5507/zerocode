@@ -94,19 +94,63 @@ pub(crate) fn print_sandbox_status_snapshot() -> Result<(), Box<dyn std::error::
         .unwrap_or_else(|_| runtime::RuntimeConfig::empty());
     println!(
         "{}",
-        crate::format_sandbox_report(&resolve_sandbox_status(runtime_config.sandbox(), &cwd))
+        format_sandbox_status_snapshot(&resolve_sandbox_status(runtime_config.sandbox(), &cwd))
     );
     Ok(())
 }
 
+fn format_sandbox_status_snapshot(status: &runtime::SandboxStatus) -> String {
+    format!(
+        "{}\n  HOME/TMPDIR redirected {}\n  Outside writes blocked {}\n  macOS Seatbelt opt-in {}",
+        crate::format_sandbox_report(status),
+        status.home_tmp_redirected,
+        status.filesystem_write_blocking_active,
+        status.macos_seatbelt_opt_in,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::print_version;
+    use super::{format_sandbox_status_snapshot, print_version};
     use crate::render_version_report;
 
     #[test]
     fn print_version_uses_shared_renderer_text() {
         assert_eq!(render_version_report(), crate::render_version_report());
         let _ = print_version as fn();
+    }
+
+    #[test]
+    fn sandbox_snapshot_distinguishes_redirection_from_write_blocking() {
+        let status = runtime::SandboxStatus {
+            enabled: true,
+            home_tmp_redirected: true,
+            filesystem_active: false,
+            filesystem_write_blocking_active: false,
+            macos_seatbelt_opt_in: false,
+            ..runtime::SandboxStatus::default()
+        };
+        let report = format_sandbox_status_snapshot(&status);
+
+        assert!(report.contains("HOME/TMPDIR redirected true"));
+        assert!(report.contains("Outside writes blocked false"));
+        assert!(report.contains("macOS Seatbelt opt-in false"));
+    }
+
+    #[test]
+    fn sandbox_snapshot_reports_active_seatbelt_write_blocking() {
+        let status = runtime::SandboxStatus {
+            enabled: true,
+            home_tmp_redirected: true,
+            filesystem_active: true,
+            filesystem_write_blocking_active: true,
+            macos_seatbelt_opt_in: true,
+            ..runtime::SandboxStatus::default()
+        };
+        let report = format_sandbox_status_snapshot(&status);
+
+        assert!(report.contains("HOME/TMPDIR redirected true"));
+        assert!(report.contains("Outside writes blocked true"));
+        assert!(report.contains("macOS Seatbelt opt-in true"));
     }
 }

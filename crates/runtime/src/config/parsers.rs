@@ -461,6 +461,7 @@ pub(super) fn parse_optional_sandbox_config(
         filesystem_mode,
         allowed_mounts: optional_string_array(sandbox, "allowedMounts", "merged settings.sandbox")?
             .unwrap_or_default(),
+        macos_seatbelt: optional_bool(sandbox, "macosSeatbelt", "merged settings.sandbox")?,
     })
 }
 
@@ -826,5 +827,13 @@ mod hook_alias_tests {
             .expect("valid json");
         let config = parse_optional_hooks_config(&root).expect("hooks parse");
         assert_eq!(commands(config.turn_end()), vec!["native", "legacy"]);
+    }
+
+    #[test]
+    fn sandbox_macos_seatbelt_setting_is_parsed() {
+        let root = JsonValue::parse(r#"{"sandbox":{"macosSeatbelt":true}}"#)
+            .expect("valid json");
+        let config = super::parse_optional_sandbox_config(&root).expect("sandbox parse");
+        assert_eq!(config.macos_seatbelt, Some(true));
     }
 }

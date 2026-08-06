@@ -97,7 +97,7 @@ pub(crate) fn format_status_report(
 
 pub(crate) fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
     format!(
-        "Sandbox\n  Enabled           {}\n  Effective posture {}\n  Active            {}\n  Supported         {}\n  Platform backend  {}\n  In container      {}\n  Requested ns      {}\n  Active ns         {}\n  Requested net     {}\n  Active net        {}\n  Filesystem mode   {}\n  Filesystem active {}\n  Allowed mounts    {}\n  Markers           {}\n  Fallback reason   {}\n  Isolation note    {}",
+        "Sandbox\n  Enabled           {}\n  Effective posture {}\n  Active            {}\n  Supported         {}\n  Platform backend  {}\n  In container      {}\n  Requested ns      {}\n  Active ns         {}\n  Requested net     {}\n  Active net        {}\n  Filesystem mode   {}\n  Filesystem active {}\n  Home/tmp redirect {}\n  Allowed mounts    {}\n  Markers           {}\n  Fallback reason   {}\n  Isolation note    {}",
         status.enabled,
         sandbox_effective_posture(status),
         status.active,
@@ -110,6 +110,7 @@ pub(crate) fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
         status.network_active,
         status.filesystem_mode.as_str(),
         status.filesystem_active,
+        status.home_tmp_redirected,
         if status.allowed_mounts.is_empty() {
             "<none>".to_string()
         } else {
@@ -135,6 +136,8 @@ fn sandbox_effective_posture(status: &runtime::SandboxStatus) -> &'static str {
         "isolated"
     } else if status.filesystem_active {
         "filesystem-only"
+    } else if status.home_tmp_redirected {
+        "home-tmp-redirect-only"
     } else {
         "requested-but-inactive"
     }
@@ -159,6 +162,8 @@ fn sandbox_isolation_note(status: &runtime::SandboxStatus) -> &'static str {
         "namespace/network isolation active as requested"
     } else if status.filesystem_active {
         "only filesystem isolation is active; namespace/network isolation is not active"
+    } else if status.home_tmp_redirected {
+        "only HOME/TMPDIR are redirected to scratch dirs; writes outside the workspace are NOT blocked"
     } else if status.fallback_reason.is_some() {
         "sandbox requested but unavailable; see fallback reason"
     } else {

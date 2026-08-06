@@ -33,6 +33,7 @@ pub struct SandboxConfig {
     pub network_isolation: Option<bool>,
     pub filesystem_mode: Option<FilesystemIsolationMode>,
     pub allowed_mounts: Vec<String>,
+    pub macos_seatbelt: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -62,7 +63,15 @@ pub struct SandboxStatus {
     pub network_supported: bool,
     pub network_active: bool,
     pub filesystem_mode: FilesystemIsolationMode,
+    /// Compatibility field: true only when writes outside the configured roots
+    /// are actively blocked, not for scratch HOME/TMPDIR redirection alone.
     pub filesystem_active: bool,
+    #[serde(default)]
+    pub home_tmp_redirected: bool,
+    #[serde(default)]
+    pub filesystem_write_blocking_active: bool,
+    #[serde(default)]
+    pub macos_seatbelt_opt_in: bool,
     pub allowed_mounts: Vec<String>,
     pub in_container: bool,
     pub container_markers: Vec<String>,
@@ -163,17 +172,60 @@ pub fn detect_container_environment_from(
 #[must_use]
 pub fn resolve_sandbox_status(config: &SandboxConfig, cwd: &Path) -> SandboxStatus {
     let request = config.resolve_request(None, None, None, None, None);
-    resolve_sandbox_status_for_request(&request, cwd)
+    resolve_sandbox_status_for_request_with_macos_seatbelt(
+        &request,
+        cwd,
+        config.macos_seatbelt.unwrap_or(false),
+    )
 }
 
 #[must_use]
 pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) -> SandboxStatus {
+    resolve_sandbox_status_for_request_with_macos_seatbelt(request, cwd, false)
+}
+
+/// Resolve a request while applying the macOS Seatbelt setting in addition to
+/// the legacy environment opt-in. Other platforms ignore the setting.
+#[must_use]
+pub fn resolve_sandbox_status_for_request_with_macos_seatbelt(
+    request: &SandboxRequest,
+    cwd: &Path,
+    macos_seatbelt_setting: bool,
+) -> SandboxStatus {
     let container = detect_container_environment();
-    let namespace_supported = cfg!(target_os = "linux") && unshare_user_namespace_works();
+    let platform = current_platform_tag();
+    let namespace_supported = platform == "linux" && unshare_user_namespace_works();
+    let seatbelt_opt_in = resolve_macos_seatbelt_opt_in(
+        macos_seatbelt_setting,
+        env::var_os("ZO_MACOS_SEATBELT").as_deref(),
+    );
+    resolve_sandbox_status_for_platform(
+        request,
+        cwd,
+        container,
+        platform,
+        namespace_supported,
+        seatbelt_opt_in,
+        command_exists("sandbox-exec"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_sandbox_status_for_platform(
+    request: &SandboxRequest,
+    cwd: &Path,
+    container: ContainerEnvironment,
+    platform: &str,
+    namespace_supported: bool,
+    seatbelt_opt_in: bool,
+    seatbelt_available: bool,
+) -> SandboxStatus {
     let network_supported = namespace_supported;
-    let filesystem_active = request.enabled
-        && request.filesystem_mode != FilesystemIsolationMode::Off
-        && platform_applies_filesystem_isolation();
+    let filesystem_requested =
+        request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off;
+    let home_tmp_redirected = filesystem_requested && platform == "macos";
+    let filesystem_write_blocking_active =
+        filesystem_requested && platform == "macos" && seatbelt_opt_in && seatbelt_available;
     let mut fallback_reasons = Vec::new();
 
     if request.enabled && request.namespace_restrictions && !namespace_supported {
@@ -192,23 +244,28 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
             .push("filesystem allow-list requested without configured mounts".to_string());
     }
 
-    let active = request.enabled
-        && (!request.namespace_restrictions || namespace_supported)
-        && (!request.network_isolation || network_supported);
+    let namespace_active =
+        request.enabled && request.namespace_restrictions && namespace_supported;
+    let network_active = request.enabled && request.network_isolation && network_supported;
+    let active = namespace_active || network_active || filesystem_write_blocking_active;
 
     let allowed_mounts = normalize_mounts(&request.allowed_mounts, cwd);
 
     SandboxStatus {
         enabled: request.enabled,
         requested: request.clone(),
-        supported: namespace_supported,
+        supported: namespace_supported
+            || (platform == "macos" && seatbelt_opt_in && seatbelt_available),
         active,
         namespace_supported,
-        namespace_active: request.enabled && request.namespace_restrictions && namespace_supported,
+        namespace_active,
         network_supported,
-        network_active: request.enabled && request.network_isolation && network_supported,
+        network_active,
         filesystem_mode: request.filesystem_mode,
-        filesystem_active,
+        filesystem_active: filesystem_write_blocking_active,
+        home_tmp_redirected,
+        filesystem_write_blocking_active,
+        macos_seatbelt_opt_in: seatbelt_opt_in,
         allowed_mounts,
         in_container: container.in_container,
         container_markers: container.markers,
@@ -383,23 +440,14 @@ pub fn wrap_sandbox_command(
     sandbox_backend().wrap_command(command, cwd, status)
 }
 
-/// True when macOS Seatbelt wrapping is explicitly opted into. Off by default so
-/// the established macOS behavior (scratch `HOME`/`TMPDIR` redirection, no
-/// `sandbox-exec`) is byte-for-byte unchanged unless the operator asks for it.
-fn macos_seatbelt_opt_in() -> bool {
-    env::var_os("ZO_MACOS_SEATBELT").is_some()
-}
-
-/// Whether the host applies *any* real filesystem isolation behavior that the
-/// `filesystem_active` status should advertise. macOS does (scratch
-/// `HOME`/`TMPDIR` redirection by default; Seatbelt write-blocking when opted
-/// in). Linux does **not**: `build_linux_sandbox_command` only opens a mount
-/// namespace with no bind/remount, so the host filesystem stays writable —
-/// reporting `filesystem_active` there would overstate containment. Gating the
-/// flag here keeps the status honest rather than letting it claim isolation the
-/// `unshare` wrapper never delivers.
-fn platform_applies_filesystem_isolation() -> bool {
-    !cfg!(target_os = "linux")
+/// Resolve the macOS Seatbelt opt-in from either settings or the legacy
+/// environment route. An absent setting and absent variable keep the default
+/// off; the environment variable remains presence-based for compatibility.
+fn resolve_macos_seatbelt_opt_in(
+    setting: bool,
+    env_value: Option<&std::ffi::OsStr>,
+) -> bool {
+    setting || env_value.is_some()
 }
 
 /// Build the macOS `sandbox-exec` launcher for a shell command, or `None` when
@@ -410,10 +458,10 @@ fn build_macos_sandbox_command(
     cwd: &Path,
     status: &SandboxStatus,
 ) -> Option<LinuxSandboxCommand> {
-    if !cfg!(target_os = "macos") || !status.enabled || !status.filesystem_active {
-        return None;
-    }
-    if !macos_seatbelt_opt_in() {
+    if !cfg!(target_os = "macos")
+        || !status.enabled
+        || !status.filesystem_write_blocking_active
+    {
         return None;
     }
     let (sandbox_home, sandbox_tmp) = sandbox_scratch_dirs(cwd);
@@ -526,9 +574,10 @@ pub fn sandbox_unavailability_reason(
     }
     match platform {
         "linux" => fallback_reason.map(str::to_string),
-        "macos" if seatbelt_opt_in && filesystem_active && !seatbelt_available => {
-            Some("ZO_MACOS_SEATBELT is set but `sandbox-exec` is unavailable".to_string())
-        }
+        "macos" if seatbelt_opt_in && filesystem_active && !seatbelt_available => Some(
+            "macOS Seatbelt was requested by sandbox.macosSeatbelt or ZO_MACOS_SEATBELT, but `sandbox-exec` is unavailable"
+                .to_string(),
+        ),
         _ => None,
     }
 }
@@ -539,9 +588,9 @@ pub fn current_sandbox_unavailability(status: &SandboxStatus) -> Option<String> 
     sandbox_unavailability_reason(
         current_platform_tag(),
         status.enabled,
-        status.filesystem_active,
+        status.requested.filesystem_mode != FilesystemIsolationMode::Off,
         status.fallback_reason.as_deref(),
-        macos_seatbelt_opt_in(),
+        status.macos_seatbelt_opt_in,
         command_exists("sandbox-exec"),
     )
 }
@@ -697,6 +746,7 @@ mod tests {
             network_isolation: Some(false),
             filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
             allowed_mounts: vec!["logs".to_string()],
+            macos_seatbelt: Some(true),
         };
 
         let request = config.resolve_request(
@@ -822,23 +872,72 @@ mod tests {
         }
     }
 
+    fn enabled_filesystem_request() -> super::SandboxRequest {
+        super::SandboxRequest {
+            enabled: true,
+            namespace_restrictions: false,
+            network_isolation: false,
+            filesystem_mode: FilesystemIsolationMode::WorkspaceOnly,
+            allowed_mounts: Vec::new(),
+        }
+    }
+
+    fn resolve_for_test_platform(
+        platform: &str,
+        seatbelt_opt_in: bool,
+    ) -> super::SandboxStatus {
+        super::resolve_sandbox_status_for_platform(
+            &enabled_filesystem_request(),
+            Path::new("/workspace"),
+            super::ContainerEnvironment::default(),
+            platform,
+            platform == "linux",
+            seatbelt_opt_in,
+            true,
+        )
+    }
+
     #[test]
-    fn filesystem_active_is_honest_about_linux_nonenforcement() {
-        // The Linux `unshare` wrapper opens a mount namespace but performs no
-        // bind/remount, so it does not contain writes — `filesystem_active` must
-        // not claim isolation there. Every other platform applies a real
-        // filesystem behavior (scratch redirect / Seatbelt) and may report it.
-        let config = SandboxConfig::default();
-        let request = config.resolve_request(
-            Some(true),
-            None,
-            None,
-            Some(FilesystemIsolationMode::WorkspaceOnly),
-            None,
+    fn macos_enabled_without_opt_in_reports_redirection_without_write_blocking() {
+        let status = resolve_for_test_platform("macos", false);
+
+        assert!(status.home_tmp_redirected);
+        assert!(!status.filesystem_write_blocking_active);
+        assert!(!status.filesystem_active);
+        assert!(!status.macos_seatbelt_opt_in);
+    }
+
+    #[test]
+    fn macos_enabled_with_setting_reports_write_blocking() {
+        let opted_in = super::resolve_macos_seatbelt_opt_in(true, None);
+        let status = resolve_for_test_platform("macos", opted_in);
+        let profile = super::build_seatbelt_profile(Path::new("/workspace"), &status);
+
+        assert!(status.home_tmp_redirected);
+        assert!(status.filesystem_write_blocking_active);
+        assert!(status.filesystem_active);
+        assert!(profile.contains("(deny file-write*)"));
+    }
+
+    #[test]
+    fn macos_enabled_with_env_opt_in_reports_write_blocking() {
+        let opted_in = super::resolve_macos_seatbelt_opt_in(
+            false,
+            Some(std::ffi::OsStr::new("1")),
         );
-        let status =
-            super::resolve_sandbox_status_for_request(&request, Path::new("/workspace"));
-        assert_eq!(status.filesystem_active, !cfg!(target_os = "linux"));
+        let status = resolve_for_test_platform("macos", opted_in);
+
+        assert!(status.macos_seatbelt_opt_in);
+        assert!(status.filesystem_write_blocking_active);
+    }
+
+    #[test]
+    fn linux_does_not_report_filesystem_redirection_or_write_blocking() {
+        let status = resolve_for_test_platform("linux", false);
+
+        assert!(!status.home_tmp_redirected);
+        assert!(!status.filesystem_write_blocking_active);
+        assert!(!status.filesystem_active);
     }
 }
 
