@@ -341,17 +341,29 @@ fn microcompact_clears_old_results_and_keeps_the_recent_tail() {
 /// selection ([`super::plan_microcompact_clears`]) precisely so a caller
 /// gating on the estimate is never quoted a number the actual clear then
 /// misses.
+///
+/// The transcript deliberately straddles the mutation frontier: a superseded
+/// reminder ahead of the first cleared tool result (which the frontier rule
+/// strands) and one behind it (which rides along for free). A quote that
+/// counted the stranded copy would promise the caller tokens the clear never
+/// frees, which is exactly how a break-even gate starts approving losing trades.
 #[test]
 fn microcompact_clearable_estimate_matches_actual_clear() {
-    let mut session = Session::new();
+    let reminder = format!("<system-reminder>\n{}\n</system-reminder>", "nag ".repeat(400));
     let big = "x".repeat(1_000);
-    session.messages =
-        ::std::sync::Arc::new((0..8).map(|i| tool_result_message(i, &big, 0)).collect());
+    let mut messages = vec![reminder_message(&reminder)];
+    messages.extend((0..8).map(|i| tool_result_message(i, &big, 0)));
+    messages.push(reminder_message(&reminder));
+    messages.push(reminder_message(&reminder));
+    let mut session = Session::new();
+    session.messages = ::std::sync::Arc::new(messages);
 
     let estimate = microcompact_clearable_estimate(&session, 5, 240);
     assert!(estimate > 0, "8 big results with a keep-5 budget must be clearable");
 
     let event = microcompact_session(&mut session, 5, 240).expect("3 old results clearable");
+    assert_eq!(event.cleared_results, 3);
+    assert_eq!(event.cleared_superseded_reminders, 1);
     assert_eq!(
         estimate, event.estimated_tokens_saved,
         "the read-only estimate must equal what the clear actually reports"
@@ -1104,6 +1116,157 @@ fn microcompact_never_touches_a_compaction_continuation() {
     );
 }
 
+/// FRONTIER DISCIPLINE. A microcompact firing costs one re-bill of the wire
+/// prefix from its EARLIEST rewritten message to the tail, so that index is the
+/// whole price of the pass. The reminder scan has no `keep_recent` and used to
+/// run over the whole transcript, which meant a single duplicate reminder near
+/// message 1 could set that index at the head of the conversation and re-bill
+/// nearly everything to reclaim a few hundred bytes. It now reclaims only what
+/// sits at or after the frontier the tool-result pass already establishes —
+/// where it is free.
+#[test]
+fn a_reminder_at_or_after_the_tool_frontier_is_reclaimed_in_the_same_pass() {
+    let reminder = format!("<system-reminder>\n{}\n</system-reminder>", "nag ".repeat(400));
+    let big = "x".repeat(1_000);
+    let mut messages = vec![reminder_message(&reminder)];
+    messages.extend((0..8).map(|i| tool_result_message(i, &big, 0)));
+    messages.push(reminder_message(&reminder));
+    messages.push(reminder_message(&reminder));
+    let mut session = Session::new();
+    session.messages = ::std::sync::Arc::new(messages);
+
+    // 8 results, keep-recent 5 -> the three oldest clear, so the frontier is
+    // message 1. Copy 0 sits behind it; copy 9 sits inside the re-billed region;
+    // copy 10 is the newest and is always kept.
+    let event = microcompact_session(&mut session, 5, 240).expect("three old results clearable");
+    assert_eq!(event.cleared_results, 3);
+    assert_eq!(
+        event.cleared_superseded_reminders, 1,
+        "only the copy at or after the frontier is reclaimed"
+    );
+
+    let text_at = |index: usize| match &session.messages[index].blocks[0] {
+        ContentBlock::Text { text } => text.clone(),
+        other => panic!("expected text at {index}: {other:?}"),
+    };
+    assert_eq!(
+        text_at(0),
+        reminder,
+        "a copy ahead of the frontier is left in place — reclaiming it would \
+         move the divergence index to the head of the transcript"
+    );
+    assert_eq!(text_at(9), MICROCOMPACT_REMINDER_PLACEHOLDER);
+    assert_eq!(text_at(10), reminder, "the newest copy always survives");
+}
+
+/// The frontier only ever moves FORWARD (a cleared body is never a candidate
+/// again), so the copy left behind it is not picked up by a later pass either.
+/// That is the deliberate side of the trade: it keeps costing its own bytes
+/// until full compaction evicts it, which is far cheaper than one whole-context
+/// re-bill.
+#[test]
+fn a_reminder_stranded_behind_the_frontier_is_not_reclaimed_by_a_later_pass() {
+    let reminder = format!("<system-reminder>\n{}\n</system-reminder>", "nag ".repeat(400));
+    let big = "x".repeat(1_000);
+    let mut messages = vec![reminder_message(&reminder)];
+    messages.extend((0..8).map(|i| tool_result_message(i, &big, 0)));
+    messages.push(reminder_message(&reminder));
+    let mut session = Session::new();
+    session.messages = ::std::sync::Arc::new(messages);
+
+    microcompact_session(&mut session, 5, 240).expect("first pass clears the old results");
+    // Second pass: the three oldest results are placeholders now, so the
+    // frontier has advanced past message 0 for good.
+    assert!(
+        microcompact_session(&mut session, 4, 240).is_some(),
+        "a smaller keep budget still finds results to clear"
+    );
+    match &session.messages[0].blocks[0] {
+        ContentBlock::Text { text } => assert_eq!(*text, reminder),
+        other => panic!("expected the stranded reminder: {other:?}"),
+    }
+}
+
+/// A session whose clearable results have not yet outgrown `keep_recent` has no
+/// frontier at all. The reminder pass is then the whole pass and sets the
+/// divergence index itself, so it stays enabled — dropping it here would switch
+/// reclamation off in exactly the long, low-tool-traffic session it was written
+/// for. What prices it is the caller's break-even gate, which is calibrated for
+/// a whole-prefix rewrite.
+#[test]
+fn with_no_tool_frontier_the_reminder_pass_still_runs() {
+    let reminder = format!("<system-reminder>\n{}\n</system-reminder>", "nag ".repeat(400));
+    let big = "x".repeat(1_000);
+    let mut messages: Vec<ConversationMessage> =
+        (0..3).map(|i| tool_result_message(i, &big, 0)).collect();
+    messages.push(reminder_message(&reminder));
+    messages.push(reminder_message(&reminder));
+    let mut session = Session::new();
+    session.messages = ::std::sync::Arc::new(messages);
+
+    let event = microcompact_session(&mut session, 5, 240)
+        .expect("no tool result clears, but the reminders still do");
+    assert_eq!(event.cleared_results, 0, "3 results are inside the keep budget");
+    assert_eq!(event.cleared_superseded_reminders, 1);
+}
+
+/// `mutation_frontier` folds BOTH clear sets, and the image set is not a
+/// redundant second source: a long session can be pinned by pasted screenshots
+/// with no clearable tool result in sight (that is the case
+/// `microcompact_clears_old_standalone_images_but_keeps_recent` covers). If the
+/// frontier were derived from tool results alone it would read `None` here, the
+/// `is_none_or` filter would open the scan to the whole transcript, and the copy
+/// this test strands would be reclaimed — dragging the divergence index to
+/// message 0 while the images being cleared had already priced message 1.
+#[test]
+fn an_images_only_pass_still_sets_the_reminder_frontier() {
+    let reminder = format!("<system-reminder>\n{}\n</system-reminder>", "nag ".repeat(400));
+    let image_message = |i: usize| ConversationMessage {
+        role: MessageRole::User,
+        blocks: vec![
+            ContentBlock::Text {
+                text: format!("look at screenshot {i}"),
+            },
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "aGVsbG8=".to_string(),
+            },
+        ],
+        usage: None,
+        thought_signature: None,
+        reasoning_replay: None,
+        model: None,
+    };
+    let mut messages = vec![reminder_message(&reminder)];
+    messages.extend((0..7).map(image_message));
+    messages.push(reminder_message(&reminder));
+    messages.push(reminder_message(&reminder));
+    let mut session = Session::new();
+    session.messages = ::std::sync::Arc::new(messages);
+
+    // 7 images, keep-recent 5 -> the two oldest clear, at messages 1 and 2, so
+    // the frontier is message 1 and NO tool result contributed to it.
+    let event = microcompact_session(&mut session, 5, 240).expect("two old images clearable");
+    assert_eq!(event.cleared_results, 0, "there is no tool result in this session");
+    assert_eq!(event.cleared_images, 2);
+    assert_eq!(
+        event.cleared_superseded_reminders, 1,
+        "only the copy at or after the image frontier is reclaimed"
+    );
+
+    let text_at = |index: usize| match &session.messages[index].blocks[0] {
+        ContentBlock::Text { text } => text.clone(),
+        other => panic!("expected text at {index}: {other:?}"),
+    };
+    assert_eq!(
+        text_at(0),
+        reminder,
+        "the copy ahead of the image frontier is left in place"
+    );
+    assert_eq!(text_at(8), MICROCOMPACT_REMINDER_PLACEHOLDER);
+    assert_eq!(text_at(9), reminder, "the newest copy always survives");
+}
+
 fn reminder_message(text: &str) -> ConversationMessage {
     ConversationMessage {
         role: MessageRole::System,
@@ -1225,6 +1388,10 @@ fn continuation_vault_affordance_is_emitted_and_excluded_from_legacy_reparse() {
 #[test]
 fn microcompact_cleared_body_is_restored_to_vault_on_compaction() {
     use std::time::{SystemTime, UNIX_EPOCH};
+    // Serialized on the crate env lock because a sibling test flips
+    // `ZO_DISABLE_RAW_VAULT`, which would make this vault look legitimately
+    // empty; the var is process-global, so exclusion is the only defense.
+    let _env_guard = crate::test_env_lock();
 
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1265,8 +1432,12 @@ fn microcompact_cleared_body_is_restored_to_vault_on_compaction() {
     session.push_user_text("recent tail a").expect("push");
     session.push_user_text("recent tail b").expect("push");
 
-    // Microcompact clears the OLD tool-result body IN MEMORY only (the trim is
-    // never persisted), leaving the on-disk transcript holding the original.
+    // Microcompact clears the OLD tool-result body in memory. This test does not
+    // persist afterwards, so the on-disk snapshot still holds the original — the
+    // narrow window the disk FALLBACK covers. (In production the clear marks the
+    // transcript dirty and the next persist publishes the placeholder; that
+    // ordering is covered by
+    // `a_cleared_result_is_recovered_from_the_vault_after_the_clear_is_persisted`.)
     let event = microcompact_session(&mut session, 0, 10).expect("microcompact clears the body");
     assert_eq!(event.cleared_results, 1);
     if let ContentBlock::ToolResult { output, .. } = &session.messages[1].blocks[0] {
@@ -1300,6 +1471,706 @@ fn microcompact_cleared_body_is_restored_to_vault_on_compaction() {
         })
     });
     assert!(!sealed_placeholder, "the placeholder must NOT have been sealed to the vault");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- LAVA: microcompact seals its pre-clear originals ---
+
+/// A fresh temp directory plus the session path inside it, named after the
+/// caller so two tests never share a vault file.
+fn temp_session_path(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("zo-lava-{tag}-{unique}"));
+    std::fs::create_dir_all(&dir).expect("mk temp dir");
+    let path = dir.join("sess.jsonl");
+    (dir, path)
+}
+
+/// Raw (non-deduplicated) vault lines, so a test can tell "sealed twice" from
+/// "sealed once" — `Session::read_vault` collapses duplicate seqs by design and
+/// therefore cannot see a double-seal.
+fn raw_vault_lines(session_path: &std::path::Path) -> Vec<String> {
+    let vault = session_path.with_file_name("sess.vault.jsonl");
+    std::fs::read_to_string(vault).map_or_else(
+        |_| Vec::new(),
+        |text| text.lines().filter(|line| !line.trim().is_empty()).map(str::to_string).collect(),
+    )
+}
+
+/// Every tool-result body present in the session's vault, after dedup.
+fn vault_tool_bodies(session: &Session) -> Vec<String> {
+    session
+        .read_vault()
+        .into_iter()
+        .flat_map(|record| record.message.blocks)
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { output, .. } => Some(output),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Build a persisted session whose message 1 carries one big, clearable
+/// (non-edit) tool result, plus enough tail to keep compaction realistic.
+fn persisted_session_with_one_big_result(path: &std::path::Path, body: &str) -> Session {
+    let mut session = Session::new().with_persistence_path(path.to_path_buf());
+    session.push_user_text("start the task").expect("push");
+    session
+        .push_message(tool_result_message(1, body, 0))
+        .expect("push tool result");
+    session
+        .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: "did some work".to_string(),
+        }]))
+        .expect("push");
+    session.push_user_text("recent tail a").expect("push");
+    session.push_user_text("recent tail b").expect("push");
+    session
+}
+
+#[test]
+fn a_cleared_result_is_sealed_before_it_is_overwritten() {
+    // Serialized on the crate env lock because a sibling test flips
+    // `ZO_DISABLE_RAW_VAULT`, which would make this vault look legitimately
+    // empty; the var is process-global, so exclusion is the only defense.
+    let _env_guard = crate::test_env_lock();
+    let (dir, path) = temp_session_path("seal-before-clear");
+    let original_body = format!("ORIGINAL_TOOL_OUTPUT {}", "x".repeat(300));
+    let mut session = persisted_session_with_one_big_result(&path, &original_body);
+
+    let event = microcompact_session(&mut session, 0, 10).expect("microcompact clears the body");
+    assert_eq!(event.cleared_results, 1);
+
+    // In memory the body is gone — that is the whole point of the trim.
+    match session.messages[1].blocks.first() {
+        Some(ContentBlock::ToolResult { output, .. }) => {
+            assert_eq!(output, MICROCOMPACT_PLACEHOLDER, "live body is the placeholder");
+        }
+        other => panic!("unexpected block: {other:?}"),
+    }
+    // The vault holds the ORIGINAL, captured one statement before the overwrite.
+    let bodies = vault_tool_bodies(&session);
+    assert!(
+        bodies.iter().any(|body| body == &original_body),
+        "vault holds the pre-clear original, got {bodies:?}"
+    );
+    assert!(
+        !bodies.iter().any(|body| body == MICROCOMPACT_PLACEHOLDER),
+        "the placeholder must never be what the vault stores"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_cleared_result_is_recovered_from_the_vault_after_the_clear_is_persisted() {
+    // Serialized on the crate env lock because a sibling test flips
+    // `ZO_DISABLE_RAW_VAULT`, which would make this vault look legitimately
+    // empty; the var is process-global, so exclusion is the only defense.
+    let _env_guard = crate::test_env_lock();
+    // Production ordering: the clear marks the transcript dirty, so the NEXT
+    // persist rewrites the on-disk snapshot with the placeholder — long before
+    // full compaction runs. That is what made the disk-only restore structurally
+    // incapable of recovering anything.
+    let (dir, path) = temp_session_path("disk-poisoned");
+    let original_body = format!("ORIGINAL_TOOL_OUTPUT {}", "x".repeat(300));
+    let mut session = persisted_session_with_one_big_result(&path, &original_body);
+    let _ = microcompact_session(&mut session, 0, 10).expect("microcompact clears the body");
+    session.save_to_path(&path).expect("persist the cleared snapshot");
+
+    // Assert the fallback source really is poisoned, so the recovery below can
+    // only have come from the vault.
+    let on_disk = std::fs::read_to_string(&path).expect("read snapshot");
+    assert!(
+        on_disk.contains(MICROCOMPACT_PLACEHOLDER),
+        "the persisted snapshot holds the placeholder"
+    );
+    assert!(
+        !on_disk.contains("ORIGINAL_TOOL_OUTPUT"),
+        "the persisted snapshot no longer holds the original"
+    );
+
+    let mut evicted = session.messages[..2].to_vec();
+    // Live indices 0 and 1 with `first_message_index == 0`, so those are also the
+    // absolute seqs (only the image half reads them; this case is id-addressed).
+    super::restore_microcompacted_bodies(&mut evicted, &session, &[0, 1]);
+    match evicted[1].blocks.first() {
+        Some(ContentBlock::ToolResult { output, .. }) => {
+            assert_eq!(output, &original_body, "restored from the vault, not from disk");
+        }
+        other => panic!("unexpected block: {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn re_running_the_clear_does_not_double_seal() {
+    // Serialized on the crate env lock because a sibling test flips
+    // `ZO_DISABLE_RAW_VAULT`, which would make this vault look legitimately
+    // empty; the var is process-global, so exclusion is the only defense.
+    let _env_guard = crate::test_env_lock();
+    let (dir, path) = temp_session_path("idempotent-seal");
+    let original_body = format!("ORIGINAL_TOOL_OUTPUT {}", "x".repeat(300));
+    let mut session = persisted_session_with_one_big_result(&path, &original_body);
+
+    let _ = microcompact_session(&mut session, 0, 10).expect("first pass clears the body");
+    let after_first = raw_vault_lines(&path);
+    assert_eq!(after_first.len(), 1, "one message cleared, one record sealed");
+
+    let second = microcompact_session(&mut session, 0, 10);
+    assert!(second.is_none(), "nothing new to clear on the second pass");
+    assert_eq!(
+        raw_vault_lines(&path),
+        after_first,
+        "a no-op pass must append nothing to the append-only vault"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_second_clear_in_the_same_message_reseals_both_originals() {
+    // Serialized on the crate env lock because a sibling test flips
+    // `ZO_DISABLE_RAW_VAULT`, which would make this vault look legitimately
+    // empty; the var is process-global, so exclusion is the only defense.
+    let _env_guard = crate::test_env_lock();
+    // The seq domain is per MESSAGE and the vault reader is last-wins, so a
+    // later round re-sealing a message it had already sealed would bury the
+    // pristine record under a partially-cleared one. The seal heals from the
+    // vault first, so what lands is pristine both times.
+    let (dir, path) = temp_session_path("reseal-heals");
+    let first_body = format!("FIRST_BODY {}", "a".repeat(300));
+    let second_body = format!("SECOND_BODY {}", "b".repeat(300));
+    let mut session = Session::new().with_persistence_path(path.clone());
+    session
+        .push_message(ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "pair-a".to_string(),
+                    tool_name: "Read".to_string(),
+                    output: first_body.clone(),
+                    is_error: false,
+                    images: Vec::new(),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "pair-b".to_string(),
+                    tool_name: "Read".to_string(),
+                    output: second_body.clone(),
+                    is_error: false,
+                    images: Vec::new(),
+                },
+            ],
+            usage: None,
+            thought_signature: None,
+            reasoning_replay: None,
+            model: None,
+        })
+        .expect("push paired results");
+    session
+        .push_message(tool_result_message(9, &"z".repeat(300), 0))
+        .expect("push filler result");
+    session
+        .push_message(tool_result_message(10, &"z".repeat(300), 0))
+        .expect("push filler result");
+
+    // Four clearable results; keep 3 clears exactly the first block, keep 2 then
+    // clears exactly the second — two rounds touching the SAME message.
+    let first_pass = microcompact_session(&mut session, 3, 240).expect("first block clearable");
+    assert_eq!(first_pass.cleared_results, 1);
+    let second_pass = microcompact_session(&mut session, 2, 240).expect("second block clearable");
+    assert_eq!(second_pass.cleared_results, 1);
+
+    let bodies = vault_tool_bodies(&session);
+    assert!(
+        bodies.iter().any(|body| body == &first_body),
+        "round one's original survives round two's re-seal, got {bodies:?}"
+    );
+    assert!(
+        bodies.iter().any(|body| body == &second_body),
+        "round two's original is sealed too, got {bodies:?}"
+    );
+    assert!(
+        !bodies.iter().any(|body| body == MICROCOMPACT_PLACEHOLDER),
+        "no placeholder is ever the surviving vault record"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The live tool-result body of the fixture's message 1.
+fn live_body(session: &Session) -> String {
+    match session.messages[1].blocks.first() {
+        Some(ContentBlock::ToolResult { output, .. }) => output.clone(),
+        other => panic!("unexpected block: {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_seal_that_cannot_be_written_leaves_the_body_intact() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Serialized on the crate env lock because a sibling test flips
+    // `ZO_DISABLE_RAW_VAULT` — which would turn this failed append into a
+    // legitimate no-op and let the trim fire. The var is process-global, so
+    // mutual exclusion is the only defense.
+    let _env_guard = crate::test_env_lock();
+
+    // The invariant: a body is destroyed only once its original is recoverable.
+    // A failed vault append means it is NOT recoverable — and the disk fallback
+    // cannot stand in, because this pass ends with `mark_transcript_dirty`, so
+    // the next persist publishes the placeholder over the snapshot the fallback
+    // reads. The trim must therefore decline rather than clear.
+    let (dir, path) = temp_session_path("seal-write-failure");
+    let original_body = format!("ORIGINAL_TOOL_OUTPUT {}", "x".repeat(300));
+    let mut session = persisted_session_with_one_big_result(&path, &original_body);
+
+    // The smallest real seam for "the append fails": the vault lives beside the
+    // session file, so a read-only session directory makes the create+append
+    // fail with EACCES. Same seam the todo-store and agent-tools IO-failure
+    // tests use.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+        .expect("make the session directory read-only");
+    let probe = dir.join(".probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        // This uid can write a 0555 directory anyway (root): the EACCES under
+        // test cannot occur, so there is nothing to assert.
+        let _ = std::fs::remove_file(&probe);
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    let declined = microcompact_session(&mut session, 0, 10);
+    let body_after_failure = live_body(&session);
+    let vault_after_failure = raw_vault_lines(&path);
+
+    // Restore write access before asserting, so a failing assertion cannot leave
+    // an undeletable directory behind.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+        .expect("restore session directory permissions");
+
+    assert!(
+        declined.is_none(),
+        "a trim whose seal could not be written must report no firing, got {declined:?}"
+    );
+    assert_eq!(
+        body_after_failure, original_body,
+        "the raw body is the only surviving copy, so it must not have been cleared"
+    );
+    assert!(
+        vault_after_failure.is_empty(),
+        "nothing was sealed, got {vault_after_failure:?}"
+    );
+
+    // Other direction, same session: with the directory writable the identical
+    // plan seals and DOES clear — so the assertion above is about the write
+    // failure, not about this batch being unclearable.
+    let fired = microcompact_session(&mut session, 0, 10).expect("the same plan now fires");
+    assert_eq!(fired.cleared_results, 1);
+    assert_eq!(
+        live_body(&session),
+        MICROCOMPACT_PLACEHOLDER,
+        "a successful seal is what licenses the clear"
+    );
+    assert!(
+        vault_tool_bodies(&session).iter().any(|body| body == &original_body),
+        "the original reached the vault before the clear"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_trim_with_the_vault_disabled_still_clears_and_writes_nothing() {
+    // The documented intentional-loss mode: the operator turned the vault off,
+    // so "nothing was sealed" is not a failed write and must not block the trim.
+    let _guard = crate::test_env_lock();
+    let (dir, path) = temp_session_path("vault-disabled");
+    let original_body = format!("ORIGINAL_TOOL_OUTPUT {}", "x".repeat(300));
+    let mut session = persisted_session_with_one_big_result(&path, &original_body);
+
+    std::env::set_var("ZO_DISABLE_RAW_VAULT", "1");
+    let fired = microcompact_session(&mut session, 0, 10);
+    std::env::remove_var("ZO_DISABLE_RAW_VAULT");
+
+    assert!(fired.is_some(), "an opted-out vault must not disable the trim");
+    assert_eq!(
+        live_body(&session),
+        MICROCOMPACT_PLACEHOLDER,
+        "the body is cleared — the loss is what the operator asked for"
+    );
+    assert!(
+        raw_vault_lines(&path).is_empty(),
+        "no vault file is written when the vault is disabled"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_unpersisted_trim_still_clears_and_has_no_vault() {
+    // The other intentional-loss mode: with no persistence path there is no file
+    // to write and no file to recover from, so refusing the trim would only mean
+    // an in-memory session can never shrink.
+    let original_body = format!("ORIGINAL_TOOL_OUTPUT {}", "x".repeat(300));
+    let mut session = Session::new();
+    session.push_user_text("start the task").expect("push");
+    session
+        .push_message(tool_result_message(1, &original_body, 0))
+        .expect("push tool result");
+    session.push_user_text("recent tail a").expect("push");
+    session.push_user_text("recent tail b").expect("push");
+
+    let fired = microcompact_session(&mut session, 0, 10).expect("an unpersisted trim still fires");
+    assert_eq!(fired.cleared_results, 1);
+    assert_eq!(live_body(&session), MICROCOMPACT_PLACEHOLDER, "the body is cleared");
+    assert!(
+        session.read_vault().is_empty(),
+        "an unpersisted session has no vault to read"
+    );
+}
+
+/// The recall lineage is the one reminder family whose cleared copy is NOT
+/// byte-identical to a survivor, so what it gives up is real: the historical
+/// rendering of that turn's recalled memory. This pins the accepted boundary so
+/// the SCOPE note on `seal_microcompact_originals` cannot quietly become false in
+/// either direction — if a later change starts sealing the lineage, this fails and
+/// the note has to be rewritten with it.
+#[test]
+fn a_cleared_recall_lineage_reminder_is_not_sealed() {
+    let _guard = crate::test_env_lock();
+    let (dir, path) = temp_session_path("lineage-not-sealed");
+    let recall_reminder = |body: &str| {
+        reminder_message(&format!(
+            "<system-reminder>\n{}{body}\n</system-reminder>",
+            crate::memory::recall::RECALL_SECTION_HEADER
+        ))
+    };
+    let mut session = Session::new().with_persistence_path(path.clone());
+    session
+        .push_message(recall_reminder("- [older-entry](m/older.md) — OLDER_LINEAGE_BYTES"))
+        .expect("push older recall section");
+    session.push_user_text("some work happened").expect("push");
+    session
+        .push_message(recall_reminder("- [newer-entry](m/newer.md) — NEWER_LINEAGE_BYTES"))
+        .expect("push newer recall section");
+
+    // No tool result and no image: the frontier is None, so the reminder pass is
+    // the whole pass and the older section is in scope even at message 0.
+    let event = microcompact_session(&mut session, 5, 240).expect("the older section clears");
+    assert_eq!(event.cleared_superseded_reminders, 1);
+    assert_eq!(event.cleared_results, 0);
+    assert_eq!(event.cleared_images, 0);
+    match &session.messages[0].blocks[0] {
+        ContentBlock::Text { text } => {
+            assert_eq!(*text, MICROCOMPACT_REMINDER_PLACEHOLDER, "older section cleared");
+        }
+        other => panic!("expected the cleared section: {other:?}"),
+    }
+
+    // The accepted loss: the older section's bytes reached no vault record.
+    assert!(
+        raw_vault_lines(&path).is_empty(),
+        "a reminder-only plan seals nothing; got {:?}",
+        raw_vault_lines(&path)
+    );
+    let vault_text = session
+        .read_vault()
+        .into_iter()
+        .flat_map(|record| record.message.blocks)
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(
+        !vault_text.contains("OLDER_LINEAGE_BYTES"),
+        "the cleared lineage bytes are given up, not sealed: {vault_text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One user message holding a caption plus one standalone (pasted) image —
+/// the exact shape microcompact blanks in place, so the blanked form differs
+/// from this only in block 1.
+fn pasted_image_message(caption: &str, data: &str) -> ConversationMessage {
+    ConversationMessage {
+        role: MessageRole::User,
+        blocks: vec![
+            ContentBlock::Text {
+                text: caption.to_string(),
+            },
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: data.to_string(),
+            },
+        ],
+        usage: None,
+        thought_signature: None,
+        reasoning_replay: None,
+        model: None,
+    }
+}
+
+/// Every standalone-image `data` payload present in the session's vault, after
+/// dedup — i.e. what a reader could actually still recover.
+fn vault_image_payloads(session: &Session) -> Vec<String> {
+    session
+        .read_vault()
+        .into_iter()
+        .flat_map(|record| record.message.blocks)
+        .filter_map(|block| match block {
+            ContentBlock::Image { data, .. } => Some(data),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_cleared_standalone_image_survives_the_full_compaction_reseal() {
+    // Serialized on the crate env lock because a sibling test flips
+    // `ZO_DISABLE_RAW_VAULT`, which would make this vault look legitimately
+    // empty; the var is process-global, so exclusion is the only defense.
+    let _env_guard = crate::test_env_lock();
+    // The dominant loss path for a pasted image, and the reason the image heal
+    // exists: microcompact seals the pre-clear original at seq N, then full
+    // compaction evicts that same message — now carrying the placeholder — and
+    // seals it AGAIN at the same seq. `read_vault` dedups last-record-wins, so
+    // without a heal the second, lossy record buries the first and the image is
+    // gone from every reader.
+    let (dir, path) = temp_session_path("image-reseal");
+    let mut session = Session::new().with_persistence_path(path.clone());
+    session.push_user_text("start the task").expect("push");
+    session
+        .push_message(pasted_image_message("SCREENSHOT_CONTEXT", "OLDIMAGEBYTES"))
+        .expect("push pasted image");
+    session.push_user_text("some work happened").expect("push");
+    session.push_user_text("recent tail a").expect("push");
+    session.push_user_text("recent tail b").expect("push");
+
+    let event = microcompact_session(&mut session, 0, 10).expect("the old image clears");
+    assert_eq!(event.cleared_images, 1);
+    assert_eq!(event.cleared_results, 0);
+    assert!(
+        vault_image_payloads(&session).iter().any(|data| data == "OLDIMAGEBYTES"),
+        "precondition: the pre-clear seal really stored the image"
+    );
+
+    // Full compaction evicts messages 0..3, which includes the blanked image
+    // message at live index 1 — the same seq its microcompact record occupies.
+    let config = CompactionConfig {
+        preserve_recent_messages: 2,
+        max_estimated_tokens: 0,
+    };
+    let result = compact_session(&session, config);
+    assert!(result.removed_message_count >= 2, "the image message was evicted");
+
+    let payloads = vault_image_payloads(&result.compacted_session);
+    assert!(
+        payloads.iter().any(|data| data == "OLDIMAGEBYTES"),
+        "the sealed image original must survive the re-seal at its own seq, got {payloads:?}"
+    );
+    let sealed_placeholder = result.compacted_session.read_vault().iter().any(|record| {
+        record.message.blocks.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text } if text == super::MICROCOMPACT_IMAGE_PLACEHOLDER)
+        })
+    });
+    assert!(
+        !sealed_placeholder,
+        "the image placeholder must not be what the surviving vault record holds"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_second_image_cleared_in_the_same_message_does_not_bury_the_first() {
+    // Serialized on the crate env lock because a sibling test flips
+    // `ZO_DISABLE_RAW_VAULT`, which would make this vault look legitimately
+    // empty; the var is process-global, so exclusion is the only defense.
+    let _env_guard = crate::test_env_lock();
+    // The image twin of `a_second_clear_in_the_same_message_reseals_both_originals`,
+    // and the second instance of the burial class this pass fixes: a message
+    // holding TWO pasted images is selected by two different rounds, and the seq
+    // domain is per MESSAGE, so round two re-seals the same seq. Without an image
+    // heal the round-two record carries image one already blanked, and last-wins
+    // dedup drops the round-one record that still had it.
+    let (dir, path) = temp_session_path("image-reseal-heals");
+    let mut session = Session::new().with_persistence_path(path.clone());
+    session
+        .push_message(ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "two screenshots".to_string(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "FIRSTIMAGEBYTES".to_string(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "SECONDIMAGEBYTES".to_string(),
+                },
+            ],
+            usage: None,
+            thought_signature: None,
+            reasoning_replay: None,
+            model: None,
+        })
+        .expect("push a message with two pasted images");
+    session.push_user_text("some work happened").expect("push");
+
+    // keep_recent=1 clears exactly the first image; keep_recent=0 then clears the
+    // second — two rounds touching the SAME message, hence the same vault seq.
+    let first = microcompact_session(&mut session, 1, 240).expect("first image clearable");
+    assert_eq!(first.cleared_images, 1);
+    let second = microcompact_session(&mut session, 0, 240).expect("second image clearable");
+    assert_eq!(second.cleared_images, 1);
+
+    let payloads = vault_image_payloads(&session);
+    assert!(
+        payloads.iter().any(|data| data == "FIRSTIMAGEBYTES"),
+        "round one's image survives round two's re-seal, got {payloads:?}"
+    );
+    assert!(
+        payloads.iter().any(|data| data == "SECONDIMAGEBYTES"),
+        "round two's image is sealed too, got {payloads:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_image_seal_belonging_to_a_different_turn_is_refused() {
+    // Serialized on the crate env lock because a sibling test flips
+    // `ZO_DISABLE_RAW_VAULT`, which would make this vault look legitimately
+    // empty; the var is process-global, so exclusion is the only defense.
+    let _env_guard = crate::test_env_lock();
+    // What the positional address can get wrong, and why every hit is verified:
+    // the seq axis is off by one for records sealed before the session's first
+    // full compaction, so a lookup can land on the neighbouring turn's record.
+    // Pasting that record here would replace this turn's own caption with
+    // someone else's. The structural check refuses it and the turn stays blanked.
+    let (dir, path) = temp_session_path("image-wrong-owner");
+    let session = Session::new().with_persistence_path(path.clone());
+    assert!(
+        session.seal_originals_to_vault(&[(
+            0,
+            pasted_image_message("NEIGHBOUR_CAPTION", "NEIGHBOURBYTES"),
+        )]),
+        "the fixture's vault seed must actually reach the vault"
+    );
+    let mut messages = vec![ConversationMessage {
+        role: MessageRole::User,
+        blocks: vec![
+            ContentBlock::Text {
+                text: "MY_OWN_CAPTION".to_string(),
+            },
+            ContentBlock::Text {
+                text: super::MICROCOMPACT_IMAGE_PLACEHOLDER.to_string(),
+            },
+        ],
+        usage: None,
+        thought_signature: None,
+        reasoning_replay: None,
+        model: None,
+    }];
+    super::restore_microcompacted_bodies(&mut messages, &session, &[0]);
+
+    assert_eq!(
+        messages[0].blocks[0],
+        ContentBlock::Text {
+            text: "MY_OWN_CAPTION".to_string()
+        },
+        "the turn keeps its own text — the neighbour's record must not overwrite it"
+    );
+    assert_eq!(
+        messages[0].blocks[1],
+        ContentBlock::Text {
+            text: super::MICROCOMPACT_IMAGE_PLACEHOLDER.to_string()
+        },
+        "and it stays blanked rather than borrowing the neighbour's image"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_image_seal_that_two_turns_could_own_heals_neither_of_them() {
+    // Serialized on the crate env lock because a sibling test flips
+    // `ZO_DISABLE_RAW_VAULT`, which would make this vault look legitimately
+    // empty; the var is process-global, so exclusion is the only defense.
+    let _env_guard = crate::test_env_lock();
+    // A pasted image has no id, so the heal is positional — and the seq axis is
+    // off by one for records sealed before the session's first full compaction.
+    // Two BARE images (no caption) back to back are indistinguishable once
+    // blanked, so no evidence can say whether the record at seq N belongs to the
+    // turn at N or, under the drift, to the turn at N+1. Guessing would render
+    // one turn's image as the other's; refusing leaves the placeholder, which is
+    // the pre-heal behavior. This pins the refusal so a later "improvement" that
+    // drops the ambiguity gate has to argue with a test.
+    let (dir, path) = temp_session_path("image-ambiguous");
+    let bare_image = |data: &str| ConversationMessage {
+        role: MessageRole::User,
+        blocks: vec![ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: data.to_string(),
+        }],
+        usage: None,
+        thought_signature: None,
+        reasoning_replay: None,
+        model: None,
+    };
+    let session = Session::new().with_persistence_path(path.clone());
+    assert!(
+        session.seal_originals_to_vault(&[
+            (0, bare_image("ALPHABYTES")),
+            (1, bare_image("BETABYTES")),
+            (2, bare_image("GAMMABYTES")),
+        ]),
+        "the fixture's vault seed must actually reach the vault"
+    );
+    let blanked = || ConversationMessage {
+        role: MessageRole::User,
+        blocks: vec![ContentBlock::Text {
+            text: super::MICROCOMPACT_IMAGE_PLACEHOLDER.to_string(),
+        }],
+        usage: None,
+        thought_signature: None,
+        reasoning_replay: None,
+        model: None,
+    };
+    let mut messages = vec![blanked(), blanked(), blanked()];
+    super::restore_microcompacted_bodies(&mut messages, &session, &[0, 1, 2]);
+
+    let restored = |message: &ConversationMessage| {
+        matches!(message.blocks.first(), Some(ContentBlock::Image { .. }))
+    };
+    assert!(
+        !restored(&messages[0]),
+        "the record at seq 0 could equally be turn 1's under the +1 drift — refused"
+    );
+    assert!(
+        !restored(&messages[1]),
+        "same for the record at seq 1 against turn 2 — refused"
+    );
+    // The last turn of a run is the documented boundary: nothing in this batch
+    // can claim its record under the drift, so the ambiguity gate is vacuous
+    // there and the exact-seq hit is used.
+    assert!(
+        restored(&messages[2]),
+        "the tail of the run has no rival claimant in the batch, so it heals"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

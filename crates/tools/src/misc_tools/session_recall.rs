@@ -16,6 +16,12 @@
 //! sidecar and folded into the result (tagged `[evicted …]`). That makes
 //! compaction non-destructive in practice — the model can pull back an exact
 //! detail that was summarized away, which a lossy summary alone cannot provide.
+//!
+//! The vault holds a second kind of record too: pre-clear ORIGINALS that
+//! microcompact seals before it blanks a tool-result body in place. Those turns
+//! are still live, so they are not listed as evicted — they replace the blanked
+//! live copy (see [`healed_live_messages`]), which extends the same guarantee
+//! to detail a cheap trim removed, not just to detail a full compaction did.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -205,6 +211,197 @@ fn recall_base_dir(ctx: &ToolContext) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// The absolute seq of the live message at local index `index`. Used for the
+/// `[seq_from, seq_to]` window — and, for the one case that has no stable id,
+/// as the gated fallback address of a sealed standalone image (see
+/// [`healed_live_messages`]).
+fn live_seq(first_live_seq: u32, index: usize) -> u32 {
+    first_live_seq.saturating_add(u32::try_from(index).unwrap_or(u32::MAX))
+}
+
+/// A tool result's raw `(output, images)` borrowed out of a vault record —
+/// borrowed rather than owned because the heal copies it at most once, into the
+/// single live block that needs it.
+type SealedToolBody<'v> = (&'v str, &'v [(String, String)]);
+
+/// Sealed bodies addressed the way the heal addresses them: by `tool_use_id`.
+type SealedToolBodies<'v> = std::collections::HashMap<&'v str, SealedToolBody<'v>>;
+
+/// Every non-placeholder tool-result body among the sealed pre-clear
+/// `originals`, indexed by `tool_use_id`. Placeholder bodies are skipped rather
+/// than indexed, so a record that itself caught an earlier round's clear cannot
+/// "heal" a live block back to the same placeholder. First writer wins — the
+/// same rule the runtime's `index_raw_tool_bodies` applies, and since
+/// `read_vault` returns records ascending by seq (already collapsed last-wins
+/// per seq), that is the lowest seq carrying the id.
+fn sealed_tool_bodies<'v>(
+    originals: &[&'v runtime::session::VaultRecord],
+) -> SealedToolBodies<'v> {
+    let mut bodies: SealedToolBodies<'v> = std::collections::HashMap::new();
+    for record in originals {
+        for block in &record.message.blocks {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                output,
+                images,
+                ..
+            } = block
+            {
+                if output != runtime::MICROCOMPACT_PLACEHOLDER {
+                    bodies
+                        .entry(tool_use_id.as_str())
+                        .or_insert((output.as_str(), images.as_slice()));
+                }
+            }
+        }
+    }
+    bodies
+}
+
+/// The sealed pre-clear originals that actually carry an `Image` block, keyed by
+/// seq. Only this narrow case needs a positional key: a standalone user-pasted
+/// image has no `tool_use_id` to address it by (see the SCOPE note on the
+/// runtime's `seal_microcompact_originals`), so recovering it has to fall back
+/// to "what stood at seq N". Restricting the map to records that hold an image
+/// is one gate of three that keep that fallback from rendering the wrong turn's
+/// content; the other two are applied per candidate in [`healed_live_messages`],
+/// because they compare the record against the live turn it would replace.
+fn sealed_image_originals<'v>(
+    originals: &[&'v runtime::session::VaultRecord],
+) -> std::collections::HashMap<u32, &'v ConversationMessage> {
+    originals
+        .iter()
+        .filter(|record| {
+            record
+                .message
+                .blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image { .. }))
+        })
+        .map(|record| (record.vault_seq, &record.message))
+        .collect()
+}
+
+/// The vault holds two kinds of record on one seq axis, and recall must not
+/// conflate them.
+///
+/// Below `first_live_seq` are messages compaction EVICTED — gone from the
+/// transcript, so they are shown in their own right, tagged `[evicted …]`.
+/// At or above it are pre-clear ORIGINALS that `microcompact_session` sealed
+/// before blanking a body in place: those messages are STILL LIVE, so listing
+/// them as evicted would show the same turn twice. This returns the healed form
+/// of each live message a sealed original can restore — keyed by LOCAL live
+/// index, for callers to substitute for the blanked copy, which is what recall
+/// is for since the reader is asking for the detail that was trimmed away.
+///
+/// The heal is CONTENT-ADDRESSED (by `tool_use_id`), exactly like the runtime's
+/// `restore_microcompacted_bodies`, and that is the load-bearing choice: the two
+/// stampers on the seq axis disagree by one. Microcompact seals at
+/// `first_message_index + local_index`, and on the one compaction round whose
+/// `compacted_prefix_len` is 0 (a session's first) `apply_compaction` inserts a
+/// synthetic continuation at live index 0 while `first_message_index` advances
+/// only by the removed count — so a preserved-tail message's seq gains +1 that
+/// its already-written vault record does not. Later rounds add nothing further
+/// (the continuation they insert replaces one they evicted, so the tail's seq and
+/// `first_message_index` move together), which makes the drift exactly +1, once,
+/// and permanent. A positional heal would therefore render one turn's sealed body
+/// in the PREVIOUS turn's slot and leave the blanked turn blank forever. Matching
+/// on the id is immune to that drift.
+///
+/// Only blocks that are actually the placeholder AND whose id was sealed are
+/// replaced, so this never rewrites a live message that was never blanked.
+fn healed_live_messages(
+    vault: &[runtime::session::VaultRecord],
+    first_live_seq: u32,
+    live: &[ConversationMessage],
+) -> std::collections::HashMap<usize, ConversationMessage> {
+    let originals: Vec<&runtime::session::VaultRecord> = vault
+        .iter()
+        .filter(|record| record.vault_seq >= first_live_seq)
+        .collect();
+    if originals.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let bodies = sealed_tool_bodies(&originals);
+    let images = sealed_image_originals(&originals);
+    let mut healed = std::collections::HashMap::new();
+    for (index, message) in live.iter().enumerate() {
+        // The standalone-image fallback is POSITIONAL, so the seq it computes is
+        // treated as a candidate, never as an answer. Three things must hold
+        // before a sealed record is rendered in this turn's slot:
+        //
+        // 1. the live turn really holds the image placeholder, and the record at
+        //    that seq really holds an `Image` (the two-sided gate that keeps the
+        //    fallback off every other kind of turn);
+        // 2. the record is structurally a pre-clear original OF THIS TURN
+        //    (`runtime::is_pre_clear_original_of` — same role, same blocks, modulo
+        //    the blocks a clear blanks); and
+        // 3. the record is not equally a pre-clear original of the NEXT turn, the
+        //    only other turn the +1 axis drift could hand it to.
+        //
+        // Gate 1 alone was not enough, and the gap it left was not "fails to
+        // heal" but "heals with someone else's content": the drift documented
+        // above is established at the FIRST full compaction and is permanent, so
+        // after any compaction this lookup systematically resolves to the NEXT
+        // turn's record, and whenever that neighbour happened to carry an image
+        // its message was rendered here — destroying this turn's own text and
+        // leaving the true owner blanked. Gates 2 and 3 make the failure mode
+        // "still blanked" instead, which is what the reader had before any heal
+        // existed. Two adjacent turns that are byte-identical once blanked (two
+        // bare pasted images in a row, no caption) are therefore both left
+        // blanked rather than guessed at — the axes cannot distinguish them, and
+        // that is the whole point of refusing.
+        let from_image_seal = if message.blocks.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text } if text == runtime::MICROCOMPACT_IMAGE_PLACEHOLDER)
+        }) {
+            images
+                .get(&live_seq(first_live_seq, index))
+                .copied()
+                .filter(|sealed| runtime::is_pre_clear_original_of(sealed, message))
+                .filter(|sealed| {
+                    !live
+                        .get(index + 1)
+                        .is_some_and(|next| runtime::is_pre_clear_original_of(sealed, next))
+                })
+        } else {
+            None
+        };
+        let has_sealed_body = message.blocks.iter().any(|block| {
+            matches!(block, ContentBlock::ToolResult { tool_use_id, output, .. }
+                if output == runtime::MICROCOMPACT_PLACEHOLDER
+                    && bodies.contains_key(tool_use_id.as_str()))
+        });
+        if from_image_seal.is_none() && !has_sealed_body {
+            continue; // nothing sealed for this turn — leave the live copy alone
+        }
+        // Clone only what is actually healed. The image case starts from the
+        // sealed record (the whole pre-clear message, images included); the
+        // tool-result swap then still runs over it, so a record that itself
+        // carries an earlier round's placeholder is healed too.
+        let mut candidate = from_image_seal.unwrap_or(message).clone();
+        for block in &mut candidate.blocks {
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                output,
+                images: block_images,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            if output != runtime::MICROCOMPACT_PLACEHOLDER {
+                continue;
+            }
+            if let Some((sealed_output, sealed_images)) = bodies.get(tool_use_id.as_str()) {
+                (*sealed_output).clone_into(output);
+                *block_images = (*sealed_images).to_vec();
+            }
+        }
+        healed.insert(index, candidate);
+    }
+    healed
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_recall(
     base_dir: &std::path::Path,
@@ -226,11 +423,19 @@ fn run_recall(
     // summary + recent tail), so they lead the combined view, letting the model
     // pull back an exact detail that was summarized away.
     let vault = session.read_vault();
-    let evicted_total = vault.len();
-    let total = evicted_total + session.messages.len();
     // Live messages address the same monotonic seq domain the vault records use:
     // a live message at local index `i` has absolute seq `first_message_index + i`.
+    // That frontier is what splits the vault into the two record kinds: below it
+    // are EVICTED messages (listed in their own right), at or above it are
+    // pre-clear ORIGINALS of turns that are still live (which heal the blanked
+    // live copy instead of being listed — see [`healed_live_messages`]).
     let first_live_seq = session.first_message_index();
+    let evicted_total = vault
+        .iter()
+        .filter(|record| record.vault_seq < first_live_seq)
+        .count();
+    let healed = healed_live_messages(&vault, first_live_seq, &session.messages);
+    let total = evicted_total + session.messages.len();
 
     let seq_in_range = |seq: u32| {
         seq_from.is_none_or(|from| seq >= from) && seq_to.is_none_or(|to| seq <= to)
@@ -245,7 +450,7 @@ fn run_recall(
     // messages. They lead the output, tagged `[evicted …]`.
     let mut evicted: Vec<&ConversationMessage> = vault
         .iter()
-        .filter(|record| seq_in_range(record.vault_seq))
+        .filter(|record| record.vault_seq < first_live_seq && seq_in_range(record.vault_seq))
         .map(|record| &record.message)
         .filter(|msg| matches_filters(msg))
         .collect();
@@ -259,11 +464,13 @@ fn run_recall(
         .iter()
         .enumerate()
         .filter(|(index, msg)| {
-            let seq = first_live_seq.saturating_add(u32::try_from(*index).unwrap_or(u32::MAX));
             !(suppress_summary && *index == 0 && msg.role == MessageRole::System)
-                && seq_in_range(seq)
+                && seq_in_range(live_seq(first_live_seq, *index))
         })
-        .map(|(_, msg)| msg)
+        // Prefer the sealed pre-clear original over the live, body-blanked copy
+        // of the same turn. The swap happens before `matches_filters` so a query
+        // matches the text the reader is actually shown.
+        .map(|(index, msg)| healed.get(&index).unwrap_or(msg))
         .filter(|msg| matches_filters(msg))
         .collect();
 
@@ -381,14 +588,27 @@ fn run_search(
         };
         // Search the compaction vault too, so a term that was summarized out of a
         // session is still discoverable — otherwise the lossless recovery is
-        // invisible on the primary discovery path.
+        // invisible on the primary discovery path. Same split as `run_recall`
+        // (see [`healed_live_messages`]): evicted records are searched
+        // alongside the live messages, while a pre-clear original heals its
+        // still-live copy, which makes text a microcompact blanked findable
+        // without counting the same turn twice.
         let vault = session.read_vault();
+        let first_live_seq = session.first_message_index();
+        let healed = healed_live_messages(&vault, first_live_seq, &session.messages);
         let mut count = 0usize;
         let mut snippet = String::new();
         for msg in vault
             .iter()
+            .filter(|record| record.vault_seq < first_live_seq)
             .map(|record| &record.message)
-            .chain(session.messages.iter())
+            .chain(
+                session
+                    .messages
+                    .iter()
+                    .enumerate()
+                    .map(|(index, msg)| healed.get(&index).unwrap_or(msg)),
+            )
         {
             if !role.is_none_or(|want| msg.role == want) {
                 continue;
@@ -699,6 +919,12 @@ mod tests {
         }
     }
 
+    /// A tool-result message — the shape microcompact blanks in place and the
+    /// vault heals by `tool_use_id` (never by position).
+    fn tool_msg(tool_use_id: &str, output: &str) -> ConversationMessage {
+        ConversationMessage::tool_result(tool_use_id, "read_file", output, false)
+    }
+
     /// Write a session transcript under `<base>/.zo/sessions/<id>.jsonl`.
     fn write_session(base: &std::path::Path, id: &str, messages: Vec<ConversationMessage>) {
         let dir = base.join(".zo").join("sessions");
@@ -811,6 +1037,10 @@ mod tests {
             MessageRole::System,
             "Summary: discussed a database connection issue",
         )]);
+        // `record_compaction` is what makes this an EVICTED record rather than a
+        // microcompact pre-clear original: it advances `first_message_index`
+        // past the sealed seq, which is the boundary recall splits the vault on.
+        session.record_compaction("Summary: discussed a database connection issue", 1);
         session.save_to_path(&session_path).expect("save");
 
         let out = run_session_recall(
@@ -855,6 +1085,9 @@ mod tests {
         let mut live = vec![msg(MessageRole::System, "Summary: discussed stuff")];
         live.extend((0..40).map(|i| msg(MessageRole::User, &format!("live {i}"))));
         session.messages = Arc::new(live);
+        // Advance past the sealed seq so the record reads as EVICTED, not as a
+        // microcompact pre-clear original of a still-live turn.
+        session.record_compaction("Summary: discussed stuff", 1);
         session.save_to_path(&session_path).expect("save");
 
         // Default recall (no query, no last_n): the live tail is capped, but the
@@ -880,6 +1113,292 @@ mod tests {
         assert!(
             !out.contains("Summary: discussed stuff"),
             "index-0 compaction summary suppressed when raw recovered: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_pre_clear_original_heals_its_live_copy_instead_of_being_listed_twice() {
+        // Microcompact seals pre-clear originals at seqs that are STILL LIVE, so
+        // the vault now overlaps the transcript. Recall must not show that turn
+        // twice (once "evicted", once live) — it substitutes the original body for
+        // the blanked live copy, which is exactly the detail a reader recalls
+        // for.
+        //
+        // SCOPE of this case, so it is not mistaken for the regression guard it
+        // is not: `first_message_index` is 0 and nothing has compacted yet, so seq
+        // 0 and live index 0 coincide and a POSITIONAL heal would pass here too
+        // (verified: reverting the heal to seq-addressing leaves this test green).
+        // What pins the content-addressed heal is
+        // `a_sealed_body_heals_its_own_turn_after_compaction_shifts_the_seq_axis`,
+        // where the axes disagree.
+        let base = temp_base("vault-heal");
+        let dir = base.join(".zo").join("sessions");
+        std::fs::create_dir_all(&dir).expect("mk sessions dir");
+        let session_path = dir.join("sess-heal.jsonl");
+
+        let mut session = Session::new();
+        session.session_id = "sess-heal".to_owned();
+        let session = session.with_persistence_path(session_path.clone());
+        // No `record_compaction` here: `first_message_index` stays 0, so seq 0
+        // is inside the live range — the pre-clear-original case.
+        assert!(
+            session.seal_originals_to_vault(&[(
+                0,
+                tool_msg("tu-1", "PRE_CLEAR_ORIGINAL full tool body"),
+            )]),
+            "the fixture's vault seed must actually reach the vault"
+        );
+        let mut session = session;
+        session.messages = Arc::new(vec![tool_msg("tu-1", runtime::MICROCOMPACT_PLACEHOLDER)]);
+        session.save_to_path(&session_path).expect("save");
+
+        let out = run_session_recall(
+            SessionRecallInput {
+                session_ref: Some("sess-heal".into()),
+                ..Default::default()
+            },
+            &ctx_for(&base),
+        )
+        .expect("recall ok");
+
+        assert!(
+            out.contains("PRE_CLEAR_ORIGINAL full tool body"),
+            "the live copy is healed from the sealed original: {out}"
+        );
+        assert!(
+            !out.contains(runtime::MICROCOMPACT_PLACEHOLDER),
+            "the blanked live copy is replaced, not shown alongside: {out}"
+        );
+        assert!(
+            out.contains("1 of 1 message(s)"),
+            "the turn is counted once, not once per source: {out}"
+        );
+        assert!(
+            !out.contains("recovered from the compaction vault"),
+            "a still-live turn is not reported as evicted: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_sealed_body_heals_its_own_turn_after_compaction_shifts_the_seq_axis() {
+        // The two stampers on the seq axis disagree by one after the first full
+        // compaction: microcompact sealed at `first_message_index + index`, then
+        // `apply_compaction` prepended a synthetic continuation while
+        // `first_message_index` advanced only by the removed count. A positional
+        // heal therefore lands one turn early — it would paste the sealed body
+        // over the PREVIOUS turn and leave the blanked turn blank forever. The
+        // heal is keyed on `tool_use_id`, so the drift cannot mis-target it.
+        let base = temp_base("vault-heal-drift");
+        let dir = base.join(".zo").join("sessions");
+        std::fs::create_dir_all(&dir).expect("mk sessions dir");
+        let session_path = dir.join("sess-drift.jsonl");
+
+        let mut session = Session::new();
+        session.session_id = "sess-drift".to_owned();
+        let session = session.with_persistence_path(session_path.clone());
+        // Sealed while the turn sat at absolute seq 4.
+        assert!(
+            session.seal_originals_to_vault(&[(4, tool_msg("tu-late", "LATE_BODY exact bytes"))]),
+            "the fixture's vault seed must actually reach the vault"
+        );
+        let mut session = session;
+        // Post-compaction transcript: continuation at local 0, then the preserved
+        // tail. With `first_message_index == 3` the local indices address seqs
+        // 3, 4, 5 — so seq 4 (the sealed record) now points at the DECOY, one
+        // slot before the turn that actually owns `tu-late`.
+        session.messages = Arc::new(vec![
+            msg(MessageRole::System, "Summary: continuation"),
+            msg(MessageRole::User, "POSITION_FOUR_DECOY"),
+            tool_msg("tu-late", runtime::MICROCOMPACT_PLACEHOLDER),
+        ]);
+        session.record_compaction("Summary: continuation", 3);
+        session.save_to_path(&session_path).expect("save");
+        assert_eq!(session.first_message_index(), 3, "seq base after one round");
+
+        let out = run_session_recall(
+            SessionRecallInput {
+                session_ref: Some("sess-drift".into()),
+                ..Default::default()
+            },
+            &ctx_for(&base),
+        )
+        .expect("recall ok");
+
+        assert!(
+            out.contains("LATE_BODY exact bytes"),
+            "the sealed body is restored despite the +1 seq drift: {out}"
+        );
+        assert!(
+            !out.contains(runtime::MICROCOMPACT_PLACEHOLDER),
+            "the turn that owns tu-late is healed, not left blank: {out}"
+        );
+        assert!(
+            out.contains("POSITION_FOUR_DECOY"),
+            "the turn at the sealed seq is untouched — substitution needs a \
+             blanked body with a matching id, not a position: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The pre-clear original of a captioned pasted image, and the blanked form
+    /// microcompact leaves in its place — the clear rewrites the `Image` block IN
+    /// PLACE, so the two differ only at block 1. Tests that hand-build a live
+    /// turn must use this shape, or they are pinning a message no production
+    /// path can produce (and the heal's structural check will reject it).
+    fn image_turn(caption: &str, data: &str) -> (ConversationMessage, ConversationMessage) {
+        let build = |second: ContentBlock| ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: caption.to_owned(),
+                },
+                second,
+            ],
+            usage: None,
+            thought_signature: None,
+            reasoning_replay: None,
+            model: None,
+        };
+        (
+            build(ContentBlock::Image {
+                media_type: "image/png".to_owned(),
+                data: data.to_owned(),
+            }),
+            build(ContentBlock::Text {
+                text: runtime::MICROCOMPACT_IMAGE_PLACEHOLDER.to_owned(),
+            }),
+        )
+    }
+
+    #[test]
+    fn a_sealed_standalone_image_heals_only_the_turn_that_lost_an_image() {
+        // A standalone pasted image has no `tool_use_id`, so its recovery is the
+        // one positional case left. Both sides must agree before it fires: the
+        // live turn must actually hold the image placeholder AND the record at
+        // that seq must actually hold an `Image`. The second live turn has the
+        // placeholder but no image was sealed at its seq, so it stays blanked
+        // rather than borrowing some other record's content.
+        let base = temp_base("vault-heal-image");
+        let dir = base.join(".zo").join("sessions");
+        std::fs::create_dir_all(&dir).expect("mk sessions dir");
+        let session_path = dir.join("sess-image.jsonl");
+
+        let mut session = Session::new();
+        session.session_id = "sess-image".to_owned();
+        let session = session.with_persistence_path(session_path.clone());
+        let (sealed_image, blanked_image) = image_turn("SCREENSHOT_CONTEXT", "AAAA");
+        assert!(
+            session.seal_originals_to_vault(&[
+                (0, sealed_image),
+                // A record at seq 1 that carries no image at all — the negative
+                // side of the gate.
+                (1, tool_msg("tu-other", "UNRELATED_SEALED_BODY")),
+            ]),
+            "the fixture's vault seed must actually reach the vault"
+        );
+        let mut session = session;
+        session.messages = Arc::new(vec![
+            blanked_image,
+            msg(MessageRole::User, runtime::MICROCOMPACT_IMAGE_PLACEHOLDER),
+        ]);
+        session.save_to_path(&session_path).expect("save");
+
+        let out = run_session_recall(
+            SessionRecallInput {
+                session_ref: Some("sess-image".into()),
+                ..Default::default()
+            },
+            &ctx_for(&base),
+        )
+        .expect("recall ok");
+
+        assert!(
+            out.contains("SCREENSHOT_CONTEXT") && out.contains("[image: image/png]"),
+            "the turn whose image was sealed is healed whole: {out}"
+        );
+        assert_eq!(
+            out.matches(runtime::MICROCOMPACT_IMAGE_PLACEHOLDER).count(),
+            1,
+            "the turn with no sealed image at its seq keeps its placeholder: {out}"
+        );
+        assert!(
+            !out.contains("UNRELATED_SEALED_BODY"),
+            "a record without an image never substitutes for an image turn: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn adjacent_blanked_image_turns_never_borrow_each_other_s_sealed_content() {
+        // The harm this pins is not "fails to heal" but "heals with the WRONG
+        // turn's content". The +1 seq drift is established at the first full
+        // compaction and is permanent, so every preserved-tail lookup lands one
+        // record late: turn A at seq 4 resolves to the record sealed for turn B.
+        // Both sides of the old gate agreed (A holds the image placeholder, the
+        // record at 4 holds an Image), so B's whole message was rendered in A's
+        // slot — A's own caption gone, B still blanked.
+        //
+        // The heal is structural now: the record must be a pre-clear original OF
+        // THIS turn. B's record cannot pass for A (different caption), so both
+        // turns degrade to "still blanked", which is what the reader had before
+        // any image heal existed.
+        let base = temp_base("vault-image-adjacent");
+        let dir = base.join(".zo").join("sessions");
+        std::fs::create_dir_all(&dir).expect("mk sessions dir");
+        let session_path = dir.join("sess-adj.jsonl");
+
+        let mut session = Session::new();
+        session.session_id = "sess-adj".to_owned();
+        let session = session.with_persistence_path(session_path.clone());
+        let (sealed_a, blanked_a) = image_turn("CAPTION_ALPHA", "AAAA");
+        let (sealed_b, blanked_b) = image_turn("CAPTION_BETA", "BBBB");
+        // Sealed BEFORE the session's first compaction, so both records sit one
+        // seq below the live axis the transcript below addresses.
+        assert!(
+            session.seal_originals_to_vault(&[(3, sealed_a), (4, sealed_b)]),
+            "the fixture's vault seed must actually reach the vault"
+        );
+        let mut session = session;
+        // `first_message_index == 3`: local indices 0,1,2 address seqs 3,4,5, so
+        // turn A (local 1) looks up seq 4 — the record sealed for turn B.
+        session.messages = Arc::new(vec![
+            msg(MessageRole::System, "Summary: continuation"),
+            blanked_a,
+            blanked_b,
+        ]);
+        session.record_compaction("Summary: continuation", 3);
+        session.save_to_path(&session_path).expect("save");
+        assert_eq!(session.first_message_index(), 3, "seq base after one round");
+
+        let out = run_session_recall(
+            SessionRecallInput {
+                session_ref: Some("sess-adj".into()),
+                ..Default::default()
+            },
+            &ctx_for(&base),
+        )
+        .expect("recall ok");
+
+        assert!(
+            out.contains("CAPTION_ALPHA"),
+            "turn A keeps its OWN text — a neighbouring record must never \
+             overwrite it: {out}"
+        );
+        assert!(
+            out.contains("CAPTION_BETA"),
+            "turn B keeps its own text too: {out}"
+        );
+        assert!(
+            !out.contains("[image:"),
+            "neither turn borrows an image it does not own; the degraded mode is \
+             'still blanked', not 'wrong content': {out}"
+        );
+        assert_eq!(
+            out.matches(runtime::MICROCOMPACT_IMAGE_PLACEHOLDER).count(),
+            2,
+            "both turns stay blanked: {out}"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

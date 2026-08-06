@@ -1098,13 +1098,122 @@ impl Session {
         Some((lo, hi))
     }
 
-    /// Load the messages this session persisted to disk, if any — the lossless
-    /// counterpart to the in-memory `messages`, used by compaction to recover a
-    /// microcompact-cleared tool-result body before it is sealed to the vault.
+    /// Seal messages that are still LIVE — the pre-clear originals a cheaper
+    /// microcompact tier is about to overwrite in place — into the same
+    /// append-only vault [`seal_evicted_to_vault`](Self::seal_evicted_to_vault)
+    /// writes, using the same record format and the same seq domain.
     ///
-    /// The transcript is append-only, so before `record_compaction` rewrites the
-    /// snapshot it still holds every message verbatim, including bodies a cheaper
-    /// microcompact tier cleared in memory (that trim is never persisted).
+    /// The seq is passed explicitly per message because these positions are
+    /// scattered: microcompact clears the OLDEST clearable results wherever they
+    /// sit, not a contiguous head, so the caller (which knows the local index)
+    /// must stamp `first_message_index + local_index` itself.
+    ///
+    /// AXIS: the two stampers coincide only on a session's FIRST compaction
+    /// round. [`seal_evicted_to_vault`](Self::seal_evicted_to_vault) stamps
+    /// `first_message_index` on the first message it evicts, and the runtime's
+    /// `prepare_compaction` starts the evicted run at `compacted_prefix_len` —
+    /// which is 1 as soon as live index 0 is a prior continuation. From the
+    /// second round on, the same `messages[i]` is therefore addressed as
+    /// `first_message_index + i` here and `first_message_index + i - 1` there, so
+    /// a duplicate vault line for that message IS written. That is expected, not
+    /// a defect: the vault is append-only and its reader dedups by `vault_seq`,
+    /// so the extra line costs one record, never correctness of the record the
+    /// reader resolves.
+    ///
+    /// FOLLOW-UP (deliberately not done here): re-aligning the two axes would
+    /// retroactively change the meaning of every `vault_seq` already written into
+    /// existing vaults, and with it the `seq_from`/`seq_to` recall spans a prior
+    /// continuation message has already advertised to the model. That is a
+    /// migration, not a comment fix, so it is recorded rather than performed.
+    ///
+    /// The dedup is last-record-wins, which makes an ORDERING CONTRACT for
+    /// callers: whatever re-seals a seq later must first heal the message back
+    /// to its pre-clear form (see the runtime's `restore_microcompacted_bodies`),
+    /// or the later, lossier record shadows the good one. The full-compaction
+    /// path does exactly that before calling `seal_evicted_to_vault` — for a
+    /// tool-result body and for a standalone image alike — which is also why the
+    /// misalignment above does not lose a tool-result body: the
+    /// record full compaction writes already carries the healed original, and the
+    /// stale microcompact line at `+1` falls inside the same contiguous evicted
+    /// run and is shadowed by it. The one line that escapes the run lands exactly
+    /// on the post-round `first_message_index`, where a reader reads it as a
+    /// pre-clear original of live index 0 — the continuation, which carries
+    /// neither a tool result nor an image, so no heal keys off it.
+    ///
+    /// Returns whether the caller may now destroy the in-memory originals:
+    /// `true` when this batch reached the vault, or when there is intentionally
+    /// no vault to reach; `false` ONLY when the append itself failed.
+    ///
+    /// That distinction is the whole point of the return value. Unlike the
+    /// evicted seal, this one is called one statement before the bodies are
+    /// overwritten, and the caller's own disk fallback cannot cover a failure
+    /// here: `microcompact_session` ends by marking the transcript dirty, which
+    /// publishes the placeholder to the snapshot the fallback would read. So a
+    /// failed append reported as success destroys the last copy. That is a
+    /// hazard found by review, not a measured incident — it takes a vault the
+    /// process cannot write (an unwritable session directory, a full disk) — but
+    /// the loss it causes is silent and unrecoverable, so the caller is given a
+    /// signal it can act on instead of an `eprintln!` nobody reads.
+    ///
+    /// The three modes that return `true` having written nothing are each an
+    /// INTENTIONAL loss, never a silent one:
+    ///
+    /// * Empty batch — this call wrote nothing, so there is no append failure to
+    ///   report. (The reminder-only trim is this case; see the runtime's
+    ///   `seal_microcompact_originals`, whose SCOPE note owns the decision and
+    ///   states what the recall-lineage family gives up.)
+    /// * `ZO_DISABLE_RAW_VAULT` — the operator turned the vault off, and
+    ///   honoring that means honoring the loss it asks for.
+    /// * Unpersisted session (in-memory tests, `zo -p` with no store) — there is
+    ///   no file to write and no file to recover from; the transcript itself
+    ///   evaporates at exit. Reporting failure here would instead mean an
+    ///   unpersisted session can never trim at all, i.e. it dies on the
+    ///   provider's ceiling to protect bodies that were never durable.
+    ///
+    /// A failure IS safe for this caller to act on, which is why the signal
+    /// exists here and not on [`seal_evicted_to_vault`](Self::seal_evicted_to_vault):
+    /// full compaction must proceed through a failed seal (refusing would brick
+    /// the session — it is the only tier that can shrink a transcript), whereas
+    /// the trim this guards is optional, and full compaction is still reachable
+    /// at its own threshold when the trim declines.
+    #[must_use]
+    pub fn seal_originals_to_vault(&self, originals: &[(u32, ConversationMessage)]) -> bool {
+        if originals.is_empty() || std::env::var_os("ZO_DISABLE_RAW_VAULT").is_some() {
+            return true;
+        }
+        let Some(session_path) = self.persistence_path() else {
+            return true;
+        };
+        let stamped: Vec<(u32, &ConversationMessage)> = originals
+            .iter()
+            .map(|(seq, message)| (*seq, message))
+            .collect();
+        if let Err(error) = append_stamped_vault_records(&vault_path_for(session_path), &stamped) {
+            eprintln!(
+                "zo: raw vault seal of pre-clear originals failed; the trim is skipped so the raw bodies survive in context: {error}"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Load the messages this session persisted to disk, if any — a SECONDARY
+    /// recovery source for a microcompact-cleared tool-result body, behind the
+    /// Raw Vault.
+    ///
+    /// Beware the obvious-but-false reading: the transcript is append-only for
+    /// ordinary turns, but `microcompact_session` ends with
+    /// [`mark_transcript_dirty`](Self::mark_transcript_dirty), which forces the
+    /// next persist off the append path (`can_skip` requires
+    /// `!transcript_dirty`) and onto a full snapshot — so the cleared bodies ARE
+    /// published to the JSONL, typically one turn after the clear and long
+    /// before compaction runs. Measured on real sessions, 54.7% of tool results
+    /// in live transcripts and 50.9% in rotated ones are already the
+    /// placeholder, so this path recovers an original only in the narrow window
+    /// where a clear has not yet been persisted. It is kept as a fallback for
+    /// exactly that window (and for sessions whose vault predates the
+    /// pre-clear seal), never as the primary source.
+    ///
     /// Returns `None` for an unpersisted session or an unreadable/corrupt file —
     /// callers treat that as "no recovery source" and degrade, never fail.
     #[must_use]
@@ -1128,14 +1237,25 @@ impl Session {
     /// compaction recoverable (used by cold-resume page-back and the
     /// `RecallArchive` tool).
     ///
+    /// Two kinds of record share one seq axis, and a reader must split them on
+    /// `first_message_index`: below it are messages compaction EVICTED (no
+    /// longer in the transcript), at or above it are pre-clear ORIGINALS sealed
+    /// by [`seal_originals_to_vault`](Self::seal_originals_to_vault) for turns
+    /// that are STILL LIVE. Treating the second kind as evicted double-lists the
+    /// turn; the right use is to substitute it for the body-blanked live copy.
+    ///
     /// Records are deduplicated by `vault_seq` (last record wins): a crash
     /// between [`seal_evicted_to_vault`](Self::seal_evicted_to_vault) and the
     /// destructive rewrite, or two processes compacting the same session, can
-    /// append the same seq range twice — duplication, never loss. An unparseable
-    /// line (a torn trailing append, or interior corruption) is skipped, never
-    /// fatal, so one bad line cannot hide the rest of the vault. Returns records
-    /// ascending by `vault_seq`; empty when the session is unpersisted or has no
-    /// vault yet.
+    /// append the same seq range twice — duplication, never loss. A microcompact
+    /// original is also re-sealed at the same seq once full compaction evicts
+    /// that message, which is why the compaction path heals the message back to
+    /// its pre-clear form before re-sealing it.
+    ///
+    /// An unparseable line (a torn trailing append, or interior corruption) is
+    /// skipped, never fatal, so one bad line cannot hide the rest of the vault.
+    /// Returns records ascending by `vault_seq`; empty when the session is
+    /// unpersisted or has no vault yet.
     #[must_use]
     pub fn read_vault(&self) -> Vec<VaultRecord> {
         let Some(session_path) = self.persistence_path() else {
@@ -1931,6 +2051,30 @@ fn vault_path_for(session_path: &Path) -> PathBuf {
 
 /// Append `evicted` to the append-only vault, stamping each with a `vault_seq`
 /// counting up from `base_seq` (the session's pre-compaction `first_message_index`).
+/// The contiguous-run case; [`append_stamped_vault_records`] is the general one.
+fn append_vault_records(
+    path: &Path,
+    evicted: &[ConversationMessage],
+    base_seq: u32,
+) -> Result<(), SessionError> {
+    let stamped: Vec<(u32, &ConversationMessage)> = evicted
+        .iter()
+        .enumerate()
+        .map(|(offset, message)| {
+            (
+                base_seq.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX)),
+                message,
+            )
+        })
+        .collect();
+    append_stamped_vault_records(path, &stamped)
+}
+
+/// The single vault writer: render each `(seq, message)` pair and append the
+/// whole batch in one `write_all`. Both seal entry points funnel through here so
+/// there is exactly one on-disk vault format — a pre-clear original sealed by
+/// microcompact is byte-for-byte the same kind of record as an evicted message
+/// sealed by full compaction, and the reader needs no second parser.
 ///
 /// The whole batch is rendered into one buffer and written with a single
 /// `write_all` to an `O_APPEND` handle: that collapses N per-message torn-write
@@ -1938,18 +2082,16 @@ fn vault_path_for(session_path: &Path) -> PathBuf {
 /// (small-batch) case. A crash mid-write can still leave a torn trailing line,
 /// which the vault reader recovers from (drop the torn last line) — the same
 /// contract the session transcript uses.
-fn append_vault_records(
+fn append_stamped_vault_records(
     path: &Path,
-    evicted: &[ConversationMessage],
-    base_seq: u32,
+    records: &[(u32, &ConversationMessage)],
 ) -> Result<(), SessionError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut batch = String::new();
-    for (offset, message) in evicted.iter().enumerate() {
-        let seq = base_seq.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
-        batch.push_str(&vault_record(message, seq).render());
+    for (seq, message) in records {
+        batch.push_str(&vault_record(message, *seq).render());
         batch.push('\n');
     }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;

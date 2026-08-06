@@ -7160,11 +7160,11 @@ fn recalled_entry_reseeds_after_microcompact_reclaims_older_full_section() {
         .session
         .push_user_text("tell me about parser bugs")
         .expect("user message");
-
-    let first = runtime.request_wire_reminders();
-    runtime.absorb_wire_reminders_into_session(&first);
-    assert!(last_system_text(&runtime.session).contains("recall me about parser bugs"));
-
+    // The bulky results land BEFORE the first recall section, so the section
+    // sits at or after the tool-result clear frontier and the reminder pass is
+    // allowed to reclaim it (see `plan_superseded_reminders`: a reminder behind
+    // the frontier is deliberately left alone rather than dragging the cache
+    // divergence index to the head of the transcript).
     for k in 0..11 {
         runtime
             .session
@@ -7176,6 +7176,11 @@ fn recalled_entry_reseeds_after_microcompact_reclaims_older_full_section() {
             ))
             .expect("bulky result");
     }
+
+    let first = runtime.request_wire_reminders();
+    runtime.absorb_wire_reminders_into_session(&first);
+    assert!(last_system_text(&runtime.session).contains("recall me about parser bugs"));
+
     runtime.replace_transient_system_reminder_by_prefix(
         "[zo:test-shift]",
         Some("[zo:test-shift] a"),
@@ -7191,10 +7196,12 @@ fn recalled_entry_reseeds_after_microcompact_reclaims_older_full_section() {
         "second appearance must collapse to a pointer"
     );
 
-    let precompaction = runtime.precompaction_input_tokens_threshold();
+    // A one-result batch never clears the break-even bar, so drive context to
+    // the hard ceiling — the one tier that still bypasses it.
+    runtime.set_context_window(200_000);
     let event = runtime
-        .maybe_microcompact_for_tokens(precompaction)
-        .expect("pressure valve must fire microcompact");
+        .maybe_microcompact_for_tokens(200_000 * 95 / 100 + 1)
+        .expect("the hard ceiling must fire microcompact");
     assert_eq!(event.cleared_results, 1);
     assert_eq!(event.cleared_superseded_reminders, 1);
 
@@ -8974,10 +8981,10 @@ fn thrash_promotion_fires_across_livelock_rounds() {
     //
     // Break-even gate note: an 8×400-byte batch is nowhere near 20% of a 1M
     // window, so under the break-even gate it would never be "worth it" on its
-    // own — the probe instead pins context at the precompaction pressure
-    // valve, the near-ceiling regime where the gate fires unconditionally, so
-    // the thrash streak can still accumulate and this test keeps proving the
-    // promotion dynamics rather than the (now separately gated) economics.
+    // own — the probe instead pins context at the hard context ceiling, the one
+    // remaining regime where the gate fires unconditionally, so the thrash
+    // streak can still accumulate and this test keeps proving the promotion
+    // dynamics rather than the (now separately gated) economics.
     struct SimpleApi;
     impl ApiClient for SimpleApi {
         fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -9003,7 +9010,7 @@ fn thrash_promotion_fires_across_livelock_rounds() {
     runtime.set_context_window(1_000_000);
     let floor = runtime.microcompact_input_tokens_threshold();
     assert!(floor > 0, "1M window must have a nonzero microcompact floor");
-    let precompaction = runtime.precompaction_input_tokens_threshold();
+    let over_ceiling = 1_000_000 * 95 / 100 + 1;
 
     // The re-read signal the live session showed (counts of 4-5 per file).
     let fp = fingerprint_tool_call("read_file", r#"{"path":"x.rs"}"#);
@@ -9026,9 +9033,9 @@ fn thrash_promotion_fires_across_livelock_rounds() {
                 ))
                 .expect("bulky result");
         }
-        // Pin context at the precompaction pressure valve every round (see the
+        // Pin context at the hard context ceiling every round (see the
         // break-even gate note above) so the batch fires unconditionally.
-        runtime.maybe_microcompact_for_tokens(precompaction);
+        runtime.maybe_microcompact_for_tokens(over_ceiling);
         if runtime.auto_compaction_config_if_ready().is_some() {
             promoted_at_round = Some(round);
             break;
@@ -10010,12 +10017,13 @@ fn microcompact_keep_budget_scales_with_context_window() {
 
     // Small window: the classic keep-10 budget clears the older half. The
     // 10-item, 400-byte-each batch this clears is well under the break-even
-    // gate's 20%-of-context bar on its own, so drive context to the
-    // precompaction pressure valve to exercise the keep-recent scaling
-    // independent of that (separately tested) economics gate.
+    // gate's 20%-of-context bar on its own, so drive context to the hard
+    // context ceiling — the one remaining tier that bypasses break-even — to
+    // exercise the keep-recent scaling independent of that (separately tested)
+    // economics gate.
     let mut small = build(200_000);
-    let precompaction = small.precompaction_input_tokens_threshold();
-    assert!(small.maybe_microcompact_for_tokens(precompaction).is_some());
+    let over_ceiling = 200_000 * 95 / 100 + 1;
+    assert!(small.maybe_microcompact_for_tokens(over_ceiling).is_some());
     assert_eq!(
         placeholder_count(&small),
         10,
@@ -10038,9 +10046,9 @@ fn microcompact_keep_budget_scales_with_context_window() {
 /// from the earliest cleared block onward, re-billing the whole prefix on the
 /// next request. A batch that only frees a sliver of a huge context is a net
 /// loss, so [`ConversationRuntime::maybe_microcompact_for_tokens`] must
-/// refuse to fire below the 20%-of-context (floor 4,000 token) bar — unless
-/// the precompaction pressure valve is active. These three probes exercise
-/// each arm of that gate directly.
+/// refuse to fire below the 20%-of-context (floor 4,000 token) bar — unless the
+/// request is at the hard context ceiling, where a bad trim beats a rejection.
+/// These probes exercise each arm of that gate directly.
 #[test]
 fn microcompact_break_even_gate_blocks_small_clearable_batch() {
     struct SimpleApi;
@@ -10155,8 +10163,212 @@ fn microcompact_break_even_gate_fires_when_batch_clears_meaningful_share() {
     );
 }
 
+/// The old pressure valve voided the break-even test at
+/// `precompaction_input_tokens_threshold` — character-for-character the
+/// predicate the PREFLIGHT compaction gate uses to fire full compaction, with
+/// microcompact running first and the full gate then re-reading the estimate
+/// from the session microcompact just mutated. A not-worth-it trim could
+/// therefore cancel the summarize round that would have shrunk the session far
+/// more, for the same one-time prefix reset.
+///
+/// Pinned in BOTH directions on purpose: asserting only that microcompact
+/// declines cannot tell a working gate from a dead ladder, so the same state
+/// must also show the full-compaction path standing right behind it.
 #[test]
-fn microcompact_pressure_valve_fires_despite_tiny_clearable_batch() {
+fn a_not_worth_it_batch_at_the_precompaction_tier_yields_to_full_compaction() {
+    struct SimpleApi;
+    impl ApiClient for SimpleApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            Ok(vec![AssistantEvent::MessageStop])
+        }
+    }
+    let mut session = Session::new();
+    // Eleven results against a keep-recent of 10 leaves exactly one clearable —
+    // ~7,250 tokens, well under the break-even bar — while the eleven together
+    // put the session inside the old valve's band.
+    let bulky = "x".repeat(29_000);
+    for k in 0..11 {
+        session
+            .push_message(crate::session::ConversationMessage::tool_result(
+                format!("r{k}"),
+                "read_file",
+                bulky.clone(),
+                false,
+            ))
+            .expect("bulky result");
+    }
+    let mut runtime = ConversationRuntime::new(
+        session,
+        SimpleApi,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    // 100k is the smallest window whose ladder is not distorted by the
+    // `FALLBACK_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD` floor that
+    // `set_context_window` applies to the precompaction tier — below it the
+    // precompaction threshold would sit ABOVE the full-compaction one and the
+    // band under test would not exist.
+    runtime.set_context_window(100_000);
+
+    let context_tokens = runtime.estimated_request_context_tokens();
+    let precompaction = runtime.precompaction_input_tokens_threshold();
+    let full = u64::from(runtime.auto_compaction_input_tokens_threshold());
+    assert!(
+        context_tokens >= precompaction && context_tokens < full,
+        "probe must sit in the old valve's band: {context_tokens} in \
+         [{precompaction}, {full})"
+    );
+
+    // Direction 1: the batch fails break-even and the valve no longer overrides
+    // that, so nothing is trimmed and nothing counts toward the thrash streak.
+    // The batch is non-empty — a gate that refuses nothing proves nothing.
+    let clearable = crate::microcompact_clearable_estimate(runtime.session(), 10, 240);
+    assert!(
+        clearable > 0 && clearable < context_tokens / 5,
+        "premise: one clearable result, far under the break-even bar: {clearable}"
+    );
+    assert!(
+        runtime
+            .maybe_microcompact_for_tokens(context_tokens)
+            .is_none(),
+        "a batch below the break-even bar must not fire just because the \
+         session reached the precompaction tier"
+    );
+    assert_eq!(runtime.consecutive_microcompacts, 0);
+    assert!(
+        !runtime.session().messages.iter().any(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(block, ContentBlock::ToolResult { output, .. }
+                    if output == crate::MICROCOMPACT_PLACEHOLDER)
+            })
+        }),
+        "declining must leave the transcript byte-identical — the whole point \
+         is not paying for the cache break"
+    );
+
+    // Direction 2: the tier is not idle — full compaction is reachable on this
+    // very state, which is what makes declining the trim the cheaper move. The
+    // state-distill tier sits below precompaction and defers the summarize round
+    // exactly once (`state_distill_deferred_precompaction`), so consume that
+    // one-shot deferral before reading the gate.
+    let mut config = runtime.auto_compaction_config_if_preflight_ready();
+    if config.is_none() {
+        assert!(
+            runtime.state_distill_deferred_precompaction,
+            "the only legal reason to decline once is the state-distill deferral"
+        );
+        config = runtime.auto_compaction_config_if_preflight_ready();
+    }
+    assert!(
+        config.is_some(),
+        "the preflight gate must fire FULL compaction at the same threshold the \
+         valve used to trim at"
+    );
+}
+
+/// The reminder scan has no `keep_recent` and, alone among the microcompact
+/// passes, can reach the head of a transcript. A session whose only reclaimable
+/// mass is one small superseded duplicate must therefore NOT fire: the trim
+/// would set the cache divergence index at that duplicate and re-bill nearly the
+/// whole context — a full-prefix rewrite bought for ~25 tokens.
+///
+/// Two things keep that shut, and this pins the outer one. The frontier rule in
+/// `plan_superseded_reminders` drops any copy ahead of the tool-result clears;
+/// when there are no tool-result clears at all, as here, the reminders set their
+/// own divergence index and the break-even gate is what refuses — which is why
+/// it is calibrated for exactly that worst case.
+#[test]
+fn a_lone_small_superseded_reminder_does_not_buy_a_whole_prefix_rewrite() {
+    struct SimpleApi;
+    impl ApiClient for SimpleApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            Ok(vec![AssistantEvent::MessageStop])
+        }
+    }
+    let nag = "<system-reminder>run the tests before you claim it works</system-reminder>";
+    let mut session = Session::new();
+    // The duplicate sits at message 1, near the head of a long transcript.
+    session.push_user_text("start").expect("opening message");
+    session
+        .push_message(reminder_system_message(nag))
+        .expect("first copy");
+    // Sized so the session sits ABOVE the precompaction tier — where the old
+    // unconditional pressure valve voided the break-even test and fired this
+    // very batch — but below the hard ceiling.
+    let bulky = "x".repeat(33_000);
+    for k in 0..10 {
+        session
+            .push_message(crate::session::ConversationMessage::tool_result(
+                format!("r{k}"),
+                "read_file",
+                bulky.clone(),
+                false,
+            ))
+            .expect("bulky result");
+    }
+    session
+        .push_message(reminder_system_message(nag))
+        .expect("second copy supersedes the first");
+
+    let mut runtime = ConversationRuntime::new(
+        session,
+        SimpleApi,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    runtime.set_context_window(100_000);
+    let context_tokens = runtime.estimated_request_context_tokens();
+    assert!(
+        context_tokens >= runtime.precompaction_input_tokens_threshold()
+            && !runtime.request_reaches_hard_context_ceiling(context_tokens),
+        "premise: the session sits in the old valve's band ({context_tokens})"
+    );
+    // Ten results against a keep-recent of 10: no tool result is clearable, so
+    // the ~60-byte duplicate reminder is the entire batch. Assert the batch is
+    // REAL first — a gate that refuses an empty batch proves nothing.
+    let clearable = crate::microcompact_clearable_estimate(runtime.session(), 10, 240);
+    assert!(
+        clearable > 0 && clearable < context_tokens / 5,
+        "premise: something is clearable, and it is far under the bar: {clearable}"
+    );
+    assert!(
+        runtime
+            .maybe_microcompact_for_tokens(context_tokens)
+            .is_none(),
+        "a lone duplicate reminder is not worth a whole-prefix rewrite"
+    );
+    assert!(
+        !runtime.session().messages.iter().any(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text }
+                    if text == crate::session::CLEARED_REMINDER_PLACEHOLDER)
+            })
+        }),
+        "nothing may be cleared, so nothing may diverge"
+    );
+}
+
+fn reminder_system_message(text: &str) -> crate::session::ConversationMessage {
+    crate::session::ConversationMessage {
+        role: MessageRole::System,
+        blocks: vec![ContentBlock::Text {
+            text: text.to_string(),
+        }],
+        usage: None,
+        thought_signature: None,
+        reasoning_replay: None,
+        model: None,
+    }
+}
+
+/// The narrowed valve still has a door: at the hard context ceiling (95% of the
+/// REAL window) a bad trim beats a provider rejection, so break-even is bypassed
+/// there and only there. Without this the previous test would be satisfied by a
+/// valve that can never open at all.
+#[test]
+fn the_hard_context_ceiling_still_bypasses_the_break_even_bar() {
     struct SimpleApi;
     impl ApiClient for SimpleApi {
         fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -10184,13 +10396,17 @@ fn microcompact_pressure_valve_fires_despite_tiny_clearable_batch() {
     );
     runtime.set_context_window(200_000);
     let precompaction = runtime.precompaction_input_tokens_threshold();
+    let ceiling = 200_000 * 95 / 100 + 1;
 
-    // 11 pushed, keep-recent 10 → only 1 clearable: far under the break-even
-    // bar, but context sits AT the precompaction ceiling, so the pressure
-    // valve must force the fire regardless.
+    // Same one-result batch, one tier apart: refused at precompaction, forced at
+    // the ceiling.
+    assert!(
+        runtime.maybe_microcompact_for_tokens(precompaction).is_none(),
+        "the precompaction tier no longer overrides break-even"
+    );
     let event = runtime
-        .maybe_microcompact_for_tokens(precompaction)
-        .expect("context at the precompaction ceiling must fire regardless of batch size");
+        .maybe_microcompact_for_tokens(ceiling)
+        .expect("a request that would be rejected must trim whatever it can");
     assert_eq!(event.cleared_results, 1);
     assert_eq!(runtime.consecutive_microcompacts, 1);
 }
@@ -11866,6 +12082,10 @@ fn repeated_auto_compaction_replaces_reminders_instead_of_stacking() {
 /// tests cover sealing and recall separately; this proves the runtime wiring.
 #[test]
 fn repeated_auto_compaction_seals_both_rounds_to_the_vault() {
+    // Serialized on the crate env lock because a compaction test in this same
+    // binary flips `ZO_DISABLE_RAW_VAULT`, which would make this vault look
+    // legitimately empty; the var is process-global.
+    let _env_guard = crate::test_env_lock();
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("session.jsonl");
 
@@ -13567,35 +13787,35 @@ fn anthropic_server_trim_gate_controls_local_microcompact() {
         runtime
     };
 
+    // This probe is about WHO owns the trim, not about its economics, so it
+    // drives context to the hard ceiling — the one tier that still bypasses the
+    // break-even bar — rather than depending on batch size.
+    let over_ceiling =
+        |runtime: &ConversationRuntime<_, _>| runtime.context_window() * 95 / 100 + 1;
+
     let mut default_off = seeded_runtime("claude-opus-4-8");
-    let pressure_valve = default_off.precompaction_input_tokens_threshold();
+    let ceiling = over_ceiling(&default_off);
     assert!(!default_off.anthropic_server_trim_active());
     assert!(
-        default_off
-            .maybe_microcompact_for_tokens(pressure_valve)
-            .is_some(),
+        default_off.maybe_microcompact_for_tokens(ceiling).is_some(),
         "local trim remains the default Anthropic hygiene path"
     );
 
     {
         let _opt_in = EnvVarGuard::set("ZO_ANTHROPIC_CONTEXT_EDIT", "1");
         let mut opted_in = seeded_runtime("claude-opus-4-8");
-        let pressure_valve = opted_in.precompaction_input_tokens_threshold();
+        let ceiling = over_ceiling(&opted_in);
         assert!(opted_in.anthropic_server_trim_active());
         assert!(
-            opted_in
-                .maybe_microcompact_for_tokens(pressure_valve)
-                .is_none(),
+            opted_in.maybe_microcompact_for_tokens(ceiling).is_none(),
             "explicit opt-in hands trimming to the server executor"
         );
 
         let mut non_anthropic = seeded_runtime("gpt-5.6-sol");
-        let pressure_valve = non_anthropic.precompaction_input_tokens_threshold();
+        let ceiling = over_ceiling(&non_anthropic);
         assert!(!non_anthropic.anthropic_server_trim_active());
         assert!(
-            non_anthropic
-                .maybe_microcompact_for_tokens(pressure_valve)
-                .is_some(),
+            non_anthropic.maybe_microcompact_for_tokens(ceiling).is_some(),
             "GPT sessions keep the local trim under the Anthropic-only gate"
         );
     }

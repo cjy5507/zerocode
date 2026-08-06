@@ -89,10 +89,12 @@ pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use compact::{
     apply_compaction, compact_session, compact_session_with, compaction_system_prompt,
     distill_session_state, edited_file_paths, estimate_session_tokens, format_compact_summary,
-    get_compact_continuation_message, is_edit_result_tool, microcompact_clearable_estimate,
-    microcompact_session, prepare_compaction, should_compact, summary_fabricates_identifiers,
+    get_compact_continuation_message, is_edit_result_tool, is_pre_clear_original_of,
+    microcompact_clearable_estimate, microcompact_session, prepare_compaction, should_compact,
+    summary_fabricates_identifiers,
     CompactionConfig, CompactionPlan, CompactionResult, CompactionSummarizer, FocusSummarizer,
-    LocalSummarizer, MicrocompactEvent, COMPACTION_SYSTEM_PROMPT, MICROCOMPACT_PLACEHOLDER,
+    LocalSummarizer, MicrocompactEvent, COMPACTION_SYSTEM_PROMPT, MICROCOMPACT_IMAGE_PLACEHOLDER,
+    MICROCOMPACT_PLACEHOLDER,
 };
 pub use compact_diff::{
     CompactDiffHunk, CompactDiffLine, CompactDiffLineKind, compact_line_diff,

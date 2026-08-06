@@ -434,14 +434,20 @@ fn message_has_tool_result(message: &ConversationMessage) -> bool {
 #[must_use]
 pub fn apply_compaction(plan: CompactionPlan, raw_summary: &str) -> CompactionResult {
     let CompactionPlan {
-        // Only the summary REQUEST needs it; the live message it names is
-        // already in the session and is replaced by this round's continuation.
-        cache_prefix: _,
+        // Only the summary REQUEST needs the prefix CONTENT; the live message it
+        // names is already in the session and is replaced by this round's
+        // continuation, so it is dropped below rather than held. Its LENGTH is
+        // load-bearing here and cannot be: it is the offset between an index into
+        // `messages_to_compact` and the live index microcompact stamped its
+        // pre-clear seal from.
+        cache_prefix,
         mut messages_to_compact,
         preserved_tail,
         existing_anchor,
         session_shell,
     } = plan;
+    let compacted_prefix_len = cache_prefix.len();
+    drop(cache_prefix);
     let removed_message_count = messages_to_compact.len();
     // Fold this round's delta into the prior typed anchor (verbatim carry, no
     // re-truncation), then RENDER the model-facing summary from the folded
@@ -456,12 +462,27 @@ pub fn apply_compaction(plan: CompactionPlan, raw_summary: &str) -> CompactionRe
     let mut compacted_session = session_shell;
 
     // LAVA lossless: before sealing, swap any microcompact-cleared tool-result
-    // body back to its raw original from the append-only transcript on disk —
-    // which `record_compaction` has not overwritten yet — so the vault seals the
-    // pre-clear original, not the `[Old tool result content cleared]`
-    // placeholder. Best-effort: a missing/corrupt/unmatched source degrades to
-    // sealing the in-memory (placeholder) state, never failing the compaction.
-    restore_microcompacted_bodies_from_disk(&mut messages_to_compact, &compacted_session);
+    // body — and any microcompact-cleared standalone image — back to its raw
+    // original, from the vault the clear itself sealed it into (falling back, for
+    // tool results, to the on-disk transcript), so the vault seals the pre-clear
+    // original rather than the placeholder. This also protects the seal below
+    // from shadowing a good record: `read_vault` dedups last-wins, so re-sealing
+    // this same seq with a placeholder buries the original the clear had stored.
+    // Best-effort: a missing/corrupt/unmatched source degrades to sealing the
+    // in-memory (placeholder) state, never failing the compaction.
+    //
+    // The image half is addressed POSITIONALLY (it has no id), so the seqs are
+    // computed here, on the same axis microcompact stamped: a message at index
+    // `i` of `messages_to_compact` sits at live index `compacted_prefix_len + i`,
+    // and `first_message_index` has not been rebased yet (`record_compaction`
+    // runs below, inside `apply_compaction_atomic`).
+    let restore_base_seq = compacted_session
+        .first_message_index()
+        .saturating_add(u32::try_from(compacted_prefix_len).unwrap_or(u32::MAX));
+    let restore_seqs: Vec<u32> = (0..messages_to_compact.len())
+        .map(|offset| restore_base_seq.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX)))
+        .collect();
+    restore_microcompacted_bodies(&mut messages_to_compact, &compacted_session, &restore_seqs);
 
     // Seal the raw evicted messages to the append-only vault BEFORE
     // `record_compaction` overwrites the transcript with the lossy summary, so
@@ -519,50 +540,209 @@ pub fn apply_compaction(plan: CompactionPlan, raw_summary: &str) -> CompactionRe
     }
 }
 
-/// A tool result's raw `(output, images)` borrowed from a persisted message —
-/// the restore source keyed by `tool_use_id`.
+/// A tool result's raw `(output, images)`, BORROWED from the source that holds
+/// it. Owning these instead would duplicate the recovery source in RSS — the
+/// vault of a long session is tens of MB and every non-placeholder body in it
+/// would be cloned while the materialized vault is still alive — so the two
+/// sources are indexed in sequence, each inside its own scope, rather than
+/// merged into one owned map.
 type RawToolResultBody<'a> = (&'a String, &'a Vec<(String, String)>);
 
-/// Swap microcompact-cleared tool-result bodies in `evicted` back to their raw
-/// originals, read from the session's append-only transcript on disk — the step
-/// that makes the vault seal truly lossless even for a body a cheaper tier had
-/// already trimmed from the live context.
-///
-/// Microcompact overwrites an old tool-result `output` with
-/// [`MICROCOMPACT_PLACEHOLDER`] in memory but never persists that edit, so at
-/// seal time — before `record_compaction` rewrites the snapshot — the on-disk
-/// JSONL still holds the pre-clear original. Matching is by `tool_use_id` (a
-/// required, session-unique field on every tool result, preserved verbatim
-/// through microcompact), so a cleared result is paired with its exact original
-/// regardless of position; a positional fallback is unnecessary because the id
-/// map is built from the whole persisted transcript, so any evicted result
-/// whose original still exists on disk is found by id. Only the `ToolResult`
-/// body and its out-of-band `images` are restored; a standalone user-pasted
-/// image cleared to a text placeholder has no such stable id and is left as-is.
-///
-/// Strictly best-effort: no persistence path, an unreadable/corrupt transcript,
-/// or an id whose original no longer survives on disk all degrade to leaving the
-/// placeholder in place — the pre-vault lossy behavior, never worse, and never a
-/// failed compaction.
-fn restore_microcompacted_bodies_from_disk(evicted: &mut [ConversationMessage], session: &Session) {
-    // Only pay the disk read when something was actually cleared — the common
-    // case (no microcompact this session) reads nothing.
-    let has_cleared = evicted.iter().any(|message| {
-        message.blocks.iter().any(|block| {
-            matches!(block, ContentBlock::ToolResult { output, .. } if output == MICROCOMPACT_PLACEHOLDER)
+/// Whether any block in `messages` is a microcompact placeholder — a cleared
+/// tool-result body or a cleared standalone image — i.e. what
+/// [`seal_microcompact_originals`] checks before paying for the heal.
+/// [`restore_microcompacted_bodies`] needs the positions/ids themselves, so it
+/// re-derives them; this only answers "is there anything to heal at all".
+fn needs_microcompact_heal(messages: &[ConversationMessage]) -> bool {
+    messages.iter().any(|message| {
+        message.blocks.iter().any(|block| match block {
+            ContentBlock::ToolResult { output, .. } => output == MICROCOMPACT_PLACEHOLDER,
+            ContentBlock::Text { text } => text == MICROCOMPACT_IMAGE_PLACEHOLDER,
+            _ => false,
         })
-    });
-    if !has_cleared {
+    })
+}
+
+/// Whether `sealed` is the pre-clear ORIGINAL of `live` — the same message, with
+/// the blocks microcompact blanks still intact.
+///
+/// This is the verification a POSITIONAL heal needs and a content-addressed one
+/// does not. A standalone pasted image carries no `tool_use_id`, so the only
+/// address a sealed image has is its `vault_seq`, and that axis is off by one for
+/// any record written before the session's first full compaction (see the AXIS
+/// note on [`Session::seal_originals_to_vault`]). Grafting the neighbouring
+/// turn's image into this turn is strictly worse than leaving the placeholder, so
+/// the address is treated as a CANDIDATE and this predicate decides.
+///
+/// Structural, not fuzzy: microcompact rewrites blocks IN PLACE, so a blanked
+/// message differs from its original only where a clear ran — same role, same
+/// block count, same order. The two blanking rules are the only tolerated
+/// differences:
+///
+/// * an `Image` became the [`MICROCOMPACT_IMAGE_PLACEHOLDER`] text block, and
+/// * a `ToolResult` body became [`MICROCOMPACT_PLACEHOLDER`] (its
+///   `tool_use_id` must still match, and its out-of-band images are ignored
+///   because the clear drops them).
+///
+/// A superseded REMINDER clear is deliberately NOT tolerated: a message that lost
+/// both a reminder and an image would fail here and keep its placeholder (the
+/// accepted loss), which needs a `System` message carrying an `Image` — no
+/// producer in this codebase makes one, and admitting the case would let any text
+/// block match any other, which is exactly the discrimination this predicate
+/// exists to provide.
+#[must_use]
+pub fn is_pre_clear_original_of(sealed: &ConversationMessage, live: &ConversationMessage) -> bool {
+    sealed.role == live.role
+        && sealed.blocks.len() == live.blocks.len()
+        && sealed
+            .blocks
+            .iter()
+            .zip(live.blocks.iter())
+            .all(|(sealed_block, live_block)| is_pre_clear_block(sealed_block, live_block))
+}
+
+/// One block pair under the [`is_pre_clear_original_of`] rules.
+fn is_pre_clear_block(sealed: &ContentBlock, live: &ContentBlock) -> bool {
+    match (sealed, live) {
+        (ContentBlock::Image { .. }, ContentBlock::Text { text }) => {
+            text == MICROCOMPACT_IMAGE_PLACEHOLDER
+        }
+        (
+            ContentBlock::ToolResult {
+                tool_use_id: sealed_id,
+                ..
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: live_id,
+                output,
+                ..
+            },
+        ) if output == MICROCOMPACT_PLACEHOLDER => sealed_id == live_id,
+        _ => sealed == live,
+    }
+}
+
+/// Indices of the messages in `messages` that carry a cleared standalone image.
+fn cleared_image_indices(messages: &[ConversationMessage]) -> Vec<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            message.blocks.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text } if text == MICROCOMPACT_IMAGE_PLACEHOLDER)
+            })
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Swap every microcompact-cleared standalone image in `messages` back to the
+/// `Image` block the pre-clear seal stored, addressing the seal by `seqs[i]` (the
+/// absolute vault seq of `messages[i]`) and verifying the hit before using it.
+///
+/// The seq is the only address a pasted image has, and it is not reliable on its
+/// own: a record sealed before the session's FIRST full compaction is one behind
+/// the live axis forever after (the AXIS note on
+/// [`Session::seal_originals_to_vault`]), so a bare `seqs[i]` lookup can land on
+/// the NEXT turn's record. Two gates make a wrong graft unreachable and turn the
+/// failure mode into "still blanked", which is the pre-existing behavior:
+///
+/// 1. [`is_pre_clear_original_of`] must accept the record for THIS message, and
+/// 2. the record must not equally accept the message one seq later — the only
+///    other turn the +1 drift could hand it to. Two adjacent turns that are
+///    byte-identical once blanked (e.g. two bare pasted images in a row) are
+///    therefore both left blanked rather than guessed at.
+///
+/// Gate 2 is fully armed only where `seqs` is contiguous, which is the call site
+/// that matters: `apply_compaction`, whose seal is the permanent one. From
+/// [`seal_microcompact_originals`] the batch is a scattered selection, so when the
+/// `seq + 1` neighbour is not in the batch the check is vacuous there.
+fn heal_cleared_images(
+    messages: &mut [ConversationMessage],
+    seqs: &[u32],
+    blanked: &[usize],
+    vault: &[crate::session::VaultRecord],
+) {
+    // Index only the seqs actually wanted, and only records that hold an image
+    // at all — a whole-vault index would be proportional to session history to
+    // serve the handful of turns being healed.
+    let wanted: std::collections::HashSet<u32> =
+        blanked.iter().filter_map(|&index| seqs.get(index).copied()).collect();
+    let sealed: std::collections::HashMap<u32, &ConversationMessage> = vault
+        .iter()
+        .filter(|record| {
+            wanted.contains(&record.vault_seq)
+                && record
+                    .message
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Image { .. }))
+        })
+        .map(|record| (record.vault_seq, &record.message))
+        .collect();
+    if sealed.is_empty() {
         return;
     }
-    let Some(persisted) = session.load_persisted_messages() else {
-        return;
-    };
-    // tool_use_id -> the raw (non-placeholder) body + images from disk. First
-    // writer wins; a duplicated id (should not happen) keeps the earliest.
-    let mut originals: std::collections::HashMap<&str, RawToolResultBody> =
-        std::collections::HashMap::new();
-    for message in &persisted {
+    for &index in blanked {
+        let (Some(&seq), Some(live)) = (seqs.get(index), messages.get(index)) else {
+            continue;
+        };
+        let Some(&original) = sealed.get(&seq) else {
+            continue;
+        };
+        // Gate 1: the record must be the pre-clear shape of THIS message —
+        // same role, same block count, every surviving block byte-identical,
+        // every blanked block accounted for. A neighbour's record differs in
+        // its own surviving text and is refused here.
+        if !is_pre_clear_original_of(original, live) {
+            continue;
+        }
+        // Gate 2: nor may the record equally claim the message one seq later,
+        // the only other owner the +1 drift could hand it to.
+        let next_owner = seqs
+            .iter()
+            .position(|&other| other == seq.saturating_add(1))
+            .and_then(|position| messages.get(position));
+        if next_owner.is_some_and(|next| is_pre_clear_original_of(original, next)) {
+            continue;
+        }
+        // Restore only the blocks that were actually blanked, so anything the
+        // tool-result pass already healed into this message survives.
+        let restored: Vec<(usize, ContentBlock)> = live
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(block_index, block)| {
+                matches!(block, ContentBlock::Text { text } if text == MICROCOMPACT_IMAGE_PLACEHOLDER)
+                    && matches!(original.blocks.get(*block_index), Some(ContentBlock::Image { .. }))
+            })
+            .map(|(block_index, _)| (block_index, original.blocks[block_index].clone()))
+            .collect();
+        for (block_index, block) in restored {
+            messages[index].blocks[block_index] = block;
+        }
+    }
+}
+
+/// Index the non-placeholder tool-result bodies in `messages` that some caller
+/// actually WANTS, keyed by `tool_use_id`.
+///
+/// `wanted` is the set of ids currently holding the placeholder. Filtering on it
+/// keeps this map proportional to what is actually being restored: a recovery
+/// source is the WHOLE vault (or the whole transcript), so indexing unfiltered
+/// builds an entry per tool result in the session's history to serve the handful
+/// about to be swapped.
+///
+/// Within one source, first writer wins: a duplicated id (should not happen —
+/// ids are session-unique) keeps the earliest. Priority BETWEEN sources is not
+/// expressed here but by call order — a body already swapped in is no longer a
+/// placeholder, so a later source cannot overwrite it.
+fn index_raw_tool_bodies<'a>(
+    messages: impl IntoIterator<Item = &'a ConversationMessage>,
+    wanted: &std::collections::HashSet<String>,
+    originals: &mut std::collections::HashMap<&'a str, RawToolResultBody<'a>>,
+) {
+    for message in messages {
         for block in &message.blocks {
             if let ContentBlock::ToolResult {
                 tool_use_id,
@@ -571,7 +751,7 @@ fn restore_microcompacted_bodies_from_disk(evicted: &mut [ConversationMessage], 
                 ..
             } = block
             {
-                if output != MICROCOMPACT_PLACEHOLDER {
+                if output != MICROCOMPACT_PLACEHOLDER && wanted.contains(tool_use_id) {
                     originals
                         .entry(tool_use_id.as_str())
                         .or_insert((output, images));
@@ -579,26 +759,150 @@ fn restore_microcompacted_bodies_from_disk(evicted: &mut [ConversationMessage], 
             }
         }
     }
-    for message in evicted.iter_mut() {
-        for block in &mut message.blocks {
+}
+
+/// The `tool_use_id`s in `messages` whose tool-result body is the microcompact
+/// placeholder — exactly the ids a recovery source is worth reading for, and
+/// therefore also the guard for whether to read one at all (an empty set means
+/// nothing was cleared).
+///
+/// Owned rather than borrowed because the caller needs it alive across the
+/// mutable borrow that performs the swap.
+fn cleared_tool_use_ids(messages: &[ConversationMessage]) -> std::collections::HashSet<String> {
+    let mut wanted = std::collections::HashSet::new();
+    for message in messages {
+        for block in &message.blocks {
             if let ContentBlock::ToolResult {
+                tool_use_id,
+                output,
+                ..
+            } = block
+            {
+                if output == MICROCOMPACT_PLACEHOLDER {
+                    wanted.insert(tool_use_id.clone());
+                }
+            }
+        }
+    }
+    wanted
+}
+
+/// Replace every microcompact placeholder body in `messages` whose `tool_use_id`
+/// is present in `originals`. Returns `true` when no placeholder was left
+/// unresolved, which is what lets the caller skip a second recovery source.
+fn swap_placeholders_from(
+    messages: &mut [ConversationMessage],
+    originals: &std::collections::HashMap<&str, RawToolResultBody<'_>>,
+) -> bool {
+    let mut resolved_all = true;
+    for message in messages.iter_mut() {
+        for block in &mut message.blocks {
+            let ContentBlock::ToolResult {
                 tool_use_id,
                 output,
                 images,
                 ..
             } = block
-            {
-                if output == MICROCOMPACT_PLACEHOLDER {
-                    if let Some(&(original_output, original_images)) =
-                        originals.get(tool_use_id.as_str())
-                    {
-                        output.clone_from(original_output);
-                        images.clone_from(original_images);
-                    }
-                }
+            else {
+                continue;
+            };
+            if output != MICROCOMPACT_PLACEHOLDER {
+                continue;
+            }
+            if let Some((original_output, original_images)) = originals.get(tool_use_id.as_str()) {
+                output.clone_from(original_output);
+                images.clone_from(original_images);
+            } else {
+                resolved_all = false;
             }
         }
     }
+    resolved_all
+}
+
+/// Swap microcompact-cleared tool-result bodies in `messages` back to their raw
+/// originals — the step that makes the vault seal truly lossless even for a body
+/// a cheaper tier already trimmed out of the live context.
+///
+/// PRIMARY SOURCE: the Raw Vault. `microcompact_session` seals each pre-clear
+/// original before it overwrites the body, so the original is in the vault by
+/// construction, for the life of the session, immune to every later rewrite.
+///
+/// FALLBACK SOURCE: the persisted transcript. It is a fallback and not the
+/// primary because microcompact's clear IS persisted — the pass ends with
+/// `mark_transcript_dirty`, which forces the next persist onto the full-snapshot
+/// path, so the disk copy holds the placeholder from roughly one turn after the
+/// clear onward. Measured across real sessions, only 3.7% of vault-placeholder
+/// `tool_use_id`s still had an intact original anywhere on disk, which is why
+/// this path alone could never make the seal lossless. It is retained rather
+/// than deleted because it is the only source that covers two real cases the
+/// vault cannot: a clear that happened before the pre-clear seal shipped (an
+/// older session resumed on a newer binary), and a run with
+/// `ZO_DISABLE_RAW_VAULT` set. It is also skipped entirely whenever the vault
+/// already resolved every placeholder, so in the healthy case it costs nothing.
+///
+/// TOOL RESULTS are matched by `tool_use_id` (a required, session-unique field on
+/// every tool result, preserved verbatim through microcompact), so a cleared
+/// result is paired with its exact original regardless of position; no positional
+/// fallback is needed because both sources are indexed whole.
+///
+/// STANDALONE IMAGES have no such id, so they are matched positionally, by
+/// `seqs[i]` — the absolute vault seq of `messages[i]`, which the caller must
+/// stamp on the same axis the pre-clear seal used. Because that axis carries a
+/// documented +1 drift, every positional hit is verified with
+/// [`is_pre_clear_original_of`] before it is used; see [`heal_cleared_images`]
+/// for the two gates and for what they refuse. Images are recovered from the
+/// VAULT ONLY: the disk fallback below is keyed by id and has nothing to offer a
+/// block that has none.
+///
+/// Strictly best-effort: no persistence path, an unreadable/corrupt transcript,
+/// an empty vault, an id whose original survives in neither source, or a
+/// positional hit that fails verification all degrade to leaving the placeholder
+/// in place — the pre-vault lossy behavior, never worse, and never a failed
+/// compaction.
+fn restore_microcompacted_bodies(
+    messages: &mut [ConversationMessage],
+    session: &Session,
+    seqs: &[u32],
+) {
+    // Only pay for a recovery source when something was actually cleared — the
+    // common case (no microcompact this session) reads nothing.
+    let wanted = cleared_tool_use_ids(messages);
+    let blanked_images = cleared_image_indices(messages);
+    if wanted.is_empty() && blanked_images.is_empty() {
+        return;
+    }
+    // Each source lives in its own scope, and its index borrows from it rather
+    // than cloning. Both matter because a recovery source is a whole-history
+    // read: the largest real vault measured is 52MB, an owned index of its
+    // bodies would roughly double that, and merging both sources into one map
+    // would hold the disk snapshot alongside the vault. Scoped + borrowed keeps
+    // the peak at one source at a time.
+    let resolved_all = {
+        let vault = session.read_vault();
+        let mut originals: std::collections::HashMap<&str, RawToolResultBody<'_>> =
+            std::collections::HashMap::new();
+        index_raw_tool_bodies(vault.iter().map(|record| &record.message), &wanted, &mut originals);
+        let resolved_all = swap_placeholders_from(messages, &originals);
+        // Images run AFTER the tool-result swap so a message that lost both is
+        // already healed on the id-addressed side when its shape is verified.
+        heal_cleared_images(messages, seqs, &blanked_images, &vault);
+        resolved_all
+    };
+    if resolved_all {
+        return;
+    }
+    // The vault left at least one placeholder unresolved. Pay for the disk
+    // snapshot only now, and re-run the swap for what is still missing — the
+    // bodies the vault already restored are no longer placeholders, so this pass
+    // cannot overwrite them with an older copy.
+    let Some(persisted) = session.load_persisted_messages() else {
+        return;
+    };
+    let mut originals: std::collections::HashMap<&str, RawToolResultBody<'_>> =
+        std::collections::HashMap::new();
+    index_raw_tool_bodies(&persisted, &wanted, &mut originals);
+    let _ = swap_placeholders_from(messages, &originals);
 }
 
 const STATE_DISTILL_MAX_CHARS: usize = 1_600;
@@ -1468,8 +1772,18 @@ pub struct MicrocompactEvent {
     /// [`MICROCOMPACT_IMAGE_PLACEHOLDER`]. Tool-result images are cleared with
     /// their result and counted there, not here.
     pub cleared_images: usize,
-    /// Persisted reminder blocks a byte-identical later copy superseded,
-    /// replaced with [`MICROCOMPACT_REMINDER_PLACEHOLDER`].
+    /// Persisted reminder blocks a byte-identical later copy superseded (or, for
+    /// the recalled-memory lineage, any later section), replaced with
+    /// [`MICROCOMPACT_REMINDER_PLACEHOLDER`].
+    ///
+    /// When [`mutation_frontier`] is `Some`, this counts only the copies at or
+    /// after it — the pass never reaches further back into the prefix than the
+    /// tool-result/image passes already do. When it is `None` (this pass clears
+    /// no tool result and no image, so there is no re-billed region to ride on),
+    /// the filter is `is_none_or` and this counts EVERY superseded copy in the
+    /// whole transcript: the reminders are then the entire pass and set the
+    /// divergence index themselves. See [`plan_superseded_reminders`] for why
+    /// that case stays enabled and what prices it.
     pub cleared_superseded_reminders: usize,
     /// Fast estimate of the context tokens the clearing freed.
     pub estimated_tokens_saved: u64,
@@ -1486,8 +1800,12 @@ struct MicrocompactPlan {
     tool_results: Vec<(usize, usize)>,
     /// `(message_index, block_index)` of each standalone image to placeholder.
     images: Vec<(usize, usize)>,
-    /// `(message_index, block_index)` of each persisted reminder block that a
-    /// byte-identical later copy has superseded.
+    /// `(message_index, block_index)` of each persisted reminder block a later
+    /// copy has superseded, restricted to [`mutation_frontier`] so this pass
+    /// never reaches further back than the tool-result/image passes already do —
+    /// except when that frontier is `None`, where the whole transcript is in
+    /// scope because the reminders ARE the pass (see
+    /// [`plan_superseded_reminders`]).
     superseded_reminders: Vec<(usize, usize)>,
 }
 
@@ -1547,11 +1865,36 @@ fn plan_microcompact_clears(
         })
         .collect();
     let image_clear_count = clearable_images.len().saturating_sub(keep_recent);
+    let tool_results: Vec<(usize, usize)> = clearable.into_iter().take(clear_count).collect();
+    let images: Vec<(usize, usize)> =
+        clearable_images.into_iter().take(image_clear_count).collect();
+    // The reminder pass runs LAST and only inside the region the two passes
+    // above already price — see `mutation_frontier`.
+    let superseded_reminders =
+        plan_superseded_reminders(session, mutation_frontier(&tool_results, &images));
     MicrocompactPlan {
-        tool_results: clearable.into_iter().take(clear_count).collect(),
-        images: clearable_images.into_iter().take(image_clear_count).collect(),
-        superseded_reminders: plan_superseded_reminders(session),
+        tool_results,
+        images,
+        superseded_reminders,
     }
+}
+
+/// The earliest message index this pass is already going to rewrite in place,
+/// or `None` when it would rewrite nothing.
+///
+/// This index IS the price of a microcompact firing. Both rolling message cache
+/// breakpoints sit on the tail ([`crate::convert_messages`] marks the last two
+/// cacheable messages and no more), so an in-place edit anywhere in the prefix
+/// drops `cache_read` back to the system blocks and re-bills essentially the
+/// whole context once. Where the edit lands therefore decides nothing about the
+/// bill *except* through this minimum — and everything the pass additionally
+/// clears at or after it rides along for free.
+fn mutation_frontier(tool_results: &[(usize, usize)], images: &[(usize, usize)]) -> Option<usize> {
+    tool_results
+        .iter()
+        .chain(images.iter())
+        .map(|&(message_index, _)| message_index)
+        .min()
 }
 
 const RECALL_REMINDER_LINEAGE_ANCHOR: &str = "# Recalled memory";
@@ -1587,7 +1930,9 @@ fn is_recalled_memory_reminder(text: &str) -> bool {
         .is_some_and(|(_, body)| body.trim_start().starts_with(RECALL_REMINDER_LINEAGE_ANCHOR))
 }
 
-/// Every persisted reminder block that a byte-identical LATER copy supersedes.
+/// Every persisted reminder block a LATER copy supersedes — byte-identically for
+/// every family but the recalled-memory lineage, where any newer section counts
+/// (the paragraph on the allowlist below owns that distinction).
 ///
 /// The reminder set is re-appended to the transcript whenever the live set
 /// falls out of the dedupe window, deliberately, so the nag stays near the
@@ -1605,11 +1950,50 @@ fn is_recalled_memory_reminder(text: &str) -> bool {
 /// deliberately contains only [`RECALL_REMINDER_LINEAGE_ANCHOR`]. The LAST copy
 /// is always kept, with no `keep_recent` slack: an older superseded copy carries
 /// no information the newest valid copy does not.
-fn plan_superseded_reminders(session: &Session) -> Vec<(usize, usize)> {
+///
+/// FRONTIER DISCIPLINE. `frontier` is [`mutation_frontier`] — the earliest
+/// message index the tool-result and image passes of this same pass are already
+/// rewriting. Only reminders at or after it are reclaimed, because those sit
+/// inside the prefix that is being re-billed anyway, so taking them costs
+/// nothing extra. Without that restriction this scan had no lower bound at all
+/// (it still has no `keep_recent`), so a single 100-byte duplicate reminder near
+/// message 1 could drag the divergence index to the head of a 900-message
+/// conversation and re-bill ~95% of the context to reclaim ~25 tokens. Measured
+/// across three days of real `breaks.jsonl`: rows diverging in the first dozen
+/// messages carry ~9.0M of 35.5M pure-divergence `cache_creation`.
+///
+/// The trade-off is deliberate and one-directional: the tool frontier only ever
+/// moves FORWARD (a cleared body is never a candidate again), so a superseded
+/// copy left behind it is not picked up by a later pass either — it keeps
+/// costing its own bytes until full compaction evicts it. Those bytes are a few
+/// hundred per copy per request; pulling the divergence index to the head costs
+/// a whole-context re-bill, once, at cache-write price. The first firing on a
+/// fresh prefix clears from the OLDEST results, so in practice the stranded band
+/// is only what precedes the very first clearable tool result.
+///
+/// `frontier == None` means this pass clears no tool result and no image, so
+/// the reminders ARE the pass and have no free region to ride on — they set the
+/// divergence index themselves. They are still planned rather than dropped,
+/// because the caller's break-even gate
+/// (`ConversationRuntime::maybe_microcompact_for_tokens`) is calibrated for
+/// exactly that worst case: it requires the whole batch to be at least a fifth
+/// of the live context before anything fires. That makes "a lone small reminder
+/// buys a whole-prefix rewrite" unreachable, while the case this pass was
+/// written for — a long, low-tool-traffic session whose only reclaimable mass is
+/// tens of thousands of tokens of repeated nag — still reaches it. Dropping the
+/// pass whenever the tool set is empty would have switched it off precisely
+/// there, since an empty tool set is also what "fewer than `keep_recent`
+/// clearable results" looks like.
+fn plan_superseded_reminders(session: &Session, frontier: Option<usize>) -> Vec<(usize, usize)> {
     let mut newest_exact_at: std::collections::HashMap<&str, (usize, usize)> =
         std::collections::HashMap::new();
     let mut newest_recall_at: Option<(usize, usize)> = None;
     let mut candidates: Vec<((usize, usize), &str, bool)> = Vec::new();
+    // The "which copy is newest" scan deliberately covers the WHOLE transcript
+    // even when a frontier will discard most of the result: a copy at or after
+    // the frontier is only superseded if a later copy exists, and answering that
+    // from a truncated view could clear the last surviving copy of a reminder
+    // whose earlier duplicates were the ones cut off.
     for (message_index, message) in session.messages.iter().enumerate() {
         if message.role != MessageRole::System {
             continue;
@@ -1633,6 +2017,9 @@ fn plan_superseded_reminders(session: &Session) -> Vec<(usize, usize)> {
     }
     candidates
         .into_iter()
+        .filter(|((message_index, _), _, _)| {
+            frontier.is_none_or(|earliest| *message_index >= earliest)
+        })
         .filter(|(position, text, is_recall)| {
             if *is_recall {
                 newest_recall_at != Some(*position)
@@ -1672,6 +2059,123 @@ fn plan_estimated_tokens(session: &Session, plan: &MicrocompactPlan) -> u64 {
     estimated
 }
 
+/// Seal the pre-clear ORIGINAL of every message this plan is about to mutate
+/// into the session's Raw Vault, so the bodies survive the trim.
+///
+/// This is the fix for a defect that made the vault's "lossless" guarantee false
+/// in production: microcompact's clear IS persisted (the pass ends with
+/// `mark_transcript_dirty`, which forces the next persist onto a full snapshot),
+/// so by the time full compaction ran and tried to recover the originals from
+/// disk, the disk already held the placeholder and the seal quietly stored the
+/// placeholder instead — measured at 35-70% of tool results across real
+/// `.vault.jsonl` files. Sealing here removes the race entirely: the original is
+/// captured while it is still in hand, one statement before it is destroyed.
+///
+/// SCOPE. Messages carrying a cleared tool result or a cleared standalone image
+/// are sealed; messages carrying only a superseded reminder are NOT. The two
+/// reminder families this leaves behind are not equivalent, and only one of them
+/// is genuinely free:
+///
+/// * EXACT-DUPLICATE family — the cleared copy is byte-identical to a later one
+///   that survives, so the bytes are still in the transcript and will themselves
+///   be sealed intact when full compaction evicts that later copy. Sealing here
+///   would write a second copy of bytes the vault is already guaranteed to
+///   receive. Nothing is lost but *positional* recovery: "what stood at seq N"
+///   answers with the placeholder.
+/// * RECALL LINEAGE — [`plan_superseded_reminders`] takes `newest_recall_at`
+///   from ANY recalled-memory section and clears every earlier one, byte-identical
+///   or not. What survives is therefore the reseed CONTRACT (the newest section
+///   plus a `recalled_memory_slugs` recount can re-render an EQUIVALENT body, and
+///   every cleared entry line named the memory file it was rendered from), NOT
+///   the original bytes. The historical rendering — which entries were relevant
+///   at that turn, and how each snippet read then — is given up.
+///
+/// The recall-lineage bytes are deliberately NOT sealed, against the general
+/// preference in this pass for sealing anything it destroys, because a seal here
+/// would be write-only: a reminder message carries no `tool_use_id` and no
+/// `Image`, which are the only two things either read path keys a heal off
+/// (`session_recall`'s `healed_live_messages`), and while the message is still
+/// live its record sits at or above `first_message_index`, where both readers
+/// exclude it from the evicted listing. Once full compaction does evict the
+/// message, its own seal writes the PLACEHOLDER — `restore_microcompacted_bodies`
+/// heals tool-result bodies and standalone images, never reminders — into the
+/// contiguous run of seqs that swallows the microcompact record's seq, and
+/// because that run is appended later, last-record-wins dedup drops the original.
+/// So the cost would be one vault record per cleared lineage reminder for bytes
+/// no reader can surface. Making it worth paying needs two changes this pass is
+/// not making: a reminder-placeholder heal in `restore_microcompacted_bodies` (so
+/// the compaction seal carries the original), and a reminder arm in
+/// `healed_live_messages` (so recall can show it). Both are positional, on the
+/// axis that is misaligned by one (see [`Session::seal_originals_to_vault`]), and
+/// unlike an image a reminder has no verification to lean on: the clear replaces
+/// its bytes with a fixed string, so nothing about the placeholder identifies
+/// which sealed record was its original (`is_pre_clear_original_of` deliberately
+/// refuses that pairing for the same reason).
+///
+/// The whole message is sealed, not just the blocks being cleared, because the
+/// vault's unit is a message. That is also what gives a standalone `Image`, which
+/// has no stable id, an original to be recovered FROM — but the seal alone does
+/// not make it recoverable: full compaction re-seals that same message, now
+/// carrying the placeholder, and last-record-wins dedup buries the good record
+/// unless the eviction path heals the image first. It does, positionally and
+/// verified (see [`heal_cleared_images`]); before that heal existed, every sealed
+/// pasted image was destroyed by the next full compaction. It does NOT put this
+/// record on the same `vault_seq` as the later full-compaction seal of the same
+/// message except on a session's first compaction round — see the AXIS note on
+/// [`Session::seal_originals_to_vault`] for why a duplicate line is expected
+/// from the second round on.
+///
+/// A message already holding an EARLIER round's placeholder — of either kind — is
+/// healed from the vault first, so round two cannot seal a partially-cleared
+/// snapshot over round one's pristine record (dedup is last-wins). The guard used
+/// to ask about tool-result placeholders alone, which left the image instance of
+/// exactly the same burial live: a message holding two pasted images has its
+/// second image cleared a round after its first, and re-sealing it with image one
+/// already blanked would have buried the record that still had it. That heal
+/// reads the vault, so it is guarded on the batch actually containing such a
+/// message — rare in practice: across 400 real session transcripts, all 35,163
+/// tool-result-bearing messages carried EXACTLY one result, so a message can
+/// almost never be selected twice. Steady-state cost of this function is
+/// therefore one append, no read.
+///
+/// Returns whether the caller may now destroy those bodies — `false` only when
+/// the vault append FAILED, so the sole surviving copy is still the one in
+/// memory. An empty selection returns `true`: this function wrote nothing, so
+/// there is no append failure to report. A reminder-only plan is the live
+/// instance of that, and SCOPE above states exactly what it costs. The
+/// `true`-with-nothing-written modes are enumerated on
+/// [`Session::seal_originals_to_vault`], which owns them.
+#[must_use]
+fn seal_microcompact_originals(session: &Session, plan: &MicrocompactPlan) -> bool {
+    let mut indices: Vec<usize> = plan
+        .tool_results
+        .iter()
+        .chain(plan.images.iter())
+        .map(|&(message_index, _)| message_index)
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+    if indices.is_empty() {
+        return true;
+    }
+    let base_seq = session.first_message_index();
+    let seqs: Vec<u32> = indices
+        .iter()
+        .map(|&message_index| {
+            base_seq.saturating_add(u32::try_from(message_index).unwrap_or(u32::MAX))
+        })
+        .collect();
+    let mut batch: Vec<ConversationMessage> = indices
+        .iter()
+        .map(|&message_index| session.messages[message_index].clone())
+        .collect();
+    if needs_microcompact_heal(&batch) {
+        restore_microcompacted_bodies(&mut batch, session, &seqs);
+    }
+    let originals: Vec<(u32, ConversationMessage)> = seqs.into_iter().zip(batch).collect();
+    session.seal_originals_to_vault(&originals)
+}
+
 /// Read-only token estimate of what [`microcompact_session`] would free on
 /// `session` right now, without mutating anything. Exists so a caller can
 /// decide whether firing is even worth it *before* paying for it: a
@@ -1709,6 +2213,32 @@ pub fn microcompact_clearable_estimate(
 /// [`plan_microcompact_clears`] (never duplicated), so callers that gate on
 /// the estimate before calling this are guaranteed to get exactly the batch
 /// they were quoted.
+///
+/// The superseded-reminder pass rides along rather than leading: it only
+/// reclaims copies at or after [`mutation_frontier`], the earliest message the
+/// tool-result/image passes are already rewriting, because that index — not the
+/// number of blocks touched — is what a firing costs. The exception is a pass
+/// that clears no tool result and no image at all: with no frontier there is no
+/// free region to ride on, so the reminders lead and the whole transcript is in
+/// scope. See [`plan_superseded_reminders`] for the trade-off that leaves behind
+/// and for why that case is still worth running.
+///
+/// Not purely in-memory: every message whose tool-result body or standalone image
+/// this pass is about to destroy is first sealed to the session's Raw Vault by
+/// [`seal_microcompact_originals`]. Sealing is necessary but NOT sufficient for
+/// that part of the trim to be reversible: the seal only survives if the eviction
+/// path heals the message before re-sealing the same seq, which
+/// [`restore_microcompacted_bodies`] does for both kinds — by `tool_use_id` for a
+/// body, positionally-and-verified for an image. A message the pass touches only
+/// to clear a superseded reminder is deliberately NOT sealed, and that clear is
+/// therefore NOT reversible — see that function's SCOPE note, which states what
+/// the recall lineage gives up for it. That
+/// costs one append per firing (no-op for an unpersisted session or with
+/// `ZO_DISABLE_RAW_VAULT`), and it is what makes it safe for this pass to end by
+/// marking the transcript dirty — which publishes the cleared bodies to disk.
+/// A seal that FAILS to write returns `None` without touching the transcript:
+/// this pass never destroys a body whose original is unrecoverable, and the
+/// declined round is indistinguishable to callers from "nothing to clear".
 pub fn microcompact_session(
     session: &mut Session,
     keep_recent: usize,
@@ -1720,6 +2250,32 @@ pub fn microcompact_session(
         return None;
     }
     let estimated_tokens_saved = plan_estimated_tokens(session, &plan);
+
+    // Seal the pre-clear originals BEFORE the mutation below destroys them. This
+    // is the only moment the raw bodies are guaranteed to exist: the clear is
+    // persisted one turn later (`mark_transcript_dirty` at the end of this
+    // function), which is what used to leave full compaction with nothing but
+    // placeholders to seal. Deliberately placed after the empty-plan early
+    // return, so a no-op pass appends nothing and re-running the clear cannot
+    // double-seal.
+    //
+    // A FAILED append aborts the trim: the bodies below are irrecoverable once
+    // overwritten (the disk fallback reads a snapshot this pass is about to
+    // poison), so the only safe response to "the copy did not land" is to keep
+    // the original. This cannot wedge a session that needs to shrink — the trim
+    // is not the tier that has to succeed. `maybe_microcompact*` treats `None`
+    // as "did not trim" and the caller falls straight through to
+    // `maybe_auto_compact*` on the same iteration
+    // (`auto_compaction_config_if_preflight_ready` on iteration 1,
+    // `auto_compaction_config_if_ready` from iteration 2 and at the post-turn
+    // seam — neither predicate reads the trim's outcome, only token
+    // thresholds); full compaction's own seal is deliberately allowed to
+    // proceed through a write failure because it is the only tier that can
+    // shrink a transcript. And a transient failure costs one round, not the
+    // session: the plan is recomputed from scratch next request.
+    if !seal_microcompact_originals(session, &plan) {
+        return None;
+    }
 
     let messages = std::sync::Arc::make_mut(&mut session.messages);
     for &(message_index, block_index) in &plan.tool_results {

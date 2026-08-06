@@ -21,9 +21,27 @@
 //!
 //! What it replays is the production path itself — `convert_messages` followed
 //! by `mark_conversation_cache_breakpoints` — so the numbers describe the
-//! shipped behavior and not a model of it. The persisted transcript is a
-//! faithful source for this: microcompact clears bodies in memory but never
-//! persists that edit, so the file still holds what the live request carried.
+//! shipped LOWERING behavior and not a model of it.
+//!
+//! KNOW WHAT THIS CANNOT SEE. It loads ONE snapshot, freezes it into a single
+//! immutable `history`, and builds every simulated request as a prefix
+//! `history[..boundary]`. So `history[..b1]` is literally a prefix of
+//! `history[..b2]`, and the only thing that can make the measured divergence
+//! index fall inside the shared span is `convert_messages` itself being
+//! non-monotonic. What this harness measures is therefore LOWERING-PATH
+//! MONOTONICITY OVER A FIXED SNAPSHOT — a real and useful property, but it is
+//! structurally blind to in-place mutation of a message that has already been
+//! sent.
+//!
+//! That blindness matters because such mutation is real: `microcompact_session`
+//! rewrites old tool-result bodies to a placeholder in place, and it IS
+//! persisted (the pass ends with `mark_transcript_dirty`, forcing the next
+//! persist onto a full snapshot). A persisted transcript is consequently NOT a
+//! faithful record of what each live request carried — measured on real data,
+//! 54.7% of tool results in live session files are already the placeholder. A
+//! "100% pure append" result here is therefore not evidence that the live wire
+//! prefix was append-only. Detecting mid-prefix rewrites needs a CROSS-snapshot
+//! differ (consecutive `session-*.jsonl` / `*.rot-*.jsonl` siblings), not this.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

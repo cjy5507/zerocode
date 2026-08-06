@@ -810,7 +810,7 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
         }
     }
 
-    fn request_reaches_hard_context_ceiling(&self, context_tokens: u64) -> bool {
+    pub(super) fn request_reaches_hard_context_ceiling(&self, context_tokens: u64) -> bool {
         let window = self.context_window_for_guards();
         window > 0 && context_tokens > window.saturating_mul(95) / 100
     }
@@ -853,7 +853,10 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
         None
     }
 
-    fn auto_compaction_config_if_preflight_ready(&mut self) -> Option<CompactionConfig> {
+    // `pub(super)` for the same reason as `auto_compaction_config_if_ready`: the
+    // gate has to be assertable on its own, without `apply_auto_compaction`
+    // making a summarize round-trip inside the assertion.
+    pub(super) fn auto_compaction_config_if_preflight_ready(&mut self) -> Option<CompactionConfig> {
         let context_tokens = self.estimated_request_context_tokens();
         if self.auto_compaction_enabled {
             if self.request_reaches_hard_context_ceiling(context_tokens)
@@ -951,10 +954,9 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
     /// earliest cleared block onward, so the entire prefix up to that point is
     /// re-billed on the next request. Clearing a sliver of a huge context pays
     /// full re-prefill cost to save a fraction of it, so this only fires when
-    /// the clearable batch is itself a meaningful share of `context_tokens`,
-    /// unless the precompaction ceiling is close enough that skipping would
-    /// risk a provider rejection, in which case it fires regardless (see
-    /// [`Self::precompaction_input_tokens_threshold`]).
+    /// the clearable batch is itself a meaningful share of `context_tokens` —
+    /// or when nothing better than a bad trim is available at all, which is
+    /// what [`Self::microcompact_is_last_resort`] decides.
     pub(super) fn maybe_microcompact_for_tokens(
         &mut self,
         context_tokens: u64,
@@ -992,8 +994,7 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
             MICROCOMPACT_MIN_OUTPUT_BYTES,
         );
         let worth_it = clearable >= (context_tokens / 5).max(4_000);
-        let pressure_valve = context_tokens >= self.precompaction_input_tokens_threshold;
-        if !worth_it && !pressure_valve {
+        if !worth_it && !self.microcompact_is_last_resort(context_tokens) {
             // In the trim zone but the batch is not worth the cache
             // invalidation: this is not a firing, so it must not count toward
             // the thrash-promotion streak (the streak only tracks rounds that
@@ -1023,6 +1024,97 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
             );
         }
         event
+    }
+
+    /// Whether a batch that FAILED the break-even test must still be cleared
+    /// because nothing better than a bad trim can run.
+    ///
+    /// This is the narrowed successor of an unconditional "pressure valve" that
+    /// read `context_tokens >= self.precompaction_input_tokens_threshold` and
+    /// voided the economics test outright.
+    ///
+    /// WHY (the mechanism the measurement supports): a session in the band
+    /// `[precompaction, full_compaction)` — five points wide, 75% → 80% on the
+    /// Claude ladder — is a furnace on every iteration after the first. From
+    /// iteration 2 on, `streaming_turn` uses the post-turn gates: microcompact
+    /// runs against the trim floor while full compaction goes through
+    /// [`Self::auto_compaction_config_if_ready`] →
+    /// [`Self::auto_compaction_config_for_tokens`], which requires
+    /// `context_tokens >= auto_compaction_input_tokens_threshold` — the FULL tier.
+    /// So inside that band the trim fires and full compaction structurally cannot,
+    /// round after round, each firing paying a whole-prefix re-bill at
+    /// cache-write price to reclaim a sliver. The one exit is the thrash escape
+    /// (`consecutive_microcompacts >= MICROCOMPACT_THRASH_PROMOTION` AND
+    /// `has_repeated_tool_call() || has_cross_turn_repeated_tool_call()`), which
+    /// needs a re-read signal the band does not supply on its own. Sessions do
+    /// not pass through the
+    /// band, they sit pinned at its floor: measured over three days,
+    /// 27 of 57 cost-bearing pure-divergence cache-break rows sat at
+    /// `prev_cache_read` 740–750k, exactly the precompaction threshold then in
+    /// force, and 17 of those cleared LESS than the break-even bar — some ~0
+    /// while paying ~700k of cold writes. Those firings were only possible
+    /// through the valve.
+    ///
+    /// NOT the reason, though an earlier draft of this comment said so: "the trim
+    /// shrinks the estimate and cancels full compaction on the same iteration."
+    /// This repo's own adversarial verification refuted it, and the refutation is
+    /// structural. On iteration 1 the preflight order is microcompact then
+    /// auto-compact, but inside
+    /// [`Self::auto_compaction_config_if_preflight_ready`] the precompaction arm
+    /// is not reached first: [`Self::should_defer_preflight_compaction_for_state_distill`]
+    /// sits ahead of it and the state-distill tier (70%) is strictly below
+    /// precompaction (75%), so on the FIRST crossing that deferral is satisfied by
+    /// construction (its other two conjuncts — not having deferred yet, and a
+    /// distill being producible — both hold there), sets
+    /// `state_distill_deferred_precompaction`, and returns `None`. There is then
+    /// no summarize round for a shrunken estimate to cancel, and the trim is the
+    /// only relief the ladder left armed on that round. And when
+    /// full compaction DOES fire on the same iteration, it rewrites the session
+    /// at `streaming_turn` *before* `assemble_request`, so the trim's edit never
+    /// reaches the wire and costs zero cache tokens. The empirical side agrees:
+    /// full compaction rewrites the head into a summary, which shows as
+    /// `first_divergence_index <= 3`, and the expensive rows are 42 rows /
+    /// 21.78M `cache_creation` at index > 3 (mid-transcript, the microcompact
+    /// signature) against 15 rows / 5.27M at index <= 3.
+    ///
+    /// So the precompaction arm is gone: at that tier full compaction is the
+    /// better answer to the same pressure, and it is available — the ladder
+    /// invariant `microcompact < state_distill < precompaction < full_compaction`
+    /// holds by construction, and both compaction gates keep their own hard
+    /// ceiling and over-window emergency seams. The trade-off is that a session
+    /// sitting in the band on a mid-turn iteration now trims nothing until it
+    /// crosses the full tier, which is the point: that is the furnace above, and
+    /// waiting is cheaper than re-billing the prefix each round for a sliver.
+    ///
+    /// What is left is the request-would-be-rejected emergency:
+    /// [`Self::request_reaches_hard_context_ceiling`], 95% of the REAL context
+    /// window. At that point a bad trim beats a provider rejection, and it
+    /// cannot reproduce the defect above, because the full-compaction predicate
+    /// there is `context_tokens >= auto_compaction_input_tokens_threshold` — the
+    /// 80%-of-`min(window, 650k)` tier, which on a 1M model sits at 520k against
+    /// a 950k ceiling. A trim the break-even test rejected frees less than a
+    /// fifth of the context, nowhere near enough to drop 950k back under 520k,
+    /// so full compaction still fires on the same iteration.
+    ///
+    /// REJECTED ALTERNATIVE: also requiring `compaction_config_if_possible()`
+    /// to be `None` ("full compaction is impossible"). The conjunct buys
+    /// nothing at the ceiling and costs clarity elsewhere. When the hard
+    /// ceiling is reached, full compaction is the tier that must run, and the
+    /// compaction gates already route there on their own token predicates —
+    /// the valve's only job is to let a below-break-even trim shed a few
+    /// tokens while that happens, not to arbitrate which tier runs. The one
+    /// population the conjunct would newly admit is a session too small for
+    /// `prepare_compaction` (≤ 4 messages) whose plan is non-empty anyway —
+    /// reachable since the frontier change via a reminder-only plan — and a
+    /// whole-prefix rewrite to reclaim a few reminder copies on a session
+    /// that tiny is exactly the trade the break-even gate exists to refuse.
+    ///
+    /// (An earlier draft argued the conjunct was arithmetically unreachable
+    /// because a non-empty plan needed more than `keep_recent` tool results;
+    /// the reminder-only plan this same change introduced broke that
+    /// arithmetic, so the argument above no longer leans on it.)
+    fn microcompact_is_last_resort(&self, context_tokens: u64) -> bool {
+        self.request_reaches_hard_context_ceiling(context_tokens)
     }
 
     /// True when the P6a Anthropic server-side trim executor owns tool-result
