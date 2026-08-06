@@ -26,18 +26,44 @@ const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_
 /// measured its tiers against the model's full window.
 const AUTO_COMPACT_WINDOW_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 
-/// The window the compaction tiers are percentages of.
+/// Claude Code's own auto-compaction window on a large-context session — the
+/// number it exports for a 1M-context Opus run. It does NOT scale its tiers to
+/// the full window, and this is the value it picks instead.
+pub(super) const CLAUDE_CODE_AUTO_COMPACT_WINDOW_TOKENS: u64 = 650_000;
+
+/// The window the compaction tiers are percentages of: the model's own window,
+/// capped at [`CLAUDE_CODE_AUTO_COMPACT_WINDOW_TOKENS`].
 ///
-/// Normally the model's own window: the late-ceiling policy
-/// ([`AUTO_COMPACTION_CONTEXT_WINDOW_PERCENT`]) is a deliberate trade — a long
-/// unchanged prefix re-reads at cached rates, while every compaction invalidates
-/// that cache wholesale — and this must not quietly undo it.
+/// The cap is the whole point. The percentages
+/// ([`AUTO_COMPACTION_CONTEXT_WINDOW_PERCENT`] and the family ladders) were
+/// chosen for a 200k window, where 80% is 160k of steady-state context. Riding
+/// the same percentage up a 1M window means compacting at 800k and carrying a
+/// prefix that big on every request — and the trade that justified it ("the
+/// prompt cache absorbs a long prefix, since it re-reads at cached rates while
+/// every compaction invalidates the cache wholesale") does not survive contact
+/// with the numbers:
 ///
-/// [`AUTO_COMPACT_WINDOW_ENV_VAR`] overrides it outright, which is what makes
-/// this worth having: Claude Code sets that variable to 650000 for a 1M-context
-/// Opus session, i.e. it does not scale its tiers to the full window, and zo
-/// ignored the instruction. An operator who has measured their own sessions can
-/// now say so in the same terms.
+/// - Measured over one real day (2026-08-05, 3,872 requests): 1.109B cache-READ
+///   tokens against 97.6M cache-write, i.e. ~286k of cached prefix re-read on
+///   *every* request. At Anthropic's 0.1×/1.25× multipliers those two sides cost
+///   within 10% of each other — the cached prefix is not free, it is half the
+///   bill.
+/// - Keeping X extra tokens in context costs `0.1 · X` on each of the session's
+///   remaining requests. Shedding them costs one cold prefix, `1.25 · S` where
+///   S is the post-compaction size, once. On a session with hundreds of
+///   requests (these run 500–1,100 messages) the break-even is a handful of
+///   requests, not hundreds: compacting earlier wins by an order of magnitude.
+///
+/// So a 1M-window model now compacts against 650k — full compaction at 520k
+/// instead of 800k, microcompact at 416k instead of 640k — which is the number
+/// Claude Code itself uses. Windows at or below the cap (200k Claude, 258k GPT)
+/// are untouched: this only removes the part of the ladder that was extrapolated
+/// past where it was calibrated.
+///
+/// [`AUTO_COMPACT_WINDOW_ENV_VAR`] replaces the result outright, in either
+/// direction — `1000000` restores the uncapped behavior, a smaller value
+/// compacts sooner still — so an operator who has measured their own sessions
+/// keeps the last word.
 ///
 /// Whatever it returns, it only moves the *compaction* tiers. The provider-limit
 /// guards — the hard context ceiling and the per-request budget — stay on the
@@ -48,7 +74,7 @@ pub(super) fn auto_compaction_window(context_window: u64) -> u64 {
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|window| *window > 0)
-        .unwrap_or(context_window)
+        .unwrap_or_else(|| context_window.min(CLAUDE_CODE_AUTO_COMPACT_WINDOW_TOKENS))
 }
 
 /// Preserved-tail token budget as a share of the context window, and its
@@ -109,13 +135,17 @@ pub(super) fn compaction_model_override(context_model: Option<&str>) -> Option<S
 /// Trade-off, stated once here for all thresholds: a later ceiling means far
 /// fewer compaction rounds per session (each round costs a summary round-trip,
 /// a full prompt-cache re-prefill, and permanent loss of evicted detail), at
-/// the price of a longer steady-state prefix — which the prompt cache absorbs,
-/// since an unchanged long prefix re-reads at cached rates while every
-/// compaction invalidates that cache wholesale. Claude sits at 80% (slightly
-/// under CC's ~83.5%) to keep headroom for the earlier hygiene tiers plus the
-/// post-threshold turn in flight; other families keep the legacy 85%. An
-/// explicit `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS` env override or the
+/// the price of a longer steady-state prefix, which re-reads at cached rates
+/// while every compaction invalidates that cache wholesale. Claude sits at 80%
+/// (slightly under CC's ~83.5%) to keep headroom for the earlier hygiene tiers
+/// plus the post-threshold turn in flight; other families keep the legacy 85%.
+/// An explicit `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS` env override or the
 /// settings `autoCompactThresholdPercent` key replaces the family default.
+///
+/// These percentages are calibrated for a ~200k window and are NOT extrapolated
+/// past 650k: see [`auto_compaction_window`], which caps the window the
+/// percentages apply to, and the measurement showing that a cached prefix is
+/// about half the bill rather than something the cache absorbs for free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ContextPolicy {
     microcompact: u64,
@@ -690,6 +720,16 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
         if self.memory_retriever.is_some() {
             let reserve = crate::memory::recall::recall_section_reserve_tokens();
             lines.push(format!("    {:<15}{}", "Recall reserve", kilo(reserve)));
+        }
+        // Name the compaction window whenever it is not the model's, or the
+        // ladder reads as an unexplained "auto compact at 52%".
+        let compaction_window = auto_compaction_window(self.context_window);
+        if compaction_window < window {
+            lines.push(format!(
+                "  {:<17}{} tokens (tiers are a % of this, not the window)",
+                "Compaction window",
+                kilo(compaction_window)
+            ));
         }
         lines.push("  Ladder".to_string());
         for (tier, threshold) in [

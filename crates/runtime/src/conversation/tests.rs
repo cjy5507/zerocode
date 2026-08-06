@@ -2383,14 +2383,8 @@ fn claude_codes_auto_compact_window_overrides_the_model_window_for_the_tiers() {
         )
     };
 
-    // Unset: the model's own window, i.e. the deliberate late-ceiling policy is
-    // untouched. This variable adds a way to say otherwise; it does not change
-    // what zo does by default.
-    assert_eq!(opus().auto_compaction_input_tokens_threshold(), 800_000);
-
-    // Claude Code sets exactly this for a 1M-context Opus session — it does not
-    // scale its tiers to the full window — and zo ignored the instruction.
-    std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "650000");
+    // Unset: the tiers ride Claude Code's own 650k auto-compaction window, the
+    // value it exports for a 1M-context session. 80% of 650k, not of 1M.
     let capped = opus();
     assert_eq!(
         capped.context_window(),
@@ -2402,16 +2396,27 @@ fn claude_codes_auto_compact_window_overrides_the_model_window_for_the_tiers() {
     assert!(
         capped.precompaction_input_tokens_threshold()
             < u64::from(capped.auto_compaction_input_tokens_threshold()),
-        "the tier order must survive the override"
+        "the tier order must survive the cap"
     );
 
-    // Garbage and zero fall back to the model window rather than disabling
+    // Saying the same number explicitly changes nothing.
+    std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "650000");
+    assert_eq!(opus().auto_compaction_input_tokens_threshold(), 520_000);
+
+    // The escape hatch works in both directions: an operator who measured their
+    // own sessions can restore the uncapped ladder, or compact sooner still.
+    std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "1000000");
+    assert_eq!(opus().auto_compaction_input_tokens_threshold(), 800_000);
+    std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "200000");
+    assert_eq!(opus().auto_compaction_input_tokens_threshold(), 160_000);
+
+    // Garbage and zero fall back to the default cap rather than disabling
     // compaction outright.
     for bogus in ["0", "", "abc", "-5"] {
         std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW", bogus);
         assert_eq!(
             opus().auto_compaction_input_tokens_threshold(),
-            800_000,
+            520_000,
             "unusable value {bogus:?} must not change the tiers"
         );
     }
@@ -2433,7 +2438,8 @@ fn adopting_a_provider_ceiling_shrinks_every_threshold_and_never_grows_them() {
     let restore = std::env::var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS").ok();
     std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS");
 
-    // An Opus session: 1M declared window → 80% full-compaction threshold.
+    // An Opus session: 1M declared window → 80% of the capped 650k
+    // auto-compaction window.
     let mut runtime = ConversationRuntime::new_with_features(
         Session::new(),
         NoopApiClient,
@@ -2443,7 +2449,7 @@ fn adopting_a_provider_ceiling_shrinks_every_threshold_and_never_grows_them() {
         &RuntimeFeatureConfig::default().with_model("opus"),
     );
     assert_eq!(runtime.context_window(), 1_000_000);
-    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 800_000);
+    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 520_000);
 
     // The provider then rejects a 211k prompt with `> 200000 maximum`. Every
     // threshold was derived from a window five times the real ceiling, so
@@ -2490,7 +2496,7 @@ fn set_context_window_redrives_compaction_threshold_on_model_switch() {
     // this fixes (compaction firing at ~22% of Opus's real window).
     runtime.set_context_window(1_000_000);
     assert_eq!(runtime.context_window(), 1_000_000);
-    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 850_000);
+    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 552_500);
 
     // Switch back down to a smaller window: the threshold must shrink again so
     // an over-full request can't slip past the smaller backend limit.
@@ -2561,8 +2567,8 @@ fn precompaction_threshold_is_model_aware_and_distinct_from_full_threshold() {
     std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS");
 
     let opus = runtime_for_context_policy(Some("claude-opus-4-1"), 1_000_000);
-    assert_eq!(opus.precompaction_input_tokens_threshold(), 750_000);
-    assert_eq!(opus.auto_compaction_input_tokens_threshold(), 800_000);
+    assert_eq!(opus.precompaction_input_tokens_threshold(), 487_500);
+    assert_eq!(opus.auto_compaction_input_tokens_threshold(), 520_000);
 
     let gpt = runtime_for_context_policy(Some("gpt-5.5-fast"), 258_000);
     assert_eq!(gpt.precompaction_input_tokens_threshold(), 190_920);
@@ -2670,13 +2676,32 @@ fn claude_context_policy_compacts_late_like_claude_code() {
     std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS");
 
     // The old 45% "tool-use risk zone" ceiling was an unmeasured guess that
-    // wasted more than half of a 1M window; the contract is now a LATE ceiling
+    // wasted more than half of a 1M window; the contract is a LATE ceiling
     // (80%, slightly under Claude Code's ~83.5%) with the hygiene tiers riding
     // below it.
+    //
+    // On a 200k window that is exactly what ships — the percentages were
+    // calibrated here, and they are unchanged.
+    let runtime = runtime_for_context_policy(Some("claude-opus-4-1"), 200_000);
+    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 160_000);
+    assert_eq!(runtime.microcompact_input_tokens_threshold(), 128_000);
+    assert_eq!(runtime.state_distill_input_tokens_threshold(), 140_000);
+
+    // Past 650k the ladder is no longer extrapolated: the same percentages ride
+    // Claude Code's own auto-compact window instead of the model's, so a 1M
+    // session compacts at 520k rather than carrying an 800k prefix into every
+    // request. See `compaction::auto_compaction_window` for the measurement —
+    // ~286k of cached prefix re-read per request costs about what the writes do.
     let runtime = runtime_for_context_policy(Some("claude-opus-4-1[1m]"), 1_000_000);
-    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 800_000);
-    assert_eq!(runtime.microcompact_input_tokens_threshold(), 640_000);
-    assert_eq!(runtime.state_distill_input_tokens_threshold(), 700_000);
+    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 520_000);
+    assert_eq!(runtime.microcompact_input_tokens_threshold(), 416_000);
+    assert_eq!(runtime.state_distill_input_tokens_threshold(), 455_000);
+    assert_eq!(
+        runtime.context_window(),
+        1_000_000,
+        "the cap moves the compaction tiers only — the provider-limit guards \
+         still know the real window"
+    );
 
     match restore {
         Some(value) => std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", value),
@@ -2707,10 +2732,12 @@ fn gemini_context_policy_uses_midrange_microcompact_without_changing_full_compac
     let restore = std::env::var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS").ok();
     std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS");
 
+    // Percentages unchanged (85/60/62); the tiers ride the capped 650k
+    // auto-compaction window, same as every other family on a 1M model.
     let runtime = runtime_for_context_policy(Some("gemini-3.1-pro-preview"), 1_000_000);
-    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 850_000);
-    assert_eq!(runtime.microcompact_input_tokens_threshold(), 600_000);
-    assert_eq!(runtime.state_distill_input_tokens_threshold(), 620_000);
+    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 552_500);
+    assert_eq!(runtime.microcompact_input_tokens_threshold(), 390_000);
+    assert_eq!(runtime.state_distill_input_tokens_threshold(), 403_000);
 
     match restore {
         Some(value) => std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", value),
@@ -2743,8 +2770,8 @@ fn explicit_auto_compaction_env_override_only_replaces_full_threshold() {
 
     let runtime = runtime_for_context_policy(Some("claude-opus-4-1[1m]"), 1_000_000);
     assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 123_456);
-    assert_eq!(runtime.microcompact_input_tokens_threshold(), 640_000);
-    assert_eq!(runtime.state_distill_input_tokens_threshold(), 700_000);
+    assert_eq!(runtime.microcompact_input_tokens_threshold(), 416_000);
+    assert_eq!(runtime.state_distill_input_tokens_threshold(), 455_000);
 
     match restore {
         Some(value) => std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", value),
@@ -2779,10 +2806,10 @@ fn settings_percent_override_rescales_full_ceiling_and_hygiene_tiers() {
     // `autoCompactThresholdPercent: 60` replaces the Claude 80% default, and
     // the hygiene tiers ride the fixed 16/10/5-point ladder below it.
     let runtime = runtime_with_threshold_percent("claude-opus-4-1[1m]", 1_000_000, 60);
-    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 600_000);
-    assert_eq!(runtime.precompaction_input_tokens_threshold(), 550_000);
-    assert_eq!(runtime.state_distill_input_tokens_threshold(), 500_000);
-    assert_eq!(runtime.microcompact_input_tokens_threshold(), 440_000);
+    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 390_000);
+    assert_eq!(runtime.precompaction_input_tokens_threshold(), 357_500);
+    assert_eq!(runtime.state_distill_input_tokens_threshold(), 325_000);
+    assert_eq!(runtime.microcompact_input_tokens_threshold(), 286_000);
     assert_context_policy_order(&runtime);
 
     match restore {
@@ -2800,13 +2827,13 @@ fn settings_percent_override_clamps_to_valid_range() {
     // Below the floor → 20%; the tier ladder stays strictly ordered even at
     // the extreme (4/10/15/20).
     let low = runtime_with_threshold_percent("claude-opus-4-1[1m]", 1_000_000, 5);
-    assert_eq!(low.auto_compaction_input_tokens_threshold(), 200_000);
+    assert_eq!(low.auto_compaction_input_tokens_threshold(), 130_000);
     assert_context_policy_order(&low);
 
     // Above the cap → 95%, so the ceiling never collides with the 95% hard
     // context ceiling short-circuit.
     let high = runtime_with_threshold_percent("claude-opus-4-1[1m]", 1_000_000, 99);
-    assert_eq!(high.auto_compaction_input_tokens_threshold(), 950_000);
+    assert_eq!(high.auto_compaction_input_tokens_threshold(), 617_500);
     assert_context_policy_order(&high);
 
     match restore {
@@ -2828,7 +2855,7 @@ fn settings_percent_override_survives_model_switch() {
     // must be re-applied on the new window, not reverted to the 80% default.
     runtime.set_context_model("claude-opus-4-1[1m]");
     assert_eq!(runtime.context_window(), 1_000_000);
-    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 600_000);
+    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 390_000);
 
     match restore {
         Some(value) => std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", value),
@@ -2847,7 +2874,8 @@ fn env_absolute_override_beats_settings_percent() {
     // percent (the env var has always replaced just the full threshold).
     let runtime = runtime_with_threshold_percent("claude-opus-4-1[1m]", 1_000_000, 60);
     assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 123_456);
-    assert_eq!(runtime.microcompact_input_tokens_threshold(), 440_000);
+    // 44% (60 - 16) of the capped 650k window.
+    assert_eq!(runtime.microcompact_input_tokens_threshold(), 286_000);
 
     match restore {
         Some(value) => std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", value),
@@ -2870,8 +2898,8 @@ fn runtime_context_policy_tracks_feature_config_model() {
         &RuntimeFeatureConfig::default().with_model("claude-opus-4-1[1m]"),
     );
     assert_eq!(opus.context_window(), 1_000_000);
-    assert_eq!(opus.microcompact_input_tokens_threshold(), 640_000);
-    assert_eq!(opus.state_distill_input_tokens_threshold(), 700_000);
+    assert_eq!(opus.microcompact_input_tokens_threshold(), 416_000);
+    assert_eq!(opus.state_distill_input_tokens_threshold(), 455_000);
 
     let gpt = ConversationRuntime::new_with_features(
         Session::new(),
@@ -2903,18 +2931,18 @@ fn set_context_model_updates_policy_without_bare_window_inference() {
 
     runtime.set_context_window(1_000_000);
     assert_eq!(runtime.context_window(), 1_000_000);
-    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 850_000);
+    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 552_500);
     assert_eq!(
         runtime.microcompact_input_tokens_threshold(),
-        680_000,
+        442_000,
         "bare window switches must keep the existing GPT policy"
     );
 
     runtime.set_context_model("claude-opus-4-1[1m]");
     assert_eq!(runtime.context_window(), 1_000_000);
-    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 800_000);
-    assert_eq!(runtime.microcompact_input_tokens_threshold(), 640_000);
-    assert_eq!(runtime.state_distill_input_tokens_threshold(), 700_000);
+    assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 520_000);
+    assert_eq!(runtime.microcompact_input_tokens_threshold(), 416_000);
+    assert_eq!(runtime.state_distill_input_tokens_threshold(), 455_000);
 
     match restore {
         Some(value) => std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", value),
@@ -2948,8 +2976,8 @@ fn microcompact_threshold_is_separate_from_full_compaction_threshold() {
 
     let runtime = runtime_for_context_policy(Some("gemini-3.1-pro-preview"), 1_000_000);
     assert_eq!(runtime.auto_compaction_input_tokens_threshold(), 900_000);
-    assert_eq!(runtime.microcompact_input_tokens_threshold(), 600_000);
-    assert_eq!(runtime.state_distill_input_tokens_threshold(), 620_000);
+    assert_eq!(runtime.microcompact_input_tokens_threshold(), 390_000);
+    assert_eq!(runtime.state_distill_input_tokens_threshold(), 403_000);
     assert!(
         runtime.microcompact_input_tokens_threshold()
             < runtime.state_distill_input_tokens_threshold()
@@ -3141,6 +3169,10 @@ fn state_distill_prompt_count(runtime: &ConversationRuntime<NoopApiClient, Stati
 fn push_until_precompaction_threshold(
     runtime: &mut ConversationRuntime<NoopApiClient, StaticToolExecutor>,
 ) {
+    // Chunk size matters: the caller's contract is to land BETWEEN the
+    // precompaction and full-compaction thresholds, so one push must be small
+    // relative to the gap between them (~52k tokens on a capped 650k window).
+    // A 100k-token chunk used to sail straight past the full threshold.
     while runtime.estimated_request_context_tokens()
         < runtime.precompaction_input_tokens_threshold
     {
@@ -3149,7 +3181,7 @@ fn push_until_precompaction_threshold(
             .push_user_text(
                 "continue StateDistill in crates/runtime/src/conversation/compaction.rs \
                  and keep it below full compaction threshold "
-                    .repeat(4_000),
+                    .repeat(400),
             )
             .expect("message");
     }
@@ -13343,6 +13375,21 @@ fn context_breakdown_report_lists_window_split_ladder_and_headroom() {
     }
     assert!(report.contains("200.0k tokens"), "{report}");
     assert!(report.contains("· 1 messages"), "{report}");
+    // A 200k window is at or under the compaction cap, so there is no second
+    // window to explain and the line stays out of the way.
+    assert!(
+        !report.contains("Compaction window"),
+        "an uncapped session must not grow an extra line: {report}"
+    );
+
+    // A 1M session compacts against 650k, and the report says so — otherwise
+    // "Auto compact 520.0k (52%)" reads as a bug rather than as the policy.
+    let wide = runtime_for_context_policy(Some("claude-opus-4-1[1m]"), 1_000_000);
+    let wide_report = wide.context_breakdown_report();
+    assert!(
+        wide_report.contains("Compaction window") && wide_report.contains("650.0k tokens"),
+        "{wide_report}"
+    );
 
     // Disabled auto-compaction is stated instead of a fake headroom figure.
     runtime.set_auto_compaction_enabled(false);
