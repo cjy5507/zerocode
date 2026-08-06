@@ -605,7 +605,6 @@ where
         // the session to a lighter tier after one capacity dip.
         self.overload_demoted_this_turn = false;
         self.overload_demotion_model = None;
-
         if self
             .quota_dry_until
             .is_some_and(|until| std::time::Instant::now() >= until)
@@ -697,14 +696,15 @@ where
         error: &RuntimeError,
         fallback_permitted: impl FnOnce(::api::ProviderKind) -> bool,
     ) -> QuotaEscape {
-        // A deep-gate PLAN/VERIFY leg runs on a swapped deep client, so a hard
-        // `RateLimit` here belongs to that provider, not the main model's quota
-        // window. Never arm the main-turn quota fallback from it:
-        // that would poison `quota_fallback_active`/`quota_dry_until` and force
-        // every later main turn onto the fallback client. The verifier's own
-        // 429 failover is handled by the deep gate's ranked-candidate loop
-        // ([`verify_subturn`]), which never touches this state.
-        if self.deep_plan_leg_active || self.deep_verify_leg_active {
+        // A deep-gate PLAN/VERIFY/EXEC-implementer leg runs on a swapped deep
+        // client, so a hard `RateLimit` here belongs to that provider, not the
+        // main model's quota window. Never arm the main-turn quota fallback
+        // from one of these legs: that would poison
+        // `quota_fallback_active`/`quota_dry_until` and force later main turns
+        // onto a fallback chosen for the wrong provider. PLAN/VERIFY have
+        // their own candidate handling; EXEC transport failures return to the
+        // deep driver's bounded attempt loop.
+        if self.deep_plan_leg_active || self.deep_verify_leg_active || self.exec_impl_leg_active {
             return QuotaEscape::None;
         }
         if self.quota_fallback_active {

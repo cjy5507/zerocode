@@ -1967,6 +1967,64 @@ fn deep_verify_rate_limit_does_not_arm_the_main_turn_quota_fallback() {
 }
 
 #[test]
+fn deep_exec_implementer_rate_limit_does_not_arm_main_turn_quota_fallback() {
+    struct NeverCalledFallback;
+
+    impl AsyncApiClient for NeverCalledFallback {
+        fn stream_async<'a>(
+            &'a self,
+            _request: ApiRequest,
+            _render_tx: tokio::sync::mpsc::Sender<crate::message_stream::types::RenderBlock>,
+            _text_block_id: crate::message_stream::types::BlockId,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<AssistantEvent>, RuntimeError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { panic!("implementer 429 must not enter the main-turn fallback") })
+        }
+    }
+
+    let fallback = Arc::new(NeverCalledFallback);
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        StopApiClient,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    runtime.set_context_model("claude-opus-4-8");
+    runtime.set_exec_contract(Some(crate::conversation::ExecContract {
+        impl_client: Some(Arc::clone(&fallback) as Arc<dyn AsyncApiClient>),
+        impl_model: "gpt-5.6-sol".to_string(),
+        plan_first: false,
+    }));
+    runtime.set_quota_fallback_client(Some((
+        fallback as Arc<dyn AsyncApiClient>,
+        "gpt-5.6-sol".to_string(),
+    )));
+    runtime.exec_impl_leg_active = true;
+    let rate_limit = RuntimeError::with_provider_error_class(
+        "api failed after 6 attempts: api returned 429 Too Many Requests",
+        api::ProviderErrorClass::account_rate_limit(None),
+    );
+
+    assert!(matches!(
+        runtime.decide_quota_escape(&rate_limit),
+        QuotaEscape::None
+    ));
+    assert!(!runtime.quota_fallback_active);
+    assert!(runtime.quota_dry_until.is_none());
+    assert_eq!(runtime.effective_request_model(), Some("gpt-5.6-sol"));
+    assert_eq!(
+        runtime.rate_limit_model_for_active_stream(),
+        Some("gpt-5.6-sol")
+    );
+}
+
+#[test]
 fn main_quota_escape_waits_once_then_surfaces_when_fallback_gate_is_closed() {
     struct NeverCalledQuotaFallback;
 

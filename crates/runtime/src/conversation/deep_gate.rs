@@ -1028,6 +1028,22 @@ fn exec_retry_context(
     )
 }
 
+/// Convert only typed provider transport failures into a bounded deep EXEC
+/// retry contract. Authentication, context, permission, and tool-protocol
+/// failures need to surface rather than repeatedly replaying an unchanged
+/// request. The original typed error remains the terminal result at the
+/// attempt cap.
+fn exec_transport_retry_context(error: &StreamingTurnError) -> Option<String> {
+    let signature = match error.provider_error_class()? {
+        api::ProviderErrorClass::RateLimit { .. } => "provider_rate_limit",
+        api::ProviderErrorClass::Transient => "provider_transient",
+        _ => return None,
+    };
+    Some(format!(
+        "The previous EXEC attempt failed before it completed ({signature}). This is an infrastructure failure, not a verifier rejection. Retry the same task from the current working tree; preserve valid prior edits and do not claim completion without verifying the result."
+    ))
+}
+
 fn verification_outcome_note(
     scope: &str,
     decision: DeepDecision,
@@ -2353,6 +2369,7 @@ where
         let mut pending_images = Some(images);
         let mut extra: Option<String> = None;
         let mut exec_retry: Option<String> = None;
+        let mut exec_transport_escalated = false;
         let mut decision = DeepDecision::Accept;
         let mut attempts = 0u32;
         // The verifier's semantic verdict for goal-completion gating. `None`
@@ -2410,7 +2427,14 @@ where
                 )
                 .await;
             }
-            if let Some(note) = self.exec_leg_note(attempt) {
+            if exec_transport_escalated {
+                self.reserved_edit_gate = false;
+                if attempt == 2 {
+                    if let Some(note) = self.exec_transport_escalation_note() {
+                        deep_note(&render_tx, &ids, note).await;
+                    }
+                }
+            } else if let Some(note) = self.exec_leg_note(attempt) {
                 deep_note(&render_tx, &ids, note).await;
             }
             if self.exec_swap_enabled() && attempt > ARCHITECT_IMPL_ATTEMPTS {
@@ -2423,19 +2447,44 @@ where
             // the leg onto the implementer client — without one this is
             // byte-identical to the old direct sub-turn call.
             let base_mode = self.permission_policy.active_mode();
+            let exec_client = if exec_transport_escalated {
+                SubturnClient::Native
+            } else {
+                self.exec_leg_client(attempt)
+            };
+            let exec_was_implementer = exec_client == SubturnClient::Implementer;
             let exec_result = self
                 .deep_subturn(
                     prompt,
                     phase_images,
                     base_mode,
-                    self.exec_leg_client(attempt),
+                    exec_client,
                     DeepSubturnPhase::Exec,
                     &render_tx,
                     &prompter,
                 )
                 .await;
             self.set_effort_override(None);
-            let exec_result = exec_result?;
+            let exec_result = match exec_result {
+                Ok(result) => result,
+                Err(error) if attempt < max => {
+                    if let Some(retry_context) = exec_transport_retry_context(&error) {
+                        if exec_was_implementer {
+                            exec_transport_escalated = true;
+                        }
+                        exec_retry = Some(retry_context);
+                        deep_note(
+                            &render_tx,
+                            &ids,
+                            "auto: EXEC transport failure — retrying…",
+                        )
+                        .await;
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
             let verify_images = exec_result.verify_images;
             let summary = exec_result.summary;
             let edited = made_edits(&summary);
@@ -2722,6 +2771,20 @@ where
         } else {
             None
         }
+    }
+
+    /// Narration for a typed implementer transport failure that moves the next
+    /// EXEC attempt to the native model immediately, rather than spending a
+    /// second attempt against the same exhausted provider.
+    fn exec_transport_escalation_note(&self) -> Option<String> {
+        let contract = self.exec_contract.as_ref()?;
+        if !contract.exec_swap_enabled() {
+            return None;
+        }
+        let native = self.context_model.as_deref().unwrap_or("the main model");
+        Some(format!(
+            "architect: implementer transport failure — escalating implementation to {native}"
+        ))
     }
 
     /// One VERIFY sub-turn (read-only). When cross-model verifier candidates are
@@ -3072,6 +3135,7 @@ where
         // ── IMPLEMENT → check → VERIFY → decide, bounded retries. ──
         let mut extra: Option<String> = None;
         let mut exec_retry: Option<String> = None;
+        let mut exec_transport_escalated = false;
         let mut decision = DeepDecision::GiveUp;
         let mut attempts = 0u32;
         // Previous attempt's verifier issues, for the ALP §3 "no more progress"
@@ -3125,7 +3189,14 @@ where
             // after EXEC would key `baseline_files` in a different frame
             // than the snapshot they came from.
             let own_root = own_repo_root_async().await;
-            if let Some(note) = self.exec_leg_note(attempt) {
+            if exec_transport_escalated {
+                self.reserved_edit_gate = false;
+                if attempt == 2 {
+                    if let Some(note) = self.exec_transport_escalation_note() {
+                        deep_note(&render_tx, &ids, note).await;
+                    }
+                }
+            } else if let Some(note) = self.exec_leg_note(attempt) {
                 deep_note(&render_tx, &ids, note).await;
             }
             if self.exec_swap_enabled() && attempt > ARCHITECT_IMPL_ATTEMPTS {
@@ -3133,23 +3204,48 @@ where
                 // from here on, so the edit gate stands down for this turn.
                 self.reserved_edit_gate = false;
             }
+            let exec_client = if exec_transport_escalated {
+                SubturnClient::Native
+            } else {
+                self.exec_leg_client(attempt)
+            };
+            let exec_was_implementer = exec_client == SubturnClient::Implementer;
             let exec_result = self
                 .deep_subturn(
                     exec_prompt(&task, &plan_md, exec_retry.as_deref()),
                     Vec::new(),
                     base_mode,
-                    self.exec_leg_client(attempt),
+                    exec_client,
                     DeepSubturnPhase::Exec,
                     &render_tx,
                     &prompter,
                 )
                 .await;
             // Clear the escalation floor immediately after the (possibly
-            // escalated) EXEC sub-turn — before `?` and before VERIFY — so it
-            // never leaks into the read-only verify turn or a later turn on
+            // escalated) EXEC sub-turn — before retry handling and VERIFY — so
+            // it never leaks into the read-only verify turn or a later turn on
             // error. Idempotent when no escalation was set.
             self.set_effort_override(None);
-            let exec_result = exec_result?;
+            let exec_result = match exec_result {
+                Ok(result) => result,
+                Err(error) if attempt < max => {
+                    if let Some(retry_context) = exec_transport_retry_context(&error) {
+                        if exec_was_implementer {
+                            exec_transport_escalated = true;
+                        }
+                        exec_retry = Some(retry_context);
+                        deep_note(
+                            &render_tx,
+                            &ids,
+                            "deep: EXEC transport failure — retrying…",
+                        )
+                        .await;
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
             let verify_images = exec_result.verify_images;
             let summary = exec_result.summary;
             let edited_paths = edited_file_paths(&summary);
@@ -5531,6 +5627,220 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(attached, vec![image]);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deep_exec_retries_typed_transport_failure_into_next_attempt() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::conversation::{
+            ApiRequest, AssistantEvent, AsyncApiClient, RuntimeError, StaticToolExecutor,
+        };
+        use crate::message_stream::types::{BlockId, RenderBlock};
+        use crate::permission::{
+            PermissionDecision as AsyncPermissionDecision, PermissionError,
+            PermissionPrompter as AsyncPermissionPrompter,
+            PermissionRequest as AsyncPermissionRequest,
+        };
+        use crate::session::Session;
+
+        struct NoopApiClient;
+        impl ApiClient for NoopApiClient {
+            fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![AssistantEvent::MessageStop])
+            }
+        }
+
+        struct FailThenSuccess {
+            calls: Arc<AtomicUsize>,
+        }
+        impl AsyncApiClient for FailThenSuccess {
+            fn stream_async<'a>(
+                &'a self,
+                _request: ApiRequest,
+                _render_tx: mpsc::Sender<RenderBlock>,
+                _text_block_id: BlockId,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<AssistantEvent>, RuntimeError>> + Send + 'a>>
+            {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if call == 0 {
+                        return Err(RuntimeError::with_provider_error_class(
+                            "api failed after 6 attempts: api returned 429 Too Many Requests",
+                            api::ProviderErrorClass::account_rate_limit(None),
+                        ));
+                    }
+                    Ok(vec![
+                        AssistantEvent::TextDelta("recovered".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                })
+            }
+        }
+
+        struct AllowAsyncPrompter;
+        impl AsyncPermissionPrompter for AllowAsyncPrompter {
+            fn decide<'a>(
+                &'a self,
+                _request: AsyncPermissionRequest,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<AsyncPermissionDecision, PermissionError>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(AsyncPermissionDecision::Allow) })
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApiClient,
+            StaticToolExecutor::new(),
+            crate::PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .with_async_api_client(Arc::new(FailThenSuccess {
+            calls: Arc::clone(&calls),
+        }));
+        runtime.set_deep_gate(Some(DeepGateConfig {
+            mode: DeepMode::Reactive,
+            check_command: None,
+            max_attempts: 2,
+        }));
+
+        let (render_tx, mut render_rx) = mpsc::channel(64);
+        let _drain = tokio::spawn(async move { while render_rx.recv().await.is_some() {} });
+        let prompter: Arc<dyn AsyncPermissionPrompter> = Arc::new(AllowAsyncPrompter);
+        let (_summary, outcome) = runtime
+            .run_auto_turn_streaming("retry the task", Vec::new(), render_tx, prompter)
+            .await
+            .expect("typed transport failure should use the remaining EXEC attempt");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(outcome.attempts, 2);
+        assert_eq!(outcome.decision, DeepDecision::Accept);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn deep_exec_implementer_transport_failure_escalates_to_native() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::conversation::{
+            ApiRequest, AssistantEvent, AsyncApiClient, ExecContract, RuntimeError,
+            StaticToolExecutor,
+        };
+        use crate::message_stream::types::{BlockId, RenderBlock};
+        use crate::permission::{
+            PermissionDecision as AsyncPermissionDecision, PermissionError,
+            PermissionPrompter as AsyncPermissionPrompter,
+            PermissionRequest as AsyncPermissionRequest,
+        };
+        use crate::session::Session;
+
+        struct NoopApiClient;
+        impl ApiClient for NoopApiClient {
+            fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![AssistantEvent::MessageStop])
+            }
+        }
+
+        struct NativeSuccess {
+            calls: Arc<AtomicUsize>,
+        }
+        impl AsyncApiClient for NativeSuccess {
+            fn stream_async<'a>(
+                &'a self,
+                _request: ApiRequest,
+                _render_tx: mpsc::Sender<RenderBlock>,
+                _text_block_id: BlockId,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<AssistantEvent>, RuntimeError>> + Send + 'a>>
+            {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("native recovery".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                })
+            }
+        }
+
+        struct ImplementerRateLimited {
+            calls: Arc<AtomicUsize>,
+        }
+        impl AsyncApiClient for ImplementerRateLimited {
+            fn stream_async<'a>(
+                &'a self,
+                _request: ApiRequest,
+                _render_tx: mpsc::Sender<RenderBlock>,
+                _text_block_id: BlockId,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<AssistantEvent>, RuntimeError>> + Send + 'a>>
+            {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Err(RuntimeError::with_provider_error_class(
+                        "api failed after 6 attempts: api returned 429 Too Many Requests",
+                        api::ProviderErrorClass::account_rate_limit(None),
+                    ))
+                })
+            }
+        }
+
+        struct AllowAsyncPrompter;
+        impl AsyncPermissionPrompter for AllowAsyncPrompter {
+            fn decide<'a>(
+                &'a self,
+                _request: AsyncPermissionRequest,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<AsyncPermissionDecision, PermissionError>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(AsyncPermissionDecision::Allow) })
+            }
+        }
+
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        let implementer_calls = Arc::new(AtomicUsize::new(0));
+        let implementer: Arc<dyn AsyncApiClient> = Arc::new(ImplementerRateLimited {
+            calls: Arc::clone(&implementer_calls),
+        });
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApiClient,
+            StaticToolExecutor::new(),
+            crate::PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .with_async_api_client(Arc::new(NativeSuccess {
+            calls: Arc::clone(&native_calls),
+        }));
+        runtime.set_context_model("claude-opus-4-8");
+        runtime.set_exec_contract(Some(ExecContract {
+            impl_client: Some(implementer),
+            impl_model: "gpt-5.6-sol".to_string(),
+            plan_first: false,
+        }));
+        runtime.set_deep_gate(Some(DeepGateConfig {
+            mode: DeepMode::Reactive,
+            check_command: None,
+            max_attempts: 2,
+        }));
+
+        let (render_tx, mut render_rx) = mpsc::channel(64);
+        let _drain = tokio::spawn(async move { while render_rx.recv().await.is_some() {} });
+        let prompter: Arc<dyn AsyncPermissionPrompter> = Arc::new(AllowAsyncPrompter);
+        let (_summary, outcome) = runtime
+            .run_auto_turn_streaming("recover through the main model", Vec::new(), render_tx, prompter)
+            .await
+            .expect("native EXEC should recover an implementer transport failure");
+
+        assert_eq!(implementer_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(native_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.attempts, 2);
+        assert_eq!(outcome.decision, DeepDecision::Accept);
     }
 
     #[test]
