@@ -67,14 +67,35 @@ impl ProviderConnection {
         }
     }
 
-    fn connected_detail(self) -> &'static str {
+    /// What this account is connected *through*, for the manager's detail column.
+    ///
+    /// Claude names the rung that actually answered when one has
+    /// ([`api::latest_claude_auth_origin`], a free in-process read — the manager
+    /// must not fork `security` or run a refresh on the render thread). Listing
+    /// every possibility instead told the user nothing about which credential is
+    /// live, which is what made a stale one so hard to notice.
+    fn connected_detail(self) -> String {
         match self {
-            Self::Env { env_key } => env_key,
-            Self::Anthropic => {
-                "saved Anthropic OAuth, ANTHROPIC_API_KEY, or Claude Code session credentials"
-            }
-            Self::OpenAi => "OPENAI_API_KEY or saved ChatGPT OAuth",
-            Self::Google => "saved Gemini OAuth, GOOGLE_API_KEY, or Google ADC",
+            Self::Env { env_key } => env_key.to_string(),
+            Self::Anthropic => match claude_connection(
+                api::latest_claude_auth_origin(),
+                api::oauth_store::load_oauth_credentials()
+                    .ok()
+                    .flatten()
+                    .is_some(),
+                env_non_empty("ANTHROPIC_API_KEY") || env_non_empty("ANTHROPIC_AUTH_TOKEN"),
+            ) {
+                ClaudeConnection::Resolved(origin) => origin.to_string(),
+                ClaudeConnection::CredentialOnHand => {
+                    "saved Anthropic OAuth or ANTHROPIC_API_KEY".to_string()
+                }
+                ClaudeConnection::Missing => {
+                    "saved Anthropic OAuth, ANTHROPIC_API_KEY, or Claude Code session credentials"
+                        .to_string()
+                }
+            },
+            Self::OpenAi => "OPENAI_API_KEY or saved ChatGPT OAuth".to_string(),
+            Self::Google => "saved Gemini OAuth, GOOGLE_API_KEY, or Google ADC".to_string(),
         }
     }
 
@@ -778,7 +799,7 @@ pub(crate) fn account_rows() -> Vec<zo_cli::tui::modals::ProviderAccountRow> {
         .map(|provider| zo_cli::tui::modals::ProviderAccountRow {
             id: provider.aliases[0].to_string(),
             label: provider.label.to_string(),
-            detail: provider.connection.connected_detail().to_string(),
+            detail: provider.connection.connected_detail(),
             connected: provider.connection.is_connected(),
             disconnectable: provider.connection.is_disconnectable(),
         })
@@ -828,35 +849,22 @@ impl Provider {
     }
 }
 
-/// Report what Claude is actually authenticated with.
+/// The `/login` provider name for an alias that has an OAuth sign-in flow, or
+/// `None` for one that is configured with an environment key instead.
 ///
-/// This used to be a fixed string — "Claude: connected via OAuth" — printed
-/// without consulting anything, so it said "connected" on a machine with no
-/// Claude credential at all while every turn failed on auth. Every other
-/// provider goes through a real check, and so does this one now.
-///
-/// Nothing here forks `security` or refreshes a token: `/connect` is a glance at
-/// state on the render thread (see [`saved_oauth_providers`] for the same rule).
-/// [`api::latest_claude_auth_origin`] is a plain in-process read of the rung that
-/// most recently satisfied a resolution, which is exactly the fact worth
-/// reporting — including the keychain, without touching it.
-fn claude_connection_status() -> CommandOutput {
-    let saved = api::oauth_store::load_oauth_credentials()
-        .ok()
-        .flatten()
-        .is_some();
-    let env_key = env_non_empty("ANTHROPIC_API_KEY") || env_non_empty("ANTHROPIC_AUTH_TOKEN");
-    match claude_connection(api::latest_claude_auth_origin(), saved, env_key) {
-        ClaudeConnection::Resolved(origin) => CommandOutput::info(format!(
-            "Claude: ✓ connected via {origin}\nUse /login claude to re-authenticate, /providers to manage accounts."
-        )),
-        ClaudeConnection::CredentialOnHand => CommandOutput::info(
-            "Claude: credential available (saved OAuth or environment key); not exercised yet this session.\nUse /login claude to re-authenticate.",
-        ),
-        ClaudeConnection::Missing => CommandOutput::warn(
-            "Claude: ✗ not connected\n\nRun `/login claude` for Anthropic OAuth, or set:\n  export ANTHROPIC_API_KEY=your-key-here",
-        ),
-    }
+/// Single source of truth for "is this connected by signing in?", so `/connect`
+/// and the pickers cannot disagree about which providers have a browser flow.
+fn oauth_login_provider(lower: &str) -> Option<&'static str> {
+    PROVIDERS
+        .iter()
+        .find(|provider| provider.matches(lower))
+        .and_then(|provider| match provider.connection {
+            ProviderConnection::Anthropic => Some("claude"),
+            ProviderConnection::OpenAi => Some("openai"),
+            ProviderConnection::Google => Some("google"),
+            // xAI is an API key in the environment; there is nothing to sign into.
+            ProviderConnection::Env { .. } => None,
+        })
 }
 
 /// What can honestly be said about Claude's connection.
@@ -896,15 +904,20 @@ fn claude_connection(
 }
 
 pub(super) fn connect(ctx: &mut DispatchCtx<'_>, provider: Option<&str>) -> CommandOutput {
-    // `/connect`, `/login`, `/logout` and `/providers` all answer one question,
-    // so with no argument they all open the one manager. The argument forms are
-    // unchanged, which is what keeps `/connect deepseek` in muscle memory.
+    // What this verb can register — cloud presets, local servers, the custom
+    // endpoint wizard. It used to open the manager, identically to `/login`,
+    // `/logout` and `/providers`, so the verb the user typed predicted nothing.
     let Some(prov) = provider else {
-        return super::providers::providers(ctx);
+        open_provider_picker(ctx.app, PickerScope::Register);
+        return CommandOutput::Quiet;
     };
     let lower = prov.to_ascii_lowercase();
-    if matches!(lower.as_str(), "claude" | "anthropic") {
-        return claude_connection_status();
+    // An OAuth account is connected by signing in, so do that instead of
+    // reporting on it. `/connect claude` used to answer with a status line (and
+    // before that, a fixed "connected" string) — a verb that promised to connect
+    // and then refused, for exactly the providers people most want connected.
+    if oauth_login_provider(&lower).is_some() {
+        return login(ctx, Some(prov));
     }
     if matches!(lower.as_str(), "custom" | "openai-compatible" | "openai-compatible-custom") {
         ctx.app.open_custom_provider_modal();
@@ -947,7 +960,7 @@ pub(super) fn connect(ctx: &mut DispatchCtx<'_>, provider: Option<&str>) -> Comm
 /// the modal (`<command>:<provider>` → `/<command> <provider>`), so `/login`
 /// starts OAuth while `/connect` runs its preset/status path.
 pub(crate) fn open_add_provider_picker(app: &mut zo_cli::tui::App) {
-    open_provider_modal_on(app, "connect");
+    open_provider_picker(app, PickerScope::Everything);
 }
 
 /// Which providers have a credential saved in zo's own store.
@@ -991,35 +1004,74 @@ fn sign_in_row_ids() -> Vec<String> {
         .collect()
 }
 
-fn open_provider_modal_on(app: &mut zo_cli::tui::App, command: &str) {
+/// Which rows a provider picker offers.
+///
+/// The bare `/login`, `/connect`, `/logout` and `/providers` forms used to be four
+/// names for one screen — the manager — so three of them were pure duplicates and
+/// the verb the user typed said nothing about what came next. Each verb now opens
+/// only what it can actually do; the manager stays the one place that shows
+/// everything at once ([`Scope::Everything`], reached by `/providers` → Add).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerScope {
+    /// OAuth accounts zo can sign into.
+    SignIn,
+    /// Providers zo can register: cloud presets, local servers, custom endpoints.
+    Register,
+    /// Accounts zo holds credentials for and can therefore clear.
+    Disconnect,
+    /// Sign-in plus registration, for the manager's "add" affordance.
+    Everything,
+}
+
+fn open_provider_picker(app: &mut zo_cli::tui::App, scope: PickerScope) {
+    let (ids, rows) = picker_rows(scope).into_iter().unzip();
+    app.open_login_modal_rows(picker_title(scope), rows, ids);
+}
+
+fn picker_title(scope: PickerScope) -> &'static str {
+    match scope {
+        PickerScope::SignIn => "Log in — select account",
+        PickerScope::Register => "Connect — add a provider",
+        PickerScope::Disconnect => "Log out — select account",
+        PickerScope::Everything => "Add — sign in or register a provider",
+    }
+}
+
+/// The picker's rows paired with the ids that route them, built together so the
+/// two can never drift out of step (an id at the wrong index dispatches the wrong
+/// provider, and nothing about the visible list would look wrong).
+fn picker_rows(scope: PickerScope) -> Vec<(String, zo_cli::tui::modals::ChoiceRow)> {
     use zo_cli::tui::modals::{ChoiceBadge, ChoiceRow};
 
     const SIGN_IN: &str = "Sign in";
     const API_KEY: &str = "API key";
     const ON_MACHINE: &str = "On this machine";
+    const ACCOUNTS: &str = "Accounts";
 
-    let saved = saved_oauth_providers();
-    let mut rows: Vec<ChoiceRow> = [
-        ("Claude", "Anthropic OAuth"),
-        ("ChatGPT", "OpenAI subscription"),
-        ("Gemini", "Google OAuth"),
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(index, (label, description))| {
-        let row = ChoiceRow::new(label).describe(description).in_group(SIGN_IN);
-        if saved[index] {
-            row.with_badge(ChoiceBadge::Saved)
-        } else {
-            row
+    let mut rows: Vec<ChoiceRow> = Vec::new();
+    let mut ids: Vec<String> = Vec::new();
+
+    if matches!(scope, PickerScope::SignIn | PickerScope::Everything) {
+        let saved = saved_oauth_providers();
+        for (index, (label, description)) in [
+            ("Claude", "Anthropic OAuth"),
+            ("ChatGPT", "OpenAI subscription"),
+            ("Gemini", "Google OAuth"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let row = ChoiceRow::new(label).describe(description).in_group(SIGN_IN);
+            rows.push(if saved[index] {
+                row.with_badge(ChoiceBadge::Saved)
+            } else {
+                row
+            });
         }
-    })
-    .collect();
-    let mut ids: Vec<String> = sign_in_row_ids();
-    // `/connect` also sets up OpenAI-compatible local/cloud providers; list them
-    // so they are discoverable without typing the alias. Each re-dispatches as
-    // `/connect <id>` through the same selection path.
-    if command == "connect" {
+        ids.extend(sign_in_row_ids());
+    }
+
+    if matches!(scope, PickerScope::Register | PickerScope::Everything) {
         for (id, label, description) in [
             ("nvidia", "NVIDIA", "NIM free endpoint"),
             ("openrouter", "OpenRouter", "OpenAI-compatible router"),
@@ -1054,12 +1106,32 @@ fn open_provider_modal_on(app: &mut zo_cli::tui::App, command: &str) {
             );
         }
     }
-    let title = if command == "connect" {
-        "Connect — select provider"
-    } else {
-        "Log in — select provider"
-    };
-    app.open_login_modal_rows(title, rows, ids);
+
+    if scope == PickerScope::Disconnect {
+        // Only accounts zo can actually clear. A shell export or a `gcloud` ADC
+        // login is not zo's to remove, so listing it would offer an action that
+        // cannot happen.
+        for provider in PROVIDERS
+            .iter()
+            .filter(|provider| provider.connection.is_disconnectable())
+        {
+            ids.push(format!("logout:{}", provider.aliases[0]));
+            rows.push(
+                ChoiceRow::new(provider.label)
+                    .describe(provider.connection.connected_detail())
+                    .in_group(ACCOUNTS),
+            );
+        }
+        ids.push("logout:all".to_string());
+        rows.push(
+            ChoiceRow::new("All accounts")
+                .describe("clear every saved OAuth credential")
+                .in_group(ACCOUNTS),
+        );
+    }
+
+    debug_assert_eq!(ids.len(), rows.len(), "every row must carry its own id");
+    ids.into_iter().zip(rows).collect()
 }
 
 /// Hand the provider's OAuth sign-in to the host loop and return immediately.
@@ -1073,7 +1145,10 @@ fn open_provider_modal_on(app: &mut zo_cli::tui::App, command: &str) {
 /// runs the flow off-thread, and reports the outcome when it lands.
 pub(super) fn login(ctx: &mut DispatchCtx<'_>, provider: Option<&str>) -> CommandOutput {
     let Some(prov) = provider else {
-        return super::providers::providers(ctx);
+        // The accounts this verb can sign into — not the whole manager, which
+        // `/providers` owns.
+        open_provider_picker(ctx.app, PickerScope::SignIn);
+        return CommandOutput::Quiet;
     };
     ctx.app.request_oauth_login(prov.to_string());
     // Drop the "return to the manager afterwards" flag rather than honoring it.
@@ -1126,10 +1201,25 @@ fn reopen_manager_if_requested(
 /// has to be asked for by name.
 pub(super) fn logout(ctx: &mut DispatchCtx<'_>, scope: Option<&str>) -> CommandOutput {
     match scope.map(str::trim).filter(|scope| !scope.is_empty()) {
-        None => super::providers::providers(ctx),
+        // The accounts this verb can clear. Previously the whole manager, which
+        // meant `/logout` and `/login` opened the same screen.
+        None => {
+            open_provider_picker(ctx.app, PickerScope::Disconnect);
+            CommandOutput::Quiet
+        }
         Some(scope) if scope.eq_ignore_ascii_case("all") => logout_all(),
+        // Named account. This is what the picker's rows re-dispatch as, and it
+        // was previously an error — per-account disconnect existed only as a
+        // keystroke inside the manager.
+        Some(name) if PROVIDERS.iter().any(|provider| provider.matches(name)) => {
+            match disconnect_account(name).report {
+                ConnectReport::Info(message) => CommandOutput::info(message),
+                ConnectReport::Warn(message) => CommandOutput::warn(message),
+                ConnectReport::Error(message) => CommandOutput::error(message),
+            }
+        }
         Some(other) => CommandOutput::error(format!(
-            "Unknown /logout argument: {other}\n  /logout        open the provider manager and disconnect one account\n  /logout all    clear every saved OAuth credential"
+            "Unknown /logout argument: {other}\n  /logout            pick an account to disconnect\n  /logout <account>  claude, openai, google, xai\n  /logout all        clear every saved OAuth credential"
         )),
     }
 }
@@ -1151,11 +1241,68 @@ fn logout_all() -> CommandOutput {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeConnection, ConnectReport, CustomProviderRequest, ProviderTokenLimits,
+        ClaudeConnection, ConnectReport, CustomProviderRequest, PickerScope, ProviderTokenLimits,
         SmokeTestResult, claude_connection, connect_custom_provider, connect_preset,
-        provider_name_from_url, saved_oauth_providers, sign_in_row_ids,
-        smoke_test_custom_provider, write_user_provider_with_options,
+        oauth_login_provider, picker_rows, provider_name_from_url, saved_oauth_providers,
+        sign_in_row_ids, smoke_test_custom_provider, write_user_provider_with_options,
     };
+
+    fn ids(scope: PickerScope) -> Vec<String> {
+        picker_rows(scope).into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// `/login`, `/connect`, `/logout` and `/providers` used to be four names for
+    /// one screen — the manager — so three of them were pure duplicates and the
+    /// verb the user typed predicted nothing about what came next. Each bare verb
+    /// must now offer only what it can actually do.
+    #[test]
+    fn each_verb_offers_only_the_rows_it_can_act_on() {
+        let sign_in = ids(PickerScope::SignIn);
+        assert_eq!(sign_in, ["login:claude", "login:openai", "login:google"]);
+
+        let register = ids(PickerScope::Register);
+        assert!(
+            register.iter().all(|id| !id.starts_with("login:")),
+            "registering a provider is not signing in: {register:?}"
+        );
+        assert!(register.iter().any(|id| id == "connect-key:deepseek"));
+        assert!(register.iter().any(|id| id == "connect:ollama"));
+        assert!(register.iter().any(|id| id == "connect-custom:openai-compatible"));
+
+        let disconnect = ids(PickerScope::Disconnect);
+        assert!(
+            disconnect.iter().all(|id| id.starts_with("logout:")),
+            "the log-out picker must only offer log-outs: {disconnect:?}"
+        );
+        assert_eq!(
+            disconnect.last().map(String::as_str),
+            Some("logout:all"),
+            "clearing everything stays available, at the bottom"
+        );
+
+        // The manager's "add" affordance is the one place that still shows both.
+        let everything = ids(PickerScope::Everything);
+        assert!(everything.iter().any(|id| id.starts_with("login:")));
+        assert!(everything.iter().any(|id| id.starts_with("connect-key:")));
+    }
+
+    /// `/connect <oauth account>` answered with a status line — a verb that
+    /// promised to connect and then refused, for exactly the providers people
+    /// most want connected. It now hands off to the sign-in flow, and this is the
+    /// single predicate both `/connect` and the pickers read.
+    #[test]
+    fn oauth_accounts_are_connected_by_signing_in() {
+        assert_eq!(oauth_login_provider("claude"), Some("claude"));
+        assert_eq!(oauth_login_provider("anthropic"), Some("claude"));
+        assert_eq!(oauth_login_provider("gpt"), Some("openai"));
+        assert_eq!(oauth_login_provider("gemini"), Some("google"));
+        assert_eq!(
+            oauth_login_provider("xai"),
+            None,
+            "an environment API key has no browser flow to hand off to"
+        );
+        assert_eq!(oauth_login_provider("deepseek"), None);
+    }
 
     /// `/connect claude` used to print "connected via OAuth" without consulting
     /// anything, so it said connected on a machine holding no Claude credential
@@ -1184,10 +1331,11 @@ mod tests {
         );
     }
 
-    /// The "Sign in" rows must reach `/login` from the `/connect` picker too.
-    /// `connect` has no OAuth branch — `claude` returns a fixed string and
-    /// `openai`/`google` fall through to a status read — so a `connect:` id
-    /// here means selecting an account never opens a browser.
+    /// The "Sign in" rows must reach `/login`, including from the manager's
+    /// combined picker. A `connect:` id here would mean selecting an account
+    /// never opens a browser — and while `/connect <account>` now hands off to
+    /// the sign-in flow, routing through it rather than to it keeps one owner for
+    /// the OAuth path.
     #[test]
     fn sign_in_rows_route_to_the_login_handler() {
         assert_eq!(

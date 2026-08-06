@@ -332,7 +332,7 @@ pub(super) const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "login",
         aliases: &[],
-        summary: "OAuth login for one provider; bare /login opens the manager",
+        summary: "Sign in to an account (claude, openai, google); bare /login picks one",
         argument_hint: Some("[provider]"),
         resume_supported: false,
         category: CommandCategory::Session,
@@ -340,8 +340,8 @@ pub(super) const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "logout",
         aliases: &[],
-        summary: "Disconnect one account from the manager; /logout all clears every saved OAuth",
-        argument_hint: Some("[all]"),
+        summary: "Disconnect an account; bare /logout picks one, /logout all clears every saved OAuth",
+        argument_hint: Some("[account|all]"),
         resume_supported: false,
         category: CommandCategory::Session,
     },
@@ -542,7 +542,7 @@ pub(super) const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "connect",
         aliases: &[],
-        summary: "Add a provider (deepseek, kimi, qwen, ollama, or a URL); bare /connect opens the manager",
+        summary: "Register a provider (deepseek, kimi, qwen, ollama, or a URL); bare /connect picks one",
         argument_hint: Some("[provider]"),
         resume_supported: false,
         category: CommandCategory::Session,
@@ -550,7 +550,7 @@ pub(super) const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "providers",
         aliases: &[],
-        summary: "Connections and registered providers in one place (connect, add, edit, delete)",
+        summary: "Every account and registered provider in one screen (add, edit, delete, disconnect)",
         argument_hint: None,
         resume_supported: false,
         category: CommandCategory::Session,
