@@ -336,11 +336,28 @@ fn is_deferred_tool(name: &str) -> bool {
 /// source as [`is_deferred_tool`]) so the manifest can never drift from what
 /// is actually off the wire. ~1 line per family; the whole point of deferral
 /// is that this costs a fraction of the schemas it replaces.
+/// One-line capability hooks for deferred tools whose NAME alone under-sells
+/// a distinctive capability — without the hook the model has no reason to
+/// ever load them, and the feature ships as a gate with no door. Kept tiny
+/// deliberately: every entry costs prompt tokens on every turn.
+const DEFERRED_TOOL_HOOKS: &[(&str, &str)] = &[(
+    "REPL",
+    "session-persistent Python kernel; variables survive across calls and compaction",
+)];
+
 #[must_use]
 pub fn deferred_tool_manifest_section() -> String {
     let names = deferred_tool_names()
         .iter()
-        .copied()
+        .map(|name| {
+            DEFERRED_TOOL_HOOKS
+                .iter()
+                .find(|(hooked, _)| hooked == name)
+                .map_or_else(
+                    || (*name).to_string(),
+                    |(_, hook)| format!("{name} ({hook})"),
+                )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -1171,7 +1188,10 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::{deferred_tool_manifest_section, deferred_tool_names, GlobalToolRegistry};
+    use super::{
+        deferred_tool_manifest_section, deferred_tool_names, GlobalToolRegistry,
+        DEFERRED_TOOL_HOOKS,
+    };
     use crate::ToolPolicyDecision;
     use plugins::{PluginTool, PluginToolDefinition, PluginToolPermission};
     use runtime::{permission_enforcer::PermissionEnforcer, PermissionMode, PermissionPolicy};
@@ -1295,6 +1315,21 @@ mod tests {
             assert!(
                 registered.contains(name),
                 "deferred name {name} does not match any registered tool spec"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_manifest_carries_capability_hooks() {
+        let section = deferred_tool_manifest_section();
+        for (name, hook) in DEFERRED_TOOL_HOOKS {
+            assert!(
+                deferred_tool_names().contains(name),
+                "hooked tool {name} must actually be deferred"
+            );
+            assert!(
+                section.contains(&format!("{name} ({hook})")),
+                "manifest must sell {name}'s capability: {section}"
             );
         }
     }
