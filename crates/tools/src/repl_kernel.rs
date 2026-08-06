@@ -52,6 +52,12 @@ const MAX_STREAM_BYTES: usize = 200_000;
 /// milliseconds; seconds mean a broken install and should fail loudly.
 const SPAWN_PROBE_TIMEOUT: Duration = Duration::from_millis(10_000);
 
+/// Most kernels one zo process keeps alive at once. Sessions are serial in
+/// practice, but `/clear` mints a new session id while the old session's
+/// kernel would otherwise idle forever — beyond this bound the
+/// longest-idle kernel is killed when a new one is admitted.
+const MAX_KERNELS: usize = 8;
+
 /// Stdlib-only bootstrap. Executes each request in a single shared namespace
 /// and evaluates a trailing expression like a REPL. `__name__` is set so
 /// `if __name__ == "__main__"` blocks behave as in a script.
@@ -109,6 +115,8 @@ struct KernelHandle {
     /// frame from a timed-out call can never satisfy a later call.
     next_request: u64,
     started: Instant,
+    /// Last successful exec — the LRU axis for [`MAX_KERNELS`] eviction.
+    last_used: Instant,
 }
 
 /// Result of one persistent execution, shaped by the caller into the tool's
@@ -200,6 +208,7 @@ pub(crate) fn execute_persistent_python(
             if let Some(existing) = map.get(scope) {
                 (Arc::clone(existing), false)
             } else {
+                evict_longest_idle_if_full(&mut map);
                 let handle = spawn_kernel(program, cwd)?;
                 let handle = Arc::new(Mutex::new(handle));
                 map.insert(scope.to_string(), Arc::clone(&handle));
@@ -213,6 +222,7 @@ pub(crate) fn execute_persistent_python(
         let started = Instant::now();
         match exec_on_kernel(&mut guard, code, timeout) {
             Ok(frame) => {
+                guard.last_used = Instant::now();
                 return Ok(KernelExecOutput {
                     ok: frame.ok,
                     value: frame.value,
@@ -262,6 +272,40 @@ pub(crate) fn remove_kernel(scope: &str) {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = guard.child.kill();
         let _ = guard.child.wait();
+    }
+}
+
+/// Kill and unregister the longest-idle kernel when the registry is at
+/// [`MAX_KERNELS`]. Only idle kernels are candidates: a kernel whose mutex is
+/// held is mid-exec, and `try_lock` skipping it is what keeps eviction from
+/// ever tearing down live work. All-busy at the cap leaves the cap soft — one
+/// extra kernel beats blocking a session behind another session's cell.
+fn evict_longest_idle_if_full(map: &mut HashMap<String, Arc<Mutex<KernelHandle>>>) {
+    if map.len() < MAX_KERNELS {
+        return;
+    }
+    let victim = map
+        .iter()
+        .filter_map(|(scope, handle)| {
+            let guard = handle.try_lock().ok()?;
+            Some((scope.clone(), guard.last_used))
+        })
+        .min_by_key(|(_, last_used)| *last_used)
+        .map(|(scope, _)| scope);
+    if let Some(scope) = victim {
+        if let Some(handle) = map.remove(&scope) {
+            // try_lock only: a blocking lock here would hold the REGISTRY
+            // mutex while waiting out another call's exec (up to its full
+            // timeout), stalling every session's kernel ops. If a racer
+            // grabbed the kernel between the probe above and now (it cloned
+            // the Arc before we took the map lock), the kernel is merely left
+            // unregistered — it idles until zo exits and its stdin EOFs, a
+            // bounded leak instead of a global stall.
+            if let Ok(mut guard) = handle.try_lock() {
+                let _ = guard.child.kill();
+                let _ = guard.child.wait();
+            }
+        }
     }
 }
 
@@ -331,6 +375,7 @@ fn spawn_kernel(program: &str, cwd: Option<&std::path::Path>) -> Result<KernelHa
         frames,
         next_request: 0,
         started: Instant::now(),
+        last_used: Instant::now(),
     };
     // Readiness probe: a no-op cell proves the interpreter parsed the
     // bootstrap and is serving frames, so a broken install fails here with a
@@ -531,6 +576,48 @@ mod tests {
         assert_eq!(other.value.as_deref(), Some("False"));
         remove_kernel(&left);
         remove_kernel(&right);
+    }
+
+    /// Hermetic eviction test on a LOCAL map: filling the global registry to
+    /// its cap from a test would evict other parallel tests' kernels and make
+    /// the suite flaky.
+    #[test]
+    fn eviction_kills_the_longest_idle_kernel_and_skips_busy_ones() {
+        let mut map: HashMap<String, Arc<Mutex<KernelHandle>>> = HashMap::new();
+        for i in 0..MAX_KERNELS {
+            let mut handle = spawn_kernel(python(), None).expect("spawn");
+            // Deterministic idleness ranking without sleeping: older index =
+            // longer idle.
+            handle.last_used = Instant::now()
+                .checked_sub(Duration::from_secs((MAX_KERNELS - i) as u64))
+                .expect("process uptime exceeds a few seconds");
+            map.insert(format!("k{i}"), Arc::new(Mutex::new(handle)));
+        }
+
+        evict_longest_idle_if_full(&mut map);
+        assert_eq!(map.len(), MAX_KERNELS - 1);
+        assert!(!map.contains_key("k0"), "longest-idle kernel must be evicted");
+
+        // A busy kernel (mutex held) is never the victim even when longest idle.
+        let busy = Arc::clone(map.get("k1").expect("k1 present"));
+        let busy_guard = busy.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Refill to the cap so eviction triggers again.
+        let mut extra = spawn_kernel(python(), None).expect("spawn extra");
+        extra.last_used = Instant::now();
+        map.insert("fresh".into(), Arc::new(Mutex::new(extra)));
+        evict_longest_idle_if_full(&mut map);
+        assert!(
+            map.contains_key("k1"),
+            "a mid-exec kernel must be skipped by eviction"
+        );
+        drop(busy_guard);
+
+        for (_, handle) in map.drain() {
+            if let Ok(mut guard) = handle.try_lock() {
+                let _ = guard.child.kill();
+                let _ = guard.child.wait();
+            }
+        }
     }
 
     #[test]
