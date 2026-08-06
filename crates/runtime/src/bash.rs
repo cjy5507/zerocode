@@ -158,10 +158,10 @@ pub fn timeout_stderr(effective_timeout_ms: u64) -> String {
 /// property of the tool but of the caller's wiring. Only
 /// [`execute_bash_with_tasks`] **with a registry in scope** turns a background
 /// run into a real task whose log `TaskOutput` can read. Without one — plain
-/// [`execute_bash`], and the `PowerShell` runner in the `tools` crate — the
-/// background branch detaches with both streams on `Stdio::null()` and hands
-/// back a bare OS pid, so promising a pollable task there would name a route
-/// that does not exist.
+/// [`execute_bash`] — the background branch detaches with both streams on
+/// `Stdio::null()` and hands back a bare OS pid, so promising a pollable task
+/// there would name a route that does not exist. Tool-dispatched Bash and
+/// `PowerShell` calls both provide a registry and may truthfully advertise it.
 #[must_use]
 pub fn timeout_stderr_with_background_advice(
     effective_timeout_ms: u64,
@@ -409,6 +409,25 @@ fn spawn_background_task_watcher(
     });
 }
 
+impl crate::task_registry::TaskRegistry {
+    /// Attach a spawned process with piped stdout/stderr to an existing
+    /// background-process task. The shared drain and watcher make its output
+    /// pollable and make `TaskStop` terminate the child.
+    pub fn attach_background_process(&self, task_id: &str, mut child: std::process::Child) {
+        let gate = spawn_background_task_drain(
+            self.clone(),
+            task_id.to_string(),
+            &mut child,
+        );
+        spawn_background_task_watcher(
+            self.clone(),
+            task_id.to_string(),
+            child,
+            gate,
+        );
+    }
+}
+
 /// Re-describe an out-of-disk (`ENOSPC`) failure with an actionable cleanup
 /// hint; every other error passes through unchanged. Matched by errno as well
 /// as [`io::ErrorKind::StorageFull`] because the kind mapping differs across
@@ -587,7 +606,7 @@ pub fn execute_bash_with_tasks(
         // Registry-integrated path: the background run becomes a real task so
         // `TaskOutput`/`TaskGet`/`TaskStop` work on it.
         if let Some(registry) = tasks {
-            let mut child = command
+            let child = command
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -604,9 +623,7 @@ pub fn execute_bash_with_tasks(
                 &task.task_id,
                 &format!("$ {}\n[pid {pid}]\n", input.command),
             );
-            let gate =
-                spawn_background_task_drain(registry.clone(), task.task_id.clone(), &mut child);
-            spawn_background_task_watcher(registry.clone(), task.task_id.clone(), child, gate);
+            registry.attach_background_process(&task.task_id, child);
 
             return Ok(BashCommandOutput {
                 stdout: format!(

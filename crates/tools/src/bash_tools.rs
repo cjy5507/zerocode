@@ -152,7 +152,8 @@ pub(crate) fn dispatch(
             maybe_enforce_permission_check(enforcer, name, input).and_then(|()| {
                 from_value::<PowerShellInput>(input).and_then(|inp| {
                     mark_shell_checkpoint_if_write_intent(ctx, &inp.command);
-                    run_powershell(&inp, cwd)
+                    let session_id = ctx.session_id();
+                    run_powershell(&inp, cwd, Some(&ctx.tasks), session_id.as_deref())
                 })
             }),
         ),
@@ -218,8 +219,10 @@ pub(crate) fn run_repl(input: ReplInput, cwd: Option<&Path>) -> Result<String, T
 pub(crate) fn run_powershell(
     input: &PowerShellInput,
     cwd: Option<&Path>,
+    tasks: Option<&runtime::task_registry::TaskRegistry>,
+    session_id: Option<&str>,
 ) -> Result<String, ToolError> {
-    to_pretty_json(execute_powershell(input, cwd)?)
+    to_pretty_json(execute_powershell(input, cwd, tasks, session_id)?)
 }
 
 fn execute_repl(input: ReplInput, cwd: Option<&Path>) -> Result<ReplOutput, ToolError> {
@@ -380,6 +383,8 @@ pub(crate) fn command_exists(command: &str) -> bool {
 fn execute_powershell(
     input: &PowerShellInput,
     cwd: Option<&Path>,
+    tasks: Option<&runtime::task_registry::TaskRegistry>,
+    session_id: Option<&str>,
 ) -> std::io::Result<BashCommandOutput> {
     if let runtime::bash_validation::ValidationResult::Block { reason } =
         runtime::bash_validation::check_destructive(&input.command)
@@ -400,6 +405,8 @@ fn execute_powershell(
         input.timeout,
         input.run_in_background,
         cwd,
+        tasks,
+        session_id,
     )
 }
 
@@ -422,6 +429,8 @@ fn execute_shell_command(
     timeout: Option<u64>,
     run_in_background: Option<bool>,
     exec_cwd: Option<&Path>,
+    tasks: Option<&runtime::task_registry::TaskRegistry>,
+    session_id: Option<&str>,
 ) -> std::io::Result<BashCommandOutput> {
     // A per-agent context can pin the working directory; otherwise use the
     // live process cwd (unchanged default). Both the spawn and the sandbox
@@ -444,19 +453,39 @@ fn execute_shell_command(
     fail_closed_if_sandbox_unavailable(&sandbox_status)?;
 
     if run_in_background.unwrap_or(false) {
-        let child = std::process::Command::new(shell)
+        let mut process = std::process::Command::new(shell);
+        process
             .arg("-NoProfile")
             .arg("-NonInteractive")
             .arg("-Command")
             .arg(command)
             .current_dir(&cwd)
             .envs(&settings_env)
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+
+        if let Some(registry) = tasks {
+            let child = process
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()?;
+            return Ok(register_background_command(
+                child,
+                registry,
+                command,
+                "background PowerShell",
+                session_id,
+                sandbox_status,
+            ));
+        }
+
+        let child = process
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()?;
         return Ok(backgrounded_command_output(
             child.id().to_string(),
+            Some(child.id()),
+            false,
             sandbox_status,
         ));
     }
@@ -479,7 +508,11 @@ fn execute_shell_command(
         return match wait_child_with_timeout(child, timeout_dur) {
             Ok(output) => Ok(completed_command_output(&output, sandbox_status)),
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                Ok(timed_out_command_output(timeout_ms, sandbox_status))
+                Ok(timed_out_command_output(
+                    timeout_ms,
+                    tasks.is_some(),
+                    sandbox_status,
+                ))
             }
             Err(e) => Err(e),
         };
@@ -487,6 +520,28 @@ fn execute_shell_command(
 
     let output = process.output()?;
     Ok(completed_command_output(&output, sandbox_status))
+}
+
+fn register_background_command(
+    child: Child,
+    registry: &runtime::task_registry::TaskRegistry,
+    command: &str,
+    description: &str,
+    session_id: Option<&str>,
+    sandbox_status: SandboxStatus,
+) -> BashCommandOutput {
+    let pid = child.id();
+    let task = registry.create_background_process(command, Some(description), session_id);
+    let _ = registry.set_status(
+        &task.task_id,
+        runtime::task_registry::TaskStatus::Running,
+    );
+    let _ = registry.append_output(
+        &task.task_id,
+        &format!("$ {command}\n[pid {pid}]\n"),
+    );
+    registry.attach_background_process(&task.task_id, child);
+    backgrounded_command_output(task.task_id, Some(pid), true, sandbox_status)
 }
 
 fn fail_closed_if_sandbox_unavailable(sandbox_status: &SandboxStatus) -> std::io::Result<()> {
@@ -500,14 +555,24 @@ fn fail_closed_if_sandbox_unavailable(sandbox_status: &SandboxStatus) -> std::io
     Ok(())
 }
 
-/// Output shape for a command spawned detached via `run_in_background`: no
-/// captured streams, only the spawned OS task id.
+/// Output shape for a command spawned via `run_in_background`. Registry-backed
+/// calls return a task id whose output can be polled and stopped; legacy callers
+/// without a registry retain the detached PID-only behavior.
 fn backgrounded_command_output(
     task_id: String,
+    pid: Option<u32>,
+    output_captured: bool,
     sandbox_status: SandboxStatus,
 ) -> BashCommandOutput {
     BashCommandOutput {
-        stdout: String::new(),
+        stdout: if output_captured {
+            format!(
+                "Started background task {task_id} (pid {}). Poll output with TaskOutput(task_id), stop with TaskStop.",
+                pid.map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
+            )
+        } else {
+            String::new()
+        },
         stderr: String::new(),
         raw_output_path: None,
         interrupted: false,
@@ -517,7 +582,7 @@ fn backgrounded_command_output(
         assistant_auto_backgrounded: Some(false),
         dangerously_disable_sandbox: None,
         return_code_interpretation: None,
-        no_output_expected: Some(true),
+        no_output_expected: Some(!output_captured),
         structured_content: None,
         persisted_output_path: None,
         persisted_output_size: None,
@@ -554,14 +619,14 @@ fn completed_command_output(output: &Output, sandbox_status: SandboxStatus) -> B
 }
 
 /// Output shape for a command killed because it exceeded its timeout budget.
-fn timed_out_command_output(timeout_ms: u64, sandbox_status: SandboxStatus) -> BashCommandOutput {
+fn timed_out_command_output(
+    timeout_ms: u64,
+    output_is_pollable: bool,
+    sandbox_status: SandboxStatus,
+) -> BashCommandOutput {
     BashCommandOutput {
         stdout: String::new(),
-        // `false`: this path's background mode detaches with both streams on
-        // `Stdio::null()` and hands back a bare OS pid rather than a registry
-        // task id (`backgrounded_command_output`), so it must not promise a
-        // pollable `TaskOutput` — that route does not exist here.
-        stderr: runtime::timeout_stderr_with_background_advice(timeout_ms, false),
+        stderr: runtime::timeout_stderr_with_background_advice(timeout_ms, output_is_pollable),
         raw_output_path: None,
         interrupted: true,
         is_image: None,
@@ -889,16 +954,74 @@ mod tests {
         );
     }
 
-    /// The `PowerShell` timeout reply must not inherit bash's recovery route.
-    /// `execute_shell_command`'s background branch pipes both streams to
-    /// `Stdio::null()` and returns `child.id()` — a bare OS pid, never a
-    /// registry `task_…` — so `TaskOutput` could not resolve it and there would
-    /// be no captured output to resolve to.
     #[test]
-    fn powershell_timeout_advice_never_promises_a_task_lookup() {
+    fn powershell_background_task_captures_output_in_registry() {
+        let registry = runtime::task_registry::TaskRegistry::default();
+        let child = spawn("printf 'from-stdout\\n'; printf 'from-stderr\\n' >&2");
+        let output = register_background_command(
+            child,
+            &registry,
+            "test PowerShell output",
+            "background PowerShell",
+            Some("test-session"),
+            resolve_sandbox_status(&SandboxConfig::default(), Path::new(".")),
+        );
+        let task_id = output
+            .background_task_id
+            .as_deref()
+            .expect("registry task id");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let task = registry.get(task_id).expect("registered task");
+            if task.output.contains("from-stdout")
+                && task.output.contains("[stderr] from-stderr")
+                && task.output.contains("[exit 0]")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "background output was not drained");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(output.no_output_expected, Some(false));
+    }
+
+    #[test]
+    fn powershell_background_task_stop_terminates_registered_child() {
+        let registry = runtime::task_registry::TaskRegistry::default();
+        let child = spawn("printf 'started\\n'; sleep 60");
+        let output = register_background_command(
+            child,
+            &registry,
+            "test PowerShell stop",
+            "background PowerShell",
+            Some("test-session"),
+            resolve_sandbox_status(&SandboxConfig::default(), Path::new(".")),
+        );
+        let task_id = output
+            .background_task_id
+            .as_deref()
+            .expect("registry task id");
+        registry.stop(task_id).expect("stop task");
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            let task = registry.get(task_id).expect("registered task");
+            if task.output.contains("[killed by TaskStop]") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "background child was not terminated");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A caller without a task registry retains the legacy detached route, so
+    /// its timeout advice must not promise a task lookup.
+    #[test]
+    fn powershell_timeout_advice_never_promises_a_task_lookup_without_registry() {
         let sandbox_status =
             resolve_sandbox_status(&SandboxConfig::default(), Path::new("."));
-        let output = timed_out_command_output(1_000, sandbox_status);
+        let output = timed_out_command_output(1_000, false, sandbox_status);
 
         assert!(output.interrupted);
         assert_eq!(output.return_code_interpretation.as_deref(), Some("timeout"));
@@ -1035,6 +1158,8 @@ mod tests {
                 run_in_background: None,
             },
             Some(&missing_cwd),
+            None,
+            None,
         );
         let ordinary = execute_powershell(
             &PowerShellInput {
@@ -1044,6 +1169,8 @@ mod tests {
                 run_in_background: None,
             },
             Some(&missing_cwd),
+            None,
+            None,
         );
 
         let err = catastrophic.expect_err("catastrophic PowerShell command must be refused");
