@@ -21,13 +21,12 @@ pub(crate) fn normalize_tool_name(value: &str) -> String {
 /// Keys are matched after [`normalize_tool_name`] (lowercased, `-`→`_`), so a
 /// single entry handles e.g. `Read`, `read`, and `READ`.
 ///
-/// NOTE: `MultiEdit` has no dedicated handler yet; when it lands, add
-/// `("multi_edit", "MultiEdit")` here and a new match arm in `file_tools`.
 pub(crate) const TOOL_NAME_ALIASES: &[(&str, &str)] = &[
-    // File tools — PascalCase and short forms route to snake_case handlers.
+    // File tools — PascalCase and short forms route to their handlers.
     ("read", "read_file"),
     ("write", "write_file"),
     ("edit", "edit_file"),
+    ("multi_edit", "MultiEdit"),
     ("glob", "glob_search"),
     ("grep", "grep_search"),
     // Bash handler is registered under lowercase `bash`; force PascalCase

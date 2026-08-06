@@ -1432,6 +1432,139 @@ fn file_tools_cover_read_write_and_edit_behaviors() {
 }
 
 #[test]
+fn multi_edit_applies_edits_sequentially_against_one_buffer() {
+    let path = temp_path("multi-edit-sequential.txt");
+    fs::write(&path, "alpha\ntail\n").expect("seed multi-edit file");
+    let ctx = ToolContext::new();
+    execute_tool(&ctx, "read_file", &json!({ "path": path }))
+        .expect("read should seed freshness guard");
+
+    execute_tool(
+        &ctx,
+        "MultiEdit",
+        &json!({
+            "path": path,
+            "edits": [
+                { "old_string": "alpha", "new_string": "beta" },
+                { "old_string": "beta", "new_string": "gamma" }
+            ]
+        }),
+    )
+    .expect("later edit should see earlier edit output");
+
+    assert_eq!(fs::read_to_string(&path).expect("read result"), "gamma\ntail\n");
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn multi_edit_without_prior_read_is_rejected() {
+    let path = temp_path("multi-edit-unread.txt");
+    fs::write(&path, "alpha\n").expect("seed unread file");
+    let ctx = ToolContext::new();
+
+    let error = execute_tool(
+        &ctx,
+        "MultiEdit",
+        &json!({
+            "path": path,
+            "edits": [{ "old_string": "alpha", "new_string": "beta" }]
+        }),
+    )
+    .expect_err("MultiEdit must share the read-before-write guard");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("has not been read in this conversation")
+            && message.contains("read_file"),
+        "{message}"
+    );
+    assert_eq!(fs::read_to_string(&path).expect("read unchanged file"), "alpha\n");
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn multi_edit_duplicate_edit_reports_index_and_writes_nothing() {
+    let path = temp_path("multi-edit-duplicate-failure.txt");
+    let original = "alpha\ntail\n";
+    fs::write(&path, original).expect("seed multi-edit file");
+    let ctx = ToolContext::new();
+    execute_tool(&ctx, "read_file", &json!({ "path": path }))
+        .expect("read should seed freshness guard");
+
+    let error = execute_tool(
+        &ctx,
+        "MultiEdit",
+        &json!({
+            "path": path,
+            "edits": [
+                { "old_string": "alpha", "new_string": "beta" },
+                { "old_string": "alpha", "new_string": "never-written" }
+            ]
+        }),
+    )
+    .expect_err("a failing later edit must reject the whole call");
+
+    assert!(error.to_string().contains("edit[1] failed: old_string not found"));
+    assert_eq!(fs::read_to_string(&path).expect("read unchanged file"), original);
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn multi_edit_ambiguous_edit_reports_index_and_writes_nothing() {
+    let path = temp_path("multi-edit-atomic-ambiguous.txt");
+    let original = "alpha\nduplicate\nduplicate\n";
+    fs::write(&path, original).expect("seed multi-edit file");
+    let ctx = ToolContext::new();
+    execute_tool(&ctx, "read_file", &json!({ "path": path }))
+        .expect("read should seed freshness guard");
+
+    let error = execute_tool(
+        &ctx,
+        "MultiEdit",
+        &json!({
+            "path": path,
+            "edits": [
+                { "old_string": "alpha", "new_string": "beta" },
+                { "old_string": "duplicate", "new_string": "ambiguous" }
+            ]
+        }),
+    )
+    .expect_err("an ambiguous edit must reject the whole call");
+
+    assert!(error.to_string().contains("edit[1] failed: old_string is not unique"));
+    assert_eq!(fs::read_to_string(&path).expect("read unchanged file"), original);
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn multi_edit_tolerant_match_preserves_crlf_line_endings() {
+    let path = temp_path("multi-edit-crlf.txt");
+    fs::write(&path, b"alpha\r\nbeta\r\ntail\r\n").expect("seed CRLF file");
+    let ctx = ToolContext::new();
+    execute_tool(&ctx, "read_file", &json!({ "path": path }))
+        .expect("read should seed freshness guard");
+
+    execute_tool(
+        &ctx,
+        "MultiEdit",
+        &json!({
+            "path": path,
+            "edits": [
+                { "old_string": "alpha\nbeta", "new_string": "ALPHA\nBETA" },
+                { "old_string": "tail", "new_string": "done\nmore" }
+            ]
+        }),
+    )
+    .expect("CRLF-tolerant multi-edit should succeed");
+
+    assert_eq!(
+        fs::read(&path).expect("read CRLF result"),
+        b"ALPHA\r\nBETA\r\ndone\r\nmore\r\n"
+    );
+    let _ = fs::remove_file(path);
+}
+
+#[test]
 fn glob_and_grep_tools_cover_success_and_errors() {
     let _guard = env_lock()
         .lock()

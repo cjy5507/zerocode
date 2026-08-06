@@ -47,6 +47,7 @@ fn exposes_mvp_tools() {
         .collect::<Vec<_>>();
     assert!(names.contains(&"bash"));
     assert!(names.contains(&"read_file"));
+    assert!(names.contains(&"MultiEdit"));
     assert!(names.contains(&"WebFetch"));
     assert!(names.contains(&"WebSearch"));
     assert!(names.contains(&"TodoWrite"));
@@ -93,6 +94,47 @@ fn exposes_mvp_tools() {
     assert!(!names.contains(&"ReadMcpResource"));
     assert!(!names.contains(&"McpAuth"));
     assert!(!names.contains(&"MCP"));
+}
+
+#[test]
+fn multi_edit_is_registered_inline_with_the_expected_schema() {
+    let spec = mvp_tool_specs()
+        .iter()
+        .find(|spec| spec.name == "MultiEdit")
+        .expect("MultiEdit tool registered");
+    assert_eq!(spec.required_permission, PermissionMode::WorkspaceWrite);
+    assert_eq!(
+        spec.input_schema,
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": { "type": "string" },
+                            "new_string": { "type": "string" },
+                            "replace_all": { "type": "boolean" }
+                        },
+                        "required": ["old_string", "new_string"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["path", "edits"],
+            "additionalProperties": false
+        })
+    );
+
+    let advertised = GlobalToolRegistry::builtin()
+        .definitions(None)
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect::<BTreeSet<_>>();
+    assert!(advertised.contains("MultiEdit"));
 }
 
 #[test]
@@ -147,6 +189,8 @@ fn canonical_tool_name_maps_pascal_and_short_aliases_to_handlers() {
     assert_eq!(canonical_tool_name("write_file"), "write_file");
     assert_eq!(canonical_tool_name("Edit"), "edit_file");
     assert_eq!(canonical_tool_name("edit"), "edit_file");
+    assert_eq!(canonical_tool_name("MultiEdit"), "MultiEdit");
+    assert_eq!(canonical_tool_name("multi_edit"), "MultiEdit");
     assert_eq!(canonical_tool_name("Glob"), "glob_search");
     assert_eq!(canonical_tool_name("glob"), "glob_search");
     assert_eq!(canonical_tool_name("Grep"), "grep_search");

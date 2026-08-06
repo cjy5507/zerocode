@@ -796,64 +796,7 @@ pub fn edit_file(
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
     let original_file = fs::read_to_string(&absolute_path)?;
-    if old_string == new_string {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "old_string and new_string must differ",
-        ));
-    }
-    let occurrences = original_file.matches(old_string).count();
-    if occurrences == 0 {
-        // Exact match failed. The model's `old_string` very often differs from
-        // the file by nothing more than trailing whitespace, a tab-vs-spaces
-        // indent, or CRLF-vs-LF line endings — a one-byte mismatch that makes
-        // an otherwise valid edit fail intermittently (the "full-access but the
-        // tool still failed" symptom). Retry against a whitespace-tolerant view
-        // before giving up, but only commit when the tolerant match is unique
-        // (or `replace_all`), so we never silently patch the wrong site.
-        if let Some(updated) =
-            whitespace_tolerant_replace(&original_file, old_string, new_string, replace_all)?
-        {
-            replace_file_atomic(&absolute_path, updated.as_bytes())?;
-            return Ok(EditFileOutput {
-                file_path: absolute_path.to_string_lossy().into_owned(),
-                old_string: old_string.to_owned(),
-                new_string: new_string.to_owned(),
-                original_file: original_file.clone(),
-                structured_patch: make_patch(&original_file, &updated),
-                // 모델 툴 경로에서는 tools 층 read-registry 가드가 "마지막
-                // 읽기 이후 변경"을 사전에 거부하므로, 성공한 edit은 구조상
-                // user_modified=false다 (필드 doc 참조). 내부 호출자는 가드
-                // 미적용 — 역사적 상수 false 유지.
-                user_modified: false,
-                replace_all,
-                git_diff: None,
-            });
-        }
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "old_string not found in file",
-        ));
-    }
-    // Parity with upstream: a non-`replace_all` edit must target a unique
-    // anchor. Replacing the first of several identical matches silently edits
-    // the wrong site, so refuse and ask for more context instead.
-    if !replace_all && occurrences > 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "old_string is not unique: found {occurrences} matches. Add more \
-                 surrounding context to target one occurrence, or set \
-                 replace_all=true to replace every match."
-            ),
-        ));
-    }
-
-    let updated = if replace_all {
-        original_file.replace(old_string, new_string)
-    } else {
-        original_file.replacen(old_string, new_string, 1)
-    };
+    let updated = apply_text_edit(&original_file, old_string, new_string, replace_all)?;
     replace_file_atomic(&absolute_path, updated.as_bytes())?;
 
     Ok(EditFileOutput {
@@ -866,6 +809,92 @@ pub fn edit_file(
         user_modified: false,
         replace_all,
         git_diff: None,
+    })
+}
+
+/// Applies ordered replacements in memory, then publishes the final buffer with
+/// one atomic replacement. Any failing edit returns before the write and names
+/// its zero-based array index, making partial multi-edits impossible.
+pub fn multi_edit_file(
+    path: &str,
+    edits: &[(&str, &str, bool)],
+) -> io::Result<WriteFileOutput> {
+    if edits.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "edits must contain at least one edit",
+        ));
+    }
+
+    let absolute_path = normalize_path(path)?;
+    let original_file = fs::read_to_string(&absolute_path)?;
+    let mut updated = original_file.clone();
+    for (index, (old_string, new_string, replace_all)) in edits.iter().enumerate() {
+        if old_string == new_string {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("edit[{index}] failed: old_string and new_string must differ"),
+            ));
+        }
+        let new_string = replacement_with_line_ending(&updated, new_string);
+        updated = apply_text_edit(&updated, old_string, &new_string, *replace_all).map_err(|error| {
+            io::Error::new(error.kind(), format!("edit[{index}] failed: {error}"))
+        })?;
+    }
+    if updated.len() > MAX_WRITE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "content is too large ({} bytes, max {} bytes)",
+                updated.len(),
+                MAX_WRITE_SIZE
+            ),
+        ));
+    }
+    replace_file_atomic(&absolute_path, updated.as_bytes())?;
+
+    Ok(WriteFileOutput {
+        kind: String::from("update"),
+        file_path: absolute_path.to_string_lossy().into_owned(),
+        content: updated.clone(),
+        structured_patch: make_patch(&original_file, &updated),
+        original_file: Some(original_file),
+        git_diff: None,
+    })
+}
+
+fn apply_text_edit(
+    original: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> io::Result<String> {
+    if old_string == new_string {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "old_string and new_string must differ",
+        ));
+    }
+    let occurrences = original.matches(old_string).count();
+    if occurrences == 0 {
+        return whitespace_tolerant_replace(original, old_string, new_string, replace_all)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "old_string not found in file"));
+    }
+    if !replace_all && occurrences > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "old_string is not unique: found {occurrences} matches. Add more \
+                 surrounding context to target one occurrence, or set \
+                 replace_all=true to replace every match."
+            ),
+        ));
+    }
+
+    Ok(if replace_all {
+        original.replace(old_string, new_string)
+    } else {
+        original.replacen(old_string, new_string, 1)
     })
 }
 
@@ -884,11 +913,61 @@ fn normalize_for_match(text: &str) -> String {
     out
 }
 
+#[derive(Clone, Copy)]
+struct LineSpan<'a> {
+    start: usize,
+    content_end: usize,
+    content: &'a str,
+}
+
+fn line_spans(text: &str) -> Vec<LineSpan<'_>> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for segment in text.split_inclusive('\n') {
+        let end = start + segment.len();
+        let content_end = if segment.ends_with("\r\n") {
+            end - 2
+        } else if segment.ends_with('\n') {
+            end - 1
+        } else {
+            end
+        };
+        lines.push(LineSpan {
+            start,
+            content_end,
+            content: &text[start..content_end],
+        });
+        start = end;
+    }
+    if start < text.len() || text.is_empty() || text.ends_with('\n') {
+        lines.push(LineSpan {
+            start,
+            content_end: text.len(),
+            content: &text[start..],
+        });
+    }
+    lines
+}
+
+fn preferred_line_ending(text: &str) -> &'static str {
+    text.find('\n').map_or("\n", |index| {
+        if index > 0 && text.as_bytes()[index - 1] == b'\r' {
+            "\r\n"
+        } else {
+            "\n"
+        }
+    })
+}
+
+fn replacement_with_line_ending(original: &str, replacement: &str) -> String {
+    replacement
+        .replace("\r\n", "\n")
+        .replace('\n', preferred_line_ending(original))
+}
+
 /// Attempt a whitespace-tolerant replacement when the exact `old_string` was
-/// not found. Returns `Ok(Some(updated))` when a unique (or `replace_all`)
-/// normalized match exists, `Ok(None)` when no tolerant match is found, and an
-/// error when a tolerant match is ambiguous (so the caller refuses rather than
-/// patching the wrong place).
+/// not found. Untouched bytes are copied verbatim and replacement newlines use
+/// the file's existing style, so tolerant matching never normalizes a CRLF file.
 fn whitespace_tolerant_replace(
     original: &str,
     old_string: &str,
@@ -899,22 +978,17 @@ fn whitespace_tolerant_replace(
     if needle.is_empty() {
         return Ok(None);
     }
-    // Build a map from byte offset in the *normalized* haystack back to byte
-    // offset in the original, so a normalized match can be applied to the real
-    // (un-normalized) bytes. We normalize line-by-line to keep offsets aligned.
-    let original_lf = original.replace("\r\n", "\n");
-    let lines: Vec<&str> = original_lf.split('\n').collect();
-
-    // Find candidate start lines: a normalized match must begin at a line start
-    // (our normalization is per-line), so scan line windows.
+    let lines = line_spans(original);
     let needle_lines: Vec<&str> = needle.split('\n').collect();
-    let mut match_line_starts: Vec<usize> = Vec::new();
+    let mut match_line_starts = Vec::new();
     if needle_lines.len() <= lines.len() {
         for start in 0..=(lines.len() - needle_lines.len()) {
             let window_matches = needle_lines
                 .iter()
                 .enumerate()
-                .all(|(k, nline)| lines[start + k].trim_end() == *nline);
+                .all(|(offset, needle_line)| {
+                    lines[start + offset].content.trim_end() == *needle_line
+                });
             if window_matches {
                 match_line_starts.push(start);
             }
@@ -936,26 +1010,27 @@ fn whitespace_tolerant_replace(
         ));
     }
 
-    // Rebuild the file, replacing each matched line-window with `new_string`.
-    // We operate on the LF-normalized text; this is a display/edit operation
-    // and downstream diffing is line-based, so collapsing CRLF to LF here is
-    // acceptable and keeps offsets simple.
-    let mut result_lines: Vec<String> = Vec::with_capacity(lines.len());
-    let new_block: Vec<&str> = new_string.split('\n').collect();
-    let mut i = 0usize;
-    let starts: std::collections::HashSet<usize> = match_line_starts.iter().copied().collect();
-    while i < lines.len() {
-        if starts.contains(&i) {
-            for nl in &new_block {
-                result_lines.push((*nl).to_string());
-            }
-            i += needle_lines.len();
-        } else {
-            result_lines.push(lines[i].to_string());
-            i += 1;
+    let replacement = replacement_with_line_ending(original, new_string);
+    let mut updated = String::with_capacity(
+        original.len().saturating_sub(needle.len()) + replacement.len(),
+    );
+    let mut cursor = 0usize;
+    let mut next_available_line = 0usize;
+    for start_line in match_line_starts {
+        if start_line < next_available_line {
+            continue;
+        }
+        let end_line = start_line + needle_lines.len() - 1;
+        updated.push_str(&original[cursor..lines[start_line].start]);
+        updated.push_str(&replacement);
+        cursor = lines[end_line].content_end;
+        next_available_line = end_line + 1;
+        if !replace_all {
+            break;
         }
     }
-    Ok(Some(result_lines.join("\n")))
+    updated.push_str(&original[cursor..]);
+    Ok(Some(updated))
 }
 
 const MAX_GLOB_BRACE_EXPANSIONS: usize = 128;
@@ -1930,9 +2005,12 @@ mod tests {
             false,
         )
         .expect("CRLF-tolerant edit should succeed");
-        let after = std::fs::read_to_string(&path).expect("read back");
-        assert!(after.contains("ALPHA"), "edit must apply, got:\n{after}");
-        assert!(after.contains("BETA"));
+        let after = std::fs::read(&path).expect("read back");
+        assert_eq!(
+            after,
+            b"ALPHA\r\nBETA\r\ngamma\r\n",
+            "tolerant edit must preserve CRLF line endings"
+        );
     }
 
     #[test]

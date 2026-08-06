@@ -1253,6 +1253,7 @@ mod tests {
             "read_file",
             "write_file",
             "edit_file",
+            "MultiEdit",
             "glob_search",
             "grep_search",
             "read_image",
@@ -1276,7 +1277,7 @@ mod tests {
             assert!(wire.contains(core), "{core} must stay on the wire");
         }
         assert!(
-            wire.len() <= 20,
+            wire.len() <= 21,
             "wire advertisement crept past the lean core ({} tools): {wire:?}",
             wire.len()
         );

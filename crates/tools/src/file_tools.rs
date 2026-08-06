@@ -8,7 +8,9 @@ use super::{
 };
 use crate::context::{DebugHypothesis, HypothesisStatus, Probe};
 use runtime::{
-    edit_file, file_ops::validate_workspace_boundary, glob_search, grep_search,
+    edit_file,
+    file_ops::{multi_edit_file, validate_workspace_boundary},
+    glob_search, grep_search,
     permission_enforcer::PermissionEnforcer, read_file, write_file, FileFreshness,
     FileReadRegistry, GrepSearchInput, PermissionMode,
 };
@@ -34,6 +36,19 @@ pub(crate) struct WriteFileInput {
 #[derive(Debug, Deserialize)]
 pub(crate) struct EditFileInput {
     pub path: String,
+    pub old_string: String,
+    pub new_string: String,
+    pub replace_all: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct MultiEditInput {
+    pub path: String,
+    pub edits: Vec<MultiEditReplacement>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct MultiEditReplacement {
     pub old_string: String,
     pub new_string: String,
     pub replace_all: Option<bool>,
@@ -137,6 +152,33 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
                     "replace_all": { "type": "boolean" }
                 },
                 "required": ["path", "old_string", "new_string"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "MultiEdit",
+            description: "Apply several text replacements to one workspace file in one atomic write. Edits run sequentially in array order against one in-memory buffer, so a later edit can match text produced by an earlier edit. Every `old_string` must be unique unless its edit sets `replace_all`; if any edit fails, nothing is written and the error names its zero-based index. Read the file in this conversation first.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "edits": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": { "type": "string" },
+                                "new_string": { "type": "string" },
+                                "replace_all": { "type": "boolean" }
+                            },
+                            "required": ["old_string", "new_string"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["path", "edits"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::WorkspaceWrite,
@@ -270,6 +312,14 @@ pub(crate) fn dispatch(
                 })
             }),
         ),
+        "MultiEdit" => Some(
+            maybe_enforce_permission_check(enforcer, name, input).and_then(|()| {
+                from_value::<MultiEditInput>(input).and_then(|inp| {
+                    enforce_write_lease(ctx, &inp.path)?;
+                    run_multi_edit(&inp, enforcer, ctx)
+                })
+            }),
+        ),
         "InstrumentLog" => Some(
             maybe_enforce_permission_check(enforcer, name, input).and_then(|()| {
                 from_value::<InstrumentLogInput>(input)
@@ -324,7 +374,7 @@ pub(crate) fn dispatch(
     }
 }
 
-/// Acquire the cross-process write lease for a `write_file`/`edit_file` target
+/// Acquire the cross-process write lease for a `write_file`/`edit_file`/`MultiEdit` target
 /// before the write runs (track 4-2). A no-op unless the context carries a
 /// `lease_owner` (a spawned agent / identified session) **and** the workspace
 /// guard is opt-in enabled — so solo, single-process editing is never gated.
@@ -359,7 +409,7 @@ fn enforce_write_lease(ctx: &ToolContext, path: &str) -> Result<(), ToolError> {
     match crate::acquire_write_lease(&resolved, owner, &cwd) {
         crate::LeaseOutcome::Acquired => Ok(()),
         crate::LeaseOutcome::Conflict(holder) => Err(ToolError::PermissionDenied {
-            tool: "write_file/edit_file".to_string(),
+            tool: "write_file/edit_file/MultiEdit".to_string(),
             reason: format!(
                 "file `{}` is being edited by another agent (owner `{}`, pid {}); \
                  coordinate or wait for it to finish instead of overwriting its in-flight changes \
@@ -746,6 +796,33 @@ pub(crate) fn run_edit_file(
     // 자기 자신이 만든 변경은 신선한 것으로 등재 — 연속 edit 허용.
     record_file_observation(&ctx.file_reads, &output.file_path);
     to_pretty_json(output)
+}
+
+pub(crate) fn run_multi_edit(
+    input: &MultiEditInput,
+    enforcer: Option<&PermissionEnforcer>,
+    ctx: &ToolContext,
+) -> Result<String, ToolError> {
+    let (target, target_path) = prepare_guarded_file_write(ctx, enforcer, "MultiEdit", &input.path)?;
+    let edits = input
+        .edits
+        .iter()
+        .map(|edit| {
+            (
+                edit.old_string.as_str(),
+                edit.new_string.as_str(),
+                edit.replace_all.unwrap_or(false),
+            )
+        })
+        .collect::<Vec<_>>();
+    let output = multi_edit_file(&target, &edits)?;
+    ctx.record_workspace_checkpoint_write(&target_path);
+    record_file_observation(&ctx.file_reads, &output.file_path);
+    to_pretty_json(json!({
+        "filePath": output.file_path,
+        "editsApplied": edits.len(),
+        "structuredPatch": output.structured_patch,
+    }))
 }
 
 fn prepare_guarded_file_write(
