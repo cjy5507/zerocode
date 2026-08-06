@@ -683,7 +683,9 @@ impl App {
                 self.set_follow_output(false);
                 Some(AppAction::None)
             }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('d')
+                if self.input.is_empty() && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 self.prepare_user_scroll();
                 self.transcript.scroll_down(Self::HALF_PAGE_SCROLL_ROWS);
                 self.refresh_follow_output();
@@ -1211,5 +1213,23 @@ mod secret_paste_key_tests {
             KeyCode::Char('v'),
             KeyModifiers::NONE,
         )));
+    }
+
+    #[test]
+    fn ctrl_d_scrolls_only_when_composer_is_empty() {
+        let (_block_tx, block_rx) = tokio::sync::mpsc::channel::<
+            runtime::message_stream::RenderBlock,
+        >(1);
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel::<AgentCommand>(1);
+        let mut app = App::new(crate::tui::theme::Theme::no_color(), block_rx, cmd_tx);
+        let ctrl_d = key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        app.input.insert_char('x');
+        assert!(app.handle_normal_scroll_shortcuts(ctrl_d, false).is_none());
+        assert_eq!(app.transcript.scroll(), 0);
+
+        app.input.clear();
+        assert!(app.handle_normal_scroll_shortcuts(ctrl_d, false).is_some());
+        assert_eq!(app.transcript.scroll(), App::HALF_PAGE_SCROLL_ROWS);
     }
 }
