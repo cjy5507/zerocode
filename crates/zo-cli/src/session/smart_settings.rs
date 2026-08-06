@@ -2376,12 +2376,20 @@ fn smart_status_setting_rows(
             }
         ),
         format!(
-            "EXEC swap: {}",
+            "EXEC swap: {}{}",
             match snapshot.exec_swap {
                 tools::SmartExecSwap::Always =>
-                    "always (default) — implementer writes every diff, planner plans/verifies",
+                    "always — implementer writes every diff, planner plans/verifies",
                 tools::SmartExecSwap::Easy => "easy — only the lowest complexity band hands off",
                 tools::SmartExecSwap::Never => "never — EXEC stays on the session model",
+            },
+            // Derived from the enum's own Default so this line can never claim
+            // a stale default again (it shipped saying "always (default)" for
+            // a mode whose real default had become Never).
+            if snapshot.exec_swap == tools::SmartExecSwap::default() {
+                " (default)"
+            } else {
+                ""
             }
         ),
         format!(

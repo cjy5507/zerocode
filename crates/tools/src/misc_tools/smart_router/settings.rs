@@ -264,7 +264,8 @@ pub struct SmartSettingDefaults {
     /// Default `smart.policy` (`Architect` — the role-separation contract is
     /// the live default; `classic` opts out).
     pub policy: SmartPolicy,
-    /// Default `smart.execSwap` (`always`).
+    /// Default `smart.execSwap` (`never` — see [`SmartExecSwap::Never`] for
+    /// why `always` was demoted).
     pub exec_swap: SmartExecSwap,
 }
 

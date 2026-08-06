@@ -69,9 +69,14 @@ pub struct StartupAuthState {
 }
 
 impl StartupAuthState {
+    /// Whether the launchpad should show the connect-a-provider onboarding.
+    /// True only when NO provider is connected: one working provider is a
+    /// fully usable zo, and the old OR-predicate kept every single-provider
+    /// user (the normal case) on a permanent "1. Connect provider" checklist
+    /// — which also made the recent-sessions stage unreachable for them.
     #[must_use]
     pub const fn needs_onboarding(self) -> bool {
-        !self.anthropic_oauth || !self.chatgpt_oauth
+        !self.anthropic_oauth && !self.chatgpt_oauth
     }
 }
 
@@ -769,14 +774,19 @@ fn hints_line(theme: &Theme) -> Line<'static> {
         Span::styled("/help".to_string(), key),
         Span::styled(" commands".to_string(), label),
         Span::styled("  •  ".to_string(), divider),
+        // Hints must match the bindings: Ctrl+P opens the command surface
+        // (the model picker is F3/Alt+1) and quitting is Ctrl+C — Esc
+        // interrupts/rewinds. The launchpad shipped both wrong, and a first
+        // screen that lies about its own keys costs more trust than it saves
+        // in space.
         Span::styled("ctrl+p".to_string(), key),
-        Span::styled(" model".to_string(), label),
+        Span::styled(" commands".to_string(), label),
         Span::styled("  •  ".to_string(), divider),
         Span::styled("ctrl+b".to_string(), key),
         Span::styled(" sidebar".to_string(), label),
         Span::styled("  •  ".to_string(), divider),
-        Span::styled("esc".to_string(), key),
-        Span::styled(" quit".to_string(), label),
+        Span::styled("ctrl+c".to_string(), key),
+        Span::styled(" exit".to_string(), label),
     ])
 }
 
@@ -1156,7 +1166,11 @@ mod tests {
     }
 
     #[test]
-    fn startup_onboarding_summarizes_mixed_provider_state() {
+    fn startup_single_provider_skips_onboarding_entirely() {
+        // One connected provider is a fully usable zo: the launchpad must not
+        // keep nagging "Connect provider" (the old OR-predicate did, which
+        // also made the recent-sessions stage unreachable for the normal
+        // single-provider user).
         let theme = Theme::no_color();
         let mut screen = sample_startup_screen();
         screen.auth = StartupAuthState {
@@ -1168,9 +1182,9 @@ mod tests {
             .draw(|frame| draw(frame, frame.area(), &screen, &theme, None))
             .expect("draw");
         let dumped = dump_terminal(&terminal);
-        assert!(dumped.contains("Claude connected"), "{dumped}");
-        assert!(dumped.contains("/login openai"), "{dumped}");
-        assert!(!dumped.contains("/login claude"), "{dumped}");
+        assert!(!dumped.contains("Connect provider"), "{dumped}");
+        assert!(!dumped.contains("/login openai"), "{dumped}");
+        assert!(dumped.contains("Ready"), "{dumped}");
     }
 
     #[test]

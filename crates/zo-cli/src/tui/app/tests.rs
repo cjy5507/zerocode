@@ -11743,7 +11743,7 @@ fn inline_launchpad_sits_against_the_composer_not_the_top_of_the_screen() {
     let regions = app.regions.expect("regions after draw");
     let dump = dump_all(&terminal, width, height);
     let hint_row = (0..height)
-        .find(|&y| buffer_row(&terminal, width, y).contains("esc quit"))
+        .find(|&y| buffer_row(&terminal, width, y).contains("ctrl+c exit"))
         .expect("the launchpad's key-hint row must render");
     // The hint row is the launchpad's last line, so it lands directly above the
     // activity rule that caps the transcript region.
