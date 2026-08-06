@@ -255,7 +255,10 @@ fn push_header(
     styles: SidebarStyles,
 ) {
     let project = project_name(hud);
-    let branch = hud.git_branch.as_deref().unwrap_or("detached");
+    // Outside a git repository the branch slot stays empty: the old
+    // "detached" fallback described a non-repo folder with a git term that —
+    // sitting beside the session name — read as a broken session connection.
+    let branch = hud.git_branch.as_deref().unwrap_or("");
     // The project is the panel's title line, so it carries the only bright BOLD
     // in the rail; the branch takes the teal every other git surface uses, and
     // the cwd below stays dim. Three weights, one glance.
