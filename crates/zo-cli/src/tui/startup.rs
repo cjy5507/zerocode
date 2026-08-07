@@ -12,7 +12,7 @@ use super::glyphs;
 use super::theme::Theme;
 
 /// Full launchpad height for the large ignition masthead.
-const STARTUP_HEIGHT: u16 = 19;
+const STARTUP_HEIGHT: u16 = 15;
 /// Compact height for narrow terminals.
 const STARTUP_HEIGHT_PLAIN: u16 = 12;
 /// Short label for the startup summary suggestion shown in the launchpad.
@@ -31,7 +31,7 @@ const RICH_MIN_WIDTH: u16 = 58;
 /// Width below which the masthead falls back to the compact one-line wordmark.
 const LARGE_MASTHEAD_MIN_WIDTH: u16 = 44;
 /// Height below which the masthead falls back to the compact one-line wordmark.
-const LARGE_MASTHEAD_MIN_HEIGHT: u16 = 18;
+const LARGE_MASTHEAD_MIN_HEIGHT: u16 = 14;
 /// Width where the launchpad has enough room for a two-column command surface.
 const DENSE_MIN_WIDTH: u16 = 72;
 /// Wide launchpad starts filling more of the chat column before capping.
@@ -47,9 +47,12 @@ const INTRO_BUCKET_MS: u64 = 33;
 const INTRO_SPARK_END_MS: u64 = 250;
 const INTRO_SWEEP_END_MS: u64 = 550;
 const INTRO_FADE_STEP_MS: u64 = 625;
-const LARGE_WORDMARK_ART: [&str; 3] = ["▰▰▰▰▰ ▰▰▰▰▰", "  ▰▰  ▰▰ ▰▰", "▰▰▰▰▰ ▰▰▰▰▰"];
-const LARGE_WORDMARK_SHADOW: char = '░';
-const LARGE_WORDMARK_RAIL: char = '▌';
+/// The brand signature. The former 3-row ▰ block art could not draw Z's
+/// diagonal at that height, so it read as an abstract pattern, not a name —
+/// the minimal one-line signature spends those rows on whitespace instead
+/// and lets typography carry the identity.
+const BRAND_WORDMARK: &str = "ZeroCode";
+const SIGNATURE_TAGLINE: &str = "in the zone — AI pair-programming for this repo";
 const LARGE_WORDMARK_SPARK: char = '✦';
 
 /// A recent session surfaced on the startup launchpad. `label` is the
@@ -345,10 +348,10 @@ fn masthead_lines(
     }
     let elapsed = quantized_intro_ms(intro);
     let chrome = intro_chrome(elapsed);
-    let mut lines = large_wordmark_lines(theme, width, elapsed, chrome);
-    lines.push(tagline_line(theme, chrome));
-    lines.push(divider_line(theme, width, chrome));
-    lines
+    vec![
+        signature_line(theme, width, elapsed, chrome),
+        divider_line(theme, width, chrome),
+    ]
 }
 
 fn quantized_intro_ms(intro: Option<Duration>) -> Option<u64> {
@@ -369,95 +372,73 @@ fn intro_chrome(elapsed: Option<u64>) -> IntroChrome {
     }
 }
 
-fn large_wordmark_lines(
+/// The one-line brand signature: ignition spark, gradient wordmark, tagline,
+/// and the right-aligned launchpad chip. The intro plays out entirely on this
+/// line — the spark ramps through the heat colors, then the wordmark's
+/// glyphs reveal left-to-right on the sweep, then tagline/chip/divider fade
+/// in — so the settled state and the animation share one layout.
+fn signature_line(
     theme: &Theme,
     width: u16,
     elapsed: Option<u64>,
     chrome: IntroChrome,
-) -> Vec<Line<'static>> {
-    let art = LARGE_WORDMARK_ART
-        .iter()
-        .map(|row| row.chars().collect::<Vec<_>>())
-        .collect::<Vec<_>>();
-    let ncols = art.iter().map(Vec::len).max().unwrap_or_default();
+) -> Line<'static> {
+    let ncols = BRAND_WORDMARK.chars().count();
     let gradient = theme.heat().wordmark_gradient(ncols);
-    let rendered_width = ncols.saturating_add(1);
+    let spark_glyph = if theme.no_color {
+        ">".to_string()
+    } else {
+        LARGE_WORDMARK_SPARK.to_string()
+    };
+    let spark_style = match elapsed {
+        Some(ms) if ms < INTRO_SPARK_END_MS => style(spark_ramp_color(theme, ms), true),
+        _ => style(theme.heat().ember, true),
+    };
+    let mut spans = vec![Span::styled(spark_glyph, spark_style), Span::raw(" ")];
+    let mut used = 2usize;
+    for (col, glyph) in BRAND_WORDMARK.chars().enumerate() {
+        used += 1;
+        match wordmark_column_style(theme, &gradient, col, ncols, elapsed) {
+            Some(glyph_style) => spans.push(Span::styled(glyph.to_string(), glyph_style)),
+            None => spans.push(Span::raw(" ")),
+        }
+    }
+    let tagline_style = match chrome {
+        IntroChrome::Hidden => None,
+        IntroChrome::Dim => Some(theme.typography.dim),
+        IntroChrome::Settled => Some(theme.typography.body),
+    };
     let chip = "launchpad";
     let available = usize::from(width.saturating_sub(2));
-    let brand_width = rendered_width.saturating_add(2);
-    let gap = available
-        .saturating_sub(brand_width.saturating_add(chip.len()))
-        .max(2);
-    let mut lines = Vec::with_capacity(4);
-
-    for row in 0..4 {
-        let mut spans = Vec::with_capacity(rendered_width.saturating_add(4));
-        if row == 0 {
-            spans.push(Span::styled(
-                LARGE_WORDMARK_RAIL.to_string(),
-                style(theme.heat().ember, true),
-            ));
-            spans.push(Span::raw(" "));
+    // The tagline yields before the chip does — longest form that still
+    // leaves the chip its gap wins; identity and navigation never yield.
+    let full = format!(" \u{00b7} {SIGNATURE_TAGLINE}");
+    let short = " \u{00b7} in the zone".to_string();
+    let tagline = [full, short]
+        .into_iter()
+        .find(|candidate| available >= used + candidate.chars().count() + chip.len() + 2);
+    if let Some(tagline) = tagline {
+        let tagline_len = tagline.chars().count();
+        if let Some(tagline_style) = tagline_style {
+            spans.push(Span::styled(tagline, tagline_style));
         } else {
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(" ".repeat(tagline_len)));
         }
-        for col in 0..rendered_width {
-            if row == 0 && col == 0 && elapsed.is_some_and(|ms| ms < INTRO_SPARK_END_MS) {
-                spans.push(Span::styled(
-                    LARGE_WORDMARK_SPARK.to_string(),
-                    style(spark_ramp_color(theme, elapsed.unwrap_or_default()), true),
-                ));
-                continue;
-            }
-            let foreground = art.get(row).and_then(|line| line.get(col)).copied();
-            if let Some(glyph) = foreground.filter(|glyph| *glyph != ' ') {
-                if let Some(glyph_style) = wordmark_column_style(theme, &gradient, col, ncols, elapsed)
-                {
-                    spans.push(Span::styled(glyph.to_string(), glyph_style));
-                    continue;
-                }
-            }
-            let cast_from_above = row
-                .checked_sub(1)
-                .and_then(|source_row| art.get(source_row))
-                .and_then(|line| col.checked_sub(1).and_then(|source_col| line.get(source_col)))
-                .is_some_and(|glyph| *glyph != ' ');
-            // The extrusion only falls on the outer lower-right silhouette:
-            // inside a counter or an inter-letter gap the row still has glyphs
-            // to the right, and shade there reads as noise, not depth.
-            let outside_glyph_run = art
-                .get(row)
-                .is_none_or(|line| line.iter().skip(col).all(|glyph| *glyph == ' '));
-            if cast_from_above
-                && outside_glyph_run
-                && shadow_column_visible(col.saturating_sub(1), ncols, elapsed)
-            {
-                spans.push(Span::styled(
-                    LARGE_WORDMARK_SHADOW.to_string(),
-                    Style::new()
-                        .fg(theme.heat().steel_dim)
-                        .add_modifier(Modifier::DIM),
-                ));
-            } else {
-                spans.push(Span::raw(" "));
-            }
-        }
-        if row == 0 {
-            spans.push(Span::raw(" ".repeat(gap)));
-            let chip_style = match chrome {
-                IntroChrome::Hidden => None,
-                IntroChrome::Dim => Some(theme.typography.dim),
-                IntroChrome::Settled => Some(style(theme.palette.accent, true)),
-            };
-            if let Some(chip_style) = chip_style {
-                spans.push(Span::styled(chip.to_string(), chip_style));
-            } else {
-                spans.push(Span::raw(" ".repeat(chip.len())));
-            }
-        }
-        lines.push(indented(spans));
+        used += tagline_len;
     }
-    lines
+    let gap = available.saturating_sub(used + chip.len()).max(2);
+    spans.push(Span::raw(" ".repeat(gap)));
+    let chip_style = match chrome {
+        IntroChrome::Hidden => None,
+        IntroChrome::Dim => Some(theme.typography.dim),
+        IntroChrome::Settled => Some(style(theme.palette.accent, true)),
+    };
+    if let Some(chip_style) = chip_style {
+        spans.push(Span::styled(chip.to_string(), chip_style));
+    } else {
+        spans.push(Span::raw(" ".repeat(chip.len())));
+    }
+    indented(spans)
 }
 
 fn wordmark_column_style(
@@ -485,17 +466,6 @@ fn wordmark_column_style(
     }
 }
 
-fn shadow_column_visible(col: usize, ncols: usize, elapsed: Option<u64>) -> bool {
-    match elapsed {
-        None => true,
-        Some(ms) if ms >= INTRO_SWEEP_END_MS => true,
-        Some(ms) if ms < INTRO_SPARK_END_MS => false,
-        Some(ms) => ms
-            >= column_reveal_ms(col, ncols)
-                .saturating_add(INTRO_BUCKET_MS),
-    }
-}
-
 fn column_reveal_ms(col: usize, ncols: usize) -> u64 {
     let columns = u64::try_from(ncols).unwrap_or(1).max(1);
     let col = u64::try_from(col).unwrap_or(u64::MAX);
@@ -511,19 +481,6 @@ fn spark_ramp_color(theme: &Theme, elapsed: u64) -> Color {
         .unwrap_or(last)
         .min(last);
     ramp[index]
-}
-
-fn tagline_line(theme: &Theme, chrome: IntroChrome) -> Line<'static> {
-    const TAGLINE: &str = "in the zone — AI pair-programming for this repo";
-    let tagline_style = match chrome {
-        IntroChrome::Hidden => None,
-        IntroChrome::Dim => Some(theme.typography.dim),
-        IntroChrome::Settled => Some(theme.typography.body),
-    };
-    match tagline_style {
-        Some(tagline_style) => indented(vec![Span::styled(TAGLINE.to_string(), tagline_style)]),
-        None => Line::from(""),
-    }
 }
 
 fn divider_line(theme: &Theme, width: u16, chrome: IntroChrome) -> Line<'static> {
@@ -602,13 +559,17 @@ fn info_line(startup: &StartupScreen, theme: &Theme) -> Line<'static> {
 }
 
 fn brand_line(theme: &Theme, compact: bool, width: u16) -> Line<'static> {
-    let rail = if theme.no_color { ">" } else { "▌" };
+    let rail = if theme.no_color {
+        ">".to_string()
+    } else {
+        LARGE_WORDMARK_SPARK.to_string()
+    };
     let label = Style::new()
         .fg(theme.palette.accent)
         .add_modifier(Modifier::BOLD);
-    let wordmark = "zo";
+    let wordmark = BRAND_WORDMARK;
     let wordmark_colors = theme.heat().wordmark_gradient(wordmark.chars().count());
-    let brand_width = 7; // rail + space + ZO
+    let brand_width = wordmark.chars().count() + 2; // spark + space + wordmark
     let chip = "launchpad";
     let available = usize::from(width.saturating_sub(2));
     let gap = if compact {
@@ -619,7 +580,7 @@ fn brand_line(theme: &Theme, compact: bool, width: u16) -> Line<'static> {
             .max(2)
     };
     let mut spans = vec![
-        Span::styled(rail.to_string(), style(theme.heat().ember, true)),
+        Span::styled(rail, style(theme.heat().ember, true)),
         Span::raw(" "),
     ];
     spans.extend(
@@ -1266,34 +1227,32 @@ mod tests {
             .draw(|frame| draw(frame, frame.area(), &sample_startup_screen(), &theme, None))
             .expect("draw");
         let dumped = dump_terminal(&terminal);
-        assert!(dumped.contains("zo"), "{dumped}");
+        assert!(dumped.contains("ZeroCode"), "{dumped}");
         assert!(dumped.contains("Get ready"), "{dumped}");
         assert!(dumped.contains("/login claude"), "{dumped}");
     }
 
     #[test]
-    fn startup_masthead_uses_large_ignition_lockup_without_card_chrome() {
+    fn startup_masthead_is_a_one_line_signature_without_block_art() {
         let terminal = render(&Theme::zo(), None);
         let dumped = dump_terminal(&terminal);
         let rows = dump_rows(&terminal);
+        // Brand, tagline, and the chip share ONE line — the whole identity.
         assert!(
             rows.iter().any(|row| {
-                row.trim_start().starts_with("▌ ▰▰▰▰▰ ▰▰▰▰▰")
+                row.trim_start().starts_with("✦ ZeroCode")
+                    && row.contains("in the zone")
                     && row.contains("launchpad")
             }),
             "{rows:?}"
         );
-        assert!(dumped.contains("▰▰ ▰▰░"), "right-edge extrusion missing: {rows:?}");
-        assert!(dumped.contains("░░░░░ ░░░░░"), "baseline shade missing: {rows:?}");
-        assert!(!dumped.contains("▰░▰"), "shade must not fill letter counters: {rows:?}");
-        assert!(
-            dumped.contains("in the zone — AI pair-programming for this repo"),
-            "{dumped}"
-        );
         assert!(dumped.contains("Opus 4.8"), "{dumped}");
         assert!(dumped.contains("full access"), "{dumped}");
         assert!(dumped.contains("Alt+S"), "wide launchpad should expose quick actions: {dumped}");
-        assert!(dumped.contains("────────────────"), "wide divider should make the launchpad feel anchored: {dumped}");
+        assert!(dumped.contains("────────────────"), "divider should anchor the signature: {dumped}");
+        // The old 3-row block art (and any FIGlet-ish mass) must stay gone.
+        assert!(!dumped.contains('▰'), "block art must be gone: {dumped}");
+        assert!(!dumped.contains("░░░"), "shadow row must be gone: {dumped}");
         assert!(!dumped.contains("████"), "blocky FIGlet logo must stay gone: {dumped}");
         assert!(!dumped.contains('╭'), "card chrome must be gone: {dumped}");
         assert!(!dumped.contains('│'), "card chrome must be gone: {dumped}");
@@ -1356,9 +1315,8 @@ mod tests {
 
         let dumped = dump_terminal(&terminal);
         for expected in [
-            "▌ ▰▰▰▰▰ ▰▰▰▰▰",
+            "> ZeroCode",
             "launchpad",
-            "in the zone — AI pair-programming for this repo",
             "────────────────",
             "Opus 4.8",
             "full access",
@@ -1403,45 +1361,17 @@ mod tests {
     }
 
     #[test]
-    fn large_masthead_glyphs_are_width_safe() {
-        let structural = LARGE_WORDMARK_ART
-            .iter()
-            .flat_map(|row| row.chars())
-            .chain([
-                LARGE_WORDMARK_SHADOW,
-                LARGE_WORDMARK_RAIL,
-                LARGE_WORDMARK_SPARK,
-            ]);
-        let banned = ['█', '■', '·', '…', '↺'];
-        for glyph in structural.filter(|glyph| *glyph != ' ') {
-            let allowed = ('\u{2500}'..='\u{257f}').contains(&glyph)
-                || matches!(glyph, '░' | '▰')
-                || matches!(glyph, LARGE_WORDMARK_RAIL | LARGE_WORDMARK_SPARK);
-            assert!(allowed, "unsafe masthead glyph {glyph:?}");
-            assert!(!banned.contains(&glyph), "banned masthead glyph {glyph:?}");
-        }
-        // The mass letterforms and their shade live in width-sensitive rows
-        // (row 0 right-aligns the chip), so each cell must hold one column
-        // under a wide-ambiguous CJK locale — the same bar as the HUD gauges.
-        for glyph in LARGE_WORDMARK_ART
-            .iter()
-            .flat_map(|row| row.chars())
-            .chain([LARGE_WORDMARK_SHADOW])
-            .filter(|glyph| *glyph != ' ')
-        {
+    fn signature_glyphs_are_width_safe() {
+        // The signature row right-aligns the chip, so every glyph must hold
+        // exactly one column under a wide-ambiguous CJK locale — the same
+        // bar as the HUD gauges.
+        for glyph in BRAND_WORDMARK.chars().chain([LARGE_WORDMARK_SPARK]) {
             assert_eq!(
                 unicode_width::UnicodeWidthChar::width_cjk(glyph),
                 Some(1),
-                "masthead glyph {glyph:?} must stay Neutral-width"
+                "signature glyph {glyph:?} must stay single-width"
             );
         }
-        let rendered_width = LARGE_WORDMARK_ART
-            .iter()
-            .map(|row| row.chars().count())
-            .max()
-            .unwrap_or_default()
-            .saturating_add(1);
-        assert!(rendered_width <= 13, "wordmark + shadow width {rendered_width}");
     }
 
     #[test]
@@ -1461,7 +1391,7 @@ mod tests {
         let late = dump_cells_with_style(&render_small(Some(Duration::from_millis(699))));
         assert_eq!(settled, early);
         assert_eq!(settled, late);
-        assert!(dump_terminal(&render_small(None)).contains("zo"));
+        assert!(dump_terminal(&render_small(None)).contains("ZeroCode"));
     }
 
     #[test]
