@@ -26,6 +26,14 @@ use self::manifest::{
     load_agent_manifest_from_scanned_path, persist_agent_stopped_state_with, read_agent_output,
     run_if_agent_manifest_running, write_agent_manifest,
 };
+
+/// The on-disk manifest for one agent id, or `None` when the store has no
+/// such agent (or the manifest is unreadable). The kernel bridge's `zo.result`
+/// read — callers must validate the id's alphabet before it becomes a path.
+pub(crate) fn agent_manifest_by_id(agent_id: &str) -> Option<AgentOutput> {
+    let path = agent_store_dir().ok()?.join(format!("{agent_id}.json"));
+    load_agent_manifest_from_scanned_path(&path).ok()
+}
 #[cfg(test)]
 use self::manifest::persist_agent_stopped_state;
 #[cfg(test)]

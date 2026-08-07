@@ -2,7 +2,7 @@ mod agent_tools;
 mod audit;
 mod config_tools;
 pub(crate) mod council;
-mod dispatch;
+pub(crate) mod dispatch;
 mod fanout_isolation;
 mod notebook_tools;
 mod retrieve_output;

@@ -558,6 +558,189 @@ pub(crate) fn dispatch(
     }
 }
 
+// ── Kernel bridge (`zo.*` inside the persistent REPL) ────────────────────────
+
+/// Host servicing for kernel-side `zo.spawn`/`zo.result`, backed by THIS
+/// dispatcher. Carrying the same `ctx`/`enforcer` the REPL call ran under is
+/// the whole security story: a kernel spawn IS an `Agent` tool call with
+/// `background: true` — permission-checked, routed, capped, and
+/// manifest-tracked identically — never a private side door.
+pub(crate) struct DispatchKernelBridge<'a> {
+    pub(crate) ctx: &'a ToolContext,
+    pub(crate) enforcer: Option<&'a PermissionEnforcer>,
+}
+
+impl crate::repl_kernel::KernelBridge for DispatchKernelBridge<'_> {
+    fn call(&self, op: &str, args: &Value) -> Value {
+        kernel_bridge_call(self.ctx, self.enforcer, op, args)
+    }
+}
+
+fn kernel_bridge_call(
+    ctx: &ToolContext,
+    enforcer: Option<&PermissionEnforcer>,
+    op: &str,
+    args: &Value,
+) -> Value {
+    match op {
+        "spawn" => kernel_bridge_spawn(ctx, enforcer, args),
+        "result" => kernel_bridge_result(args),
+        other => serde_json::json!({
+            "error": format!("unknown zo bridge op `{other}` — this build supports spawn and result")
+        }),
+    }
+}
+
+fn kernel_bridge_spawn(
+    ctx: &ToolContext,
+    enforcer: Option<&PermissionEnforcer>,
+    args: &Value,
+) -> Value {
+    let Some(prompt) = args
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|prompt| !prompt.trim().is_empty())
+    else {
+        return serde_json::json!({"error": "zo.spawn requires a non-empty prompt"});
+    };
+    let mut agent_input = serde_json::Map::new();
+    agent_input.insert("prompt".to_string(), Value::String(prompt.to_string()));
+    // The Python side always derives a description; falling back to the
+    // prompt keeps a hand-built frame valid without inventing another label.
+    let description = args
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|description| !description.trim().is_empty())
+        .unwrap_or(prompt);
+    agent_input.insert("description".to_string(), Value::String(description.to_string()));
+    for key in ["subagent_type", "model"] {
+        if let Some(value) = args.get(key).and_then(Value::as_str) {
+            if !value.trim().is_empty() {
+                agent_input.insert(key.to_string(), Value::String(value.to_string()));
+            }
+        }
+    }
+    // Detach at spawn: the kernel gets a handle back immediately and collects
+    // the report in a LATER cell via `zo.result`, so a cell never blocks for
+    // agent-length time inside its own exec deadline.
+    agent_input.insert("background".to_string(), Value::Bool(true));
+    match dispatch(ctx, enforcer, "Agent", &Value::Object(agent_input)) {
+        Some(Ok(text)) => {
+            let parsed = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
+            serde_json::json!({"result": parsed})
+        }
+        Some(Err(error)) => serde_json::json!({"error": format!("zo.spawn failed: {error}")}),
+        None => serde_json::json!({"error": "the Agent tool is not available in this dispatcher"}),
+    }
+}
+
+fn kernel_bridge_result(args: &Value) -> Value {
+    let Some(agent_id) = args
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return serde_json::json!({"error": "zo.result requires an agent_id"});
+    };
+    // The id becomes a store file name; restricting it to the id alphabet the
+    // spawn paths produce keeps kernel input from ever walking the path.
+    if !agent_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        return serde_json::json!({
+            "error": "zo.result: agent_id must be a plain agent identifier"
+        });
+    }
+    let Some(manifest) = super::agent_tools::agent_manifest_by_id(agent_id) else {
+        return serde_json::json!({
+            "error": format!("no agent manifest found for `{agent_id}`")
+        });
+    };
+    let (report, report_truncated) = kernel_bridge_report(&manifest.output_file);
+    serde_json::json!({"result": {
+        "agentId": manifest.agent_id,
+        "name": manifest.name,
+        "status": manifest.status,
+        "resolvedModel": manifest.resolved_model,
+        "report": report,
+        "reportTruncated": report_truncated,
+    }})
+}
+
+#[cfg(test)]
+mod kernel_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn bridge_rejects_unknown_ops_and_path_shaped_agent_ids() {
+        let unknown = kernel_bridge_result(&serde_json::json!({}));
+        assert!(
+            unknown
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("requires an agent_id")),
+            "{unknown}"
+        );
+        for hostile in ["../secrets", "a/b", "a\\b", "agent id", "x.json"] {
+            let denied = kernel_bridge_result(&serde_json::json!({"agent_id": hostile}));
+            assert!(
+                denied
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .is_some_and(|error| error.contains("plain agent identifier")),
+                "{hostile} must be rejected: {denied}"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_report_caps_and_signals_truncation() {
+        let dir = std::env::temp_dir().join(format!("zo-bridge-report-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("report.md");
+        std::fs::write(&path, "b".repeat(crate::repl_kernel::BRIDGE_REPORT_MAX_BYTES + 100))
+            .expect("write report");
+        let (report, truncated) = kernel_bridge_report(&path.display().to_string());
+        assert!(truncated);
+        assert_eq!(
+            report.as_str().map(str::len),
+            Some(crate::repl_kernel::BRIDGE_REPORT_MAX_BYTES)
+        );
+        let (missing, missing_truncated) = kernel_bridge_report("");
+        assert_eq!(missing, Value::Null);
+        assert!(!missing_truncated);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// The agent's report file as a JSON value, `Null` while absent or empty (an
+/// agent that has not written yet), capped at the same byte budget the REPL
+/// applies to its own captured streams so one report cannot flood a cell.
+fn kernel_bridge_report(path: &str) -> (Value, bool) {
+    if path.trim().is_empty() {
+        return (Value::Null, false);
+    }
+    match std::fs::read_to_string(path) {
+        Ok(text) if text.trim().is_empty() => (Value::Null, false),
+        Ok(mut text) => {
+            let cap = crate::repl_kernel::BRIDGE_REPORT_MAX_BYTES;
+            if text.len() > cap {
+                let mut end = cap;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                (Value::String(text), true)
+            } else {
+                (Value::String(text), false)
+            }
+        }
+        Err(_) => (Value::Null, false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -48,6 +48,11 @@ const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_millis(120_000);
 /// repr it produces (`MAX_VALUE_REPR_CHARS` in the bootstrap).
 const MAX_STREAM_BYTES: usize = 200_000;
 
+/// The same budget, applied by the dispatch bridge to an agent report handed
+/// back through `zo.result` — defined AS the stream cap so the two can never
+/// drift apart.
+pub(crate) const BRIDGE_REPORT_MAX_BYTES: usize = MAX_STREAM_BYTES;
+
 /// Spawn-to-first-frame deadline. Interpreter startup is tens of
 /// milliseconds; seconds mean a broken install and should fail loudly.
 const SPAWN_PROBE_TIMEOUT: Duration = Duration::from_millis(10_000);
@@ -61,13 +66,69 @@ const MAX_KERNELS: usize = 8;
 /// Stdlib-only bootstrap. Executes each request in a single shared namespace
 /// and evaluates a trailing expression like a REPL. `__name__` is set so
 /// `if __name__ == "__main__"` blocks behave as in a script.
+///
+/// The `zo` object is the sub-agent bridge: `zo.spawn(...)` / `zo.result(...)`
+/// write a bridge frame to the REAL stdout (`sys.__stdout__` — during exec the
+/// visible `sys.stdout` is redirected into the cell's captured stream) and
+/// block on ONE stdin line for the host's reply. The main loop uses
+/// `readline()` rather than iterating `sys.stdin` because the iterator's
+/// readahead could swallow a bridge reply into its private buffer and
+/// deadlock the cell against the host.
 const PYTHON_BOOTSTRAP: &str = r#"
 import ast, contextlib, io, json, sys, traceback
 
 MAX_VALUE_REPR_CHARS = 10_000
-ns = {"__name__": "__main__"}
 
-for line in sys.stdin:
+class _ZoBridge:
+    """Talk to the zo host mid-cell. Each call is one request frame out on the
+    real stdout and one reply frame in from stdin; the host services it with
+    the SAME tool machinery (permissions, routing, spawn caps) a direct tool
+    call gets."""
+    def __init__(self):
+        self._next = 0
+    def _call(self, op, args):
+        self._next += 1
+        rid = self._next
+        sys.__stdout__.write(json.dumps({"zo_bridge": rid, "op": op, "args": args}) + "\n")
+        sys.__stdout__.flush()
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                raise RuntimeError("zo bridge: host closed the channel")
+            try:
+                frame = json.loads(line)
+            except Exception:
+                continue
+            if frame.get("zo_bridge") != rid:
+                continue
+            payload = frame.get("payload") or {}
+            if payload.get("error"):
+                raise RuntimeError(payload["error"])
+            return payload.get("result")
+    def spawn(self, prompt, description=None, agent_type=None, model=None):
+        """Launch a background sub-agent; returns at spawn with its handle
+        (a dict carrying agentId). Collect the report later with
+        zo.result(agent_id) — do not busy-poll in a single cell."""
+        if description is None:
+            description = prompt if len(prompt) <= 60 else prompt[:57] + "..."
+        return self._call("spawn", {
+            "prompt": prompt,
+            "description": description,
+            "subagent_type": agent_type,
+            "model": model,
+        })
+    def result(self, agent_id):
+        """Current status of a spawned agent, plus its report text once the
+        agent has written one. Non-blocking: while the agent runs you get
+        status without a report."""
+        return self._call("result", {"agent_id": agent_id})
+
+ns = {"__name__": "__main__", "zo": _ZoBridge()}
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
     line = line.strip()
     if not line:
         continue
@@ -147,6 +208,29 @@ struct KernelFrame {
     stderr: String,
 }
 
+/// A mid-cell request from kernel code (the `zo` object) to the host. Shaped
+/// so it can never be mistaken for a [`KernelFrame`]: it has no `id`/`ok`
+/// pair, so a host without bridge support parses nothing and drops the line
+/// — the Python side then raises on the closed/ignored channel instead of
+/// hanging forever (its read loop only ends on EOF or a reply).
+#[derive(Debug, Deserialize)]
+struct BridgeFrame {
+    zo_bridge: u64,
+    op: String,
+    #[serde(default)]
+    args: serde_json::Value,
+}
+
+/// Host-side servicing for kernel `zo.*` calls. The REPL dispatch site
+/// supplies one backed by the real tool dispatcher, so a kernel spawn walks
+/// the SAME permission check, routing, caps, and manifest bookkeeping as a
+/// direct `Agent` tool call — the bridge adds transport, never authority.
+pub(crate) trait KernelBridge {
+    /// Service one op, returning `{"result": ...}` or `{"error": "..."}` —
+    /// the payload handed verbatim to the waiting Python call.
+    fn call(&self, op: &str, args: &serde_json::Value) -> serde_json::Value;
+}
+
 /// Why one exec failed, typed so the caller can tell "this kernel is dead —
 /// respawning is safe" apart from "the USER'S code hung" (a timeout), which
 /// must never be silently re-run. String matching here would repeat the
@@ -187,6 +271,7 @@ pub(crate) fn execute_persistent_python(
     cwd: Option<&std::path::Path>,
     timeout: Option<Duration>,
     reset: bool,
+    bridge: Option<&dyn KernelBridge>,
 ) -> Result<KernelExecOutput, ToolError> {
     let timeout = timeout.unwrap_or(DEFAULT_EXEC_TIMEOUT);
     if reset {
@@ -220,7 +305,7 @@ pub(crate) fn execute_persistent_python(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let started = Instant::now();
-        match exec_on_kernel(&mut guard, code, timeout) {
+        match exec_on_kernel(&mut guard, code, timeout, bridge) {
             Ok(frame) => {
                 guard.last_used = Instant::now();
                 return Ok(KernelExecOutput {
@@ -380,7 +465,7 @@ fn spawn_kernel(program: &str, cwd: Option<&std::path::Path>) -> Result<KernelHa
     // Readiness probe: a no-op cell proves the interpreter parsed the
     // bootstrap and is serving frames, so a broken install fails here with a
     // clear message instead of as a timeout on the user's first real cell.
-    exec_on_kernel(&mut handle, "None", SPAWN_PROBE_TIMEOUT).map_err(|e| {
+    exec_on_kernel(&mut handle, "None", SPAWN_PROBE_TIMEOUT, None).map_err(|e| {
         let _ = handle.child.kill();
         let _ = handle.child.wait();
         ToolError::Execution(format!(
@@ -395,6 +480,7 @@ fn exec_on_kernel(
     kernel: &mut KernelHandle,
     code: &str,
     timeout: Duration,
+    bridge: Option<&dyn KernelBridge>,
 ) -> Result<KernelFrame, KernelError> {
     kernel.next_request += 1;
     let id = kernel.next_request;
@@ -420,6 +506,30 @@ fn exec_on_kernel(
                     if frame.id == id {
                         return Ok(frame);
                     }
+                    continue;
+                }
+                // A mid-cell `zo.*` call. Serviced inline on this thread —
+                // the cell is blocked on the reply anyway — and the time it
+                // takes stays inside the cell's own deadline, exactly like
+                // any other work the cell chooses to do. `zo.spawn` detaches
+                // at spawn time, so servicing is bounded, not agent-length.
+                if let Ok(frame) = serde_json::from_str::<BridgeFrame>(&line) {
+                    let payload = bridge.map_or_else(
+                        || json!({"error": "the zo bridge is not available in this REPL context"}),
+                        |bridge| bridge.call(&frame.op, &frame.args),
+                    );
+                    let reply =
+                        json!({"zo_bridge": frame.zo_bridge, "payload": payload}).to_string();
+                    kernel
+                        .stdin
+                        .write_all(reply.as_bytes())
+                        .and_then(|()| kernel.stdin.write_all(b"\n"))
+                        .and_then(|()| kernel.stdin.flush())
+                        .map_err(|e| {
+                            KernelError::Dead(format!(
+                                "kernel stopped accepting bridge replies: {e}"
+                            ))
+                        })?;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -475,13 +585,27 @@ mod tests {
         format!("test-{name}-{}", std::process::id())
     }
 
+    /// Serialize every kernel-spawning test in this module. The registry and
+    /// its [`MAX_KERNELS`] LRU cap are process-global, so enough parallel
+    /// tests (each with its own scope) evict each other's idle kernels
+    /// between two calls of the SAME test — persistence assertions then fail
+    /// with `fresh_kernel: true` for a reason that has nothing to do with the
+    /// code under test.
+    fn kernel_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn state_persists_across_calls() {
+        let _serial = kernel_test_lock();
         let scope = scope("persist");
-        let a = execute_persistent_python(&scope, "x = 41", python(), None, None, false)
+        let a = execute_persistent_python(&scope, "x = 41", python(), None, None, false, None)
             .expect("first exec");
         assert!(a.ok && a.fresh_kernel);
-        let b = execute_persistent_python(&scope, "x + 1", python(), None, None, false)
+        let b = execute_persistent_python(&scope, "x + 1", python(), None, None, false, None)
             .expect("second exec");
         assert!(b.ok && !b.fresh_kernel);
         assert_eq!(b.value.as_deref(), Some("42"));
@@ -490,9 +614,10 @@ mod tests {
 
     #[test]
     fn exception_reports_but_kernel_survives() {
+        let _serial = kernel_test_lock();
         let scope = scope("survive");
-        execute_persistent_python(&scope, "y = 7", python(), None, None, false).expect("seed");
-        let boom = execute_persistent_python(&scope, "1/0", python(), None, None, false)
+        execute_persistent_python(&scope, "y = 7", python(), None, None, false, None).expect("seed");
+        let boom = execute_persistent_python(&scope, "1/0", python(), None, None, false, None)
             .expect("exception is a result, not a transport error");
         assert!(!boom.ok);
         assert!(
@@ -500,7 +625,7 @@ mod tests {
             "traceback expected: {:?}",
             boom.error
         );
-        let after = execute_persistent_python(&scope, "y", python(), None, None, false)
+        let after = execute_persistent_python(&scope, "y", python(), None, None, false, None)
             .expect("kernel survives the exception");
         assert_eq!(after.value.as_deref(), Some("7"));
         remove_kernel(&scope);
@@ -508,9 +633,10 @@ mod tests {
 
     #[test]
     fn reset_discards_the_namespace() {
+        let _serial = kernel_test_lock();
         let scope = scope("reset");
-        execute_persistent_python(&scope, "z = 1", python(), None, None, false).expect("seed");
-        let fresh = execute_persistent_python(&scope, "'z' in dir()", python(), None, None, true)
+        execute_persistent_python(&scope, "z = 1", python(), None, None, false, None).expect("seed");
+        let fresh = execute_persistent_python(&scope, "'z' in dir()", python(), None, None, true, None)
             .expect("reset exec");
         assert!(fresh.fresh_kernel);
         assert_eq!(fresh.value.as_deref(), Some("False"));
@@ -519,8 +645,9 @@ mod tests {
 
     #[test]
     fn timeout_discards_kernel_and_next_call_starts_fresh() {
+        let _serial = kernel_test_lock();
         let scope = scope("timeout");
-        execute_persistent_python(&scope, "w = 5", python(), None, None, false).expect("seed");
+        execute_persistent_python(&scope, "w = 5", python(), None, None, false, None).expect("seed");
         let hung = execute_persistent_python(
             &scope,
             "import time\ntime.sleep(60)",
@@ -528,11 +655,12 @@ mod tests {
             None,
             Some(Duration::from_millis(300)),
             false,
+            None,
         );
         let message = hung.expect_err("must time out").to_string();
         assert!(message.contains("timeout"), "{message}");
         assert!(message.contains("variables are lost"), "{message}");
-        let fresh = execute_persistent_python(&scope, "'w' in dir()", python(), None, None, false)
+        let fresh = execute_persistent_python(&scope, "'w' in dir()", python(), None, None, false, None)
             .expect("fresh kernel after timeout");
         assert!(fresh.fresh_kernel);
         assert_eq!(fresh.value.as_deref(), Some("False"));
@@ -541,8 +669,9 @@ mod tests {
 
     #[test]
     fn kernel_death_mid_call_errors_once_then_next_call_is_fresh() {
+        let _serial = kernel_test_lock();
         let scope = scope("death");
-        execute_persistent_python(&scope, "v = 9", python(), None, None, false).expect("seed");
+        execute_persistent_python(&scope, "v = 9", python(), None, None, false, None).expect("seed");
         // `os._exit` kills the kernel before any frame is written. The dead
         // kernel triggers the single respawn-retry, which re-runs the same
         // cell and dies again — so the call errors instead of looping.
@@ -553,12 +682,13 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
         let message = died.expect_err("kernel death must surface").to_string();
         assert!(message.contains("exited mid-call"), "{message}");
         assert!(message.contains("variables are lost"), "{message}");
 
-        let fresh = execute_persistent_python(&scope, "'v' in dir()", python(), None, None, false)
+        let fresh = execute_persistent_python(&scope, "'v' in dir()", python(), None, None, false, None)
             .expect("fresh kernel after death");
         assert!(fresh.fresh_kernel);
         assert_eq!(fresh.value.as_deref(), Some("False"));
@@ -567,11 +697,12 @@ mod tests {
 
     #[test]
     fn scopes_are_isolated() {
+        let _serial = kernel_test_lock();
         let left = scope("iso-left");
         let right = scope("iso-right");
-        execute_persistent_python(&left, "secret = 'left'", python(), None, None, false)
+        execute_persistent_python(&left, "secret = 'left'", python(), None, None, false, None)
             .expect("left seed");
-        let other = execute_persistent_python(&right, "'secret' in dir()", python(), None, None, false)
+        let other = execute_persistent_python(&right, "'secret' in dir()", python(), None, None, false, None)
             .expect("right probe");
         assert_eq!(other.value.as_deref(), Some("False"));
         remove_kernel(&left);
@@ -583,6 +714,7 @@ mod tests {
     /// the suite flaky.
     #[test]
     fn eviction_kills_the_longest_idle_kernel_and_skips_busy_ones() {
+        let _serial = kernel_test_lock();
         let mut map: HashMap<String, Arc<Mutex<KernelHandle>>> = HashMap::new();
         for i in 0..MAX_KERNELS {
             let mut handle = spawn_kernel(python(), None).expect("spawn");
@@ -622,6 +754,7 @@ mod tests {
 
     #[test]
     fn stdout_is_captured_not_interleaved() {
+        let _serial = kernel_test_lock();
         let scope = scope("stdout");
         let out = execute_persistent_python(
             &scope,
@@ -630,6 +763,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .expect("exec");
         assert_eq!(out.stdout, "hello\nworld\n");
@@ -639,11 +773,119 @@ mod tests {
 
     #[test]
     fn statement_only_cells_return_no_value() {
+        let _serial = kernel_test_lock();
         let scope = scope("stmt");
-        let out = execute_persistent_python(&scope, "for _ in range(3): pass", python(), None, None, false)
+        let out = execute_persistent_python(&scope, "for _ in range(3): pass", python(), None, None, false, None)
             .expect("exec");
         assert!(out.ok);
         assert_eq!(out.value, None);
+        remove_kernel(&scope);
+    }
+
+    struct MockBridge {
+        calls: Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl KernelBridge for MockBridge {
+        fn call(&self, op: &str, args: &serde_json::Value) -> serde_json::Value {
+            self.calls
+                .lock()
+                .expect("mock bridge lock")
+                .push((op.to_string(), args.clone()));
+            match op {
+                "spawn" => json!({"result": {"agentId": "agent-mock-1", "status": "running"}}),
+                "result" => json!({"result": {
+                    "agentId": args.get("agent_id").cloned().unwrap_or_default(),
+                    "status": "completed",
+                    "report": "all done",
+                }}),
+                other => json!({"error": format!("unknown op {other}")}),
+            }
+        }
+    }
+
+    #[test]
+    fn zo_bridge_round_trips_spawn_and_result_mid_cell() {
+        let _serial = kernel_test_lock();
+        let scope = scope("bridge");
+        let bridge = MockBridge {
+            calls: Mutex::new(Vec::new()),
+        };
+        let spawned = execute_persistent_python(
+            &scope,
+            "h = zo.spawn('scan the repository for TODO markers')\nh['agentId']",
+            python(),
+            None,
+            None,
+            false,
+            Some(&bridge),
+        )
+        .expect("spawn cell");
+        assert!(spawned.ok, "{spawned:?}");
+        assert_eq!(spawned.value.as_deref(), Some("'agent-mock-1'"));
+
+        // The handle survives in the namespace; a LATER cell collects the
+        // report — the exact two-call shape the tool description teaches.
+        let collected = execute_persistent_python(
+            &scope,
+            "zo.result(h['agentId'])['report']",
+            python(),
+            None,
+            None,
+            false,
+            Some(&bridge),
+        )
+        .expect("result cell");
+        assert!(collected.ok, "{collected:?}");
+        assert_eq!(collected.value.as_deref(), Some("'all done'"));
+
+        let calls = bridge.calls.lock().expect("mock bridge lock");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "spawn");
+        assert_eq!(
+            calls[0].1.get("prompt").and_then(serde_json::Value::as_str),
+            Some("scan the repository for TODO markers")
+        );
+        assert!(
+            calls[0]
+                .1
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|description| !description.is_empty()),
+            "python derives a description when none is given"
+        );
+        assert_eq!(calls[1].0, "result");
+        assert_eq!(
+            calls[1].1.get("agent_id").and_then(serde_json::Value::as_str),
+            Some("agent-mock-1")
+        );
+        remove_kernel(&scope);
+    }
+
+    #[test]
+    fn zo_bridge_error_payload_raises_in_cell_and_kernel_survives() {
+        let _serial = kernel_test_lock();
+        let scope = scope("bridge-error");
+        // No bridge installed: the host replies with an error payload, the
+        // Python call raises, and the KERNEL (with its variables) stays alive.
+        execute_persistent_python(&scope, "kept = 11", python(), None, None, false, None)
+            .expect("seed");
+        let denied =
+            execute_persistent_python(&scope, "zo.spawn('x')", python(), None, None, false, None)
+                .expect("cell runs; the raise is a result, not a transport failure");
+        assert!(!denied.ok);
+        assert!(
+            denied
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not available")),
+            "{denied:?}"
+        );
+        let after = execute_persistent_python(&scope, "kept", python(), None, None, false, None)
+            .expect("kernel survives the raised bridge error");
+        assert!(after.ok);
+        assert_eq!(after.value.as_deref(), Some("11"));
+        assert!(!after.fresh_kernel, "the same kernel answered");
         remove_kernel(&scope);
     }
 }

@@ -342,7 +342,9 @@ fn is_deferred_tool(name: &str) -> bool {
 /// deliberately: every entry costs prompt tokens on every turn.
 const DEFERRED_TOOL_HOOKS: &[(&str, &str)] = &[(
     "REPL",
-    "session-persistent Python kernel; variables survive across calls and compaction",
+    "session-persistent Python kernel; variables survive across calls and compaction; \
+     zo.spawn('task') launches background sub-agents and zo.result(id) collects their \
+     reports as variables",
 )];
 
 #[must_use]

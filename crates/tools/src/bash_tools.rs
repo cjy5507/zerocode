@@ -73,7 +73,7 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "REPL",
-            description: "Execute code in a REPL. Python runs in a SESSION-PERSISTENT kernel: variables, imports, functions, and parsed data survive across calls and across context compaction — assign intermediate results to variables and reuse them in later calls instead of re-reading files or re-deriving state. A trailing expression's value is returned like a REPL prompt; exceptions return a traceback while the kernel (and its variables) stays alive. Pass reset:true to discard the kernel and start clean. Other languages (js, sh) run one-shot per call with no persistent state.",
+            description: "Execute code in a REPL. Python runs in a SESSION-PERSISTENT kernel: variables, imports, functions, and parsed data survive across calls and across context compaction — assign intermediate results to variables and reuse them in later calls instead of re-reading files or re-deriving state. A trailing expression's value is returned like a REPL prompt; exceptions return a traceback while the kernel (and its variables) stays alive. The built-in `zo` object bridges to sub-agents: `h = zo.spawn(\"task prompt\")` launches a background agent through the normal Agent machinery and returns its handle dict immediately; in a LATER call, `zo.result(h[\"agentId\"])` returns its status and report text — so kernel code can fan work out over data structures and aggregate the reports as variables instead of transcript tokens. Pass reset:true to discard the kernel and start clean. Other languages (js, sh) run one-shot per call with no persistent state.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -150,10 +150,14 @@ pub(crate) fn dispatch(
             maybe_enforce_permission_check(enforcer, name, input).and_then(|()| {
                 // REPL has no background mode, so it creates no task to session-stamp.
                 // The session id scopes the persistent Python kernel: concurrent
-                // sessions and sub-agents each get their own namespace.
+                // sessions and sub-agents each get their own namespace. The
+                // bridge services kernel `zo.spawn`/`zo.result` calls by
+                // re-entering the tool dispatcher — same permission check,
+                // routing, caps, and manifest bookkeeping as a direct call.
                 let session_id = ctx.session_id();
+                let bridge = super::misc_tools::dispatch::DispatchKernelBridge { ctx, enforcer };
                 from_value::<ReplInput>(input)
-                    .and_then(|inp| run_repl(inp, cwd, session_id.as_deref()))
+                    .and_then(|inp| run_repl(inp, cwd, session_id.as_deref(), Some(&bridge)))
             }),
         ),
         "PowerShell" => Some(
@@ -224,6 +228,7 @@ pub(crate) fn run_repl(
     input: ReplInput,
     cwd: Option<&Path>,
     session_id: Option<&str>,
+    bridge: Option<&dyn super::repl_kernel::KernelBridge>,
 ) -> Result<String, ToolError> {
     if input.code.trim().is_empty() {
         return Err(ToolError::InvalidInput("code must not be empty".into()));
@@ -234,7 +239,7 @@ pub(crate) fn run_repl(
         )));
     }
     if is_python_language(&input.language) {
-        return run_persistent_python(&input, cwd, session_id);
+        return run_persistent_python(&input, cwd, session_id, bridge);
     }
     to_pretty_json(execute_repl(input, cwd)?)
 }
@@ -250,6 +255,7 @@ fn run_persistent_python(
     input: &ReplInput,
     cwd: Option<&Path>,
     session_id: Option<&str>,
+    bridge: Option<&dyn super::repl_kernel::KernelBridge>,
 ) -> Result<String, ToolError> {
     let program = detect_first_command(&["python3", "python"])
         .ok_or_else(|| ToolError::Execution("python runtime not found".into()))?;
@@ -261,6 +267,7 @@ fn run_persistent_python(
         cwd,
         input.timeout_ms.map(Duration::from_millis),
         input.reset.unwrap_or(false),
+        bridge,
     )?;
     to_pretty_json(json!({
         "language": "python",
