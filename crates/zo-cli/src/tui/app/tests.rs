@@ -6617,6 +6617,70 @@ fn fanout_progress_block_keeps_chat_pane_nonblank_during_delegation() {
     );
 }
 
+/// A detached background agent outlives its spawning turn; the pinned panel
+/// must keep showing it — clickable — while the conversation idles (CC's
+/// background-task line), and settled agents must not resurrect the panel.
+#[test]
+fn idle_conversation_keeps_running_background_agents_pinned() {
+    let mut app = test_app();
+    assert!(app.turn_activity.is_none(), "fixture must be idle");
+    app.hud_state.running_agents = 1;
+    app.hud_state.agents = vec![
+        AgentTaskSummary {
+            id: "agent-bg-1".to_string(),
+            name: "repo-scan".to_string(),
+            status: "running".to_string(),
+            model: "claude-haiku".to_string(),
+            elapsed_secs: 12,
+            ..Default::default()
+        },
+        AgentTaskSummary {
+            id: "agent-done".to_string(),
+            name: "old-review".to_string(),
+            status: "completed".to_string(),
+            model: "claude-haiku".to_string(),
+            elapsed_secs: 90,
+            ..Default::default()
+        },
+    ];
+
+    let width = 160;
+    let height = 30;
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+    app.draw(&mut terminal).expect("draw");
+    let dump = (0..height)
+        .map(|y| buffer_row(&terminal, width, y))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(dump.contains("repo-scan"), "running agent must stay pinned while idle:\n{dump}");
+    // Per-agent click targets come ONLY from the pinned panel (the sidebar
+    // tree is a separate, legitimately-full surface), so they are the precise
+    // signal for what the pin offers: the running agent clickable, the
+    // settled one absent.
+    assert!(
+        app.agent_row_click_targets.iter().any(|(_, id)| id == "agent-bg-1"),
+        "the idle pin must keep its per-agent click target"
+    );
+    assert!(
+        !app.agent_row_click_targets.iter().any(|(_, id)| id == "agent-done"),
+        "settled agents must not appear in the idle pin"
+    );
+
+    // Everything settled: the panel yields the space back.
+    app.hud_state.agents[0].status = "completed".to_string();
+    app.hud_state.running_agents = 0;
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+    app.draw(&mut terminal).expect("draw");
+    assert!(
+        app.agent_row_click_targets.is_empty(),
+        "a fully settled fleet must not pin anything"
+    );
+    assert!(
+        app.agent_panel_click_rect.is_none(),
+        "a fully settled fleet must release the panel rect"
+    );
+}
+
 #[test]
 fn full_frame_keeps_sidebar_chat_and_activity_in_sync_for_agents() {
     let mut app = test_app();

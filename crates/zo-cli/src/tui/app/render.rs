@@ -1692,8 +1692,29 @@ impl App {
     /// tail) instead of a dead "no output" spinner — even after the host
     /// `ToolCall` row scrolls off, or for fan-out paths that open no host row.
     fn agent_panel_lines(&self) -> (Vec<Line<'static>>, Vec<AgentRowSpan>) {
+        // An idle conversation still shows agents that are genuinely RUNNING
+        // (a detached `Agent`/`zo.spawn` outlives its spawning turn), so the
+        // user keeps a clickable pin above the input until the work lands —
+        // CC's background-task line. The turn gate only suppresses settled
+        // history: once nothing is running and no turn is live, the panel
+        // yields the space back.
         if self.turn_activity.is_none() {
-            return (Vec::new(), Vec::new());
+            let running: Vec<crate::tui::hud::AgentTaskSummary> = self
+                .hud_state
+                .agents
+                .iter()
+                .filter(|agent| agent.status.eq_ignore_ascii_case("running"))
+                .cloned()
+                .collect();
+            if running.is_empty() {
+                return (Vec::new(), Vec::new());
+            }
+            return crate::tui::blocks::tool_call::live_agent_panel_lines_with_spans(
+                &running,
+                &self.theme,
+                self.active_agent_batch_label(),
+                self.hovered_agent.as_deref(),
+            );
         }
         if !self.hud_state.agents.is_empty() {
             return crate::tui::blocks::tool_call::live_agent_panel_lines_with_spans(
