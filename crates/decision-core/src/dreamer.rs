@@ -110,6 +110,13 @@ pub enum CandidateKind {
     /// A successful foreground turn finished; this is a low-priority scheduler
     /// hint, not evidence of a bug by itself.
     PostTurn,
+    /// A harness feature attested as FAILING across the `/refine` evidence
+    /// window: it tried at least once, never fired, on the current build.
+    /// This is the live fail-open defect signature (the shape a 100%-failing
+    /// routing probe had for weeks while emitting nothing), promoted from the
+    /// attest ledger into the candidate store so `/improve` can plan a repair
+    /// for it — counted by code, not inferred by a model.
+    HarnessDefect,
 }
 
 impl CandidateKind {
@@ -123,6 +130,7 @@ impl CandidateKind {
             Self::TurnFailure => "turn_failure",
             Self::UserCancelled => "user_cancelled",
             Self::PostTurn => "post_turn",
+            Self::HarnessDefect => "harness_defect",
         }
     }
 
@@ -133,6 +141,10 @@ impl CandidateKind {
     pub const fn base_score(self) -> u32 {
         match self {
             Self::TurnFailure => 90,
+            // A failing harness feature outranks a failed goal: the goal
+            // failed once, but a Failing attestation means a shipped code
+            // path fails EVERY time it is reached and hides it.
+            Self::HarnessDefect => 85,
             Self::GoalTerminal | Self::GoalFailure => 80,
             Self::VerifiedAccept => 50,
             Self::PostTurn => 10,
@@ -143,7 +155,10 @@ impl CandidateKind {
     /// Whether this signal may enter self-repair planning.
     #[must_use]
     pub const fn is_actionable(self) -> bool {
-        matches!(self, Self::TurnFailure | Self::GoalFailure)
+        matches!(
+            self,
+            Self::TurnFailure | Self::GoalFailure | Self::HarnessDefect
+        )
     }
 }
 

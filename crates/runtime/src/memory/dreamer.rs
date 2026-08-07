@@ -1229,9 +1229,12 @@ fn default_advisor_findings(candidate: &SelfImproveCandidate) -> Vec<AdvisorFind
         CandidateKind::PostTurn | CandidateKind::VerifiedAccept | CandidateKind::UserCancelled => {
             PatchRisk::Low
         }
-        CandidateKind::GoalTerminal | CandidateKind::GoalFailure | CandidateKind::TurnFailure => {
-            PatchRisk::Medium
-        }
+        CandidateKind::GoalTerminal
+        | CandidateKind::GoalFailure
+        | CandidateKind::TurnFailure
+        // A failing harness feature is repaired inside the harness plumbing
+        // it names — the same blast radius a turn-failure repair has.
+        | CandidateKind::HarnessDefect => PatchRisk::Medium,
     };
     let representative = decision_core::dreamer::representative_candidate_evidence(candidate, 3);
     let detail = if representative.is_empty() {

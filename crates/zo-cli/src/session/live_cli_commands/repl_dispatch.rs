@@ -127,6 +127,13 @@ impl LiveCli {
                 self.run_dream()?;
                 false
             }
+            SlashCommand::Refine => {
+                println!(
+                    "{}",
+                    crate::session::refine::run_refine(&self.cwd, &self.session.id, None)
+                );
+                false
+            }
             SlashCommand::Diff => {
                 Self::print_diff()?;
                 false

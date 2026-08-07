@@ -281,6 +281,18 @@ pub(super) fn dream(ctx: &mut DispatchCtx) -> CommandOutput {
     }
 }
 
+/// `/refine` — the evidence-backed tuning report. Local reads only (attest
+/// evidence rows, shadow-routing stamps, the Dreamer candidate store); the
+/// one write is promoting a FAILING feature into a dream candidate, which is
+/// itself just input to the review-first `/improve` pipeline.
+pub(super) fn refine(ctx: &mut DispatchCtx) -> CommandOutput {
+    CommandOutput::info(crate::session::refine::run_refine(
+        &ctx.cli.cwd,
+        &ctx.cli.session.id,
+        None,
+    ))
+}
+
 /// `/ide [name]` — discover a running IDE extension (Claude Code extension
 /// lockfile protocol), connect to its WebSocket MCP server, and surface its
 /// tools (`mcp__ide__*`). An optional name filters when several IDEs run.

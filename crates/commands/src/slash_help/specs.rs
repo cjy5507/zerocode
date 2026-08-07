@@ -130,6 +130,14 @@ pub(super) const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         category: CommandCategory::Workspace,
     },
     SlashCommandSpec {
+        name: "refine",
+        aliases: &[],
+        summary: "Evidence-backed tuning report: harness health, shadow routing, improve hand-off (applies nothing)",
+        argument_hint: None,
+        resume_supported: false,
+        category: CommandCategory::Workspace,
+    },
+    SlashCommandSpec {
         name: "init",
         aliases: &[],
         summary: "Scaffold context.md, .zo/ settings, docs, and agent stubs",

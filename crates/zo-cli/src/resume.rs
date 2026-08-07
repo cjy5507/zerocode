@@ -251,6 +251,13 @@ pub(crate) fn run_resume_command(
                     .map(|report| format!("Dream\n  Result           {}", report.summary_line()))?
             }),
         }),
+        SlashCommand::Refine => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some({
+                let cwd = crate::current_cli_cwd()?;
+                crate::session::refine::run_refine(&cwd, &session.session_id, None)
+            }),
+        }),
         SlashCommand::Init => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(init_context_md()?),

@@ -1984,7 +1984,7 @@ fn smart_doctor_verify_pair_section(records: &[runtime::RouteOutcomeRecord]) -> 
 /// pairs, newest-manifest-first is NOT guaranteed (directory read order);
 /// best-effort — an unreadable store or a malformed manifest is skipped, not
 /// an error.
-fn scan_learned_shadow_stamps() -> Vec<(String, String)> {
+pub(crate) fn scan_learned_shadow_stamps() -> Vec<(String, String)> {
     let Ok(dir) = tools::agent_store_dir() else {
         return Vec::new();
     };
@@ -2737,7 +2737,7 @@ impl SmartLearnedSpecialtyMode {
         }
     }
 
-    fn status_label(self) -> &'static str {
+    pub(crate) fn status_label(self) -> &'static str {
         match self {
             Self::Off => "off",
             Self::Shadow => "shadow (soaking — seed still routes; delta logged for doctor)",

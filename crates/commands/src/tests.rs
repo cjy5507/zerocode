@@ -939,7 +939,10 @@ fn renders_help_from_shared_specs() {
     // /summary folded into /status, and /sandbox into /permissions. +1 for
     // /providers, the register/edit/delete manager split out of /connect.
     assert!(help.contains("/providers"));
-    assert_eq!(slash_command_specs().len(), 161);
+    // +1 in 2026-08: /refine, the evidence-backed tuning report that seals
+    // the attest ledger, shadow routing, and the /improve pipeline.
+    assert!(help.contains("/refine"));
+    assert_eq!(slash_command_specs().len(), 162);
     assert!(resume_supported_slash_commands().len() >= 25);
 }
 

@@ -340,6 +340,9 @@ pub async fn run_repl_session(
     // latency (terminal init + app build + first draw) distinctly from the
     // pre-TUI phases `boot` already carries.
     let repl_entry = Instant::now();
+    // Persist this session's harness attest evidence on EVERY exit route
+    // (quit, error, panic) — `/refine` aggregates these rows across sessions.
+    let _attest_evidence = crate::session::refine::AttestPersistGuard::new(cli.session.id.clone());
     let (render_tx, render_rx) = mpsc::channel::<RenderBlock>(RENDER_CHANNEL_CAPACITY);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<AgentCommand>(COMMAND_CHANNEL_CAPACITY);
     let mut agent_rx = tools::register_agent_completion_channel();

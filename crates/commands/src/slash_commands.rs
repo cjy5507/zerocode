@@ -124,6 +124,11 @@ pub enum SlashCommand {
     Tools,
     Memory,
     Dream,
+    /// `/refine` — the evidence-backed tuning report: harness attest health,
+    /// learned-specialty shadow deltas, and the improve-pipeline hand-off.
+    /// Read-only by contract; every finding names the command that would
+    /// apply it.
+    Refine,
     Init,
     Diff,
     Version,
@@ -514,6 +519,10 @@ pub fn validate_slash_command_input(
         "dream" => {
             validate_no_args(command, &args)?;
             SlashCommand::Dream
+        }
+        "refine" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Refine
         }
         "init" => {
             validate_no_args(command, &args)?;
@@ -1654,6 +1663,18 @@ mod session_name_tests {
 #[cfg(test)]
 mod self_improve_tests {
     use super::{SelfImproveAction, SlashCommand};
+
+    #[test]
+    fn refine_parses_bare_and_rejects_arguments() {
+        let refine = SlashCommand::parse("/refine")
+            .expect("parse should succeed")
+            .expect("slash command expected");
+        assert_eq!(refine, SlashCommand::Refine);
+        assert!(
+            SlashCommand::parse("/refine now").is_err(),
+            "/refine takes no arguments"
+        );
+    }
 
     #[test]
     fn improve_parses_status_apply_and_default_actions() {

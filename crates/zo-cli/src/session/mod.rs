@@ -21,6 +21,7 @@ mod mcp_runtime;
 mod ndjson_summary;
 pub(crate) use ndjson_summary::StreamPrompter;
 pub(crate) mod permission_bridge;
+pub(crate) mod refine;
 pub(crate) mod report_services;
 mod request_types;
 pub(crate) mod restart;

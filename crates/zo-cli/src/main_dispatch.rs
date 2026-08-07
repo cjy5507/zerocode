@@ -314,6 +314,10 @@ fn run_headless_turn_with_optional_fallback(
     output_format: CliOutputFormat,
     fallback_model: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Same evidence teardown the TUI loop has: headless turns attest too, and
+    // `/refine` is only as good as the sessions that report in.
+    let _attest_evidence =
+        crate::session::refine::AttestPersistGuard::new(cli.session.id.clone());
     let mut turn_result = cli.run_turn_with_output(prompt, output_format);
     // `--fallback-model` (CC parity): one retry on a capacity-shaped failure of
     // the primary model — overload, rate-limit, or a 5xx that survived the

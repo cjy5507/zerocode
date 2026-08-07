@@ -76,6 +76,7 @@ fn dispatch(ctx: &mut DispatchCtx, command: SlashCommand) -> Result<CommandOutpu
         C::Config { section } => view::config(section.as_deref())?,
         C::Memory => system::edit_memory(ctx),
         C::Dream => system::dream(ctx),
+        C::Refine => system::refine(ctx),
         C::Diff => view::diff(ctx)?,
         C::Agents { args } => view::agents(ctx, args.as_deref())?,
         C::Inbox { args } => view::inbox(ctx, args.as_deref()),
