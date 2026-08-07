@@ -475,7 +475,16 @@ struct BenchEvidence {
     tools: Vec<BenchToolSummary>,
     verdicts: Vec<String>,
     lost_tasks: Vec<String>,
+    /// The exact arguments that produced this scoreboard, stamped by
+    /// `zo-bench` itself — the refresh door names a reproduction, never a
+    /// guess at flags.
+    rerun_args: Option<String>,
 }
+
+/// Bench evidence older than this earns a refresh note — the weekly cadence,
+/// expressed as staleness the explicit `/refine` surfaces rather than a
+/// scheduled job that would spend tokens nobody asked for.
+const BENCH_STALE_DAYS: u64 = 7;
 
 /// Which scoreboard row is "us". Derived from the running binary's name so
 /// the report never pins a product name the bench config didn't use; a tool
@@ -553,12 +562,22 @@ fn bench_evidence_for(cwd: &Path, self_tool: &str, now_secs: u64) -> Option<Benc
         return None;
     }
 
+    let rerun_args = value
+        .get("rerun_args")
+        .and_then(serde_json::Value::as_array)
+        .map(|args| {
+            args.iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
     Some(BenchEvidence {
         run_name,
         age_days: now_secs.saturating_sub(epoch) / (24 * 60 * 60),
         verdicts: bench_verdicts(&tools, self_tool),
         lost_tasks: bench_lost_tasks(&value, self_tool),
         tools,
+        rerun_args,
     })
 }
 
@@ -910,6 +929,22 @@ fn render_report(
         }
         if !bench.lost_tasks.is_empty() {
             lines.push(format!("  lost task(s): {}", bench.lost_tasks.join(" · ")));
+        }
+        if bench.age_days >= BENCH_STALE_DAYS {
+            let refresh = bench.rerun_args.as_ref().map_or_else(
+                || "re-run zo-bench".to_string(),
+                |args| {
+                    if args.is_empty() {
+                        "zo-bench".to_string()
+                    } else {
+                        format!("zo-bench {args}")
+                    }
+                },
+            );
+            lines.push(format!(
+                "  -> this measurement is {} day(s) old — refresh: {refresh}",
+                bench.age_days,
+            ));
         }
     }
 
@@ -1524,6 +1559,7 @@ mod tests {
                     {"task": "fix-off-by-one", "tool": "zo", "success": true},
                     {"task": "fix-off-by-one", "tool": "claude-code", "success": true},
                 ],
+                "rerun_args": ["--trials", "2"],
             }),
         );
 
@@ -1575,6 +1611,30 @@ mod tests {
             "{report}"
         );
         assert!(report.contains("lost task(s): rust-compile-fix (claude-code passed)"), "{report}");
+        assert!(
+            !report.contains("refresh:"),
+            "3-day-old evidence is fresh, no staleness note: {report}"
+        );
+
+        // Ten days later the same artifact earns a refresh note that names
+        // the run's own stamped reproduction command.
+        let stale = bench_evidence_for(&dir, "zo", 200 + 10 * DAY).expect("stale evidence");
+        assert_eq!(stale.rerun_args.as_deref(), Some("--trials 2"));
+        let stale_report = render_report(
+            &dir,
+            "sha-current",
+            14,
+            &WindowAggregate::default(),
+            &shadow_fixture(),
+            &[],
+            Some(&stale),
+            &[],
+        );
+        assert!(
+            stale_report
+                .contains("this measurement is 10 day(s) old — refresh: zo-bench --trials 2"),
+            "{stale_report}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

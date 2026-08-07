@@ -253,7 +253,11 @@ fn run(args: &[String]) -> Result<(), String> {
         }
     }
 
-    let scoreboard = build_scoreboard(&rows);
+    let mut scoreboard = build_scoreboard(&rows);
+    // Stamp the run's own reproduction command: whoever reads this artifact
+    // later (e.g. /refine's staleness note) can name the EXACT invocation
+    // that refreshes it instead of guessing at flags.
+    scoreboard["rerun_args"] = serde_json::json!(std::env::args().skip(1).collect::<Vec<_>>());
     std::fs::write(
         run_root.join("scoreboard.json"),
         serde_json::to_string_pretty(&scoreboard).map_err(|e| e.to_string())?,
