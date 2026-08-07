@@ -433,6 +433,201 @@ fn shadow_evidence() -> ShadowEvidence {
     }
 }
 
+// ── Head-to-head bench evidence ──────────────────────────────────────────────
+
+/// One tool's aggregate line from a `zo-bench` `scoreboard.json`.
+struct BenchToolSummary {
+    tool: String,
+    tasks: u64,
+    successes: u64,
+    median_wall_ms: u64,
+    total_cost_usd: f64,
+    total_tokens: u64,
+}
+
+/// The newest bench run's scoreboard, reduced to what the report says:
+/// the per-tool digest, the axes where this tool trails each rival, and
+/// the tasks it lost outright. Absence of a scoreboard is not a finding —
+/// callers render nothing when this is `None`.
+struct BenchEvidence {
+    run_name: String,
+    age_days: u64,
+    tools: Vec<BenchToolSummary>,
+    verdicts: Vec<String>,
+    lost_tasks: Vec<String>,
+}
+
+/// Which scoreboard row is "us". Derived from the running binary's name so
+/// the report never pins a product name the bench config didn't use; a tool
+/// list that doesn't include it still renders, just without verdict lines.
+fn self_tool_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "zo".to_string())
+}
+
+fn bench_evidence(cwd: &Path) -> Option<BenchEvidence> {
+    bench_evidence_for(cwd, &self_tool_name(), now_ms() / 1000)
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn percent_over(mine: f64, rival: f64) -> u64 {
+    if rival <= 0.0 {
+        return 0;
+    }
+    (((mine - rival) / rival) * 100.0).round().max(0.0) as u64
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn format_wall(ms: u64) -> String {
+    format!("{:.1}s", ms as f64 / 1000.0)
+}
+
+fn format_tokens(tokens: u64) -> String {
+    if tokens >= 1000 {
+        format!("{}k", (tokens + 500) / 1000)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn bench_evidence_for(cwd: &Path, self_tool: &str, now_secs: u64) -> Option<BenchEvidence> {
+    let results_dir = cwd.join("bench").join("results");
+    let mut newest: Option<(u64, String)> = None;
+    for entry in std::fs::read_dir(&results_dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(epoch) = name
+            .strip_prefix("run-")
+            .and_then(|suffix| suffix.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if !entry.path().join("scoreboard.json").is_file() {
+            continue;
+        }
+        if newest.as_ref().is_none_or(|(top, _)| epoch > *top) {
+            newest = Some((epoch, name));
+        }
+    }
+    let (epoch, run_name) = newest?;
+    let raw = std::fs::read_to_string(results_dir.join(&run_name).join("scoreboard.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+
+    let tools: Vec<BenchToolSummary> = value
+        .get("tools")?
+        .as_array()?
+        .iter()
+        .filter_map(|tool| {
+            Some(BenchToolSummary {
+                tool: tool.get("tool")?.as_str()?.to_string(),
+                tasks: tool.get("tasks")?.as_u64()?,
+                successes: tool.get("successes")?.as_u64()?,
+                median_wall_ms: tool.get("median_wall_ms")?.as_u64()?,
+                total_cost_usd: tool.get("total_cost_usd")?.as_f64()?,
+                total_tokens: tool.get("total_tokens")?.as_u64()?,
+            })
+        })
+        .collect();
+    if tools.is_empty() {
+        return None;
+    }
+
+    Some(BenchEvidence {
+        run_name,
+        age_days: now_secs.saturating_sub(epoch) / (24 * 60 * 60),
+        verdicts: bench_verdicts(&tools, self_tool),
+        lost_tasks: bench_lost_tasks(&value, self_tool),
+        tools,
+    })
+}
+
+/// Per-task outcomes: a task is lost when none of our trials passed it; the
+/// rivals that DID pass it are named so the loss is reproducible.
+fn bench_lost_tasks(scoreboard: &serde_json::Value, self_tool: &str) -> Vec<String> {
+    let mut self_task_passed: BTreeMap<String, bool> = BTreeMap::new();
+    let mut rivals_passed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let empty = Vec::new();
+    for row in scoreboard
+        .get("rows")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&empty)
+    {
+        let (Some(task), Some(tool), Some(success)) = (
+            row.get("task").and_then(serde_json::Value::as_str),
+            row.get("tool").and_then(serde_json::Value::as_str),
+            row.get("success").and_then(serde_json::Value::as_bool),
+        ) else {
+            continue;
+        };
+        if tool == self_tool {
+            *self_task_passed.entry(task.to_string()).or_insert(false) |= success;
+        } else if success {
+            rivals_passed.entry(task.to_string()).or_default().insert(tool.to_string());
+        }
+    }
+    self_task_passed
+        .iter()
+        .filter(|(_, passed)| !**passed)
+        .map(|(task, _)| {
+            rivals_passed.get(task).map_or_else(
+                || format!("{task} (no tool passed)"),
+                |winners| {
+                    format!(
+                        "{task} ({} passed)",
+                        winners.iter().cloned().collect::<Vec<_>>().join(", ")
+                    )
+                },
+            )
+        })
+        .collect()
+}
+
+/// One line per rival naming every axis where our row trails theirs. No self
+/// row in the scoreboard ⇒ no verdicts — the summary still renders.
+#[allow(clippy::cast_precision_loss)]
+fn bench_verdicts(tools: &[BenchToolSummary], self_tool: &str) -> Vec<String> {
+    let Some(mine) = tools.iter().find(|tool| tool.tool == self_tool) else {
+        return Vec::new();
+    };
+    tools
+        .iter()
+        .filter(|rival| rival.tool != self_tool)
+        .map(|rival| {
+            let mut behind = Vec::new();
+            if mine.successes * rival.tasks < rival.successes * mine.tasks {
+                behind.push(format!(
+                    "pass rate ({}/{} vs {}/{})",
+                    mine.successes, mine.tasks, rival.successes, rival.tasks
+                ));
+            }
+            if mine.median_wall_ms > rival.median_wall_ms {
+                behind.push(format!(
+                    "median wall (+{}%)",
+                    percent_over(mine.median_wall_ms as f64, rival.median_wall_ms as f64)
+                ));
+            }
+            if mine.total_cost_usd > rival.total_cost_usd {
+                behind.push(format!(
+                    "cost (+{}%)",
+                    percent_over(mine.total_cost_usd, rival.total_cost_usd)
+                ));
+            }
+            if mine.total_tokens > rival.total_tokens {
+                behind.push(format!(
+                    "tokens (+{}%)",
+                    percent_over(mine.total_tokens as f64, rival.total_tokens as f64)
+                ));
+            }
+            if behind.is_empty() {
+                format!("vs {}: ahead or even on every axis", rival.tool)
+            } else {
+                format!("vs {}: behind on {}", rival.tool, behind.join(", "))
+            }
+        })
+        .collect()
+}
+
 /// The launchpad's one-line pointer, computed at boot on the startup loader
 /// thread. Pure read — no persist, no candidate write; those stay behind the
 /// explicit `/refine`.
@@ -475,7 +670,8 @@ pub(crate) fn run_refine(cwd: &Path, session_id: &str, window_days: Option<u64>)
     let aggregate = aggregate_window(&rows, sha, now_ms(), window);
     let shadow = shadow_evidence();
     let proposed_skills = tools::stranded_proposed_skills(cwd);
-    render_report(cwd, sha, window, &aggregate, &shadow, &proposed_skills)
+    let bench = bench_evidence(cwd);
+    render_report(cwd, sha, window, &aggregate, &shadow, &proposed_skills, bench.as_ref())
 }
 
 #[allow(clippy::too_many_lines)] // one linear report assembly, sectioned by comments
@@ -486,6 +682,7 @@ fn render_report(
     aggregate: &WindowAggregate,
     shadow: &ShadowEvidence,
     proposed_skills: &[tools::ProposedSkill],
+    bench: Option<&BenchEvidence>,
 ) -> String {
     let mut lines = vec![
         "Refine — evidence-backed tuning report (applies nothing)".to_string(),
@@ -502,6 +699,46 @@ fn render_report(
             "  {} ablated session(s) excluded — their zeros are control-arm results, not findings",
             aggregate.ablated_session_count
         ));
+    }
+
+    // Head-to-head bench — the "are we winning" evidence, straight from the
+    // newest scoreboard artifact. Absence of a run renders nothing: not
+    // having measured is not a finding, and a nag row would push people to
+    // burn tokens on benches they didn't ask for.
+    if let Some(bench) = bench {
+        lines.push(String::new());
+        lines.push(format!(
+            "Head-to-head bench (bench/results/{} · {})",
+            bench.run_name,
+            if bench.age_days == 0 {
+                "today".to_string()
+            } else {
+                format!("{} day(s) ago", bench.age_days)
+            },
+        ));
+        let name_width = bench
+            .tools
+            .iter()
+            .map(|tool| tool.tool.len())
+            .max()
+            .unwrap_or(0);
+        for tool in &bench.tools {
+            lines.push(format!(
+                "  {:<name_width$}  {}/{} pass · {} median · ${:.2} · {} tokens",
+                tool.tool,
+                tool.successes,
+                tool.tasks,
+                format_wall(tool.median_wall_ms),
+                tool.total_cost_usd,
+                format_tokens(tool.total_tokens),
+            ));
+        }
+        for verdict in &bench.verdicts {
+            lines.push(format!("  {verdict}"));
+        }
+        if !bench.lost_tasks.is_empty() {
+            lines.push(format!("  lost task(s): {}", bench.lost_tasks.join(" · ")));
+        }
     }
 
     // Harness health — findings first, then the alive digest.
@@ -964,7 +1201,7 @@ mod tests {
             stamp_count: 3,
             distinct_models: ["a".to_string(), "b".to_string()].into_iter().collect(),
         };
-        let report = render_report(&dir, "sha-current", 14, &aggregate, &shadow, &[]);
+        let report = render_report(&dir, "sha-current", 14, &aggregate, &shadow, &[], None);
         assert!(report.contains("gated    design guidance reminder"), "{report}");
         assert!(
             report.contains("requires a turn whose resolved intent is Design"),
@@ -987,7 +1224,8 @@ mod tests {
             origin: "project-zo".to_string(),
             path: "/tmp/x/SKILL.md".to_string(),
         }];
-        let with_skills = render_report(&dir, "sha-current", 14, &aggregate, &shadow, &proposed);
+        let with_skills =
+            render_report(&dir, "sha-current", 14, &aggregate, &shadow, &proposed, None);
         assert!(
             with_skills.contains("~ proposed  tui-palette-fixes (project-zo)"),
             "{with_skills}"
@@ -996,5 +1234,127 @@ mod tests {
             with_skills.contains("approve the skill tui-palette-fixes"),
             "{with_skills}"
         );
+        assert!(
+            !with_skills.contains("Head-to-head bench"),
+            "no bench section without a scoreboard: {with_skills}"
+        );
+    }
+
+    fn write_scoreboard(dir: &Path, run: &str, body: &serde_json::Value) {
+        let run_dir = dir.join("bench").join("results").join(run);
+        std::fs::create_dir_all(&run_dir).expect("mkdir");
+        std::fs::write(
+            run_dir.join("scoreboard.json"),
+            serde_json::to_string(body).expect("json"),
+        )
+        .expect("write scoreboard");
+    }
+
+    #[test]
+    fn bench_evidence_reads_the_newest_run_and_names_losing_axes_and_lost_tasks() {
+        const DAY: u64 = 24 * 60 * 60;
+        let dir = std::env::temp_dir().join(format!("zo-refine-bench-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A stale run that must NOT be picked, and a run directory without a
+        // scoreboard artifact that must be skipped entirely.
+        write_scoreboard(&dir, "run-100", &serde_json::json!({"tools": [], "rows": []}));
+        std::fs::create_dir_all(dir.join("bench").join("results").join("run-999"))
+            .expect("empty run dir");
+        write_scoreboard(
+            &dir,
+            "run-200",
+            &serde_json::json!({
+                "tools": [
+                    {"tool": "zo", "tasks": 6, "successes": 5, "median_wall_ms": 31_000,
+                     "total_cost_usd": 1.29, "total_tokens": 910_921},
+                    {"tool": "claude-code", "tasks": 6, "successes": 6, "median_wall_ms": 29_000,
+                     "total_cost_usd": 1.98, "total_tokens": 1_098_867},
+                ],
+                "rows": [
+                    {"task": "rust-compile-fix", "tool": "zo", "success": false},
+                    {"task": "rust-compile-fix", "tool": "claude-code", "success": true},
+                    {"task": "fix-off-by-one", "tool": "zo", "success": true},
+                    {"task": "fix-off-by-one", "tool": "claude-code", "success": true},
+                ],
+            }),
+        );
+
+        let bench = bench_evidence_for(&dir, "zo", 200 + 3 * DAY).expect("bench evidence");
+        assert_eq!(bench.run_name, "run-200", "newest run with an artifact wins");
+        assert_eq!(bench.age_days, 3);
+        assert_eq!(bench.verdicts.len(), 1);
+        assert!(
+            bench.verdicts[0].contains("behind on pass rate (5/6 vs 6/6)"),
+            "{}",
+            bench.verdicts[0]
+        );
+        assert!(
+            bench.verdicts[0].contains("median wall (+7%)"),
+            "{}",
+            bench.verdicts[0]
+        );
+        assert!(
+            !bench.verdicts[0].contains("cost") && !bench.verdicts[0].contains("tokens"),
+            "axes we lead must not be listed as behind: {}",
+            bench.verdicts[0]
+        );
+        assert_eq!(bench.lost_tasks, vec!["rust-compile-fix (claude-code passed)"]);
+
+        let report = render_report(
+            &dir,
+            "sha-current",
+            14,
+            &WindowAggregate::default(),
+            &ShadowEvidence {
+                mode_label: "shadow".to_string(),
+                mode_is_on: false,
+                stamp_count: 0,
+                distinct_models: BTreeSet::new(),
+            },
+            &[],
+            Some(&bench),
+        );
+        assert!(
+            report.contains("Head-to-head bench (bench/results/run-200 · 3 day(s) ago)"),
+            "{report}"
+        );
+        assert!(report.contains("zo           5/6 pass · 31.0s median · $1.29 · 911k tokens"), "{report}");
+        assert!(
+            report.contains("claude-code  6/6 pass · 29.0s median · $1.98 · 1099k tokens"),
+            "{report}"
+        );
+        assert!(report.contains("lost task(s): rust-compile-fix (claude-code passed)"), "{report}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bench_evidence_without_a_self_row_still_summarizes_but_stays_verdict_free() {
+        let dir = std::env::temp_dir().join(format!("zo-refine-bench-noself-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_scoreboard(
+            &dir,
+            "run-50",
+            &serde_json::json!({
+                "tools": [
+                    {"tool": "claude-code", "tasks": 2, "successes": 2, "median_wall_ms": 1000,
+                     "total_cost_usd": 0.10, "total_tokens": 900},
+                ],
+                "rows": [],
+            }),
+        );
+        let bench = bench_evidence_for(&dir, "zo", 50).expect("bench evidence");
+        assert!(bench.verdicts.is_empty(), "no self row, no verdict");
+        assert!(bench.lost_tasks.is_empty());
+        assert_eq!(bench.tools.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bench_evidence_is_none_without_any_scoreboard() {
+        let dir = std::env::temp_dir().join(format!("zo-refine-bench-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        assert!(bench_evidence_for(&dir, "zo", 0).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
