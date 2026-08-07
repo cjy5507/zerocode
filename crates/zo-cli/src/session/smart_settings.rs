@@ -1259,6 +1259,33 @@ fn deep_verify_feedback_hint_at(
     summary.feedback_hint_for_route_key("deep-verify:leg")
 }
 
+/// `/refine`'s promotion-gate evidence: how many learned-specialty entries
+/// exist at all, plus display lines for the ones clearing the router's own
+/// rung-admission predicate — the exact bar that changes routing once
+/// `smart.learnedSpecialty` is `on`. Divergence stamps alone prove the
+/// learned hint DIFFERS; an armed entry is the measured claim that it is
+/// RIGHT, so recommendations key off this and never off stamp volume.
+pub(crate) fn learned_promotion_evidence(cwd: &std::path::Path) -> (usize, Vec<String>) {
+    let records = read_route_outcomes(cwd).unwrap_or_default();
+    let hint = LearnedSpecialtyHint::compute(&records, epoch_seconds_now(), |raw| {
+        api::resolve_model_alias(raw.trim())
+    });
+    let armed = hint
+        .entries()
+        .iter()
+        .filter(|(_, _, entry)| entry.earns_rung_admission())
+        .map(|(role, model, entry)| {
+            format!(
+                "{}: {model} ({:+}, {}\u{2030} confidence)",
+                role_display_label(role.key()),
+                entry.model_adjustment,
+                entry.confidence_permille
+            )
+        })
+        .collect();
+    (hint.entries().len(), armed)
+}
+
 /// Seconds-since-epoch for [`LearnedSpecialtyHint::compute`]'s recency decay.
 /// Mirrors `tools::misc_tools::smart_router::apply::epoch_seconds_now`
 /// (crate-private there, so duplicated here rather than plumbed across the

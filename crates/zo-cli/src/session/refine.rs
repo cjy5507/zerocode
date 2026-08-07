@@ -416,9 +416,16 @@ struct ShadowEvidence {
     mode_is_on: bool,
     stamp_count: usize,
     distinct_models: BTreeSet<String>,
+    /// Learned-specialty entries the engine currently holds at all.
+    learned_entry_count: usize,
+    /// Display lines for entries clearing the router's own rung-admission
+    /// predicate — the promotion gate's evidence. Promotion is only ever
+    /// recommended when this is non-empty: turning the mode on with nothing
+    /// armed changes no routing decision.
+    armed_entries: Vec<String>,
 }
 
-fn shadow_evidence() -> ShadowEvidence {
+fn shadow_evidence(cwd: &Path) -> ShadowEvidence {
     let (mode_label, mode_is_on) = super::smart_settings::read_global_smart_settings()
         .map_or_else(
             |_| ("unknown (settings unreadable)".to_string(), false),
@@ -434,11 +441,15 @@ fn shadow_evidence() -> ShadowEvidence {
         );
     let stamps = super::smart_settings::scan_learned_shadow_stamps();
     let distinct_models = stamps.iter().map(|(_, model)| model.clone()).collect();
+    let (learned_entry_count, armed_entries) =
+        super::smart_settings::learned_promotion_evidence(cwd);
     ShadowEvidence {
         mode_label,
         mode_is_on,
         stamp_count: stamps.len(),
         distinct_models,
+        learned_entry_count,
+        armed_entries,
     }
 }
 
@@ -677,7 +688,7 @@ pub(crate) fn run_refine(cwd: &Path, session_id: &str, window_days: Option<u64>)
     let rows = read_rows(&attest_evidence_path());
     let window = window_days.unwrap_or(DEFAULT_WINDOW_DAYS);
     let aggregate = aggregate_window(&rows, sha, now_ms(), window);
-    let shadow = shadow_evidence();
+    let shadow = shadow_evidence(cwd);
     let proposed_skills = tools::stranded_proposed_skills(cwd);
     let bench = bench_evidence(cwd);
     render_report(cwd, sha, window, &aggregate, &shadow, &proposed_skills, bench.as_ref())
@@ -834,9 +845,31 @@ fn render_report(
             shadow.stamp_count,
             shadow.distinct_models.len(),
         ));
-        if !shadow.mode_is_on {
+    }
+    // Promotion gate: `/smart learned on` is recommended ONLY when an entry
+    // clears the router's own rung-admission predicate — the exact bar that
+    // changes a routing decision once the mode is on. Stamps prove the
+    // learned hint DIFFERS; an armed entry is the measured claim that it is
+    // RIGHT. Recommending on stamp volume alone would be advice without
+    // evidence — and turning the mode on with nothing armed changes nothing.
+    if !shadow.mode_is_on {
+        if !shadow.armed_entries.is_empty() {
             lines.push(format!(
-                "  -> smallest change: {SHADOW_DOOR}   (observation-only until then; stamps accrue at zero cost)"
+                "  {} learned entr{} clear the router's rung-admission bar:",
+                shadow.armed_entries.len(),
+                if shadow.armed_entries.len() == 1 { "y" } else { "ies" },
+            ));
+            for armed in shadow.armed_entries.iter().take(4) {
+                lines.push(format!("    {armed}"));
+            }
+            lines.push(format!(
+                "  -> promotion evidence met — smallest change: {SHADOW_DOOR}"
+            ));
+        } else if shadow.learned_entry_count > 0 {
+            lines.push(format!(
+                "  0 of {} learned entr{} clear the rung-admission bar yet — promotion would not change routing; the shadow soak continues at zero cost",
+                shadow.learned_entry_count,
+                if shadow.learned_entry_count == 1 { "y" } else { "ies" },
             ));
         }
     }
@@ -1200,12 +1233,7 @@ mod tests {
         aggregate
             .current
             .insert("info_topology".to_string(), attestation(9, &[], &[]));
-        let shadow = ShadowEvidence {
-            mode_label: "shadow".to_string(),
-            mode_is_on: false,
-            stamp_count: 3,
-            distinct_models: ["a".to_string(), "b".to_string()].into_iter().collect(),
-        };
+        let shadow = shadow_fixture();
         let report = render_report(&dir, "sha-current", 14, &aggregate, &shadow, &[], None);
         assert!(report.contains("gated    design guidance reminder"), "{report}");
         assert!(
@@ -1213,7 +1241,18 @@ mod tests {
             "{report}"
         );
         assert!(report.contains("alive    information topology"), "{report}");
-        assert!(report.contains("/smart learned on"), "{report}");
+        assert!(
+            report.contains("1 learned entry clear the router's rung-admission bar"),
+            "{report}"
+        );
+        assert!(
+            report.contains("executor: model-x (+72, 910‰ confidence)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("promotion evidence met — smallest change: /smart learned on"),
+            "{report}"
+        );
         assert!(report.contains("Nothing was changed."), "{report}");
         assert!(
             !report.contains("FAILING"),
@@ -1222,6 +1261,24 @@ mod tests {
         assert!(
             !report.contains("Distilled skills"),
             "no skills section without proposed drafts: {report}"
+        );
+
+        // With nothing armed the door must NOT print: turning the mode on
+        // would change no routing decision, so recommending it is advice
+        // without evidence.
+        let unarmed = ShadowEvidence {
+            armed_entries: Vec::new(),
+            learned_entry_count: 3,
+            ..shadow_fixture()
+        };
+        let soaking = render_report(&dir, "sha-current", 14, &aggregate, &unarmed, &[], None);
+        assert!(
+            soaking.contains("0 of 3 learned entries clear the rung-admission bar yet"),
+            "{soaking}"
+        );
+        assert!(
+            !soaking.contains("/smart learned on"),
+            "no promotion door without armed evidence: {soaking}"
         );
 
         let proposed = vec![tools::ProposedSkill {
@@ -1243,6 +1300,17 @@ mod tests {
             !with_skills.contains("Head-to-head bench"),
             "no bench section without a scoreboard: {with_skills}"
         );
+    }
+
+    fn shadow_fixture() -> ShadowEvidence {
+        ShadowEvidence {
+            mode_label: "shadow".to_string(),
+            mode_is_on: false,
+            stamp_count: 3,
+            distinct_models: ["a".to_string(), "b".to_string()].into_iter().collect(),
+            learned_entry_count: 2,
+            armed_entries: vec!["executor: model-x (+72, 910‰ confidence)".to_string()],
+        }
     }
 
     fn write_scoreboard(dir: &Path, run: &str, body: &serde_json::Value) {
@@ -1315,6 +1383,8 @@ mod tests {
                 mode_is_on: false,
                 stamp_count: 0,
                 distinct_models: BTreeSet::new(),
+                learned_entry_count: 0,
+                armed_entries: Vec::new(),
             },
             &[],
             Some(&bench),
