@@ -111,6 +111,15 @@ impl PromptCachePaths {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptCacheStats {
     pub tracked_requests: u64,
+    /// Microcompact firings whose trim credit this session consumed, and the
+    /// estimated tokens those trims cleared — the aggregate side of the
+    /// per-row `trimmed_tokens_estimate` pairing, and the denominator that
+    /// still counts a firing whose following drop stayed under the row
+    /// threshold.
+    #[serde(default)]
+    pub context_trims_noted: u64,
+    #[serde(default)]
+    pub context_trim_tokens_noted: u64,
     pub completion_cache_hits: u64,
     pub completion_cache_misses: u64,
     pub completion_cache_writes: u64,
@@ -384,6 +393,43 @@ pub struct PromptCacheRecord {
     pub low_cache_hit_warning: Option<String>,
 }
 
+/// Pending context-trim credits, keyed by prompt-cache session id.
+///
+/// The compaction planner (in `runtime`, which depends on this crate and so
+/// cannot be called back into) deposits the estimated tokens a microcompact
+/// cleared; the SAME session's next `record_usage` withdraws it and stamps
+/// the figure on the break row that trim is about to cause. This is the
+/// "missing third column" the ledger doc used to declare unrecordable: a row
+/// said what got re-billed, never what the trim bought, so the firing could
+/// not be priced. Keyed by session id so concurrent sessions/subagents in
+/// one process can never claim each other's credit; a credit whose session
+/// never sends another request idles harmlessly for the process lifetime.
+fn pending_context_trims() -> &'static Mutex<std::collections::HashMap<String, u64>> {
+    static PENDING: std::sync::OnceLock<Mutex<std::collections::HashMap<String, u64>>> = std::sync::OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Deposit a microcompact's estimated cleared tokens for `session_id`.
+/// Accumulates: two firings before the next request price as one combined
+/// trim, which is what the single following break row actually reflects.
+pub fn note_context_trim(session_id: &str, estimated_tokens_cleared: u64) {
+    if estimated_tokens_cleared == 0 {
+        return;
+    }
+    let mut pending = pending_context_trims()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *pending.entry(session_id.to_string()).or_default() += estimated_tokens_cleared;
+}
+
+fn take_pending_context_trim(session_id: &str) -> u64 {
+    pending_context_trims()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(session_id)
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Clone)]
 pub struct PromptCache {
     inner: Arc<Mutex<PromptCacheInner>>,
@@ -494,6 +540,14 @@ impl PromptCache {
     ) -> PromptCacheRecord {
         let request_hash = request_hash_hex(request);
         let mut inner = self.lock();
+        // Withdraw this session's pending trim credit up front: the trim
+        // fired before THIS request regardless of whether a break row gets
+        // written below, and the stats pair must count such firings too.
+        let trimmed_tokens = take_pending_context_trim(&inner.config.session_id);
+        if trimmed_tokens > 0 {
+            inner.stats.context_trims_noted += 1;
+            inner.stats.context_trim_tokens_noted += trimmed_tokens;
+        }
         let previous = inner.previous.clone();
         let fingerprints = RequestFingerprints::from_request(request);
         let current = TrackedPromptState::from_fingerprints(&fingerprints, usage);
@@ -570,6 +624,7 @@ impl PromptCache {
                     // persisted row can never disagree about which model broke.
                     model: event.model.clone(),
                     provider: event.provider.clone(),
+                    trimmed_tokens_estimate: (trimmed_tokens > 0).then_some(trimmed_tokens),
                 },
             );
         }
@@ -1631,14 +1686,12 @@ pub fn doctor_cache_summary() -> Option<PromptCacheDoctorSummary> {
 /// rewrite); all axis flags `false` with `unexpected: true` = our payload was
 /// byte-stable yet reads dropped (provider-side miss / eviction).
 ///
-/// Deliberately NOT recorded: how many tokens a microcompact cleared between
-/// the previous request and this one. That is the missing third column for
-/// pricing a firing — a row says what got re-billed, never what the trim
-/// bought — but the figure is produced by the compaction planner in `runtime`,
-/// which depends on this crate and cannot be called back into. Recording it
-/// means a new value threaded through `record_usage` / `record_response` at
-/// every provider call site, so it belongs to its own change rather than being
-/// half-wired here with a field nothing fills.
+/// `trimmed_tokens_estimate` is the trim-pricing column: the compaction
+/// planner deposits each microcompact's cleared estimate through
+/// [`note_context_trim`] (a session-keyed side channel — `runtime` depends on
+/// this crate and cannot be called back into), and the same session's next
+/// recorded request withdraws it here. Rows without a preceding trim carry
+/// nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 // Same rationale as `CacheBreakEvent`: the axis flags are independent
 // fingerprint dimensions, not mutually exclusive states.
@@ -1714,6 +1767,12 @@ pub struct CacheBreakLedgerRow {
     /// row costs no bytes for a field it cannot fill.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider: String,
+    /// Estimated tokens the microcompact(s) firing right before this request
+    /// cleared — the price-of-trim pairing: `cache_creation` on this row is
+    /// what the trim COST, this field is what it BOUGHT. `None` on rows not
+    /// preceded by a trim, and on rows written by builds before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trimmed_tokens_estimate: Option<u64>,
 }
 
 /// Cause of a break whose axis flags are all `false` (the request fingerprint
@@ -1956,6 +2015,52 @@ mod tests {
         .expect("break should be detected");
         assert!(event.unexpected);
         assert!(event.reason.contains("stable"));
+    }
+
+    /// The trim-pricing pair: a deposited microcompact credit rides the SAME
+    /// session's next break row as `trimmed_tokens_estimate`, is consumed
+    /// exactly once, and never crosses sessions.
+    #[test]
+    fn a_context_trim_credit_stamps_the_next_break_row_once_for_its_own_session() {
+        use super::{note_context_trim, read_break_ledger, take_pending_context_trim};
+        let _env = test_env_lock();
+        let home = std::env::temp_dir().join(format!("zo-trim-pair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("ZO_CONFIG_HOME", &home);
+
+        let session = format!("trim-pair-{}", std::process::id());
+        let cache = PromptCache::new(session.clone());
+        let usage_with_read = |cache_read: u32| Usage {
+            input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: cache_read,
+            output_tokens: 0,
+        };
+        let _ = cache.record_usage(&sample_request_with_messages(&["a", "b"]), &usage_with_read(50_000));
+        note_context_trim(&session, 12_345);
+        note_context_trim("someone-else", 999);
+        // The trim rewrote history mid-prefix → divergence → break row.
+        let _ = cache.record_usage(
+            &sample_request_with_messages(&["a", "REWRITTEN", "c"]),
+            &usage_with_read(30_000),
+        );
+        let stats = cache.stats();
+        assert_eq!(stats.context_trims_noted, 1);
+        assert_eq!(stats.context_trim_tokens_noted, 12_345);
+        let rows = read_break_ledger(&PromptCachePaths::for_session(&session).breaks_path);
+        let row = rows.last().expect("break row written");
+        assert_eq!(row.trimmed_tokens_estimate, Some(12_345), "{row:?}");
+        // Consumed once: the next break carries nothing.
+        let _ = cache.record_usage(
+            &sample_request_with_messages(&["a", "DIFFERENT", "c"]),
+            &usage_with_read(500),
+        );
+        let rows = read_break_ledger(&PromptCachePaths::for_session(&session).breaks_path);
+        assert_eq!(rows.last().expect("second row").trimmed_tokens_estimate, None);
+        // The other session's deposit is still waiting for ITS next request.
+        assert_eq!(take_pending_context_trim("someone-else"), 999);
+        std::env::remove_var("ZO_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// A pure tail append cannot legitimately drop cache reads — the previous
@@ -2794,6 +2899,7 @@ mod tests {
             tools_removed: event.tools_removed.clone(),
             model: event.model.clone(),
             provider: event.provider.clone(),
+            trimmed_tokens_estimate: None,
         };
 
         // Provider-side: byte-stable fingerprint, inside the TTL, reads drop.

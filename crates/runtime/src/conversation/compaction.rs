@@ -1007,6 +1007,14 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
             MICROCOMPACT_MIN_OUTPUT_BYTES,
         );
         if let Some(fired) = event {
+            // Price this firing: deposit the cleared estimate for the ledger
+            // (`api::prompt_cache`), which pairs it with the cache re-bill the
+            // trim is about to cause on the next request — the third column
+            // that makes microcompact economics measurable per firing.
+            api::note_context_trim(
+                &self.session.session_id,
+                fired.estimated_tokens_saved,
+            );
             // Recompute recall dedup for the same reason as full compaction:
             // reclaimed full bodies must be free to reseed, while any full
             // entries that survived this trim must remain deduplicated.

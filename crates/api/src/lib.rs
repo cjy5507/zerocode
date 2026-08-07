@@ -18,7 +18,7 @@ pub use client::{
 pub use core_types::{RateLimitSnapshot, RateLimitWindow, RateLimitWindowKind};
 pub use error::{ApiError, CapacityScope, ProviderErrorClass, context_overflow_ceiling_tokens};
 pub use prompt_cache::{
-    doctor_cache_summary, read_break_ledger, read_sweep_marker, CacheBreakEvent,
+    doctor_cache_summary, note_context_trim, read_break_ledger, read_sweep_marker, CacheBreakEvent,
     CacheBreakLedgerRow, DivergedWireMessage, NoAxisBreakCause, PromptCache, PromptCacheConfig,
     PromptCacheDoctorSummary, PromptCachePaths, PromptCacheRecord, PromptCacheStats, SweepMarker,
     WireMessageShape,
