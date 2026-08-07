@@ -75,9 +75,62 @@ const MAX_KERNELS: usize = 8;
 /// readahead could swallow a bridge reply into its private buffer and
 /// deadlock the cell against the host.
 const PYTHON_BOOTSTRAP: &str = r#"
-import ast, contextlib, io, json, sys, traceback
+import ast, contextlib, io, json, os, pickle, sys, traceback
 
 MAX_VALUE_REPR_CHARS = 10_000
+
+# Namespace snapshot: the host hands a per-scope path via ZO_KERNEL_SNAPSHOT
+# (popped so user code and its subprocesses never see it). After every cell
+# the picklable subset of the namespace is dumped atomically; a fresh kernel
+# for the same scope restores it, so a timeout, eviction, or zo restart
+# loses the process but not the data. Everything here is best-effort: a
+# snapshot failure must never break the cell that triggered it.
+_SNAPSHOT_PATH = os.environ.pop("ZO_KERNEL_SNAPSHOT", None)
+_SNAPSHOT_VALUE_CAP = 2_000_000
+_SNAPSHOT_TOTAL_CAP = 8_000_000
+_SNAPSHOT_RESERVED = ("__name__", "zo")
+
+def _snapshot_save(ns):
+    if not _SNAPSHOT_PATH:
+        return
+    try:
+        blobs, total = {}, 0
+        for key in sorted(ns):
+            if key in _SNAPSHOT_RESERVED or key.startswith("_"):
+                continue
+            try:
+                blob = pickle.dumps(ns[key], protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception:
+                continue  # unpicklable values (open files, modules, …) just don't survive
+            if len(blob) > _SNAPSHOT_VALUE_CAP or total + len(blob) > _SNAPSHOT_TOTAL_CAP:
+                continue
+            blobs[key] = blob
+            total += len(blob)
+        tmp = _SNAPSHOT_PATH + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump({"v": 1, "vars": blobs}, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, _SNAPSHOT_PATH)
+    except Exception:
+        pass
+
+def _snapshot_restore(ns):
+    names = []
+    if not _SNAPSHOT_PATH or not os.path.exists(_SNAPSHOT_PATH):
+        return names
+    try:
+        with open(_SNAPSHOT_PATH, "rb") as f:
+            snap = pickle.load(f)
+        for key, blob in sorted((snap.get("vars") or {}).items()):
+            if key in _SNAPSHOT_RESERVED:
+                continue
+            try:
+                ns[key] = pickle.loads(blob)
+                names.append(key)
+            except Exception:
+                pass  # a value whose class vanished only loses that one key
+    except Exception:
+        return []
+    return names
 
 class _ZoBridge:
     """Talk to the zo host mid-cell. Each call is one request frame out on the
@@ -138,6 +191,10 @@ class _ZoBridge:
         return self._call("history", {"contains": contains, "role": role, "limit": limit})
 
 ns = {"__name__": "__main__", "zo": _ZoBridge()}
+# Restored names ride on the FIRST response frame only (the host's readiness
+# probe), where the host records them; repeating them on every frame would
+# tax each cell for a boot-time fact.
+_restored_pending = _snapshot_restore(ns)
 
 while True:
     line = sys.stdin.readline()
@@ -152,6 +209,9 @@ while True:
         continue
     out, err = io.StringIO(), io.StringIO()
     resp = {"id": req.get("id"), "ok": True, "value": None, "error": None}
+    if _restored_pending is not None:
+        resp["restored"] = _restored_pending
+        _restored_pending = None
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             tree = ast.parse(req.get("code", ""), "<zo-repl>", "exec")
@@ -175,6 +235,11 @@ while True:
     resp["stderr"] = err.getvalue()
     sys.stdout.write(json.dumps(resp) + "\n")
     sys.stdout.flush()
+    # After the reply, not before: the host is already reading the result
+    # while the dump runs, so durability costs no cell latency. Worst case a
+    # crash right here loses one cell's delta — and the restore report names
+    # exactly what survived, so nothing is silently misrepresented.
+    _snapshot_save(ns)
 "#;
 
 /// One live kernel: the child process, its stdin, and the reader-thread
@@ -192,6 +257,10 @@ struct KernelHandle {
     started: Instant,
     /// Last successful exec — the LRU axis for [`MAX_KERNELS`] eviction.
     last_used: Instant,
+    /// Variable names this kernel restored from its scope's snapshot at
+    /// boot, reported once on the readiness probe's frame. Empty when there
+    /// was nothing (or no snapshot path).
+    restored_vars: Vec<String>,
 }
 
 /// Result of one persistent execution, shaped by the caller into the tool's
@@ -208,6 +277,10 @@ pub(crate) struct KernelExecOutput {
     /// "same kernel as before" without the model tracking it.
     pub kernel_uptime_secs: u64,
     pub fresh_kernel: bool,
+    /// On a fresh kernel: the variables it restored from the scope's
+    /// snapshot, so the model knows state carried over instead of assuming
+    /// an empty namespace. Always empty on a reused kernel.
+    pub restored_vars: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,6 +293,10 @@ struct KernelFrame {
     stdout: String,
     #[serde(default)]
     stderr: String,
+    /// Present only on the first frame a kernel emits: the names its boot
+    /// restored from the scope's snapshot.
+    #[serde(default)]
+    restored: Option<Vec<String>>,
 }
 
 /// A mid-cell request from kernel code (the `zo` object) to the host. Shaped
@@ -274,6 +351,84 @@ fn registry() -> &'static Mutex<HashMap<String, Arc<Mutex<KernelHandle>>>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// How long an untouched snapshot file survives before the boot-time sweep
+/// removes it. Sessions are mortal; their kernel state should not outlive
+/// them by more than a resume-plausible window.
+const SNAPSHOT_KEEP: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: snapshots are OFF in tests unless a test opts in with a
+    /// directory of its own. The production default would have every kernel
+    /// test writing into (and restoring from!) the real config home —
+    /// cross-run contamination exactly like the env-inherited todo store.
+    static SNAPSHOT_DIR_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_snapshot_dir_for_this_thread(dir: Option<std::path::PathBuf>) {
+    SNAPSHOT_DIR_OVERRIDE.with(|slot| *slot.borrow_mut() = dir);
+}
+
+// The Option is the test seam's contract: under cfg(test) this is None until
+// a test opts in, so the production arm alone looks unnecessarily wrapped.
+#[allow(clippy::unnecessary_wraps)]
+fn snapshot_dir() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    {
+        SNAPSHOT_DIR_OVERRIDE.with(|slot| slot.borrow().clone())
+    }
+    #[cfg(not(test))]
+    {
+        Some(runtime::default_config_home().join("kernel-snapshots"))
+    }
+}
+
+/// The snapshot file for one scope, with the directory created, locked to
+/// the owner, and swept of stale files. Any failure returns `None`: the
+/// snapshot is an amenity and must never block an exec.
+fn kernel_snapshot_path(scope: &str) -> Option<std::path::PathBuf> {
+    let dir = snapshot_dir()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    let _ = core_types::paths::restrict_permissions_owner_only(&dir);
+    prune_stale_snapshots(&dir);
+    // Scopes are session ids (uuid-shaped) — sanitize rather than hash so
+    // the mapping stays stable across processes and readable on disk.
+    let safe: String = scope
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(96)
+        .collect();
+    Some(dir.join(format!("{safe}.pkl")))
+}
+
+/// Once per process: drop snapshot files idle past [`SNAPSHOT_KEEP`].
+fn prune_stale_snapshots(dir: &std::path::Path) {
+    static SWEPT: OnceLock<()> = OnceLock::new();
+    SWEPT.get_or_init(|| {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let stale = entry
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > SNAPSHOT_KEEP);
+                if stale {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    });
+}
+
 /// Execute `code` in the persistent kernel for `scope`, spawning one if
 /// needed. `reset` discards any existing kernel first. `scope` is the
 /// isolation key — callers pass the session id so concurrent sessions (and
@@ -288,8 +443,14 @@ pub(crate) fn execute_persistent_python(
     bridge: Option<&dyn KernelBridge>,
 ) -> Result<KernelExecOutput, ToolError> {
     let timeout = timeout.unwrap_or(DEFAULT_EXEC_TIMEOUT);
+    let snapshot = kernel_snapshot_path(scope);
     if reset {
         remove_kernel(scope);
+        // Reset means "start clean" — restoring the old namespace from disk
+        // right after would betray it, so the snapshot goes with the kernel.
+        if let Some(path) = &snapshot {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     // Two attempts, but only for a DEAD kernel: a concurrent call on the same
@@ -308,7 +469,7 @@ pub(crate) fn execute_persistent_python(
                 (Arc::clone(existing), false)
             } else {
                 evict_longest_idle_if_full(&mut map);
-                let handle = spawn_kernel(program, cwd)?;
+                let handle = spawn_kernel(program, cwd, snapshot.as_deref())?;
                 let handle = Arc::new(Mutex::new(handle));
                 map.insert(scope.to_string(), Arc::clone(&handle));
                 (handle, true)
@@ -331,6 +492,11 @@ pub(crate) fn execute_persistent_python(
                     duration_ms: started.elapsed().as_millis(),
                     kernel_uptime_secs: guard.started.elapsed().as_secs(),
                     fresh_kernel,
+                    restored_vars: if fresh_kernel {
+                        guard.restored_vars.clone()
+                    } else {
+                        Vec::new()
+                    },
                 });
             }
             Err(error) => {
@@ -347,9 +513,21 @@ pub(crate) fn execute_persistent_python(
                     attempted_respawn = true;
                     continue;
                 }
+                // Truthful loss report: with a snapshot on disk the next
+                // kernel restores the picklable variables, and claiming
+                // total loss would push the model into needless rebuilds.
+                let recovery = match &snapshot {
+                    Some(path) if path.exists() => {
+                        "the next REPL call starts a fresh kernel and restores \
+                         the last snapshot's picklable variables"
+                    }
+                    _ => {
+                        "its variables are lost; the next REPL call starts a \
+                         fresh kernel"
+                    }
+                };
                 return Err(ToolError::Execution(format!(
-                    "{} — the kernel was discarded and its variables are lost; \
-                     the next REPL call starts a fresh kernel",
+                    "{} — the kernel was discarded; {recovery}",
                     error.message()
                 )));
             }
@@ -423,7 +601,11 @@ fn remove_kernel_handle(scope: &str, expected: &Arc<Mutex<KernelHandle>>) {
     }
 }
 
-fn spawn_kernel(program: &str, cwd: Option<&std::path::Path>) -> Result<KernelHandle, ToolError> {
+fn spawn_kernel(
+    program: &str,
+    cwd: Option<&std::path::Path>,
+    snapshot: Option<&std::path::Path>,
+) -> Result<KernelHandle, ToolError> {
     let mut command = Command::new(program);
     command
         .args(["-u", "-c", PYTHON_BOOTSTRAP])
@@ -433,6 +615,9 @@ fn spawn_kernel(program: &str, cwd: Option<&std::path::Path>) -> Result<KernelHa
     // Same scoping rule as the one-shot path: the parent session's todo store
     // is a zo implementation detail and must not leak into children.
     command.env_remove("ZO_TODO_STORE");
+    if let Some(snapshot) = snapshot {
+        command.env("ZO_KERNEL_SNAPSHOT", snapshot);
+    }
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -475,11 +660,13 @@ fn spawn_kernel(program: &str, cwd: Option<&std::path::Path>) -> Result<KernelHa
         next_request: 0,
         started: Instant::now(),
         last_used: Instant::now(),
+        restored_vars: Vec::new(),
     };
     // Readiness probe: a no-op cell proves the interpreter parsed the
     // bootstrap and is serving frames, so a broken install fails here with a
     // clear message instead of as a timeout on the user's first real cell.
-    exec_on_kernel(&mut handle, "None", SPAWN_PROBE_TIMEOUT, None).map_err(|e| {
+    // Its frame also carries the boot-time snapshot-restore report.
+    let probe = exec_on_kernel(&mut handle, "None", SPAWN_PROBE_TIMEOUT, None).map_err(|e| {
         let _ = handle.child.kill();
         let _ = handle.child.wait();
         ToolError::Execution(format!(
@@ -487,6 +674,7 @@ fn spawn_kernel(program: &str, cwd: Option<&std::path::Path>) -> Result<KernelHa
             e.message()
         ))
     })?;
+    handle.restored_vars = probe.restored.unwrap_or_default();
     Ok(handle)
 }
 
@@ -612,6 +800,110 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Opt this thread into snapshots under a fresh temp dir; hand back the
+    /// dir for cleanup. Snapshots stay OFF for every test that doesn't call
+    /// this — the production default writing into the real config home would
+    /// contaminate runs through restored state.
+    fn snapshot_sandbox(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("zo-kernel-snap-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        set_snapshot_dir_for_this_thread(Some(dir.clone()));
+        dir
+    }
+
+    fn teardown_snapshot_sandbox(dir: &std::path::Path) {
+        set_snapshot_dir_for_this_thread(None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn snapshot_restores_variables_after_kernel_death() {
+        let _serial = kernel_test_lock();
+        let dir = snapshot_sandbox("restore");
+        let scope = scope("snap-restore");
+        execute_persistent_python(&scope, "x = 41", python(), None, None, false, None)
+            .expect("seed");
+        // os._exit skips the save for THIS cell, so the surviving snapshot is
+        // the one from `x = 41` — exactly the durability contract.
+        let _ = execute_persistent_python(
+            &scope,
+            "import os\nos._exit(0)",
+            python(),
+            None,
+            None,
+            false,
+            None,
+        );
+        let revived = execute_persistent_python(&scope, "x + 1", python(), None, None, false, None)
+            .expect("fresh kernel after death");
+        assert!(revived.fresh_kernel);
+        assert_eq!(revived.value.as_deref(), Some("42"), "x must survive the dead kernel");
+        assert_eq!(revived.restored_vars, vec!["x".to_string()]);
+        remove_kernel(&scope);
+        teardown_snapshot_sandbox(&dir);
+    }
+
+    #[test]
+    fn reset_discards_the_snapshot_with_the_kernel() {
+        let _serial = kernel_test_lock();
+        let dir = snapshot_sandbox("reset");
+        let scope = scope("snap-reset");
+        execute_persistent_python(&scope, "x = 1", python(), None, None, false, None)
+            .expect("seed");
+        let cleared =
+            execute_persistent_python(&scope, "'x' in dir()", python(), None, None, true, None)
+                .expect("reset exec");
+        assert!(cleared.fresh_kernel);
+        assert_eq!(cleared.value.as_deref(), Some("False"), "reset must not restore");
+        assert!(cleared.restored_vars.is_empty());
+        remove_kernel(&scope);
+        teardown_snapshot_sandbox(&dir);
+    }
+
+    #[test]
+    fn unpicklable_values_are_skipped_without_losing_the_rest() {
+        let _serial = kernel_test_lock();
+        let dir = snapshot_sandbox("unpicklable");
+        let scope = scope("snap-partial");
+        execute_persistent_python(
+            &scope,
+            "f = open('/dev/null')\ny = 7",
+            python(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("seed");
+        let _ = execute_persistent_python(
+            &scope,
+            "import os\nos._exit(0)",
+            python(),
+            None,
+            None,
+            false,
+            None,
+        );
+        let revived = execute_persistent_python(
+            &scope,
+            "('f' in dir(), 'y' in dir(), y)",
+            python(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("fresh kernel");
+        assert_eq!(
+            revived.value.as_deref(),
+            Some("(False, True, 7)"),
+            "the open file handle is gone, the data survives"
+        );
+        assert_eq!(revived.restored_vars, vec!["y".to_string()]);
+        remove_kernel(&scope);
+        teardown_snapshot_sandbox(&dir);
+    }
+
     #[test]
     fn state_persists_across_calls() {
         let _serial = kernel_test_lock();
@@ -731,7 +1023,7 @@ mod tests {
         let _serial = kernel_test_lock();
         let mut map: HashMap<String, Arc<Mutex<KernelHandle>>> = HashMap::new();
         for i in 0..MAX_KERNELS {
-            let mut handle = spawn_kernel(python(), None).expect("spawn");
+            let mut handle = spawn_kernel(python(), None, None).expect("spawn");
             // Deterministic idleness ranking without sleeping: older index =
             // longer idle.
             handle.last_used = Instant::now()
@@ -748,7 +1040,7 @@ mod tests {
         let busy = Arc::clone(map.get("k1").expect("k1 present"));
         let busy_guard = busy.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Refill to the cap so eviction triggers again.
-        let mut extra = spawn_kernel(python(), None).expect("spawn extra");
+        let mut extra = spawn_kernel(python(), None, None).expect("spawn extra");
         extra.last_used = Instant::now();
         map.insert("fresh".into(), Arc::new(Mutex::new(extra)));
         evict_longest_idle_if_full(&mut map);

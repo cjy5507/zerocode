@@ -269,6 +269,17 @@ fn run_persistent_python(
         input.reset.unwrap_or(false),
         bridge,
     )?;
+    let mut kernel = json!({
+        "persistent": true,
+        "fresh": output.fresh_kernel,
+        "uptimeSecs": output.kernel_uptime_secs,
+    });
+    // Only a fresh kernel can have restored anything, and an empty list on
+    // every reply would just be noise — the field appears exactly when the
+    // model must know the namespace did NOT start empty.
+    if !output.restored_vars.is_empty() {
+        kernel["restoredVars"] = json!(output.restored_vars);
+    }
     to_pretty_json(json!({
         "language": "python",
         "ok": output.ok,
@@ -277,11 +288,7 @@ fn run_persistent_python(
         "stderr": output.stderr,
         "error": output.error,
         "durationMs": output.duration_ms,
-        "kernel": {
-            "persistent": true,
-            "fresh": output.fresh_kernel,
-            "uptimeSecs": output.kernel_uptime_secs,
-        },
+        "kernel": kernel,
     }))
 }
 
