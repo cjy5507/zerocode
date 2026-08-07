@@ -22,10 +22,16 @@ if [ "${1:-}" != "--allow-dirty" ] && ! git diff --quiet HEAD -- 2>/dev/null; th
     exit 1
 fi
 
+# Resolve cargo even from shells whose PATH lacks the rustup shim dir (the
+# standard install location) — non-interactive invocations routinely do.
+CARGO=$(command -v cargo || true)
+[ -n "$CARGO" ] || CARGO="$HOME/.cargo/bin/cargo"
+[ -x "$CARGO" ] || { echo "deploy-local: cargo not found" >&2; exit 1; }
+
 echo "building release with symbols (codegen-identical; strip=none) …"
 CARGO_PROFILE_RELEASE_STRIP=none \
 CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
-cargo build --release -p zo-cli
+"$CARGO" build --release -p zo-cli
 
 expected=$(git rev-parse --short=12 HEAD)
 built=$(./target/release/zo --version | sed -n 's/.*Git SHA[[:space:]]*\([0-9a-f]*\).*/\1/p')

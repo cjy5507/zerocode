@@ -666,7 +666,11 @@ fn push_live_activity_section(
 
     lines.push(section_line("live", width, theme));
     if let Some(tool) = hud.last_tool.as_deref() {
-        let label = truncate_to_cells(tool, usize::from(width).saturating_sub(9).max(8));
+        // The whole row budget belongs to the NAME: the old " · tool" suffix
+        // cost 7 cells of vocabulary the accent + live section already carry,
+        // and on a narrow panel it squeezed real names into stumps
+        // ("toolsear"). Chevron + indent take ~3 cells; the rest is label.
+        let label = truncate_to_cells(tool, usize::from(width).saturating_sub(4).max(8));
         // The running tool is the single most volatile fact in the panel, so it
         // takes the accent; everything else on the row stays quiet around it.
         lines.push(Line::from(vec![
@@ -679,7 +683,6 @@ fn push_live_activity_section(
                 styles.accent,
             ),
             Span::styled(label, styles.accent),
-            Span::styled(" · tool", styles.muted),
         ]));
     }
     if hud.running_agents > 0 {

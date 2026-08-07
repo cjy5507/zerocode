@@ -6496,22 +6496,23 @@ fn effort_badge_renders_on_rule_line_not_transcript_top() {
         .map(|y| buffer_row(&terminal, width, y))
         .collect::<Vec<_>>()
         .join("\n");
+    // The DEFAULT mode's composer chip reads "auto" — the band vocabulary
+    // (`smart→xhigh~max`) stays on the tuning surfaces.
     assert!(
-        !top_half.contains("smart"),
+        !top_half.contains("auto"),
         "effort badge should not be in the top half:\n{top_half}"
     );
     assert!(
-        bottom_half.contains("smart"),
+        bottom_half.contains("auto"),
         "active effort badge should render on the rule line above input (bottom half):\n{bottom_half}"
     );
     let badge_row = (height / 2..height)
         .map(|y| buffer_row(&terminal, width, y))
-        .find(|row| row.contains("smart"))
+        .find(|row| row.contains("auto"))
         .expect("effort badge row");
     let label_col = badge_row
-        .chars()
-        .position(|ch| ch == 's')
-        .expect("smart label position");
+        .find("auto")
+        .expect("auto label position");
     let badge_cells = badge_row.chars().collect::<Vec<_>>();
     assert_eq!(
         &badge_cells[label_col - 3..label_col],

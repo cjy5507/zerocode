@@ -832,7 +832,15 @@ impl App {
                     }
                 }
                 KeyCode::Esc => {
-                    self.hide_slash_hint_for_current_input();
+                    // A bare "/" exists only to summon this popup; abandoning
+                    // the popup abandons it too. Anything more is typed work
+                    // the user keeps — Esc then only hides the hint.
+                    if self.input_text().trim() == "/" {
+                        self.input.clear();
+                        self.hints.slash_hidden_for = None;
+                    } else {
+                        self.hide_slash_hint_for_current_input();
+                    }
                     return Some(AppAction::None);
                 }
                 _ => {

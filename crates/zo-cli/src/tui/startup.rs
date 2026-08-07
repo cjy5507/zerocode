@@ -923,11 +923,10 @@ fn render_ready_dense_lines(
         ],
         vec![Span::styled("Suggested prompts".to_string(), style(theme.palette.accent, true))],
     ));
-    lines.push(two_column_line(
-        width,
-        workspace_summary_spans(startup, theme),
-        summarize_action_spans(theme),
-    ));
+    // The masthead already states the workspace summary; repeating it here
+    // printed "workspace clean" twice on every fresh launchpad. The left
+    // column carries the one-line facts that are NOT above: the evidence
+    // pointer (rare) or the fresh-session note, then the input hint.
     lines.push(two_column_line(
         width,
         // The evidence pointer outranks the "fresh session" filler: it only
@@ -936,13 +935,14 @@ fn render_ready_dense_lines(
             || vec![Span::styled("No resume queue — fresh session".to_string(), dim_label(theme))],
             |notice| harness_notice_spans(notice, theme),
         ),
-        action_spans("review my diff", theme),
+        summarize_action_spans(theme),
     ));
     lines.push(two_column_line(
         width,
         vec![Span::styled("Type a task or pick a prompt".to_string(), dim_label(theme))],
-        action_spans("find failing tests", theme),
+        action_spans("review my diff", theme),
     ));
+    lines.push(two_column_line(width, Vec::new(), action_spans("find failing tests", theme)));
 }
 
 fn two_column_line(
@@ -1011,17 +1011,6 @@ fn action_spans(label: &str, theme: &Theme) -> Vec<Span<'static>> {
     ]
 }
 
-fn workspace_summary_spans(startup: &StartupScreen, theme: &Theme) -> Vec<Span<'static>> {
-    let workspace = if startup.workspace.is_empty() {
-        "workspace".to_string()
-    } else {
-        startup.workspace.clone()
-    };
-    vec![
-        Span::styled("workspace ".to_string(), faint_label(theme)),
-        Span::styled(workspace, style(theme.heat().steel, false)),
-    ]
-}
 
 fn session_context_line(startup: &StartupScreen, theme: &Theme, width: u16) -> Line<'static> {
     let short_session = startup.session_id.chars().take(12).collect::<String>();

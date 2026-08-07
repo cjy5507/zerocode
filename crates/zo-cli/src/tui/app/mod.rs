@@ -3540,9 +3540,20 @@ use paste::pasted_image_data_url;
 /// Build the active reasoning-effort badge for the idle rule above the input.
 /// The caller uses the returned display width to stop the hairline one clear
 /// cell before the badge while keeping the badge's right edge fixed.
+///
+/// The DEFAULT mode reads "auto", not the band machinery: `smart→xhigh~max`
+/// was the first thing every new user saw on the composer, and it is
+/// vocabulary only the tuning surfaces should speak. An explicitly picked
+/// effort keeps its full label (including a clamp arrow) — the user chose
+/// that word, and the clamp is information about their own pick. The band
+/// truth stays on `/effort` and `/effort show`.
 fn effort_rule_badge(state: &HudState, theme: &Theme) -> Option<(Line<'static>, u16)> {
-    let label = hud::effort_badge_label(state.effort, &state.model.alias)?;
     let effort = state.effort?;
+    let label = if effort == Effort::Smart {
+        "auto".to_string()
+    } else {
+        hud::effort_badge_label(state.effort, &state.model.alias)?
+    };
     let badge = format!(" {label} ");
     let badge_width = u16::try_from(badge.chars().count()).unwrap_or(u16::MAX);
     let badge_style = match effort {
