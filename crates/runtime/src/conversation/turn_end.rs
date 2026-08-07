@@ -229,57 +229,63 @@ fn spec_literal_autopatch_path_allowed(path: &str) -> bool {
             .is_some_and(|(stem, _)| stem.ends_with("_test") || stem.ends_with("_spec")))
 }
 
+/// Spec-literal self-verify (deterministic auto-patch): for each file changed
+/// this turn, if it reproduced a literal the original request spelled out in
+/// backticks (e.g. a help marker `` `(DEPRECATED)` ``) with the wrong case
+/// (`(Deprecated)`), rewrite it to the exact case on disk and return `true`.
+/// Does NOT route through the model: a repair prompt only fixes the casing
+/// ~50 % of the time (measured), whereas the marker is a pure substitution.
+/// `false` when nothing changed, nothing mismatched, or the workspace is not
+/// git-inspectable.
+///
+/// A free function (not an associated fn): the streaming dispatcher offloads
+/// it through `spawn_blocking`, whose `'static` closure must not drag the
+/// runtime's `C`/`T` type parameters along.
+///
+/// [perf] This terminal arm runs on *every* completed turn — both the sync
+/// `run_turn` loop and the streaming `run_turn_streaming_maybe_deep`
+/// dispatcher. The git probe ([`gate_changed_files`] = `git diff HEAD` +
+/// `git ls-files --others`) is the dominant per-turn stall on a dirty repo,
+/// and the old `changed.is_empty()` short-circuit ran only *after* both
+/// subprocesses had already spawned — so a chatty, non-coding turn paid the
+/// full cost every time. The autopatch can only ever repair a backticked spec
+/// literal in the request, so when `original` carries no candidate literal we
+/// return early *before* touching git
+/// ([`original_has_candidate_spec_literals`]): no candidate ⇒ no possible
+/// patch ⇒ no reason to inspect the worktree.
+pub(super) fn spec_literal_autopatch(original: &str) -> bool {
+    if !original_has_candidate_spec_literals(original) {
+        return false;
+    }
+    let changed = gate_changed_files();
+    if changed.is_empty() {
+        return false;
+    }
+    let mut patched = false;
+    for path in &changed {
+        if !spec_literal_autopatch_path_allowed(path) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let mismatches = decision_core::detect_case_mismatched_literals(original, &content);
+        if mismatches.is_empty() {
+            continue;
+        }
+        let fixed = decision_core::apply_case_fixes(&content, &mismatches);
+        if fixed != content && std::fs::write(path, fixed).is_ok() {
+            patched = true;
+        }
+    }
+    patched
+}
+
 impl<C, T> ConversationRuntime<C, T>
 where
     C: ApiClient,
     T: ToolExecutor,
 {
-    /// Spec-literal self-verify (deterministic auto-patch): for each file changed
-    /// this turn, if it reproduced a literal the original request spelled out in
-    /// backticks (e.g. a help marker `` `(DEPRECATED)` ``) with the wrong case
-    /// (`(Deprecated)`), rewrite it to the exact case on disk and return `true`.
-    /// Does NOT route through the model: a repair prompt only fixes the casing
-    /// ~50 % of the time (measured), whereas the marker is a pure substitution.
-    /// `false` when nothing changed, nothing mismatched, or the workspace is not
-    /// git-inspectable.
-    ///
-    /// [perf] This terminal arm runs on *every* completed turn. The git probe
-    /// ([`gate_changed_files`] = `git diff HEAD` + `git ls-files --others`) is the
-    /// dominant per-turn stall on a dirty repo, and the old `changed.is_empty()`
-    /// short-circuit ran only *after* both subprocesses had already spawned — so a
-    /// chatty, non-coding turn paid the full cost every time. The autopatch can
-    /// only ever repair a backticked spec literal in the request, so when
-    /// `original` carries no candidate literal we return early *before* touching
-    /// git ([`original_has_candidate_spec_literals`]): no candidate ⇒ no possible
-    /// patch ⇒ no reason to inspect the worktree.
-    pub(super) fn spec_literal_autopatch(original: &str) -> bool {
-        if !original_has_candidate_spec_literals(original) {
-            return false;
-        }
-        let changed = gate_changed_files();
-        if changed.is_empty() {
-            return false;
-        }
-        let mut patched = false;
-        for path in &changed {
-            if !spec_literal_autopatch_path_allowed(path) {
-                continue;
-            }
-            let Ok(content) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            let mismatches = decision_core::detect_case_mismatched_literals(original, &content);
-            if mismatches.is_empty() {
-                continue;
-            }
-            let fixed = decision_core::apply_case_fixes(&content, &mismatches);
-            if fixed != content && std::fs::write(path, fixed).is_ok() {
-                patched = true;
-            }
-        }
-        patched
-    }
-
     /// Assemble the [`TurnSummary`] for a completed turn. Shared by the sync
     /// ([`Self::run_turn_once`]) and streaming
     /// ([`Self::run_turn_streaming_with_images`]) loops, which built an identical

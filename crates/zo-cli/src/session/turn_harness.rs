@@ -134,6 +134,25 @@ impl TurnHarness {
         DeepGateRestore::installed(change.restore)
     }
 
+    /// The one gate-install boundary for a headless one-shot turn: the
+    /// automation plan gate first (a `/goal`/plan-first turn owns the deep
+    /// driver), then the reactive auto-verify gate, which yields to it via its
+    /// `deep_gate().is_some()` guard. Every `-p` output format must cross this
+    /// pair AND drive the turn through the streaming dispatcher
+    /// (`run_turn_streaming_maybe_deep`) — the sync `run_turn` loop ignores an
+    /// installed `DeepGateConfig`, so a format that installs gates but drives
+    /// the sync loop ships a gate with no engine (the json path's historical
+    /// defect). Restore in reverse order via [`Self::restore_deep_gate`]:
+    /// reactive first, then automation.
+    pub(crate) fn install_headless_deep_gates(
+        input: &str,
+        runtime: &mut BuiltRuntime,
+    ) -> (DeepGateRestore, DeepGateRestore) {
+        let restore_automation = Self::install_automation_plan_gate_if_needed(input, runtime);
+        let restore_reactive = Self::install_reactive_verify_gate_if_coding(input, runtime);
+        (restore_automation, restore_reactive)
+    }
+
     pub(crate) fn install_reactive_verify_gate_if_coding(
         input: &str,
         runtime: &mut BuiltRuntime,

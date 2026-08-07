@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 /// other durable evidence stores.
 const ATTEST_EVIDENCE_FILE: &str = "attest.jsonl";
 const ATTEST_EVIDENCE_DIR: &str = "evidence";
+const VERIFIER_CALIBRATION_FILE: &str = "verifier-calibration.jsonl";
 /// Compact the append-only row file once it outgrows this, keeping only
 /// [`JANITOR_KEEP_DAYS`] of rows. One row per session lands well under 2 KiB,
 /// so this bound is years of normal use, not months.
@@ -236,6 +237,47 @@ pub(crate) fn persist_attest_snapshot(session_id: &str) {
     let _ = append_row(&attest_evidence_path(), &row);
 }
 
+/// Drain the runtime's buffered VERIFY calibration events into the evidence
+/// ledger. Same persist-guard lifecycle as the attest snapshot — only a real
+/// host session flushes, so a dependent crate's test suite driving deep folds
+/// against mock providers never touches the file (the runtime used to append
+/// directly at fold time, and every `cargo test -p zo-cli` run salted the
+/// ledger with mock rows). Row schema matches
+/// [`verifier_calibration_evidence`]; each event carries its own session id
+/// (a deep sub-turn's, not necessarily this guard's).
+fn persist_verifier_calibration() {
+    let events = runtime::take_verifier_calibration_events();
+    if events.is_empty() {
+        return;
+    }
+    let path = runtime::default_config_home()
+        .join(ATTEST_EVIDENCE_DIR)
+        .join(VERIFIER_CALIBRATION_FILE);
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    // Whole-file truncation at the cap: `/refine` reads a bounded window, and
+    // recent history regrows within days.
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 512 * 1024) {
+        let _ = std::fs::remove_file(&path);
+    }
+    let mut lines = String::new();
+    for event in events {
+        let row = serde_json::json!({
+            "tsMs": event.ts_ms,
+            "session": event.session_id,
+            "objectiveOk": event.objective_ok,
+            "accepted": event.accepted,
+            "parse": event.parse,
+        });
+        lines.push_str(&row.to_string());
+        lines.push('\n');
+    }
+    let _ = core_types::paths::append_private_file(&path, lines.as_bytes());
+}
+
 /// RAII teardown hook: entry paths create one, and the drop persists the
 /// session's attest evidence on every exit route — including panics, where
 /// the evidence of what the session reached is worth the most.
@@ -254,6 +296,7 @@ impl AttestPersistGuard {
 impl Drop for AttestPersistGuard {
     fn drop(&mut self) {
         persist_attest_snapshot(&self.session_id);
+        persist_verifier_calibration();
     }
 }
 
@@ -682,8 +725,8 @@ struct VerifierCalibration {
 
 fn verifier_calibration_evidence(window_days: u64) -> VerifierCalibration {
     let path = runtime::default_config_home()
-        .join("evidence")
-        .join("verifier-calibration.jsonl");
+        .join(ATTEST_EVIDENCE_DIR)
+        .join(VERIFIER_CALIBRATION_FILE);
     let Ok(raw) = std::fs::read_to_string(path) else {
         return VerifierCalibration::default();
     };
@@ -778,9 +821,14 @@ fn ask_tokens(text: &str) -> BTreeSet<String> {
 }
 
 /// Greedy seed clustering over opening asks: a member shares ≥2 tokens with
-/// the seed at Jaccard ≥ 0.4, and only clusters of ≥3 sessions count —
-/// two similar asks are coincidence, three are a workflow. Top two clusters
-/// by size, so the report never scrolls on repetition evidence.
+/// the seed covering ≥40% of the smaller token set (overlap coefficient),
+/// and only clusters of ≥3 sessions count — two similar asks are
+/// coincidence, three are a workflow. Overlap, not Jaccard: the tokenizer
+/// deliberately emits both the CJK stem and the full run, which inflates the
+/// union and made Jaccard reject exactly the suffix-variant asks
+/// ("배포해줘" / "배포 절차 실행해줘") this axis exists to catch. The ≥2
+/// shared-token floor carries the precision. Top two clusters by size, so
+/// the report never scrolls on repetition evidence.
 fn cluster_repeated_asks(asks: &[String]) -> Vec<RepeatedWorkflow> {
     let tokenized: Vec<(&String, BTreeSet<String>)> = asks
         .iter()
@@ -799,8 +847,8 @@ fn cluster_repeated_asks(asks: &[String]) -> Vec<RepeatedWorkflow> {
                 continue;
             }
             let shared = tokenized[seed].1.intersection(&tokenized[candidate].1).count();
-            let union = tokenized[seed].1.union(&tokenized[candidate].1).count();
-            if shared >= 2 && shared * 10 >= union * 4 {
+            let smaller = tokenized[seed].1.len().min(tokenized[candidate].1.len());
+            if shared >= 2 && shared * 10 >= smaller * 4 {
                 members.push(candidate);
             }
         }

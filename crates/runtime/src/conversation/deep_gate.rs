@@ -1125,74 +1125,80 @@ fn issue_count_label(count: usize) -> String {
     }
 }
 
-/// Verifier-calibration evidence: one row per VERIFY fold pairing what the
+/// One VERIFY fold's (objective, verifier) pairing, buffered in-process for
+/// the host to drain via [`take_verifier_calibration_events`].
+#[derive(Debug, Clone)]
+pub struct VerifierCalibrationEvent {
+    /// Unix milliseconds at fold time.
+    pub ts_ms: u64,
+    /// Session the VERIFY leg folded in.
+    pub session_id: String,
+    /// What the objective check observed (green = true).
+    pub objective_ok: bool,
+    /// What the verifier claimed.
+    pub accepted: bool,
+    /// Verdict parse class (`VerifierParse::as_str`).
+    pub parse: &'static str,
+}
+
+/// Never-drained backstop: a host that installs no persist guard must not
+/// grow the buffer for the life of the process.
+const VERIFIER_CALIBRATION_BUFFER_CAP: usize = 4096;
+
+fn verifier_calibration_buffer() -> &'static std::sync::Mutex<Vec<VerifierCalibrationEvent>> {
+    static BUFFER: std::sync::OnceLock<std::sync::Mutex<Vec<VerifierCalibrationEvent>>> =
+        std::sync::OnceLock::new();
+    BUFFER.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Drain every buffered VERIFY calibration event, oldest first. The host owns
+/// persistence (zo-cli appends to `~/.zo/evidence/verifier-calibration.jsonl`
+/// behind the same guard that persists harness attest); a process that never
+/// drains simply discards the buffer at exit.
+#[must_use]
+pub fn take_verifier_calibration_events() -> Vec<VerifierCalibrationEvent> {
+    std::mem::take(
+        &mut *verifier_calibration_buffer()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Verifier-calibration evidence: one event per VERIFY fold pairing what the
 /// OBJECTIVE check observed with what the VERIFIER claimed. The matrix this
 /// accumulates is the false-accept measurement the pillar map called missing:
 /// `objectiveOk:false, accepted:true` is a verifier rubber-stamp the gate
 /// caught — a measured LOWER BOUND on the false-accept rate (accepts of
-/// semantically-wrong-but-tests-green changes stay invisible, and the row
+/// semantically-wrong-but-tests-green changes stay invisible, and the event
 /// says so by construction, not by claim). Kept out of the route-outcome
 /// ledger on purpose: those records feed routing feedback, and calibration
 /// counts would warp what they tune (the one-predicate-two-questions class).
-/// Best-effort append; failures never touch the turn.
+///
+/// Buffered in-process instead of appended straight to disk, mirroring the
+/// harness-attest ledger: only a host that installs a persist guard writes
+/// the file, so a dependent crate's test suite driving deep folds against
+/// mock providers never pollutes the real ledger. (The direct-append version
+/// wrote ~30 mock rows per `cargo test -p zo-cli` run — a runtime-side
+/// `cfg(test)` seam cannot see a dependent crate's tests, which compile this
+/// crate without `cfg(test)`.)
 fn record_verifier_calibration(session_id: &str, objective_ok: bool, verdict: &VerifierVerdict) {
-    let Some(path) = verifier_calibration_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
-    }
-    // Whole-file truncation at the cap: `/refine` reads a bounded window, and
-    // recent history regrows within days.
-    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 512 * 1024) {
-        let _ = std::fs::remove_file(&path);
-    }
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0);
-    let row = serde_json::json!({
-        "tsMs": ts_ms,
-        "session": session_id,
-        "objectiveOk": objective_ok,
-        "accepted": verdict.accepted,
-        "parse": verdict.parse.as_str(),
+    let mut buffer = verifier_calibration_buffer()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if buffer.len() >= VERIFIER_CALIBRATION_BUFFER_CAP {
+        return;
+    }
+    buffer.push(VerifierCalibrationEvent {
+        ts_ms,
+        session_id: session_id.to_string(),
+        objective_ok,
+        accepted: verdict.accepted,
+        parse: verdict.parse.as_str(),
     });
-    let mut line = row.to_string();
-    line.push('\n');
-    let _ = core_types::paths::append_private_file(&path, line.as_bytes());
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Test seam: calibration rows are OFF in tests unless a test opts in —
-    /// the fold sites run inside ordinary deep-gate tests, and the production
-    /// default would have every one of them appending to the real config
-    /// home.
-    static VERIFIER_CALIBRATION_DIR_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-// The Option is the test seam's contract: under cfg(test) this is None until
-// a test opts in, so the production arm alone looks unnecessarily wrapped.
-#[allow(clippy::unnecessary_wraps)]
-fn verifier_calibration_path() -> Option<std::path::PathBuf> {
-    #[cfg(test)]
-    {
-        VERIFIER_CALIBRATION_DIR_OVERRIDE
-            .with(|slot| slot.borrow().clone())
-            .map(|dir| dir.join("verifier-calibration.jsonl"))
-    }
-    #[cfg(not(test))]
-    {
-        Some(
-            crate::default_config_home()
-                .join("evidence")
-                .join("verifier-calibration.jsonl"),
-        )
-    }
 }
 
 /// Iteration budget for one VERIFY leg. Production distribution (223 legs,
@@ -2256,6 +2262,31 @@ fn skip_parked_verifier(
 
 /// Emit a non-critical deep-phase progress note into the render stream. A closed
 /// channel just means the turn is unwinding, so the error is ignored.
+/// Spec-literal self-verify gate for the streaming dispatcher's terminal arm,
+/// parity with the sync `run_turn`: an edit that reproduced a task-specified
+/// backticked literal with the wrong case is patched deterministically (a
+/// model repair only fixes the casing ~50% of the time, measured). Offloaded
+/// through `spawn_blocking` because the gate probes git when the prompt
+/// carries a candidate literal, and this dispatcher also drives TUI turns on
+/// the render reactor. The visible note keeps the file mutation honest
+/// instead of silent.
+async fn run_spec_literal_gate(original: &str, render_tx: &mpsc::Sender<RenderBlock>) {
+    let spec_original = original.to_string();
+    let patched = tokio::task::spawn_blocking(move || {
+        super::turn_end::spec_literal_autopatch(&spec_original)
+    })
+    .await
+    .unwrap_or(false);
+    if patched {
+        deep_note(
+            render_tx,
+            &BlockIdGen::default(),
+            "spec-literal gate: auto-patched exact-case literal(s)",
+        )
+        .await;
+    }
+}
+
 async fn deep_note(
     render_tx: &mpsc::Sender<RenderBlock>,
     ids: &BlockIdGen,
@@ -2369,6 +2400,10 @@ where
         prompter: Arc<dyn AsyncPermissionPrompter>,
     ) -> Result<TurnSummary, StreamingTurnError> {
         let mut input: String = user_input.into();
+        // Keep the original request verbatim for the spec-literal self-verify
+        // gate in the terminal arm — the Stop-loop rewrites `input` with each
+        // followup (mirrors the sync `run_turn`).
+        let original = input.clone();
         // Follow-up rounds are text-only; the original images belong to the
         // first round (mirrors the sync Stop-loop).
         let mut images = images;
@@ -2468,6 +2503,7 @@ where
                     input = followup;
                 }
                 _ => {
+                    run_spec_literal_gate(&original, &render_tx).await;
                     summary.turn_output_tokens = self
                         .usage_tracker
                         .cumulative_usage()

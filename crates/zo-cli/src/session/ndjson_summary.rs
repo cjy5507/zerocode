@@ -289,6 +289,43 @@ where
     Box::new(sink).finalize()
 }
 
+/// Drive a turn through the streaming runtime path headlessly and DISCARD
+/// every [`RenderBlock`](runtime::message_stream::RenderBlock): the
+/// `--output-format json` contract is a single terminal result object on
+/// stdout, but the turn itself must still cross the deep-gate-aware
+/// dispatcher (`run_turn_streaming_maybe_deep`) — the sync `run_turn` loop
+/// ignores an installed `DeepGateConfig` entirely, so a format driven through
+/// it silently loses reactive auto-verify and the plan-first automation gate
+/// (the exact defect that kept headless json coding turns un-verified while
+/// their gate-install predicate tested green). Residual permission prompts
+/// deny, same as the ndjson path: machine stdout has no human attached.
+pub(crate) async fn drive_discarding_stream(
+    rt: &mut runtime::ConversationRuntime<crate::AnthropicRuntimeClient, crate::CliToolExecutor>,
+    live_client: std::sync::Arc<super::runtime_bridge::LiveAsyncApiClient>,
+    input: String,
+    model: &str,
+) -> Result<runtime::TurnSummary, String> {
+    use runtime::message_stream::RenderBlock;
+
+    let (block_tx, mut block_rx) = tokio::sync::mpsc::channel::<RenderBlock>(64);
+    // The receiver must be drained (not dropped): `drive_render_stream` treats
+    // a closed receiver as "consumer gone" and aborts the turn.
+    let drain = async move { while block_rx.recv().await.is_some() {} };
+    let (turn_result, ()) = tokio::join!(
+        drive_render_stream(
+            rt,
+            live_client,
+            input,
+            model,
+            block_tx,
+            // Stdout `-p` has no human attached: deny residual prompts.
+            StreamPrompter::Headless(runtime::permission::HeadlessDecision::DenyAll),
+        ),
+        drain
+    );
+    turn_result
+}
+
 /// Drive a turn through the streaming runtime path headlessly, emitting each
 /// [`RenderBlock`] as a typed ndjson line *live* to stdout (text deltas, tool
 /// calls/results, usage) instead of replaying a post-hoc summary. Thin stdout

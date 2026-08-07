@@ -455,9 +455,11 @@ impl CliPermissionPrompter {
         }
     }
 
-    /// Never-interactive prompter for machine output paths (JSON/NDJSON) and
-    /// tests. Always denies without reading stdin or writing any UI, so
-    /// structured stdout stays parseable and the run never blocks.
+    /// Never-interactive prompter that always denies without reading stdin or
+    /// writing any UI. Production machine-output paths (JSON/NDJSON) moved to
+    /// the streaming dispatcher's `HeadlessPermissionPrompter`, so this
+    /// remains only as the test double for the non-interactive contract.
+    #[cfg(test)]
     pub(crate) fn new_non_interactive(current_mode: PermissionMode) -> Self {
         Self {
             current_mode,

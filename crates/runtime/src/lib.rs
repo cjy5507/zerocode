@@ -114,6 +114,7 @@ pub use conversation::{AgentNotification, AgentNotificationInbox, AgentNotificat
 pub use conversation::{
     auto_compaction_threshold_for_model, auto_compaction_threshold_from_env, detect_check_command,
     env_deadline_extension, env_turn_budgets, final_assistant_text, read_only_bash_allow_rules,
+    take_verifier_calibration_events, VerifierCalibrationEvent,
     flush_pending_tool_events, prompt_cache_record_to_event, record_non_anthropic_prompt_cache_usage, push_output_block, redacted_thinking_data_to_string, response_to_events, ApiClient, ApiRequest,
     AssistantEvent, AsyncApiClient, AutoCompactionEvent, BudgetExhausted, ConcurrentDispatchFn,
     ConversationRuntime, DeepGateConfig, DeepMode,

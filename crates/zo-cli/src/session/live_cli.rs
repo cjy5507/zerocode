@@ -2727,14 +2727,12 @@ impl LiveCli {
         let tokio_rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let restore_deep_gate =
-            TurnHarness::install_automation_plan_gate_if_needed(input, &mut runtime);
         // Capability parity with the TUI: a code-changing headless `-p` turn
-        // gets reactive auto-verify (implement→verify→retry). Installed *after*
-        // the automation gate so its `deep_gate().is_some()` guard yields to a
-        // plan-first/`/goal` gate; a no-op for analysis prompts or `ZO_AUTO_VERIFY=0`.
-        let restore_reactive_gate =
-            TurnHarness::install_reactive_verify_gate_if_coding(input, &mut runtime);
+        // gets reactive auto-verify (implement→verify→retry); a `/goal`/
+        // plan-first turn keeps its automation gate. See
+        // `install_headless_deep_gates` for the pairing contract.
+        let (restore_deep_gate, restore_reactive_gate) =
+            TurnHarness::install_headless_deep_gates(input, &mut runtime);
         let started = std::time::Instant::now();
         let result = match runtime.runtime.as_mut() {
             Some(rt) => tokio_rt.block_on(super::ndjson_summary::drive_ndjson_stream(
@@ -2952,19 +2950,43 @@ impl LiveCli {
                 clear_stale_reactive_gate: false,
             },
         );
-        let restore_deep_gate =
-            TurnHarness::install_automation_plan_gate_if_needed(input, &mut runtime);
-        // JSON stdout must stay machine-parseable: never prompt interactively
-        // (even on a TTY), so permission requests resolve to a structured deny
-        // in the emitted result rather than a prompt interleaved with stdout.
-        let mut permission_prompter =
-            crate::CliPermissionPrompter::new_non_interactive(self.permission_mode);
+        // Drive the turn through the deep-gate-aware streaming dispatcher, NOT
+        // the sync `runtime.run_turn` loop: that loop ignores an installed
+        // `DeepGateConfig`, which left json coding turns without reactive
+        // auto-verify and made a `/goal` plan gate on this path a no-op.
+        // Render blocks are discarded — the json contract is a single
+        // terminal result object — and residual permission prompts deny
+        // headlessly, the same structured-deny behavior the old
+        // `new_non_interactive` prompter produced (JSON stdout must never
+        // interleave an interactive prompt).
+        let live_client = TurnHarness::build_live_client(
+            &runtime,
+            self.allowed_tools.clone(),
+            self.thinking_config(),
+            self.effort.and_then(Effort::level),
+            self.effort.and_then(Effort::band_ceiling),
+        );
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let (restore_deep_gate, restore_reactive_gate) =
+            TurnHarness::install_headless_deep_gates(input, &mut runtime);
         let started = std::time::Instant::now();
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let result = match runtime.runtime.as_mut() {
+            Some(rt) => tokio_rt.block_on(super::ndjson_summary::drive_discarding_stream(
+                rt,
+                live_client,
+                input.to_string(),
+                &self.model,
+            )),
+            None => Err("runtime not available".into()),
+        };
         let duration_ms = started.elapsed().as_millis();
+        // Restore in reverse install order (reactive first, then automation).
+        TurnHarness::restore_deep_gate(&mut runtime, restore_reactive_gate);
         TurnHarness::restore_deep_gate(&mut runtime, restore_deep_gate);
         hook_abort_monitor.stop();
-        let summary = result?;
+        let summary = result.map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
         self.replace_runtime(runtime)?;
         self.persist_appended_session()?;
         println!(

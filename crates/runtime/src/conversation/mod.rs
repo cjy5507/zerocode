@@ -45,8 +45,9 @@ pub use config::{
 #[allow(unused_imports)]
 pub use compaction::auto_compaction_threshold_from_env_or_model;
 pub use deep_gate::{
-    detect_check_command, read_only_bash_allow_rules, DeepGateConfig, DeepMode, DeepOutcome,
-    ExecContract, AUTO_RETRY_MARKER, DEEP_EXEC_MARKER, DEEP_PLAN_MARKER, DEEP_VERIFY_MARKER,
+    detect_check_command, read_only_bash_allow_rules, take_verifier_calibration_events,
+    DeepGateConfig, DeepMode, DeepOutcome, ExecContract, VerifierCalibrationEvent,
+    AUTO_RETRY_MARKER, DEEP_EXEC_MARKER, DEEP_PLAN_MARKER, DEEP_VERIFY_MARKER,
 };
 // `parse_auto_compaction_threshold` is only touched from `#[cfg(test)]`,
 // re-exported here so the test mod's `super::` paths keep working.
@@ -1530,7 +1531,7 @@ where
                     // a task-specified literal with the wrong case, patch it on
                     // disk directly (deterministic — a model repair only fixes the
                     // casing ~50% of the time, measured).
-                    if Self::spec_literal_autopatch(&original) {
+                    if turn_end::spec_literal_autopatch(&original) {
                         eprintln!("[zo] spec-literal gate: auto-patched exact-case literal(s)");
                     }
                     summary.turn_output_tokens = self
