@@ -187,9 +187,9 @@ pub fn draw_anchored(
     ));
     lines.push(info_line(startup, theme));
     lines.push(workspace_line(startup, theme));
-    if !compact {
-        lines.push(path_line(startup, theme));
-    }
+    // No path row: the footer bar shows the working directory persistently
+    // (in ~-shortened form), so the masthead printing the ABSOLUTE path was
+    // the same fact twice — and the longest, noisiest line on the launchpad.
     lines.push(Line::from(""));
 
     let stage = onboarding_stage(startup);
@@ -673,14 +673,6 @@ fn quickstart_line(theme: &Theme) -> Line<'static> {
     ])
 }
 
-fn path_line(startup: &StartupScreen, theme: &Theme) -> Line<'static> {
-    indented(vec![Span::styled(
-        startup.directory.display().to_string(),
-        Style::new()
-            .fg(theme.heat().steel)
-            .add_modifier(Modifier::DIM),
-    )])
-}
 
 fn auth_onboarding_lines(auth: StartupAuthState, theme: &Theme) -> Vec<Line<'static>> {
     let title = style(theme.palette.accent, true);
@@ -1371,11 +1363,13 @@ mod tests {
             "Opus 4.8",
             "full access",
             "@ main",
-            "/tmp/zo",
             "1297ms",
         ] {
             assert!(dumped.contains(expected), "missing {expected}: {dumped}");
         }
+        // The footer already shows the working directory persistently, so the
+        // masthead must not repeat the absolute path.
+        assert!(!dumped.contains("/tmp/zo"), "{dumped}");
         assert!(!dumped.contains("*-["), "{dumped}");
         assert!(!dumped.contains("*----+----*"), "{dumped}");
     }
