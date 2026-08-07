@@ -917,6 +917,52 @@ fn break_reasons(
 /// `model` is the wire model id of the request being recorded — the one thing
 /// the tracked state cannot supply (it keeps only a hash of the model, so a
 /// break row could name the axis that moved but never the model it moved on).
+/// The event for a read drop on a PURE tail append (all invariants of that
+/// branch hold by construction: only the messages axis changed, nothing
+/// truncated or diverged, no tool diff). TTL when the gap explains it;
+/// unexpected provider-side loss otherwise.
+fn pure_append_break_event(
+    config: &PromptCacheConfig,
+    previous: &TrackedPromptState,
+    current: &TrackedPromptState,
+    token_drop: u32,
+    elapsed: u64,
+    model: &str,
+) -> CacheBreakEvent {
+    let (unexpected, reason) = if elapsed > config.prompt_ttl.as_secs() {
+        (
+            false,
+            format!(
+                "cache reads dropped on a pure append — possible prompt cache TTL expiry after {elapsed}s"
+            ),
+        )
+    } else {
+        (
+            true,
+            "cache reads dropped on a pure append (prefix unchanged) — provider-side miss or eviction"
+                .to_string(),
+        )
+    };
+    CacheBreakEvent {
+        unexpected,
+        reason,
+        previous_cache_read_input_tokens: previous.cache_read_input_tokens,
+        current_cache_read_input_tokens: current.cache_read_input_tokens,
+        token_drop,
+        model_changed: false,
+        system_changed: false,
+        tools_changed: false,
+        messages_changed: true,
+        messages_truncated: false,
+        elapsed_secs: elapsed,
+        diverged_message: None,
+        tools_added: Vec::new(),
+        tools_removed: Vec::new(),
+        model: model.to_string(),
+        provider: provider_family_for_model(model).to_string(),
+    }
+}
+
 fn detect_cache_break(
     config: &PromptCacheConfig,
     previous: Option<&TrackedPromptState>,
@@ -968,6 +1014,30 @@ fn detect_cache_break(
             current: current.message_shapes.get(index)?.clone(),
         })
     });
+
+    // A PURE tail append cannot legitimately drop reads: the previous request
+    // is a byte-identical prefix of this one, and the provider's cache keys
+    // on content, so everything it read last time is still there to read.
+    // Reads dropping here is provider-side (miss, eviction, TTL) — yet the
+    // reason machinery below files it under "message payload changed
+    // (append-only…)" with `unexpected: false`, because an append does change
+    // the aggregate messages hash. That misclassification buried 84M dropped
+    // tokens across 577 ledger rows as self-inflicted-and-expected — the
+    // wire-reminder silence pattern all over again. Classify it with the
+    // fingerprint-stable case instead: TTL when the gap explains it,
+    // unexpected otherwise.
+    let pure_append = messages_changed
+        && !messages_truncated
+        && first_divergence_index.is_none()
+        && current_message_count > previous.message_hashes.len()
+        && !model_changed
+        && !system_changed
+        && !tools_changed;
+    if pure_append {
+        return Some(pure_append_break_event(
+            config, previous, current, token_drop, elapsed, model,
+        ));
+    }
 
     let reasons = break_reasons(
         BreakAxes {
@@ -1886,6 +1956,60 @@ mod tests {
         .expect("break should be detected");
         assert!(event.unexpected);
         assert!(event.reason.contains("stable"));
+    }
+
+    /// A pure tail append cannot legitimately drop cache reads — the previous
+    /// request is a byte-identical prefix, and the provider caches on
+    /// content. A drop there is provider-side, and it must be UNEXPECTED, not
+    /// filed under "message payload changed (expected)": that misclass buried
+    /// 84M dropped tokens across 577 production rows as self-inflicted.
+    #[test]
+    fn a_read_drop_on_a_pure_append_is_unexpected_not_self_inflicted() {
+        let read = |request: &MessageRequest, cache_read: u32| {
+            TrackedPromptState::from_usage(
+                request,
+                &Usage {
+                    input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: cache_read,
+                    output_tokens: 0,
+                },
+            )
+        };
+        let previous = read(&sample_request_with_messages(&["a", "b"]), 50_000);
+        let appended = sample_request_with_messages(&["a", "b", "c"]);
+        // Within the TTL: the gap cannot explain the drop — provider-side.
+        let event = detect_cache_break(
+            &PromptCacheConfig::default(),
+            Some(&previous),
+            &read(&appended, 1_000),
+            None, // shared prefix identical: no divergence index, like a real append
+            3,
+            TEST_MODEL,
+        )
+        .expect("drop on append must produce a row");
+        assert!(event.unexpected, "{}", event.reason);
+        assert!(event.reason.contains("pure append"), "{}", event.reason);
+        assert!(
+            event.reason.contains("provider-side"),
+            "{}",
+            event.reason
+        );
+        // A drop AFTER the TTL window is the one self-explaining append case.
+        let mut stale_previous = read(&sample_request_with_messages(&["a", "b"]), 50_000);
+        stale_previous.observed_at_unix_secs =
+            stale_previous.observed_at_unix_secs.saturating_sub(24 * 60 * 60);
+        let ttl_event = detect_cache_break(
+            &PromptCacheConfig::default(),
+            Some(&stale_previous),
+            &read(&appended, 1_000),
+            None,
+            3,
+            TEST_MODEL,
+        )
+        .expect("row still written");
+        assert!(!ttl_event.unexpected, "{}", ttl_event.reason);
+        assert!(ttl_event.reason.contains("TTL"), "{}", ttl_event.reason);
     }
 
     /// A `tools_changed` break must name the tools. Without this the ledger says
