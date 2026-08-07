@@ -927,6 +927,8 @@ impl AnthropicClient {
     ) -> Result<reqwest::Response, ApiError> {
         let mut attempts = 0;
         let mut last_error: Option<ApiError>;
+        let mut transport_streak: u32 = 0;
+        let mut escape_http: Option<reqwest::Client> = None;
 
         loop {
             attempts += 1;
@@ -938,7 +940,7 @@ impl AnthropicClient {
                     Map::new(),
                 );
             }
-            match self.send_raw_request(request).await {
+            match self.send_raw_request(request, escape_http.as_ref()).await {
                 Ok((response, context_edit_sent)) => match expect_success(response).await {
                     Ok(response) => {
                         if let Some(session_tracer) = &self.session_tracer {
@@ -994,6 +996,12 @@ impl AnthropicClient {
                 break;
             }
 
+            Self::escape_pool_on_transport_streak(
+                last_error.as_ref(),
+                &mut transport_streak,
+                &mut escape_http,
+            );
+
             // Server-provided `Retry-After` is authoritative and used verbatim;
             // our own exponential backoff is jittered so N parallel agents
             // retrying the same 429 don't re-collide on an identical wakeup.
@@ -1031,9 +1039,36 @@ impl AnthropicClient {
         })
     }
 
+    /// Track consecutive transport-level send failures (connect/TLS/socket —
+    /// no HTTP response at all) and, on the second in a row, arm a fresh
+    /// connection pool for the request's remaining attempts. Two identical
+    /// send failures point at the SHARED pool reusing a connection the
+    /// keep-alive probe has not declared dead yet — re-probing the same
+    /// corpse fails the whole ladder (measured live: zo-bench, 6/6 attempts
+    /// dead while claude-code succeeded alongside). An HTTP-status error
+    /// resets the streak: a response proves the transport works.
+    fn escape_pool_on_transport_streak(
+        last_error: Option<&ApiError>,
+        transport_streak: &mut u32,
+        escape_http: &mut Option<reqwest::Client>,
+    ) {
+        if matches!(last_error, Some(ApiError::Http(_))) {
+            *transport_streak += 1;
+        } else {
+            *transport_streak = 0;
+        }
+        if *transport_streak >= 2 && escape_http.is_none() {
+            *escape_http = Some(super::poison_escape_http_client());
+            eprintln!(
+                "[zo] transport failures persist on the pooled connection — retrying on a fresh connection pool"
+            );
+        }
+    }
+
     async fn send_raw_request(
         &self,
         request: &MessageRequest,
+        http_override: Option<&reqwest::Client>,
     ) -> Result<(reqwest::Response, bool), ApiError> {
         // Cloud-gateway routing (Bedrock/Vertex): every Anthropic request —
         // foreground, sub-agent, mid-stream restart — flows through this one
@@ -1049,8 +1084,8 @@ impl AnthropicClient {
             || format!("{}/v1/messages", self.base_url.trim_end_matches('/')),
             |gateway| gateway.request_url(&request.model, request.stream),
         );
-        let request_builder = self
-            .http
+        let request_builder = http_override
+            .unwrap_or(&self.http)
             .post(&request_url)
             .header("content-type", "application/json");
 

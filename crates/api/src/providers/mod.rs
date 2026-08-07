@@ -329,23 +329,35 @@ pub fn max_request_bytes_for_model(model: &str) -> Option<u64> {
 #[must_use]
 pub(crate) fn shared_http_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .tcp_nodelay(true)
-                // Bound the connect phase only — a dead/blackholed host must not
-                // wedge the SSE client forever. No blanket `.timeout()`: Anthropic
-                // documents streaming as the timeout-avoidance path for large
-                // `max_tokens` requests, and an active Opus/Fable stream can run
-                // for minutes.
-                .connect_timeout(Duration::from_secs(15))
-                .pool_idle_timeout(Some(Duration::from_secs(300)))
-                .http2_keep_alive_interval(Some(Duration::from_secs(30)))
-                .http2_keep_alive_while_idle(true)
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new())
-        })
-        .clone()
+    CLIENT.get_or_init(tuned_http_client).clone()
+}
+
+/// Escape hatch for a poisoned shared pool: a brand-new client — fresh TCP,
+/// fresh TLS, empty pool — with the same tuning as [`shared_http_client`].
+/// Reached for only after consecutive transport-level send failures, where
+/// connection REUSE is the prime suspect (a half-open keep-alive the H2 ping
+/// hasn't declared dead yet fails every retry identically, while a new
+/// process connects fine — measured live: zo-bench fix-off-by-one, 6/6
+/// attempts dead on the shared pool while claude-code succeeded alongside).
+#[must_use]
+pub(crate) fn poison_escape_http_client() -> reqwest::Client {
+    tuned_http_client()
+}
+
+fn tuned_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .tcp_nodelay(true)
+        // Bound the connect phase only — a dead/blackholed host must not
+        // wedge the SSE client forever. No blanket `.timeout()`: Anthropic
+        // documents streaming as the timeout-avoidance path for large
+        // `max_tokens` requests, and an active Opus/Fable stream can run
+        // for minutes.
+        .connect_timeout(Duration::from_secs(15))
+        .pool_idle_timeout(Some(Duration::from_secs(300)))
+        .http2_keep_alive_interval(Some(Duration::from_secs(30)))
+        .http2_keep_alive_while_idle(true)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
