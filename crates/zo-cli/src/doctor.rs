@@ -1809,6 +1809,7 @@ mod tests {
             tools_removed: Vec::new(),
             model: String::new(),
             provider: String::new(),
+            trimmed_tokens_estimate: None,
         }
     }
 
