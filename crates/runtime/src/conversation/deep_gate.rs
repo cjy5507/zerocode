@@ -1284,6 +1284,150 @@ fn made_edits(summary: &TurnSummary) -> bool {
     })
 }
 
+/// Command substrings that mark a bash call as a build/test/run check whose
+/// green exit is worth reporting to the verifier. Aligned with
+/// [`detect_check_command`]'s per-ecosystem vocabulary, plus the direct
+/// script-run shapes implementers actually type (`python3 test_x.py`,
+/// `cargo run` as an output check).
+const EXEC_CHECK_COMMAND_MARKERS: &[&str] = &[
+    "cargo build",
+    "cargo check",
+    "cargo clippy",
+    "cargo test",
+    "cargo run",
+    "npm test",
+    "npm run",
+    "yarn test",
+    "pnpm test",
+    "pytest",
+    "python -m",
+    "python3 -m",
+    "python test",
+    "python3 test",
+    "python tests",
+    "python3 tests",
+    "go build",
+    "go test",
+    "go vet",
+    "go run",
+    "dotnet build",
+    "dotnet test",
+    "make test",
+    "make check",
+    "make build",
+    "tsc",
+    "./gradlew",
+    "mvn test",
+];
+
+fn command_is_check_shaped(command: &str) -> bool {
+    EXEC_CHECK_COMMAND_MARKERS
+        .iter()
+        .any(|marker| command.contains(marker))
+}
+
+/// `true` when a non-error bash tool result records a foreground command that
+/// ran to completion with exit 0. The bash tool encodes a non-zero exit as
+/// `returnCodeInterpretation: "exit_code:N"` (absent on success), a timeout as
+/// `interrupted: true`, and a backgrounded launch as `backgroundTaskId` — a
+/// background start proves nothing about the command's outcome. The `stdout`
+/// key doubles as a shape check so arbitrary JSON from another tool can never
+/// read as a green check.
+fn bash_result_exited_zero(output: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
+        return false;
+    };
+    value.get("stdout").is_some_and(serde_json::Value::is_string)
+        && value
+            .get("returnCodeInterpretation")
+            .is_none_or(serde_json::Value::is_null)
+        && value.get("interrupted").and_then(serde_json::Value::as_bool) != Some(true)
+        && value
+            .get("backgroundTaskId")
+            .is_none_or(serde_json::Value::is_null)
+}
+
+/// Check-shaped bash commands this attempt's EXEC leg ran to completion with
+/// exit 0 AFTER its last successful edit — runtime-observed IO facts (the
+/// executor recorded the exit), NOT model claims. Injected into the VERIFY
+/// prompt so the verifier can cite the implementer's own green run instead of
+/// attempting a build/test itself: the verify phase's bash grant is read-only,
+/// so such an attempt burns a model round trip only to be denied (observed on
+/// the bench: the verifier tried `cargo run --quiet`, was denied, and the
+/// implementer's green `cargo build && cargo run` sat unreported in the same
+/// transcript). A check that ran BEFORE the last edit is stale evidence and is
+/// dropped.
+fn exec_green_checks(summary: &TurnSummary) -> Vec<String> {
+    let mut commands: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for message in &summary.assistant_messages {
+        for block in &message.blocks {
+            if let ContentBlock::ToolUse { id, name, input } = block {
+                if name == "bash" {
+                    commands.insert(id.as_str(), input.as_str());
+                }
+            }
+        }
+    }
+    let mut checks: Vec<String> = Vec::new();
+    for message in &summary.tool_results {
+        for block in &message.blocks {
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            if *is_error {
+                continue;
+            }
+            // Evidence must postdate the last mutation: a green check that ran
+            // before a later edit validated a different tree.
+            if super::is_edit_or_write_tool(tool_name) {
+                checks.clear();
+                continue;
+            }
+            if tool_name != "bash" || !bash_result_exited_zero(output) {
+                continue;
+            }
+            let Some(command) = commands
+                .get(tool_use_id.as_str())
+                .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
+                .and_then(|value| {
+                    value
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+            else {
+                continue;
+            };
+            if !command_is_check_shaped(&command) {
+                continue;
+            }
+            let mut command = command;
+            truncate_on_boundary(&mut command, EXEC_CHECK_COMMAND_BYTES);
+            if !checks.contains(&command) {
+                checks.push(command);
+            }
+        }
+    }
+    // Newest evidence wins the cap: the last commands run are the closest to
+    // the final tree state.
+    if checks.len() > EXEC_CHECK_MAX_COMMANDS {
+        checks.drain(..checks.len() - EXEC_CHECK_MAX_COMMANDS);
+    }
+    checks
+}
+
+/// Display cap for one harvested check command inside the VERIFY prompt.
+const EXEC_CHECK_COMMAND_BYTES: usize = 240;
+/// At most this many observed commands are reported (newest kept).
+const EXEC_CHECK_MAX_COMMANDS: usize = 3;
+
 fn task_with_retry_context(task: &str, retry: Option<&str>) -> String {
     match retry {
         Some(retry) if !retry.trim().is_empty() => {
@@ -1877,16 +2021,18 @@ struct VerifyPromptContext<'a> {
 }
 
 impl<'a> VerifyPromptContext<'a> {
+    #[allow(clippy::too_many_arguments)] // bounded context facts, built in one place
     fn new(
         task: &'a str,
         diff: &'a str,
         check: Option<(&str, &CheckObservation)>,
+        exec_checks: &[String],
         edited_paths: &[String],
         preexisting_dirty: &[String],
         assistant_claim: &str,
         has_images: bool,
     ) -> Self {
-        let objective = match check {
+        let mut objective = match check {
             // Name the tree the check ran in: the diff may span a sibling
             // worktree while the check runs in this process's cwd, and an
             // unqualified "PASS" next to a foreign-tree diff reads as if the
@@ -1899,6 +2045,26 @@ impl<'a> VerifyPromptContext<'a> {
             ),
             None => "No objective check command was configured for this turn.".to_string(),
         };
+        // The implementer's own green runs are objective evidence too: the
+        // harness (not the model) recorded each exit 0. Reporting them stops
+        // the verifier from spending a round trip attempting a build/test the
+        // read-only phase will deny.
+        if !exec_checks.is_empty() {
+            objective.push_str(
+                "\n\nCommands the implementer ran in this workspace AFTER its last edit, each \
+                 observed by the harness to exit 0 (runtime-recorded facts, not model claims):\n",
+            );
+            for command in exec_checks {
+                objective.push_str("- `");
+                objective.push_str(command);
+                objective.push_str("`\n");
+            }
+            objective.push_str(
+                "Treat these as this attempt's execution evidence. Do NOT re-run build/test \
+                 commands yourself — bash in this phase is read-only and such commands are \
+                 denied; judge from the diff, the files you inspect, and these observations.",
+            );
+        }
         let mut paths = if edited_paths.is_empty() {
             "(none reported)".to_string()
         } else {
@@ -1960,6 +2126,7 @@ fn verify_prompt(
     task: &str,
     diff: &str,
     check: Option<(&str, &CheckObservation)>,
+    exec_checks: &[String],
     edited_paths: &[String],
     preexisting_dirty: &[String],
     assistant_claim: &str,
@@ -1971,6 +2138,7 @@ fn verify_prompt(
         task,
         diff,
         check,
+        exec_checks,
         edited_paths,
         preexisting_dirty,
         assistant_claim,
@@ -2669,6 +2837,7 @@ where
             let edited = made_edits(&summary);
             let edited_paths = edited_file_paths(&summary);
             let assistant_claim = latest_assistant_text(&summary.assistant_messages);
+            let green_checks = exec_green_checks(&summary);
             acc.fold(summary);
 
             // No edits ⇒ a question/analysis/chat turn. Done — never tax a turn
@@ -2757,6 +2926,7 @@ where
                         cfg.check_command
                             .as_deref()
                             .zip(check_observation.as_ref()),
+                        &green_checks,
                         &diff_paths,
                         &preexisting_dirty_paths(
                             &baseline_files,
@@ -3506,6 +3676,7 @@ where
             let summary = exec_result.summary;
             let edited_paths = edited_file_paths(&summary);
             let assistant_claim = latest_assistant_text(&summary.assistant_messages);
+            let green_checks = exec_green_checks(&summary);
             acc.fold(summary);
 
             // Objective gate: the project's own check command, when configured.
@@ -3580,6 +3751,7 @@ where
                         cfg.check_command
                             .as_deref()
                             .zip(check_observation.as_ref()),
+                        &green_checks,
                         &diff_paths,
                         &preexisting_dirty_paths(
                             &baseline_files,
@@ -4477,6 +4649,7 @@ mod tests {
             Some(("cargo test", &check)),
             &[],
             &[],
+            &[],
             "implemented the fix",
             VerifyLensMode::Full,
             RouteTaskIntent::Other,
@@ -4512,6 +4685,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             "updated the implementation",
             VerifyLensMode::Full,
             RouteTaskIntent::Other,
@@ -4533,6 +4707,7 @@ mod tests {
             "t",
             "diff",
             Some(("cargo test", &check)),
+            &[],
             &["src/changed.rs".to_string()],
             &[],
             "ASSISTANT_CLAIM_MARKER",
@@ -4561,6 +4736,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             "claim",
             VerifyLensMode::Full,
             RouteTaskIntent::Other,
@@ -4580,6 +4756,7 @@ mod tests {
                 "task",
                 "diff",
                 None,
+            &[],
                 &[],
                 &[],
                 "claim",
@@ -4591,6 +4768,7 @@ mod tests {
                 "task",
                 "diff",
                 None,
+            &[],
                 &[],
                 &[],
                 "claim",
@@ -4633,6 +4811,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             "claim",
             VerifyLensMode::SpecOnly,
             RouteTaskIntent::Other,
@@ -4658,6 +4837,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             "claim",
             VerifyLensMode::Full,
             RouteTaskIntent::Other,
@@ -4680,6 +4860,7 @@ mod tests {
             "TASK",
             "DIFF",
             Some(("cargo test", &check)),
+            &[],
             &["src/a.rs".to_string()],
             &[],
             "CLAIM",
@@ -4911,6 +5092,128 @@ mod tests {
                 "crates/runtime/src/new.rs".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn exec_green_checks_reports_only_post_edit_foreground_zero_exits() {
+        let bash_use = |id: &str, command: &str| {
+            ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: "bash".to_string(),
+                input: serde_json::json!({ "command": command }).to_string(),
+            }
+        };
+        let summary = TurnSummary {
+            assistant_messages: vec![ConversationMessage::assistant(vec![
+                bash_use("pre-edit", "cargo build --tests"),
+                bash_use("green", "cargo build 2>&1 | tail -5 && cargo run --quiet"),
+                bash_use("red", "cargo test broken"),
+                bash_use("bg", "cargo test --workspace"),
+                bash_use("not-a-check", "ls -la"),
+            ])],
+            tool_results: vec![
+                // Green check BEFORE the edit: stale evidence, must be dropped.
+                ConversationMessage::tool_result(
+                    "pre-edit",
+                    "bash",
+                    r#"{"stdout":"ok","stderr":""}"#,
+                    false,
+                ),
+                ConversationMessage::tool_result(
+                    "edit-1",
+                    "edit_file",
+                    r#"{"filePath":"src/main.rs"}"#,
+                    false,
+                ),
+                // Post-edit green check: the evidence this axis exists for.
+                ConversationMessage::tool_result(
+                    "green",
+                    "bash",
+                    r#"{"stdout":"15\n","stderr":""}"#,
+                    false,
+                ),
+                // Non-zero exit is not green.
+                ConversationMessage::tool_result(
+                    "red",
+                    "bash",
+                    r#"{"stdout":"","stderr":"boom","returnCodeInterpretation":"exit_code:101"}"#,
+                    false,
+                ),
+                // A backgrounded start proves nothing about the outcome.
+                ConversationMessage::tool_result(
+                    "bg",
+                    "bash",
+                    r#"{"stdout":"Started background task","stderr":"","backgroundTaskId":"t1"}"#,
+                    false,
+                ),
+                // Green but not check-shaped: noise, not evidence.
+                ConversationMessage::tool_result(
+                    "not-a-check",
+                    "bash",
+                    r#"{"stdout":"total 8","stderr":""}"#,
+                    false,
+                ),
+            ],
+            prompt_cache_events: Vec::new(),
+            iterations: 1,
+            usage: TokenUsage::default(),
+            turn_output_tokens: 0,
+            auto_compaction: None,
+            microcompact: None,
+            deep_verification: None,
+            verification_issues: Vec::new(),
+            deep_verifier_parse: None,
+            deep_verifier_model: None,
+            budget_exhausted: None,
+        };
+
+        assert_eq!(
+            exec_green_checks(&summary),
+            vec!["cargo build 2>&1 | tail -5 && cargo run --quiet".to_string()]
+        );
+    }
+
+    #[test]
+    fn verify_prompt_reports_exec_observed_checks_and_forbids_reruns() {
+        let checks = vec!["cargo build --tests && cargo run --quiet".to_string()];
+        let with = verify_prompt(
+            "fix the crate",
+            "diff",
+            None,
+            &checks,
+            &[],
+            &[],
+            "claim",
+            VerifyLensMode::Full,
+            RouteTaskIntent::Other,
+            false,
+        );
+        assert!(
+            with.contains("cargo build --tests && cargo run --quiet"),
+            "the observed command must be quoted verbatim"
+        );
+        assert!(
+            with.contains("observed by the harness to exit 0"),
+            "the prompt must attribute the observation to the harness, not the model"
+        );
+        assert!(
+            with.contains("Do NOT re-run build/test commands yourself"),
+            "the prompt must forbid the denied-anyway re-run attempt"
+        );
+        // Without observations the prompt stays byte-identical to the old form.
+        let without = verify_prompt(
+            "fix the crate",
+            "diff",
+            None,
+            &[],
+            &[],
+            &[],
+            "claim",
+            VerifyLensMode::Full,
+            RouteTaskIntent::Other,
+            false,
+        );
+        assert!(!without.contains("observed by the harness"));
     }
 
     #[test]
@@ -5334,6 +5637,7 @@ mod tests {
             "(this attempt reported no file edits)",
             None,
             &[],
+            &[],
             &["Business/Card/CardBusiness.cs".to_string()],
             "분석 완료 — 파일 변경 없음",
             VerifyLensMode::Full,
@@ -5368,6 +5672,7 @@ mod tests {
             "(this attempt reported no file edits)",
             None,
             &[],
+            &[],
             &["Business/Card/CardBusiness.cs".to_string()],
             "wrote the plan",
             VerifyLensMode::Full,
@@ -5384,6 +5689,7 @@ mod tests {
             "write a fix plan",
             "diff",
             None,
+            &[],
             &[],
             &[],
             "wrote the plan",
@@ -5836,6 +6142,7 @@ mod tests {
             "FOCUSED_TASK_MARKER",
             "FOCUSED_DIFF_MARKER",
             Some(("cargo test -p runtime", &check)),
+            &[],
             &["src/focused.rs".to_string()],
             &[],
             "FOCUSED_ASSISTANT_CLAIM_MARKER",
