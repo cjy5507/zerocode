@@ -349,9 +349,18 @@ pub(crate) fn aggregate_window(
 /// The one command that opens a gated feature's door, for the features whose
 /// door IS a setting. Everything else is gated by usage or by wire (the
 /// precondition text says which), so there is no command to suggest.
+/// Door commands are the report's contract: the EXACT existing command that
+/// applies a suggestion. Both are proven against the live `/smart` grammar
+/// by `refine_door_commands_resolve_to_real_smart_subcommands` — a door that
+/// the dispatcher rejects is a defect (the first two shipped here were: they
+/// used the settings-key spellings `autoClassifier`/`learnedSpecialty`,
+/// which the command grammar does not accept).
+const ROUTING_PROBE_DOOR: &str = "/smart classifier probed";
+const SHADOW_DOOR: &str = "/smart learned on";
+
 fn door_command(key: &str) -> Option<&'static str> {
     telemetry::HarnessFeature::from_key(key).and_then(|feature| match feature {
-        telemetry::HarnessFeature::RoutingProbe => Some("/smart autoClassifier probed"),
+        telemetry::HarnessFeature::RoutingProbe => Some(ROUTING_PROBE_DOOR),
         _ => None,
     })
 }
@@ -812,7 +821,7 @@ fn render_report(
 
     // Shadow routing evidence.
     lines.push(String::new());
-    lines.push("Shadow routing (Phase 6 learned specialty)".to_string());
+    lines.push("Shadow routing (learned specialty)".to_string());
     lines.push(format!("  mode: {}", shadow.mode_label));
     if shadow.stamp_count == 0 {
         lines.push(
@@ -826,10 +835,9 @@ fn render_report(
             shadow.distinct_models.len(),
         ));
         if !shadow.mode_is_on {
-            lines.push(
-                "  -> smallest change: /smart learnedSpecialty on   (observation-only until then; stamps accrue at zero cost)"
-                    .to_string(),
-            );
+            lines.push(format!(
+                "  -> smallest change: {SHADOW_DOOR}   (observation-only until then; stamps accrue at zero cost)"
+            ));
         }
     }
 
@@ -1168,10 +1176,7 @@ mod tests {
 
     #[test]
     fn door_commands_exist_only_for_setting_gated_features() {
-        assert_eq!(
-            door_command("routing_probe"),
-            Some("/smart autoClassifier probed")
-        );
+        assert_eq!(door_command("routing_probe"), Some(ROUTING_PROBE_DOOR));
         for feature in telemetry::HarnessFeature::all() {
             if *feature == telemetry::HarnessFeature::RoutingProbe {
                 continue;
@@ -1208,7 +1213,7 @@ mod tests {
             "{report}"
         );
         assert!(report.contains("alive    information topology"), "{report}");
-        assert!(report.contains("/smart learnedSpecialty on"), "{report}");
+        assert!(report.contains("/smart learned on"), "{report}");
         assert!(report.contains("Nothing was changed."), "{report}");
         assert!(
             !report.contains("FAILING"),
@@ -1347,6 +1352,39 @@ mod tests {
         assert!(bench.lost_tasks.is_empty());
         assert_eq!(bench.tools.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every door the report can print must be a command the live `/smart`
+    /// grammar accepts. Probing with the SUBCOMMAND ALONE keeps the check
+    /// side-effect free: a real subcommand missing its argument answers with
+    /// a usage error, while a made-up one answers "Unsupported subcommand" —
+    /// exactly how both original doors (settings-key spellings) were broken.
+    #[test]
+    fn refine_door_commands_resolve_to_real_smart_subcommands() {
+        let mut doors: Vec<&str> = vec![SHADOW_DOOR];
+        doors.extend(
+            telemetry::HarnessFeature::all()
+                .iter()
+                .filter_map(|feature| door_command(feature.key())),
+        );
+        for door in doors {
+            let subcommand = door
+                .strip_prefix("/smart ")
+                .unwrap_or_else(|| panic!("door must be a /smart command: {door}"))
+                .split_whitespace()
+                .next()
+                .expect("subcommand token");
+            let outcome = super::super::smart_settings::execute_smart_text_command(
+                "claude-opus-5",
+                Some(subcommand),
+            );
+            if let Err(error) = outcome {
+                assert!(
+                    !error.contains("Unsupported subcommand"),
+                    "door `{door}` names a subcommand the dispatcher rejects: {error}"
+                );
+            }
+        }
     }
 
     #[test]

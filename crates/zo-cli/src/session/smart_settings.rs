@@ -1326,7 +1326,7 @@ pub(crate) fn execute_smart_text_command(
 ) -> Result<String, String> {
     let raw_arg = arg.unwrap_or("").trim();
     if raw_arg.is_empty() {
-        return Ok("Smart Router settings open in the TUI. Use `/smart status` to view the current setup.\n\nQuick CLI commands:\n  /smart agents         Show builtin and loaded custom agent types\n  /smart on | off       Enable or disable Smart Router\n  /smart reset          Reset all subagent and role overrides to Auto\n  /smart pin <target> <model>   Pin a role or subagent to a model\n  /smart auto <target>          Reset a role or subagent override to Auto\n  /smart doctor         Show aggregate route outcome feedback + provenance/exploration/learned status\n  /smart execswap always|easy|never   When the Architect contract hands EXEC to the routed implementer\n  /smart explore on | off        Toggle Phase 5 deterministic exploration\n  /smart explore cadence <n>     Set the exploration cadence divisor (default 5)\n  /smart classifier deterministic | assisted | probed | off   Set the auto-route classifier mode (probed = fuse a Fast-tier self-assessment)\n  /smart learned shadow | on | off   Set the Phase 6 learned-specialty mode\n  /smart feedback on | off       Toggle feedback-informed auto routing\n  /smart diversity on | off      Toggle cross-provider diversity\n  /smart verify-cross on | off   Toggle the deep-gate VERIFY leg's cross-provider routing\n  /smart quota-fallback on | off Toggle auto cross-provider fallback on main-model quota exhaustion\n  /smart providers <csv> | clear Restrict (or unrestrict) the AUTO provider pool".to_string());
+        return Ok("Smart Router settings open in the TUI. Use `/smart status` to view the current setup.\n\nQuick CLI commands:\n  /smart agents         Show builtin and loaded custom agent types\n  /smart on | off       Enable or disable Smart Router\n  /smart reset          Reset all subagent and role overrides to Auto\n  /smart pin <target> <model>   Pin a role or subagent to a model\n  /smart auto <target>          Reset a role or subagent override to Auto\n  /smart doctor         Show aggregate route outcome feedback + provenance/exploration/learned status\n  /smart execswap always|easy|never   When the Architect contract hands EXEC to the routed implementer\n  /smart explore on | off        Toggle deterministic exploration\n  /smart explore cadence <n>     Set the exploration cadence divisor (default 5)\n  /smart classifier deterministic | assisted | probed | off   Set the auto-route classifier mode (probed = fuse a Fast-tier self-assessment)\n  /smart learned shadow | on | off   Set the learned-specialty mode\n  /smart feedback on | off       Toggle feedback-informed auto routing\n  /smart diversity on | off      Toggle cross-provider diversity\n  /smart verify-cross on | off   Toggle the deep-gate VERIFY leg's cross-provider routing\n  /smart quota-fallback on | off Toggle auto cross-provider fallback on main-model quota exhaustion\n  /smart providers <csv> | clear Restrict (or unrestrict) the AUTO provider pool".to_string());
     }
 
     let parts: Vec<&str> = raw_arg.split_whitespace().collect();
@@ -1421,12 +1421,12 @@ pub(crate) fn execute_smart_text_command(
                 "on" => {
                     write_global_smart_exploration(true)
                         .map_err(|e| format!("Failed to enable exploration: {e}"))?;
-                    Ok("Phase 5 deterministic exploration enabled.".to_string())
+                    Ok("Deterministic exploration enabled.".to_string())
                 }
                 "off" => {
                     write_global_smart_exploration(false)
                         .map_err(|e| format!("Failed to disable exploration: {e}"))?;
-                    Ok("Phase 5 deterministic exploration disabled.".to_string())
+                    Ok("Deterministic exploration disabled.".to_string())
                 }
                 "cadence" => {
                     let Some(raw) = parts.get(2) else {
@@ -1884,7 +1884,7 @@ fn smart_doctor_calibration_section(records: &[runtime::RouteOutcomeRecord]) -> 
 fn smart_doctor_verdict_section(records: &[runtime::RouteOutcomeRecord]) -> String {
     let mut lines = vec![
         String::new(),
-        "Verdict channel (Phase 4)".to_string(),
+        "Verdict channel".to_string(),
         "────────────────────────────────────".to_string(),
     ];
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
@@ -2041,7 +2041,7 @@ fn smart_doctor_learned_shadow_section(
 ) -> String {
     let mut lines = vec![
         String::new(),
-        "Learned specialty (Phase 6, shadow-first)".to_string(),
+        "Learned specialty (shadow-first)".to_string(),
         "────────────────────────────────────".to_string(),
     ];
     let mode_label = snapshot.map_or("unknown (settings unreadable)", |snapshot| {
@@ -2101,7 +2101,7 @@ fn smart_doctor_exploration_section(
 ) -> String {
     let mut lines = vec![
         String::new(),
-        "Exploration (Phase 5)".to_string(),
+        "Exploration".to_string(),
         "────────────────────────────────────".to_string(),
     ];
     let Some(snapshot) = snapshot else {
@@ -2150,7 +2150,7 @@ fn smart_doctor_exploration_section(
 fn smart_doctor_canonical_merge_section(records: &[runtime::RouteOutcomeRecord]) -> String {
     let mut lines = vec![
         String::new(),
-        "Canonical id merges (Phase 3)".to_string(),
+        "Canonical id merges".to_string(),
         "────────────────────────────────────".to_string(),
     ];
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -2208,7 +2208,7 @@ fn provenance_label(provenance: runtime::TiersProvenance) -> &'static str {
 fn smart_doctor_provenance_section(default_model: &str) -> String {
     let mut lines = vec![
         String::new(),
-        "Model tier provenance (Phase 1)".to_string(),
+        "Model tier provenance".to_string(),
         "────────────────────────────────────".to_string(),
     ];
     let inventory = connected_model_inventory(default_model);
@@ -5435,7 +5435,7 @@ mod tests {
         // (no credentials assumed) — just assert the section renders its header
         // and, if any model line exists at all, that it carries one of the three
         // documented provenance labels rather than a raw enum debug string.
-        assert!(rendered.contains("Model tier provenance (Phase 1)"), "{rendered}");
+        assert!(rendered.contains("Model tier provenance"), "{rendered}");
         if rendered.lines().count() > 3 {
             assert!(
                 rendered.contains("fallback (")
