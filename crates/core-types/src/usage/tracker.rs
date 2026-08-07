@@ -13,6 +13,14 @@ pub struct UsageTracker {
     /// consumed on each turn.
     cumulative_new_input_tokens: u32,
     turns: u32,
+    /// The cumulative usage this tracker was REHYDRATED with (a resumed
+    /// session's stored history). `cumulative - rehydrated` is what THIS
+    /// process actually consumed — the number a per-run report (headless
+    /// `--output-format json`) must bill, or every stage of a resumed
+    /// multi-stage run re-reports the whole session and a consumer that sums
+    /// runs double-counts (observed: a 3-stage bench inflated zo's token
+    /// total by ~75% vs the provider-billed truth).
+    rehydrated: TokenUsage,
 }
 
 impl UsageTracker {
@@ -29,7 +37,16 @@ impl UsageTracker {
                 tracker.record(usage);
             }
         }
+        tracker.rehydrated = tracker.cumulative;
         tracker
+    }
+
+    /// The cumulative usage carried in from a resumed session's stored
+    /// history at construction — zero for a fresh session. Subtract from
+    /// [`Self::cumulative_usage`] for this process's own consumption.
+    #[must_use]
+    pub fn rehydrated_usage(&self) -> TokenUsage {
+        self.rehydrated
     }
 
     pub fn record(&mut self, usage: TokenUsage) {

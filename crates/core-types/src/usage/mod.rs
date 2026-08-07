@@ -32,6 +32,25 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    /// Field-wise saturating subtraction — the "what did THIS process
+    /// consume" delta between a cumulative reading and its rehydrated
+    /// baseline. Saturating because an imported/edited transcript can carry a
+    /// baseline larger than a later reading; a wrapped counter would report
+    /// astronomical usage.
+    #[must_use]
+    pub fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_sub(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(other.output_tokens),
+            cache_creation_input_tokens: self
+                .cache_creation_input_tokens
+                .saturating_sub(other.cache_creation_input_tokens),
+            cache_read_input_tokens: self
+                .cache_read_input_tokens
+                .saturating_sub(other.cache_read_input_tokens),
+        }
+    }
+
     #[must_use]
     pub fn total_tokens(self) -> u32 {
         self.input_tokens

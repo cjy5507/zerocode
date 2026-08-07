@@ -2812,6 +2812,11 @@ impl LiveCli {
         TurnHarness::restore_deep_gate(&mut runtime, restore_reactive_gate);
         TurnHarness::restore_deep_gate(&mut runtime, restore_deep_gate);
         hook_abort_monitor.stop();
+        let usage_baseline = runtime
+            .runtime
+            .as_ref()
+            .map(ConversationRuntime::usage_baseline)
+            .unwrap_or_default();
         let summary = result.map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
         self.replace_runtime(runtime)?;
         self.persist_appended_session()?;
@@ -2822,6 +2827,7 @@ impl LiveCli {
             &self.model,
             &self.session.id,
             duration_ms,
+            usage_baseline,
             stdout.lock(),
         )
     }
@@ -3050,12 +3056,23 @@ impl LiveCli {
         TurnHarness::restore_deep_gate(&mut runtime, restore_reactive_gate);
         TurnHarness::restore_deep_gate(&mut runtime, restore_deep_gate);
         hook_abort_monitor.stop();
+        let usage_baseline = runtime
+            .runtime
+            .as_ref()
+            .map(ConversationRuntime::usage_baseline)
+            .unwrap_or_default();
         let summary = result.map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
         self.replace_runtime(runtime)?;
         self.persist_appended_session()?;
         println!(
             "{}",
-            prompt_result_json(&summary, &self.model, &self.session.id, duration_ms)
+            prompt_result_json(
+                &summary,
+                &self.model,
+                &self.session.id,
+                duration_ms,
+                usage_baseline
+            )
         );
         Ok(())
     }
@@ -3391,10 +3408,16 @@ fn prompt_result_json(
     model: &str,
     session_id: &str,
     duration_ms: u128,
+    usage_baseline: runtime::TokenUsage,
 ) -> serde_json::Value {
     let tool_uses = crate::collect_tool_uses(summary);
-    let mut value =
-        super::ndjson_summary::sdk_result_object(summary, model, session_id, duration_ms);
+    let mut value = super::ndjson_summary::sdk_result_object(
+        summary,
+        model,
+        session_id,
+        duration_ms,
+        usage_baseline,
+    );
     let total_cost_usd = value["total_cost_usd"].as_f64().unwrap_or(0.0);
     if let Some(object) = value.as_object_mut() {
         // Additive zo extras layered on top of the SDK key set. `message`
@@ -3705,12 +3728,53 @@ mod prompt_json_tests {
         }
     }
 
+    /// A resumed session's report bills only THIS run: `summary.usage` is
+    /// session-cumulative (the tracker rehydrates from stored history), so
+    /// without the baseline subtraction every stage of a multi-stage run
+    /// re-reports the whole session and a consumer summing runs double-counts
+    /// (observed: the long-lane bench inflated zo's token total ~75% vs the
+    /// provider-billed truth).
+    #[test]
+    fn resumed_run_reports_usage_delta_not_session_cumulative() {
+        let full = summary(4, 250); // cumulative: in 1000 / out 250
+        let baseline = runtime::TokenUsage {
+            input_tokens: 900,
+            output_tokens: 200,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        let value = prompt_result_json(&full, "claude-sonnet-4-6", "sess-r", 10, baseline);
+        assert_eq!(value["usage"]["input_tokens"], 100);
+        assert_eq!(value["usage"]["output_tokens"], 50);
+        // Cost derives from the delta too — a fresh session (zero baseline)
+        // must report strictly more than the resumed continuation.
+        let fresh = prompt_result_json(
+            &full,
+            "claude-sonnet-4-6",
+            "sess-r",
+            10,
+            runtime::TokenUsage::default(),
+        );
+        let delta_cost = value["total_cost_usd"].as_f64().expect("cost");
+        let fresh_cost = fresh["total_cost_usd"].as_f64().expect("cost");
+        assert!(
+            delta_cost < fresh_cost,
+            "resumed cost {delta_cost} must be below cumulative {fresh_cost}"
+        );
+    }
+
     /// The benchmark-comparability fields must all be present and well-typed so
     /// a harness can compare Zo against Claude Code without reverse
     /// engineering the schema.
     #[test]
     fn json_carries_benchmark_comparability_fields() {
-        let value = prompt_result_json(&summary(4, 250), "claude-sonnet-4-6", "sess-1", 1_234);
+        let value = prompt_result_json(
+            &summary(4, 250),
+            "claude-sonnet-4-6",
+            "sess-1",
+            1_234,
+            runtime::TokenUsage::default(),
+        );
 
         assert_eq!(value["is_error"], false);
         assert_eq!(value["model"], "claude-sonnet-4-6");
@@ -3726,7 +3790,13 @@ mod prompt_json_tests {
 
     #[test]
     fn num_tool_uses_matches_tool_uses_len() {
-        let value = prompt_result_json(&summary(1, 10), "claude-opus-4-8", "sess-2", 0);
+        let value = prompt_result_json(
+            &summary(1, 10),
+            "claude-opus-4-8",
+            "sess-2",
+            0,
+            runtime::TokenUsage::default(),
+        );
         let len = value["tool_uses"].as_array().map_or(0, Vec::len);
         assert_eq!(value["num_tool_uses"], len);
     }
@@ -3745,7 +3815,13 @@ mod prompt_json_tests {
         let duration_ms = 1_234;
 
         // json path.
-        let json_value = prompt_result_json(&summary, model, session_id, duration_ms);
+        let json_value = prompt_result_json(
+            &summary,
+            model,
+            session_id,
+            duration_ms,
+            runtime::TokenUsage::default(),
+        );
 
         // stream-json terminal event path: capture the line the production
         // writer emits and parse it back.
@@ -3755,6 +3831,7 @@ mod prompt_json_tests {
             model,
             session_id,
             duration_ms,
+            runtime::TokenUsage::default(),
             &mut buf,
         )
         .expect("write_ndjson_result_event should succeed");

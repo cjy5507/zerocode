@@ -67,7 +67,14 @@ pub(crate) fn write_ndjson_summary<W: std::io::Write>(
         sink.finalize()?;
     }
 
-    write_ndjson_result_event(summary, model, session_id, duration_ms, &mut writer)
+    write_ndjson_result_event(
+        summary,
+        model,
+        session_id,
+        duration_ms,
+        runtime::TokenUsage::default(),
+        &mut writer,
+    )
 }
 
 /// Build the **Claude-Code-SDK-compatible** terminal `result` object shared by
@@ -100,9 +107,16 @@ pub(crate) fn sdk_result_object(
     model: &str,
     session_id: &str,
     duration_ms: u128,
+    usage_baseline: runtime::TokenUsage,
 ) -> serde_json::Value {
-    let total_cost_usd = summary
-        .usage
+    // Per-RUN usage, not session-cumulative: `summary.usage` counts the whole
+    // session including the history a resumed `--session-id` run rehydrated,
+    // and Claude Code's result object bills per run — a consumer summing
+    // stage reports (the bench, CI cost gates) double-counts otherwise. The
+    // baseline is zero for a fresh session, so single-shot output is
+    // unchanged.
+    let run_usage = summary.usage.saturating_sub(usage_baseline);
+    let total_cost_usd = run_usage
         .estimate_cost_usd_with_pricing(
             runtime::pricing_for_model(model)
                 .unwrap_or_else(runtime::ModelPricing::default_sonnet_tier),
@@ -118,10 +132,10 @@ pub(crate) fn sdk_result_object(
         "duration_ms": duration_ms,
         "total_cost_usd": total_cost_usd,
         "usage": {
-            "input_tokens": summary.usage.input_tokens,
-            "output_tokens": summary.usage.output_tokens,
-            "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
-            "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
+            "input_tokens": run_usage.input_tokens,
+            "output_tokens": run_usage.output_tokens,
+            "cache_creation_input_tokens": run_usage.cache_creation_input_tokens,
+            "cache_read_input_tokens": run_usage.cache_read_input_tokens,
         },
     })
 }
@@ -138,9 +152,10 @@ pub(crate) fn write_ndjson_result_event<W: std::io::Write>(
     model: &str,
     session_id: &str,
     duration_ms: u128,
+    usage_baseline: runtime::TokenUsage,
     mut writer: W,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut result = sdk_result_object(summary, model, session_id, duration_ms);
+    let mut result = sdk_result_object(summary, model, session_id, duration_ms, usage_baseline);
     let total_cost_usd = result["total_cost_usd"].as_f64().unwrap_or(0.0);
     if let Some(object) = result.as_object_mut() {
         // Additive zo extras: keep the legacy `model`/`iterations` keys and a

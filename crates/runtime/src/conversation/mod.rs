@@ -1494,6 +1494,18 @@ where
         }
     }
 
+    /// The cumulative usage this runtime was rehydrated with from its
+    /// session's stored history — zero for a fresh session. A per-run report
+    /// (headless `--output-format json`) subtracts this from
+    /// [`TurnSummary::usage`] (which is session-cumulative) so a resumed
+    /// stage bills only its own consumption; without the subtraction every
+    /// stage re-reports the whole session and a consumer that sums runs
+    /// double-counts.
+    #[must_use]
+    pub fn usage_baseline(&self) -> TokenUsage {
+        self.usage_tracker.rehydrated_usage()
+    }
+
     /// Run a user turn, honoring the `TurnEnd` (Stop) hook's `followupMessage`:
     /// when a `TurnEnd` hook returns one, the message is re-injected as the next
     /// user turn and the agent keeps working, bounded by `max_stop_loops`. With
