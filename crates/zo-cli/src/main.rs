@@ -112,7 +112,7 @@ pub(crate) use crate::response_events::{push_output_block, response_to_events};
 use crate::resume::{StatusContext, StatusUsage};
 #[cfg(test)]
 pub(crate) use crate::runtime_support::build_runtime_with_plugin_state;
-pub(crate) use crate::runtime_support::{AnthropicRuntimeClient, CliPermissionPrompter};
+pub(crate) use crate::runtime_support::AnthropicRuntimeClient;
 use crate::session::{BuiltRuntime, RuntimePluginState};
 pub(crate) use crate::session_format::{
     format_missing_session_reference, format_no_managed_sessions, format_session_modified_age,

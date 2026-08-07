@@ -426,23 +426,23 @@ fn interactive_terminal(stdin_tty: bool, stdout_tty: bool, stderr_tty: bool) -> 
     stdin_tty && stdout_tty && stderr_tty
 }
 
-pub(crate) struct CliPermissionPrompter {
+/// Terminal prompter for the text one-shot path (`run_turn_capturing` drives
+/// the deep-gate-aware streaming dispatcher, whose residual prompts arrive on
+/// the async [`runtime::permission::PermissionPrompter`] contract).
+/// Interactive only when stdin, stdout, and stderr are all terminals; the
+/// approval UI is written to stderr so it never corrupts machine-readable
+/// stdout, and a redirected stdout (`zo -p ... > out.txt`) marks an
+/// automation run, which resolves every residual prompt to a safe deny
+/// without touching stdin. The y/N read runs on the blocking pool so it never
+/// stalls the render drain. `y` maps to `AllowOnce`: the y/N prompt never
+/// installed a durable rule, and `Allow` on the async contract grants one for
+/// the whole session.
+pub(crate) struct TerminalPermissionPrompter {
     current_mode: PermissionMode,
-    /// When false, `decide` never touches stdin/stderr and denies immediately.
-    /// This is the non-TTY / machine-output contract: a one-shot run whose
-    /// stdin, stdout, and stderr are not all terminals (or a JSON/NDJSON run,
-    /// which must never interleave a prompt with machine stdout) must resolve
-    /// permission requests to a safe deny rather than blocking on an
-    /// interactive prompt.
     interactive: bool,
 }
 
-impl CliPermissionPrompter {
-    /// TTY-aware prompter for the human text one-shot path. Interactive only
-    /// when stdin, stdout, and stderr are all terminals; the approval UI is
-    /// written to stderr so it never corrupts machine-readable stdout. A
-    /// redirected stdout (`zo -p ... > out.txt`) marks an automation run,
-    /// so it stays non-interactive even when stdin and stderr are still TTYs.
+impl TerminalPermissionPrompter {
     pub(crate) fn new(current_mode: PermissionMode) -> Self {
         let interactive = interactive_terminal(
             io::stdin().is_terminal(),
@@ -455,78 +455,73 @@ impl CliPermissionPrompter {
         }
     }
 
-    /// Never-interactive prompter that always denies without reading stdin or
-    /// writing any UI. Production machine-output paths (JSON/NDJSON) moved to
-    /// the streaming dispatcher's `HeadlessPermissionPrompter`, so this
-    /// remains only as the test double for the non-interactive contract.
+    /// The non-interactive state a redirected fd produces, constructed
+    /// directly so tests never depend on the harness's real fds.
     #[cfg(test)]
-    pub(crate) fn new_non_interactive(current_mode: PermissionMode) -> Self {
+    pub(crate) fn non_interactive_for_test(current_mode: PermissionMode) -> Self {
         Self {
             current_mode,
             interactive: false,
         }
     }
-
-    fn auto_deny(&self, request: &runtime::PermissionRequest) -> runtime::PermissionPromptDecision {
-        runtime::PermissionPromptDecision::Deny {
-            reason: format!(
-                "tool '{}' auto-denied: non-interactive session has no terminal for approval (mode {})",
-                request.tool_name,
-                self.current_mode.as_str()
-            ),
-        }
-    }
 }
 
-impl runtime::PermissionPrompter for CliPermissionPrompter {
-    fn decide(
-        &mut self,
-        request: &runtime::PermissionRequest,
-    ) -> runtime::PermissionPromptDecision {
-        if !self.interactive {
-            return self.auto_deny(request);
-        }
-
-        // Interactive approval UI goes to stderr so machine-readable stdout
-        // (text with NO_COLOR, or a caller reading our stdout) is never mixed
-        // with the prompt.
-        let mut err = io::stderr();
-        let _ = writeln!(err);
-        let _ = writeln!(err, "Permission approval required");
-        let _ = writeln!(err, "  Tool             {}", request.tool_name);
-        let _ = writeln!(err, "  Current mode     {}", self.current_mode.as_str());
-        let _ = writeln!(err, "  Required mode    {}", request.required_mode.as_str());
-        if let Some(reason) = &request.reason {
-            let _ = writeln!(err, "  Reason           {reason}");
-        }
-        let _ = writeln!(err, "  Input            {}", request.input);
-        let _ = write!(err, "Approve this tool call? [y/N]: ");
-        let _ = err.flush();
-
-        let mut response = String::new();
-        match io::stdin().read_line(&mut response) {
-            Ok(0) => {
-                // EOF on an interactive stdin (e.g. closed pipe): treat as deny
-                // rather than looping or hanging.
-                self.auto_deny(request)
+impl runtime::permission::PermissionPrompter for TerminalPermissionPrompter {
+    fn decide<'a>(
+        &'a self,
+        request: runtime::permission::PermissionRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        runtime::permission::PermissionDecision,
+                        runtime::permission::PermissionError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        use runtime::permission::PermissionDecision;
+        let interactive = self.interactive;
+        let mode = self.current_mode;
+        Box::pin(async move {
+            if !interactive {
+                return Ok(PermissionDecision::Deny);
             }
-            Ok(_) => {
-                let normalized = response.trim().to_ascii_lowercase();
-                if matches!(normalized.as_str(), "y" | "yes") {
-                    runtime::PermissionPromptDecision::Allow
-                } else {
-                    runtime::PermissionPromptDecision::Deny {
-                        reason: format!(
-                            "tool '{}' denied by user approval prompt",
-                            request.tool_name
-                        ),
+            let decision = tokio::task::spawn_blocking(move || {
+                // Interactive approval UI goes to stderr so machine-readable
+                // stdout is never mixed with the prompt (mirrors the sync
+                // prompter). The async request deliberately carries a
+                // display-safe input summary, never the full payload.
+                let mut err = io::stderr();
+                let _ = writeln!(err);
+                let _ = writeln!(err, "Permission approval required");
+                let _ = writeln!(err, "  Tool             {}", request.tool);
+                let _ = writeln!(err, "  Current mode     {}", mode.as_str());
+                let _ = writeln!(err, "  Reason           {}", request.reasoning);
+                let _ = writeln!(err, "  Input            {}", request.input_summary);
+                let _ = write!(err, "Approve this tool call? [y/N]: ");
+                let _ = err.flush();
+
+                let mut response = String::new();
+                match io::stdin().read_line(&mut response) {
+                    // EOF or a read error on an interactive stdin: deny rather
+                    // than looping or hanging.
+                    Ok(0) | Err(_) => PermissionDecision::Deny,
+                    Ok(_) => {
+                        let normalized = response.trim().to_ascii_lowercase();
+                        if matches!(normalized.as_str(), "y" | "yes") {
+                            PermissionDecision::AllowOnce
+                        } else {
+                            PermissionDecision::Deny
+                        }
                     }
                 }
-            }
-            Err(error) => runtime::PermissionPromptDecision::Deny {
-                reason: format!("permission approval failed: {error}"),
-            },
-        }
+            })
+            .await
+            .unwrap_or(PermissionDecision::Deny);
+            Ok(decision)
+        })
     }
 }
 
@@ -1475,9 +1470,16 @@ pub(crate) async fn refresh_claude_oauth() -> Option<AuthSource> {
 /// (`NO_COLOR` non-empty, or stdout is not a TTY), so a piped or `NO_COLOR`
 /// consumer gets clean text while an interactive terminal keeps the existing
 /// colored UX. JSON/NDJSON never reach here — they route to `io::sink`.
-struct StripAnsiWriter<W: Write> {
+pub(crate) struct StripAnsiWriter<W: Write> {
     inner: W,
     strip: bool,
+}
+
+impl<W: Write> StripAnsiWriter<W> {
+    /// Wrap `inner`; strips ANSI per write when `strip` is true.
+    pub(crate) fn new(inner: W, strip: bool) -> Self {
+        Self { inner, strip }
+    }
 }
 
 impl<W: Write> Write for StripAnsiWriter<W> {
@@ -2719,58 +2721,62 @@ mod tests {
 
 #[cfg(test)]
 mod headless_permission_tests {
-    use super::CliPermissionPrompter;
-    use runtime::{
-        PermissionMode, PermissionPrompter, PermissionPromptDecision, PermissionRequest,
+    use super::TerminalPermissionPrompter;
+    use runtime::permission::{
+        PermissionDecision, PermissionPrompter, PermissionRequest, RiskLevel,
     };
+    use runtime::PermissionMode;
 
     fn sample_request() -> PermissionRequest {
         PermissionRequest {
-            tool_name: "bash".to_string(),
-            input: "ls -la".to_string(),
-            current_mode: PermissionMode::ReadOnly,
-            required_mode: PermissionMode::WorkspaceWrite,
-            reason: None,
-            deny_reason: None,
+            tool: "bash".to_string(),
+            input_summary: "ls -la".to_string(),
+            input_hash: "0".repeat(64),
+            reasoning: "tool 'bash' requires approval to run while mode is read-only".to_string(),
+            choices: Vec::new(),
+            risk_level: RiskLevel::Medium,
         }
+    }
+
+    fn decide_blocking(
+        prompter: &TerminalPermissionPrompter,
+        request: PermissionRequest,
+    ) -> PermissionDecision {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(prompter.decide(request))
+            .expect("terminal prompter never errors")
     }
 
     /// Contract (a): a non-interactive one-shot must resolve permission
     /// requests to a safe deny without reading stdin (no blocking prompt).
+    /// If `decide` fell through to the interactive branch it would block on
+    /// `stdin.read_line`; returning at all proves the short-circuit fires.
     #[test]
     fn non_interactive_prompter_denies_without_blocking() {
-        let mut prompter = CliPermissionPrompter::new_non_interactive(PermissionMode::ReadOnly);
-        match prompter.decide(&sample_request()) {
-            PermissionPromptDecision::Deny { reason } => {
-                assert!(reason.contains("bash"), "reason names the tool: {reason}");
-                assert!(
-                    reason.contains("auto-denied"),
-                    "reason explains the auto-deny: {reason}"
-                );
-                assert!(
-                    reason.contains("read-only"),
-                    "reason preserves the permission mode: {reason}"
-                );
-            }
-            PermissionPromptDecision::Allow => {
-                panic!("non-interactive session must never auto-approve")
-            }
-        }
+        let prompter =
+            TerminalPermissionPrompter::non_interactive_for_test(PermissionMode::ReadOnly);
+        assert_eq!(
+            decide_blocking(&prompter, sample_request()),
+            PermissionDecision::Deny,
+            "non-interactive session must never auto-approve",
+        );
     }
 
-    /// Contract (d): the deny reason reflects the current permission mode so
-    /// mode semantics are preserved in machine output.
+    /// Contract (d): the deny holds regardless of how permissive the active
+    /// mode is — mode rules are the policy's job; residual prompts with no
+    /// human attached always resolve to deny.
     #[test]
-    fn non_interactive_deny_reports_current_mode() {
-        let mut prompter =
-            CliPermissionPrompter::new_non_interactive(PermissionMode::DangerFullAccess);
-        match prompter.decide(&sample_request()) {
-            PermissionPromptDecision::Deny { reason } => assert!(
-                reason.contains("danger-full-access"),
-                "reason preserves the active mode: {reason}"
-            ),
-            PermissionPromptDecision::Allow => panic!("must deny in non-interactive session"),
-        }
+    fn non_interactive_deny_holds_in_permissive_mode() {
+        let prompter =
+            TerminalPermissionPrompter::non_interactive_for_test(PermissionMode::DangerFullAccess);
+        assert_eq!(
+            decide_blocking(&prompter, sample_request()),
+            PermissionDecision::Deny,
+            "must deny in non-interactive session",
+        );
     }
 
     /// Contract (b): the interactive predicate is true for exactly one point of
@@ -2807,26 +2813,18 @@ mod headless_permission_tests {
         );
     }
 
-    /// Contract (c) end-to-end: a prompter in the non-interactive state that a
-    /// redirected-stdout run produces must auto-deny without ever reading
-    /// stdin. `new_non_interactive` yields the same `interactive == false`
-    /// state as `new` under a redirected fd, and `decide` short-circuits to
-    /// `auto_deny` before touching stdin — so this proves the no-block, no
-    /// stdin-access contract for the automation path.
+    /// Contract (c) end-to-end: the non-interactive state a redirected-stdout
+    /// run produces must deny without ever reading stdin — the deny arm
+    /// returns before the blocking-pool prompt is even spawned.
     #[test]
     fn non_interactive_state_auto_denies_without_reading_stdin() {
-        let mut prompter = CliPermissionPrompter::new_non_interactive(PermissionMode::ReadOnly);
-        // If `decide` fell through to the interactive branch it would block on
-        // `stdin.read_line`; returning at all proves the short-circuit fires.
-        match prompter.decide(&sample_request()) {
-            PermissionPromptDecision::Deny { reason } => assert!(
-                reason.contains("auto-denied") && reason.contains("no terminal"),
-                "auto-deny reason must state the missing-terminal cause: {reason}",
-            ),
-            PermissionPromptDecision::Allow => {
-                panic!("redirected-stdout automation must never auto-approve")
-            }
-        }
+        let prompter =
+            TerminalPermissionPrompter::non_interactive_for_test(PermissionMode::ReadOnly);
+        assert_eq!(
+            decide_blocking(&prompter, sample_request()),
+            PermissionDecision::Deny,
+            "redirected-stdout automation must never auto-approve",
+        );
     }
 }
 

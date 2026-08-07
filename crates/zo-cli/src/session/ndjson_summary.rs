@@ -326,6 +326,116 @@ pub(crate) async fn drive_discarding_stream(
     turn_result
 }
 
+/// Drive a turn through the streaming runtime path headlessly, rendering the
+/// blocks a text one-shot shows: assistant text through the shared markdown
+/// streamer (the same `push`/`flush` cadence the retired sync-client stdout
+/// emission used, ANSI-stripped for `NO_COLOR`/non-TTY) and tool-call start
+/// cards from the structured preview. Tool RESULTS are deliberately not
+/// rendered here — the executor prints them at execution time
+/// (`emit_output`), byte-identical to the sync path. Reasoning, system notes
+/// and usage stay off stdout, as before. The prompter is the caller's choice:
+/// the text path passes a terminal y/N prompter so interactive approvals keep
+/// working.
+pub(crate) async fn drive_text_stream(
+    rt: &mut runtime::ConversationRuntime<crate::AnthropicRuntimeClient, crate::CliToolExecutor>,
+    live_client: std::sync::Arc<super::runtime_bridge::LiveAsyncApiClient>,
+    input: String,
+    model: &str,
+    prompter: StreamPrompter,
+) -> Result<runtime::TurnSummary, String> {
+    use std::io::IsTerminal as _;
+    use std::io::Write as _;
+
+    use runtime::message_stream::{RenderBlock, ToolCallStatus};
+
+    let (block_tx, mut block_rx) = tokio::sync::mpsc::channel::<RenderBlock>(64);
+    let drain = async move {
+        let renderer = crate::render::TerminalRenderer::new();
+        let mut markdown = crate::render::MarkdownStreamState::default();
+        let strip = crate::render::no_color_env() || !std::io::stdout().is_terminal();
+        let mut out = crate::runtime_support::StripAnsiWriter::new(std::io::stdout(), strip);
+        // One call streams as SEVERAL ToolCall blocks with the same
+        // tool_call_id (the wire parser announces it, the dispatch loop
+        // re-sends it with its permission-settled status) — the TUI coalesces
+        // them by id in place, an append-only transcript must print the card
+        // exactly once. The map also names each call's ToolResult, which
+        // carries only the id.
+        let mut announced_calls: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        while let Some(block) = block_rx.recv().await {
+            match block {
+                RenderBlock::TextDelta { text, done, .. } => {
+                    if !text.is_empty() {
+                        if let Some(rendered) = markdown.push(&renderer, &text) {
+                            let _ = write!(out, "{rendered}").and_then(|()| out.flush());
+                        }
+                    }
+                    if done {
+                        if let Some(rendered) = markdown.flush(&renderer) {
+                            let _ = write!(out, "{rendered}").and_then(|()| out.flush());
+                        }
+                    }
+                }
+                RenderBlock::ToolCall {
+                    tool_call_id,
+                    name,
+                    summary,
+                    preview,
+                    status,
+                    ..
+                } => {
+                    if status == ToolCallStatus::Running
+                        && !announced_calls.contains_key(&tool_call_id.0)
+                    {
+                        let card = crate::tool_formatting::format_tool_call_start_from_preview(
+                            &name, &preview, &summary,
+                        );
+                        announced_calls.insert(tool_call_id.0.clone(), name);
+                        let _ = writeln!(out, "\n{card}").and_then(|()| out.flush());
+                    }
+                }
+                RenderBlock::ToolResult {
+                    tool_call_id,
+                    is_error,
+                    body,
+                    ..
+                } => {
+                    // The concurrent dispatch closure the streaming loop
+                    // executes tools through never writes to stdout (the
+                    // serial executor's `emit_output` branch is sync-loop
+                    // machinery), so the result renders here — from the same
+                    // structured body the TUI shows.
+                    let name = announced_calls
+                        .get(&tool_call_id.0)
+                        .cloned()
+                        .or_else(|| match &body {
+                            runtime::message_stream::ToolResultBody::Generic {
+                                name, ..
+                            } => Some(name.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "tool".to_string());
+                    let result_text = crate::tool_formatting::format_tool_result_from_body(
+                        &name, is_error, &body,
+                    );
+                    let _ = writeln!(out, "{result_text}").and_then(|()| out.flush());
+                }
+                _ => {}
+            }
+        }
+        // Channel closed mid-message (error paths): flush any buffered tail so
+        // partial assistant text is not silently dropped.
+        if let Some(rendered) = markdown.flush(&renderer) {
+            let _ = write!(out, "{rendered}").and_then(|()| out.flush());
+        }
+    };
+    let (turn_result, ()) = tokio::join!(
+        drive_render_stream(rt, live_client, input, model, block_tx, prompter),
+        drain
+    );
+    turn_result
+}
+
 /// Drive a turn through the streaming runtime path headlessly, emitting each
 /// [`RenderBlock`] as a typed ndjson line *live* to stdout (text deltas, tool
 /// calls/results, usage) instead of replaying a post-hoc summary. Thin stdout

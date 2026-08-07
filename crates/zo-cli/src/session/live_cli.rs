@@ -2622,10 +2622,42 @@ impl LiveCli {
                 &mut spinner_out,
             )?;
         }
-        let mut permission_prompter = crate::CliPermissionPrompter::new(self.permission_mode);
-        let restore_deep_gate =
-            TurnHarness::install_automation_plan_gate_if_needed(input, &mut runtime);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        // Drive the turn through the deep-gate-aware streaming dispatcher, NOT
+        // the sync `runtime.run_turn` loop: that loop ignores an installed
+        // `DeepGateConfig`, which left text coding turns (and the goal loop's
+        // plan-first gate on this path) without the verify safety net — the
+        // same defect `run_prompt_json` had. Assistant text and tool-start
+        // cards render from the block stream; tool results keep printing from
+        // the executor (`emit_output`), byte-identical to the sync loop.
+        // Residual permission prompts go to the terminal y/N flow on a full
+        // TTY and deny otherwise, matching the retired sync prompter.
+        let live_client = TurnHarness::build_live_client(
+            &runtime,
+            self.allowed_tools.clone(),
+            self.thinking_config(),
+            self.effort.and_then(Effort::level),
+            self.effort.and_then(Effort::band_ceiling),
+        );
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let (restore_deep_gate, restore_reactive_gate) =
+            TurnHarness::install_headless_deep_gates(input, &mut runtime);
+        let prompter = super::ndjson_summary::StreamPrompter::External(std::sync::Arc::new(
+            crate::runtime_support::TerminalPermissionPrompter::new(self.permission_mode),
+        ));
+        let result = match runtime.runtime.as_mut() {
+            Some(rt) => tokio_rt.block_on(super::ndjson_summary::drive_text_stream(
+                rt,
+                live_client,
+                input.to_string(),
+                &self.model,
+                prompter,
+            )),
+            None => Err("runtime not available".into()),
+        };
+        // Restore in reverse install order (reactive first, then automation).
+        TurnHarness::restore_deep_gate(&mut runtime, restore_reactive_gate);
         TurnHarness::restore_deep_gate(&mut runtime, restore_deep_gate);
         hook_abort_monitor.stop();
         match result {
@@ -2660,7 +2692,7 @@ impl LiveCli {
                         &mut spinner_out,
                     )?;
                 }
-                Err(Box::new(error))
+                Err(error.into())
             }
         }
     }
