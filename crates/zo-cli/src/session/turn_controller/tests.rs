@@ -731,43 +731,26 @@ fn verify_intent_applies_the_design_kill_switch_before_the_runtime_sees_it() {
     }
 }
 
-/// A design turn's single-lens VERIFY is the ONE leg that drops below the
-/// `xhigh` pin: that lens reads "is this the asked-for deliverable, does it look
-/// right", and its quality saturates below max reasoning. Everything else — a
-/// full-depth design verify, every non-design verify at either depth — must stay
-/// byte-for-byte on `xhigh`.
+/// VERIFY effort follows the leg's depth and nothing else: a single-lens leg
+/// is the spec-only read, whose quality saturates below max reasoning, while
+/// the full three-lens judgment keeps `xhigh` — it gates the whole turn.
 #[test]
-fn design_single_lens_verify_runs_at_high_and_nothing_else_moves() {
+fn verify_effort_follows_depth_single_lens_high_full_xhigh() {
     use api::EffortLevel as L;
-    use runtime::RouteTaskIntent as I;
     use VerifyLegDepth as D;
 
-    assert_eq!(deep_verify_leg_effort(I::Design, D::SingleLens), L::High);
-    // The design exception is depth-scoped: three lenses on a design diff is
-    // the expensive judgment, and it keeps its reasoning.
-    assert_eq!(deep_verify_leg_effort(I::Design, D::Full), L::Xhigh);
-    for intent in [I::Other, I::Implementation, I::Analysis] {
-        for depth in [D::SingleLens, D::Full] {
-            assert_eq!(
-                deep_verify_leg_effort(intent, depth),
-                L::Xhigh,
-                "{intent:?}/{depth:?} must keep the xhigh pin"
-            );
-        }
-    }
+    assert_eq!(deep_verify_leg_effort(D::SingleLens), L::High);
+    assert_eq!(deep_verify_leg_effort(D::Full), L::Xhigh);
 }
 
-/// The band half of the deep gate's depth cut, reproduced host-side so the
-/// leg's client can be built before the diff exists. Mirrors
-/// `deep_gate::verify_depth`: `Small` at `Low`/`Medium` risk is the only band
-/// that can ever reach one lens.
-///
-/// `Trivial` is asserted to be `Full` on EVERY risk, matching the gate rather
-/// than the leading `Full` guard alone: `verify_depth` sends `Trivial`/`Low` to
-/// `Skip` (no leg, so leg effort is moot) and all other `Trivial` bands —
-/// notably `Trivial`/`Medium`, which no diff can rescue — to `Full`. A mirror
-/// that said `SingleLens` there would give a full three-lens design verify the
-/// single-lens `high` discount.
+/// The band-only PREDICTION half of the deep gate's depth cut, made before
+/// any diff exists. Deliberately more conservative than the gate: the gate
+/// may demote a `Medium` or `Trivial` band to one lens after measuring a
+/// small green diff, but this mirror sizes the client's reasoning up front,
+/// and a `Medium` verb guess spans one-line fixes and twelve-file features
+/// alike. `Small` at `Low`/`Medium` risk stays the ONLY band that predicts a
+/// single lens — anything wider would run a ballooned diff's three-lens
+/// verify on a discounted client.
 #[test]
 fn only_a_small_low_risk_band_can_reach_a_single_lens() {
     use runtime::RouteTaskComplexity as C;
@@ -798,26 +781,21 @@ fn only_a_small_low_risk_band_can_reach_a_single_lens() {
     }
 }
 
-/// The kill switch reaches the verify effort too, without this helper reading
-/// any env of its own: `verify_intent_for_turn` has already downgraded a
-/// switched-off `Design` turn to `Other`, so the leg is back on `xhigh`.
+/// The kill switch downgrades a `Design` turn's verify intent to `Other`,
+/// disarming the guidance reminder and the gate's design verify floor. It
+/// deliberately does NOT move the leg's effort anymore — effort follows the
+/// depth alone, and the single-lens `high` saturation argument holds whether
+/// or not the design machinery is switched on.
 #[test]
-fn design_verify_effort_rides_the_kill_switch_through_the_verify_intent() {
-    use api::EffortLevel as L;
+fn design_kill_switch_downgrades_the_verify_intent_only() {
     use runtime::RouteTaskIntent as I;
 
     let _guard = crate::test_env_lock();
     let prior = std::env::var_os("ZO_DESIGN_GUIDANCE");
     std::env::set_var("ZO_DESIGN_GUIDANCE", "off");
-    assert_eq!(
-        deep_verify_leg_effort(verify_intent_for_turn(I::Design), VerifyLegDepth::SingleLens),
-        L::Xhigh
-    );
+    assert_eq!(verify_intent_for_turn(I::Design), I::Other);
     std::env::remove_var("ZO_DESIGN_GUIDANCE");
-    assert_eq!(
-        deep_verify_leg_effort(verify_intent_for_turn(I::Design), VerifyLegDepth::SingleLens),
-        L::High
-    );
+    assert_eq!(verify_intent_for_turn(I::Design), I::Design);
     match prior {
         Some(prior) => std::env::set_var("ZO_DESIGN_GUIDANCE", prior),
         None => std::env::remove_var("ZO_DESIGN_GUIDANCE"),

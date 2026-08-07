@@ -304,6 +304,16 @@ enum VerifyDepth {
     Full,
 }
 
+/// The band is a pre-execution guess (probe/verb match); the diff arguments
+/// are post-execution facts. For `Medium` complexity the facts outrank the
+/// guess — a verb like "fix" bands casual one-line turns as `Medium`, and the
+/// spec lens covers a measured-small green change regardless of what the verb
+/// promised. `Large`/`Unknown` complexity and `High`/`Critical`/`Unknown`
+/// risk stay `Full` no matter how small the diff: when the guess says "big or
+/// unreadable", a small measured diff is evidence the change may be
+/// INCOMPLETE, not that it is safe. Every objective guard (unscoped or
+/// oversized diff, security or test paths, red check) forces `Full`
+/// regardless of band.
 fn verify_depth(
     complexity: RouteTaskComplexity,
     risk: RouteTaskRisk,
@@ -316,13 +326,13 @@ fn verify_depth(
     if files_changed == 0
         || matches!(
             complexity,
-            RouteTaskComplexity::Medium
-                | RouteTaskComplexity::Large
-                | RouteTaskComplexity::Unknown
-        ) || matches!(
-        risk,
-        RouteTaskRisk::High | RouteTaskRisk::Critical | RouteTaskRisk::Unknown
-    ) || !objective_ok
+            RouteTaskComplexity::Large | RouteTaskComplexity::Unknown
+        )
+        || matches!(
+            risk,
+            RouteTaskRisk::High | RouteTaskRisk::Critical | RouteTaskRisk::Unknown
+        )
+        || !objective_ok
         || files_changed > FILES_SMALL_MAX
         || line_churn > CHURN_SMALL_MAX
         || touches_security
@@ -331,12 +341,11 @@ fn verify_depth(
         return VerifyDepth::Full;
     }
 
-    if complexity == RouteTaskComplexity::Small
-        && matches!(risk, RouteTaskRisk::Low | RouteTaskRisk::Medium)
-    {
-        return VerifyDepth::SingleLens;
-    }
-
+    // Reachable here: {Trivial, Small, Medium} complexity × {Low, Medium}
+    // risk, with a small green diff outside security/test paths. Depth must
+    // stay monotone in the band from this point — Trivial may never verify
+    // deeper than Small — so everything that does not qualify for the
+    // tiny-Trivial skip gets exactly one spec lens.
     if complexity == RouteTaskComplexity::Trivial
         && risk == RouteTaskRisk::Low
         && files_changed <= FILES_TRIVIAL_MAX
@@ -345,7 +354,7 @@ fn verify_depth(
         return VerifyDepth::Skip;
     }
 
-    VerifyDepth::Full
+    VerifyDepth::SingleLens
 }
 
 fn verify_depth_for_band(
@@ -3715,6 +3724,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // exhaustive band × diff-fact matrix
     fn verify_depth_is_conservative_across_band_and_change_matrix() {
         assert_eq!(
             verify_depth(
@@ -3742,7 +3752,84 @@ mod tests {
                 VerifyDepth::SingleLens
             );
         }
-        for complexity in [RouteTaskComplexity::Medium, RouteTaskComplexity::Large] {
+        // A measured-small green diff demotes the Medium band guess to one
+        // lens, and keeps the ladder monotone: Trivial at Medium risk (or
+        // above the tiny-skip caps) must never verify deeper than Small.
+        assert_eq!(
+            verify_depth(
+                RouteTaskComplexity::Medium,
+                RouteTaskRisk::Low,
+                1,
+                1,
+                true,
+                false,
+                false,
+            ),
+            VerifyDepth::SingleLens
+        );
+        assert_eq!(
+            verify_depth(
+                RouteTaskComplexity::Medium,
+                RouteTaskRisk::Medium,
+                FILES_SMALL_MAX,
+                CHURN_SMALL_MAX,
+                true,
+                false,
+                false,
+            ),
+            VerifyDepth::SingleLens
+        );
+        assert_eq!(
+            verify_depth(
+                RouteTaskComplexity::Trivial,
+                RouteTaskRisk::Medium,
+                1,
+                1,
+                true,
+                false,
+                false,
+            ),
+            VerifyDepth::SingleLens
+        );
+        assert_eq!(
+            verify_depth(
+                RouteTaskComplexity::Trivial,
+                RouteTaskRisk::Low,
+                1,
+                CHURN_TRIVIAL_MAX + 1,
+                true,
+                false,
+                false,
+            ),
+            VerifyDepth::SingleLens
+        );
+        // The facts only rescue Medium while they stay small: an oversized
+        // churn or file count drops it right back to Full.
+        assert_eq!(
+            verify_depth(
+                RouteTaskComplexity::Medium,
+                RouteTaskRisk::Low,
+                1,
+                CHURN_SMALL_MAX + 1,
+                true,
+                false,
+                false,
+            ),
+            VerifyDepth::Full
+        );
+        assert_eq!(
+            verify_depth(
+                RouteTaskComplexity::Medium,
+                RouteTaskRisk::Low,
+                FILES_SMALL_MAX + 1,
+                1,
+                true,
+                false,
+                false,
+            ),
+            VerifyDepth::Full
+        );
+        for complexity in [RouteTaskComplexity::Large, RouteTaskComplexity::Unknown] {
             assert_eq!(
                 verify_depth(complexity, RouteTaskRisk::Low, 1, 1, true, false, false),
                 VerifyDepth::Full

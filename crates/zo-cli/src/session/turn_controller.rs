@@ -719,11 +719,11 @@ fn deep_verify_candidate_clients(
 /// turn's routing band — which this host installs itself
 /// ([`runtime::ConversationRuntime::set_verify_band`]), so it is exactly
 /// reproducible here — and the diff it is about to judge, which does not exist
-/// yet. The diff half only ever DEEPENS the verdict (large churn, security
-/// paths, touched tests, a red objective all force `Full`), so the band alone
-/// answers the one question the effort decision needs: whether one lens is even
-/// on the table. A band outside `Trivial`/`Small` complexity, or above `Medium`
-/// risk, forces `Full` no matter what the diff turns out to be.
+/// yet. The measured diff can move the gate's verdict in BOTH directions (a
+/// small green diff demotes even a `Medium` band to one spec lens; large
+/// churn, security paths, touched tests, or a red objective force `Full`), so
+/// this mirror answers a narrower question than the gate: which depth is a
+/// SAFE prediction from the band alone, before any diff exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VerifyLegDepth {
     /// The band permits the deep gate's single-lens verify.
@@ -732,18 +732,17 @@ enum VerifyLegDepth {
     Full,
 }
 
-/// Mirror of the deep gate's band-only depth cut (`deep_gate::verify_depth`'s
-/// leading `Full` guard). Kept in lockstep with it: this decides only how much
-/// reasoning the leg's client is built with, so a drift can cost speed, never
-/// correctness — the gate itself still picks the lens count.
-///
-/// `Small` at `Low`/`Medium` risk is the ONLY band that can reach one lens.
-/// `Trivial` deliberately is not: `verify_depth` sends `Trivial`/`Low` to
-/// `Skip` (no leg runs at all, so the leg's effort is moot) and everything else
-/// `Trivial` — including every `Trivial`/`Medium` turn — to `Full`. Admitting
-/// it here would hand a full three-lens design verify the single-lens `high`
-/// discount, which is exactly what [`deep_verify_leg_effort`] promises not to
-/// touch. Erring toward `Full` only ever costs speed, never reasoning.
+/// The band-only PREDICTION of the deep gate's depth cut, made before the
+/// diff exists. Deliberately more conservative than `deep_gate::verify_depth`
+/// itself: the gate can demote a `Medium` (or `Trivial`) band to one lens
+/// once it has MEASURED a small green diff, but this mirror decides how much
+/// reasoning the leg's client is built with, and a `Medium` verb guess spans
+/// everything from a one-line fix to a twelve-file feature. Predicting one
+/// lens there would run a ballooned diff's full three-lens verify on a
+/// discounted client — reasoning lost exactly where it matters. `Small` at
+/// `Low`/`Medium` risk is the one band whose diff prior is tight enough to
+/// predict a single lens; erring toward `Full` everywhere else only ever
+/// costs speed, never reasoning.
 const fn verify_leg_depth_for_band(
     complexity: runtime::RouteTaskComplexity,
     risk: runtime::RouteTaskRisk,
@@ -759,26 +758,22 @@ const fn verify_leg_depth_for_band(
 
 /// The effort this turn's VERIFY leg runs at.
 ///
-/// `xhigh` for every leg but one: one focused judgment gates the whole turn, so
-/// "one smart verification beats several mediocre ones". The exception is the
-/// single-lens verify of a `Design` turn. That lens is the spec-only read — is
-/// the deliverable what was asked for, does it look right — and its quality
-/// saturates well below max reasoning: the measured design win came from the
-/// guidance reminder plus the existence of the lens, not from how hard the
-/// verifier thought. Running it at `high` is the second half of the design
-/// speed fix (the first is the capped `high..=xhigh` main band), and it touches
-/// nothing else: a full-depth design verify and EVERY non-design verify stay
-/// exactly where they were.
-///
-/// `intent` is the POST-kill-switch verify intent ([`verify_intent_for_turn`]),
-/// so `ZO_DESIGN_GUIDANCE=off` restores the flat `xhigh` pin for free.
-const fn deep_verify_leg_effort(
-    intent: runtime::RouteTaskIntent,
-    depth: VerifyLegDepth,
-) -> api::EffortLevel {
-    match (intent, depth) {
-        (runtime::RouteTaskIntent::Design, VerifyLegDepth::SingleLens) => api::EffortLevel::High,
-        _ => api::EffortLevel::Xhigh,
+/// `xhigh` for a full-depth leg: one focused judgment gates the whole turn,
+/// so "one smart verification beats several mediocre ones". A single-lens leg
+/// runs at `high` instead: that lens is the spec-only read — is the
+/// deliverable what was asked for — and its quality saturates well below max
+/// reasoning. Measured first on design turns (the win came from the guidance
+/// reminder plus the existence of the lens, not from how hard the verifier
+/// thought), and the lens is the same spec-only read whatever the intent, so
+/// the discount follows the DEPTH, not the intent. The design kill switch
+/// (`ZO_DESIGN_GUIDANCE=off`) therefore no longer touches effort: it still
+/// downgrades the intent — killing the guidance reminder and the design
+/// verify floor — but a single-lens leg keeps `high` on the saturation
+/// argument alone.
+const fn deep_verify_leg_effort(depth: VerifyLegDepth) -> api::EffortLevel {
+    match depth {
+        VerifyLegDepth::SingleLens => api::EffortLevel::High,
+        VerifyLegDepth::Full => api::EffortLevel::Xhigh,
     }
 }
 
@@ -806,10 +801,11 @@ fn deep_verify_leg_client(
         cli.allowed_tools.clone(),
         api_client.tool_registry(),
         // Thinking budgets are main-model-specific (None). The leg effort is
-        // resolved once per turn by `deep_verify_leg_effort` — xhigh for every
-        // verify but a design single-lens read. Models without the level are
-        // clamped by the api layer. No dynamic band — the verifier is a fixed
-        // independent check, not a Smart-mode main turn.
+        // resolved once per turn by `deep_verify_leg_effort` — xhigh for a
+        // full-depth verify, high for a predicted single-lens read. Models
+        // without the level are clamped by the api layer. No dynamic band —
+        // the verifier is a fixed independent check, not a Smart-mode main
+        // turn.
         None,
         Some(leg_effort),
         None,
@@ -1443,15 +1439,15 @@ pub(crate) async fn run_live_turn_with_images(
         .as_ref()
         .filter(|contract| contract.exec_swap_enabled())
         .map_or_else(|| cli.runtime.api_client().model().to_string(), |contract| contract.impl_model.clone());
-    // The VERIFY leg's effort, resolved from the SAME band and intent this turn
-    // installs on the runtime below (`set_verify_band` / `set_verify_intent`),
-    // so the leg's client and the gate's own depth decision read one turn.
+    // The VERIFY leg's effort, resolved from the SAME band this turn installs
+    // on the runtime below (`set_verify_band`), so the leg's client and the
+    // gate's own depth decision read one turn. The intent is installed
+    // alongside (`set_verify_intent`) for the gate's design verify floor; it
+    // no longer moves effort.
     let turn_orchestration = tools::assess_turn_orchestration(&user_input);
     let verify_intent = verify_intent_for_turn(turn_assessment.intent);
-    let verify_leg_effort = deep_verify_leg_effort(
-        verify_intent,
-        verify_leg_depth_for_band(complexity, turn_orchestration.risk),
-    );
+    let verify_leg_effort =
+        deep_verify_leg_effort(verify_leg_depth_for_band(complexity, turn_orchestration.risk));
     let deep_verify_candidates = deep_verify_candidate_clients(
         cli,
         &verify_anchor,
