@@ -667,6 +667,55 @@ fn bench_verdicts(tools: &[BenchToolSummary], self_tool: &str) -> Vec<String> {
         .collect()
 }
 
+// ── Verifier calibration evidence ─────────────────────────────────────────────
+
+/// The (objective, verifier) disagreement matrix over the window — the
+/// false-accept measurement. `accepted_red` is the hard number: the verifier
+/// stamped ACCEPT on an objectively red change and only the gate stopped it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct VerifierCalibration {
+    legs: usize,
+    accepted_red: usize,
+    rejected_green: usize,
+    agreed: usize,
+}
+
+fn verifier_calibration_evidence(window_days: u64) -> VerifierCalibration {
+    let path = runtime::default_config_home()
+        .join("evidence")
+        .join("verifier-calibration.jsonl");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return VerifierCalibration::default();
+    };
+    let now = now_ms();
+    let window_ms = window_days * 24 * 60 * 60 * 1000;
+    let mut out = VerifierCalibration::default();
+    for line in raw.lines() {
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(ts_ms) = row.get("tsMs").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        if now.saturating_sub(ts_ms) > window_ms {
+            continue;
+        }
+        let (Some(objective_ok), Some(accepted)) = (
+            row.get("objectiveOk").and_then(serde_json::Value::as_bool),
+            row.get("accepted").and_then(serde_json::Value::as_bool),
+        ) else {
+            continue;
+        };
+        out.legs += 1;
+        match (objective_ok, accepted) {
+            (false, true) => out.accepted_red += 1,
+            (true, false) => out.rejected_green += 1,
+            _ => out.agreed += 1,
+        }
+    }
+    out
+}
+
 // ── Repeated-workflow evidence (skill distill trigger) ───────────────────────
 
 /// A cluster of recent sessions that opened with near-identical asks — the
@@ -850,6 +899,7 @@ pub(crate) fn run_refine(cwd: &Path, session_id: &str, window_days: Option<u64>)
     let proposed_skills = tools::stranded_proposed_skills(cwd);
     let bench = bench_evidence(cwd);
     let repeated = repeated_workflow_evidence(window);
+    let calibration = verifier_calibration_evidence(window);
     render_report(
         cwd,
         sha,
@@ -859,6 +909,7 @@ pub(crate) fn run_refine(cwd: &Path, session_id: &str, window_days: Option<u64>)
         &proposed_skills,
         bench.as_ref(),
         &repeated,
+        &calibration,
     )
 }
 
@@ -874,6 +925,7 @@ fn render_report(
     proposed_skills: &[tools::ProposedSkill],
     bench: Option<&BenchEvidence>,
     repeated: &[RepeatedWorkflow],
+    calibration: &VerifierCalibration,
 ) -> String {
     let mut lines = vec![
         "Refine — evidence-backed tuning report (applies nothing)".to_string(),
@@ -1073,6 +1125,23 @@ fn render_report(
                 skill.slug, skill.origin, skill.slug,
             ));
         }
+    }
+
+    // Verifier calibration — the (objective, verifier) disagreement matrix.
+    // `accepted_red` is a measured LOWER BOUND on the false-accept rate: the
+    // verifier stamped an objectively red change and only the gate stopped
+    // it. Silent until legs exist; no advice line, because the fix (verifier
+    // prompt/model work) has no one-command door to name honestly.
+    if calibration.legs > 0 {
+        lines.push(String::new());
+        lines.push(format!(
+            "Verifier calibration ({} leg(s) this window)",
+            calibration.legs
+        ));
+        lines.push(format!(
+            "  agreed {} \u{b7} accepted-red {} (false accepts the objective gate caught) \u{b7} rejected-green {}",
+            calibration.agreed, calibration.accepted_red, calibration.rejected_green,
+        ));
     }
 
     // Repetition evidence — recent sessions that opened with the same ask.
@@ -1444,7 +1513,7 @@ mod tests {
             .current
             .insert("info_topology".to_string(), attestation(9, &[], &[]));
         let shadow = shadow_fixture();
-        let report = render_report(&dir, "sha-current", 14, &aggregate, &shadow, &[], None, &[]);
+        let report = render_report(&dir, "sha-current", 14, &aggregate, &shadow, &[], None, &[], &VerifierCalibration::default());
         assert!(report.contains("gated    design guidance reminder"), "{report}");
         assert!(
             report.contains("requires a turn whose resolved intent is Design"),
@@ -1481,7 +1550,7 @@ mod tests {
             learned_entry_count: 3,
             ..shadow_fixture()
         };
-        let soaking = render_report(&dir, "sha-current", 14, &aggregate, &unarmed, &[], None, &[]);
+        let soaking = render_report(&dir, "sha-current", 14, &aggregate, &unarmed, &[], None, &[], &VerifierCalibration::default());
         assert!(
             soaking.contains("0 of 3 learned entries clear the rung-admission bar yet"),
             "{soaking}"
@@ -1497,7 +1566,7 @@ mod tests {
             path: "/tmp/x/SKILL.md".to_string(),
         }];
         let with_skills =
-            render_report(&dir, "sha-current", 14, &aggregate, &shadow, &proposed, None, &[]);
+            render_report(&dir, "sha-current", 14, &aggregate, &shadow, &proposed, None, &[], &VerifierCalibration::default());
         assert!(
             with_skills.contains("~ proposed  tui-palette-fixes (project-zo)"),
             "{with_skills}"
@@ -1600,6 +1669,7 @@ mod tests {
             &[],
             Some(&bench),
             &[],
+            &VerifierCalibration::default(),
         );
         assert!(
             report.contains("Head-to-head bench (bench/results/run-200 · 3 day(s) ago)"),
@@ -1629,6 +1699,7 @@ mod tests {
             &[],
             Some(&stale),
             &[],
+            &VerifierCalibration::default(),
         );
         assert!(
             stale_report
@@ -1740,6 +1811,7 @@ mod tests {
             &[],
             None,
             &repeated,
+            &VerifierCalibration::default(),
         );
         assert!(
             report.contains(
@@ -1761,10 +1833,54 @@ mod tests {
             &[],
             None,
             &[],
+            &VerifierCalibration::default(),
         );
         assert!(
             !without.contains("Repeated workflows"),
             "no repetition, no section: {without}"
+        );
+    }
+
+    #[test]
+    fn verifier_calibration_section_renders_the_matrix_only_when_legs_exist() {
+        let dir = std::env::temp_dir().join(format!("zo-refine-calib-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let calibration = VerifierCalibration {
+            legs: 12,
+            accepted_red: 2,
+            rejected_green: 3,
+            agreed: 7,
+        };
+        let report = render_report(
+            &dir,
+            "sha-current",
+            14,
+            &WindowAggregate::default(),
+            &shadow_fixture(),
+            &[],
+            None,
+            &[],
+            &calibration,
+        );
+        assert!(report.contains("Verifier calibration (12 leg(s) this window)"), "{report}");
+        assert!(
+            report.contains("agreed 7 · accepted-red 2 (false accepts the objective gate caught) · rejected-green 3"),
+            "{report}"
+        );
+        let silent = render_report(
+            &dir,
+            "sha-current",
+            14,
+            &WindowAggregate::default(),
+            &shadow_fixture(),
+            &[],
+            None,
+            &[],
+            &VerifierCalibration::default(),
+        );
+        assert!(
+            !silent.contains("Verifier calibration"),
+            "no legs, no section: {silent}"
         );
     }
 

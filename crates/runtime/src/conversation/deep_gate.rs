@@ -1125,6 +1125,76 @@ fn issue_count_label(count: usize) -> String {
     }
 }
 
+/// Verifier-calibration evidence: one row per VERIFY fold pairing what the
+/// OBJECTIVE check observed with what the VERIFIER claimed. The matrix this
+/// accumulates is the false-accept measurement the pillar map called missing:
+/// `objectiveOk:false, accepted:true` is a verifier rubber-stamp the gate
+/// caught — a measured LOWER BOUND on the false-accept rate (accepts of
+/// semantically-wrong-but-tests-green changes stay invisible, and the row
+/// says so by construction, not by claim). Kept out of the route-outcome
+/// ledger on purpose: those records feed routing feedback, and calibration
+/// counts would warp what they tune (the one-predicate-two-questions class).
+/// Best-effort append; failures never touch the turn.
+fn record_verifier_calibration(session_id: &str, objective_ok: bool, verdict: &VerifierVerdict) {
+    let Some(path) = verifier_calibration_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    // Whole-file truncation at the cap: `/refine` reads a bounded window, and
+    // recent history regrows within days.
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 512 * 1024) {
+        let _ = std::fs::remove_file(&path);
+    }
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let row = serde_json::json!({
+        "tsMs": ts_ms,
+        "session": session_id,
+        "objectiveOk": objective_ok,
+        "accepted": verdict.accepted,
+        "parse": verdict.parse.as_str(),
+    });
+    let mut line = row.to_string();
+    line.push('\n');
+    let _ = core_types::paths::append_private_file(&path, line.as_bytes());
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: calibration rows are OFF in tests unless a test opts in —
+    /// the fold sites run inside ordinary deep-gate tests, and the production
+    /// default would have every one of them appending to the real config
+    /// home.
+    static VERIFIER_CALIBRATION_DIR_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+// The Option is the test seam's contract: under cfg(test) this is None until
+// a test opts in, so the production arm alone looks unnecessarily wrapped.
+#[allow(clippy::unnecessary_wraps)]
+fn verifier_calibration_path() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    {
+        VERIFIER_CALIBRATION_DIR_OVERRIDE
+            .with(|slot| slot.borrow().clone())
+            .map(|dir| dir.join("verifier-calibration.jsonl"))
+    }
+    #[cfg(not(test))]
+    {
+        Some(
+            crate::default_config_home()
+                .join("evidence")
+                .join("verifier-calibration.jsonl"),
+        )
+    }
+}
+
 /// Iteration budget for one VERIFY leg. Production distribution (223 legs,
 /// 2026-08-07): p50 3, p90 7, p99 19, max 51 — the cap leaves the typical
 /// inspection untouched and kills the runaway tail (a 51-iteration leg spends
@@ -2707,6 +2777,7 @@ where
             // objective-red post-edit check remains blocking rather than delaying
             // the first token to classify it as a pre-existing failure.
             let gating_objective_ok = objective_ok;
+            record_verifier_calibration(&self.session.session_id, gating_objective_ok, &verifier);
             let folded = fold_verification_attempt(
                 attempt,
                 max,
@@ -3524,6 +3595,7 @@ where
             // A still-red baseline failure is out of scope: only an edit-introduced
             // regression gates the deep loop. The verifier still sees raw objective.
             let gating_objective_ok = objective_ok || !baseline_objective_green;
+            record_verifier_calibration(&self.session.session_id, gating_objective_ok, &verifier);
             // Keep accept/retry/stall policy in decision-core; this runtime only
             // supplies observed IO facts from the live VERIFY sub-turn.
             let folded = fold_verification_attempt(
