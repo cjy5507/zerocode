@@ -128,6 +128,14 @@ class _ZoBridge:
         sys.path.insert(0, info["dir"]) and import shipped helpers. Proposed
         (unreviewed) skills stay blocked, same as the Skill tool."""
         return self._call("skill", {"name": name})
+    def history(self, contains=None, role=None, limit=20):
+        """Search this session's own transcript as data: the most recent
+        `limit` messages (chronological order) whose text contains
+        `contains` (case-insensitive), optionally filtered to one role
+        ("user"/"assistant"/"tool"/"system"). Each hit is a dict with role
+        and text — assign it to a variable and slice/filter in code instead
+        of re-reading the conversation."""
+        return self._call("history", {"contains": contains, "role": role, "limit": limit})
 
 ns = {"__name__": "__main__", "zo": _ZoBridge()}
 

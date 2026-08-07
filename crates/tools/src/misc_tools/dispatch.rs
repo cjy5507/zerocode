@@ -586,12 +586,140 @@ fn kernel_bridge_call(
         "spawn" => kernel_bridge_spawn(ctx, enforcer, args),
         "result" => kernel_bridge_result(args),
         "skill" => kernel_bridge_skill(args),
+        "history" => kernel_bridge_history(ctx, args),
         other => serde_json::json!({
             "error": format!(
-                "unknown zo bridge op `{other}` — this build supports spawn, result, and skill"
+                "unknown zo bridge op `{other}` — this build supports spawn, result, skill, and history"
             )
         }),
     }
+}
+
+/// `zo.history(...)`: the session's own persisted transcript as data. Reads
+/// the SAME autosave file `/resume` replays — no parallel history store —
+/// so what kernel code sees is exactly what survives a restart. Main
+/// transcript file only: rotated segments overlap the live file's compaction
+/// summary, and including both would double-count the overlap.
+fn kernel_bridge_history(ctx: &ToolContext, args: &Value) -> Value {
+    let Some(session_id) = ctx.session_id() else {
+        return serde_json::json!({
+            "error": "zo.history: no session id in this REPL context (bare dispatch has no transcript)"
+        });
+    };
+    let base = ctx
+        .cwd
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let transcript = runtime::session_control::managed_session_search_dirs_for(&base)
+        .into_iter()
+        .map(|dir| dir.join(format!("{session_id}.jsonl")))
+        .find(|path| path.is_file());
+    let Some(path) = transcript else {
+        return serde_json::json!({
+            "error": format!("zo.history: no transcript found for session `{session_id}` yet")
+        });
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return serde_json::json!({"error": "zo.history: the transcript is unreadable"});
+    };
+    let matches = history_matches(
+        &text,
+        args.get("contains").and_then(Value::as_str),
+        args.get("role").and_then(Value::as_str),
+        args.get("limit").and_then(Value::as_u64),
+    );
+    serde_json::json!({"result": matches})
+}
+
+/// Newest `limit` matching messages, returned in chronological order. Every
+/// bound is enforced here so one call can never flood a cell: the limit is
+/// clamped, each message's text is capped, and the assembled result is
+/// trimmed oldest-first to the same byte budget every other bridge payload
+/// honors.
+fn history_matches(
+    transcript: &str,
+    contains: Option<&str>,
+    role: Option<&str>,
+    limit: Option<u64>,
+) -> Vec<Value> {
+    const TEXT_CAP_CHARS: usize = 4_000;
+    const LIMIT_MAX: u64 = 100;
+    let limit = usize::try_from(limit.unwrap_or(20).clamp(1, LIMIT_MAX)).unwrap_or(20);
+    let needle = contains.map(str::to_lowercase);
+    let role = role.map(str::to_lowercase);
+
+    let mut matches: Vec<Value> = Vec::new();
+    for line in transcript.lines() {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(message) = record.get("message") else {
+            continue;
+        };
+        let Some(message_role) = message.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        if role.as_deref().is_some_and(|role| role != message_role) {
+            continue;
+        }
+        let text = message_text(message);
+        if text.is_empty() {
+            continue;
+        }
+        if needle
+            .as_deref()
+            .is_some_and(|needle| !text.to_lowercase().contains(needle))
+        {
+            continue;
+        }
+        let mut text = text;
+        if text.chars().count() > TEXT_CAP_CHARS {
+            text = text.chars().take(TEXT_CAP_CHARS).collect::<String>() + "…(truncated)";
+        }
+        matches.push(serde_json::json!({"role": message_role, "text": text}));
+    }
+    // Newest `limit`, chronological order preserved by draining from the front.
+    if matches.len() > limit {
+        matches.drain(..matches.len() - limit);
+    }
+    // Total-budget trim, oldest first — same ceiling as every bridge payload.
+    while matches.len() > 1
+        && serde_json::to_string(&matches).map_or(0, |s| s.len())
+            > crate::repl_kernel::BRIDGE_REPORT_MAX_BYTES
+    {
+        matches.remove(0);
+    }
+    matches
+}
+
+/// Concatenated text blocks of one transcript message (the same block shape
+/// the session writer persists).
+fn message_text(message: &Value) -> String {
+    let blocks = message
+        .get("blocks")
+        .or_else(|| message.get("content"))
+        .and_then(Value::as_array);
+    let Some(blocks) = blocks else {
+        return message
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+    };
+    let mut out = String::new();
+    for block in blocks {
+        if let Some(text) = block.get("text").and_then(Value::as_str) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(text);
+        }
+    }
+    out
 }
 
 /// `zo.skill(name)`: the resolved skill's instruction text plus its asset
@@ -727,6 +855,50 @@ mod kernel_bridge_tests {
                 "{hostile} must be rejected: {denied}"
             );
         }
+    }
+
+    #[test]
+    fn history_matches_filters_clamps_and_orders_chronologically() {
+        let line = |role: &str, text: &str| {
+            serde_json::json!({
+                "type": "message",
+                "message": {"role": role, "blocks": [{"type": "text", "text": text}]},
+            })
+            .to_string()
+        };
+        let transcript = [
+            line("user", "fix the login bug"),
+            line("assistant", "found the login handler"),
+            line("tool", "grep output about sessions"),
+            line("user", "now fix the logout path"),
+            serde_json::json!({"type": "session_meta"}).to_string(),
+            "not json at all".to_string(),
+        ]
+        .join("\n");
+
+        let all = history_matches(&transcript, None, None, None);
+        assert_eq!(all.len(), 4, "meta and garbage lines are skipped");
+        assert_eq!(all[0]["text"], "fix the login bug", "chronological order");
+
+        let user_only = history_matches(&transcript, None, Some("user"), None);
+        assert_eq!(user_only.len(), 2);
+
+        let login = history_matches(&transcript, Some("LOGIN"), None, None);
+        assert_eq!(login.len(), 2, "contains is case-insensitive");
+
+        let last_one = history_matches(&transcript, None, None, Some(1));
+        assert_eq!(last_one.len(), 1);
+        assert_eq!(last_one[0]["text"], "now fix the logout path", "newest wins");
+
+        let huge = line("assistant", &"x".repeat(10_000));
+        let capped = history_matches(&huge, None, None, None);
+        assert!(
+            capped[0]["text"]
+                .as_str()
+                .expect("text")
+                .ends_with("…(truncated)"),
+            "per-message text cap applies"
+        );
     }
 
     #[test]

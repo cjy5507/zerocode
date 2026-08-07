@@ -345,7 +345,8 @@ const DEFERRED_TOOL_HOOKS: &[(&str, &str)] = &[(
     "session-persistent Python kernel; variables survive across calls and compaction; \
      zo.spawn('task') launches background sub-agents and zo.result(id) collects their \
      reports as variables; zo.skill(name) loads an approved skill's text and asset dir \
-     for import",
+     for import; zo.history(contains=, role=, limit=) searches this session's own \
+     transcript as data",
 )];
 
 #[must_use]
