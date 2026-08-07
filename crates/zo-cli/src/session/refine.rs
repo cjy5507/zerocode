@@ -648,6 +648,145 @@ fn bench_verdicts(tools: &[BenchToolSummary], self_tool: &str) -> Vec<String> {
         .collect()
 }
 
+// ── Repeated-workflow evidence (skill distill trigger) ───────────────────────
+
+/// A cluster of recent sessions that opened with near-identical asks — the
+/// evidence axis for "this workflow repeats; a skill would compress it".
+/// Detection only: creating the skill stays a model+human action, and the
+/// section renders nothing when nothing repeats.
+struct RepeatedWorkflow {
+    session_count: usize,
+    sample: String,
+    shared_terms: Vec<String>,
+}
+
+/// Meaningful tokens of one opening ask. ASCII words are lowercased and kept
+/// at ≥3 chars minus a tiny stopword list; CJK runs are kept whole AND as
+/// their leading two syllables, so Korean verb-suffix variation
+/// ("배포해줘" / "배포 절차") still overlaps on the stem. A heuristic, not
+/// a parser — the cluster thresholds below carry the precision.
+fn ask_tokens(text: &str) -> BTreeSet<String> {
+    const STOPWORDS: [&str; 10] = [
+        "the", "and", "for", "this", "that", "with", "into", "from", "please", "run",
+    ];
+    fn flush(word: &mut String, is_cjk: bool, tokens: &mut BTreeSet<String>) {
+        if word.is_empty() {
+            return;
+        }
+        let token = word.to_lowercase();
+        word.clear();
+        if is_cjk {
+            let syllables: Vec<char> = token.chars().collect();
+            if syllables.len() >= 2 {
+                tokens.insert(syllables.iter().take(2).collect());
+                tokens.insert(token);
+            }
+        } else if token.chars().count() >= 3
+            && !STOPWORDS.contains(&token.as_str())
+            && !token.chars().all(|c| c.is_ascii_digit())
+        {
+            tokens.insert(token);
+        }
+    }
+    let mut tokens = BTreeSet::new();
+    let mut word = String::new();
+    let mut word_cjk = false;
+    for ch in text.chars() {
+        let is_ascii_word = ch.is_ascii_alphanumeric();
+        let is_cjk = matches!(ch,
+            '\u{AC00}'..='\u{D7AF}' | '\u{4E00}'..='\u{9FFF}' | '\u{3040}'..='\u{30FF}');
+        if is_ascii_word || is_cjk {
+            if !word.is_empty() && word_cjk != is_cjk {
+                flush(&mut word, word_cjk, &mut tokens);
+            }
+            word_cjk = is_cjk;
+            word.push(ch);
+        } else {
+            flush(&mut word, word_cjk, &mut tokens);
+        }
+    }
+    flush(&mut word, word_cjk, &mut tokens);
+    tokens
+}
+
+/// Greedy seed clustering over opening asks: a member shares ≥2 tokens with
+/// the seed at Jaccard ≥ 0.4, and only clusters of ≥3 sessions count —
+/// two similar asks are coincidence, three are a workflow. Top two clusters
+/// by size, so the report never scrolls on repetition evidence.
+fn cluster_repeated_asks(asks: &[String]) -> Vec<RepeatedWorkflow> {
+    let tokenized: Vec<(&String, BTreeSet<String>)> = asks
+        .iter()
+        .map(|ask| (ask, ask_tokens(ask)))
+        .filter(|(_, tokens)| tokens.len() >= 2)
+        .collect();
+    let mut assigned = vec![false; tokenized.len()];
+    let mut out = Vec::new();
+    for seed in 0..tokenized.len() {
+        if assigned[seed] {
+            continue;
+        }
+        let mut members = vec![seed];
+        for candidate in (seed + 1)..tokenized.len() {
+            if assigned[candidate] {
+                continue;
+            }
+            let shared = tokenized[seed].1.intersection(&tokenized[candidate].1).count();
+            let union = tokenized[seed].1.union(&tokenized[candidate].1).count();
+            if shared >= 2 && shared * 10 >= union * 4 {
+                members.push(candidate);
+            }
+        }
+        assigned[seed] = true;
+        if members.len() < 3 {
+            continue;
+        }
+        for &member in &members {
+            assigned[member] = true;
+        }
+        // Terms every member shares with the seed — each member shares ≥2
+        // seed tokens pairwise, but not necessarily the same two, so this
+        // can legitimately come up short; the sample ask still identifies
+        // the cluster.
+        let shared_terms: Vec<String> = tokenized[seed]
+            .1
+            .iter()
+            .filter(|token| {
+                members[1..]
+                    .iter()
+                    .all(|&member| tokenized[member].1.contains(*token))
+            })
+            .take(4)
+            .cloned()
+            .collect();
+        out.push(RepeatedWorkflow {
+            session_count: members.len(),
+            sample: tokenized[seed].0.chars().take(48).collect(),
+            shared_terms,
+        });
+    }
+    out.sort_by(|left, right| right.session_count.cmp(&left.session_count));
+    out.truncate(2);
+    out
+}
+
+/// Opening asks of this project's recent worked sessions, from the registry's
+/// already-computed summaries. "Worked" = enough messages that the session
+/// plausibly held a workflow, not a one-line Q&A.
+fn repeated_workflow_evidence(window_days: u64) -> Vec<RepeatedWorkflow> {
+    let Ok(sessions) = crate::session_registry::list_managed_sessions_limited(Some(48)) else {
+        return Vec::new();
+    };
+    let now = u128::from(now_ms());
+    let window = u128::from(window_days) * 24 * 60 * 60 * 1000;
+    let asks: Vec<String> = sessions
+        .iter()
+        .filter(|session| session.message_count >= 6)
+        .filter(|session| now.saturating_sub(session.modified_epoch_millis) <= window)
+        .filter_map(|session| session.first_user_text.clone())
+        .collect();
+    cluster_repeated_asks(&asks)
+}
+
 /// The launchpad's one-line pointer, computed at boot on the startup loader
 /// thread. Pure read — no persist, no candidate write; those stay behind the
 /// explicit `/refine`.
@@ -691,10 +830,22 @@ pub(crate) fn run_refine(cwd: &Path, session_id: &str, window_days: Option<u64>)
     let shadow = shadow_evidence(cwd);
     let proposed_skills = tools::stranded_proposed_skills(cwd);
     let bench = bench_evidence(cwd);
-    render_report(cwd, sha, window, &aggregate, &shadow, &proposed_skills, bench.as_ref())
+    let repeated = repeated_workflow_evidence(window);
+    render_report(
+        cwd,
+        sha,
+        window,
+        &aggregate,
+        &shadow,
+        &proposed_skills,
+        bench.as_ref(),
+        &repeated,
+    )
 }
 
-#[allow(clippy::too_many_lines)] // one linear report assembly, sectioned by comments
+// One flat evidence-section-per-argument report; bundling them into a struct
+// would only rename the same eight things.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn render_report(
     cwd: &Path,
     sha: &str,
@@ -703,6 +854,7 @@ fn render_report(
     shadow: &ShadowEvidence,
     proposed_skills: &[tools::ProposedSkill],
     bench: Option<&BenchEvidence>,
+    repeated: &[RepeatedWorkflow],
 ) -> String {
     let mut lines = vec![
         "Refine — evidence-backed tuning report (applies nothing)".to_string(),
@@ -886,6 +1038,29 @@ fn render_report(
                 skill.slug, skill.origin, skill.slug,
             ));
         }
+    }
+
+    // Repetition evidence — recent sessions that opened with the same ask.
+    // Detection only: the distill itself stays a model+human action, and
+    // silence is the default (no repetition ⇒ no section, never a nag).
+    if !repeated.is_empty() {
+        lines.push(String::new());
+        lines.push("Repeated workflows (skill evidence)".to_string());
+        for workflow in repeated {
+            let shared = if workflow.shared_terms.is_empty() {
+                String::new()
+            } else {
+                format!(" (shared: {})", workflow.shared_terms.join(", "))
+            };
+            lines.push(format!(
+                "  ~ {} recent sessions opened with variants of \"{}\"{shared}",
+                workflow.session_count, workflow.sample,
+            ));
+        }
+        lines.push(
+            "  -> a skill would make this one command — say \"distill this workflow into a skill\" in such a session"
+                .to_string(),
+        );
     }
 
     // Older builds: context only.
@@ -1234,7 +1409,7 @@ mod tests {
             .current
             .insert("info_topology".to_string(), attestation(9, &[], &[]));
         let shadow = shadow_fixture();
-        let report = render_report(&dir, "sha-current", 14, &aggregate, &shadow, &[], None);
+        let report = render_report(&dir, "sha-current", 14, &aggregate, &shadow, &[], None, &[]);
         assert!(report.contains("gated    design guidance reminder"), "{report}");
         assert!(
             report.contains("requires a turn whose resolved intent is Design"),
@@ -1271,7 +1446,7 @@ mod tests {
             learned_entry_count: 3,
             ..shadow_fixture()
         };
-        let soaking = render_report(&dir, "sha-current", 14, &aggregate, &unarmed, &[], None);
+        let soaking = render_report(&dir, "sha-current", 14, &aggregate, &unarmed, &[], None, &[]);
         assert!(
             soaking.contains("0 of 3 learned entries clear the rung-admission bar yet"),
             "{soaking}"
@@ -1287,7 +1462,7 @@ mod tests {
             path: "/tmp/x/SKILL.md".to_string(),
         }];
         let with_skills =
-            render_report(&dir, "sha-current", 14, &aggregate, &shadow, &proposed, None);
+            render_report(&dir, "sha-current", 14, &aggregate, &shadow, &proposed, None, &[]);
         assert!(
             with_skills.contains("~ proposed  tui-palette-fixes (project-zo)"),
             "{with_skills}"
@@ -1388,6 +1563,7 @@ mod tests {
             },
             &[],
             Some(&bench),
+            &[],
         );
         assert!(
             report.contains("Head-to-head bench (bench/results/run-200 · 3 day(s) ago)"),
@@ -1455,6 +1631,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn repeated_asks_cluster_across_suffix_variants_and_ignore_generic_asks() {
+        let asks: Vec<String> = [
+            "release 배포 절차 실행해줘",
+            "release 배포해줘",
+            "이번 버전 release 배포 진행",
+            // Generic one-token asks must never form a cluster.
+            "진행",
+            "고쳐줘",
+            "계속",
+            // Two similar asks are coincidence, not a workflow.
+            "bench 스코어보드 돌려줘",
+            "bench 스코어보드 실행",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let clusters = cluster_repeated_asks(&asks);
+        assert_eq!(clusters.len(), 1, "only the 3-session release cluster counts");
+        assert_eq!(clusters[0].session_count, 3);
+        assert!(
+            clusters[0].shared_terms.iter().any(|term| term == "release")
+                && clusters[0].shared_terms.iter().any(|term| term == "배포"),
+            "{:?}",
+            clusters[0].shared_terms
+        );
+        assert!(clusters[0].sample.contains("release"));
+    }
+
+    #[test]
+    fn repeated_workflow_section_renders_only_with_evidence() {
+        let dir = std::env::temp_dir().join(format!("zo-refine-repeat-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let repeated = vec![RepeatedWorkflow {
+            session_count: 4,
+            sample: "release 배포 절차 실행해줘".to_string(),
+            shared_terms: vec!["release".to_string(), "배포".to_string()],
+        }];
+        let report = render_report(
+            &dir,
+            "sha-current",
+            14,
+            &WindowAggregate::default(),
+            &shadow_fixture(),
+            &[],
+            None,
+            &repeated,
+        );
+        assert!(
+            report.contains(
+                "~ 4 recent sessions opened with variants of \"release 배포 절차 실행해줘\" (shared: release, 배포)"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("say \"distill this workflow into a skill\""),
+            "{report}"
+        );
+
+        let without = render_report(
+            &dir,
+            "sha-current",
+            14,
+            &WindowAggregate::default(),
+            &shadow_fixture(),
+            &[],
+            None,
+            &[],
+        );
+        assert!(
+            !without.contains("Repeated workflows"),
+            "no repetition, no section: {without}"
+        );
     }
 
     #[test]
