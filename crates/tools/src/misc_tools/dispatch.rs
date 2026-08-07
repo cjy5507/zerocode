@@ -585,9 +585,43 @@ fn kernel_bridge_call(
     match op {
         "spawn" => kernel_bridge_spawn(ctx, enforcer, args),
         "result" => kernel_bridge_result(args),
+        "skill" => kernel_bridge_skill(args),
         other => serde_json::json!({
-            "error": format!("unknown zo bridge op `{other}` — this build supports spawn and result")
+            "error": format!(
+                "unknown zo bridge op `{other}` — this build supports spawn, result, and skill"
+            )
         }),
+    }
+}
+
+/// `zo.skill(name)`: the resolved skill's instruction text plus its asset
+/// directory. Goes through [`super::skill_tools::execute_skill`] — the same
+/// loader the `Skill` tool uses — so the proposed-state review gate holds
+/// identically for kernel code.
+fn kernel_bridge_skill(args: &Value) -> Value {
+    let Some(name) = args
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+    else {
+        return serde_json::json!({"error": "zo.skill requires a skill name"});
+    };
+    match super::skill_tools::execute_skill(super::skill_tools::SkillInput {
+        skill: name.to_string(),
+        args: None,
+    }) {
+        Ok(output) => {
+            let dir = std::path::Path::new(&output.path)
+                .parent()
+                .map_or_else(String::new, |parent| parent.display().to_string());
+            serde_json::json!({"result": {
+                "name": output.skill,
+                "origin": output.origin,
+                "dir": dir,
+                "prompt": output.prompt,
+            }})
+        }
+        Err(error) => serde_json::json!({"error": format!("zo.skill failed: {error}")}),
     }
 }
 
@@ -693,6 +727,30 @@ mod kernel_bridge_tests {
                 "{hostile} must be rejected: {denied}"
             );
         }
+    }
+
+    #[test]
+    fn bridge_skill_op_validates_and_reports_loader_errors() {
+        let missing_name = kernel_bridge_skill(&serde_json::json!({}));
+        assert!(
+            missing_name
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("requires a skill name")),
+            "{missing_name}"
+        );
+        // A name no catalog can resolve surfaces the loader's own error —
+        // the bridge adds transport, never a second resolution path.
+        let unknown = kernel_bridge_skill(&serde_json::json!({
+            "name": format!("zo-test-nonexistent-skill-{}", std::process::id()),
+        }));
+        assert!(
+            unknown
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("unknown skill")),
+            "{unknown}"
+        );
     }
 
     #[test]

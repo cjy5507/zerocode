@@ -66,6 +66,7 @@ pub(crate) use retrieve_output::{run_retrieve_tool_output, RetrieveToolOutputInp
 pub(crate) use session_recall::{run_session_recall, SessionRecallInput};
 #[cfg(test)]
 pub(crate) use skill_tools::execute_skill;
+pub use skill_tools::{stranded_proposed_skills, ProposedSkill};
 pub(crate) use skill_tools::{
     normalize_skill_slug, parse_skill_frontmatter_field, render_proposed_skill, write_atomic_new,
     write_atomic_replace, SkillDistillInput, SkillInput, SkillReviewInput,

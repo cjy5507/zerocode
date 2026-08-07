@@ -122,6 +122,12 @@ class _ZoBridge:
         agent has written one. Non-blocking: while the agent runs you get
         status without a report."""
         return self._call("result", {"agent_id": agent_id})
+    def skill(self, name):
+        """An approved skill as data: its instruction text plus the directory
+        holding its assets, so kernel code can read templates or
+        sys.path.insert(0, info["dir"]) and import shipped helpers. Proposed
+        (unreviewed) skills stay blocked, same as the Skill tool."""
+        return self._call("skill", {"name": name})
 
 ns = {"__name__": "__main__", "zo": _ZoBridge()}
 

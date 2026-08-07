@@ -77,6 +77,7 @@ pub use hunk_attribution::{
     HunkAttributionLedger, ReviewHunkError, apply_reverse_patch,
 };
 pub use misc_tools::agent_store_dir;
+pub use misc_tools::{stranded_proposed_skills, ProposedSkill};
 pub use misc_tools::{loaded_custom_agents, LoadedCustomAgent};
 pub use misc_tools::{send_agent_message, AgentSendOutcome};
 pub use misc_tools::{

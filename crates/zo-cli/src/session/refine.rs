@@ -474,7 +474,8 @@ pub(crate) fn run_refine(cwd: &Path, session_id: &str, window_days: Option<u64>)
     let window = window_days.unwrap_or(DEFAULT_WINDOW_DAYS);
     let aggregate = aggregate_window(&rows, sha, now_ms(), window);
     let shadow = shadow_evidence();
-    render_report(cwd, sha, window, &aggregate, &shadow)
+    let proposed_skills = tools::stranded_proposed_skills(cwd);
+    render_report(cwd, sha, window, &aggregate, &shadow, &proposed_skills)
 }
 
 #[allow(clippy::too_many_lines)] // one linear report assembly, sectioned by comments
@@ -484,6 +485,7 @@ fn render_report(
     window_days: u64,
     aggregate: &WindowAggregate,
     shadow: &ShadowEvidence,
+    proposed_skills: &[tools::ProposedSkill],
 ) -> String {
     let mut lines = vec![
         "Refine — evidence-backed tuning report (applies nothing)".to_string(),
@@ -591,6 +593,20 @@ fn render_report(
                 "  -> smallest change: /smart learnedSpecialty on   (observation-only until then; stamps accrue at zero cost)"
                     .to_string(),
             );
+        }
+    }
+
+    // Distilled skills stranded behind the review gate. The gate that keeps
+    // a proposed skill unusable is only honest if something shows the human
+    // the queue — this is that surface.
+    if !proposed_skills.is_empty() {
+        lines.push(String::new());
+        lines.push("Distilled skills awaiting review".to_string());
+        for skill in proposed_skills {
+            lines.push(format!(
+                "  ~ proposed  {} ({}) — say \"approve the skill {}\" (or discard it) to decide; it stays unusable until then",
+                skill.slug, skill.origin, skill.slug,
+            ));
         }
     }
 
@@ -948,7 +964,7 @@ mod tests {
             stamp_count: 3,
             distinct_models: ["a".to_string(), "b".to_string()].into_iter().collect(),
         };
-        let report = render_report(&dir, "sha-current", 14, &aggregate, &shadow);
+        let report = render_report(&dir, "sha-current", 14, &aggregate, &shadow, &[]);
         assert!(report.contains("gated    design guidance reminder"), "{report}");
         assert!(
             report.contains("requires a turn whose resolved intent is Design"),
@@ -960,6 +976,25 @@ mod tests {
         assert!(
             !report.contains("FAILING"),
             "no failing rows in this fixture: {report}"
+        );
+        assert!(
+            !report.contains("Distilled skills"),
+            "no skills section without proposed drafts: {report}"
+        );
+
+        let proposed = vec![tools::ProposedSkill {
+            slug: "tui-palette-fixes".to_string(),
+            origin: "project-zo".to_string(),
+            path: "/tmp/x/SKILL.md".to_string(),
+        }];
+        let with_skills = render_report(&dir, "sha-current", 14, &aggregate, &shadow, &proposed);
+        assert!(
+            with_skills.contains("~ proposed  tui-palette-fixes (project-zo)"),
+            "{with_skills}"
+        );
+        assert!(
+            with_skills.contains("approve the skill tui-palette-fixes"),
+            "{with_skills}"
         );
     }
 }

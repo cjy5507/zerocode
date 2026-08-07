@@ -94,6 +94,35 @@ pub(crate) fn execute_skill(input: SkillInput) -> Result<SkillOutput, ToolError>
     })
 }
 
+/// A distilled skill parked in `state: proposed` — a draft the review gate
+/// blocks from use, waiting on a decision nothing surfaces on its own.
+#[derive(Debug, Clone)]
+pub struct ProposedSkill {
+    pub slug: String,
+    pub origin: String,
+    pub path: String,
+}
+
+/// Every trusted skill candidate currently in `state: proposed`, in catalog
+/// precedence order. `/refine` renders these so a `SkillDistill` draft can
+/// never strand silently: the gate that keeps a proposed skill unusable is
+/// only honest if something eventually shows the human the queue.
+#[must_use]
+pub fn stranded_proposed_skills(cwd: &Path) -> Vec<ProposedSkill> {
+    runtime::SkillCatalog::discover(cwd)
+        .candidates()
+        .iter()
+        .filter_map(|candidate| {
+            let contents = std::fs::read_to_string(&candidate.skill_md).ok()?;
+            is_proposed_skill(&contents).then(|| ProposedSkill {
+                slug: candidate.dir_name.clone(),
+                origin: candidate.source.origin_label().to_string(),
+                path: candidate.skill_md.display().to_string(),
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn execute_skill_distill(
     input: &SkillDistillInput,
 ) -> Result<SkillDistillOutput, ToolError> {
