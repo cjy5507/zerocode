@@ -1887,7 +1887,10 @@ fn internal_refusal_subturns_do_not_double_count_the_public_turn() {
 }
 
 #[test]
+// The serialization guard precedes the test's local items by design.
+#[allow(clippy::items_after_statements)]
 fn deep_verify_rate_limit_does_not_arm_the_main_turn_quota_fallback() {
+    let _quota_serial = api::quota::rate_limit_test_guard();
     struct NeverCalledQuotaFallback;
 
     impl AsyncApiClient for NeverCalledQuotaFallback {

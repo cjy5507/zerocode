@@ -692,6 +692,7 @@ mod tests {
     /// marks the cool-down state, so the slot is clean.
     #[test]
     fn foreground_rate_limit_marks_provider_cooldown() {
+        let _quota_serial = api::quota::rate_limit_test_guard();
         // Isolate first: `api`'s `cfg!(test)` guard is FALSE when it is compiled as a
         // dependency of THIS crate's test binary, so an un-isolated mark writes a real
         // cool-down into the account-global `~/.zo/rate/*.v1` that every running zo

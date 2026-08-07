@@ -250,7 +250,10 @@ print("ok")
 id = "rust-compile-fix"
 tags = ["small", "rust"]
 prompt = "`cargo build` fails in this crate. Fix src/main.rs so it compiles and `cargo run --quiet` prints: 15. Do not add dependencies."
-check = "cargo run --quiet 2>/dev/null | grep -qx 15"
+# The check shell inherits the bench process env, where cargo may not be on
+# PATH (first full run: BOTH tools "failed" this task because the check
+# itself could not find cargo — a fixture defect, not a tool defect).
+check = "PATH=\"$HOME/.cargo/bin:$PATH\" cargo run --quiet 2>/dev/null | grep -qx 15"
 
 [[tasks.files]]
 path = "Cargo.toml"

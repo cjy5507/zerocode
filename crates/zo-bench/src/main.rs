@@ -218,6 +218,14 @@ fn run(args: &[String]) -> Result<(), String> {
         .as_secs();
     let run_root = cli.out_dir.join(format!("run-{epoch}"));
     std::fs::create_dir_all(&run_root).map_err(|e| e.to_string())?;
+    // Workspaces live OUTSIDE the repo tree: a fixture inside it is captured
+    // by ancestor build config (the first full run had cargo claiming the
+    // fixture for this repo's own workspace — one tool diagnosed and
+    // detached itself, the other lost the task to the environment, which is
+    // exactly the kind of confound a benchmark must not contain).
+    let work_base = std::env::temp_dir().join(format!("zo-bench-{epoch}"));
+    std::fs::create_dir_all(&work_base).map_err(|e| e.to_string())?;
+    eprintln!("workspaces: {}", work_base.display());
     let rows_path = run_root.join("rows.jsonl");
     let mut rows_file = std::fs::OpenOptions::new()
         .create(true)
@@ -230,7 +238,7 @@ fn run(args: &[String]) -> Result<(), String> {
         for tool in &tools {
             for trial in 1..=trials {
                 eprintln!("── {} × {} (trial {trial}/{trials})", task.id, tool.name);
-                let row = run_one(&config.defaults, &run_root, task, tool, trial)?;
+                let row = run_one(&config.defaults, &run_root, &work_base, task, tool, trial)?;
                 let line = serde_json::to_string(&row).map_err(|e| e.to_string())?;
                 writeln!(rows_file, "{line}").map_err(|e| e.to_string())?;
                 eprintln!(
@@ -261,11 +269,12 @@ fn run(args: &[String]) -> Result<(), String> {
 fn run_one(
     defaults: &Defaults,
     run_root: &Path,
+    work_base: &Path,
     task: &TaskConfig,
     tool: &ToolConfig,
     trial: u32,
 ) -> Result<RowRecord, String> {
-    let workdir = run_root
+    let workdir = work_base
         .join(&task.id)
         .join(&tool.name)
         .join(format!("t{trial}"));

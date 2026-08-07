@@ -148,6 +148,25 @@ pub fn latest_rate_limit_snapshot() -> Option<(RateLimitSnapshot, Duration)> {
 /// whenever `api` is compiled as a dependency of another crate's test binary,
 /// which is precisely where the leak happens, so a `cfg`-gated helper would be
 /// invisible to the tests that need it.
+/// Serializes every test that resets ([`isolate_rate_limit_state_for_tests`])
+/// or DRIVES the process-global rate-limit registry (streams a 429/overload
+/// through the retry ladder, whose `on_error` hook marks provider cool-downs
+/// in the same statics). Isolation alone cannot protect a parallel schedule:
+/// it resets the state once, and a sibling test then re-marks a cool-down
+/// mid-test — the ranked verifier walk pre-flight-skips that provider and the
+/// assertion fails for a reason unrelated to the code under test. Hold the
+/// guard for the WHOLE test, first line, before isolating.
+///
+/// Not `#[cfg(test)]` for the same reason as
+/// [`isolate_rate_limit_state_for_tests`]: the callers live in OTHER crates'
+/// test binaries, where this crate's `cfg(test)` is false.
+pub fn rate_limit_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub fn isolate_rate_limit_state_for_tests() {
     // One-way, so a concurrently running sibling test cannot re-enable the
     // shared file underneath a test that has already isolated itself.

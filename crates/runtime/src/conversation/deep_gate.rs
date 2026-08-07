@@ -1200,6 +1200,12 @@ fn task_with_retry_context(task: &str, retry: Option<&str>) -> String {
 pub const DEEP_PLAN_MARKER: &str = "[deep:PLAN]";
 pub const DEEP_EXEC_MARKER: &str = "[deep:EXEC]";
 pub const DEEP_VERIFY_MARKER: &str = "[deep:VERIFY]";
+
+// See `ConversationRuntime::set_quota_preflight_clean_for_this_thread`.
+#[cfg(test)]
+thread_local! {
+    static QUOTA_PREFLIGHT_CLEAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 pub const AUTO_RETRY_MARKER: &str = "[auto:RETRY]";
 
 /// Delegation tools a bounded PLAN/VERIFY leg may not call — the single
@@ -2937,6 +2943,49 @@ where
         !self.deep_tier_only || crate::is_deep_tier_model(model, &self.deep_tier_models)
     }
 
+    /// Test-only: make every quota pre-flight read report a clean registry on
+    /// THIS thread. The ranked-walk tests assert walk semantics driven by
+    /// client outcomes, but the pre-flight consults process-global quota
+    /// state that ANY parallel test streaming a 429-shaped error repollutes
+    /// (via `streaming_turn`'s capacity-stall marking) — an unwinnable
+    /// whack-a-mole. The parked-skip POLICY keeps its own coverage through
+    /// the pure `skip_parked_verifier` unit tests. Thread-local is sound
+    /// here because `#[tokio::test]` runs a current-thread runtime: the
+    /// whole walk executes on the test's thread.
+    #[cfg(test)]
+    fn set_quota_preflight_clean_for_this_thread() {
+        QUOTA_PREFLIGHT_CLEAN.set(true);
+    }
+
+    fn quota_preflight_clean() -> bool {
+        #[cfg(test)]
+        {
+            QUOTA_PREFLIGHT_CLEAN.get()
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    fn preflight_parked_ms(provider: api::ProviderKind) -> u64 {
+        if Self::quota_preflight_clean() {
+            return 0;
+        }
+        Self::verifier_provider_parked_ms(provider)
+    }
+
+    fn preflight_headroom_low(provider: api::ProviderKind) -> bool {
+        !Self::quota_preflight_clean() && api::quota::rate_limit_headroom_low(provider)
+    }
+
+    fn preflight_exhausted_ms(provider: api::ProviderKind) -> u64 {
+        if Self::quota_preflight_clean() {
+            return 0;
+        }
+        api::quota::provider_quota_exhausted_remaining_ms(provider)
+    }
+
     /// Whether some eligible verifier candidate has quota headroom right now.
     /// When one does, a parked candidate is strictly worse and is skipped
     /// outright; when none does, skipping every parked candidate would degrade
@@ -2946,8 +2995,8 @@ where
         self.deep_verify_candidates.iter().any(|(_, model)| {
             let provider = api::detect_provider_kind(model);
             self.verifier_candidate_eligible(model)
-                && Self::verifier_provider_parked_ms(provider) == 0
-                && !api::quota::rate_limit_headroom_low(provider)
+                && Self::preflight_parked_ms(provider) == 0
+                && !Self::preflight_headroom_low(provider)
         })
     }
 
@@ -3010,9 +3059,9 @@ where
         render_tx: &mpsc::Sender<RenderBlock>,
         ids: &BlockIdGen,
     ) -> bool {
-        let parked_ms = Self::verifier_provider_parked_ms(provider);
-        let headroom_low = api::quota::rate_limit_headroom_low(provider);
-        let exhausted_ms = api::quota::provider_quota_exhausted_remaining_ms(provider);
+        let parked_ms = Self::preflight_parked_ms(provider);
+        let headroom_low = Self::preflight_headroom_low(provider);
+        let exhausted_ms = Self::preflight_exhausted_ms(provider);
         if !skip_parked_verifier(parked_ms, headroom_low, alternative_usable, exhausted_ms) {
             return false;
         }
@@ -3053,10 +3102,10 @@ where
                 let provider = api::detect_provider_kind(model);
                 self.verifier_candidate_eligible(model)
                     && !skip_parked_verifier(
-                        Self::verifier_provider_parked_ms(provider),
-                        api::quota::rate_limit_headroom_low(provider),
+                        Self::preflight_parked_ms(provider),
+                        Self::preflight_headroom_low(provider),
                         alternative_usable,
-                        api::quota::provider_quota_exhausted_remaining_ms(provider),
+                        Self::preflight_exhausted_ms(provider),
                     )
             })
     }
@@ -5732,6 +5781,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    // The serialization guard below is held across awaits BY DESIGN (the
+    // whole test is the critical section against sibling registry writers),
+    // and it deliberately precedes the test's local item definitions.
+    #[allow(clippy::await_holding_lock, clippy::items_after_statements)]
     async fn deep_exec_retries_typed_transport_failure_into_next_attempt() {
         use std::future::Future;
         use std::pin::Pin;
@@ -5747,6 +5800,8 @@ mod tests {
             PermissionRequest as AsyncPermissionRequest,
         };
         use crate::session::Session;
+
+        let _quota_serial = api::quota::rate_limit_test_guard();
 
         struct NoopApiClient;
         impl ApiClient for NoopApiClient {
@@ -5826,6 +5881,10 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test(flavor = "current_thread")]
+    // The serialization guard below is held across awaits BY DESIGN (the
+    // whole test is the critical section against sibling registry writers),
+    // and it deliberately precedes the test's local item definitions.
+    #[allow(clippy::await_holding_lock, clippy::items_after_statements)]
     async fn deep_exec_implementer_transport_failure_escalates_to_native() {
         use std::future::Future;
         use std::pin::Pin;
@@ -5842,6 +5901,7 @@ mod tests {
             PermissionRequest as AsyncPermissionRequest,
         };
         use crate::session::Session;
+        let _quota_serial = api::quota::rate_limit_test_guard();
 
         struct NoopApiClient;
         impl ApiClient for NoopApiClient {
@@ -6366,6 +6426,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::too_many_lines)] // two end-to-end candidate-walk scenarios
+    // The serialization guard below is held across awaits BY DESIGN (the
+    // whole test is the critical section against sibling registry writers),
+    // and it deliberately precedes the test's local item definitions.
+    #[allow(clippy::await_holding_lock, clippy::items_after_statements)]
     async fn verify_subturn_uses_ranked_candidates_then_native_fallback() {
         use std::future::Future;
         use std::pin::Pin;
@@ -6379,6 +6443,7 @@ mod tests {
             PermissionRequest as AsyncPermissionRequest,
         };
         use crate::session::Session;
+        let _quota_serial = api::quota::rate_limit_test_guard();
 
         struct NoopApiClient;
         impl ApiClient for NoopApiClient {
@@ -6444,6 +6509,11 @@ mod tests {
         // cool-down) or on a real `zo` throttling the same account through the
         // cross-process file. Both made this test fail on a clean checkout.
         api::quota::isolate_rate_limit_state_for_tests();
+        // Walk semantics are driven by CLIENT outcomes below; pin the quota
+        // pre-flight to a clean registry so no parallel test's capacity-stall
+        // marking can inject a skip (policy coverage lives in the pure
+        // `skip_parked_verifier` tests).
+        ConversationRuntime::<NoopApiClient, StaticToolExecutor>::set_quota_preflight_clean_for_this_thread();
 
         // A 429 on the first provider skips lower-ranked models on that same
         // provider and uses the next different-provider candidate. It must not

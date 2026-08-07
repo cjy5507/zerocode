@@ -537,7 +537,11 @@ mod tests {
     }
 
     #[tokio::test]
+    // Serialization guard held across awaits by design — the whole test
+    // is the critical section against sibling quota-registry writers.
+    #[allow(clippy::await_holding_lock)]
     async fn cancellable_cooldown_wakes_on_cancel_flag() {
+        let _quota_serial = api::quota::rate_limit_test_guard();
         // Isolate first: `api`'s `cfg!(test)` guard is FALSE when it is compiled as a
         // dependency of THIS crate's test binary, so an un-isolated mark writes a real
         // cool-down into the account-global `~/.zo/rate/*.v1` that every running zo
@@ -564,6 +568,7 @@ mod tests {
 
     #[test]
     fn cooldown_from_prefers_larger_retry_after_over_backoff() {
+        let _quota_serial = api::quota::rate_limit_test_guard();
         // Isolate first: `api`'s `cfg!(test)` guard is FALSE when it is compiled as a
         // dependency of THIS crate's test binary, so an un-isolated mark writes a real
         // cool-down into the account-global `~/.zo/rate/*.v1` that every running zo
