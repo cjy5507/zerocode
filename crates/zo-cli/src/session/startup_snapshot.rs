@@ -123,9 +123,23 @@ pub(crate) fn build_startup_screen(
     let branch = status.and_then(|context| context.git_branch.clone());
     let mem_kb = resident_memory_kb();
     let recent_sessions = recent_sessions_for_launchpad(session_id);
+    // "Connected" must match what the AUTH layer accepts, not just the OAuth
+    // stores: an env API key (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) or a
+    // saved key is a fully working provider (`providers/anthropic.rs` reads
+    // it), and a user running on one used to be stuck on the permanent
+    // "Connect provider" onboarding — the display predicate was narrower
+    // than the credential resolution.
+    let env_key = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty())
+    };
     let auth = StartupAuthState {
-        anthropic_oauth: runtime::load_oauth_credentials().ok().flatten().is_some(),
-        chatgpt_oauth: runtime::load_openai_oauth().ok().flatten().is_some(),
+        anthropic_oauth: runtime::load_oauth_credentials().ok().flatten().is_some()
+            || env_key("ANTHROPIC_API_KEY")
+            || env_key("ANTHROPIC_AUTH_TOKEN"),
+        chatgpt_oauth: runtime::load_openai_oauth().ok().flatten().is_some()
+            || env_key("OPENAI_API_KEY"),
     };
 
     StartupScreen {

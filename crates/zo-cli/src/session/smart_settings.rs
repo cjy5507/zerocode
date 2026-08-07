@@ -2808,13 +2808,18 @@ pub(crate) fn global_preferences_object() -> Option<JsonMap<String, Value>> {
 /// the banner is per-user rather than per-session, and tests are isolated the
 /// same way `global_settings_path` is.
 fn smart_default_banner_marker_path() -> PathBuf {
+    smart_config_home().join("notices").join("smart-default-banner-shown")
+}
+
+/// The config home every banner read/write resolves against — the test
+/// override and `default_config_home()` in one place, so the marker and the
+/// prior-use scan can never disagree about whose home they are looking at.
+fn smart_config_home() -> PathBuf {
     #[cfg(test)]
     if let Some(path) = SMART_TEST_CONFIG_HOME.with(|home| home.borrow().clone()) {
-        return path.join("notices").join("smart-default-banner-shown");
+        return path;
     }
     default_config_home()
-        .join("notices")
-        .join("smart-default-banner-shown")
 }
 
 /// One-time boot notice for the smart-AUTO default flip (`smart.enabled` now
@@ -2828,6 +2833,27 @@ fn smart_default_banner_marker_path() -> PathBuf {
 /// point is gated by the caller: only the interactive REPL/TUI boot pushes
 /// this notice (headless `-p`, `serve`, and spawned sub-agents never enter
 /// that path).
+/// Whether any managed project under `root` holds at least one session file —
+/// the cheapest durable "this user has used zo before" signal. Bounded walk:
+/// first hit wins, and a fresh install short-circuits on the missing
+/// `projects/` directory.
+fn any_prior_session_under(root: &Path) -> bool {
+    let Ok(projects) = fs::read_dir(root.join("projects")) else {
+        return false;
+    };
+    for project in projects.flatten() {
+        let Ok(sessions) = fs::read_dir(project.path().join("sessions")) else {
+            continue;
+        };
+        for entry in sessions.flatten() {
+            if entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn smart_default_banner_notice() -> Option<String> {
     let root = read_merged_global_settings_object(&global_settings_paths()).ok()?;
     // Match the readers' semantics (`as_bool`): only a *boolean* value counts
@@ -2854,6 +2880,15 @@ pub(crate) fn smart_default_banner_notice() -> Option<String> {
         let _ = fs::create_dir_all(parent);
     }
     let _ = fs::write(&marker, b"shown\n");
+    // The banner announces a CHANGED default — it only means something to a
+    // user whose earlier sessions ran under the old one. A first boot has no
+    // prior expectation to correct, and the notice was the very first thing
+    // a brand-new user saw (100% firing, and it demoted the fresh launchpad
+    // into the transcript layout). The marker above is still written, so the
+    // notice never fires later either: their default was AUTO from day one.
+    if !any_prior_session_under(&smart_config_home()) {
+        return None;
+    }
     Some(
         "smart AUTO routing is now enabled by default: subagent turns route to the best \
          connected model per role. Run /smart off to disable it, or /smart doctor to \
@@ -5426,11 +5461,48 @@ mod tests {
         assert!(!explicit_off.enabled, "explicit smart.enabled=false must win over the default");
     }
 
+    /// Seed one managed session file under `config_home` so the banner's
+    /// prior-use gate reads this as an EXISTING user's home.
+    fn seed_prior_session(config_home: &std::path::Path) {
+        let sessions = config_home.join("projects").join("proj-a").join("sessions");
+        fs::create_dir_all(&sessions).expect("create sessions dir");
+        fs::write(sessions.join("session-1.jsonl"), "{}\n").expect("seed session");
+    }
+
+    #[test]
+    fn smart_default_banner_never_fires_for_a_brand_new_user() {
+        let config_home = temp_config_home("default-banner-new-user");
+        with_config_home(&config_home, || {
+            // Fresh install: no settings.json AND no prior sessions. The
+            // banner announces a changed default, which a first boot has no
+            // expectation about — it must stay silent AND burn the marker so
+            // it cannot fire later once sessions exist.
+            assert!(
+                smart_default_banner_notice().is_none(),
+                "a brand-new user must never see the changed-default banner"
+            );
+            assert!(
+                config_home
+                    .join("notices")
+                    .join("smart-default-banner-shown")
+                    .exists(),
+                "the silent first boot must still burn the marker"
+            );
+            seed_prior_session(&config_home);
+            assert!(
+                smart_default_banner_notice().is_none(),
+                "the burned marker must hold once the user has sessions"
+            );
+        });
+        let _ = fs::remove_dir_all(config_home);
+    }
+
     #[test]
     fn smart_default_banner_shows_once_then_marker_suppresses_it() {
         let config_home = temp_config_home("default-banner-once");
         with_config_home(&config_home, || {
-            // No settings.json at all — the pure default path.
+            // An EXISTING user (has prior sessions) on the pure default path.
+            seed_prior_session(&config_home);
             let banner = smart_default_banner_notice().expect("first boot must banner");
             assert!(banner.contains("/smart off"), "{banner}");
             assert!(banner.contains("/smart doctor"), "{banner}");
