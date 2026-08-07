@@ -374,13 +374,164 @@ pub fn deferred_tool_manifest_section() -> String {
     )
 }
 
+// ── Deferred-tool preload (usage-profile hybrid) ─────────────────────────────
+//
+// Deferral saves upfront schema tokens, but a mid-session `ToolSearch` load
+// ADDS a schema to the tool block — the top of the prompt prefix — so the
+// whole conversation re-bills. Measured live (breaks.jsonl, 1,071 rows): 159
+// tools_changed breaks re-billing 67.2M tokens, ~423k per load, and the
+// loaded names were overwhelmingly the same few per project. The hybrid:
+// record every mid-session load per project, and preload the tools this
+// project keeps reaching for — a preloaded schema costs its own few-k tokens
+// once, against ~423k for each avoided mid-session break.
+
+const TOOL_LOAD_LEDGER_FILE: &str = "tool-loads.jsonl";
+const TOOL_LOAD_LEDGER_MAX_BYTES: u64 = 512 * 1024;
+/// How far back the preload profile looks.
+const PRELOAD_WINDOW_DAYS: u64 = 30;
+/// A tool must have been loaded on this many DISTINCT days to earn a preload
+/// slot — one burst of loads in a single session is not a habit.
+const PRELOAD_MIN_DISTINCT_DAYS: usize = 2;
+/// Preload slots per session. Six schemas ≈ a few k upfront tokens, bounded
+/// even when a project's profile is broad.
+const PRELOAD_MAX_TOOLS: usize = 6;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the ledger is OFF in tests unless a test opts in with its
+    /// own directory — the production default would have every registry
+    /// construction reading (and every ToolSearch test writing) the real
+    /// config home, contaminating runs through preloaded state.
+    static TOOL_LOAD_LEDGER_DIR_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_tool_load_ledger_dir_for_this_thread(dir: Option<std::path::PathBuf>) {
+    TOOL_LOAD_LEDGER_DIR_OVERRIDE.with(|slot| *slot.borrow_mut() = dir);
+}
+
+// The Option is the test seam's contract: under cfg(test) this is None until
+// a test opts in, so the production arm alone looks unnecessarily wrapped.
+#[allow(clippy::unnecessary_wraps)]
+fn tool_load_ledger_path() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    {
+        TOOL_LOAD_LEDGER_DIR_OVERRIDE
+            .with(|slot| slot.borrow().clone())
+            .map(|dir| dir.join(TOOL_LOAD_LEDGER_FILE))
+    }
+    #[cfg(not(test))]
+    {
+        Some(
+            runtime::default_config_home()
+                .join("evidence")
+                .join(TOOL_LOAD_LEDGER_FILE),
+        )
+    }
+}
+
+/// The project key for ledger rows: the process cwd, which IS the project a
+/// session runs in. Plain string comparison on read — no hashing, so the
+/// ledger stays greppable.
+fn tool_load_project_key() -> String {
+    std::env::current_dir()
+        .map(|cwd| cwd.display().to_string())
+        .unwrap_or_default()
+}
+
+fn now_ms_for_ledger() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Best-effort append of freshly activated deferred tools. Never blocks or
+/// fails a `ToolSearch` call; a full ledger is truncated wholesale (recent
+/// history regrows within days, and the preload only needs a window anyway).
+fn record_tool_loads(names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    let Some(path) = tool_load_ledger_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > TOOL_LOAD_LEDGER_MAX_BYTES) {
+        let _ = std::fs::remove_file(&path);
+    }
+    let project = tool_load_project_key();
+    let ts_ms = now_ms_for_ledger();
+    let mut payload = String::new();
+    for name in names {
+        let row = serde_json::json!({ "tsMs": ts_ms, "project": project, "tool": name });
+        payload.push_str(&row.to_string());
+        payload.push('\n');
+    }
+    let _ = core_types::paths::append_private_file(&path, payload.as_bytes());
+}
+
+/// The tools this project keeps loading mid-session: loaded on
+/// ≥ [`PRELOAD_MIN_DISTINCT_DAYS`] distinct days within the window, ranked by
+/// total loads, capped at [`PRELOAD_MAX_TOOLS`]. Names whose tool no longer
+/// exists are harmless — `definitions()` only advertises names that resolve
+/// to a live schema.
+fn preloaded_deferred_tools() -> BTreeSet<String> {
+    let Some(path) = tool_load_ledger_path() else {
+        return BTreeSet::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return BTreeSet::new();
+    };
+    let project = tool_load_project_key();
+    let now_ms = now_ms_for_ledger();
+    let window_ms = PRELOAD_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+    let mut per_tool: BTreeMap<String, (BTreeSet<u64>, usize)> = BTreeMap::new();
+    for line in raw.lines() {
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if row.get("project").and_then(Value::as_str) != Some(project.as_str()) {
+            continue;
+        }
+        let Some(ts_ms) = row.get("tsMs").and_then(Value::as_u64) else {
+            continue;
+        };
+        if now_ms.saturating_sub(ts_ms) > window_ms {
+            continue;
+        }
+        let Some(tool) = row.get("tool").and_then(Value::as_str) else {
+            continue;
+        };
+        let entry = per_tool.entry(tool.to_string()).or_default();
+        entry.0.insert(ts_ms / (24 * 60 * 60 * 1000));
+        entry.1 += 1;
+    }
+    let mut ranked: Vec<(String, usize)> = per_tool
+        .into_iter()
+        .filter(|(_, (days, _))| days.len() >= PRELOAD_MIN_DISTINCT_DAYS)
+        .map(|(tool, (_, count))| (tool, count))
+        .collect();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    ranked
+        .into_iter()
+        .take(PRELOAD_MAX_TOOLS)
+        .map(|(tool, _)| tool)
+        .collect()
+}
+
 impl GlobalToolRegistry {
     #[must_use]
     pub fn builtin() -> Self {
         Self {
             plugin_tools: Vec::new(),
             runtime_tools: Arc::new(Mutex::new(Vec::new())),
-            activated_deferred_tools: Arc::new(Mutex::new(BTreeSet::new())),
+            activated_deferred_tools: Arc::new(Mutex::new(preloaded_deferred_tools())),
             enforcer: None,
             context: ToolContext::new(),
         }
@@ -406,7 +557,7 @@ impl GlobalToolRegistry {
         Ok(Self {
             plugin_tools,
             runtime_tools: Arc::new(Mutex::new(Vec::new())),
-            activated_deferred_tools: Arc::new(Mutex::new(BTreeSet::new())),
+            activated_deferred_tools: Arc::new(Mutex::new(preloaded_deferred_tools())),
             enforcer: None,
             context: ToolContext::new(),
         })
@@ -790,10 +941,28 @@ impl GlobalToolRegistry {
         // on subsequent requests, so strict function-calling providers can
         // emit the call the model just searched for. Core tools inserting
         // here is harmless — they are advertised regardless.
-        self.activated_deferred_tools
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(schemas.iter().map(|definition| definition.name.clone()));
+        let newly_activated: Vec<String> = {
+            let mut activated = self
+                .activated_deferred_tools
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            schemas
+                .iter()
+                .map(|definition| definition.name.clone())
+                .filter(|name| activated.insert(name.clone()))
+                .collect()
+        };
+        // Feed the preload profile with genuinely deferred surfaces only:
+        // recording an always-advertised core tool would waste a preload slot
+        // on a no-op. Non-builtin names (MCP/plugin) are deferred by
+        // definition on every provider.
+        let builtin_names: BTreeSet<&str> =
+            mvp_tool_specs().iter().map(|spec| spec.name).collect();
+        let loads: Vec<String> = newly_activated
+            .into_iter()
+            .filter(|name| is_deferred_tool(name) || !builtin_names.contains(name.as_str()))
+            .collect();
+        record_tool_loads(&loads);
 
         ToolSearchOutput {
             matches,
@@ -1193,7 +1362,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        deferred_tool_manifest_section, deferred_tool_names, GlobalToolRegistry,
+        deferred_tool_manifest_section, deferred_tool_names, now_ms_for_ledger,
+        preloaded_deferred_tools, set_tool_load_ledger_dir_for_this_thread,
+        tool_load_project_key, GlobalToolRegistry, PRELOAD_MAX_TOOLS, TOOL_LOAD_LEDGER_FILE,
         DEFERRED_TOOL_HOOKS,
     };
     use crate::ToolPolicyDecision;
@@ -1960,6 +2131,95 @@ mod tests {
                 .any(|d| d.name == "Workflow"),
             "a loaded deferred builtin rejoins the wire advertisement"
         );
+    }
+
+    fn ledger_sandbox(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("zo-tool-loads-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        set_tool_load_ledger_dir_for_this_thread(Some(dir.clone()));
+        dir
+    }
+
+    fn teardown_ledger_sandbox(dir: &std::path::Path) {
+        set_tool_load_ledger_dir_for_this_thread(None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn ledger_row(dir: &std::path::Path, ts_ms: u64, project: &str, tool: &str) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(TOOL_LOAD_LEDGER_FILE))
+            .expect("open ledger");
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"tsMs": ts_ms, "project": project, "tool": tool})
+        )
+        .expect("append row");
+    }
+
+    #[test]
+    fn preload_profile_requires_distinct_days_and_caps_at_the_slot_budget() {
+        const DAY: u64 = 24 * 60 * 60 * 1000;
+        let dir = ledger_sandbox("profile");
+        let now = now_ms_for_ledger();
+        let here = tool_load_project_key();
+        // Habit: loaded on two distinct days → preloads.
+        ledger_row(&dir, now - DAY, &here, "REPL");
+        ledger_row(&dir, now - 2 * DAY, &here, "REPL");
+        // Burst: five loads inside one day → NOT a habit, no slot.
+        for _ in 0..5 {
+            ledger_row(&dir, now - DAY, &here, "Workflow");
+        }
+        // Another project's habit must not leak here.
+        ledger_row(&dir, now - DAY, "/elsewhere", "Git");
+        ledger_row(&dir, now - 2 * DAY, "/elsewhere", "Git");
+        // A stale habit outside the window has expired.
+        ledger_row(&dir, now - 40 * DAY, &here, "LSP");
+        ledger_row(&dir, now - 41 * DAY, &here, "LSP");
+        // Seven more habits; with REPL that is 8 qualifying — cap keeps 6 by
+        // load count (each of these has 4 loads, REPL only 2, so REPL is the
+        // one squeezed out).
+        for tool in ["T1", "T2", "T3", "T4", "T5", "T6", "T7"] {
+            for day in 1..=2 {
+                ledger_row(&dir, now - day * DAY, &here, tool);
+                ledger_row(&dir, now - day * DAY - 1, &here, tool);
+            }
+        }
+        let preloaded = preloaded_deferred_tools();
+        assert_eq!(preloaded.len(), PRELOAD_MAX_TOOLS, "{preloaded:?}");
+        assert!(!preloaded.contains("Workflow"), "single-day burst: {preloaded:?}");
+        assert!(!preloaded.contains("Git"), "other project: {preloaded:?}");
+        assert!(!preloaded.contains("LSP"), "outside window: {preloaded:?}");
+        assert!(!preloaded.contains("REPL"), "lowest count loses the cap race: {preloaded:?}");
+        teardown_ledger_sandbox(&dir);
+    }
+
+    #[test]
+    fn tool_search_load_feeds_the_ledger_and_the_next_registry_preloads_it() {
+        const DAY: u64 = 24 * 60 * 60 * 1000;
+        let dir = ledger_sandbox("roundtrip");
+        let here = tool_load_project_key();
+        // Yesterday's load, so today's live load completes the two-day habit.
+        ledger_row(&dir, now_ms_for_ledger() - DAY, &here, "Workflow");
+
+        let registry = GlobalToolRegistry::builtin();
+        assert!(
+            !registry.definitions(None).iter().any(|d| d.name == "Workflow"),
+            "one prior day is not yet a habit"
+        );
+        let output = registry.search("select:Workflow", 3, None, None);
+        assert_eq!(output.matches, vec!["Workflow".to_string()]);
+
+        let reborn = GlobalToolRegistry::builtin();
+        assert!(
+            reborn.definitions(None).iter().any(|d| d.name == "Workflow"),
+            "a fresh session preloads the two-day habit — no mid-session break needed"
+        );
+        teardown_ledger_sandbox(&dir);
     }
 
     #[test]
