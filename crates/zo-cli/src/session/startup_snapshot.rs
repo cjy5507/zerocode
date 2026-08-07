@@ -143,6 +143,9 @@ pub(crate) fn build_startup_screen(
             .then(|| f64::from(u32::try_from(mem_kb).unwrap_or(u32::MAX)) / 1024.0),
         auth,
         recent_sessions,
+        // Cheap local read (one small JSONL + settings) on the loader thread;
+        // `None` on every healthy install, so the launchpad stays quiet.
+        harness_notice: crate::session::refine::startup_notice(),
     }
 }
 

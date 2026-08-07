@@ -967,6 +967,7 @@ fn startup_screen_for_shortcut() -> StartupScreen {
         memory_mb: Some(42.0),
         auth: StartupAuthState::default(),
         recent_sessions: Vec::new(),
+        harness_notice: None,
     }
 }
 

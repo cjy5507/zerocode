@@ -106,6 +106,11 @@ pub struct StartupScreen {
     /// Most-recent resumable sessions (newest first), already trimmed to a
     /// small N by the caller. Empty ⇒ the launchpad section is omitted.
     pub recent_sessions: Vec<RecentSession>,
+    /// One-line evidence pointer from the `/refine` loop (e.g. a harness
+    /// feature attested FAILING on this build). `None` — the overwhelmingly
+    /// common case — renders nothing: the launchpad only interrupts for a
+    /// finding that is rare and actionable, never as a standing status line.
+    pub harness_notice: Option<String>,
 }
 
 /// Banner height for `width`. The rich launchpad is taller than the plain
@@ -862,11 +867,23 @@ fn render_returning_dense_lines(
     // `/resume` hint exactly once, then a fresh-start hint if rows remain.
     // Building the list first (instead of hardcoding one hint per row) is what
     // keeps a single-session launchpad from printing the resume hint twice.
+    // A harness-evidence notice (rare: a feature attested FAILING on this
+    // build) takes one recent-session slot rather than growing the column —
+    // the row budget is fixed, and the zip below would silently drop a
+    // fourth row.
+    let recent_slots = if startup.harness_notice.is_some() { 1 } else { 2 };
     let mut left_rows: Vec<Vec<Span<'static>>> = startup
-        .recent_sessions
-        .iter()
-        .take(2)
-        .map(|session| recent_session_spans(session, theme))
+        .harness_notice
+        .as_deref()
+        .map(|notice| harness_notice_spans(notice, theme))
+        .into_iter()
+        .chain(
+            startup
+                .recent_sessions
+                .iter()
+                .take(recent_slots)
+                .map(|session| recent_session_spans(session, theme)),
+        )
         .collect();
     if left_rows.is_empty() {
         left_rows.push(vec![Span::styled(
@@ -913,7 +930,12 @@ fn render_ready_dense_lines(
     ));
     lines.push(two_column_line(
         width,
-        vec![Span::styled("No resume queue — fresh session".to_string(), dim_label(theme))],
+        // The evidence pointer outranks the "fresh session" filler: it only
+        // ever exists when a harness feature is attested FAILING right now.
+        startup.harness_notice.as_deref().map_or_else(
+            || vec![Span::styled("No resume queue — fresh session".to_string(), dim_label(theme))],
+            |notice| harness_notice_spans(notice, theme),
+        ),
         action_spans("review my diff", theme),
     ));
     lines.push(two_column_line(
@@ -959,6 +981,16 @@ fn resume_hint_spans(theme: &Theme) -> Vec<Span<'static>> {
     vec![
         Span::styled("/resume".to_string(), style(theme.heat().steel, false)),
         Span::styled(" continue".to_string(), faint_label(theme)),
+    ]
+}
+
+/// The `/refine` evidence pointer, in the warn tone: it only exists when a
+/// harness feature is attested FAILING on the running build, so it reads as
+/// the finding it is rather than ambient status.
+fn harness_notice_spans(notice: &str, theme: &Theme) -> Vec<Span<'static>> {
+    vec![
+        Span::styled("! ".to_string(), style(theme.palette.warn, true)),
+        Span::styled(notice.to_string(), style(theme.palette.warn, false)),
     ]
 }
 
@@ -1103,7 +1135,45 @@ mod tests {
             memory_mb: Some(42.0),
             auth: StartupAuthState::default(),
             recent_sessions: Vec::new(),
+            harness_notice: None,
         }
+    }
+
+    /// The launchpad's evidence pointer: absent on a healthy install, and
+    /// when present it takes the fixed row budget's filler slot instead of
+    /// growing the banner.
+    #[test]
+    fn harness_notice_replaces_the_filler_row_when_present() {
+        let draw_wide = |startup: &StartupScreen| {
+            let mut terminal =
+                Terminal::new(TestBackend::new(180, 40)).expect("terminal");
+            terminal
+                .draw(|f| draw(f, f.area(), startup, &Theme::no_color(), None))
+                .expect("draw");
+            dump_terminal(&terminal)
+        };
+
+        let mut startup = sample_startup_screen();
+        // A connected provider keeps the launchpad on the ready-dense
+        // variant; the onboarding variant has no filler row to replace.
+        startup.auth = StartupAuthState {
+            anthropic_oauth: true,
+            chatgpt_oauth: false,
+        };
+        let clean = draw_wide(&startup);
+        assert!(
+            !clean.contains("harness feature"),
+            "no notice on a healthy install: {clean}"
+        );
+        assert!(clean.contains("No resume queue"), "{clean}");
+
+        startup.harness_notice = Some("1 harness feature failing — /refine".to_string());
+        let with_notice = draw_wide(&startup);
+        assert!(
+            with_notice.contains("1 harness feature failing"),
+            "{with_notice}"
+        );
+        assert!(!with_notice.contains("No resume queue"), "{with_notice}");
     }
 
     fn dump_terminal(terminal: &Terminal<TestBackend>) -> String {

@@ -433,6 +433,36 @@ fn shadow_evidence() -> ShadowEvidence {
     }
 }
 
+/// The launchpad's one-line pointer, computed at boot on the startup loader
+/// thread. Pure read — no persist, no candidate write; those stay behind the
+/// explicit `/refine`.
+///
+/// Deliberately fires on current-build FAILING features ONLY. Gated features
+/// and shadow stamps exist on most healthy installs, so a boot line for them
+/// would be a permanent nag (the `needs_onboarding` OR-predicate mistake all
+/// over again); a FAILING attestation is rare, actionable, and worth the
+/// interruption. Zero findings ⇒ `None` ⇒ the launchpad says nothing.
+pub(crate) fn startup_notice() -> Option<String> {
+    let sha = crate::GIT_SHA.unwrap_or("unknown");
+    let rows = read_rows(&attest_evidence_path());
+    let aggregate = aggregate_window(&rows, sha, now_ms(), DEFAULT_WINDOW_DAYS);
+    startup_notice_from(&aggregate)
+}
+
+fn startup_notice_from(aggregate: &WindowAggregate) -> Option<String> {
+    let failing = aggregate
+        .current
+        .values()
+        .filter(|attestation| attestation.health() == PersistedHealth::Failing)
+        .count();
+    (failing > 0).then(|| {
+        format!(
+            "{failing} harness feature{} failing — /refine",
+            if failing == 1 { "" } else { "s" },
+        )
+    })
+}
+
 /// Run `/refine`: persist the live snapshot, aggregate the evidence window,
 /// and render the findings. Local reads only — no model call anywhere.
 pub(crate) fn run_refine(cwd: &Path, session_id: &str, window_days: Option<u64>) -> String {
@@ -849,6 +879,37 @@ mod tests {
             candidate.id.starts_with("harness_defect-"),
             "deterministic id namespaced by kind: {}",
             candidate.id
+        );
+    }
+
+    #[test]
+    fn startup_notice_fires_only_on_current_build_failing_features() {
+        let mut aggregate = WindowAggregate::default();
+        assert_eq!(startup_notice_from(&aggregate), None, "empty window is silent");
+        aggregate
+            .current
+            .insert("design_guidance".to_string(), attestation(0, &[], &[("intent", 7)]));
+        aggregate
+            .current
+            .insert("info_topology".to_string(), attestation(3, &[], &[]));
+        assert_eq!(
+            startup_notice_from(&aggregate),
+            None,
+            "gated and alive features never nag the launchpad"
+        );
+        aggregate
+            .current
+            .insert("routing_probe".to_string(), attestation(0, &[("http_400", 5)], &[]));
+        assert_eq!(
+            startup_notice_from(&aggregate).as_deref(),
+            Some("1 harness feature failing — /refine")
+        );
+        aggregate
+            .current
+            .insert("workflow_relay".to_string(), attestation(0, &[("dead", 1)], &[]));
+        assert_eq!(
+            startup_notice_from(&aggregate).as_deref(),
+            Some("2 harness features failing — /refine")
         );
     }
 
