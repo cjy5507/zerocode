@@ -16,9 +16,12 @@ trials = 1
 
 [[tools]]
 name = "zo"
+# `--session-id X` both creates and continues session X, so multi-stage tasks
+# reuse this argv for every stage (no resume_argv needed).
 argv = [
     "zo",
     "--model", "claude-opus-5",
+    "--session-id", "{session_id}",
     "--output-format", "json",
     "--permission-mode", "danger-full-access",
     "prompt", "{prompt}",
@@ -32,6 +35,16 @@ argv = [
     "claude",
     "-p", "{prompt}",
     "--model", "claude-opus-5",
+    "--session-id", "{session_id}",
+    "--output-format", "json",
+    "--dangerously-skip-permissions",
+]
+# CC names a session with --session-id but CONTINUES one with --resume.
+resume_argv = [
+    "claude",
+    "-p", "{prompt}",
+    "--model", "claude-opus-5",
+    "--resume", "{session_id}",
     "--output-format", "json",
     "--dangerously-skip-permissions",
 ]
@@ -283,3 +296,103 @@ fn main() {
     println!("{total}");
 }
 '''
+
+# ── long lane: multi-stage tasks against ONE session ─────────────────────────
+# The long-horizon axis: does the tool actually carry earlier conversation
+# (facts, its own decisions) into later stages, and at what cumulative cost?
+# Every stage is a separate headless invocation resuming the same session in
+# the same workspace.
+
+[[tasks]]
+id = "long-recall-fact"
+tags = ["long"]
+# The password exists ONLY in the stage-1 conversation — never on disk. A tool
+# whose resume is lossy (or whose compaction drops it) fails outright; a tool
+# that carries it cheaply wins the cost axis.
+check = '''test "$(cat password.txt)" = "quartz-HORIZON-42" && python3 test_util.py'''
+
+[[tasks.stages]]
+prompt = "Remember this fact for later in our session: the deploy password is quartz-HORIZON-42. Just acknowledge it. Do NOT write it to any file yet."
+
+[[tasks.stages]]
+prompt = "Create util.py with a function slugify(text) that lowercases text, trims it, and replaces every run of spaces with a single hyphen. Also create test_util.py with a few asserts covering those rules and run python3 test_util.py to confirm it passes."
+check = "python3 test_util.py"
+
+[[tasks.stages]]
+prompt = "Now write the deploy password I told you at the start of this session to a file named password.txt — exactly the password, a single line, nothing else."
+
+[[tasks]]
+id = "long-decision-carry"
+tags = ["long"]
+# Stage 1 makes a naming decision; stages 2 and 3 must stay consistent with
+# it. The check derives the chosen name from DECISIONS.md and requires the
+# SAME name everywhere — a tool that re-derives instead of remembering
+# diverges and fails.
+check = '''
+python3 - << 'PYEOF'
+import re, pathlib
+decisions = pathlib.Path("DECISIONS.md").read_text()
+match = re.search(r"key:\s*([A-Z][A-Z0-9_]*_SECS)", decisions)
+assert match, "DECISIONS.md must record 'key: <NAME>_SECS'"
+key = match.group(1)
+for path in ("config.py", "server.py", "README.md"):
+    text = pathlib.Path(path).read_text()
+    assert key in text, f"{path} must use the chosen key {key}"
+print("consistent:", key)
+PYEOF
+python3 test_ttl.py'''
+
+[[tasks.files]]
+path = "config.py"
+content = '''"""Project configuration constants."""
+
+APP_NAME = "cachetron"
+'''
+
+[[tasks.files]]
+path = "server.py"
+content = '''"""Toy server that will need a cache TTL setting."""
+
+import config
+
+
+def get_ttl():
+    """Return the cache TTL in seconds (to be wired to config)."""
+    raise NotImplementedError
+'''
+
+[[tasks.files]]
+path = "README.md"
+content = '''# cachetron
+
+A toy caching server.
+'''
+
+[[tasks.stages]]
+prompt = "Look at this small project. Choose a config key name for the cache TTL setting — SCREAMING_SNAKE_CASE, ending in _SECS. Record your choice in a new DECISIONS.md file as a line 'key: <NAME>' and add the constant to config.py with value 300. Do not touch the other files yet."
+
+[[tasks.stages]]
+prompt = "Wire the TTL key you chose in the previous step into server.py: get_ttl() should return it from config. Add test_ttl.py asserting get_ttl() == 300 and run python3 test_ttl.py."
+check = "python3 test_ttl.py"
+
+[[tasks.stages]]
+prompt = "Document the configuration: add a Configuration section to README.md that names the exact TTL key you chose earlier and its default. Keep it consistent with DECISIONS.md."
+
+[[tasks]]
+id = "long-iterative-feature"
+tags = ["long"]
+# Three incremental builds on the same module: measures the cumulative token
+# economics of a growing session (cache health, history re-billing) with a
+# straightforward always-passable spec.
+check = "python3 test_calc.py && python3 main.py add 2 3 | grep -qx '5'"
+
+[[tasks.stages]]
+prompt = "Create calc.py with add(a, b) and sub(a, b), and test_calc.py covering both. Run python3 test_calc.py to confirm."
+check = "python3 test_calc.py"
+
+[[tasks.stages]]
+prompt = "Extend calc.py with mul(a, b) and div(a, b) (div raises ValueError on zero). Extend test_calc.py to cover both, including the zero case, and run it."
+check = "python3 test_calc.py"
+
+[[tasks.stages]]
+prompt = "Add main.py: a CLI that takes an operation name (add/sub/mul/div) and two numbers as argv, prints the integer result of the calc.py function. Example: python3 main.py add 2 3 prints 5. Confirm the example works."

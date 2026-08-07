@@ -745,6 +745,34 @@ fn value_was_scoped_by_us(value: &std::ffi::OsStr) -> bool {
 ///
 /// `fresh` clears any stale file at the target (new session); a resume leaves
 /// the existing per-session todos in place so the restored checklist survives.
+/// The session an explicit `--session-id` names: loaded when its transcript
+/// already exists in the scope, fresh otherwise. `--session-id X` ADDRESSES
+/// session X — it does not merely name a new one. The old create-only
+/// behavior silently OVERWROTE the prior transcript at save time (the second
+/// run's "resumed" conversation started empty and the first run's history was
+/// destroyed — observed live as the model hallucinating a codeword the real
+/// session held). Returns `(session, resumed_existing)`; a transcript that
+/// exists but cannot load is an error, never an overwrite.
+fn session_for_explicit_id(
+    id: &str,
+    path: &std::path::Path,
+) -> Result<(Session, bool), Box<dyn std::error::Error>> {
+    if path.is_file() {
+        let mut session = Session::load_from_path(path).map_err(|error| {
+            format!(
+                "--session-id {id}: an existing session transcript at {} could not be \
+                 loaded ({error}); refusing to overwrite it",
+                path.display()
+            )
+        })?;
+        id.clone_into(&mut session.session_id);
+        return Ok((session, true));
+    }
+    let mut session = Session::new();
+    id.clone_into(&mut session.session_id);
+    Ok((session, false))
+}
+
 pub(super) fn scope_todo_store_to_session(session_path: &std::path::Path, fresh: bool) {
     if user_supplied_todo_store() {
         return;
@@ -1074,24 +1102,28 @@ impl LiveCli {
             prompt_mode_for(scope),
             &model,
         )?;
-        let mut session_state = Session::new();
-        if let Some(id) = explicit_session_id {
-            let id = id.trim();
-            if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-                return Err(format!(
-                    "--session-id must be non-empty and use only [A-Za-z0-9-]: {id:?}"
-                )
-                .into());
+        let (session_state, resumed_existing) = match explicit_session_id {
+            Some(id) => {
+                let id = id.trim();
+                if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                    return Err(format!(
+                        "--session-id must be non-empty and use only [A-Za-z0-9-]: {id:?}"
+                    )
+                    .into());
+                }
+                let handle = create_managed_session_handle_at(id, scope, &cwd)?;
+                session_for_explicit_id(id, &handle.path)?
             }
-            id.clone_into(&mut session_state.session_id);
-        }
+            None => (Session::new(), false),
+        };
         let session = create_managed_session_handle_at(&session_state.session_id, scope, &cwd)?;
         // Isolate this session's todo store so a second `zo` in the same cwd
         // (e.g. GPT and Claude side by side) does not share — and overwrite —
         // one `cwd/.zo-todos.json`. Same harness for every model; only the
         // store location is per-session. `fresh`: a brand-new session starts
-        // with an empty checklist.
-        scope_todo_store_to_session(&session.path, true);
+        // with an empty checklist, while a resumed one keeps the checklist it
+        // saved.
+        scope_todo_store_to_session(&session.path, !resumed_existing);
         let preferences = load_project_preferences(&cwd)?;
         let model = if model == crate::DEFAULT_MODEL {
             preferences.model.clone().unwrap_or(model)
@@ -4051,6 +4083,77 @@ mod prompt_override_tests {
             Some(value) => std::env::set_var("ZO_AUTO_VERIFY_CMD", value),
             None => std::env::remove_var("ZO_AUTO_VERIFY_CMD"),
         }
+    }
+}
+
+#[cfg(test)]
+mod explicit_session_id_tests {
+    use runtime::{ContentBlock, ConversationMessage, Session};
+
+    use super::session_for_explicit_id;
+
+    fn temp_session_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "zo-explicit-sid-{tag}-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    #[test]
+    fn absent_transcript_creates_a_fresh_session_named_by_the_id() {
+        let path = temp_session_path("fresh");
+        let (session, resumed) =
+            session_for_explicit_id("bench-stage-1", &path).expect("fresh session");
+        assert!(!resumed);
+        assert_eq!(session.session_id, "bench-stage-1");
+        assert!(session.messages.is_empty());
+    }
+
+    #[test]
+    fn existing_transcript_is_resumed_with_its_history_not_overwritten() {
+        let path = temp_session_path("resume");
+        let mut first = Session::new();
+        "bench-stage-1".clone_into(&mut first.session_id);
+        first
+            .push_message(ConversationMessage::user_text(
+                "the codeword is quartz-HORIZON-42",
+            ))
+            .expect("push");
+        first.save_to_path(&path).expect("save");
+
+        let (session, resumed) =
+            session_for_explicit_id("bench-stage-1", &path).expect("resume session");
+        assert!(resumed, "an existing transcript must resume, never restart");
+        assert_eq!(session.session_id, "bench-stage-1");
+        assert!(
+            session.messages.iter().any(|message| {
+                message.blocks.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::Text { text } if text.contains("quartz-HORIZON-42")
+                ))
+            }),
+            "the prior conversation must be visible to the resumed run"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn corrupt_transcript_is_an_error_never_an_overwrite() {
+        let path = temp_session_path("corrupt");
+        std::fs::write(&path, "{not json\ngarbage{{{\n").expect("write corrupt");
+        let error = session_for_explicit_id("bench-stage-1", &path)
+            .expect_err("corrupt transcript must refuse");
+        assert!(
+            error.to_string().contains("refusing to overwrite"),
+            "error must state the no-overwrite contract: {error}"
+        );
+        // The transcript survives untouched for manual recovery.
+        assert!(path.is_file());
+        let _ = std::fs::remove_file(&path);
     }
 }
 

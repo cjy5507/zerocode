@@ -63,9 +63,17 @@ const fn default_check_timeout_secs() -> u64 {
 #[derive(Debug, Deserialize)]
 struct ToolConfig {
     name: String,
-    /// Full argv; `{prompt}` is replaced with the task prompt, `{run_root}`
-    /// and `{workdir}` with the run/workspace directories.
+    /// Full argv; `{prompt}` is replaced with the (stage) prompt, `{run_root}`
+    /// and `{workdir}` with the run/workspace directories, and `{session_id}`
+    /// with the per-(task, tool, trial) session id (UUID-shaped, so tools that
+    /// require a UUID accept it).
     argv: Vec<String>,
+    /// Argv for stage 2+ of a multi-stage task, for tools whose "continue this
+    /// session" flag differs from their "name this session" flag (Claude Code:
+    /// `--session-id X` creates, `--resume X` continues). Absent = stages
+    /// reuse `argv` (zo: `--session-id X` both creates and continues).
+    #[serde(default)]
+    resume_argv: Option<Vec<String>>,
     #[serde(default)]
     env: BTreeMap<String, String>,
 }
@@ -73,7 +81,14 @@ struct ToolConfig {
 #[derive(Debug, Deserialize)]
 struct TaskConfig {
     id: String,
-    prompt: String,
+    /// Single-stage prompt. Exactly one of `prompt` / `stages` must be set.
+    #[serde(default)]
+    prompt: Option<String>,
+    /// Multi-stage prompts, run in order against the SAME session and the
+    /// SAME workspace — the long-horizon lane: later stages measure whether
+    /// the tool actually carries the earlier conversation (and at what cost).
+    #[serde(default)]
+    stages: Vec<StageConfig>,
     /// Objective success gate, run with `sh -c` in the workspace after the
     /// tool exits. Exit 0 = success. This is the ONLY success signal.
     check: String,
@@ -81,9 +96,18 @@ struct TaskConfig {
     timeout_secs: Option<u64>,
     #[serde(default)]
     files: Vec<TaskFile>,
-    /// Optional tag (e.g. "smoke", "rust") for --filter selection.
+    /// Optional tag (e.g. "smoke", "rust", "long") for --filter selection.
     #[serde(default)]
     tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StageConfig {
+    prompt: String,
+    /// Optional mid-stage gate; a red stage check fails the whole task even
+    /// if a later stage papers over it.
+    #[serde(default)]
+    check: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +132,26 @@ struct RowRecord {
     cache_read_tokens: u64,
     cache_creation_tokens: u64,
     tool_reported_error: bool,
+    /// Number of prompts this row spans (1 = classic single-shot task).
+    stages: u32,
+    /// Per-stage breakdown for multi-stage tasks (`None` on single-shot rows,
+    /// keeping legacy row shape byte-compatible). This is where the
+    /// long-horizon economics live: a stage-3 cost far above stage 1's on the
+    /// same tool means the session carry is re-billing history instead of
+    /// caching it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage_detail: Option<Vec<StageDetail>>,
+}
+
+#[derive(Debug, Serialize)]
+struct StageDetail {
+    stage: u32,
+    wall_ms: u128,
+    cost_usd: Option<f64>,
+    tokens: u64,
+    tool_exit: Option<i32>,
+    timed_out: bool,
+    check_exit: Option<i32>,
 }
 
 fn main() {
@@ -270,6 +314,69 @@ fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The stage prompts a task runs: its `stages` when declared, else the single
+/// `prompt` as a one-stage list.
+fn task_stages(task: &TaskConfig) -> Result<Vec<StageConfig>, String> {
+    if !task.stages.is_empty() {
+        if task.prompt.is_some() {
+            return Err(format!(
+                "task {}: set either `prompt` or `stages`, not both",
+                task.id
+            ));
+        }
+        return Ok(task
+            .stages
+            .iter()
+            .map(|stage| StageConfig {
+                prompt: stage.prompt.clone(),
+                check: stage.check.clone(),
+            })
+            .collect());
+    }
+    match &task.prompt {
+        Some(prompt) => Ok(vec![StageConfig {
+            prompt: prompt.clone(),
+            check: None,
+        }]),
+        None => Err(format!("task {}: needs `prompt` or `stages`", task.id)),
+    }
+}
+
+/// UUID-v4-shaped session id (Claude Code validates the flag as a UUID; zo
+/// accepts any `[A-Za-z0-9-]`). Derived from time + pid + a counter through
+/// two hash rounds — uniqueness per bench run is all that matters here, not
+/// cryptographic randomness.
+fn make_session_id(seed: u64) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (
+        seed,
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    )
+        .hash(&mut hasher);
+    let hi = hasher.finish();
+    hi.hash(&mut hasher);
+    let lo = hasher.finish();
+    let bytes: Vec<u8> = hi
+        .to_be_bytes()
+        .into_iter()
+        .chain(lo.to_be_bytes())
+        .collect();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-4{:01x}{:02x}-{:01x}{:01x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5],
+        bytes[6] & 0x0f, bytes[7],
+        8 + (bytes[8] & 0x03), bytes[8] & 0x0f, bytes[9],
+        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    )
+}
+
+#[allow(clippy::too_many_lines)] // one linear stage loop; helpers carry the logic
 fn run_one(
     defaults: &Defaults,
     run_root: &Path,
@@ -296,58 +403,127 @@ fn run_one(
         .canonicalize()
         .unwrap_or_else(|_| run_root.to_path_buf());
     let workdir_abs = workdir.canonicalize().unwrap_or_else(|_| workdir.clone());
-    let argv: Vec<String> = tool
-        .argv
-        .iter()
-        .map(|arg| expand_placeholders(arg, &task.prompt, &run_root_abs, &workdir_abs))
-        .collect();
-    let (program, rest) = argv
-        .split_first()
-        .ok_or_else(|| format!("tool {} has an empty argv", tool.name))?;
+    let stages = task_stages(task)?;
+    let session_id = make_session_id(u64::from(trial));
+    let timeout = Duration::from_secs(task.timeout_secs.unwrap_or(defaults.timeout_secs));
 
-    let stdout_path = workdir.join(".bench-stdout.json");
-    let stderr_path = workdir.join(".bench-stderr.log");
-    let mut command = Command::new(program);
-    command
-        .args(rest)
-        .current_dir(&workdir)
-        .stdin(Stdio::null())
-        .stdout(std::fs::File::create(&stdout_path).map_err(|e| e.to_string())?)
-        .stderr(std::fs::File::create(&stderr_path).map_err(|e| e.to_string())?);
-    for (key, value) in &tool.env {
-        command.env(
-            key,
-            expand_placeholders(value, &task.prompt, &run_root_abs, &workdir_abs),
-        );
+    let mut total_wall: u128 = 0;
+    let mut total_metrics = ToolMetrics::default();
+    let mut last_tool_exit: Option<i32> = None;
+    let mut any_timed_out = false;
+    let mut stage_details: Vec<StageDetail> = Vec::new();
+    let mut all_stage_checks_green = true;
+
+    for (index, stage) in stages.iter().enumerate() {
+        let stage_no = u32::try_from(index).unwrap_or(u32::MAX) + 1;
+        let template = if index > 0 {
+            tool.resume_argv.as_ref().unwrap_or(&tool.argv)
+        } else {
+            &tool.argv
+        };
+        let argv: Vec<String> = template
+            .iter()
+            .map(|arg| {
+                expand_placeholders(arg, &stage.prompt, &run_root_abs, &workdir_abs, &session_id)
+            })
+            .collect();
+        let (program, rest) = argv
+            .split_first()
+            .ok_or_else(|| format!("tool {} has an empty argv", tool.name))?;
+
+        let stdout_path = workdir.join(format!(".bench-stdout-s{stage_no}.json"));
+        let stderr_path = workdir.join(format!(".bench-stderr-s{stage_no}.log"));
+        let mut command = Command::new(program);
+        command
+            .args(rest)
+            .current_dir(&workdir)
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(&stdout_path).map_err(|e| e.to_string())?)
+            .stderr(std::fs::File::create(&stderr_path).map_err(|e| e.to_string())?);
+        for (key, value) in &tool.env {
+            command.env(
+                key,
+                expand_placeholders(
+                    value,
+                    &stage.prompt,
+                    &run_root_abs,
+                    &workdir_abs,
+                    &session_id,
+                ),
+            );
+        }
+
+        let started = Instant::now();
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("spawn {program}: {e}"))?;
+        let (tool_exit, timed_out) = wait_with_timeout(&mut child, timeout);
+        let wall_ms = started.elapsed().as_millis();
+
+        let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+        let metrics = parse_tool_metrics(&stdout);
+        let stage_check_exit = stage
+            .check
+            .as_deref()
+            .map(|check| run_check(check, &workdir, defaults.check_timeout_secs))
+            .map(|exit| exit.unwrap_or(-1));
+        if let Some(exit) = stage_check_exit {
+            if exit != 0 {
+                all_stage_checks_green = false;
+            }
+        }
+
+        total_wall += wall_ms;
+        total_metrics.accumulate(&metrics);
+        last_tool_exit = tool_exit;
+        any_timed_out |= timed_out;
+        stage_details.push(StageDetail {
+            stage: stage_no,
+            wall_ms,
+            cost_usd: metrics.cost_usd,
+            tokens: metrics.input_tokens
+                + metrics.output_tokens
+                + metrics.cache_read_tokens
+                + metrics.cache_creation_tokens,
+            tool_exit,
+            timed_out,
+            check_exit: stage_check_exit,
+        });
+        if stages.len() > 1 {
+            eprintln!(
+                "   stage {stage_no}/{} · {}ms · ${:.4}",
+                stages.len(),
+                wall_ms,
+                metrics.cost_usd.unwrap_or(0.0),
+            );
+        }
+        // A timed-out stage leaves the session in an unknown state; later
+        // stages would measure recovery, not carry. Stop the trial here.
+        if timed_out {
+            all_stage_checks_green = false;
+            break;
+        }
     }
 
-    let timeout = Duration::from_secs(task.timeout_secs.unwrap_or(defaults.timeout_secs));
-    let started = Instant::now();
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("spawn {program}: {e}"))?;
-    let (tool_exit, timed_out) = wait_with_timeout(&mut child, timeout);
-    let wall_ms = started.elapsed().as_millis();
-
-    let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
-    let metrics = parse_tool_metrics(&stdout);
-
     let check_exit = run_check(&task.check, &workdir, defaults.check_timeout_secs);
+    let stage_count = u32::try_from(stage_details.len()).unwrap_or(u32::MAX);
     Ok(RowRecord {
         task: task.id.clone(),
         tool: tool.name.clone(),
         trial,
-        success: check_exit == Some(0),
-        wall_ms,
+        success: check_exit == Some(0) && all_stage_checks_green,
+        wall_ms: total_wall,
         check_exit,
-        tool_exit,
-        timed_out,
-        cost_usd: metrics.cost_usd,
-        input_tokens: metrics.input_tokens,
-        output_tokens: metrics.output_tokens,
-        cache_read_tokens: metrics.cache_read_tokens,
-        cache_creation_tokens: metrics.cache_creation_tokens,
-        tool_reported_error: metrics.reported_error,
+        tool_exit: last_tool_exit,
+        timed_out: any_timed_out,
+        cost_usd: total_metrics.cost_usd,
+        input_tokens: total_metrics.input_tokens,
+        output_tokens: total_metrics.output_tokens,
+        cache_read_tokens: total_metrics.cache_read_tokens,
+        cache_creation_tokens: total_metrics.cache_creation_tokens,
+        tool_reported_error: total_metrics.reported_error,
+        stages: stage_count,
+        stage_detail: (stages.len() > 1).then_some(stage_details),
     })
 }
 
@@ -378,10 +554,17 @@ fn seed_git(workdir: &Path) {
     ]);
 }
 
-fn expand_placeholders(arg: &str, prompt: &str, run_root: &Path, workdir: &Path) -> String {
+fn expand_placeholders(
+    arg: &str,
+    prompt: &str,
+    run_root: &Path,
+    workdir: &Path,
+    session_id: &str,
+) -> String {
     arg.replace("{prompt}", prompt)
         .replace("{run_root}", &run_root.display().to_string())
         .replace("{workdir}", &workdir.display().to_string())
+        .replace("{session_id}", session_id)
 }
 
 /// Poll-wait with a deadline. On expiry the direct child is killed (grand-
@@ -412,6 +595,22 @@ struct ToolMetrics {
     cache_read_tokens: u64,
     cache_creation_tokens: u64,
     reported_error: bool,
+}
+
+impl ToolMetrics {
+    /// Fold one stage's metrics into a multi-stage total. Cost stays `None`
+    /// only while EVERY stage reported none — a single reporting stage makes
+    /// the total honest-but-partial rather than silently zero.
+    fn accumulate(&mut self, stage: &ToolMetrics) {
+        if let Some(cost) = stage.cost_usd {
+            *self.cost_usd.get_or_insert(0.0) += cost;
+        }
+        self.input_tokens += stage.input_tokens;
+        self.output_tokens += stage.output_tokens;
+        self.cache_read_tokens += stage.cache_read_tokens;
+        self.cache_creation_tokens += stage.cache_creation_tokens;
+        self.reported_error |= stage.reported_error;
+    }
 }
 
 /// Pull the terminal metrics record out of a tool's stdout. Both supported
@@ -538,17 +737,121 @@ mod tests {
     use super::*;
 
     #[test]
-    fn placeholder_expansion_covers_prompt_and_paths() {
+    fn placeholder_expansion_covers_prompt_paths_and_session() {
         let expanded = expand_placeholders(
-            "--session-root={run_root}/s --task={prompt} --dir={workdir}",
+            "--session-root={run_root}/s --task={prompt} --dir={workdir} --sid={session_id}",
             "fix the bug",
             Path::new("/tmp/run"),
             Path::new("/tmp/run/w"),
+            "abc-123",
         );
         assert_eq!(
             expanded,
-            "--session-root=/tmp/run/s --task=fix the bug --dir=/tmp/run/w"
+            "--session-root=/tmp/run/s --task=fix the bug --dir=/tmp/run/w --sid=abc-123"
         );
+    }
+
+    #[test]
+    fn session_ids_are_uuid_shaped_and_distinct() {
+        let a = make_session_id(1);
+        let b = make_session_id(2);
+        assert_ne!(a, b);
+        for id in [&a, &b] {
+            let parts: Vec<&str> = id.split('-').collect();
+            assert_eq!(parts.len(), 5, "{id}");
+            assert_eq!(
+                parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+                vec![8, 4, 4, 4, 12],
+                "{id}"
+            );
+            assert!(
+                id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+                "{id}"
+            );
+            // v4 marker: tools that validate the UUID version accept it.
+            assert_eq!(parts[2].chars().next(), Some('4'), "{id}");
+        }
+    }
+
+    #[test]
+    fn task_stages_normalizes_single_prompt_and_rejects_ambiguity() {
+        let single = TaskConfig {
+            id: "t".into(),
+            prompt: Some("do the thing".into()),
+            stages: Vec::new(),
+            check: "true".into(),
+            timeout_secs: None,
+            files: Vec::new(),
+            tags: Vec::new(),
+        };
+        let stages = task_stages(&single).expect("single prompt is one stage");
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].prompt, "do the thing");
+
+        let multi = TaskConfig {
+            id: "t".into(),
+            prompt: None,
+            stages: vec![
+                StageConfig {
+                    prompt: "one".into(),
+                    check: None,
+                },
+                StageConfig {
+                    prompt: "two".into(),
+                    check: Some("true".into()),
+                },
+            ],
+            check: "true".into(),
+            timeout_secs: None,
+            files: Vec::new(),
+            tags: Vec::new(),
+        };
+        assert_eq!(task_stages(&multi).expect("multi").len(), 2);
+
+        let both = TaskConfig {
+            id: "t".into(),
+            prompt: Some("x".into()),
+            stages: vec![StageConfig {
+                prompt: "one".into(),
+                check: None,
+            }],
+            check: "true".into(),
+            timeout_secs: None,
+            files: Vec::new(),
+            tags: Vec::new(),
+        };
+        assert!(task_stages(&both).is_err(), "prompt+stages must be rejected");
+        let neither = TaskConfig {
+            id: "t".into(),
+            prompt: None,
+            stages: Vec::new(),
+            check: "true".into(),
+            timeout_secs: None,
+            files: Vec::new(),
+            tags: Vec::new(),
+        };
+        assert!(task_stages(&neither).is_err());
+    }
+
+    #[test]
+    fn metrics_accumulate_sums_stages_and_keeps_cost_honest() {
+        let mut total = ToolMetrics::default();
+        total.accumulate(&ToolMetrics {
+            cost_usd: None,
+            input_tokens: 5,
+            ..ToolMetrics::default()
+        });
+        assert_eq!(total.cost_usd, None, "no stage reported cost yet");
+        total.accumulate(&ToolMetrics {
+            cost_usd: Some(0.25),
+            output_tokens: 7,
+            reported_error: true,
+            ..ToolMetrics::default()
+        });
+        assert_eq!(total.cost_usd, Some(0.25));
+        assert_eq!(total.input_tokens, 5);
+        assert_eq!(total.output_tokens, 7);
+        assert!(total.reported_error);
     }
 
     #[test]
@@ -592,6 +895,8 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             tool_reported_error: false,
+            stages: 1,
+            stage_detail: None,
         };
         let rows = vec![
             row("a", true, 1000, 0.10),
