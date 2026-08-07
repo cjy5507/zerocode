@@ -835,6 +835,12 @@ mod tests {
     /// reasoning budget may scale with task difficulty now.
     #[test]
     fn subagents_inherit_the_parent_model_verbatim() {
+        // Env reads below race any parallel test's `EnvGuard` mutation of
+        // `ZO_AGENT_MODEL` unless serialized on the SAME crate-wide lock the
+        // mutators hold (a fn-start skip check alone is a racy read).
+        let _env = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if std::env::var("ZO_AGENT_MODEL").is_ok() {
             return; // env override active in this environment — contract not observable
         }
@@ -878,6 +884,12 @@ mod tests {
     /// on-wire user `model` which stays fenced to the parent's provider family.
     #[test]
     fn smart_routed_model_is_applied_verbatim_across_provider_families() {
+        // Env reads below race any parallel test's `EnvGuard` mutation of
+        // `ZO_AGENT_MODEL` unless serialized on the SAME crate-wide lock the
+        // mutators hold (a fn-start skip check alone is a racy read).
+        let _env = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if std::env::var(AGENT_MODEL_ENV).is_ok() {
             return; // env override intentionally wins over Smart routes
         }
@@ -1005,6 +1017,12 @@ mod tests {
     /// model is still inherited verbatim; only the budget is asserted here.
     #[test]
     fn non_anthropic_non_gpt_parents_get_difficulty_scaled_budget() {
+        // Env reads below race any parallel test's `EnvGuard` mutation of
+        // `ZO_AGENT_MODEL` unless serialized on the SAME crate-wide lock the
+        // mutators hold (a fn-start skip check alone is a racy read).
+        let _env = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if std::env::var("ZO_AGENT_MODEL").is_ok() {
             return; // env override active — inheritance/budget contract not observable
         }
