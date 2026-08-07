@@ -841,7 +841,9 @@ fn verifier_retry_is_better(current: &VerifierVerdict, retry: &VerifierVerdict) 
 
 const fn parse_rank(parse: VerifierParse) -> u8 {
     match parse {
-        VerifierParse::Timeout => 0,
+        // Same "did not finish" rank as a timeout: a budget-capped leg
+        // carries no verdict signal a retry parse could improve on.
+        VerifierParse::Timeout | VerifierParse::BudgetExhausted => 0,
         VerifierParse::Empty => 1,
         VerifierParse::Unparseable => 2,
         VerifierParse::Salvaged => 3,

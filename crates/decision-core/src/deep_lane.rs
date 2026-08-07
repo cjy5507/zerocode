@@ -57,6 +57,14 @@ pub enum VerifierParse {
     /// verifier call is killed, so it is a classified outcome, never inferred
     /// from text.
     Timeout,
+    /// The verifier hit its iteration budget before emitting a verdict. Spec
+    /// maps to `timeout` (same "did not finish" class), but it is a DISTINCT
+    /// deep-loop policy input: a timeout is transient — retrying the attempt
+    /// can plausibly verify next time — while a budget spiral is a property
+    /// of the diff-vs-inspection pairing, so the same retry re-spirals and
+    /// only the objective gate carries signal. Injected by the harness like
+    /// `Timeout`, never inferred from text.
+    BudgetExhausted,
 }
 
 impl VerifierParse {
@@ -69,6 +77,7 @@ impl VerifierParse {
             Self::Empty => "empty",
             Self::Unparseable => "unparseable",
             Self::Timeout => "timeout",
+            Self::BudgetExhausted => "budget_exhausted",
         }
     }
 
@@ -82,7 +91,10 @@ impl VerifierParse {
             Self::Salvaged => "salvage_valid",
             Self::Unparseable => "malformed",
             Self::Empty => "missing",
-            Self::Timeout => "timeout",
+            // BudgetExhausted shares the spec class: the verifier did not
+            // finish. The policy distinction lives in `verifier_gate_accepts`,
+            // not in the fairness ledger vocabulary.
+            Self::Timeout | Self::BudgetExhausted => "timeout",
         }
     }
 
@@ -96,6 +108,7 @@ impl VerifierParse {
             "empty" | "missing" => Self::Empty,
             "unparseable" | "malformed" => Self::Unparseable,
             "timeout" => Self::Timeout,
+            "budget_exhausted" => Self::BudgetExhausted,
             _ => return None,
         })
     }
@@ -727,7 +740,13 @@ pub const fn verifier_gate_accepts(
     } else {
         objective_ok
             && (matches!(parse, VerifierParse::Salvaged)
-                || (matches!(parse, VerifierParse::Json) && !has_reasons))
+                || (matches!(parse, VerifierParse::Json) && !has_reasons)
+                // An inspection that ran past its iteration budget produced
+                // no verdict AND named no issue — blocking on it would spend
+                // a full retry to re-run the same spiral. The objective gate
+                // (tests) stays the hard gate; a budget stop with any named
+                // reason still blocks.
+                || (matches!(parse, VerifierParse::BudgetExhausted) && !has_reasons))
     }
 }
 
@@ -1220,6 +1239,38 @@ TODO
         assert!(!failures_match(&[], &["x".to_string()]));
         assert!(!failures_match(&["x".to_string()], &[]));
         assert!(!failures_match(&[], &[]));
+    }
+
+    #[test]
+    fn budget_exhausted_verifier_defers_to_the_objective_gate() {
+        let unfinished = VerifierVerdict {
+            accepted: false,
+            issues: Vec::new(),
+            parse: VerifierParse::BudgetExhausted,
+            evidence: None,
+        };
+        // Objective green: the unfinished OPTIONAL inspection must not spend
+        // a retry — the same spiral would just run again.
+        let green = fold_verification_attempt(1, 3, true, &unfinished, &[]);
+        assert!(green.gate_accepted);
+        assert_eq!(green.decision, DeepDecision::Accept);
+        // Objective red stays blocking regardless of the verifier.
+        let red = fold_verification_attempt(1, 3, false, &unfinished, &[]);
+        assert!(!red.gate_accepted);
+        assert_eq!(red.decision, DeepDecision::Retry);
+        // A named reason blocks even at budget exhaustion.
+        let with_issue = VerifierVerdict {
+            issues: vec!["missed spec".to_string()],
+            ..unfinished.clone()
+        };
+        assert!(!fold_verification_attempt(1, 3, true, &with_issue, &[]).gate_accepted);
+        // Timeout (transient — a retry can plausibly verify) must NOT merge
+        // into this class: it still withholds the gate under objective green.
+        let timeout = VerifierVerdict {
+            parse: VerifierParse::Timeout,
+            ..unfinished
+        };
+        assert!(!fold_verification_attempt(1, 3, true, &timeout, &[]).gate_accepted);
     }
 
     #[test]

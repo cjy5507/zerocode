@@ -143,9 +143,10 @@ impl VerifierDecision {
         } else {
             match parse {
                 VerifierParse::Json | VerifierParse::Salvaged => Self::Reject,
-                VerifierParse::Empty | VerifierParse::Unparseable | VerifierParse::Timeout => {
-                    Self::Unknown
-                }
+                VerifierParse::Empty
+                | VerifierParse::Unparseable
+                | VerifierParse::Timeout
+                | VerifierParse::BudgetExhausted => Self::Unknown,
             }
         }
     }
@@ -403,8 +404,12 @@ pub fn decide_final(
             }
             // Row 6: missing
             VerifierParse::Empty => verdict(D::Inconclusive, Some(F::VerifierMissing)),
-            // Row 7: timeout
-            VerifierParse::Timeout => verdict(D::Inconclusive, Some(F::VerifierTimeout)),
+            // Row 7: timeout — budget exhaustion is the same "did not
+            // finish" row for the fairness matrix (the deep-loop retry
+            // policy distinguishes them, this ledger does not).
+            VerifierParse::Timeout | VerifierParse::BudgetExhausted => {
+                verdict(D::Inconclusive, Some(F::VerifierTimeout))
+            }
         },
     }
 }

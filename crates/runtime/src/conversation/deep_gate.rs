@@ -1100,6 +1100,9 @@ fn verifier_display_summary(verifier: &VerifierVerdict) -> String {
         VerifierParse::Empty => "verifier returned no output".to_string(),
         VerifierParse::Unparseable => "verifier returned no usable verdict".to_string(),
         VerifierParse::Timeout => "verifier timed out".to_string(),
+        VerifierParse::BudgetExhausted => {
+            "verifier hit its inspection budget; objective check gated".to_string()
+        }
     }
 }
 
@@ -1107,7 +1110,10 @@ const fn verifier_mode_label(parse: VerifierParse) -> &'static str {
     match parse {
         VerifierParse::Json => "strict verifier",
         VerifierParse::Salvaged => "salvaged verifier",
-        VerifierParse::Empty | VerifierParse::Unparseable | VerifierParse::Timeout => "verifier",
+        VerifierParse::Empty
+        | VerifierParse::Unparseable
+        | VerifierParse::Timeout
+        | VerifierParse::BudgetExhausted => "verifier",
     }
 }
 
@@ -1116,6 +1122,30 @@ fn issue_count_label(count: usize) -> String {
         "1 issue".to_string()
     } else {
         format!("{count} issues")
+    }
+}
+
+/// Iteration budget for one VERIFY leg. Production distribution (223 legs,
+/// 2026-08-07): p50 3, p90 7, p99 19, max 51 — the cap leaves the typical
+/// inspection untouched and kills the runaway tail (a 51-iteration leg spends
+/// dozens of model calls re-reading a diff it was seeded with). Hitting the
+/// cap is graceful: the loop ends `BudgetExhausted::Iterations` well-formed,
+/// and the caller folds it into [`verify_budget_exhausted_verdict`] instead
+/// of parsing the synthetic closer as a verdict.
+const VERIFY_LEG_MAX_ITERATIONS: usize = 12;
+
+/// The verdict for a VERIFY leg that hit [`VERIFY_LEG_MAX_ITERATIONS`] before
+/// emitting one. Distinct from [`verify_leg_failed_verdict`] (transient
+/// failure, where a retry can plausibly verify next time): a budget spiral is
+/// a property of the diff-vs-inspection pairing, so the same retry re-spirals
+/// — `fold_verification_attempt` lets this class defer to the objective gate
+/// rather than buying a 325-422k retry of the same walk.
+fn verify_budget_exhausted_verdict() -> VerifierVerdict {
+    VerifierVerdict {
+        accepted: false,
+        issues: Vec::new(),
+        parse: VerifierParse::BudgetExhausted,
+        evidence: None,
     }
 }
 
@@ -1390,6 +1420,10 @@ struct DeepSubturnPermissionGuard<'a, C, T> {
     /// ([`DEEP_LEG_DELEGATION_TOOLS`]); Drop restores the prior list so a
     /// nested phase cannot clear an outer one's block.
     saved_phase_tool_block: Option<Vec<String>>,
+    /// `Some(prior)` when a VERIFY leg clamped the runtime's iteration budget
+    /// to [`VERIFY_LEG_MAX_ITERATIONS`]; Drop restores it so the main turn
+    /// (and later legs) keep their full budget.
+    saved_max_iterations: Option<usize>,
 }
 
 impl<'a, C, T> DeepSubturnPermissionGuard<'a, C, T> {
@@ -1480,6 +1514,11 @@ impl<'a, C, T> DeepSubturnPermissionGuard<'a, C, T> {
                 .permission_policy
                 .begin_phase_tool_block(DEEP_LEG_DELEGATION_TOOLS)
         });
+        let saved_max_iterations = matches!(phase, DeepSubturnPhase::Verify).then(|| {
+            let saved = runtime.max_iterations;
+            runtime.max_iterations = saved.min(VERIFY_LEG_MAX_ITERATIONS);
+            saved
+        });
         Self {
             runtime,
             saved_mode,
@@ -1492,6 +1531,7 @@ impl<'a, C, T> DeepSubturnPermissionGuard<'a, C, T> {
             message_start,
             verify_images: Vec::new(),
             saved_phase_tool_block,
+            saved_max_iterations,
         }
     }
 }
@@ -1570,6 +1610,9 @@ impl<C, T> Drop for DeepSubturnPermissionGuard<'_, C, T> {
             self.runtime
                 .permission_policy
                 .end_phase_tool_block(saved);
+        }
+        if let Some(saved) = self.saved_max_iterations.take() {
+            self.runtime.max_iterations = saved;
         }
         self.runtime
             .permission_policy
@@ -2634,9 +2677,27 @@ where
             // non-accept (Timeout) so the loop retries or gives up at the cap,
             // preserving the completed implementation in the work tree.
             let verifier = match verify_result {
-                Ok(verify_summary) => {
+                Ok(mut verify_summary) => {
+                    // The leg's own iteration cap is verify-local: folding it
+                    // unstripped would mark the WHOLE deep turn budget-stopped
+                    // (the flag that drives /loop pause and grind escalation),
+                    // and parsing the synthetic closer would misread the stop
+                    // as a rejection. It becomes the verdict instead.
+                    let verify_budget_stopped = verify_summary.budget_exhausted.take().is_some();
                     acc.fold(verify_summary);
-                    parse_verify_leg_text(&self.last_assistant_text())
+                    if verify_budget_stopped {
+                        deep_note(
+                            &render_tx,
+                            &ids,
+                            format!(
+                                "verifier hit its inspection budget ({VERIFY_LEG_MAX_ITERATIONS} rounds) without a verdict — the objective check gates this attempt"
+                            ),
+                        )
+                        .await;
+                        verify_budget_exhausted_verdict()
+                    } else {
+                        parse_verify_leg_text(&self.last_assistant_text())
+                    }
                 }
                 Err(_) => verify_leg_failed_verdict(),
             };
@@ -3423,9 +3484,25 @@ where
             // conservative non-accept (Timeout) so the loop retries or gives up at
             // the cap, preserving the completed implementation in the work tree.
             let verifier = match verify_result {
-                Ok(summary) => {
+                Ok(mut summary) => {
+                    // Same stripping as the reactive path: the leg-local cap
+                    // must neither budget-stop the whole turn nor read as a
+                    // rejection.
+                    let verify_budget_stopped = summary.budget_exhausted.take().is_some();
                     acc.fold(summary);
-                    parse_verify_leg_text(&self.last_assistant_text())
+                    if verify_budget_stopped {
+                        deep_note(
+                            &render_tx,
+                            &ids,
+                            format!(
+                                "verifier hit its inspection budget ({VERIFY_LEG_MAX_ITERATIONS} rounds) without a verdict — the objective check gates this attempt"
+                            ),
+                        )
+                        .await;
+                        verify_budget_exhausted_verdict()
+                    } else {
+                        parse_verify_leg_text(&self.last_assistant_text())
+                    }
                 }
                 Err(_) => verify_leg_failed_verdict(),
             };
@@ -5320,6 +5397,84 @@ mod tests {
         // both reactive and plan-first paths (display already handles Timeout).
         let verdict = verify_leg_failed_verdict();
         assert_eq!(verifier_display_summary(&verdict), "verifier timed out");
+    }
+
+    #[test]
+    fn verify_leg_budget_verdict_is_distinct_from_timeout_and_displays_honestly() {
+        let verdict = verify_budget_exhausted_verdict();
+        assert!(!verdict.accepted);
+        assert_eq!(verdict.parse, VerifierParse::BudgetExhausted);
+        assert_eq!(
+            verifier_display_summary(&verdict),
+            "verifier hit its inspection budget; objective check gated"
+        );
+    }
+
+    #[test]
+    fn verify_leg_clamps_the_iteration_budget_and_drop_restores_it() {
+        use crate::conversation::StaticToolExecutor;
+        use crate::session::Session;
+
+        struct NoopApiClient;
+        impl crate::conversation::ApiClient for NoopApiClient {
+            fn stream(
+                &mut self,
+                _request: crate::conversation::ApiRequest,
+            ) -> Result<Vec<crate::conversation::AssistantEvent>, crate::conversation::RuntimeError>
+            {
+                unreachable!("guard construction must not call the client")
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApiClient,
+            StaticToolExecutor::new(),
+            crate::PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+        // Set explicitly rather than trusting the default: the default reads
+        // ZO_MAX_ITERATIONS, and an env-reading assertion is a parallel-test
+        // landmine.
+        runtime.max_iterations = 40;
+        {
+            let guard = DeepSubturnPermissionGuard::new(
+                &mut runtime,
+                PermissionMode::ReadOnly,
+                SubturnClient::Native,
+                DeepSubturnPhase::Verify,
+            );
+            assert_eq!(
+                guard.runtime.max_iterations, VERIFY_LEG_MAX_ITERATIONS,
+                "a VERIFY leg runs under the inspection budget"
+            );
+        }
+        assert_eq!(runtime.max_iterations, 40, "Drop must restore the full budget");
+        {
+            let guard = DeepSubturnPermissionGuard::new(
+                &mut runtime,
+                PermissionMode::ReadOnly,
+                SubturnClient::Native,
+                DeepSubturnPhase::Plan,
+            );
+            assert_eq!(
+                guard.runtime.max_iterations, 40,
+                "the cap is verify-local; PLAN keeps the full budget"
+            );
+        }
+        assert_eq!(runtime.max_iterations, 40);
+        // A budget SMALLER than the cap is never raised by the clamp.
+        runtime.max_iterations = 5;
+        {
+            let guard = DeepSubturnPermissionGuard::new(
+                &mut runtime,
+                PermissionMode::ReadOnly,
+                SubturnClient::Native,
+                DeepSubturnPhase::Verify,
+            );
+            assert_eq!(guard.runtime.max_iterations, 5);
+        }
+        assert_eq!(runtime.max_iterations, 5);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
