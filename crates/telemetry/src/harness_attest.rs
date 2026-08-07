@@ -92,6 +92,13 @@ pub enum HarnessFeature {
     /// that works leaves no other durable trace — its whole success condition
     /// is that the user never sees the empty turn.
     EmptyRetryDeescalation,
+    /// A deep-gate `[auto:RETRY]` chain converting: `fired` = a turn whose
+    /// verifier rejected at least once ended Accepted after the retry;
+    /// `failed(gave_up)` = the retry budget was spent and the loop still gave
+    /// up. Measured live at ~$4 median per retry (84 turns), so the
+    /// fired:failed ratio is the evidence that tunes max attempts — without
+    /// it every retry-budget change is blind.
+    DeepRetryConversion,
 }
 
 impl HarnessFeature {
@@ -106,6 +113,7 @@ impl HarnessFeature {
             Self::InformationTopology => "info_topology",
             Self::WorkflowRelay => "workflow_relay",
             Self::EmptyRetryDeescalation => "empty_retry_deescalation",
+            Self::DeepRetryConversion => "deep_retry_conversion",
         }
     }
 
@@ -120,6 +128,7 @@ impl HarnessFeature {
             Self::InformationTopology => "information topology (sees edges)",
             Self::WorkflowRelay => "workflow {seen} relay",
             Self::EmptyRetryDeescalation => "empty-response retry de-escalation",
+            Self::DeepRetryConversion => "deep retry conversion",
         }
     }
 
@@ -146,6 +155,9 @@ impl HarnessFeature {
             Self::EmptyRetryDeescalation => {
                 "OpenAI Responses wire only; requires a turn that already came back empty"
             }
+            Self::DeepRetryConversion => {
+                "requires a deep-gate turn whose verifier rejected an attempt (an [auto:RETRY] follow-up ran)"
+            }
         }
     }
 
@@ -162,6 +174,7 @@ impl HarnessFeature {
             Self::InformationTopology,
             Self::WorkflowRelay,
             Self::EmptyRetryDeescalation,
+            Self::DeepRetryConversion,
         ]
     }
 

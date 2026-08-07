@@ -2738,6 +2738,21 @@ where
                     if decision == DeepDecision::Accept {
                         self.record_verified_accept(objective_ok);
                     }
+                    // Retry-conversion evidence: only a turn that actually
+                    // spent a retry carries signal. fired = the retry
+                    // converted to Accept; failed = the budget went for
+                    // nothing — the fired:failed ratio is what lets a future
+                    // max-attempts change cite measurement instead of taste.
+                    if attempt > 1 {
+                        if decision == DeepDecision::Accept {
+                            telemetry::attest_fired(telemetry::HarnessFeature::DeepRetryConversion);
+                        } else {
+                            telemetry::attest_failed(
+                                telemetry::HarnessFeature::DeepRetryConversion,
+                                "gave_up",
+                            );
+                        }
+                    }
                     break;
                 }
                 DeepDecision::Retry => {
@@ -3537,6 +3552,21 @@ where
                 DeepDecision::Accept | DeepDecision::GiveUp => {
                     if decision == DeepDecision::Accept {
                         self.record_verified_accept(objective_ok);
+                    }
+                    // Retry-conversion evidence: only a turn that actually
+                    // spent a retry carries signal. fired = the retry
+                    // converted to Accept; failed = the budget went for
+                    // nothing — the fired:failed ratio is what lets a future
+                    // max-attempts change cite measurement instead of taste.
+                    if attempt > 1 {
+                        if decision == DeepDecision::Accept {
+                            telemetry::attest_fired(telemetry::HarnessFeature::DeepRetryConversion);
+                        } else {
+                            telemetry::attest_failed(
+                                telemetry::HarnessFeature::DeepRetryConversion,
+                                "gave_up",
+                            );
+                        }
                     }
                     break;
                 }
