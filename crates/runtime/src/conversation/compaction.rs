@@ -1877,8 +1877,10 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
                 wire_reminders: Arc::from(Vec::new()),
                 messages: Arc::new(request_messages),
                 tool_choice: None,
-                // Compaction summary never escalates effort.
+                // Compaction summary never escalates effort — and a summary
+                // needs no extended thinking either.
                 effort_override: None,
+                suppress_thinking: true,
                 model_override: None,
             };
         }
@@ -1887,8 +1889,10 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
             wire_reminders: Arc::from(Vec::new()),
             messages: Arc::new(crate::compact::pretrim_messages_for_summary(messages)),
             tool_choice: None,
-            // Compaction summary never escalates effort.
+            // Compaction summary never escalates effort — and a summary
+            // needs no extended thinking either.
             effort_override: None,
+            suppress_thinking: true,
             model_override,
         }
     }

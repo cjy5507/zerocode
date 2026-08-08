@@ -47,6 +47,16 @@ impl TurnHarness {
             assessment.intent,
         );
         if let Some(inner) = runtime.try_runtime_mut() {
+            // The verify BAND was TUI-only (`turn_controller` set it, this
+            // path never did), so every headless verify ran with band `None`
+            // → unconditionally Full three-lens depth: the proportional
+            // SingleLens demotion for small green diffs never fired on the
+            // paths the bench measures. Same inputs the TUI uses: this
+            // assessment's complexity plus the orchestration risk.
+            inner.set_verify_band(
+                assessment.complexity,
+                tools::assess_turn_orchestration(options.input).risk,
+            );
             inner.set_verify_intent(super::turn_controller::verify_intent_for_turn(
                 assessment.intent,
             ));

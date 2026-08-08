@@ -299,6 +299,10 @@ where
             // Effort floor for this turn (deep-gate escalation); `None` on an
             // ordinary turn leaves the client's configured effort unchanged.
             effort_override: self.effort_override,
+            // SingleLens verify legs run their verdict without extended
+            // thinking (see `ApiRequest::suppress_thinking`); false on every
+            // other request.
+            suppress_thinking: self.verify_thinking_suppressed,
             // Per-turn wire-model override: the refusal fallback wins over a
             // confidence-cascade escalation (a refusal on the escalated model
             // must still swap to the safe fallback); `None` on an ordinary

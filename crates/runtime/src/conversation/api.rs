@@ -63,6 +63,17 @@ pub struct ApiRequest {
     /// escalation; this is that seam). `None` on every ordinary turn, so the
     /// configured effort is unchanged unless escalation explicitly engages.
     pub effort_override: Option<u32>,
+    /// Disable extended thinking for THIS request. Set only while a
+    /// `SingleLens` deep-VERIFY leg runs: the verdict on a small green diff is
+    /// analysis-shaped work, and the effort bench measured analysis at
+    /// thinking-Off as accuracy-neutral and 1.3–2× cheaper/faster — while a
+    /// verify leg inheriting the EXEC stage's High effort was the largest
+    /// single wall component of a long-lane stage (~23s). Full-lens verifies
+    /// keep the session's effort (conservative: a three-lens judgment on a
+    /// large or red change earns its thinking). Applied AFTER the
+    /// `effort_override` floor merge, so suppression wins; the floor never
+    /// rides a verify leg anyway (escalation clears before VERIFY).
+    pub suppress_thinking: bool,
     /// Per-turn wire-model override, or `None` for the client's bound model.
     /// The runtime sets it VERBATIM when an Anthropic safety classifier declines
     /// a Fable/Mythos turn (`stop_reason: "refusal"`): the turn is retried once
