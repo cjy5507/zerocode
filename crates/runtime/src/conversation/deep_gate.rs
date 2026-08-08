@@ -1418,6 +1418,80 @@ fn verify_file_attachments(diff_paths: &[String], own_root: Option<&std::path::P
     )
 }
 
+/// Files the EXEC leg consulted this turn: successful `read_file` targets
+/// plus every edited/written path. The verifier's remaining round trip was
+/// cross-checking the change against context the implementer had consulted
+/// but this attempt did not touch (measured: a decision-carry verifier
+/// `read_file`ing the stage-1 `DECISIONS.md`) — so the attachment set must
+/// cover what the implementer SAW, not just what it changed.
+fn exec_consulted_paths(summary: &TurnSummary) -> Vec<String> {
+    let mut read_targets: std::collections::HashMap<&str, String> =
+        std::collections::HashMap::new();
+    for message in &summary.assistant_messages {
+        for block in &message.blocks {
+            if let ContentBlock::ToolUse { id, name, input } = block {
+                if name == "read_file" {
+                    if let Some(path) = serde_json::from_str::<serde_json::Value>(input)
+                        .ok()
+                        .as_ref()
+                        .and_then(|value| value.get("path"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|path| !path.is_empty())
+                    {
+                        read_targets.insert(id.as_str(), path.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut paths: Vec<String> = Vec::new();
+    for message in &summary.tool_results {
+        for block in &message.blocks {
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            if *is_error {
+                continue;
+            }
+            if let Some(path) = read_targets.get(tool_use_id.as_str()) {
+                if !paths.contains(path) {
+                    paths.push(path.clone());
+                }
+            }
+        }
+    }
+    for path in edited_file_paths(summary) {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// The attachment set for a `SingleLens` leg: this attempt's diff paths first
+/// (they own the byte budget), then the other files EXEC consulted, deduped
+/// by resolved location so one file under two spellings attaches once.
+fn verify_attachment_paths(
+    diff_paths: &[String],
+    consulted: &[String],
+    own_root: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut seen: BTreeSet<std::path::PathBuf> = BTreeSet::new();
+    let mut ordered: Vec<String> = Vec::new();
+    for path in diff_paths.iter().chain(consulted.iter()) {
+        if seen.insert(attempt_path_key(path, own_root)) {
+            ordered.push(path.clone());
+        }
+    }
+    ordered
+}
+
 fn exec_green_checks(summary: &TurnSummary) -> Vec<String> {
     let mut commands: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for message in &summary.assistant_messages {
@@ -2920,6 +2994,9 @@ where
             let edited_paths = edited_file_paths(&summary);
             let assistant_claim = latest_assistant_text(&summary.assistant_messages);
             let green_checks = exec_green_checks(&summary);
+            // Snapshot before the fold consumes `summary`: the SingleLens
+            // attachment set needs what EXEC consulted this attempt.
+            let consulted_paths = exec_consulted_paths(&summary);
             acc.fold(summary);
 
             // No edits ⇒ a question/analysis/chat turn. Done — never tax a turn
@@ -3011,7 +3088,10 @@ where
             // prompt drops it anyway, and large/red changes read files
             // selectively themselves).
             let attached_files = if depth == VerifyDepth::SingleLens {
-                verify_file_attachments(&diff_paths, own_root.as_deref())
+                verify_file_attachments(
+                    &verify_attachment_paths(&diff_paths, &consulted_paths, own_root.as_deref()),
+                    own_root.as_deref(),
+                )
             } else {
                 String::new()
             };
@@ -3775,6 +3855,9 @@ where
             let edited_paths = edited_file_paths(&summary);
             let assistant_claim = latest_assistant_text(&summary.assistant_messages);
             let green_checks = exec_green_checks(&summary);
+            // Snapshot before the fold consumes `summary`: the SingleLens
+            // attachment set needs what EXEC consulted this attempt.
+            let consulted_paths = exec_consulted_paths(&summary);
             acc.fold(summary);
 
             // Objective gate: the project's own check command, when configured.
@@ -3852,7 +3935,10 @@ where
             // prompt drops it anyway, and large/red changes read files
             // selectively themselves).
             let attached_files = if depth == VerifyDepth::SingleLens {
-                verify_file_attachments(&diff_paths, own_root.as_deref())
+                verify_file_attachments(
+                    &verify_attachment_paths(&diff_paths, &consulted_paths, own_root.as_deref()),
+                    own_root.as_deref(),
+                )
             } else {
                 String::new()
             };
@@ -5215,6 +5301,70 @@ mod tests {
                 "crates/runtime/src/new.rs".to_string()
             ]
         );
+    }
+
+    /// 첨부 경로 합집합: diff 경로가 예산 우선권을 갖고, EXEC가 읽은(성공한
+    /// `read_file`) 파일이 뒤따르며, 같은 파일의 두 표기는 한 번만 실린다.
+    #[test]
+    fn verify_attachment_paths_unions_diff_and_consulted_reads() {
+        let dir = std::env::temp_dir().join(format!(
+            "zo-attach-union-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("changed.rs"), "x").expect("seed");
+        std::fs::write(dir.join("DECISIONS.md"), "d").expect("seed");
+
+        let read_use = |id: &str, path: &str| ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({ "path": path }).to_string(),
+        };
+        let summary = TurnSummary {
+            assistant_messages: vec![ConversationMessage::assistant(vec![
+                read_use("r1", "DECISIONS.md"),
+                // diff 경로와 같은 파일의 다른 표기 — 중복 첨부 금지.
+                read_use("r2", "./changed.rs"),
+                read_use("r3", "failed.txt"),
+            ])],
+            tool_results: vec![
+                ConversationMessage::tool_result("r1", "read_file", "content", false),
+                ConversationMessage::tool_result("r2", "read_file", "content", false),
+                ConversationMessage::tool_result("r3", "read_file", "denied", true),
+            ],
+            prompt_cache_events: Vec::new(),
+            iterations: 1,
+            usage: TokenUsage::default(),
+            turn_output_tokens: 0,
+            auto_compaction: None,
+            microcompact: None,
+            deep_verification: None,
+            verification_issues: Vec::new(),
+            deep_verifier_parse: None,
+            deep_verifier_model: None,
+            budget_exhausted: None,
+        };
+        let consulted = exec_consulted_paths(&summary);
+        let union = verify_attachment_paths(
+            &["changed.rs".to_string()],
+            &consulted,
+            Some(&dir),
+        );
+        assert_eq!(union[0], "changed.rs", "diff paths own the byte budget");
+        assert!(union.contains(&"DECISIONS.md".to_string()), "consulted read attaches");
+        assert_eq!(
+            union.iter().filter(|p| p.contains("changed")).count(),
+            1,
+            "two spellings of one file attach once"
+        );
+        assert!(
+            !union.iter().any(|p| p.contains("failed")),
+            "errored reads must not attach"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 첨부 빌더 계약: 작은 UTF-8 파일은 전문 첨부·초과/비UTF-8은 스킵
