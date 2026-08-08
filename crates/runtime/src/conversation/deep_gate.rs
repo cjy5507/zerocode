@@ -75,6 +75,14 @@ const ARCHITECT_IMPL_ATTEMPTS: u32 = 2;
 const CHECK_OUTPUT_TAIL_BYTES: usize = 4_000;
 const VERIFY_EDITED_PATHS_BYTES: usize = 2_000;
 const VERIFY_ASSISTANT_CLAIM_BYTES: usize = 4_000;
+// Post-edit file contents attached to a SingleLens verify prompt so the
+// common leg is a one-call verdict instead of read_file-then-verdict
+// (measured: the leg's only tool call was re-reading files whose content the
+// diff or the conversation already carried — a full API round trip per leg).
+// Proportionate to the 6KB diff bound; oversized/binary files get a skip
+// note directing the verifier to read_file them instead.
+const VERIFY_FILE_ATTACH_PER_FILE_BYTES: usize = 12_000;
+const VERIFY_FILE_ATTACH_TOTAL_BYTES: usize = 32_000;
 const EXEC_PRIOR_DIFF_BYTES: usize = 6_000;
 const EXEC_PRIOR_EDITED_PATHS_BYTES: usize = 2_000;
 // Desktop, mobile, and one intermediate/current frame cover the common visual
@@ -1357,6 +1365,59 @@ fn bash_result_exited_zero(output: &str) -> bool {
 /// implementer's green `cargo build && cargo run` sat unreported in the same
 /// transcript). A check that ran BEFORE the last edit is stale evidence and is
 /// dropped.
+/// Ready-to-embed section carrying the CURRENT post-edit content of each
+/// changed file, read from disk by the harness at leg-build time — the same
+/// IO-fact pattern as [`exec_green_checks`]. Injected only into `SingleLens`
+/// prompts so the common small-green-diff leg can verdict in ONE call instead
+/// of spending a round trip on `read_file`s whose bytes the diff or the
+/// conversation already carried (measured: that read was the leg's only tool
+/// call in both long-lane iterative trials). Oversized, unreadable, or
+/// non-UTF-8 files get a skip note pointing the verifier at `read_file`;
+/// an empty `diff_paths` yields an empty string, leaving the prompt
+/// byte-identical.
+fn verify_file_attachments(diff_paths: &[String], own_root: Option<&std::path::Path>) -> String {
+    use std::fmt::Write as _;
+    if diff_paths.is_empty() {
+        return String::new();
+    }
+    let mut blocks = String::new();
+    let mut attached_total = 0usize;
+    for path in diff_paths {
+        let resolved = attempt_path_key(path, own_root);
+        let note = match std::fs::read(&resolved) {
+            Ok(bytes) if bytes.len() > VERIFY_FILE_ATTACH_PER_FILE_BYTES => {
+                Some("too large to attach — read_file it if you need it")
+            }
+            Ok(bytes) if attached_total + bytes.len() > VERIFY_FILE_ATTACH_TOTAL_BYTES => {
+                Some("attachment budget spent — read_file it if you need it")
+            }
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(content) => {
+                    attached_total += content.len();
+                    let _ = write!(
+                        blocks,
+                        "──── FILE: {path} (attached in full, {len} bytes) ────\n{content}\n──── END FILE: {path} ────\n",
+                        len = content.len(),
+                    );
+                    None
+                }
+                Err(_) => Some("binary or non-UTF-8 — read_file it if you need it"),
+            },
+            Err(_) => Some("unreadable or deleted"),
+        };
+        if let Some(note) = note {
+            let _ = writeln!(blocks, "──── FILE: {path} (not attached: {note}) ────");
+        }
+    }
+    format!(
+        "\n\nCurrent post-edit content of every changed file, read from disk by the harness \
+         AFTER the last edit (runtime-recorded IO facts, byte-identical to what `read_file` \
+         would return — do NOT re-read attached files):\n{blocks}\
+         If these contents plus the observations above already settle every requirement, \
+         deliver your verdict JSON in THIS response without any tool calls."
+    )
+}
+
 fn exec_green_checks(summary: &TurnSummary) -> Vec<String> {
     let mut commands: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for message in &summary.assistant_messages {
@@ -2017,6 +2078,9 @@ struct VerifyPromptContext<'a> {
     /// left modified).
     preexisting: String,
     assistant_claim: String,
+    /// Ready-to-embed post-edit file contents ([`verify_file_attachments`]);
+    /// empty for Full-lens prompts, which stay byte-identical.
+    attached_files: &'a str,
     visual_evidence: &'static str,
 }
 
@@ -2030,6 +2094,7 @@ impl<'a> VerifyPromptContext<'a> {
         edited_paths: &[String],
         preexisting_dirty: &[String],
         assistant_claim: &str,
+        attached_files: &'a str,
         has_images: bool,
     ) -> Self {
         let mut objective = match check {
@@ -2103,6 +2168,7 @@ impl<'a> VerifyPromptContext<'a> {
             paths,
             preexisting,
             assistant_claim,
+            attached_files,
             visual_evidence: if has_images {
                 VERIFY_VISUAL_EVIDENCE_BLOCK
             } else {
@@ -2130,10 +2196,18 @@ fn verify_prompt(
     edited_paths: &[String],
     preexisting_dirty: &[String],
     assistant_claim: &str,
+    attached_files: &str,
     lens_mode: VerifyLensMode,
     intent: RouteTaskIntent,
     has_images: bool,
 ) -> String {
+    // Attachments are a SingleLens-only optimization; the Full-lens prompt
+    // stays byte-identical regardless of what the caller computed.
+    let attached_files = if lens_mode == VerifyLensMode::Full {
+        ""
+    } else {
+        attached_files
+    };
     let context = VerifyPromptContext::new(
         task,
         diff,
@@ -2142,6 +2216,7 @@ fn verify_prompt(
         edited_paths,
         preexisting_dirty,
         assistant_claim,
+        attached_files,
         has_images,
     );
     let design = intent == RouteTaskIntent::Design;
@@ -2162,6 +2237,7 @@ fn design_lens_verify_prompt(context: &VerifyPromptContext<'_>) -> String {
         paths,
         preexisting,
         assistant_claim,
+        attached_files,
         visual_evidence,
     } = context;
     format!(
@@ -2175,7 +2251,7 @@ fn design_lens_verify_prompt(context: &VerifyPromptContext<'_>) -> String {
          {objective}\n\n\
          Paths changed this attempt:\n{paths}\n\n\
          {preexisting}Assistant's final claim for this attempt (bounded):\n{assistant_claim}\n\n\
-         Diff (scoped git diff, bounded):\n{diff}{visual_evidence}\n\n\
+         Diff (scoped git diff, bounded):\n{diff}{attached_files}{visual_evidence}\n\n\
          Judge the design lens (true = the result holds up, false = it does not):\n\
          {DESIGN_LENS_CRITERIA}\n\
          A design defect is a real defect — reject and itemize it exactly as a correctness verifier \
@@ -2199,6 +2275,7 @@ fn spec_only_verify_prompt(context: &VerifyPromptContext<'_>) -> String {
         paths,
         preexisting,
         assistant_claim,
+        attached_files,
         visual_evidence,
     } = context;
     format!(
@@ -2212,7 +2289,7 @@ fn spec_only_verify_prompt(context: &VerifyPromptContext<'_>) -> String {
              {objective}\n\n\
              Paths changed this attempt:\n{paths}\n\n\
              {preexisting}Assistant's final claim for this attempt (bounded):\n{assistant_claim}\n\n\
-             Diff (scoped git diff, bounded):\n{diff}{visual_evidence}\n\n\
+             Diff (scoped git diff, bounded):\n{diff}{attached_files}{visual_evidence}\n\n\
              Does the change FULLY and CORRECTLY satisfy the task, including every requirement, \
              correct error handling, and edge cases? If the change FIXES A BUG, prefer a test that \
              fails on the unfixed code and passes now; reject a bug fix that lacks such a test ONLY \
@@ -2243,6 +2320,7 @@ fn full_lens_verify_prompt(context: &VerifyPromptContext<'_>, design: bool) -> S
         paths,
         preexisting,
         assistant_claim,
+        attached_files: _,
         visual_evidence,
     } = context;
     let design_lens = full_lens_design_block(design);
@@ -2924,6 +3002,15 @@ where
             // message-level prompt cache and re-bills the whole conversation
             // prefix as cache-write — measured at 14-25k tokens per leg,
             // dwarfing the few hundred thinking tokens it would save.
+            // Post-edit file contents ride the SingleLens prompt so the
+            // common leg verdicts in one call; Full legs skip the read (the
+            // prompt drops it anyway, and large/red changes read files
+            // selectively themselves).
+            let attached_files = if depth == VerifyDepth::SingleLens {
+                verify_file_attachments(&diff_paths, own_root.as_deref())
+            } else {
+                String::new()
+            };
             let verify_result = self
                 .verify_subturn(
                     verify_prompt(
@@ -2940,6 +3027,7 @@ where
                             own_root.as_deref(),
                         ),
                         &assistant_claim,
+                        &attached_files,
                         if depth == VerifyDepth::SingleLens {
                             VerifyLensMode::SpecOnly
                         } else {
@@ -3755,6 +3843,15 @@ where
             // message-level prompt cache and re-bills the whole conversation
             // prefix as cache-write — measured at 14-25k tokens per leg,
             // dwarfing the few hundred thinking tokens it would save.
+            // Post-edit file contents ride the SingleLens prompt so the
+            // common leg verdicts in one call; Full legs skip the read (the
+            // prompt drops it anyway, and large/red changes read files
+            // selectively themselves).
+            let attached_files = if depth == VerifyDepth::SingleLens {
+                verify_file_attachments(&diff_paths, own_root.as_deref())
+            } else {
+                String::new()
+            };
             let verify_result = self
                 .verify_subturn(
                     verify_prompt(
@@ -3771,6 +3868,7 @@ where
                             own_root.as_deref(),
                         ),
                         &assistant_claim,
+                        &attached_files,
                         if depth == VerifyDepth::SingleLens {
                             VerifyLensMode::SpecOnly
                         } else {
@@ -4663,6 +4761,7 @@ mod tests {
             &[],
             &[],
             "implemented the fix",
+            "",
             VerifyLensMode::Full,
             RouteTaskIntent::Other,
             false,
@@ -4699,6 +4798,7 @@ mod tests {
             &[],
             &[],
             "updated the implementation",
+            "",
             VerifyLensMode::Full,
             RouteTaskIntent::Other,
             false,
@@ -4723,6 +4823,7 @@ mod tests {
             &["src/changed.rs".to_string()],
             &[],
             "ASSISTANT_CLAIM_MARKER",
+            "",
             VerifyLensMode::Full,
             RouteTaskIntent::Other,
             false,
@@ -4750,6 +4851,7 @@ mod tests {
             &[],
             &[],
             "claim",
+            "",
             VerifyLensMode::Full,
             RouteTaskIntent::Other,
             false,
@@ -4768,10 +4870,11 @@ mod tests {
                 "task",
                 "diff",
                 None,
-            &[],
+                &[],
                 &[],
                 &[],
                 "claim",
+                "",
                 lens_mode,
                 intent,
                 false,
@@ -4780,10 +4883,11 @@ mod tests {
                 "task",
                 "diff",
                 None,
-            &[],
+                &[],
                 &[],
                 &[],
                 "claim",
+                "",
                 lens_mode,
                 intent,
                 true,
@@ -4825,6 +4929,7 @@ mod tests {
             &[],
             &[],
             "claim",
+            "",
             VerifyLensMode::SpecOnly,
             RouteTaskIntent::Other,
             false,
@@ -4851,6 +4956,7 @@ mod tests {
             &[],
             &[],
             "claim",
+            "",
             VerifyLensMode::Full,
             RouteTaskIntent::Other,
             false,
@@ -4876,6 +4982,7 @@ mod tests {
             &["src/a.rs".to_string()],
             &[],
             "CLAIM",
+            "",
             lens_mode,
             intent,
             false,
@@ -5106,6 +5213,79 @@ mod tests {
         );
     }
 
+    /// 첨부 빌더 계약: 작은 UTF-8 파일은 전문 첨부·초과/비UTF-8은 스킵
+    /// 노트(`read_file` 안내)·빈 `diff_paths`는 빈 문자열(프롬프트 바이트 불변).
+    #[test]
+    fn verify_file_attachments_caps_and_skip_notes() {
+        assert_eq!(verify_file_attachments(&[], None), "");
+
+        let dir = std::env::temp_dir().join(format!(
+            "zo-verify-attach-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("small.py"), "def f():\n    return 1\n").expect("seed");
+        std::fs::write(
+            dir.join("big.py"),
+            "x".repeat(VERIFY_FILE_ATTACH_PER_FILE_BYTES + 1),
+        )
+        .expect("seed");
+        std::fs::write(dir.join("bin.dat"), [0xFF, 0xFE, 0x00, 0x9F]).expect("seed");
+
+        let section = verify_file_attachments(
+            &[
+                "small.py".to_string(),
+                "big.py".to_string(),
+                "bin.dat".to_string(),
+                "gone.py".to_string(),
+            ],
+            Some(&dir),
+        );
+        assert!(section.contains("FILE: small.py (attached in full"));
+        assert!(section.contains("def f():"));
+        assert!(section.contains("FILE: big.py (not attached: too large"));
+        assert!(!section.contains(&"x".repeat(64)), "oversized content must not leak");
+        assert!(section.contains("FILE: bin.dat (not attached: binary or non-UTF-8"));
+        assert!(section.contains("FILE: gone.py (not attached: unreadable or deleted"));
+        assert!(section.contains("deliver your verdict JSON in THIS response"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 첨부는 `SingleLens` 전용: `Full` 렌즈 프롬프트는 첨부를 건네도 바이트
+    /// 불변이고, `SpecOnly`는 첨부가 diff 뒤에 그대로 실린다. 빈 첨부의
+    /// `SpecOnly`도 종전과 바이트 동일(무발화 시 완전 무변화 핀).
+    #[test]
+    fn verify_prompt_attaches_files_only_on_single_lens() {
+        let build = |attached: &str, lens: VerifyLensMode| {
+            verify_prompt(
+                "task",
+                "diff",
+                None,
+                &[],
+                &[],
+                &[],
+                "claim",
+                attached,
+                lens,
+                RouteTaskIntent::Other,
+                false,
+            )
+        };
+        let attachment = "\n\nATTACHED-SENTINEL";
+        let spec_with = build(attachment, VerifyLensMode::SpecOnly);
+        let spec_without = build("", VerifyLensMode::SpecOnly);
+        assert!(spec_with.contains("ATTACHED-SENTINEL"));
+        assert_eq!(spec_with.replacen(attachment, "", 1), spec_without);
+
+        let full_with = build(attachment, VerifyLensMode::Full);
+        let full_without = build("", VerifyLensMode::Full);
+        assert!(!full_with.contains("ATTACHED-SENTINEL"));
+        assert_eq!(full_with, full_without);
+    }
+
     #[test]
     fn exec_green_checks_reports_only_post_edit_foreground_zero_exits() {
         let bash_use = |id: &str, command: &str| {
@@ -5196,6 +5376,7 @@ mod tests {
             &[],
             &[],
             "claim",
+            "",
             VerifyLensMode::Full,
             RouteTaskIntent::Other,
             false,
@@ -5221,6 +5402,7 @@ mod tests {
             &[],
             &[],
             "claim",
+            "",
             VerifyLensMode::Full,
             RouteTaskIntent::Other,
             false,
@@ -5652,6 +5834,7 @@ mod tests {
             &[],
             &["Business/Card/CardBusiness.cs".to_string()],
             "분석 완료 — 파일 변경 없음",
+            "",
             VerifyLensMode::Full,
             RouteTaskIntent::Other,
             false,
@@ -5687,6 +5870,7 @@ mod tests {
             &[],
             &["Business/Card/CardBusiness.cs".to_string()],
             "wrote the plan",
+            "",
             VerifyLensMode::Full,
             RouteTaskIntent::Other,
             false,
@@ -5705,6 +5889,7 @@ mod tests {
             &[],
             &[],
             "wrote the plan",
+            "",
             VerifyLensMode::Full,
             RouteTaskIntent::Other,
             false,
@@ -6158,6 +6343,7 @@ mod tests {
             &["src/focused.rs".to_string()],
             &[],
             "FOCUSED_ASSISTANT_CLAIM_MARKER",
+            "",
             VerifyLensMode::Full,
             RouteTaskIntent::Other,
             true,
