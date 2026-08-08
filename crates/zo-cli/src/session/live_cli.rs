@@ -745,6 +745,96 @@ fn value_was_scoped_by_us(value: &std::ffi::OsStr) -> bool {
 ///
 /// `fresh` clears any stale file at the target (new session); a resume leaves
 /// the existing per-session todos in place so the restored checklist survives.
+/// Sidecar path for a session's original system prompt
+/// (`<id>.system-prompt.json` next to `<id>.jsonl`, same convention as the
+/// todo store's `<id>.todos.json`).
+fn session_system_prompt_path(session_path: &std::path::Path) -> std::path::PathBuf {
+    session_path.with_extension("system-prompt.json")
+}
+
+/// Persist the system prompt an addressed session was CREATED with, so a
+/// later resume can reuse it verbatim instead of rebuilding (a rebuild embeds
+/// a fresh git-status snapshot, and any byte difference invalidates the
+/// entire provider cache prefix). Best-effort: a failed write only costs the
+/// resume its cache stability, never the session.
+fn persist_session_system_prompt(session_path: &std::path::Path, sections: &[String]) {
+    let path = session_system_prompt_path(session_path);
+    let Ok(payload) = serde_json::to_vec(sections) else {
+        return;
+    };
+    // LeaveAlone: the sessions directory already exists (the transcript lives
+    // there) and may sit under a shared temp root this process must not chmod.
+    let _ = core_types::paths::write_private_file(
+        &path,
+        &payload,
+        &core_types::paths::ParentDirPolicy::LeaveParent,
+    );
+}
+
+/// The system prompt an addressed session was created with, when its sidecar
+/// exists and parses. `None` (pre-sidecar sessions, corrupt file) falls back
+/// to a fresh rebuild — the pre-stabilization behavior.
+fn load_session_system_prompt(session_path: &std::path::Path) -> Option<Vec<String>> {
+    let raw = std::fs::read(session_system_prompt_path(session_path)).ok()?;
+    let sections: Vec<String> = serde_json::from_slice(&raw).ok()?;
+    // An empty prompt is a corrupt artifact, not a usable prompt.
+    (!sections.is_empty()).then_some(sections)
+}
+
+/// The system prompt for a (possibly resumed) session. A resumed session
+/// reuses its ORIGINAL prompt verbatim (the sidecar written at creation): the
+/// prompt embeds volatile facts — the git status snapshot above all — so a
+/// per-stage rebuild differs the moment stage 1 edits a file, and a changed
+/// system prompt invalidates the ENTIRE provider cache prefix (system is
+/// first), so every resumed stage re-ingested the whole history cold
+/// (observed: the long-lane ledger flagged "system prompt changed" at each
+/// stage boundary). Nothing is lost by reusing: everything that changed since
+/// creation was changed BY this conversation and is already in it. A resume
+/// without a sidecar (pre-sidecar sessions, corrupt file) rebuilds as before.
+/// Only an ADDRESSED (`--session-id`) fresh session pays the sidecar write —
+/// only those can be resumed later.
+fn session_system_prompt(
+    cwd: &std::path::Path,
+    scope: SessionScope,
+    model: &str,
+    session_path: &std::path::Path,
+    addressed_session: bool,
+    resumed_existing: bool,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if resumed_existing {
+        if let Some(stored) = load_session_system_prompt(session_path) {
+            return Ok(stored);
+        }
+    }
+    let built =
+        crate::conversation_support::build_system_prompt_for_mode(cwd, prompt_mode_for(scope), model)?;
+    if addressed_session && !resumed_existing {
+        persist_session_system_prompt(session_path, &built);
+    }
+    Ok(built)
+}
+
+/// The session a run starts with: session X when `--session-id X` was given
+/// (validated, resumed if its transcript exists), a fresh anonymous session
+/// otherwise. Returns `(session, resumed_existing)`.
+fn resolve_addressed_session(
+    explicit_session_id: Option<String>,
+    scope: SessionScope,
+    cwd: &std::path::Path,
+) -> Result<(Session, bool), Box<dyn std::error::Error>> {
+    let Some(id) = explicit_session_id else {
+        return Ok((Session::new(), false));
+    };
+    let id = id.trim();
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(
+            format!("--session-id must be non-empty and use only [A-Za-z0-9-]: {id:?}").into(),
+        );
+    }
+    let handle = create_managed_session_handle_at(id, scope, cwd)?;
+    session_for_explicit_id(id, &handle.path)
+}
+
 /// The session an explicit `--session-id` names: loaded when its transcript
 /// already exists in the scope, fresh otherwise. `--session-id X` ADDRESSES
 /// session X — it does not merely name a new one. The old create-only
@@ -1097,26 +1187,18 @@ impl LiveCli {
         // the first render — can read it. Honors `ZO_TODO_STORE` overrides
         // (tests, explicit scoping) by leaving non-default stores untouched.
         clear_stale_default_todo_store_at(&cwd);
-        let mut system_prompt = crate::conversation_support::build_system_prompt_for_mode(
-            &cwd,
-            prompt_mode_for(scope),
-            &model,
-        )?;
-        let (session_state, resumed_existing) = match explicit_session_id {
-            Some(id) => {
-                let id = id.trim();
-                if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-                    return Err(format!(
-                        "--session-id must be non-empty and use only [A-Za-z0-9-]: {id:?}"
-                    )
-                    .into());
-                }
-                let handle = create_managed_session_handle_at(id, scope, &cwd)?;
-                session_for_explicit_id(id, &handle.path)?
-            }
-            None => (Session::new(), false),
-        };
+        let addressed_session = explicit_session_id.is_some();
+        let (session_state, resumed_existing) =
+            resolve_addressed_session(explicit_session_id, scope, &cwd)?;
         let session = create_managed_session_handle_at(&session_state.session_id, scope, &cwd)?;
+        let mut system_prompt = session_system_prompt(
+            &cwd,
+            scope,
+            &model,
+            &session.path,
+            addressed_session,
+            resumed_existing,
+        )?;
         // Isolate this session's todo store so a second `zo` in the same cwd
         // (e.g. GPT and Claude side by side) does not share — and overwrite —
         // one `cwd/.zo-todos.json`. Same harness for every model; only the
@@ -4216,6 +4298,28 @@ mod explicit_session_id_tests {
             "the prior conversation must be visible to the resumed run"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn system_prompt_sidecar_roundtrips_and_rejects_corruption() {
+        let session_path = temp_session_path("sysprompt");
+        let sections = vec!["core prompt".to_string(), "git status: ?? a.py".to_string()];
+        super::persist_session_system_prompt(&session_path, &sections);
+        assert_eq!(
+            super::load_session_system_prompt(&session_path),
+            Some(sections),
+            "a stored prompt must round-trip verbatim"
+        );
+        // Corrupt sidecar → None (resume falls back to a fresh rebuild).
+        let sidecar = super::session_system_prompt_path(&session_path);
+        std::fs::write(&sidecar, b"{not json").expect("corrupt");
+        assert_eq!(super::load_session_system_prompt(&session_path), None);
+        // Empty prompt list is an artifact, not a prompt.
+        std::fs::write(&sidecar, b"[]").expect("empty");
+        assert_eq!(super::load_session_system_prompt(&session_path), None);
+        // Missing sidecar (pre-sidecar session) → None.
+        let _ = std::fs::remove_file(&sidecar);
+        assert_eq!(super::load_session_system_prompt(&session_path), None);
     }
 
     #[test]
