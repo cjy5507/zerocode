@@ -179,17 +179,6 @@ pub fn build_message_request(
     // dynamic band. The thinking BUDGET NUMBER above still incorporates the
     // deep-gate floor either way; only this named-tier merge is bypassed.
     let effort = effort_with_budget_floor(named_effort, effective_budget, effort_band_ceiling);
-    // A SingleLens verify verdict runs at the minimum reasoning tier (see
-    // `ApiRequest::suppress_thinking`). Replacing all three controls at once
-    // matters: adaptive Anthropic models treat an ABSENT effort as "model
-    // decides" and think by default, so suppression must send an explicit
-    // `low`, not nothing — and a live Smart band ceiling would re-resolve the
-    // level upward per difficulty, so it is parked too.
-    let (thinking, effort, effort_band_ceiling) = if request.suppress_thinking {
-        (None, Some(api::EffortLevel::Low), None)
-    } else {
-        (thinking, effort, effort_band_ceiling)
-    };
 
     MessageRequest {
         model: wire_model.clone(),
@@ -576,7 +565,6 @@ mod tests {
             messages: Arc::new(messages),
             tool_choice: None,
             effort_override: None,
-            suppress_thinking: false,
             model_override: None,
         };
         build_message_request(&request, model, true, None, registry, None, None, None)
@@ -712,44 +700,6 @@ mod tests {
         assert!(text.contains("reconnecting in 4s (attempt 2/3)"), "text: {text}");
     }
 
-    /// `suppress_thinking` (a `SingleLens` verify verdict) must drop BOTH wire
-    /// controls — the legacy `thinking.budget_tokens` and the adaptive named
-    /// effort — even when a floor or an explicit preset would otherwise raise
-    /// them. Either control alone re-enables extended thinking wire-side.
-    #[test]
-    fn suppress_thinking_drops_budget_and_named_effort() {
-        let request = ApiRequest {
-            system_prompt: Arc::from(Vec::<String>::new()),
-            wire_reminders: Arc::from(Vec::<String>::new()),
-            messages: Arc::new(Vec::new()),
-            tool_choice: None,
-            effort_override: Some(16_000),
-            suppress_thinking: true,
-            model_override: None,
-        };
-        let wire = build_message_request(
-            &request,
-            "claude-opus-5",
-            false,
-            None,
-            &GlobalToolRegistry::builtin(),
-            Some(api::ThinkingConfig::enabled(20_000)),
-            Some(api::EffortLevel::High),
-            Some(api::EffortLevel::Xhigh),
-        );
-        assert_eq!(wire.thinking, None, "budget control must be dropped");
-        assert_eq!(
-            wire.effort,
-            Some(api::EffortLevel::Low),
-            "adaptive models treat absent effort as 'model decides' and think \
-             by default — suppression must send an explicit minimum tier"
-        );
-        assert_eq!(
-            wire.effort_band_ceiling, None,
-            "a live Smart band would re-resolve the level upward"
-        );
-    }
-
     #[test]
     fn build_message_request_preserves_named_ultra_alongside_20k_budget() {
         let request = ApiRequest {
@@ -758,7 +708,6 @@ mod tests {
             messages: Arc::new(Vec::new()),
             tool_choice: None,
             effort_override: None,
-            suppress_thinking: false,
             model_override: None,
         };
         let wire = build_message_request(
@@ -795,7 +744,6 @@ mod tests {
             messages: Arc::new(Vec::new()),
             tool_choice: None,
             effort_override: None,
-            suppress_thinking: false,
             model_override: None,
         };
         let wire = build_message_request(
@@ -824,7 +772,6 @@ mod tests {
             messages: Arc::new(Vec::new()),
             tool_choice: None,
             effort_override: None,
-            suppress_thinking: false,
             model_override: None,
         };
         let wire = build_message_request(

@@ -1877,10 +1877,12 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
                 wire_reminders: Arc::from(Vec::new()),
                 messages: Arc::new(request_messages),
                 tool_choice: None,
-                // Compaction summary never escalates effort — and a summary
-                // needs no extended thinking either.
+                // Compaction summary never escalates effort. Do NOT disable
+                // thinking here either: a thinking-config change invalidates
+                // the provider's message-level prompt cache, so a summary
+                // request over a large conversation would re-bill the entire
+                // prefix as cache-write (measured: ~14-25k tokens per toggle).
                 effort_override: None,
-                suppress_thinking: true,
                 model_override: None,
             };
         }
@@ -1889,10 +1891,9 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
             wire_reminders: Arc::from(Vec::new()),
             messages: Arc::new(crate::compact::pretrim_messages_for_summary(messages)),
             tool_choice: None,
-            // Compaction summary never escalates effort — and a summary
-            // needs no extended thinking either.
+            // Compaction summary never escalates effort (thinking stays
+            // untouched too — see the cache-invalidation note above).
             effort_override: None,
-            suppress_thinking: true,
             model_override,
         }
     }

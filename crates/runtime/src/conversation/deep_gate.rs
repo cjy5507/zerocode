@@ -2918,12 +2918,12 @@ where
             // read-only `bash` grant) and always restores the prior mode. When a
             // cross-model verifier is installed the leg runs on it (native
             // fallback inside `verify_subturn`).
-            // A SingleLens verdict is analysis-shaped: run the leg without
-            // extended thinking (accuracy-neutral per the effort bench, and
-            // the leg inheriting the EXEC stage's High effort was the largest
-            // wall component of a long-lane stage). Cleared right after the
-            // leg either way.
-            self.verify_thinking_suppressed = depth == VerifyDepth::SingleLens;
+            // The leg deliberately inherits the session's thinking/effort
+            // config unchanged: any per-leg config delta (e.g. disabling
+            // thinking for a SingleLens verdict) invalidates the provider's
+            // message-level prompt cache and re-bills the whole conversation
+            // prefix as cache-write — measured at 14-25k tokens per leg,
+            // dwarfing the few hundred thinking tokens it would save.
             let verify_result = self
                 .verify_subturn(
                     verify_prompt(
@@ -2954,7 +2954,6 @@ where
                     &prompter,
                 )
                 .await;
-            self.verify_thinking_suppressed = false;
             // A failed VERIFY leg (transient streaming error) must NOT throw away
             // the EXEC edits already applied this attempt. Fold a conservative
             // non-accept (Timeout) so the loop retries or gives up at the cap,
@@ -3750,12 +3749,12 @@ where
                 None => "deep: VERIFY phase (read-only)…".to_string(),
             };
             deep_note(&render_tx, &ids, verify_note).await;
-            // A SingleLens verdict is analysis-shaped: run the leg without
-            // extended thinking (accuracy-neutral per the effort bench, and
-            // the leg inheriting the EXEC stage's High effort was the largest
-            // wall component of a long-lane stage). Cleared right after the
-            // leg either way.
-            self.verify_thinking_suppressed = depth == VerifyDepth::SingleLens;
+            // The leg deliberately inherits the session's thinking/effort
+            // config unchanged: any per-leg config delta (e.g. disabling
+            // thinking for a SingleLens verdict) invalidates the provider's
+            // message-level prompt cache and re-bills the whole conversation
+            // prefix as cache-write — measured at 14-25k tokens per leg,
+            // dwarfing the few hundred thinking tokens it would save.
             let verify_result = self
                 .verify_subturn(
                     verify_prompt(
@@ -3786,7 +3785,6 @@ where
                     &prompter,
                 )
                 .await;
-            self.verify_thinking_suppressed = false;
             // A failed VERIFY leg (transient streaming error) must NOT throw away
             // the EXEC edits already applied this attempt via `?`. Fold a
             // conservative non-accept (Timeout) so the loop retries or gives up at

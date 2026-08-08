@@ -906,13 +906,6 @@ pub struct ConversationRuntime<C, T> {
     /// of the quota fallback shadowing the verifier. Restored by the guard's
     /// `Drop`, so a cancelled verify leg cannot leave it stuck on.
     deep_verify_leg_active: bool,
-    /// True while a `SingleLens` deep-VERIFY leg runs: every request assembled
-    /// in that window carries `ApiRequest::suppress_thinking`, dropping
-    /// extended thinking for the verdict (analysis-shaped work the effort
-    /// bench measured as accuracy-neutral at thinking-Off). Set and cleared
-    /// around the verify sub-turn at both deep-loop call sites, same
-    /// discipline as `set_effort_override`.
-    verify_thinking_suppressed: bool,
     /// True while a PLAN leg uses [`Self::deep_plan_client`]. Kept separate
     /// from VERIFY because only VERIFY walks the ranked candidate ladder.
     deep_plan_leg_active: bool,
@@ -1401,7 +1394,6 @@ where
             overload_demotion_model: None,
             overload_demoted_this_turn: false,
             deep_verify_leg_active: false,
-            verify_thinking_suppressed: false,
             deep_verify_candidates: Vec::new(),
             deep_verify_candidate_idx: 0,
             deep_verify_succeeded_model: None,

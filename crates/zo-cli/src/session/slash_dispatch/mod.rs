@@ -735,7 +735,6 @@ mod allowed_tools_turn_scoping_tests {
             messages: Arc::new(Vec::new()),
             tool_choice: None,
             effort_override: None,
-            suppress_thinking: false,
             model_override: None,
         };
         let wire = build_message_request(

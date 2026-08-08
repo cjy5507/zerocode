@@ -1547,27 +1547,16 @@ impl ApiClient for AnthropicRuntimeClient {
         // without them only the system blocks cache and every call re-bills
         // the full transcript as uncached input.
         runtime::mark_conversation_cache_breakpoints(&mut messages);
-        // A SingleLens verify verdict runs at the minimum reasoning tier (see
-        // `ApiRequest::suppress_thinking` and the runtime_bridge mirror):
-        // adaptive Anthropic models treat an ABSENT effort as "model decides"
-        // and think by default, so suppression sends an explicit `low` and
-        // parks the numeric budget, named preset, and Smart band ceiling.
-        let (thinking, effort, effort_band_ceiling) = if request.suppress_thinking {
-            (None, Some(api::EffortLevel::Low), None)
-        } else {
-            (
-                effective_budget.map_or_else(
-                    || self.thinking.clone(),
-                    |b| Some(api::ThinkingConfig::enabled(b)),
-                ),
-                crate::session::runtime_bridge::effort_with_budget_floor(
-                    self.named_effort,
-                    effective_budget,
-                    self.effort_band_ceiling,
-                ),
-                self.effort_band_ceiling,
-            )
-        };
+        let thinking = effective_budget.map_or_else(
+            || self.thinking.clone(),
+            |b| Some(api::ThinkingConfig::enabled(b)),
+        );
+        let effort = crate::session::runtime_bridge::effort_with_budget_floor(
+            self.named_effort,
+            effective_budget,
+            self.effort_band_ceiling,
+        );
+        let effort_band_ceiling = self.effort_band_ceiling;
         let message_request = MessageRequest {
             model: wire_model.clone(),
             max_tokens: crate::max_tokens_for_model(&wire_model),
