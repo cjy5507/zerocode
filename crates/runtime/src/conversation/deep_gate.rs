@@ -2260,7 +2260,9 @@ fn design_lens_verify_prompt(context: &VerifyPromptContext<'_>) -> String {
          Respond with ONLY a single-line JSON object and NOTHING else — no prose, no markdown \
          code fences, no extra keys, and no text before or after it. Use exactly these scalar \
          verdict keys (accepted, issues, evidence). List each concrete design defect in issues, and \
-         cite what you actually inspected in evidence:\n\
+         cite what you actually inspected in evidence — at most two short sentences naming the \
+         decisive facts, never a narration of your process (issues may be as detailed as a \
+         rejection needs):\n\
          {VERIFY_SCALAR_ACCEPT_EXAMPLE}\n\
          or\n\
          {VERIFY_SCALAR_REJECT_EXAMPLE}\n"
@@ -2302,7 +2304,9 @@ fn spec_only_verify_prompt(context: &VerifyPromptContext<'_>) -> String {
              Respond with ONLY a single-line JSON object and NOTHING else — no prose, no markdown \
              code fences, no extra keys, and no text before or after it. Use exactly these scalar \
              verdict keys (accepted, issues, evidence). List each concrete unmet task requirement \
-             in issues, and cite what you actually inspected in evidence:\n\
+             in issues, and cite what you actually inspected in evidence — at most two short \
+             sentences naming the decisive facts, never a narration of your process (issues may \
+             be as detailed as a rejection needs):\n\
              {VERIFY_SCALAR_ACCEPT_EXAMPLE}\n\
              or\n\
              {VERIFY_SCALAR_REJECT_EXAMPLE}\n"
