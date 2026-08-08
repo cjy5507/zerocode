@@ -1555,16 +1555,12 @@ impl LiveCli {
                 .tool_registry_mut()
                 .context()
                 .set_session_id(&self.session.id);
-            // 세션 스왑은 ToolContext를 재생성하지 않으므로 read-before-edit
-            // 레지스트리를 명시적으로 비운다 — 이전 대화의 읽기 기록이 새
-            // 대화의 edit 가드를 통과시키면 안 된다.
-            rt.tool_executor_mut()
-                .tool_registry_mut()
-                .context()
-                .file_reads
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
+            // read-before-edit 레지스트리는 아래 refresh_agent_manifest_scope →
+            // refresh_file_reads_scope가 새 세션 사이드카로 rebind하며 교체한다.
+            // 여기서 직접 clear()하면 안 된다: 이 시점의 레지스트리는 아직
+            // 이전 세션 사이드카에 바인드돼 있어, clear의 write-through가
+            // 이전 세션의 신선도 기준선을 지워 버린다(/clear는 이전 세션을
+            // /resume 가능하게 보존하는 명령이다).
         } else {
             return Err("runtime not available".into());
         }
@@ -1668,17 +1664,14 @@ impl LiveCli {
                 .tool_registry_mut()
                 .context()
                 .set_session_id(&session_id);
-            // 세션 스왑은 ToolContext를 재생성하지 않으므로 read-before-edit
-            // 레지스트리를 명시적으로 비운다 — 다른 세션의 읽기 기록이 재개된
-            // 대화의 edit 가드를 통과시키면 안 된다. (재개 세션이 과거에 읽은
-            // 파일도 그 사이 바뀌었을 수 있어 재읽기가 정직한 기준선이다.)
-            rt.tool_executor_mut()
-                .tool_registry_mut()
-                .context()
-                .file_reads
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
+            // read-before-edit 레지스트리는 아래 refresh_agent_manifest_scope →
+            // refresh_file_reads_scope가 재개 세션의 사이드카로 rebind하며
+            // 복원한다(다른 세션의 기록은 rebind가 교체하므로 누출 불가).
+            // 과거의 수동 clear는 "그 사이 바뀌었을 수 있다"는 보수적
+            // 기준선이었지만, 사이드카가 마지막 관측 해시를 보존하므로 바뀐
+            // 파일만 정확히 ModifiedSinceRead에 걸린다 — 재읽기 전면 강요보다
+            // 엄밀히 낫다. 직접 clear()하면 이전 세션 사이드카(아직 바인드
+            // 중)에 빈 상태가 write-through되는 부작용도 있다.
         } else {
             return Err("runtime not available".into());
         }

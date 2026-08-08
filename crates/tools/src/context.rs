@@ -612,6 +612,21 @@ impl ToolContext {
         crate::file_tools::restore_workspace_checkpoint(self, None, target_turn_index, force)
     }
 
+    /// Rebind the read-before-edit registry to a session's sidecar
+    /// (`<session>.file-reads.json`) and restore whatever it recorded —
+    /// [`runtime::FileReadRegistry::rebind_sidecar`]. Every session
+    /// create/swap/resume must pass through here (mirror of
+    /// [`Self::reset_workspace_checkpoint_session`]): a resumed conversation
+    /// keeps the freshness baseline it actually observed, while a swap can
+    /// never leak the previous conversation's read history into the new
+    /// guard. `None` unbinds (in-memory only — subagent contexts).
+    pub fn reset_file_reads_session(&self, sidecar: Option<std::path::PathBuf>) {
+        self.file_reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rebind_sidecar(sidecar);
+    }
+
     pub fn reset_workspace_checkpoint_session(
         &self,
         durable_dir: Option<std::path::PathBuf>,

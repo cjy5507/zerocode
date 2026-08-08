@@ -1058,6 +1058,25 @@ impl LiveCli {
                 eprintln!("warning: failed to load workspace checkpoints: {error}");
             }
         }
+        self.refresh_file_reads_scope();
+    }
+
+    /// Rebind the read-before-edit registry to this session's sidecar
+    /// (`<id>.file-reads.json`, same convention as `<id>.todos.json`). A
+    /// resumed session restores the freshness baseline it last observed, so
+    /// its first `edit_file` of a file the conversation itself wrote is no
+    /// longer rejected with "has not been read in this conversation"
+    /// (long-lane measured: a failed-edit → re-read → retry loop of two extra
+    /// API calls per resumed stage). Externally modified files still hash-
+    /// mismatch into `ModifiedSinceRead`, so the guard is not weakened.
+    fn refresh_file_reads_scope(&mut self) {
+        if let Some(runtime) = self.runtime.runtime.as_mut() {
+            runtime
+                .tool_executor_mut()
+                .tool_registry_mut()
+                .context()
+                .reset_file_reads_session(Some(self.session.path.with_extension("file-reads.json")));
+        }
     }
 
     /// Construct a CLI whose session persistence is governed by `scope`.
@@ -1416,6 +1435,14 @@ impl LiveCli {
         permission_mode: PermissionMode,
         thinking: Option<api::ThinkingConfig>,
     ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
+        // Capture before `session` moves: every rebuilt runtime gets a FRESH
+        // `ToolContext` from `runtime_builder`, so the read-before-edit
+        // registry must be rebound here or per-turn runtimes (the headless
+        // `prepare_turn_runtime` above all) run unbound and a resumed stage's
+        // first edit is rejected despite the sidecar existing.
+        let file_reads_sidecar = session
+            .persistence_path()
+            .map(|path| path.with_extension("file-reads.json"));
         let mut runtime = build_runtime_with_optional_mcp_config(
             &self.cwd,
             self.mcp_config.as_ref(),
@@ -1434,6 +1461,13 @@ impl LiveCli {
             crate::runtime_support::StartupAuthPolicy::Require,
         )?;
         self.apply_spawn_model_context(&mut runtime);
+        if let Some(inner) = runtime.try_runtime_mut() {
+            inner
+                .tool_executor_mut()
+                .tool_registry_mut()
+                .context()
+                .reset_file_reads_session(file_reads_sidecar);
+        }
         Ok(runtime)
     }
 

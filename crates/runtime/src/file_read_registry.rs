@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// `edit_file`/`write_file` 가드가 소비하는 신선도 판정.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,9 +50,34 @@ struct FileSnapshot {
 
 /// 대화 스코프 `path → 스냅샷` 맵. 키는 canonicalize된 절대 경로라
 /// 상대/절대·심링크 표기가 달라도 같은 파일은 같은 엔트리로 수렴한다.
+///
+/// ## 사이드카 영속 (resume가 프로세스 경계를 넘는 이유)
+///
+/// 가드의 선언적 의미론은 "이 **대화**에서 읽었는가"인데, 레지스트리가
+/// 프로세스 인메모리로만 살면 `--session-id`/`/resume`로 이어받은 대화가
+/// 자기 자신이 만든 파일의 첫 편집마다 거부당한다(장기 lane 실측: 스테이지당
+/// 실패-재읽기-재시도 +2 API 콜). [`Self::rebind_sidecar`]로 세션 사이드카에
+/// 바인드하면 모든 기록·클리어가 write-through되고, resume가 마지막 관측
+/// 해시를 복원한다 — 그 사이 디스크가 바뀐 파일은 여전히 해시 불일치로
+/// [`FileFreshness::ModifiedSinceRead`]에 걸리므로 가드는 약화되지 않는다.
 #[derive(Debug, Default)]
 pub struct FileReadRegistry {
     entries: HashMap<PathBuf, FileSnapshot>,
+    /// 영속 대상 파일(`<session>.file-reads.json`). `None`이면 순수 인메모리
+    /// (서브에이전트의 fresh `ToolContext` 등) — 종전 동작 그대로.
+    sidecar: Option<PathBuf>,
+}
+
+/// 사이드카 JSON 한 행. `mtime`은 epoch 기준 `(secs, nanos)`로 저장해
+/// `SystemTime` 왕복이 무손실이다(pre-epoch mtime은 `None`으로 강등 —
+/// 빠른 경로만 포기하고 hash 판정은 그대로).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedObservation {
+    path: PathBuf,
+    mtime_secs: Option<u64>,
+    mtime_nanos: Option<u32>,
+    len: u64,
+    hash: u64,
 }
 
 impl FileReadRegistry {
@@ -98,6 +123,76 @@ impl FileReadRegistry {
             Err(_) => {
                 self.entries.remove(&key);
             }
+        }
+        self.persist_sidecar();
+    }
+
+    /// 사이드카를 교체 바인드하고 그 내용으로 엔트리를 복원한다(파일 부재·
+    /// 손상은 빈 레지스트리 = 종전 fresh 동작). 세션 생성/스왑/재개가 모두
+    /// 이 한 곳을 지나므로, 이전 세션의 기록이 새 세션의 가드를 통과시키는
+    /// 오염 경로가 없다. 바인드 자체는 디스크에 쓰지 않는다 — resume가
+    /// 자기 사이드카를 로드 전에 빈 상태로 덮어쓰면 안 되기 때문.
+    pub fn rebind_sidecar(&mut self, sidecar: Option<PathBuf>) {
+        self.sidecar = sidecar;
+        self.entries = self.load_sidecar_entries();
+    }
+
+    fn load_sidecar_entries(&self) -> HashMap<PathBuf, FileSnapshot> {
+        let Some(path) = self.sidecar.as_ref() else {
+            return HashMap::new();
+        };
+        let Ok(raw) = fs::read(path) else {
+            return HashMap::new();
+        };
+        let Ok(rows) = serde_json::from_slice::<Vec<PersistedObservation>>(&raw) else {
+            return HashMap::new();
+        };
+        rows.into_iter()
+            .map(|row| {
+                let mtime = row.mtime_secs.map(|secs| {
+                    UNIX_EPOCH + Duration::new(secs, row.mtime_nanos.unwrap_or(0))
+                });
+                (
+                    row.path,
+                    FileSnapshot {
+                        mtime,
+                        len: row.len,
+                        hash: row.hash,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// 현재 엔트리를 사이드카에 write-through한다(바인드 없으면 no-op).
+    /// tmp+rename 원자 교체·베스트에포트 — 실패해도 편집은 계속되고,
+    /// 다음 resume가 재읽기를 요구하는 보수적 방향으로만 퇴화한다.
+    fn persist_sidecar(&self) {
+        let Some(path) = self.sidecar.as_ref() else {
+            return;
+        };
+        let rows: Vec<PersistedObservation> = self
+            .entries
+            .iter()
+            .map(|(entry_path, snapshot)| {
+                let epoch = snapshot
+                    .mtime
+                    .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok());
+                PersistedObservation {
+                    path: entry_path.clone(),
+                    mtime_secs: epoch.map(|d| d.as_secs()),
+                    mtime_nanos: epoch.map(|d| d.subsec_nanos()),
+                    len: snapshot.len,
+                    hash: snapshot.hash,
+                }
+            })
+            .collect();
+        let Ok(payload) = serde_json::to_vec(&rows) else {
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        if fs::write(&tmp, payload).is_ok() {
+            let _ = fs::rename(&tmp, path);
         }
     }
 
@@ -145,9 +240,11 @@ impl FileReadRegistry {
         self.entries.is_empty()
     }
 
-    /// 모든 기록 제거 — 대화 리셋(/clear류) 배선용.
+    /// 모든 기록 제거 — 대화 리셋(/clear류) 배선용. 사이드카에도 반영해
+    /// 다음 resume가 클리어 이전 상태를 부활시키지 못하게 한다.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.persist_sidecar();
     }
 }
 
@@ -246,6 +343,74 @@ mod tests {
         registry.record_from_disk(&dotted);
         assert_eq!(registry.check(&file), FileFreshness::Fresh);
         assert_eq!(registry.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 사이드카 왕복: 기록 → 새 레지스트리가 rebind로 복원 → 무변경 파일은
+    /// Fresh(재읽기 강요 없음 = resume 첫 편집 거부 버그의 핀).
+    #[test]
+    fn sidecar_roundtrip_restores_fresh_across_registries() {
+        let dir = temp_path("sidecar-dir");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("a.txt");
+        let sidecar = dir.join("session.file-reads.json");
+        std::fs::write(&file, "v1").expect("seed");
+
+        let mut writer = FileReadRegistry::new();
+        writer.rebind_sidecar(Some(sidecar.clone()));
+        writer.record_from_disk(&file);
+        assert!(sidecar.exists(), "record must write through to the sidecar");
+
+        let mut resumed = FileReadRegistry::new();
+        resumed.rebind_sidecar(Some(sidecar.clone()));
+        assert_eq!(resumed.len(), 1, "rebind must restore persisted entries");
+        assert_eq!(resumed.check(&file), FileFreshness::Fresh);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// resume 후에도 외부 변경은 잡혀야 가드가 약화되지 않은 것이다:
+    /// 영속된 해시와 다른 디스크 내용은 `ModifiedSinceRead`.
+    #[test]
+    fn sidecar_restore_still_rejects_externally_modified_files() {
+        let dir = temp_path("sidecar-mod-dir");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("a.txt");
+        let sidecar = dir.join("session.file-reads.json");
+        std::fs::write(&file, "v1").expect("seed");
+
+        let mut writer = FileReadRegistry::new();
+        writer.rebind_sidecar(Some(sidecar.clone()));
+        writer.record_from_disk(&file);
+
+        // 프로세스 경계 사이의 외부 편집.
+        std::fs::write(&file, "v2-external").expect("external edit");
+
+        let mut resumed = FileReadRegistry::new();
+        resumed.rebind_sidecar(Some(sidecar.clone()));
+        assert_eq!(resumed.check(&file), FileFreshness::ModifiedSinceRead);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 손상 사이드카는 빈 레지스트리(종전 fresh 동작)로 퇴화하고, clear는
+    /// 사이드카에도 반영돼 다음 resume가 클리어 이전 상태를 못 살린다.
+    #[test]
+    fn corrupt_sidecar_degrades_to_empty_and_clear_writes_through() {
+        let dir = temp_path("sidecar-corrupt-dir");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("a.txt");
+        let sidecar = dir.join("session.file-reads.json");
+        std::fs::write(&file, "v1").expect("seed");
+        std::fs::write(&sidecar, b"{not json").expect("corrupt seed");
+
+        let mut registry = FileReadRegistry::new();
+        registry.rebind_sidecar(Some(sidecar.clone()));
+        assert!(registry.is_empty(), "corrupt sidecar must not poison state");
+
+        registry.record_from_disk(&file);
+        registry.clear();
+        let mut resumed = FileReadRegistry::new();
+        resumed.rebind_sidecar(Some(sidecar));
+        assert!(resumed.is_empty(), "clear must persist the empty state");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
