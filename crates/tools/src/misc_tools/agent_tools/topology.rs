@@ -114,36 +114,60 @@ fn seen_output_from_completion(
     .into_iter()
     .next()
     .filter(|completion| completion.status != "still_running");
-    let Some(completion) = completion else {
-        // The completion store holds results for a bounded window in THIS
-        // process; a manifest can outlive it (another process, an old run).
-        // Refusing is honest — the alternative silently injects nothing.
-        return Err(ToolError::InvalidInput(format!(
-            "sees: agent '{reference}' finished, but its result is no longer held by this \
-             process (results are kept for a bounded window after completion) — include the \
-             needed context in the prompt directly instead"
-        )));
-    };
     // Structured-first, text fallback: the same payload precedence the
-    // workflow engine's `item_text_for_mapping` established.
-    let raw = completion
-        .structured
-        .as_ref()
-        .map(|value| serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()))
-        .or_else(|| completion.result.clone())
-        .unwrap_or_default();
+    // workflow engine's `item_text_for_mapping` established. When the in-memory
+    // completion is gone, the deliverable is still on disk — read it there
+    // rather than refusing an edge that is perfectly valid.
+    let (status, raw) = match completion {
+        Some(completion) => {
+            let raw = completion
+                .structured
+                .as_ref()
+                .map(|value| {
+                    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+                })
+                .or_else(|| completion.result.clone())
+                .unwrap_or_default();
+            (completion.status, raw)
+        }
+        None => (
+            manifest.status.clone(),
+            persisted_deliverable(manifest).unwrap_or_default(),
+        ),
+    };
     if raw.trim().is_empty() {
         return Err(ToolError::InvalidInput(format!(
-            "sees: agent '{reference}' finished with status '{}' but produced no deliverable \
-             to share — nothing would be injected",
-            completion.status
+            "sees: agent '{reference}' finished with status '{status}' but produced no \
+             deliverable to share — nothing would be injected"
         )));
     }
     Ok(SeenAgentOutput {
         name: reference.to_string(),
         agent_id: manifest.agent_id.clone(),
-        status: completion.status,
+        status,
         payload: core_types::text::elide_middle(&raw, crate::misc_tools::AGENT_RESULT_RELAY_CHARS),
+    })
+}
+
+/// A finished agent's deliverable as persisted on disk.
+///
+/// The completion store is per-process and bounded (one hour, 256 entries), but
+/// the deliverable itself is durable: a completed agent's final response is a
+/// section of its output file, and the streamed tail is on the manifest. Every
+/// long session, wide fan-out, and resumed run outlives that memory window, so
+/// resolving only from it made a valid edge fail — and the refusal told the
+/// model to paste the context by hand, which is the work `sees` exists to
+/// remove. Same shaping as the dead-worker reconciler uses.
+fn persisted_deliverable(manifest: &AgentOutput) -> Option<String> {
+    let from_file = super::manifest::read_agent_output(manifest)
+        .ok()
+        .and_then(|body| {
+            body.rsplit_once("\n### Final response\n\n")
+                .map(|(_, result)| result.trim().to_string())
+        })
+        .filter(|result| !result.is_empty());
+    from_file.or_else(|| {
+        Some(manifest.output_tail.trim().to_string()).filter(|tail| !tail.is_empty())
     })
 }
 
@@ -298,18 +322,36 @@ mod tests {
         assert_eq!(back.sees, vec!["builder", "reviewer"]);
     }
 
+    /// The completion store is per-process and bounded (one hour, 256 agents),
+    /// but the deliverable is durable. An edge into an agent whose completion
+    /// has aged out must still resolve — from the manifest's streamed tail when
+    /// the output file is not reachable — because every long session, wide
+    /// fan-out, and resumed run outlives that memory window. Refusing here is
+    /// what taught the model to paste context by hand instead.
     #[test]
-    fn a_result_evicted_from_the_completion_store_refuses_instead_of_injecting_nothing() {
-        // Manifest says completed, but no completion is held in this process
-        // (evicted/other-process). Silent empty injection is the failure mode
-        // this guards against.
-        let evicted = resolve_seen_outputs_with(&["topo-evicted-agent".to_string()], |reference| {
+    fn an_evicted_completion_still_resolves_from_the_persisted_deliverable() {
+        let mut manifest = manifest_fixture("topo-evicted-agent", "completed");
+        manifest.output_tail = "the builder's persisted deliverable".to_string();
+        let resolved = resolve_seen_outputs_with(&["topo-evicted-agent".to_string()], |_| {
+            Some(manifest.clone())
+        })
+        .expect("a durable deliverable resolves without the in-memory completion");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].payload, "the builder's persisted deliverable");
+        assert_eq!(resolved[0].status, "completed");
+    }
+
+    /// Only when nothing survives anywhere is the refusal honest — injecting an
+    /// empty section would leave the agent believing it was handed context.
+    #[test]
+    fn an_agent_with_no_deliverable_anywhere_still_refuses() {
+        let refused = resolve_seen_outputs_with(&["topo-empty-agent".to_string()], |reference| {
             Some(manifest_fixture(reference, "completed"))
         })
-        .expect_err("evicted result must refuse");
+        .expect_err("nothing to inject must refuse");
         assert!(
-            evicted.to_string().contains("no longer held"),
-            "unexpected error: {evicted}"
+            refused.to_string().contains("no deliverable"),
+            "unexpected error: {refused}"
         );
     }
 
