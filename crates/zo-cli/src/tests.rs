@@ -462,6 +462,7 @@ fn parses_prompt_subcommand() {
             no_follow: false,
             session_id: None,
             fallback_model: None,
+            check_command: None,
         }
     );
 }
@@ -678,6 +679,7 @@ fn parses_bare_prompt_and_json_output_flag() {
             no_follow: false,
             session_id: None,
             fallback_model: None,
+            check_command: None,
         }
     );
 }
@@ -798,6 +800,7 @@ fn resolves_model_aliases_in_args() {
             no_follow: false,
             session_id: None,
             fallback_model: None,
+            check_command: None,
         }
     );
 }
@@ -1114,6 +1117,7 @@ fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
             no_follow: false,
             session_id: None,
             fallback_model: None,
+            check_command: None,
         }
     );
 }

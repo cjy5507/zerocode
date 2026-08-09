@@ -51,6 +51,7 @@ pub(crate) const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--add-dir",
     "--settings",
     "--session-id",
+    "--check",
     "--fallback-model",
     "--from-turn",
     "--strict-mcp-config",
@@ -121,6 +122,11 @@ pub(crate) enum CliAction {
         /// Retry-once model when the primary fails on overload/rate-limit
         /// (`--fallback-model`, CC parity).
         fallback_model: Option<String>,
+        /// Objective check command for the deep gate (`--check`, first-class
+        /// door for the engine previously reachable only through the
+        /// `ZO_AUTO_VERIFY_CMD` env var): the run's edits are verified against
+        /// this command exiting 0.
+        check_command: Option<String>,
     },
     Login {
         provider: Option<String>,
@@ -334,6 +340,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut fullscreen = false;
     let mut session_id_override: Option<String> = None;
     let mut fallback_model: Option<String> = None;
+    let mut check_command: Option<String> = None;
     let mut fork_session = false;
     let mut _cwd_override: Option<PathBuf> = None;
     let mut rest = Vec::new();
@@ -371,6 +378,23 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             flag if flag.starts_with("--session-id=") => {
                 session_id_override = Some(flag[13..].to_string());
+                index += 1;
+            }
+            // `update --check` / `doctor --check` keep their bare boolean
+            // meaning (read-only check mode) — the value-taking objective
+            // check applies to prompt runs only, so once one of those
+            // subcommands is on `rest` this flag falls through to them.
+            "--check"
+                if !rest
+                    .iter()
+                    .any(|token| token == "update" || token == "doctor") =>
+            {
+                let value = next_value(args, index, "--check")?;
+                check_command = Some(value.clone());
+                index += 2;
+            }
+            flag if flag.starts_with("--check=") => {
+                check_command = Some(flag[8..].to_string());
                 index += 1;
             }
             "--fallback-model" => {
@@ -491,6 +515,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     no_follow,
                     session_id: session_id_override,
                     fallback_model,
+                    check_command,
                 });
             }
             "--print" => {
@@ -754,6 +779,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 no_follow,
                 session_id: session_id_override.clone(),
                 fallback_model: fallback_model.clone(),
+                check_command: check_command.clone(),
             })
         }
         other if other.starts_with('/') => {
@@ -778,6 +804,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             no_follow,
             session_id: session_id_override,
             fallback_model,
+            check_command,
         }),
     }
 }
@@ -1495,7 +1522,7 @@ mod format_parse_tests {
 
 #[cfg(test)]
 mod suggestion_coverage_tests {
-    use super::{format_unknown_option, parse_args, CLI_OPTION_SUGGESTIONS};
+    use super::{format_unknown_option, parse_args, CliAction, CLI_OPTION_SUGGESTIONS};
 
     /// Every long flag the parser accepts, so a typo of any of them lands in the
     /// did-you-mean set. This list is the source of truth for the guard below:
@@ -1574,6 +1601,22 @@ mod suggestion_coverage_tests {
                 message.contains(expected),
                 "expected {expected} suggested for {typo}, got: {message}"
             );
+        }
+    }
+
+    /// `--check` is the first-class door for the headless objective check:
+    /// both spellings parse onto `CliAction::Prompt::check_command`.
+    #[test]
+    fn check_flag_parses_in_both_spellings() {
+        for argv in [
+            vec!["--check".to_string(), "npm test".to_string(), "prompt".to_string(), "fix".to_string()],
+            vec!["--check=npm test".to_string(), "prompt".to_string(), "fix".to_string()],
+        ] {
+            let action = parse_args(&argv).expect("must parse");
+            let CliAction::Prompt { check_command, .. } = action else {
+                panic!("expected a prompt action: {argv:?}");
+            };
+            assert_eq!(check_command.as_deref(), Some("npm test"), "{argv:?}");
         }
     }
 

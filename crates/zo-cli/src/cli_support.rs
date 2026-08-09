@@ -96,6 +96,8 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
             "  --dangerously-skip-permissions  Skip all permission checks",
             "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)",
             "  --max-turns N              Cap the non-interactive agentic loop",
+            "  --check CMD                Objective check for this run: edits are auto-verified",
+            "                             against CMD exiting 0 (e.g. --check \"npm test\")",
             "  --max-tool-calls N         Cap model-requested tool calls per non-interactive turn",
             "  --settings FILE            Merge an extra settings document with highest precedence",
             "  --strict-mcp-config        Use MCP servers only from --mcp-config (ignore settings)",

@@ -120,7 +120,19 @@ pub(crate) fn run_action(action: CliAction) -> Result<(), Box<dyn std::error::Er
             no_follow,
             session_id,
             fallback_model,
+            check_command,
         } => {
+            // `--check` is the first-class door for the headless objective
+            // check; the env var stays as the internal seam (same flag->env
+            // pattern as `redirect_workflow_cache_off_tree`). The flag wins
+            // over a pre-set env so the invocation's contract is explicit.
+            if let Some(check) = check_command
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                std::env::set_var("ZO_AUTO_VERIFY_CMD", check);
+            }
             warn_unapplied_prompt_flags(verbose, no_follow);
             crate::runtime_support::install_cli_runtime_overrides(
                 crate::runtime_support::CliRuntimeOverrides {
