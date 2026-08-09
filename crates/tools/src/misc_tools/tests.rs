@@ -1403,34 +1403,56 @@ fn shared_deadline_is_not_rearmed_per_reclaim() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// What counts as evidence that an agent is still working: a heartbeat inside
+/// the activity window, or being blocked inside a tool call (tool execution
+/// stamps only on entry and exit, so a multi-minute build reads as idle by
+/// heartbeat alone — the exact shape that would kill a healthy agent).
+#[test]
+fn progress_snapshot_covers_heartbeat_and_in_tool_work() {
+    let window_secs = super::SPAWN_RECLAIM_ACTIVITY_WINDOW.as_secs();
+    assert!(super::snapshot_shows_progress(Some(0), false));
+    assert!(
+        super::snapshot_shows_progress(Some(window_secs), false),
+        "the window boundary is inclusive"
+    );
+    assert!(
+        !super::snapshot_shows_progress(Some(window_secs + 1), false),
+        "a heartbeat past the window with no tool in flight is stale"
+    );
+    assert!(
+        !super::snapshot_shows_progress(None, false),
+        "never stamped and not in a tool is no evidence at all"
+    );
+    assert!(
+        super::snapshot_shows_progress(Some(window_secs * 10), true),
+        "an agent inside a long tool call is working even with a stale stamp"
+    );
+    assert!(
+        super::snapshot_shows_progress(None, true),
+        "in-tool alone is sufficient evidence"
+    );
+}
+
 /// The progress gate that decides between extending the fan-out deadline and
 /// cancelling: pure, so every branch is exercised without waiting out a real
-/// deadline. A candidate is spared only when its heartbeat is inside the
-/// activity window AND extensions remain; a never-stamped heartbeat is stale.
+/// deadline. A candidate is spared only while it is progressing AND extensions
+/// remain, so the total collection budget stays bounded.
 #[test]
 fn deadline_extension_gate_is_progress_and_cap_bounded() {
-    let window_secs = super::SPAWN_RECLAIM_ACTIVITY_WINDOW.as_secs();
     assert!(
-        super::reclaim_should_extend_deadline(Some(0), 0),
-        "a just-stamped heartbeat with extensions remaining earns an extension"
+        super::reclaim_should_extend_deadline(true, 0),
+        "a progressing candidate with extensions remaining earns an extension"
     );
     assert!(
-        super::reclaim_should_extend_deadline(
-            Some(window_secs),
-            super::SPAWN_DEADLINE_MAX_EXTENSIONS - 1
-        ),
-        "the window boundary is inclusive and the last extension is grantable"
+        super::reclaim_should_extend_deadline(true, super::SPAWN_DEADLINE_MAX_EXTENSIONS - 1),
+        "the last extension is grantable"
     );
     assert!(
-        !super::reclaim_should_extend_deadline(Some(window_secs + 1), 0),
-        "a heartbeat past the activity window is stale — reclaim"
+        !super::reclaim_should_extend_deadline(false, 0),
+        "a stalled candidate is reclaimed even with extensions to spare"
     );
     assert!(
-        !super::reclaim_should_extend_deadline(None, 0),
-        "no heartbeat ever stamped means no evidence of progress — reclaim"
-    );
-    assert!(
-        !super::reclaim_should_extend_deadline(Some(0), super::SPAWN_DEADLINE_MAX_EXTENSIONS),
+        !super::reclaim_should_extend_deadline(true, super::SPAWN_DEADLINE_MAX_EXTENSIONS),
         "once the cap is spent even a busy agent is reclaimed — the budget stays bounded"
     );
 }
@@ -1447,6 +1469,18 @@ fn stamp_manifest_activity(dir: &std::path::Path, id: &str, stamped_at: u64) {
         .expect("write stamped manifest");
 }
 
+/// Mark a persisted manifest as blocked inside a tool call, as
+/// `record_current_tool` does in production.
+fn set_manifest_current_tool(dir: &std::path::Path, id: &str, tool: &str) {
+    let path = dir.join(format!("{id}.json"));
+    let raw = std::fs::read_to_string(&path).expect("read manifest for tool stamp");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).expect("parse manifest for tool stamp");
+    value["currentTool"] = serde_json::json!(tool);
+    std::fs::write(&path, serde_json::to_string(&value).expect("manifest json"))
+        .expect("write manifest with current tool");
+}
+
 /// Epoch seconds for heartbeat fixtures.
 fn epoch_secs_now() -> u64 {
     SystemTime::now()
@@ -1455,10 +1489,11 @@ fn epoch_secs_now() -> u64 {
         .as_secs()
 }
 
-/// The heartbeat readers behind the progress gate, against a real store: a
-/// fresh stamp reads back as a small age, a stale one as a large age, a
-/// never-stamped manifest as `None` — and the drain's freshest-of-set pick
-/// takes the minimum so one working straggler represents the whole set.
+/// The manifest readers behind the progress gate, against a real store: a
+/// fresh stamp reads as progress, a stale one does not, a never-stamped
+/// manifest does not — an agent whose manifest says it is inside a tool call
+/// does even with an ancient stamp, and the drain's set-level reader answers
+/// yes when any single member is working.
 #[test]
 fn heartbeat_age_readers_reflect_the_persisted_stamp() {
     let _guard = env_lock();
@@ -1474,28 +1509,37 @@ fn heartbeat_age_readers_reflect_the_persisted_stamp() {
     let fresh = format!("hb-fresh-{stamp}");
     let stale = format!("hb-stale-{stamp}");
     let never = format!("hb-never-{stamp}");
-    write_manifest_for_drain(&dir, &fresh, "hb-sess", "running");
-    write_manifest_for_drain(&dir, &stale, "hb-sess", "running");
-    write_manifest_for_drain(&dir, &never, "hb-sess", "running");
+    let in_tool = format!("hb-in-tool-{stamp}");
+    for id in [&fresh, &stale, &never, &in_tool] {
+        write_manifest_for_drain(&dir, id, "hb-sess", "running");
+    }
     stamp_manifest_activity(&dir, &fresh, epoch_secs_now());
     stamp_manifest_activity(&dir, &stale, epoch_secs_now().saturating_sub(10_000));
+    // A long build: stamped when the tool started, silent ever since.
+    stamp_manifest_activity(&dir, &in_tool, epoch_secs_now().saturating_sub(10_000));
+    set_manifest_current_tool(&dir, &in_tool, "bash");
 
-    let fresh_age = super::agent_tools::agent_seconds_since_last_activity(&fresh)
-        .expect("fresh agent has a heartbeat");
-    assert!(fresh_age <= 5, "a just-stamped heartbeat reads near zero: {fresh_age}");
-    let stale_age = super::agent_tools::agent_seconds_since_last_activity(&stale)
-        .expect("stale agent has a heartbeat");
-    assert!(stale_age >= 9_000, "an old stamp reads as a large age: {stale_age}");
-    assert_eq!(
-        super::agent_tools::agent_seconds_since_last_activity(&never),
-        None,
-        "a manifest without the stamp yields no age"
-    );
-    let set_age = super::freshest_activity_age_secs(&[stale.clone(), fresh.clone(), never.clone()])
-        .expect("set with a heartbeat yields an age");
+    let snapshot = super::agent_tools::agent_progress_snapshot(&fresh)
+        .expect("fresh agent has a manifest");
     assert!(
-        set_age <= 5,
-        "the set-level reader picks the freshest member, not the stale one: {set_age}"
+        snapshot.seconds_since_activity.is_some_and(|age| age <= 5),
+        "a just-stamped heartbeat reads near zero: {:?}",
+        snapshot.seconds_since_activity
+    );
+    assert!(super::agent_shows_progress(&fresh));
+    assert!(!super::agent_shows_progress(&stale));
+    assert!(!super::agent_shows_progress(&never));
+    assert!(
+        super::agent_shows_progress(&in_tool),
+        "an agent blocked in a tool call is working despite the old stamp"
+    );
+    assert!(
+        super::any_agent_shows_progress(&[stale.clone(), never.clone(), fresh.clone()]),
+        "the set-level reader answers yes when any member is working"
+    );
+    assert!(
+        !super::any_agent_shows_progress(&[stale.clone(), never.clone()]),
+        "a set with no working member is reclaimable"
     );
 
     match prior_store {

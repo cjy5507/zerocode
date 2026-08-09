@@ -1371,7 +1371,7 @@ fn drain_or_cancel_remaining_agents(
         }
         // The deadline elapsed with live stragglers. A straggler that is still
         // demonstrably working keeps the set alive for one more bounded step.
-        if reclaim_should_extend_deadline(freshest_activity_age_secs(in_flight), *extensions_used) {
+        if reclaim_should_extend_deadline(any_agent_shows_progress(in_flight), *extensions_used) {
             *extensions_used += 1;
             *deadline = std::time::Instant::now() + SPAWN_DEADLINE_EXTENSION_STEP;
             continue;
@@ -1395,9 +1395,10 @@ const SPAWN_SLOT_RECLAIM_POLL: Duration = Duration::from_millis(25);
 /// heartbeat within this window), the deadline is extended instead of the
 /// agent being cancelled: killing a mid-work agent discards its entire
 /// deliverable to save wall-clock, and long-thinking models routinely exceed
-/// a fixed wall budget while perfectly healthy. Heartbeats are stamped on
-/// every provider/tool/reasoning frame, so a live agent refreshes far inside
-/// this window while a hung one goes stale past it.
+/// a fixed wall budget while perfectly healthy. Streaming refreshes the
+/// heartbeat continuously — reasoning deltas coalesce to one stamp every few
+/// seconds, output-tail flushes are sub-second — so a live agent stays far
+/// inside this window while a hung one goes stale past it.
 const SPAWN_RECLAIM_ACTIVITY_WINDOW: Duration = Duration::from_secs(180);
 
 /// Hard cap on progress extensions, so the total collection budget stays
@@ -1409,31 +1410,42 @@ const SPAWN_DEADLINE_MAX_EXTENSIONS: u32 = 2;
 /// the extension is decided (not stacked onto the stale deadline).
 const SPAWN_DEADLINE_EXTENSION_STEP: Duration = Duration::from_secs(10 * 60);
 
-/// Decide whether an elapsed fan-out deadline is extended instead of the
-/// candidate agent(s) being cancelled. Pure so the gate is testable without
-/// waiting out real deadlines: `seconds_since_activity` is the candidate's
-/// manifest-heartbeat age (`None` when no heartbeat was ever stamped — treated
-/// as stale, never extended), `extensions_used` counts extensions already
-/// granted against [`SPAWN_DEADLINE_MAX_EXTENSIONS`].
-fn reclaim_should_extend_deadline(
-    seconds_since_activity: Option<u64>,
-    extensions_used: u32,
-) -> bool {
-    extensions_used < SPAWN_DEADLINE_MAX_EXTENSIONS
-        && seconds_since_activity
-            .is_some_and(|age| age <= SPAWN_RECLAIM_ACTIVITY_WINDOW.as_secs())
+/// Whether a manifest snapshot is evidence of an agent still working. Pure so
+/// both progress signals are testable without a real agent: a heartbeat inside
+/// [`SPAWN_RECLAIM_ACTIVITY_WINDOW`], or being blocked inside a tool call —
+/// tool execution stamps only on entry and exit, so a multi-minute build would
+/// otherwise read as idle for its whole run. A never-stamped heartbeat with no
+/// tool in flight is no evidence at all.
+const fn snapshot_shows_progress(seconds_since_activity: Option<u64>, inside_tool_call: bool) -> bool {
+    if inside_tool_call {
+        return true;
+    }
+    match seconds_since_activity {
+        Some(age) => age <= SPAWN_RECLAIM_ACTIVITY_WINDOW.as_secs(),
+        None => false,
+    }
 }
 
-/// Freshest manifest-heartbeat age across the still-in-flight set, for the
-/// final drain's extension decision: one demonstrably working straggler is
-/// enough to keep waiting for the whole set (the deadline is shared, so a
-/// per-agent extension is not expressible), while a set with no heartbeat at
-/// all yields `None` and is reclaimed immediately.
-fn freshest_activity_age_secs(in_flight: &[String]) -> Option<u64> {
-    in_flight
-        .iter()
-        .filter_map(|id| agent_tools::agent_seconds_since_last_activity(id))
-        .min()
+/// Decide whether an elapsed fan-out deadline is extended instead of the
+/// candidate agent(s) being cancelled: only for a candidate that is still
+/// making progress, and only while extensions remain against
+/// [`SPAWN_DEADLINE_MAX_EXTENSIONS`].
+const fn reclaim_should_extend_deadline(candidate_progressing: bool, extensions_used: u32) -> bool {
+    candidate_progressing && extensions_used < SPAWN_DEADLINE_MAX_EXTENSIONS
+}
+
+/// Whether one specific agent's manifest shows progress right now.
+fn agent_shows_progress(agent_id: &str) -> bool {
+    agent_tools::agent_progress_snapshot(agent_id).is_some_and(|snapshot| {
+        snapshot_shows_progress(snapshot.seconds_since_activity, snapshot.inside_tool_call)
+    })
+}
+
+/// Whether ANY still-in-flight agent shows progress, for the final drain: one
+/// demonstrably working straggler is enough to keep waiting for the whole set,
+/// because the deadline is shared and a per-agent extension is not expressible.
+fn any_agent_shows_progress(in_flight: &[String]) -> bool {
+    in_flight.iter().any(|id| agent_shows_progress(id))
 }
 
 /// Count the fan-out members that are still *physically* live.
@@ -1535,10 +1547,8 @@ fn reclaim_spawn_slots(
             // check whether the candidate (the oldest in-flight agent) is
             // still demonstrably working — if so, grant a bounded extension
             // instead of destroying in-progress work on a fixed wall clock.
-            let candidate_age = in_flight
-                .first()
-                .and_then(|id| agent_tools::agent_seconds_since_last_activity(id));
-            if reclaim_should_extend_deadline(candidate_age, *extensions_used) {
+            let candidate_progressing = in_flight.first().is_some_and(|id| agent_shows_progress(id));
+            if reclaim_should_extend_deadline(candidate_progressing, *extensions_used) {
                 *extensions_used += 1;
                 *deadline = std::time::Instant::now() + SPAWN_DEADLINE_EXTENSION_STEP;
                 continue;

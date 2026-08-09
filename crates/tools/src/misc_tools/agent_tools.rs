@@ -35,15 +35,33 @@ pub(crate) fn agent_manifest_by_id(agent_id: &str) -> Option<AgentOutput> {
     load_agent_manifest_from_scanned_path(&path).ok()
 }
 
-/// Seconds elapsed since the agent's manifest heartbeat (`lastActivityAt`), or
-/// `None` when the agent has no manifest or the heartbeat was never stamped.
-/// Every provider/tool/reasoning frame refreshes the stamp (all the
-/// `record_agent_*` paths route through the manifest read-modify-write that
-/// stamps it), so a small age means the worker is demonstrably mid-work while
-/// a large one means it has produced nothing observable for that long.
-pub(crate) fn agent_seconds_since_last_activity(agent_id: &str) -> Option<u64> {
-    let stamped_at = agent_manifest_by_id(agent_id)?.last_activity_at?;
-    Some(manifest::epoch_seconds_now_u64().saturating_sub(stamped_at))
+/// What an agent's manifest says about its progress right now, for schedulers
+/// deciding whether a deadline should cancel it.
+pub(crate) struct AgentProgressSnapshot {
+    /// Seconds since the manifest heartbeat (`lastActivityAt`), or `None` when
+    /// it was never stamped. Streaming refreshes it continuously — reasoning
+    /// deltas every few seconds, output-tail flushes sub-second — because
+    /// every `record_agent_*` path goes through the manifest read-modify-write
+    /// that stamps it.
+    pub seconds_since_activity: Option<u64>,
+    /// Whether the agent is currently blocked inside a tool call. Tool
+    /// execution stamps on entry and exit but not while it runs, so a long
+    /// build or test would otherwise look idle for its whole duration; the
+    /// field is the manifest's own answer to "is it in one right now".
+    pub inside_tool_call: bool,
+}
+
+/// Read an agent's progress snapshot in a single manifest load, or `None` when
+/// no manifest exists for the id.
+pub(crate) fn agent_progress_snapshot(agent_id: &str) -> Option<AgentProgressSnapshot> {
+    let manifest = agent_manifest_by_id(agent_id)?;
+    let now = manifest::epoch_seconds_now_u64();
+    Some(AgentProgressSnapshot {
+        seconds_since_activity: manifest
+            .last_activity_at
+            .map(|stamped_at| now.saturating_sub(stamped_at)),
+        inside_tool_call: manifest.current_tool.is_some(),
+    })
 }
 #[cfg(test)]
 use self::manifest::persist_agent_stopped_state;
