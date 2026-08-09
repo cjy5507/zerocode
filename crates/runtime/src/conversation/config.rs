@@ -21,6 +21,7 @@ use super::{
     TemporaryAllowGrant, ToolExecutor, UsageTracker,
     FALLBACK_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
 };
+use crate::tool_cancel::ToolCancelSignal;
 
 impl<C, T> ConversationRuntime<C, T>
 where
@@ -434,6 +435,20 @@ where
     #[must_use]
     pub fn hook_abort_signal(&self) -> HookAbortSignal {
         self.hook_abort_signal.clone()
+    }
+
+    pub fn set_tool_cancel_signal(&mut self, tool_cancel_signal: ToolCancelSignal) {
+        self.tool_cancel_signal = tool_cancel_signal;
+    }
+
+    /// Clone this runtime's per-tool cancel signal. The host keeps a clone so a
+    /// single Esc can drop the tool that is executing right now **without**
+    /// ending the turn — the turn resumes from the synthetic tool result and
+    /// the model picks another approach. Ending the turn is
+    /// [`Self::hook_abort_signal`]'s job and stays on Ctrl+C / Esc-Esc.
+    #[must_use]
+    pub fn tool_cancel_signal(&self) -> ToolCancelSignal {
+        self.tool_cancel_signal.clone()
     }
 
 

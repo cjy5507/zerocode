@@ -39,6 +39,51 @@ use super::{
     REFUSAL_FALLBACK_WARN, REFUSAL_SURFACED_NOTICE, STEERING_ECHO_PREFIX,
     TRUNCATION_CONTINUATION_REMINDER,
 };
+use crate::tool_cancel::{ToolCancelWatch, ToolDispatchOutcome};
+
+/// Await one `spawn_blocking` tool dispatch, racing it against a user cancel
+/// (Esc once — "drop this tool, keep the turn").
+///
+/// ## What cancellation can and cannot do here
+///
+/// A `spawn_blocking` task **cannot be aborted**: `JoinHandle::abort` is a
+/// no-op once the closure is on a blocking thread, and dropping the handle only
+/// detaches it. So this function does two honest things and does not pretend to
+/// do a third:
+///
+/// 1. It signals every foreground bash process group owned by this session, so
+///    the overwhelmingly common case — a wedged shell command — really dies.
+/// 2. It stops *waiting*. The turn moves on from the synthetic result at once,
+///    which is the behavior the user asked for.
+///
+/// What it does **not** do is unwind a tool with no kill route — a hung MCP
+/// call, an in-flight HTTP request, a long local computation. Those keep running
+/// on their blocking thread until they finish on their own, and their eventual
+/// return value is dropped on the floor. That is a real cost and it is chosen
+/// deliberately: the alternative is the status quo, where the user's only exit
+/// from a wedged MCP tool is killing the whole turn. Side effects already
+/// committed by such a tool (a file written, a request sent) stand — the
+/// synthetic result says "cancelled", not "did nothing".
+async fn await_cancellable_tool_dispatch(
+    handle: tokio::task::JoinHandle<(String, bool)>,
+    watch: &mut ToolCancelWatch,
+    owner_session: &str,
+) -> ToolDispatchOutcome {
+    tokio::select! {
+        // Biased so a dispatch that already completed settles as itself even if
+        // a cancel lands in the same poll: a finished tool has a real answer and
+        // reporting it as cancelled would throw away work already paid for.
+        biased;
+        joined = handle => match joined {
+            Ok(result) => ToolDispatchOutcome::Completed(result.0, result.1),
+            Err(join_error) => ToolDispatchOutcome::Completed(join_error.to_string(), true),
+        },
+        () = watch.cancelled() => {
+            crate::bash::interrupt_foreground_bash(Some(owner_session));
+            ToolDispatchOutcome::Cancelled
+        }
+    }
+}
 
 // Rough token estimate for the system prompt sections.
 //
@@ -1885,24 +1930,47 @@ where
                             let dispatch = Arc::clone(&dispatch);
                             let name = p.tool_name.clone();
                             let input = p.effective_input.clone();
+                            // Opened BEFORE the tool starts, so this dispatch is
+                            // cancelled only by an Esc that arrives while it is
+                            // genuinely in flight. Every member of the wave gets
+                            // its own watch off the same epoch, which is why one
+                            // keypress settles the whole parallel batch.
+                            let mut watch = self.tool_cancel_signal.watch();
+                            let owner_session = self.session.session_id.clone();
                             let handle = tokio::task::spawn_blocking(move || {
                                 match dispatch(&name, &input) {
                                     Ok(output) => (output, false),
                                     Err(e) => (e.to_string(), true),
                                 }
                             });
-                            handles.push(async move { (idx, tool_start, handle.await) });
+                            handles.push(async move {
+                                let outcome = await_cancellable_tool_dispatch(
+                                    handle,
+                                    &mut watch,
+                                    &owner_session,
+                                )
+                                .await;
+                                (idx, tool_start, outcome)
+                            });
                         }
-                        while let Some((idx, tool_start, joined)) = handles.next().await {
-                            let (output, is_error) = match joined {
-                                Ok(result) => result,
-                                Err(join_err) => (join_err.to_string(), true),
-                            };
-                            crate::notifications::notify_if_slow(
-                                &prepared[idx].tool_name,
-                                tool_start,
-                                std::time::Duration::from_secs(10),
-                            );
+                        while let Some((idx, tool_start, outcome)) = handles.next().await {
+                            let (output, is_error, cancelled) = outcome.into_tool_result();
+                            if cancelled {
+                                self.mark_streaming_tool_cancelled(
+                                    iterations,
+                                    &prepared[idx],
+                                    &render_tx,
+                                    &id_gen,
+                                    message_count_before,
+                                )
+                                .await?;
+                            } else {
+                                crate::notifications::notify_if_slow(
+                                    &prepared[idx].tool_name,
+                                    tool_start,
+                                    std::time::Duration::from_secs(10),
+                                );
+                            }
                             self.render_precomputed_streaming_tool_result(
                                 iterations,
                                 &prepared[idx],
@@ -1996,6 +2064,12 @@ where
                             } else {
                             self.record_tool_started(iterations, &p.tool_name);
                             let tool_start = std::time::Instant::now();
+                            // Set by the dispatch arm below. A cancelled tool
+                            // must not also fire the "this tool is slow"
+                            // notification: the user just stopped it, and being
+                            // told it was slow a moment later is noise about a
+                            // wait they already ended.
+                            let mut tool_was_cancelled = false;
 
                             let (output, is_error) = if p.tool_name == "AskUserQuestion" {
                                 // AskUserQuestion must be handled async:
@@ -2030,14 +2104,41 @@ where
                                     let dispatch = std::sync::Arc::clone(dispatch);
                                     let name = p.tool_name.clone();
                                     let input = execution_input.into_owned();
-                                    let join =
-                                        tokio::task::spawn_blocking(move || dispatch(&name, &input))
-                                            .await;
-                                    match join {
-                                        Ok(Ok(output)) => (output, false),
-                                        Ok(Err(e)) => (e.to_string(), true),
-                                        Err(join_err) => (join_err.to_string(), true),
+                                    // Same bracket as the parallel wave: watch
+                                    // opened before the tool starts, so only an
+                                    // Esc pressed while THIS tool runs settles
+                                    // it as cancelled. This is the arm that
+                                    // carries Bash and MCP — the wedged calls
+                                    // the feature exists for.
+                                    let mut watch = self.tool_cancel_signal.watch();
+                                    let owner_session = self.session.session_id.clone();
+                                    let handle =
+                                        tokio::task::spawn_blocking(move || {
+                                            match dispatch(&name, &input) {
+                                                Ok(output) => (output, false),
+                                                Err(e) => (e.to_string(), true),
+                                            }
+                                        });
+                                    let (output, is_error, cancelled) =
+                                        await_cancellable_tool_dispatch(
+                                            handle,
+                                            &mut watch,
+                                            &owner_session,
+                                        )
+                                        .await
+                                        .into_tool_result();
+                                    if cancelled {
+                                        tool_was_cancelled = true;
+                                        self.mark_streaming_tool_cancelled(
+                                            iterations,
+                                            p,
+                                            &render_tx,
+                                            &id_gen,
+                                            message_count_before,
+                                        )
+                                        .await?;
                                     }
+                                    (output, is_error)
                                 } else {
                                     unblock_tool_execute(
                                         &mut self.tool_executor,
@@ -2059,7 +2160,7 @@ where
                                 StreamingToolFinalizeOptions {
                                     tool_start,
                                     render_result: true,
-                                    notify_slow: true,
+                                    notify_slow: !tool_was_cancelled,
                                 },
                                 &mut batch_hard_stops,
                             )
@@ -2314,6 +2415,44 @@ where
                 iterations,
                 "render channel closed delivering tool result",
                 render.rollback_message_count,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Repaint a user-cancelled tool card as `⊘ cancelled` before its synthetic
+    /// result lands.
+    ///
+    /// The result itself carries `is_error: true` (the tool-result wire format
+    /// has no third state), and the TUI's reconcile would otherwise settle the
+    /// card as a red `×` — indistinguishable from a tool that genuinely blew up.
+    /// Re-sending the `ToolCall` block with `ToolCallStatus::Cancelled` merges
+    /// in place on `tool_call_id`, so the row reads as "you stopped this", which
+    /// is the whole difference the user needs to see.
+    async fn mark_streaming_tool_cancelled(
+        &mut self,
+        iterations: usize,
+        p: &PreparedStreamingTool,
+        render_tx: &mpsc::Sender<RenderBlock>,
+        id_gen: &BlockIdGen,
+        rollback_message_count: usize,
+    ) -> Result<(), StreamingTurnError> {
+        if render_tx
+            .send(RenderBlock::ToolCall {
+                id: id_gen.next(),
+                tool_call_id: p.tool_call_id.clone(),
+                name: p.tool_name.clone(),
+                summary: tool_summary_line(&p.tool_name, &p.effective_input),
+                preview: tool_preview_from(&p.tool_name, &p.effective_input),
+                status: ToolCallStatus::Cancelled,
+            })
+            .await
+            .is_err()
+        {
+            return Err(self.cancel_streaming_turn(
+                iterations,
+                "render channel closed marking a cancelled tool",
+                rollback_message_count,
             ));
         }
         Ok(())

@@ -159,6 +159,12 @@ impl std::fmt::Display for AppMode {
 pub enum AgentCommand {
     /// User cancelled the in-flight turn (first Ctrl-C).
     CancelTurn,
+    /// User cancelled the tool(s) executing right now — a single Esc mid-turn
+    /// while a tool is in flight. The **turn survives**: each cancelled call
+    /// settles a synthetic error `tool_result` and the model continues from
+    /// that boundary with another approach. Ending the turn stays on Ctrl+C
+    /// and on Esc-Esc.
+    CancelTool,
     /// User requested a clean shutdown.
     Quit,
     /// Mid-turn steering: the user typed a plain message and pressed Enter

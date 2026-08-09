@@ -723,6 +723,7 @@ fn activity_limit_for_width(
     elapsed: &str,
     token_label: &str,
     context_label: Option<&str>,
+    tool_running: bool,
 ) -> usize {
     // Prefix: 2-cell leading rule + space (the shared 3-cell `── ` leader —
     // same gutter as the HUD line and the input's `│❯ `, so all three bottom
@@ -732,7 +733,8 @@ fn activity_limit_for_width(
     // tokens, model, and interrupt stay visible on medium and narrow panes.
     let prefix_width = 2 + 1 + 1 + 1;
     let context_width = context_label.map_or(0, |label| 3 + display_width(label));
-    let suffix_width = activity_suffix(elapsed, token_label, usize::from(width)).width();
+    let suffix_width =
+        activity_suffix(elapsed, token_label, usize::from(width), tool_running).width();
     usize::from(width)
         .saturating_sub(prefix_width + context_width + suffix_width)
         .min(MAX_ACTIVITY_CHARS)
@@ -745,20 +747,44 @@ struct ActivitySuffix {
     interrupt_label: &'static str,
 }
 
+/// The control hint at the end of the activity line.
+///
+/// While a tool is executing, Esc means something *different* — it drops that
+/// tool and lets the turn continue — so the line has to say so. An unadvertised
+/// key is an absent feature, and both spellings are bare ASCII, so they stay
+/// reachable mid-IME-composition.
+fn interrupt_label_for(tool_running: bool, width: InterruptLabelWidth) -> &'static str {
+    match (tool_running, width) {
+        (true, InterruptLabelWidth::Full) => "esc cancel tool \u{b7} esc esc stop turn",
+        (true, InterruptLabelWidth::Compact) => "esc cancel tool",
+        (false, InterruptLabelWidth::Full) => "esc to interrupt",
+        (false, InterruptLabelWidth::Compact) => "esc",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How much room the control hint may spend. The `minimal`/`escape_only`
+/// fallbacks below are already down to a bare `esc`, so they have no variant:
+/// there is nothing left to trade away.
+enum InterruptLabelWidth {
+    Full,
+    Compact,
+}
+
 impl ActivitySuffix {
-    fn full(elapsed: &str, token_label: &str) -> Self {
+    fn full(elapsed: &str, token_label: &str, tool_running: bool) -> Self {
         Self {
             elapsed: Some(elapsed.to_string()),
             token_label: Some(token_label.to_string()),
-            interrupt_label: "esc to interrupt",
+            interrupt_label: interrupt_label_for(tool_running, InterruptLabelWidth::Full),
         }
     }
 
-    fn compact(elapsed: &str, token_label: &str) -> Self {
+    fn compact(elapsed: &str, token_label: &str, tool_running: bool) -> Self {
         Self {
             elapsed: Some(elapsed.to_string()),
             token_label: Some(compact_token_label(token_label)),
-            interrupt_label: "esc",
+            interrupt_label: interrupt_label_for(tool_running, InterruptLabelWidth::Compact),
         }
     }
 
@@ -795,13 +821,18 @@ impl ActivitySuffix {
     }
 }
 
-fn activity_suffix(elapsed: &str, token_label: &str, width: usize) -> ActivitySuffix {
-    let full = ActivitySuffix::full(elapsed, token_label);
+fn activity_suffix(
+    elapsed: &str,
+    token_label: &str,
+    width: usize,
+    tool_running: bool,
+) -> ActivitySuffix {
+    let full = ActivitySuffix::full(elapsed, token_label, tool_running);
     if full.width() <= width {
         return full;
     }
 
-    let compact = ActivitySuffix::compact(elapsed, token_label);
+    let compact = ActivitySuffix::compact(elapsed, token_label, tool_running);
     if compact.width() <= width {
         return compact;
     }
@@ -1091,8 +1122,16 @@ pub fn draw_with_context(
         activity.output_tokens_per_sec(),
     );
     let mut context_label = activity_context_label(context, area.width);
-    let mut activity_limit =
-        activity_limit_for_width(area.width, &elapsed, &token_label, context_label.as_deref());
+    // Same signal the key handler branches on, so the advertised key and the
+    // key's actual effect can never disagree on screen.
+    let tool_running = activity.action_is_tool();
+    let mut activity_limit = activity_limit_for_width(
+        area.width,
+        &elapsed,
+        &token_label,
+        context_label.as_deref(),
+        tool_running,
+    );
     if context_label.is_some()
         && activity_progress_prefix_width(&action).is_some_and(|needed| activity_limit < needed)
     {
@@ -1100,13 +1139,15 @@ pub fn draw_with_context(
         // primary "is this moving?" signal. Prefer preserving that over a
         // model/context badge when the row is tight.
         context_label = None;
-        activity_limit = activity_limit_for_width(area.width, &elapsed, &token_label, None);
+        activity_limit =
+            activity_limit_for_width(area.width, &elapsed, &token_label, None, tool_running);
     }
     if activity_limit == 0 && context_label.is_some() {
         // On awkward widths, prefer keeping a readable action phrase and the
         // interrupt hint over showing context that would consume the whole row.
         context_label = None;
-        activity_limit = activity_limit_for_width(area.width, &elapsed, &token_label, None);
+        activity_limit =
+            activity_limit_for_width(area.width, &elapsed, &token_label, None, tool_running);
     }
     // The active plan step, when there is one, owns the waved phrase: the user's
     // own sentence for the current step answers "what is it doing?" better than a
@@ -1187,7 +1228,7 @@ pub fn draw_with_context(
         left_spans.push(Span::styled(" · ", dim_style));
         left_spans.push(Span::styled(label, value_style));
     }
-    let suffix = activity_suffix(&elapsed, &token_label, usize::from(area.width));
+    let suffix = activity_suffix(&elapsed, &token_label, usize::from(area.width), tool_running);
     let mut right_spans = Vec::new();
     right_spans.push(Span::styled(" (", dim_style));
     if let Some(elapsed) = suffix.elapsed {
@@ -1741,6 +1782,42 @@ mod tests {
     }
 
     #[test]
+    fn the_activity_line_advertises_the_tool_cancel_only_while_a_tool_runs() {
+        // An unadvertised key is an absent feature. While a tool executes, Esc
+        // means something different from what it means during generation, so
+        // the line has to say both spellings.
+        let running = ActivitySuffix::full("1m 51s", "↓ ~2.3k tokens", true);
+        assert!(
+            running.text().contains("esc cancel tool")
+                && running.text().contains("esc esc stop turn"),
+            "{}",
+            running.text()
+        );
+
+        // Generation-only keeps the historical wording — there is no tool to
+        // cancel, so offering one would be a lie.
+        let generating = ActivitySuffix::full("1m 51s", "↓ ~2.3k tokens", false);
+        assert!(
+            generating.text().contains("esc to interrupt"),
+            "{}",
+            generating.text()
+        );
+        assert!(!generating.text().contains("cancel tool"));
+
+        // Both spellings are bare ASCII, so they stay typeable mid-IME.
+        assert!(running.text().is_ascii() || running.text().contains('\u{b7}'));
+    }
+
+    #[test]
+    fn a_narrow_activity_line_drops_the_second_gesture_before_the_first() {
+        // On a tight row the user keeps the key they are most likely to want.
+        let compact = ActivitySuffix::compact("1m 51s", "↓ ~2.3k tokens", true);
+        assert!(compact.text().contains("esc cancel tool"), "{}", compact.text());
+        assert!(!compact.text().contains("esc esc"), "{}", compact.text());
+        assert!(compact.width() < ActivitySuffix::full("1m 51s", "↓ ~2.3k tokens", true).width());
+    }
+
+    #[test]
     fn turn_token_label_shows_live_rate_next_to_output() {
         // CC-style: the running output count carries a live tok/s so the figure
         // visibly moves while streaming.
@@ -1775,7 +1852,7 @@ mod tests {
 
     #[test]
     fn activity_suffix_compacts_without_losing_pending_or_escape() {
-        let suffix = activity_suffix("1m 51s", "↑ 1.2k input · output pending", 36);
+        let suffix = activity_suffix("1m 51s", "↑ 1.2k input · output pending", 36, false);
 
         assert!(
             suffix.width() <= 36,
@@ -1793,7 +1870,7 @@ mod tests {
 
     #[test]
     fn activity_suffix_drops_elapsed_before_pending_or_escape() {
-        let suffix = activity_suffix("1m 51s", "agent output pending", 18);
+        let suffix = activity_suffix("1m 51s", "agent output pending", 18, false);
         let text = suffix.text();
 
         assert!(suffix.width() <= 18, "suffix should fit: {text:?}");
@@ -1906,8 +1983,8 @@ mod tests {
 
     #[test]
     fn activity_limit_preserves_spinner_metrics_on_medium_widths() {
-        let wide = activity_limit_for_width(140, "1m 51s", "↓ ~2.3k tokens", None);
-        let medium = activity_limit_for_width(60, "1m 51s", "↓ ~2.3k tokens", None);
+        let wide = activity_limit_for_width(140, "1m 51s", "↓ ~2.3k tokens", None, false);
+        let medium = activity_limit_for_width(60, "1m 51s", "↓ ~2.3k tokens", None, false);
         assert_eq!(wide, MAX_ACTIVITY_CHARS);
         assert!(
             medium < wide,
@@ -2169,12 +2246,13 @@ mod tests {
 
     #[test]
     fn activity_context_reduces_action_budget_but_keeps_it_positive() {
-        let plain = activity_limit_for_width(120, "1m 51s", "↓ ~2.3k tokens", None);
+        let plain = activity_limit_for_width(120, "1m 51s", "↓ ~2.3k tokens", None, false);
         let with_context = activity_limit_for_width(
             120,
             "1m 51s",
             "↓ ~2.3k tokens",
             Some("phase 2/4 read-code running · gpt-5.5-fast"),
+            false,
         );
 
         assert!(

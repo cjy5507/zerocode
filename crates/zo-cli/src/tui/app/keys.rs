@@ -6,6 +6,8 @@ use super::{
     mention_trigger, slash_completion_for,
 };
 use super::queue::NoSteerReason;
+use runtime::message_stream::{RenderBlock, SystemLevel};
+use std::time::Duration;
 use crate::tui::modals::TeamInboxViewerAction;
 use crate::tui::startup::{
     STARTUP_LOGIN_CLAUDE_COMMAND, STARTUP_LOGIN_OPENAI_COMMAND, STARTUP_PERMISSIONS_COMMAND,
@@ -928,20 +930,65 @@ impl App {
         None
     }
 
+    /// First Esc mid-turn with nothing executing: kill nothing, say what a
+    /// second Esc would do.
+    ///
+    /// Silence here reads as a dropped keypress — and guessing that the user
+    /// meant "stop the turn" is precisely the over-eager behavior this feature
+    /// exists to remove.
+    fn note_esc_arms_turn_stop(&mut self) {
+        const HINT: &str = "no tool running \u{b7} esc esc stops the turn";
+        let repeated = matches!(
+            self.transcript.blocks().last(),
+            Some(RenderBlock::System { text, .. }) if text.as_str() == HINT
+        );
+        if repeated {
+            return;
+        }
+        self.push_diff_note(SystemLevel::Info, HINT.to_string());
+    }
+
     fn handle_normal_esc(&mut self, key: KeyEvent) -> Option<AppAction> {
         // Claude Code Esc semantics, in priority order (modal/search/pager and
         // hint-popup Esc are consumed earlier in the dispatch):
-        //   1. a turn is running  → interrupt it (the spinner has always
-        //      advertised `esc to interrupt`; only Ctrl+C was wired),
+        //   1. a turn is running  → `mid_turn_esc_action` decides: cancel the
+        //      running tool(s) and KEEP the turn, or (on the second tap inside
+        //      the arming window) stop the turn outright,
         //   2. the composer holds a draft → clear it,
         //   3. otherwise Esc-Esc rewinds the previous turn's conversation
         //      *and* code together (one combined checkpoint step). The window
         //      is short (600 ms) so a lone Esc decays quickly.
         if matches!(self.mode, AppMode::Normal) && matches!(key.code, KeyCode::Esc) {
             if self.turn_activity.is_some() {
-                self.last_esc = None;
-                let _ = self.cmd_tx.try_send(AgentCommand::CancelTurn);
-                return Some(AppAction::None);
+                let now = Instant::now();
+                // "Is a tool running" is read off the tool cards' own status —
+                // the dispatch's render blocks — never guessed from the key
+                // handler's own state.
+                let tool_running = self.transcript.has_running_tool_call();
+                return Some(
+                    match mid_turn_esc_action(
+                        self.last_mid_turn_esc,
+                        now,
+                        Self::ESC_DOUBLE_TAP_WINDOW,
+                        tool_running,
+                    ) {
+                        MidTurnEsc::StopTurn => {
+                            self.last_mid_turn_esc = None;
+                            let _ = self.cmd_tx.try_send(AgentCommand::CancelTurn);
+                            AppAction::None
+                        }
+                        MidTurnEsc::CancelTool => {
+                            self.last_mid_turn_esc = Some(now);
+                            let _ = self.cmd_tx.try_send(AgentCommand::CancelTool);
+                            AppAction::None
+                        }
+                        MidTurnEsc::Hint => {
+                            self.last_mid_turn_esc = Some(now);
+                            self.note_esc_arms_turn_stop();
+                            AppAction::Redraw
+                        }
+                    },
+                );
             }
             // A focused transcript block claims Esc next: dropping the focus
             // restores composer-driven Enter (submit) / Tab semantics.
@@ -1201,6 +1248,48 @@ impl App {
     }
 }
 
+/// What a bare Esc means while a turn is in flight.
+///
+/// Three outcomes, and the split between the first two is the entire point of
+/// the feature: the most common mid-turn interrupt in practice is a wedged
+/// tool, where the user wants that call dropped — not the turn thrown away and
+/// the request re-typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MidTurnEsc {
+    /// Second Esc inside the arming window → the existing turn-kill path.
+    StopTurn,
+    /// First Esc with a tool in flight → cancel the tool(s), keep the turn.
+    CancelTool,
+    /// First Esc with nothing executing → kill nothing, show the hint.
+    Hint,
+}
+
+/// Pure mid-turn Esc policy.
+///
+/// Extracted from the key handler so the arming window is tested against an
+/// injected clock instead of a live turn and a real 600 ms of wall time — the
+/// off-by-one at the window edge is exactly the kind of bug a timing-dependent
+/// test hides.
+///
+/// `armed_at` is the previous mid-turn Esc, if any. The window is checked
+/// *first*: a double-tap stops the turn whether or not a tool is running, so the
+/// escape hatch stays reachable at every moment of the turn.
+pub(crate) fn mid_turn_esc_action(
+    armed_at: Option<Instant>,
+    now: Instant,
+    window: Duration,
+    tool_running: bool,
+) -> MidTurnEsc {
+    let armed = armed_at.is_some_and(|prev| now.duration_since(prev) <= window);
+    if armed {
+        MidTurnEsc::StopTurn
+    } else if tool_running {
+        MidTurnEsc::CancelTool
+    } else {
+        MidTurnEsc::Hint
+    }
+}
+
 fn secret_modal_paste_key(key: &KeyEvent) -> bool {
     if key.kind != KeyEventKind::Press {
         return false;
@@ -1230,6 +1319,74 @@ fn workflow_modal_consumes_key(key: &KeyEvent) -> bool {
             | KeyCode::PageUp
             | KeyCode::PageDown
     )
+}
+
+#[cfg(test)]
+mod mid_turn_esc_tests {
+    use super::{mid_turn_esc_action, MidTurnEsc};
+    use std::time::{Duration, Instant};
+
+    const WINDOW: Duration = Duration::from_millis(600);
+
+    #[test]
+    fn first_esc_over_a_running_tool_cancels_only_the_tool() {
+        let now = Instant::now();
+        assert_eq!(
+            mid_turn_esc_action(None, now, WINDOW, true),
+            MidTurnEsc::CancelTool
+        );
+    }
+
+    #[test]
+    fn first_esc_with_no_tool_running_kills_nothing() {
+        let now = Instant::now();
+        // The negative case the feature is judged on: a pure generation phase
+        // must not lose the turn to a stray keypress.
+        assert_eq!(
+            mid_turn_esc_action(None, now, WINDOW, false),
+            MidTurnEsc::Hint
+        );
+    }
+
+    #[test]
+    fn second_esc_inside_the_window_stops_the_turn() {
+        let armed = Instant::now();
+        let now = armed + Duration::from_millis(300);
+        assert_eq!(
+            mid_turn_esc_action(Some(armed), now, WINDOW, true),
+            MidTurnEsc::StopTurn
+        );
+        // Also reachable while nothing is executing — the escape hatch must not
+        // depend on a tool happening to be in flight.
+        assert_eq!(
+            mid_turn_esc_action(Some(armed), now, WINDOW, false),
+            MidTurnEsc::StopTurn
+        );
+    }
+
+    #[test]
+    fn the_window_edge_is_inclusive() {
+        let armed = Instant::now();
+        assert_eq!(
+            mid_turn_esc_action(Some(armed), armed + WINDOW, WINDOW, false),
+            MidTurnEsc::StopTurn
+        );
+    }
+
+    #[test]
+    fn second_esc_outside_the_window_re_arms_instead_of_stopping() {
+        let armed = Instant::now();
+        let now = armed + WINDOW + Duration::from_millis(1);
+        // A decayed arm is a *first* tap again: a tool cancel, or a hint.
+        assert_eq!(
+            mid_turn_esc_action(Some(armed), now, WINDOW, true),
+            MidTurnEsc::CancelTool
+        );
+        assert_eq!(
+            mid_turn_esc_action(Some(armed), now, WINDOW, false),
+            MidTurnEsc::Hint
+        );
+    }
 }
 
 #[cfg(test)]

@@ -690,6 +690,11 @@ pub fn execute_bash_with_tasks(
     // bounded observation window.
     let _head_scope = crate::commit_ledger::HeadTransitionScope::begin(session_id, &cwd);
 
+    // Owner of the foreground process group for the cancel registry (see
+    // `interrupt_foreground_bash`). Owned because the async body outlives the
+    // borrow across the `std::thread::spawn` fallback below.
+    let owner_session = session_id.map(ToOwned::to_owned);
+
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         // Already inside a tokio runtime — use `block_in_place` which lets
         // the current worker thread run blocking code while migrating other
@@ -701,6 +706,7 @@ pub fn execute_bash_with_tasks(
         // thread since `block_in_place` panics on single-threaded executors.
         let result = if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
             let live_writer = live_writer.clone();
+            let owner_session = owner_session.clone();
             std::thread::spawn(move || {
                 let runtime = Builder::new_current_thread().enable_all().build()?;
                 runtime.block_on(execute_bash_async(
@@ -709,6 +715,7 @@ pub fn execute_bash_with_tasks(
                     cwd,
                     live_writer,
                     registry_backed,
+                    owner_session,
                 ))
             })
             .join()
@@ -721,6 +728,7 @@ pub fn execute_bash_with_tasks(
                     cwd,
                     live_writer,
                     registry_backed,
+                    owner_session,
                 ))
             })
         };
@@ -735,6 +743,7 @@ pub fn execute_bash_with_tasks(
             cwd,
             live_writer,
             registry_backed,
+            owner_session,
         ))
         .map(|output| attach_disk_warning(output, low_disk))
 }
@@ -750,6 +759,7 @@ async fn execute_bash_async(
     cwd: std::path::PathBuf,
     live_output: crate::live_output::LiveOutputWriter,
     registry_backed: bool,
+    owner_session: Option<String>,
 ) -> io::Result<BashCommandOutput> {
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true)?;
 
@@ -772,6 +782,14 @@ async fn execute_bash_async(
     // timeout below.
     #[cfg(unix)]
     let child_pid = child.id();
+
+    // Publish the group for the duration of the run so a user cancel (Esc once)
+    // can reap it. Dropped on every exit path below, including the timeout
+    // branch that reaps the group itself.
+    #[cfg(unix)]
+    let _foreground_group = ForegroundBashGroup::register(owner_session.as_deref(), child_pid);
+    #[cfg(not(unix))]
+    let _ = &owner_session;
 
     let stdout_reader = child
         .stdout
@@ -1054,6 +1072,108 @@ fn prepare_tokio_command(
     Ok(prepared)
 }
 
+/// Live foreground bash process groups, keyed by the session that owns them.
+///
+/// Exists so a user cancel ("Esc once cancels the running tool") can actually
+/// reap a wedged command instead of only synthesizing a tool result over a
+/// process that keeps burning the machine. Only *foreground* runs register:
+/// background runs already have a real kill route (`TaskStop` →
+/// [`crate::task_registry::TaskRegistry::stop`]) and must survive an Esc, since
+/// backgrounding is exactly how the user says "keep this alive".
+///
+/// Keyed by session so a parent's Esc cannot reach into an unrelated session's
+/// command running concurrently in the same process (background agent workers
+/// outlive the turn that spawned them). `None` is its own key, not a wildcard.
+///
+/// `(owning session id, process-group leader pid)`.
+#[cfg(unix)]
+type ForegroundBashGroups = Mutex<Vec<(Option<String>, u32)>>;
+
+#[cfg(unix)]
+static FOREGROUND_BASH_GROUPS: OnceLock<ForegroundBashGroups> = OnceLock::new();
+
+#[cfg(unix)]
+fn foreground_bash_groups() -> &'static ForegroundBashGroups {
+    FOREGROUND_BASH_GROUPS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Registration bracket for a live foreground process group.
+///
+/// RAII rather than paired calls: `execute_bash_async` has a timeout branch, an
+/// error branch and a success branch, and a missed unregister would leave a
+/// recycled pid in the table for a later Esc to signal — i.e. kill an innocent
+/// process.
+#[cfg(unix)]
+struct ForegroundBashGroup {
+    pid: Option<u32>,
+}
+
+#[cfg(unix)]
+impl ForegroundBashGroup {
+    fn register(owner: Option<&str>, pid: Option<u32>) -> Self {
+        if let Some(pid) = pid {
+            foreground_bash_groups()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((owner.map(ToOwned::to_owned), pid));
+        }
+        Self { pid }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ForegroundBashGroup {
+    fn drop(&mut self) {
+        let Some(pid) = self.pid else {
+            return;
+        };
+        let mut groups = foreground_bash_groups()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(idx) = groups.iter().position(|(_, live)| *live == pid) {
+            groups.swap_remove(idx);
+        }
+    }
+}
+
+/// Kill every foreground bash process group owned by `session_id`, returning how
+/// many groups were signalled.
+///
+/// Called when the user cancels the running tool (Esc once). The entries are
+/// removed under the lock before signalling, so a concurrent second Esc cannot
+/// signal the same pid twice after it has been reaped and its pid recycled.
+///
+/// Honest limits, all of them deliberate:
+/// - Unix only. On Windows this is a no-op and a wedged command keeps running;
+///   the synthetic tool result still settles so the turn is not stuck.
+/// - Only *bash* dies. A wedged MCP call, a hung HTTP fetch or a sub-agent's
+///   own inner work has no kill route from here — see
+///   [`crate::tool_cancel`] for what the caller does about that.
+#[cfg(unix)]
+pub fn interrupt_foreground_bash(session_id: Option<&str>) -> usize {
+    let doomed: Vec<u32> = {
+        let mut groups = foreground_bash_groups()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (mine, theirs): (Vec<_>, Vec<_>) = groups
+            .drain(..)
+            .partition(|(owner, _)| owner.as_deref() == session_id);
+        *groups = theirs;
+        mine.into_iter().map(|(_, pid)| pid).collect()
+    };
+    for pid in &doomed {
+        terminate_process_group(Some(*pid));
+    }
+    doomed.len()
+}
+
+/// Non-Unix stub: no process-group signalling is available, so a cancelled bash
+/// keeps running to completion in the background while its tool result settles.
+#[cfg(not(unix))]
+pub fn interrupt_foreground_bash(_session_id: Option<&str>) -> usize {
+    0
+}
+
 /// Kill an entire process group on Unix — the child plus any grandchildren it
 /// spawned. The child is its own group leader (`process_group(0)`), so its pid
 /// doubles as the pgid and a negated pid signals the whole group. Mirrors the
@@ -1200,6 +1320,66 @@ mod tests {
             allowed_mounts: None,
             cwd: None,
         }
+    }
+
+    /// The kill half of "Esc once cancels the running tool": a wedged
+    /// foreground command must actually die, not merely stop being awaited.
+    ///
+    /// Scoped to a private session id on purpose — an unscoped cancel would
+    /// reap the foreground bash of whatever *other* test happens to be running
+    /// in this process, which is exactly the blast radius the session key
+    /// exists to prevent.
+    #[cfg(unix)]
+    #[test]
+    fn a_scoped_cancel_reaps_a_wedged_foreground_command() {
+        const OWNER: &str = "tool-cancel-test-session";
+        let started = Instant::now();
+        let runner = std::thread::spawn(|| {
+            super::execute_bash_with_tasks(input("sleep 30", Some(60_000)), None, Some(OWNER))
+        });
+
+        // Wait until the group is actually published, then cancel it.
+        wait_for(Duration::from_secs(10), || {
+            let live = super::foreground_bash_groups()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|(owner, _)| owner.as_deref() == Some(OWNER));
+            live.then_some(())
+        });
+        assert_eq!(
+            super::interrupt_foreground_bash(Some(OWNER)),
+            1,
+            "the live foreground group must be signalled"
+        );
+
+        let result = runner.join().expect("bash thread");
+        assert!(result.is_ok(), "a reaped command still returns cleanly");
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "the wedged command must die on cancel, not run its full sleep ({:?})",
+            started.elapsed()
+        );
+        assert!(
+            super::foreground_bash_groups()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .all(|(owner, _)| owner.as_deref() != Some(OWNER)),
+            "the registration bracket must unpublish the group on every exit path"
+        );
+    }
+
+    /// A cancel aimed at one session must not touch another's command — the
+    /// background-agent overreach this key exists to prevent.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_does_not_cross_session_boundaries() {
+        assert_eq!(
+            super::interrupt_foreground_bash(Some("a-session-that-owns-nothing")),
+            0,
+            "an unrelated session's cancel must signal nothing"
+        );
     }
 
     fn wait_for<T>(deadline: Duration, mut probe: impl FnMut() -> Option<T>) -> T {

@@ -1162,6 +1162,11 @@ pub(super) fn collapsed_tool_detail_lines(
                     ),
                     _ => (if theme.no_color { "o" } else { "\u{25cb}" }, dim),
                 }
+            } else if matches!(row.status, ToolCallStatus::Cancelled) {
+                // Checked before `is_err`: a user-cancelled call settles as an
+                // error result (the wire format has no third state), so without
+                // this arm the row the user stopped would wear the failure `×`.
+                (if theme.no_color { "/" } else { "\u{2298}" }, dim)
             } else if row.is_err {
                 (if theme.no_color { "x" } else { "\u{00d7}" }, err_marker_style)
             } else {

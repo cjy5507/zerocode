@@ -9494,26 +9494,145 @@ fn rewind_confirm_modal_cancels_on_n_and_esc() {
     }
 }
 
+/// Seed a live tool card so `Transcript::has_running_tool_call` reports the
+/// same thing a user staring at the spinner would.
+fn seed_running_tool(app: &mut App, call_id: &str) {
+    app.push_block(RenderBlock::ToolCall {
+        id: BlockId(4_100),
+        tool_call_id: ToolCallId(call_id.to_string()),
+        name: "Bash".to_string(),
+        summary: r#"{"command":"sleep 900"}"#.to_string(),
+        preview: ToolPreview::Bash {
+            command: "sleep 900".to_string(),
+        },
+        status: ToolCallStatus::Running,
+    });
+}
+
 #[test]
-fn esc_interrupts_inflight_turn_like_claude_code() {
-    // CC parity: the spinner advertises `esc to interrupt`, so Esc during a
-    // live turn must actually send CancelTurn (it used to be Ctrl+C only).
+fn esc_over_a_running_tool_cancels_the_tool_then_esc_esc_stops_the_turn() {
+    // The semantics this feature exists for. Esc once drops the wedged call and
+    // the turn lives; only the double-tap inside the arming window kills it.
+    let (mut app, mut cmd_rx) = test_app_with_cmd();
+    app.enable_input();
+    app.begin_turn_with_generation(0);
+    seed_running_tool(&mut app, "call-wedged");
+
+    let action = app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(action, AppAction::None);
+    assert!(
+        matches!(cmd_rx.try_recv(), Ok(AgentCommand::CancelTool)),
+        "Esc over a running tool must cancel the TOOL, not the turn"
+    );
+
+    // Immediately after: the arming window is open, so this one stops the turn.
+    let action = app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(action, AppAction::None);
+    assert!(
+        matches!(cmd_rx.try_recv(), Ok(AgentCommand::CancelTurn)),
+        "Esc-Esc must still reach the turn-kill path unchanged"
+    );
+}
+
+#[test]
+fn esc_mid_turn_with_no_tool_running_kills_nothing() {
+    // The negative pin. During pure generation there is nothing to cancel, so a
+    // single Esc must emit no command at all — the old behavior lost the whole
+    // turn here, which is the failure this feature removes.
     let (mut app, mut cmd_rx) = test_app_with_cmd();
     app.enable_input();
     app.begin_turn_with_generation(0);
 
     let action = app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(action, AppAction::Redraw);
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "a lone Esc with no tool running must not cancel the tool OR the turn"
+    );
+    assert!(
+        app.transcript()
+            .blocks()
+            .iter()
+            .any(|block| matches!(block, RenderBlock::System { text, .. }
+                if text.contains("esc esc stops the turn"))),
+        "the swallowed keypress must be explained, or it reads as a dead key"
+    );
+
+    // And the escape hatch still works from there.
+    assert_eq!(
+        app.handle_key(press(KeyCode::Esc)).unwrap(),
+        AppAction::None
+    );
+    assert!(matches!(cmd_rx.try_recv(), Ok(AgentCommand::CancelTurn)));
+}
+
+#[test]
+fn a_settled_tool_card_no_longer_arms_the_tool_cancel() {
+    // "A tool is running" is derived from the cards' own status. Once the call
+    // settles, Esc must fall back to the hint rather than claim a cancel.
+    let (mut app, mut cmd_rx) = test_app_with_cmd();
+    app.enable_input();
+    app.begin_turn_with_generation(0);
+    seed_running_tool(&mut app, "call-done");
+    app.push_block(RenderBlock::ToolResult {
+        id: BlockId(4_101),
+        tool_call_id: ToolCallId("call-done".to_string()),
+        is_error: false,
+        body: ToolResultBody::Text {
+            content: "ok".to_string(),
+            truncated: false,
+        },
+    });
+
+    assert_eq!(
+        app.handle_key(press(KeyCode::Esc)).unwrap(),
+        AppAction::Redraw
+    );
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "a settled tool must not be reported as cancellable"
+    );
+}
+
+#[test]
+fn ctrl_c_mid_turn_still_cancels_the_whole_turn() {
+    // Pin: the Ctrl+C path is untouched by the Esc split. A single Ctrl+C ends
+    // the turn even with a tool in flight — that is the unambiguous stop, and
+    // users who reach for it must not get the softer tool-only cancel.
+    let (mut app, mut cmd_rx) = test_app_with_cmd();
+    app.enable_input();
+    app.begin_turn_with_generation(0);
+    seed_running_tool(&mut app, "call-ctrl-c");
+
+    let action = app
+        .handle_key(press_with(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .unwrap();
     assert_eq!(action, AppAction::None);
     assert!(
         matches!(cmd_rx.try_recv(), Ok(AgentCommand::CancelTurn)),
-        "Esc during a turn must request a turn cancel"
+        "Ctrl+C must still cancel the turn, not just the tool"
     );
+}
 
-    // A second Esc while the turn is still live re-sends the cancel —
-    // it must never fall through to the rewind double-tap.
+#[test]
+fn an_open_modal_keeps_esc_even_with_a_tool_running() {
+    // Pin: modal Esc outranks the mid-turn branch. The dispatch order (modal
+    // keys first) is what guarantees this, so this test fails loudly if the new
+    // mid-turn branch is ever hoisted above it.
+    let (mut app, mut cmd_rx) = test_app_with_cmd();
+    app.enable_input();
+    app.begin_turn_with_generation(0);
+    seed_running_tool(&mut app, "call-modal");
+    app.open_rewind_confirm(vec!["Rewind?".to_string()]);
+
     let action = app.handle_key(press(KeyCode::Esc)).unwrap();
     assert_eq!(action, AppAction::None);
-    assert!(matches!(cmd_rx.try_recv(), Ok(AgentCommand::CancelTurn)));
+    assert_eq!(app.mode(), AppMode::Normal, "Esc must close the modal");
+    assert!(app.rewind_confirm_lines().is_none());
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "a modal-dismissing Esc must not also cancel the running tool"
+    );
 }
 
 #[test]

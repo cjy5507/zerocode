@@ -2256,6 +2256,10 @@ where
         .take()
         .expect("runtime slot was Some at the top of drive_turn");
     let abort_signal = runtime.hook_abort_signal();
+    // Cloned before the runtime moves onto the turn task. Unlike the abort
+    // signal this is NOT re-created per turn: it is a monotonic epoch, so there
+    // is nothing to reset and a stale clone can never cancel a later tool.
+    let tool_cancel_signal = runtime.tool_cancel_signal();
     let task_abort = abort_signal.clone();
     let user_cancel_requested = Arc::new(AtomicBool::new(false));
     let task_user_cancel_requested = Arc::clone(&user_cancel_requested);
@@ -2650,6 +2654,20 @@ where
                         });
                         app.draw_frame(terminal)?;
                         break;
+                    }
+                    AgentCommand::CancelTool => {
+                        // Esc once, mid-turn, with a tool in flight. Bump the
+                        // epoch and nothing else: no `user_cancel_requested`, no
+                        // `abort_signal.abort()`, no `break`. The turn task keeps
+                        // running and resumes from the synthetic tool result the
+                        // runtime settles for each cancelled call, so the model
+                        // sees the cancellation and picks another approach —
+                        // instead of the user losing the turn and re-typing.
+                        //
+                        // No transcript note here: the cancelled tool card flips
+                        // to `⊘` and its result body says so, which is feedback
+                        // at the right altitude. A system line would double it.
+                        tool_cancel_signal.cancel_running_tools();
                     }
                     AgentCommand::Quit => {
                         user_cancel_requested.store(true, Ordering::SeqCst);
@@ -4451,7 +4469,10 @@ fn command_targets_turn(command: &AgentCommand, turn_generation: u64) -> bool {
             turn_generation: command_generation,
             ..
         } => *command_generation == turn_generation,
-        AgentCommand::CancelTurn | AgentCommand::Quit | AgentCommand::Steer(_) => true,
+        AgentCommand::CancelTurn
+        | AgentCommand::CancelTool
+        | AgentCommand::Quit
+        | AgentCommand::Steer(_) => true,
     }
 }
 
@@ -4487,6 +4508,11 @@ fn handle_auto_fanout_command(
             prelude_steers.push(text);
             Ok(false)
         }
+        // Smart pre-analysis runs before the turn exists, so there is no tool
+        // dispatch to cancel yet. Swallow it rather than escalating to a
+        // fan-out cancel: Esc-once must never end anything the user did not
+        // aim it at.
+        AgentCommand::CancelTool => Ok(false),
     }
 }
 

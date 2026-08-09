@@ -582,6 +582,10 @@ pub struct ConversationRuntime<C, T> {
     /// Total input context window for the active model (tokens).
     context_window: u64,
     hook_abort_signal: HookAbortSignal,
+    /// "Cancel the tool, keep the turn" signal. Distinct from
+    /// `hook_abort_signal`, which ends the whole turn — see
+    /// [`crate::tool_cancel`].
+    tool_cancel_signal: crate::tool_cancel::ToolCancelSignal,
     // `+ Send` so the whole `ConversationRuntime` is `Send`: `zo serve`
     // builds sessions on a `spawn_blocking` worker and shares them across the
     // multi-thread runtime's tasks. The two impls (`CliHookProgressReporter`,
@@ -1340,6 +1344,7 @@ where
             full_compaction_override_percent,
             context_window,
             hook_abort_signal: HookAbortSignal::default(),
+            tool_cancel_signal: crate::tool_cancel::ToolCancelSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
             async_api_client: None,

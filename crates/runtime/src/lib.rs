@@ -59,6 +59,7 @@ mod team_inbox_digest;
 pub mod team_cron_registry;
 pub mod todo_progress;
 pub mod todo_store;
+pub mod tool_cancel;
 pub mod trust_resolver;
 pub mod worker_boot;
 
@@ -72,8 +73,11 @@ pub use core_types::sse;
 pub use core_types::usage;
 
 pub use bash::{
-    execute_bash, execute_bash_with_tasks, timeout_stderr,
+    execute_bash, execute_bash_with_tasks, interrupt_foreground_bash, timeout_stderr,
     timeout_stderr_with_background_advice, BashCommandInput, BashCommandOutput,
+};
+pub use tool_cancel::{
+    ToolCancelSignal, ToolCancelWatch, ToolDispatchOutcome, CANCELLED_TOOL_RESULT,
 };
 
 #[must_use]

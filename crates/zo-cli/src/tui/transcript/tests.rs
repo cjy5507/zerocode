@@ -5714,3 +5714,98 @@ fn cached_tool_result_lines_fit_their_width_and_paint_every_glyph() {
         }
     }
 }
+
+
+/// A user-cancelled tool card must keep its cancelled glyph, and must stop
+/// counting as "running" the moment it settles.
+///
+/// The runtime settles a cancellation as an *error* tool result — the wire
+/// format has no third state — so without the guard in
+/// `reconcile_tool_call_status` the row the user deliberately stopped would
+/// repaint with the failure marker and read as a crash.
+#[test]
+fn a_cancelled_tool_card_is_not_repainted_as_a_failure() {
+    fn card(call: &ToolCallId, status: ToolCallStatus) -> RenderBlock {
+        RenderBlock::ToolCall {
+            id: id(),
+            tool_call_id: call.clone(),
+            name: "Bash".to_string(),
+            summary: "sleep 900".to_string(),
+            preview: ToolPreview::Bash {
+                command: "sleep 900".to_string(),
+            },
+            status,
+        }
+    }
+
+    let mut t = Transcript::new();
+    let call = ToolCallId("call-cancelled".to_string());
+    t.push(card(&call, ToolCallStatus::Running));
+    assert_eq!(
+        t.running_tool_call_ids(),
+        vec![call.clone()],
+        "a Running card is what makes Esc offer a tool cancel"
+    );
+
+    // The runtime repaints the card, then settles the synthetic error result.
+    t.push(card(&call, ToolCallStatus::Cancelled));
+    t.push(RenderBlock::ToolResult {
+        id: id(),
+        tool_call_id: call.clone(),
+        is_error: true,
+        body: ToolResultBody::Text {
+            content: runtime::CANCELLED_TOOL_RESULT.to_string(),
+            truncated: false,
+        },
+    });
+
+    let statuses: Vec<ToolCallStatus> = t
+        .blocks()
+        .iter()
+        .filter_map(|block| match block {
+            RenderBlock::ToolCall {
+                tool_call_id,
+                status,
+                ..
+            } if *tool_call_id == call => Some(*status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        vec![ToolCallStatus::Cancelled],
+        "the error result must not downgrade a cancelled card to Errored"
+    );
+    assert!(
+        t.running_tool_call_ids().is_empty(),
+        "a cancelled card is settled: Esc must not offer to cancel it again"
+    );
+}
+
+/// A tool card frozen on `Running` by a killed turn must not make a much later
+/// Esc claim there is something to cancel.
+#[test]
+fn a_previous_turns_orphaned_tool_card_is_not_reported_as_running() {
+    let mut t = Transcript::new();
+    t.push(RenderBlock::ToolCall {
+        id: id(),
+        tool_call_id: ToolCallId("call-orphan".to_string()),
+        name: "Bash".to_string(),
+        summary: "sleep 900".to_string(),
+        preview: ToolPreview::Bash {
+            command: "sleep 900".to_string(),
+        },
+        status: ToolCallStatus::Running,
+    });
+    assert!(!t.running_tool_call_ids().is_empty());
+
+    // A new user turn begins; the orphan belongs to history now.
+    t.push(RenderBlock::UserMessage {
+        id: id(),
+        text: "try again".to_string(),
+    });
+    assert!(
+        t.running_tool_call_ids().is_empty(),
+        "the scan must stop at the newest user message"
+    );
+}

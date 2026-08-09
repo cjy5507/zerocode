@@ -432,6 +432,14 @@ pub struct App {
     /// Last observed bare-Esc timestamp in Normal mode (for the
     /// Esc-Esc "rewind previous checkpoint" double-tap).
     last_esc: Option<Instant>,
+    /// Last observed bare-Esc timestamp **while a turn was running**, arming the
+    /// Esc-Esc "stop the turn" double-tap.
+    ///
+    /// Deliberately a separate clock from `last_esc`: sharing one would let an
+    /// idle Esc that armed a *rewind* be answered, 200 ms later, by a turn-kill
+    /// — and vice versa. The two windows must not be able to complete each
+    /// other's gesture.
+    last_mid_turn_esc: Option<Instant>,
     /// Count of render blocks drained — exposed for integration tests.
     blocks_drained: usize,
     /// Live streaming pacer: buffers the open prose block's arrived-but-unrevealed
@@ -764,6 +772,7 @@ impl App {
             cmd_tx,
             last_ctrl_c: None,
             last_esc: None,
+            last_mid_turn_esc: None,
             blocks_drained: 0,
             stream_pacer: None,
             should_quit: false,

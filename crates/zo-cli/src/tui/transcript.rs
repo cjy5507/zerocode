@@ -1562,6 +1562,39 @@ impl Transcript {
         &self.blocks
     }
 
+    /// Tool cards still in flight **for the current turn**, newest first.
+    ///
+    /// This is the derived answer to "is a tool running right now?" — it reads
+    /// the very status the cards draw, so the Esc branch can never claim to
+    /// cancel a tool the user cannot see spinning.
+    ///
+    /// The scan stops at the newest `UserMessage`. A turn killed mid-tool leaves
+    /// its cards frozen on `Running` forever (nothing settles them once the turn
+    /// is gone), and counting those would let a much later Esc report "cancelled
+    /// the tool" over a card that has been dead for ten minutes.
+    #[must_use]
+    pub fn running_tool_call_ids(&self) -> Vec<ToolCallId> {
+        let mut running = Vec::new();
+        for block in self.blocks.iter().rev() {
+            match block {
+                RenderBlock::UserMessage { .. } => break,
+                RenderBlock::ToolCall {
+                    tool_call_id,
+                    status: ToolCallStatus::Pending | ToolCallStatus::Running,
+                    ..
+                } => running.push(tool_call_id.clone()),
+                _ => {}
+            }
+        }
+        running
+    }
+
+    /// `true` when at least one tool of the current turn is still executing.
+    #[must_use]
+    pub fn has_running_tool_call(&self) -> bool {
+        !self.running_tool_call_ids().is_empty()
+    }
+
     /// Height of settled transcript content rendered at `width`.
     ///
     /// This excludes the viewport-only two-row breathing pad. Inline mode uses
@@ -2552,7 +2585,14 @@ impl Transcript {
 
         for &idx in &matching_indices {
             if let Some(RenderBlock::ToolCall { status, .. }) = self.blocks.get_mut(idx) {
-                *status = next_status;
+                // A user-cancelled card keeps its `⊘`. The runtime settles a
+                // cancellation as an *error* tool result — the wire format has
+                // no third state — so without this guard the row the user just
+                // stopped would repaint as a red `×`, borrowing the vocabulary
+                // of failure for something that did not fail.
+                if !matches!(*status, ToolCallStatus::Cancelled) {
+                    *status = next_status;
+                }
             }
             if let Some(slot) = self.rendered_cache.get_mut(idx) {
                 *slot = None;
