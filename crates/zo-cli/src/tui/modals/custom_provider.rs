@@ -337,16 +337,32 @@ impl CustomProviderWizardModal {
                 self.next_field();
                 None
             }
+            // The arrows adjust whatever the focused field holds: they cycle
+            // the auth mode and flip the two boolean fields. The booleans used
+            // to answer only to Space, which is the one key a text-entry
+            // surface cannot promise — here it is also ordinary typed text.
             KeyCode::Left => {
-                if matches!(self.current_field(), Field::AuthMode) {
-                    self.auth_mode = self.auth_mode.prev();
+                match self.current_field() {
+                    Field::AuthMode => self.auth_mode = self.auth_mode.prev(),
+                    Field::IncludeUsage => self.include_usage = !self.include_usage,
+                    Field::ReasoningEffort => {
+                        self.supports_reasoning_effort = !self.supports_reasoning_effort;
+                    }
+                    _ => {}
                 }
                 None
             }
             KeyCode::Right => {
-                if matches!(self.current_field(), Field::AuthMode) {
-                    self.auth_mode = self.auth_mode.next();
-                    self.sync_default_auth_env();
+                match self.current_field() {
+                    Field::AuthMode => {
+                        self.auth_mode = self.auth_mode.next();
+                        self.sync_default_auth_env();
+                    }
+                    Field::IncludeUsage => self.include_usage = !self.include_usage,
+                    Field::ReasoningEffort => {
+                        self.supports_reasoning_effort = !self.supports_reasoning_effort;
+                    }
+                    _ => {}
                 }
                 None
             }

@@ -81,15 +81,23 @@ impl ReviewModal {
                 self.body_scroll = self.body_scroll.saturating_add(10);
                 None
             }
-            KeyCode::Char('a') => {
+            // Every mutation must be reachable without typing a bare ASCII
+            // letter: while a Korean IME is composing, `a`/`A`/`r` never arrive
+            // and this modal would degrade to a read-only hunk scroller. Enter
+            // accepts, Delete/Backspace rejects, Tab accepts the whole file;
+            // the letters stay as aliases for muscle memory. Tab rather than
+            // Shift+Enter for the bulk action because plain terminals collapse
+            // Shift+Enter to Enter — which would silently accept one hunk
+            // where the user asked for the file.
+            KeyCode::Enter | KeyCode::Char('a') => {
                 self.accept_selected();
                 None
             }
-            KeyCode::Char('A') => {
+            KeyCode::Tab | KeyCode::Char('A') => {
                 self.accept_selected_file();
                 None
             }
-            KeyCode::Char('r') => {
+            KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('r') => {
                 self.reject_selected();
                 None
             }
@@ -163,10 +171,10 @@ impl ReviewModal {
             Paragraph::new(super::key_hint_footer_fitted(
                 theme,
                 &[
-                    ("j/k", "hunk"),
-                    ("a", "accept"),
-                    ("r", "reject"),
-                    ("A", "accept file"),
+                    ("↑↓", "hunk"),
+                    ("Enter", "accept"),
+                    ("Del", "reject"),
+                    ("Tab", "accept file"),
                     ("Esc", "close"),
                 ],
                 footer_area.width,
@@ -444,6 +452,56 @@ mod tests {
         output
     }
 
+    /// Under a Korean IME every bare ASCII letter is swallowed by the
+    /// composition, so a modal whose mutations are letter-only reads as having
+    /// no mutations at all. Accept and reject must answer to Enter and Delete;
+    /// this is the regression pin for the whole class.
+    #[test]
+    fn accept_and_reject_are_reachable_without_typing_a_letter() {
+        // Each IME-independent key must do exactly what its letter alias does.
+        // Comparing outcomes (rather than asserting a specific ledger state)
+        // keeps the pin about key routing and independent of whether the
+        // workspace store behind the action is reachable in a unit test.
+        for (reachable, alias) in [
+            (KeyCode::Enter, KeyCode::Char('a')),
+            (KeyCode::Delete, KeyCode::Char('r')),
+            (KeyCode::Backspace, KeyCode::Char('r')),
+            (KeyCode::Tab, KeyCode::Char('A')),
+        ] {
+            let mut by_key = sample();
+            by_key.handle_key(press(KeyCode::Down));
+            by_key.handle_key(press(reachable));
+            let mut by_letter = sample();
+            by_letter.handle_key(press(KeyCode::Down));
+            by_letter.handle_key(press(alias));
+            assert_eq!(
+                outcome(&by_key),
+                outcome(&by_letter),
+                "{reachable:?} must do what {alias:?} does"
+            );
+            let untouched = sample();
+            assert_ne!(
+                outcome(&by_key),
+                outcome(&untouched),
+                "{reachable:?} must actually act, not fall through"
+            );
+        }
+    }
+
+    /// Everything a key press can change about this modal, for comparing the
+    /// effect of two different keys.
+    fn outcome(modal: &ReviewModal) -> (Vec<AttributionStatus>, Option<String>) {
+        (
+            modal
+                .ledger()
+                .hunks
+                .iter()
+                .map(|hunk| hunk.status)
+                .collect(),
+            modal.error.clone(),
+        )
+    }
+
     #[test]
     fn arrows_and_jk_navigate_hunks() {
         let mut modal = sample();
@@ -472,8 +530,9 @@ mod tests {
         assert!(rendered.contains("[human]"), "{rendered}");
         assert!(rendered.contains("accepted"), "{rendered}");
         assert!(rendered.contains("+Human note"), "{rendered}");
-        assert!(rendered.contains("a accept"), "{rendered}");
-        assert!(rendered.contains("r reject"), "{rendered}");
-        assert!(rendered.contains("A accept file"), "{rendered}");
+        // The footer advertises only keys a composing IME still delivers.
+        assert!(rendered.contains("Enter accept"), "{rendered}");
+        assert!(rendered.contains("Del reject"), "{rendered}");
+        assert!(rendered.contains("Tab accept file"), "{rendered}");
     }
 }

@@ -91,11 +91,19 @@ impl TeamInboxViewerModal {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => Some(TeamInboxViewerAction::Close),
-            KeyCode::Char('r') if key.modifiers.is_empty() => Some(TeamInboxViewerAction::Refresh),
-            KeyCode::Char('a') if key.modifiers.is_empty() => self
-                .selected_row()
-                .filter(|row| !is_terminal(row))
-                .map(|row| TeamInboxViewerAction::Ack(row.id.clone())),
+            KeyCode::F(5) | KeyCode::Char('r') if key.modifiers.is_empty() => {
+                Some(TeamInboxViewerAction::Refresh)
+            }
+            // Enter already means "quote this into the composer", so ack — the
+            // other mutation — takes Delete: a bare `a` never arrives while a
+            // Korean IME is composing.
+            KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('a')
+                if key.modifiers.is_empty() =>
+            {
+                self.selected_row()
+                    .filter(|row| !is_terminal(row))
+                    .map(|row| TeamInboxViewerAction::Ack(row.id.clone()))
+            }
             KeyCode::Enter => self.selected_row().map(|row| {
                 TeamInboxViewerAction::Include(format!(
                     "[TeamInbox {}/{}] {}",
@@ -324,7 +332,7 @@ fn age_label(created_at_unix: i64) -> String {
 fn footer_line(theme: &Theme) -> Line<'static> {
     super::key_hint_footer_reflowing(
         theme,
-        &[("Enter", "include"), ("a", "ack"), ("r", "refresh"), ("Esc", "close")],
+        &[("Enter", "include"), ("Del", "ack"), ("F5", "refresh"), ("Esc", "close")],
     )
 }
 
@@ -355,6 +363,22 @@ mod tests {
     }
 
     fn press(code: KeyCode) -> KeyEvent { KeyEvent::new(code, KeyModifiers::NONE) }
+
+    /// Ack is a mutation and Enter is taken by "quote into the composer", so
+    /// Delete has to carry it: a bare `a` never arrives while a Korean IME is
+    /// composing, which would leave the viewer with no way to acknowledge.
+    #[test]
+    fn ack_and_refresh_are_reachable_without_typing_a_letter() {
+        let mut modal = TeamInboxViewerModal::new(snapshot(vec![row("a", None)]));
+        assert_eq!(
+            modal.handle_key(press(KeyCode::Delete)),
+            Some(TeamInboxViewerAction::Ack("a".to_string()))
+        );
+        assert_eq!(
+            modal.handle_key(press(KeyCode::F(5))),
+            Some(TeamInboxViewerAction::Refresh)
+        );
+    }
 
     #[test]
     fn refresh_preserves_selection_by_update_id() {

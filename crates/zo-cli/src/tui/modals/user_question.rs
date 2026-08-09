@@ -276,9 +276,15 @@ impl UserQuestionModal {
                 self.move_down();
                 None
             }
-            // Space toggles the checkbox on an option row. On the free-form row
-            // it is ordinary typed text, so fall through to the char handler.
-            KeyCode::Char(' ') if !self.on_freeform_row() => {
+            // Space or ←/→ toggles the checkbox on an option row. On the
+            // free-form row space is ordinary typed text, so it falls through
+            // to the char handler; the arrows have nothing else to do there.
+            // Enter cannot carry the toggle — it confirms the whole set — so
+            // without the arrows a composing IME could scroll the checkboxes
+            // without ever being able to tick one.
+            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                if !self.on_freeform_row() =>
+            {
                 self.toggle_current();
                 None
             }

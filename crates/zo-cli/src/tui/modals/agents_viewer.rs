@@ -204,8 +204,10 @@ impl AgentsViewerModal {
             KeyCode::Up | KeyCode::Char('k') => self.select_prev(1),
             KeyCode::Down | KeyCode::Char('j') => self.select_next(1),
             // Message box: talk to the selected agent (steer it mid-run, or
-            // resume it with context if it already finished).
-            KeyCode::Char('m' | 'i') if self.selected_row().is_some() => {
+            // resume it with context if it already finished). Enter carries it
+            // too — this is the viewer's only mutation, and bare `m`/`i` never
+            // arrive while a Korean IME is composing.
+            KeyCode::Enter | KeyCode::Char('m' | 'i') if self.selected_row().is_some() => {
                 self.input = Some(String::new());
                 self.feedback = None;
             }
@@ -817,8 +819,8 @@ fn footer_line(theme: &Theme, width: u16) -> Line<'static> {
             ("↑/↓", "agent"),
             ("PgUp/PgDn", "output"),
             ("click", "select/fold"),
-            ("m", "message"),
-            ("a", "history"),
+            ("Enter", "message"),
+            ("Tab", "history"),
             ("Esc", "close"),
         ],
     );

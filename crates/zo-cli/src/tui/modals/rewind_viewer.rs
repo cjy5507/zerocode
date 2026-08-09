@@ -140,8 +140,9 @@ impl RewindViewerModal {
             // Diff-body scroll (secondary axis).
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
-            // `d` toggles the diff body.
-            KeyCode::Char('d') => {
+            // Tab (or `d`) toggles the diff body — Enter is the rewind itself,
+            // and a bare letter is unreachable under a composing IME.
+            KeyCode::Tab | KeyCode::Char('d') => {
                 self.show_diff = !self.show_diff;
                 self.scroll = 0;
             }
@@ -307,7 +308,7 @@ fn footer_line(theme: &Theme, width: u16) -> Line<'static> {
         theme,
         &[
             ("↑/↓", "turn"),
-            ("d", "diff"),
+            ("Tab", "diff"),
             ("Enter", "rewind here"),
             ("Esc", "close"),
         ],

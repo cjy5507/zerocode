@@ -2,10 +2,11 @@
 //!
 //! The surface is a two-level tree: each registered provider is a parent row
 //! whose children are the model ids it serves. Everything the user can do to a
-//! provider is reachable from the row itself (`e` edit, `d` delete, `r`
+//! provider is reachable from the row itself (F2 edit, Del delete, F5
 //! rediscover) and everything they can do to a single model is reachable from
-//! the model row (`d` delete), so there is no second menu to learn and no mode
-//! to remember.
+//! the model row (Del delete), so there is no second menu to learn and no mode
+//! to remember. Every mutation answers to a key an IME cannot swallow — the
+//! `e`/`d`/`r` letters remain as aliases.
 //!
 //! Deleting is the only destructive action, so it routes through an inline
 //! confirmation that spells out what disappears and — when the credential is
@@ -348,8 +349,11 @@ impl ProviderManagerModal {
             KeyCode::Char('a') => Some(ModalResult::Selected(ModalSelection::ProviderManage(
                 ProviderManagerAction::Add,
             ))),
-            KeyCode::Char('e') => self.edit_current(),
-            KeyCode::Char('r') => self.rediscover_current(),
+            // F2/F5 carry edit and re-probe because Enter is already taken by
+            // fold-open and a bare `e`/`r` never arrives while a Korean IME is
+            // composing — the letters stay as aliases.
+            KeyCode::F(2) | KeyCode::Char('e') => self.edit_current(),
+            KeyCode::F(5) | KeyCode::Char('r') => self.rediscover_current(),
             KeyCode::Char('d') | KeyCode::Delete => {
                 self.begin_delete();
                 None
@@ -364,7 +368,10 @@ impl ProviderManagerModal {
                 self.confirm = None;
                 None
             }
-            KeyCode::Char(' ') => {
+            // Arrows toggle the "also wipe the stored key" checkbox alongside
+            // Space, so the choice is reachable with a composing IME instead of
+            // the user being stuck with whatever the default was.
+            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
                 if let Some(Confirm::Provider {
                     delete_key: Some(delete_key),
                     ..
@@ -857,15 +864,13 @@ impl ProviderManagerModal {
                 &[
                     ("↑↓", "move"),
                     ("Enter", "reconnect"),
-                    ("d", "disconnect"),
-                    ("a", "add"),
+                    ("Del", "disconnect"),
                     ("Esc", "close"),
                 ]
             }
             Some(TreeRow::Account { .. }) => &[
                 ("↑↓", "move"),
                 ("Enter", "connect"),
-                ("a", "add"),
                 ("Esc", "close"),
             ],
             Some(TreeRow::Provider { provider })
@@ -876,25 +881,22 @@ impl ProviderManagerModal {
             {
                 &[
                     ("↑↓", "move"),
-                    ("Space", "fold"),
-                    ("e", "edit"),
-                    ("r", "rediscover"),
-                    ("d", "delete"),
-                    ("a", "add"),
+                    ("Enter", "fold"),
+                    ("F2", "edit"),
+                    ("F5", "rediscover"),
+                    ("Del", "delete"),
                     ("Esc", "close"),
                 ]
             }
             Some(TreeRow::Model { .. }) => &[
                 ("↑↓", "move"),
                 ("←", "collapse"),
-                ("d", "remove model"),
-                ("a", "add"),
+                ("Del", "remove model"),
                 ("Esc", "close"),
             ],
             _ => &[
                 ("↑↓", "move"),
                 ("Enter", "add"),
-                ("a", "add"),
                 ("Esc", "close"),
             ],
         };

@@ -202,8 +202,10 @@ impl App {
                 // History toggle needs a disk re-read, so it lives here rather
                 // than inside the modal (which never touches the disk). While
                 // the message box is open, `a` is a character being typed, so
-                // it falls through to the modal instead.
-                if matches!(key.code, KeyCode::Char('a'))
+                // it falls through to the modal instead. Tab carries the toggle
+                // too, because a bare letter never arrives while a Korean IME
+                // is composing — and Tab is not typed text even in the box.
+                if matches!(key.code, KeyCode::Char('a') | KeyCode::Tab)
                     && key.modifiers.is_empty()
                     && key.kind == KeyEventKind::Press
                     && self

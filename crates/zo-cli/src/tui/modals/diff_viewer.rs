@@ -172,15 +172,17 @@ impl DiffViewerModal {
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
             KeyCode::Home | KeyCode::Char('g') => self.scroll = 0,
-            // `s` toggles unified ↔ side-by-side; scroll resets so the
+            // Tab (or `s`) toggles unified ↔ side-by-side; scroll resets so the
             // re-flowed body starts at the top.
-            KeyCode::Char('s') => {
+            KeyCode::Tab | KeyCode::Char('s') => {
                 self.side_by_side = !self.side_by_side;
                 self.scroll = 0;
             }
-            // `r` requests reverting the selected file to HEAD. The host
-            // app runs the git checkout and rebuilds the viewer.
-            KeyCode::Char('r') => {
+            // Delete (or `r`) requests reverting the selected file to HEAD. The
+            // host app runs the git checkout and rebuilds the viewer. This
+            // throws away work on disk, so it must stay reachable when a Korean
+            // IME is composing and the bare letter never arrives.
+            KeyCode::Delete | KeyCode::Char('r') => {
                 if let Some(path) = self.selected_path() {
                     return Some(DiffViewerAction::RevertFile(path.to_string()));
                 }
@@ -679,8 +681,8 @@ fn footer_line(
             FooterSegment::hint("←/→", "file"),
             FooterSegment::hint("↑/↓", "scroll"),
             FooterSegment::hint("PgUp/PgDn", "page"),
-            FooterSegment::hint_with_key_style("s", view_label, s_key_style),
-            FooterSegment::hint("r", "revert"),
+            FooterSegment::hint_with_key_style("Tab", view_label, s_key_style),
+            FooterSegment::hint("Del", "revert"),
             FooterSegment::hint("Esc", "close"),
         ],
         " · ",
@@ -1214,6 +1216,30 @@ diff --git a/README.md b/README.md\n\
         assert_eq!(
             modal.handle_key(press(KeyCode::Esc)),
             Some(DiffViewerAction::Close)
+        );
+    }
+
+    /// Reverting a file throws away work on disk, so it must stay reachable
+    /// when a Korean IME is composing and the bare `r` never arrives; Tab
+    /// carries the view toggle for the same reason.
+    #[test]
+    fn revert_and_view_toggle_are_reachable_without_typing_a_letter() {
+        let mut modal = DiffViewerModal::new(parse_unified_diff(SAMPLE));
+        let before = modal.is_side_by_side();
+        modal.handle_key(press(KeyCode::Tab));
+        assert_ne!(modal.is_side_by_side(), before, "Tab toggles the view");
+
+        let mut modal = DiffViewerModal::new(parse_unified_diff(SAMPLE));
+        let by_delete = modal.handle_key(press(KeyCode::Delete));
+        assert!(
+            matches!(by_delete, Some(DiffViewerAction::RevertFile(_))),
+            "Delete requests the revert: {by_delete:?}"
+        );
+        let mut modal = DiffViewerModal::new(parse_unified_diff(SAMPLE));
+        assert_eq!(
+            by_delete,
+            modal.handle_key(press(KeyCode::Char('r'))),
+            "Delete does exactly what the letter alias did"
         );
     }
 

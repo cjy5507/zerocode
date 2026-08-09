@@ -129,9 +129,11 @@ impl ReportViewerModal {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => Some(ModalResult::Cancelled),
-            KeyCode::Char('c') => Some(ModalResult::Selected(ModalSelection::CopyText(
-                self.copy_text.clone(),
-            ))),
+            // Enter carries the copy alongside `c`: it is this viewer's only
+            // action, and a bare letter never arrives under a composing IME.
+            KeyCode::Enter | KeyCode::Char('c') => Some(ModalResult::Selected(
+                ModalSelection::CopyText(self.copy_text.clone()),
+            )),
             KeyCode::Up | KeyCode::Char('k') => {
                 self.scroll_by(-1);
                 None
@@ -206,7 +208,7 @@ impl ReportViewerModal {
         // would be cut mid-word at the edge.
         visible.push(super::key_hint_footer_fitted(
             theme,
-            &[("↑↓", "scroll"), ("c", "copy"), ("Esc", "close")],
+            &[("↑↓", "scroll"), ("Enter", "copy"), ("Esc", "close")],
             inner.width,
         ));
         // Fitted: this body renders without `wrap`, so an over-wide row would be

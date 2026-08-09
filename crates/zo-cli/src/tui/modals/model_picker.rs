@@ -949,7 +949,10 @@ impl ModelManager {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.cursor = (self.cursor + 1).min(self.rows.len().saturating_sub(1));
             }
-            KeyCode::Char('a' | 'A') => {
+            // Insert adds and Delete deletes, because bare `a`/`d`/`r` never
+            // reach a modal while a Korean IME is composing and Enter is
+            // already spoken for by edit. Letters stay as aliases.
+            KeyCode::Insert | KeyCode::Char('a' | 'A') => {
                 let providers = self.connected.clone();
                 if providers.is_empty() {
                     self.error = Some("Connect a provider before adding a model".to_string());
@@ -966,6 +969,12 @@ impl ModelManager {
                         error: None,
                     });
                 }
+            }
+            // Restoring only applies to a hidden row, where edit is inert, so
+            // Enter means restore for exactly those rows and edit everywhere
+            // else — one key doing the obvious thing for the highlighted row.
+            KeyCode::Enter if self.selected().is_some_and(|row| row.hidden) => {
+                self.restore_selected();
             }
             KeyCode::Enter | KeyCode::Char('e' | 'E') => {
                 if let Some(row) = self.selected().filter(|row| !row.hidden).cloned() {
@@ -990,20 +999,27 @@ impl ModelManager {
                     });
                 }
             }
-            KeyCode::Char('d' | 'D') => {
+            KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('d' | 'D') => {
                 if self.selected().is_some_and(|row| !row.hidden) { self.confirm = true; }
             }
-            KeyCode::Char('r' | 'R') => {
-                if let Some(row) = self.selected().filter(|row| row.hidden).cloned() {
-                    match self.catalog.restore(&row) {
-                        Ok(()) => { self.changed = true; self.refresh(); }
-                        Err(error) => self.error = Some(error),
-                    }
-                }
-            }
+            KeyCode::Char('r' | 'R') => self.restore_selected(),
             _ => {}
         }
         false
+    }
+
+    /// Un-hide the selected catalog row, if it is a hidden one.
+    fn restore_selected(&mut self) {
+        let Some(row) = self.selected().filter(|row| row.hidden).cloned() else {
+            return;
+        };
+        match self.catalog.restore(&row) {
+            Ok(()) => {
+                self.changed = true;
+                self.refresh();
+            }
+            Err(error) => self.error = Some(error),
+        }
     }
 
     fn handle_form_key(&mut self, key: KeyEvent) -> bool {
@@ -1214,7 +1230,7 @@ impl ModelManager {
             if self.confirm {
                 lines.push(Line::from(Span::styled("Delete this user model or hide this built-in? Enter/y confirms; Esc/n cancels", Style::new().fg(theme.palette.warn))));
             } else {
-                lines.push(key_hint_footer_reflowing(theme, &[("↑↓/j/k", "move"), ("a", "add"), ("Enter/e", "edit"), ("d", "delete/hide"), ("r", "restore"), ("Esc", "back")]));
+                lines.push(key_hint_footer_reflowing(theme, &[("↑↓", "move"), ("Ins", "add"), ("Enter", "edit/restore"), ("Del", "delete/hide"), ("Esc", "back")]));
             }
         }
         frame.render_widget(

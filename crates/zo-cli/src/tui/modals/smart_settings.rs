@@ -248,19 +248,55 @@ enum ActivePane {
     Targets,
     /// The merged editor + live preview for the selected target.
     Detail,
+    /// The header's global switches. A focus stop of their own so every global
+    /// toggle is reachable by cursor: they used to answer only to bare letters
+    /// (`d`, `b`, `A`), which a composing Korean IME never delivers, leaving
+    /// them unreachable — the same defect the /tier modal had.
+    Globals,
 }
 
 impl ActivePane {
     fn next(self) -> Self {
         match self {
             Self::Targets => Self::Detail,
-            Self::Detail => Self::Targets,
+            Self::Detail => Self::Globals,
+            Self::Globals => Self::Targets,
         }
     }
 
     fn prev(self) -> Self {
-        // Two panes: prev == next.
-        self.next()
+        match self {
+            Self::Targets => Self::Globals,
+            Self::Detail => Self::Targets,
+            Self::Globals => Self::Detail,
+        }
+    }
+}
+
+/// The header's global switches, in cursor order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalRow {
+    SmartEnabled,
+    CrossProvider,
+    Feedback,
+    ApplyRecommended,
+}
+
+impl GlobalRow {
+    const ALL: [Self; 4] = [
+        Self::SmartEnabled,
+        Self::CrossProvider,
+        Self::Feedback,
+        Self::ApplyRecommended,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SmartEnabled => "Smart",
+            Self::CrossProvider => "Cross-provider",
+            Self::Feedback => "Feedback",
+            Self::ApplyRecommended => "Apply setup",
+        }
     }
 }
 
@@ -368,6 +404,7 @@ pub struct SmartSettingsModal {
     subagents: Vec<TargetState>,
     tab: TargetTab,
     pane: ActivePane,
+    global_cursor: usize,
     role_cursor: usize,
     subagent_cursor: usize,
     editor_cursor: usize,
@@ -398,6 +435,7 @@ impl SmartSettingsModal {
             subagents: view.subagents.into_iter().map(TargetState::from_target).collect(),
             tab: TargetTab::Roles,
             pane: ActivePane::Targets,
+            global_cursor: 0,
             role_cursor: 0,
             subagent_cursor: 0,
             editor_cursor: 0,
@@ -447,6 +485,10 @@ impl SmartSettingsModal {
                 self.pane = self.pane.prev();
                 None
             }
+            KeyCode::Char(' ') if self.pane == ActivePane::Globals => {
+                self.activate_current_global();
+                None
+            }
             KeyCode::Char(' ') => {
                 self.enabled = !self.enabled;
                 None
@@ -461,6 +503,11 @@ impl SmartSettingsModal {
             }
             KeyCode::Char('A') => {
                 self.apply_recommended_setup();
+                None
+            }
+            // Reverting the selected target used to answer only to `r`.
+            KeyCode::Delete | KeyCode::Backspace if self.pane != ActivePane::Globals => {
+                self.reset_current_target();
                 None
             }
             KeyCode::Char('a') => {
@@ -608,12 +655,50 @@ impl SmartSettingsModal {
             ));
         }
 
-        let mut settings = vec![Span::styled("Global  ", theme.typography.dim)];
-        settings.extend(toggle_spans("Space", "Smart", self.enabled, theme));
-        settings.push(Span::raw("   "));
-        settings.extend(toggle_spans("d", "Cross-provider", self.policy.allow_cross_provider_diversity, theme));
-        settings.push(Span::raw("   "));
-        settings.extend(toggle_spans("b", "Feedback", self.policy.feedback_informed_auto, theme));
+        // With the Globals pane focused the switches become a cursor list, so
+        // every one of them is reachable by arrow keys alone.
+        let focused = self.pane == ActivePane::Globals;
+        let mut settings = vec![Span::styled(
+            if focused { "Global ▸" } else { "Global  " },
+            theme.typography.dim,
+        )];
+        for (index, row) in GlobalRow::ALL.iter().enumerate() {
+            if index > 0 {
+                settings.push(Span::raw("   "));
+            }
+            let on_cursor = focused && index == self.global_cursor;
+            if focused {
+                settings.push(Span::styled(
+                    if on_cursor { "› " } else { "  " },
+                    theme.typography.key_hint,
+                ));
+            }
+            match row {
+                GlobalRow::SmartEnabled => {
+                    settings.extend(toggle_spans("Space", "Smart", self.enabled, theme));
+                }
+                GlobalRow::CrossProvider => settings.extend(toggle_spans(
+                    "d",
+                    "Cross-provider",
+                    self.policy.allow_cross_provider_diversity,
+                    theme,
+                )),
+                GlobalRow::Feedback => settings.extend(toggle_spans(
+                    "b",
+                    "Feedback",
+                    self.policy.feedback_informed_auto,
+                    theme,
+                )),
+                GlobalRow::ApplyRecommended => settings.push(Span::styled(
+                    row.label(),
+                    if on_cursor {
+                        theme.typography.bold
+                    } else {
+                        theme.typography.dim
+                    },
+                )),
+            }
+        }
         settings.push(Span::styled(format!("   Classifier: {}", self.auto_classifier), theme.typography.dim));
 
         let mut lines = vec![Line::from(status), Line::from(""), Line::from(settings)];
@@ -1064,20 +1149,24 @@ impl SmartSettingsModal {
 
     fn render_footer(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         // Only the keys relevant to the focused pane, so the footer is not a wall
-        // of twelve shortcuts. Global toggles (Space/d/b) live in the header bar.
+        // of twelve shortcuts. The global switches are their own Tab stop, and
+        // every hint here is a key a composing IME still delivers.
         let context: &[(&str, &str)] = match self.pane {
             ActivePane::Targets => &[
                 ("↑↓", "pick"),
                 ("←→", "Roles/Subagents"),
                 ("Tab", "edit"),
-                ("a", "auto"),
-                ("A", "auto all"),
+                ("Del", "revert"),
             ],
             ActivePane::Detail => &[
                 ("↑↓←→", "adjust"),
-                ("a/p/f", "mode"),
                 ("/", "filter models"),
-                ("r", "revert"),
+                ("Del", "revert"),
+                ("Tab", "globals"),
+            ],
+            ActivePane::Globals => &[
+                ("↑↓", "pick switch"),
+                ("←→", "toggle"),
                 ("Tab", "back to list"),
             ],
         };
@@ -1105,6 +1194,7 @@ impl SmartSettingsModal {
         match self.pane {
             ActivePane::Targets => self.switch_tab(self.tab.prev()),
             ActivePane::Detail => self.editor_left(),
+            ActivePane::Globals => self.activate_current_global(),
         }
     }
 
@@ -1112,6 +1202,7 @@ impl SmartSettingsModal {
         match self.pane {
             ActivePane::Targets => self.switch_tab(self.tab.next()),
             ActivePane::Detail => self.editor_right(),
+            ActivePane::Globals => self.activate_current_global(),
         }
     }
 
@@ -1119,6 +1210,7 @@ impl SmartSettingsModal {
         match self.pane {
             ActivePane::Targets => self.move_target(-1),
             ActivePane::Detail => self.editor_up(),
+            ActivePane::Globals => self.global_cursor = self.global_cursor.saturating_sub(1),
         }
     }
 
@@ -1126,6 +1218,9 @@ impl SmartSettingsModal {
         match self.pane {
             ActivePane::Targets => self.move_target(1),
             ActivePane::Detail => self.editor_down(),
+            ActivePane::Globals => {
+                self.global_cursor = (self.global_cursor + 1).min(GlobalRow::ALL.len() - 1);
+            }
         }
     }
 
@@ -1133,6 +1228,7 @@ impl SmartSettingsModal {
         match self.pane {
             ActivePane::Targets => self.set_current_cursor(0),
             ActivePane::Detail => self.editor_home(),
+            ActivePane::Globals => self.global_cursor = 0,
         }
     }
 
@@ -1140,6 +1236,31 @@ impl SmartSettingsModal {
         match self.pane {
             ActivePane::Targets => self.set_current_cursor(self.current_targets().len().saturating_sub(1)),
             ActivePane::Detail => self.editor_end(),
+            ActivePane::Globals => self.global_cursor = GlobalRow::ALL.len() - 1,
+        }
+    }
+
+    /// The global switch the cursor is on while the Globals pane has focus.
+    fn current_global(&self) -> GlobalRow {
+        GlobalRow::ALL
+            .get(self.global_cursor)
+            .copied()
+            .unwrap_or(GlobalRow::SmartEnabled)
+    }
+
+    /// Flip (or run) the selected global switch. Reached by ←/→/Space, so a
+    /// composing IME can still operate every global.
+    fn activate_current_global(&mut self) {
+        match self.current_global() {
+            GlobalRow::SmartEnabled => self.enabled = !self.enabled,
+            GlobalRow::CrossProvider => {
+                self.policy.allow_cross_provider_diversity =
+                    !self.policy.allow_cross_provider_diversity;
+            }
+            GlobalRow::Feedback => {
+                self.policy.feedback_informed_auto = !self.policy.feedback_informed_auto;
+            }
+            GlobalRow::ApplyRecommended => self.apply_recommended_setup(),
         }
     }
 
@@ -1711,6 +1832,65 @@ mod tests {
             observed_routes: vec![SmartSettingsObservedRoute { kind: SmartSettingsTargetKind::Subagent, key: "Verification".to_string(), completed: 8, decisive: 9, model: Some("code-model".to_string()) }],
             turn_output_tokens: vec![120, 340, 90, 510, 220],
         })
+    }
+
+    /// The three global switches and "apply recommended" used to answer only
+    /// to bare `Space`/`d`/`b`/`A`, which a composing Korean IME never
+    /// delivers. They are now a Tab stop of their own, driven by arrows.
+    #[test]
+    fn every_global_switch_is_reachable_by_cursor() {
+        let mut modal = sample_modal();
+        // Targets → Detail → Globals.
+        modal.handle_key(press(KeyCode::Tab));
+        modal.handle_key(press(KeyCode::Tab));
+        assert_eq!(modal.pane, ActivePane::Globals);
+
+        modal.handle_key(press(KeyCode::Right));
+        assert!(modal.enabled, "row 0 toggles the master switch");
+        modal.handle_key(press(KeyCode::Down));
+        modal.handle_key(press(KeyCode::Right));
+        assert!(
+            modal.policy.allow_cross_provider_diversity,
+            "row 1 toggles cross-provider diversity"
+        );
+        modal.handle_key(press(KeyCode::Down));
+        modal.handle_key(press(KeyCode::Left));
+        assert!(
+            modal.policy.feedback_informed_auto,
+            "row 2 toggles feedback-informed auto"
+        );
+
+        // Row 3 runs the recommended setup: stage an override first so the
+        // reset it performs is observable.
+        modal.handle_key(press(KeyCode::Tab));
+        modal.handle_key(press(KeyCode::Tab));
+        modal.handle_key(press(KeyCode::Char('p')));
+        modal.handle_key(press(KeyCode::Tab));
+        assert_eq!(modal.pane, ActivePane::Globals);
+        modal.handle_key(press(KeyCode::End));
+        modal.handle_key(press(KeyCode::Right));
+        assert!(
+            modal
+                .roles
+                .iter()
+                .all(|target| matches!(target.current, SmartSettingsUpdate::Auto)),
+            "row 3 applies the recommended setup"
+        );
+    }
+
+    /// Reverting the selected target answered only to `r`.
+    #[test]
+    fn delete_reverts_the_selected_target() {
+        let mut modal = sample_modal();
+        modal.handle_key(press(KeyCode::Tab));
+        modal.handle_key(press(KeyCode::Char('p')));
+        assert_eq!(modal.pending_change_count(), 1);
+        modal.handle_key(press(KeyCode::Delete));
+        assert_eq!(
+            modal.pending_change_count(),
+            0,
+            "Delete reverts the staged change"
+        );
     }
 
     #[test]
