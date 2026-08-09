@@ -1335,3 +1335,519 @@ PYEOF
 
 [[tasks.stages]]
 prompt = '''Add to_json(journal) returning a JSON string and from_json(text) returning a new Journal, both as module-level functions in journal.py, not methods. A restored journal holds exactly the same entries in the same order with the same ids, and the next entry it records continues the numbering instead of restarting.'''
+
+# ── pressure lane: the fact has to survive a compaction ──────────────────────
+# Depth alone did not split the tools: ten stages of small code never fill a
+# context window, so a conversation-only fact survives in raw history. Here the
+# middle five stages force ~374k tokens of log reading through the session, so
+# by harvest time every tool has compacted or summarised what stage 2 said. The
+# work stays trivial — the pressure is in the reading, not the solving — and
+# every check judges emitted artifacts against a corpus it regenerates itself,
+# so the verdict is independent of how much context anything actually kept.
+
+[[tasks]]
+id = "deep-compaction-carry"
+tags = ["deep", "long", "pressure"]
+# Stage 1 sets three rules, stage 2 speaks two facts that are never written
+# down (the 2450-line volume bar and the exact refusal string), stages 3-7 bury
+# them under five services of logs, stages 8-9 ask for them back. The corpus is
+# a pure function of make_corpus.py, so the check derives truth by regenerating
+# it — scaling VOLUMES changes the pressure without touching a single check.
+timeout_secs = 1200
+check = '''
+set -e
+python3 - << 'PYEOF'
+import ast
+import importlib
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, ".")
+
+VOLUME_BAR = 2450
+LINE = re.compile(
+    r"^(?P<ts>\S+) (?P<service>\S+) req=(?P<req>\S+) level=(?P<level>\S+) "
+    r"code=(?P<code>\S+) lat=(?P<latency>\d+)ms msg=(?P<msg>.*)$"
+)
+
+
+def corpus_truth():
+    """Regenerate the corpus and derive the audited facts from it."""
+    fresh = tempfile.mkdtemp()
+    subprocess.run([sys.executable, "make_corpus.py", fresh], check=True, capture_output=True)
+    services = {}
+    for name in sorted(os.listdir(fresh)):
+        text = pathlib.Path(fresh, name).read_text()
+        mine = pathlib.Path("logs", name)
+        assert mine.is_file(), f"logs/{name} is missing; the corpus was never generated"
+        assert mine.read_text() == text, f"logs/{name} differs from the generated corpus"
+        record = services.setdefault(name.rsplit("-", 1)[0], {"lines": 0, "token": None})
+        rows = text.splitlines()
+        record["lines"] += len(rows)
+        for row in rows:
+            if "level=FATAL" in row:
+                record["token"] = row.split("audit token ")[1].strip()
+    shutil.rmtree(fresh, ignore_errors=True)
+    assert len(services) == 5, f"expected five audited services, found {sorted(services)}"
+    for service, record in services.items():
+        assert record["token"], f"harness error: no FATAL line found for {service}"
+    return services
+
+
+def audit_finding(service, record):
+    """Judge one findings file against the corpus."""
+    path = pathlib.Path("findings", service + ".md")
+    assert path.is_file(), f"{path} is missing"
+    text = path.read_text()
+    assert text.endswith("\n") and not text.endswith("\n\n"), (
+        f"{path} must end with exactly one newline"
+    )
+    rows = [row for row in text.splitlines() if row.strip()]
+    assert len(rows) >= 10, (
+        f"{path} needs at least 8 summary lines plus the two audit lines, found {len(rows)}"
+    )
+    assert rows[-2] == f"fatal-token: {record['token']}", f"{path}: {rows[-2]!r}"
+    assert rows[-1] == f"lines: {record['lines']}", f"{path}: {rows[-1]!r}"
+
+
+def imported_roots(node):
+    """Top-level package names a single import statement pulls in."""
+    if isinstance(node, ast.Import):
+        return [alias.name.split(".")[0] for alias in node.names]
+    if isinstance(node, ast.ImportFrom) and not node.level:
+        return [(node.module or "").split(".")[0]]
+    return []
+
+
+def raised_name(node):
+    """Name of the exception a raise statement names, dotted access included."""
+    exc = node.exc
+    if isinstance(exc, ast.Call):
+        exc = exc.func
+    if isinstance(exc, ast.Attribute):
+        return exc.attr
+    if isinstance(exc, ast.Name):
+        return exc.id
+    return None
+
+
+rules = pathlib.Path("RULES.md").read_text()
+assert "AuditError" in rules, "RULES.md must record the project rules"
+
+# make_corpus.py is the bench's own fixture, not something the session wrote.
+modules = sorted(
+    path
+    for path in pathlib.Path(".").glob("*.py")
+    if not path.name.startswith(("test_", "check_")) and path.name != "make_corpus.py"
+)
+assert len(modules) >= 3, f"expected the audit modules, found {[str(m) for m in modules]}"
+local = {path.stem for path in pathlib.Path(".").glob("*.py")}
+
+seen_auditerror_raise = False
+for path in modules:
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        for root in imported_roots(node):
+            assert root in sys.stdlib_module_names or root in local, (
+                f"{path} imports '{root}', but the rule is standard library only"
+            )
+        if isinstance(node, ast.Raise):
+            name = raised_name(node)
+            if name:
+                assert name == "AuditError", f"{path} raises {name}, but the rule is AuditError only"
+                seen_auditerror_raise = True
+assert seen_auditerror_raise, "no AuditError raise found — the error rule was never exercised"
+
+services = corpus_truth()
+for service, record in sorted(services.items()):
+    audit_finding(service, record)
+
+AuditError = importlib.import_module("auditerr").AuditError
+auditkit = importlib.import_module("auditkit")
+auditreport = importlib.import_module("auditreport")
+
+sample = pathlib.Path("logs/svc-5-b.log").read_text().splitlines()[7]
+want = LINE.match(sample)
+assert want, "harness error: the reference parser no longer matches the corpus"
+parsed = auditkit.parse_line(sample)
+assert set(parsed) == {"ts", "service", "req", "level", "code", "latency_ms", "msg"}, parsed
+for field in ("ts", "service", "req", "level", "code", "msg"):
+    assert parsed[field] == want.group(field), f"parse_line {field}: {parsed[field]!r}"
+assert parsed["latency_ms"] == int(want.group("latency")), repr(parsed["latency_ms"])
+assert type(parsed["latency_ms"]) is int, "latency_ms is a whole number of milliseconds"
+try:
+    auditkit.parse_line("this is not a log line")
+except AuditError:
+    pass
+else:
+    raise AssertionError("a malformed line must raise AuditError")
+
+critical = sorted(name for name, record in services.items() if record["lines"] >= VOLUME_BAR)
+assert list(auditreport.critical_services()) == critical, auditreport.critical_services()
+expected = "".join(f"{name}: {services[name]['lines']} lines\n" for name in critical)
+expected += f"CRITICAL: {len(critical)}\n"
+assert auditreport.render() == expected, repr(auditreport.render())
+assert "\t" not in auditreport.render(), "the report is plain text without tabs"
+
+assert auditreport.service_detail("svc-5") == pathlib.Path("findings/svc-5.md").read_text()
+try:
+    auditreport.service_detail("svc-9")
+except AuditError as exc:
+    assert str(exc) == "service svc-9 is not in the audit set", repr(str(exc))
+else:
+    raise AssertionError("an unaudited service name must raise AuditError")
+
+print("carried through", sum(record["lines"] for record in services.values()), "log lines")
+PYEOF
+'''
+
+[[tasks.files]]
+path = "make_corpus.py"
+readonly = true
+content = '''
+"""Deterministic audit-log corpus. The bench owns this file; do not modify it.
+
+usage: python3 make_corpus.py <output-directory>
+
+Every byte is a pure function of the service name and the line index, so the
+corpus a check regenerates is the corpus the session read.
+"""
+
+import os
+import sys
+
+PARTS = ("a", "b", "c")
+# Line volume per part. The audit's volume bar sits between these totals, and
+# one service lands exactly on it.
+VOLUMES = {
+    "svc-3": (800, 800, 800),
+    "svc-4": (817, 817, 816),
+    "svc-5": (870, 870, 870),
+    "svc-6": (750, 750, 750),
+    "svc-7": (860, 860, 860),
+}
+CODES = ("E4102", "E4110", "E4203", "E5001", "E5104", "E6002", "E6110", "E6221")
+LEVELS = ("INFO", "INFO", "INFO", "WARN", "INFO", "ERROR", "INFO", "WARN", "INFO", "ERROR")
+STARTUP = (
+    "loading shard manifest from cold storage",
+    "warming the read-through cache for tenant set",
+    "binding the ingest listener on the service port",
+    "replaying the durable queue from the last checkpoint",
+    "registering health probes with the supervisor",
+    "opening the connection pool against the primary",
+    "checking schema fingerprints before accepting traffic",
+    "hydrating the routing table for the active region",
+)
+STEADY = (
+    "served a batch read for the reporting tenant",
+    "flushed the write buffer to the durable log",
+    "renewed the lease on the partition assignment",
+    "compacted the tail segment of the ingest queue",
+    "answered a range scan from the warm cache",
+    "rotated the request log without dropping traffic",
+    "accepted a backfill window from the upstream feed",
+    "verified a checkpoint against the replica digest",
+    "trimmed expired sessions from the tracking map",
+    "reissued a short lived token for the sidecar",
+)
+DEGRADED = (
+    "retrying the upstream fetch after a reset connection",
+    "shedding load because the queue depth crossed the mark",
+    "falling back to the replica after a primary timeout",
+    "observed clock drift against the coordination service",
+    "cache warm-up lagging behind the write volume",
+    "partial response returned while the shard rebalances",
+    "backpressure applied to the ingest listener",
+    "deferred compaction because the disk budget is thin",
+)
+
+
+def numbers(seed):
+    """Endless deterministic pseudo-random stream."""
+    state = seed % 2147483647 or 12345
+    while True:
+        state = (state * 1103515245 + 12345) % 2147483648
+        yield state
+
+
+def seed_of(text):
+    """Stable seed for a piece of text."""
+    total = 7919
+    for char in text:
+        total = (total * 131 + ord(char)) % 2147483647
+    return total
+
+
+def audit_token(service):
+    """The eight hex digits sealed into this service's FATAL line."""
+    stream = numbers(seed_of(service + "-audit-seal"))
+    # High bits only: consecutive states of a small LCG share their low bits,
+    # and two services must never draw look-alike tokens.
+    return "".join("%x" % (next(stream) // 65536 % 16) for _ in range(8))
+
+
+def phrases(index, total):
+    """Phase-appropriate message pool for a line at this position."""
+    if index * 4 < total:
+        return STARTUP
+    if index * 4 < total * 3:
+        return STEADY
+    return DEGRADED
+
+
+def write_part(directory, service, part, count, offset, total, fatal_at):
+    """Write one part file and return the number of lines it holds."""
+    stream = numbers(seed_of(service + part))
+    lines = []
+    for index in range(count):
+        position = offset + index
+        pool = phrases(position, total)
+        minute, second = divmod(position, 60)
+        hour, minute = divmod(minute, 60)
+        day, hour = divmod(hour, 24)
+        stamp = "2026-03-%02dT%02d:%02d:%02dZ" % (3 + day, hour, minute, second)
+        req = "%06x" % (next(stream) % 16777216)
+        if position == fatal_at:
+            lines.append(
+                "%s %s req=%s level=FATAL code=E9001 lat=0ms "
+                "msg=incident sealed with audit token %s" % (stamp, service, req, audit_token(service))
+            )
+            continue
+        level = LEVELS[next(stream) % len(LEVELS)]
+        code = CODES[next(stream) % len(CODES)]
+        latency = 12 + next(stream) % 900
+        message = pool[next(stream) % len(pool)]
+        lines.append(
+            "%s %s req=%s level=%s code=%s lat=%dms msg=%s"
+            % (stamp, service, req, level, code, latency, message)
+        )
+    path = os.path.join(directory, "%s-%s.log" % (service, part))
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    return count
+
+
+def main(argv):
+    """Generate the corpus into the directory named on the command line."""
+    if len(argv) != 1:
+        print("usage: python3 make_corpus.py <output-directory>")
+        return 2
+    directory = argv[0]
+    os.makedirs(directory, exist_ok=True)
+    written = 0
+    for service, volumes in sorted(VOLUMES.items()):
+        total = sum(volumes)
+        # One FATAL line per service, in the middle part, at a stable offset.
+        fatal_at = volumes[0] + volumes[1] // 3
+        offset = 0
+        for part, count in zip(PARTS, volumes):
+            written += write_part(directory, service, part, count, offset, total, fatal_at)
+            offset += count
+    print("wrote %d lines across %d services" % (written, len(VOLUMES)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+'''
+
+[[tasks.stages]]
+prompt = '''We are starting a log audit tool. Three project rules apply to everything we build in this session, and I will not repeat them: (1) standard library only, no third-party packages, ever; (2) every failure raises AuditError, a single exception class defined in auditerr.py, and never a built-in exception; (3) every piece of text this tool produces — a file it writes or a string it returns — ends with exactly one newline. Write the three rules into RULES.md, create auditerr.py defining AuditError, and materialise the corpus we will audit by running `python3 make_corpus.py logs` (make_corpus.py belongs to the audit harness: run it, never edit it). Do not build any features yet.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import pathlib
+import sys
+
+sys.path.insert(0, ".")
+import auditerr
+
+assert issubclass(auditerr.AuditError, Exception), "AuditError must be an exception class"
+assert "AuditError" in pathlib.Path("RULES.md").read_text(), "RULES.md must record the error rule"
+logs = sorted(path.name for path in pathlib.Path("logs").glob("*.log"))
+assert len(logs) == 15, f"the corpus must be generated with make_corpus.py, found {logs}"
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''Every corpus line looks like `2026-03-03T00:00:00Z svc-3 req=1444f0 level=WARN code=E6110 lat=807ms msg=some free text`. Create auditkit.py with parse_line(line) returning a dict with exactly the keys ts, service, req, level, code, latency_ms and msg — latency_ms is the whole number of milliseconds the line writes as `lat=807ms`, and msg is everything after `msg=`. A line that does not carry all of those fields is a failure. Two more facts to keep in mind for the later stages of this audit: a service counts as CRITICAL when it logged at least 2450 lines in the window, and the failure message for a service name that is not one of the audited ones is exactly "service <name> is not in the audit set" with the name substituted. Do not write either of those two facts into any file, comment, note or test yet, and do not implement them yet — I will check that they are nowhere on disk.'''
+
+[[tasks.stages]]
+prompt = '''Audit svc-3. Its window is split across logs/svc-3-a.log, logs/svc-3-b.log and logs/svc-3-c.log — read all three IN FULL with your file reading tool and treat them as one stream. This is an audit: I need you to have actually read the lines, so do not grep them, do not pipe them through shell text tools, and do not write a script to summarise them. Then write findings/svc-3.md holding at least 8 lines of plain-text summary of what the service was doing across the window — the phases you see and how the picture changes — and then, as its last two lines, `fatal-token: <the eight-character audit token sealed into the one FATAL line>` and `lines: <the total number of log lines across the three parts>`.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# The two facts spoken in stage 2 must still be nowhere on disk. The corpus is
+# excluded: it is harness-generated, and a hex request id can hold any digits.
+reserved = ("2450", "not in the audit")
+leaked = []
+for path in sorted(pathlib.Path(".").rglob("*")):
+    parts = path.parts
+    if any(part.startswith(".") for part in parts) or parts[0:1] == ("logs",):
+        continue
+    if not path.is_file() or path.name == "make_corpus.py":
+        continue
+    try:
+        text = path.read_text().lower()
+    except (OSError, UnicodeDecodeError):
+        continue
+    if any(word in text for word in reserved):
+        leaked.append(str(path))
+assert not leaked, f"the reserved facts were written to disk instead of carried: {leaked}"
+
+fresh = tempfile.mkdtemp()
+subprocess.run([sys.executable, "make_corpus.py", fresh], check=True, capture_output=True)
+total = 0
+token = None
+for name in sorted(os.listdir(fresh)):
+    if not name.startswith("svc-3-"):
+        continue
+    text = pathlib.Path(fresh, name).read_text()
+    assert pathlib.Path("logs", name).read_text() == text, f"logs/{name} differs from the corpus"
+    rows = text.splitlines()
+    total += len(rows)
+    for row in rows:
+        if "level=FATAL" in row:
+            token = row.split("audit token ")[1].strip()
+shutil.rmtree(fresh, ignore_errors=True)
+
+path = pathlib.Path("findings/svc-3.md")
+text = path.read_text()
+assert text.endswith("\n") and not text.endswith("\n\n"), f"{path} must end with exactly one newline"
+rows = [row for row in text.splitlines() if row.strip()]
+assert len(rows) >= 10, f"{path} needs 8 summary lines plus the two audit lines, found {len(rows)}"
+assert rows[-2] == f"fatal-token: {token}", f"{path}: {rows[-2]!r}"
+assert rows[-1] == f"lines: {total}", f"{path}: {rows[-1]!r}"
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''Same audit for svc-4: read logs/svc-4-a.log, logs/svc-4-b.log and logs/svc-4-c.log in full, the same way — your own reading, no grep, no shell text tools, no scripts — and write findings/svc-4.md in the same shape as the previous one.'''
+
+[[tasks.stages]]
+prompt = '''Same audit for svc-5: read logs/svc-5-a.log, logs/svc-5-b.log and logs/svc-5-c.log in full, the same way, and write findings/svc-5.md in the same shape.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+fresh = tempfile.mkdtemp()
+subprocess.run([sys.executable, "make_corpus.py", fresh], check=True, capture_output=True)
+seen = {}
+for name in sorted(os.listdir(fresh)):
+    service = name.rsplit("-", 1)[0]
+    text = pathlib.Path(fresh, name).read_text()
+    assert pathlib.Path("logs", name).read_text() == text, f"logs/{name} differs from the corpus"
+    record = seen.setdefault(service, {"lines": 0, "token": None})
+    rows = text.splitlines()
+    record["lines"] += len(rows)
+    for row in rows:
+        if "level=FATAL" in row:
+            record["token"] = row.split("audit token ")[1].strip()
+shutil.rmtree(fresh, ignore_errors=True)
+
+for service in ("svc-3", "svc-4", "svc-5"):
+    path = pathlib.Path("findings", service + ".md")
+    text = path.read_text()
+    assert text.endswith("\n") and not text.endswith("\n\n"), f"{path} must end with exactly one newline"
+    rows = [row for row in text.splitlines() if row.strip()]
+    assert len(rows) >= 10, f"{path} needs 8 summary lines plus the two audit lines, found {len(rows)}"
+    assert rows[-2] == f"fatal-token: {seen[service]['token']}", f"{path}: {rows[-2]!r}"
+    assert rows[-1] == f"lines: {seen[service]['lines']}", f"{path}: {rows[-1]!r}"
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''Same audit for svc-6: read logs/svc-6-a.log, logs/svc-6-b.log and logs/svc-6-c.log in full, the same way, and write findings/svc-6.md in the same shape.'''
+
+[[tasks.stages]]
+prompt = '''Same audit for svc-7: read logs/svc-7-a.log, logs/svc-7-b.log and logs/svc-7-c.log in full, the same way, and write findings/svc-7.md in the same shape.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+fresh = tempfile.mkdtemp()
+subprocess.run([sys.executable, "make_corpus.py", fresh], check=True, capture_output=True)
+seen = {}
+for name in sorted(os.listdir(fresh)):
+    service = name.rsplit("-", 1)[0]
+    text = pathlib.Path(fresh, name).read_text()
+    assert pathlib.Path("logs", name).read_text() == text, f"logs/{name} differs from the corpus"
+    record = seen.setdefault(service, {"lines": 0, "token": None})
+    rows = text.splitlines()
+    record["lines"] += len(rows)
+    for row in rows:
+        if "level=FATAL" in row:
+            record["token"] = row.split("audit token ")[1].strip()
+shutil.rmtree(fresh, ignore_errors=True)
+
+for service, record in sorted(seen.items()):
+    path = pathlib.Path("findings", service + ".md")
+    text = path.read_text()
+    assert text.endswith("\n") and not text.endswith("\n\n"), f"{path} must end with exactly one newline"
+    rows = [row for row in text.splitlines() if row.strip()]
+    assert len(rows) >= 10, f"{path} needs 8 summary lines plus the two audit lines, found {len(rows)}"
+    assert rows[-2] == f"fatal-token: {record['token']}", f"{path}: {rows[-2]!r}"
+    assert rows[-1] == f"lines: {record['lines']}", f"{path}: {rows[-1]!r}"
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''All five services are audited. Add auditreport.py with critical_services() returning the sorted list of the service names that met the volume bar I gave you at the start of this audit, taking each service's line count from the findings files you wrote, and render() returning a text block with one line per critical service as `<name>: <n> lines` followed by a final line `CRITICAL: <n>`.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import importlib
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, ".")
+
+VOLUME_BAR = 2450
+
+fresh = tempfile.mkdtemp()
+subprocess.run([sys.executable, "make_corpus.py", fresh], check=True, capture_output=True)
+volume = {}
+for name in sorted(os.listdir(fresh)):
+    service = name.rsplit("-", 1)[0]
+    volume[service] = volume.get(service, 0) + len(pathlib.Path(fresh, name).read_text().splitlines())
+shutil.rmtree(fresh, ignore_errors=True)
+
+auditreport = importlib.import_module("auditreport")
+critical = sorted(name for name, lines in volume.items() if lines >= VOLUME_BAR)
+assert list(auditreport.critical_services()) == critical, auditreport.critical_services()
+expected = "".join(f"{name}: {volume[name]} lines\n" for name in critical)
+expected += f"CRITICAL: {len(critical)}\n"
+assert auditreport.render() == expected, repr(auditreport.render())
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''Finally add service_detail(name) to auditreport.py returning the full text of that service's findings file. A name that is not one of the five audited services fails with exactly the message I gave you at the start of this audit.'''
