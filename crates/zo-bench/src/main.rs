@@ -527,7 +527,9 @@ fn run_one(
         task: task.id.clone(),
         tool: tool.name.clone(),
         trial,
-        success: check_exit == Some(0) && all_stage_checks_green,
+        success: check_exit == Some(0)
+            && all_stage_checks_green
+            && restores_are_complete(&restored_files),
         restored_files,
         wall_ms: total_wall,
         check_exit,
@@ -680,15 +682,34 @@ fn restore_readonly_files(files: &[TaskFile], workdir: &Path) -> Vec<String> {
     let mut restored = Vec::new();
     for file in files.iter().filter(|file| file.readonly) {
         let path = workdir.join(&file.path);
-        let current = std::fs::read_to_string(&path).ok();
-        if current.as_deref() == Some(file.content.as_str()) {
+        if std::fs::read_to_string(&path).ok().as_deref() == Some(file.content.as_str()) {
             continue;
         }
-        if std::fs::write(&path, &file.content).is_ok() {
-            restored.push(file.path.clone());
-        }
+        restored.push(match force_write(&path, &file.content) {
+            true => file.path.clone(),
+            // A tool that chmods the test read-only, or leaves a directory in
+            // its place, would otherwise defeat the restore silently and score
+            // the pass anyway. `unrestored:` marks the row failed.
+            false => format!("unrestored:{}", file.path),
+        });
     }
     restored
+}
+
+/// Write `content` to `path`, clearing whatever stands in the way first.
+fn force_write(path: &Path, content: &str) -> bool {
+    if std::fs::write(path, content).is_ok() {
+        return true;
+    }
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(path);
+    std::fs::write(path, content).is_ok()
+}
+
+/// Whether the measurement itself survived — a row whose task-owned files could
+/// not be put back has not been measured, whatever the check printed.
+fn restores_are_complete(restored: &[String]) -> bool {
+    !restored.iter().any(|entry| entry.starts_with("unrestored:"))
 }
 
 fn run_check(check: &str, workdir: &Path, timeout_secs: u64) -> Option<i32> {
@@ -828,6 +849,59 @@ mod tests {
             std::fs::read_to_string(workdir.join("calc.py")).expect("read"),
             "def calc():\n    return 6\n",
             "the tool's own work is left alone"
+        );
+        assert!(restores_are_complete(&restored), "a plain rewrite is recoverable");
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    /// Restoring by rewriting is only enforcement if it cannot be blocked.
+    /// A tool that neuters the test and then makes it unwritable — or puts a
+    /// directory in its place — must not be able to reach the check.
+    #[test]
+    fn a_test_that_cannot_be_written_back_voids_the_row() {
+        let workdir = std::env::temp_dir().join(format!(
+            "zo-bench-unrestorable-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workdir).expect("workdir");
+        let files = vec![
+            TaskFile {
+                path: "test_locked.py".to_string(),
+                content: "assert calc() == 6\n".to_string(),
+                readonly: true,
+            },
+            TaskFile {
+                path: "test_shadowed.py".to_string(),
+                content: "assert True\n".to_string(),
+                readonly: true,
+            },
+        ];
+        std::fs::write(workdir.join("test_locked.py"), "pass\n").expect("tamper");
+        let mut locked = std::fs::metadata(workdir.join("test_locked.py"))
+            .expect("metadata")
+            .permissions();
+        locked.set_readonly(true);
+        std::fs::set_permissions(workdir.join("test_locked.py"), locked).expect("chmod");
+        std::fs::create_dir_all(workdir.join("test_shadowed.py")).expect("shadow with a directory");
+
+        let restored = restore_readonly_files(&files, &workdir);
+
+        assert_eq!(
+            restored,
+            vec!["test_locked.py".to_string(), "test_shadowed.py".to_string()],
+            "both obstructions are cleared and the files are put back"
+        );
+        assert!(
+            restores_are_complete(&restored),
+            "clearing the obstruction is a successful restore, not a void row"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("test_shadowed.py")).expect("read"),
+            "assert True\n"
         );
         let _ = std::fs::remove_dir_all(&workdir);
     }

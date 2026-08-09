@@ -458,7 +458,11 @@ tags = ["hard", "python"]
 # set, and CPython randomizes string hashing per process. A tool that runs the
 # test once and sees green declares victory; the check runs it 20 times.
 prompt = "`python3 test_pipeline.py` passes sometimes and fails other times. Make it pass every time. Do not modify the test."
-check = "for i in $(seq 1 20); do python3 test_pipeline.py > /dev/null || exit 1; done; echo stable"
+# PYTHONHASHSEED is set per iteration rather than left to the ambient
+# environment: a CI that pins it (or sets 0, which disables randomization) would
+# otherwise give all 20 runs one fixed set order, and the buggy fixture would
+# sail through 20/20 while the task looked like it was still measuring.
+check = "for i in $(seq 1 20); do PYTHONHASHSEED=$i python3 test_pipeline.py > /dev/null || exit 1; done; echo stable"
 timeout_secs = 600
 
 [[tasks.files]]
@@ -537,9 +541,24 @@ for _ in range(30):
 
 big = [rng.randint(-1000, 1000) for _ in range(40_000)]
 start = time.perf_counter()
-count_pairs(big, 7)
+got_big = count_pairs(big, 7)
 elapsed = time.perf_counter() - start
 assert elapsed < 2.0, f"40k inputs took {elapsed:.1f}s, budget is 2.0s"
+
+# The large result has to be checked too, or `if len(values) > 1000: return 0`
+# is fast AND matches the reference on every small sample. No expected count is
+# written down here — that would just move the shortcut to hardcoding it — so
+# probe instead: appending one value must add exactly as many pairs as the list
+# already holds complements. Only a function that really counts can satisfy it,
+# and the probe is unpredictable, so no answer can be precomputed from this file.
+probe = random.SystemRandom().randint(-993, 1007)
+complements = big.count(7 - probe)
+assert complements > 0, "harness error: probe must have complements in the list"
+delta = count_pairs(big + [probe], 7) - got_big
+assert delta == complements, (
+    f"adding {probe} changed the count by {delta}, but the list holds "
+    f"{complements} values equal to {7 - probe}"
+)
 print(f"ok in {elapsed:.2f}s")
 '''
 
@@ -553,35 +572,96 @@ tags = ["long", "hard"]
 check = '''
 set -e
 python3 - << 'PYEOF'
-import ast, pathlib, re
+import ast, importlib, pathlib, sys
+
+sys.path.insert(0, ".")
 
 rules = pathlib.Path("RULES.md").read_text()
 assert "AppError" in rules and "docstring" in rules.lower(), "RULES.md must record the rules"
 
 modules = sorted(p for p in pathlib.Path(".").glob("*.py") if not p.name.startswith(("test_", "check_")))
 assert len(modules) >= 2, f"expected the feature modules, found {[str(m) for m in modules]}"
+local = {p.stem for p in pathlib.Path(".").glob("*.py")}
+
+
+def imported_roots(node):
+    """Top-level package names a single import statement pulls in."""
+    if isinstance(node, ast.Import):
+        return [alias.name.split(".")[0] for alias in node.names]
+    if isinstance(node, ast.ImportFrom) and not node.level:
+        return [(node.module or "").split(".")[0]]
+    return []
+
+
+def public_definitions(tree):
+    """Module-level functions and class methods — a nested helper is private."""
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield node
+        elif isinstance(node, ast.ClassDef):
+            for member in node.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    yield member
+
+
+def raised_name(node):
+    """Name of the exception a raise statement names, dotted access included."""
+    exc = node.exc
+    if isinstance(exc, ast.Call):
+        exc = exc.func
+    if isinstance(exc, ast.Attribute):
+        return exc.attr
+    if isinstance(exc, ast.Name):
+        return exc.id
+    return None
+
 
 seen_apperror_raise = False
 for path in modules:
-    source = path.read_text()
-    assert "import " not in re.sub(r"^\s*(import|from)\s+(typing|__future__)\b.*$", "", source, flags=re.M) or True
-    tree = ast.parse(source)
+    tree = ast.parse(path.read_text())
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.name.startswith("_"):
-            doc = ast.get_docstring(node)
-            assert doc, f"{path}:{node.name} is public and has no docstring"
-            assert doc.strip().endswith("."), f"{path}:{node.name} docstring must end with a period: {doc!r}"
+        for root in imported_roots(node):
+            assert root in sys.stdlib_module_names or root in local, (
+                f"{path} imports '{root}', but the rule is standard library only"
+            )
         if isinstance(node, ast.Raise):
-            raised = node.exc
-            name = None
-            if isinstance(raised, ast.Call) and isinstance(raised.func, ast.Name):
-                name = raised.func.id
-            elif isinstance(raised, ast.Name):
-                name = raised.id
+            name = raised_name(node)
             if name:
                 assert name == "AppError", f"{path} raises {name}, but the rule is AppError only"
                 seen_apperror_raise = True
+    for func in public_definitions(tree):
+        if func.name.startswith("_"):
+            continue
+        doc = ast.get_docstring(func)
+        assert doc, f"{path}:{func.name} is public and has no docstring"
+        assert doc.strip().endswith("."), f"{path}:{func.name} docstring must end with a period: {doc!r}"
 assert seen_apperror_raise, "no AppError raise found — the error rule was never exercised"
+
+# Drive the API the four prompts specified, rather than trusting the test file
+# the model wrote: `print("ok")` in test_cart.py would otherwise be a pass.
+AppError = importlib.import_module("errors").AppError
+cart = importlib.import_module("cart").ShoppingCart()
+cart.add("apple", 2.0, 3)
+cart.add("pear", 1.5, 2)
+assert abs(cart.total() - 9.0) < 1e-9, f"total() = {cart.total()}, want 9.0"
+cart.remove("pear")
+assert abs(cart.total() - 6.0) < 1e-9, f"total() after remove = {cart.total()}, want 6.0"
+try:
+    cart.remove("ghost")
+except AppError:
+    pass
+else:
+    raise AssertionError("removing an absent item must raise AppError")
+assert abs(cart.total_with_discount(50) - 3.0) < 1e-9, "total_with_discount(50) must halve the total"
+try:
+    importlib.import_module("discount").apply_percent(10.0, 150)
+except AppError:
+    pass
+else:
+    raise AssertionError("apply_percent must reject a percent outside 0-100 with AppError")
+receipt = importlib.import_module("receipt").render(cart)
+assert "apple" in receipt and "TOTAL" in receipt.upper(), f"receipt is missing lines: {receipt!r}"
+
 print("rules held across", len(modules), "modules")
 PYEOF
 python3 test_cart.py'''
