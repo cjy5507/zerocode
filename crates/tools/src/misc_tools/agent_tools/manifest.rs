@@ -643,13 +643,37 @@ pub(super) fn manifest_generation_is_current(manifest: &AgentOutput) -> bool {
         .is_ok_and(|current| current.run_generation == manifest.run_generation)
 }
 
+/// Header that opens the deliverable section of a terminal output file.
+const FINAL_RESPONSE_MARKER: &str = "\n### Final response\n\n";
+/// Headers this module appends *after* the deliverable. A reader that stops at
+/// the first of them gets the response and nothing else.
+const POST_RESPONSE_MARKERS: [&str; 2] = ["\n### Error\n\n", "\n### Worker detail\n\n"];
+
+/// The deliverable recorded in a terminal agent output file, if there is one.
+///
+/// The file is append-only across resumed runs, so the newest run's response is
+/// the one after the *last* marker; and both `### Error` and `### Worker detail`
+/// are written after it, so reading to end-of-file would fold a worker's
+/// stacktrace into what a peer agent is handed as finished work. Parsing lives
+/// here, next to the writer, so the two cannot drift apart.
+pub(super) fn final_response_section(body: &str) -> Option<String> {
+    let (_, tail) = body.rsplit_once(FINAL_RESPONSE_MARKER)?;
+    let end = POST_RESPONSE_MARKERS
+        .iter()
+        .filter_map(|marker| tail.find(marker))
+        .min()
+        .unwrap_or(tail.len());
+    let response = tail[..end].trim();
+    (!response.is_empty()).then(|| response.to_string())
+}
+
 fn format_agent_terminal_enrichment(result: Option<&str>, error: Option<&str>) -> String {
     let mut sections = Vec::new();
     if let Some(result) = result.filter(|value| !value.trim().is_empty()) {
-        sections.push(format!("\n### Final response\n\n{}\n", result.trim()));
+        sections.push(format!("{FINAL_RESPONSE_MARKER}{}\n", result.trim()));
     }
     if let Some(error) = error.filter(|value| !value.trim().is_empty()) {
-        sections.push(format!("\n### Worker detail\n\n{}\n", error.trim()));
+        sections.push(format!("{}{}\n", POST_RESPONSE_MARKERS[1], error.trim()));
     }
     sections.join("")
 }
@@ -680,10 +704,10 @@ fn format_agent_terminal_output(
         ));
     }
     if let Some(result) = result.filter(|value| !value.trim().is_empty()) {
-        sections.push(format!("\n### Final response\n\n{}\n", result.trim()));
+        sections.push(format!("{FINAL_RESPONSE_MARKER}{}\n", result.trim()));
     }
     if let Some(error) = error.filter(|value| !value.trim().is_empty()) {
-        sections.push(format!("\n### Error\n\n{}\n", error.trim()));
+        sections.push(format!("{}{}\n", POST_RESPONSE_MARKERS[0], error.trim()));
     }
     sections.join("")
 }

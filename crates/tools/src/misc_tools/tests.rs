@@ -1515,9 +1515,14 @@ fn heartbeat_age_readers_reflect_the_persisted_stamp() {
     }
     stamp_manifest_activity(&dir, &fresh, epoch_secs_now());
     stamp_manifest_activity(&dir, &stale, epoch_secs_now().saturating_sub(10_000));
-    // A long build: stamped when the tool started, silent ever since.
+    // A long build: stamped when the tool started, silent ever since, worker
+    // still registered.
     stamp_manifest_activity(&dir, &in_tool, epoch_secs_now().saturating_sub(10_000));
     set_manifest_current_tool(&dir, &in_tool, "bash");
+    super::agent_tools::register_agent_cancel_signal_for_tests(
+        &in_tool,
+        super::agent_tools::AGENT_INITIAL_RUN_GENERATION,
+    );
 
     let snapshot = super::agent_tools::agent_progress_snapshot(&fresh)
         .expect("fresh agent has a manifest");
@@ -1540,6 +1545,23 @@ fn heartbeat_age_readers_reflect_the_persisted_stamp() {
     assert!(
         !super::any_agent_shows_progress(&[stale.clone(), never.clone()]),
         "a set with no working member is reclaimable"
+    );
+
+    // The corpse: same manifest, worker gone. `current_tool` is cleared by the
+    // worker itself, so a worker that died before its terminal transition
+    // leaves the claim standing forever — and taken at face value it wins every
+    // extension and holds the whole set's collection for the full budget.
+    super::agent_tools::unregister_agent_cancel_signal_for_tests(
+        &in_tool,
+        super::agent_tools::AGENT_INITIAL_RUN_GENERATION,
+    );
+    assert!(
+        !super::agent_shows_progress(&in_tool),
+        "a dead worker's stale tool claim is not evidence of progress"
+    );
+    assert!(
+        !super::any_agent_shows_progress(&[in_tool.clone(), stale.clone()]),
+        "the set-level reader must not follow a corpse either"
     );
 
     match prior_store {

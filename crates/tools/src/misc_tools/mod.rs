@@ -870,6 +870,11 @@ pub(crate) fn run_spawn_multi_agent_with_timeout_and_hooks(
     // while a cancellation candidate is demonstrably still working — regardless
     // of fan-out width.
     let mut overall_deadline = std::time::Instant::now() + wait_timeout;
+    // An extension buys a *working agent* time to finish; it is not more room to
+    // start work. Gating spawns on the extendable deadline handed that borrowed
+    // time to fresh workers, which then get cancelled at the drain — so the
+    // spawn gate keeps the deadline the caller asked for.
+    let spawn_deadline = overall_deadline;
     let mut deadline_extensions: u32 = 0;
     {
         for (idx, agent_val) in input.agents.iter().enumerate() {
@@ -880,7 +885,7 @@ pub(crate) fn run_spawn_multi_agent_with_timeout_and_hooks(
             // Instead record an explicit, ordered timeout error for this input so
             // result cardinality and input order are preserved (aggregation keys
             // both `spawned` and `errors` by `index`).
-            if std::time::Instant::now() >= overall_deadline {
+            if std::time::Instant::now() >= spawn_deadline {
                 errors.push(serde_json::json!({
                     "index": idx,
                     "error": "fan-out overall deadline elapsed before this agent was spawned",
@@ -920,7 +925,7 @@ pub(crate) fn run_spawn_multi_agent_with_timeout_and_hooks(
                 // and, if either still bars a spawn, record an ordered timeout
                 // error for this input instead of spawning — preserving input
                 // order and result cardinality (aggregation keys by `index`).
-                if spawn_barred_after_reclaim(&in_flight, window, overall_deadline) {
+                if spawn_barred_after_reclaim(&in_flight, window, spawn_deadline) {
                     errors.push(serde_json::json!({
                         "index": idx,
                         "error": "fan-out overall deadline elapsed before a worker slot became free",
@@ -1435,9 +1440,17 @@ const fn reclaim_should_extend_deadline(candidate_progressing: bool, extensions_
 }
 
 /// Whether one specific agent's manifest shows progress right now.
+///
+/// `current_tool` is cleared by the worker itself, so a worker that died
+/// without reaching a terminal transition leaves its manifest claiming a tool
+/// is running forever. Taken at face value that corpse reads as progress, wins
+/// every extension, and holds the whole fan-out's collection for the full
+/// extension budget. The cancel-signal registry — which the worker unregisters
+/// at physical exit — is what says the claim is still someone's to make.
 fn agent_shows_progress(agent_id: &str) -> bool {
     agent_tools::agent_progress_snapshot(agent_id).is_some_and(|snapshot| {
-        snapshot_shows_progress(snapshot.seconds_since_activity, snapshot.inside_tool_call)
+        let working = snapshot.inside_tool_call && agent_tools::agent_worker_is_live(agent_id);
+        snapshot_shows_progress(snapshot.seconds_since_activity, working)
     })
 }
 

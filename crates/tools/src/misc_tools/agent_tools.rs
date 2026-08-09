@@ -2085,12 +2085,7 @@ pub fn reconcile_dead_agent_worker(agent_id: &str) -> bool {
     let result = (manifest.status == "completed")
         .then(|| manifest::read_agent_output(&manifest).ok())
         .flatten()
-        .and_then(|output| {
-            output
-                .rsplit_once("\n### Final response\n\n")
-                .map(|(_, result)| result.trim().to_string())
-        })
-        .filter(|result| !result.is_empty());
+        .and_then(|output| manifest::final_response_section(&output));
     let generation = manifest.run_generation;
     completion::notify_agent_completion(
         AgentCompletion {
