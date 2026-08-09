@@ -3439,13 +3439,23 @@ fn spawn_freeze_watchdog() {
                     if stalled_secs >= STALL_SECS && !reported {
                         let pid = std::process::id();
                         match capture_freeze_stack(pid) {
+                            // Read the sample we just took instead of asserting
+                            // whose stall this is: a render-loop write to a
+                            // terminal that stopped draining freezes the beat
+                            // exactly like a wedged loop does, and calling that
+                            // a "ZO-SIDE hang" sent the last investigation
+                            // looking for a deadlock that was not there.
                             Some(path) => eprintln!(
-                                "[FREEZE-WATCHDOG] zo main TUI event loop has not advanced for ~{stalled_secs}s (beat={beat}, pid={pid}, phase=\"{}\"). The async loop itself is stalled \u{2192} this is a ZO-SIDE hang, not a terminal-render issue. Auto-captured a full-process stack sample to: {}",
+                                "[FREEZE-WATCHDOG] zo main TUI event loop has not advanced for ~{stalled_secs}s (beat={beat}, pid={pid}, phase=\"{}\"). Stack says: {} Sample: {}",
                                 phase_label(),
+                                std::fs::read_to_string(&path)
+                                    .map(|report| zo_cli::tui::watchdog::classify_freeze_sample(&report))
+                                    .unwrap_or(zo_cli::tui::watchdog::FreezeVerdict::Unknown)
+                                    .sentence(),
                                 path.display(),
                             ),
                             None => eprintln!(
-                                "[FREEZE-WATCHDOG] zo main TUI event loop has not advanced for ~{stalled_secs}s (beat={beat}, pid={pid}, phase=\"{}\"). The async loop itself is stalled \u{2192} this is a ZO-SIDE hang, not a terminal-render issue. Capture the stack with: lldb -p {pid} -o 'thread backtrace all' -o detach -o quit   (or: sample {pid} 5 -f /tmp/zo-freeze.sample)",
+                                "[FREEZE-WATCHDOG] zo main TUI event loop has not advanced for ~{stalled_secs}s (beat={beat}, pid={pid}, phase=\"{}\"). No stack was captured, so whose stall this is stays unknown. Capture it with: lldb -p {pid} -o 'thread backtrace all' -o detach -o quit   (or: sample {pid} 5 -f /tmp/zo-freeze.sample)",
                                 phase_label(),
                             ),
                         }
