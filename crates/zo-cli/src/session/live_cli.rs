@@ -970,6 +970,24 @@ fn startup_auth_policy_for_scope(_scope: SessionScope) -> crate::runtime_support
     crate::runtime_support::StartupAuthPolicy::Require
 }
 
+/// Outcome of screening + starting a `/goal`: the ambiguity gate either held
+/// the goal on one clarifying question (cues carried structurally so the TUI
+/// can render a picker) or the goal started and queued its first action turn.
+pub(crate) enum GoalStartOutcome {
+    Held {
+        /// Text rendering of the hold (headless/non-TUI hosts print this).
+        report: String,
+        /// The fired ambiguity cues — term + candidate readings, table-driven.
+        cues: Vec<decision_core::AmbiguityCue>,
+    },
+    Started {
+        report: String,
+        /// The queued first action prompt (`None` never happens for a started
+        /// goal; kept optional to mirror `GoalController::active_prompt`).
+        prompt: Option<String>,
+    },
+}
+
 impl LiveCli {
     /// Construct an interactive (project-scoped) CLI: sessions persist into
     /// the working tree's `.zo/sessions/`. This is the historical default
@@ -1808,6 +1826,20 @@ impl LiveCli {
         goal: String,
         options: commands::GoalOptions,
     ) -> (String, Option<String>) {
+        match self.start_goal_controller_screened(goal, options) {
+            GoalStartOutcome::Held { report, .. } => (report, None),
+            GoalStartOutcome::Started { report, prompt } => (report, prompt),
+        }
+    }
+
+    /// [`Self::start_goal_controller`] with the ambiguity hold surfaced
+    /// structurally: the TUI turns a `Held` into the clarify picker modal
+    /// (selection UX) while text hosts render the report string.
+    pub(crate) fn start_goal_controller_screened(
+        &mut self,
+        goal: String,
+        options: commands::GoalOptions,
+    ) -> GoalStartOutcome {
         // Goal-contract gate (decision_core::goal_contract): an ambiguous
         // success metric ("100프로 커버리지") with no objective check gets ONE
         // clarifying question BEFORE any turn is spent — the observed runaway
@@ -1820,10 +1852,10 @@ impl LiveCli {
         {
             if let decision_core::GoalAmbiguity::Ambiguous(cues) = decision_core::screen_goal(&goal)
             {
-                return (
-                    super::automation::build_goal_clarify_report(&goal, &cues),
-                    None,
-                );
+                return GoalStartOutcome::Held {
+                    report: super::automation::build_goal_clarify_report(&goal, &cues),
+                    cues,
+                };
             }
         }
         let report = self.goal_controller.start(goal, options);
@@ -1839,7 +1871,7 @@ impl LiveCli {
         // at the headless goal loop top — not here at dispatch — so a user message
         // typed ahead of this prompt cannot consume the goal's verifier verdict.
         let prompt = self.goal_controller.active_prompt();
-        (report, prompt)
+        GoalStartOutcome::Started { report, prompt }
     }
 
     pub(crate) fn edit_goal_controller(&mut self, goal: String) -> String {

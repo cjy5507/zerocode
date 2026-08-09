@@ -118,7 +118,24 @@ const DECIDABLE: &[&str] = &[
     "git:",
     "--check",
     "--until",
+    // An explicit criterion phrase pins the metric in natural Korean prose
+    // ("최적화 기준: 메모리 사용량"). This is also the marker the TUI's
+    // clarify picker appends when the user answers the one-question hold,
+    // so an answered goal can never re-trigger the gate into a modal loop.
+    "기준:",
+    "criterion:",
 ];
+
+/// Rewrite a held goal with the user's chosen reading pinned as an explicit
+/// criterion. This is the ONLY place the pin phrase is spelled: it embeds a
+/// [`DECIDABLE`] marker (`기준:`), so the returned text can never re-trigger
+/// [`screen_goal`] — the clarify picker's answer path and the screen share
+/// one source of truth instead of two surfaces that could drift (the
+/// round-trip property is pinned by `a_pinned_goal_never_refires`).
+#[must_use]
+pub fn pin_goal_criterion(goal: &str, term: &str, reading: &str) -> String {
+    format!("{goal} — {term} 기준: {reading}")
+}
 
 /// Screen one goal text. See the module docs for the three-way AND rule.
 #[must_use]
@@ -187,6 +204,36 @@ mod tests {
         assert!(!is_ambiguous("make coverage perfect --check \"go test -cover\""));
         assert!(!is_ambiguous("완벽하게 최적화해줘 grep:BENCH_OK"));
         assert!(!is_ambiguous("전부 커버리지 --until grep:DONE"));
+    }
+
+    /// `기준:` 은 clarify 픽커가 답을 각인하는 마커: 답한 goal이 게이트를
+    /// 다시 발화시키면 모달 루프가 되므로, 이 형태는 반드시 침묵해야 한다.
+    #[test]
+    fn an_explicit_criterion_phrase_silences_the_screen() {
+        assert!(!is_ambiguous("완벽하게 최적화해줘 — 최적화 기준: 메모리 사용량"));
+        assert!(!is_ambiguous("fully optimize the pipeline — criterion: p99 latency"));
+    }
+
+    /// 라운드트립 속성: 발화한 어떤 goal이든, 그 cue의 어떤 해석으로
+    /// [`pin_goal_criterion`]을 통과시키면 다시는 발화하지 않는다 — 픽커
+    /// 문구와 스크린 마커가 한 소스라는 계약 자체를 핀한다.
+    #[test]
+    fn a_pinned_goal_never_refires() {
+        for goal in ["완벽하게 최적화해줘", "make coverage perfect", "성능을 완벽하게 튜닝해"] {
+            let GoalAmbiguity::Ambiguous(cues) = screen_goal(goal) else {
+                panic!("fixture goal must fire: {goal}");
+            };
+            for cue in &cues {
+                for reading in cue.interpretations {
+                    let pinned = pin_goal_criterion(goal, cue.term, reading);
+                    assert_eq!(
+                        screen_goal(&pinned),
+                        GoalAmbiguity::Clear,
+                        "pinned goal must never re-trigger the screen: {pinned}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

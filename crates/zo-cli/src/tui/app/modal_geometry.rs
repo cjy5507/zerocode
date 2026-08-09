@@ -68,6 +68,7 @@ pub(super) fn modal_size_for_mode(app: &App, area: Rect) -> (u16, u16) {
         | AppMode::ModalModel
         | AppMode::ModalPermissions
         | AppMode::ModalArgPick
+        | AppMode::ModalGoalClarify
         | AppMode::ModalSession
         | AppMode::ModalLogin
         | AppMode::ModalQuestion

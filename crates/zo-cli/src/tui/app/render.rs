@@ -1067,6 +1067,7 @@ impl App {
             | AppMode::ModalPermissions
             | AppMode::ModalReport
             | AppMode::ModalArgPick
+            | AppMode::ModalGoalClarify
             | AppMode::ModalSession
             | AppMode::ModalLogin
             | AppMode::ModalEffort

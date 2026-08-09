@@ -23,6 +23,10 @@ use crate::tui::modals::workflow_viewer::WorkflowAgentRow;
 use crate::tui::workflow_progress::AgentRowsSnapshot;
 use runtime::TeamInboxSnapshot;
 
+/// The always-last row of the `/goal` clarify picker: proceed with the goal
+/// exactly as written (no reading pinned beyond "as written, broadly").
+const GOAL_CLARIFY_AS_WRITTEN: &str = "이 문구 그대로 진행";
+
 impl App {
     /// Open the permission modal for `prompt`.
     ///
@@ -204,6 +208,37 @@ impl App {
         );
     }
 
+    /// Open the `/goal` ambiguity-hold clarify picker: ONE question, answered
+    /// by selection. `readings` come straight from the fired
+    /// `decision_core::AmbiguityCue` (table-driven, nothing invented here);
+    /// the last row is always the explicit "proceed as written" opt-out. On
+    /// Enter the choice is pinned into the goal text via
+    /// `decision_core::pin_goal_criterion` and the whole command re-submitted
+    /// through the normal `/goal` text path — one apply path, and the pin
+    /// marker guarantees the gate cannot re-fire into a modal loop.
+    pub fn open_goal_clarify_modal(
+        &mut self,
+        goal: String,
+        term: String,
+        readings: Vec<String>,
+        flags_suffix: String,
+    ) {
+        let mut options = readings;
+        options.push(GOAL_CLARIFY_AS_WRITTEN.to_string());
+        let title = format!("/goal — \"{term}\"이(가) 무엇을 뜻하나요?");
+        self.set_active_modal(
+            Box::new(ChoicePickerModal::new(title, options)),
+            AppMode::ModalGoalClarify,
+        );
+        // Set after `set_active_modal`, which clears the choice side-lists via
+        // `exit_modal` (same ordering contract as the session/login pickers).
+        self.choice_modals.goal_clarify = Some(super::GoalClarifyPending {
+            goal,
+            term,
+            flags_suffix,
+        });
+    }
+
     /// Open the `/effort` slider modal, pre-positioned on the step that
     /// best matches `current_budget` (`None` ⇒ first step).
     pub fn open_effort_modal(&mut self, current_budget: Option<u32>) {
@@ -347,6 +382,7 @@ impl App {
         self.active_modal = None;
         self.choice_modals.session_ids.clear();
         self.choice_modals.login_provider_ids.clear();
+        self.choice_modals.goal_clarify = None;
         self.mode = AppMode::Normal;
     }
 
@@ -473,6 +509,24 @@ impl App {
                 // and applies the choice (mirrors /login, /effort — one apply
                 // path, no duplicated logic).
                 AppAction::Submit(format!("/{command} {label}"))
+            }
+            AppMode::ModalGoalClarify => {
+                let Some(pending) = self.choice_modals.goal_clarify.take() else {
+                    self.exit_modal();
+                    return AppAction::None;
+                };
+                self.exit_modal();
+                // "As written" still pins a criterion (the goal's own wording,
+                // read broadly) — the pin is what keeps the gate from firing
+                // again, and the user explicitly chose to proceed.
+                let reading = if label == GOAL_CLARIFY_AS_WRITTEN {
+                    "문구 그대로 (넓은 의미)"
+                } else {
+                    label
+                };
+                let pinned =
+                    decision_core::pin_goal_criterion(&pending.goal, &pending.term, reading);
+                AppAction::Submit(format!("/goal {pinned}{}", pending.flags_suffix))
             }
             AppMode::ModalSession => {
                 let session_id = self

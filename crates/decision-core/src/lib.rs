@@ -44,7 +44,7 @@ pub use dreamer::{
 pub use failure_triage::{
     triage_failures, BlockTracker, BlockedNeed, FailureTriage, BLOCK_ESCALATION_THRESHOLD,
 };
-pub use goal_contract::{screen_goal, AmbiguityCue, GoalAmbiguity};
+pub use goal_contract::{pin_goal_criterion, screen_goal, AmbiguityCue, GoalAmbiguity};
 pub use goal_gate::{decide_goal_completion, GoalCompletion};
 pub use loop_budget::{BudgetExhaustion, BudgetLedger, LoopBudget};
 pub use loop_fanout::{fold_lens_verdicts, ConsensusPolicy, LensVerdict};

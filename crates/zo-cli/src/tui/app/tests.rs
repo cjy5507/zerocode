@@ -12395,3 +12395,83 @@ fn pager_can_scroll_to_the_last_row_of_a_wide_glyph_document() {
         "scrolling to the end must reach the last row; painted frame was:\n{painted}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `/goal` ambiguity-hold clarify picker (AppMode::ModalGoalClarify): the ONE
+// clarifying question asked as a selection. Enter pins the chosen reading via
+// `decision_core::pin_goal_criterion` and re-submits the whole `/goal` — and
+// the pinned text must never re-trigger the gate (round-trip pinned here at
+// the TUI seam too, not just in decision-core).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn goal_clarify_picker_pins_the_chosen_reading_and_resubmits() {
+    let mut app = test_app();
+    app.open_goal_clarify_modal(
+        "완벽하게 최적화해줘".to_string(),
+        "최적화".to_string(),
+        vec!["실행 속도".to_string(), "메모리 사용량".to_string()],
+        " --max-turns 7".to_string(),
+    );
+    assert_eq!(app.mode(), AppMode::ModalGoalClarify);
+
+    // Second row = "메모리 사용량".
+    let _ = app.handle_key(press(KeyCode::Down)).unwrap();
+    let action = app.handle_key(press(KeyCode::Enter)).unwrap();
+    let AppAction::Submit(text) = action else {
+        panic!("selection must re-submit through the /goal text path: {action:?}");
+    };
+    let expected = format!(
+        "/goal {} --max-turns 7",
+        decision_core::pin_goal_criterion("완벽하게 최적화해줘", "최적화", "메모리 사용량")
+    );
+    assert_eq!(text, expected);
+    // The resubmission must not re-fire the gate (no modal loop).
+    let goal_body = text
+        .strip_prefix("/goal ")
+        .and_then(|rest| rest.strip_suffix(" --max-turns 7"))
+        .expect("resubmission keeps the /goal prefix and flag suffix");
+    assert_eq!(
+        decision_core::screen_goal(goal_body),
+        decision_core::GoalAmbiguity::Clear,
+        "pinned resubmission must pass the gate: {goal_body}"
+    );
+    assert_eq!(app.mode(), AppMode::Normal, "picker closes on selection");
+}
+
+#[test]
+fn goal_clarify_picker_as_written_row_still_pins_and_passes_the_gate() {
+    let mut app = test_app();
+    app.open_goal_clarify_modal(
+        "완벽하게 최적화해줘".to_string(),
+        "최적화".to_string(),
+        vec!["실행 속도".to_string()],
+        String::new(),
+    );
+    // Last row is always the as-written opt-out (readings + 1).
+    let _ = app.handle_key(press(KeyCode::Down)).unwrap();
+    let action = app.handle_key(press(KeyCode::Enter)).unwrap();
+    let AppAction::Submit(text) = action else {
+        panic!("as-written must still re-submit: {action:?}");
+    };
+    let goal_body = text.strip_prefix("/goal ").expect("prefix");
+    assert_eq!(
+        decision_core::screen_goal(goal_body),
+        decision_core::GoalAmbiguity::Clear,
+        "as-written resubmission must pass the gate: {goal_body}"
+    );
+}
+
+#[test]
+fn goal_clarify_picker_esc_cancels_without_submitting() {
+    let mut app = test_app();
+    app.open_goal_clarify_modal(
+        "완벽하게 최적화해줘".to_string(),
+        "최적화".to_string(),
+        vec!["실행 속도".to_string()],
+        String::new(),
+    );
+    let action = app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(action, AppAction::None);
+    assert_eq!(app.mode(), AppMode::Normal, "Esc closes the picker");
+}

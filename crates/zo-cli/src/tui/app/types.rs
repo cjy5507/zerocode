@@ -85,6 +85,13 @@ pub enum AppMode {
     /// the chosen label is re-submitted as `/<command> <label>` so the
     /// command's existing text handler applies it.
     ModalArgPick,
+    /// `/goal` ambiguity-hold picker: the goal-contract gate held the goal on
+    /// one ambiguous metric, and this picker asks the ONE clarifying question
+    /// as a selection instead of a text report (the multi-line report
+    /// collapsed into an unreadable wrapped blob in the transcript info
+    /// line). The chosen reading is pinned into the goal text via
+    /// `decision_core::pin_goal_criterion` and re-submitted through `/goal`.
+    ModalGoalClarify,
     /// Transcript text search overlay (Ctrl+F).
     Search,
     /// Full-screen pager for long output (scrollable overlay).
@@ -136,6 +143,7 @@ impl std::fmt::Display for AppMode {
             Self::ModalDeepTier => f.write_str("ModalDeepTier"),
             Self::ModalRemoteOnboarding => f.write_str("ModalRemoteOnboarding"),
             Self::ModalArgPick => f.write_str("ModalArgPick"),
+            Self::ModalGoalClarify => f.write_str("ModalGoalClarify"),
             Self::Search => f.write_str("Search"),
             Self::Pager => f.write_str("Pager"),
             Self::Focus => f.write_str("Focus"),

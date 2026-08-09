@@ -312,6 +312,22 @@ struct ChoiceModalState {
     /// Slash command backing the arg-picker modal on the active slot (e.g.
     /// `"theme"`); the chosen label is re-submitted as `/<command> <label>`.
     arg_picker_command: String,
+    /// Pending `/goal` held by the ambiguity gate while its clarify picker is
+    /// open: the original goal text, the ambiguous term being asked about,
+    /// and the original options re-serialized as a flag suffix. The chosen
+    /// reading is pinned into the goal and the whole command re-submitted.
+    goal_clarify: Option<GoalClarifyPending>,
+}
+
+/// See [`ChoiceModalState::goal_clarify`].
+struct GoalClarifyPending {
+    /// The goal text exactly as the user typed it (flags already stripped).
+    goal: String,
+    /// The ambiguous metric term the picker is asking about (e.g. `최적화`).
+    term: String,
+    /// Original options as a re-parseable ` --flag …` suffix (empty when
+    /// default) — `commands::GoalOptions::to_flags_suffix`.
+    flags_suffix: String,
 }
 
 /// Slash-command / `@`-mention hint popup state, grouped off [`App`]

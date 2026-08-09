@@ -536,11 +536,41 @@ pub(super) fn goal(ctx: &mut DispatchCtx, command: GoalCommand) -> CommandOutput
         GoalCommand::Status => CommandOutput::popup("/goal status", ctx.cli.goal_status_report()),
         GoalCommand::Start { goal, options } => {
             let goal_text = goal.clone();
+            // Serialized before the options move: the clarify picker's answer
+            // re-submits `/goal <pinned text><flags>` through the text path,
+            // so the original flags must round-trip (commands::goal_flags).
+            let flags_suffix = options.to_flags_suffix();
             let warning = goal_state_writability_warning();
-            let (report, prompt) = ctx.cli.start_goal_controller(goal, options);
-            // `None` prompt = the ambiguity gate held the goal back (a started
-            // goal always has an action prompt): surface only the clarify
-            // report — no todo, no queued turn.
+            let (report, prompt) =
+                match ctx.cli.start_goal_controller_screened(goal, options) {
+                    // The ambiguity hold is ONE question — ask it as a picker.
+                    // The multi-line text report collapsed into a wrapped blob
+                    // on the transcript info line (observed live), and a
+                    // selection is the answer shape anyway. The chosen reading
+                    // is pinned via `decision_core::pin_goal_criterion`, whose
+                    // marker guarantees the resubmission cannot re-fire the
+                    // gate into a modal loop.
+                    super::super::live_cli::GoalStartOutcome::Held { cues, .. } => {
+                        let Some(cue) = cues.first() else {
+                            return CommandOutput::error(
+                                "goal held with no ambiguity cue".to_string(),
+                            );
+                        };
+                        ctx.app.open_goal_clarify_modal(
+                            goal_text,
+                            cue.term.to_string(),
+                            cue.interpretations
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect(),
+                            flags_suffix,
+                        );
+                        return CommandOutput::Quiet;
+                    }
+                    super::super::live_cli::GoalStartOutcome::Started { report, prompt } => {
+                        (report, prompt)
+                    }
+                };
             let Some(prompt) = prompt else {
                 return CommandOutput::info(report);
             };

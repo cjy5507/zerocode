@@ -1,3 +1,4 @@
+mod goal_flags;
 mod mcp_command;
 mod plugins_agents;
 mod prompt_commands;

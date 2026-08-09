@@ -1407,6 +1407,7 @@ fn mode_tag_for(mode: AppMode) -> &'static str {
         | AppMode::Pager
         | AppMode::Focus
         | AppMode::ModalArgPick
+        | AppMode::ModalGoalClarify
         | AppMode::ModalReport => "",
         AppMode::ModalModel => "/model ",
         AppMode::ModalPermissions => "/perm ",
