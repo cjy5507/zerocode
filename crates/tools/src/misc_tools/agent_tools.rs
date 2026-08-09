@@ -49,6 +49,11 @@ pub(crate) struct AgentProgressSnapshot {
     /// build or test would otherwise look idle for its whole duration; the
     /// field is the manifest's own answer to "is it in one right now".
     pub inside_tool_call: bool,
+    /// Whether a provider request is in flight right now. A turn that streams
+    /// no frame — silent thinking, a non-streaming call — refreshes nothing,
+    /// so the heartbeat goes stale while the agent is perfectly healthy; the
+    /// manifest's request bracket is what says the call itself is still open.
+    pub awaiting_provider: bool,
 }
 
 /// Read an agent's progress snapshot in a single manifest load, or `None` when
@@ -61,6 +66,7 @@ pub(crate) fn agent_progress_snapshot(agent_id: &str) -> Option<AgentProgressSna
             .last_activity_at
             .map(|stamped_at| now.saturating_sub(stamped_at)),
         inside_tool_call: manifest.current_tool.is_some(),
+        awaiting_provider: manifest.awaiting_provider_since.is_some(),
     })
 }
 #[cfg(test)]
@@ -476,6 +482,18 @@ pub(crate) struct AgentOutput {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) current_tool: Option<String>,
+    /// Epoch seconds at which the worker issued the provider request it is
+    /// still blocked on, absent whenever no request is in flight. Every other
+    /// progress signal is a *frame*: a leg that streams nothing at all — a
+    /// silent thinking turn, a non-streaming fallback — produces none, so this
+    /// is the only harness-recorded evidence that the API call itself is
+    /// running. Cleared when the request returns and on terminal states.
+    #[serde(
+        rename = "awaitingProviderSince",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) awaiting_provider_since: Option<u64>,
     /// Rolling feed of the agent's most recent tool calls (oldest → newest,
     /// capped at [`manifest::RECENT_TOOLS_CAP`]) with a one-line argument
     /// brief, e.g. `read_file · src/main.rs`. The parent's agent viewer
@@ -1116,6 +1134,7 @@ where
         error: None,
         token_history: Vec::new(),
         current_tool: None,
+        awaiting_provider_since: None,
         recent_tools: Vec::new(),
         tool_calls: 0,
         current_phase: None,

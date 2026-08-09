@@ -462,6 +462,7 @@ fn persist_agent_terminal_state_with_history_if_running(
         next_manifest.status = status.to_string();
         next_manifest.completed_at = Some(epoch_seconds_now());
         next_manifest.current_tool = None;
+        next_manifest.awaiting_provider_since = None;
         next_manifest.current_phase = None;
         next_manifest.last_activity_at = Some(epoch_seconds_now_u64());
         next_manifest.current_blocker.clone_from(&blocker);
@@ -527,6 +528,7 @@ pub(super) fn persist_agent_resumed_state_with(
         next_manifest.error = None;
         next_manifest.current_blocker = None;
         next_manifest.current_tool = None;
+        next_manifest.awaiting_provider_since = None;
         next_manifest.current_phase = None;
         next_manifest.started_at = Some(epoch_seconds_now());
         next_manifest.last_activity_at = Some(epoch_seconds_now_u64());
@@ -606,6 +608,7 @@ pub(super) fn persist_agent_stopped_state_with(
         next_manifest.status = String::from("stopped");
         next_manifest.completed_at = Some(epoch_seconds_now());
         next_manifest.current_tool = None;
+        next_manifest.awaiting_provider_since = None;
         next_manifest.current_phase = None;
         next_manifest.last_activity_at = Some(epoch_seconds_now_u64());
         next_manifest.current_blocker = None;
@@ -648,22 +651,43 @@ const FINAL_RESPONSE_MARKER: &str = "\n### Final response\n\n";
 /// Headers this module appends *after* the deliverable. A reader that stops at
 /// the first of them gets the response and nothing else.
 const POST_RESPONSE_MARKERS: [&str; 2] = ["\n### Error\n\n", "\n### Worker detail\n\n"];
+/// Header every writer here opens a run's result block with. The block is the
+/// unit of "one run", so it — not the response header — is what selects which
+/// run's deliverable is read back.
+const RESULT_BLOCK_MARKER: &str = "\n## Result\n";
 
 /// The deliverable recorded in a terminal agent output file, if there is one.
 ///
-/// The file is append-only across resumed runs, so the newest run's response is
-/// the one after the *last* marker; and both `### Error` and `### Worker detail`
-/// are written after it, so reading to end-of-file would fold a worker's
-/// stacktrace into what a peer agent is handed as finished work. Parsing lives
-/// here, next to the writer, so the two cannot drift apart.
+/// The file is append-only across resumed runs, so the newest run is the one
+/// after the *last* result-block header; within that block the deliverable is
+/// what the *first* response header opens, and both `### Error` and `### Worker
+/// detail` are written after it, so reading to end-of-file would fold a
+/// worker's stacktrace into what a peer agent is handed as finished work.
+///
+/// Anchoring on the last *response* header instead would let a payload that
+/// quotes the header — an agent reporting on this very format, or pasting a
+/// sample output file — truncate its own deliverable at the quote. Structural
+/// headers can still collide: a payload containing BOTH `## Result` and the
+/// response header at line starts shifts the anchor into itself. That is a
+/// bounded residue, not a fix — result blocks are far rarer in payload prose
+/// than a quoted section header.
+///
+/// A block with no response header at all (a `stopped` run carries only
+/// `### Stop reason`) yields `None`, so callers fall through to the streamed
+/// tail rather than reviving an older run's answer as if it were this one's.
+/// Parsing lives here, next to the writer, so the two cannot drift apart.
 pub(super) fn final_response_section(body: &str) -> Option<String> {
-    let (_, tail) = body.rsplit_once(FINAL_RESPONSE_MARKER)?;
+    let newest_run = body
+        .rfind(RESULT_BLOCK_MARKER)
+        .map_or(body, |block_at| &body[block_at..]);
+    let response_at = newest_run.find(FINAL_RESPONSE_MARKER)? + FINAL_RESPONSE_MARKER.len();
+    let response = &newest_run[response_at..];
     let end = POST_RESPONSE_MARKERS
         .iter()
-        .filter_map(|marker| tail.find(marker))
+        .filter_map(|marker| response.find(marker))
         .min()
-        .unwrap_or(tail.len());
-    let response = tail[..end].trim();
+        .unwrap_or(response.len());
+    let response = response[..end].trim();
     (!response.is_empty()).then(|| response.to_string())
 }
 
@@ -681,9 +705,9 @@ fn format_agent_terminal_enrichment(result: Option<&str>, error: Option<&str>) -
 fn format_agent_stopped_output(reason: &str) -> String {
     let reason = reason.trim();
     if reason.is_empty() {
-        "\n## Result\n\n- status: stopped\n".to_string()
+        format!("{RESULT_BLOCK_MARKER}\n- status: stopped\n")
     } else {
-        format!("\n## Result\n\n- status: stopped\n\n### Stop reason\n\n{reason}\n")
+        format!("{RESULT_BLOCK_MARKER}\n- status: stopped\n\n### Stop reason\n\n{reason}\n")
     }
 }
 
@@ -693,7 +717,7 @@ fn format_agent_terminal_output(
     blocker: Option<&LaneEventBlocker>,
     error: Option<&str>,
 ) -> String {
-    let mut sections = vec![format!("\n## Result\n\n- status: {status}\n")];
+    let mut sections = vec![format!("{RESULT_BLOCK_MARKER}\n- status: {status}\n")];
     if let Some(blocker) = blocker {
         sections.push(format!(
             "\n### Blocker\n\n- failure_class: {}\n- detail: {}\n",
@@ -883,18 +907,32 @@ pub(super) fn record_tool_finished(manifest_path: &std::path::Path) {
 /// Stamp the beginning of a provider request, before opening its stream. If no
 /// decoded event follows, `streamOpenAt` + absent `firstProviderEventAt` is the
 /// observable signature of a provider/startup stall.
+///
+/// This also opens the `awaitingProviderSince` bracket that
+/// [`record_provider_request_finished`] closes. `streamOpenAt` is
+/// first-attempt-only telemetry; the bracket is per attempt, because it answers
+/// "is a request in flight *now*" for the fan-out progress gate.
 pub(super) fn record_agent_stream_open(
     manifest_path: &std::path::Path,
     effective_effort: Option<&str>,
     thinking_budget_tokens: Option<u32>,
 ) {
     update_manifest_best_effort(manifest_path, |manifest| {
-        manifest
-            .activity
-            .stream_open_at
-            .get_or_insert_with(epoch_seconds_now_u64);
+        let now = epoch_seconds_now_u64();
+        manifest.activity.stream_open_at.get_or_insert(now);
         manifest.activity.effective_effort = effective_effort.map(str::to_string);
         manifest.activity.thinking_budget_tokens = thinking_budget_tokens;
+        manifest.awaiting_provider_since = Some(now);
+    });
+}
+
+/// Best-effort: close the `awaitingProviderSince` bracket once the provider
+/// request returns, whichever way it returned. Only the worker clears it, so a
+/// worker that died mid-request leaves the claim standing — readers must gate
+/// it on physical worker liveness, exactly as they do `currentTool`.
+pub(super) fn record_provider_request_finished(manifest_path: &std::path::Path) {
+    update_manifest_best_effort(manifest_path, |manifest| {
+        manifest.awaiting_provider_since = None;
     });
 }
 
@@ -1336,5 +1374,107 @@ mod activity_tests {
         assert!(current.current_phase.is_none());
         assert_eq!(current.tool_calls, 0);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The provider-request bracket has to survive a leg that produces no
+    /// frames at all — that is the only case it exists for — and it must not
+    /// outlive the run: a terminal transition happens on a thread that is not
+    /// the worker, so the worker's own release never runs for a cancelled call.
+    #[test]
+    fn an_open_provider_request_is_recorded_and_cleared_on_the_way_out() {
+        let (dir, manifest) = test_manifest("awaiting");
+        write_agent_manifest(&manifest).expect("write manifest");
+        let path = std::path::Path::new(&manifest.manifest_file);
+        let reread = || -> AgentOutput {
+            serde_json::from_str(
+                &std::fs::read_to_string(&manifest.manifest_file).expect("read manifest"),
+            )
+            .expect("parse manifest")
+        };
+
+        record_agent_stream_open(path, Some("high"), None);
+        let waiting = reread();
+        assert!(
+            waiting.awaiting_provider_since.is_some(),
+            "an issued request is recorded before any frame can arrive"
+        );
+        assert!(
+            waiting.current_tool.is_none(),
+            "waiting on the provider is not a tool call"
+        );
+
+        record_provider_request_finished(path);
+        assert!(reread().awaiting_provider_since.is_none());
+
+        record_agent_stream_open(path, Some("high"), None);
+        assert!(
+            persist_agent_stopped_state(&manifest, "fan-out deadline elapsed")
+                .expect("stop a running agent"),
+            "the stop claims the running manifest"
+        );
+        let stopped = reread();
+        assert_eq!(stopped.status, "stopped");
+        assert!(
+            stopped.awaiting_provider_since.is_none(),
+            "a terminal agent must never read as still mid-request"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// An agent whose subject *is* this output format quotes the response
+    /// header inside its own deliverable. Anchoring the read on the last such
+    /// header made the payload cut itself in half — and this payload is what a
+    /// peer agent is handed over a `sees` edge, so the collision silently
+    /// decided what someone else read.
+    #[test]
+    fn a_deliverable_that_quotes_the_response_header_survives_whole() {
+        let payload = "The writer emits\n\n### Final response\n\nand the reader stops at \
+                       `### Error`.";
+        let body = format!(
+            "{RESULT_BLOCK_MARKER}\n- status: completed\n{FINAL_RESPONSE_MARKER}{payload}\n"
+        );
+        assert_eq!(final_response_section(&body).as_deref(), Some(payload));
+    }
+
+    /// The output file is append-only across resume generations, and both the
+    /// worker's stacktrace and its post-mortem detail are written after the
+    /// deliverable.
+    #[test]
+    fn the_newest_run_is_read_without_the_sections_written_after_it() {
+        let body = "## Result\n\n- status: completed\n\n### Final response\n\nfirst run answer\n\
+                    \n## Result\n\n- status: failed\n\n### Final response\n\nsecond run answer\n\
+                    \n### Error\n\nthread 'worker' panicked at src/lib.rs:1\n";
+        assert_eq!(
+            final_response_section(body).as_deref(),
+            Some("second run answer")
+        );
+
+        let enriched = "\n## Result\n\n- status: stopped\n\n### Stop reason\n\ndeadline\n\
+                        \n### Final response\n\nsalvaged deliverable\n\
+                        \n### Worker detail\n\nworker exited after cancel\n";
+        assert_eq!(
+            final_response_section(enriched).as_deref(),
+            Some("salvaged deliverable")
+        );
+    }
+
+    /// A stopped run records why it stopped, never a deliverable. Answering
+    /// with an older run's response here would hand a peer finished work the
+    /// newest run never produced; `None` sends the caller to the streamed tail.
+    #[test]
+    fn a_run_that_only_stopped_reports_no_deliverable() {
+        let stopped = format_agent_stopped_output("fan-out deadline elapsed");
+        assert_eq!(final_response_section(&stopped), None);
+
+        let after_a_finished_run = format!(
+            "## Result\n\n- status: completed\n{FINAL_RESPONSE_MARKER}older run answer\n{stopped}"
+        );
+        assert_eq!(final_response_section(&after_a_finished_run), None);
+
+        assert_eq!(final_response_section("# Agent\n\nnothing terminal yet\n"), None);
+        assert_eq!(
+            final_response_section(&format!("{RESULT_BLOCK_MARKER}{FINAL_RESPONSE_MARKER}   \n")),
+            None
+        );
     }
 }

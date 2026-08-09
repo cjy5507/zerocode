@@ -1404,9 +1404,11 @@ fn shared_deadline_is_not_rearmed_per_reclaim() {
 }
 
 /// What counts as evidence that an agent is still working: a heartbeat inside
-/// the activity window, or being blocked inside a tool call (tool execution
-/// stamps only on entry and exit, so a multi-minute build reads as idle by
-/// heartbeat alone — the exact shape that would kill a healthy agent).
+/// the activity window, or being blocked in a harness call it cannot stamp from
+/// — a tool call (stamped on entry and exit only, so a multi-minute build reads
+/// as idle by heartbeat alone) or an open provider request (a silently thinking
+/// turn streams no frame at all). Both are the exact shape that would otherwise
+/// kill a healthy agent.
 #[test]
 fn progress_snapshot_covers_heartbeat_and_in_tool_work() {
     let window_secs = super::SPAWN_RECLAIM_ACTIVITY_WINDOW.as_secs();
@@ -1417,19 +1419,20 @@ fn progress_snapshot_covers_heartbeat_and_in_tool_work() {
     );
     assert!(
         !super::snapshot_shows_progress(Some(window_secs + 1), false),
-        "a heartbeat past the window with no tool in flight is stale"
+        "a heartbeat past the window with nothing in flight is stale"
     );
     assert!(
         !super::snapshot_shows_progress(None, false),
-        "never stamped and not in a tool is no evidence at all"
+        "never stamped and nothing in flight is no evidence at all"
     );
     assert!(
         super::snapshot_shows_progress(Some(window_secs * 10), true),
-        "an agent inside a long tool call is working even with a stale stamp"
+        "an agent blocked in a tool call or a provider request is working even \
+         with a stale stamp"
     );
     assert!(
         super::snapshot_shows_progress(None, true),
-        "in-tool alone is sufficient evidence"
+        "a live harness call alone is sufficient evidence"
     );
 }
 
@@ -1479,6 +1482,18 @@ fn set_manifest_current_tool(dir: &std::path::Path, id: &str, tool: &str) {
     value["currentTool"] = serde_json::json!(tool);
     std::fs::write(&path, serde_json::to_string(&value).expect("manifest json"))
         .expect("write manifest with current tool");
+}
+
+/// Mark a persisted manifest as blocked on an open provider request, as
+/// `record_agent_stream_open` does in production.
+fn set_manifest_awaiting_provider(dir: &std::path::Path, id: &str, since: u64) {
+    let path = dir.join(format!("{id}.json"));
+    let raw = std::fs::read_to_string(&path).expect("read manifest for provider stamp");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).expect("parse manifest for provider stamp");
+    value["awaitingProviderSince"] = serde_json::json!(since);
+    std::fs::write(&path, serde_json::to_string(&value).expect("manifest json"))
+        .expect("write manifest awaiting a provider");
 }
 
 /// Epoch seconds for heartbeat fixtures.
@@ -1562,6 +1577,72 @@ fn heartbeat_age_readers_reflect_the_persisted_stamp() {
     assert!(
         !super::any_agent_shows_progress(&[in_tool.clone(), stale.clone()]),
         "the set-level reader must not follow a corpse either"
+    );
+
+    match prior_store {
+        Some(value) => std::env::set_var("ZO_AGENT_STORE", value),
+        None => std::env::remove_var("ZO_AGENT_STORE"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The defect no frame-driven signal could see: a provider that accepts a
+/// request and then thinks silently streams nothing for minutes, so no
+/// heartbeat is stamped and no tool is in flight — a healthy agent mid-API-call
+/// read as hung and was cancelled by the fan-out deadline. The manifest's
+/// request bracket is the harness's own record that the call is open, and like
+/// every other in-flight claim it is worth nothing once the worker is gone.
+#[test]
+fn an_agent_awaiting_a_provider_is_progress_only_while_its_worker_lives() {
+    let _guard = env_lock();
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).expect("create agent store");
+    let prior_store = std::env::var_os("ZO_AGENT_STORE");
+    std::env::set_var("ZO_AGENT_STORE", &dir);
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be after epoch")
+        .as_nanos();
+    let thinking = format!("hb-thinking-{stamp}");
+    write_manifest_for_drain(&dir, &thinking, "hb-sess", "running");
+    // The request went out and nothing has come back: the newest stamp of any
+    // kind is the request itself, far outside the reclaim window.
+    let issued_at = epoch_secs_now().saturating_sub(10_000);
+    stamp_manifest_activity(&dir, &thinking, issued_at);
+    set_manifest_awaiting_provider(&dir, &thinking, issued_at);
+    super::agent_tools::register_agent_cancel_signal_for_tests(
+        &thinking,
+        super::agent_tools::AGENT_INITIAL_RUN_GENERATION,
+    );
+
+    let snapshot = super::agent_tools::agent_progress_snapshot(&thinking)
+        .expect("the waiting agent has a manifest");
+    assert!(
+        snapshot.awaiting_provider,
+        "the open request has to reach the scheduler's snapshot"
+    );
+    assert!(
+        !snapshot.inside_tool_call,
+        "a provider request is not a tool call — the two signals stay distinct"
+    );
+    assert!(
+        super::agent_shows_progress(&thinking),
+        "an agent blocked in a provider call is working despite the stale heartbeat"
+    );
+    assert!(
+        super::any_agent_shows_progress(std::slice::from_ref(&thinking)),
+        "the set-level reader sees it too"
+    );
+
+    super::agent_tools::unregister_agent_cancel_signal_for_tests(
+        &thinking,
+        super::agent_tools::AGENT_INITIAL_RUN_GENERATION,
+    );
+    assert!(
+        !super::agent_shows_progress(&thinking),
+        "a worker that died mid-request leaves the claim standing forever; that \
+         corpse must not win extensions"
     );
 
     match prior_store {

@@ -1417,12 +1417,16 @@ const SPAWN_DEADLINE_EXTENSION_STEP: Duration = Duration::from_secs(10 * 60);
 
 /// Whether a manifest snapshot is evidence of an agent still working. Pure so
 /// both progress signals are testable without a real agent: a heartbeat inside
-/// [`SPAWN_RECLAIM_ACTIVITY_WINDOW`], or being blocked inside a tool call —
-/// tool execution stamps only on entry and exit, so a multi-minute build would
-/// otherwise read as idle for its whole run. A never-stamped heartbeat with no
-/// tool in flight is no evidence at all.
-const fn snapshot_shows_progress(seconds_since_activity: Option<u64>, inside_tool_call: bool) -> bool {
-    if inside_tool_call {
+/// [`SPAWN_RECLAIM_ACTIVITY_WINDOW`], or being blocked in a harness call the
+/// worker cannot stamp from — a tool call (stamped on entry and exit only, so a
+/// multi-minute build would otherwise read as idle for its whole run) or a
+/// provider request that has not streamed a frame. A never-stamped heartbeat
+/// with nothing in flight is no evidence at all.
+const fn snapshot_shows_progress(
+    seconds_since_activity: Option<u64>,
+    blocked_in_harness_call: bool,
+) -> bool {
+    if blocked_in_harness_call {
         return true;
     }
     match seconds_since_activity {
@@ -1441,15 +1445,17 @@ const fn reclaim_should_extend_deadline(candidate_progressing: bool, extensions_
 
 /// Whether one specific agent's manifest shows progress right now.
 ///
-/// `current_tool` is cleared by the worker itself, so a worker that died
-/// without reaching a terminal transition leaves its manifest claiming a tool
-/// is running forever. Taken at face value that corpse reads as progress, wins
-/// every extension, and holds the whole fan-out's collection for the full
-/// extension budget. The cancel-signal registry — which the worker unregisters
-/// at physical exit — is what says the claim is still someone's to make.
+/// Both in-flight claims — `current_tool` and the provider-request bracket —
+/// are cleared by the worker itself, so a worker that died without reaching a
+/// terminal transition leaves its manifest claiming work forever. Taken at face
+/// value that corpse reads as progress, wins every extension, and holds the
+/// whole fan-out's collection for the full extension budget. The cancel-signal
+/// registry — which the worker unregisters at physical exit — is what says the
+/// claim is still someone's to make.
 fn agent_shows_progress(agent_id: &str) -> bool {
     agent_tools::agent_progress_snapshot(agent_id).is_some_and(|snapshot| {
-        let working = snapshot.inside_tool_call && agent_tools::agent_worker_is_live(agent_id);
+        let claims_work = snapshot.inside_tool_call || snapshot.awaiting_provider;
+        let working = claims_work && agent_tools::agent_worker_is_live(agent_id);
         snapshot_shows_progress(snapshot.seconds_since_activity, working)
     })
 }

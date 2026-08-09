@@ -15,7 +15,7 @@ use super::manifest::{
     append_agent_output_tail, record_agent_phase, record_agent_provider_event,
     record_agent_reasoning_activity, record_agent_retry_cause, record_agent_runtime_model,
     record_agent_stream_notice, record_agent_stream_open, record_agent_task_activity,
-    retain_output_tail_window, trim_agent_output_tail_suffix,
+    record_provider_request_finished, retain_output_tail_window, trim_agent_output_tail_suffix,
 };
 use super::rate_limit::{
     QUOTA_SNAPSHOT_FRESH, RateGovernor, agent_rate_governor, binding_window,
@@ -171,6 +171,40 @@ const REASONING_ACTIVITY_FLUSH_INTERVAL: std::time::Duration =
 fn stamp_phase(manifest_path: Option<&std::path::Path>, phase: Option<&str>) {
     if let Some(path) = manifest_path {
         record_agent_phase(path, phase);
+    }
+}
+
+/// Holds the manifest's "a provider request is in flight" claim for the life of
+/// one attempt.
+///
+/// The claim must be released on *every* way out of the attempt — clean stream,
+/// mid-stream error, rate-limit retry, transient fallback, cancellation — and
+/// the retry loop has a dozen of them, so `Drop` owns the release rather than
+/// each exit remembering to. What it buys: a turn the model thinks about
+/// silently streams no frame, refreshes no heartbeat, and would otherwise be
+/// cancelled by the fan-out deadline as if it had hung.
+struct ProviderRequestGuard {
+    manifest_path: Option<std::path::PathBuf>,
+}
+
+impl ProviderRequestGuard {
+    fn open(
+        manifest_path: Option<std::path::PathBuf>,
+        effective_effort: Option<&str>,
+        thinking_budget_tokens: Option<u32>,
+    ) -> Self {
+        if let Some(path) = manifest_path.as_deref() {
+            record_agent_stream_open(path, effective_effort, thinking_budget_tokens);
+        }
+        Self { manifest_path }
+    }
+}
+
+impl Drop for ProviderRequestGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.manifest_path.as_deref() {
+            record_provider_request_finished(path);
+        }
     }
 }
 
@@ -1019,13 +1053,13 @@ impl ApiClient for ProviderRuntimeClient {
                 // The first streamed-text flush (or tool start) clears this.
                 stamp_phase(manifest_path.as_deref(), Some("thinking"));
 
-                if let Some(path) = manifest_path.as_deref() {
-                    record_agent_stream_open(
-                        path,
-                        effective_effort_label.as_deref(),
-                        self.thinking_budget_tokens,
-                    );
-                }
+                // Spans the non-stream fallback below too: it is part of the
+                // same attempt, and it is the leg that streams nothing at all.
+                let _provider_request = ProviderRequestGuard::open(
+                    manifest_path.clone(),
+                    effective_effort_label.as_deref(),
+                    self.thinking_budget_tokens,
+                );
                 let stream = match self.client.stream_message(&message_request).await {
                     Ok(stream) => stream,
                     Err(error) => {

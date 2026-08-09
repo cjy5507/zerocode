@@ -702,6 +702,7 @@ mod tests {
             error: None,
             token_history: Vec::new(),
             current_tool: None,
+            awaiting_provider_since: None,
             recent_tools: Vec::new(),
             tool_calls: 0,
             current_phase: None,
