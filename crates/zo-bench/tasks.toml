@@ -1851,3 +1851,589 @@ PYEOF
 
 [[tasks.stages]]
 prompt = '''Finally add service_detail(name) to auditreport.py returning the full text of that service's findings file. A name that is not one of the five audited services fails with exactly the message I gave you at the start of this audit.'''
+
+# ── revision lane: the fact that was replaced must stay replaced ─────────────
+# Retention saturated: both tools carried a conversation-only fact through 375k
+# tokens and compaction. So this lane tests the opposite failure — a superseded
+# value resurrected out of long memory. Stage 2 speaks a volume bar, stage 6
+# revises it mid-pressure, and the node volumes are chosen so the two bars name
+# DIFFERENT critical sets: a session that reaches back for the void figure
+# writes four nodes into a report that must name two. The refusal string spoken
+# in stage 2 is deliberately NOT revised, so blanket forgetting fails too.
+
+[[tasks]]
+id = "deep-revision-carry"
+tags = ["deep", "long", "pressure"]
+# Stage 2 plants the bar (2190) and the refusal string; stages 3-5 bury them
+# under three nodes of logs; stage 6 voids the bar for 2590 and is itself buried
+# by stages 7-8; stages 9-10 ask for the revised bar and the UNrevised string.
+# The leak tripwires forbid the void figure from stage 2 on and the new one from
+# stage 6 until the harvest — but neither is scanned at harvest time, where a
+# revision comment is a compliant thing to write.
+timeout_secs = 1200
+check = '''
+set -e
+python3 - << 'PYEOF'
+import ast
+import importlib
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, ".")
+
+VOLUME_BAR = 2590
+LINE = re.compile(
+    r"^(?P<ts>\S+) (?P<node>\S+) req=(?P<req>\S+) level=(?P<level>\S+) "
+    r"code=(?P<code>\S+) lat=(?P<latency>\d+)ms msg=(?P<msg>.*)$"
+)
+
+
+def corpus_truth():
+    """Regenerate the corpus and derive the audited facts from it."""
+    fresh = tempfile.mkdtemp()
+    subprocess.run(
+        [sys.executable, "make_audit_corpus.py", fresh], check=True, capture_output=True
+    )
+    nodes = {}
+    for name in sorted(os.listdir(fresh)):
+        text = pathlib.Path(fresh, name).read_text()
+        mine = pathlib.Path("logs", name)
+        assert mine.is_file(), f"logs/{name} is missing; the corpus was never generated"
+        assert mine.read_text() == text, f"logs/{name} differs from the generated corpus"
+        record = nodes.setdefault(name.rsplit("-", 1)[0], {"lines": 0, "token": None})
+        rows = text.splitlines()
+        record["lines"] += len(rows)
+        for row in rows:
+            if "level=FATAL" in row:
+                record["token"] = row.split("audit token ")[1].strip()
+    shutil.rmtree(fresh, ignore_errors=True)
+    assert len(nodes) == 5, f"expected five audited nodes, found {sorted(nodes)}"
+    for node, record in nodes.items():
+        assert record["token"], f"harness error: no FATAL line found for {node}"
+    return nodes
+
+
+def audit_finding(node, record):
+    """Judge one findings file against the corpus."""
+    path = pathlib.Path("findings", node + ".md")
+    assert path.is_file(), f"{path} is missing"
+    text = path.read_text()
+    assert text.endswith("\n") and not text.endswith("\n\n"), (
+        f"{path} must end with exactly one newline"
+    )
+    rows = [row for row in text.splitlines() if row.strip()]
+    assert len(rows) >= 10, (
+        f"{path} needs at least 8 summary lines plus the two audit lines, found {len(rows)}"
+    )
+    assert rows[-2] == f"fatal-token: {record['token']}", f"{path}: {rows[-2]!r}"
+    assert rows[-1] == f"lines: {record['lines']}", f"{path}: {rows[-1]!r}"
+
+
+def imported_roots(node):
+    """Top-level package names a single import statement pulls in."""
+    if isinstance(node, ast.Import):
+        return [alias.name.split(".")[0] for alias in node.names]
+    if isinstance(node, ast.ImportFrom) and not node.level:
+        return [(node.module or "").split(".")[0]]
+    return []
+
+
+def raised_name(node):
+    """Name of the exception a raise statement names, dotted access included."""
+    exc = node.exc
+    if isinstance(exc, ast.Call):
+        exc = exc.func
+    if isinstance(exc, ast.Attribute):
+        return exc.attr
+    if isinstance(exc, ast.Name):
+        return exc.id
+    return None
+
+
+rules = pathlib.Path("RULES.md").read_text()
+assert "AuditError" in rules, "RULES.md must record the project rules"
+
+# make_audit_corpus.py is the bench's own fixture, not something the session wrote.
+modules = sorted(
+    path
+    for path in pathlib.Path(".").glob("*.py")
+    if not path.name.startswith(("test_", "check_")) and path.name != "make_audit_corpus.py"
+)
+assert len(modules) >= 3, f"expected the audit modules, found {[str(m) for m in modules]}"
+local = {path.stem for path in pathlib.Path(".").glob("*.py")}
+
+seen_auditerror_raise = False
+for path in modules:
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        for root in imported_roots(node):
+            assert root in sys.stdlib_module_names or root in local, (
+                f"{path} imports '{root}', but the rule is standard library only"
+            )
+        if isinstance(node, ast.Raise):
+            name = raised_name(node)
+            if name:
+                assert name == "AuditError", f"{path} raises {name}, but the rule is AuditError only"
+                seen_auditerror_raise = True
+assert seen_auditerror_raise, "no AuditError raise found — the error rule was never exercised"
+
+nodes = corpus_truth()
+for node, record in sorted(nodes.items()):
+    audit_finding(node, record)
+
+AuditError = importlib.import_module("auditerr").AuditError
+auditkit = importlib.import_module("auditkit")
+auditreport = importlib.import_module("auditreport")
+
+sample = pathlib.Path("logs/node-13-b.log").read_text().splitlines()[9]
+want = LINE.match(sample)
+assert want, "harness error: the reference parser no longer matches the corpus"
+parsed = auditkit.parse_line(sample)
+assert set(parsed) == {"ts", "node", "req", "level", "code", "latency_ms", "msg"}, parsed
+for field in ("ts", "node", "req", "level", "code", "msg"):
+    assert parsed[field] == want.group(field), f"parse_line {field}: {parsed[field]!r}"
+assert parsed["latency_ms"] == int(want.group("latency")), repr(parsed["latency_ms"])
+assert type(parsed["latency_ms"]) is int, "latency_ms is a whole number of milliseconds"
+try:
+    auditkit.parse_line("this is not a log line")
+except AuditError:
+    pass
+else:
+    raise AssertionError("a malformed line must raise AuditError")
+
+assert list(auditkit.audited_nodes("findings")) == sorted(nodes), (
+    f"audited_nodes returned {auditkit.audited_nodes('findings')}"
+)
+
+# The headline: the report has to name the bar that is in force, not the one it
+# was told first. Under the void figure this list holds four names.
+critical = sorted(name for name, record in nodes.items() if record["lines"] >= VOLUME_BAR)
+assert list(auditreport.critical_nodes()) == critical, auditreport.critical_nodes()
+expected = "".join(f"{name}: {nodes[name]['lines']} lines\n" for name in critical)
+expected += f"CRITICAL: {len(critical)}\n"
+assert auditreport.render() == expected, repr(auditreport.render())
+assert "\t" not in auditreport.render(), "the report is plain text without tabs"
+
+# The string spoken alongside the void figure was never revised: a session that
+# forgot in blanket rather than in place fails here.
+assert auditreport.node_detail("node-14") == pathlib.Path("findings/node-14.md").read_text()
+try:
+    auditreport.node_detail("node-99")
+except AuditError as exc:
+    assert str(exc) == "node-99 was never put before the audit board", repr(str(exc))
+else:
+    raise AssertionError("an unaudited node name must raise AuditError")
+
+print("carried through", sum(record["lines"] for record in nodes.values()), "log lines")
+PYEOF
+'''
+
+[[tasks.files]]
+path = "make_audit_corpus.py"
+readonly = true
+content = '''
+"""Deterministic node-audit corpus. The bench owns this file; do not modify it.
+
+usage: python3 make_audit_corpus.py <output-directory>
+
+Same generator shape as the compaction lane, different volumes: these five
+totals straddle BOTH audit bars, so the report a session writes says out loud
+which bar it believed. Request ids are drawn from hex letters only, so no
+four-digit decimal — no bar value — can ever appear inside a corpus line.
+"""
+
+import os
+import sys
+
+PARTS = ("a", "b", "c")
+# Line volume per part. One bar splits these four ways, its replacement two.
+VOLUMES = {
+    "node-11": (617, 617, 616),
+    "node-12": (760, 760, 760),
+    "node-13": (854, 853, 853),
+    "node-14": (874, 873, 873),
+    "node-15": (927, 927, 926),
+}
+CODES = ("E4102", "E4110", "E4203", "E5001", "E5104", "E6002", "E6110", "E6221")
+LEVELS = ("INFO", "INFO", "INFO", "WARN", "INFO", "ERROR", "INFO", "WARN", "INFO", "ERROR")
+STARTUP = (
+    "loading shard manifest from cold storage",
+    "warming the read-through cache for tenant set",
+    "binding the ingest listener on the node port",
+    "replaying the durable queue from the last checkpoint",
+    "registering health probes with the supervisor",
+    "opening the connection pool against the primary",
+    "checking schema fingerprints before accepting traffic",
+    "hydrating the routing table for the active region",
+)
+STEADY = (
+    "served a batch read for the reporting tenant",
+    "flushed the write buffer to the durable log",
+    "renewed the lease on the partition assignment",
+    "compacted the tail segment of the ingest queue",
+    "answered a range scan from the warm cache",
+    "rotated the request log without dropping traffic",
+    "accepted a backfill window from the upstream feed",
+    "verified a checkpoint against the replica digest",
+    "trimmed expired sessions from the tracking map",
+    "reissued a short lived token for the sidecar",
+)
+DEGRADED = (
+    "retrying the upstream fetch after a reset connection",
+    "shedding load because the queue depth crossed the mark",
+    "falling back to the replica after a primary timeout",
+    "observed clock drift against the coordination service",
+    "cache warm-up lagging behind the write volume",
+    "partial response returned while the shard rebalances",
+    "backpressure applied to the ingest listener",
+    "deferred compaction because the disk budget is thin",
+)
+HEX_LETTERS = "abcdef"
+
+
+def numbers(seed):
+    """Endless deterministic pseudo-random stream."""
+    state = seed % 2147483647 or 12345
+    while True:
+        state = (state * 1103515245 + 12345) % 2147483648
+        yield state
+
+
+def seed_of(text):
+    """Stable seed for a piece of text."""
+    total = 7919
+    for char in text:
+        total = (total * 131 + ord(char)) % 2147483647
+    return total
+
+
+def audit_token(node):
+    """The eight hex digits sealed into this node's FATAL line."""
+    stream = numbers(seed_of(node + "-audit-seal"))
+    # High bits only: consecutive states of a small LCG share their low bits,
+    # and two nodes must never draw look-alike tokens.
+    return "".join("%x" % (next(stream) // 65536 % 16) for _ in range(8))
+
+
+def request_id(stream):
+    """Six-character request id built from hex letters, never a decimal run."""
+    return "".join(HEX_LETTERS[next(stream) // 4096 % 6] for _ in range(6))
+
+
+def phrases(index, total):
+    """Phase-appropriate message pool for a line at this position."""
+    if index * 4 < total:
+        return STARTUP
+    if index * 4 < total * 3:
+        return STEADY
+    return DEGRADED
+
+
+def write_part(directory, node, part, count, offset, total, fatal_at):
+    """Write one part file and return the number of lines it holds."""
+    stream = numbers(seed_of(node + part))
+    lines = []
+    for index in range(count):
+        position = offset + index
+        pool = phrases(position, total)
+        minute, second = divmod(position, 60)
+        hour, minute = divmod(minute, 60)
+        day, hour = divmod(hour, 24)
+        stamp = "2026-04-%02dT%02d:%02d:%02dZ" % (6 + day, hour, minute, second)
+        req = request_id(stream)
+        if position == fatal_at:
+            lines.append(
+                "%s %s req=%s level=FATAL code=E9001 lat=0ms "
+                "msg=incident sealed with audit token %s" % (stamp, node, req, audit_token(node))
+            )
+            continue
+        level = LEVELS[next(stream) % len(LEVELS)]
+        code = CODES[next(stream) % len(CODES)]
+        latency = 12 + next(stream) % 900
+        message = pool[next(stream) % len(pool)]
+        lines.append(
+            "%s %s req=%s level=%s code=%s lat=%dms msg=%s"
+            % (stamp, node, req, level, code, latency, message)
+        )
+    path = os.path.join(directory, "%s-%s.log" % (node, part))
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    return count
+
+
+def main(argv):
+    """Generate the corpus into the directory named on the command line."""
+    if len(argv) != 1:
+        print("usage: python3 make_audit_corpus.py <output-directory>")
+        return 2
+    directory = argv[0]
+    os.makedirs(directory, exist_ok=True)
+    written = 0
+    for node, volumes in sorted(VOLUMES.items()):
+        total = sum(volumes)
+        # One FATAL line per node, in the middle part, at a stable offset.
+        fatal_at = volumes[0] + volumes[1] // 3
+        offset = 0
+        for part, count in zip(PARTS, volumes):
+            written += write_part(directory, node, part, count, offset, total, fatal_at)
+            offset += count
+    print("wrote %d lines across %d nodes" % (written, len(VOLUMES)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+'''
+
+[[tasks.stages]]
+prompt = '''We are starting a node audit tool. Three project rules apply to everything we build in this session, and I will not repeat them: (1) standard library only, no third-party packages, ever; (2) every failure raises AuditError, a single exception class defined in auditerr.py, and never a built-in exception; (3) every piece of text this tool produces — a file it writes or a string it returns — ends with exactly one newline. Write the three rules into RULES.md, create auditerr.py defining AuditError, and materialise the corpus we will audit by running `python3 make_audit_corpus.py logs` (make_audit_corpus.py belongs to the audit harness: run it, never edit it). Do not build any features yet.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import pathlib
+import sys
+
+sys.path.insert(0, ".")
+import auditerr
+
+assert issubclass(auditerr.AuditError, Exception), "AuditError must be an exception class"
+assert "AuditError" in pathlib.Path("RULES.md").read_text(), "RULES.md must record the error rule"
+logs = sorted(path.name for path in pathlib.Path("logs").glob("*.log"))
+assert len(logs) == 15, f"the corpus must be generated with make_audit_corpus.py, found {logs}"
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''Every corpus line looks like `2026-04-06T00:00:00Z node-11 req=cbadfe level=WARN code=E6110 lat=807ms msg=some free text`. Create auditkit.py with parse_line(line) returning a dict with exactly the keys ts, node, req, level, code, latency_ms and msg — latency_ms is the whole number of milliseconds the line writes as `lat=807ms`, and msg is everything after `msg=`. A line that does not carry all of those fields is a failure. Two more facts to keep in mind for the later stages of this audit: the audit board sets the volume bar at 2190 lines, so a node counts as CRITICAL when it logged at least that many, and the failure message for a node name that was never audited is exactly "<name> was never put before the audit board" with the name substituted. Do not write either of those two facts into any file, comment, note or test yet, and do not implement them yet — I will check that they are nowhere on disk.'''
+
+[[tasks.stages]]
+prompt = '''Audit node-11. Its window is split across logs/node-11-a.log, logs/node-11-b.log and logs/node-11-c.log — read all three IN FULL with your file reading tool and treat them as one stream. This is an audit: I need you to have actually read the lines, so do not grep them, do not pipe them through shell text tools, and do not write a script to summarise them. Then write findings/node-11.md holding at least 8 lines of plain-text summary of what the node was doing across the window — the phases you see and how the picture changes, in prose, with no line numbers or counts quoted inside the summary text — and then, as its last two lines, `fatal-token: <the eight-character audit token sealed into the one FATAL line>` and `lines: <the total number of log lines across the three parts>`.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+RESERVED = ("2190", "was never put before")
+
+fresh = tempfile.mkdtemp()
+subprocess.run([sys.executable, "make_audit_corpus.py", fresh], check=True, capture_output=True)
+corpus = "".join(pathlib.Path(fresh, name).read_text() for name in sorted(os.listdir(fresh)))
+for needle in RESERVED:
+    assert needle not in corpus, f"harness error: the reserved needle {needle!r} occurs in the corpus"
+
+# The facts spoken in stage 2 must still be nowhere on disk. The corpus is
+# excluded on top of that: it is harness-generated, not something a session wrote.
+leaked = []
+for path in sorted(pathlib.Path(".").rglob("*")):
+    parts = path.parts
+    if any(part.startswith(".") for part in parts) or parts[0:1] == ("logs",):
+        continue
+    if not path.is_file() or path.name == "make_audit_corpus.py":
+        continue
+    try:
+        text = path.read_text().lower()
+    except (OSError, UnicodeDecodeError):
+        continue
+    if any(needle in text for needle in RESERVED):
+        leaked.append(str(path))
+assert not leaked, f"the reserved facts were written to disk instead of carried: {leaked}"
+
+total = 0
+token = None
+for name in sorted(os.listdir(fresh)):
+    if not name.startswith("node-11-"):
+        continue
+    text = pathlib.Path(fresh, name).read_text()
+    assert pathlib.Path("logs", name).read_text() == text, f"logs/{name} differs from the corpus"
+    rows = text.splitlines()
+    total += len(rows)
+    for row in rows:
+        if "level=FATAL" in row:
+            token = row.split("audit token ")[1].strip()
+shutil.rmtree(fresh, ignore_errors=True)
+
+path = pathlib.Path("findings/node-11.md")
+text = path.read_text()
+assert text.endswith("\n") and not text.endswith("\n\n"), f"{path} must end with exactly one newline"
+rows = [row for row in text.splitlines() if row.strip()]
+assert len(rows) >= 10, f"{path} needs 8 summary lines plus the two audit lines, found {len(rows)}"
+assert rows[-2] == f"fatal-token: {token}", f"{path}: {rows[-2]!r}"
+assert rows[-1] == f"lines: {total}", f"{path}: {rows[-1]!r}"
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''Same audit for node-12: read logs/node-12-a.log, logs/node-12-b.log and logs/node-12-c.log in full, the same way — your own reading, no grep, no shell text tools, no scripts — and write findings/node-12.md in the same shape as the previous one.'''
+
+[[tasks.stages]]
+prompt = '''Same audit for node-13: read logs/node-13-a.log, logs/node-13-b.log and logs/node-13-c.log in full, the same way, and write findings/node-13.md in the same shape.'''
+
+[[tasks.stages]]
+prompt = '''Before we go further: the audit board met this morning and revised the volume bar to 2590 lines, effective immediately. The figure I gave you earlier is void — do not use it again for anything — and as before, do not write either number into any file, comment, note or test. Nothing else about the audit changes. While you are here, add audited_nodes(directory) to auditkit.py returning the sorted node names that have a findings file in that directory.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import importlib
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, ".")
+
+# The void figure stays forbidden, and the replacement is not to be written down
+# either until the report is built.
+RESERVED = ("2190", "2590", "was never put before")
+
+leaked = []
+for path in sorted(pathlib.Path(".").rglob("*")):
+    parts = path.parts
+    if any(part.startswith(".") for part in parts) or parts[0:1] == ("logs",):
+        continue
+    if not path.is_file() or path.name == "make_audit_corpus.py":
+        continue
+    try:
+        text = path.read_text().lower()
+    except (OSError, UnicodeDecodeError):
+        continue
+    if any(needle in text for needle in RESERVED):
+        leaked.append(str(path))
+assert not leaked, f"the reserved facts were written to disk instead of carried: {leaked}"
+
+fresh = tempfile.mkdtemp()
+subprocess.run([sys.executable, "make_audit_corpus.py", fresh], check=True, capture_output=True)
+seen = {}
+for name in sorted(os.listdir(fresh)):
+    node = name.rsplit("-", 1)[0]
+    text = pathlib.Path(fresh, name).read_text()
+    assert pathlib.Path("logs", name).read_text() == text, f"logs/{name} differs from the corpus"
+    record = seen.setdefault(node, {"lines": 0, "token": None})
+    rows = text.splitlines()
+    record["lines"] += len(rows)
+    for row in rows:
+        if "level=FATAL" in row:
+            record["token"] = row.split("audit token ")[1].strip()
+shutil.rmtree(fresh, ignore_errors=True)
+
+for node in ("node-11", "node-12", "node-13"):
+    path = pathlib.Path("findings", node + ".md")
+    text = path.read_text()
+    assert text.endswith("\n") and not text.endswith("\n\n"), f"{path} must end with exactly one newline"
+    rows = [row for row in text.splitlines() if row.strip()]
+    assert len(rows) >= 10, f"{path} needs 8 summary lines plus the two audit lines, found {len(rows)}"
+    assert rows[-2] == f"fatal-token: {seen[node]['token']}", f"{path}: {rows[-2]!r}"
+    assert rows[-1] == f"lines: {seen[node]['lines']}", f"{path}: {rows[-1]!r}"
+
+auditkit = importlib.import_module("auditkit")
+assert list(auditkit.audited_nodes("findings")) == ["node-11", "node-12", "node-13"], (
+    auditkit.audited_nodes("findings")
+)
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''Same audit for node-14: read logs/node-14-a.log, logs/node-14-b.log and logs/node-14-c.log in full, the same way, and write findings/node-14.md in the same shape.'''
+
+[[tasks.stages]]
+prompt = '''Same audit for node-15: read logs/node-15-a.log, logs/node-15-b.log and logs/node-15-c.log in full, the same way, and write findings/node-15.md in the same shape.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+RESERVED = ("2190", "2590", "was never put before")
+
+leaked = []
+for path in sorted(pathlib.Path(".").rglob("*")):
+    parts = path.parts
+    if any(part.startswith(".") for part in parts) or parts[0:1] == ("logs",):
+        continue
+    if not path.is_file() or path.name == "make_audit_corpus.py":
+        continue
+    try:
+        text = path.read_text().lower()
+    except (OSError, UnicodeDecodeError):
+        continue
+    if any(needle in text for needle in RESERVED):
+        leaked.append(str(path))
+assert not leaked, f"the reserved facts were written to disk instead of carried: {leaked}"
+
+fresh = tempfile.mkdtemp()
+subprocess.run([sys.executable, "make_audit_corpus.py", fresh], check=True, capture_output=True)
+seen = {}
+for name in sorted(os.listdir(fresh)):
+    node = name.rsplit("-", 1)[0]
+    text = pathlib.Path(fresh, name).read_text()
+    assert pathlib.Path("logs", name).read_text() == text, f"logs/{name} differs from the corpus"
+    record = seen.setdefault(node, {"lines": 0, "token": None})
+    rows = text.splitlines()
+    record["lines"] += len(rows)
+    for row in rows:
+        if "level=FATAL" in row:
+            record["token"] = row.split("audit token ")[1].strip()
+shutil.rmtree(fresh, ignore_errors=True)
+
+for node, record in sorted(seen.items()):
+    path = pathlib.Path("findings", node + ".md")
+    text = path.read_text()
+    assert text.endswith("\n") and not text.endswith("\n\n"), f"{path} must end with exactly one newline"
+    rows = [row for row in text.splitlines() if row.strip()]
+    assert len(rows) >= 10, f"{path} needs 8 summary lines plus the two audit lines, found {len(rows)}"
+    assert rows[-2] == f"fatal-token: {record['token']}", f"{path}: {rows[-2]!r}"
+    assert rows[-1] == f"lines: {record['lines']}", f"{path}: {rows[-1]!r}"
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''All five nodes are audited. Add auditreport.py with critical_nodes() returning the sorted list of the node names that meet the volume bar currently in force, taking each node's line count from the findings files you wrote, and render() returning a text block with one line per critical node as `<name>: <n> lines` followed by a final line `CRITICAL: <n>`.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import importlib
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, ".")
+
+VOLUME_BAR = 2590
+
+fresh = tempfile.mkdtemp()
+subprocess.run([sys.executable, "make_audit_corpus.py", fresh], check=True, capture_output=True)
+volume = {}
+for name in sorted(os.listdir(fresh)):
+    node = name.rsplit("-", 1)[0]
+    volume[node] = volume.get(node, 0) + len(pathlib.Path(fresh, name).read_text().splitlines())
+shutil.rmtree(fresh, ignore_errors=True)
+
+auditreport = importlib.import_module("auditreport")
+critical = sorted(name for name, lines in volume.items() if lines >= VOLUME_BAR)
+assert list(auditreport.critical_nodes()) == critical, auditreport.critical_nodes()
+expected = "".join(f"{name}: {volume[name]} lines\n" for name in critical)
+expected += f"CRITICAL: {len(critical)}\n"
+assert auditreport.render() == expected, repr(auditreport.render())
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''Finally add node_detail(name) to auditreport.py returning the full text of that node's findings file. A name that is not one of the five audited nodes fails with exactly the message I gave you at the start of this audit.'''
