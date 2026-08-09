@@ -92,6 +92,12 @@ struct TaskConfig {
     /// Objective success gate, run with `sh -c` in the workspace after the
     /// tool exits. Exit 0 = success. This is the ONLY success signal.
     check: String,
+    /// Graded gate, same shape as `check`, run ONLY after a green `check`. Its
+    /// stdout must carry a `GRADE <k>/<n>` line; its exit code means nothing.
+    /// This is the robustness axis for a suite where binary success has
+    /// saturated — it never feeds `success`.
+    #[serde(default)]
+    graded_check: Option<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
     #[serde(default)]
@@ -153,6 +159,18 @@ struct RowRecord {
     /// caching it.
     #[serde(skip_serializing_if = "Option::is_none")]
     stage_detail: Option<Vec<StageDetail>>,
+    /// The graded axis: how much of the task's battery the row's work survives,
+    /// present only when the task declares a `graded_check` AND the row's check
+    /// was green. Never an input to `success`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grade_passed: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grade_total: Option<u32>,
+    /// Why a declared battery produced no grade. A protocol violation is a
+    /// fixture bug: it is recorded loudly here, never as a silent zero and
+    /// never as a silent skip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grade_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -304,6 +322,11 @@ fn run(args: &[String]) -> Result<(), String> {
                     row.cost_usd.unwrap_or(0.0),
                     row.check_exit,
                 );
+                if let Some(error) = &row.grade_error {
+                    eprintln!("   grade: PROTOCOL — {error}");
+                } else if let (Some(passed), Some(total)) = (row.grade_passed, row.grade_total) {
+                    eprintln!("   grade: {passed}/{total}");
+                }
                 rows.push(row);
             }
         }
@@ -522,6 +545,7 @@ fn run_one(
     restored_files.sort_unstable();
     restored_files.dedup();
     let check_exit = run_check(&task.check, &workdir, defaults.check_timeout_secs);
+    let grade = grade_row(task, &workdir, defaults.check_timeout_secs, check_exit);
     let stage_count = u32::try_from(stage_details.len()).unwrap_or(u32::MAX);
     Ok(RowRecord {
         task: task.id.clone(),
@@ -543,7 +567,100 @@ fn run_one(
         tool_reported_error: total_metrics.reported_error,
         stages: stage_count,
         stage_detail: (stages.len() > 1).then_some(stage_details),
+        grade_passed: grade.passed,
+        grade_total: grade.total,
+        grade_error: grade.error,
     })
+}
+
+/// One row's graded verdict. All-`None` = the row carries no graded axis at all
+/// (no battery declared, or the check was not green).
+#[derive(Debug, Default, PartialEq)]
+struct GradeResult {
+    passed: Option<u32>,
+    total: Option<u32>,
+    error: Option<String>,
+}
+
+impl GradeResult {
+    fn violation(error: String) -> Self {
+        Self {
+            passed: None,
+            total: None,
+            error: Some(error),
+        }
+    }
+}
+
+/// Run the task's battery on a row that already passed, and read its verdict.
+///
+/// Order matters: the battery and the tests are task-owned alike, so the
+/// readonly files go back before it runs — a graded run must judge the declared
+/// battery, not the tool's edit of it. The restore list is deliberately NOT
+/// extended: the tool has already exited, so anything moved between the final
+/// check and here cannot retro-void `success`.
+fn grade_row(
+    task: &TaskConfig,
+    workdir: &Path,
+    timeout_secs: u64,
+    check_exit: Option<i32>,
+) -> GradeResult {
+    let Some(graded_check) = task.graded_check.as_deref() else {
+        return GradeResult::default();
+    };
+    if check_exit != Some(0) {
+        return GradeResult::default();
+    }
+    restore_readonly_files(&task.files, workdir);
+    match run_check_capturing_stdout(graded_check, workdir, timeout_secs)
+        .and_then(|stdout| parse_grade(&stdout))
+    {
+        Ok((passed, total)) => GradeResult {
+            passed: Some(passed),
+            total: Some(total),
+            error: None,
+        },
+        Err(error) => GradeResult::violation(error),
+    }
+}
+
+/// The battery's report contract: a whitespace-trimmed line `GRADE <k>/<n>`
+/// with k <= n and n > 0. The LAST shape-matching line wins, so a battery may
+/// print per-case progress before it and chatter after it. Anything else is a
+/// fixture bug and comes back as an error, never as a zero.
+fn parse_grade(stdout: &str) -> Result<(u32, u32), String> {
+    let Some((passed, total)) = stdout
+        .lines()
+        .filter_map(|line| grade_pair(line.trim()))
+        .next_back()
+    else {
+        return Err("graded_check printed no `GRADE <k>/<n>` line".to_string());
+    };
+    if total == 0 {
+        return Err(format!(
+            "graded_check printed `GRADE {passed}/{total}`: total must be > 0"
+        ));
+    }
+    if passed > total {
+        return Err(format!(
+            "graded_check printed `GRADE {passed}/{total}`: passed exceeds total"
+        ));
+    }
+    Ok((passed, total))
+}
+
+/// `GRADE k/n`, exactly: one space, unsigned decimals, no prefixes, no percent
+/// forms. Semantics (k <= n, n > 0) are the caller's.
+fn grade_pair(line: &str) -> Option<(u32, u32)> {
+    let (passed, total) = line.strip_prefix("GRADE ")?.split_once('/')?;
+    Some((unsigned_decimal(passed)?, unsigned_decimal(total)?))
+}
+
+fn unsigned_decimal(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
 }
 
 /// A git repo is part of a realistic coding workspace (several harnesses key
@@ -728,6 +845,37 @@ fn run_check(check: &str, workdir: &Path, timeout_secs: u64) -> Option<i32> {
     code
 }
 
+/// `run_check`'s sibling for the graded battery: same shell, same deadline, but
+/// stdout is kept. It lands in a file rather than a pipe because the deadline
+/// is enforced by polling `try_wait` — a battery chatty enough to fill a pipe
+/// buffer would otherwise block forever with nobody draining it.
+///
+/// The exit code is deliberately dropped: batteries report through their GRADE
+/// line and exit 0 by design, and a crashed one must surface as a missing line,
+/// not as a score.
+fn run_check_capturing_stdout(
+    check: &str,
+    workdir: &Path,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let stdout_path = workdir.join(".bench-graded-stdout.log");
+    let stdout =
+        std::fs::File::create(&stdout_path).map_err(|e| format!("graded_check capture: {e}"))?;
+    let mut child = Command::new("sh")
+        .args(["-c", check])
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("graded_check spawn: {e}"))?;
+    let (_, timed_out) = wait_with_timeout(&mut child, Duration::from_secs(timeout_secs));
+    if timed_out {
+        return Err(format!("graded_check timed out after {timeout_secs}s"));
+    }
+    std::fs::read_to_string(&stdout_path).map_err(|e| format!("graded_check capture: {e}"))
+}
+
 fn build_scoreboard(rows: &[RowRecord]) -> Value {
     let mut tools: BTreeMap<&str, Vec<&RowRecord>> = BTreeMap::new();
     for row in rows {
@@ -750,6 +898,14 @@ fn build_scoreboard(rows: &[RowRecord]) -> Value {
                         + row.cache_creation_tokens
                 })
                 .sum();
+            // Only rows that produced a grade count: a protocol violation
+            // contributes nothing rather than diluting the ratio with a zero.
+            let graded_rows = rows.iter().filter(|row| row.grade_total.is_some()).count();
+            let sum_grade = |field: fn(&RowRecord) -> Option<u32>| -> u64 {
+                rows.iter().filter_map(|row| field(row)).map(u64::from).sum()
+            };
+            let grade_passed = sum_grade(|row| row.grade_passed);
+            let grade_total = sum_grade(|row| row.grade_total);
             json!({
                 "tool": tool,
                 "tasks": rows.len(),
@@ -757,6 +913,9 @@ fn build_scoreboard(rows: &[RowRecord]) -> Value {
                 "median_wall_ms": median_wall,
                 "total_cost_usd": cost,
                 "total_tokens": tokens,
+                "graded_rows": graded_rows,
+                "grade_passed": grade_passed,
+                "grade_total": grade_total,
             })
         })
         .collect();
@@ -769,8 +928,8 @@ fn build_scoreboard(rows: &[RowRecord]) -> Value {
 
 fn render_scoreboard(scoreboard: &Value) -> String {
     let mut out = String::new();
-    out.push_str("| tool | success | median wall | cost | tokens |\n");
-    out.push_str("|---|---|---|---|---|\n");
+    out.push_str("| tool | success | grade | median wall | cost | tokens |\n");
+    out.push_str("|---|---|---|---|---|---|\n");
     for tool in scoreboard
         .get("tools")
         .and_then(Value::as_array)
@@ -778,8 +937,14 @@ fn render_scoreboard(scoreboard: &Value) -> String {
         .unwrap_or_default()
     {
         let get_u64 = |key: &str| tool.get(key).and_then(Value::as_u64).unwrap_or(0);
+        // `-` distinguishes "no task declared a battery" from a real 0/n.
+        let grade = if get_u64("graded_rows") == 0 {
+            "-".to_string()
+        } else {
+            format!("{}/{}", get_u64("grade_passed"), get_u64("grade_total"))
+        };
         out.push_str(&format!(
-            "| {} | {}/{} | {}ms | ${:.4} | {} |\n",
+            "| {} | {}/{} | {grade} | {}ms | ${:.4} | {} |\n",
             tool.get("tool").and_then(Value::as_str).unwrap_or("?"),
             get_u64("successes"),
             get_u64("tasks"),
@@ -950,6 +1115,7 @@ mod tests {
             prompt: Some("do the thing".into()),
             stages: Vec::new(),
             check: "true".into(),
+            graded_check: None,
             timeout_secs: None,
             files: Vec::new(),
             tags: Vec::new(),
@@ -972,6 +1138,7 @@ mod tests {
                 },
             ],
             check: "true".into(),
+            graded_check: None,
             timeout_secs: None,
             files: Vec::new(),
             tags: Vec::new(),
@@ -986,6 +1153,7 @@ mod tests {
                 check: None,
             }],
             check: "true".into(),
+            graded_check: None,
             timeout_secs: None,
             files: Vec::new(),
             tags: Vec::new(),
@@ -996,6 +1164,7 @@ mod tests {
             prompt: None,
             stages: Vec::new(),
             check: "true".into(),
+            graded_check: None,
             timeout_secs: None,
             files: Vec::new(),
             tags: Vec::new(),
@@ -1068,6 +1237,9 @@ mod tests {
             stages: 1,
             restored_files: Vec::new(),
             stage_detail: None,
+            grade_passed: None,
+            grade_total: None,
+            grade_error: None,
         };
         let rows = vec![
             row("a", true, 1000, 0.10),
@@ -1083,5 +1255,215 @@ mod tests {
         assert_eq!(tools[1]["successes"], 0);
         let rendered = render_scoreboard(&scoreboard);
         assert!(rendered.contains("| a | 2/2 |"), "{rendered}");
+        assert!(
+            rendered.contains("| a | 2/2 | - |"),
+            "no task declared a battery, so the graded column is blank, not 0/0: {rendered}"
+        );
+    }
+
+    fn temp_workdir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zo-bench-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("workdir");
+        dir
+    }
+
+    fn graded_task(graded_check: Option<&str>, files: Vec<TaskFile>) -> TaskConfig {
+        TaskConfig {
+            id: "graded".into(),
+            prompt: Some("do the thing".into()),
+            stages: Vec::new(),
+            check: "true".into(),
+            graded_check: graded_check.map(str::to_string),
+            timeout_secs: None,
+            files,
+            tags: Vec::new(),
+        }
+    }
+
+    /// The graded axis is only as trustworthy as its parser. A battery may
+    /// narrate before and after its verdict; what it may not do is report in
+    /// some other shape and have the runner guess a number out of it.
+    #[test]
+    fn the_last_grade_line_wins_and_every_other_shape_is_a_protocol_violation() {
+        assert_eq!(parse_grade("GRADE 3/5\n").expect("plain verdict"), (3, 5));
+        assert_eq!(
+            parse_grade("case 1 ok\nGRADE 1/5\nrerun\nGRADE 4/5\n").expect("last verdict"),
+            (4, 5),
+            "a battery that re-reports ends with the line that counts"
+        );
+        assert_eq!(
+            parse_grade("GRADE 14/20\nteardown: removed 3 temp files\nall done\n")
+                .expect("trailing chatter"),
+            (14, 20),
+            "output after the verdict is tolerated"
+        );
+        assert_eq!(
+            parse_grade("  GRADE 2/2  \n").expect("padded line"),
+            (2, 2),
+            "the line is matched whitespace-trimmed"
+        );
+
+        for (stdout, expected) in [
+            ("grade: 80%\n", "no `GRADE <k>/<n>` line"),
+            ("score GRADE 3/5\n", "no `GRADE <k>/<n>` line"),
+            ("GRADE 3 / 5\n", "no `GRADE <k>/<n>` line"),
+            ("GRADE 80%\n", "no `GRADE <k>/<n>` line"),
+            ("", "no `GRADE <k>/<n>` line"),
+            ("GRADE 5/3\n", "passed exceeds total"),
+            ("GRADE 0/0\n", "total must be > 0"),
+        ] {
+            let error = parse_grade(stdout).expect_err(stdout);
+            assert!(
+                error.contains(expected),
+                "{stdout:?} must be named as a fixture bug: got {error}"
+            );
+        }
+    }
+
+    /// The graded axis is additive: a suite with no battery must emit the rows
+    /// it emitted yesterday, byte for byte.
+    #[test]
+    fn a_row_from_a_task_without_a_graded_check_serializes_exactly_as_before() {
+        let row = RowRecord {
+            task: "t".into(),
+            tool: "zo".into(),
+            trial: 1,
+            success: true,
+            wall_ms: 42,
+            check_exit: Some(0),
+            tool_exit: Some(0),
+            timed_out: false,
+            cost_usd: Some(0.5),
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            tool_reported_error: false,
+            stages: 1,
+            restored_files: Vec::new(),
+            stage_detail: None,
+            grade_passed: None,
+            grade_total: None,
+            grade_error: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&row).expect("serialize"),
+            "{\"task\":\"t\",\"tool\":\"zo\",\"trial\":1,\"success\":true,\"wall_ms\":42,\
+             \"check_exit\":0,\"tool_exit\":0,\"timed_out\":false,\"cost_usd\":0.5,\
+             \"input_tokens\":100,\"output_tokens\":10,\"cache_read_tokens\":0,\
+             \"cache_creation_tokens\":0,\"tool_reported_error\":false,\"stages\":1}"
+        );
+    }
+
+    /// A battery grades work that already passed. On a red row it must not run
+    /// at all — a partial score for a failed task is a number nobody can read.
+    #[test]
+    fn a_battery_does_not_run_behind_a_failed_check() {
+        let workdir = temp_workdir("grade-skip");
+        let task = graded_task(Some("printf 'GRADE 1/1\\n' | tee battery-ran.txt"), Vec::new());
+
+        let grade = grade_row(&task, &workdir, 30, Some(1));
+
+        assert_eq!(grade, GradeResult::default(), "a red row carries no grade");
+        assert!(
+            !workdir.join("battery-ran.txt").exists(),
+            "the battery was never spawned"
+        );
+        assert_eq!(
+            grade_row(&graded_task(None, Vec::new()), &workdir, 30, Some(0)),
+            GradeResult::default(),
+            "a task with no battery carries no grade either"
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    /// End to end on a real workspace: the battery is task-owned like the
+    /// tests are, so it is put back before it runs — a tool that rewrote it to
+    /// print a perfect score is graded on the declared one.
+    #[test]
+    fn a_printf_battery_is_restored_before_it_grades_the_row() {
+        let workdir = temp_workdir("grade-e2e");
+        let files = vec![TaskFile {
+            path: "battery.sh".to_string(),
+            content: "printf 'case 1 ok\\nGRADE 14/20\\ndone\\n'\n".to_string(),
+            readonly: true,
+        }];
+        std::fs::write(workdir.join("battery.sh"), "printf 'GRADE 20/20\\n'\n").expect("tamper");
+        let task = graded_task(Some("sh battery.sh"), files);
+
+        let grade = grade_row(&task, &workdir, 30, Some(0));
+
+        assert_eq!(grade.passed, Some(14), "the declared battery's verdict");
+        assert_eq!(grade.total, Some(20));
+        assert_eq!(grade.error, None);
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    /// A battery that hangs is a fixture bug like any other: it is named in the
+    /// row, and the row's success — already decided by the check — is untouched.
+    #[test]
+    fn a_hanging_battery_is_recorded_as_a_protocol_violation() {
+        let workdir = temp_workdir("grade-timeout");
+        let task = graded_task(Some("sleep 30"), Vec::new());
+
+        let grade = grade_row(&task, &workdir, 1, Some(0));
+
+        assert_eq!(grade.passed, None);
+        assert_eq!(grade.total, None);
+        assert!(
+            grade.error.as_deref().unwrap_or_default().contains("timed out"),
+            "{grade:?}"
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    /// The scoreboard's graded column sums the rows that produced a grade, and
+    /// says so — a violation must not be laundered into the denominator.
+    #[test]
+    fn the_scoreboard_sums_grades_across_graded_rows_only() {
+        let row = |tool: &str, grade: Option<(u32, u32)>, error: Option<&str>| RowRecord {
+            task: "t".into(),
+            tool: tool.into(),
+            trial: 1,
+            success: true,
+            wall_ms: 1000,
+            check_exit: Some(0),
+            tool_exit: Some(0),
+            timed_out: false,
+            cost_usd: Some(0.1),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            tool_reported_error: false,
+            stages: 1,
+            restored_files: Vec::new(),
+            stage_detail: None,
+            grade_passed: grade.map(|(passed, _)| passed),
+            grade_total: grade.map(|(_, total)| total),
+            grade_error: error.map(str::to_string),
+        };
+        let rows = vec![
+            row("a", Some((14, 20)), None),
+            row("a", Some((13, 20)), None),
+            row("a", None, Some("graded_check printed no `GRADE <k>/<n>` line")),
+            row("b", None, None),
+        ];
+        let scoreboard = build_scoreboard(&rows);
+        let tools = scoreboard["tools"].as_array().expect("tools");
+        assert_eq!(tools[0]["grade_passed"], 27);
+        assert_eq!(tools[0]["grade_total"], 40);
+        assert_eq!(tools[0]["graded_rows"], 2, "the violation is not a graded row");
+        assert_eq!(tools[1]["graded_rows"], 0);
+        let rendered = render_scoreboard(&scoreboard);
+        assert!(rendered.contains("| a | 3/3 | 27/40 |"), "{rendered}");
+        assert!(rendered.contains("| b | 1/1 | - |"), "{rendered}");
     }
 }
