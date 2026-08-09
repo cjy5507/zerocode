@@ -887,6 +887,265 @@ print("carried across", len(modules), "modules")
 PYEOF
 '''
 
+graded_check = '''
+python3 - << 'PYEOF'
+import copy
+import os
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, ".")
+
+PROBES = []
+
+
+def probe(label):
+    def register(function):
+        PROBES.append((label, function))
+        return function
+    return register
+
+
+def lib(name):
+    import importlib
+
+    return importlib.import_module(name)
+
+
+def err():
+    return lib("carderr").CardError
+
+
+def cli(*argv):
+    done = subprocess.run(
+        [sys.executable, "cardcli.py", *argv], capture_output=True, text=True, timeout=60
+    )
+    # A missing cardcli.py also exits 2; that must not read as a passing probe.
+    if "can't open file" in done.stderr:
+        raise AssertionError("cardcli.py is not there to run")
+    return done.returncode, done.stdout, done.stderr
+
+
+def pairs(card):
+    return [(key, value) for key, value in card["fields"]]
+
+
+@probe("a unicode card name survives a round trip")
+def _():
+    doc = "# café 노드 ✅\n  k: v\n"
+    assert lib("cardrender").render(lib("cardparse").parse(doc)) == doc
+
+
+@probe("a unicode key and value survive a round trip")
+def _():
+    doc = "# a\n  이름: 값 \U0001f600\n"
+    assert lib("cardrender").render(lib("cardparse").parse(doc)) == doc
+
+
+@probe("CRLF input parses as if it were LF")
+def _():
+    cards = lib("cardparse").parse("# a\r\n  k: v\r\n---\r\n# b\r\n")
+    assert [card["name"] for card in cards] == ["a", "b"]
+    assert pairs(cards[0]) == [("k", "v")]
+
+
+@probe("a 60k character value round trips")
+def _():
+    big = "x" * 60000
+    doc = "# a\n  k: %s\n" % big
+    assert pairs(lib("cardparse").parse(doc)[0]) == [("k", big)]
+    assert lib("cardrender").render(lib("cardparse").parse(doc)) == doc
+
+
+@probe("a whitespace-only value reads as empty")
+def _():
+    assert pairs(lib("cardparse").parse("# a\n  k:    \n")[0]) == [("k", "")]
+
+
+@probe("duplicate keys are all kept, in order")
+def _():
+    assert pairs(lib("cardparse").parse("# a\n  k: 1\n  k: 2\n")[0]) == [("k", "1"), ("k", "2")]
+
+
+@probe("field takes the first of duplicate keys")
+def _():
+    card = lib("cardparse").parse("# a\n  k: first\n  k: second\n")[0]
+    assert lib("cardquery").field(card, "k") == "first"
+
+
+@probe("render stays stable on a third pass")
+def _():
+    parse, render = lib("cardparse").parse, lib("cardrender").render
+    doc = "# a\n  k: v\n  k2: v2\n---\n# b\n"
+    once = render(parse(doc))
+    twice = render(parse(once))
+    assert twice == once and render(parse(twice)) == once
+
+
+@probe("a document that is only a separator is refused")
+def _():
+    try:
+        lib("cardparse").parse("---\n")
+    except err():
+        return
+    raise AssertionError("a separator line is not a title line")
+
+
+@probe("a trailing separator does not invent an empty card")
+def _():
+    try:
+        cards = lib("cardparse").parse("# a\n  k: v\n---\n")
+    except err():
+        return
+    assert [card["name"] for card in cards] == ["a"], cards
+
+
+@probe("a value holding a newline cannot corrupt the document")
+def _():
+    try:
+        text = lib("cardrender").render([{"name": "a", "fields": [("k", "one\ntwo")]}])
+    except err():
+        return
+    assert pairs(lib("cardparse").parse(text)[0]) == [("k", "one\ntwo")], text
+
+
+@probe("a name holding a newline cannot corrupt the document")
+def _():
+    try:
+        text = lib("cardrender").render([{"name": "a\n# b", "fields": []}])
+    except err():
+        return
+    assert [card["name"] for card in lib("cardparse").parse(text)] == ["a\n# b"], text
+
+
+@probe("a key holding a colon cannot corrupt the document")
+def _():
+    try:
+        text = lib("cardrender").render([{"name": "a", "fields": [("k:j", "v")]}])
+    except err():
+        return
+    assert pairs(lib("cardparse").parse(text)[0]) == [("k:j", "v")], text
+
+
+@probe("render refuses a card that is not shaped like a card")
+def _():
+    try:
+        lib("cardrender").render([{"name": "a"}])
+    except err():
+        return
+    raise AssertionError("a card with no fields entry is not renderable")
+
+
+@probe("parse of bytes fails as a CardError, not a builtin")
+def _():
+    try:
+        lib("cardparse").parse(b"# a\n")
+    except err():
+        return
+    raise AssertionError("bytes are not a document")
+
+
+@probe("load of a non-path fails as a CardError, not a builtin")
+def _():
+    try:
+        lib("cardparse").load(None)
+    except err():
+        return
+    raise AssertionError("None is not a path")
+
+
+@probe("summary of something that is not a card list fails as a CardError")
+def _():
+    try:
+        lib("cardstats").summary("not cards")
+    except err():
+        return
+    raise AssertionError("a string is not a list of cards")
+
+
+@probe("merge keeps every base field when a key repeats")
+def _():
+    base = {"name": "a", "fields": [("k", "1"), ("k", "2"), ("j", "3")]}
+    merged = lib("cardquery").merge(base, {"name": "b", "fields": [("j", "9")]})
+    assert len(merged["fields"]) == 3, merged
+    assert pairs(merged)[-1] == ("j", "9"), merged
+
+
+@probe("merge leaves list-shaped arguments untouched")
+def _():
+    base = {"name": "a", "fields": [["k", "1"]]}
+    overlay = {"name": "b", "fields": [["k", "2"]]}
+    before = copy.deepcopy((base, overlay))
+    lib("cardquery").merge(base, overlay)
+    assert (base, overlay) == before
+
+
+@probe("sort_cards keeps document order for equal names")
+def _():
+    cards = [
+        {"name": "a", "fields": [("i", "1")]},
+        {"name": "a", "fields": [("i", "2")]},
+        {"name": "A", "fields": [("i", "3")]},
+    ]
+    ordered = lib("cardquery").sort_cards(cards)
+    assert [pairs(c)[0][1] for c in ordered if c["name"] == "a"] == ["1", "2"], ordered
+
+
+@probe("the command line with no arguments exits 2")
+def _():
+    status, out, error = cli()
+    assert status == 2, status
+    assert out == "", repr(out)
+    assert error.strip(), "a failure has to say something on stderr"
+
+
+@probe("an unknown mode exits 2 without touching stdout")
+def _():
+    status, out, _unused = cli("frobnicate", "x")
+    assert status == 2 and out == "", (status, out)
+
+
+@probe("fmt of an empty document prints nothing and succeeds")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "empty.card")
+        open(path, "w", encoding="utf-8").close()
+        status, out, _unused = cli("fmt", path)
+    assert status == 0 and out == "", (status, repr(out))
+
+
+@probe("fmt of a missing path exits 2 with nothing on stdout")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        status, out, _unused = cli("fmt", os.path.join(tmp, "nope.card"))
+    assert status == 2 and out == "", (status, out)
+
+
+@probe("get of an absent card name exits 2")
+def _():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "doc.card")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("# a\n  k: v\n")
+        status, out, _unused = cli("get", path, "ghost", "k")
+    assert status == 2 and out == "", (status, out)
+
+
+PASSED = 0
+for _label, _function in PROBES:
+    try:
+        _function()
+        PASSED += 1
+    except BaseException as _exc:
+        if os.environ.get("BATTERY_VERBOSE"):
+            print("FAIL: %s -> %s: %s" % (_label, type(_exc).__name__, str(_exc)[:70]))
+
+print("GRADE %d/%d" % (PASSED, len(PROBES)))
+PYEOF
+exit 0
+'''
+
 [[tasks.stages]]
 prompt = '''We are starting a small Python library for a text format called CARDv1. Four project rules apply to everything we build in this session, and I will not repeat them: (1) standard library only, no third-party packages, ever; (2) every failure raises CardError, a single exception class defined in carderr.py, and never a built-in exception; (3) every public function has a docstring whose last character is a period; (4) any text this library renders indents with exactly two spaces and never contains a tab character. Write the four rules into RULES.md and create carderr.py defining CardError. Do not build any features yet.'''
 check = '''
@@ -1220,6 +1479,225 @@ else:
 
 print("carried across", len(modules), "modules")
 PYEOF
+'''
+
+graded_check = '''
+python3 - << 'PYEOF'
+import json
+import os
+import sys
+
+sys.path.insert(0, ".")
+
+PROBES = []
+
+
+def probe(label):
+    def register(function):
+        PROBES.append((label, function))
+        return function
+    return register
+
+
+def lib(name):
+    import importlib
+
+    return importlib.import_module(name)
+
+
+def err():
+    return lib("ledgererr").LedgerError
+
+
+def book(entries=3):
+    journal = lib("journal").Journal()
+    journal.post("2026-01-01", "cash", "sales", 100, "one")
+    if entries > 1:
+        journal.post("2026-01-02", "rent", "cash", 250, "two")
+    if entries > 2:
+        journal.post("2026-01-03", "cash", "tips", 7, "three")
+    return journal
+
+
+def refuses(call):
+    try:
+        call()
+    except Exception as exc:
+        assert isinstance(exc, err()), "%s escaped instead of LedgerError" % type(exc).__name__
+        return
+    raise AssertionError("the call was accepted")
+
+
+@probe("a boolean is not a postable amount")
+def _():
+    refuses(lambda: lib("journal").Journal().post("2026-01-01", "a", "b", True, "m"))
+
+
+@probe("an astronomically large amount is refused")
+def _():
+    refuses(lambda: lib("journal").Journal().post("2026-01-01", "a", "b", 10 ** 12, "m"))
+
+
+@probe("a missing amount is refused as a LedgerError")
+def _():
+    refuses(lambda: lib("journal").Journal().post("2026-01-01", "a", "b", None, "m"))
+
+
+@probe("a refused posting does not consume an id")
+def _():
+    journal = lib("journal").Journal()
+    journal.post("2026-01-01", "a", "b", 5, "first")
+    try:
+        journal.post("2026-01-02", "a", "b", -1, "bad")
+    except Exception:
+        pass
+    assert journal.post("2026-01-03", "a", "b", 5, "second") == 2
+
+
+@probe("a unicode memo survives the journal")
+def _():
+    journal = lib("journal").Journal()
+    journal.post("2026-01-01", "카드", "매출 ✅", 100, "커피 \U0001f600")
+    entry = journal.entries()[0]
+    assert entry["memo"] == "커피 \U0001f600" and entry["debit"] == "카드", entry
+
+
+@probe("the list entries() returns is not the journal's own")
+def _():
+    journal = book()
+    journal.entries().append({"id": 99})
+    assert len(journal.entries()) == 3
+
+
+@probe("an entry handed out cannot be edited from outside")
+def _():
+    journal = book()
+    journal.entries()[0]["amount"] = 1
+    assert journal.entries()[0]["amount"] == 100, journal.entries()[0]
+
+
+@probe("an account that only ever appears as a credit balances negative")
+def _():
+    assert book().balance("sales") == -100
+
+
+@probe("reversing a reversal returns the balance to where it was")
+def _():
+    journal = book()
+    before = journal.balance("cash")
+    journal.reverse(journal.reverse(1))
+    assert journal.balance("cash") == before, journal.balance("cash")
+
+
+@probe("an id that is a boolean is not an entry id")
+def _():
+    refuses(lambda: book().reverse(True))
+
+
+@probe("an id that is a string is refused as a LedgerError")
+def _():
+    refuses(lambda: book().reverse("1"))
+
+
+@probe("an empty journal survives a JSON round trip")
+def _():
+    journal_module = lib("journal")
+    restored = journal_module.from_json(journal_module.to_json(journal_module.Journal()))
+    assert restored.entries() == []
+    assert restored.post("2026-01-01", "a", "b", 5, "m") == 1
+
+
+@probe("a pretty-printed journal restores like a minified one")
+def _():
+    journal_module = lib("journal")
+    minified = journal_module.to_json(book())
+    pretty = json.dumps(json.loads(minified), indent=2)
+    assert journal_module.from_json(pretty).entries() == journal_module.from_json(minified).entries()
+
+
+@probe("restoring keeps every balance")
+def _():
+    journal_module = lib("journal")
+    original = book()
+    restored = journal_module.from_json(journal_module.to_json(original))
+    for account in ("cash", "sales", "rent", "tips"):
+        assert restored.balance(account) == original.balance(account), account
+
+
+@probe("text that is not JSON is refused as a LedgerError")
+def _():
+    refuses(lambda: lib("journal").from_json("not json at all"))
+
+
+@probe("JSON that is not a journal is refused as a LedgerError")
+def _():
+    refuses(lambda: lib("journal").from_json('{"nope": 1}'))
+
+
+@probe("an entry missing a field is refused as a LedgerError")
+def _():
+    refuses(lambda: lib("journal").from_json('[{"id": 1, "date": "d", "debit": "a"}]'))
+
+
+@probe("from_json of a non-string is refused as a LedgerError")
+def _():
+    refuses(lambda: lib("journal").from_json(None))
+
+
+@probe("an empty journal reports empty views rather than failing")
+def _():
+    empty = lib("journal").Journal()
+    assert lib("accounts").summary(empty) == {}
+    assert lib("accounts").names(empty) == []
+    assert lib("reconcile").daily_totals(empty) == {}
+
+
+@probe("an empty journal renders as a statement with no entries")
+def _():
+    assert lib("report").render(lib("journal").Journal()) == "ENTRIES: 0\n"
+
+
+@probe("a single minor unit renders as major units")
+def _():
+    journal = lib("journal").Journal()
+    journal.post("2026-01-01", "a", "b", 1, "m")
+    assert lib("report").render(journal).startswith("1 2026-01-01 a -> b 0.01\n")
+
+
+@probe("correcting past the ceiling is refused")
+def _():
+    refuses(lambda: lib("reconcile").correct(book(), 1, 300000))
+
+
+@probe("the typical entry of a one-entry journal is that entry")
+def _():
+    journal = book(1)
+    assert lib("report").average_entry(journal) == 100
+    assert lib("report").median_entry(journal) == 100
+
+
+@probe("two thousand entries stay correct")
+def _():
+    journal = lib("journal").Journal()
+    for _unused in range(2000):
+        journal.post("2026-02-01", "cash", "sales", 3, "m")
+    assert len(journal.entries()) == 2000
+    assert journal.balance("cash") == 6000
+    assert lib("report").render(journal).count("\n") == 2001
+
+
+PASSED = 0
+for _label, _function in PROBES:
+    try:
+        _function()
+        PASSED += 1
+    except BaseException as _exc:
+        if os.environ.get("BATTERY_VERBOSE"):
+            print("FAIL: %s -> %s: %s" % (_label, type(_exc).__name__, str(_exc)[:70]))
+
+print("GRADE %d/%d" % (PASSED, len(PROBES)))
+PYEOF
+exit 0
 '''
 
 [[tasks.stages]]
@@ -2031,6 +2509,205 @@ else:
 
 print("carried through", sum(record["lines"] for record in nodes.values()), "log lines")
 PYEOF
+'''
+
+graded_check = '''
+python3 - << 'PYEOF'
+import os
+import pathlib
+import sys
+import tempfile
+
+sys.path.insert(0, ".")
+
+PROBES = []
+
+SAMPLE = (
+    "2026-04-06T00:00:00Z node-11 req=cbadfe level=WARN code=E6110 lat=807ms "
+    "msg=served a batch read for the reporting tenant"
+)
+
+
+def probe(label):
+    def register(function):
+        PROBES.append((label, function))
+        return function
+    return register
+
+
+def lib(name):
+    import importlib
+
+    return importlib.import_module(name)
+
+
+def err():
+    return lib("auditerr").AuditError
+
+
+def refuses(call):
+    try:
+        call()
+    except Exception as exc:
+        assert isinstance(exc, err()), "%s escaped instead of AuditError" % type(exc).__name__
+        return
+    raise AssertionError("the call was accepted")
+
+
+def scratch():
+    return tempfile.mkdtemp()
+
+
+@probe("a line straight off a file handle, newline and all, parses")
+def _():
+    assert lib("auditkit").parse_line(SAMPLE + "\n")["msg"].startswith("served a batch")
+
+
+@probe("a unicode message survives parsing")
+def _():
+    line = SAMPLE.replace("served a batch read", "서비스 배치 읽기 \U0001f600")
+    assert lib("auditkit").parse_line(line)["msg"].startswith("서비스")
+
+
+@probe("a message that itself holds ' msg=' is not cut short")
+def _():
+    parsed = lib("auditkit").parse_line(SAMPLE + " msg=again")
+    assert parsed["msg"].endswith("msg=again"), parsed["msg"][-30:]
+
+
+@probe("the FATAL line of the corpus parses like any other")
+def _():
+    line = (
+        "2026-04-06T00:18:09Z node-11 req=cbadfe level=FATAL code=E9001 lat=0ms "
+        "msg=incident sealed with audit token abcdef01"
+    )
+    parsed = lib("auditkit").parse_line(line)
+    assert parsed["level"] == "FATAL" and parsed["latency_ms"] == 0, parsed
+
+
+@probe("every line of a corpus part parses")
+def _():
+    parse_line = lib("auditkit").parse_line
+    rows = pathlib.Path("logs/node-11-a.log").read_text().splitlines()
+    assert len(rows) > 500
+    for row in rows:
+        assert parse_line(row)["node"] == "node-11"
+
+
+@probe("a latency that is not a number is refused")
+def _():
+    refuses(lambda: lib("auditkit").parse_line(SAMPLE.replace("lat=807ms", "lat=abcms")))
+
+
+@probe("a latency with no unit is refused")
+def _():
+    refuses(lambda: lib("auditkit").parse_line(SAMPLE.replace("lat=807ms", "lat=807")))
+
+
+@probe("a line missing its level field is refused")
+def _():
+    refuses(lambda: lib("auditkit").parse_line(SAMPLE.replace("level=WARN ", "")))
+
+
+@probe("an empty line is refused as an AuditError")
+def _():
+    refuses(lambda: lib("auditkit").parse_line(""))
+
+
+@probe("a line that is not a string is refused as an AuditError")
+def _():
+    refuses(lambda: lib("auditkit").parse_line(None))
+
+
+@probe("bytes are not a log line")
+def _():
+    refuses(lambda: lib("auditkit").parse_line(SAMPLE.encode()))
+
+
+@probe("a directory with no findings lists no nodes")
+def _():
+    assert list(lib("auditkit").audited_nodes(scratch())) == []
+
+
+@probe("a directory that is not there is refused as an AuditError")
+def _():
+    refuses(lambda: lib("auditkit").audited_nodes(os.path.join(scratch(), "gone")))
+
+
+@probe("a directory argument that is not a path is refused as an AuditError")
+def _():
+    refuses(lambda: lib("auditkit").audited_nodes(None))
+
+
+@probe("files that are not findings are ignored")
+def _():
+    where = scratch()
+    open(os.path.join(where, "notes.txt"), "w").close()
+    open(os.path.join(where, "node-1.md"), "w").close()
+    assert list(lib("auditkit").audited_nodes(where)) == ["node-1"]
+
+
+@probe("audited nodes come back in name order")
+def _():
+    where = scratch()
+    for name in ("node-9.md", "node-10.md", "node-2.md"):
+        open(os.path.join(where, name), "w").close()
+    listed = list(lib("auditkit").audited_nodes(where))
+    assert listed == sorted(listed), listed
+
+
+@probe("the critical list is sorted and stable across calls")
+def _():
+    report = lib("auditreport")
+    first = list(report.critical_nodes())
+    assert first == sorted(first), first
+    assert list(report.critical_nodes()) == first
+
+
+@probe("rendering twice gives the same report")
+def _():
+    report = lib("auditreport")
+    assert report.render() == report.render()
+
+
+@probe("a node detail ends with exactly one newline")
+def _():
+    text = lib("auditreport").node_detail("node-14")
+    assert text.endswith("\n") and not text.endswith("\n\n")
+
+
+@probe("a name that walks out of the findings directory is refused")
+def _():
+    refuses(lambda: lib("auditreport").node_detail("../RULES"))
+
+
+@probe("a name holding a path separator is refused")
+def _():
+    refuses(lambda: lib("auditreport").node_detail("a/b"))
+
+
+@probe("an empty node name is refused")
+def _():
+    refuses(lambda: lib("auditreport").node_detail(""))
+
+
+@probe("a node name that is not a string is refused as an AuditError")
+def _():
+    refuses(lambda: lib("auditreport").node_detail(None))
+
+
+PASSED = 0
+for _label, _function in PROBES:
+    try:
+        _function()
+        PASSED += 1
+    except BaseException as _exc:
+        if os.environ.get("BATTERY_VERBOSE"):
+            print("FAIL: %s -> %s: %s" % (_label, type(_exc).__name__, str(_exc)[:70]))
+
+print("GRADE %d/%d" % (PASSED, len(PROBES)))
+PYEOF
+exit 0
 '''
 
 [[tasks.files]]
