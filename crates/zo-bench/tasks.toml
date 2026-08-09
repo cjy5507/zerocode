@@ -679,3 +679,652 @@ check = "python3 test_cart.py"
 
 [[tasks.stages]]
 prompt = "Finally add receipt.py with render(cart) returning a plain-text receipt: one line per item as 'name x qty = price', then a TOTAL line. Extend test_cart.py to cover it and run python3 test_cart.py."
+
+# ── deep lane: 10-stage sessions where the carry IS the task ─────────────────
+# The hard lane saturated at 4/4, so the axis moves to depth. Facts land in
+# stages 1-2 and are never restated, middle stages build features that silently
+# depend on them, a late stage tempts a rule violation, and the final check
+# enforces stage 1 across everything built. Two facts per task exist ONLY in
+# the conversation (a limit and an exact failure string) and a stage-3 tripwire
+# fails the row if they were written to disk instead of carried, so a note file
+# cannot stand in for memory. Checks drive the API the prompts specified; no
+# model-written test is ever the verdict. Stage checks at 1/3/6/9 record WHERE
+# drift began, not just that it did.
+
+[[tasks]]
+id = "deep-format-carry"
+tags = ["deep", "long"]
+# Domain: exact-output text format. Four rules in stage 1 (stdlib only,
+# CardError only, docstrings ending in a period, two-space indent and never a
+# tab) and a grammar in stage 2 govern ten stages that never mention them
+# again. Stage 8 asks for retries ("use whatever is simplest") — the third-party
+# import and the built-in raise are both one keystroke away. Stage 9 harvests
+# the field limit and the failure string that were spoken, never written.
+timeout_secs = 900
+check = '''
+set -e
+python3 - << 'PYEOF'
+import ast
+import copy
+import importlib
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, ".")
+
+rules = pathlib.Path("RULES.md").read_text()
+assert "CardError" in rules, "RULES.md must record the project rules"
+
+modules = sorted(p for p in pathlib.Path(".").glob("*.py") if not p.name.startswith(("test_", "check_")))
+assert len(modules) >= 5, f"expected the library modules, found {[str(m) for m in modules]}"
+local = {p.stem for p in pathlib.Path(".").glob("*.py")}
+
+
+def imported_roots(node):
+    """Top-level package names a single import statement pulls in."""
+    if isinstance(node, ast.Import):
+        return [alias.name.split(".")[0] for alias in node.names]
+    if isinstance(node, ast.ImportFrom) and not node.level:
+        return [(node.module or "").split(".")[0]]
+    return []
+
+
+def public_definitions(tree):
+    """Module-level functions and class methods — a nested helper is private."""
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield node
+        elif isinstance(node, ast.ClassDef):
+            for member in node.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    yield member
+
+
+def raised_name(node):
+    """Name of the exception a raise statement names, dotted access included."""
+    exc = node.exc
+    if isinstance(exc, ast.Call):
+        exc = exc.func
+    if isinstance(exc, ast.Attribute):
+        return exc.attr
+    if isinstance(exc, ast.Name):
+        return exc.id
+    return None
+
+
+seen_carderror_raise = False
+for path in modules:
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        for root in imported_roots(node):
+            assert root in sys.stdlib_module_names or root in local, (
+                f"{path} imports '{root}', but the rule is standard library only"
+            )
+        if isinstance(node, ast.Raise):
+            name = raised_name(node)
+            if name:
+                assert name == "CardError", f"{path} raises {name}, but the rule is CardError only"
+                seen_carderror_raise = True
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            assert "\t" not in node.value, f"{path} embeds a tab; the rule is two-space indentation"
+    for func in public_definitions(tree):
+        if func.name.startswith("_"):
+            continue
+        doc = ast.get_docstring(func)
+        assert doc, f"{path}:{func.name} is public and has no docstring"
+        assert doc.strip().endswith("."), f"{path}:{func.name} docstring must end with a period: {doc!r}"
+assert seen_carderror_raise, "no CardError raise found — the error rule was never exercised"
+
+CardError = importlib.import_module("carderr").CardError
+cardparse = importlib.import_module("cardparse")
+cardrender = importlib.import_module("cardrender")
+cardquery = importlib.import_module("cardquery")
+cardstats = importlib.import_module("cardstats")
+
+
+def pairs(card):
+    """Field pairs of a card, tuple-shaped or list-shaped."""
+    return [(key, value) for key, value in card["fields"]]
+
+
+DOC = "# widget\n  color: red\n  size: 12\n---\n# gadget\n"
+cards = cardparse.parse(DOC)
+assert [card["name"] for card in cards] == ["widget", "gadget"], cards
+assert pairs(cards[0]) == [("color", "red"), ("size", "12")], cards[0]
+assert pairs(cards[1]) == [], cards[1]
+assert cardrender.render(cards) == DOC, repr(cardrender.render(cards))
+
+MESSY = "\n\n# alpha\nurl: http://host:8080/a\n\n   note:   hi there\n---\n# beta\n  k: v\n"
+CANON = "# alpha\n  url: http://host:8080/a\n  note: hi there\n---\n# beta\n  k: v\n"
+messy_cards = cardparse.parse(MESSY)
+assert [card["name"] for card in messy_cards] == ["alpha", "beta"], messy_cards
+assert pairs(messy_cards[0]) == [("url", "http://host:8080/a"), ("note", "hi there")], messy_cards[0]
+assert cardrender.render(messy_cards) == CANON, repr(cardrender.render(messy_cards))
+assert cardparse.parse("") == [], "an empty document holds no cards"
+assert cardparse.parse("\n \n") == [], "a blank document holds no cards"
+assert cardrender.render([]) == "", "no cards render as the empty string"
+try:
+    cardparse.parse("color: red\n")
+except CardError:
+    pass
+else:
+    raise AssertionError("a document that does not open with a title must raise CardError")
+
+assert cardquery.field(cards[0], "color") == "red"
+try:
+    cardquery.field(cards[0], "absent")
+except CardError:
+    pass
+else:
+    raise AssertionError("an absent key must raise CardError")
+
+base = {"name": "widget", "fields": [("color", "red"), ("size", "12")]}
+overlay = {"name": "other", "fields": [("size", "20"), ("shape", "round")]}
+base_before = copy.deepcopy(base)
+overlay_before = copy.deepcopy(overlay)
+merged = cardquery.merge(base, overlay)
+assert merged["name"] == "widget", merged
+assert pairs(merged) == [("color", "red"), ("size", "20"), ("shape", "round")], merged
+assert base == base_before and overlay == overlay_before, "merge must not modify its arguments"
+
+unsorted = cardparse.parse("# zeta\n  a: 1\n---\n# alpha\n  b: 2\n")
+ordered = cardquery.sort_cards(unsorted)
+assert [card["name"] for card in ordered] == ["alpha", "zeta"], ordered
+assert [card["name"] for card in unsorted] == ["zeta", "alpha"], "sort_cards must not reorder its argument"
+
+with tempfile.TemporaryDirectory() as tmp:
+    good = os.path.join(tmp, "doc.card")
+    with open(good, "w", encoding="utf-8") as handle:
+        handle.write(MESSY)
+    assert cardrender.render(cardparse.load(good)) == CANON, "load must parse the file it reads"
+    try:
+        cardparse.load(os.path.join(tmp, "not-here.card"))
+    except CardError:
+        pass
+    else:
+        raise AssertionError("load of an unreadable path must raise CardError")
+
+    result = subprocess.run([sys.executable, "cardcli.py", "fmt", good], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == CANON, repr(result.stdout)
+    result = subprocess.run(
+        [sys.executable, "cardcli.py", "get", good, "alpha", "note"], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "hi there\n", repr(result.stdout)
+    bad = os.path.join(tmp, "bad.card")
+    with open(bad, "w", encoding="utf-8") as handle:
+        handle.write("color: red\n")
+    result = subprocess.run([sys.executable, "cardcli.py", "fmt", bad], capture_output=True, text=True)
+    assert result.returncode == 2, f"an invalid document must exit 2, got {result.returncode}"
+    assert result.stdout == "", repr(result.stdout)
+    assert result.stderr.strip(), "the failure text belongs on stderr"
+
+at_limit = "# widget\n" + "".join(f"  k{i}: v{i}\n" for i in range(17))
+assert len(cardparse.parse(at_limit)[0]["fields"]) == 17, "17 fields are inside the limit"
+over_limit = "# widget\n" + "".join(f"  k{i}: v{i}\n" for i in range(18))
+try:
+    cardparse.parse(over_limit)
+except CardError as exc:
+    assert str(exc) == "card widget exceeds the field budget", repr(str(exc))
+else:
+    raise AssertionError("a card past the limit must be rejected")
+
+block = cardstats.summary(cards)
+assert block == "SUMMARY\n  widget: 2 fields\n  gadget: 0 fields\nTOTAL: 2 cards\n", repr(block)
+
+print("carried across", len(modules), "modules")
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''We are starting a small Python library for a text format called CARDv1. Four project rules apply to everything we build in this session, and I will not repeat them: (1) standard library only, no third-party packages, ever; (2) every failure raises CardError, a single exception class defined in carderr.py, and never a built-in exception; (3) every public function has a docstring whose last character is a period; (4) any text this library renders indents with exactly two spaces and never contains a tab character. Write the four rules into RULES.md and create carderr.py defining CardError. Do not build any features yet.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import pathlib
+import sys
+
+sys.path.insert(0, ".")
+import carderr
+
+assert issubclass(carderr.CardError, Exception), "CardError must be an exception class"
+assert "CardError" in pathlib.Path("RULES.md").read_text(), "RULES.md must record the error rule"
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''Here is the CARDv1 grammar. I will not repeat it, so keep it: a document is a sequence of cards; a line containing exactly three hyphens (---) separates one card from the next; a card opens with a title line "# <name>"; every other line of a card is a field line "<key>: <value>" where the key is everything before the FIRST colon and the value is everything after it, each stripped of surrounding whitespace; blank lines are ignored anywhere; a document with no non-blank lines holds no cards. Create cardparse.py with parse(text) returning a list of cards, each a dict {"name": str, "fields": [(key, value), ...]} with the fields in document order. A document whose first non-blank line is not a title line is a failure. Two more facts to keep in mind for later stages: a card may hold at most 17 fields, and the failure message for a card that exceeds that is exactly "card <name> exceeds the field budget" with the card name substituted. Do not write those two facts into any file, comment, note or test yet, and do not implement the limit yet — I will check that they are nowhere on disk.'''
+
+[[tasks.stages]]
+prompt = '''Add cardrender.py with render(cards), the exact inverse of parse: for each card the title line "# <name>", then one line per field as "<key>: <value>" indented per our rules, with a line containing exactly --- between consecutive cards; the returned text ends with a single newline, and an empty list of cards renders as the empty string. Confirm that render(parse(text)) == text for a document that is already canonical.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import pathlib
+import sys
+
+sys.path.insert(0, ".")
+
+reserved = ("budget", "exceeds the field")
+leaked = []
+for path in sorted(pathlib.Path(".").rglob("*")):
+    if any(part.startswith(".") for part in path.parts) or not path.is_file():
+        continue
+    try:
+        text = path.read_text().lower()
+    except (OSError, UnicodeDecodeError):
+        continue
+    if any(word in text for word in reserved):
+        leaked.append(str(path))
+assert not leaked, f"the reserved facts were written to disk instead of carried: {leaked}"
+
+import cardparse
+import cardrender
+
+doc = "# widget\n  color: red\n  size: 12\n---\n# gadget\n"
+assert cardrender.render(cardparse.parse(doc)) == doc, repr(cardrender.render(cardparse.parse(doc)))
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''Add cardquery.py with field(card, key) returning the value of the first field carrying that key. A key the card does not have is a failure.'''
+
+[[tasks.stages]]
+prompt = '''Add merge(base, overlay) to cardquery.py: return a NEW card carrying base's name, with base's fields in their order, each key that also appears in overlay taking overlay's value in place, and the overlay-only keys appended in overlay order. Neither argument may be modified.'''
+
+[[tasks.stages]]
+prompt = '''Add cardcli.py, a command line run as `python3 cardcli.py <mode> ...`. Mode `fmt <path>` reads the document at that path and writes its canonical rendering to stdout — stdout is exactly that rendering, with no extra blank line. Mode `get <path> <name> <key>` writes the value of that field of that card followed by a newline. Any failure, an unknown mode included, exits with status 2, writes nothing to stdout, and puts the failure text on stderr.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import os
+import subprocess
+import sys
+import tempfile
+
+MESSY = "\n\n# alpha\nurl: http://host:8080/a\n\n   note:   hi there\n---\n# beta\n  k: v\n"
+CANON = "# alpha\n  url: http://host:8080/a\n  note: hi there\n---\n# beta\n  k: v\n"
+with tempfile.TemporaryDirectory() as tmp:
+    path = os.path.join(tmp, "doc.card")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(MESSY)
+    result = subprocess.run([sys.executable, "cardcli.py", "fmt", path], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == CANON, repr(result.stdout)
+    result = subprocess.run(
+        [sys.executable, "cardcli.py", "get", path, "alpha", "note"], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "hi there\n", repr(result.stdout)
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''Add sort_cards(cards) to cardquery.py returning a new list holding the same cards ordered by name with plain string ordering, ties keeping document order. The list you are given must not be reordered.'''
+
+[[tasks.stages]]
+prompt = '''These documents sometimes live on a flaky network share. Add load(path) to cardparse.py: read the file at that path and parse it, and because the share hiccups, retry the read up to 3 times with a short backoff before giving up. Use whatever is simplest to get the retries working. A read that still fails after the retries has to surface to the caller.'''
+
+[[tasks.stages]]
+prompt = '''Now implement, in parse, the per-card field limit I gave you earlier in this session: a card that exceeds it fails with exactly the message I gave you then. Change nothing else.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import sys
+
+sys.path.insert(0, ".")
+import cardparse
+from carderr import CardError
+
+at_limit = "# widget\n" + "".join(f"  k{i}: v{i}\n" for i in range(17))
+assert len(cardparse.parse(at_limit)[0]["fields"]) == 17, "17 fields are inside the limit"
+over_limit = "# widget\n" + "".join(f"  k{i}: v{i}\n" for i in range(18))
+try:
+    cardparse.parse(over_limit)
+except CardError as exc:
+    assert str(exc) == "card widget exceeds the field budget", repr(str(exc))
+else:
+    raise AssertionError("a card past the limit must be rejected")
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''Add cardstats.py with summary(cards) returning a plain-text block: the line SUMMARY, then one indented line per card as "<name>: <n> fields", then a final line "TOTAL: <n> cards". The block ends with a single newline.'''
+
+[[tasks]]
+id = "deep-ledger-invariants"
+tags = ["deep", "long"]
+# Domain: a ledger whose invariants live only in stage 1 (stdlib only, integer
+# minor units with no float literal and no true division, LedgerError only,
+# append-only journal) plus a sign convention and an entry shape in stage 2.
+# Stage 6 asks for amounts printed in major units (a `/ 100` away from breaking
+# the money rule), stage 7 asks to correct a wrong amount (an in-place edit away
+# from breaking append-only), stage 8 says "use whatever library makes the
+# median easiest" (statistics returns a float, numpy is not stdlib). Stage 9
+# harvests the entry ceiling and failure string that were spoken, never written.
+timeout_secs = 900
+check = '''
+set -e
+python3 - << 'PYEOF'
+import ast
+import copy
+import importlib
+import pathlib
+import sys
+
+sys.path.insert(0, ".")
+
+rules = pathlib.Path("RULES.md").read_text()
+assert "LedgerError" in rules, "RULES.md must record the project rules"
+
+modules = sorted(p for p in pathlib.Path(".").glob("*.py") if not p.name.startswith(("test_", "check_")))
+assert len(modules) >= 5, f"expected the library modules, found {[str(m) for m in modules]}"
+local = {p.stem for p in pathlib.Path(".").glob("*.py")}
+
+
+def imported_roots(node):
+    """Top-level package names a single import statement pulls in."""
+    if isinstance(node, ast.Import):
+        return [alias.name.split(".")[0] for alias in node.names]
+    if isinstance(node, ast.ImportFrom) and not node.level:
+        return [(node.module or "").split(".")[0]]
+    return []
+
+
+def raised_name(node):
+    """Name of the exception a raise statement names, dotted access included."""
+    exc = node.exc
+    if isinstance(exc, ast.Call):
+        exc = exc.func
+    if isinstance(exc, ast.Attribute):
+        return exc.attr
+    if isinstance(exc, ast.Name):
+        return exc.id
+    return None
+
+
+seen_ledgererror_raise = False
+for path in modules:
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        for root in imported_roots(node):
+            assert root in sys.stdlib_module_names or root in local, (
+                f"{path} imports '{root}', but the rule is standard library only"
+            )
+        if isinstance(node, ast.Raise):
+            name = raised_name(node)
+            if name:
+                assert name == "LedgerError", f"{path} raises {name}, but the rule is LedgerError only"
+                seen_ledgererror_raise = True
+        if isinstance(node, ast.Constant) and isinstance(node.value, float):
+            raise AssertionError(f"{path} carries the float literal {node.value}; money is integer minor units")
+        if isinstance(node, ast.Div):
+            raise AssertionError(f"{path} uses true division; money is integer minor units")
+assert seen_ledgererror_raise, "no LedgerError raise found — the error rule was never exercised"
+
+LedgerError = importlib.import_module("ledgererr").LedgerError
+journal = importlib.import_module("journal")
+accounts = importlib.import_module("accounts")
+reconcile = importlib.import_module("reconcile")
+report = importlib.import_module("report")
+
+book = journal.Journal()
+assert book.post("2026-01-02", "cash", "sales", 12345, "invoice 1") == 1
+assert book.post("2026-01-02", "rent", "cash", 5000, "office") == 2
+assert book.post("2026-01-03", "cash", "sales", 700, "invoice 2") == 3
+rows = book.entries()
+assert len(rows) == 3, rows
+assert set(rows[0]) == {"id", "date", "debit", "credit", "amount", "memo"}, rows[0]
+assert rows[0] == {
+    "id": 1,
+    "date": "2026-01-02",
+    "debit": "cash",
+    "credit": "sales",
+    "amount": 12345,
+    "memo": "invoice 1",
+}, rows[0]
+assert book.balance("cash") == 8045, book.balance("cash")
+assert book.balance("sales") == -13045, book.balance("sales")
+assert book.balance("rent") == 5000, book.balance("rent")
+assert book.balance("nobody") == 0, "an unknown account has a zero balance"
+assert type(book.balance("cash")) is int, "balances are integer minor units"
+
+for bad in (0, -5, 100.0, "100"):
+    try:
+        book.post("2026-01-04", "cash", "sales", bad, "bad amount")
+    except LedgerError:
+        pass
+    else:
+        raise AssertionError(f"amount {bad!r} must be rejected")
+try:
+    book.post("2026-01-04", "cash", "cash", 100, "self")
+except LedgerError:
+    pass
+else:
+    raise AssertionError("an entry whose debit and credit are the same account must be rejected")
+assert len(book.entries()) == 3, "a rejected posting must not be recorded"
+
+assert accounts.summary(book) == {"cash": 8045, "sales": -13045, "rent": 5000}, accounts.summary(book)
+assert accounts.names(book) == ["cash", "rent", "sales"], accounts.names(book)
+
+reversal_id = book.reverse(2)
+assert reversal_id == 4, reversal_id
+rows = book.entries()
+assert rows[1] == {
+    "id": 2,
+    "date": "2026-01-02",
+    "debit": "rent",
+    "credit": "cash",
+    "amount": 5000,
+    "memo": "office",
+}, "the reversed entry itself must be untouched"
+assert rows[3] == {
+    "id": 4,
+    "date": "2026-01-02",
+    "debit": "cash",
+    "credit": "rent",
+    "amount": 5000,
+    "memo": "reversal of 2",
+}, rows[3]
+assert book.balance("rent") == 0, book.balance("rent")
+try:
+    book.reverse(999)
+except LedgerError:
+    pass
+else:
+    raise AssertionError("reversing an unknown id must raise LedgerError")
+
+assert reconcile.daily_totals(book) == {"2026-01-02": 22345, "2026-01-03": 700}, reconcile.daily_totals(book)
+assert reconcile.busiest_day(book) == "2026-01-02", reconcile.busiest_day(book)
+tie = journal.Journal()
+tie.post("2026-05-02", "cash", "sales", 400, "later")
+tie.post("2026-05-01", "cash", "sales", 400, "earlier")
+assert reconcile.busiest_day(tie) == "2026-05-01", "a tie goes to the earliest date"
+try:
+    reconcile.busiest_day(journal.Journal())
+except LedgerError:
+    pass
+else:
+    raise AssertionError("an empty journal has no busiest day")
+
+statement = journal.Journal()
+statement.post("2026-02-01", "cash", "sales", 12345, "one")
+statement.post("2026-02-02", "rent", "cash", 5000, "two")
+statement.post("2026-02-03", "cash", "tips", 7, "three")
+assert report.render(statement) == (
+    "1 2026-02-01 cash -> sales 123.45\n"
+    "2 2026-02-02 rent -> cash 50.00\n"
+    "3 2026-02-03 cash -> tips 0.07\n"
+    "ENTRIES: 3\n"
+), repr(report.render(statement))
+
+before = copy.deepcopy(book.entries())
+corrected_id = reconcile.correct(book, 3, 900)
+after = book.entries()
+assert corrected_id != 3, "correcting must record, not edit"
+assert len(after) > len(before), "a correction is recorded as new entries"
+assert after[: len(before)] == before, "the recorded entries must survive a correction unchanged"
+assert book.balance("cash") == 13245, book.balance("cash")
+assert book.balance("sales") == -13245, book.balance("sales")
+try:
+    reconcile.correct(book, 999, 100)
+except LedgerError:
+    pass
+else:
+    raise AssertionError("correcting an unknown id must raise LedgerError")
+
+typical = journal.Journal()
+for amount in (100, 201, 302, 404):
+    typical.post("2026-03-01", "cash", "sales", amount, "x")
+assert report.average_entry(typical) == 251, report.average_entry(typical)
+assert type(report.average_entry(typical)) is int, "the average is integer minor units"
+assert report.median_entry(typical) == 251, report.median_entry(typical)
+assert type(report.median_entry(typical)) is int, "the median is integer minor units"
+for empty_case in (report.average_entry, report.median_entry):
+    try:
+        empty_case(journal.Journal())
+    except LedgerError:
+        pass
+    else:
+        raise AssertionError("an empty journal has no typical entry")
+
+capped = journal.Journal()
+assert capped.post("2026-04-01", "cash", "sales", 250000, "at the limit") == 1
+try:
+    capped.post("2026-04-02", "cash", "sales", 250001, "over the limit")
+except LedgerError as exc:
+    assert str(exc) == "entry of 250001 exceeds the single-entry ceiling", repr(str(exc))
+else:
+    raise AssertionError("an entry past the limit must be rejected")
+
+restored = journal.from_json(journal.to_json(capped))
+assert restored.entries() == capped.entries(), restored.entries()
+assert restored.post("2026-04-03", "cash", "sales", 100, "after restore") == 2, "numbering continues"
+try:
+    restored.post("2026-04-04", "cash", "sales", 250001, "over the limit")
+except LedgerError as exc:
+    assert str(exc) == "entry of 250001 exceeds the single-entry ceiling", repr(str(exc))
+else:
+    raise AssertionError("a restored journal still enforces the limit")
+
+print("carried across", len(modules), "modules")
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''We are starting a small Python ledger library. Four project rules apply to everything we build in this session, and I will not repeat them: (1) standard library only, no third-party packages, ever; (2) money is integer minor units end to end — no float literal and no / true division anywhere in the library, use // and % instead; (3) every failure raises LedgerError, a single exception class defined in ledgererr.py, and never a built-in exception; (4) the journal is append-only — once an entry is recorded nothing may change or remove it, and corrections are recorded as new entries. Write the four rules into RULES.md and create ledgererr.py defining LedgerError. Do not build any features yet.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import pathlib
+import sys
+
+sys.path.insert(0, ".")
+import ledgererr
+
+assert issubclass(ledgererr.LedgerError, Exception), "LedgerError must be an exception class"
+assert "LedgerError" in pathlib.Path("RULES.md").read_text(), "RULES.md must record the error rule"
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''Create journal.py with a Journal class. post(date, debit, credit, amount, memo) records one double entry — date is a "YYYY-MM-DD" string, debit and credit are account names, amount is a positive whole number of minor units — and returns the entry id: ids start at 1 and rise by one per recorded entry. entries() returns the recorded entries in order, each a dict with exactly the keys id, date, debit, credit, amount, memo. balance(account) returns the sum of the amounts where that account is the DEBIT side minus the sum where it is the CREDIT side, and an account with no entries balances to zero. An amount that is not a positive whole number, and an entry whose debit and credit are the same account, are failures, and a rejected posting is not recorded. Two more facts to keep in mind for later stages: no single entry may exceed 250000 minor units, and the failure message for one that does is exactly "entry of <amount> exceeds the single-entry ceiling" with the amount substituted. Do not write those two facts into any file, comment, note or test yet, and do not implement the limit yet — I will check that they are nowhere on disk.'''
+
+[[tasks.stages]]
+prompt = '''Add accounts.py with summary(journal) returning a dict mapping every account name that appears anywhere in the journal to its balance, and names(journal) returning those account names sorted.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import pathlib
+import sys
+
+sys.path.insert(0, ".")
+
+reserved = ("ceiling", "single-entry")
+leaked = []
+for path in sorted(pathlib.Path(".").rglob("*")):
+    if any(part.startswith(".") for part in path.parts) or not path.is_file():
+        continue
+    try:
+        text = path.read_text().lower()
+    except (OSError, UnicodeDecodeError):
+        continue
+    if any(word in text for word in reserved):
+        leaked.append(str(path))
+assert not leaked, f"the reserved facts were written to disk instead of carried: {leaked}"
+
+import accounts
+import journal
+
+book = journal.Journal()
+book.post("2026-01-02", "cash", "sales", 12345, "invoice 1")
+book.post("2026-01-02", "rent", "cash", 5000, "office")
+assert accounts.summary(book) == {"cash": 7345, "sales": -12345, "rent": 5000}, accounts.summary(book)
+assert accounts.names(book) == ["cash", "rent", "sales"], accounts.names(book)
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''Add reverse(entry_id) to Journal: it records a new entry that swaps the original entry's debit and credit, keeps its date and amount, and carries the memo "reversal of <id>" with the original id substituted, and it returns the new entry's id. Reversing an id the journal does not hold is a failure.'''
+
+[[tasks.stages]]
+prompt = '''Add reconcile.py with daily_totals(journal) returning a dict mapping each date to the total amount recorded on that date, and busiest_day(journal) returning the date with the largest total, ties going to the earliest date. A journal with no entries has no busiest day, which is a failure.'''
+
+[[tasks.stages]]
+prompt = '''Add report.py with render(journal) returning a plain-text statement: one line per entry as "<id> <date> <debit> -> <credit> <amount>" where the amount is written in MAJOR units with exactly two decimal places (12345 minor units is written 123.45), then a final line "ENTRIES: <n>". The statement ends with a single newline.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import sys
+
+sys.path.insert(0, ".")
+import journal
+import report
+
+statement = journal.Journal()
+statement.post("2026-02-01", "cash", "sales", 12345, "one")
+statement.post("2026-02-02", "rent", "cash", 5000, "two")
+statement.post("2026-02-03", "cash", "tips", 7, "three")
+assert report.render(statement) == (
+    "1 2026-02-01 cash -> sales 123.45\n"
+    "2 2026-02-02 rent -> cash 50.00\n"
+    "3 2026-02-03 cash -> tips 0.07\n"
+    "ENTRIES: 3\n"
+), repr(report.render(statement))
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''Someone recorded an entry with the wrong amount. Add correct(journal, entry_id, amount) to reconcile.py so that the ledger reflects the right amount for that entry, returning the id of the entry that now carries the corrected amount. Correcting an id the journal does not hold is a failure.'''
+
+[[tasks.stages]]
+prompt = '''Add average_entry(journal) and median_entry(journal) to report.py, each returning that statistic of the recorded amounts in minor units, rounded down to a whole minor unit. Use whatever library makes the median easiest. A journal with no entries is a failure for both.'''
+
+[[tasks.stages]]
+prompt = '''Now enforce, in post, the single-entry limit I gave you earlier in this session: an entry that exceeds it fails with exactly the message I gave you then. Change nothing else.'''
+check = '''
+set -e
+python3 - << 'PYEOF'
+import sys
+
+sys.path.insert(0, ".")
+import journal
+from ledgererr import LedgerError
+
+book = journal.Journal()
+assert book.post("2026-04-01", "cash", "sales", 250000, "at the limit") == 1
+try:
+    book.post("2026-04-02", "cash", "sales", 250001, "over the limit")
+except LedgerError as exc:
+    assert str(exc) == "entry of 250001 exceeds the single-entry ceiling", repr(str(exc))
+else:
+    raise AssertionError("an entry past the limit must be rejected")
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''Add to_json(journal) returning a JSON string and from_json(text) returning a new Journal, both as module-level functions in journal.py, not methods. A restored journal holds exactly the same entries in the same order with the same ids, and the next entry it records continues the numbering instead of restarting.'''
