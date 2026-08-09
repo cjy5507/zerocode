@@ -227,6 +227,17 @@ impl CliInputFormat {
 }
 
 impl CliOutputFormat {
+    /// Whether this run's visible text is consumed by a program rather than
+    /// read by a person. `text` is excluded: it prints prose to a terminal a
+    /// human may be watching, so it keeps the interactive output contract.
+    ///
+    /// Latched once at session start (never re-evaluated mid-session): the
+    /// headless output contract it gates rides in the system prefix, and a
+    /// mid-conversation prefix change re-bills the whole cached context.
+    pub(crate) const fn machine_consumed(self) -> bool {
+        matches!(self, Self::Json | Self::Ndjson)
+    }
+
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "text" => Ok(Self::Text),
@@ -1488,6 +1499,18 @@ mod format_parse_tests {
         assert_eq!(
             CliOutputFormat::parse("ndjson"),
             Ok(CliOutputFormat::Ndjson)
+        );
+    }
+
+    /// The mode split the headless output contract keys off: both JSON shapes
+    /// are parsed by a program, `text` is prose a person may be watching.
+    #[test]
+    fn only_the_json_output_formats_are_machine_consumed() {
+        assert!(CliOutputFormat::Json.machine_consumed());
+        assert!(CliOutputFormat::Ndjson.machine_consumed());
+        assert!(
+            !CliOutputFormat::Text.machine_consumed(),
+            "headless text prints prose for a human reader"
         );
     }
 

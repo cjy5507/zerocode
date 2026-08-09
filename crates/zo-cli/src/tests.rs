@@ -1825,6 +1825,78 @@ fn live_cli_plan_selection_gates_the_per_turn_plan_contract() {
     std::env::remove_var("ANTHROPIC_API_KEY");
 }
 
+/// The headless output contract is mode-conditional, and both directions are
+/// load-bearing:
+///   - a machine-consumed run (`-p --output-format json|ndjson`) carries it, so
+///     the JSON consumer stops paying for narration nobody reads,
+///   - every other session — the TUI, and headless `--output-format text` —
+///     assembles a **byte-identical** prefix to today. That is the cache
+///     constraint, not a style preference: a changed system prefix re-bills the
+///     whole context, so the contract may only ride runs that opted in at start.
+#[test]
+fn machine_consumed_output_gates_the_headless_output_contract() {
+    let _guard = env_lock();
+    std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-headless-contract");
+    let root = temp_dir();
+    fs::create_dir_all(&root).expect("root dir");
+
+    with_current_dir(&root, || {
+        let mut cli = LiveCli::new(
+            "claude-sonnet-4-6".to_string(),
+            true,
+            None,
+            PermissionMode::WorkspaceWrite,
+        )
+        .expect("cli should initialize");
+
+        // Baseline: an unarmed session (the TUI's shape) carries no contract.
+        let interactive = cli.effective_system_prompt();
+        assert!(
+            !interactive
+                .iter()
+                .any(|segment| segment.contains("[zo:headless-output]")),
+            "an interactive session must not receive the headless output contract"
+        );
+
+        // Headless text is machine_consumed()==false, so it must reproduce the
+        // interactive prefix byte for byte.
+        cli.set_machine_consumed_output(CliOutputFormat::Text.machine_consumed());
+        assert_eq!(
+            cli.effective_system_prompt(),
+            interactive,
+            "headless text must leave the assembled prefix byte-identical"
+        );
+
+        // Both JSON shapes arm it, and the text must say all three things the
+        // benchmark measured: no narration, no preamble/recap, no offers.
+        for format in [CliOutputFormat::Json, CliOutputFormat::Ndjson] {
+            cli.set_machine_consumed_output(format.machine_consumed());
+            let assembled = cli.effective_system_prompt();
+            let contract = assembled
+                .iter()
+                .find(|segment| segment.contains("[zo:headless-output]"))
+                .unwrap_or_else(|| panic!("{format:?} must inject the headless output contract"));
+            assert!(contract.contains("Do not narrate between tool calls"), "{contract}");
+            assert!(contract.contains("no preamble"), "{contract}");
+            assert!(contract.contains("no recap of the steps"), "{contract}");
+            assert!(contract.contains("no offer of further help"), "{contract}");
+            // Thinking and self-verification are quality, not narration: the
+            // contract must never read as permission to do less of either.
+            assert!(
+                contract.contains("does not reduce how much you think, verify, or check"),
+                "the contract must fence itself to visible prose: {contract}"
+            );
+            // Arming adds exactly one segment — it never rewrites the base
+            // prompt the cache is keyed on.
+            assert_eq!(assembled.len(), interactive.len() + 1, "{assembled:?}");
+            assert_eq!(assembled[..interactive.len()], interactive[..]);
+        }
+    });
+
+    fs::remove_dir_all(root).expect("cleanup temp dir");
+    std::env::remove_var("ANTHROPIC_API_KEY");
+}
+
 #[test]
 fn resume_supported_command_list_matches_expected_surface() {
     let names = resume_supported_slash_commands()

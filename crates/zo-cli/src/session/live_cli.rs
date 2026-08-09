@@ -388,6 +388,16 @@ pub(crate) struct LiveCli {
     /// are project-scoped; one-shot `-p` / headless runs are ephemeral so
     /// they never pollute the target repo. Inherited by `/new` and `/fork`.
     pub(crate) session_scope: SessionScope,
+    /// Whether this session's visible text is machine-consumed
+    /// (`-p --output-format json|ndjson`), which arms the headless output
+    /// contract in [`Self::effective_system_prompt`].
+    ///
+    /// Latched once at session start from [`CliOutputFormat::machine_consumed`]
+    /// and never flipped afterwards: it is part of the system prefix, so a
+    /// mid-session change would invalidate the prompt cache and re-bill the
+    /// entire context. The TUI never sets it, so the interactive prefix stays
+    /// byte-identical.
+    machine_consumed_output: bool,
     /// Explicit MCP config file supplied through `--mcp-config`.
     ///
     /// Kept on the session harness so any runtime rebuild (`/clear`,
@@ -522,7 +532,29 @@ pub(crate) struct LiveCli {
 const SESSION_GOAL_REMINDER_PREFIX: &str = "[zo:session-goal]";
 const MODEL_HANDOFF_REMINDER_PREFIX: &str = "[zo:model-handoff]";
 const PLAN_MODE_REMINDER_PREFIX: &str = "[zo:plan-mode]";
+const HEADLESS_OUTPUT_REMINDER_PREFIX: &str = "[zo:headless-output]";
 const DEFAULT_EFFORT: Effort = Effort::High;
+
+/// The output contract for a headless run whose visible text is parsed by a
+/// program (`--output-format json|ndjson`). Without it the session inherits the
+/// interactive Response Style Contract, which asks for a sentence before the
+/// first tool call and a note whenever direction changes — prose no JSON
+/// consumer reads, and which every later turn re-bills as prompt prefix.
+///
+/// Scope is visible prose only. It must never read as license to think less,
+/// verify less, or skip a check: the last sentence exists to block that
+/// reading, and removing it changes what the model *does*, not just what it
+/// says.
+fn headless_output_contract_reminder() -> String {
+    format!(
+        "{HEADLESS_OUTPUT_REMINDER_PREFIX} This run is headless: your visible text is parsed by a \
+         program, not read by a person. Do not narrate between tool calls — emit at most one short \
+         status line, and only when you change direction. Your final message is the deliverable: \
+         complete and self-contained, with no preamble, no recap of the steps you took, and no \
+         offer of further help. This constrains visible prose only — it does not reduce how much \
+         you think, verify, or check your own work."
+    )
+}
 
 /// The per-turn contract injected while the user has explicitly selected Plan
 /// (Shift+Tab plan stop or `/plan on`). The runtime is read-only in Plan, but a
@@ -1298,6 +1330,7 @@ impl LiveCli {
             effort,
             effort_user_selected,
             session_scope: scope,
+            machine_consumed_output: false,
             mcp_config,
             session_goal: None,
             goal_controller: GoalController::default(),
@@ -1409,6 +1442,7 @@ impl LiveCli {
             snapshot_stack: runtime::git_snapshot::SnapshotStack::try_new(),
             pending_code_checkpoint: None,
             session_scope: scope,
+            machine_consumed_output: false,
             mcp_config: None,
             session_goal: restored_session_goal,
             goal_controller: GoalController::default(),
@@ -1614,6 +1648,16 @@ impl LiveCli {
         self.max_tool_calls = max_tool_calls;
     }
 
+    /// Arm the headless output contract for a machine-consumed run.
+    ///
+    /// Call site contract: exactly once, at session start, before the first
+    /// turn — see [`Self::machine_consumed_output`]. Flipping it between turns
+    /// would rewrite the system prefix mid-session and re-bill the whole
+    /// cached context.
+    pub(crate) fn set_machine_consumed_output(&mut self, machine_consumed: bool) {
+        self.machine_consumed_output = machine_consumed;
+    }
+
     /// Apply a custom numeric `/effort <n>` budget. Snaps to a preset
     /// level when the budget matches one exactly; otherwise tracks no
     /// named level (`Smart`'s reminder only fires for the preset).
@@ -1649,6 +1693,12 @@ impl LiveCli {
     /// standing fan-out reminder on top.
     pub(crate) fn effective_system_prompt(&self) -> Vec<String> {
         let mut prompt = self.system_prompt.clone();
+        // Ahead of the goal/handoff/plan reminders on purpose: this one is
+        // latched at session start and identical on every turn, so it belongs
+        // with the stable prefix rather than behind sections that come and go.
+        if self.machine_consumed_output {
+            prompt.push(headless_output_contract_reminder());
+        }
         if let Some(goal_reminder) = self
             .session_goal
             .as_deref()

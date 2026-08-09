@@ -161,6 +161,11 @@ pub(crate) fn run_action(action: CliAction) -> Result<(), Box<dyn std::error::Er
                 crate::runtime_support::StartupAuthPolicy::Require,
             )?;
             cli.set_model_user_pinned(model_pinned);
+            // Session start is the only place this may be set: the contract it
+            // arms rides in the system prefix, and `--output-format` is fixed
+            // for the life of the process, so both turn paths below (text
+            // stdin-stream and one-shot) inherit one stable prefix.
+            cli.set_machine_consumed_output(output_format.machine_consumed());
             // Extended thinking bills as (expensive) output tokens. A headless
             // one-shot defaults it OFF — analysis/summarization is quality-neutral
             // without it and it was the dominant cost driver vs. peer CLIs. Opt
