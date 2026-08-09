@@ -3463,7 +3463,10 @@ fn spawn_freeze_watchdog() {
                                 phase_label(),
                                 std::fs::read_to_string(&path)
                                     .map(|report| zo_cli::tui::watchdog::classify_freeze_sample(&report))
-                                    .unwrap_or(zo_cli::tui::watchdog::FreezeVerdict::Unknown)
+                                    // A capture we could not even read back is
+                                    // an unread capture, not a read one whose
+                                    // leaves tied.
+                                    .unwrap_or(zo_cli::tui::watchdog::FreezeVerdict::UnreadableCapture)
                                     .sentence(),
                                 path.display(),
                             ),

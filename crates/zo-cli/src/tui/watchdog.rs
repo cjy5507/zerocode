@@ -94,8 +94,14 @@ pub enum FreezeVerdict {
     LockWait,
     /// Parked reading input or in an event wait, while the loop reports stalled.
     InputWait,
-    /// No dominant leaf syscall — say so instead of guessing.
+    /// The main thread's block parsed, but no leaf owns [`DOMINANT_LEAF_SHARE`]
+    /// of its samples — say so instead of guessing.
     Unknown,
+    /// The report is not a macOS `sample(1)` call graph, so no leaf was ever
+    /// read. The Linux capture is a `/proc/<pid>/task/*/stack` dump, which this
+    /// parser cannot read at all; every other verdict — [`Self::Unknown`]
+    /// included — would be a claim about an analysis that never ran.
+    UnreadableCapture,
 }
 
 impl FreezeVerdict {
@@ -115,6 +121,9 @@ impl FreezeVerdict {
             Self::Unknown => {
                 "the captured stack has no dominant blocking leaf; read the sample before concluding whose stall this is."
             }
+            Self::UnreadableCapture => {
+                "the capture is not a macOS sample(1) call graph (a Linux /proc kernel-stack dump reads like this), so no stack frame was analyzed at all — the freeze is real but unattributed. Read the capture file by hand."
+            }
         }
     }
 }
@@ -127,6 +136,11 @@ const DOMINANT_LEAF_SHARE: f64 = 0.8;
 /// Classify a macOS `sample(1)` report by what the main thread's dominant leaf
 /// frame is. Pure so the real captures in `~/.zo/logs/zo-freeze-*.sample` can
 /// be replayed as fixtures.
+///
+/// The whole walk is anchored on the `com.apple.main-thread` header frame:
+/// without it nothing is ever counted, so any report lacking one — an empty
+/// capture, or the Linux `/proc/<pid>/task/*/stack` dump the watchdog writes
+/// there — is [`FreezeVerdict::UnreadableCapture`], not a finding about leaves.
 #[must_use]
 pub fn classify_freeze_sample(report: &str) -> FreezeVerdict {
     let mut total: Option<u64> = None;
@@ -167,9 +181,14 @@ pub fn classify_freeze_sample(report: &str) -> FreezeVerdict {
             *leaves.entry(symbol).or_default() += count;
         }
     }
-    let Some(total) = total.filter(|total| *total > 0) else {
-        return FreezeVerdict::Unknown;
+    let Some(total) = total else {
+        return FreezeVerdict::UnreadableCapture;
     };
+    // A header that samples zero times parsed fine, it just has nothing to
+    // attribute — that is the honest "no dominant leaf", not an unreadable file.
+    if total == 0 {
+        return FreezeVerdict::Unknown;
+    }
     #[allow(clippy::cast_precision_loss)] // sample counts are small
     let dominant = leaves
         .into_iter()
@@ -302,6 +321,51 @@ Call graph:
     + 30 kevent  (in libsystem_kernel.dylib) + 8  [0x3]
 ";
         assert_eq!(classify_freeze_sample(report), FreezeVerdict::Unknown);
+    }
+
+    /// Shape of the Linux capture (`/proc/<pid>/task/*/stack`), which shares
+    /// nothing with a `sample(1)` call graph: no counts, no main-thread header.
+    const PROC_KERNEL_STACK: &str = "\
+--- thread 41207 (zo) ---
+[<0>] ep_poll+0x2dd/0x330
+[<0>] do_epoll_wait+0xb1/0xd0
+[<0>] __x64_sys_epoll_wait+0x6a/0x100
+[<0>] do_syscall_64+0x59/0xc0
+--- thread 41211 (tokio-runtime-w) ---
+[<0>] futex_wait_queue_me+0xb6/0x120
+[<0>] do_syscall_64+0x59/0xc0
+";
+
+    /// On Linux the watchdog captures a format this parser cannot read, and the
+    /// old `Unknown` verdict then announced a leaf analysis that never ran — on
+    /// every Linux freeze report.
+    #[test]
+    fn a_proc_kernel_stack_dump_is_reported_as_unread_not_as_analyzed() {
+        assert_eq!(
+            classify_freeze_sample(PROC_KERNEL_STACK),
+            FreezeVerdict::UnreadableCapture
+        );
+        assert!(
+            !FreezeVerdict::UnreadableCapture
+                .sentence()
+                .contains("no dominant blocking leaf"),
+            "an unparsed capture must not claim its leaves were weighed"
+        );
+        assert!(
+            FreezeVerdict::UnreadableCapture
+                .sentence()
+                .contains("not a macOS sample(1) call graph"),
+            "the verdict names the format it could not read"
+        );
+    }
+
+    #[test]
+    fn an_empty_capture_is_reported_as_unread() {
+        assert_eq!(classify_freeze_sample(""), FreezeVerdict::UnreadableCapture);
+        assert_eq!(
+            classify_freeze_sample("   \n\n\t\n"),
+            FreezeVerdict::UnreadableCapture
+        );
     }
 
     /// Sibling threads must not contribute: only the main thread's block counts.
