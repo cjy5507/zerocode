@@ -2062,7 +2062,10 @@ fn footer_lines(theme: &Theme, width: u16) -> Vec<Line<'static>> {
         vec![
             (format!("{ctrl}F"), "find"),
             (format!("{ctrl}P"), "cmds"),
-            ("?".to_string(), "help"),
+            // F1, not `?`: a bare ASCII key never arrives while a Korean IME
+            // is composing, so a legend advertising `?` points at a key that
+            // does not answer for the users most likely to be reading it.
+            ("F1".to_string(), "help"),
         ],
     ];
 

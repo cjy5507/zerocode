@@ -697,7 +697,7 @@ fn footer_legend_uses_the_pi_key_hint_idiom() {
         .flat_map(|line| line.spans.iter())
         .map(|span| span.content.as_ref())
         .collect();
-    for expected in ["drag", "copy", "click", "expand", "find", "cmds", "?", "help"] {
+    for expected in ["drag", "copy", "click", "expand", "find", "cmds", "F1", "help"] {
         assert!(footer_text.contains(expected), "missing {expected}: {footer_text}");
     }
     assert!(footer_text.contains(" · "), "hints chain with ` · `: {footer_text}");
@@ -710,6 +710,25 @@ fn footer_legend_uses_the_pi_key_hint_idiom() {
         keys[1].style.fg,
         Some(theme.palette.muted),
         "descriptions are muted, one step brighter than the key"
+    );
+}
+
+/// The rail's legend is a promise about which keys answer. `?` does not answer
+/// while a Korean IME is composing — the keypress commits the pending syllables
+/// into the composer instead — so the legend names F1, the key that does.
+#[test]
+fn footer_legend_advertises_the_ime_independent_help_key() {
+    let theme = Theme::default_dark();
+    let footer_text: String = footer_lines(&theme, 36)
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect();
+
+    assert!(footer_text.contains("F1 help"), "legend must point at F1: {footer_text}");
+    assert!(
+        !footer_text.contains("? help"),
+        "a bare `?` is unreachable mid-composition: {footer_text}"
     );
 }
 

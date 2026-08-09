@@ -5311,6 +5311,132 @@ fn tab_focuses_block_enter_expands_esc_clears_focus() {
     assert_eq!(app.transcript.focused_idx(), None, "Esc cleared focus");
 }
 
+/// Build a settled app holding one focusable transcript block, with input
+/// enabled — the state a user is in after any tool call finishes.
+fn app_with_one_focusable_block() -> App {
+    let mut app = test_app();
+    app.begin_turn_with_generation(0);
+    app.push_block(RenderBlock::ToolResult {
+        id: BlockId(2),
+        tool_call_id: ToolCallId("call-1".to_string()),
+        is_error: false,
+        body: ToolResultBody::Text {
+            content: "ok".to_string(),
+            truncated: false,
+        },
+    });
+    app.end_turn();
+    app.enable_input();
+    app
+}
+
+/// P0 repro, end to end: one Tab focuses a block, the focus is sticky, and the
+/// focused block is usually scrolled off-screen. Typing a message and pressing
+/// Enter then did nothing visible — the transcript stage claimed Enter before
+/// the composer ever saw it, so the draft sat there and an invisible block
+/// toggled. The user reads that as "Enter is dead".
+#[test]
+fn enter_submits_a_draft_typed_after_tab_focused_a_transcript_block() {
+    let mut app = app_with_one_focusable_block();
+
+    let _ = app.handle_key(press(KeyCode::Tab));
+    assert!(app.transcript.focused_idx().is_some(), "precondition: Tab focused a block");
+
+    for ch in "hello".chars() {
+        let _ = app.handle_key(press(KeyCode::Char(ch)));
+    }
+    let action = app.handle_key(press(KeyCode::Enter)).expect("enter");
+
+    assert!(
+        matches!(&action, AppAction::Submit(text) if text == "hello"),
+        "a drafted message must submit, got {action:?}"
+    );
+}
+
+/// The Enter gate alone, with the focus installed *after* the draft so the
+/// typing-clears-focus rule cannot mask it: a composer holding text owns Enter
+/// no matter what the transcript thinks it is browsing.
+#[test]
+fn enter_falls_through_to_submit_when_a_draft_outlives_a_focused_block() {
+    let mut app = app_with_one_focusable_block();
+
+    // Seed both states directly — this is the one combination the key
+    // sequence can no longer produce, and the gate must still hold for it.
+    app.input.insert_char('h');
+    assert!(app.transcript.focus_next(), "precondition: a block can be focused");
+
+    let action = app.handle_key(press(KeyCode::Enter)).expect("enter");
+    assert!(
+        matches!(&action, AppAction::Submit(text) if text == "h"),
+        "Enter over a draft must submit, not toggle a block: {action:?}"
+    );
+}
+
+/// A pasted image with no text is submittable — the queue path treats it as a
+/// message — so the Enter gate is `is_empty` (text *and* images), not merely
+/// `is_text_empty`. Otherwise Enter on an image-only composer toggled a block
+/// and the image was never sent.
+#[test]
+fn enter_sends_an_image_only_composer_instead_of_toggling_a_focused_block() {
+    let mut app = app_with_one_focusable_block();
+
+    app.input.add_image();
+    assert!(app.transcript.focus_next(), "precondition: a block can be focused");
+    let expanded_before = app.transcript.focused_idx().map(|i| app.transcript.is_expanded(i));
+
+    let action = app.handle_key(press(KeyCode::Enter)).expect("enter");
+    assert!(
+        !matches!(action, AppAction::Redraw),
+        "Enter must not be spent toggling a block while an image waits: {action:?}"
+    );
+    assert_eq!(
+        app.transcript.focused_idx().map(|i| app.transcript.is_expanded(i)),
+        expanded_before,
+        "the focused block's expansion must be untouched"
+    );
+}
+
+/// Typing is a mode switch back out of browsing, so the focus a Tab press left
+/// behind does not survive it. Without this the focus stays armed and reclaims
+/// Enter the moment the draft is cleared.
+#[test]
+fn typing_clears_the_transcript_focus_left_by_tab() {
+    let mut app = app_with_one_focusable_block();
+
+    let _ = app.handle_key(press(KeyCode::Tab));
+    assert!(app.transcript.focused_idx().is_some(), "precondition: a block is focused");
+
+    let _ = app.handle_key(press(KeyCode::Char('h')));
+    assert_eq!(
+        app.transcript.focused_idx(),
+        None,
+        "typing must drop the browse focus"
+    );
+}
+
+/// Mid-turn the stakes are higher: `handle_normal_esc` spends Esc on
+/// interrupting the live turn, so a focus that swallows Enter leaves no exit at
+/// all — the queued message can neither be sent nor abandoned.
+#[test]
+fn enter_queues_a_mid_turn_draft_even_after_tab_focused_a_block() {
+    let mut app = app_with_one_focusable_block();
+
+    let _ = app.handle_key(press(KeyCode::Tab));
+    assert!(app.transcript.focused_idx().is_some(), "precondition: a block is focused");
+
+    app.disable_input();
+    for ch in "steer me".chars() {
+        let _ = app.handle_key(press(KeyCode::Char(ch)));
+    }
+    let _ = app.handle_key(press(KeyCode::Enter));
+
+    assert_eq!(app.queued_message_count(), 1, "the mid-turn draft must queue");
+    assert_eq!(
+        app.pop_next_queued_message().map(|m| m.text),
+        Some("steer me".to_string())
+    );
+}
+
 #[test]
 fn tab_does_not_steal_focus_while_composer_has_text() {
     // Regression guard: with a non-empty composer Tab must still fall through
@@ -8247,6 +8373,79 @@ fn question_mark_mid_turn_types_into_queue_not_help_overlay() {
     assert_eq!(
         app.pop_next_queued_message().map(|m| m.text),
         Some("?fix it".to_string())
+    );
+}
+
+/// `?` opens the help overlay only on an empty prompt. A Korean IME commits
+/// its pending syllables into the composer *before* delivering the keypress,
+/// so by the time `?` arrives the buffer is non-empty and the overlay is
+/// unreachable — the help screen reads as a feature that does not exist. F1
+/// carries no empty-buffer guard, so it answers over a draft and leaves the
+/// draft alone.
+#[test]
+fn f1_opens_the_help_overlay_over_a_draft_that_blocks_the_bare_question_mark() {
+    let mut app = test_app();
+    app.enable_input();
+    for ch in "한글".chars() {
+        let _ = app.handle_key(press(KeyCode::Char(ch)));
+    }
+
+    // Precondition: this is exactly the state `?` cannot escape from.
+    let _ = app.handle_key(press(KeyCode::Char('?')));
+    assert_eq!(app.mode(), AppMode::Normal, "`?` over a draft is text, not a command");
+    assert_eq!(app.input().text(), "한글?");
+
+    let _ = app.handle_key(press(KeyCode::F(1)));
+    assert_eq!(app.mode(), AppMode::Pager, "F1 must open the help overlay over a draft");
+    assert_eq!(
+        app.input().text(),
+        "한글?",
+        "opening help must not consume or clear the composer"
+    );
+}
+
+/// Mid-turn the composer queues, so `?` is deliberately literal text there.
+/// That leaves no key at all for help while a turn streams; F1 is never text,
+/// so it opens the overlay without eating the queued draft.
+#[test]
+fn f1_opens_the_help_overlay_mid_turn_leaving_the_queued_draft_intact() {
+    let mut app = test_app();
+    app.disable_input();
+    for ch in "fix it".chars() {
+        let _ = app.handle_key(press(KeyCode::Char(ch)));
+    }
+
+    let _ = app.handle_key(press(KeyCode::F(1)));
+    assert_eq!(app.mode(), AppMode::Pager, "F1 must reach help mid-turn");
+    assert_eq!(app.input().text(), "fix it", "the queued draft survives the overlay");
+}
+
+/// The key that opens the overlay closes it, so a user who never learned the
+/// `q`/Esc aliases is not stranded inside the pager.
+#[test]
+fn f1_closes_the_help_overlay_it_opened() {
+    let mut app = test_app();
+    app.enable_input();
+
+    let _ = app.handle_key(press(KeyCode::F(1)));
+    assert_eq!(app.mode(), AppMode::Pager);
+    let _ = app.handle_key(press(KeyCode::F(1)));
+    assert_eq!(app.mode(), AppMode::Normal, "F1 must toggle the overlay closed");
+}
+
+/// The overlay itself is the catalogue of keys, so it must name the
+/// IME-independent one first — a help screen that only advertises `?` teaches
+/// the unreachable key.
+#[test]
+fn help_overlay_advertises_f1_ahead_of_the_bare_question_mark() {
+    let mut app = test_app();
+    app.enable_input();
+    let _ = app.handle_key(press(KeyCode::F(1)));
+
+    let body = app.pager_content.clone().expect("help overlay content");
+    assert!(
+        body.contains("F1 / ?"),
+        "help overlay must advertise F1 for itself: {body}"
     );
 }
 

@@ -729,8 +729,13 @@ fn hints_line(theme: &Theme) -> Line<'static> {
         Span::styled(enter_glyph.to_string(), key),
         Span::styled(" submit".to_string(), label),
         Span::styled("  •  ".to_string(), divider),
-        Span::styled("/help".to_string(), key),
-        Span::styled(" commands".to_string(), label),
+        // The help affordance must not be a typed one. `/help` and the `?`
+        // accelerator are both bare ASCII, so a Korean IME mid-composition
+        // swallows either — on the one screen a first-time user reads before
+        // anything else. F1 survives the composition; ctrl+p below already
+        // carries the command surface this row used to advertise twice.
+        Span::styled("F1".to_string(), key),
+        Span::styled(" help".to_string(), label),
         Span::styled("  •  ".to_string(), divider),
         // Hints must match the bindings: Ctrl+P opens the command surface
         // (the model picker is F3/Alt+1) and quitting is Ctrl+C — Esc
@@ -1218,6 +1223,20 @@ mod tests {
         assert!(!dumped.contains("/login claude"), "{dumped}");
     }
 
+    /// The launchpad is the first screen a new user reads, and its only help
+    /// affordance used to be `/help` — text that a composing Korean IME
+    /// swallows, exactly like the `?` accelerator behind it. The row must name
+    /// the key that survives the composition.
+    #[test]
+    fn launchpad_hint_row_advertises_the_ime_independent_help_key() {
+        let dumped = dump_terminal(&render(&Theme::no_color(), None));
+        assert!(dumped.contains("F1 help"), "launchpad must offer F1 for help: {dumped}");
+        assert!(
+            !dumped.contains("/help"),
+            "a typed help command is unreachable mid-composition: {dumped}"
+        );
+    }
+
     #[test]
     fn narrow_plain_startup_keeps_onboarding_cta_visible() {
         let theme = Theme::no_color();
@@ -1558,7 +1577,7 @@ mod tests {
             "second recent session",
             "/resume",
             STARTUP_SUMMARIZE_REPO_LABEL,
-            "/help",
+            "F1 help",
         ] {
             assert!(dumped.contains(expected), "missing {expected}: {dumped}");
         }
@@ -1594,7 +1613,7 @@ mod tests {
             "/resume",
             "Alt+S",
             STARTUP_SUMMARIZE_REPO_LABEL,
-            "/help",
+            "F1 help",
         ] {
             assert!(dumped.contains(expected), "missing {expected}: {dumped}");
         }

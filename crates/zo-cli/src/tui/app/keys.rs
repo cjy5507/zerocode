@@ -337,7 +337,10 @@ impl App {
                 _ => return Some(AppAction::None),
             },
             AppMode::Pager => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
+                // F1 mirrors the key that opens the help overlay, so the same
+                // keypress closes it; `q` needs the Esc alias because a bare
+                // letter never arrives while a Korean IME is composing.
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(1) => {
                     self.exit_pager();
                     return Some(AppAction::None);
                 }
@@ -463,16 +466,28 @@ impl App {
 
         // Transcript block navigation — the keybinding overlay advertises Tab
         // (focus next block) and Enter (expand/collapse the focused block).
-        // Both are gated so they never shadow the composer, which owns Enter
-        // (submit) and Tab (slash completion) in later dispatch stages:
-        //   • Enter acts here only while a block is actually focused; with no
-        //     focus it falls through to submit.
+        // Both carry the SAME empty-composer gate, because this stage runs
+        // before `handle_input_key`/`handle_queued_input_key` and anything it
+        // claims here the composer never sees:
+        //   • Enter acts here only while a block is focused AND the composer
+        //     holds nothing to send — text *or* a pasted image, which is why
+        //     this gate is `is_empty` where Tab's is `is_text_empty`: the queue
+        //     path treats an image-only buffer as submittable, so Enter must
+        //     reach it. Anything in the composer means the intent is submit, so
+        //     Enter falls through. Focus is sticky and set by one Tab press,
+        //     and the focused block is routinely scrolled off-screen —
+        //     ungated, Enter silently toggled an invisible block and the
+        //     composer read as a box whose Enter key was dead. Esc is no
+        //     escape hatch mid-turn either: `handle_normal_esc` spends it on
+        //     interrupting the turn.
         //   • Tab acts only while the composer is empty (so no slash/mention
         //     completion is pending) and a focusable block exists; otherwise it
         //     falls through.
-        // Esc clears the focus (see `handle_normal_esc`), restoring submit.
         if key.modifiers.is_empty() {
-            if matches!(key.code, KeyCode::Enter) && self.transcript.focused_idx().is_some() {
+            if matches!(key.code, KeyCode::Enter)
+                && self.input.is_empty()
+                && self.transcript.focused_idx().is_some()
+            {
                 self.transcript.toggle_expanded();
                 return Some(AppAction::Redraw);
             }
@@ -599,6 +614,18 @@ impl App {
             && key.modifiers.contains(KeyModifiers::SHIFT)
         {
             return Some(AppAction::ClipboardCopy(ClipboardCopyTarget::Last));
+        }
+        // F1 is the IME-independent route to the same help overlay `?` opens
+        // below. A bare `?` cannot carry it alone: while a Korean IME is
+        // composing, the keypress first commits the pending syllables into the
+        // composer, so the empty-buffer guard below can never hold and the
+        // overlay is unreachable for exactly the users who type Korean. F1 is
+        // never text under any input method, so it needs neither the
+        // empty-buffer nor the between-turns guard — it can open the overlay
+        // over a half-written draft without consuming or clearing it.
+        if matches!(key.code, KeyCode::F(1)) {
+            self.open_pager(crate::tui::keybindings::help_text(!self.theme.no_color));
+            return Some(AppAction::None);
         }
         // `?` on an empty prompt opens the keybinding help overlay — but only
         // between turns. Mid-turn (input disabled) the composer is in
@@ -1043,6 +1070,12 @@ impl App {
 
             if self.input.content_revision() != input_revision_before_key {
                 self.hints.slash_hidden_for = None;
+                // Composing is a mode switch back out of transcript browsing,
+                // so the focus a Tab press left behind cannot survive it. The
+                // Enter gate above already refuses to fire over a draft; this
+                // makes the sticky focus unable to hold Enter hostage under
+                // *any* sequence, including a draft cleared back to empty.
+                self.transcript.clear_focus();
             }
 
             // Reset history browsing after any key routed through the input.
@@ -1151,8 +1184,16 @@ impl App {
             // Forward all other keys (chars, backspace, arrows,
             // etc.) to the input widget so the user can compose
             // their next message while waiting.
+            let revision_before_key = self.input.content_revision();
             let _ = self.input.handle_key(key);
             let _ = self.input.strip_sgr_mouse_sequences();
+            // Same mode switch as the input-enabled path: typing ends transcript
+            // browsing. Mid-turn this is the only exit — `handle_normal_esc`
+            // spends Esc on interrupting the live turn, so a focus left standing
+            // here has no other way out.
+            if self.input.content_revision() != revision_before_key {
+                self.transcript.clear_focus();
+            }
             return Some(AppAction::None);
         }
 

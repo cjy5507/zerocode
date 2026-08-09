@@ -65,15 +65,19 @@ pub const BINDINGS: &[Binding] = &[
         key: "Home / End",
         action: "jump to top / bottom",
     },
+    // Both are gated on an empty prompt, and the overlay must say so: a
+    // composer holding a draft owns Enter (send) and Tab (completion). An
+    // unqualified "Enter — expand / collapse" is what made a stuck focus read
+    // as a dead Enter key rather than a mode the user was still in.
     Binding {
         group: Group::Navigation,
         key: "Tab",
-        action: "focus next block",
+        action: "focus next block (empty prompt)",
     },
     Binding {
         group: Group::Navigation,
         key: "Enter",
-        action: "expand / collapse focused block",
+        action: "expand / collapse focused block (empty prompt)",
     },
     // View.
     Binding {
@@ -121,9 +125,11 @@ pub const BINDINGS: &[Binding] = &[
         key: "F11",
         action: "toggle focus mode",
     },
+    // F1 leads: `?` is a bare ASCII key, so it is unreachable while a Korean
+    // IME is composing. The IME-independent key is the one advertised first.
     Binding {
         group: Group::View,
-        key: "?",
+        key: "F1 / ?",
         action: "show this help",
     },
     // Editing.
@@ -221,7 +227,7 @@ pub const BINDINGS: &[Binding] = &[
 /// genuine command↔accelerator pairs belong here: every key is handled by the
 /// `App` key dispatch and every name is a real slash command.
 const COMMAND_HINTS: &[(&str, &str)] = &[
-    ("help", "?"),
+    ("help", "F1 / ?"),
     ("agents", "\u{2303}A"),       // ⌃A — toggle agents tree
     ("rewind", "\u{2303}R"),       // ⌃R — rewind viewer
     ("copy", "\u{2303}Y"),         // ⌃Y — copy last message
@@ -411,7 +417,17 @@ mod tests {
             );
         }
         // The keys that carry those actions must be present too (colored form).
-        for key in ["F3 / ⌥1", "⌥2", "⌃V", "⌃⇧C", "⌃E", "⌃R", "F11", "Space / Tab"] {
+        for key in [
+            "F3 / ⌥1",
+            "⌥2",
+            "⌃V",
+            "⌃⇧C",
+            "⌃E",
+            "⌃R",
+            "F11",
+            "Space / Tab",
+            "F1 / ?",
+        ] {
             assert!(text.contains(key), "help overlay must show key {key:?}");
         }
     }
@@ -420,7 +436,7 @@ mod tests {
     /// and are case-insensitive on the command name.
     #[test]
     fn command_hint_resolves_known_pairs_only() {
-        assert_eq!(command_hint("help", true).as_deref(), Some("?"));
+        assert_eq!(command_hint("help", true).as_deref(), Some("F1 / ?"));
         assert_eq!(command_hint("AGENTS", true).as_deref(), Some("\u{2303}A"));
         assert_eq!(
             command_hint("model", true).as_deref(),
@@ -444,7 +460,7 @@ mod tests {
         );
         assert_eq!(command_hint("smart", false).as_deref(), Some("Alt+2"));
         // A bare printable key is unchanged.
-        assert_eq!(command_hint("help", false).as_deref(), Some("?"));
+        assert_eq!(command_hint("help", false).as_deref(), Some("F1 / ?"));
     }
 
     /// Every command named in the hint table is a real slash command and
