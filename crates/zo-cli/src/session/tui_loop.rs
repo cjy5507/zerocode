@@ -3364,14 +3364,21 @@ static KEYBOARD_ENHANCED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 static INLINE_TERMINAL_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// The concrete ratatui terminal the live TUI drives. The stdout handle is
-/// wrapped in a [`io::BufWriter`] so each frame's cell-diff is coalesced into a
-/// single flush instead of trickling through `io::Stdout`'s 1 KiB line buffer
-/// in several syscalls — that removes the progressive mid-frame paint window on
-/// terminals without synchronized-output support. This single-flush coalescing
-/// is the substantive atomic-frame win; `App::draw` deliberately does not wrap
-/// frames in CSI ?2026 (see `tui/app/render.rs` for the rationale).
-pub(crate) type TuiTerminal = Terminal<CrosstermBackend<io::BufWriter<io::Stdout>>>;
+/// The concrete ratatui terminal the live TUI drives.
+///
+/// Frames go through [`zo_cli::tui::term::FrameWriter`], which buffers a whole
+/// frame in memory and hands it to a writer thread. Two properties matter here:
+/// one frame is one write, so a slow terminal cannot paint a half-finished
+/// cell-diff (the old `BufWriter` did this with a 256 KiB capacity, and split
+/// anything larger); and the write itself happens off the async main task, so a
+/// terminal that stops draining no longer blocks input, the spinner, or Ctrl+C
+/// — every freeze captured since 2026-08-02 was exactly that stall.
+pub(crate) type TuiTerminal = Terminal<CrosstermBackend<zo_cli::tui::term::FrameWriter>>;
+
+/// How long a handoff of the terminal — viewport rebuild, teardown — waits for
+/// queued frames to reach it. Generous enough for any healthy terminal, short
+/// enough that a wedged one delays an exit by a beat instead of hanging it.
+const TERMINAL_HANDOFF_DRAIN: std::time::Duration = std::time::Duration::from_millis(750);
 
 #[cfg(not(test))]
 fn set_terminal_session_title(terminal: &mut TuiTerminal, name: Option<&str>) {
@@ -3628,11 +3635,7 @@ fn init_fullscreen_terminal() -> Result<(TuiTerminal, Option<StderrRedirectGuard
     }
     crate::mark_tui_thread();
     crate::TUI_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
-    // A full-screen diff on a large terminal easily exceeds BufWriter's 8 KiB
-    // default, splitting one frame across several stdout writes — and a slow
-    // terminal may paint a partial frame between them. 256 KiB keeps a frame
-    // to a single flush.
-    let backend = CrosstermBackend::new(io::BufWriter::with_capacity(256 * 1024, stdout));
+    let backend = CrosstermBackend::new(zo_cli::tui::term::FrameWriter::stdout());
     let terminal = Terminal::new(backend).map_err(TuiLoopError::Io)?;
     Ok((terminal, stderr_guard))
 }
@@ -3682,7 +3685,7 @@ fn init_inline_terminal() -> Result<(TuiTerminal, Option<StderrRedirectGuard>), 
     // Best-effort: a terminal that will not report its cursor just starts where
     // the prompt already is, which is the old behavior rather than a failure.
     let _ = anchor_inline_viewport_to_bottom(&mut stdout, viewport_rows);
-    let backend = CrosstermBackend::new(io::BufWriter::with_capacity(256 * 1024, stdout));
+    let backend = CrosstermBackend::new(zo_cli::tui::term::FrameWriter::stdout());
     let terminal = Terminal::with_options(
         backend,
         TerminalOptions {
@@ -3763,10 +3766,13 @@ fn resync_inline_viewport(terminal: &mut TuiTerminal) -> Result<bool, TuiLoopErr
         return Ok(false);
     }
 
-    // Drain the outgoing terminal's buffered writer before a second one exists
-    // over the same stdout, so its Drop cannot flush stale cells on top of the
-    // rebuilt viewport.
-    io::Write::flush(terminal.backend_mut())?;
+    // Wait for the outgoing terminal's queued frames to actually reach stdout
+    // before a second writer exists over it: `flush` now only means "frame
+    // complete", so without this the direct escapes below could interleave with
+    // a frame still going out, and the old writer's Drop could paint stale
+    // cells on top of the rebuilt viewport.
+    let _ = io::Write::flush(terminal.backend_mut());
+    zo_cli::tui::term::frame_writer::drain_active(TERMINAL_HANDOFF_DRAIN);
     let mut stdout = io::stdout();
     move_cursor_to_inline_anchor(&mut stdout, desired)?;
     // Erase from the new anchor to the screen bottom before the rebuilt
@@ -3780,7 +3786,7 @@ fn resync_inline_viewport(terminal: &mut TuiTerminal) -> Result<bool, TuiLoopErr
         use crossterm::terminal::{Clear, ClearType};
         execute!(stdout, Clear(ClearType::FromCursorDown))?;
     }
-    let backend = CrosstermBackend::new(io::BufWriter::with_capacity(256 * 1024, stdout));
+    let backend = CrosstermBackend::new(zo_cli::tui::term::FrameWriter::stdout());
     *terminal = Terminal::with_options(
         backend,
         TerminalOptions {
@@ -3842,6 +3848,10 @@ fn restore_fullscreen_terminal(terminal: &mut TuiTerminal) -> Result<(), TuiLoop
         DisableFocusChange
     );
     let cursor = terminal.show_cursor();
+    // The teardown escapes ride the frame queue like everything else, so hand
+    // the terminal back only once they have actually been written.
+    let _ = io::Write::flush(terminal.backend_mut());
+    zo_cli::tui::term::frame_writer::drain_active(TERMINAL_HANDOFF_DRAIN);
     raw.map_err(TuiLoopError::Io)?;
     exec.map_err(TuiLoopError::Io)?;
     cursor.map_err(TuiLoopError::Io)?;
@@ -3879,6 +3889,8 @@ fn restore_inline_terminal(terminal: &mut TuiTerminal) -> Result<(), TuiLoopErro
         DisableFocusChange
     );
     let cursor = terminal.show_cursor();
+    let _ = io::Write::flush(terminal.backend_mut());
+    zo_cli::tui::term::frame_writer::drain_active(TERMINAL_HANDOFF_DRAIN);
     clear.map_err(TuiLoopError::Io)?;
     position.map_err(TuiLoopError::Io)?;
     raw.map_err(TuiLoopError::Io)?;

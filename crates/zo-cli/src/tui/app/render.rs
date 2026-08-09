@@ -125,6 +125,14 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<W>>,
     ) -> Result<(), TuiError> {
         use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+        // A frame the writer had to discard (terminal not draining) leaves the
+        // screen holding cells this frame's diff assumes are already there, so
+        // repaint everything before drawing. Checked here rather than at each
+        // call site because every live frame in the process goes through this
+        // one function.
+        if crate::tui::term::frame_writer::take_needs_full_redraw() {
+            let _ = terminal.clear();
+        }
         let synchronized = self.frame_synchronized_output();
         if synchronized {
             let _ = crossterm::execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
