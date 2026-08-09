@@ -60,6 +60,61 @@ where
             .unwrap_or_default()
     }
 
+    /// Fold already-drained steering into the settled tail of the session,
+    /// using the same wire shape both existing boundary folds use.
+    ///
+    /// Two shapes, picked by the role of the last *settled* message:
+    ///
+    /// * `User` / `Tool` — append the steering as extra `Text` blocks on that
+    ///   message. Tool-result messages lower to wire role `user`, so a
+    ///   separate user message would be two consecutive user turns; appending
+    ///   keeps one valid turn (the judgement recorded at the sync tool-result
+    ///   boundary in `mod.rs`, mirrored by the streaming boundary).
+    /// * anything else — push a fresh user message. `Assistant` is the
+    ///   text-only-boundary case. `System` is the persisted reminder message
+    ///   [`Self::absorb_wire_reminders_into_session`] leaves as the tail of an
+    ///   in-flight request: appending into it would both bury a user
+    ///   instruction inside a host-authored reminder message and break that
+    ///   function's dedupe (it matches on exact block equality), so the steer
+    ///   gets its own message — the shape the reminder absorb itself already
+    ///   puts on the wire after a tool-result message.
+    ///
+    /// Callers own the transcript echo; this only touches the session.
+    pub(super) fn fold_steering_into_settled_tail(
+        &mut self,
+        steers: &[String],
+    ) -> Result<(), RuntimeError> {
+        if steers.is_empty() {
+            return Ok(());
+        }
+        let append_in_place = matches!(
+            self.session.messages.last().map(|message| message.role),
+            Some(crate::session::MessageRole::User | crate::session::MessageRole::Tool)
+        );
+        if append_in_place {
+            let messages = Arc::make_mut(&mut self.session.messages);
+            if let Some(last) = messages.last_mut() {
+                for steer in steers {
+                    last.blocks.push(crate::ContentBlock::Text {
+                        text: super::steering_message(steer),
+                    });
+                }
+            }
+            self.session.mark_transcript_dirty();
+            return Ok(());
+        }
+        let mut text = String::new();
+        for steer in steers {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&super::steering_message(steer));
+        }
+        self.session
+            .push_user_text(text)
+            .map_err(|error| RuntimeError::new(error.to_string()))
+    }
+
     /// Cloneable handle to the mid-turn agent-notification inbox. The host's
     /// agent-completion consumer stages finished background agents here while a
     /// turn is in flight; the turn drains them at each tool-result boundary

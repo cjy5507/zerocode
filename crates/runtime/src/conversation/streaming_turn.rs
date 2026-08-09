@@ -28,9 +28,10 @@ use super::{
     AssistantTurn, AsyncPermissionDecision, AsyncPermissionPrompter, BlockIdGen, BudgetExhausted,
     CapturePrompter, ContentBlock, ConversationMessage, ConversationRuntime, EmptyAssistantAction,
     HookEvent, HookRunResult, PermissionContext, PermissionOutcome, PermissionPromptDecision,
-    PromptCacheEvent, QuotaEscape, RefusalDecision, RenderBlock, RuntimeError, StreamingTurnError,
-    SystemLevel,
+    PromptCacheEvent, QuotaEscape, RefusalDecision, RenderBlock, RuntimeError, SteeringQueue,
+    StreamingTurnError, SystemLevel,
     TokenUsage, ToolBatchRepetitionHardStops, ToolCallId, ToolCallStatus, ToolExecutor, TurnSummary,
+    DEFAULT_STREAMING_CHANNEL_CAPACITY,
     EMPTY_STREAM_CONTINUATION_REMINDER, EMPTY_STREAM_CONTINUATION_REMINDER_PREFIX,
     EMPTY_STREAM_EXHAUSTED_FALLBACK_TEXT, EMPTY_STREAM_RETRY_REMINDER,
     EMPTY_STREAM_RETRY_REMINDER_PREFIX, EMPTY_STREAM_TRUNCATION_RETRY_REMINDER,
@@ -104,6 +105,146 @@ fn permission_prompt_expired_reason(tool_name: &str, budget: std::time::Duration
          escalation.",
         budget.as_secs()
     )
+}
+
+// ============================================================================
+// Mid-generation steering re-issue (gen-abort)
+// ============================================================================
+
+/// How often the mid-generation steering check re-runs while the provider
+/// stream is producing nothing at all.
+///
+/// The check is event-driven first: it re-runs after every block the provider
+/// streams, which is the common case (text/reasoning deltas arrive
+/// continuously). This tick only covers the silent window — a model that
+/// thinks for many seconds without emitting anything is exactly when a user
+/// gives up waiting and types a correction, and that steer should not sit
+/// behind the silence. It is armed only while a stream is in flight, so it
+/// costs nothing between calls.
+const STEERING_INTERRUPT_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(120);
+
+/// Whether the user has typed steering that no boundary has folded yet.
+///
+/// The read-only counterpart to `drain_steering`: the mid-generation check
+/// runs on every streamed block, so it must never *take* the queue (a drain
+/// there would strand the steer whenever the re-issue is declined) and must
+/// never panic on a poisoned lock — an unreadable queue reads as "no
+/// steering", exactly like the drain does.
+fn steering_pending(queue: &SteeringQueue) -> bool {
+    queue.lock().map(|queue| !queue.is_empty()).unwrap_or(false)
+}
+
+/// How a streaming provider call stopped being consumed.
+enum StreamRace {
+    /// The call ran to its own end — success or provider error. Everything
+    /// downstream (retry ladder, quota escape, refusal ladder, empty-stream
+    /// recovery, bookkeeping) sees exactly what it saw before this race
+    /// existed.
+    Completed(Result<Vec<AssistantEvent>, RuntimeError>),
+    /// The user steered while the model was still generating, before this call
+    /// had emitted a single `tool_use` block, so the in-flight call was
+    /// abandoned to be re-issued with the steering folded in.
+    ///
+    /// Deliberately its own variant rather than an error, because it is none
+    /// of the three things the loop already knows how to unwind: not a
+    /// provider failure (so no retry counter, no fallback ladder, no quota
+    /// escape), not a user cancel ([`ConversationRuntime::cancel_streaming_turn_by_user`]
+    /// ends the turn), and not a render-channel drop
+    /// ([`ConversationRuntime::cancel_streaming_turn`] truncates the
+    /// transcript). Nothing from the abandoned call is settled; the turn
+    /// continues with a fresh request built from the same conversation.
+    SteeringReissue {
+        /// The text block this call left mid-stream, if any, so the caller can
+        /// close it before the re-issued call opens a new one. Carries the id
+        /// the provider actually used rather than assuming the iteration's
+        /// reserved one: a turn that opens with reasoning spends that id on the
+        /// `Reasoning` block and streams its text under a later one.
+        open_text_block: Option<crate::message_stream::types::BlockId>,
+    },
+}
+
+/// Drive one provider stream to completion while forwarding its render blocks,
+/// racing it against the mid-turn steering queue.
+///
+/// `stream` writes its blocks into `probe_rx`'s channel rather than straight
+/// to `render_tx`; this function forwards them one by one. The interposition
+/// buys exactly two facts that cannot be observed from outside the call:
+///
+/// * the instant the first `tool_use` block starts streaming (`ToolCall`), and
+/// * a place on the *same* task to re-check the steering queue as the call
+///   progresses.
+///
+/// Forwarding is awaited, so end-to-end backpressure (code-rules R8) is
+/// unchanged. A consumer that drops the render receiver mid-stream closes the
+/// probe channel, which makes the provider's next send fail exactly as a
+/// direct send would have — the existing stream-error path stays in charge of
+/// that case.
+///
+/// Returns as soon as the stream resolves *or* the re-issue conditions hold.
+/// The caller owns the future, so dropping it (which tears down the upstream
+/// connection) and draining any blocks still buffered are the caller's job.
+async fn race_stream_against_steering<F>(
+    stream: &mut F,
+    probe_rx: &mut mpsc::Receiver<RenderBlock>,
+    render_tx: &mpsc::Sender<RenderBlock>,
+    steering: &SteeringQueue,
+    abort: &std::sync::atomic::AtomicBool,
+    interrupt_armed: bool,
+) -> StreamRace
+where
+    F: std::future::Future<Output = Result<Vec<AssistantEvent>, RuntimeError>> + Unpin,
+{
+    // A call that has begun emitting tool calls is past the point where
+    // re-issuing pays: the batch is nearly assembled, and the existing
+    // tool-result boundary fold delivers the steer before those tools' results
+    // are ever reasoned about. Only a call still purely generating is worth
+    // abandoning.
+    let mut saw_tool_use = false;
+    let mut open_text_block = None;
+    let mut probe_open = true;
+    let mut forwarding = true;
+    loop {
+        tokio::select! {
+            // The provider always wins the race when it is ready: a call that
+            // has already finished must never be reported as interrupted.
+            biased;
+            outcome = &mut *stream => return StreamRace::Completed(outcome),
+            block = probe_rx.recv(), if probe_open => {
+                match block {
+                    Some(block) => {
+                        match &block {
+                            RenderBlock::ToolCall { .. } => saw_tool_use = true,
+                            RenderBlock::TextDelta { id, done, .. } => {
+                                open_text_block = (!done).then_some(*id);
+                            }
+                            _ => {}
+                        }
+                        if forwarding && render_tx.send(block).await.is_err() {
+                            // The render consumer is gone. Close the probe so
+                            // the provider's next send fails the way a direct
+                            // send would have, then keep draining so it is
+                            // never blocked on a full channel while it unwinds.
+                            forwarding = false;
+                            probe_rx.close();
+                        }
+                    }
+                    None => probe_open = false,
+                }
+            }
+            () = tokio::time::sleep(STEERING_INTERRUPT_POLL_INTERVAL) => {}
+        }
+        // A turn already being torn down (Ctrl+C, a hook abort, a host
+        // failure) must not buy one more provider call on the way out: the
+        // steering it would carry has nowhere to land.
+        if interrupt_armed
+            && !saw_tool_use
+            && !abort.load(std::sync::atomic::Ordering::SeqCst)
+            && steering_pending(steering)
+        {
+            return StreamRace::SteeringReissue { open_text_block };
+        }
+    }
 }
 
 struct PreparedStreamingTool {
@@ -504,6 +645,14 @@ where
         // stops externalizing progress stops earning extensions.
         let mut deadline_extensions_used: u8 = 0;
         let mut extension_progress_marker: usize = 0;
+        // Gen-abort cap. Set when a call is abandoned mid-generation to deliver
+        // steering early (see [`StreamRace::SteeringReissue`]); cleared once the
+        // re-issued work reaches a fold boundary. While set, steering that
+        // arrives during the re-issued call takes the ordinary boundary fold
+        // instead of abandoning another call — which is what makes an
+        // abort→re-issue→abort spin impossible no matter how fast the user
+        // types.
+        let mut steering_reissued = false;
 
         'outer: loop {
             if self.tool_loop_break_requested {
@@ -833,7 +982,17 @@ where
                     // The hook abort flag cuts a transient-error backoff short so
                     // a foreground Ctrl+C is observed during the wait, not only at
                     // the next iteration boundary (WI-G).
-                    let notice_tx = render_tx.clone();
+                    let async_client = async_client.clone();
+                    // Gen-abort probe. The call's render blocks travel through a
+                    // bounded interposer channel instead of straight to
+                    // `render_tx` so this task can watch the stream go by (see
+                    // [`race_stream_against_steering`]). Same capacity and the
+                    // same awaited forwarding as before, so backpressure is
+                    // unchanged; retry notices ride the same channel so they
+                    // cannot overtake blocks still queued ahead of them.
+                    let (probe_tx, mut probe_rx) =
+                        mpsc::channel::<RenderBlock>(DEFAULT_STREAMING_CHANNEL_CAPACITY);
+                    let notice_tx = probe_tx.clone();
                     let notice_ids = id_gen.clone();
                     // The model this turn streams on, cloned out before the
                     // closures so a foreground 429 can feed the SAME per-provider
@@ -845,11 +1004,11 @@ where
                         .rate_limit_model_for_active_stream()
                         .map(str::to_string);
                     let verifier_rate_limit_retry_cap = self.verifier_rate_limit_retry_cap();
-                    let stream_result = crate::retry::retry_async(
+                    let mut stream_fut = Box::pin(crate::retry::retry_async(
                         "stream_async",
                         Some(self.hook_abort_signal.flag()),
                         verifier_rate_limit_retry_cap,
-                        |attempt, error: &RuntimeError| {
+                        move |attempt, error: &RuntimeError| {
                             if let Some(model) = rate_limit_model.as_deref() {
                                 crate::retry::mark_foreground_capacity_stall(
                                     model,
@@ -858,7 +1017,7 @@ where
                                 );
                             }
                         },
-                        |attempt, delay, error: &RuntimeError| {
+                        move |attempt, delay, error: &RuntimeError| {
                             // Keep the live UI honest while L2 backs off: a
                             // capacity stall (overload/429/5xx) is otherwise a
                             // silent multi-second pause before the next attempt,
@@ -878,14 +1037,95 @@ where
                                 ),
                             });
                         },
-                        |_attempt| {
+                        move |_attempt| {
                             let req = request.clone();
-                            let tx = render_tx.clone();
+                            let tx = probe_tx.clone();
                             let client = async_client.clone();
                             async move { client.stream_async(req, tx, text_block_id).await }
                         },
+                    ));
+                    let race = race_stream_against_steering(
+                        &mut stream_fut,
+                        &mut probe_rx,
+                        &render_tx,
+                        &self.steering,
+                        self.hook_abort_signal.flag(),
+                        !steering_reissued,
                     )
                     .await;
+                    // Dropping the future is what actually tears the upstream
+                    // connection down on the re-issue path, and it is also what
+                    // releases the last probe sender so the drain below can end.
+                    // Explicit because `Box` has a `Drop`, which would otherwise
+                    // hold this scope's borrow of `self` past the `&mut self`
+                    // work in both arms.
+                    drop(stream_fut);
+                    let stream_result = match race {
+                        StreamRace::Completed(outcome) => {
+                            // Blocks the provider produced before the race
+                            // resolved but that had not been forwarded yet. Best
+                            // effort: if the render consumer is gone the stream
+                            // already failed for that reason.
+                            while let Some(block) = probe_rx.recv().await {
+                                let _ = render_tx.send(block).await;
+                            }
+                            outcome
+                        }
+                        StreamRace::SteeringReissue { open_text_block } => {
+                            // Nothing from the abandoned call is settled: no
+                            // assistant message, no iteration record, no
+                            // retry/refusal/quota/deep-gate accounting — the
+                            // branch returns before every one of those.
+                            //
+                            // Usage is the one honest gap. The provider DOES
+                            // bill the partial generation, but the usage event
+                            // arrives at the end of a stream we are dropping, so
+                            // there is nothing to record: `usage_tracker` and
+                            // the two turn token breakers under-count by one
+                            // abandoned call per fold boundary. Compaction is
+                            // unaffected (`effective_context_tokens` maxes in a
+                            // local estimate); only the cost view drifts low.
+                            //
+                            // The deltas already on screen stay there (same as
+                            // the refusal path) — close their block so the
+                            // re-issued call, which takes a fresh block id,
+                            // opens cleanly.
+                            if let Some(id) = open_text_block {
+                                let _ = render_tx
+                                    .send(RenderBlock::TextDelta {
+                                        id,
+                                        text: String::new(),
+                                        done: true,
+                                    })
+                                    .await;
+                            }
+                            drop(probe_rx);
+                            steering_reissued = true;
+                            let steers = self.drain_steering();
+                            for steer in &steers {
+                                let _ = render_tx
+                                    .send(RenderBlock::System {
+                                        id: id_gen.next(),
+                                        level: SystemLevel::Info,
+                                        text: format!("{STEERING_ECHO_PREFIX}{steer}"),
+                                    })
+                                    .await;
+                            }
+                            self.fold_steering_into_settled_tail(&steers)
+                                .map_err(StreamingTurnError::from)?;
+                            // Re-request from the top with the identical
+                            // thinking/effort/tool configuration — the request is
+                            // rebuilt by the same `assemble_request` call every
+                            // other iteration uses, so the re-issue is a pure
+                            // append to the cached prefix rather than a settings
+                            // delta that would invalidate the whole prompt cache.
+                            // Costing an iteration is the established idiom for a
+                            // re-requested call here (quota hold/swap, tier
+                            // demotion, refusal retry, empty-stream retry all
+                            // `continue 'outer` the same way).
+                            continue 'outer;
+                        }
+                    };
                     match stream_result {
                         Ok(events) => events,
                         Err(error) => {
@@ -1389,6 +1629,9 @@ where
                 self.session
                     .push_user_text(continuation_text)
                     .map_err(|error| StreamingTurnError::runtime(error.to_string()))?;
+                // A fold boundary was reached, so the gen-abort cap resets: the
+                // next generation may again be abandoned for a *newer* steer.
+                steering_reissued = false;
                 continue;
             }
             if let Err(error) = self.check_tool_call_budget(tool_calls, pending_tool_use_count) {
@@ -1937,6 +2180,13 @@ where
             // (which the API rejects). A user turn may carry tool_result blocks
             // followed by text, so appending keeps one valid turn. `make_mut`
             // mirrors the truncate path already used in this function.
+            //
+            // Reaching this boundary also resets the gen-abort cap
+            // (unconditionally, steers or not): the tool batch this iteration
+            // dispatched has already run, so the "stale batch" the
+            // mid-generation re-issue exists to prevent is no longer in front
+            // of the user, and the next generation is eligible again.
+            steering_reissued = false;
             let steers = self.drain_steering();
             if !steers.is_empty() {
                 let messages = Arc::make_mut(&mut self.session.messages);
