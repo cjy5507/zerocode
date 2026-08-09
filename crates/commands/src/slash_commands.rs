@@ -7,7 +7,7 @@ use crate::slash_help::render_slash_command_help_detail;
 
 pub const MAX_SESSION_NAME_CHARS: usize = 24;
 pub const DEEP_TIER_USAGE: &str =
-    "Usage: /tier [add <model>|remove <model|N>|move <N> <M>|reset]";
+    "Usage: /tier [add <model>|set <N|model> <model>|remove <model|N>|move <N> <M>|reset]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelfImproveAction {
@@ -29,6 +29,11 @@ fn is_sha256_hex(value: &str) -> bool {
 pub enum DeepTierAction {
     Show,
     Add { model: String },
+    /// Replace the entry at `target` (1-based position or model name) in place,
+    /// keeping its rank. Swapping a planner without `remove` + `add` + `move`
+    /// is the difference between one keystroke and three, and it is the only
+    /// mutation that cannot change the pool's order by accident.
+    Set { target: String, model: String },
     Remove { target: String },
     Move { from: usize, to: usize },
     Reset,
@@ -598,6 +603,10 @@ pub fn validate_slash_command_input(
             action: match args.as_slice() {
                 [] => DeepTierAction::Show,
                 ["add", model] => DeepTierAction::Add {
+                    model: (*model).to_string(),
+                },
+                ["set", target, model] => DeepTierAction::Set {
+                    target: (*target).to_string(),
                     model: (*model).to_string(),
                 },
                 ["remove", target] => DeepTierAction::Remove {

@@ -535,7 +535,10 @@ pub(super) const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "tier",
         aliases: &[],
         summary: "Manage the Architect PLAN/VERIFY model pool",
-        argument_hint: Some("[add <model>|remove <model|N>|reset]"),
+        // Kept in lockstep with `DEEP_TIER_USAGE` by
+        // `tier_argument_hint_lists_every_parsed_action` — a hint that omits an
+        // action the parser accepts is a feature nobody can find.
+        argument_hint: Some("[add <model>|set <N> <model>|remove <model|N>|move <N> <M>|reset]"),
         resume_supported: false,
         category: CommandCategory::Analysis,
     },

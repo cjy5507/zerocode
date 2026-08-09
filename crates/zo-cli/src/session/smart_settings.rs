@@ -778,24 +778,11 @@ pub(crate) fn execute_deep_tier_command(
                 models.len()
             ))
         }
+        commands::DeepTierAction::Set { target, model } => {
+            set_deep_tier_model(cwd, setting.models, target, model)
+        }
         commands::DeepTierAction::Remove { target } => {
-            let index = target
-                .parse::<usize>()
-                .ok()
-                .filter(|index| (1..=setting.models.len()).contains(index))
-                .map(|index| index - 1)
-                .or_else(|| {
-                    setting
-                        .models
-                        .iter()
-                        .position(|model| runtime::deep_tier_model_matches(target, model))
-                })
-                .ok_or_else(|| {
-                    format!(
-                        "No deep-tier model matches `{target}`.\n{}",
-                        commands::DEEP_TIER_USAGE
-                    )
-                })?;
+            let index = resolve_deep_tier_target(&setting.models, target)?;
             if setting.models.len() == 1 {
                 return Err(
                     "Cannot remove the last deep-tier model; use /tier reset to restore the built-in default."
@@ -828,6 +815,66 @@ pub(crate) fn execute_deep_tier_command(
                 .to_string())
         }
     }
+}
+
+/// Replace the pool entry `target` names, keeping its rank — the mutation the
+/// modal's Enter performs, and the only one that cannot reorder the pool by
+/// accident (remove + add would drop the entry to last place).
+fn set_deep_tier_model(
+    cwd: &Path,
+    mut models: Vec<String>,
+    target: &str,
+    model: &str,
+) -> Result<String, String> {
+    let index = resolve_deep_tier_target(&models, target)?;
+    let model = api::resolve_model_alias(model.trim());
+    if let Some(existing) = models
+        .iter()
+        .position(|existing| runtime::deep_tier_model_matches(&model, existing))
+    {
+        if existing == index {
+            return Ok(format!(
+                "Deep-tier #{position} is already {model}. No changes made.",
+                position = index + 1
+            ));
+        }
+        // Refuse rather than silently collapse the pool: accepting the write
+        // would leave the same model at two ranks, and the verify ladder's dedup
+        // would then hand the leg fewer real candidates than the list shows.
+        return Err(format!(
+            "{model} is already in the deep-tier pool at #{}. Remove it first, or move it.",
+            existing + 1
+        ));
+    }
+    let replaced = std::mem::replace(&mut models[index], model.clone());
+    write_project_deep_tier_models(cwd, Some(&models))
+        .map_err(|error| format!("Deep-tier pool: could not update project settings: {error}"))?;
+    Ok(format!(
+        "Set deep-tier #{position} to {model} (was {replaced}).\nApplies from next turn.",
+        position = index + 1
+    ))
+}
+
+/// Resolve a `/tier` target — a 1-based position or a model name — to an index
+/// into `models`. Shared by `set` and `remove` so the two can never disagree
+/// about which entry `2` or `opus` names.
+fn resolve_deep_tier_target(models: &[String], target: &str) -> Result<usize, String> {
+    target
+        .parse::<usize>()
+        .ok()
+        .filter(|index| (1..=models.len()).contains(index))
+        .map(|index| index - 1)
+        .or_else(|| {
+            models
+                .iter()
+                .position(|model| runtime::deep_tier_model_matches(target, model))
+        })
+        .ok_or_else(|| {
+            format!(
+                "No deep-tier model matches `{target}`.\n{}",
+                commands::DEEP_TIER_USAGE
+            )
+        })
 }
 
 fn move_deep_tier_model(
@@ -4146,6 +4193,98 @@ mod tests {
     }
 
     #[test]
+    fn deep_tier_command_set_replaces_in_place_and_refuses_duplicates() {
+        let root = temp_config_home("deep-tier-command-set");
+        let config_home = root.join("config");
+        let cwd = root.join("project");
+        let settings_path = super::super::session_preferences::project_settings_path(&cwd);
+        fs::create_dir_all(settings_path.parent().expect("settings parent"))
+            .expect("project settings dir");
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "smart": {
+                    "deepTierModels": ["architect-a", "architect-b", "architect-c"]
+                }
+            }))
+            .expect("json"),
+        )
+        .expect("write project settings");
+
+        with_merged_config_home(&config_home, || {
+            // By position: the replacement keeps the rank it was given.
+            let replaced = execute_deep_tier_command(
+                &cwd,
+                &commands::DeepTierAction::Set {
+                    target: "2".to_string(),
+                    model: "architect-d".to_string(),
+                },
+            )
+            .expect("set by position");
+            assert!(
+                replaced.contains("Set deep-tier #2 to architect-d (was architect-b)"),
+                "{replaced}"
+            );
+            let active = tools::smart_deep_tier_models_for(&cwd).expect("pool");
+            assert_eq!(
+                active.models,
+                vec![
+                    "architect-a".to_string(),
+                    "architect-d".to_string(),
+                    "architect-c".to_string()
+                ],
+                "rank is preserved — this is the whole point of `set` over remove+add"
+            );
+
+            // By name, addressing the same entry.
+            execute_deep_tier_command(
+                &cwd,
+                &commands::DeepTierAction::Set {
+                    target: "architect-d".to_string(),
+                    model: "architect-e".to_string(),
+                },
+            )
+            .expect("set by name");
+            let active = tools::smart_deep_tier_models_for(&cwd).expect("pool");
+            assert_eq!(active.models[1], "architect-e");
+
+            // A model already at another rank is refused, not duplicated: the
+            // verify ladder dedups, so accepting it would silently shorten the
+            // candidate list the pool advertises.
+            let error = execute_deep_tier_command(
+                &cwd,
+                &commands::DeepTierAction::Set {
+                    target: "1".to_string(),
+                    model: "architect-c".to_string(),
+                },
+            )
+            .expect_err("duplicate is refused");
+            assert!(error.contains("already in the deep-tier pool at #3"), "{error}");
+
+            let unchanged = execute_deep_tier_command(
+                &cwd,
+                &commands::DeepTierAction::Set {
+                    target: "3".to_string(),
+                    model: "architect-c".to_string(),
+                },
+            )
+            .expect("setting an entry to itself is a no-op");
+            assert!(unchanged.contains("No changes made."), "{unchanged}");
+
+            let missing = execute_deep_tier_command(
+                &cwd,
+                &commands::DeepTierAction::Set {
+                    target: "9".to_string(),
+                    model: "architect-f".to_string(),
+                },
+            )
+            .expect_err("out-of-range target is rejected");
+            assert!(missing.contains("No deep-tier model matches"), "{missing}");
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn trusted_probe_downshifts_simple_turns_while_keyword_verdicts_only_raise() {
         use api::EffortLevel as L;
         use runtime::RouteAssessmentProvenance as P;
@@ -4544,6 +4683,54 @@ mod tests {
                 ),
                 vec![pinned_model],
                 "an exact verifier pin stays first and exact; no hardcoded fallback is appended"
+            );
+        });
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    /// `/tier`'s whole promise is that rank 1 is preferred, so under Architect
+    /// the candidate ladder must be the configured pool *verbatim* — the order
+    /// the modal shows is the order PLAN borrows from and VERIFY falls through.
+    /// The only entry dropped is the model being judged (it is the terminal
+    /// native fallback, not a cross-model candidate), which is why the pool's
+    /// top entry is skipped exactly when it is the session's own model.
+    #[test]
+    fn architect_deep_verify_candidates_follow_the_configured_pool_order() {
+        let config_home = temp_config_home("deep-verify-architect-order");
+        with_config_home(&config_home, || {
+            fs::create_dir_all(config_home.as_path()).expect("create config home");
+            fs::write(
+                global_settings_path(),
+                r#"{"smart":{"enabled":true,"policy":"architect"}}"#,
+            )
+            .expect("seed settings");
+
+            let pool = vec![
+                "architect-a".to_string(),
+                "architect-b".to_string(),
+                "architect-c".to_string(),
+            ];
+            assert_eq!(
+                route_deep_verify_candidates("some-main-model", &pool),
+                pool,
+                "an outside main model borrows the pool in rank order"
+            );
+            assert_eq!(
+                route_deep_verify_candidates("architect-a", &pool),
+                vec!["architect-b".to_string(), "architect-c".to_string()],
+                "the judged model drops out; the remaining ranks keep their order"
+            );
+
+            // Reordering the pool reorders the ladder — the property `/tier`
+            // move/set exist to give the operator.
+            let reordered = vec![
+                "architect-c".to_string(),
+                "architect-a".to_string(),
+                "architect-b".to_string(),
+            ];
+            assert_eq!(
+                route_deep_verify_candidates("some-main-model", &reordered),
+                reordered
             );
         });
         let _ = fs::remove_dir_all(config_home);

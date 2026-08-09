@@ -753,6 +753,24 @@ fn parses_deep_tier_management_commands() {
         }
     );
     assert_eq!(
+        parse("/tier set 2 claude-opus-5"),
+        SlashCommand::DeepTier {
+            action: DeepTierAction::Set {
+                target: "2".to_string(),
+                model: "claude-opus-5".to_string()
+            }
+        }
+    );
+    assert_eq!(
+        parse("/tier set gpt-5.6-sol claude-opus-5"),
+        SlashCommand::DeepTier {
+            action: DeepTierAction::Set {
+                target: "gpt-5.6-sol".to_string(),
+                model: "claude-opus-5".to_string()
+            }
+        }
+    );
+    assert_eq!(
         parse("/tier move 3 1"),
         SlashCommand::DeepTier {
             action: DeepTierAction::Move { from: 3, to: 1 }
@@ -769,6 +787,42 @@ fn parses_deep_tier_management_commands() {
         let error = SlashCommand::parse(input).expect_err("invalid move should be a usage error");
         assert_eq!(
             error.to_string(),
+            crate::DEEP_TIER_USAGE
+        );
+    }
+}
+
+/// The palette's argument hint is the only place most users learn what `/tier`
+/// can do, so an action the parser accepts but the hint omits is a feature
+/// nobody finds — `move` shipped that way. Pinned against the parser itself,
+/// not against a second hand-written list.
+#[test]
+fn tier_argument_hint_lists_every_parsed_action() {
+    let hint = crate::slash_help::slash_command_specs()
+        .iter()
+        .find(|spec| spec.name == "tier")
+        .expect("/tier has a spec")
+        .argument_hint
+        .expect("/tier takes arguments");
+
+    for (action, sample) in [
+        ("add", "/tier add claude-opus-5"),
+        ("set", "/tier set 2 claude-opus-5"),
+        ("remove", "/tier remove 2"),
+        ("move", "/tier move 2 1"),
+        ("reset", "/tier reset"),
+    ] {
+        assert!(
+            SlashCommand::parse(sample).is_ok_and(|parsed| parsed.is_some()),
+            "parser should accept {sample:?}"
+        );
+        assert!(
+            hint.contains(action),
+            "argument hint {hint:?} omits the parsed action {action:?}"
+        );
+        assert!(
+            crate::DEEP_TIER_USAGE.contains(action),
+            "usage {:?} omits the parsed action {action:?}",
             crate::DEEP_TIER_USAGE
         );
     }
@@ -929,7 +983,7 @@ fn renders_help_from_shared_specs() {
     assert!(help.contains(
         "/smart [status|agents|doctor|on|off|pin|auto|reset|explore|learned|feedback|diversity|providers]"
     ));
-    assert!(help.contains("/tier [add <model>|remove <model|N>|reset]"));
+    assert!(help.contains("/tier [add <model>|set <N> <model>|remove <model|N>|move <N> <M>|reset]"));
     assert!(help.contains("/dump [edit]"));
     // +1 for the /restart re-exec command (Control category).
     assert!(help.contains("/restart"));
