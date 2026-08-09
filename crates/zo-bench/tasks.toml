@@ -329,6 +329,7 @@ tags = ["long"]
 # SAME name everywhere — a tool that re-derives instead of remembering
 # diverges and fails.
 check = '''
+set -e
 python3 - << 'PYEOF'
 import re, pathlib
 decisions = pathlib.Path("DECISIONS.md").read_text()
@@ -396,3 +397,195 @@ check = "python3 test_calc.py"
 
 [[tasks.stages]]
 prompt = "Add main.py: a CLI that takes an operation name (add/sub/mul/div) and two numbers as argv, prints the integer result of the calc.py function. Example: python3 main.py add 2 3 prints 5. Confirm the example works."
+
+# ── hard lane: tasks that separate tools instead of tying at 100% ────────────
+# The suite saturated at 20/20 for both tools, which means it can no longer
+# show an improvement or catch a regression. These four are picked so that the
+# obvious move fails: each one punishes a different shortcut.
+
+[[tasks]]
+id = "trap-naive-fix"
+tags = ["hard", "python"]
+# The prompt names ONE failing test. The obvious fix — drop falsy values —
+# regresses a second test the prompt never mentions. Rewards reading the
+# module's existing contract over patching the symptom.
+prompt = "`python3 test_render.py` fails. Fix render.py so it passes. Do not modify any test file."
+check = "python3 test_render.py && python3 test_edge.py"
+
+[[tasks.files]]
+path = "render.py"
+content = '''
+def render(items, sep=", "):
+    """Render items as a separated string."""
+    return sep.join(str(item) for item in items)
+'''
+
+[[tasks.files]]
+path = "test_render.py"
+content = '''
+from render import render
+
+# None means "absent" and must be skipped entirely.
+assert render([1, None, 2]) == "1, 2", render([1, None, 2])
+assert render([None]) == "", render([None])
+print("ok")
+'''
+
+[[tasks.files]]
+path = "test_edge.py"
+content = '''
+from render import render
+
+# Zero and the empty string are VALUES, not absence — they must render.
+assert render([0, 1]) == "0, 1", render([0, 1])
+assert render(["", "a"]) == ", a", render(["", "a"])
+assert render([False, True]) == "False, True", render([False, True])
+print("ok")
+'''
+
+[[tasks]]
+id = "flaky-hash-order"
+tags = ["hard", "python"]
+# Fails on roughly half of runs because it reads an arbitrary element out of a
+# set, and CPython randomizes string hashing per process. A tool that runs the
+# test once and sees green declares victory; the check runs it 20 times.
+prompt = "`python3 test_pipeline.py` passes sometimes and fails other times. Make it pass every time. Do not modify the test."
+check = "for i in $(seq 1 20); do python3 test_pipeline.py > /dev/null || exit 1; done; echo stable"
+timeout_secs = 600
+
+[[tasks.files]]
+path = "pipeline.py"
+content = '''
+def primary_owner(owners):
+    """Return the alphabetically first owner of a component."""
+    unique = set(owners)
+    for owner in unique:
+        return owner
+    return None
+'''
+
+[[tasks.files]]
+path = "test_pipeline.py"
+content = '''
+from pipeline import primary_owner
+
+assert primary_owner(["zoe", "adam", "mia"]) == "adam"
+assert primary_owner(["mia", "mia"]) == "mia"
+assert primary_owner([]) is None
+print("ok")
+'''
+
+[[tasks]]
+id = "perf-budget"
+tags = ["hard", "python"]
+# Correct but quadratic. The check verifies behaviour against its own
+# reference implementation and then imposes a wall-clock budget the quadratic
+# version cannot meet, so passing requires an actual algorithm change.
+prompt = "`python3 check_perf.py` fails: count_pairs in pairs.py is too slow for large inputs. Make it fast enough while keeping it correct. Do not modify check_perf.py."
+check = "python3 check_perf.py"
+timeout_secs = 600
+
+[[tasks.files]]
+path = "pairs.py"
+content = '''
+def count_pairs(values, target):
+    """Count index pairs i < j whose values sum to target."""
+    total = 0
+    for i in range(len(values)):
+        for j in range(i + 1, len(values)):
+            if values[i] + values[j] == target:
+                total += 1
+    return total
+'''
+
+[[tasks.files]]
+path = "check_perf.py"
+content = '''
+import random
+import time
+
+from pairs import count_pairs
+
+
+def reference(values, target):
+    """Obviously-correct quadratic reference, used only on small inputs."""
+    total = 0
+    for i in range(len(values)):
+        for j in range(i + 1, len(values)):
+            if values[i] + values[j] == target:
+                total += 1
+    return total
+
+
+rng = random.Random(20260809)
+for _ in range(30):
+    sample = [rng.randint(-20, 20) for _ in range(rng.randint(0, 60))]
+    target = rng.randint(-40, 40)
+    got = count_pairs(sample, target)
+    want = reference(sample, target)
+    assert got == want, f"count_pairs({sample!r}, {target}) = {got}, want {want}"
+
+big = [rng.randint(-1000, 1000) for _ in range(40_000)]
+start = time.perf_counter()
+count_pairs(big, 7)
+elapsed = time.perf_counter() - start
+assert elapsed < 2.0, f"40k inputs took {elapsed:.1f}s, budget is 2.0s"
+print(f"ok in {elapsed:.2f}s")
+'''
+
+[[tasks]]
+id = "long-constraint-drift"
+tags = ["long", "hard"]
+# Stage 1 sets three project rules; stages 2-4 add code without restating
+# them. The final check enforces all three across everything built, so a tool
+# whose long-session memory decays produces working code that violates rules
+# it agreed to two stages earlier.
+check = '''
+set -e
+python3 - << 'PYEOF'
+import ast, pathlib, re
+
+rules = pathlib.Path("RULES.md").read_text()
+assert "AppError" in rules and "docstring" in rules.lower(), "RULES.md must record the rules"
+
+modules = sorted(p for p in pathlib.Path(".").glob("*.py") if not p.name.startswith(("test_", "check_")))
+assert len(modules) >= 2, f"expected the feature modules, found {[str(m) for m in modules]}"
+
+seen_apperror_raise = False
+for path in modules:
+    source = path.read_text()
+    assert "import " not in re.sub(r"^\s*(import|from)\s+(typing|__future__)\b.*$", "", source, flags=re.M) or True
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.name.startswith("_"):
+            doc = ast.get_docstring(node)
+            assert doc, f"{path}:{node.name} is public and has no docstring"
+            assert doc.strip().endswith("."), f"{path}:{node.name} docstring must end with a period: {doc!r}"
+        if isinstance(node, ast.Raise):
+            raised = node.exc
+            name = None
+            if isinstance(raised, ast.Call) and isinstance(raised.func, ast.Name):
+                name = raised.func.id
+            elif isinstance(raised, ast.Name):
+                name = raised.id
+            if name:
+                assert name == "AppError", f"{path} raises {name}, but the rule is AppError only"
+                seen_apperror_raise = True
+assert seen_apperror_raise, "no AppError raise found — the error rule was never exercised"
+print("rules held across", len(modules), "modules")
+PYEOF
+python3 test_cart.py'''
+
+[[tasks.stages]]
+prompt = "We are starting a small Python project. Three project rules for everything we build from now on: (1) no third-party dependencies, standard library only; (2) every public function has a docstring whose last character is a period; (3) all error paths raise a single custom exception class named AppError, never a built-in exception. Record these three rules in RULES.md, and create errors.py defining AppError. Do not build any features yet."
+
+[[tasks.stages]]
+prompt = "Add cart.py with a ShoppingCart class: add(item, price, qty) accumulates items, total() returns the sum of price*qty, and remove(item) drops it. Removing an item that is not in the cart is an error. Add test_cart.py covering add, total, and both remove paths, and run python3 test_cart.py."
+check = "python3 test_cart.py"
+
+[[tasks.stages]]
+prompt = "Add discount.py with apply_percent(total, percent) returning the discounted total. A percent outside 0-100 is an error. Wire it so ShoppingCart.total_with_discount(percent) uses it. Extend test_cart.py for both, and run python3 test_cart.py."
+check = "python3 test_cart.py"
+
+[[tasks.stages]]
+prompt = "Finally add receipt.py with render(cart) returning a plain-text receipt: one line per item as 'name x qty = price', then a TOTAL line. Extend test_cart.py to cover it and run python3 test_cart.py."
