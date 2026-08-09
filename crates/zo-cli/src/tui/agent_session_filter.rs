@@ -54,10 +54,57 @@ pub fn manifest_belongs_to_session(
     tools::parent_session_belongs(parent_session_id, session_id, allow_unstamped)
 }
 
+/// Whether `manifest` is the internal micro-prompt classifier — the harness's
+/// own `fan-out intent triage` / `decompose` one-shots, not fleet work the
+/// operator asked for.
+///
+/// They run on a cheap model with no workspace tools and finish before the
+/// agents they select even start, so listing them as executors only pads the
+/// fleet count and buries the real agents. Every agent surface hides them, and
+/// each hides them *while reading manifests*, before a row exists: the tallies
+/// those surfaces show are derived from the rows they kept, so a row that were
+/// hidden but still counted would read as an executor stuck at "running"
+/// forever.
+///
+/// The live HUD list is one of those readers, and it is the single in-memory
+/// fleet the sidebar, the inline fan-out panel, and the viewers' spawn-window
+/// fallback all share — so filtering there covers those three at once.
+#[must_use]
+pub fn manifest_is_internal_classifier(manifest: &Value) -> bool {
+    manifest
+        .get("subagentType")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("classifier"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::manifest_belongs_to_session;
+    use super::{manifest_belongs_to_session, manifest_is_internal_classifier};
     use serde_json::json;
+
+    #[test]
+    fn only_the_classifier_subagent_type_is_internal() {
+        assert!(manifest_is_internal_classifier(
+            &json!({ "subagentType": "classifier" })
+        ));
+        // The spawner writes the type verbatim, so the match is case-insensitive.
+        assert!(manifest_is_internal_classifier(
+            &json!({ "subagentType": "Classifier" })
+        ));
+        for ordinary in [
+            json!({ "subagentType": "code-reviewer" }),
+            json!({ "subagentType": "Explore" }),
+            // A `triage`-named agent of an ordinary type is real fleet work.
+            json!({ "name": "triage", "subagentType": "general-purpose" }),
+            json!({ "name": "classifier" }),
+            json!({}),
+        ] {
+            assert!(
+                !manifest_is_internal_classifier(&ordinary),
+                "{ordinary} must stay visible"
+            );
+        }
+    }
 
     #[test]
     fn matching_parent_session_is_visible() {

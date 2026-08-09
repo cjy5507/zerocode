@@ -2992,6 +2992,13 @@ pub(crate) fn list_running_agents_since(
         ) {
             continue;
         }
+        // The HUD fleet is the single in-memory source the sidebar, the inline
+        // fan-out panel, and the viewers' spawn-window fallback all read, so
+        // dropping the internal classifier here hides it from every one of them
+        // at once — and from the running/total counters derived from this list.
+        if zo_cli::tui::agent_session_filter::manifest_is_internal_classifier(&value) {
+            continue;
+        }
         let reconciled_dead_worker = value
             .get("agentId")
             .and_then(serde_json::Value::as_str)

@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::agent_session_filter::manifest_belongs_to_session;
+use super::agent_session_filter::{manifest_belongs_to_session, manifest_is_internal_classifier};
 use super::modals::{WorkflowAgentRow, WorkflowPhaseRow, WorkflowView};
 
 /// Must match `tools::workflow_tools::progress::ACTIVE_PROGRESS_FILE`.
@@ -865,6 +865,7 @@ fn session_filter_enabled(session_id: Option<&str>) -> bool {
     session_id.is_some_and(|id| !id.trim().is_empty())
 }
 
+
 fn view_has_agents(view: &WorkflowView) -> bool {
     view.phases.iter().any(|phase| !phase.agents.is_empty())
 }
@@ -1469,6 +1470,9 @@ fn build_agents_fallback_since(
         if !manifest_belongs_to_session(&value, session_id, false) {
             continue;
         }
+        if manifest_is_internal_classifier(&value) {
+            continue;
+        }
         if !manifest_value_created_after(&value, started_after_secs) {
             continue;
         }
@@ -1611,6 +1615,11 @@ fn build_agent_rows_since(
             continue;
         };
         if !manifest_belongs_to_session(&value, session_id, false) {
+            continue;
+        }
+        // Not counted in `older_hidden` either: the history toggle promises the
+        // session's own agents, and this one is never the user's work.
+        if manifest_is_internal_classifier(&value) {
             continue;
         }
         if !include_history && !manifest_value_created_after(&value, started_after_secs) {
@@ -2443,6 +2452,61 @@ mod tests {
                 .is_none(),
             "foreign and unstamped manifests must not open another session's panel"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The internal fan-out classifier is harness plumbing: it must not appear
+    /// as an executor in either agent surface, and — because both surfaces
+    /// derive their tallies from the rows they kept — it must not be counted
+    /// either. A hidden-but-counted row would read as an executor stuck at
+    /// "running" forever.
+    #[test]
+    fn agent_surfaces_hide_the_internal_fanout_classifier() {
+        let _guard = manifest_cache_test_lock();
+        let dir = temp_store("classifier-hidden");
+        fs::write(
+            dir.join("triage.json"),
+            r#"{"name":"triage","subagentType":"classifier","status":"running","createdAt":"200","parentSessionId":"session-a"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("decompose.json"),
+            r#"{"name":"decompose","subagentType":"Classifier","status":"completed","createdAt":"200","parentSessionId":"session-a"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("worker.json"),
+            r#"{"name":"real-worker","subagentType":"code-reviewer","status":"running","createdAt":"200","parentSessionId":"session-a"}"#,
+        )
+        .unwrap();
+
+        let view = build_agents_fallback_since(&dir, true, now_secs(), 150, Some("session-a"))
+            .expect("the real worker still opens the panel");
+        let phase = &view.phases[0];
+        assert_eq!(phase.total, 1, "classifiers are not executors");
+        assert_eq!(phase.still_running, 1);
+        assert_eq!(phase.agents.len(), 1);
+        assert_eq!(phase.agents[0].name, "real-worker");
+
+        let snapshot = build_agent_rows_since(&dir, now_secs(), 0, Some("session-a"), false);
+        assert_eq!(snapshot.rows.len(), 1);
+        assert_eq!(snapshot.rows[0].name, "real-worker");
+        assert_eq!(
+            snapshot.older_hidden, 0,
+            "a classifier is not 'hidden history' the toggle could reveal"
+        );
+
+        // Negative control: the same manifests without the classifier tag are
+        // ordinary agents, so the filter is keying on `subagentType` and not on
+        // the name or on some incidental field of the fixtures.
+        fs::write(
+            dir.join("triage.json"),
+            r#"{"name":"triage","subagentType":"Explore","status":"running","createdAt":"200","parentSessionId":"session-a"}"#,
+        )
+        .unwrap();
+        let view = build_agents_fallback_since(&dir, true, now_secs(), 150, Some("session-a"))
+            .expect("panel opens");
+        assert_eq!(view.phases[0].total, 2);
         let _ = fs::remove_dir_all(&dir);
     }
 
