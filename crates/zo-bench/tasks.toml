@@ -79,6 +79,7 @@ def sum_range(a, b):
 
 [[tasks.files]]
 path = "test_calc.py"
+readonly = true
 content = '''
 from calc import sum_range
 
@@ -104,6 +105,7 @@ def median(values):
 
 [[tasks.files]]
 path = "test_stats.py"
+readonly = true
 content = '''
 from stats import median
 
@@ -156,6 +158,7 @@ class UserStore:
 
 [[tasks.files]]
 path = "test_store.py"
+readonly = true
 content = '''
 from store import UserStore
 
@@ -196,6 +199,7 @@ if __name__ == "__main__":
 
 [[tasks.files]]
 path = "data.txt"
+readonly = true
 content = '''widget,10
 gadget,25
 
@@ -205,6 +209,7 @@ gizmo,7
 
 [[tasks.files]]
 path = "check_report.py"
+readonly = true
 content = '''
 import subprocess
 
@@ -243,6 +248,7 @@ if __name__ == "__main__":
 
 [[tasks.files]]
 path = "test_shout.py"
+readonly = true
 content = '''
 import subprocess
 
@@ -422,6 +428,7 @@ def render(items, sep=", "):
 
 [[tasks.files]]
 path = "test_render.py"
+readonly = true
 content = '''
 from render import render
 
@@ -433,6 +440,7 @@ print("ok")
 
 [[tasks.files]]
 path = "test_edge.py"
+readonly = true
 content = '''
 from render import render
 
@@ -466,6 +474,7 @@ def primary_owner(owners):
 
 [[tasks.files]]
 path = "test_pipeline.py"
+readonly = true
 content = '''
 from pipeline import primary_owner
 
@@ -500,6 +509,7 @@ def count_pairs(values, target):
 
 [[tasks.files]]
 path = "check_perf.py"
+readonly = true
 content = '''
 import random
 import time

@@ -114,6 +114,12 @@ struct StageConfig {
 struct TaskFile {
     path: String,
     content: String,
+    /// A file the task owns rather than the tool: a test the prompt says not
+    /// to touch, or a check script. Every such file is written back verbatim
+    /// before the check runs, so "do not modify the test" stops being an
+    /// honour rule that a tool can score a pass by breaking.
+    #[serde(default)]
+    readonly: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -134,6 +140,12 @@ struct RowRecord {
     tool_reported_error: bool,
     /// Number of prompts this row spans (1 = classic single-shot task).
     stages: u32,
+    /// Task-owned files (tests, check scripts) the tool had modified, restored
+    /// verbatim before the check ran. Non-empty means the tool edited the
+    /// measurement — the row still scores on the declared check, and this names
+    /// what it touched.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    restored_files: Vec<String>,
     /// Per-stage breakdown for multi-stage tasks (`None` on single-shot rows,
     /// keeping legacy row shape byte-compatible). This is where the
     /// long-horizon economics live: a stage-3 cost far above stage 1's on the
@@ -413,6 +425,8 @@ fn run_one(
     let mut any_timed_out = false;
     let mut stage_details: Vec<StageDetail> = Vec::new();
     let mut all_stage_checks_green = true;
+    // Task-owned files the tool changed and the runner put back before judging.
+    let mut restored_files: Vec<String> = Vec::new();
 
     for (index, stage) in stages.iter().enumerate() {
         let stage_no = u32::try_from(index).unwrap_or(u32::MAX) + 1;
@@ -462,11 +476,10 @@ fn run_one(
 
         let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
         let metrics = parse_tool_metrics(&stdout);
-        let stage_check_exit = stage
-            .check
-            .as_deref()
-            .map(|check| run_check(check, &workdir, defaults.check_timeout_secs))
-            .map(|exit| exit.unwrap_or(-1));
+        let stage_check_exit = stage.check.as_deref().map(|check| {
+            restored_files.extend(restore_readonly_files(&task.files, &workdir));
+            run_check(check, &workdir, defaults.check_timeout_secs).unwrap_or(-1)
+        });
         if let Some(exit) = stage_check_exit {
             if exit != 0 {
                 all_stage_checks_green = false;
@@ -505,6 +518,9 @@ fn run_one(
         }
     }
 
+    restored_files.extend(restore_readonly_files(&task.files, &workdir));
+    restored_files.sort_unstable();
+    restored_files.dedup();
     let check_exit = run_check(&task.check, &workdir, defaults.check_timeout_secs);
     let stage_count = u32::try_from(stage_details.len()).unwrap_or(u32::MAX);
     Ok(RowRecord {
@@ -512,6 +528,7 @@ fn run_one(
         tool: tool.name.clone(),
         trial,
         success: check_exit == Some(0) && all_stage_checks_green,
+        restored_files,
         wall_ms: total_wall,
         check_exit,
         tool_exit: last_tool_exit,
@@ -651,6 +668,29 @@ fn parse_tool_metrics(stdout: &str) -> ToolMetrics {
     }
 }
 
+/// Put the task-owned files back exactly as declared and report which ones had
+/// been changed.
+///
+/// The suite tells tools not to edit its tests, and until this ran, nothing
+/// checked: a tool that rewrote `test_edge.py` — or the perf check that times
+/// it — scored a clean pass. Restoring immediately before the check makes the
+/// verdict independent of what the tool did to the measurement, and the
+/// returned list turns a silent cheat into a recorded fact.
+fn restore_readonly_files(files: &[TaskFile], workdir: &Path) -> Vec<String> {
+    let mut restored = Vec::new();
+    for file in files.iter().filter(|file| file.readonly) {
+        let path = workdir.join(&file.path);
+        let current = std::fs::read_to_string(&path).ok();
+        if current.as_deref() == Some(file.content.as_str()) {
+            continue;
+        }
+        if std::fs::write(&path, &file.content).is_ok() {
+            restored.push(file.path.clone());
+        }
+    }
+    restored
+}
+
 fn run_check(check: &str, workdir: &Path, timeout_secs: u64) -> Option<i32> {
     let mut child = Command::new("sh")
         .args(["-c", check])
@@ -735,6 +775,62 @@ fn render_scoreboard(scoreboard: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every "do not modify the test" in the suite was an honour rule until the
+    /// runner started putting task-owned files back before judging. A tool that
+    /// rewrites the test it is measured by must not score a pass, and the row
+    /// must name what it touched.
+    #[test]
+    fn a_rewritten_test_is_restored_before_the_check_and_reported() {
+        let workdir = std::env::temp_dir().join(format!(
+            "zo-bench-restore-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workdir).expect("workdir");
+        let files = vec![
+            TaskFile {
+                path: "test_calc.py".to_string(),
+                content: "assert calc() == 6\n".to_string(),
+                readonly: true,
+            },
+            TaskFile {
+                path: "untouched_test.py".to_string(),
+                content: "assert True\n".to_string(),
+                readonly: true,
+            },
+            TaskFile {
+                path: "calc.py".to_string(),
+                content: "def calc():\n    return 0\n".to_string(),
+                readonly: false,
+            },
+        ];
+        for file in &files {
+            std::fs::write(workdir.join(&file.path), &file.content).expect("materialize");
+        }
+        // The tool neuters the test it is judged by and edits the file it is
+        // supposed to edit.
+        std::fs::write(workdir.join("test_calc.py"), "pass\n").expect("tamper");
+        std::fs::write(workdir.join("calc.py"), "def calc():\n    return 6\n").expect("real work");
+
+        let restored = restore_readonly_files(&files, &workdir);
+
+        assert_eq!(restored, vec!["test_calc.py".to_string()], "only the changed task-owned file is reported");
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("test_calc.py")).expect("read"),
+            "assert calc() == 6\n",
+            "the check judges the declared test, not the tool's rewrite"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("calc.py")).expect("read"),
+            "def calc():\n    return 6\n",
+            "the tool's own work is left alone"
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
 
     #[test]
     fn placeholder_expansion_covers_prompt_paths_and_session() {
@@ -896,6 +992,7 @@ mod tests {
             cache_creation_tokens: 0,
             tool_reported_error: false,
             stages: 1,
+            restored_files: Vec::new(),
             stage_detail: None,
         };
         let rows = vec![
