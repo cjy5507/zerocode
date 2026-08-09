@@ -2080,12 +2080,21 @@ fn clarify_report_names_the_readings_and_the_next_step() {
         panic!("the canonical ambiguous goal must fire");
     };
     let report = build_goal_clarify_report("100프로 커버리지 만들어", &cues);
-    assert!(report.contains("not started"), "the goal must NOT start: {report}");
+    assert!(report.contains("아직 시작 안 함"), "the goal must NOT start: {report}");
+    assert!(
+        report.contains("무엇을 뜻하나요"),
+        "the hold must read as a question, not an error: {report}"
+    );
     assert!(
         report.contains("테스트 커버리지") && report.contains("요구사항"),
         "both readings offered: {report}"
     );
     assert!(report.contains("--check"), "objective-check escape hatch: {report}");
+    // M3 내부 용어 노출 제로: 게이트 해제 env 노브는 사용자 표면에 나오면 안 됨.
+    assert!(
+        !report.contains("ZO_GOAL_CONTRACT"),
+        "internal env knob must never surface to the user: {report}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -145,19 +145,29 @@ pub(crate) fn has_objective_checks(checks: &[String]) -> bool {
 /// objective `--check`). This is the pre-execution half of the goal contract —
 /// one question here is cheaper than hours on the wrong reading.
 pub(crate) fn build_goal_clarify_report(goal: &str, cues: &[decision_core::AmbiguityCue]) -> String {
+    // This is a QUESTION, not an error: the goal is held (not started) until
+    // one ambiguous success metric is pinned down — the 12-hour runaway burned
+    // on exactly such a goal. The copy must read conversationally; internal
+    // knobs (env vars) never surface here (M3: zero internal-term exposure).
     let mut out = format!(
-        "Goal needs one clarification (not started)\n  Goal             {goal}"
+        "시작 전에 하나만 확인할게요 (아직 시작 안 함)\n  목표             {goal}"
     );
     for cue in cues {
-        let _ = write!(out, "\n  \"{}\" 해석      ", cue.term);
+        let _ = write!(
+            out,
+            "\n  \"{}\"이(가) 무엇을 뜻하나요?",
+            cue.term
+        );
         for (index, reading) in cue.interpretations.iter().enumerate() {
             let _ = write!(out, "\n    {}. {reading}", index + 1);
         }
     }
     let _ = write!(
         out,
-        "\n  Next             해석을 명시해 `/goal`을 다시 실행하거나, 객관 기준을 붙이세요 \
-         (예: `--check cargo:test`, `--check grep:PATTERN`). ZO_GOAL_CONTRACT=0 으로 게이트 해제."
+        "\n  다음             기준을 한 줄 덧붙여 `/goal`을 다시 실행하세요 — 예: \
+         `/goal <목표> — \"{}\"은 1번 기준`. 객관 검증 명령이 있다면 `--check <명령>`이 \
+         가장 확실합니다 (그 명령이 그린이면 완료로 인정).",
+        cues.first().map_or("용어", |cue| cue.term)
     );
     out
 }
