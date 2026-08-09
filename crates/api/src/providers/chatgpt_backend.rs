@@ -240,6 +240,39 @@ pub(crate) fn build_responses_request_for_session(
     payload
 }
 
+fn build_image_generation_request(
+    model: &str,
+    prompt: &str,
+    size: Option<&str>,
+    quality: Option<&str>,
+) -> Value {
+    let (model, fast) = chatgpt_model_and_speed(model);
+    let mut tool = json!({ "type": "image_generation" });
+    if let Some(size) = size {
+        tool["size"] = json!(size);
+    }
+    if let Some(quality) = quality {
+        tool["quality"] = json!(quality);
+    }
+    let mut payload = json!({
+        "model": model,
+        "instructions": "Use the image generation tool exactly once. Do not emit prose.",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": prompt }],
+        }],
+        "store": false,
+        "stream": true,
+        "tools": [tool],
+        "tool_choice": { "type": "image_generation" },
+    });
+    if fast {
+        payload["service_tier"] = json!("priority");
+    }
+    payload
+}
+
 /// Stable marker prefixes of the runtime's empty-response retry/continuation
 /// system reminders (`crates/runtime/src/conversation/mod.rs`). The api crate
 /// cannot depend on the runtime crate, so the literals are duplicated here and
@@ -1733,6 +1766,31 @@ impl ChatGptBackendClient {
         builder
     }
 
+    pub async fn generate_image(
+        &self,
+        model: &str,
+        prompt: &str,
+        size: Option<&str>,
+        quality: Option<&str>,
+    ) -> Result<String, ApiError> {
+        let body = build_image_generation_request(model, prompt, size, quality);
+        let response = self
+            .apply_headers(self.http.post(&self.base_url))
+            .json(&body)
+            .send()
+            .await
+            .map_err(ApiError::from)?;
+        let idle_timeout = super::stream_idle_timeout();
+        let response = match idle_timeout {
+            Some(idle) => tokio::time::timeout(idle, expect_success(response))
+                .await
+                .map_err(|_| ApiError::stream_idle_timeout(idle))??,
+            None => expect_success(response).await?,
+        };
+        let body = read_image_generation_sse(response, idle_timeout).await?;
+        image_generation_result_from_sse(&body)
+    }
+
     pub async fn stream_message(
         &self,
         request: &MessageRequest,
@@ -1799,6 +1857,145 @@ impl ChatGptBackendClient {
             &request.model,
             self.cache_scope(),
         ))
+    }
+}
+
+const MAX_IMAGE_GENERATION_SSE_BYTES: usize = 64 * 1024 * 1024;
+
+async fn read_image_generation_sse(
+    mut response: reqwest::Response,
+    idle_timeout: Option<std::time::Duration>,
+) -> Result<String, ApiError> {
+    let mut body = Vec::new();
+    loop {
+        let chunk = match idle_timeout {
+            Some(idle) => tokio::time::timeout(idle, response.chunk())
+                .await
+                .map_err(|_| ApiError::stream_idle_timeout(idle))??,
+            None => response.chunk().await?,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if body
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|size| size > MAX_IMAGE_GENERATION_SSE_BYTES)
+        {
+            return Err(ApiError::InvalidSseFrame(
+                "Codex image generation response exceeded the safe size limit",
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|_| {
+        ApiError::InvalidSseFrame("Codex image generation returned non-UTF-8 SSE data")
+    })
+}
+
+fn image_generation_result_from_sse(body: &str) -> Result<String, ApiError> {
+    let mut latest_partial = None;
+    let mut final_result = None;
+    let mut completed = false;
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.image_generation_call.partial_image") => {
+                if let Some(result) = event.get("partial_image_b64").and_then(Value::as_str) {
+                    latest_partial = Some(result.to_string());
+                }
+            }
+            Some("response.image_generation_call.completed") => {
+                if let Some(result) = event.get("result").and_then(Value::as_str) {
+                    final_result = Some(result.to_string());
+                }
+            }
+            Some("response.output_item.done") => {
+                if let Some(result) = event
+                    .get("item")
+                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("image_generation_call"))
+                    .and_then(|item| item.get("result"))
+                    .and_then(Value::as_str)
+                {
+                    final_result = Some(result.to_string());
+                }
+            }
+            Some("response.completed") => {
+                completed = true;
+                if let Some(result) = event
+                    .get("response")
+                    .and_then(|response| response.get("output"))
+                    .and_then(Value::as_array)
+                    .and_then(|items| {
+                        items.iter().rev().find_map(|item| {
+                            (item.get("type").and_then(Value::as_str)
+                                == Some("image_generation_call"))
+                            .then(|| item.get("result").and_then(Value::as_str))
+                            .flatten()
+                        })
+                    })
+                {
+                    final_result = Some(result.to_string());
+                }
+            }
+            Some("response.failed" | "response.incomplete" | "error") => {
+                return Err(image_generation_failure(&event));
+            }
+            _ => {}
+        }
+    }
+    if !completed {
+        return Err(ApiError::InvalidSseFrame(
+            "Codex image generation stream ended before response.completed",
+        ));
+    }
+    // With `store: false`, the subscription backend can leave terminal output
+    // empty and place the completed PNG in the last partial-image event.
+    final_result.or(latest_partial).ok_or(ApiError::InvalidSseFrame(
+        "Codex image generation completed without image data",
+    ))
+}
+
+fn image_generation_failure(event: &Value) -> ApiError {
+    let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
+    let (code, message) = match event_type {
+        "response.failed" => (
+            event.pointer("/response/error/code").and_then(Value::as_str),
+            event.pointer("/response/error/message").and_then(Value::as_str),
+        ),
+        "response.incomplete" => (
+            Some("response_incomplete"),
+            event
+                .pointer("/response/incomplete_details/reason")
+                .and_then(Value::as_str),
+        ),
+        _ => (
+            event.get("code").and_then(Value::as_str),
+            event.get("message").and_then(Value::as_str),
+        ),
+    };
+    let code = code.unwrap_or(event_type);
+    let retryable = matches!(
+        code,
+        "server_error" | "rate_limit_exceeded" | "overloaded" | "slow_down"
+    );
+    ApiError::StreamApi {
+        error_type: (!code.is_empty()).then(|| code.to_string()),
+        message: message.map(str::to_string).or_else(|| {
+            failure_frame_digest(event)
+                .map(|digest| format!("image generation failed ({digest})"))
+        }),
+        body: String::new(),
+        retryable,
     }
 }
 

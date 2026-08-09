@@ -225,6 +225,7 @@ const CORE_TOOL_SPEC_FACTORIES: &[ToolSpecFactory] = &[
     bash_tools::tool_specs,
     typed_actions::tool_specs,
     file_tools::tool_specs,
+    crate::image_tools::tool_specs,
     task_tools::tool_specs,
     mcp_tools::tool_specs,
     misc_tools::tool_specs,
@@ -814,8 +815,13 @@ impl GlobalToolRegistry {
         &self,
         allowed_tools: Option<&BTreeSet<String>>,
     ) -> Result<Vec<(String, PermissionMode)>, ToolError> {
-        let builtin = self
-            .builtin_tool_specs()
+        let mut builtin_specs = self.builtin_tool_specs();
+        if !builtin_specs.iter().any(|spec| spec.name == "imagegen")
+            && !self.is_tool_disabled("imagegen")
+        {
+            builtin_specs.extend(crate::image_tools::tool_specs());
+        }
+        let builtin = builtin_specs
             .into_iter()
             .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
             .map(|spec| (spec.name.to_string(), spec.required_permission));
@@ -1223,9 +1229,14 @@ impl GlobalToolRegistry {
         // Drive their visibility from the authoritative plan flag, not a prompt
         // hint. `ExitPlanModeV2` (ReadOnly plan submission) stays advertised.
         let plan_selected = self.context.plan_selected();
+        let imagegen_available = self
+            .context
+            .active_model()
+            .is_some_and(|model| crate::image_tools::supports_model(&model));
         mvp_tool_specs()
             .iter()
             .filter(|spec| spec.name != "LSP" || !self.context.lsp.is_empty())
+            .filter(|spec| spec.name != "imagegen" || imagegen_available)
             .filter(|spec| !is_agent_only_tool(spec.name))
             .filter(|spec| !self.is_tool_disabled(spec.name))
             .filter(|spec| !plan_selected || !is_plan_reentry_tool(spec.name))
@@ -1395,6 +1406,34 @@ mod tests {
             PluginToolPermission::ReadOnly,
             None,
         )
+    }
+
+    #[test]
+    fn imagegen_is_advertised_only_for_current_gpt_models() {
+        let registry = GlobalToolRegistry::builtin();
+        let advertised = |registry: &GlobalToolRegistry| {
+            registry
+                .definitions(None)
+                .iter()
+                .any(|definition| definition.name == "imagegen")
+        };
+
+        let imagegen_permission = |registry: &GlobalToolRegistry| {
+            registry
+                .permission_specs(None)
+                .expect("permission specs")
+                .into_iter()
+                .find_map(|(name, mode)| (name == "imagegen").then_some(mode))
+        };
+
+        assert!(!advertised(&registry));
+        assert_eq!(imagegen_permission(&registry), Some(PermissionMode::WorkspaceWrite));
+        registry.context().set_active_model("gpt-5.6-sol");
+        assert!(advertised(&registry));
+        assert_eq!(imagegen_permission(&registry), Some(PermissionMode::WorkspaceWrite));
+        registry.context().set_active_model("claude-opus-5");
+        assert!(!advertised(&registry));
+        assert_eq!(imagegen_permission(&registry), Some(PermissionMode::WorkspaceWrite));
     }
 
     #[test]

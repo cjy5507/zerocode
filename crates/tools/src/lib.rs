@@ -26,6 +26,7 @@ mod dispatch;
 pub mod error;
 mod fanout;
 mod file_tools;
+mod image_tools;
 mod file_write_lease;
 mod gateway;
 mod hunk_attribution;

@@ -421,6 +421,22 @@ impl ProviderClient {
         }
     }
 
+    pub async fn generate_image(
+        &self,
+        model: &str,
+        prompt: &str,
+        size: Option<&str>,
+        quality: Option<&str>,
+    ) -> Result<String, ApiError> {
+        match self {
+            Self::ChatGpt(client) => client.generate_image(model, prompt, size, quality).await,
+            _ => Err(ApiError::unsupported_auth_route(
+                "OpenAI image generation",
+                "non-OAuth",
+            )),
+        }
+    }
+
     pub async fn stream_message(
         &self,
         request: &MessageRequest,

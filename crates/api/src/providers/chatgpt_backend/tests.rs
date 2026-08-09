@@ -4302,3 +4302,94 @@ fn a_populated_terminal_frame_is_authoritative_over_the_streamed_items() {
         ])
     );
 }
+
+#[test]
+fn image_generation_request_uses_the_hosted_tool_contract() {
+    let body = super::build_image_generation_request(
+        "gpt-5.6-sol[fast]",
+        "a blue circle",
+        Some("1024x1024"),
+        Some("low"),
+    );
+
+    assert_eq!(body["model"], "gpt-5.6-sol");
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["store"], false);
+    assert_eq!(body["service_tier"], "priority");
+    assert_eq!(body["tools"][0]["type"], "image_generation");
+    assert_eq!(body["tools"][0]["size"], "1024x1024");
+    assert_eq!(body["tools"][0]["quality"], "low");
+    assert_eq!(body["tool_choice"]["type"], "image_generation");
+    assert_eq!(
+        body["input"][0]["content"][0]["text"],
+        "a blue circle"
+    );
+}
+
+#[test]
+fn image_generation_parser_keeps_the_last_image_only_after_completion() {
+    let complete = concat!(
+        "data: {\"type\":\"response.image_generation_call.partial_image\",",
+        "\"partial_image_b64\":\"EARLY\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"item\":{",
+        "\"type\":\"image_generation_call\",\"result\":\"FINAL\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
+    );
+    let incomplete = concat!(
+        "data: {\"type\":\"response.image_generation_call.partial_image\",",
+        "\"partial_image_b64\":\"PARTIAL\"}\n\n",
+    );
+
+    assert_eq!(
+        super::image_generation_result_from_sse(complete).expect("completed image"),
+        "FINAL"
+    );
+    let error = super::image_generation_result_from_sse(incomplete)
+        .expect_err("an unterminated image stream must fail");
+    assert!(error.to_string().contains("before response.completed"));
+}
+
+#[test]
+fn image_generation_parser_surfaces_provider_failure_messages() {
+    let failed = concat!(
+        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{",
+        "\"code\":\"rate_limit_exceeded\",\"message\":\"image quota exhausted\"}}}\n\n",
+    );
+
+    let error = super::image_generation_result_from_sse(failed)
+        .expect_err("provider failure must be preserved");
+    assert!(error.to_string().contains("image quota exhausted"));
+    assert!(error.is_retryable());
+}
+
+#[tokio::test]
+async fn image_generation_round_trips_over_the_chatgpt_backend() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let response = concat!(
+        "data: {\"type\":\"response.image_generation_call.partial_image\",",
+        "\"partial_image_b64\":\"IMAGE_BYTES\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
+    );
+    let server = tokio::spawn(scripted_responses_backend(
+        listener,
+        vec![Some(response)],
+        bodies.clone(),
+    ));
+    let client = super::ChatGptBackendClient::new("token", Some("account".to_string()))
+        .with_base_url(format!("http://{addr}"));
+
+    let generated = client
+        .generate_image("gpt-5.6-sol", "a test image", None, Some("low"))
+        .await
+        .expect("image response");
+    assert_eq!(generated, "IMAGE_BYTES");
+    server.await.unwrap();
+
+    let request = bodies.lock().expect("bodies lock").pop().expect("request");
+    let payload = request.split_once("\r\n\r\n").expect("HTTP body").1;
+    let payload: serde_json::Value = serde_json::from_str(payload).expect("JSON request");
+    assert_eq!(payload["tools"][0]["type"], "image_generation");
+    assert_eq!(payload["tools"][0]["quality"], "low");
+}

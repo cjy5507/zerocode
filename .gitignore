@@ -18,6 +18,7 @@
 **/.zo/tasks/
 **/.zo/design/
 **/.zo/artifacts/
+**/.zo/generated-images/
 **/.zo/automation/
 **/.zo/memory/.embcache.bin
 **/.zo/workflows/

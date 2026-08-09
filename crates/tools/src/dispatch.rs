@@ -33,7 +33,8 @@ use crate::gateway::{
     self, failed_result, successful_result, toggle_denied_decision, ToolResultMetadata,
 };
 use crate::{
-    bash_tools, codegraph_tools, file_tools, mcp_tools, misc_tools, plan_mode_v2, task_tools,
+    bash_tools, codegraph_tools, file_tools, image_tools, mcp_tools, misc_tools, plan_mode_v2,
+    task_tools,
     team_tools, typed_actions, web_tools, worker_tools, workflow_tools, worktree_tools,
 };
 
@@ -49,6 +50,7 @@ const BUILTIN_DISPATCHERS: &[BuiltinDispatcher] = &[
     codegraph_tools::dispatch,
     typed_actions::dispatch,
     file_tools::dispatch,
+    image_tools::dispatch,
     web_tools::dispatch,
     task_tools::dispatch,
     worker_tools::dispatch,
