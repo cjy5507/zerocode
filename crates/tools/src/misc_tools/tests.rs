@@ -1182,12 +1182,10 @@ fn reclaim_spawn_slots_frees_one_and_keeps_the_unfinished() {
 
     let mut in_flight = vec![done_id.clone(), slow_id.clone()];
     let mut completions = Vec::new();
+    let mut deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut extensions = 0u32;
     let start = std::time::Instant::now();
-    super::reclaim_spawn_slots(
-        &mut in_flight,
-        &mut completions,
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
-    );
+    super::reclaim_spawn_slots(&mut in_flight, &mut completions, &mut deadline, &mut extensions);
     let elapsed = start.elapsed();
 
     assert_eq!(in_flight, [slow_id], "the unfinished sibling stays in flight");
@@ -1247,13 +1245,13 @@ fn reclaim_timeout_cancels_oldest_to_terminal_before_freeing_slot() {
 
     let mut in_flight = vec![oldest.clone(), younger.clone()];
     let mut completions = Vec::new();
+    // No manifest heartbeat was ever stamped (`lastActivityAt` absent), so the
+    // progress gate treats both agents as stale and never extends the deadline.
+    let mut deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+    let mut extensions = 0u32;
     let start = std::time::Instant::now();
     // Deadline already at/near now, so the timeout branch fires deterministically.
-    super::reclaim_spawn_slots(
-        &mut in_flight,
-        &mut completions,
-        std::time::Instant::now() + std::time::Duration::from_millis(20),
-    );
+    super::reclaim_spawn_slots(&mut in_flight, &mut completions, &mut deadline, &mut extensions);
     let elapsed = start.elapsed();
 
     assert_eq!(
@@ -1311,11 +1309,15 @@ fn final_drain_cancels_all_live_agents_before_worktree_collect() {
 
     let mut in_flight = vec![first.clone(), second.clone()];
     let mut completions = Vec::new();
+    // No heartbeat stamped → stale → the drain cancels instead of extending.
+    let mut deadline = std::time::Instant::now();
+    let mut extensions = 0u32;
     let start = std::time::Instant::now();
     super::drain_or_cancel_remaining_agents(
         &mut in_flight,
         &mut completions,
-        std::time::Instant::now(),
+        &mut deadline,
+        &mut extensions,
     );
     let elapsed = start.elapsed();
 
@@ -1371,11 +1373,13 @@ fn shared_deadline_is_not_rearmed_per_reclaim() {
 
     let mut in_flight = ids.clone();
     let mut completions = Vec::new();
-    // One deadline shared by every reclaim, already elapsed.
-    let deadline = std::time::Instant::now();
+    // One deadline shared by every reclaim, already elapsed. No heartbeat is
+    // stamped on any manifest, so the progress gate never re-arms it either.
+    let mut deadline = std::time::Instant::now();
+    let mut extensions = 0u32;
     let start = std::time::Instant::now();
     while !in_flight.is_empty() {
-        super::reclaim_spawn_slots(&mut in_flight, &mut completions, deadline);
+        super::reclaim_spawn_slots(&mut in_flight, &mut completions, &mut deadline, &mut extensions);
     }
     let elapsed = start.elapsed();
 
@@ -1391,6 +1395,322 @@ fn shared_deadline_is_not_rearmed_per_reclaim() {
             "every reclaimed agent is driven terminal"
         );
     }
+
+    match prior_store {
+        Some(value) => std::env::set_var("ZO_AGENT_STORE", value),
+        None => std::env::remove_var("ZO_AGENT_STORE"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The progress gate that decides between extending the fan-out deadline and
+/// cancelling: pure, so every branch is exercised without waiting out a real
+/// deadline. A candidate is spared only when its heartbeat is inside the
+/// activity window AND extensions remain; a never-stamped heartbeat is stale.
+#[test]
+fn deadline_extension_gate_is_progress_and_cap_bounded() {
+    let window_secs = super::SPAWN_RECLAIM_ACTIVITY_WINDOW.as_secs();
+    assert!(
+        super::reclaim_should_extend_deadline(Some(0), 0),
+        "a just-stamped heartbeat with extensions remaining earns an extension"
+    );
+    assert!(
+        super::reclaim_should_extend_deadline(
+            Some(window_secs),
+            super::SPAWN_DEADLINE_MAX_EXTENSIONS - 1
+        ),
+        "the window boundary is inclusive and the last extension is grantable"
+    );
+    assert!(
+        !super::reclaim_should_extend_deadline(Some(window_secs + 1), 0),
+        "a heartbeat past the activity window is stale — reclaim"
+    );
+    assert!(
+        !super::reclaim_should_extend_deadline(None, 0),
+        "no heartbeat ever stamped means no evidence of progress — reclaim"
+    );
+    assert!(
+        !super::reclaim_should_extend_deadline(Some(0), super::SPAWN_DEADLINE_MAX_EXTENSIONS),
+        "once the cap is spent even a busy agent is reclaimed — the budget stays bounded"
+    );
+}
+
+/// Patch a persisted manifest's `lastActivityAt` heartbeat, mirroring what the
+/// production `record_agent_*` frame updates do.
+fn stamp_manifest_activity(dir: &std::path::Path, id: &str, stamped_at: u64) {
+    let path = dir.join(format!("{id}.json"));
+    let raw = std::fs::read_to_string(&path).expect("read manifest for stamp");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).expect("parse manifest for stamp");
+    value["lastActivityAt"] = serde_json::json!(stamped_at);
+    std::fs::write(&path, serde_json::to_string(&value).expect("manifest json"))
+        .expect("write stamped manifest");
+}
+
+/// Epoch seconds for heartbeat fixtures.
+fn epoch_secs_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be after epoch")
+        .as_secs()
+}
+
+/// The heartbeat readers behind the progress gate, against a real store: a
+/// fresh stamp reads back as a small age, a stale one as a large age, a
+/// never-stamped manifest as `None` — and the drain's freshest-of-set pick
+/// takes the minimum so one working straggler represents the whole set.
+#[test]
+fn heartbeat_age_readers_reflect_the_persisted_stamp() {
+    let _guard = env_lock();
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).expect("create agent store");
+    let prior_store = std::env::var_os("ZO_AGENT_STORE");
+    std::env::set_var("ZO_AGENT_STORE", &dir);
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be after epoch")
+        .as_nanos();
+    let fresh = format!("hb-fresh-{stamp}");
+    let stale = format!("hb-stale-{stamp}");
+    let never = format!("hb-never-{stamp}");
+    write_manifest_for_drain(&dir, &fresh, "hb-sess", "running");
+    write_manifest_for_drain(&dir, &stale, "hb-sess", "running");
+    write_manifest_for_drain(&dir, &never, "hb-sess", "running");
+    stamp_manifest_activity(&dir, &fresh, epoch_secs_now());
+    stamp_manifest_activity(&dir, &stale, epoch_secs_now().saturating_sub(10_000));
+
+    let fresh_age = super::agent_tools::agent_seconds_since_last_activity(&fresh)
+        .expect("fresh agent has a heartbeat");
+    assert!(fresh_age <= 5, "a just-stamped heartbeat reads near zero: {fresh_age}");
+    let stale_age = super::agent_tools::agent_seconds_since_last_activity(&stale)
+        .expect("stale agent has a heartbeat");
+    assert!(stale_age >= 9_000, "an old stamp reads as a large age: {stale_age}");
+    assert_eq!(
+        super::agent_tools::agent_seconds_since_last_activity(&never),
+        None,
+        "a manifest without the stamp yields no age"
+    );
+    let set_age = super::freshest_activity_age_secs(&[stale.clone(), fresh.clone(), never.clone()])
+        .expect("set with a heartbeat yields an age");
+    assert!(
+        set_age <= 5,
+        "the set-level reader picks the freshest member, not the stale one: {set_age}"
+    );
+
+    match prior_store {
+        Some(value) => std::env::set_var("ZO_AGENT_STORE", value),
+        None => std::env::remove_var("ZO_AGENT_STORE"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The screenshot defect: the final drain used to cancel a healthy agent that
+/// was 20+ minutes into real work the instant the fixed deadline elapsed. Now
+/// a fresh heartbeat earns a bounded extension and the agent's own terminal
+/// completion is collected instead of a synthetic `stopped`: the deliverable
+/// survives, the extension counter records the grant, and the manifest is
+/// never driven terminal by the scheduler.
+#[test]
+fn final_drain_extends_for_a_mid_work_agent_instead_of_cancelling() {
+    let _guard = env_lock();
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).expect("create agent store");
+    let prior_store = std::env::var_os("ZO_AGENT_STORE");
+    std::env::set_var("ZO_AGENT_STORE", &dir);
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be after epoch")
+        .as_nanos();
+    let _completion_rx = super::agent_tools::register_agent_completion_channel();
+    let busy = format!("drain-busy-{stamp}");
+    write_manifest_for_drain(&dir, &busy, "sched-sess", "running");
+    std::fs::write(dir.join(format!("{busy}.md")), "").expect("busy output file");
+    stamp_manifest_activity(&dir, &busy, epoch_secs_now());
+
+    // The agent finishes on its own shortly after the (already-elapsed)
+    // deadline — inside the extension the gate grants for its fresh heartbeat.
+    let publish_id = busy.clone();
+    let publisher = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(super::agent_tools::publish_agent_completion_for_tests(
+            super::AgentCompletion {
+                agent_id: publish_id.clone(),
+                name: "busy".to_string(),
+                status: "completed".to_string(),
+                result: Some("real deliverable".to_string()),
+                structured: None,
+                error: None,
+                output_tokens: 1,
+            }
+        ));
+    });
+
+    let mut in_flight = vec![busy.clone()];
+    let mut completions = Vec::new();
+    let mut deadline = std::time::Instant::now();
+    let mut extensions = 0u32;
+    let start = std::time::Instant::now();
+    super::drain_or_cancel_remaining_agents(
+        &mut in_flight,
+        &mut completions,
+        &mut deadline,
+        &mut extensions,
+    );
+    let elapsed = start.elapsed();
+    publisher.join().expect("publisher thread");
+
+    assert!(in_flight.is_empty(), "the drain still empties the in-flight set");
+    assert_eq!(extensions, 1, "exactly one progress extension was granted");
+    assert_eq!(completions.len(), 1);
+    assert_eq!(
+        completions[0].status, "completed",
+        "the agent's own terminal completion is collected, not a synthetic stop"
+    );
+    assert_eq!(completions[0].result.as_deref(), Some("real deliverable"));
+    assert_eq!(
+        manifest_status_on_disk(&dir, &busy),
+        "running",
+        "the scheduler never drove the mid-work agent terminal"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the extension wait returns on the completion, not after the whole step: {elapsed:?}"
+    );
+
+    match prior_store {
+        Some(value) => std::env::set_var("ZO_AGENT_STORE", value),
+        None => std::env::remove_var("ZO_AGENT_STORE"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Once the extension cap is spent, even a demonstrably busy agent is
+/// reclaimed — the collection budget must stay bounded. Same fixture as the
+/// rescue test, but with the counter already at the cap: the drain cancels
+/// immediately instead of waiting another step.
+#[test]
+fn final_drain_reclaims_a_busy_agent_once_the_extension_cap_is_spent() {
+    let _guard = env_lock();
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).expect("create agent store");
+    let prior_store = std::env::var_os("ZO_AGENT_STORE");
+    std::env::set_var("ZO_AGENT_STORE", &dir);
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be after epoch")
+        .as_nanos();
+    let _completion_rx = super::agent_tools::register_agent_completion_channel();
+    let busy = format!("drain-capped-{stamp}");
+    write_manifest_for_drain(&dir, &busy, "sched-sess", "running");
+    std::fs::write(dir.join(format!("{busy}.md")), "").expect("busy output file");
+    stamp_manifest_activity(&dir, &busy, epoch_secs_now());
+
+    let mut in_flight = vec![busy.clone()];
+    let mut completions = Vec::new();
+    let mut deadline = std::time::Instant::now();
+    let mut extensions = super::SPAWN_DEADLINE_MAX_EXTENSIONS;
+    let start = std::time::Instant::now();
+    super::drain_or_cancel_remaining_agents(
+        &mut in_flight,
+        &mut completions,
+        &mut deadline,
+        &mut extensions,
+    );
+    let elapsed = start.elapsed();
+
+    assert!(in_flight.is_empty());
+    assert_eq!(
+        extensions,
+        super::SPAWN_DEADLINE_MAX_EXTENSIONS,
+        "no further extension is granted past the cap"
+    );
+    assert_eq!(
+        manifest_status_on_disk(&dir, &busy),
+        "stopped",
+        "past the cap the busy agent is driven terminal as before"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "a capped drain cancels promptly instead of waiting another step: {elapsed:?}"
+    );
+
+    match prior_store {
+        Some(value) => std::env::set_var("ZO_AGENT_STORE", value),
+        None => std::env::remove_var("ZO_AGENT_STORE"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Mid-loop mirror of the rescue: when the deadline elapses but the OLDEST
+/// in-flight agent (the cancellation candidate) is still mid-work, the reclaim
+/// extends and keeps waiting — the slot is then freed by a sibling's real
+/// completion, and the busy oldest keeps running untouched.
+#[test]
+fn reclaim_extension_keeps_the_busy_oldest_until_a_sibling_frees_the_slot() {
+    let _guard = env_lock();
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).expect("create agent store");
+    let prior_store = std::env::var_os("ZO_AGENT_STORE");
+    std::env::set_var("ZO_AGENT_STORE", &dir);
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be after epoch")
+        .as_nanos();
+    let _completion_rx = super::agent_tools::register_agent_completion_channel();
+    let oldest = format!("reclaim-busy-oldest-{stamp}");
+    let sibling = format!("reclaim-sibling-{stamp}");
+    write_manifest_for_drain(&dir, &oldest, "sched-sess", "running");
+    write_manifest_for_drain(&dir, &sibling, "sched-sess", "running");
+    std::fs::write(dir.join(format!("{oldest}.md")), "").expect("oldest output file");
+    std::fs::write(dir.join(format!("{sibling}.md")), "").expect("sibling output file");
+    stamp_manifest_activity(&dir, &oldest, epoch_secs_now());
+
+    let publish_id = sibling.clone();
+    let publisher = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(super::agent_tools::publish_agent_completion_for_tests(
+            super::AgentCompletion {
+                agent_id: publish_id.clone(),
+                name: "sibling".to_string(),
+                status: "completed".to_string(),
+                result: Some("sibling done".to_string()),
+                structured: None,
+                error: None,
+                output_tokens: 1,
+            }
+        ));
+    });
+
+    let mut in_flight = vec![oldest.clone(), sibling.clone()];
+    let mut completions = Vec::new();
+    let mut deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+    let mut extensions = 0u32;
+    let start = std::time::Instant::now();
+    super::reclaim_spawn_slots(&mut in_flight, &mut completions, &mut deadline, &mut extensions);
+    let elapsed = start.elapsed();
+    publisher.join().expect("publisher thread");
+
+    assert_eq!(
+        in_flight,
+        std::slice::from_ref(&oldest),
+        "the busy oldest keeps its slot; the finished sibling freed one"
+    );
+    assert_eq!(extensions, 1, "the grant is recorded against the shared cap");
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].agent_id, sibling);
+    assert_eq!(
+        manifest_status_on_disk(&dir, &oldest),
+        "running",
+        "the mid-work candidate was never cancelled"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the reclaim returns on the sibling's completion: {elapsed:?}"
+    );
 
     match prior_store {
         Some(value) => std::env::set_var("ZO_AGENT_STORE", value),

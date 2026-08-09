@@ -34,6 +34,17 @@ pub(crate) fn agent_manifest_by_id(agent_id: &str) -> Option<AgentOutput> {
     let path = agent_store_dir().ok()?.join(format!("{agent_id}.json"));
     load_agent_manifest_from_scanned_path(&path).ok()
 }
+
+/// Seconds elapsed since the agent's manifest heartbeat (`lastActivityAt`), or
+/// `None` when the agent has no manifest or the heartbeat was never stamped.
+/// Every provider/tool/reasoning frame refreshes the stamp (all the
+/// `record_agent_*` paths route through the manifest read-modify-write that
+/// stamps it), so a small age means the worker is demonstrably mid-work while
+/// a large one means it has produced nothing observable for that long.
+pub(crate) fn agent_seconds_since_last_activity(agent_id: &str) -> Option<u64> {
+    let stamped_at = agent_manifest_by_id(agent_id)?.last_activity_at?;
+    Some(manifest::epoch_seconds_now_u64().saturating_sub(stamped_at))
+}
 #[cfg(test)]
 use self::manifest::persist_agent_stopped_state;
 #[cfg(test)]

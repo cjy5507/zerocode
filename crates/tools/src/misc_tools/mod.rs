@@ -863,9 +863,14 @@ pub(crate) fn run_spawn_multi_agent_with_timeout_and_hooks(
     // ONE overall deadline for the whole fan-out, not one per reclaim: a rolling
     // window over N agents reclaims `N - window` times, so a per-call
     // `wait_timeout` would let the total collection budget grow with the agent
-    // count. Every reclaim and the final drain share this single deadline, so the
-    // public collection budget stays `wait_timeout` regardless of fan-out width.
-    let overall_deadline = std::time::Instant::now() + wait_timeout;
+    // count. Every reclaim and the final drain share this single deadline (and
+    // one shared progress-extension counter), so the public collection budget
+    // stays bounded by `wait_timeout` plus at most
+    // `SPAWN_DEADLINE_MAX_EXTENSIONS` progress-gated extensions — granted only
+    // while a cancellation candidate is demonstrably still working — regardless
+    // of fan-out width.
+    let mut overall_deadline = std::time::Instant::now() + wait_timeout;
+    let mut deadline_extensions: u32 = 0;
     {
         for (idx, agent_val) in input.agents.iter().enumerate() {
             // Never spawn a fresh worker once the overall deadline has elapsed:
@@ -892,7 +897,12 @@ pub(crate) fn run_spawn_multi_agent_with_timeout_and_hooks(
             // agents are already live, so the first `window` agents all spawn
             // back-to-back with no wait between them.
             if in_flight.len() >= window {
-                reclaim_spawn_slots(&mut in_flight, &mut completions, overall_deadline);
+                reclaim_spawn_slots(
+                    &mut in_flight,
+                    &mut completions,
+                    &mut overall_deadline,
+                    &mut deadline_extensions,
+                );
 
                 // `reclaim_spawn_slots` may have blocked all the way to the
                 // overall deadline before cancelling the oldest agent. Two hazards
@@ -1155,7 +1165,12 @@ pub(crate) fn run_spawn_multi_agent_with_timeout_and_hooks(
         // grows with the agent count; any agent still live at the deadline is
         // cancelled+salvaged here (not merely observed as `still_running`), so no
         // worktree merge-back/drop can race a live editor and tear a patch.
-        drain_or_cancel_remaining_agents(&mut in_flight, &mut completions, overall_deadline);
+        drain_or_cancel_remaining_agents(
+            &mut in_flight,
+            &mut completions,
+            &mut overall_deadline,
+            &mut deadline_extensions,
+        );
         // Merge each isolated agent's change-set back into the main tree in spawn
         // order (same 3-way apply the workflow engine uses), then drop the guards
         // to tear down every worktree at once — but ONLY for workers that have
@@ -1311,10 +1326,14 @@ fn wait_for_spawned_agent_completions(
 /// agent to a terminal/cancelled state before the caller collects or drops any
 /// worktree.
 ///
-/// First it waits (bounded by the shared overall `deadline`, so the total budget
-/// never grows with fan-out width) for agents that finish on their own, draining
-/// their terminal completions and clearing them from `in_flight`. Any agent still
-/// live when the deadline passes is then cancelled+salvaged via
+/// First it waits (bounded by the shared overall `deadline`) for agents that
+/// finish on their own, draining their terminal completions and clearing them
+/// from `in_flight`. When the deadline passes with live stragglers, any
+/// straggler whose manifest heartbeat shows fresh activity earns the whole set
+/// a bounded deadline extension (shared cap in `extensions_used`, same gate as
+/// the mid-loop reclaim) — this was the site that killed a healthy long-running
+/// agent mid-work at the fixed wall budget. Only when every straggler is stale,
+/// or the extension cap is spent, are the survivors cancelled+salvaged via
 /// [`reclaim_cancel_and_collect`], which persists a terminal record and drains
 /// it. On return `in_flight` is empty and no listed agent has a live editor, so
 /// the subsequent per-agent worktree `collect_patch`/`drop` cannot race a writer
@@ -1323,32 +1342,46 @@ fn wait_for_spawned_agent_completions(
 fn drain_or_cancel_remaining_agents(
     in_flight: &mut Vec<String>,
     completions: &mut Vec<AgentCompletion>,
-    deadline: std::time::Instant,
+    deadline: &mut std::time::Instant,
+    extensions_used: &mut u32,
 ) {
-    if in_flight.is_empty() {
+    loop {
+        if in_flight.is_empty() {
+            return;
+        }
+        let remaining = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .max(Duration::ZERO);
+        let observed = wait_for_spawned_agent_completions(in_flight, remaining);
+        let terminal: std::collections::HashSet<String> = observed
+            .iter()
+            .filter(|c| agent_tools::agent_output_status_is_terminal(&c.status))
+            .map(|c| c.agent_id.clone())
+            .collect();
+        if !terminal.is_empty() {
+            completions.extend(
+                observed
+                    .into_iter()
+                    .filter(|c| terminal.contains(&c.agent_id)),
+            );
+            in_flight.retain(|id| !terminal.contains(id));
+        }
+        if in_flight.is_empty() {
+            return;
+        }
+        // The deadline elapsed with live stragglers. A straggler that is still
+        // demonstrably working keeps the set alive for one more bounded step.
+        if reclaim_should_extend_deadline(freshest_activity_age_secs(in_flight), *extensions_used) {
+            *extensions_used += 1;
+            *deadline = std::time::Instant::now() + SPAWN_DEADLINE_EXTENSION_STEP;
+            continue;
+        }
+        // Anything still live is driven terminal here so its worktree is safe
+        // to collect. Drain the vector so callers see an empty in-flight set.
+        for agent_id in std::mem::take(in_flight) {
+            reclaim_cancel_and_collect(&agent_id, completions);
+        }
         return;
-    }
-    let remaining = deadline
-        .saturating_duration_since(std::time::Instant::now())
-        .max(Duration::ZERO);
-    let observed = wait_for_spawned_agent_completions(in_flight, remaining);
-    let terminal: std::collections::HashSet<String> = observed
-        .iter()
-        .filter(|c| agent_tools::agent_output_status_is_terminal(&c.status))
-        .map(|c| c.agent_id.clone())
-        .collect();
-    if !terminal.is_empty() {
-        completions.extend(
-            observed
-                .into_iter()
-                .filter(|c| terminal.contains(&c.agent_id)),
-        );
-        in_flight.retain(|id| !terminal.contains(id));
-    }
-    // Anything still live at the deadline is driven terminal here so its worktree
-    // is safe to collect. Drain the vector so callers see an empty in-flight set.
-    for agent_id in std::mem::take(in_flight) {
-        reclaim_cancel_and_collect(&agent_id, completions);
     }
 }
 
@@ -1356,6 +1389,52 @@ fn drain_or_cancel_remaining_agents(
 /// enough that a slot is reclaimed promptly after a completion lands, large
 /// enough not to busy-spin. The overall wait is still bounded by `wait_timeout`.
 const SPAWN_SLOT_RECLAIM_POLL: Duration = Duration::from_millis(25);
+
+/// Progress gate for the shared fan-out deadline. When the deadline elapses
+/// while the cancellation candidate is still demonstrably working (manifest
+/// heartbeat within this window), the deadline is extended instead of the
+/// agent being cancelled: killing a mid-work agent discards its entire
+/// deliverable to save wall-clock, and long-thinking models routinely exceed
+/// a fixed wall budget while perfectly healthy. Heartbeats are stamped on
+/// every provider/tool/reasoning frame, so a live agent refreshes far inside
+/// this window while a hung one goes stale past it.
+const SPAWN_RECLAIM_ACTIVITY_WINDOW: Duration = Duration::from_secs(180);
+
+/// Hard cap on progress extensions, so the total collection budget stays
+/// bounded (`wait_timeout + MAX_EXTENSIONS * EXTENSION_STEP`) instead of
+/// following an agent that stays busy forever.
+const SPAWN_DEADLINE_MAX_EXTENSIONS: u32 = 2;
+
+/// Collection budget each progress extension grants, measured from the moment
+/// the extension is decided (not stacked onto the stale deadline).
+const SPAWN_DEADLINE_EXTENSION_STEP: Duration = Duration::from_secs(10 * 60);
+
+/// Decide whether an elapsed fan-out deadline is extended instead of the
+/// candidate agent(s) being cancelled. Pure so the gate is testable without
+/// waiting out real deadlines: `seconds_since_activity` is the candidate's
+/// manifest-heartbeat age (`None` when no heartbeat was ever stamped — treated
+/// as stale, never extended), `extensions_used` counts extensions already
+/// granted against [`SPAWN_DEADLINE_MAX_EXTENSIONS`].
+fn reclaim_should_extend_deadline(
+    seconds_since_activity: Option<u64>,
+    extensions_used: u32,
+) -> bool {
+    extensions_used < SPAWN_DEADLINE_MAX_EXTENSIONS
+        && seconds_since_activity
+            .is_some_and(|age| age <= SPAWN_RECLAIM_ACTIVITY_WINDOW.as_secs())
+}
+
+/// Freshest manifest-heartbeat age across the still-in-flight set, for the
+/// final drain's extension decision: one demonstrably working straggler is
+/// enough to keep waiting for the whole set (the deadline is shared, so a
+/// per-agent extension is not expressible), while a set with no heartbeat at
+/// all yields `None` and is reclaimed immediately.
+fn freshest_activity_age_secs(in_flight: &[String]) -> Option<u64> {
+    in_flight
+        .iter()
+        .filter_map(|id| agent_tools::agent_seconds_since_last_activity(id))
+        .min()
+}
 
 /// Count the fan-out members that are still *physically* live.
 ///
@@ -1406,18 +1485,26 @@ fn spawn_barred_after_reclaim(
 /// while a slot is free.
 ///
 /// If the shared `deadline` elapses with nothing terminal, the oldest agent is
-/// **cancelled and salvaged to a terminal state before its slot is freed**: the
-/// cancel drives that agent to a persisted terminal record, its completion is
-/// drained into `completions`, and only then is its id removed from `in_flight`.
-/// A freed slot therefore never leaves a live worker running, so the live worker
-/// count stays at or below the window, and the reclaimed agent's worktree is
-/// safe to collect (its editor is no longer live). `deadline` is the single
-/// overall fan-out deadline shared by every reclaim and the final drain, so the
-/// total collection budget does not grow with the agent count.
+/// the cancellation candidate — but a candidate whose manifest heartbeat shows
+/// fresh activity is *not* cancelled: the shared deadline is extended (bounded
+/// by [`SPAWN_DEADLINE_MAX_EXTENSIONS`], counted in `extensions_used`) and the
+/// wait resumes, because cancelling a demonstrably mid-work agent discards its
+/// whole deliverable. Only a stale candidate — or one past the extension cap —
+/// is **cancelled and salvaged to a terminal state before its slot is freed**:
+/// the cancel drives that agent to a persisted terminal record, its completion
+/// is drained into `completions`, and only then is its id removed from
+/// `in_flight`. A freed slot therefore never leaves a live worker running, so
+/// the live worker count stays at or below the window, and the reclaimed
+/// agent's worktree is safe to collect (its editor is no longer live).
+/// `deadline` is the single overall fan-out deadline shared by every reclaim
+/// and the final drain, so the total collection budget stays bounded by
+/// `wait_timeout` plus at most the capped extensions, regardless of fan-out
+/// width.
 fn reclaim_spawn_slots(
     in_flight: &mut Vec<String>,
     completions: &mut Vec<AgentCompletion>,
-    deadline: std::time::Instant,
+    deadline: &mut std::time::Instant,
+    extensions_used: &mut u32,
 ) {
     if in_flight.is_empty() {
         return;
@@ -1443,17 +1530,29 @@ fn reclaim_spawn_slots(
             in_flight.retain(|id| !terminal.contains(id));
             return;
         }
-        if std::time::Instant::now() >= deadline {
-            // Nothing finished within the shared budget; reclaim the oldest slot
-            // by driving its agent to a terminal manifest state. The cancel is
-            // cooperative, so the physical worker may still be running after this
-            // returns; we deliberately keep its cancel signal registered so
-            // `agent_worker_is_live` still reports it live and its worktree
-            // teardown is deferred until it actually exits. Freeing the scheduler
-            // slot here does not breach `live workers <= window`: reclaim only
-            // ever runs before the overall deadline, and once the deadline
-            // elapses the spawn loop starts no further workers, so the count can
-            // only fall.
+        if std::time::Instant::now() >= *deadline {
+            // Nothing finished within the shared budget. Before cancelling,
+            // check whether the candidate (the oldest in-flight agent) is
+            // still demonstrably working — if so, grant a bounded extension
+            // instead of destroying in-progress work on a fixed wall clock.
+            let candidate_age = in_flight
+                .first()
+                .and_then(|id| agent_tools::agent_seconds_since_last_activity(id));
+            if reclaim_should_extend_deadline(candidate_age, *extensions_used) {
+                *extensions_used += 1;
+                *deadline = std::time::Instant::now() + SPAWN_DEADLINE_EXTENSION_STEP;
+                continue;
+            }
+            // Reclaim the oldest slot by driving its agent to a terminal
+            // manifest state. The cancel is cooperative, so the physical
+            // worker may still be running after this returns; we deliberately
+            // keep its cancel signal registered so `agent_worker_is_live`
+            // still reports it live and its worktree teardown is deferred
+            // until it actually exits. Freeing the scheduler slot here does
+            // not breach `live workers <= window`: reclaim only ever runs
+            // before the overall deadline, and once the deadline elapses the
+            // spawn loop starts no further workers, so the count can only
+            // fall.
             let oldest = in_flight.remove(0);
             reclaim_cancel_and_collect(&oldest, completions);
             return;
