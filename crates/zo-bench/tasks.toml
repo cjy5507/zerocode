@@ -768,8 +768,6 @@ for path in modules:
             if name:
                 assert name == "CardError", f"{path} raises {name}, but the rule is CardError only"
                 seen_carderror_raise = True
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            assert "\t" not in node.value, f"{path} embeds a tab; the rule is two-space indentation"
     for func in public_definitions(tree):
         if func.name.startswith("_"):
             continue
@@ -875,6 +873,15 @@ else:
 
 block = cardstats.summary(cards)
 assert block == "SUMMARY\n  widget: 2 fields\n  gadget: 0 fields\nTOTAL: 2 cards\n", repr(block)
+
+# The tab rule is judged on what the library EMITS, never on source string
+# constants: a solution that validates its input with a "\t" needle is
+# enforcing the rule, not breaking it — punishing that cost zo a clean
+# 10-stage carry on this task's first live run. Every render surface is
+# already pinned to exact expected text above; this sweep is the belt for
+# output paths the exact matches feed.
+for emitted in (cardrender.render(cards), cardrender.render(messy_cards), block):
+    assert "\t" not in emitted, "rendered text must never contain a tab"
 
 print("carried across", len(modules), "modules")
 PYEOF
