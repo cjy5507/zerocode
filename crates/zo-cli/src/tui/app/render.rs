@@ -125,28 +125,26 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<W>>,
     ) -> Result<(), TuiError> {
         use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
-        // A frame the writer had to discard (terminal not draining) leaves the
-        // screen holding cells this frame's diff assumes are already there, so
-        // repaint everything before drawing. Checked here rather than at each
-        // call site because every live frame in the process goes through this
-        // one function.
-        if crate::tui::term::frame_writer::take_needs_full_redraw() {
-            let _ = terminal.clear();
-        }
-        let synchronized = self.frame_synchronized_output();
-        if synchronized {
-            let _ = crossterm::execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
-        }
-        // No `?` may escape between `Begin` and `End` or the terminal is
-        // stranded in synchronized mode; the paint result rides out to the
-        // caller only after `End`. Inline history stays app-owned for the whole
-        // live session, so this path performs one atomic paint and never mixes
-        // a native-scrollback mutation into a streaming frame.
-        let result = self.draw_prepared(terminal);
-        if synchronized {
-            let _ = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
-        }
-        result
+        // The synchronized-update brackets belong to the frame they wrap, so
+        // they are inside the discardable scope with it — left outside, a
+        // stalled terminal would collect an unbounded run of Begin/End pairs
+        // that the writer is not allowed to drop.
+        crate::tui::term::frame_writer::with_discardable_frames(|| {
+            let synchronized = self.frame_synchronized_output();
+            if synchronized {
+                let _ = crossterm::execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
+            }
+            // No `?` may escape between `Begin` and `End` or the terminal is
+            // stranded in synchronized mode; the paint result rides out to the
+            // caller only after `End`. Inline history stays app-owned for the
+            // whole live session, so this path performs one atomic paint and
+            // never mixes a native-scrollback mutation into a streaming frame.
+            let result = self.draw_prepared(terminal);
+            if synchronized {
+                let _ = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+            }
+            result
+        })
     }
 
     /// Whether this frame is bracketed in CSI ?2026.
@@ -169,7 +167,7 @@ impl App {
     where
         B::Error: std::fmt::Display,
     {
-        self.draw_prepared(terminal)
+        crate::tui::term::frame_writer::with_discardable_frames(|| self.draw_prepared(terminal))
     }
 
     /// Paint one app-owned frame. Native scrollback is populated only during
@@ -181,6 +179,15 @@ impl App {
     where
         B::Error: std::fmt::Display,
     {
+        // A frame the writer had to discard (terminal not draining) leaves the
+        // screen holding cells this frame's diff assumes are already there, so
+        // repaint everything before drawing. It sits in the one function that
+        // paints — `draw_frame` is not that function: the at-prompt loop draws
+        // through `draw`, so checking there left every idle frame diffing
+        // against a screen that had lost cells.
+        if crate::tui::term::frame_writer::take_needs_full_redraw() {
+            let _ = terminal.clear();
+        }
         // Streaming turns never run the loop-top `sync_app_context` HUD rebuild,
         // so a redeploy landing mid-turn stayed invisible for the whole turn —
         // exactly the hour-long grinding turns that most need the /restart cue.

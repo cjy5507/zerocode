@@ -2285,6 +2285,12 @@ async fn run_program_on_path<B: ratatui::backend::Backend + std::io::Write>(
     use std::io::Write;
 
     let inline = INLINE_TERMINAL_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+    // Hand the terminal over only once the writer thread has finished with it.
+    // The escapes below go straight to stdout, so a frame still queued would be
+    // written after them — an alternate-screen diff painted into the editor's
+    // session, and a queued `Begin` freezing the editor in synchronized mode.
+    Write::flush(terminal.backend_mut()).ok();
+    zo_cli::tui::term::frame_writer::drain_active(TERMINAL_HANDOFF_DRAIN);
     crossterm::terminal::disable_raw_mode().ok();
     if inline {
         crossterm::execute!(std::io::stdout(), DisableMouseCapture).ok();
@@ -3772,7 +3778,14 @@ fn resync_inline_viewport(terminal: &mut TuiTerminal) -> Result<bool, TuiLoopErr
     // a frame still going out, and the old writer's Drop could paint stale
     // cells on top of the rebuilt viewport.
     let _ = io::Write::flush(terminal.backend_mut());
-    zo_cli::tui::term::frame_writer::drain_active(TERMINAL_HANDOFF_DRAIN);
+    if !zo_cli::tui::term::frame_writer::drain_active(TERMINAL_HANDOFF_DRAIN) {
+        // The terminal is not consuming. Rebuilding now would put two writers
+        // on one fd and block this thread on the direct escapes below — the
+        // freeze the writer thread exists to prevent, moved onto the resize
+        // path. Keep the current viewport and let a later resize try again.
+        zo_cli::tui::term::frame_writer::request_full_redraw();
+        return Ok(false);
+    }
     let mut stdout = io::stdout();
     move_cursor_to_inline_anchor(&mut stdout, desired)?;
     // Erase from the new anchor to the screen bottom before the rebuilt
@@ -3968,6 +3981,12 @@ pub(crate) fn emergency_restore() {
     }
 
     let inline = INLINE_TERMINAL_ACTIVE.swap(false, std::sync::atomic::Ordering::Relaxed);
+    // Whatever the writer thread still holds was composed for a screen that is
+    // about to stop existing. Unwinding drops the terminal after this hook runs
+    // and its `Drop` would flush that backlog on top of the restore below, so
+    // drop it here instead — including any `Begin` that would re-strand the
+    // terminal in synchronized mode behind the defensive `End`.
+    zo_cli::tui::term::frame_writer::abandon_queued_frames();
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
     // Pop Kitty keyboard-enhancement flags if `init_terminal` pushed them, so

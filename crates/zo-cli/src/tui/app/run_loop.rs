@@ -227,7 +227,13 @@ impl App {
                     let tick_has_work = dirty
                         || tick_stream_work
                         || next_cooling_active
-                        || self.startup_intro_active();
+                        || self.startup_intro_active()
+                        // A discarded frame owes the screen a full repaint, and
+                        // the discard happens on the writer thread while the app
+                        // may have nothing else to do. Without this the terminal
+                        // keeps whatever the dropped frames left behind until
+                        // the user happens to press a key.
+                        || crate::tui::term::frame_writer::full_redraw_pending();
                     let decision = if tick_stream_work {
                         frame_gate.on_stream_tick(tick_now, tick_has_work)
                     } else {

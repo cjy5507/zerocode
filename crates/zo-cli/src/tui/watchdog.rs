@@ -133,6 +133,21 @@ pub fn classify_freeze_sample(report: &str) -> FreezeVerdict {
     let mut leaves: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
     let mut in_main = false;
     for line in report.lines() {
+        // The call graph is followed by process-wide summaries whose lines are
+        // also count-first, so they parse as frames. Their counts pool every
+        // thread — thirty parked tokio workers dwarf the main thread's total —
+        // and would outvote the real leaf whenever the main thread's block is
+        // the last one in the graph, turning terminal backpressure into a
+        // "zo-side hang". Stop at the summary the same way as at a sibling.
+        if line.starts_with("Total number in stack")
+            || line.starts_with("Sort by top of stack")
+            || line.starts_with("Binary Images:")
+        {
+            if in_main {
+                break;
+            }
+            continue;
+        }
         let Some((count, symbol)) = parse_sample_frame(line) else {
             continue;
         };
@@ -229,6 +244,38 @@ Call graph:
                 .sentence()
                 .contains("terminal is not draining"),
             "the verdict names the terminal, not zo"
+        );
+    }
+
+    /// `sample` closes with process-wide summaries whose lines are count-first
+    /// like frames, and their counts pool every thread. With the main thread's
+    /// block last in the graph there is no sibling header to stop at, so those
+    /// totals used to be folded into the main thread's leaves — dozens of
+    /// parked worker threads outvoting the real `write` and turning terminal
+    /// backpressure into an accusation against zo.
+    #[test]
+    fn the_process_wide_summary_cannot_outvote_the_main_threads_own_leaf() {
+        let main_thread_last = BLOCKED_ON_WRITE.replace(
+            "    12 Thread_372581960\n    + 12 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x198c744f8]\n",
+            "",
+        );
+        let report = format!(
+            "{main_thread_last}\n\
+Total number in stack (recursive counted multiple, when >= 5):\n\
+        13748 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x198c744f8]\n\
+        9021 kevent  (in libsystem_kernel.dylib) + 8  [0x198c74aa0]\n\
+\n\
+Binary Images:\n\
+       0x102394000 -        0x1043c3fff  zo (0) <A> /Users/x/.local/bin/zo\n"
+        );
+        assert!(
+            !report.contains("Thread_372581960"),
+            "the fixture must leave the main thread's block last"
+        );
+        assert_eq!(
+            classify_freeze_sample(&report),
+            FreezeVerdict::TerminalWriteBlocked,
+            "the summary's process-wide counts are not the main thread's leaves"
         );
     }
 

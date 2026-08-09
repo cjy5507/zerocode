@@ -18,6 +18,9 @@
 //!   draw, which clears the terminal and paints a complete frame. The backlog is
 //!   discarded wholesale rather than trimmed, because that full repaint
 //!   supersedes all of it.
+//! - Only a cell diff may be dropped. Teardown escapes, scrollback insertions,
+//!   and mode switches ride this same writer and no repaint reproduces them, so
+//!   discarding is opt-in per write: see [`with_discardable_frames`].
 //! - A frame may be bracketed in synchronized-output escapes (CSI ?2026), and
 //!   the `Begin` can already be on its way out when the rest is dropped. That
 //!   would strand the terminal in synchronized mode — the exact freeze that got
@@ -41,6 +44,12 @@ use std::time::{Duration, Instant};
 /// hiccup without a full repaint.
 pub const DEFAULT_QUEUE_FRAMES: usize = 4;
 
+/// Handoffs a bracketed frame costs: `Begin`, the cell diff, `End` — each one
+/// its own `execute!`, so each is its own flush. The queue bound is stated in
+/// frames, so it has to be scaled by this or "four frames of slack" is really
+/// one and a third, and an ordinary hiccup turns into a full-screen repaint.
+const HANDOFFS_PER_BRACKETED_FRAME: usize = 3;
+
 /// `CSI ?2026l` — leave synchronized output. Queued in place of a discarded
 /// backlog so a `Begin` that already went out cannot strand the terminal.
 const END_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026l";
@@ -54,6 +63,64 @@ static NEEDS_FULL_REDRAW: AtomicBool = AtomicBool::new(false);
 /// Consumes the flag.
 pub fn take_needs_full_redraw() -> bool {
     NEEDS_FULL_REDRAW.swap(false, Ordering::AcqRel)
+}
+
+/// Whether a repaint is owed, without consuming the flag. The discard happens
+/// while the app may be otherwise idle, so the event loop has to count this as
+/// work — nothing else would schedule the frame that repairs the screen.
+pub fn full_redraw_pending() -> bool {
+    NEEDS_FULL_REDRAW.load(Ordering::Acquire)
+}
+
+thread_local! {
+    /// Whether writes from this thread are repaintable frames.
+    static FRAMES_DISCARDABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark what `paint` writes as a frame the writer may drop when the terminal
+/// stops draining.
+///
+/// The default is the opposite, and has to be: teardown escapes, a scrollback
+/// insertion, and a mode switch all travel this same writer, and no repaint can
+/// reproduce any of them. Dropping a `LeaveAlternateScreen` hands the user back
+/// a shell stuck on the alternate screen; dropping an `insert_before` loses that
+/// much transcript for good. Only a ratatui cell diff is safe to discard,
+/// because [`take_needs_full_redraw`] makes the next frame a complete repaint.
+pub fn with_discardable_frames<R>(paint: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FRAMES_DISCARDABLE.with(|discardable| discardable.set(self.0));
+        }
+    }
+
+    let _restore = Restore(FRAMES_DISCARDABLE.with(|discardable| discardable.replace(true)));
+    paint()
+}
+
+fn frames_are_discardable() -> bool {
+    FRAMES_DISCARDABLE.with(std::cell::Cell::get)
+}
+
+/// Throw away everything queued and stop accepting more.
+///
+/// For the panic path only: the hook has already written the restore escapes
+/// straight to stdout, so any frame still queued would land *after* them — alt
+/// screen diffs dumped into the recovered shell, and a queued `Begin` stranding
+/// the terminal in synchronized mode behind the hook's defensive `End`.
+pub fn abandon_queued_frames() {
+    let Some(shared) = ACTIVE_QUEUE
+        .lock()
+        .ok()
+        .and_then(|active| active.as_ref().map(Arc::clone))
+    else {
+        return;
+    };
+    shared.abandoned.store(true, Ordering::Release);
+    if let Ok(mut queue) = shared.queue.lock() {
+        queue.blobs.clear();
+    }
+    shared.wake.notify_all();
 }
 
 /// Force a full repaint on the next draw, e.g. after a mode switch rebuilds the
@@ -107,7 +174,7 @@ fn wait_until_drained(shared: &Arc<Shared>, timeout: Duration) -> bool {
 
 #[derive(Default)]
 struct Queue {
-    blobs: VecDeque<Vec<u8>>,
+    blobs: VecDeque<Blob>,
     /// A blob the thread has taken but not finished writing. An empty `blobs`
     /// alone does not mean the terminal has the bytes — it usually means the
     /// thread is blocked inside that very write — and a `drain_blocking` that
@@ -121,10 +188,26 @@ struct Queue {
     dropped_frames: u64,
 }
 
+/// One handoff's bytes, and whether a full repaint would bring them back.
+struct Blob {
+    bytes: Vec<u8>,
+    discardable: bool,
+}
+
 impl Queue {
     /// Whether anything is still on its way to the terminal.
     fn outstanding(&self) -> bool {
         !self.blobs.is_empty() || self.in_flight
+    }
+
+    /// Drop the repaintable backlog, keeping what no repaint reproduces, and
+    /// report how many frames went. Retaining rather than clearing is the whole
+    /// guarantee: a teardown escape queued behind four frames must not be swept
+    /// away by the *next* overflow.
+    fn discard_repaintable(&mut self) -> u64 {
+        let before = self.blobs.len();
+        self.blobs.retain(|blob| !blob.discardable);
+        (before - self.blobs.len()) as u64
     }
 }
 
@@ -133,6 +216,9 @@ struct Shared {
     /// Signalled on every enqueue, on close, and after each blob is written, so
     /// both the writer thread and `drain_blocking` can wait without polling.
     wake: Condvar,
+    /// Set by [`abandon_queued_frames`]: the terminal has been restored behind
+    /// this writer's back, so nothing more may be written to it.
+    abandoned: AtomicBool,
 }
 
 /// A terminal writer that never blocks the caller.
@@ -146,6 +232,8 @@ pub struct FrameWriter {
     pending: Vec<u8>,
     shared: Arc<Shared>,
     handle: Option<std::thread::JoinHandle<()>>,
+    /// Queued handoffs allowed before the repaintable backlog goes, already
+    /// scaled from frames by [`HANDOFFS_PER_BRACKETED_FRAME`].
     max_queued: usize,
     /// Whether to queue a compensating synchronized-output `End` when a backlog
     /// is discarded. Only meaningful when the app brackets frames in CSI ?2026;
@@ -163,6 +251,7 @@ impl FrameWriter {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue::default()),
             wake: Condvar::new(),
+            abandoned: AtomicBool::new(false),
         });
         let worker = Arc::clone(&shared);
         let handle = std::thread::Builder::new()
@@ -178,7 +267,12 @@ impl FrameWriter {
             pending: Vec::with_capacity(64 * 1024),
             shared,
             handle,
-            max_queued: max_queued.max(1),
+            max_queued: max_queued.max(1)
+                * if compensate_synchronized {
+                    HANDOFFS_PER_BRACKETED_FRAME
+                } else {
+                    1
+                },
             compensate_synchronized,
         }
     }
@@ -221,22 +315,34 @@ impl FrameWriter {
         }
         let blob = std::mem::take(&mut self.pending);
         self.pending = Vec::with_capacity(64 * 1024);
+        if self.shared.abandoned.load(Ordering::Acquire) {
+            return;
+        }
+        let discardable = frames_are_discardable();
         let Ok(mut queue) = self.shared.queue.lock() else {
             return;
         };
         if queue.blobs.len() >= self.max_queued {
-            // Everything queued — and this frame — is a diff against a screen
-            // state the coming full repaint will overwrite, so keeping any of
-            // it only delays the recovery.
-            let discarded = queue.blobs.len() as u64 + 1;
-            queue.blobs.clear();
-            queue.dropped_frames = queue.dropped_frames.saturating_add(discarded);
+            // The backlog's frames are diffs against a screen state the coming
+            // full repaint will overwrite, so keeping any of them only delays
+            // the recovery. This blob joins them only if the render path
+            // vouched for it — otherwise it is a write that must still land.
+            let stale = queue.discard_repaintable();
+            queue.dropped_frames = queue
+                .dropped_frames
+                .saturating_add(stale + u64::from(discardable));
             if self.compensate_synchronized {
-                queue.blobs.push_back(END_SYNCHRONIZED_UPDATE.to_vec());
+                queue.blobs.push_back(Blob {
+                    bytes: END_SYNCHRONIZED_UPDATE.to_vec(),
+                    discardable: false,
+                });
             }
             NEEDS_FULL_REDRAW.store(true, Ordering::Release);
+            if !discardable {
+                queue.blobs.push_back(Blob { bytes: blob, discardable });
+            }
         } else {
-            queue.blobs.push_back(blob);
+            queue.blobs.push_back(Blob { bytes: blob, discardable });
         }
         drop(queue);
         self.shared.wake.notify_all();
@@ -315,7 +421,7 @@ fn drain_forever<W: Write>(shared: &Arc<Shared>, mut sink: W) {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         };
-        let _ = sink.write_all(&blob);
+        let _ = sink.write_all(&blob.bytes);
         let _ = sink.flush();
         if let Ok(mut queue) = shared.queue.lock() {
             queue.in_flight = false;
@@ -389,9 +495,20 @@ mod tests {
         cv.notify_all();
     }
 
+    /// A rendered frame: a cell diff a later full repaint can reproduce, so the
+    /// writer is allowed to drop it.
     fn frame(writer: &mut FrameWriter, body: &[u8]) {
+        with_discardable_frames(|| {
+            writer.write_all(body).expect("buffered write");
+            writer.flush().expect("frame handoff");
+        });
+    }
+
+    /// A write nothing can reproduce — a teardown escape, a scrollback
+    /// insertion — handed over exactly the way the app's non-render paths do.
+    fn control_write(writer: &mut FrameWriter, body: &[u8]) {
         writer.write_all(body).expect("buffered write");
-        writer.flush().expect("frame handoff");
+        writer.flush().expect("control handoff");
     }
 
     /// The whole point: a terminal that has stopped reading must not slow the
@@ -445,6 +562,60 @@ mod tests {
         assert!(
             written.iter().any(|blob| blob == END_SYNCHRONIZED_UPDATE),
             "the discarded backlog is replaced by a synchronized-output End: {written:?}"
+        );
+    }
+
+    /// The discard policy is for cell diffs. `LeaveAlternateScreen` and the
+    /// inline scrollback insertion travel this same writer, and no repaint
+    /// brings them back: dropping one hands the user a shell stuck on the
+    /// alternate screen, or silently loses that much transcript. They must
+    /// survive a backlog that is being discarded around them.
+    #[test]
+    fn a_write_no_repaint_can_reproduce_outlives_a_discarded_backlog() {
+        let _serial = serialized();
+        let (sink, gate, rx) = blocking_sink();
+        let mut writer = FrameWriter::spawn(sink, 2, true);
+        for index in 0..16u8 {
+            frame(&mut writer, &[index]);
+        }
+        assert!(writer.dropped_frames() > 0, "the frames overflowed the queue");
+        control_write(&mut writer, b"leave-alternate-screen");
+        // And it stays safe once more frames pile up behind it.
+        for index in 16..32u8 {
+            frame(&mut writer, &[index]);
+        }
+
+        open(&gate);
+        assert!(writer.drain_blocking(Duration::from_secs(2)), "the sink is open");
+        drop(writer);
+
+        let written: Vec<Vec<u8>> = rx.try_iter().collect();
+        assert!(
+            written.iter().any(|blob| blob == b"leave-alternate-screen"),
+            "the teardown escape must reach the terminal: {written:?}"
+        );
+    }
+
+    /// The panic hook restores the terminal by writing straight to stdout, then
+    /// unwinding drops the writer. Anything still queued would land on top of
+    /// that restore — alternate-screen diffs in the recovered shell, or a
+    /// `Begin` re-stranding it in synchronized mode behind the defensive `End`.
+    #[test]
+    fn an_abandoned_queue_never_paints_over_a_terminal_someone_else_restored() {
+        let _serial = serialized();
+        let (sink, gate, rx) = blocking_sink();
+        let mut writer = FrameWriter::spawn(sink, 4, true);
+        frame(&mut writer, b"half-painted frame");
+
+        abandon_queued_frames();
+        control_write(&mut writer, b"too late");
+        open(&gate);
+        drop(writer);
+
+        let written: Vec<Vec<u8>> = rx.try_iter().collect();
+        assert!(
+            written.is_empty(),
+            "nothing may reach the terminal after the queue is abandoned: {written:?}"
         );
     }
 
