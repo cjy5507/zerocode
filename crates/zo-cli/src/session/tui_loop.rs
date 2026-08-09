@@ -2767,6 +2767,7 @@ fn build_hud_state(cli: &LiveCli) -> HudState {
         background_tasks: 0,
         // App replaces this from its cached scheduler sources.
         scheduled_wake: None,
+        block_focused: false,
     }
 }
 

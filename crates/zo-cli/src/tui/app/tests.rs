@@ -5437,6 +5437,63 @@ fn enter_queues_a_mid_turn_draft_even_after_tab_focused_a_block() {
     );
 }
 
+/// Tab-focus is otherwise invisible whenever the focused block has scrolled
+/// off-screen — the exact state in which a claimed Enter reads as a dead Enter
+/// key. The footer must name the mode while it is on, and say nothing once it
+/// is cleared (a chip that outlives the state is worse than no chip).
+#[test]
+fn footer_shows_a_block_focused_chip_only_while_a_block_is_focused() {
+    let mut app = app_with_one_focusable_block();
+    let (width, height) = (100u16, 24u16);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+
+    app.draw(&mut terminal).expect("unfocused draw");
+    let unfocused = buffer_text(&terminal, width, height);
+    assert!(
+        !unfocused.contains("block focused"),
+        "no chip before anything is focused: {unfocused}"
+    );
+
+    let _ = app.handle_key(press(KeyCode::Tab));
+    assert!(app.transcript.focused_idx().is_some(), "precondition: Tab focused a block");
+    app.draw(&mut terminal).expect("focused draw");
+    let focused = buffer_text(&terminal, width, height);
+    assert!(
+        focused.contains("block focused"),
+        "the footer must name the focus mode: {focused}"
+    );
+
+    let _ = app.handle_key(press(KeyCode::Esc));
+    assert_eq!(app.transcript.focused_idx(), None, "Esc cleared the focus");
+    app.draw(&mut terminal).expect("cleared draw");
+    let cleared = buffer_text(&terminal, width, height);
+    assert!(
+        !cleared.contains("block focused"),
+        "the chip must disappear with the focus: {cleared}"
+    );
+}
+
+/// The chip is derived at paint time, so the path that clears focus without
+/// touching the HUD (typing, from the Enter-hostage fix) also clears the chip.
+#[test]
+fn the_block_focused_chip_clears_when_typing_drops_the_focus() {
+    let mut app = app_with_one_focusable_block();
+    let (width, height) = (100u16, 24u16);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+
+    let _ = app.handle_key(press(KeyCode::Tab));
+    app.draw(&mut terminal).expect("focused draw");
+    assert!(buffer_text(&terminal, width, height).contains("block focused"));
+
+    let _ = app.handle_key(press(KeyCode::Char('h')));
+    app.draw(&mut terminal).expect("typed draw");
+    let typed = buffer_text(&terminal, width, height);
+    assert!(
+        !typed.contains("block focused"),
+        "typing drops the focus, so the chip goes with it: {typed}"
+    );
+}
+
 #[test]
 fn tab_does_not_steal_focus_while_composer_has_text() {
     // Regression guard: with a non-empty composer Tab must still fall through

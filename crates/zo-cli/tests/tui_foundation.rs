@@ -154,6 +154,7 @@ fn sample_hud_state() -> HudState {
         stale_binary: None,
         background_tasks: 0,
         scheduled_wake: None,
+        block_focused: false,
     }
 }
 
@@ -1031,6 +1032,7 @@ async fn app_shift_tab_cycles_permission_via_session_action() {
             stale_binary: None,
             background_tasks: 0,
             scheduled_wake: None,
+            block_focused: false,
         }
     }
 

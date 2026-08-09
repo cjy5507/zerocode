@@ -232,6 +232,7 @@ fn sample_hud() -> HudState {
         stale_binary: None,
         background_tasks: 0,
         scheduled_wake: None,
+        block_focused: false,
     }
 }
 

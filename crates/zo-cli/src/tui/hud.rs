@@ -681,6 +681,13 @@ pub struct HudState {
     /// Nearest pending `ScheduleWakeup` or recurring `/loop` deadline. The App
     /// refreshes the source snapshot; renderers only subtract wall time.
     pub scheduled_wake: Option<ScheduledWakeHud>,
+    /// A transcript block holds the Tab focus, so an empty-composer Enter
+    /// expands that block instead of submitting. Derived at paint time from
+    /// `transcript.focused_idx()` — never mirrored at the mutation sites — so
+    /// the chip cannot outlive the state it reports. Without it the focus is
+    /// invisible whenever the focused block has scrolled off-screen, which is
+    /// what made a claimed Enter read as a dead Enter key.
+    pub block_focused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1327,6 +1334,20 @@ fn compose_location_row(state: &HudState, theme: &Theme, cols: u16) -> Line<'sta
             };
             left.push(Span::styled(name.to_string(), style));
         }
+    }
+    // Tab-focus is a mode the composer does not otherwise show: the focused
+    // block is routinely scrolled out of view, and then the only evidence of
+    // it is an Enter that expands something invisible instead of sending.
+    if state.block_focused {
+        push_separator(&mut left, theme);
+        left.push(Span::styled(
+            "block focused".to_string(),
+            Style::new().fg(theme.palette.accent),
+        ));
+        left.push(Span::styled(
+            " · Esc".to_string(),
+            Style::new().fg(theme.palette.dim),
+        ));
     }
     // A newer build landed on disk while this session runs old code. The
     // sidebar has carried this warning all along, but inline mode hides the
@@ -2264,6 +2285,7 @@ mod tests {
             stale_binary: None,
             background_tasks: 0,
             scheduled_wake: None,
+            block_focused: false,
         }
     }
 

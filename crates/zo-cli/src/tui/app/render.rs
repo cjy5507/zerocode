@@ -195,6 +195,10 @@ impl App {
         // streams; `check` is throttled to one `stat` per 5s and latches, so
         // per-frame is its designed cadence.
         self.hud_state.stale_binary = crate::tui::stale_binary::check();
+        // Derived here, not mirrored at the focus mutation sites (Tab, Esc,
+        // typing, block removal): this is the one function that paints, so a
+        // chip drawn from it can never outlive the focus it reports.
+        self.hud_state.block_focused = self.transcript.focused_idx().is_some();
         let heat_state = self.heat_state();
         let perf_t0 = perf_debug_enabled().then(std::time::Instant::now);
         // Per-region draw accounting (only meaningful when perf is on). The
