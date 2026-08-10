@@ -26,6 +26,20 @@
 //! exists to prevent. So the observation lists the edit delta and leaves the
 //! judgement to the model: "this ran green, and these files changed since".
 //!
+//! ## Recorded in real time, not at turn end
+//!
+//! Every fact is folded in the moment the tool result settles
+//! ([`VerifiedStateLedger::record_event`]), not when the turn completes. That
+//! is not a performance choice — it is what makes the ledger safe to QUOTE
+//! mid-turn. A ledger that settled at turn end could not know about the edit
+//! the turn had just made, so anything reading it mid-turn (the deep gate's
+//! VERIFY leg, which opens right after EXEC) would be told "nothing edited
+//! since" about a tree EXEC had just changed. Recording at the seam makes that
+//! lie unrepresentable rather than merely unlikely.
+//!
+//! [`VerifiedStateLedger::note_turn_boundary`] is all that is left at turn end,
+//! and it only advances the turn counter — no facts arrive there.
+//!
 //! ## Persistence (why a sidecar and not memory)
 //!
 //! A bench stage is a fresh process resuming a session, and headless rebuilds
@@ -33,6 +47,12 @@
 //! exactly the moment it is worth reading — the start of stage N+1. It
 //! write-throughs to `<session>.verified-state.json` and reloads on rebind,
 //! the same shape as [`crate::file_read_registry::FileReadRegistry`].
+//!
+//! Write-through happens per recorded event, so a session killed mid-turn
+//! resumes knowing the greens that turn had already earned. The cost is one
+//! bounded atomic write (a pruned ledger is a few KB) per green check or
+//! successful edit — orders of magnitude below the tool call that produced it,
+//! which had just written the very file being recorded.
 //!
 //! ## Bounded by construction
 //!
@@ -119,6 +139,12 @@ pub struct VerifiedStateLedger {
     /// `None` = pure in-memory (sub-agent contexts, tests), same convention as
     /// the file-read registry: unbound means no write-through, not an error.
     sidecar: Option<PathBuf>,
+    /// Whether any event has been recorded since the last
+    /// [`Self::note_turn_boundary`]. Deliberately NOT persisted: it exists only
+    /// to keep `turn` counting turns-that-contributed-something, and a process
+    /// that dies mid-turn simply never closes that turn — the facts it recorded
+    /// are already on disk, which is the half that matters.
+    dirty_since_boundary: bool,
 }
 
 impl VerifiedStateLedger {
@@ -134,6 +160,7 @@ impl VerifiedStateLedger {
     pub fn rebind_sidecar(&mut self, sidecar: Option<PathBuf>) {
         self.sidecar = sidecar;
         self.state = self.load_sidecar();
+        self.dirty_since_boundary = false;
     }
 
     fn load_sidecar(&self) -> PersistedLedger {
@@ -162,51 +189,70 @@ impl VerifiedStateLedger {
         }
     }
 
-    /// Fold one completed turn's ordered events into the ledger.
+    /// Fold ONE settled tool result's fact into the ledger, at the moment the
+    /// executor settled it.
     ///
-    /// Order within the slice is load-bearing: a check followed by an edit in
-    /// the SAME turn must come out as "green, then invalidated", which is only
-    /// representable because each event takes its own sequence number.
+    /// Arrival order is load-bearing: a check followed by an edit must come out
+    /// as "green, then invalidated", which is representable because each event
+    /// takes its own sequence number. Recording at the seam is what makes the
+    /// ledger true DURING a turn and therefore quotable by a mid-turn reader
+    /// (see the module docs).
     ///
-    /// An empty slice is a no-op — it neither advances the turn counter nor
-    /// touches the disk, so chat-only turns cost nothing.
-    pub fn record_turn(&mut self, events: &[VerifiedStateEvent]) {
-        if events.is_empty() {
-            return;
-        }
-        self.state.turn += 1;
-        let turn = self.state.turn;
-        for event in events {
-            self.state.seq += 1;
-            let seq = self.state.seq;
-            match event {
-                VerifiedStateEvent::GreenCheck(command) => {
-                    let command = command.trim();
-                    if command.is_empty() {
-                        continue;
-                    }
-                    self.state.checks.retain(|check| check.command != command);
-                    self.state.checks.push(GreenCheck {
-                        command: command.to_string(),
-                        seq,
-                        turn,
-                    });
+    /// Returns whether anything was recorded — an empty command/path is
+    /// ignored, consumes no sequence number, and touches no disk.
+    pub fn record_event(&mut self, event: &VerifiedStateEvent) -> bool {
+        // The turn in flight is the one after the last closed boundary; the
+        // boundary below promotes the counter to match, so a record/boundary
+        // pair numbers events exactly as a turn-end fold used to.
+        let turn = self.state.turn + 1;
+        match event {
+            VerifiedStateEvent::GreenCheck(command) => {
+                let command = command.trim();
+                if command.is_empty() {
+                    return false;
                 }
-                VerifiedStateEvent::Edit(path) => {
-                    let path = path.trim();
-                    if path.is_empty() {
-                        continue;
-                    }
-                    self.state.edits.retain(|edit| edit.path != path);
-                    self.state.edits.push(EditRecord {
-                        path: path.to_string(),
-                        seq,
-                        turn,
-                    });
+                self.state.seq += 1;
+                let seq = self.state.seq;
+                self.state.checks.retain(|check| check.command != command);
+                self.state.checks.push(GreenCheck {
+                    command: command.to_string(),
+                    seq,
+                    turn,
+                });
+            }
+            VerifiedStateEvent::Edit(path) => {
+                let path = path.trim();
+                if path.is_empty() {
+                    return false;
                 }
+                self.state.seq += 1;
+                let seq = self.state.seq;
+                self.state.edits.retain(|edit| edit.path != path);
+                self.state.edits.push(EditRecord {
+                    path: path.to_string(),
+                    seq,
+                    turn,
+                });
             }
         }
+        self.dirty_since_boundary = true;
         self.prune();
+        self.persist();
+        true
+    }
+
+    /// Close the current turn. All this does is advance the turn counter, and
+    /// only when the turn actually contributed a fact — so a chat-only turn
+    /// costs nothing and `recorded_turns` keeps meaning "turns that recorded
+    /// something". No fact is ever folded here: that would be a second write
+    /// path for events the seam already recorded, and the same check would land
+    /// twice.
+    pub fn note_turn_boundary(&mut self) {
+        if !self.dirty_since_boundary {
+            return;
+        }
+        self.dirty_since_boundary = false;
+        self.state.turn += 1;
         self.persist();
     }
 
@@ -291,6 +337,36 @@ impl VerifiedStateLedger {
         }
     }
 
+    /// The commands that ran green with NOTHING recorded as edited since, newest
+    /// last, at most `max`.
+    ///
+    /// This is the ONLY slice of the ledger fit to hand a verifier. The turn-start
+    /// observation deliberately reports invalidated checks too — telling the
+    /// planner "this ran green BUT these files changed" is the useful half there,
+    /// because the planner can judge coverage. A VERIFY leg is a different
+    /// contract: it is handed harness-owned IO facts to CITE, so a line it cannot
+    /// verify is a line it can only be misled by. Anything with an edit after it
+    /// is therefore withheld rather than qualified.
+    ///
+    /// Because the seam records this turn's edits in real time, an attempt that
+    /// edited anything invalidates every earlier check by construction — which is
+    /// exactly the guarantee that makes this safe to quote mid-turn.
+    #[must_use]
+    pub fn fresh_green_checks(&self, max: usize) -> Vec<&str> {
+        let newest_edit = self.state.edits.last().map_or(0, |edit| edit.seq);
+        let mut fresh: Vec<&str> = self
+            .state
+            .checks
+            .iter()
+            .filter(|check| check.seq > newest_edit)
+            .map(|check| check.command.as_str())
+            .collect();
+        if fresh.len() > max {
+            fresh.drain(..fresh.len() - max);
+        }
+        fresh
+    }
+
     /// Recorded commands, oldest first — diagnostics and tests.
     #[must_use]
     pub fn green_check_commands(&self) -> Vec<&str> {
@@ -364,12 +440,22 @@ mod tests {
         VerifiedStateEvent::Edit(path.to_string())
     }
 
+    /// One whole turn's worth of facts, in arrival order, then its boundary —
+    /// i.e. exactly what the runtime seam does across a turn, expressed in one
+    /// call so these tests keep reading as "a turn recorded X".
+    fn record_turn(ledger: &mut VerifiedStateLedger, events: &[VerifiedStateEvent]) {
+        for event in events {
+            ledger.record_event(event);
+        }
+        ledger.note_turn_boundary();
+    }
+
     /// (a) A green check recorded in one turn is observable at the next turn's
     /// start, and reads as FRESH while nothing has been edited since.
     #[test]
     fn a_green_check_with_no_later_edit_renders_as_fresh() {
         let mut ledger = VerifiedStateLedger::new();
-        ledger.record_turn(&[green("cargo test -p runtime")]);
+        record_turn(&mut ledger, &[green("cargo test -p runtime")]);
         let block = ledger.render_observation(None).expect("observation");
         assert!(block.starts_with(VERIFIED_STATE_REMINDER_PREFIX));
         assert!(block.contains("`cargo test -p runtime` — ran green, nothing edited since"));
@@ -381,7 +467,7 @@ mod tests {
     #[test]
     fn an_edit_after_the_check_marks_it_invalidated_and_names_the_files() {
         let mut ledger = VerifiedStateLedger::new();
-        ledger.record_turn(&[
+        record_turn(&mut ledger, &[
             green("cargo test -p runtime"),
             edit("/repo/crates/runtime/src/a.rs"),
         ]);
@@ -402,7 +488,7 @@ mod tests {
     #[test]
     fn an_edit_before_the_check_leaves_it_fresh() {
         let mut ledger = VerifiedStateLedger::new();
-        ledger.record_turn(&[edit("/repo/a.rs"), green("cargo test")]);
+        record_turn(&mut ledger, &[edit("/repo/a.rs"), green("cargo test")]);
         let block = ledger.render_observation(None).expect("observation");
         assert!(block.contains("ran green, nothing edited since"), "{block}");
         // The now-unanswerable edit is pruned rather than carried forever.
@@ -414,12 +500,12 @@ mod tests {
     #[test]
     fn rerunning_a_check_restores_freshness_and_prunes_the_stale_edit() {
         let mut ledger = VerifiedStateLedger::new();
-        ledger.record_turn(&[green("cargo test"), edit("/repo/a.rs")]);
+        record_turn(&mut ledger, &[green("cargo test"), edit("/repo/a.rs")]);
         assert!(ledger
             .render_observation(None)
             .expect("observation")
             .contains("changed since"));
-        ledger.record_turn(&[green("cargo test")]);
+        record_turn(&mut ledger, &[green("cargo test")]);
         let block = ledger.render_observation(None).expect("observation");
         assert!(block.contains("ran green, nothing edited since"), "{block}");
         assert_eq!(ledger.green_check_commands(), vec!["cargo test"]);
@@ -432,12 +518,12 @@ mod tests {
     fn without_any_green_check_the_observation_is_empty() {
         let mut ledger = VerifiedStateLedger::new();
         assert!(ledger.render_observation(None).is_none());
-        ledger.record_turn(&[edit("/repo/a.rs"), edit("/repo/b.rs")]);
+        record_turn(&mut ledger, &[edit("/repo/a.rs"), edit("/repo/b.rs")]);
         assert!(
             ledger.render_observation(None).is_none(),
             "edits alone must not produce an observation"
         );
-        ledger.record_turn(&[]);
+        record_turn(&mut ledger, &[]);
         assert_eq!(ledger.recorded_turns(), 1, "an empty turn records nothing");
     }
 
@@ -451,7 +537,7 @@ mod tests {
 
         let mut writer = VerifiedStateLedger::new();
         writer.rebind_sidecar(Some(sidecar.clone()));
-        writer.record_turn(&[green("cargo test -p runtime"), edit("/repo/a.rs")]);
+        record_turn(&mut writer, &[green("cargo test -p runtime"), edit("/repo/a.rs")]);
         assert!(sidecar.exists(), "record must write through");
 
         let mut resumed = VerifiedStateLedger::new();
@@ -462,7 +548,7 @@ mod tests {
         assert_eq!(resumed.recorded_turns(), 1);
 
         // A later stage keeps counting from where the previous one stopped.
-        resumed.record_turn(&[green("cargo clippy -p runtime")]);
+        record_turn(&mut resumed, &[green("cargo clippy -p runtime")]);
         assert_eq!(resumed.recorded_turns(), 2);
         let mut third = VerifiedStateLedger::new();
         third.rebind_sidecar(Some(sidecar));
@@ -500,7 +586,7 @@ mod tests {
 
         let mut ledger = VerifiedStateLedger::new();
         ledger.rebind_sidecar(Some(old.clone()));
-        ledger.record_turn(&[green("cargo test -p runtime")]);
+        record_turn(&mut ledger, &[green("cargo test -p runtime")]);
 
         ledger.rebind_sidecar(Some(new));
         assert!(ledger.is_empty(), "the fresh session starts empty");
@@ -518,7 +604,7 @@ mod tests {
     fn caps_keep_the_newest_checks() {
         let mut ledger = VerifiedStateLedger::new();
         for index in 0..(STORED_MAX_CHECKS + 4) {
-            ledger.record_turn(&[green(&format!("cargo test case{index}"))]);
+            record_turn(&mut ledger, &[green(&format!("cargo test case{index}"))]);
         }
         let stored = ledger.green_check_commands();
         assert_eq!(stored.len(), STORED_MAX_CHECKS);
@@ -543,7 +629,7 @@ mod tests {
         for index in 0..12 {
             events.push(edit(&format!("/repo/f{index}.rs")));
         }
-        ledger.record_turn(&events);
+        record_turn(&mut ledger, &events);
         let block = ledger.render_observation(None).expect("observation");
         assert!(block.contains("(+4 more)"), "{block}");
         // Newest-first: the last edit leads the list.
@@ -554,12 +640,51 @@ mod tests {
         assert!(!block.contains("/repo/f3.rs"), "{block}");
     }
 
+    /// The VERIFY-leg slice reports only checks with nothing edited since, and
+    /// an edit recorded WITHOUT a turn boundary (i.e. mid-turn, the way the seam
+    /// records) invalidates them immediately. This is the property the leg join
+    /// was blocked on: mid-turn truth, not turn-end truth.
+    #[test]
+    fn fresh_green_checks_exclude_anything_edited_since_even_mid_turn() {
+        let mut ledger = VerifiedStateLedger::new();
+        record_turn(&mut ledger, &[green("cargo test"), green("cargo clippy")]);
+        assert_eq!(
+            ledger.fresh_green_checks(8),
+            vec!["cargo test", "cargo clippy"]
+        );
+
+        // No boundary here: a turn is in flight and it just edited a file.
+        ledger.record_event(&edit("/repo/a.rs"));
+        assert!(
+            ledger.fresh_green_checks(8).is_empty(),
+            "an edit invalidates every earlier check the moment it lands"
+        );
+
+        // Re-running one restores exactly that one.
+        ledger.record_event(&green("cargo test"));
+        assert_eq!(ledger.fresh_green_checks(8), vec!["cargo test"]);
+    }
+
+    /// The leg cap keeps the NEWEST fresh commands, like every other cap here.
+    #[test]
+    fn fresh_green_checks_cap_keeps_the_newest() {
+        let mut ledger = VerifiedStateLedger::new();
+        for index in 0..5 {
+            record_turn(&mut ledger, &[green(&format!("cargo test case{index}"))]);
+        }
+        assert_eq!(
+            ledger.fresh_green_checks(2),
+            vec!["cargo test case3", "cargo test case4"]
+        );
+        assert!(ledger.fresh_green_checks(0).is_empty());
+    }
+
     /// A heredoc check script renders as ONE line — the observation must stay
     /// compact no matter how large the command that produced it was.
     #[test]
     fn a_multiline_command_renders_on_a_single_line() {
         let mut ledger = VerifiedStateLedger::new();
-        ledger.record_turn(&[green("python3 - <<'PY'\nassert 1\nPY")]);
+        record_turn(&mut ledger, &[green("python3 - <<'PY'\nassert 1\nPY")]);
         let block = ledger.render_observation(None).expect("observation");
         assert!(block.contains("`python3 - <<'PY' …` — ran green"), "{block}");
         assert!(!block.contains("assert 1"), "{block}");

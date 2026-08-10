@@ -136,6 +136,19 @@ pub enum HarnessFeature {
     /// empty at exactly the moment it should have spoken — is precisely the
     /// invisible one.
     VerifiedStateObservation,
+    /// Session-ledger green checks joined into a deep-gate VERIFY leg's
+    /// objective section, beside this attempt's own post-edit greens.
+    ///
+    /// Counted apart from [`Self::VerifiedStateObservation`] because they
+    /// measure different things and can diverge completely: the observation
+    /// fires whenever the session has ANY recorded check, while the leg join
+    /// fires only when the ledger knows a still-fresh check the attempt's own
+    /// summary does not. Since the attempt's edits invalidate every older
+    /// check by construction, that surplus is narrow by design — which is
+    /// exactly why it needs its own counter rather than an assumption. Folded
+    /// into the observation's row, a busy observation count would have made a
+    /// join that never once contributed look perfectly healthy.
+    VerifiedStateVerifyLeg,
 }
 
 impl HarnessFeature {
@@ -154,6 +167,7 @@ impl HarnessFeature {
             Self::SteeringReissue => "steering_reissue",
             Self::ToolCancelSettled => "tool_cancel_settled",
             Self::VerifiedStateObservation => "verified_state_observation",
+            Self::VerifiedStateVerifyLeg => "verified_state_verify_leg",
         }
     }
 
@@ -172,6 +186,7 @@ impl HarnessFeature {
             Self::SteeringReissue => "mid-generation steering re-issue",
             Self::ToolCancelSettled => "Esc tool cancel (settled)",
             Self::VerifiedStateObservation => "verified-state observation",
+            Self::VerifiedStateVerifyLeg => "verified-state checks in VERIFY leg",
         }
     }
 
@@ -208,6 +223,9 @@ impl HarnessFeature {
             Self::VerifiedStateObservation => {
                 "requires a turn start after this session recorded a check-shaped bash command exiting 0"
             }
+            Self::VerifiedStateVerifyLeg => {
+                "requires a deep-gate VERIFY leg while the ledger holds a still-fresh check the attempt did not itself report"
+            }
         }
     }
 
@@ -228,6 +246,7 @@ impl HarnessFeature {
             Self::SteeringReissue,
             Self::ToolCancelSettled,
             Self::VerifiedStateObservation,
+            Self::VerifiedStateVerifyLeg,
         ]
     }
 

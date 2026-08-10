@@ -363,11 +363,25 @@ where
         );
     }
 
+    /// Settle one tool result: fold its verified-state facts into the session
+    /// ledger, retire a now-stale standing observation, and trace it.
+    ///
+    /// `tool_input` is the EFFECTIVE input the executor ran (post-`PreToolUse`
+    /// hook), which is where a bash command's text comes from — the tool RESULT
+    /// carries only the exit shape. Both turn loops have it in scope at this
+    /// call, which is why the ledger can record here at all: the turn-end fold
+    /// it replaces had to join `tool_use` inputs by id after the fact, and by
+    /// then a VERIFY leg opened mid-turn had already read a stale ledger.
     pub(super) fn record_tool_finished(
         &mut self,
         iteration: usize,
         result_message: &ConversationMessage,
+        tool_input: &str,
     ) {
+        // Record BEFORE retiring: the retirement below is a reaction to the very
+        // mutation this call just put on record, and a reader between the two
+        // must never see the retirement without the fact that caused it.
+        self.record_verified_state_from_tool(result_message, tool_input);
         // A turn-start verified-state observation is only true until this turn
         // mutates something, and the reminder absorber deliberately RE-ANCHORS
         // an unchanged set near the tail once it drifts past its dedupe window
@@ -412,12 +426,11 @@ where
     }
 
     pub(super) fn record_turn_completed(&mut self, summary: &TurnSummary) {
-        // Fold this turn's observed green checks and edits into the session
-        // ledger before anything else: both turn loops reach this seam, so it
-        // is the one place that sees every settled turn on every path. It
-        // write-throughs to the session sidecar, which is what carries the
-        // observation across the process boundary a resumed stage crosses.
-        self.record_verified_state_from_turn(summary);
+        // Close the verified-state turn. The facts themselves were recorded at
+        // the tool-result seam as they settled (`record_tool_finished`), so this
+        // only advances the ledger's turn counter — folding the summary here as
+        // well would record every check of this turn a second time.
+        self.note_verified_state_turn_boundary();
 
         // Externalize the turn into the durable, compaction-proof trace under
         // `.zo/turns/` (Harness-1: state lives outside the context window).

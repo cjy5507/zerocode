@@ -45,7 +45,10 @@ argv = [
 ]
 [tools.env]
 ZO_SESSION_ROOT = "{run_root}/zo-ablated-sessions"
-ZO_ABLATE = "verified_state_observation"
+# Both halves of verified-state, or the arm measures a feature that is still
+# half on: the turn-start observation and the VERIFY-leg join read the same
+# ledger but are counted (and suppressed) separately.
+ZO_ABLATE = "verified_state_observation,verified_state_verify_leg"
 
 [[tools]]
 name = "claude-code"

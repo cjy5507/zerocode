@@ -2443,7 +2443,7 @@ where
                 self.session
                     .push_message(result_message.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.record_tool_finished(iterations, &result_message);
+                self.record_tool_finished(iterations, &result_message, p.effective_input.as_ref());
                 tool_results.push(result_message);
             }
             self.arm_tool_repetition_hard_stops();

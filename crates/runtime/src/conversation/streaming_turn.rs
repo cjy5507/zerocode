@@ -2247,7 +2247,7 @@ where
                 self.session
                     .push_message(result_message.clone())
                     .map_err(|error| StreamingTurnError::runtime(error.to_string()))?;
-                self.record_tool_finished(iterations, &result_message);
+                self.record_tool_finished(iterations, &result_message, p.effective_input.as_str());
                 tool_results.push(result_message);
             }
 

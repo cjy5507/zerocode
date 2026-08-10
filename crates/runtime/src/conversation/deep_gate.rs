@@ -1599,6 +1599,25 @@ pub(super) const EXEC_CHECK_COMMAND_BYTES: usize = 240;
 /// At most this many observed commands are reported (newest kept).
 const EXEC_CHECK_MAX_COMMANDS: usize = 3;
 
+/// The green-check evidence one VERIFY leg may cite, by provenance.
+///
+/// Two sources, kept apart all the way to the prompt because they answer
+/// different questions and a verifier that conflated them would over-credit the
+/// attempt: `this_turn` is what THIS attempt ran after its own last edit, while
+/// `session` is what earlier turns ran and the ledger still holds as
+/// uninvalidated. Bundling them also keeps the prompt builders' argument lists
+/// from growing a second bare `&[String]` that a caller could swap by mistake —
+/// the two are indistinguishable to the type system, and getting them backwards
+/// would silently relabel this attempt's evidence as an earlier turn's.
+#[derive(Debug, Clone, Copy, Default)]
+struct GreenCheckEvidence<'a> {
+    /// [`exec_green_checks`] for this attempt: post-last-edit, exit 0.
+    this_turn: &'a [String],
+    /// Session-ledger checks with nothing recorded as edited since
+    /// (`ConversationRuntime::verify_leg_session_checks`).
+    session: &'a [String],
+}
+
 fn task_with_retry_context(task: &str, retry: Option<&str>) -> String {
     match retry {
         Some(retry) if !retry.trim().is_empty() => {
@@ -2200,7 +2219,7 @@ impl<'a> VerifyPromptContext<'a> {
         task: &'a str,
         diff: &'a str,
         check: Option<(&str, &CheckObservation)>,
-        exec_checks: &[String],
+        checks: GreenCheckEvidence<'_>,
         edited_paths: &[String],
         preexisting_dirty: &[String],
         assistant_claim: &str,
@@ -2224,12 +2243,12 @@ impl<'a> VerifyPromptContext<'a> {
         // harness (not the model) recorded each exit 0. Reporting them stops
         // the verifier from spending a round trip attempting a build/test the
         // read-only phase will deny.
-        if !exec_checks.is_empty() {
+        if !checks.this_turn.is_empty() {
             objective.push_str(
                 "\n\nCommands the implementer ran in this workspace AFTER its last edit, each \
                  observed by the harness to exit 0 (runtime-recorded facts, not model claims):\n",
             );
-            for command in exec_checks {
+            for command in checks.this_turn {
                 objective.push_str("- `");
                 objective.push_str(command);
                 objective.push_str("`\n");
@@ -2239,6 +2258,35 @@ impl<'a> VerifyPromptContext<'a> {
                  commands yourself — bash in this phase is read-only and such commands are \
                  denied; judge from the diff, the files you inspect, and these observations.",
             );
+        }
+        // Earlier turns' greens come SECOND and stay labelled as such: they are
+        // weaker evidence about this diff (they predate it), and the ordering is
+        // what stops a verifier reading them as this attempt's own run. Only
+        // still-fresh ones reach here — the ledger withholds any command it has
+        // recorded an edit after — so every line is a fact the leg can cite
+        // without qualifying it.
+        if !checks.session.is_empty() {
+            objective.push_str(
+                "\n\nAlso on record from earlier turns in this session, and still green — the \
+                 harness observed each exit 0 and has recorded no edit since (runtime-recorded \
+                 facts, not model claims):\n",
+            );
+            for command in checks.session {
+                objective.push_str("- `");
+                objective.push_str(command);
+                objective.push_str("`\n");
+            }
+            objective.push_str(
+                "These ran before this attempt, so they are standing evidence about the parts of \
+                 the tree it did not touch — not coverage of this diff.",
+            );
+            if checks.this_turn.is_empty() {
+                objective.push_str(
+                    " Do NOT re-run build/test commands yourself — bash in this phase is \
+                     read-only and such commands are denied; judge from the diff, the files you \
+                     inspect, and these observations.",
+                );
+            }
         }
         let mut paths = if edited_paths.is_empty() {
             "(none reported)".to_string()
@@ -2302,7 +2350,7 @@ fn verify_prompt(
     task: &str,
     diff: &str,
     check: Option<(&str, &CheckObservation)>,
-    exec_checks: &[String],
+    checks: GreenCheckEvidence<'_>,
     edited_paths: &[String],
     preexisting_dirty: &[String],
     assistant_claim: &str,
@@ -2322,7 +2370,7 @@ fn verify_prompt(
         task,
         diff,
         check,
-        exec_checks,
+        checks,
         edited_paths,
         preexisting_dirty,
         assistant_claim,
@@ -3131,6 +3179,18 @@ where
             } else {
                 String::new()
             };
+            // Read the session ledger HERE — after every gate that can skip the
+            // leg — so the attest counts legs that were actually built. Computed
+            // earlier it would record a decline for turns that never opened a
+            // verifier, and a counter diluted by non-events cannot answer the
+            // only question it exists for: how often the join had something to
+            // say when a verifier was listening.
+            //
+            // The ledger is current because the tool-result seam kept it so
+            // THROUGH the EXEC leg above: any earlier check those edits
+            // invalidated is already excluded, rather than being handed to the
+            // verifier as a still-true fact.
+            let session_checks = self.verify_leg_session_checks(&green_checks);
             let verify_result = self
                 .verify_subturn(
                     verify_prompt(
@@ -3139,7 +3199,10 @@ where
                         cfg.check_command
                             .as_deref()
                             .zip(check_observation.as_ref()),
-                        &green_checks,
+                        GreenCheckEvidence {
+                            this_turn: &green_checks,
+                            session: &session_checks,
+                        },
                         &diff_paths,
                         &preexisting_dirty_paths(
                             &baseline_files,
@@ -3978,6 +4041,18 @@ where
             } else {
                 String::new()
             };
+            // Read the session ledger HERE — after every gate that can skip the
+            // leg — so the attest counts legs that were actually built. Computed
+            // earlier it would record a decline for turns that never opened a
+            // verifier, and a counter diluted by non-events cannot answer the
+            // only question it exists for: how often the join had something to
+            // say when a verifier was listening.
+            //
+            // The ledger is current because the tool-result seam kept it so
+            // THROUGH the EXEC leg above: any earlier check those edits
+            // invalidated is already excluded, rather than being handed to the
+            // verifier as a still-true fact.
+            let session_checks = self.verify_leg_session_checks(&green_checks);
             let verify_result = self
                 .verify_subturn(
                     verify_prompt(
@@ -3986,7 +4061,10 @@ where
                         cfg.check_command
                             .as_deref()
                             .zip(check_observation.as_ref()),
-                        &green_checks,
+                        GreenCheckEvidence {
+                            this_turn: &green_checks,
+                            session: &session_checks,
+                        },
                         &diff_paths,
                         &preexisting_dirty_paths(
                             &baseline_files,
@@ -4910,7 +4988,7 @@ mod tests {
             "fix the bug",
             "diff",
             Some(("cargo test", &check)),
-            &[],
+            GreenCheckEvidence::default(),
             &[],
             &[],
             "implemented the fix",
@@ -4947,7 +5025,7 @@ mod tests {
             &task,
             "diff",
             None,
-            &[],
+            GreenCheckEvidence::default(),
             &[],
             &[],
             "updated the implementation",
@@ -4972,7 +5050,7 @@ mod tests {
             "t",
             "diff",
             Some(("cargo test", &check)),
-            &[],
+            GreenCheckEvidence::default(),
             &["src/changed.rs".to_string()],
             &[],
             "ASSISTANT_CLAIM_MARKER",
@@ -5000,7 +5078,7 @@ mod tests {
             "t",
             "diff",
             None,
-            &[],
+            GreenCheckEvidence::default(),
             &[],
             &[],
             "claim",
@@ -5023,7 +5101,7 @@ mod tests {
                 "task",
                 "diff",
                 None,
-                &[],
+                GreenCheckEvidence::default(),
                 &[],
                 &[],
                 "claim",
@@ -5036,7 +5114,7 @@ mod tests {
                 "task",
                 "diff",
                 None,
-                &[],
+                GreenCheckEvidence::default(),
                 &[],
                 &[],
                 "claim",
@@ -5078,7 +5156,7 @@ mod tests {
             "task",
             "diff",
             None,
-            &[],
+            GreenCheckEvidence::default(),
             &[],
             &[],
             "claim",
@@ -5105,7 +5183,7 @@ mod tests {
             "task",
             "diff",
             None,
-            &[],
+            GreenCheckEvidence::default(),
             &[],
             &[],
             "claim",
@@ -5131,7 +5209,7 @@ mod tests {
             "TASK",
             "DIFF",
             Some(("cargo test", &check)),
-            &[],
+            GreenCheckEvidence::default(),
             &["src/a.rs".to_string()],
             &[],
             "CLAIM",
@@ -5481,7 +5559,7 @@ mod tests {
                 "task",
                 "diff",
                 None,
-                &[],
+                GreenCheckEvidence::default(),
                 &[],
                 &[],
                 "claim",
@@ -5589,7 +5667,7 @@ mod tests {
             "fix the crate",
             "diff",
             None,
-            &checks,
+            GreenCheckEvidence { this_turn: &checks, session: &[] },
             &[],
             &[],
             "claim",
@@ -5615,7 +5693,7 @@ mod tests {
             "fix the crate",
             "diff",
             None,
-            &[],
+            GreenCheckEvidence::default(),
             &[],
             &[],
             "claim",
@@ -5625,6 +5703,109 @@ mod tests {
             false,
         );
         assert!(!without.contains("observed by the harness"));
+    }
+
+    /// Every VERIFY prompt for one fixed input except the check evidence, so the
+    /// assertions below compare exactly one variable.
+    fn verify_prompt_with_checks(checks: GreenCheckEvidence<'_>) -> String {
+        verify_prompt(
+            "fix the crate",
+            "diff",
+            None,
+            checks,
+            &[],
+            &[],
+            "claim",
+            "",
+            VerifyLensMode::Full,
+            RouteTaskIntent::Other,
+            false,
+        )
+    }
+
+    /// Session-ledger checks join the SAME objective section, after this
+    /// attempt's own and labelled by provenance — and an empty session set
+    /// leaves the prompt byte-identical to the pre-join form.
+    #[test]
+    fn verify_prompt_joins_session_checks_after_this_attempts_own() {
+        let this_turn = vec!["cargo test -p runtime".to_string()];
+        let session = vec!["cargo clippy -p runtime".to_string()];
+
+        let exec_only = verify_prompt_with_checks(GreenCheckEvidence {
+            this_turn: &this_turn,
+            session: &[],
+        });
+        let both = verify_prompt_with_checks(GreenCheckEvidence {
+            this_turn: &this_turn,
+            session: &session,
+        });
+
+        assert!(both.contains("cargo clippy -p runtime"), "{both}");
+        assert!(
+            both.contains("still green — the harness observed each exit 0 and has recorded no \
+                           edit since"),
+            "the session lines must carry their own provenance: {both}"
+        );
+        assert!(
+            both.contains("not coverage of this diff"),
+            "the leg must be told these predate the attempt: {both}"
+        );
+        // Ordering: this attempt's evidence is what the verifier weighs first.
+        assert!(
+            both.find("AFTER its last edit").expect("exec heading")
+                < both.find("earlier turns in this session").expect("session heading"),
+            "this attempt's observations must come first: {both}"
+        );
+        // Additive only: the exec-only prompt is a strict prefix-preserving
+        // subset, so a leg with nothing to join is byte-identical to before.
+        assert_eq!(
+            verify_prompt_with_checks(GreenCheckEvidence {
+                this_turn: &this_turn,
+                session: &[],
+            }),
+            exec_only
+        );
+        assert!(
+            !exec_only.contains("earlier turns in this session"),
+            "an empty session set must add nothing at all: {exec_only}"
+        );
+    }
+
+    /// With no observation of its own, a leg carrying only session checks still
+    /// gets the read-only warning — otherwise the one prompt shape that has
+    /// evidence but no re-run ban is the one most likely to attempt a build.
+    #[test]
+    fn a_session_only_prompt_still_forbids_reruns() {
+        let session = vec!["cargo test -p runtime".to_string()];
+        let session_only = verify_prompt_with_checks(GreenCheckEvidence {
+            this_turn: &[],
+            session: &session,
+        });
+        assert!(
+            session_only.contains("Do NOT re-run build/test commands yourself"),
+            "{session_only}"
+        );
+        // And it is stated exactly once when BOTH sources are present.
+        let both = verify_prompt_with_checks(GreenCheckEvidence {
+            this_turn: &["cargo build".to_string()],
+            session: &session,
+        });
+        assert_eq!(
+            both.matches("Do NOT re-run build/test commands yourself").count(),
+            1,
+            "{both}"
+        );
+    }
+
+    /// The whole objective section stays byte-identical to the pre-feature form
+    /// when neither source observed anything — the neutrality pin.
+    #[test]
+    fn no_observations_leaves_the_verify_prompt_byte_identical() {
+        let none = verify_prompt_with_checks(GreenCheckEvidence::default());
+        assert!(!none.contains("observed by the harness"));
+        assert!(!none.contains("earlier turns in this session"));
+        assert!(!none.contains("Do NOT re-run build/test commands yourself"));
+        assert!(none.contains("No objective check command was configured for this turn."));
     }
 
     #[test]
@@ -6047,7 +6228,7 @@ mod tests {
             "다른 추가 개선 가능 한부분이있는지 분석만 해줘",
             "(this attempt reported no file edits)",
             None,
-            &[],
+            GreenCheckEvidence::default(),
             &[],
             &["Business/Card/CardBusiness.cs".to_string()],
             "분석 완료 — 파일 변경 없음",
@@ -6083,7 +6264,7 @@ mod tests {
             "write a fix plan",
             "(this attempt reported no file edits)",
             None,
-            &[],
+            GreenCheckEvidence::default(),
             &[],
             &["Business/Card/CardBusiness.cs".to_string()],
             "wrote the plan",
@@ -6102,7 +6283,7 @@ mod tests {
             "write a fix plan",
             "diff",
             None,
-            &[],
+            GreenCheckEvidence::default(),
             &[],
             &[],
             "wrote the plan",
@@ -6556,7 +6737,7 @@ mod tests {
             "FOCUSED_TASK_MARKER",
             "FOCUSED_DIFF_MARKER",
             Some(("cargo test -p runtime", &check)),
-            &[],
+            GreenCheckEvidence::default(),
             &["src/focused.rs".to_string()],
             &[],
             "FOCUSED_ASSISTANT_CLAIM_MARKER",
