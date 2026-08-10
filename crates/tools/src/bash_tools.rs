@@ -664,7 +664,6 @@ fn backgrounded_command_output(
         persisted_output_size: None,
         sandbox_status: Some(sandbox_status),
         safety_warning: None,
-        saved_script: None,
     }
 }
 
@@ -692,7 +691,6 @@ fn completed_command_output(output: &Output, sandbox_status: SandboxStatus) -> B
         persisted_output_size: None,
         sandbox_status: Some(sandbox_status),
         safety_warning: None,
-        saved_script: None,
     }
 }
 
@@ -719,7 +717,6 @@ fn timed_out_command_output(
         persisted_output_size: None,
         sandbox_status: Some(sandbox_status),
         safety_warning: None,
-        saved_script: None,
     }
 }
 
