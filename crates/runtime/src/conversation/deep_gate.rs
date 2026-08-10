@@ -1332,6 +1332,40 @@ pub(super) fn command_is_check_shaped(command: &str) -> bool {
     EXEC_CHECK_COMMAND_MARKERS
         .iter()
         .any(|marker| command.contains(marker))
+        || command_is_assert_heredoc(command)
+}
+
+/// The other shape a self-verification takes: an inline interpreter heredoc
+/// whose body asserts something (`python3 - <<'EOF' … assert … EOF`).
+///
+/// Measured on the deep lanes this is the DOMINANT check shape — the model
+/// writes an ad-hoc assert script per stage rather than a `pytest` run — and
+/// the marker list above cannot name it because the command line carries no
+/// tool name, just `python3 -`. Without this arm the verified-state ledger
+/// records nothing in exactly the sessions it was built for (observed live:
+/// ten turns, an empty ledger, every injection declined `no_green_checks`).
+///
+/// The `assert`/`raise` requirement keeps data-transform heredocs (scripts
+/// that only compute or write) out: a green transform proves nothing worth
+/// carrying, and recording one would let a tree-mutating script masquerade as
+/// a still-true check. A script that both asserts and writes files can still
+/// slip in — a known limit, mitigated by the observation's own wording (the
+/// harness never claims coverage, it lists edits and lets the model judge).
+fn command_is_assert_heredoc(command: &str) -> bool {
+    let Some(heredoc) = command.find("<<") else {
+        return false;
+    };
+    let opener = &command[..heredoc];
+    let opener_is_interpreter = ["python3", "python"].iter().any(|interpreter| {
+        opener
+            .split_whitespace()
+            .any(|word| word == *interpreter || word.ends_with(&format!("/{interpreter}")))
+    });
+    if !opener_is_interpreter {
+        return false;
+    }
+    let body = &command[heredoc..];
+    body.contains("assert") || body.contains("raise ")
 }
 
 /// `true` when a non-error bash tool result records a foreground command that
@@ -4102,6 +4136,33 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_assert_heredoc_is_check_shaped() {
+        // The dominant deep-lane self-check shape, verbatim from a bench
+        // transcript: no tool name on the command line, just `python3 -`.
+        let command = "python3 - <<'EOF'\nimport cardparse\nassert cardparse.parse('# a\\n')[0]['name'] == 'a'\nEOF";
+        assert!(command_is_check_shaped(command));
+        // Path-qualified interpreter and a pipeline prefix still count.
+        assert!(command_is_check_shaped(
+            "cd /tmp && /usr/bin/python3 - <<'PY'\nraise SystemExit(0)\nPY"
+        ));
+    }
+
+    #[test]
+    fn a_transform_heredoc_is_not_check_shaped() {
+        // No assertion — a green transform proves nothing worth carrying, and
+        // recording it would let a tree-mutating script read as a check.
+        assert!(!command_is_check_shaped(
+            "python3 - <<'EOF'\nopen('out.txt','w').write('data')\nEOF"
+        ));
+        // Assert-y body under a non-Python interpreter stays out.
+        assert!(!command_is_check_shaped(
+            "node - <<'EOF'\nconsole.assert(1 == 1)\nEOF"
+        ));
+        // A bare heredoc with no interpreter at all stays out.
+        assert!(!command_is_check_shaped("cat <<'EOF'\nassert docs\nEOF"));
+    }
 
     fn test_png_bytes(width: u32, height: u32) -> Vec<u8> {
         use image::{DynamicImage, ImageFormat, RgbImage};
