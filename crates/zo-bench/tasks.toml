@@ -1028,6 +1028,29 @@ def _():
     assert pairs(lib("cardparse").parse(text)[0]) == [("k:j", "v")], text
 
 
+@probe("a key holding a newline cannot corrupt the document")
+def _():
+    try:
+        text = lib("cardrender").render([{"name": "a", "fields": [("k\nx", "v")]}])
+    except err():
+        return
+    assert pairs(lib("cardparse").parse(text)[0]) == [("k\nx", "v")], text
+
+
+@probe("a value holding a tab never reaches rendered text")
+def _():
+    # Rule 4 judged on the EMITTED text (the needle lesson): rendering data
+    # that holds a tab must either refuse or keep the tab out of the output
+    # without silently mutating the value — and no output can satisfy both,
+    # so in practice this demands the refusal.
+    try:
+        text = lib("cardrender").render([{"name": "a", "fields": [("k", "x\ty")]}])
+    except err():
+        return
+    assert "\t" not in text, "rule 4: rendered text may never contain a tab"
+    assert pairs(lib("cardparse").parse(text)[0]) == [("k", "x\ty")], text
+
+
 @probe("render refuses a card that is not shaped like a card")
 def _():
     try:
