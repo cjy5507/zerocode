@@ -120,6 +120,20 @@ fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
     }
 }
 
+/// `parse_args` resolves its default permission mode FROM THE PROCESS CWD
+/// (that directory's config, then the workspace-risk fallback), so a parser
+/// assertion is only deterministic with the cwd pinned. Unpinned, the call
+/// inherits whichever temp dir a parallel `with_current_dir` test occupies at
+/// that instant — observed as eight parser tests failing deterministically
+/// (expected `DangerFullAccess`, got the safe-default `ReadOnly`) under a
+/// scheduler that parked the suite inside another test's temp cwd.
+fn parse_args_in_pinned_cwd(args: &[String]) -> Result<CliAction, String> {
+    crate::isolate_global_zo_home_for_tests();
+    let cwd = std::env::temp_dir().join(format!("zo-args-cwd-{}", std::process::id()));
+    std::fs::create_dir_all(&cwd).expect("pinned args cwd should exist");
+    with_current_dir(&cwd, || parse_args(args))
+}
+
 fn with_env_vars<T>(vars: &[(&str, Option<std::ffi::OsString>)], f: impl FnOnce() -> T) -> T {
     let previous = vars
         .iter()
@@ -226,7 +240,7 @@ fn defaults_to_repl_when_no_args() {
     let _guard = env_lock();
     std::env::remove_var("ZO_PERMISSION_MODE");
     assert_eq!(
-        parse_args(&[]).expect("args should parse"),
+        parse_args_in_pinned_cwd(&[]).expect("args should parse"),
         CliAction::Repl {
             model: DEFAULT_MODEL.to_string(),
             model_pinned: false,
@@ -442,7 +456,7 @@ fn parses_prompt_subcommand() {
         "world".to_string(),
     ];
     assert_eq!(
-        parse_args(&args).expect("args should parse"),
+        parse_args_in_pinned_cwd(&args).expect("args should parse"),
         CliAction::Prompt {
             prompt: "hello world".to_string(),
             model_pinned: false,
@@ -550,7 +564,7 @@ fn parses_serve_with_default_bind() {
     let _guard = env_lock();
     std::env::remove_var("ZO_PERMISSION_MODE");
     assert_eq!(
-        parse_args(&["serve".to_string()]).expect("serve should parse"),
+        parse_args_in_pinned_cwd(&["serve".to_string()]).expect("serve should parse"),
         CliAction::Serve {
             bind_addr: "127.0.0.1:8787".to_string(),
             model: DEFAULT_MODEL.to_string(),
@@ -659,7 +673,7 @@ fn parses_bare_prompt_and_json_output_flag() {
         "this".to_string(),
     ];
     assert_eq!(
-        parse_args(&args).expect("args should parse"),
+        parse_args_in_pinned_cwd(&args).expect("args should parse"),
         CliAction::Prompt {
             prompt: "explain this".to_string(),
             model_pinned: true,
@@ -780,7 +794,7 @@ fn resolves_model_aliases_in_args() {
         "this".to_string(),
     ];
     assert_eq!(
-        parse_args(&args).expect("args should parse"),
+        parse_args_in_pinned_cwd(&args).expect("args should parse"),
         CliAction::Prompt {
             prompt: "explain this".to_string(),
             model_pinned: true,
@@ -904,7 +918,7 @@ fn parses_allowed_tools_flags_with_aliases_and_lists() {
         "--allowed-tools=write_file".to_string(),
     ];
     assert_eq!(
-        parse_args(&args).expect("args should parse"),
+        parse_args_in_pinned_cwd(&args).expect("args should parse"),
         CliAction::Repl {
             model: DEFAULT_MODEL.to_string(),
             model_pinned: false,
@@ -1064,29 +1078,29 @@ fn parses_single_word_command_aliases_without_falling_back_to_prompt_mode() {
     let _guard = env_lock();
     std::env::remove_var("ZO_PERMISSION_MODE");
     assert_eq!(
-        parse_args(&["help".to_string()]).expect("help should parse"),
+        parse_args_in_pinned_cwd(&["help".to_string()]).expect("help should parse"),
         CliAction::Help
     );
     assert_eq!(
-        parse_args(&["version".to_string()]).expect("version should parse"),
+        parse_args_in_pinned_cwd(&["version".to_string()]).expect("version should parse"),
         CliAction::Version
     );
     assert_eq!(
-        parse_args(&["status".to_string()]).expect("status should parse"),
+        parse_args_in_pinned_cwd(&["status".to_string()]).expect("status should parse"),
         CliAction::Status {
             model: DEFAULT_MODEL.to_string(),
             permission_mode: PermissionMode::DangerFullAccess,
         }
     );
     assert_eq!(
-        parse_args(&["sandbox".to_string()]).expect("sandbox should parse"),
+        parse_args_in_pinned_cwd(&["sandbox".to_string()]).expect("sandbox should parse"),
         CliAction::Sandbox
     );
 }
 
 #[test]
 fn single_word_slash_command_names_return_guidance_instead_of_hitting_prompt_mode() {
-    let error = parse_args(&["cost".to_string()]).expect_err("cost should return guidance");
+    let error = parse_args_in_pinned_cwd(&["cost".to_string()]).expect_err("cost should return guidance");
     assert!(error.contains("slash command"));
     assert!(error.contains("/cost"));
 }
@@ -1096,7 +1110,7 @@ fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
     let _guard = env_lock();
     std::env::remove_var("ZO_PERMISSION_MODE");
     assert_eq!(
-        parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
+        parse_args_in_pinned_cwd(&["help".to_string(), "me".to_string(), "debug".to_string()])
             .expect("prompt shorthand should still work"),
         CliAction::Prompt {
             prompt: "help me debug".to_string(),
