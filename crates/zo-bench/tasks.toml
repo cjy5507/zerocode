@@ -29,6 +29,24 @@ argv = [
 [tools.env]
 ZO_SESSION_ROOT = "{run_root}/zo-sessions"
 
+# Ablation arm: identical zo with a harness feature held out via ZO_ABLATE,
+# for same-window feature-judgment runs (`--tool zo,zo-ablated`). Edit the env
+# value to hold out a different feature; keys must be ablatable
+# (telemetry::HarnessFeature::ablatable) or the process refuses the spec.
+[[tools]]
+name = "zo-ablated"
+argv = [
+    "zo",
+    "--model", "claude-opus-5",
+    "--session-id", "{session_id}",
+    "--output-format", "json",
+    "--permission-mode", "danger-full-access",
+    "prompt", "{prompt}",
+]
+[tools.env]
+ZO_SESSION_ROOT = "{run_root}/zo-ablated-sessions"
+ZO_ABLATE = "verified_state_observation"
+
 [[tools]]
 name = "claude-code"
 argv = [
