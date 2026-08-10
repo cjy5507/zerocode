@@ -351,6 +351,13 @@ fn bash_digest_header(parsed: &BashCommandOutput) -> String {
     if let Some(warning) = &parsed.safety_warning {
         header_notes.push(format!("safety: {warning}"));
     }
+    // The over-cap path is exactly where this matters most: a check script big
+    // enough to be saved is the kind that floods the envelope past the cap, so
+    // dropping the note here would silently retire the affordance on the calls
+    // that need it. Carried verbatim — it is already one self-describing line.
+    if let Some(note) = &parsed.saved_script {
+        header_notes.push(note.clone());
+    }
     if let Some(status) = &parsed.sandbox_status {
         if let Ok(rendered) = serde_json::to_string(status) {
             header_notes.push(format!("sandbox: {rendered}"));

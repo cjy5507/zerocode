@@ -168,5 +168,6 @@ fn branch_divergence_output(
         persisted_output_size: None,
         sandbox_status: None,
         safety_warning: None,
+        saved_script: None,
     }
 }

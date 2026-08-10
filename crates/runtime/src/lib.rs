@@ -7,6 +7,7 @@
 pub mod auto_format;
 mod bash;
 pub mod bash_validation;
+mod check_script;
 mod bootstrap;
 mod compact;
 mod compact_diff;

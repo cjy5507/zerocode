@@ -316,6 +316,7 @@ fn blocked_output(violation: &WorkspaceScopeViolation) -> BashCommandOutput {
         persisted_output_size: None,
         sandbox_status: None,
         safety_warning: None,
+        saved_script: None,
     }
 }
 

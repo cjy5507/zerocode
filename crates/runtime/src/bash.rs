@@ -84,6 +84,19 @@ pub struct BashCommandOutput {
         skip_serializing_if = "Option::is_none"
     )]
     pub safety_warning: Option<String>,
+    /// One line naming the file this call's large inline Python heredoc was
+    /// saved to, plus what to do with it — see [`crate::check_script`].
+    ///
+    /// Last field on purpose: it serializes as the final line of the tool
+    /// result, an addendum after the outcome rather than something the model
+    /// has to read past to reach stdout. Absent (and omitted from the wire)
+    /// on every call that did not save a script, which is nearly all of them.
+    #[serde(
+        rename = "savedScript",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub saved_script: Option<String>,
 }
 
 /// Default wall-clock deadline applied to a bash call that carries no explicit
@@ -557,10 +570,41 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
 /// terminates the process (a watcher thread observes the `Stopped` status).
 /// This closes the old design gap where the tool returned a bare OS PID that
 /// no other tool could look up — with the output already discarded.
+///
+/// This wrapper also owns the check-script affordance: a large inline
+/// `python3 - <<EOF` verification script is saved to a file and the tool result
+/// gains one line naming it, so a failing check can be edited instead of
+/// retyped (see [`crate::check_script`] for the measured motivation). It sits
+/// here, at the execution chokepoint every caller funnels through, rather than
+/// in any UI path — headless `-p` runs and the TUI get identical behavior, and
+/// there is no second dispatcher that could quietly miss it.
+///
+/// The affordance is strictly additive. The body is captured before dispatch
+/// but written after it returns, so the command's stdout, stderr, exit status
+/// and timing are what they were; a save failure yields no note at all rather
+/// than a warning; and an `Err` from the command itself is propagated
+/// untouched.
+pub fn execute_bash_with_tasks(
+    input: BashCommandInput,
+    tasks: Option<&crate::task_registry::TaskRegistry>,
+    session_id: Option<&str>,
+) -> io::Result<BashCommandOutput> {
+    // Captured up front because `input` is moved into the dispatch below.
+    // `None` for every command without a qualifying heredoc — the overwhelming
+    // majority — and those calls allocate nothing and return byte-identically.
+    let heredoc =
+        crate::check_script::saveable_python_heredoc(&input.command).map(ToOwned::to_owned);
+    let mut output = execute_bash_dispatch(input, tasks, session_id)?;
+    if let Some(body) = heredoc {
+        output.saved_script = crate::check_script::save_and_describe(&body, session_id);
+    }
+    Ok(output)
+}
+
 // The dispatch reads as one unit (validation → preflight → three exit paths);
 // splitting it would thread five locals through helper signatures.
 #[allow(clippy::too_many_lines)]
-pub fn execute_bash_with_tasks(
+fn execute_bash_dispatch(
     input: BashCommandInput,
     tasks: Option<&crate::task_registry::TaskRegistry>,
     session_id: Option<&str>,
@@ -645,6 +689,7 @@ pub fn execute_bash_with_tasks(
                 persisted_output_size: None,
                 sandbox_status: Some(sandbox_status),
                 safety_warning: low_disk,
+                saved_script: None,
             });
         }
 
@@ -674,6 +719,7 @@ pub fn execute_bash_with_tasks(
             persisted_output_size: None,
             sandbox_status: Some(sandbox_status),
             safety_warning: low_disk,
+            saved_script: None,
         });
     }
 
@@ -753,6 +799,11 @@ pub fn execute_bash_with_tasks(
 /// execution, only what the timeout reply may promise: without a registry a
 /// re-run with `run_in_background` detaches and discards its output, so naming
 /// `TaskOutput` there would be false.
+// One linear command lifecycle (spawn → stream → deadline → assemble) that
+// crossed the 100-line threshold when `BashCommandOutput` gained a field; the
+// two exit paths share five locals, so splitting it would thread them through
+// helper signatures for no gain. Same justification as `execute_bash_dispatch`.
+#[allow(clippy::too_many_lines)]
 async fn execute_bash_async(
     input: BashCommandInput,
     sandbox_status: SandboxStatus,
@@ -860,6 +911,7 @@ async fn execute_bash_async(
             persisted_output_size: None,
             sandbox_status: Some(sandbox_status),
             safety_warning: None,
+            saved_script: None,
         });
     };
 
@@ -895,6 +947,7 @@ async fn execute_bash_async(
         persisted_output_size: None,
         sandbox_status: Some(sandbox_status),
         safety_warning: None,
+        saved_script: None,
     })
 }
 
@@ -2253,6 +2306,220 @@ mod tests {
         assert!(
             !polluted,
             ".sandbox-home must not be created inside the workspace"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Check-script affordance (see `crate::check_script`)
+    //
+    // These drive the real `execute_bash_with_tasks` chokepoint rather than the
+    // parser alone: the parser's own unit tests cannot tell whether the save is
+    // actually wired into a bash call, which is exactly the "gate with no
+    // engine behind it" failure this feature must not repeat.
+    // ---------------------------------------------------------------------
+
+    /// A Python check script comfortably over the save threshold, shaped like
+    /// the ones the model actually writes (relative-path import, asserts).
+    fn python_check_body(marker: &str) -> String {
+        let mut body = format!("import sys\nsys.path.insert(0, \".\")\nprint(\"{marker}\")\n");
+        while body.chars().count() < 900 {
+            body.push_str("assert 1 + 1 == 2, \"arithmetic still works in this build\"\n");
+        }
+        body
+    }
+
+    /// Run `command` with saved scripts rooted at `root` — or with the
+    /// affordance switched off entirely when `root` is `None`, which is what
+    /// this binary did before the feature existed.
+    fn run_with_script_root(
+        command: &str,
+        root: Option<&std::path::Path>,
+    ) -> std::io::Result<super::BashCommandOutput> {
+        crate::check_script::set_root_for_this_thread(root.map(std::path::Path::to_path_buf));
+        let result = super::execute_bash_with_tasks(
+            input(command, Some(30_000)),
+            None,
+            Some("check-script-test-session"),
+        );
+        // Never leave the seam set for whatever test this thread runs next.
+        crate::check_script::set_root_for_this_thread(None);
+        result
+    }
+
+    /// Every `check-*.py` under `root`, sorted, as (path, contents).
+    fn saved_scripts(root: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+        let mut found = Vec::new();
+        let Ok(sessions) = std::fs::read_dir(root) else {
+            return found;
+        };
+        for session in sessions.flatten() {
+            let Ok(scripts) = std::fs::read_dir(session.path()) else {
+                continue;
+            };
+            for script in scripts.flatten() {
+                let contents = std::fs::read_to_string(script.path()).unwrap_or_default();
+                found.push((script.path(), contents));
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// (a) A large Python heredoc is written to disk verbatim and the call that
+    /// carried it comes back naming the file and what to do with it.
+    #[test]
+    fn a_large_python_heredoc_is_saved_and_announced() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let body = python_check_body("stage-1");
+        let command = format!("python3 - <<'EOF'\n{body}EOF\n");
+
+        let output = run_with_script_root(&command, Some(root.path())).expect("bash runs");
+
+        let scripts = saved_scripts(root.path());
+        assert_eq!(scripts.len(), 1, "exactly one script saved: {scripts:?}");
+        let (path, contents) = &scripts[0];
+        assert_eq!(contents, &body, "the file holds the heredoc body verbatim");
+        assert_eq!(
+            path.file_name().and_then(std::ffi::OsStr::to_str),
+            Some("check-1.py"),
+            "the counter starts at 1: {path:?}"
+        );
+
+        let note = output.saved_script.as_deref().expect("note attached");
+        assert!(note.contains(&path.display().to_string()), "{note}");
+        assert!(note.contains("python3"), "{note}");
+        assert!(note.contains("edit_file"), "{note}");
+        assert_eq!(note.lines().count(), 1, "the note is one line: {note}");
+
+        // The envelope carries it as its final line — an addendum after the
+        // outcome, not something the model reads past to reach stdout.
+        let envelope = serde_json::to_string_pretty(&output).expect("serialize");
+        let last_field = envelope
+            .lines()
+            .rev()
+            .find(|line| line.contains(": "))
+            .unwrap_or_default();
+        assert!(last_field.contains("\"savedScript\""), "{envelope}");
+    }
+
+    /// The counter increases across calls in one session instead of
+    /// overwriting the script the model may still be editing.
+    #[test]
+    fn each_saved_script_gets_the_next_number() {
+        let root = tempfile::tempdir().expect("tempdir");
+        for stage in 1..=3 {
+            let body = python_check_body(&format!("stage-{stage}"));
+            let command = format!("python3 - <<'EOF'\n{body}EOF\n");
+            run_with_script_root(&command, Some(root.path())).expect("bash runs");
+        }
+        let names: Vec<String> = saved_scripts(root.path())
+            .into_iter()
+            .filter_map(|(path, _)| {
+                path.file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .map(ToOwned::to_owned)
+            })
+            .collect();
+        assert_eq!(names, vec!["check-1.py", "check-2.py", "check-3.py"]);
+    }
+
+    /// (b) Everything that is not a large Python heredoc is byte-for-byte what
+    /// it was before this feature existed. The comparison is against the same
+    /// command run with the affordance switched off, so it pins the whole
+    /// serialized envelope rather than one field.
+    #[test]
+    fn non_triggering_commands_are_byte_identical() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let big = python_check_body("negative");
+        for command in [
+            String::from("echo plain-command"),
+            // A small Python heredoc: cheaper to retype than to open.
+            String::from("python3 - <<'EOF'\nprint(1 + 1)\nEOF\n"),
+            // A large heredoc for a different interpreter.
+            format!("cat <<'EOF' > /dev/null\n{big}EOF\n"),
+            // A here-string, not a heredoc.
+            String::from("echo hi <<< 'inline'"),
+        ] {
+            let with_feature =
+                run_with_script_root(&command, Some(root.path())).expect("bash runs");
+            let without_feature = run_with_script_root(&command, None).expect("bash runs");
+            assert_eq!(
+                serde_json::to_string_pretty(&with_feature).expect("serialize"),
+                serde_json::to_string_pretty(&without_feature).expect("serialize"),
+                "envelope must not move for: {}",
+                &command[..command.len().min(30)]
+            );
+            assert!(
+                !serde_json::to_string_pretty(&with_feature)
+                    .expect("serialize")
+                    .contains("savedScript"),
+                "no field is emitted at all for: {}",
+                &command[..command.len().min(30)]
+            );
+        }
+        assert!(
+            saved_scripts(root.path()).is_empty(),
+            "nothing was written to disk"
+        );
+    }
+
+    /// (c) Several qualifying heredocs in one command save exactly one file —
+    /// the largest, whose re-emission would cost the most.
+    #[test]
+    fn several_heredocs_save_only_the_largest() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let small = python_check_body("small");
+        let mut large = python_check_body("large");
+        large.push_str("# a clear margin of extra padding makes this one the biggest\n");
+        let command =
+            format!("python3 - <<'A'\n{small}A\npython3 - <<'B'\n{large}B\n");
+
+        let output = run_with_script_root(&command, Some(root.path())).expect("bash runs");
+
+        let scripts = saved_scripts(root.path());
+        assert_eq!(scripts.len(), 1, "only one file: {scripts:?}");
+        assert_eq!(scripts[0].1, large, "the largest body is the one saved");
+        assert!(output.saved_script.is_some());
+    }
+
+    /// (d) A storage failure costs the caller nothing: the command still runs,
+    /// its result is intact, and no note claims a file that is not there.
+    #[test]
+    fn a_save_failure_is_silent_and_harmless() {
+        let root = tempfile::tempdir().expect("tempdir");
+        // A regular file where the scripts root should be: `create_dir_all`
+        // cannot succeed against it, standing in for a read-only home or a
+        // full disk without needing either.
+        let blocked = root.path().join("not-a-directory");
+        std::fs::write(&blocked, b"occupied").expect("write blocker");
+
+        let body = python_check_body("blocked");
+        let command = format!("python3 - <<'EOF'\n{body}EOF\necho ran-anyway\n");
+
+        let blocked_run = run_with_script_root(&command, Some(&blocked)).expect("bash runs");
+        assert!(
+            blocked_run.saved_script.is_none(),
+            "a failed save must not advertise a path"
+        );
+        assert!(
+            !serde_json::to_string_pretty(&blocked_run)
+                .expect("serialize")
+                .contains("savedScript"),
+            "and must not emit the field at all"
+        );
+
+        // The execution result is exactly the affordance-off result.
+        let clean_run = run_with_script_root(&command, None).expect("bash runs");
+        assert_eq!(blocked_run.stdout, clean_run.stdout);
+        assert_eq!(blocked_run.stderr, clean_run.stderr);
+        assert_eq!(
+            blocked_run.return_code_interpretation,
+            clean_run.return_code_interpretation
+        );
+        assert!(
+            blocked_run.stdout.contains("ran-anyway"),
+            "the command really ran: {}",
+            blocked_run.stdout
         );
     }
 }
