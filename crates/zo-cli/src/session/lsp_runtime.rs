@@ -38,7 +38,14 @@ pub(crate) struct RuntimeLspState {
 /// Mirrors the MCP stdio init budget so one hung server (e.g. a
 /// misconfigured rust-analyzer) can't freeze the session before the
 /// banner.
+#[cfg(not(test))]
 const LSP_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The test profile gets a loaded-machine allowance instead: under a full
+/// parallel suite the init-only fixture server intermittently missed the
+/// interactive 5s budget (2/80 loaded stress rounds), and the tests that
+/// exercise the timeout path inject their own short deadline explicitly.
+#[cfg(test)]
+const LSP_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const LSP_AUTODETECT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
 static RUST_ANALYZER_USABILITY_CACHE: LazyLock<Mutex<BTreeMap<PathBuf, bool>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
