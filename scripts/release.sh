@@ -15,6 +15,13 @@ version="$1"
   fail "version must be strict MAJOR.MINOR.PATCH"
 tag="v${version}"
 
+# Everything below shells out to cargo (directly and via ensure-cargo-space/just),
+# and a missing cargo used to surface as a mid-script death that an outer
+# `| tail` could mask into apparent success. Fail here, by name, before any
+# state is touched.
+command -v cargo >/dev/null 2>&1 || \
+  fail "cargo is not on PATH (try PATH=\"\$HOME/.cargo/bin:\$PATH\")"
+
 [[ "$(git branch --show-current)" == "main" ]] || fail "release must run from main"
 [[ -z "$(git status --porcelain)" ]] || fail "working tree must be clean"
 git remote get-url origin >/dev/null 2>&1 || fail "origin remote is missing"
@@ -74,4 +81,31 @@ git tag -a "$tag" -m "$tag"
 rollback=0
 trap - EXIT INT TERM
 git push --atomic origin main "$tag"
-printf 'Pushed %s; the release workflow will publish its assets.\n' "$tag"
+
+# Post-push verification — success is judged by what the REMOTE holds, never by
+# this script having reached its last line (a masked mid-script death once read
+# as a finished release until the missing remote tag exposed it). Two facts:
+# the tag must be on origin now, and the release workflow must publish assets.
+git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null || \
+  fail "pushed, but origin does not show ${tag} — the release did NOT land"
+printf 'Remote tag %s verified.\n' "$tag"
+
+if command -v gh >/dev/null 2>&1; then
+  # Bounded wait for the workflow's release assets. A timeout here is a
+  # warning, not a failure: the tag landed, so the release exists; assets can
+  # lag. What must never happen is this script CLAIMING assets it never saw.
+  assets=""
+  for _ in $(seq 1 30); do
+    assets="$(gh release view "$tag" --json assets \
+      --jq '.assets | length' 2>/dev/null || true)"
+    [[ -n "$assets" && "$assets" != "0" ]] && break
+    sleep 20
+  done
+  if [[ -n "$assets" && "$assets" != "0" ]]; then
+    printf 'Release %s verified: %s asset(s) published.\n' "$tag" "$assets"
+  else
+    printf 'WARNING: %s tag landed but no assets visible after 10min — check `gh run list`.\n' "$tag" >&2
+  fi
+else
+  printf 'gh CLI not found; asset publication NOT verified (tag is confirmed).\n' >&2
+fi
