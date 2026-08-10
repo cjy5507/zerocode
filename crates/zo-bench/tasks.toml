@@ -2006,6 +2006,155 @@ else:
 print("carried through", sum(record["lines"] for record in services.values()), "log lines")
 PYEOF
 '''
+graded_check = '''
+python3 - << 'PYEOF'
+import os
+import sys
+
+sys.path.insert(0, ".")
+
+PROBES = []
+
+
+def probe(label):
+    def register(function):
+        PROBES.append((label, function))
+        return function
+    return register
+
+
+def lib(name):
+    import importlib
+
+    return importlib.import_module(name)
+
+
+def err():
+    return lib("auditerr").AuditError
+
+
+LINE = "2026-03-03T00:00:00Z svc-3 req=1444f0 level=WARN code=E6110 lat=807ms msg=free text here"
+
+
+@probe("field-like text inside msg stays msg")
+def _():
+    row = lib("auditkit").parse_line(
+        "2026-03-03T00:00:00Z svc-3 req=aa11bb level=WARN code=E6110 lat=12ms "
+        "msg=retry storm level=FATAL code=E9999 lat=1ms"
+    )
+    assert row["level"] == "WARN", row
+    assert row["code"] == "E6110", row
+    assert row["msg"] == "retry storm level=FATAL code=E9999 lat=1ms", row
+
+
+@probe("latency_ms is a whole number, not text")
+def _():
+    row = lib("auditkit").parse_line(LINE)
+    assert row["latency_ms"] == 807 and not isinstance(row["latency_ms"], str), row
+
+
+@probe("parse_line returns exactly the seven promised keys")
+def _():
+    row = lib("auditkit").parse_line(LINE)
+    assert set(row) == {"ts", "service", "req", "level", "code", "latency_ms", "msg"}, sorted(row)
+
+
+@probe("a line missing fields fails as an AuditError, not a builtin")
+def _():
+    try:
+        lib("auditkit").parse_line("not a corpus line at all")
+    except err():
+        return
+    raise AssertionError("a shapeless line is a failure")
+
+
+@probe("a wrong latency unit fails as an AuditError, not a builtin")
+def _():
+    try:
+        lib("auditkit").parse_line(
+            "2026-03-03T00:00:00Z svc-3 req=aa11bb level=WARN code=E6110 lat=807s msg=x"
+        )
+    except err():
+        return
+    raise AssertionError("lat=807s does not carry the latency field")
+
+
+@probe("parse_line of bytes fails as an AuditError, not a builtin")
+def _():
+    try:
+        lib("auditkit").parse_line(LINE.encode())
+    except err():
+        return
+    raise AssertionError("bytes are not a corpus line")
+
+
+@probe("parse_line of None fails as an AuditError, not a builtin")
+def _():
+    try:
+        lib("auditkit").parse_line(None)
+    except err():
+        return
+    raise AssertionError("None is not a corpus line")
+
+
+@probe("render ends with exactly one newline")
+def _():
+    text = lib("auditreport").render()
+    assert text.endswith("\n") and not text.endswith("\n\n"), repr(text[-8:])
+
+
+@probe("service_detail text ends with exactly one newline")
+def _():
+    text = lib("auditreport").service_detail("svc-3")
+    assert text.endswith("\n") and not text.endswith("\n\n"), repr(text[-8:])
+
+
+@probe("service_detail returns the findings file, whole")
+def _():
+    import pathlib
+
+    text = lib("auditreport").service_detail("svc-3")
+    on_disk = pathlib.Path("findings", "svc-3.md").read_text()
+    assert text == on_disk, "service_detail must be the file's full text"
+
+
+@probe("critical_services is sorted")
+def _():
+    names = lib("auditreport").critical_services()
+    assert list(names) == sorted(names), names
+
+
+@probe("render agrees with critical_services, line for line")
+def _():
+    report = lib("auditreport")
+    names = list(report.critical_services())
+    lines = report.render().splitlines()
+    assert lines[-1] == "CRITICAL: %d" % len(names), lines[-1:]
+    heads = [line.split(":", 1)[0] for line in lines[:-1]]
+    assert heads == names, (heads, names)
+
+
+@probe("service_detail of a non-string fails as an AuditError, not a builtin")
+def _():
+    try:
+        lib("auditreport").service_detail(123)
+    except err():
+        return
+    raise AssertionError("a number is not a service name")
+
+
+PASSED = 0
+for _label, _function in PROBES:
+    try:
+        _function()
+        PASSED += 1
+    except BaseException as _exc:
+        if os.environ.get("BATTERY_VERBOSE"):
+            print("FAIL: %s -> %s: %s" % (_label, type(_exc).__name__, str(_exc)[:70]))
+
+print("GRADE %d/%d" % (PASSED, len(PROBES)))
+PYEOF
+'''
 
 [[tasks.files]]
 path = "make_corpus.py"
