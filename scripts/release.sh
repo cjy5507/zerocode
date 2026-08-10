@@ -91,11 +91,13 @@ git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null || \
 printf 'Remote tag %s verified.\n' "$tag"
 
 if command -v gh >/dev/null 2>&1; then
-  # Bounded wait for the workflow's release assets. A timeout here is a
-  # warning, not a failure: the tag landed, so the release exists; assets can
-  # lag. What must never happen is this script CLAIMING assets it never saw.
+  # Bounded wait for the workflow's release assets — 40 minutes, calibrated to
+  # the measured ~23-minute workflow (the first 10-minute bound cried wolf on a
+  # healthy in-progress run). A timeout here is a warning, not a failure: the
+  # tag landed, so the release exists; assets can lag. What must never happen
+  # is this script CLAIMING assets it never saw.
   assets=""
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 120); do
     assets="$(gh release view "$tag" --json assets \
       --jq '.assets | length' 2>/dev/null || true)"
     [[ -n "$assets" && "$assets" != "0" ]] && break
@@ -104,7 +106,9 @@ if command -v gh >/dev/null 2>&1; then
   if [[ -n "$assets" && "$assets" != "0" ]]; then
     printf 'Release %s verified: %s asset(s) published.\n' "$tag" "$assets"
   else
-    printf 'WARNING: %s tag landed but no assets visible after 10min — check `gh run list`.\n' "$tag" >&2
+    printf 'WARNING: %s tag landed but no assets after 40min — workflow state: %s\n' \
+      "$tag" "$(gh run list --limit 1 --json status,conclusion \
+        --jq '.[0] | .status + "/" + (.conclusion // "-")' 2>/dev/null || echo unknown)" >&2
   fi
 else
   printf 'gh CLI not found; asset publication NOT verified (tag is confirmed).\n' >&2
