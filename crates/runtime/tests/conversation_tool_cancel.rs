@@ -93,8 +93,33 @@ fn cancelled_tool_results(runtime_session: &Session) -> Vec<(String, String, boo
         .collect()
 }
 
+// ── Harness attestation ─────────────────────────────────────────────────────
+//
+// Esc-once is at its most invisible when it works: what the user sees is a turn
+// that kept going, which is exactly what they see when nothing was cancelled.
+// The attest ledger is the only place a firing leaves a durable mark, and
+// `/smart doctor` and `/refine` read a never-firing feature as a dead one.
+
+/// The ledger is PROCESS-wide by design and both tests below share it, so an
+/// exact-delta assertion would be a coin flip under cargo's default
+/// parallelism. Both tests take this lock, which makes each delta its own work.
+///
+/// An ASYNC mutex on purpose: the guard is held across the turn's awaits,
+/// because the turn IS the measured region. It also has no poisoning, so one
+/// failing test cannot cascade into the other and hide which one broke.
+static ATTEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Settled tool cancellations recorded in this process so far.
+fn cancel_firings() -> u64 {
+    telemetry::harness_attest_snapshot()
+        .attestation(telemetry::HarnessFeature::ToolCancelSettled)
+        .fired
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelling_a_running_tool_settles_a_tool_result_and_keeps_the_turn() {
+    let _serial = ATTEST_SERIAL.lock().await;
+    let firings_before = cancel_firings();
     let calls = Arc::new(AtomicUsize::new(0));
     let dispatch_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let entered = Arc::clone(&dispatch_entered);
@@ -193,12 +218,23 @@ async fn cancelling_a_running_tool_settles_a_tool_result_and_keeps_the_turn() {
         )),
         "a cancelled tool must repaint its card as Cancelled before the error result lands"
     );
+
+    // 4. …and it left evidence that it ran. One cancelled tool, one firing —
+    // both dispatch arms funnel through the same helper, so this also pins
+    // that the parallel wave and the single dispatch cannot double-count.
+    assert_eq!(
+        cancel_firings() - firings_before,
+        1,
+        "a settled cancellation must attest exactly one firing"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancel_requested_before_a_tool_starts_does_not_touch_it() {
     // The reset-race a boolean flag would lose: the user cancels tool A, the
     // model immediately calls tool B, and B must run normally.
+    let _serial = ATTEST_SERIAL.lock().await;
+    let firings_before = cancel_firings();
     let calls = Arc::new(AtomicUsize::new(0));
     let dispatch: ConcurrentDispatchFn = Arc::new(|_name, _input| Ok("real output".to_string()));
 
@@ -233,4 +269,13 @@ async fn a_cancel_requested_before_a_tool_starts_does_not_touch_it() {
         "a stale cancel must not settle over a tool that started after it"
     );
     assert!(!results[0].2, "an uncancelled tool result is not an error");
+
+    // The negative half: an inert cancel must leave the ledger alone. A counter
+    // that ticks on a stale keypress would report the feature as alive on a
+    // build where it had stopped cancelling anything.
+    assert_eq!(
+        cancel_firings(),
+        firings_before,
+        "a cancel that touched no dispatch must attest no firing"
+    );
 }

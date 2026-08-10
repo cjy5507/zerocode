@@ -1158,6 +1158,20 @@ where
                             }
                             self.fold_steering_into_settled_tail(&steers)
                                 .map_err(StreamingTurnError::from)?;
+                            // Attested AFTER the fold, not at the race's
+                            // decision: a firing has to mean the steer really
+                            // reached the next request, and the fold is where
+                            // that becomes true (a fold error returns above and
+                            // records nothing, which is the honest reading —
+                            // the call was abandoned for nothing).
+                            //
+                            // The steer COUNT is deliberately not carried: the
+                            // ledger is a counter table whose reasons are
+                            // `&'static str` by construction, and per-call
+                            // detail is an explicit non-goal there (see the
+                            // `harness_attest` module doc). One firing per
+                            // re-issued call is the axis this proves.
+                            telemetry::attest_fired(telemetry::HarnessFeature::SteeringReissue);
                             // Re-request from the top with the identical
                             // thinking/effort/tool configuration — the request is
                             // rebuilt by the same `assemble_request` call every
@@ -2455,6 +2469,17 @@ where
                 rollback_message_count,
             ));
         }
+        // The cancel is committed here: the card now reads "you stopped this"
+        // and the caller settles `CANCELLED_TOOL_RESULT` for this same tool
+        // next. Both dispatch arms — the parallel-safe wave and the single
+        // concurrent dispatch — funnel through this one helper, so a cancelled
+        // tool is counted exactly once and neither arm can drift from the other.
+        //
+        // The tool NAME is deliberately not carried: attestation reasons are
+        // `&'static str` by construction so the table's cardinality stays
+        // bounded by the code's, and per-call detail is a stated non-goal of
+        // the ledger (see the `harness_attest` module doc).
+        telemetry::attest_fired(telemetry::HarnessFeature::ToolCancelSettled);
         Ok(())
     }
 

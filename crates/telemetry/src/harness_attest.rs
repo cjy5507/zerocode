@@ -99,6 +99,30 @@ pub enum HarnessFeature {
     /// fired:failed ratio is the evidence that tunes max attempts — without
     /// it every retry-budget change is blind.
     DeepRetryConversion,
+    /// Mid-generation steering re-issue ("gen-abort"): a correction typed while
+    /// the model was still generating abandoned the in-flight call and re-issued
+    /// it with the steer folded in, rather than letting the steer wait behind a
+    /// stale tool batch.
+    ///
+    /// Attested because a working re-issue leaves NO durable trace: the
+    /// abandoned call settles nothing at all — no assistant message, no
+    /// iteration record — so the transcript of a steer delivered early and the
+    /// transcript of a steer that silently waited for the tool-result boundary
+    /// are the same transcript. The race is also fail-open by construction (a
+    /// turn being torn down, a call that already emitted `tool_use`, and an
+    /// unreadable steering queue all fall through to the old boundary fold), so
+    /// a regression that stops abandoning is invisible from the outside.
+    SteeringReissue,
+    /// Esc-once tool cancellation: a dispatch the user stopped mid-flight
+    /// settled as cancelled and the turn carried on.
+    ///
+    /// Attested because the feature is at its most invisible when it works —
+    /// what the user sees is a turn that kept going, which is exactly what they
+    /// see when nothing was cancelled at all. The cancel is armed per dispatch
+    /// off a signal epoch, so it fails open in both directions (a keypress
+    /// outside a dispatch is inert, and a tool that finishes in the same poll
+    /// wins the race deliberately); neither leaves a trace of its own.
+    ToolCancelSettled,
 }
 
 impl HarnessFeature {
@@ -114,6 +138,8 @@ impl HarnessFeature {
             Self::WorkflowRelay => "workflow_relay",
             Self::EmptyRetryDeescalation => "empty_retry_deescalation",
             Self::DeepRetryConversion => "deep_retry_conversion",
+            Self::SteeringReissue => "steering_reissue",
+            Self::ToolCancelSettled => "tool_cancel_settled",
         }
     }
 
@@ -129,6 +155,8 @@ impl HarnessFeature {
             Self::WorkflowRelay => "workflow {seen} relay",
             Self::EmptyRetryDeescalation => "empty-response retry de-escalation",
             Self::DeepRetryConversion => "deep retry conversion",
+            Self::SteeringReissue => "mid-generation steering re-issue",
+            Self::ToolCancelSettled => "Esc tool cancel (settled)",
         }
     }
 
@@ -158,6 +186,10 @@ impl HarnessFeature {
             Self::DeepRetryConversion => {
                 "requires a deep-gate turn whose verifier rejected an attempt (an [auto:RETRY] follow-up ran)"
             }
+            Self::SteeringReissue => {
+                "requires steering typed while a call is still generating, before it emits any tool_use"
+            }
+            Self::ToolCancelSettled => "requires Esc pressed while a tool dispatch is in flight",
         }
     }
 
@@ -175,6 +207,8 @@ impl HarnessFeature {
             Self::WorkflowRelay,
             Self::EmptyRetryDeescalation,
             Self::DeepRetryConversion,
+            Self::SteeringReissue,
+            Self::ToolCancelSettled,
         ]
     }
 

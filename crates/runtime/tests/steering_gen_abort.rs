@@ -154,6 +154,32 @@ async fn collect_blocks(mut rx: mpsc::Receiver<RenderBlock>) -> Vec<RenderBlock>
     blocks
 }
 
+// ── Harness attestation ─────────────────────────────────────────────────────
+//
+// The re-issue is the kind of feature the attest ledger exists for: when it
+// works it settles NOTHING (no assistant message, no iteration record), so a
+// build where it silently stopped firing produces the same transcript as a
+// build where it works. `/smart doctor` and `/refine` read the ledger, so a
+// firing that is never recorded reads as a dead feature.
+
+/// The ledger is PROCESS-wide by design and every test in this binary shares
+/// it, so an exact-delta assertion would be a coin flip under cargo's default
+/// parallelism — a sibling test's re-issue would land inside this one's
+/// measurement. Every test here that FIRES the feature or MEASURES it takes
+/// this lock, which makes each delta the measuring test's own work.
+///
+/// An ASYNC mutex on purpose: the guard is held across the turn's awaits,
+/// because the turn IS the measured region. It also has no poisoning, so one
+/// failing test cannot cascade into its siblings and hide which one broke.
+static ATTEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Re-issue firings recorded in this process so far.
+fn reissue_firings() -> u64 {
+    telemetry::harness_attest_snapshot()
+        .attestation(telemetry::HarnessFeature::SteeringReissue)
+        .fired
+}
+
 // ============================================================================
 // (a) abandon → fold → re-issue
 // ============================================================================
@@ -217,6 +243,8 @@ impl AsyncApiClient for SteeredMidGenerationAsyncApi {
 
 #[tokio::test]
 async fn steering_during_generation_abandons_the_call_and_reissues_with_it_folded() {
+    let _serial = ATTEST_SERIAL.lock().await;
+    let firings_before = reissue_firings();
     let mut runtime = test_runtime(StaticToolExecutor::new());
     let steering = runtime.steering_handle();
     let first_call_ran_to_completion = Arc::new(AtomicBool::new(false));
@@ -297,6 +325,14 @@ async fn steering_during_generation_abandons_the_call_and_reissues_with_it_folde
         "the queue should be drained by the fold"
     );
     assert_wire_valid(&runtime.session().messages, "post-turn session");
+
+    // The ledger row is the only durable evidence this ran: everything else
+    // asserted above is invisible once the turn is over.
+    assert_eq!(
+        reissue_firings() - firings_before,
+        1,
+        "the re-issue must attest exactly one firing"
+    );
 }
 
 // ============================================================================
@@ -366,6 +402,8 @@ impl AsyncApiClient for SteeredTwiceAsyncApi {
 
 #[tokio::test]
 async fn a_reissued_call_is_not_abandoned_again_by_a_second_steer() {
+    let _serial = ATTEST_SERIAL.lock().await;
+    let firings_before = reissue_firings();
     let mut runtime = test_runtime(StaticToolExecutor::new());
     let steering = runtime.steering_handle();
     let second_call_ran_to_completion = Arc::new(AtomicBool::new(false));
@@ -407,6 +445,14 @@ async fn a_reissued_call_is_not_abandoned_again_by_a_second_steer() {
     );
     assert!(steering.lock().expect("steering lock").is_empty());
     assert_wire_valid(&runtime.session().messages, "post-turn session");
+
+    // The cap is visible in the ledger too: two steers, one abandonment, one
+    // firing. A count of 2 here would mean the boundary cap had come off.
+    assert_eq!(
+        reissue_firings() - firings_before,
+        1,
+        "one abandonment per boundary must attest one firing, not one per steer"
+    );
 }
 
 // ============================================================================
@@ -455,6 +501,8 @@ impl AsyncApiClient for SlowButUnsteeredAsyncApi {
 
 #[tokio::test]
 async fn an_empty_steering_queue_leaves_a_slow_generation_untouched() {
+    let _serial = ATTEST_SERIAL.lock().await;
+    let firings_before = reissue_firings();
     let mut runtime = test_runtime(StaticToolExecutor::new());
     let ran_to_completion = Arc::new(AtomicBool::new(false));
     let client = Arc::new(SlowButUnsteeredAsyncApi {
@@ -494,6 +542,14 @@ async fn an_empty_steering_queue_leaves_a_slow_generation_untouched() {
         })
         .collect();
     assert_eq!(text, "thinking done", "got {blocks:?}");
+
+    // The negative half of the ledger claim: a counter that also ticks when
+    // nothing was abandoned proves nothing about the feature at all.
+    assert_eq!(
+        reissue_firings(),
+        firings_before,
+        "an untouched generation must attest no firing"
+    );
 }
 
 // ============================================================================
@@ -569,6 +625,8 @@ impl AsyncApiClient for SteeredAfterToolUseAsyncApi {
 
 #[tokio::test]
 async fn a_call_that_already_emitted_a_tool_use_is_not_abandoned() {
+    let _serial = ATTEST_SERIAL.lock().await;
+    let firings_before = reissue_firings();
     let mut runtime = test_runtime(
         StaticToolExecutor::new().register("echo", |_input| Ok("echoed".to_string())),
     );
@@ -617,4 +675,13 @@ async fn a_call_that_already_emitted_a_tool_use_is_not_abandoned() {
         message_text(&tail)
     );
     assert_wire_valid(&runtime.session().messages, "post-turn session");
+
+    // A steer DID arrive here — it just arrived too late to abandon anything.
+    // The firing must follow the abandonment, not the steer, or the ledger
+    // would report the old boundary fold as if it were the new feature.
+    assert_eq!(
+        reissue_firings(),
+        firings_before,
+        "a steer delivered by the boundary fold must attest no re-issue firing"
+    );
 }
