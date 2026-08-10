@@ -25,6 +25,7 @@ mod tool_call_salvage;
 mod turn_end;
 mod turn_end_gate;
 mod turn_support;
+mod verified_state;
 mod verify_treadmill;
 
 pub use api::{
@@ -522,6 +523,21 @@ pub struct ConversationRuntime<C, T> {
     /// a session swap, and after a compaction — so an entry reseeds in full
     /// exactly when its body stops being there.
     recalled_memory_slugs: HashSet<String>,
+    /// Session-lifetime record of the check-shaped bash commands this session
+    /// observed exiting 0 and the files edited after each of them, rendered
+    /// into a turn-start observation by
+    /// [`Self::inject_verified_state_reminder`] (see
+    /// `conversation::verified_state`).
+    ///
+    /// Owned by the runtime rather than the tool context because the seam that
+    /// CONSUMES it is a turn-start reminder, and because both recording seams
+    /// (`record_turn_completed`) already sit here. Bound to a session sidecar
+    /// by [`Self::reset_verified_state_session`], which the hosts call from the
+    /// same places they bind the file-read registry — including inside
+    /// `build_runtime`, since headless rebuilds a runtime every turn and an
+    /// unbound ledger would be empty at exactly the stage boundary it exists
+    /// to cross.
+    verified_state: crate::verified_state::VerifiedStateLedger,
     /// Query-aware persistent-memory retriever. Recalled entries are appended
     /// to the outgoing request's wire reminders only, so the base prompt and
     /// cacheable static prefix do not accumulate stale per-turn memory.
@@ -1144,6 +1160,29 @@ fn is_edit_or_write_tool(tool_name: &str) -> bool {
 }
 
 impl<C, T> ConversationRuntime<C, T> {
+    /// Bind the verified-state ledger to a session sidecar
+    /// (`<session>.verified-state.json`) and restore whatever it recorded.
+    ///
+    /// The mirror of `ToolContext::reset_file_reads_session`, and it must be
+    /// called from the same places for the same reason: a multi-stage bench run
+    /// is a chain of PROCESSES resuming one session, and headless rebuilds the
+    /// runtime on every turn. An unbound ledger is therefore empty precisely at
+    /// the stage boundary the observation exists to cross. `None` unbinds
+    /// (in-memory only — sub-agent runtimes), which is also the default, so a
+    /// host that never binds it degrades to byte-neutral rather than to a wrong
+    /// observation.
+    ///
+    /// Rebinding is also how a conversation RESET drops the history: `/clear`
+    /// swaps in a fresh session and rebinds here, so the new conversation reads
+    /// its own (empty) sidecar. There is deliberately no "wipe" entry point —
+    /// at `/clear` time the ledger is still bound to the PREVIOUS session's
+    /// sidecar, so a write-through wipe would destroy the history of the
+    /// session `/clear` exists to keep resumable (the same trap already
+    /// documented at the read-registry swap in `live_cli_commands`).
+    pub fn reset_verified_state_session(&mut self, sidecar: Option<std::path::PathBuf>) {
+        self.verified_state.rebind_sidecar(sidecar);
+    }
+
     /// Install this turn's routing band for proportional deep-gate VERIFY.
     pub fn set_verify_band(
         &mut self,
@@ -1322,6 +1361,7 @@ where
             system_prompt: Arc::from(system_prompt),
             transient_reminders,
             recalled_memory_slugs,
+            verified_state: crate::verified_state::VerifiedStateLedger::new(),
             memory_retriever: None,
             max_iterations: default_max_iterations(),
             deadline: None,
@@ -1491,6 +1531,10 @@ where
                 self.inject_team_inbox_digest_reminder();
                 self.inject_recall_hint_reminder(user_input);
                 self.inject_goal_clarify_reminder(user_input);
+                // Every streaming entry point — TUI and all three headless
+                // output formats — funnels through here, so this one call
+                // covers the whole streaming dispatcher.
+                self.inject_verified_state_reminder();
                 Ok(())
             }
             PromptSubmitDecision::Denied { reason } => Err(StreamingTurnError::runtime(
@@ -1631,6 +1675,13 @@ where
         self.inject_team_inbox_digest_reminder();
         self.inject_recall_hint_reminder(&user_input);
         self.inject_goal_clarify_reminder(&user_input);
+        // The sync loop gets the observation too. It is the deep-gate-less
+        // path, so it was eligible to be deferred — but the injection is one
+        // call on a seam that already exists here, and a session that mixes
+        // both loops (a sub-agent turn, `zo -p` with `--output-format text`
+        // on the sync fallback) would otherwise record facts it can never
+        // report.
+        self.inject_verified_state_reminder();
         self.record_turn_started(&user_input);
         let turn_start_output_tokens = self.usage_tracker.cumulative_usage().output_tokens;
         self.session

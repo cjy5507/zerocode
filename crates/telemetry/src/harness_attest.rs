@@ -123,6 +123,19 @@ pub enum HarnessFeature {
     /// outside a dispatch is inert, and a tool that finishes in the same poll
     /// wins the race deliberately); neither leaves a trace of its own.
     ToolCancelSettled,
+    /// The `[zo:verified-state]` observation injected at turn start: the
+    /// check-shaped bash commands the runtime recorded exiting 0 in this
+    /// session, plus which files have been edited since each one.
+    ///
+    /// Attested because the injection is CONDITIONAL and therefore silently
+    /// skippable: a session that never ran a check produces no block at all
+    /// (deliberately — byte neutrality), which is byte-for-byte identical to a
+    /// session whose ledger never got bound, never got persisted, or lost its
+    /// sidecar across a stage boundary. Without a counter the two are the same
+    /// observation, and the failure mode being guarded here — a ledger that is
+    /// empty at exactly the moment it should have spoken — is precisely the
+    /// invisible one.
+    VerifiedStateObservation,
 }
 
 impl HarnessFeature {
@@ -140,6 +153,7 @@ impl HarnessFeature {
             Self::DeepRetryConversion => "deep_retry_conversion",
             Self::SteeringReissue => "steering_reissue",
             Self::ToolCancelSettled => "tool_cancel_settled",
+            Self::VerifiedStateObservation => "verified_state_observation",
         }
     }
 
@@ -157,6 +171,7 @@ impl HarnessFeature {
             Self::DeepRetryConversion => "deep retry conversion",
             Self::SteeringReissue => "mid-generation steering re-issue",
             Self::ToolCancelSettled => "Esc tool cancel (settled)",
+            Self::VerifiedStateObservation => "verified-state observation",
         }
     }
 
@@ -190,6 +205,9 @@ impl HarnessFeature {
                 "requires steering typed while a call is still generating, before it emits any tool_use"
             }
             Self::ToolCancelSettled => "requires Esc pressed while a tool dispatch is in flight",
+            Self::VerifiedStateObservation => {
+                "requires a turn start after this session recorded a check-shaped bash command exiting 0"
+            }
         }
     }
 
@@ -209,6 +227,7 @@ impl HarnessFeature {
             Self::DeepRetryConversion,
             Self::SteeringReissue,
             Self::ToolCancelSettled,
+            Self::VerifiedStateObservation,
         ]
     }
 

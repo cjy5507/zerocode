@@ -364,10 +364,20 @@ where
     }
 
     pub(super) fn record_tool_finished(
-        &self,
+        &mut self,
         iteration: usize,
         result_message: &ConversationMessage,
     ) {
+        // A turn-start verified-state observation is only true until this turn
+        // mutates something, and the reminder absorber deliberately RE-ANCHORS
+        // an unchanged set near the tail once it drifts past its dedupe window
+        // — so a block left standing would eventually re-assert "nothing edited
+        // since" BELOW the very edits that falsified it. Retire it at the first
+        // successful mutation instead. The copy already persisted at turn-start
+        // position stays (it is true where it sits); only the re-assertion
+        // stops. `&mut self` exists for this — both turn loops settle every
+        // tool result through here.
+        self.retire_verified_state_observation_on_mutation(result_message);
         let Some(session_tracer) = &self.session_tracer else {
             return;
         };
@@ -402,6 +412,13 @@ where
     }
 
     pub(super) fn record_turn_completed(&mut self, summary: &TurnSummary) {
+        // Fold this turn's observed green checks and edits into the session
+        // ledger before anything else: both turn loops reach this seam, so it
+        // is the one place that sees every settled turn on every path. It
+        // write-throughs to the session sidecar, which is what carries the
+        // observation across the process boundary a resumed stage crosses.
+        self.record_verified_state_from_turn(summary);
+
         // Externalize the turn into the durable, compaction-proof trace under
         // `.zo/turns/` (Harness-1: state lives outside the context window).
         // Best-effort: a recording failure must never affect the turn. This runs

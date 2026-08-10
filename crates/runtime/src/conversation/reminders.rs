@@ -6,6 +6,7 @@
 //! where the loops in `mod.rs` (and `compaction`/tests) still reach them.
 
 use crate::team_inbox_digest::TEAM_INBOX_REMINDER_PREFIX;
+use crate::verified_state::VERIFIED_STATE_REMINDER_PREFIX;
 
 use super::verify_treadmill::VERIFY_TREADMILL_REMINDER_PREFIX;
 use super::{ApiClient, ConversationRuntime, ToolExecutor, EMPTY_STREAM_RETRY_REMINDER_PREFIX};
@@ -452,6 +453,11 @@ where
         self.replace_transient_system_reminder_by_prefix(TEAM_INBOX_REMINDER_PREFIX, None);
         self.replace_transient_system_reminder_by_prefix(RECALL_HINT_REMINDER_PREFIX, None);
         self.replace_transient_system_reminder_by_prefix(GOAL_CLARIFY_REMINDER_PREFIX, None);
+        // The verified-state observation is rebuilt from the session ledger on
+        // every turn entry, so a stale render (one whose "nothing edited since"
+        // the turn just falsified) must never survive into the next turn. See
+        // [`ConversationRuntime::inject_verified_state_reminder`].
+        self.replace_transient_system_reminder_by_prefix(VERIFIED_STATE_REMINDER_PREFIX, None);
         // NOT cleared here: [`DESIGN_GUIDANCE_REMINDER_PREFIX`] is installed by
         // the HOST before the turn starts streaming, and this clear runs
         // inside `begin_streaming_turn` — i.e. after that install. Clearing it

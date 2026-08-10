@@ -61,6 +61,7 @@ pub mod todo_progress;
 pub mod todo_store;
 pub mod tool_cancel;
 pub mod trust_resolver;
+pub mod verified_state;
 pub mod worker_boot;
 
 // Re-export modules from core-types so that `crate::json`, `crate::session`,
@@ -151,6 +152,9 @@ pub use file_ops::{
     StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
 pub use file_read_registry::{FileFreshness, FileReadRegistry};
+pub use verified_state::{
+    VerifiedStateEvent, VerifiedStateLedger, VERIFIED_STATE_REMINDER_PREFIX,
+};
 pub use hooks::{
     HookAbortOrigin, HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter,
     HookRunResult, HookRunner,

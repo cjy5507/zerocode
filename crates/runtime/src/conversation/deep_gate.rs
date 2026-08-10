@@ -823,7 +823,7 @@ fn edited_file_paths(summary: &TurnSummary) -> Vec<String> {
     paths.into_iter().collect()
 }
 
-fn tool_result_path(output: &str) -> Option<String> {
+pub(super) fn tool_result_path(output: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(output).ok()?;
     ["filePath", "path", "file_path"]
         .into_iter()
@@ -935,7 +935,7 @@ fn attempt_diff_paths(
 }
 
 /// Truncate `s` to at most `max` bytes, never splitting a UTF-8 char.
-fn truncate_on_boundary(s: &mut String, max: usize) {
+pub(super) fn truncate_on_boundary(s: &mut String, max: usize) {
     if s.len() <= max {
         return;
     }
@@ -1328,7 +1328,7 @@ const EXEC_CHECK_COMMAND_MARKERS: &[&str] = &[
     "mvn test",
 ];
 
-fn command_is_check_shaped(command: &str) -> bool {
+pub(super) fn command_is_check_shaped(command: &str) -> bool {
     EXEC_CHECK_COMMAND_MARKERS
         .iter()
         .any(|marker| command.contains(marker))
@@ -1341,7 +1341,7 @@ fn command_is_check_shaped(command: &str) -> bool {
 /// background start proves nothing about the command's outcome. The `stdout`
 /// key doubles as a shape check so arbitrary JSON from another tool can never
 /// read as a green check.
-fn bash_result_exited_zero(output: &str) -> bool {
+pub(super) fn bash_result_exited_zero(output: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
         return false;
     };
@@ -1558,8 +1558,10 @@ fn exec_green_checks(summary: &TurnSummary) -> Vec<String> {
     checks
 }
 
-/// Display cap for one harvested check command inside the VERIFY prompt.
-const EXEC_CHECK_COMMAND_BYTES: usize = 240;
+/// Display cap for one harvested check command inside the VERIFY prompt, and
+/// the storage cap the session ledger applies to the same commands
+/// (`conversation::verified_state`) so both surfaces truncate identically.
+pub(super) const EXEC_CHECK_COMMAND_BYTES: usize = 240;
 /// At most this many observed commands are reported (newest kept).
 const EXEC_CHECK_MAX_COMMANDS: usize = 3;
 
