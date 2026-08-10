@@ -917,6 +917,18 @@ fn epoch_seconds_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// A startup failure must name the stage it escaped from: a one-shot
+/// `Io(EINVAL)` flake (2026-08-10, ~1/16 of full-suite rounds, never
+/// reproduced across 320+ instrumented rounds) died unattributable because
+/// every constructor stage funnels into one anonymous `Box<dyn Error>`.
+/// The Debug payload is kept verbatim so the error kind survives the wrap.
+fn stage_tag<T>(
+    label: &'static str,
+    result: Result<T, Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    result.map_err(|error| format!("startup stage {label}: {error:?}").into())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_runtime_with_optional_mcp_config(
     cwd: &std::path::Path,
@@ -1244,7 +1256,7 @@ impl LiveCli {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn new_scoped_with_mcp_config_and_session_id_at(
         model: String,
         enable_tools: bool,
@@ -1264,16 +1276,24 @@ impl LiveCli {
         // (tests, explicit scoping) by leaving non-default stores untouched.
         clear_stale_default_todo_store_at(&cwd);
         let addressed_session = explicit_session_id.is_some();
-        let (session_state, resumed_existing) =
-            resolve_addressed_session(explicit_session_id, scope, &cwd)?;
-        let session = create_managed_session_handle_at(&session_state.session_id, scope, &cwd)?;
-        let mut system_prompt = session_system_prompt(
-            &cwd,
-            scope,
-            &model,
-            &session.path,
-            addressed_session,
-            resumed_existing,
+        let (session_state, resumed_existing) = stage_tag(
+            "resolve_addressed_session",
+            resolve_addressed_session(explicit_session_id, scope, &cwd),
+        )?;
+        let session = stage_tag(
+            "create_managed_session_handle_at",
+            create_managed_session_handle_at(&session_state.session_id, scope, &cwd),
+        )?;
+        let mut system_prompt = stage_tag(
+            "session_system_prompt",
+            session_system_prompt(
+                &cwd,
+                scope,
+                &model,
+                &session.path,
+                addressed_session,
+                resumed_existing,
+            ),
         )?;
         // Isolate this session's todo store so a second `zo` in the same cwd
         // (e.g. GPT and Claude side by side) does not share — and overwrite —
@@ -1282,7 +1302,10 @@ impl LiveCli {
         // with an empty checklist, while a resumed one keeps the checklist it
         // saved.
         scope_todo_store_to_session(&session.path, !resumed_existing);
-        let preferences = load_project_preferences(&cwd)?;
+        let preferences = stage_tag(
+            "load_project_preferences",
+            load_project_preferences(&cwd),
+        )?;
         let model = if model == crate::DEFAULT_MODEL {
             preferences.model.clone().unwrap_or(model)
         } else {
@@ -1297,22 +1320,25 @@ impl LiveCli {
         let (effort, thinking_budget, effort_user_selected) =
             Self::session_start_effort_defaults(&preferences);
         let tasks = Arc::new(runtime::task_registry::TaskRegistry::new());
-        let mut runtime = build_runtime_with_optional_mcp_config(
-            &cwd,
-            mcp_config.as_ref(),
-            session_state.with_persistence_path(session.path.clone()),
-            &session.id,
-            model.clone(),
-            system_prompt.clone(),
-            enable_tools,
-            true,
-            allowed_tools.clone(),
-            permission_mode,
-            thinking_budget.map(api::ThinkingConfig::enabled),
-            effort.and_then(Effort::level),
-            effort.and_then(Effort::band_ceiling),
-            tasks.as_ref().clone(),
-            startup_auth_policy,
+        let mut runtime = stage_tag(
+            "build_runtime_with_optional_mcp_config",
+            build_runtime_with_optional_mcp_config(
+                &cwd,
+                mcp_config.as_ref(),
+                session_state.with_persistence_path(session.path.clone()),
+                &session.id,
+                model.clone(),
+                system_prompt.clone(),
+                enable_tools,
+                true,
+                allowed_tools.clone(),
+                permission_mode,
+                thinking_budget.map(api::ThinkingConfig::enabled),
+                effort.and_then(Effort::level),
+                effort.and_then(Effort::band_ceiling),
+                tasks.as_ref().clone(),
+                startup_auth_policy,
+            ),
         )?;
         // An ephemeral session is a headless one-shot: nobody is present to
         // answer a mid-run question, so the turn-end gate lints those too.

@@ -125,12 +125,18 @@ pub(crate) fn build_runtime_with_thinking_for_auth_policy(
     startup_auth_policy: StartupAuthPolicy,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let loader = ConfigLoader::default_for(cwd);
-    let runtime_config = loader.load()?;
+    // Stage-tagged like the LiveCli constructor (see `stage_tag` there): a
+    // startup error must name the stage it escaped from or a rare failure
+    // (the 2026-08-10 `Io(EINVAL)` flake) dies unattributable.
+    let runtime_config = loader
+        .load()
+        .map_err(|error| format!("startup stage config-load: {error:?}"))?;
     apply_custom_providers_env(&runtime_config);
     spawn_session_retention_cleanup(&runtime_config);
     spawn_orphaned_agent_reap();
     let runtime_plugin_state =
-        build_runtime_plugin_state_with_loader(cwd, &loader, &runtime_config, tasks)?;
+        build_runtime_plugin_state_with_loader(cwd, &loader, &runtime_config, tasks)
+            .map_err(|error| format!("startup stage plugin-state: {error:?}"))?;
     build_runtime_with_plugin_state_auth_policy(
         session,
         session_id,
@@ -224,9 +230,11 @@ pub(crate) fn build_runtime_with_plugin_state_auth_policy(
     // "escapes workspace boundary". A live Shift+Tab / `/permission` switch
     // refreshes it through the same shared cell (see `apply_permission_change`).
     tool_registry.context().set_permission_mode(permission_mode);
-    plugin_registry.initialize()?;
+    plugin_registry
+        .initialize()
+        .map_err(|error| format!("startup stage plugin-initialize: {error:?}"))?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
-        .map_err(std::io::Error::other)?;
+        .map_err(|error| format!("startup stage permission-policy: {error:?}"))?;
     // Derive context_window and model-family context policy from the actual
     // selected model so compaction thresholds match the real model limits (not
     // the optional feature_config.model() which may be None/200k default).
@@ -257,7 +265,8 @@ pub(crate) fn build_runtime_with_plugin_state_auth_policy(
             named_effort,
             effort_band_ceiling,
             startup_auth_policy,
-        )?,
+        )
+        .map_err(|error| format!("startup stage claude-runtime-client: {error:?}"))?,
         tool_executor,
         policy,
         system_prompt,
@@ -1390,11 +1399,15 @@ impl AnthropicRuntimeClient {
         let auth = if provider_kind_for_model(&model) == ProviderKind::Anthropic
             && auth_route == AuthRoute::Auto
         {
-            Some(resolve_startup_auth(startup_auth_policy, resolve_auth)?)
+            Some(
+                resolve_startup_auth(startup_auth_policy, resolve_auth)
+                    .map_err(|error| format!("startup stage resolve-startup-auth: {error:?}"))?,
+            )
         } else {
             None
         };
-        let client = build_provider_client(session_id, &model, auth_route, auth)?;
+        let client = build_provider_client(session_id, &model, auth_route, auth)
+            .map_err(|error| format!("startup stage build-provider-client: {error:?}"))?;
 
         Ok(Self {
             client,
