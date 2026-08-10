@@ -1125,13 +1125,13 @@ impl LiveCli {
                 .tool_executor_mut()
                 .tool_registry_mut()
                 .context()
-                .reset_file_reads_session(Some(self.session.path.with_extension("file-reads.json")));
+                .reset_file_reads_session(Some(self.session.path.with_extension(runtime::file_read_registry::FILE_READS_SIDECAR_EXTENSION)));
             // Same session boundary, same convention: the verified-state ledger
             // is rebound wherever the read registry is, so a swapped/resumed
             // conversation observes ITS OWN verification history and can never
             // read the previous conversation's.
             runtime.reset_verified_state_session(Some(
-                self.session.path.with_extension("verified-state.json"),
+                self.session.path.with_extension(runtime::verified_state::VERIFIED_STATE_SIDECAR_EXTENSION),
             ));
         }
     }
@@ -1501,14 +1501,14 @@ impl LiveCli {
         // first edit is rejected despite the sidecar existing.
         let file_reads_sidecar = session
             .persistence_path()
-            .map(|path| path.with_extension("file-reads.json"));
+            .map(|path| path.with_extension(runtime::file_read_registry::FILE_READS_SIDECAR_EXTENSION));
         // Same trap, same fix, for the verified-state ledger: headless builds a
         // runtime PER TURN, so a ledger bound only at session construction is
         // unbound on every rebuilt runtime — i.e. empty at the exact stage
         // boundary the observation exists to cross.
         let verified_state_sidecar = session
             .persistence_path()
-            .map(|path| path.with_extension("verified-state.json"));
+            .map(|path| path.with_extension(runtime::verified_state::VERIFIED_STATE_SIDECAR_EXTENSION));
         let mut runtime = build_runtime_with_optional_mcp_config(
             &self.cwd,
             self.mcp_config.as_ref(),

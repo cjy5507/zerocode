@@ -48,6 +48,10 @@ struct FileSnapshot {
     hash: u64,
 }
 
+/// Extension of the session sidecar this registry persists to
+/// (`<session>.file-reads.json`). Single source for every binding host.
+pub const FILE_READS_SIDECAR_EXTENSION: &str = "file-reads.json";
+
 /// 대화 스코프 `path → 스냅샷` 맵. 키는 canonicalize된 절대 경로라
 /// 상대/절대·심링크 표기가 달라도 같은 파일은 같은 엔트리로 수렴한다.
 ///

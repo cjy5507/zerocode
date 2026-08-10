@@ -74,6 +74,11 @@ const RENDER_MAX_FILES: usize = 8;
 /// match on it.
 pub const VERIFIED_STATE_REMINDER_PREFIX: &str = "[zo:verified-state]";
 
+/// Extension of the session sidecar this ledger persists to
+/// (`<session>.verified-state.json`). The single source for every host that
+/// binds the sidecar — a second literal is a second writer that can drift.
+pub const VERIFIED_STATE_SIDECAR_EXTENSION: &str = "verified-state.json";
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct GreenCheck {
     command: String,
