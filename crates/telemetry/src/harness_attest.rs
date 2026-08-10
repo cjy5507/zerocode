@@ -222,6 +222,22 @@ impl HarnessFeature {
             .copied()
             .find(|feature| feature.key().eq_ignore_ascii_case(key.trim()))
     }
+
+    /// Whether an experiment may hold this feature out (`ZO_ABLATE`).
+    ///
+    /// A harness-initiated policy is ablatable: the harness chose to run it,
+    /// so an experiment can meaningfully measure the arm where it chose not
+    /// to. A USER-initiated interaction is not — suppressing the steering
+    /// re-issue or the Esc tool cancel would mean ignoring an explicit user
+    /// action mid-session, so there is no counterfactual arm to measure, only
+    /// a broken one. Excluding these here (rather than gating their call
+    /// sites on `attest_ablated`) makes the leak state unrepresentable: a
+    /// feature that can never enter an [`AblationSet`] can never fire inside
+    /// one.
+    #[must_use]
+    pub const fn ablatable(self) -> bool {
+        !matches!(self, Self::SteeringReissue | Self::ToolCancelSettled)
+    }
 }
 
 /// Environment variable naming the features suppressed in this process, as a
@@ -238,14 +254,28 @@ pub const ABLATED_REASON: &str = "ablated";
 /// confident measurement of nothing, which is worse than no measurement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AblationSpecError {
-    /// The token that named no feature.
+    /// The token that named no feature, or named one that cannot be held out.
     pub token: String,
+    /// True when the token names a real feature that is not
+    /// [`HarnessFeature::ablatable`] — a distinct message, because "you
+    /// misspelled it" and "this cannot be an experiment arm" call for
+    /// different fixes.
+    pub not_ablatable: bool,
 }
 
 impl std::fmt::Display for AblationSpecError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.not_ablatable {
+            return write!(
+                formatter,
+                "{ABLATION_ENV}: '{}' is user-initiated and cannot be held out — suppressing it \
+                 would mean ignoring an explicit user action, so there is no control arm to measure",
+                self.token
+            );
+        }
         let known = HarnessFeature::all()
             .iter()
+            .filter(|feature| feature.ablatable())
             .map(|feature| feature.key())
             .collect::<Vec<_>>()
             .join(", ");
@@ -279,12 +309,19 @@ impl AblationSet {
         Self::default()
     }
 
-    /// Every attested feature suppressed — the floor an experiment measures
-    /// the full harness against.
+    /// Every ablatable feature suppressed — the floor an experiment measures
+    /// the full harness against. User-initiated features
+    /// ([`HarnessFeature::ablatable`] is false) stay out: they are not part of
+    /// any experiment arm, so `all` holding them out would make a user's Esc
+    /// or mid-turn correction silently inert inside the arm.
     #[must_use]
     pub fn all() -> Self {
         Self {
-            features: HarnessFeature::all().iter().copied().collect(),
+            features: HarnessFeature::all()
+                .iter()
+                .copied()
+                .filter(|feature| feature.ablatable())
+                .collect(),
         }
     }
 
@@ -299,14 +336,29 @@ impl AblationSet {
                 continue;
             }
             if token.eq_ignore_ascii_case("all") {
-                features.extend(HarnessFeature::all().iter().copied());
+                features.extend(
+                    HarnessFeature::all()
+                        .iter()
+                        .copied()
+                        .filter(|feature| feature.ablatable()),
+                );
                 continue;
             }
             let Some(feature) = HarnessFeature::from_key(token) else {
                 return Err(AblationSpecError {
                     token: token.to_string(),
+                    not_ablatable: false,
                 });
             };
+            // Naming a non-ablatable feature explicitly is a hard error, not a
+            // skip: the site never consults the gate, so accepting the token
+            // would run the treatment arm while reporting a holdout.
+            if !feature.ablatable() {
+                return Err(AblationSpecError {
+                    token: token.to_string(),
+                    not_ablatable: true,
+                });
+            }
             features.insert(feature);
         }
         Ok(Self { features })
@@ -873,6 +925,46 @@ mod tests {
         assert!(rendered.contains("desgin_guidance"), "{rendered}");
         assert!(rendered.contains("design_guidance"), "{rendered}");
         assert!(rendered.contains(ABLATION_ENV), "{rendered}");
+        // The alternatives list is an offer of valid tokens, so a feature that
+        // parse would then reject has no business appearing in it.
+        assert!(!rendered.contains("steering_reissue"), "{rendered}");
+    }
+
+    #[test]
+    fn user_initiated_features_cannot_be_held_out() {
+        // `all` is the floor arm of an experiment; a user's Esc or mid-turn
+        // correction is not part of any experiment, so the floor must not make
+        // them silently inert — and their firings must never be able to read
+        // as an AblationLeak that voids the run.
+        let floor = AblationSet::all();
+        assert!(!floor.contains(HarnessFeature::SteeringReissue));
+        assert!(!floor.contains(HarnessFeature::ToolCancelSettled));
+        assert_eq!(AblationSet::parse("all").expect("all"), floor);
+
+        // Naming one explicitly is a hard error with its own message: the call
+        // sites never consult the gate, so accepting the token would run the
+        // treatment while reporting a holdout.
+        let error = AblationSet::parse("steering_reissue")
+            .expect_err("a user-initiated feature is not a valid holdout");
+        assert!(error.not_ablatable);
+        let rendered = error.to_string();
+        assert!(rendered.contains("user-initiated"), "{rendered}");
+        assert!(rendered.contains("steering_reissue"), "{rendered}");
+        assert!(
+            AblationSet::parse("tool_cancel_settled").is_err(),
+            "both user-initiated features must be rejected"
+        );
+
+        // Every harness-initiated feature still parses — the classification
+        // must never quietly shrink the legitimate experiment surface.
+        for feature in HarnessFeature::all() {
+            assert_eq!(
+                AblationSet::parse(feature.key()).is_ok(),
+                feature.ablatable(),
+                "{} parse admission must equal its ablatable class",
+                feature.key()
+            );
+        }
     }
 
     #[test]
