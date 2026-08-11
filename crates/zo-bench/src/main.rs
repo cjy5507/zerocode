@@ -1152,10 +1152,12 @@ mod tests {
                 StageConfig {
                     prompt: "one".into(),
                     check: None,
+                    fresh_session: false,
                 },
                 StageConfig {
                     prompt: "two".into(),
                     check: Some("true".into()),
+                    fresh_session: false,
                 },
             ],
             check: "true".into(),
@@ -1172,6 +1174,7 @@ mod tests {
             stages: vec![StageConfig {
                 prompt: "one".into(),
                 check: None,
+                fresh_session: false,
             }],
             check: "true".into(),
             graded_check: None,
