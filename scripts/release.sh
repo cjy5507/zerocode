@@ -74,6 +74,22 @@ PY
 # Refresh workspace package versions in Cargo.lock before the locked release gate.
 scripts/ensure-cargo-space.sh -- cargo check --workspace
 just release-verify
+
+# Opt-in paid smoke (ZO_RELEASE_SMOKE=1): one headless `-p` turn against the
+# real provider, proving the auth + one-shot path end to end before the tag.
+# Opt-in, not default: a network flake must not be able to hold a release
+# hostage, and the free gates above already cover everything deterministic.
+# perf-gate (inside release-verify) just built target/release/zo, so the
+# binary under test is fresh.
+if [[ "${ZO_RELEASE_SMOKE:-0}" == "1" ]]; then
+  smoke_reply="$(target/release/zo --output-format json --permission-mode read-only \
+    -p 'Reply with exactly this single word and nothing else: SMOKE-OK' 2>&1 | tail -1)" || \
+    fail "paid smoke: headless zo -p run failed"
+  grep -q "SMOKE-OK" <<<"$smoke_reply" || \
+    fail "paid smoke: reply did not contain SMOKE-OK: ${smoke_reply:0:200}"
+  printf 'Paid smoke passed.\n'
+fi
+
 git diff --check
 git add Cargo.toml Cargo.lock
 git commit -m "release: ${tag}"
