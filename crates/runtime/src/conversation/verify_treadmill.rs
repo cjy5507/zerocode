@@ -7,7 +7,10 @@
 //! *self-verification loop* whose spec differs every round, so the fingerprint
 //! guard never fires.
 
-use super::{ApiClient, ConversationRuntime, ToolExecutor};
+use super::{
+    is_edit_or_write_tool, ApiClient, ContentBlock, ConversationMessage, ConversationRuntime,
+    ToolExecutor, TurnContinuity, TurnStopSignal,
+};
 
 /// Default soft (advisory) threshold: the number of consecutive verify-class
 /// rounds with no file mutation this turn that injects the "stop self-verifying,
@@ -36,6 +39,32 @@ pub(super) fn is_verify_class_tool(tool_name: &str) -> bool {
     )
 }
 
+/// Whether this tool batch actually CHANGED a file: a *successful*
+/// `edit_file`/`write_file` RESULT, not merely a requested one.
+///
+/// Reading the requested tool names instead let a failed — or permission-denied
+/// — edit reset the treadmill counter, so a loop that kept *attempting* the same
+/// impossible write evaded the guard forever while making no progress at all.
+/// The counter may only be forgiven by work that landed, which is also the
+/// definition [`super::count_progress_tool_results`] uses for the nudge ledger —
+/// the two must agree or the guard and its reprieve disagree about what progress
+/// even is.
+pub(super) fn batch_had_successful_mutation(results: &[ConversationMessage]) -> bool {
+    results
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .any(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolResult {
+                    tool_name,
+                    is_error,
+                    ..
+                } if !is_error && is_edit_or_write_tool(tool_name)
+            )
+        })
+}
+
 /// The `(advise, hard)` round thresholds, or `None` when the guard is disabled.
 /// `ZO_VERIFY_TREADMILL_ROUNDS` overrides the soft threshold (default
 /// [`VERIFY_TREADMILL_ADVISE`]); `0` disables the guard entirely; an empty or
@@ -50,6 +79,23 @@ pub(super) fn verify_treadmill_thresholds() -> Option<(usize, usize)> {
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .unwrap_or(VERIFY_TREADMILL_ADVISE);
     (advise > 0).then_some((advise, advise + VERIFY_TREADMILL_HARD_STOP_MARGIN))
+}
+
+/// The advisory injected when the HARD threshold is reached but the turn is
+/// spared because it has produced fresh objective progress (see
+/// [`ConversationRuntime::resolve_heuristic_stop`]). It must not say the turn is
+/// ending — the turn deliberately continues — but it must be unmistakably
+/// stronger than the soft advisory, because this is the last warning before the
+/// stop actually lands.
+fn verify_treadmill_nudge_advisory(run: usize) -> String {
+    format!(
+        "{VERIFY_TREADMILL_REMINDER_PREFIX} <system-reminder>You have now run {run} rounds of \
+         planning, validation, or agent-spawning this turn. This turn HAS changed files, so it \
+         is not being stopped — but this is the last warning: another run of verification \
+         rounds without changing a file will end the turn. Go make the next concrete change now \
+         (edit the file, run the command), or report what you have and hand back. Do not open \
+         another planning, validation, or spawn pass to re-check the same thing.</system-reminder>"
+    )
 }
 
 /// The soft-advisory body (a transient system-reminder) injected once the turn
@@ -72,10 +118,10 @@ where
     T: ToolExecutor,
 {
     /// Fold one completed tool batch into the verification-treadmill counter and
-    /// act on it. Returns `true` when the turn must hard-stop — the caller then
-    /// pushes the graceful [`super::BudgetExhausted::VerificationTreadmill`]
-    /// closer and breaks. The soft advisory is injected as a side effect and
-    /// never ends the turn.
+    /// act on it. Returns [`TurnContinuity::Stop`] when the turn must hard-stop —
+    /// the caller then pushes the graceful
+    /// [`super::BudgetExhausted::VerificationTreadmill`] closer and breaks. The
+    /// soft advisory is injected as a side effect and never ends the turn.
     ///
     /// Progress model (see the module doc):
     /// - `had_mutation` — the batch edited/wrote a file: real progress, reset to 0.
@@ -88,28 +134,47 @@ where
     ///
     /// False-positive note: a pure *orchestrator* turn that delegates every edit
     /// to sub-agents (`SpawnMultiAgent`/`Agent`) and never mutates a file itself
-    /// looks like a treadmill here. The generous default (hard stop at 10) and the
-    /// graceful, resumable handback keep that a rare, low-cost checkpoint rather
-    /// than a lost turn; `ZO_VERIFY_TREADMILL_ROUNDS=0` disables the guard for a
-    /// workload built entirely on delegation.
-    pub(super) fn note_verify_treadmill(&mut self, had_verify: bool, had_mutation: bool) -> bool {
+    /// looks like a treadmill here. That is why the hard threshold does not end
+    /// the turn on its own: it asks
+    /// [`ConversationRuntime::resolve_heuristic_stop`], which spares a turn that
+    /// has produced fresh objective progress exactly once. A turn with no
+    /// progress at all — the genuine no-edit spawn loop this guard exists to
+    /// catch — still stops immediately. `ZO_VERIFY_TREADMILL_ROUNDS=0` disables
+    /// the guard entirely for a workload built on delegation.
+    pub(super) fn note_verify_treadmill(
+        &mut self,
+        had_verify: bool,
+        had_mutation: bool,
+    ) -> TurnContinuity {
         if had_mutation {
             self.verify_treadmill_run = 0;
-            return false;
+            return TurnContinuity::Continue;
         }
         if !had_verify {
-            return false;
+            return TurnContinuity::Continue;
         }
         // Only a verify-without-mutation round reads the env knob, so a turn that
         // never treadmills never touches it — and the guard's env override cannot
         // perturb an unrelated turn.
         let Some((advise, hard)) = verify_treadmill_thresholds() else {
-            return false; // disabled via ZO_VERIFY_TREADMILL_ROUNDS=0
+            return TurnContinuity::Continue; // disabled via ZO_VERIFY_TREADMILL_ROUNDS=0
         };
         self.verify_treadmill_run = self.verify_treadmill_run.saturating_add(1);
         let run = self.verify_treadmill_run;
         if run >= hard {
-            return true;
+            let continuity = self.resolve_heuristic_stop(TurnStopSignal::VerifyTreadmill);
+            if continuity == TurnContinuity::Nudge {
+                // Spared: rewind to the soft threshold so the guard re-arms and
+                // the SAME climb can stop the turn a second time. The nudge
+                // budget is already spent, so that second stop is unconditional.
+                self.verify_treadmill_run = advise;
+                let advisory = verify_treadmill_nudge_advisory(run);
+                self.replace_transient_system_reminder_by_prefix(
+                    VERIFY_TREADMILL_REMINDER_PREFIX,
+                    Some(&advisory),
+                );
+            }
+            return continuity;
         }
         if run >= advise {
             let advisory = verify_treadmill_advisory(run);
@@ -118,6 +183,6 @@ where
                 Some(&advisory),
             );
         }
-        false
+        TurnContinuity::Continue
     }
 }

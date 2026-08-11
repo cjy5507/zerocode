@@ -9762,6 +9762,110 @@ fn cross_turn_repetition_hard_stops_after_warning_reaches_next_batch() {
     );
 }
 
+/// A repeated non-mutating probe used to END the turn outright — and unlike the
+/// budget breakers this stop leaves no `BudgetExhausted` marker, so the host's
+/// progress-gated auto-continue never sees it and a turn that was actively
+/// editing files dies silently mid-work. On a turn that has demonstrably
+/// produced edits the first firing is now demoted to a non-terminating skip. The
+/// turn's single nudge is then spent, so the next firing terminates exactly as
+/// it did before.
+#[test]
+fn per_turn_repetition_hard_stop_is_spared_once_on_a_turn_that_edited_files() {
+    struct SimpleApi;
+    impl ApiClient for SimpleApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            Ok(vec![AssistantEvent::MessageStop])
+        }
+    }
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        SimpleApi,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+
+    // This turn externalized real work: one successful edit result.
+    runtime.note_progress_tool_result(&ConversationMessage::tool_result(
+        "e1", "edit_file", "{}", false,
+    ));
+
+    let input = r#"{"command":"cargo test -p runtime"}"#;
+    seed_backing_tool_result(&mut runtime.session, "bash", input);
+    for _ in 0..super::TOOL_REPETITION_HARD_STOP {
+        let _ = runtime.note_tool_repetition("bash", input, false);
+    }
+    runtime.arm_tool_repetition_hard_stops();
+
+    match runtime.note_tool_repetition("bash", input, false) {
+        super::ToolRepetition::HardStop { notice, terminates } => {
+            assert!(
+                !terminates,
+                "a turn that is producing edits must not be ended by the FIRST repetition stop"
+            );
+            assert!(
+                !notice.contains("Ending this turn"),
+                "a spared turn must not be told it is ending — that makes the model stop itself: {notice}"
+            );
+        }
+        other => panic!("expected a demoted hard stop, got {other:?}"),
+    }
+
+    // The nudge is spent and no NEW progress has landed since, so the guard's
+    // original stop lands on the next firing.
+    match runtime.note_tool_repetition("bash", input, false) {
+        super::ToolRepetition::HardStop { notice, terminates } => {
+            assert!(
+                terminates,
+                "the second firing must end the turn: the nudge budget is spent"
+            );
+            assert!(notice.contains("Ending this turn"), "{notice}");
+        }
+        other => panic!("expected a terminating hard stop, got {other:?}"),
+    }
+}
+
+/// The narrowing that keeps the reprieve honest: a repeat that is itself a
+/// FAILING mutation made no progress by definition (the file is unchanged), so
+/// it must terminate even on a turn that has edits banked. Only a successful
+/// mutation clears the tally, so a failing edit is the one mutation shape that
+/// can actually reach the hard stop.
+#[test]
+fn repeated_failing_mutation_still_ends_a_productive_turn() {
+    struct SimpleApi;
+    impl ApiClient for SimpleApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            Ok(vec![AssistantEvent::MessageStop])
+        }
+    }
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        SimpleApi,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+
+    runtime.note_progress_tool_result(&ConversationMessage::tool_result(
+        "e1", "edit_file", "{}", false,
+    ));
+
+    let input = r#"{"path":"y.rs","old_string":"a","new_string":"b"}"#;
+    seed_backing_tool_result(&mut runtime.session, "edit_file", input);
+    for _ in 0..super::TOOL_REPETITION_HARD_STOP {
+        let _ = runtime.note_tool_repetition("edit_file", input, true);
+    }
+    runtime.arm_tool_repetition_hard_stops();
+
+    match runtime.note_tool_repetition("edit_file", input, true) {
+        super::ToolRepetition::HardStop { terminates, .. } => assert!(
+            terminates,
+            "a repeated FAILING edit must still end the turn — it is not progress"
+        ),
+        other => panic!("expected a terminating hard stop, got {other:?}"),
+    }
+}
+
 #[test]
 fn microcompact_relief_resets_thrash_streak() {
     struct SimpleApi;

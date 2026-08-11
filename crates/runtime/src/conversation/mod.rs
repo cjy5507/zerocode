@@ -71,10 +71,14 @@ use tool::{
     unblock_tool_execute,
 };
 use repetition::{ReadFileRange, ToolBatchRepetitionHardStops};
+// Turn-stop policy (cost breaker vs behavior heuristic). Shared with the
+// benchmark harness through `decision-core`, so the live loops cannot drift into
+// a second copy of the rule. Child modules reach these through `super::`.
+use decision_core::{decide_turn_continuity, TurnContinuity, TurnStopSignal};
 // Verification-treadmill guard: the loop-boundary predicate the sync + streaming
 // turn loops call to classify a tool batch. `note_verify_treadmill` (the counter
 // + advisory) is an inherent-impl method, reachable without an import.
-use verify_treadmill::is_verify_class_tool;
+use verify_treadmill::{batch_had_successful_mutation, is_verify_class_tool};
 // Refusal/quota-fallback items the sync + streaming turn loops still reference.
 use fallback::{
     is_refusal_stop_reason, overload_demotion_warn, quota_fallback_swap_warn,
@@ -247,6 +251,16 @@ const ESCALATION_EFFORT_BUDGET: u32 = 16_000;
 /// a misbehaving hook can never spin forever. Without a `followupMessage` the
 /// loop runs exactly once, so this is inert unless a Stop hook opts in.
 const DEFAULT_MAX_STOP_LOOPS: usize = 10;
+
+/// How many times per turn a *behavior heuristic* (the verification treadmill,
+/// the tool-call repetition guards) may be demoted from "end the turn" to "warn
+/// and keep going" on the strength of fresh objective progress. One: a
+/// demonstrably productive turn earns a single reprieve, and the guard's
+/// original stop still lands if the same pattern repeats. Turn-scoped and
+/// SHARED across every heuristic, so two different guards cannot each grant
+/// their own extension. Cost breakers are never eligible — see
+/// [`decision_core::turn_continuity`].
+const HEURISTIC_STOP_MAX_NUDGES: u32 = 1;
 
 /// The turn-loop iteration cap. Persistent interactive turns are unbounded by
 /// default because a human can interrupt them and the repetition guard already
@@ -754,6 +768,29 @@ pub struct ConversationRuntime<C, T> {
     /// [`BudgetExhausted::VerificationTreadmill`]. Reset at turn start (both turn
     /// loops). See `verify_treadmill`.
     verify_treadmill_run: usize,
+    /// Successful objective-progress tool results recorded this turn (see
+    /// [`count_progress_tool_results`]). The one ledger BOTH behavior heuristics
+    /// consult before ending a turn, so a nudge granted to one is charged
+    /// against the same watermark as the other. Reset at turn start (both loops).
+    turn_progress_results: usize,
+    /// Nudges spent this turn: how many times a behavior heuristic was demoted
+    /// from "end the turn" to "warn and keep going". Turn-scoped and SHARED
+    /// across every heuristic, so the extra work one turn can win stays bounded
+    /// by [`HEURISTIC_STOP_MAX_NUDGES`] no matter how many guards fire. Reset at
+    /// turn start (both loops).
+    heuristic_stop_nudges: u32,
+    /// [`Self::turn_progress_results`] as of the last heuristic firing. A later
+    /// heuristic is spared only when the turn progressed PAST this mark, so one
+    /// early burst of edits cannot excuse an unbounded run of stops. Reset at
+    /// turn start (both loops).
+    progress_marker_at_last_signal: usize,
+    /// Set when a turn ended on a harness budget/treadmill closer, so the NEXT
+    /// turn carries the continuation reminder naming that closer as a harness
+    /// cutoff rather than the model's own decision to quit. Deliberately NOT
+    /// cleared by the per-turn reset (it is written at the end of one turn and
+    /// read at the start of the next); consumed by
+    /// [`Self::install_turn_budget_continuation_reminder`].
+    budget_closer_pending: bool,
     /// When set, the tool the agent must call before the turn can end (workflow
     /// 8c). After the natural loop, if the agent has not called it, `run_turn`
     /// forces one final turn with `tool_choice = Tool { name }` so a schema
@@ -1160,6 +1197,46 @@ fn is_edit_or_write_tool(tool_name: &str) -> bool {
 }
 
 impl<C, T> ConversationRuntime<C, T> {
+    /// Fold one completed tool result into this turn's objective-progress
+    /// ledger — the single source of truth both behavior heuristics read.
+    ///
+    /// Progress is deliberately narrow (successful `edit_file` / `write_file` /
+    /// `NotebookEdit` / `TodoWrite`, per [`count_progress_tool_results`]):
+    /// reads and bash probes are exactly what a non-converging grind produces in
+    /// bulk, so they must never buy it a reprieve.
+    pub(super) fn note_progress_tool_result(&mut self, result: &ConversationMessage) {
+        self.turn_progress_results = self
+            .turn_progress_results
+            .saturating_add(count_progress_tool_results(std::slice::from_ref(result)));
+    }
+
+    /// Decide whether a fired *behavior heuristic* ends the turn.
+    ///
+    /// A heuristic (verification treadmill, tool-call repetition) infers that the
+    /// turn is stuck from a proxy signal, and the proxy misfires on real work —
+    /// an orchestrator that delegates every edit looks exactly like a treadmill.
+    /// So a heuristic that fires on a turn which has produced fresh objective
+    /// progress spends the turn's single nudge and keeps going; everything else
+    /// stops. Resource breakers never route through here (`decision_core` rejects
+    /// them outright), so the wall clock and the token budgets stay absolute.
+    pub(super) fn resolve_heuristic_stop(&mut self, signal: TurnStopSignal) -> TurnContinuity {
+        let progressed = self.turn_progress_results > self.progress_marker_at_last_signal;
+        let continuity = decide_turn_continuity(
+            signal,
+            progressed,
+            self.heuristic_stop_nudges,
+            HEURISTIC_STOP_MAX_NUDGES,
+        );
+        // Advance the watermark on EVERY firing, nudge or not: the next heuristic
+        // must be paid for with progress made after this one, so a single early
+        // burst of edits cannot excuse an unbounded run of stops.
+        self.progress_marker_at_last_signal = self.turn_progress_results;
+        if continuity == TurnContinuity::Nudge {
+            self.heuristic_stop_nudges = self.heuristic_stop_nudges.saturating_add(1);
+        }
+        continuity
+    }
+
     /// Bind the verified-state ledger to a session sidecar
     /// (`<session>.verified-state.json`) and restore whatever it recorded.
     ///
@@ -1415,6 +1492,10 @@ where
             mode_denial_counts: HashMap::new(),
             tool_loop_break_requested: false,
             verify_treadmill_run: 0,
+            turn_progress_results: 0,
+            heuristic_stop_nudges: 0,
+            progress_marker_at_last_signal: 0,
+            budget_closer_pending: false,
             structured_output_tool: None,
             deep_gate: None,
             workspace_cwd: None,
@@ -1535,6 +1616,7 @@ where
                 // output formats — funnels through here, so this one call
                 // covers the whole streaming dispatcher.
                 self.inject_verified_state_reminder();
+                self.install_turn_budget_continuation_reminder();
                 Ok(())
             }
             PromptSubmitDecision::Denied { reason } => Err(StreamingTurnError::runtime(
@@ -1682,6 +1764,7 @@ where
         // on the sync fallback) would otherwise record facts it can never
         // report.
         self.inject_verified_state_reminder();
+        self.install_turn_budget_continuation_reminder();
         self.record_turn_started(&user_input);
         let turn_start_output_tokens = self.usage_tracker.cumulative_usage().output_tokens;
         self.session
@@ -1697,6 +1780,9 @@ where
         self.mode_denial_counts.clear();
         self.tool_loop_break_requested = false;
         self.verify_treadmill_run = 0;
+        self.turn_progress_results = 0;
+        self.heuristic_stop_nudges = 0;
+        self.progress_marker_at_last_signal = 0;
         self.full_compactions_this_turn = 0;
         // Fold refusal history only at a PUBLIC boundary. Continuations are
         // additional legs of the same user turn and must not double-count it.
@@ -2329,6 +2415,9 @@ where
             }
 
             }
+            // Where THIS batch's results begin, so the treadmill can ask what the
+            // batch actually accomplished rather than what it merely attempted.
+            let batch_results_from = tool_results.len();
             let mut batch_hard_stops = ToolBatchRepetitionHardStops::default();
             for (idx, p) in prepared.iter().enumerate() {
                 let result_message = match &p.permission_outcome {
@@ -2444,6 +2533,7 @@ where
                     .push_message(result_message.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.record_tool_finished(iterations, &result_message, p.effective_input.as_ref());
+                self.note_progress_tool_result(&result_message);
                 tool_results.push(result_message);
             }
             self.arm_tool_repetition_hard_stops();
@@ -2456,10 +2546,8 @@ where
             let had_verify = tool_uses
                 .iter()
                 .any(|tool_use| is_verify_class_tool(&tool_use.name));
-            let had_mutation = tool_uses
-                .iter()
-                .any(|tool_use| is_edit_or_write_tool(&tool_use.name));
-            if self.note_verify_treadmill(had_verify, had_mutation) {
+            let had_mutation = batch_had_successful_mutation(&tool_results[batch_results_from..]);
+            if self.note_verify_treadmill(had_verify, had_mutation) == TurnContinuity::Stop {
                 let error = RuntimeError::new("turn hit the verification treadmill");
                 self.record_turn_failed(iterations, &error);
                 budget_exhausted = Some(BudgetExhausted::VerificationTreadmill);

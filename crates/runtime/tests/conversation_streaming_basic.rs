@@ -1665,3 +1665,234 @@ async fn verify_treadmill_hard_stops_the_streaming_loop_too() {
         "hard = soft(2) + 4 = 6, so the streaming loop stops at round 6"
     );
 }
+
+/// Scripted API that emits each `prefix` tool once and then `tail` forever, with
+/// a distinct input every round. Models the shape the treadmill guard misreads:
+/// real edits early, then a long run of delegation/verification rounds.
+struct ScriptedPrefixThenLoopApi {
+    prefix: Vec<&'static str>,
+    tail: &'static str,
+    call: usize,
+}
+
+impl ScriptedPrefixThenLoopApi {
+    fn new(prefix: Vec<&'static str>, tail: &'static str) -> Self {
+        Self {
+            prefix,
+            tail,
+            call: 0,
+        }
+    }
+}
+
+impl ApiClient for ScriptedPrefixThenLoopApi {
+    fn stream(&mut self, _req: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        let name = self.prefix.get(self.call).copied().unwrap_or(self.tail);
+        self.call += 1;
+        Ok(vec![
+            AssistantEvent::ToolUse {
+                id: format!("call-{}", self.call),
+                name: name.to_string(),
+                input: format!("{{\"round\":{}}}", self.call),
+            },
+            AssistantEvent::MessageStop,
+        ])
+    }
+}
+
+#[test]
+fn verify_treadmill_spares_a_turn_that_already_edited_files_exactly_once() {
+    // The orchestrator false positive the guard's own doc admits: a turn that
+    // does real work and then delegates/verifies looks identical to a no-edit
+    // spawn loop, and the host refuses to auto-continue a treadmill stop — so
+    // the turn was lost outright. It now costs ONE extra advisory round.
+    //
+    // Soft=2, hard=6. Round 1 edits a file (progress banked, tally reset), then
+    // Workflow forever: the tally reaches 6 at round 7 and is spared (rewound to
+    // the soft threshold), reaches 6 again at round 11, and stops for real
+    // because no NEW progress landed in between. Before the fix this stopped at
+    // round 7.
+    let _env = VerifyTreadmillEnv::set("2");
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        ScriptedPrefixThenLoopApi::new(vec!["edit_file"], "Workflow"),
+        verify_treadmill_executor(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    runtime.set_max_iterations(20);
+
+    let summary = runtime
+        .run_turn("go", None)
+        .expect("a spared treadmill must still stop gracefully, not error");
+
+    assert_eq!(
+        summary.budget_exhausted,
+        Some(runtime::BudgetExhausted::VerificationTreadmill),
+        "the guard must still stop the turn once its single nudge is spent"
+    );
+    assert_eq!(
+        summary.iterations, 11,
+        "the productive turn earns one rewind to the soft threshold (stop at 7 → 11)"
+    );
+}
+
+/// Emits one successful `edit_file`, then the SAME `bash` call with identical
+/// input forever — the shape that arms the per-turn repetition hard stop on a
+/// turn which has already produced real work.
+struct EditThenRepeatedProbeApi {
+    call: usize,
+}
+
+impl ApiClient for EditThenRepeatedProbeApi {
+    fn stream(&mut self, _req: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        self.call += 1;
+        let (name, input) = if self.call == 1 {
+            ("edit_file", r#"{"path":"x.rs"}"#)
+        } else {
+            ("bash", r#"{"command":"cargo test -p runtime"}"#)
+        };
+        Ok(vec![
+            AssistantEvent::ToolUse {
+                id: format!("call-{}", self.call),
+                name: name.to_string(),
+                input: input.to_string(),
+            },
+            AssistantEvent::MessageStop,
+        ])
+    }
+}
+
+#[test]
+fn repetition_hard_stop_spares_a_productive_turn_on_the_live_preflight_path() {
+    // The reprieve has to land on the path the turn loop ACTUALLY takes. Once a
+    // stop is armed the repeat is skipped before dispatch by
+    // `next_tool_repetition_hard_stop_notice`, so `note_tool_repetition` never
+    // runs for it — a fix wired only into the latter is dead code here, and a
+    // test that calls it directly cannot tell the difference.
+    //
+    // Round 1 edits a file (progress banked). Rounds 2-4 issue the same probe
+    // (Ok, Ok, advise-at-3), arming the stop. Round 5 hits the armed preflight
+    // and is spared; round 6 hits it again with no NEW progress and ends the
+    // turn, so the loop breaks entering round 7 and settles at 6 iterations.
+    // Before the fix round 5 terminated and it settled at 5.
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        EditThenRepeatedProbeApi { call: 0 },
+        StaticToolExecutor::new()
+            .register("edit_file", |_input| Ok("edited".to_string()))
+            .register("bash", |_input| Ok("probe output".to_string())),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    runtime.set_max_iterations(30);
+
+    let summary = runtime.run_turn("go", None).expect("the turn completes");
+
+    assert_eq!(
+        summary.budget_exhausted, None,
+        "the repetition stop deliberately leaves no budget marker — that is why \
+         the host's auto-continue never sees it, and why the reprieve has to \
+         happen inside the loop"
+    );
+    assert_eq!(
+        summary.iterations, 6,
+        "a turn that edited a file earns exactly one extra round past the armed \
+         repetition stop (5 before the fix, 6 after)"
+    );
+}
+
+/// Alternates a verify-class `Workflow` round with an `edit_file` that always
+/// FAILS — a loop that keeps attempting the same impossible write.
+struct WorkflowThenFailingEditApi {
+    call: usize,
+}
+
+impl ApiClient for WorkflowThenFailingEditApi {
+    fn stream(&mut self, _req: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        self.call += 1;
+        let name = if self.call % 2 == 1 {
+            "Workflow"
+        } else {
+            "edit_file"
+        };
+        Ok(vec![
+            AssistantEvent::ToolUse {
+                id: format!("call-{}", self.call),
+                name: name.to_string(),
+                input: format!("{{\"round\":{}}}", self.call),
+            },
+            AssistantEvent::MessageStop,
+        ])
+    }
+}
+
+#[test]
+fn verify_treadmill_is_not_reset_by_an_edit_that_failed() {
+    // The counter may only be forgiven by work that LANDED. Reading the
+    // requested tool names instead let a failed — or permission-denied — edit
+    // reset the tally every other round, so this loop made no progress at all
+    // yet evaded the guard forever and ran to the iteration cap.
+    let _env = VerifyTreadmillEnv::set("2");
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        WorkflowThenFailingEditApi { call: 0 },
+        StaticToolExecutor::new()
+            .register("Workflow", |_input| Ok("planned".to_string()))
+            .register("edit_file", |_input| {
+                Err(runtime::ToolError::new("permission denied"))
+            }),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    runtime.set_max_iterations(20);
+
+    let summary = runtime.run_turn("go", None).expect("the turn completes");
+
+    assert_eq!(
+        summary.budget_exhausted,
+        Some(runtime::BudgetExhausted::VerificationTreadmill),
+        "a failing edit is not progress, so the treadmill must still fire — \
+         reaching the iteration cap instead means the guard was evaded"
+    );
+}
+
+#[test]
+fn verify_treadmill_nudge_is_not_granted_twice_to_one_turn() {
+    // The bound that keeps the reprieve from becoming an escape hatch: banking
+    // more edits later does NOT buy a second nudge, because the nudge budget is
+    // one per turn and shared across every behavior heuristic. Edits at rounds 1
+    // and 8 would each look like "fresh progress", yet the turn still stops at
+    // round 11 — the same round as the single-edit case above.
+    let _env = VerifyTreadmillEnv::set("2");
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        ScriptedPrefixThenLoopApi::new(
+            vec![
+                "edit_file",
+                "Workflow",
+                "Workflow",
+                "Workflow",
+                "Workflow",
+                "Workflow",
+                "Workflow",
+                "edit_file",
+            ],
+            "Workflow",
+        ),
+        verify_treadmill_executor(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    runtime.set_max_iterations(30);
+
+    let summary = runtime
+        .run_turn("go", None)
+        .expect("the second stop must be graceful too");
+
+    assert_eq!(
+        summary.budget_exhausted,
+        Some(runtime::BudgetExhausted::VerificationTreadmill),
+        "a second burst of edits must not buy a second reprieve"
+    );
+}

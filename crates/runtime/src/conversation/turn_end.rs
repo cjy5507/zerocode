@@ -39,6 +39,32 @@ pub(super) fn budget_exhausted_notice(kind: BudgetExhausted, iterations: usize) 
     )
 }
 
+/// Reminder installed on the turn AFTER a budget/treadmill closer, naming that
+/// closer as a harness cutoff rather than the model's own decision to stop.
+///
+/// The closer is stored under the `assistant` role because the wire contract
+/// requires it (a user turn is never left without an assistant response) — but
+/// it is the harness speaking, not the model. Left unexplained, the next turn
+/// reads "I've stopped here because I kept planning…" as its OWN last words and
+/// is biased toward quitting again, a self-reinforcing stall no amount of
+/// prompting undoes. This reminder is where that gets corrected.
+///
+/// It carries no marker into the closer text itself: that message is also the
+/// turn's `assistant_messages` tail, which [`super::final_assistant_text`]
+/// surfaces as the headless `result` field — an internal control tag there would
+/// leak into user-facing output. Mirrors
+/// [`super::EMPTY_STREAM_CONTINUATION_REMINDER`], which solves the same problem
+/// for the empty-stream fallback.
+pub(super) fn turn_budget_continuation_reminder() -> &'static str {
+    "[zo:turn-budget-continuation] <system-reminder>The previous turn ended because it hit a \
+     harness execution budget, not because the work was finished and not because you decided to \
+     stop — its closing message was written by the harness, not by you. The session state is \
+     intact: the earlier request, tool calls, and results remain valid context. Continue from \
+     exactly where it stopped and finish the remaining work; do not redo completed steps, do not \
+     re-plan from scratch, and do not treat that closer as your own conclusion. If everything is \
+     genuinely complete, summarize the outcome instead.</system-reminder>"
+}
+
 /// CC-style handback used as the assistant closer when the verification-treadmill
 /// breaker force-ends a turn. Unlike the terse budget one-liner, the fix here is
 /// human guidance (the loop won't converge on its own), so the closer reads as
@@ -58,6 +84,11 @@ fn verification_treadmill_handback() -> &'static str {
 /// The verification-treadmill stop gets a CC-style handback instead of the terse
 /// budget line, since its fix is user direction, not "continue".
 fn budget_exhausted_message(kind: BudgetExhausted, iterations: usize) -> ConversationMessage {
+    // Text kept verbatim: this message is the turn's `assistant_messages` tail,
+    // so it is what `final_assistant_text` reports as the headless `result`.
+    // The "a harness stopped you, not your own judgement" framing belongs in the
+    // next turn's reminder ([`turn_budget_continuation_reminder`]), never in
+    // output the user reads.
     let text = match kind {
         BudgetExhausted::VerificationTreadmill => verification_treadmill_handback().to_string(),
         _ => budget_exhausted_notice(kind, iterations),
@@ -308,6 +339,10 @@ where
         assistant_messages: &mut Vec<ConversationMessage>,
     ) -> Result<(), String> {
         let message = budget_exhausted_message(kind, iterations);
+        // Arm the next turn's continuation reminder: this closer is now in the
+        // transcript under the assistant role, and the following turn must read
+        // it as a harness cutoff rather than as its own give-up.
+        self.budget_closer_pending = true;
         self.record_assistant_iteration(iterations, &message, 0);
         self.session
             .push_message(message)

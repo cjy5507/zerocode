@@ -20,6 +20,7 @@ pub mod loop_termination;
 pub mod rubric_grade;
 pub mod spec_literal;
 pub mod strategy_pivot;
+pub mod turn_continuity;
 pub mod verify_convergence;
 
 pub use checkpoint::{
@@ -57,6 +58,12 @@ pub use spec_literal::{
     apply_case_fixes, detect_case_mismatched_literals, has_candidate_spec_literals, CaseMismatch,
 };
 pub use strategy_pivot::{PivotLedger, StallResponse, GOAL_PIVOT_BUDGET};
+// The live turn loops' stop policy: which guards may end a turn outright and
+// which must first spend an advisory round. Shared so the runtime cannot drift
+// into a second copy of the cost-breaker-vs-heuristic rule.
+pub use turn_continuity::{
+    decide_turn_continuity, signal_is_heuristic, TurnContinuity, TurnStopSignal,
+};
 pub use verify_convergence::{
     finding_from_text, ConvergedReason, ConvergenceLedger, ConvergencePolicy, ConvergenceVerdict,
     DivergingReason, Finding, FindingSeverity, CONVERGENCE_CHURN_LIMIT, CONVERGENCE_MAX_ROUNDS,

@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use super::{
     ask_user_question_async, budget_exhausted_notice, build_assistant_message,
     build_async_permission_request, collect_pending_tool_uses, empty_stream_exhausted_message,
-    format_tool_result_from_raw, is_edit_or_write_tool, permission_denial_notice,
+    batch_had_successful_mutation, format_tool_result_from_raw, permission_denial_notice,
     is_refusal_stop_reason, is_truncation_stop_reason, is_verify_class_tool, merge_hook_feedback,
     normalize_empty_assistant_stream,
     parallel_safe_tool_indices, pre_hook_denial_outcome,
@@ -30,7 +30,8 @@ use super::{
     HookEvent, HookRunResult, PermissionContext, PermissionOutcome, PermissionPromptDecision,
     PromptCacheEvent, QuotaEscape, RefusalDecision, RenderBlock, RuntimeError, SteeringQueue,
     StreamingTurnError, SystemLevel,
-    TokenUsage, ToolBatchRepetitionHardStops, ToolCallId, ToolCallStatus, ToolExecutor, TurnSummary,
+    TokenUsage, ToolBatchRepetitionHardStops, ToolCallId, ToolCallStatus, ToolExecutor,
+    TurnContinuity, TurnSummary,
     DEFAULT_STREAMING_CHANNEL_CAPACITY,
     EMPTY_STREAM_CONTINUATION_REMINDER, EMPTY_STREAM_CONTINUATION_REMINDER_PREFIX,
     EMPTY_STREAM_EXHAUSTED_FALLBACK_TEXT, EMPTY_STREAM_RETRY_REMINDER,
@@ -503,6 +504,9 @@ where
         self.mode_denial_counts.clear();
         self.tool_loop_break_requested = false;
         self.verify_treadmill_run = 0;
+        self.turn_progress_results = 0;
+        self.heuristic_stop_nudges = 0;
+        self.progress_marker_at_last_signal = 0;
         self.full_compactions_this_turn = 0;
         // Fold refusal history only at a PUBLIC boundary. Internal subturns are
         // additional legs of the same user turn and must not double-count it.
@@ -2019,6 +2023,9 @@ where
             // through `spawn_blocking` there so even single Read/Edit/Skill calls
             // yield the turn future instead of freeze-then-bursting the render
             // loop. Sequential `.await`s preserve mutating tool order.
+            // Where THIS batch's results begin, so the treadmill can ask what the
+            // batch actually accomplished rather than what it merely attempted.
+            let batch_results_from = tool_results.len();
             let mut batch_hard_stops = ToolBatchRepetitionHardStops::default();
             for (idx, p) in prepared.iter().enumerate() {
                 let result_message = if let Some(precomputed_result) = precomputed.remove(&idx) {
@@ -2248,6 +2255,7 @@ where
                     .push_message(result_message.clone())
                     .map_err(|error| StreamingTurnError::runtime(error.to_string()))?;
                 self.record_tool_finished(iterations, &result_message, p.effective_input.as_str());
+                self.note_progress_tool_result(&result_message);
                 tool_results.push(result_message);
             }
 
@@ -2261,10 +2269,9 @@ where
             let had_verify = tool_uses
                 .iter()
                 .any(|tool_use| is_verify_class_tool(&tool_use.name));
-            let had_mutation = tool_uses
-                .iter()
-                .any(|tool_use| is_edit_or_write_tool(&tool_use.name));
-            if self.note_verify_treadmill(had_verify, had_mutation) {
+            let had_mutation =
+                batch_had_successful_mutation(&tool_results[batch_results_from..]);
+            if self.note_verify_treadmill(had_verify, had_mutation) == TurnContinuity::Stop {
                 let error = RuntimeError::new("turn hit the verification treadmill");
                 self.clear_empty_retry_reminder(empty_retries);
                 self.record_turn_failed(iterations, &error);

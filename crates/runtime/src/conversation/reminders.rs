@@ -35,6 +35,12 @@ const USER_PROMPT_HOOK_CONTEXT_MAX_MESSAGES: usize = 4;
 pub(super) const USER_PROMPT_HOOK_CONTEXT_MAX_CHARS: usize = 4096;
 pub(super) const USER_PROMPT_HOOK_CONTEXT_TRUNCATED_MARKER: &str = "[truncated]";
 
+/// Prefix marking the transient reminder installed on the turn that FOLLOWS a
+/// harness budget/treadmill closer. Set-or-cleared on every public turn entry
+/// ([`ConversationRuntime::install_turn_budget_continuation_reminder`]) so it
+/// appears exactly once, on the turn that can act on it, and never accumulates.
+pub(super) const TURN_BUDGET_CONTINUATION_REMINDER_PREFIX: &str = "[zo:turn-budget-continuation]";
+
 /// Prefix marking the transient recall-hint reminder, injected when a turn
 /// refers back to an earlier conversation ("earlier", "그때", …). Replace-by-prefix
 /// and a turn-start clear keep it turn-scoped: it reappears only on turns that
@@ -438,6 +444,25 @@ where
             reminder.as_deref(),
         );
     }
+    /// Install (or clear) the post-budget continuation reminder.
+    ///
+    /// Set-or-clear on every PUBLIC turn entry, exactly like the host's
+    /// route-hint and skill-routing reminders: it rides the turn that follows a
+    /// harness budget/treadmill closer and is dropped on every other turn.
+    /// Consumes the pending flag, so one closer arms one reminder — a session
+    /// that hits the budget once does not carry the notice forever.
+    ///
+    /// Rides the transient-reminder path, so it is absorbed into the transcript
+    /// as a trailing `System` message at request-build time (an APPEND behind
+    /// the new user message, never a rewrite of the cached prefix).
+    pub(super) fn install_turn_budget_continuation_reminder(&mut self) {
+        let armed = std::mem::take(&mut self.budget_closer_pending);
+        self.replace_transient_system_reminder_by_prefix(
+            TURN_BUDGET_CONTINUATION_REMINDER_PREFIX,
+            armed.then(super::turn_end::turn_budget_continuation_reminder),
+        );
+    }
+
     /// Clear per-turn prompt additions before running prompt-submit policy so a
     /// denied or failed hook cannot leak stale context into the next request.
     pub(super) fn clear_turn_start_transient_reminders(&mut self) {

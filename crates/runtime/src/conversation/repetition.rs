@@ -12,6 +12,7 @@ use crate::session::ContentBlock;
 
 use super::{
     is_concurrency_safe, is_edit_or_write_tool, ApiClient, ConversationRuntime, ToolExecutor,
+    TurnContinuity, TurnStopSignal,
 };
 
 /// Per-turn count of identical (normalized) tool calls that triggers one
@@ -250,6 +251,21 @@ pub(crate) fn per_turn_tool_repetition_nonterminating_notice(tool_name: &str, co
     )
 }
 
+/// Non-terminating variant of the cross-turn notice, used when the turn is
+/// spared by [`ConversationRuntime::resolve_heuristic_stop`] because it has
+/// produced fresh objective progress. Same "do not repeat this" instruction, but
+/// it must NOT say the turn is ending: a model told it is stopping while the
+/// harness keeps the turn alive ends its own turn, which is the stop-then-resume
+/// stutter the per-turn variant's doc already warns about.
+fn cross_turn_tool_repetition_nonterminating_notice(tool_name: &str, cross: usize) -> String {
+    format!(
+        "<system-reminder>`{tool_name}` has been called with identical input across {cross} \
+         separate turns without making progress. This exact repeat was skipped. This turn has \
+         changed files, so it continues — but do not issue this call again: use the result you \
+         already have, change the arguments, or move on to the next concrete step.</system-reminder>"
+    )
+}
+
 fn cross_turn_tool_repetition_hard_stop_notice(tool_name: &str, cross: usize) -> String {
     format!(
         "<system-reminder>Ending this turn: `{tool_name}` has been called with identical input across {cross} separate turns without making progress — a cross-turn no-progress loop that the per-turn guard cannot see (its counter resets each turn). Stop repeating it: take a genuinely different approach, or ask the user for guidance.</system-reminder>"
@@ -402,8 +418,28 @@ where
         // Precedence: a hard stop (per-turn, then cross-turn) wins over an
         // advisory; each advisory stage fires once, on the exact count, so a
         // stuck agent gets a single nudge then a stop — not a wall of reminders.
+        //
+        // Ending the turn here is a *heuristic*, not a cost breaker: it infers
+        // "stuck" from one repeated fingerprint, which misfires on a turn that is
+        // demonstrably producing work elsewhere — and unlike the budget stops it
+        // leaves no `BudgetExhausted` marker, so the host's progress-gated
+        // auto-continue never even sees it and the turn dies silently mid-work.
+        // A repeat that is itself a mutation or an error made no progress by
+        // definition, so those never demote; anything else asks
+        // `resolve_heuristic_stop`, which spares a productive turn exactly once.
         if count >= TOOL_REPETITION_HARD_STOP && self.tool_repetition_hard_stop_fps.contains(&fp) {
             let terminates = is_error || is_mutation || tool_name != "read_file";
+            if terminates
+                && !is_error
+                && !is_mutation
+                && self.resolve_heuristic_stop(TurnStopSignal::RepetitionPerTurn)
+                    == TurnContinuity::Nudge
+            {
+                return ToolRepetition::HardStop {
+                    notice: per_turn_tool_repetition_nonterminating_notice(tool_name, count),
+                    terminates: false,
+                };
+            }
             ToolRepetition::HardStop {
                 notice: if terminates {
                     per_turn_tool_repetition_hard_stop_notice(tool_name, count)
@@ -415,6 +451,16 @@ where
         } else if cross >= TOOL_REPETITION_CROSS_TURN_HARD_STOP
             && self.cross_turn_tool_repetition_hard_stop_fps.contains(&fp)
         {
+            if !is_error
+                && !is_mutation
+                && self.resolve_heuristic_stop(TurnStopSignal::RepetitionCrossTurn)
+                    == TurnContinuity::Nudge
+            {
+                return ToolRepetition::HardStop {
+                    notice: cross_turn_tool_repetition_nonterminating_notice(tool_name, cross),
+                    terminates: false,
+                };
+            }
             ToolRepetition::HardStop {
                 notice: cross_turn_tool_repetition_hard_stop_notice(tool_name, cross),
                 terminates: true,
@@ -595,6 +641,12 @@ where
     /// non-terminating skipped round; repeating after seeing that notice ends
     /// the turn. Mutations, cross-turn loops, and every other tool end at the
     /// first armed hard stop.
+    ///
+    /// This is the arm the live turn loops ACTUALLY reach once a stop is armed:
+    /// the repeat is skipped before dispatch, so [`Self::note_tool_repetition`]
+    /// never runs for it. The productive-turn reprieve therefore has to be
+    /// decided here as well, or it is dead code everywhere except a test that
+    /// calls `note_tool_repetition` directly.
     pub(super) fn next_tool_repetition_hard_stop_notice(
         &mut self,
         tool_name: &str,
@@ -619,9 +671,21 @@ where
             // the same cached result forever now that interactive turns have no
             // generic iteration ceiling.
             self.tool_fingerprint_counts.insert(fp, next_count);
-            let terminates = is_mutation
+            let mut terminates = is_mutation
                 || tool_name != "read_file"
                 || next_count > TOOL_REPETITION_HARD_STOP;
+            // A repeated mutation is never progress (it is the same write
+            // again), so it always terminates; anything else asks the shared
+            // heuristic gate, which spares a turn with fresh objective progress
+            // exactly once. The call is skipped either way — only the turn's
+            // life is at stake here.
+            if terminates
+                && !is_mutation
+                && self.resolve_heuristic_stop(TurnStopSignal::RepetitionPerTurn)
+                    == TurnContinuity::Nudge
+            {
+                terminates = false;
+            }
             let notice = if terminates {
                 per_turn_tool_repetition_hard_stop_notice(tool_name, next_count)
             } else {
@@ -639,10 +703,18 @@ where
             if next_cross >= TOOL_REPETITION_CROSS_TURN_HARD_STOP
                 && self.cross_turn_tool_repetition_hard_stop_fps.contains(&fp)
             {
-                return Some((
-                    cross_turn_tool_repetition_hard_stop_notice(tool_name, next_cross),
-                    true,
-                ));
+                // Same reprieve as the per-turn arm above (this branch is
+                // already mutation-free): a turn that has produced fresh
+                // progress keeps running for one more round.
+                let terminates = self
+                    .resolve_heuristic_stop(TurnStopSignal::RepetitionCrossTurn)
+                    != TurnContinuity::Nudge;
+                let notice = if terminates {
+                    cross_turn_tool_repetition_hard_stop_notice(tool_name, next_cross)
+                } else {
+                    cross_turn_tool_repetition_nonterminating_notice(tool_name, next_cross)
+                };
+                return Some((notice, terminates));
             }
         }
         None
