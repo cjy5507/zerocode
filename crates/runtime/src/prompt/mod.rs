@@ -231,7 +231,7 @@ impl ProjectContext {
         current_date: impl Into<String>,
     ) -> std::io::Result<Self> {
         let cwd = cwd.into();
-        let instruction_files = discover_instruction_files(&cwd)?;
+        let instruction_files = discover_instruction_files(&cwd);
         let memory_index = discover_memory_index(&cwd);
         let skills_index = discover_skills_index(&cwd);
         Ok(Self {
@@ -542,7 +542,7 @@ fn push_cache_block(blocks: &mut Vec<api::SystemBlock>, text: &str) {
     }
 }
 
-fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
+fn discover_instruction_files(cwd: &Path) -> Vec<ContextFile> {
     let mut directories = Vec::new();
     let mut cursor = Some(cwd);
     while let Some(dir) = cursor {
@@ -561,10 +561,10 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
             dir.join(".zo").join("context.md"),
             dir.join(".zo").join("CONTEXT.md"),
         ] {
-            push_context_file(&mut files, candidate)?;
+            push_context_file(&mut files, candidate);
         }
     }
-    Ok(dedupe_instruction_files(files))
+    dedupe_instruction_files(files)
 }
 
 /// Find the persistent-memory index for `cwd` in Zo's global per-project
@@ -843,16 +843,25 @@ fn push_unique_skill_entry(entries: &mut Vec<SkillIndexEntry>, entry: SkillIndex
     entries.push(entry);
 }
 
-fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Result<()> {
+fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) {
     match fs::read_to_string(&path) {
         Ok(content) if !content.trim().is_empty() => {
             let expanded = expand_context_imports(&content, &path);
             files.push(ContextFile::instruction(path, &expanded));
-            Ok(())
         }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        // Instruction files are best-effort context, and the ancestor walk
+        // probes fixed candidate paths in every directory up to the
+        // filesystem root — an unreadable probe there (permissions on a
+        // parent directory, a transient error on a shared temp root) must
+        // not kill session startup. Warn and boot without the file.
+        Err(error) => {
+            eprintln!(
+                "warning: skipping unreadable instruction file {}: {error}",
+                path.display()
+            );
+        }
     }
 }
 
@@ -1482,7 +1491,7 @@ mod import_tests {
         fs::write(&root, "Top.\n@./conventions.md").expect("write root");
 
         let mut files: Vec<ContextFile> = Vec::new();
-        push_context_file(&mut files, root).expect("push should succeed");
+        push_context_file(&mut files, root);
 
         let stored = &files.first().expect("one context file").content;
         assert!(
