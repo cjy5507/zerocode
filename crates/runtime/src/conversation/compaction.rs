@@ -321,6 +321,15 @@ pub enum BudgetExhausted {
     /// making progress. Stopped gracefully so it hands back to the user instead
     /// of self-verifying forever. See `verify_treadmill`.
     VerificationTreadmill,
+    /// The tool-call repetition guard ended the turn: the same call kept being
+    /// re-issued with identical input, within one turn or across turns, on a
+    /// turn with no fresh progress to show for it. See `repetition`.
+    ///
+    /// This stop used to report `None` — indistinguishable from a clean end —
+    /// so a host reading the summary treated a loop the harness had to kill as a
+    /// converged turn, and reset the very escalation state the pattern should
+    /// have been feeding.
+    ToolRepetition,
 }
 
 /// Summary of one completed runtime turn, including tool results and usage.

@@ -1340,6 +1340,7 @@ fn budget_exhausted_kind_label(kind: runtime::BudgetExhausted) -> &'static str {
         runtime::BudgetExhausted::OutputTokens => "output-token budget",
         runtime::BudgetExhausted::InputTokens => "input-token budget",
         runtime::BudgetExhausted::VerificationTreadmill => "verification loop",
+        runtime::BudgetExhausted::ToolRepetition => "tool-repetition guard",
     }
 }
 

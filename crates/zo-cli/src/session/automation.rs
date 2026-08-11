@@ -411,6 +411,7 @@ pub(crate) fn budget_exhausted_kind_label(kind: BudgetExhausted) -> &'static str
         BudgetExhausted::OutputTokens => "output-token budget",
         BudgetExhausted::InputTokens => "input-token budget",
         BudgetExhausted::VerificationTreadmill => "verification loop",
+        BudgetExhausted::ToolRepetition => "tool-repetition guard",
     }
 }
 

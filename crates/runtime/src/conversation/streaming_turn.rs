@@ -705,6 +705,29 @@ where
 
         'outer: loop {
             if self.tool_loop_break_requested {
+                // Mirrors the sync loop: the repetition guard is a real
+                // non-convergent stop, so it carries a marker, a closer, and a
+                // visible notice instead of ending the turn silently.
+                let error = RuntimeError::new("turn hit the tool-repetition guard");
+                self.clear_empty_retry_reminder(empty_retries);
+                self.record_turn_failed(iterations, &error);
+                budget_exhausted = Some(BudgetExhausted::ToolRepetition);
+                self.push_budget_exhausted_closer(
+                    BudgetExhausted::ToolRepetition,
+                    iterations,
+                    &mut assistant_messages,
+                )
+                .map_err(StreamingTurnError::runtime)?;
+                let _ = render_tx
+                    .send(RenderBlock::System {
+                        id: id_gen.next(),
+                        level: SystemLevel::Warn,
+                        text: budget_exhausted_notice(
+                            BudgetExhausted::ToolRepetition,
+                            iterations,
+                        ),
+                    })
+                    .await;
                 break 'outer;
             }
             iterations += 1;

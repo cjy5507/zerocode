@@ -319,7 +319,8 @@ pub(crate) fn failure_signal_for_budget(kind: runtime::BudgetExhausted) -> Failu
         runtime::BudgetExhausted::Deadline => FailureSignal::Deadline,
         runtime::BudgetExhausted::Iterations
         | runtime::BudgetExhausted::ToolCalls
-        | runtime::BudgetExhausted::VerificationTreadmill => FailureSignal::ToolBudgetExceeded,
+        | runtime::BudgetExhausted::VerificationTreadmill
+        | runtime::BudgetExhausted::ToolRepetition => FailureSignal::ToolBudgetExceeded,
         runtime::BudgetExhausted::OutputTokens | runtime::BudgetExhausted::InputTokens => {
             FailureSignal::TokenBudgetExceeded
         }

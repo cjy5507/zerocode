@@ -24,6 +24,7 @@ fn budget_exhausted_label(kind: BudgetExhausted) -> &'static str {
         BudgetExhausted::OutputTokens => "Output-token budget",
         BudgetExhausted::InputTokens => "Input-token budget",
         BudgetExhausted::VerificationTreadmill => "Verification loop",
+        BudgetExhausted::ToolRepetition => "Tool-repetition guard",
     }
 }
 

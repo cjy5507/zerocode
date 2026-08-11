@@ -1790,15 +1790,34 @@ fn repetition_hard_stop_spares_a_productive_turn_on_the_live_preflight_path() {
     let summary = runtime.run_turn("go", None).expect("the turn completes");
 
     assert_eq!(
-        summary.budget_exhausted, None,
-        "the repetition stop deliberately leaves no budget marker — that is why \
-         the host's auto-continue never sees it, and why the reprieve has to \
-         happen inside the loop"
-    );
-    assert_eq!(
         summary.iterations, 6,
         "a turn that edited a file earns exactly one extra round past the armed \
          repetition stop (5 before the fix, 6 after)"
+    );
+    // The stop reports itself. Returning `None` here made the host read a turn
+    // the harness had to kill as a converged one and call `clear_turn_failure()`,
+    // resetting the escalation ladder and grind streak this pattern should feed.
+    assert_eq!(
+        summary.budget_exhausted,
+        Some(runtime::BudgetExhausted::ToolRepetition),
+        "the repetition guard must name itself like every other non-convergent stop"
+    );
+    // ...and the transcript ends well-formed. Without the closer the turn ended
+    // on tool results, which serialize as wire role `user`.
+    let last = runtime
+        .session()
+        .messages
+        .last()
+        .expect("session has messages");
+    assert_eq!(
+        last.role,
+        runtime::session::MessageRole::Assistant,
+        "a repetition-stopped turn must still close on an assistant message"
+    );
+    let closer = runtime::final_assistant_text(&summary);
+    assert!(
+        closer.contains("Tool-repetition guard"),
+        "the closer must name the guard that stopped the turn, got: {closer}"
     );
 }
 

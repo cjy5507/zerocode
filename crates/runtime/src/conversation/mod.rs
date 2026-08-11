@@ -1906,6 +1906,26 @@ where
 
         loop {
             if self.tool_loop_break_requested {
+                // The repetition guard killed the loop. Report it like every
+                // other non-convergent stop: reporting `None` here made the
+                // host read a turn the harness had to kill as a clean one, so
+                // `clear_turn_failure()` wiped the escalation ladder and grind
+                // streak that this exact pattern should be feeding — and the
+                // transcript was left ending on tool results with no closing
+                // assistant message.
+                let error = RuntimeError::new("turn hit the tool-repetition guard");
+                self.record_turn_failed(iterations, &error);
+                budget_exhausted = Some(BudgetExhausted::ToolRepetition);
+                self.push_budget_exhausted_closer(
+                    BudgetExhausted::ToolRepetition,
+                    iterations,
+                    &mut assistant_messages,
+                )
+                .map_err(RuntimeError::new)?;
+                eprintln!(
+                    "[zo] {}",
+                    budget_exhausted_notice(BudgetExhausted::ToolRepetition, iterations)
+                );
                 break;
             }
             iterations += 1;

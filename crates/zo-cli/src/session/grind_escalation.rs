@@ -129,8 +129,10 @@ pub(crate) fn auto_continue_cap() -> Option<u32> {
 /// Whether a budget-exhausted turn should automatically continue instead of
 /// waiting for the user to type "계속". All of:
 ///
-/// - the stop was a plain budget (never [`VerificationTreadmill`] — that stop
-///   exists precisely to hand back to the user),
+/// - the stop was a plain budget (never `VerificationTreadmill` or
+///   `ToolRepetition` — both are loop-detection stops that exist precisely to
+///   hand back to the user, and auto-continuing one would hand the model the
+///   same context that produced the loop),
 /// - the turn externalized progress (successful edit/write/plan results — the
 ///   same evidence class as the in-turn deadline extension),
 /// - the chain has continuations left, and
@@ -148,7 +150,11 @@ pub(crate) fn should_auto_continue(
     streak: u32,
     threshold: Option<u32>,
 ) -> bool {
-    if matches!(kind, runtime::BudgetExhausted::VerificationTreadmill) {
+    if matches!(
+        kind,
+        runtime::BudgetExhausted::VerificationTreadmill
+            | runtime::BudgetExhausted::ToolRepetition
+    ) {
         return false;
     }
     let Some(cap) = cap else { return false };

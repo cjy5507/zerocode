@@ -13088,7 +13088,15 @@ fn repeated_successful_read_gets_one_grace_round_before_thrashing_turn_stops() {
         .expect("repetition is a graceful turn stop");
 
     assert_eq!(summary.iterations, TOOL_REPETITION_THRESHOLD + 2);
-    assert_eq!(summary.budget_exhausted, None);
+    // The repetition guard stopped this turn, NOT the iteration cap of 6 — the
+    // point this assertion has always made. It now names the cause instead of
+    // inferring it from an absent marker: reporting `None` here was
+    // indistinguishable from a clean end, so the host counted a loop the harness
+    // had to kill as a converged turn and reset its escalation state.
+    assert_eq!(
+        summary.budget_exhausted,
+        Some(BudgetExhausted::ToolRepetition)
+    );
 }
 
 #[test]
