@@ -3447,6 +3447,35 @@ def _():
         subprocess.run([sys.executable, str(path)], check=True, capture_output=True)
 
 
+@probe("adding a non-positive qty raises the module's own error class")
+def _():
+    mod = inventory()
+    name = error_class()
+    try:
+        mod.add("probe-bad-qty", 0)
+    except Exception as exc:
+        assert type(exc).__name__ == name, f"{type(exc).__name__} != {name}"
+        return
+    raise AssertionError("qty <= 0 must be an error")
+
+
+# The next two probes are the handoff needle: `total` was specified only in
+# session A's conversation, and stage 2 can know it exists only through what
+# session A chose to leave on disk. No trace left, no total built.
+@probe("total() exists and sums every tracked quantity")
+def _():
+    mod = inventory()
+    mod.add("probe-t1", 2)
+    mod.add("probe-t2", 3)
+    assert mod.total() == 5, mod.total()
+
+
+@probe("an empty inventory totals 0")
+def _():
+    mod = inventory()
+    assert mod.total() == 0, mod.total()
+
+
 PASSED = 0
 for _label, _function in PROBES:
     try:
@@ -3461,7 +3490,7 @@ PYEOF
 '''
 
 [[tasks.stages]]
-prompt = '''We are starting a small Python inventory module another engineer will finish later — you will NOT be around to explain anything, and they will not see this conversation, only the working directory. Contract: inventory.py offers add(item, qty) (repeated adds accumulate), count(item) -> int, and remove(item) removes the item entirely; removing an item that is not tracked is an error. Your design decisions, yours to make and to keep consistent: the custom error class name (a *Error, never a builtin), the internal storage shape, and any constants' naming. Implement ONLY add and count now — do not implement remove yet. Add test_inventory_part1.py covering add and count and run python3 test_inventory_part1.py until green. Leave the work in whatever state you judge best for the next engineer.'''
+prompt = '''We are starting a small Python inventory module another engineer will finish later — you will NOT be around to explain anything, and they will not see this conversation, only the working directory. Contract: inventory.py offers add(item, qty) (repeated adds accumulate; a qty of zero or less is an error), count(item) -> int, remove(item) (removes the item entirely; removing an untracked item is an error), and total() -> int (the sum of every tracked quantity; an empty inventory totals 0). Your design decisions, yours to make and to keep consistent: the custom error class name (a *Error, never a builtin), the internal storage shape, and any constants' naming. Implement ONLY add and count now — remove and total belong to the next engineer, do not implement them. Add test_inventory_part1.py covering add and count (including the bad-qty error) and run python3 test_inventory_part1.py until green. Leave the work in whatever state you judge best for the next engineer.'''
 check = '''
 set -e
 python3 test_inventory_part1.py
@@ -3471,9 +3500,10 @@ tree = ast.parse(pathlib.Path("inventory.py").read_text())
 funcs = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
 assert {"add", "count"} <= funcs, sorted(funcs)
 assert "remove" not in funcs, "remove belongs to the next engineer"
+assert "total" not in funcs, "total belongs to the next engineer"
 PYEOF
 '''
 
 [[tasks.stages]]
 fresh_session = true
-prompt = '''You are taking over this working directory from another engineer who left mid-task. You have no conversation history with them — everything you can know is on disk. Figure out what the inventory module is, finish it: implement the missing remove(item) (removing an untracked item is an error, consistent with how the existing code signals errors), extend the tests to cover remove including the error path, and run all test files until green. Follow the previous engineer's design decisions exactly — error class, storage shape, naming. Do not rename or restructure what already works.'''
+prompt = '''You are taking over this working directory from another engineer who left mid-task. You have no conversation history with them — everything you can know is on disk. Figure out what the inventory module is and what remains unbuilt, then finish ALL of it: implement the missing remove(item) (removing an untracked item is an error, consistent with how the existing code signals errors) plus whatever else the previous engineer planned but did not build, extend the tests to cover what you add including error paths, and run all test files until green. Follow the previous engineer's design decisions exactly — error class, storage shape, naming. Do not rename or restructure what already works.'''
