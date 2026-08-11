@@ -3307,3 +3307,173 @@ PYEOF
 
 [[tasks.stages]]
 prompt = '''Finally add node_detail(name) to auditreport.py returning the full text of that node's findings file. A name that is not one of the five audited nodes fails with exactly the message I gave you at the start of this audit.'''
+
+# ── deep-handoff-carry: the severed-session lane ─────────────────────────────
+# Stage 1 makes real design decisions and builds half the module inside
+# session A. Stage 2 runs in a BRAND-NEW session (fresh_session severs the
+# conversation): the only carry channel is what session A left on disk. The
+# checks judge self-consistency — a stage-2 author who ignored session A's
+# decisions cannot produce one coherent module. This measures the handoff
+# axis in-session recall lanes cannot: does a tool leave work resumable, and
+# does a fresh session actually resume it?
+
+[[tasks]]
+id = "deep-handoff-carry"
+tags = ["deep", "long", "carry"]
+timeout_secs = 900
+check = '''
+set -e
+for t in test_*.py; do python3 "$t"; done
+python3 - <<'PYEOF'
+import ast, pathlib
+tree = ast.parse(pathlib.Path("inventory.py").read_text())
+funcs = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+assert {"add", "count", "remove"} <= funcs, sorted(funcs)
+raised = set()
+for node in ast.walk(tree):
+    if isinstance(node, ast.Raise) and node.exc is not None:
+        exc = node.exc
+        if isinstance(exc, ast.Call):
+            exc = exc.func
+        if isinstance(exc, ast.Attribute):
+            raised.add(exc.attr)
+        elif isinstance(exc, ast.Name):
+            raised.add(exc.id)
+assert raised, "error paths must raise something"
+builtins = {"ValueError", "KeyError", "TypeError", "RuntimeError", "LookupError", "Exception"}
+assert len(raised) == 1, f"one error class everywhere, found {sorted(raised)}"
+name = raised.pop()
+assert name.endswith("Error") and name not in builtins, name
+PYEOF
+'''
+graded_check = '''
+python3 - <<'PYEOF'
+import ast
+import importlib
+import os
+import pathlib
+import subprocess
+import sys
+
+sys.path.insert(0, ".")
+
+PROBES = []
+
+
+def probe(label):
+    def register(function):
+        PROBES.append((label, function))
+        return function
+    return register
+
+
+def inventory():
+    module = importlib.import_module("inventory")
+    importlib.reload(module)
+    return module
+
+
+def error_class():
+    tree = ast.parse(pathlib.Path("inventory.py").read_text())
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Raise) and node.exc is not None:
+            exc = node.exc
+            if isinstance(exc, ast.Call):
+                exc = exc.func
+        else:
+            continue
+        if isinstance(exc, ast.Attribute):
+            names.add(exc.attr)
+        elif isinstance(exc, ast.Name):
+            names.add(exc.id)
+    assert len(names) == 1, names
+    return names.pop()
+
+
+@probe("exactly one custom *Error class is raised anywhere")
+def _():
+    name = error_class()
+    builtins = {"ValueError", "KeyError", "TypeError", "RuntimeError", "LookupError", "Exception"}
+    assert name.endswith("Error") and name not in builtins, name
+
+
+@probe("repeated adds accumulate into count")
+def _():
+    mod = inventory()
+    mod.add("probe-widget", 2)
+    mod.add("probe-widget", 3)
+    assert mod.count("probe-widget") == 5, mod.count("probe-widget")
+
+
+@probe("count returns an int, not a string")
+def _():
+    mod = inventory()
+    mod.add("probe-int", 1)
+    value = mod.count("probe-int")
+    assert value == 1 and not isinstance(value, str), repr(value)
+
+
+@probe("remove drops the item entirely")
+def _():
+    mod = inventory()
+    mod.add("probe-gone", 4)
+    mod.remove("probe-gone")
+    assert mod.count("probe-gone") in (0,), "removed item must count as absent"
+
+
+@probe("removing an untracked item raises the module's own error class")
+def _():
+    mod = inventory()
+    name = error_class()
+    try:
+        mod.remove("never-added-item")
+    except Exception as exc:
+        assert type(exc).__name__ == name, f"{type(exc).__name__} != {name}"
+        return
+    raise AssertionError("removing an untracked item must be an error")
+
+
+@probe("part1 tests still pass untouched semantics")
+def _():
+    subprocess.run([sys.executable, "test_inventory_part1.py"], check=True, capture_output=True)
+
+
+@probe("a remove test exists and passes")
+def _():
+    tests = [p for p in pathlib.Path(".").glob("test_*.py") if "remove" in p.read_text()]
+    assert tests, "no test covers remove"
+    for path in tests:
+        subprocess.run([sys.executable, str(path)], check=True, capture_output=True)
+
+
+PASSED = 0
+for _label, _function in PROBES:
+    try:
+        _function()
+        PASSED += 1
+    except BaseException as _exc:
+        if os.environ.get("BATTERY_VERBOSE"):
+            print("FAIL: %s -> %s: %s" % (_label, type(_exc).__name__, str(_exc)[:70]))
+
+print("GRADE %d/%d" % (PASSED, len(PROBES)))
+PYEOF
+'''
+
+[[tasks.stages]]
+prompt = '''We are starting a small Python inventory module another engineer will finish later — you will NOT be around to explain anything, and they will not see this conversation, only the working directory. Contract: inventory.py offers add(item, qty) (repeated adds accumulate), count(item) -> int, and remove(item) removes the item entirely; removing an item that is not tracked is an error. Your design decisions, yours to make and to keep consistent: the custom error class name (a *Error, never a builtin), the internal storage shape, and any constants' naming. Implement ONLY add and count now — do not implement remove yet. Add test_inventory_part1.py covering add and count and run python3 test_inventory_part1.py until green. Leave the work in whatever state you judge best for the next engineer.'''
+check = '''
+set -e
+python3 test_inventory_part1.py
+python3 - <<'PYEOF'
+import ast, pathlib
+tree = ast.parse(pathlib.Path("inventory.py").read_text())
+funcs = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+assert {"add", "count"} <= funcs, sorted(funcs)
+assert "remove" not in funcs, "remove belongs to the next engineer"
+PYEOF
+'''
+
+[[tasks.stages]]
+fresh_session = true
+prompt = '''You are taking over this working directory from another engineer who left mid-task. You have no conversation history with them — everything you can know is on disk. Figure out what the inventory module is, finish it: implement the missing remove(item) (removing an untracked item is an error, consistent with how the existing code signals errors), extend the tests to cover remove including the error path, and run all test files until green. Follow the previous engineer's design decisions exactly — error class, storage shape, naming. Do not rename or restructure what already works.'''

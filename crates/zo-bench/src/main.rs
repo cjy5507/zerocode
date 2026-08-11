@@ -79,6 +79,7 @@ struct ToolConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TaskConfig {
     id: String,
     /// Single-stage prompt. Exactly one of `prompt` / `stages` must be set.
@@ -107,13 +108,26 @@ struct TaskConfig {
     tags: Vec<String>,
 }
 
+// deny_unknown_fields: a stage key placed at the wrong level (a task-level
+// `graded_check` inside a `[[tasks.stages]]` table, say) must be a load
+// error, not a silently ignored gate — exactly that misplacement shipped
+// once and only an authoring self-test caught it.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StageConfig {
     prompt: String,
     /// Optional mid-stage gate; a red stage check fails the whole task even
     /// if a later stage papers over it.
     #[serde(default)]
     check: Option<String>,
+    /// Sever the session at this stage boundary: mint a NEW session id and
+    /// launch with the initial argv (never `resume_argv`), so the stage sees
+    /// no conversation history — only what earlier stages left on disk. This
+    /// is the handoff-carry lane: it measures whether a tool leaves work in
+    /// a state a fresh session can pick up, and whether the fresh session
+    /// actually picks it up, instead of measuring in-session recall.
+    #[serde(default)]
+    fresh_session: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -365,6 +379,7 @@ fn task_stages(task: &TaskConfig) -> Result<Vec<StageConfig>, String> {
             .map(|stage| StageConfig {
                 prompt: stage.prompt.clone(),
                 check: stage.check.clone(),
+                fresh_session: stage.fresh_session,
             })
             .collect());
     }
@@ -372,6 +387,7 @@ fn task_stages(task: &TaskConfig) -> Result<Vec<StageConfig>, String> {
         Some(prompt) => Ok(vec![StageConfig {
             prompt: prompt.clone(),
             check: None,
+            fresh_session: false,
         }]),
         None => Err(format!("task {}: needs `prompt` or `stages`", task.id)),
     }
@@ -439,7 +455,7 @@ fn run_one(
         .unwrap_or_else(|_| run_root.to_path_buf());
     let workdir_abs = workdir.canonicalize().unwrap_or_else(|_| workdir.clone());
     let stages = task_stages(task)?;
-    let session_id = make_session_id(u64::from(trial));
+    let mut session_id = make_session_id(u64::from(trial));
     let timeout = Duration::from_secs(task.timeout_secs.unwrap_or(defaults.timeout_secs));
 
     let mut total_wall: u128 = 0;
@@ -453,7 +469,12 @@ fn run_one(
 
     for (index, stage) in stages.iter().enumerate() {
         let stage_no = u32::try_from(index).unwrap_or(u32::MAX) + 1;
-        let template = if index > 0 {
+        // A severed stage mints a fresh session and launches with the initial
+        // argv: no --resume, no shared history — the handoff is disk-only.
+        if index > 0 && stage.fresh_session {
+            session_id = make_session_id(u64::from(trial) + (u64::from(stage_no) << 32));
+        }
+        let template = if index > 0 && !stage.fresh_session {
             tool.resume_argv.as_ref().unwrap_or(&tool.argv)
         } else {
             &tool.argv
