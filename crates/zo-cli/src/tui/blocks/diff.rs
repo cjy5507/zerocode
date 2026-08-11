@@ -534,6 +534,37 @@ mod tests {
         assert_eq!(rendered[3], "2 -     let x = 0;");
     }
 
+    /// `fn main() {` must paint the function name in the brand accent — the
+    /// `Func` role split out of `Name` so diffs carry per-function coloring
+    /// distinct from types/macros (owner ask: "function별 색깔").
+    #[test]
+    fn function_names_highlight_with_the_accent_role() {
+        let theme = Theme::zo();
+        let view = sample_view();
+        let out = lines(&view, &theme, true);
+        let context = &out[1];
+        let main_span = context
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "main")
+            .expect("syntect should tokenize `main` as its own span");
+        assert_eq!(
+            main_span.style.fg,
+            Some(theme.palette.accent),
+            "function names take the Func role's accent color"
+        );
+        let fn_span = context
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref().trim() == "fn")
+            .expect("syntect should tokenize `fn` as its own span");
+        assert_eq!(
+            fn_span.style.fg,
+            Some(theme.palette.violet),
+            "keywords stay on the Keyword role's violet"
+        );
+    }
+
     /// Every span on an added line carries the add background tint on a
     /// true-color palette; removed lines carry the remove tint; context stays
     /// on the normal editor surface.

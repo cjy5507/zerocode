@@ -32,7 +32,9 @@ struct ScopePrefixes {
     keyword_operator: Scope,
     storage: Scope,
     entity_name: Scope,
+    entity_name_function: Scope,
     support: Scope,
+    support_function: Scope,
 }
 
 fn scope_prefixes() -> &'static ScopePrefixes {
@@ -48,7 +50,9 @@ fn scope_prefixes() -> &'static ScopePrefixes {
             keyword_operator: mk("keyword.operator"),
             storage: mk("storage"),
             entity_name: mk("entity.name"),
+            entity_name_function: mk("entity.name.function"),
             support: mk("support"),
+            support_function: mk("support.function"),
         }
     })
 }
@@ -74,6 +78,12 @@ fn role_for_scope(scope: Scope) -> Option<SyntaxRole> {
     }
     if p.keyword.is_prefix_of(scope) || p.storage.is_prefix_of(scope) {
         return Some(SyntaxRole::Keyword);
+    }
+    // Functions get their own role (user ask: "function별 색깔") — check the
+    // narrower prefixes before the broad `entity.name`/`support` fallbacks so
+    // calls and definitions split away from types/classes/macros.
+    if p.entity_name_function.is_prefix_of(scope) || p.support_function.is_prefix_of(scope) {
+        return Some(SyntaxRole::Func);
     }
     if p.entity_name.is_prefix_of(scope) || p.support.is_prefix_of(scope) {
         return Some(SyntaxRole::Name);
@@ -198,8 +208,8 @@ mod tests {
             "`let` is a keyword"
         );
         assert!(
-            roles_for(code, "main").contains(&SyntaxRole::Name),
-            "`main` is a declared function name"
+            roles_for(code, "main").contains(&SyntaxRole::Func),
+            "`main` is a declared function name — the Func role, split from Name"
         );
     }
 

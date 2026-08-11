@@ -4,7 +4,7 @@
 |  └ src/lib.rs (+1 -1)                                      |
   0-3[fg=Indexed(245)] 4-15[fg=Indexed(253)] 16-17[fg=Indexed(114),mod=BOLD] 18-18[fg=Indexed(253)] 19-20[fg=Indexed(203),mod=BOLD] 21-21[fg=Indexed(253)]
 |  │ 1   fn main() {                                         |
-  0-7[fg=Indexed(245)] 8-9[fg=Indexed(141)] 10-10[fg=Indexed(253)] 11-14[fg=Indexed(117)] 15-18[fg=Indexed(253)]
+  0-7[fg=Indexed(245)] 8-9[fg=Indexed(141)] 10-10[fg=Indexed(253)] 11-14[fg=Indexed(111)] 15-18[fg=Indexed(253)]
 |  │ 2 -     println!("old");                                |
   0-3[fg=Indexed(245)] 4-5[fg=Indexed(245),bg=Indexed(52)] 6-6[fg=Indexed(203),bg=Indexed(52)] 7-7[fg=Indexed(245),bg=Indexed(52)] 8-11[fg=Indexed(253),bg=Indexed(52)] 12-19[fg=Indexed(117),bg=Indexed(52)] 20-20[fg=Indexed(253),bg=Indexed(52)] 21-21[fg=Indexed(109),bg=Indexed(52)] 22-24[fg=Indexed(109),bg=Indexed(88)] 25-25[fg=Indexed(109),bg=Indexed(52)] 26-27[fg=Indexed(253),bg=Indexed(52)] 28-59[bg=Indexed(52)]
 |  │ 2 +     println!("new");                                |
@@ -52,7 +52,7 @@
 |  └ src/lib.rs (+1 -1)                                                          |
   0-3[fg=Indexed(245)] 4-15[fg=Indexed(253)] 16-17[fg=Indexed(114),mod=BOLD] 18-18[fg=Indexed(253)] 19-20[fg=Indexed(203),mod=BOLD] 21-21[fg=Indexed(253)]
 |  │ 1   fn main() {                                                             |
-  0-7[fg=Indexed(245)] 8-9[fg=Indexed(141)] 10-10[fg=Indexed(253)] 11-14[fg=Indexed(117)] 15-18[fg=Indexed(253)]
+  0-7[fg=Indexed(245)] 8-9[fg=Indexed(141)] 10-10[fg=Indexed(253)] 11-14[fg=Indexed(111)] 15-18[fg=Indexed(253)]
 |  │ 2 -     println!("old");                                                    |
   0-3[fg=Indexed(245)] 4-5[fg=Indexed(245),bg=Indexed(52)] 6-6[fg=Indexed(203),bg=Indexed(52)] 7-7[fg=Indexed(245),bg=Indexed(52)] 8-11[fg=Indexed(253),bg=Indexed(52)] 12-19[fg=Indexed(117),bg=Indexed(52)] 20-20[fg=Indexed(253),bg=Indexed(52)] 21-21[fg=Indexed(109),bg=Indexed(52)] 22-24[fg=Indexed(109),bg=Indexed(88)] 25-25[fg=Indexed(109),bg=Indexed(52)] 26-27[fg=Indexed(253),bg=Indexed(52)] 28-79[bg=Indexed(52)]
 |  │ 2 +     println!("new");                                                    |

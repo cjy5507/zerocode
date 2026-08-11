@@ -443,9 +443,15 @@ pub enum SyntaxRole {
     Keyword,
     /// String / char / regex literals — `teal`.
     Str,
-    /// Declared names: `entity.name.*` + `support.*` (functions, types,
-    /// classes, macros) — `cyan`.
+    /// Declared names: `entity.name.*` + `support.*` (types, classes,
+    /// macros) — `cyan`.
     Name,
+    /// Function names (`entity.name.function*` + `support.function*`) —
+    /// brand `accent`. Split out of [`SyntaxRole::Name`] on an explicit
+    /// owner ask ("function별 색깔"): calls/definitions read distinctly from
+    /// types, and the Ember accent keeps the fourth hue on-brand instead of
+    /// widening the structural set.
+    Func,
 }
 
 /// The color capability tier a terminal is treated as supporting.
@@ -2172,10 +2178,10 @@ impl Theme {
     /// base16 theme, so code highlighting stays on-brand and inherits the
     /// palette's own degrade: truecolor keeps RGB, an indexed palette yields
     /// `Color::Indexed`, and a `NO_COLOR` palette yields `Color::Reset` (a
-    /// neutral, uniform code body). Only zo's structural hues are spent
-    /// (`violet`/`teal`/`cyan`, at most three), keeping the code card inside
-    /// the "카드당 최대 3계조" budget; chromatic status hues (`success`/`warn`/
-    /// `error`) and brand `accent` are deliberately never used here.
+    /// neutral, uniform code body). The hue budget is the structural set
+    /// (`violet`/`teal`/`cyan`) plus brand `accent` on function names alone
+    /// (an explicit owner ask — see [`SyntaxRole::Func`]); chromatic status
+    /// hues (`success`/`warn`/`error`) are deliberately never used here.
     #[must_use]
     pub fn syntax_style(&self, role: SyntaxRole) -> Style {
         let color = match role {
@@ -2184,6 +2190,7 @@ impl Theme {
             SyntaxRole::Keyword => self.palette.violet,
             SyntaxRole::Str => self.palette.teal,
             SyntaxRole::Name => self.palette.cyan,
+            SyntaxRole::Func => self.palette.accent,
         };
         let style = Style::new().fg(color);
         // Comments recede via both hue and weight; italic is the one modifier
@@ -2209,14 +2216,21 @@ impl Theme {
     /// convention), so the body fg keeps its full contrast on the band.
     #[must_use]
     pub fn diff_add_bg(&self) -> Option<Color> {
-        self.diff_band(self.palette.success, 0.18, 22, 194) // dark (0,95,0) · light (215,255,215)
+        // 0.28: a band the eye reads as a filled row (editor-diff convention,
+        // owner-matched against a reference screenshot), up from a 0.18 wash
+        // that read as barely-there tinting on dark surfaces.
+        self.diff_band(self.palette.success, 0.28, 22, 194) // dark (0,95,0) · light (215,255,215)
     }
 
     /// Semantic background band for a removed diff line. See
     /// [`Self::diff_add_bg`].
     #[must_use]
     pub fn diff_del_bg(&self) -> Option<Color> {
-        self.diff_band(self.palette.error, 0.18, 52, 224) // dark (95,0,0) · light (255,215,215)
+        // 0.22, not the add band's 0.28: the pastel `error` hue is far more
+        // luminous than `success`, and 0.28 dropped the `-` marker below the
+        // 4.5:1 readability gate on its own band (guarded by
+        // `truecolor_diff_bands_keep_the_surface_quiet_and_words_stronger`).
+        self.diff_band(self.palette.error, 0.22, 52, 224) // dark (95,0,0) · light (255,215,215)
     }
 
     /// Stronger background tint for the *changed words* within an added line
@@ -2226,6 +2240,9 @@ impl Theme {
     /// keep the result indexed; neutral palettes return `None`.
     #[must_use]
     pub fn diff_add_emphasis_bg(&self) -> Option<Color> {
+        // Raised in step with the 0.28 line band so the changed words still
+        // pop a clear step above it; 0.34 is the strongest step that keeps
+        // body text at ≥4.5:1 on the emphasis (guarded in theme tests).
         self.diff_band(self.palette.success, 0.34, 28, 157) // dark (0,135,0) · light (175,255,175)
     }
 
@@ -2233,7 +2250,7 @@ impl Theme {
     /// See [`Self::diff_add_emphasis_bg`].
     #[must_use]
     pub fn diff_del_emphasis_bg(&self) -> Option<Color> {
-        self.diff_band(self.palette.error, 0.34, 88, 217) // dark (135,0,0) · light (255,175,175)
+        self.diff_band(self.palette.error, 0.32, 88, 217) // dark (135,0,0) · light (255,175,175)
     }
 
     /// One diff band color. True-color palettes blend the status hue over the
