@@ -208,17 +208,30 @@ pub(crate) fn test_cwd_lock() -> &'static Mutex<()> {
 /// Tests that set-and-restore `ZO_CONFIG_HOME` themselves are unaffected:
 /// they capture this value as "prior" and put it back.
 #[cfg(test)]
+static ISOLATED_ZO_HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+#[cfg(test)]
 pub(crate) fn isolate_global_zo_home_for_tests() {
-    static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
-    let home = HOME.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("zo-test-home-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        std::env::set_var("ZO_CONFIG_HOME", &dir);
-        std::env::set_var("HOME", &dir);
-        dir.clone()
-    });
-    // Re-assert in case an env-restoring test removed it (prior was unset when
-    // the very first isolated test ran under a raced guard).
+    // The seeding `set_var` lives inside the env-mutex init (see
+    // `test_env_mutex`): while the mutex is still being created no test can
+    // hold it, which is the only moment a lock-free env write cannot stomp a
+    // lock-holding test's own `ZO_CONFIG_HOME`. Seeding lazily HERE did
+    // exactly that — the first caller overwrote another test's isolated home
+    // mid-guard (observed: MissingAuthRouteCredentials, 1/20 loaded rounds).
+    let _ = test_env_mutex();
+    let home = ISOLATED_ZO_HOME
+        .get()
+        .expect("seeded by the test_env_mutex init");
+    // Re-assert in case an env-restoring test removed it — but only when no
+    // test holds the env lock: a holder is managing the environment itself
+    // (possibly asserting on an EMPTY home). `try_lock` cannot deadlock, so
+    // the env→cwd lock-order contract is not violated by cwd-lock holders
+    // passing through here.
+    let guard = match test_env_mutex().try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
     if std::env::var_os("ZO_CONFIG_HOME").is_none_or(|value| value.is_empty()) {
         std::env::set_var("ZO_CONFIG_HOME", home);
     }
@@ -229,6 +242,7 @@ pub(crate) fn isolate_global_zo_home_for_tests() {
     if std::env::var_os("HOME").is_none_or(|value| value.is_empty()) {
         std::env::set_var("HOME", home);
     }
+    drop(guard);
 }
 
 #[cfg(test)]
@@ -240,6 +254,18 @@ pub(crate) fn test_env_mutex() -> &'static Mutex<()> {
         // an expired blob, fire a real token-endpoint refresh (mutating live
         // credentials / hanging in sandboxed runs).
         std::env::set_var("ZO_DISABLE_KEYCHAIN", "1");
+        // Seed the isolated global zo home in the same pre-mutex moment: no
+        // holder can exist before the mutex does, so these are the only
+        // lock-free `set_var`s that cannot race a lock-holding test. Every
+        // later reader goes through `isolate_global_zo_home_for_tests`.
+        ISOLATED_ZO_HOME.get_or_init(|| {
+            let dir =
+                std::env::temp_dir().join(format!("zo-test-home-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            std::env::set_var("ZO_CONFIG_HOME", &dir);
+            std::env::set_var("HOME", &dir);
+            dir
+        });
         Mutex::new(())
     })
 }

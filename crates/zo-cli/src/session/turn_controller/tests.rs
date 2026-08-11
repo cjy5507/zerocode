@@ -396,13 +396,6 @@ async fn blocking_the_async_thread_directly_starves_ticks() {
 
 #[test]
 fn routed_provider_client_pins_the_session_cache_scope() {
-    // Exhaust the one lock-free `ZO_CONFIG_HOME` write in the process — the
-    // OnceLock init inside `isolate_global_zo_home_for_tests` — BEFORE taking
-    // the env lock below. Left pending, whichever parallel test first calls it
-    // overwrites this test's isolated config home mid-flight and the client
-    // build reads an empty credentials root (observed: 1/20 loaded rounds
-    // failing with MissingAuthRouteCredentials).
-    crate::isolate_global_zo_home_for_tests();
     let config_home = unique_temp_dir("deep-verify-cache-scope");
     std::fs::create_dir_all(&config_home).expect("create isolated config home");
     let config_guard = EnvPathGuard::set("ZO_CONFIG_HOME", &config_home);
