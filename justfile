@@ -31,9 +31,10 @@ verify:
 
 # 릴리스 체계 게이트: 전체 Rust 검증 + 셸 구문 + 격리 installer 테스트.
 release-verify: verify
-    @bash -n install.sh scripts/release.sh scripts/test-install.sh scripts/test-deploy.sh
+    @bash -n install.sh scripts/release.sh scripts/test-install.sh scripts/test-deploy.sh scripts/perf-gate.sh
     @scripts/test-install.sh
     @scripts/test-deploy.sh
+    @scripts/perf-gate.sh
 
 # zo 릴리스 바이너리 빌드 → target/release/zo
 build:

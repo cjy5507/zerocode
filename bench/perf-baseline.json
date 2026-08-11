@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "cases": [
+    {
+      "name": "startup-bootstrap-plan",
+      "runs": 5,
+      "median_micros": 32104,
+      "min_micros": 31262,
+      "mean_micros": 32500,
+      "stddev_micros": 1156,
+      "peak_rss_kib": 7648
+    },
+    {
+      "name": "startup-help",
+      "runs": 5,
+      "median_micros": 9987,
+      "min_micros": 8510,
+      "mean_micros": 9717,
+      "stddev_micros": 1096,
+      "peak_rss_kib": 6432
+    },
+    {
+      "name": "startup-system-prompt",
+      "runs": 5,
+      "median_micros": 97626,
+      "min_micros": 95108,
+      "mean_micros": 98018,
+      "stddev_micros": 2810,
+      "peak_rss_kib": 10032
+    },
+    {
+      "name": "startup-version",
+      "runs": 5,
+      "median_micros": 8792,
+      "min_micros": 8593,
+      "mean_micros": 8951,
+      "stddev_micros": 357,
+      "peak_rss_kib": 5168
+    }
+  ]
+}
