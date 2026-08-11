@@ -3499,8 +3499,34 @@ import ast, pathlib
 tree = ast.parse(pathlib.Path("inventory.py").read_text())
 funcs = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
 assert {"add", "count"} <= funcs, sorted(funcs)
-assert "remove" not in funcs, "remove belongs to the next engineer"
-assert "total" not in funcs, "total belongs to the next engineer"
+
+
+def is_stub(fn):
+    # "Do not implement" forbids working code, not reserving the name: a
+    # docstring + pass / raise NotImplementedError placeholder is a
+    # legitimate handoff artifact (a real stage-1 run left exactly that and
+    # the original name-ban wrongly failed it).
+    body = fn.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]
+    if not body:
+        return True
+    if len(body) == 1:
+        node = body[0]
+        if isinstance(node, ast.Pass):
+            return True
+        if isinstance(node, ast.Raise) and node.exc is not None:
+            exc = node.exc
+            if isinstance(exc, ast.Call):
+                exc = exc.func
+            name = exc.attr if isinstance(exc, ast.Attribute) else getattr(exc, "id", None)
+            return name == "NotImplementedError"
+    return False
+
+
+for reserved in ("remove", "total"):
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == reserved]:
+        assert is_stub(fn), f"{reserved} belongs to the next engineer (an unimplemented stub is fine)"
 PYEOF
 '''
 
