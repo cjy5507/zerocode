@@ -575,7 +575,10 @@ struct AgentJobOutcome {
 fn agent_budget_can_auto_continue(kind: runtime::BudgetExhausted) -> bool {
     // A sub-agent continuation is a fresh model-loop window, not a fresh cost
     // budget. Only the local iteration guard is recoverable; token, deadline,
-    // tool-call, and verification-treadmill cutoffs remain hard stops.
+    // tool-call, verification-treadmill, and tool-repetition cutoffs remain hard
+    // stops. The last two are loop-detection stops in particular: continuing one
+    // hands the model back the very context that produced the loop, so it would
+    // buy another identical round rather than progress.
     kind == runtime::BudgetExhausted::Iterations
 }
 
@@ -2433,6 +2436,7 @@ mod tests {
             runtime::BudgetExhausted::Deadline,
             runtime::BudgetExhausted::ToolCalls,
             runtime::BudgetExhausted::VerificationTreadmill,
+            runtime::BudgetExhausted::ToolRepetition,
         ] {
             assert!(!should_auto_continue_budget(
                 Some(kind),
@@ -2470,6 +2474,47 @@ mod tests {
             SPAWNED_AGENT_MAX_TOOL_CALLS,
             false,
         ));
+    }
+
+    /// A sub-agent whose turn the repetition guard killed used to report
+    /// `budget_exhausted: None` — indistinguishable from a clean end — so it fell
+    /// through `agent_terminal_disposition`'s `None` arm and the parent received
+    /// a loop the harness had to kill as a `Completed` result carrying whatever
+    /// partial text was lying around. It is now an honest budget failure whose
+    /// caller-facing banner names the guard.
+    #[test]
+    fn a_repetition_killed_subagent_is_a_budget_failure_not_a_silent_completion() {
+        let killed = continuation_summary(
+            Vec::new(),
+            vec![successful_tool_result("read_file")],
+            Some(runtime::BudgetExhausted::ToolRepetition),
+        );
+        assert_eq!(
+            agent_terminal_disposition(&killed, false, false, false),
+            AgentTerminalDisposition::BudgetFailed(runtime::BudgetExhausted::ToolRepetition),
+        );
+        // A StructuredOutput deliverable in hand must NOT excuse this one: that
+        // exemption is scoped to the fences that bound WORK (iterations, tool
+        // calls), and a repetition loop is neither.
+        assert_eq!(
+            agent_terminal_disposition(&killed, true, true, false),
+            AgentTerminalDisposition::BudgetFailed(runtime::BudgetExhausted::ToolRepetition),
+            "a submission in hand must not turn a loop-detection stop into success",
+        );
+        let banner = agent_budget_exhausted_result(
+            "partial work",
+            runtime::BudgetExhausted::ToolRepetition,
+            12,
+            30,
+        );
+        assert!(
+            banner.contains("tool-repetition guard"),
+            "the banner must name the guard that stopped the agent: {banner}"
+        );
+        assert!(
+            banner.contains("partial work"),
+            "the partial result must survive the banner: {banner}"
+        );
     }
 
     #[test]
