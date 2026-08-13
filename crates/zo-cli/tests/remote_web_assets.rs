@@ -45,6 +45,71 @@ fn assert_success(label: &str, output: &Output) {
 }
 
 #[test]
+fn install_icon_manifest_and_shell_references_are_complete() {
+    let remote_web = Path::new(env!("CARGO_MANIFEST_DIR")).join("remote-web");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(remote_web.join("manifest.webmanifest"))
+            .expect("read web app manifest"),
+    )
+    .expect("parse web app manifest");
+    let icons = manifest["icons"].as_array().expect("manifest icons array");
+    for source in [
+        "icons/app-icon-1024.png",
+        "icons/maskable-icon-1024.png",
+    ] {
+        let master = image::open(remote_web.join(source)).expect("open 1024px icon master");
+        assert_eq!(
+            (master.width(), master.height()),
+            (1024, 1024),
+            "wrong dimensions for {source}"
+        );
+    }
+    for (src, sizes, purpose) in [
+        ("icons/icon-192.png", "192x192", "any"),
+        ("icons/icon-512.png", "512x512", "any"),
+        ("icons/maskable-icon-192.png", "192x192", "maskable"),
+        ("icons/maskable-icon-512.png", "512x512", "maskable"),
+    ] {
+        assert!(remote_web.join(src).is_file(), "missing install icon {src}");
+        assert!(
+            icons.iter().any(|icon| {
+                icon["src"] == src
+                    && icon["sizes"] == sizes
+                    && icon["type"] == "image/png"
+                    && icon["purpose"] == purpose
+            }),
+            "manifest is missing {src} ({sizes}, {purpose})"
+        );
+    }
+
+    let index = std::fs::read_to_string(remote_web.join("index.html")).expect("read index");
+    for href in [
+        "./favicon.ico",
+        "./icons/favicon-16.png",
+        "./icons/favicon-32.png",
+        "./apple-touch-icon.png",
+    ] {
+        assert!(index.contains(href), "index is missing {href}");
+    }
+
+    let service_worker =
+        std::fs::read_to_string(remote_web.join("sw.js")).expect("read service worker");
+    for asset in [
+        "./icons/icon-192.png",
+        "./icons/icon-512.png",
+        "./icons/maskable-icon-192.png",
+        "./icons/maskable-icon-512.png",
+        "./icons/badge-96.png",
+        "./apple-touch-icon.png",
+    ] {
+        assert!(
+            service_worker.contains(asset),
+            "service worker is missing {asset}"
+        );
+    }
+}
+
+#[test]
 fn remote_web_javascript_parses_and_unit_tests_pass() {
     let Some(node) = find_node() else {
         eprintln!("skipping remote-web JavaScript checks: node was not found via NODE or PATH");

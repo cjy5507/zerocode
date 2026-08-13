@@ -1,4 +1,4 @@
-const CACHE = "zo-remote-shell-v7";
+const CACHE = "zo-remote-shell-v8";
 const SHELL = [
   "./",
   "./styles.css",
@@ -6,6 +6,14 @@ const SHELL = [
   "./remote-state.js",
   "./manifest.webmanifest",
   "./icon.svg",
+  "./favicon.ico",
+  "./icons/favicon-16.png",
+  "./icons/favicon-32.png",
+  "./icons/icon-192.png",
+  "./icons/icon-512.png",
+  "./icons/maskable-icon-192.png",
+  "./icons/maskable-icon-512.png",
+  "./icons/badge-96.png",
   "./apple-touch-icon.png",
 ];
 const API_PATH = new URL("./api/", self.registration.scope).pathname;
@@ -51,7 +59,8 @@ self.addEventListener("push", (event) => {
   event.waitUntil(self.registration.showNotification(content.title, {
     body: content.body,
     tag: `zo-remote-${reason}`,
-    icon: "./apple-touch-icon.png",
+    icon: "./icons/icon-192.png",
+    badge: "./icons/badge-96.png",
   }));
 });
 

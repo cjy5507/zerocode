@@ -27,7 +27,6 @@ decision-core = { path = "../decision-core" }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures-util.workspace = true
 gix.workspace = true
-image = { version = "0.25", default-features = false, features = ["png"] }
 qrcode.workspace = true
 rand.workspace = true
 reqwest.workspace = true
@@ -83,6 +82,7 @@ nix = { version = "0.29", features = ["fs"] }
 workspace = true
 
 [dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
 mock-anthropic-service = { path = "../mock-anthropic-service" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }

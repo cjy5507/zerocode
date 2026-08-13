@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Json;
@@ -16,8 +16,6 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use axum::Router;
 use futures_util::{Sink, SinkExt, StreamExt};
-use image::codecs::png::PngEncoder;
-use image::{ColorType, ImageEncoder, Rgb, RgbImage};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -168,6 +166,8 @@ fn gateway_routes() -> Router<GatewayState> {
         .route("/manifest.webmanifest", get(manifest))
         .route("/sw.js", get(service_worker))
         .route("/icon.svg", get(icon_svg))
+        .route("/favicon.ico", get(favicon_ico))
+        .route("/icons/{name}", get(icon_png))
         .route("/apple-touch-icon.png", get(apple_touch_icon))
         .route("/api/pair", post(pair_start))
         .route("/api/pair/{id}", get(pair_status))
@@ -266,6 +266,59 @@ async fn icon_svg(State(state): State<GatewayState>, headers: HeaderMap) -> Resp
         "image/svg+xml",
         "public, max-age=300",
     )
+}
+
+async fn favicon_ico(State(state): State<GatewayState>, headers: HeaderMap) -> Response<Body> {
+    if !valid_host(&state, &headers) {
+        return status(StatusCode::MISDIRECTED_REQUEST);
+    }
+    asset_bytes(
+        &state,
+        include_bytes!("../../remote-web/favicon.ico"),
+        "image/x-icon",
+        "public, max-age=300",
+    )
+}
+
+async fn icon_png(
+    State(state): State<GatewayState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !valid_host(&state, &headers) {
+        return status(StatusCode::MISDIRECTED_REQUEST);
+    }
+    let Some(bytes) = icon_png_bytes(&name) else {
+        return status(StatusCode::NOT_FOUND);
+    };
+    asset_bytes(&state, bytes, "image/png", "public, max-age=300")
+}
+
+fn icon_png_bytes(name: &str) -> Option<&'static [u8]> {
+    match name {
+        "icon-192.png" => {
+            Some(include_bytes!("../../remote-web/icons/icon-192.png").as_slice())
+        }
+        "icon-512.png" => {
+            Some(include_bytes!("../../remote-web/icons/icon-512.png").as_slice())
+        }
+        "maskable-icon-192.png" => {
+            Some(include_bytes!("../../remote-web/icons/maskable-icon-192.png").as_slice())
+        }
+        "maskable-icon-512.png" => {
+            Some(include_bytes!("../../remote-web/icons/maskable-icon-512.png").as_slice())
+        }
+        "favicon-16.png" => {
+            Some(include_bytes!("../../remote-web/icons/favicon-16.png").as_slice())
+        }
+        "favicon-32.png" => {
+            Some(include_bytes!("../../remote-web/icons/favicon-32.png").as_slice())
+        }
+        "badge-96.png" => {
+            Some(include_bytes!("../../remote-web/icons/badge-96.png").as_slice())
+        }
+        _ => None,
+    }
 }
 
 async fn apple_touch_icon(
@@ -1130,52 +1183,7 @@ fn asset_response(
 }
 
 fn apple_touch_icon_png() -> &'static [u8] {
-    static PNG: OnceLock<Vec<u8>> = OnceLock::new();
-    PNG.get_or_init(generate_apple_touch_icon).as_slice()
-}
-
-fn generate_apple_touch_icon() -> Vec<u8> {
-    const SIZE: u32 = 180;
-    let background = Rgb([0x1f, 0x1e, 0x1d]);
-    let foreground = Rgb([0xfa, 0xf9, 0xf5]);
-    let vertices = [
-        (90.0, 36.0),
-        (137.0, 63.0),
-        (137.0, 117.0),
-        (90.0, 144.0),
-        (43.0, 117.0),
-        (43.0, 63.0),
-    ];
-    let mut image = RgbImage::from_pixel(SIZE, SIZE, background);
-    for (x, y, pixel) in image.enumerate_pixels_mut() {
-        if point_in_polygon(f64::from(x) + 0.5, f64::from(y) + 0.5, &vertices) {
-            *pixel = foreground;
-        }
-    }
-    let mut png = Vec::new();
-    PngEncoder::new(&mut png)
-        .write_image(image.as_raw(), SIZE, SIZE, ColorType::Rgb8.into())
-        .expect("in-memory Apple touch icon PNG encoding");
-    png
-}
-
-fn point_in_polygon(x: f64, y: f64, vertices: &[(f64, f64)]) -> bool {
-    let mut inside = false;
-    let mut previous = vertices.len() - 1;
-    for current in 0..vertices.len() {
-        let (current_x, current_y) = vertices[current];
-        let (previous_x, previous_y) = vertices[previous];
-        if (current_y > y) != (previous_y > y)
-            && x
-                < (previous_x - current_x) * (y - current_y)
-                    / (previous_y - current_y)
-                    + current_x
-        {
-            inside = !inside;
-        }
-        previous = current;
-    }
-    inside
+    include_bytes!("../../remote-web/apple-touch-icon.png")
 }
 
 fn status(status: StatusCode) -> Response<Body> {
@@ -1427,6 +1435,45 @@ mod tests {
             .and_then(|status| status.parse().ok())
             .expect("numeric HTTP status");
         (status, body.to_string())
+    }
+
+    // Status-only probe. `request_path` decodes the whole response as UTF-8,
+    // which a PNG or ICO body fails, so binary assets need their own reader.
+    async fn request_status(path: &str) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test gateway");
+        let address = listener.local_addr().expect("test gateway address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(state_with_base("/s8790")))
+                .await
+                .expect("serve test gateway");
+        });
+        let mut stream = TcpStream::connect(address).await.expect("connect to gateway");
+        stream
+            .write_all(
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: laptop.example.ts.net\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write HTTP request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read HTTP response");
+        server.abort();
+        let status_line = response
+            .split(|byte| *byte == b'\n')
+            .next()
+            .expect("HTTP status line");
+        String::from_utf8_lossy(status_line)
+            .split_whitespace()
+            .nth(1)
+            .and_then(|status| status.parse().ok())
+            .expect("numeric HTTP status")
     }
 
     #[tokio::test]
@@ -1952,10 +1999,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn icon_routes_serve_svg_and_generated_apple_touch_png() {
+    async fn icon_routes_serve_the_complete_install_icon_set() {
         let (status, body) = request_path("/s8790/icon.svg").await;
         assert_eq!(status, 200);
         assert!(body.contains("<svg"));
+
+        let response = super::icon_png(
+            State(state()),
+            super::Path("icon-192.png".to_string()),
+            push_request_headers(None, None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/png")
+        );
 
         let response =
             super::apple_touch_icon(State(state()), push_request_headers(None, None)).await;
@@ -1980,6 +2042,74 @@ mod tests {
         let corner = image::GenericImageView::get_pixel(&png, 2, 2);
         let center = image::GenericImageView::get_pixel(&png, 90, 90);
         assert_ne!(corner, center, "hexagon glyph must differ from background");
+
+        for (name, expected_dimensions) in [
+            ("icon-192.png", (192, 192)),
+            ("icon-512.png", (512, 512)),
+            ("maskable-icon-192.png", (192, 192)),
+            ("maskable-icon-512.png", (512, 512)),
+            ("favicon-16.png", (16, 16)),
+            ("favicon-32.png", (32, 32)),
+            ("badge-96.png", (96, 96)),
+        ] {
+            let bytes = super::icon_png_bytes(name).expect("known icon asset");
+            let icon = image::load_from_memory(bytes).expect("valid PNG icon");
+            assert_eq!(
+                image::GenericImageView::dimensions(&icon),
+                expected_dimensions,
+                "wrong dimensions for {name}"
+            );
+        }
+        assert!(super::icon_png_bytes("../icon-192.png").is_none());
+
+        let badge = image::load_from_memory(
+            super::icon_png_bytes("badge-96.png").expect("notification badge"),
+        )
+        .expect("valid notification badge")
+        .into_rgba8();
+        assert_eq!(badge.get_pixel(0, 0)[3], 0, "badge corner must be transparent");
+        assert!(
+            badge.pixels().any(|pixel| pixel[3] == u8::MAX),
+            "badge must contain an opaque brand mark"
+        );
+
+        let response =
+            super::favicon_ico(State(state()), push_request_headers(None, None)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/x-icon")
+        );
+    }
+
+    // The test above calls the icon handlers directly, so it stays green even
+    // when the handler is never mounted — and an unmounted path is exactly what
+    // reaches the user as a 404. A browser asks for /favicon.ico unprompted, and
+    // the web app manifest and service worker name every icons/ asset by path,
+    // so each one has to survive the real router.
+    #[tokio::test]
+    async fn browser_icon_paths_are_reachable_through_the_router() {
+        assert_eq!(request_status("/s8790/favicon.ico").await, 200);
+        assert_eq!(request_status("/s8790/apple-touch-icon.png").await, 200);
+        for name in [
+            "icon-192.png",
+            "icon-512.png",
+            "maskable-icon-192.png",
+            "maskable-icon-512.png",
+            "favicon-16.png",
+            "favicon-32.png",
+            "badge-96.png",
+        ] {
+            assert_eq!(
+                request_status(&format!("/s8790/icons/{name}")).await,
+                200,
+                "icons/{name} must be routed, not just handled"
+            );
+        }
+        assert_eq!(request_status("/s8790/icons/unknown.png").await, 404);
     }
 
     #[tokio::test]
