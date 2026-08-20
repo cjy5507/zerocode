@@ -84,10 +84,11 @@ pub use providers::{
     non_claude_adapters_enabled, openai_fast_tier_enabled, openai_fast_variant_pair,
     openai_gpt_model_family, orchestration_reserved_models, provider_catalog, provider_enabled,
     provider_usable_for_smart_inventory, refresh_custom_providers_from_env,
-    refresh_custom_providers_from_json, resolve_catalog_alias, resolve_effort_band,
+    refresh_custom_providers_from_json, refresh_model_registry_from_json,
+    resolve_catalog_alias, resolve_effort_band,
     resolve_model_alias,
     resolve_registered_model_alias, starvation_demotion_model, uses_adaptive_thinking,
-    wire_model_id,
+    wire_model_for_effort, wire_model_id,
 };
 pub use sse::{SseParser, parse_frame};
 pub use types::{

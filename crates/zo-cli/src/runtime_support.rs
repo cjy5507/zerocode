@@ -132,6 +132,7 @@ pub(crate) fn build_runtime_with_thinking_for_auth_policy(
         .load()
         .map_err(|error| format!("startup stage config-load: {error:?}"))?;
     apply_custom_providers_env(&runtime_config);
+    apply_model_wire_env();
     spawn_session_retention_cleanup(&runtime_config);
     spawn_orphaned_agent_reap();
     let runtime_plugin_state =
@@ -1127,6 +1128,23 @@ fn apply_custom_providers_env(config: &runtime::RuntimeConfig) {
         .unwrap_or_else(|| "[]".to_string());
     if let Err(error) = crate::custom_provider_env::publish(&json) {
         eprintln!("[zo] failed to refresh custom provider catalog from settings: {error}");
+    }
+}
+
+/// Mirror the settings-declared model wire ids into the env var the `api` crate
+/// reads for its model catalog. Same bridge rationale as
+/// [`apply_custom_providers_env`]: `api` cannot depend on runtime config, and
+/// this must run before any provider client is built.
+///
+/// Re-publishes on every runtime rebuild for the same reason that one does — a
+/// `/model` add or edit lands in settings and would otherwise not be served
+/// until the next restart.
+fn apply_model_wire_env() {
+    let declared = runtime::model_catalog::ModelCatalog::load()
+        .ok()
+        .and_then(|catalog| catalog.catalog_overlay_json());
+    if let Err(error) = crate::model_wire_env::publish(declared.as_deref()) {
+        eprintln!("[zo] failed to publish the declared model catalog from settings: {error}");
     }
 }
 

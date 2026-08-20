@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::types::{ContentBlockDelta, StreamEvent};
+use crate::types::{ContentBlockDelta, EffortLevel, StreamEvent};
 
 pub mod anthropic;
 pub(crate) mod aws_sigv4;
@@ -32,15 +32,121 @@ const BUILTIN_MODEL_CONTEXT_WINDOWS_JSON: &str = include_str!("model_context_win
 struct ModelContextCatalog {
     #[serde(default)]
     models: Vec<ModelContextEntry>,
+    /// Alias → canonical id rows. Order is meaningful: the first row that names
+    /// a token wins, and `latest_model_for_provider` returns a provider's first
+    /// row, so this array IS the catalog's precedence.
+    #[serde(default)]
+    aliases: Vec<AliasRow>,
+}
+
+/// One alias row as the catalog file states it. Kept separate from
+/// [`ProviderCatalogEntry`] because that type is what the rest of the codebase
+/// consumes (`&'static str` fields, provider metadata helpers) while this is
+/// only the on-disk shape.
+#[derive(Debug, Deserialize)]
+struct AliasRow {
+    alias: String,
+    canonical: String,
+    provider: String,
+    #[serde(default)]
+    orchestration_rank: Option<u8>,
+    /// One-step fallback alias when this model is starved by rate limits.
+    /// Absent means "this is the bottom rung" — see [`starvation_demotion_model`].
+    #[serde(default)]
+    demotes_to: Option<String>,
+}
+
+fn provider_kind_from_key(key: &str) -> Option<ProviderKind> {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" => Some(ProviderKind::Anthropic),
+        "openai" | "chatgpt" | "codex" => Some(ProviderKind::OpenAi),
+        "google" | "gemini" => Some(ProviderKind::Google),
+        "xai" | "grok" => Some(ProviderKind::Xai),
+        "ollama" => Some(ProviderKind::Ollama),
+        _ => None,
+    }
+}
+
+/// On-the-wire model id(s) for an entry, when the id a user selects is not the
+/// id the provider serves.
+///
+/// Gemini is the case that forces this: the Antigravity backend serves
+/// `gemini-3.6-flash-low|-medium|-high` and has no `gemini-3.6-flash` at all,
+/// so the reasoning tier is part of the model id rather than a separate field.
+/// Expressing that as data keeps a new release a catalog edit instead of a code
+/// change — the same rule the rest of this catalog already follows.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WireIds {
+    /// One id for every effort. The common case: the selection id and the wire
+    /// id differ, but the model does not tier.
+    Fixed(String),
+    /// Distinct ids per reasoning tier. A tier the provider does not publish is
+    /// left out rather than filled in — see [`WireIds::resolve`] for how an
+    /// absent tier is bridged.
+    ByEffort {
+        #[serde(default)]
+        low: Option<String>,
+        #[serde(default)]
+        medium: Option<String>,
+        #[serde(default)]
+        high: Option<String>,
+    },
+}
+
+fn non_blank_wire_id(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+impl WireIds {
+    /// The wire id to send for `effort`.
+    ///
+    /// An absent tier resolves UP first and only then down. Up-first matters:
+    /// Gemini Pro publishes `low` and `high` with no middle rung, and a medium
+    /// request there is a request for more thinking than low — resolving it
+    /// down would quietly serve less reasoning than the caller asked for, which
+    /// is the failure that cannot be seen from the outside. Resolving down is
+    /// still the last resort so a model that publishes only `low` stays usable.
+    fn resolve(&self, effort: EffortLevel) -> Option<String> {
+        match self {
+            Self::Fixed(id) => non_blank_wire_id(id),
+            Self::ByEffort { low, medium, high } => {
+                let rungs = [low.as_deref(), medium.as_deref(), high.as_deref()];
+                let tier = match effort {
+                    EffortLevel::Low => 0,
+                    EffortLevel::Medium => 1,
+                    EffortLevel::High
+                    | EffortLevel::Xhigh
+                    | EffortLevel::Max
+                    | EffortLevel::Ultra => 2,
+                };
+                rungs[tier]
+                    .or_else(|| rungs[tier + 1..].iter().copied().flatten().next())
+                    .or_else(|| rungs[..tier].iter().rev().copied().flatten().next())
+                    .and_then(non_blank_wire_id)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct ModelContextEntry {
     #[serde(default)]
     ids: Vec<String>,
+    /// Declared context window in tokens. Defaults to 0 — "undeclared" — so an
+    /// entry may carry only a `wire` mapping without inventing a token limit
+    /// the provider never published. [`ModelContextCatalog::context_window_for`]
+    /// already filters 0 out, so an undeclared window stays absent rather than
+    /// becoming a zero-token ceiling.
+    #[serde(default)]
     context_window: u64,
     #[serde(default)]
     max_output_tokens: Option<u64>,
+    /// The id(s) this model is actually served under, when they differ from the
+    /// id used to select it. Absent means the selection id IS the wire id.
+    #[serde(default)]
+    wire: Option<WireIds>,
     /// Maximum serialized request BODY size in bytes the endpoint accepts, when
     /// the provider documents one. A different ceiling from `context_window`:
     /// bytes, not tokens. A request can sit well inside the token budget and
@@ -138,6 +244,35 @@ impl ModelContextCatalog {
         self.find_entry(raw_model, canonical_model)
             .and_then(|entry| entry.class.as_deref())
             .and_then(parse_model_class)
+    }
+
+    /// The declared wire id for a model at `effort`.
+    ///
+    /// Exact ids only — deliberately NOT [`Self::find_entry`]'s family-prefix
+    /// matcher. Every other field here is a family property that a qualified
+    /// sibling legitimately inherits (a dated `gpt-5.6-sol-2026-07-09` has its
+    /// family's context window). A wire id is the opposite: it is an identity,
+    /// and a sibling that merely shares a prefix is a DIFFERENT served model.
+    /// Inheriting one would route `gemini-3.6-flash-image` to the text model's
+    /// id and quietly answer an image request with prose.
+    fn wire_for(
+        &self,
+        raw_model: &str,
+        canonical_model: &str,
+        effort: EffortLevel,
+    ) -> Option<String> {
+        let raw = raw_model.trim().to_ascii_lowercase();
+        let canonical = canonical_model.trim().to_ascii_lowercase();
+        self.models
+            .iter()
+            .find(|entry| {
+                entry.ids.iter().any(|id| {
+                    let id = id.trim().to_ascii_lowercase();
+                    id == raw || id == canonical
+                })
+            })
+            .and_then(|entry| entry.wire.as_ref())
+            .and_then(|wire| wire.resolve(effort))
     }
 }
 
@@ -271,6 +406,62 @@ fn env_model_context_window(raw_model: &str, canonical_model: &str) -> Option<u6
 fn catalog_model_context_window(raw_model: &str, canonical_model: &str) -> Option<u64> {
     env_model_context_window(raw_model, canonical_model)
         .or_else(|| builtin_model_context_catalog().context_window_for(raw_model, canonical_model))
+}
+
+/// The id `model` is actually served under at `effort`, when the catalog
+/// declares one.
+///
+/// Resolution order matches every other model fact: the
+/// [`MODEL_CONTEXT_WINDOWS_ENV`] override catalog first (which is how a
+/// settings-declared model reaches this crate), then the built-in
+/// [`model_context_windows.json`].
+///
+/// `None` means "the selection id is the wire id" — the honest default. A
+/// caller must send the model id unchanged rather than guessing a variant,
+/// because inventing one turns a model zo does not know about into a 404
+/// instead of a working request.
+/// The reasoning rung a request is asking for, as the three tiers a wire
+/// catalog expresses.
+///
+/// The legacy `thinkingBudget` path folds into the same rungs rather than
+/// keeping a parallel scale: a budget is only ever an expression of "roughly
+/// this much thinking", and the providers that tier their model ids offer
+/// nothing finer to aim at.
+#[must_use]
+pub fn effort_rung(reasoning: crate::types::ReasoningRequest) -> EffortLevel {
+    use crate::types::ReasoningRequest;
+    match reasoning {
+        ReasoningRequest::Effort(effort) => effort,
+        ReasoningRequest::BudgetTokens(8_000..) => EffortLevel::High,
+        ReasoningRequest::BudgetTokens(4_000..8_000) => EffortLevel::Medium,
+        ReasoningRequest::BudgetTokens(_) | ReasoningRequest::Auto => EffortLevel::Low,
+    }
+}
+
+/// The wire id for a request, or the request's own model id when the catalog
+/// declares none. The form every provider's request builder wants.
+#[must_use]
+pub fn wire_model_for_request(model: &str, reasoning: crate::types::ReasoningRequest) -> String {
+    let trimmed = model.trim();
+    wire_model_for_effort(trimmed, effort_rung(reasoning)).unwrap_or_else(|| trimmed.to_string())
+}
+
+#[must_use]
+pub fn wire_model_for_effort(model: &str, effort: EffortLevel) -> Option<String> {
+    // Catalog-first resolution, not the provider-enable-gated resolver: a wire
+    // id is a fact about the model, so `gemini-flash` must name the same served
+    // model whether or not this machine has finished connecting Google.
+    let canonical = resolve_catalog_alias(model);
+    if let Ok(raw) = std::env::var(MODEL_CONTEXT_WINDOWS_ENV) {
+        if !raw.trim().is_empty() {
+            if let Ok(catalog) = serde_json::from_str::<ModelContextCatalog>(&raw) {
+                if let Some(wire) = catalog.wire_for(model, &canonical, effort) {
+                    return Some(wire);
+                }
+            }
+        }
+    }
+    builtin_model_context_catalog().wire_for(model, &canonical, effort)
 }
 
 /// The docs-verified max synchronous output tokens for a model, from the env
@@ -613,7 +804,7 @@ pub fn is_openai_terra_model(model: &str) -> bool {
 #[must_use]
 pub fn is_openai_spark_model(model: &str) -> bool {
     let lower = model.trim().to_ascii_lowercase();
-    let canonical = MODEL_REGISTRY
+    let canonical = model_registry()
         .iter()
         .find(|entry| entry.alias == lower)
         .map_or(lower.as_str(), |entry| entry.canonical_model_id);
@@ -653,7 +844,7 @@ impl ModelCapability {
             && split_provider_model_ref(model).is_some()
         {
             Some(ProviderKind::OpenAi)
-        } else if let Some(entry) = catalog_entry_for_token(MODEL_REGISTRY, &canonical_model_id)
+        } else if let Some(entry) = catalog_entry_for_token(model_registry(), &canonical_model_id)
             .filter(|entry| entry.provider == ProviderKind::OpenAi)
         {
             // OpenAI's built-in ids have historically been prefix-detectable
@@ -688,7 +879,7 @@ fn provider_kind_for_canonical(
     // are hard to predict from the id. Trust an explicit OpenAI registry row
     // before prefix guessing so a newly-added family does not fall through to
     // Anthropic; leave other providers on their existing gated/prefix paths.
-    if let Some(provider) = catalog_provider_for_canonical(MODEL_REGISTRY, canonical_model_id)
+    if let Some(provider) = catalog_provider_for_canonical(model_registry(), canonical_model_id)
         .filter(|provider| *provider == ProviderKind::OpenAi)
     {
         return Some(provider);
@@ -770,10 +961,20 @@ pub struct ProviderCatalogEntry {
     /// distinguishes these models: effort ceilings do not (every Claude is
     /// `Max`; Sol and Terra are both `Ultra`).
     pub orchestration_rank: Option<u8>,
+    /// One-step fallback alias when this model is starved by rate limits, or
+    /// `None` when it is the bottom rung of its family ladder. Stated beside the
+    /// model's identity for the same reason `orchestration_rank` is: the ladder
+    /// is a fact about the lineup, and keeping it here means adding a model
+    /// never means editing a policy table.
+    pub demotes_to: Option<&'static str>,
 }
 
 impl ProviderCatalogEntry {
+    /// Build one entry directly. The shipped catalog is loaded from JSON, so
+    /// this exists for tests that need a hand-made catalog to exercise the
+    /// resolution helpers against.
     #[must_use]
+    #[cfg(test)]
     const fn new(
         alias: &'static str,
         canonical_model_id: &'static str,
@@ -785,21 +986,7 @@ impl ProviderCatalogEntry {
             provider,
             fit_hint: None,
             orchestration_rank: None,
-        }
-    }
-
-    /// Same as [`Self::new`] for a model reserved to plan/verify/orchestrate,
-    /// at an explicit PLAN/VERIFY preference `rank` (lower wins).
-    #[must_use]
-    const fn new_orchestrator(
-        alias: &'static str,
-        canonical_model_id: &'static str,
-        provider: ProviderKind,
-        rank: u8,
-    ) -> Self {
-        Self {
-            orchestration_rank: Some(rank),
-            ..Self::new(alias, canonical_model_id, provider)
+            demotes_to: None,
         }
     }
 
@@ -882,7 +1069,7 @@ pub const NVIDIA_PRESET_MODELS: &[&str] = &["meta/llama-3.1-8b-instruct", "z-ai/
 /// aliases to canonical ids and providers.
 #[must_use]
 pub fn provider_catalog() -> &'static [ProviderCatalogEntry] {
-    MODEL_REGISTRY
+    model_registry()
 }
 
 /// Canonical id for `model`, resolved from the catalog BEFORE the live
@@ -896,7 +1083,7 @@ pub fn provider_catalog() -> &'static [ProviderCatalogEntry] {
 #[must_use]
 pub fn resolve_catalog_alias(model: &str) -> String {
     let trimmed = model.trim();
-    MODEL_REGISTRY
+    model_registry()
         .iter()
         .find(|entry| entry.alias.eq_ignore_ascii_case(trimmed))
         .map_or_else(
@@ -919,7 +1106,7 @@ pub fn resolve_catalog_alias(model: &str) -> String {
 pub fn orchestration_reserved_models() -> &'static [&'static str] {
     static RESERVED: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     RESERVED.get_or_init(|| {
-        let mut ranked: Vec<&'static ProviderCatalogEntry> = MODEL_REGISTRY
+        let mut ranked: Vec<&'static ProviderCatalogEntry> = model_registry()
             .iter()
             .filter(|entry| entry.orchestration_rank.is_some())
             .collect();
@@ -963,143 +1150,134 @@ pub fn latest_model_for_provider(provider: ProviderKind) -> Option<&'static str>
         ProviderKind::Xai => XAI_LATEST_MODEL_ALIAS,
         ProviderKind::Ollama => return None,
     };
-    MODEL_REGISTRY
+    model_registry()
         .iter()
         .find(|entry| entry.provider == provider && entry.alias == alias)
         .map(|entry| entry.canonical_model_id)
 }
 
-const MODEL_REGISTRY: &[ProviderCatalogEntry] = &[
-    // Anthropic — family heads. Semantic aliases and their canonical release ids
-    // live only here; defaults, fallbacks, pickers, and agent routing resolve
-    // through this registry instead of copying version strings.
-    ProviderCatalogEntry::new(
-        ANTHROPIC_LATEST_MODEL_ALIAS,
-        "claude-opus-5",
-        ProviderKind::Anthropic,
-    ),
-    ProviderCatalogEntry::new("claude-latest", "claude-opus-5", ProviderKind::Anthropic),
-    ProviderCatalogEntry::new_orchestrator("fable", "claude-fable-5", ProviderKind::Anthropic, 0),
-    ProviderCatalogEntry::new("claude-fable", "claude-fable-5", ProviderKind::Anthropic),
-    ProviderCatalogEntry::new("opus", "claude-opus-5", ProviderKind::Anthropic),
-    // `opus[1m]` is a visible label-only alias for the same `claude-opus-5`,
-    // whose 1M window is both the default and the maximum (there is no 1M beta
-    // to opt into). It resolves to the bare canonical id — the `[1m]` suffix
-    // never reaches the wire — so it is a picker-parity affordance with Claude
-    // Code, not a distinct model, and it is deliberately NOT a catalog row.
-    ProviderCatalogEntry::new("opus[1m]", "claude-opus-5", ProviderKind::Anthropic),
-    // Previous-generation Opus stays resolvable — legacy session pins keep
-    // working and it is the refusal-fallback target for Fable/Opus 5 declines
-    // (`REFUSAL_FALLBACK_MODEL`) — but it is no longer what `opus` means.
-    ProviderCatalogEntry::new("claude-opus-4-8", "claude-opus-4-8", ProviderKind::Anthropic),
-    ProviderCatalogEntry::new("sonnet", "claude-sonnet-5", ProviderKind::Anthropic),
-    ProviderCatalogEntry::new(
-        "haiku",
-        "claude-haiku-4-5-20251001",
-        ProviderKind::Anthropic,
-    ),
-    ProviderCatalogEntry::new("claude-opus", "claude-opus-5", ProviderKind::Anthropic),
-    ProviderCatalogEntry::new("claude-opus[1m]", "claude-opus-5", ProviderKind::Anthropic),
-    ProviderCatalogEntry::new("claude-sonnet", "claude-sonnet-5", ProviderKind::Anthropic),
-    ProviderCatalogEntry::new(
-        "claude-haiku",
-        "claude-haiku-4-5-20251001",
-        ProviderKind::Anthropic,
-    ),
-    // OpenAI
-    ProviderCatalogEntry::new_orchestrator(
-        OPENAI_LATEST_MODEL_ALIAS,
-        "gpt-5.6-sol",
-        ProviderKind::OpenAi,
-        1,
-    ),
-    ProviderCatalogEntry::new("gpt-5.6-sol", "gpt-5.6-sol", ProviderKind::OpenAi),
-    ProviderCatalogEntry::new("gpt-5.6-terra", "gpt-5.6-terra", ProviderKind::OpenAi),
-    ProviderCatalogEntry::new("gpt-5.6-luna", "gpt-5.6-luna", ProviderKind::OpenAi),
-    // Bare 세대 별칭: `gpt-5.6`은 terra로 — 사용자 확정(2026-07-11): 효율
-    // 기준 기본값은 terra(gpt-5.5 계열 퇴역). 서빙 티어는 별칭에 하드코딩하지
-    // 않는다(사용자 정책 개정) — bare id로 해석되고, fast 여부는 세션 fast
-    // 상태(`/fast on|off`)가 결정한다. sol/luna는 명시 단축 별칭,
-    // opus/sonnet/haiku 관례.
-    ProviderCatalogEntry::new("gpt-5.6", "gpt-5.6-terra", ProviderKind::OpenAi),
-    ProviderCatalogEntry::new("sol", "gpt-5.6-sol", ProviderKind::OpenAi),
-    ProviderCatalogEntry::new("terra", "gpt-5.6-terra", ProviderKind::OpenAi),
-    ProviderCatalogEntry::new("luna", "gpt-5.6-luna", ProviderKind::OpenAi),
-    // gpt-5.5 계열은 카탈로그에서 퇴역(사용자 확정 2026-07-11) — terra가
-    // 대체한다. 레거시 세션/핀이 들고 있는 5.5 id의 와이어 지원
-    // (chatgpt_backend의 gpt-5.5-fast 별칭 파싱·effort 매핑)과 서브에이전트
-    // 사다리의 5.5→terra 이관 arm은 유지된다.
-    ProviderCatalogEntry::new(
-        OPENAI_FAST_MODEL_ALIAS,
-        "gpt-5.3-codex-spark",
-        ProviderKind::OpenAi,
-    ),
-    ProviderCatalogEntry::new(
-        "gpt-5.3-codex-spark",
-        "gpt-5.3-codex-spark",
-        ProviderKind::OpenAi,
-    ),
-    // Google — Antigravity IDE OAuth, two Gemini families only (Flash + Pro).
-    // These canonical ids are routing labels: the Gemini backend's `gemini_wire`
-    // derives the actual Cloud Code wire id and `thinkingLevel` from the model
-    // family (alias contains `flash` vs `pro`) plus the request effort, so any
-    // alias here resolves to `gemini-3-flash` or `gemini-3-pro-{low,high}`.
-    // Legacy public names stay accepted so existing settings keep resolving.
-    ProviderCatalogEntry::new(
-        GOOGLE_LATEST_MODEL_ALIAS,
-        "gemini-3.6-flash",
-        ProviderKind::Google,
-    ),
-    ProviderCatalogEntry::new("gemini-3.6-flash", "gemini-3.6-flash", ProviderKind::Google),
-    ProviderCatalogEntry::new(
-        "gemini-3.1-pro-preview",
-        "gemini-3.1-pro-preview",
-        ProviderKind::Google,
-    ),
-    ProviderCatalogEntry::new(
-        "gemini-3.1-pro-preview-customtools",
-        "gemini-3.1-pro-preview-customtools",
-        ProviderKind::Google,
-    ),
-    ProviderCatalogEntry::new(
-        "gemini-3-pro-preview",
-        "gemini-3-pro-preview",
-        ProviderKind::Google,
-    ),
-    ProviderCatalogEntry::new("gemini-3.5-flash", "gemini-3.5-flash", ProviderKind::Google),
-    ProviderCatalogEntry::new("gemini-3-flash", "gemini-3-flash", ProviderKind::Google),
-    ProviderCatalogEntry::new(
-        "gemini-3-flash-preview",
-        "gemini-3-flash-preview",
-        ProviderKind::Google,
-    ),
-    ProviderCatalogEntry::new(
-        "gemini-3.1-flash-lite",
-        "gemini-3.1-flash-lite",
-        ProviderKind::Google,
-    ),
-    ProviderCatalogEntry::new("gemini-pro", "gemini-3.1-pro-preview", ProviderKind::Google),
-    ProviderCatalogEntry::new("gemini-flash", "gemini-3.6-flash", ProviderKind::Google),
-    ProviderCatalogEntry::new(
-        "gemini-flash-lite",
-        "gemini-3.1-flash-lite",
-        ProviderKind::Google,
-    ),
-    ProviderCatalogEntry::new(
-        "gemini-3.5-pro",
-        "gemini-3.1-pro-preview",
-        ProviderKind::Google,
-    ),
-    // xAI
-    ProviderCatalogEntry::new(XAI_LATEST_MODEL_ALIAS, "grok-3", ProviderKind::Xai),
-    ProviderCatalogEntry::new("grok", "grok-3", ProviderKind::Xai),
-    // Ollama — generic passthrough (canonical id == alias).
-    ProviderCatalogEntry::new("ollama", "ollama", ProviderKind::Ollama),
-];
+/// The alias catalog every layer resolves through, as data.
+///
+/// Built from [`model_context_windows.json`] and re-buildable at runtime from
+/// the [`MODEL_CONTEXT_WINDOWS_ENV`] override (which is how a settings-declared
+/// model or alias reaches this crate). Nothing about which models exist, what
+/// a short alias means, or which release an alias points at is compiled in —
+/// a provider shipping a new model is a catalog edit, not a code change.
+///
+/// Entries are `&'static` because that is what the rest of the codebase
+/// consumes. They are produced by leaking one built slice, which is bounded:
+/// the builtin build happens once, and [`refresh_model_registry_from_json`]
+/// skips a republish of bytes it has already applied.
+static MODEL_REGISTRY_STORE: RwLock<Option<&'static [ProviderCatalogEntry]>> = RwLock::new(None);
+
+/// The exact override JSON last applied, so repeated identical publishes (the
+/// runtime is rebuilt several times per session) neither rebuild nor re-leak.
+static MODEL_REGISTRY_APPLIED: RwLock<Option<String>> = RwLock::new(None);
+
+fn read_registry_store() -> Option<&'static [ProviderCatalogEntry]> {
+    *MODEL_REGISTRY_STORE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn alias_rows_of(raw: &str) -> Vec<AliasRow> {
+    serde_json::from_str::<ModelContextCatalog>(raw)
+        .map(|catalog| catalog.aliases)
+        .unwrap_or_default()
+}
+
+/// Turn on-disk rows into the `&'static` entries the codebase consumes.
+///
+/// Rows are deduplicated by `(provider, alias)` keeping the FIRST occurrence,
+/// which is what makes an override authoritative: it is concatenated ahead of
+/// the built-ins, so an alias it names shadows the shipped row instead of
+/// colliding with it.
+fn leak_registry(rows: Vec<AliasRow>) -> &'static [ProviderCatalogEntry] {
+    let mut seen: Vec<(ProviderKind, String)> = Vec::new();
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(provider) = provider_kind_from_key(&row.provider) else {
+            continue;
+        };
+        let alias = row.alias.trim();
+        let canonical = row.canonical.trim();
+        if alias.is_empty() || canonical.is_empty() {
+            continue;
+        }
+        let key = (provider, alias.to_ascii_lowercase());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        entries.push(ProviderCatalogEntry {
+            alias: String::leak(alias.to_string()),
+            canonical_model_id: String::leak(canonical.to_string()),
+            provider,
+            fit_hint: None,
+            orchestration_rank: row.orchestration_rank,
+            demotes_to: row.demotes_to.map(|to| &*String::leak(to.trim().to_string())),
+        });
+    }
+    Vec::leak(entries)
+}
+
+fn model_registry() -> &'static [ProviderCatalogEntry] {
+    if let Some(registry) = read_registry_store() {
+        return registry;
+    }
+    let mut guard = MODEL_REGISTRY_STORE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Re-check under the write lock so a race builds (and leaks) once.
+    if let Some(registry) = *guard {
+        return registry;
+    }
+    let registry = leak_registry(alias_rows_of(BUILTIN_MODEL_CONTEXT_WINDOWS_JSON));
+    *guard = Some(registry);
+    registry
+}
+
+/// Layer an override catalog's alias rows ahead of the built-in ones.
+///
+/// The live companion to the startup env bridge, mirroring
+/// [`refresh_custom_providers_from_json`]: settings are written, then this is
+/// called so alias resolution and the model picker reflect the change without
+/// a restart. Idempotent — re-applying the same bytes is a no-op.
+pub fn refresh_model_registry_from_json(raw: &str) {
+    {
+        let applied = MODEL_REGISTRY_APPLIED
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if applied.as_deref() == Some(raw) {
+            return;
+        }
+    }
+    let mut rows = alias_rows_of(raw);
+    rows.extend(alias_rows_of(BUILTIN_MODEL_CONTEXT_WINDOWS_JSON));
+    let registry = leak_registry(rows);
+    *MODEL_REGISTRY_STORE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(registry);
+    *MODEL_REGISTRY_APPLIED
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(raw.to_string());
+}
+
+/// Drop every override and go back to the shipped catalog. Tests only: the
+/// registry is process-global, so a case that installs an override must undo it.
+#[cfg(test)]
+pub(crate) fn reset_model_registry_for_tests() {
+    *MODEL_REGISTRY_STORE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *MODEL_REGISTRY_APPLIED
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
 
 /// Env var holding a JSON array of user-defined OpenAI-compatible providers,
 /// letting an operator add a provider without recompiling. Consulted only
-/// after [`MODEL_REGISTRY`] misses, so built-in aliases always win.
+/// after [`model_registry`] misses, so catalog aliases always win.
 pub const CUSTOM_PROVIDERS_ENV: &str = "ZO_CUSTOM_PROVIDERS";
 
 /// A custom provider resolved for the current process: its owned model list and
@@ -1470,7 +1648,7 @@ pub fn fit_hint_for_model(model: &str) -> Option<ModelFitHint> {
     {
         let canonical = resolve_model_alias(model);
         let lower = canonical.to_ascii_lowercase();
-        if let Some(entry) = MODEL_REGISTRY.iter().find(|entry| {
+        if let Some(entry) = model_registry().iter().find(|entry| {
             entry.alias == lower || entry.canonical_model_id.eq_ignore_ascii_case(&canonical)
         }) {
             return entry.fit_hint;
@@ -1614,7 +1792,7 @@ pub fn resolve_model_alias(model: &str) -> String {
     let lower = trimmed.to_ascii_lowercase();
     let allow_experimental = non_claude_adapters_enabled();
 
-    if let Some(entry) = MODEL_REGISTRY.iter().find(|entry| entry.alias == lower) {
+    if let Some(entry) = model_registry().iter().find(|entry| entry.alias == lower) {
         if provider_enabled(entry.provider) || allow_experimental {
             return entry.canonical_model_id.to_string();
         }
@@ -1637,7 +1815,7 @@ pub fn resolve_model_alias(model: &str) -> String {
     // shorter alias) and gated on the target provider being enabled, exactly
     // like the exact-alias path above, so a Gemini/GPT typo under a Claude-only
     // setup passes through as "unsupported" rather than dialing out.
-    let is_known_canonical = MODEL_REGISTRY
+    let is_known_canonical = model_registry()
         .iter()
         .any(|entry| entry.canonical_model_id.eq_ignore_ascii_case(&lower));
     if !is_known_canonical {
@@ -1665,7 +1843,7 @@ pub fn resolve_model_alias(model: &str) -> String {
     let dashed = lower.replace('.', "-");
     let prefixed = format!("claude-{dashed}");
     for candidate in [dashed.as_str(), prefixed.as_str()] {
-        if let Some(entry) = MODEL_REGISTRY
+        if let Some(entry) = model_registry()
             .iter()
             .find(|entry| entry.canonical_model_id.eq_ignore_ascii_case(candidate))
         {
@@ -1698,13 +1876,13 @@ fn anthropic_family(model: &str) -> Option<&'static str> {
 ///
 /// This is the model-selection seam for semantic requests such as `opus` and
 /// `claude-latest`. Callers never need to know which release currently heads a
-/// family; updating [`MODEL_REGISTRY`] updates every default/fallback/spawn
+/// family; updating the alias catalog updates every default/fallback/spawn
 /// path at once.
 #[must_use]
 pub fn latest_anthropic_family_model(model: &str) -> Option<&'static str> {
     let resolved = resolve_model_alias(model);
     let family = anthropic_family(&resolved)?;
-    MODEL_REGISTRY
+    model_registry()
         .iter()
         .find(|entry| entry.provider == ProviderKind::Anthropic && entry.alias == family)
         .map(|entry| entry.canonical_model_id)
@@ -1724,7 +1902,7 @@ fn latest_google_family_model(model: &str) -> Option<&'static str> {
     } else {
         return None;
     };
-    MODEL_REGISTRY
+    model_registry()
         .iter()
         .find(|entry| entry.provider == ProviderKind::Google && entry.alias == alias)
         .map(|entry| entry.canonical_model_id)
@@ -1738,11 +1916,11 @@ fn latest_google_family_model(model: &str) -> Option<&'static str> {
 #[must_use]
 pub fn starvation_demotion_model(model: &str) -> Option<&'static str> {
     let lower = model.trim().to_ascii_lowercase();
-    match anthropic_family(&lower) {
-        Some("opus") => return Some("sonnet"),
-        Some("sonnet") => return Some("haiku"),
-        Some("fable" | "haiku") => return None,
-        _ => {}
+    // A family whose next rung the catalog states needs no rule here. An
+    // Anthropic family with no declared rung is the bottom of its ladder, which
+    // is why this returns the catalog's answer instead of falling through.
+    if let Some(family) = anthropic_family(&lower) {
+        return catalog_demotion(ProviderKind::Anthropic, family);
     }
 
     if let Some(family) = openai_gpt_model_family(&lower) {
@@ -1765,9 +1943,24 @@ pub fn starvation_demotion_model(model: &str) -> Option<&'static str> {
     }
 
     if lower.starts_with("gemini-") && lower.contains("pro") {
-        return latest_google_family_model("gemini-flash");
+        // Google callers want the pinned release rather than the family alias,
+        // so the declared rung is resolved through the catalog head. That keeps
+        // the Flash release named in exactly one row.
+        return latest_google_family_model(catalog_demotion(
+            ProviderKind::Google,
+            "gemini-pro",
+        )?);
     }
     None
+}
+
+/// The next rung the catalog declares for `alias` under `provider`, or `None`
+/// when it declares none — which means "this is the bottom", not "unknown".
+fn catalog_demotion(provider: ProviderKind, alias: &str) -> Option<&'static str> {
+    model_registry()
+        .iter()
+        .find(|entry| entry.provider == provider && entry.alias.eq_ignore_ascii_case(alias))
+        .and_then(|entry| entry.demotes_to)
 }
 
 /// Resolve model-authored spawn input to a registered Claude family target.
@@ -1794,7 +1987,7 @@ pub fn resolve_registered_model_alias(model: &str) -> String {
     if let Some(head) = latest_google_family_model(&resolved) {
         return head.to_string();
     }
-    if MODEL_REGISTRY
+    if model_registry()
         .iter()
         .any(|entry| entry.canonical_model_id.eq_ignore_ascii_case(&resolved))
     {
@@ -1828,7 +2021,7 @@ fn nearest_alias_entry(lower: &str) -> Option<&'static ProviderCatalogEntry> {
     let mut best_dist = usize::MAX;
     let mut best_entry: Option<&'static ProviderCatalogEntry> = None;
     let mut unique = false;
-    for entry in MODEL_REGISTRY {
+    for entry in model_registry() {
         let dist = levenshtein(lower, entry.alias);
         if dist < best_dist {
             best_dist = dist;
@@ -1939,7 +2132,7 @@ pub fn explicit_non_claude_provider_kind(model: &str) -> Option<ProviderKind> {
     if lower.starts_with("grok") {
         return Some(ProviderKind::Xai);
     }
-    if catalog_entry_for_token(MODEL_REGISTRY, &lower)
+    if catalog_entry_for_token(model_registry(), &lower)
         .is_some_and(|entry| entry.provider == ProviderKind::OpenAi)
         || is_openai_builtin_model_prefix(&lower)
     {
@@ -2442,7 +2635,7 @@ pub fn effective_effort_for_model(
     // does not lower the Xhigh ceiling.
     let is_openai = openai_gpt_model_family(&lower).is_some()
         || is_openai_builtin_model_prefix(&lower)
-        || catalog_entry_for_token(MODEL_REGISTRY, &lower)
+        || catalog_entry_for_token(model_registry(), &lower)
             .is_some_and(|entry| entry.provider == ProviderKind::OpenAi);
     if is_openai {
         if level == EffortLevel::Xhigh && !gpt_model_accepts_xhigh(&lower) {
@@ -2615,7 +2808,7 @@ pub fn known_effort_ceiling(model: &str) -> Option<crate::types::EffortLevel> {
 
     let is_openai = openai_gpt_model_family(&lower).is_some()
         || is_openai_builtin_model_prefix(&lower)
-        || catalog_entry_for_token(MODEL_REGISTRY, &lower)
+        || catalog_entry_for_token(model_registry(), &lower)
             .is_some_and(|entry| entry.provider == ProviderKind::OpenAi);
     if is_openai {
         if gpt_model_accepts_ultra(&lower) {
@@ -3211,6 +3404,109 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    /// The alias catalog is data: an override can introduce a model the binary
+    /// predates AND repoint a shipped alias at it, with no code change.
+    ///
+    /// Serialized against the other registry tests through the env lock — the
+    /// registry is process-global, so the override is undone before returning.
+    #[test]
+    fn an_override_can_add_and_repoint_aliases() {
+        let _lock = crate::test_env_lock();
+
+        // Baseline: the shipped catalog decides what `google-latest` means.
+        super::reset_model_registry_for_tests();
+        assert_eq!(super::resolve_catalog_alias("google-latest"), "gemini-3.6-flash");
+        assert_eq!(super::resolve_catalog_alias("gemini-3.7-flash"), "gemini-3.7-flash");
+
+        super::refresh_model_registry_from_json(
+            r#"{"aliases":[
+                {"alias":"google-latest","canonical":"gemini-3.7-flash","provider":"google"},
+                {"alias":"flash37","canonical":"gemini-3.7-flash","provider":"google"}
+            ]}"#,
+        );
+        assert_eq!(
+            super::resolve_catalog_alias("google-latest"),
+            "gemini-3.7-flash",
+            "an override row shadows the shipped one"
+        );
+        assert_eq!(
+            super::resolve_catalog_alias("flash37"),
+            "gemini-3.7-flash",
+            "a brand-new alias resolves"
+        );
+        assert_eq!(
+            super::resolve_catalog_alias("opus"),
+            "claude-opus-5",
+            "rows the override does not name are untouched"
+        );
+
+        super::reset_model_registry_for_tests();
+        assert_eq!(super::resolve_catalog_alias("google-latest"), "gemini-3.6-flash");
+    }
+
+    /// The starvation ladder is catalog data too, so a family's next rung moves
+    /// with the catalog instead of with a policy edit.
+    #[test]
+    fn the_starvation_ladder_comes_from_the_catalog() {
+        super::reset_model_registry_for_tests();
+        assert_eq!(starvation_demotion_model("claude-opus-5"), Some("sonnet"));
+        assert_eq!(starvation_demotion_model("sonnet"), Some("haiku"));
+        // No declared rung means bottom, not unknown.
+        assert_eq!(starvation_demotion_model("haiku"), None);
+        assert_eq!(starvation_demotion_model("fable"), None);
+        // Google resolves its declared rung to the pinned release.
+        assert_eq!(
+            starvation_demotion_model("gemini-3.1-pro-preview"),
+            Some("gemini-3.6-flash")
+        );
+    }
+
+    /// The wire mapping is a catalog fact, not a Gemini special case: any
+    /// provider's model can declare the id it is served under, and a model that
+    /// declares none is sent under its own id.
+    #[test]
+    fn a_declared_wire_id_applies_to_any_provider() {
+        let _lock = crate::test_env_lock();
+        let _env = EnvVarGuard::set(
+            super::MODEL_CONTEXT_WINDOWS_ENV,
+            Some(
+                r#"{"models":[
+                    {"provider":"openai","ids":["gpt-5.7"],"wire":"gpt-5.7-2026-08-01"},
+                    {"provider":"anthropic","ids":["opus-next"],"wire":{"low":"claude-opus-6-low","high":"claude-opus-6-high"}}
+                ]}"#,
+            ),
+        );
+
+        assert_eq!(
+            super::wire_model_for_request("gpt-5.7", crate::types::ReasoningRequest::Auto),
+            "gpt-5.7-2026-08-01"
+        );
+        assert_eq!(
+            super::wire_model_for_request(
+                "opus-next",
+                crate::types::ReasoningRequest::Effort(crate::types::EffortLevel::Max)
+            ),
+            "claude-opus-6-high"
+        );
+        // Undeclared stays untouched — the catalog never invents a variant.
+        assert_eq!(
+            super::wire_model_for_request("gpt-5.6-sol", crate::types::ReasoningRequest::Auto),
+            "gpt-5.6-sol"
+        );
+    }
+
+    /// The three rungs a budget folds into, so a legacy `thinkingBudget` picks
+    /// the same served id an equivalent effort would.
+    #[test]
+    fn a_thinking_budget_folds_into_the_effort_rungs() {
+        use super::effort_rung;
+        use crate::types::{EffortLevel, ReasoningRequest};
+        assert_eq!(effort_rung(ReasoningRequest::BudgetTokens(1_000)), EffortLevel::Low);
+        assert_eq!(effort_rung(ReasoningRequest::BudgetTokens(6_000)), EffortLevel::Medium);
+        assert_eq!(effort_rung(ReasoningRequest::BudgetTokens(16_000)), EffortLevel::High);
+        assert_eq!(effort_rung(ReasoningRequest::Auto), EffortLevel::Low);
     }
 
     /// A declared context window must beat the name-shape guess. The declared

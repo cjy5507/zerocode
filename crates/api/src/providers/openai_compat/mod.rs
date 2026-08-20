@@ -1369,7 +1369,11 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     }
 
     let mut payload = json!({
-        "model": request.model,
+        // The catalog decides the served id. It normally answers "the same id",
+        // but a provider whose selection id differs from what it serves (or a
+        // model declared only in settings) is handled here rather than in a
+        // per-provider special case.
+        "model": crate::providers::wire_model_for_request(&request.model, request.reasoning_request()),
         "messages": messages,
         "stream": request.stream,
     });

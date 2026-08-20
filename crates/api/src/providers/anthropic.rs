@@ -1105,6 +1105,20 @@ impl AnthropicClient {
         // because SigV4 signs over the exact bytes. Serialize once and send the
         // same bytes so the signature matches the wire payload.
         let mut request_body = self.request_profile.render_json_body(normalized.as_ref())?;
+        // Apply the catalog's served id, if it declares one. Placed here rather
+        // than on the request struct so it lands before both the gateway rewrite
+        // and serialization — SigV4 signs these exact bytes, so the model must
+        // be final by now. Normally a no-op: an Anthropic model's selection id
+        // is its served id, and the catalog answers `None`.
+        if let Some(object) = request_body.as_object_mut() {
+            let wire = crate::providers::wire_model_for_request(
+                &request.model,
+                request.reasoning_request(),
+            );
+            if wire != request.model {
+                object.insert("model".to_string(), Value::String(wire));
+            }
+        }
         // Capture what this exact attempt is about to send. The process-global
         // latch can change while the request is in flight, so the 400 fallback
         // must not re-read global state when the response arrives.

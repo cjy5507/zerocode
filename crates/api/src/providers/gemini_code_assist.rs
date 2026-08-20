@@ -1470,70 +1470,50 @@ fn build_generate_content_request(request: &MessageRequest, project_id: Option<&
     payload
 }
 
-/// Resolve a Zo model alias plus the request effort into the Cloud Code wire
-/// model id and its Gemini 3 `thinkingLevel`.
+/// The Gemini 3 `thinkingLevel` for a request that resolved to `wire`.
 ///
-/// Two Gemini text families use secondary Code Assist wire ids:
-/// - **Flash** shorthand or numeric-version stable/preview aliases → bare
-///   `gemini-3-flash`, with `low|medium|high` passed straight through.
-/// - **Pro** shorthand or numeric-version stable/preview aliases →
-///   `gemini-3-pro-{tier}` where the tier
-///   is baked into the id. Pro exposes only `low|high`, so `medium` (and every
-///   higher effort) is promoted to `high`; absent or `low` effort downgrades to
-///   `low`.
-///
-/// Effort defaults to the conservative `low` tier when the request carries none.
-fn is_versioned_text_flash(model: &str) -> bool {
-    let Some(version_and_suffix) = model.strip_prefix("gemini-") else {
-        return false;
-    };
-    let Some((version, suffix)) = version_and_suffix.split_once("-flash") else {
-        return false;
-    };
-    let numeric_version = !version.is_empty()
-        && version
-            .split('.')
-            .all(|segment| !segment.is_empty() && segment.chars().all(|ch| ch.is_ascii_digit()));
-    numeric_version && matches!(suffix, "" | "-preview")
-}
-
-fn is_versioned_text_pro(model: &str) -> bool {
-    let Some(version_and_suffix) = model.strip_prefix("gemini-") else {
-        return false;
-    };
-    let Some((version, suffix)) = version_and_suffix.split_once("-pro") else {
-        return false;
-    };
-    let numeric_version = !version.is_empty()
-        && version
-            .split('.')
-            .all(|segment| !segment.is_empty() && segment.chars().all(|ch| ch.is_ascii_digit()));
-    numeric_version && matches!(suffix, "" | "-preview" | "-preview-customtools")
-}
-
-fn gemini_wire(model: &str, reasoning: ReasoningRequest) -> (String, &'static str) {
-    let lower = model.trim().to_ascii_lowercase();
-    let known_pro_alias = lower == "gemini-pro" || is_versioned_text_pro(&lower);
-    let known_flash_alias = lower == "gemini-flash" || is_versioned_text_flash(&lower);
-    let thinking = match reasoning {
-        ReasoningRequest::Effort(EffortLevel::Medium | EffortLevel::High | EffortLevel::Max | EffortLevel::Xhigh | EffortLevel::Ultra)
-        | ReasoningRequest::BudgetTokens(8_000..) => "high",
-        ReasoningRequest::Effort(EffortLevel::Low)
-        | ReasoningRequest::BudgetTokens(_)
-        | ReasoningRequest::Auto => "low",
-    };
-    if known_pro_alias {
-        let tier = if thinking == "high" { "high" } else { "low" };
-        (format!("gemini-3-pro-{tier}"), tier)
-    } else if known_flash_alias {
-        let level = match reasoning {
-            ReasoningRequest::Effort(EffortLevel::Medium) | ReasoningRequest::BudgetTokens(4_000..8_000) => "medium",
-            _ => thinking,
-        };
-        ("gemini-3-flash".to_string(), level)
-    } else {
-        (model.trim().to_string(), thinking)
+/// Only `medium` needs the resolved id to decide: a model that publishes no
+/// middle rung (Pro is `low`/`high` only) has its medium request resolved up to
+/// the high id by the catalog, and sending `thinkingLevel: "medium"` alongside a
+/// high-tier id would name a level that model does not expose. Comparing the
+/// resolved ids answers that from the catalog data instead of from a hardcoded
+/// list of which families tier — so a model added purely in settings gets the
+/// right level with no code change.
+fn gemini_thinking_level(model: &str, effort: EffortLevel, wire: &str) -> &'static str {
+    match effort {
+        EffortLevel::Low => "low",
+        EffortLevel::Medium => {
+            let high = super::wire_model_for_effort(model, EffortLevel::High)
+                .unwrap_or_else(|| model.to_string());
+            if high == wire { "high" } else { "medium" }
+        }
+        EffortLevel::High | EffortLevel::Xhigh | EffortLevel::Max | EffortLevel::Ultra => "high",
     }
+}
+
+/// Resolve a Zo model id plus the request effort into the Cloud Code wire model
+/// id and its Gemini 3 `thinkingLevel`.
+///
+/// The mapping itself is data, not code: it lives in the shared model catalog
+/// (`model_context_windows.json`, overridable through
+/// `ZO_MODEL_CONTEXT_WINDOWS`, which is how a settings-declared model reaches
+/// this crate). That matters because Google's serving ids bake the reasoning
+/// tier in — the backend registry publishes `gemini-3.6-flash-low|-medium|-high`
+/// and no bare `gemini-3.6-flash` — and a new release has historically arrived
+/// as a new set of those ids. Teaching zo about one is a catalog edit.
+///
+/// A model the catalog says nothing about is sent under its own id. That is the
+/// only honest default: deriving a variant from the id's shape would turn an
+/// unknown model into a 404 (or, worse, silently serve a different model than
+/// the one selected, which is what the previous version-collapsing heuristic
+/// did — every `gemini-<n>.<m>-flash` became `gemini-3-flash`).
+fn gemini_wire(model: &str, reasoning: ReasoningRequest) -> (String, &'static str) {
+    let trimmed = model.trim();
+    let effort = super::effort_rung(reasoning);
+    let wire =
+        super::wire_model_for_effort(trimmed, effort).unwrap_or_else(|| trimmed.to_string());
+    let level = gemini_thinking_level(trimmed, effort, &wire);
+    (wire, level)
 }
 
 fn system_instruction(request: &MessageRequest) -> Option<Value> {

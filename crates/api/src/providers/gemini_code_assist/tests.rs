@@ -145,104 +145,138 @@ fn refresh_backoff_marks_and_clears() {
 }
 
 #[test]
-fn gemini_wire_maps_family_and_effort() {
-    // Flash: bare wire id, full low|medium|high passthrough (max collapses).
+fn gemini_wire_reads_the_tier_from_the_catalog() {
+    // Flash publishes three rungs, so each effort keeps its own served id and
+    // its own thinkingLevel.
     assert_eq!(
         gemini_wire(
             "gemini-3.5-flash",
             ReasoningRequest::Effort(EffortLevel::Medium)
         ),
-        ("gemini-3-flash".to_string(), "medium")
+        ("gemini-3.5-flash-low".to_string(), "medium")
     );
     assert_eq!(
         gemini_wire(
             "gemini-3.5-flash",
             ReasoningRequest::Effort(EffortLevel::Max)
         ),
-        ("gemini-3-flash".to_string(), "high")
+        ("gemini-3-flash-agent".to_string(), "high")
     );
     assert_eq!(
         gemini_wire(
             "gemini-3.5-flash",
             ReasoningRequest::Effort(EffortLevel::Ultra)
         ),
-        ("gemini-3-flash".to_string(), "high")
+        ("gemini-3-flash-agent".to_string(), "high")
     );
+    // An alias resolves through the catalog before the wire lookup, and absent
+    // effort takes the conservative low rung.
     assert_eq!(
         gemini_wire("gemini-flash", ReasoningRequest::Auto),
-        ("gemini-3-flash".to_string(), "low")
+        ("gemini-3.6-flash-low".to_string(), "low")
     );
-    // Pro: tier baked into the id, only low|high (medium promotes to high).
+    // Pro publishes low|high only. A medium request resolves UP to the high
+    // rung, and the level follows the id it landed on rather than naming a
+    // tier that model does not expose.
     assert_eq!(
-        gemini_wire("gemini-3.1-pro", ReasoningRequest::Effort(EffortLevel::Low)),
-        ("gemini-3-pro-low".to_string(), "low")
+        gemini_wire("gemini-pro", ReasoningRequest::Effort(EffortLevel::Low)),
+        ("gemini-3.1-pro-low".to_string(), "low")
     );
     assert_eq!(
         gemini_wire(
             "gemini-3.1-pro-preview",
             ReasoningRequest::Effort(EffortLevel::Medium)
         ),
-        ("gemini-3-pro-high".to_string(), "high")
+        ("gemini-pro-agent".to_string(), "high")
     );
-    // Tier-less pro with no effort downgrades to -low.
     assert_eq!(
         gemini_wire("gemini-pro", ReasoningRequest::Auto),
-        ("gemini-3-pro-low".to_string(), "low")
+        ("gemini-3.1-pro-low".to_string(), "low")
     );
 }
 
+/// The rule that replaced the version-collapsing heuristic: an id the catalog
+/// does not carry is sent unchanged.
+///
+/// The old code derived a wire id from the id's *shape*, so every
+/// `gemini-<n>.<m>-flash` — including versions that do not exist — became
+/// `gemini-3-flash`. Picking a newer Flash silently served an older model and
+/// nothing in the request said so. Passing an unknown id through means Google
+/// answers with a 404 naming it, which is a diagnosable failure instead of a
+/// silent substitution.
 #[test]
-fn gemini_wire_maps_versioned_text_flash_without_overmatching() {
+fn gemini_wire_never_invents_a_variant_for_an_unknown_id() {
     for model in [
-        "gemini-3-flash",
-        "gemini-3-flash-preview",
-        "gemini-3.5-flash",
-        "gemini-3.6-flash",
+        "gemini-3.7-flash",
         "gemini-12.4-flash-preview",
-    ] {
-        assert_eq!(
-            gemini_wire(model, ReasoningRequest::Effort(EffortLevel::High)),
-            ("gemini-3-flash".to_string(), "high"),
-            "{model}"
-        );
-    }
-    for model in [
-        "gemini-omni-flash",
-        "gemini-3.1-flash-lite",
-        "gemini-3.6-flash-image",
-        "gemini-3.6-flash-preview-image",
-    ] {
-        assert_eq!(
-            gemini_wire(model, ReasoningRequest::Effort(EffortLevel::High)),
-            (model.to_string(), "high"),
-            "{model}"
-        );
-    }
-}
-
-#[test]
-fn gemini_wire_maps_versioned_text_pro_without_overmatching() {
-    for model in [
         "gemini-3-pro",
-        "gemini-3.1-pro-preview",
-        "gemini-3.6-pro",
-        "gemini-12.4-pro-preview-customtools",
-    ] {
-        assert_eq!(
-            gemini_wire(model, ReasoningRequest::Effort(EffortLevel::High)),
-            ("gemini-3-pro-high".to_string(), "high"),
-            "{model}"
-        );
-    }
-    for model in [
-        "gemini-omni-pro",
-        "gemini-3.6-pro-image",
+        "gemini-omni-flash",
+        "gemini-3.6-flash-image",
         "gemini-3.6-pro-preview-image",
     ] {
         assert_eq!(
             gemini_wire(model, ReasoningRequest::Effort(EffortLevel::High)),
             (model.to_string(), "high"),
             "{model}"
+        );
+    }
+}
+
+/// The payoff: a model zo has never heard of becomes usable by declaring its
+/// served ids, with no code change. This is the same override catalog the
+/// settings bridge publishes, so what is exercised here is the path a user
+/// takes when Google ships the next Flash.
+#[test]
+fn a_declared_model_gets_its_served_ids_without_a_code_change() {
+    let _lock = crate::test_env_lock();
+    let _env = EnvVarGuard::set(
+        crate::providers::MODEL_CONTEXT_WINDOWS_ENV,
+        Some(
+            r#"{"models":[{"provider":"google","ids":["gemini-3.7-flash"],"wire":{"low":"gemini-3.7-flash-low","medium":"gemini-3.7-flash-medium","high":"gemini-3.7-flash-high"}}]}"#,
+        ),
+    );
+
+    assert_eq!(
+        gemini_wire("gemini-3.7-flash", ReasoningRequest::Auto),
+        ("gemini-3.7-flash-low".to_string(), "low")
+    );
+    assert_eq!(
+        gemini_wire(
+            "gemini-3.7-flash",
+            ReasoningRequest::Effort(EffortLevel::Medium)
+        ),
+        ("gemini-3.7-flash-medium".to_string(), "medium")
+    );
+    assert_eq!(
+        gemini_wire(
+            "gemini-3.7-flash",
+            ReasoningRequest::Effort(EffortLevel::Max)
+        ),
+        ("gemini-3.7-flash-high".to_string(), "high")
+    );
+}
+
+/// A declared model may publish a single served id, and an override wins over
+/// the built-in catalog for an id both carry.
+#[test]
+fn a_declared_wire_id_may_be_flat_and_overrides_the_builtin() {
+    let _lock = crate::test_env_lock();
+    let _env = EnvVarGuard::set(
+        crate::providers::MODEL_CONTEXT_WINDOWS_ENV,
+        Some(
+            r#"{"models":[{"provider":"google","ids":["gemini-3.6-flash"],"wire":"gemini-3.6-flash-tiered"}]}"#,
+        ),
+    );
+
+    for reasoning in [
+        ReasoningRequest::Auto,
+        ReasoningRequest::Effort(EffortLevel::Medium),
+        ReasoningRequest::Effort(EffortLevel::Max),
+    ] {
+        assert_eq!(
+            gemini_wire("gemini-3.6-flash", reasoning).0,
+            "gemini-3.6-flash-tiered",
+            "{reasoning:?}"
         );
     }
 }
@@ -280,11 +314,21 @@ fn not_found_context_does_not_claim_the_model_is_definitively_unavailable() {
     assert!(!retryable);
 }
 
+/// The legacy `thinkingBudget` path folds into the same three rungs the
+/// catalog publishes, so a budget selects a served id like any other effort.
 #[test]
 fn gemini_wire_flash_budget_uses_existing_effort_buckets() {
     assert_eq!(
         gemini_wire("gemini-flash", ReasoningRequest::BudgetTokens(16_000)),
-        ("gemini-3-flash".to_string(), "high")
+        ("gemini-3.6-flash-high".to_string(), "high")
+    );
+    assert_eq!(
+        gemini_wire("gemini-flash", ReasoningRequest::BudgetTokens(6_000)),
+        ("gemini-3.6-flash-medium".to_string(), "medium")
+    );
+    assert_eq!(
+        gemini_wire("gemini-flash", ReasoningRequest::BudgetTokens(1_000)),
+        ("gemini-3.6-flash-low".to_string(), "low")
     );
 }
 

@@ -101,6 +101,12 @@ struct Overlay {
     models: Vec<UserModel>,
     #[serde(default)]
     hidden: Vec<ModelKey>,
+    /// Alias → canonical rows in the `api` catalog's own shape, carried opaque
+    /// for the same reason [`UserModel::wire`] is: that crate owns the schema
+    /// and parses it. This is how an operator repoints a short alias
+    /// (`gemini-flash`, `google-latest`) at a model the binary predates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    aliases: Vec<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +117,17 @@ struct UserModel {
     display_name: String,
     #[serde(default = "legacy_user_auth_route")]
     auth_route: AuthRoute,
+    /// The id(s) the provider actually serves this model under, when they
+    /// differ from `id` — either a bare string or `{"low":…,"medium":…,"high":…}`
+    /// for a provider that bakes the reasoning tier into the id (Gemini does).
+    ///
+    /// Held as an opaque value on purpose: the schema belongs to the `api`
+    /// crate's model catalog, which is where it is parsed. Restating it here
+    /// would make one shape two definitions that could drift. Absent means the
+    /// selection id IS the wire id, which is what every model needed until
+    /// Google started shipping tiered ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wire: Option<Value>,
 }
 
 const fn legacy_user_auth_route() -> AuthRoute {
@@ -191,6 +208,42 @@ impl ModelCatalog {
             }
         }
         rows
+    }
+
+    /// The overlay's model-catalog declarations — served ids and alias rows —
+    /// in the `api` catalog's shape, for the process bridge that carries them
+    /// into that crate.
+    ///
+    /// `None` when nothing is declared, so the caller can tell "nothing to
+    /// publish" from "publish an empty catalog" — the two differ under an
+    /// operator-set override, which must not be clobbered by an empty mirror.
+    #[must_use]
+    pub fn catalog_overlay_json(&self) -> Option<String> {
+        let models = self
+            .overlay
+            .models
+            .iter()
+            .filter_map(|model| {
+                let wire = model.wire.as_ref()?;
+                let id = model.id.trim();
+                if id.is_empty() || wire.is_null() {
+                    return None;
+                }
+                Some(serde_json::json!({
+                    "provider": model.provider.key(),
+                    "ids": [id],
+                    "wire": wire,
+                }))
+            })
+            .collect::<Vec<_>>();
+        if models.is_empty() && self.overlay.aliases.is_empty() {
+            return None;
+        }
+        serde_json::to_string(&serde_json::json!({
+            "models": models,
+            "aliases": self.overlay.aliases,
+        }))
+        .ok()
     }
 
     #[must_use]
@@ -304,6 +357,7 @@ impl ModelCatalog {
             id: id.trim().to_string(),
             display_name: display_name.trim().to_string(),
             auth_route,
+            wire: None,
         });
         self.persist().map_err(|error| error.to_string())
     }
@@ -405,6 +459,7 @@ impl ModelCatalog {
                 id: id.trim().to_string(),
                 display_name: display_name.trim().to_string(),
                 auth_route,
+                wire: None,
             });
         }
     }
@@ -545,6 +600,90 @@ pub fn model_family_label(model: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A settings-declared model carries the ids its provider serves it under,
+    /// and those survive a round trip through the file — this is what lets a
+    /// model the binary predates be reachable without a rebuild.
+    #[test]
+    fn a_declared_wire_mapping_round_trips_and_publishes() {
+        let path = path("wire-round-trip");
+        let _ = fs::remove_file(&path);
+        fs::write(
+            &path,
+            r#"{"modelCatalog":{"models":[
+                {"provider":"google","id":"gemini-3.7-flash","displayName":"Gemini 3.7 Flash",
+                 "wire":{"low":"gemini-3.7-flash-low","high":"gemini-3.7-flash-high"}},
+                {"provider":"openai","id":"gpt-5.7","displayName":"GPT-5.7"}
+            ]}}"#,
+        )
+        .unwrap();
+
+        let mut catalog = ModelCatalog::load_from(path.clone()).unwrap();
+        let published: Value =
+            serde_json::from_str(&catalog.catalog_overlay_json().expect("declared")).unwrap();
+        let models = published["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1, "only declaring models are published");
+        assert_eq!(models[0]["ids"][0], "gemini-3.7-flash");
+        assert_eq!(models[0]["wire"]["high"], "gemini-3.7-flash-high");
+
+        // Renaming through the picker must not drop the declaration: the row
+        // would keep its name and quietly go back to being served under its own
+        // id, which is the silent-substitution failure this whole path exists
+        // to remove.
+        let row = catalog
+            .rows(&[CatalogProvider::Google], false)
+            .into_iter()
+            .find(|row| row.id == "gemini-3.7-flash")
+            .expect("row");
+        catalog
+            .edit(&row, CatalogProvider::Google, "gemini-3.7-flash", "Flash 3.7")
+            .unwrap();
+        let reloaded = ModelCatalog::load_from(path.clone()).unwrap();
+        let published: Value =
+            serde_json::from_str(&reloaded.catalog_overlay_json().expect("still declared")).unwrap();
+        assert_eq!(
+            published["models"][0]["wire"]["low"],
+            "gemini-3.7-flash-low",
+            "an edit preserves the served ids"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Nothing declared is not the same as an empty catalog — the bridge needs
+    /// to tell them apart so it never clobbers an operator's own export.
+    #[test]
+    fn no_declaration_publishes_nothing() {
+        let path = path("wire-none");
+        let _ = fs::remove_file(&path);
+        fs::write(
+            &path,
+            r#"{"modelCatalog":{"models":[{"provider":"openai","id":"gpt-5.7","displayName":"GPT-5.7"}]}}"#,
+        )
+        .unwrap();
+        let catalog = ModelCatalog::load_from(path.clone()).unwrap();
+        assert!(catalog.catalog_overlay_json().is_none());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Alias rows travel through the overlay too, so repointing a short name is
+    /// a settings edit rather than a rebuild.
+    #[test]
+    fn declared_aliases_reach_the_overlay_payload() {
+        let path = path("alias-overlay");
+        let _ = fs::remove_file(&path);
+        fs::write(
+            &path,
+            r#"{"modelCatalog":{"aliases":[{"alias":"google-latest","canonical":"gemini-3.7-flash","provider":"google"}]}}"#,
+        )
+        .unwrap();
+        let catalog = ModelCatalog::load_from(path.clone()).unwrap();
+        let published: Value =
+            serde_json::from_str(&catalog.catalog_overlay_json().expect("declared")).unwrap();
+        assert_eq!(published["aliases"][0]["canonical"], "gemini-3.7-flash");
+        assert!(published["models"].as_array().unwrap().is_empty());
+        let _ = fs::remove_file(&path);
+    }
 
     fn path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("zo-model-catalog-{name}-{}-{}.json", std::process::id(), std::thread::current().name().unwrap_or("test")))

@@ -82,6 +82,14 @@ pub(crate) fn build_responses_request_for_session(
     }
 
     let (model_id, fast) = chatgpt_model_and_speed(&request.model);
+    // `[fast]` is a zo-side service-tier marker, not part of the model's
+    // identity, so the catalog lookup runs on the family id it resolved to.
+    // Normally a no-op — an OpenAI model's selection id is its served id.
+    let model_id = super::wire_model_for_effort(
+        &model_id,
+        super::effort_rung(request.reasoning_request()),
+    )
+    .unwrap_or(model_id);
     // Current GPT families routed here support adaptive default effort — see the
     // `ReasoningRequest::Auto` arm below — and may use the low-latency fast
     // (priority) service tier when the alias carries it.

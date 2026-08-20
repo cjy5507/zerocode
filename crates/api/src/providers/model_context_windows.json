@@ -104,6 +104,262 @@
       "max_request_bytes": 33554432,
       "class": "fast",
       "source": "Executor tier per the user-declared hierarchy. context_window/max_output_tokens are informational only — see claude-fable-5 entry note. | Request BODY byte ceiling (NOT the token context window): Anthropic Messages API documents a 32MB maximum request size; a 413 request_too_large is returned above it. PROVENANCE: assistant knowledge, NOT user-confirmed — correct this figure if the documented limit differs. Consumed by request_too_large_preflight in providers/anthropic.rs to reject an oversized body before upload; an absent value simply disables the preflight."
+    },
+    {
+      "provider": "google",
+      "ids": [
+        "gemini-3.6-flash"
+      ],
+      "wire": {
+        "low": "gemini-3.6-flash-low",
+        "medium": "gemini-3.6-flash-medium",
+        "high": "gemini-3.6-flash-high"
+      },
+      "source": "Google Antigravity backend registry, read 2026-08-20 via cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels. That registry is the serving list: it publishes gemini-3.6-flash-low/-medium/-high, gemini-3.5-flash-extra-low/-low, gemini-3.1-pro-low, gemini-3-flash-agent and gemini-pro-agent, and carries NO bare gemini-3.6-flash / gemini-3.5-flash / gemini-3.x-pro id at all — the reasoning tier is part of the model id. Display names in that response map gemini-3-flash-agent to \"Gemini 3.5 Flash (High)\", and deprecatedModelIds redirects gemini-3.1-pro-high to gemini-pro-agent, which is why those two ids carry the high rung. No context window is declared here: the registry does not publish one, and inventing a figure is exactly what this catalog forbids."
+    },
+    {
+      "provider": "google",
+      "ids": [
+        "gemini-3.5-flash"
+      ],
+      "wire": {
+        "low": "gemini-3.5-flash-extra-low",
+        "medium": "gemini-3.5-flash-low",
+        "high": "gemini-3-flash-agent"
+      },
+      "source": "Google Antigravity backend registry, read 2026-08-20 via cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels. That registry is the serving list: it publishes gemini-3.6-flash-low/-medium/-high, gemini-3.5-flash-extra-low/-low, gemini-3.1-pro-low, gemini-3-flash-agent and gemini-pro-agent, and carries NO bare gemini-3.6-flash / gemini-3.5-flash / gemini-3.x-pro id at all — the reasoning tier is part of the model id. Display names in that response map gemini-3-flash-agent to \"Gemini 3.5 Flash (High)\", and deprecatedModelIds redirects gemini-3.1-pro-high to gemini-pro-agent, which is why those two ids carry the high rung. No context window is declared here: the registry does not publish one, and inventing a figure is exactly what this catalog forbids."
+    },
+    {
+      "provider": "google",
+      "ids": [
+        "gemini-3.1-pro-preview",
+        "gemini-3.1-pro-preview-customtools",
+        "gemini-3-pro-preview"
+      ],
+      "wire": {
+        "low": "gemini-3.1-pro-low",
+        "high": "gemini-pro-agent"
+      },
+      "source": "Google Antigravity backend registry, read 2026-08-20 via cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels. That registry is the serving list: it publishes gemini-3.6-flash-low/-medium/-high, gemini-3.5-flash-extra-low/-low, gemini-3.1-pro-low, gemini-3-flash-agent and gemini-pro-agent, and carries NO bare gemini-3.6-flash / gemini-3.5-flash / gemini-3.x-pro id at all — the reasoning tier is part of the model id. Display names in that response map gemini-3-flash-agent to \"Gemini 3.5 Flash (High)\", and deprecatedModelIds redirects gemini-3.1-pro-high to gemini-pro-agent, which is why those two ids carry the high rung. No context window is declared here: the registry does not publish one, and inventing a figure is exactly what this catalog forbids."
+    },
+    {
+      "provider": "google",
+      "ids": [
+        "gemini-3.1-flash-lite"
+      ],
+      "wire": "gemini-3.1-flash-lite",
+      "source": "Google Antigravity backend registry, read 2026-08-20 via cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels. That registry is the serving list: it publishes gemini-3.6-flash-low/-medium/-high, gemini-3.5-flash-extra-low/-low, gemini-3.1-pro-low, gemini-3-flash-agent and gemini-pro-agent, and carries NO bare gemini-3.6-flash / gemini-3.5-flash / gemini-3.x-pro id at all — the reasoning tier is part of the model id. Display names in that response map gemini-3-flash-agent to \"Gemini 3.5 Flash (High)\", and deprecatedModelIds redirects gemini-3.1-pro-high to gemini-pro-agent, which is why those two ids carry the high rung. No context window is declared here: the registry does not publish one, and inventing a figure is exactly what this catalog forbids."
+    },
+    {
+      "provider": "google",
+      "ids": [
+        "gemini-3-flash",
+        "gemini-3-flash-preview"
+      ],
+      "wire": "gemini-3-flash",
+      "source": "Google Antigravity backend registry, read 2026-08-20 via cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels. That registry is the serving list: it publishes gemini-3.6-flash-low/-medium/-high, gemini-3.5-flash-extra-low/-low, gemini-3.1-pro-low, gemini-3-flash-agent and gemini-pro-agent, and carries NO bare gemini-3.6-flash / gemini-3.5-flash / gemini-3.x-pro id at all — the reasoning tier is part of the model id. Display names in that response map gemini-3-flash-agent to \"Gemini 3.5 Flash (High)\", and deprecatedModelIds redirects gemini-3.1-pro-high to gemini-pro-agent, which is why those two ids carry the high rung. No context window is declared here: the registry does not publish one, and inventing a figure is exactly what this catalog forbids."
+    }
+  ],
+  "aliases": [
+    {
+      "alias": "anthropic-latest",
+      "canonical": "claude-opus-5",
+      "provider": "anthropic"
+    },
+    {
+      "alias": "claude-latest",
+      "canonical": "claude-opus-5",
+      "provider": "anthropic"
+    },
+    {
+      "alias": "fable",
+      "canonical": "claude-fable-5",
+      "provider": "anthropic",
+      "orchestration_rank": 0
+    },
+    {
+      "alias": "claude-fable",
+      "canonical": "claude-fable-5",
+      "provider": "anthropic"
+    },
+    {
+      "alias": "opus",
+      "canonical": "claude-opus-5",
+      "provider": "anthropic",
+      "demotes_to": "sonnet"
+    },
+    {
+      "alias": "opus[1m]",
+      "canonical": "claude-opus-5",
+      "provider": "anthropic"
+    },
+    {
+      "alias": "claude-opus-4-8",
+      "canonical": "claude-opus-4-8",
+      "provider": "anthropic"
+    },
+    {
+      "alias": "sonnet",
+      "canonical": "claude-sonnet-5",
+      "provider": "anthropic",
+      "demotes_to": "haiku"
+    },
+    {
+      "alias": "haiku",
+      "canonical": "claude-haiku-4-5-20251001",
+      "provider": "anthropic"
+    },
+    {
+      "alias": "claude-opus",
+      "canonical": "claude-opus-5",
+      "provider": "anthropic"
+    },
+    {
+      "alias": "claude-opus[1m]",
+      "canonical": "claude-opus-5",
+      "provider": "anthropic"
+    },
+    {
+      "alias": "claude-sonnet",
+      "canonical": "claude-sonnet-5",
+      "provider": "anthropic"
+    },
+    {
+      "alias": "claude-haiku",
+      "canonical": "claude-haiku-4-5-20251001",
+      "provider": "anthropic"
+    },
+    {
+      "alias": "openai-latest",
+      "canonical": "gpt-5.6-sol",
+      "provider": "openai",
+      "orchestration_rank": 1
+    },
+    {
+      "alias": "gpt-5.6-sol",
+      "canonical": "gpt-5.6-sol",
+      "provider": "openai"
+    },
+    {
+      "alias": "gpt-5.6-terra",
+      "canonical": "gpt-5.6-terra",
+      "provider": "openai"
+    },
+    {
+      "alias": "gpt-5.6-luna",
+      "canonical": "gpt-5.6-luna",
+      "provider": "openai"
+    },
+    {
+      "alias": "gpt-5.6",
+      "canonical": "gpt-5.6-terra",
+      "provider": "openai"
+    },
+    {
+      "alias": "sol",
+      "canonical": "gpt-5.6-sol",
+      "provider": "openai"
+    },
+    {
+      "alias": "terra",
+      "canonical": "gpt-5.6-terra",
+      "provider": "openai"
+    },
+    {
+      "alias": "luna",
+      "canonical": "gpt-5.6-luna",
+      "provider": "openai"
+    },
+    {
+      "alias": "spark",
+      "canonical": "gpt-5.3-codex-spark",
+      "provider": "openai"
+    },
+    {
+      "alias": "gpt-5.3-codex-spark",
+      "canonical": "gpt-5.3-codex-spark",
+      "provider": "openai"
+    },
+    {
+      "alias": "google-latest",
+      "canonical": "gemini-3.6-flash",
+      "provider": "google"
+    },
+    {
+      "alias": "gemini-3.6-flash",
+      "canonical": "gemini-3.6-flash",
+      "provider": "google"
+    },
+    {
+      "alias": "gemini-3.1-pro-preview",
+      "canonical": "gemini-3.1-pro-preview",
+      "provider": "google"
+    },
+    {
+      "alias": "gemini-3.1-pro-preview-customtools",
+      "canonical": "gemini-3.1-pro-preview-customtools",
+      "provider": "google"
+    },
+    {
+      "alias": "gemini-3-pro-preview",
+      "canonical": "gemini-3-pro-preview",
+      "provider": "google"
+    },
+    {
+      "alias": "gemini-3.5-flash",
+      "canonical": "gemini-3.5-flash",
+      "provider": "google"
+    },
+    {
+      "alias": "gemini-3-flash",
+      "canonical": "gemini-3-flash",
+      "provider": "google"
+    },
+    {
+      "alias": "gemini-3-flash-preview",
+      "canonical": "gemini-3-flash-preview",
+      "provider": "google"
+    },
+    {
+      "alias": "gemini-3.1-flash-lite",
+      "canonical": "gemini-3.1-flash-lite",
+      "provider": "google"
+    },
+    {
+      "alias": "gemini-pro",
+      "canonical": "gemini-3.1-pro-preview",
+      "provider": "google",
+      "demotes_to": "gemini-flash"
+    },
+    {
+      "alias": "gemini-flash",
+      "canonical": "gemini-3.6-flash",
+      "provider": "google"
+    },
+    {
+      "alias": "gemini-flash-lite",
+      "canonical": "gemini-3.1-flash-lite",
+      "provider": "google"
+    },
+    {
+      "alias": "gemini-3.5-pro",
+      "canonical": "gemini-3.1-pro-preview",
+      "provider": "google"
+    },
+    {
+      "alias": "xai-latest",
+      "canonical": "grok-3",
+      "provider": "xai"
+    },
+    {
+      "alias": "grok",
+      "canonical": "grok-3",
+      "provider": "xai"
+    },
+    {
+      "alias": "ollama",
+      "canonical": "ollama",
+      "provider": "ollama"
     }
   ]
 }

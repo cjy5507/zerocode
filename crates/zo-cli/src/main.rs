@@ -8,6 +8,7 @@ mod cli_tool_executor;
 mod command_reports;
 mod conversation_support;
 mod custom_provider_env;
+mod model_wire_env;
 mod doctor;
 mod formatting;
 mod git_helpers;
