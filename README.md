@@ -1,41 +1,28 @@
 # ZeroCode
 
-ZeroCode is a Rust-native coding agent CLI for interactive terminal work, one-shot automation, resumable sessions, MCP integrations, and parallel agent workflows. The installed command is `zo`.
+ZeroCode is a macOS app for working with coding agents: a terminal window with an orchestration ledger, a built-in browser, a mobile emulator and desktop Computer Use, plus the `zo` coding agent CLI it ships with. This repository carries the releases; the app updates itself from them.
 
-## Install
+## Install (macOS, Apple Silicon)
 
 ```bash
 curl -fsSL https://github.com/cjy5507/zerocode/releases/latest/download/install.sh | bash
 ```
 
-The installer selects the correct release for macOS Apple Silicon, macOS Intel, or Linux x86_64, verifies its SHA-256 digest, and installs it to `~/.local/bin/zo` without `sudo`. Existing `~/.zo` settings and credentials are preserved.
+The installer reads the release feed (`latest.json`), downloads that version's `ZeroCode_<version>_aarch64.app.tar.gz`, verifies the feed's minisign signature when `minisign` is installed (`brew install minisign`), installs `ZeroCode.app` into `/Applications` by one rename, clears the quarantine attribute so the first launch is not refused, and links the bundled `zo` to `~/.local/bin/zo`. Knobs: `ZEROCODE_VERSION=v1.1.4` pins a release, `ZEROCODE_INSTALL_DIR` and `ZEROCODE_BIN_DIR` move the app or the link.
 
-Ensure `~/.local/bin` is on `PATH`, then start ZeroCode:
+Manual install: download `ZeroCode_<version>_aarch64.dmg` from the [latest release](https://github.com/cjy5507/zerocode/releases/latest), drag `ZeroCode.app` to Applications, and open it once with right-click → Open (the app is signed but not notarised, so Gatekeeper asks on the first launch). `zo` sits at `/Applications/ZeroCode.app/Contents/Resources/bin/zo`; link or add it to `PATH` yourself.
 
-```bash
-zo
-```
-
-Useful commands:
+Ensure `~/.local/bin` is on `PATH`, then:
 
 ```bash
 zo --version
 zo doctor --check
-zo update --check
-zo update
 ```
 
-Installations created by the release installer check for stable updates in the background. Cargo, Homebrew, copied, and development builds are never overwritten by the automatic updater. Source and development builds cannot use `zo update`; it exits with an error rather than replacing local work with a release binary. Update a source build with `just deploy`, or rerun the release install script to switch back to an installer-managed build.
+## Updates
 
-## Build from source
+The app checks this repository's release feed and installs updates itself; the install script can also be rerun at any time. `zo` is updated with the app.
 
-```bash
-cargo install \
-  --git https://github.com/cjy5507/zerocode.git \
-  --locked \
-  --bin zo \
-  --root "$HOME/.local" \
-  zo-cli
-```
+Releases are published for macOS on Apple Silicon only.
 
 ZeroCode is an independent project and is not affiliated with Anthropic, OpenAI, Google, xAI, or other model providers. See `LICENSE`, `NOTICE`, and `PRIVACY.md` for distribution and privacy terms.
