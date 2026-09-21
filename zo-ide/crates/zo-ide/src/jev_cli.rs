@@ -1,0 +1,229 @@
+//! `zo jev summary` — every Jev seat's ledger, counted
+//! (docs/design/jev-settings-20260917.md §5).
+//!
+//! The window asks this rather than counting for itself: the window↔zo line
+//! is an exec boundary, and a screen that counted the rows would be a second
+//! reader of the same files, free to disagree with the judge that promotes a
+//! seat on them.
+
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+
+use serde_json::{Value, json};
+use tools::jev_summary::{self, SeatReport};
+
+pub const USAGE: &str = "\
+zo jev summary [--cwd <dir>] [--computer-use <sessions-dir>] [--json]
+
+  summary: count every Jev seat's ledger — today and the last seven days.
+  Per seat: its mode (off/shadow/on/auto), rows, how many answered and the
+  95% lower bound on that share, the p50 and p95 of the calls that went over
+  the wire (a memo hit answered without asking, so it is not one), the
+  refusal and failure tokens with their counts, the lines the door withheld,
+  what the billed tokens cost, and — for a seat whose `auto` may rise — the
+  share it must clear and how many rows stand before the next judgment.
+  A seat no ledger has been written for says so; it is not a seat that
+  answered nothing. --computer-use names the window's Computer Use sessions
+  folder, where the screen seats append beside each walk's evidence
+  (<dir>/<session>/<ledger>); every session's rows are counted.
+";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Request {
+    cwd: Option<PathBuf>,
+    sessions: Option<PathBuf>,
+    json: bool,
+}
+
+fn parse(args: &[String]) -> Result<Request, String> {
+    match args.first().map(String::as_str) {
+        Some("summary") => {}
+        Some("-h" | "--help") | None => return Err(USAGE.to_string()),
+        Some(other) => return Err(format!("unknown verb '{other}'\n\n{USAGE}")),
+    }
+    let mut request = Request { cwd: None, sessions: None, json: false };
+    let mut rest = args[1..].iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--json" => request.json = true,
+            "--cwd" => {
+                let dir = rest.next().ok_or_else(|| "--cwd needs a directory".to_string())?;
+                request.cwd = Some(PathBuf::from(dir));
+            }
+            "--computer-use" => {
+                let dir = rest.next().ok_or_else(|| "--computer-use needs a directory".to_string())?;
+                request.sessions = Some(PathBuf::from(dir));
+            }
+            other => return Err(format!("unknown argument '{other}'\n\n{USAGE}")),
+        }
+    }
+    Ok(request)
+}
+
+/// What the command printed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Report {
+    pub text: String,
+}
+
+/// # Errors
+///
+/// The usage, or what was wrong with the arguments.
+pub fn run(args: &[String], cwd: &Path, now_ms: i64, offset_s: i64) -> Result<Report, String> {
+    let request = parse(args)?;
+    let cwd = request.cwd.clone().unwrap_or_else(|| cwd.to_path_buf());
+    let settings = tools::merged_settings_root(&cwd);
+    let roots = jev_summary::ledger_roots(&cwd);
+    let seats = jev_summary::report(&roots, request.sessions.as_deref(), settings.as_ref(), now_ms, offset_s);
+    Ok(Report {
+        text: if request.json {
+            render_json(&seats).to_string()
+        } else {
+            render_text(&seats)
+        },
+    })
+}
+
+fn tally_json(tally: &jev_summary::SeatTally) -> Value {
+    json!({
+        "rows": tally.rows,
+        "answered": tally.answered,
+        "refused": tally.refused,
+        "answeredShare": tally.answered_share(),
+        "answeredLowerBound": tally.answered_lower_bound(),
+        "called": tally.called,
+        "requests": tally.requests,
+        "redactedLines": tally.redacted_lines,
+        "inputTokens": tally.input_tokens,
+        "p50Ms": tally.p50_ms,
+        "p95Ms": tally.p95_ms,
+        "failures": tally
+            .failures
+            .iter()
+            .map(|(token, count)| json!({ "token": token, "rows": count }))
+            .collect::<Vec<Value>>(),
+    })
+}
+
+fn render_json(seats: &[SeatReport]) -> Value {
+    json!({
+        "windowDays": jev_summary::WINDOW_DAYS,
+        "judgedEveryRows": jev_summary::JUDGED_EVERY_ROWS,
+        "seats": seats
+            .iter()
+            .map(|seat| json!({
+                "id": seat.id,
+                "setting": seat.setting,
+                "mode": seat.mode.key(),
+                "ledger": seat.ledger,
+                "found": seat.found.as_ref().map(|path| path.display().to_string()).map_or(Value::Null, Value::from),
+                "today": tally_json(&seat.today),
+                "week": tally_json(&seat.week),
+                "costUsd": seat.cost_usd,
+                "riseFloorPermille": seat.rise_floor_permille,
+                "clearsRiseFloor": seat.clears_rise_floor,
+                "rowsToNextJudgment": seat.rows_to_next_judgment(),
+                // The window the verdict was read on, and the agreement over
+                // it — the numbers a seat is promoted on, which are not the
+                // week's.
+                "judged": seat.judged.as_ref().map(|judged| json!({
+                    "window": tally_json(&judged.window),
+                    "windowWanted": judged.window_wanted,
+                    "agreement": {
+                        "compared": judged.agreement.compared,
+                        "agreed": judged.agreement.agreed,
+                        "lowerBound": judged.agreement.lower_bound(),
+                        // Control rows joined to the window for the
+                        // comparison — the probe run once more beside a
+                        // judgment an active turn acted on. They are in no
+                        // other number here.
+                        "controlRows": judged.control_rows,
+                    },
+                })),
+                "stand": seat.stand.token(),
+                "applies": seat.applies,
+                "verdict": seat.verdict().map(|verdict| json!({
+                    "verdict": verdict.token(),
+                    "line": verdict.line().map(tools::jev_summary::line_token),
+                })),
+            }))
+            .collect::<Vec<Value>>(),
+    })
+}
+
+fn render_text(seats: &[SeatReport]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<12} {:<7} {:<9} {:>7} {:>7} {:>8} {:>7} {:>7}  notes",
+        "seat", "mode", "stands", "today", "7d", "answered", "p50", "p95"
+    );
+    for seat in seats {
+        let share = seat
+            .week
+            .answered_share()
+            .map_or_else(|| "—".to_string(), |share| format!("{:.1}%", share * 100.0));
+        let mut notes = String::new();
+        if seat.found.is_none() {
+            notes.push_str("never asked");
+        }
+        if let (Some(floor), Some(judged)) = (seat.rise_floor_permille, seat.judged.as_ref()) {
+            let _ = write!(
+                notes,
+                "{}rise {} needs {:.1}% over {}/{} rows",
+                if notes.is_empty() { "" } else { " · " },
+                judged
+                    .window
+                    .answered_lower_bound()
+                    .map_or_else(|| "—".to_string(), |bound| format!("{:.1}%", bound * 100.0)),
+                f64::from(floor) / 10.0,
+                judged.window.asked(),
+                judged.window_wanted,
+            );
+            let _ = write!(
+                notes,
+                " · agrees {} of {}",
+                judged.agreement.agreed, judged.agreement.compared
+            );
+            // The rows that comparison borrowed from the control sample, when
+            // it borrowed any: an acting seat's own rows compare nothing.
+            if judged.control_rows > 0 {
+                let _ = write!(
+                    notes,
+                    " ({} control row{})",
+                    judged.control_rows,
+                    if judged.control_rows == 1 { "" } else { "s" }
+                );
+            }
+        }
+        if let Some(verdict) = seat.verdict() {
+            let _ = write!(
+                notes,
+                "{}{}{}",
+                if notes.is_empty() { "" } else { " · " },
+                verdict.token(),
+                verdict.line().map_or_else(String::new, |line| format!(" ({})", line.token()))
+            );
+        }
+        if let Some(owed) = seat.rows_to_next_judgment() {
+            let _ = write!(notes, " · {owed} rows to judgment");
+        }
+        let _ = writeln!(
+            out,
+            "{:<12} {:<7} {:<9} {:>7} {:>7} {:>8} {:>7} {:>7}  {}",
+            seat.id,
+            seat.mode.key(),
+            if seat.applies { "applying" } else { seat.stand.token() },
+            seat.today.rows,
+            seat.week.rows,
+            share,
+            seat.week.p50_ms.map_or_else(|| "—".to_string(), |ms| format!("{ms}")),
+            seat.week.p95_ms.map_or_else(|| "—".to_string(), |ms| format!("{ms}")),
+            notes
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests;

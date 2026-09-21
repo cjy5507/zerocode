@@ -1,0 +1,52 @@
+# Reverse-engineering scratch. Never commit: it holds third-party bytes
+# extracted from a locally installed application.
+.re-scratch/
+
+target/
+# The verification batteries' shared build cache — see WORKBOARD memo 54.
+target-verify/
+# No trailing slash: a directory rule does not match the node_modules SYMLINK the
+# window shares into every worktree, and `git add -A` there once committed it (249f699).
+node_modules
+ui/node_modules/
+ui/dist/
+.DS_Store
+
+# Local runtime state. Hosting a lane in this checkout makes `zo` write here,
+# and `settings.local.json` is per-machine by definition.
+.zo/
+
+# tauri-build regenerates these permission schemas from the installed Tauri
+# version on every build, so committing them only produces churn.
+crates/zerocode-shell/gen/
+
+# Local tool droppings — an IDE's project dir and the artifacts the browser
+# harnesses leave behind. Twice now a stray `git add -A` swept all four into
+# the index; ignoring them is what makes that sweep impossible.
+.idea/
+.playwright-cli/
+.playwright-mcp/
+output/
+
+# The updater's private key lives under ~/.local/share/zerocode/release/keys on
+# the lane machine only (tools/release/README.md); the contract
+# no_private_key_in_the_tree reads the tree for one as well.
+*.key
+
+# tools/release/tests leaves these behind when run as a module.
+__pycache__/
+
+# The zo binary staged for the release bundle (t-3191, scripts/stage-zo.mjs):
+# built or copied right before `tauri build`, never committed.
+crates/zerocode-shell/bin/
+
+# Working notes: meeting jottings and the PRD draft. They are notes about the
+# work, not the work, and nothing in the tree reads them.
+/PRD.md
+/CLAUDE.md
+/untitled.md
+/untitled-2.md
+
+# Design notes and plans stay on this machine; the public repository carries code only (2026-09-21).
+docs/
+zo-ide/docs/
