@@ -1184,10 +1184,14 @@ mod tests {
              device boots, so a pane's first seconds are the slow road's"
         );
         let hid = include_str!("../../src/emulator/ios_hid.rs");
+        let standing = block_after(hid, "pub(super) fn standing(");
         assert!(
-            hid.contains(".is_some_and(|entry| entry.client.alive())"),
-            "a dead helper still counts as retained, so the frame road spends \
-             its whole miss budget on a corpse once per rest"
+            standing.contains("entry.client.alive()")
+                && standing.contains("HelperStanding::Fallen")
+                && standing.contains("HelperStanding::Unasked"),
+            "a dead helper reads the same as one nobody asked for, so the \
+             frame road either spends its miss budget on a corpse or waits \
+             forever for a helper nobody will bring:\n{standing}"
         );
     }
 
@@ -1243,6 +1247,66 @@ mod tests {
                 .contains("UnixStream::connect(socket)"),
             "nothing wakes the frame thread out of `accept`, so it outlives \
              the client it belongs to"
+        );
+    }
+
+    /// t-5763 — a reader that walks away costs a thread, never the helper.
+    ///
+    /// Every road in this window that lets go of a pusher connection is
+    /// DESIGNED to be survivable: the bus is put down when a client is
+    /// replaced, a read can be interrupted by a signal the still-picture
+    /// road's own `simctl` child delivers, a dial can be aborted before it is
+    /// accepted. The helper turned each of them into its own death — measured
+    /// out of the window on 2026-09-22 as signal 13 within 250ms of the reader
+    /// closing — and in the window that read as a pane pushing one picture,
+    /// resting the fast road for five seconds, and doing it again on a six
+    /// second beat for as long as it stayed open (v1.1.11, 20:02-20:05).
+    ///
+    /// Three facts hold the repair, and losing any one puts the beat back:
+    /// the helper survives a broken pipe, the window notices a helper that
+    /// died without being asked anything, and the bus tells a still screen
+    /// from a stream nobody is pushing.
+    #[test]
+    fn a_frame_reader_that_walks_away_costs_the_ios_helper_a_thread_not_its_life() {
+        let swift =
+            include_str!("../../../../crates/zerocode-shell/native/ios-emulator-helper/main.swift");
+        assert!(
+            swift.contains("signal(SIGPIPE, SIG_IGN)"),
+            "the helper dies of SIGPIPE again, so one dropped pusher \
+             connection costs the whole process"
+        );
+        let helper = include_str!("../../src/emulator/ios_hid.rs");
+        // The helper's stdout closes when it dies and the reply thread is
+        // already sitting on it, so that thread is where a death costs
+        // nothing to notice. Asked for by the flag it sets, not by its
+        // spelling: the point is that SOMETHING other than a failed request
+        // reaches the conclusion.
+        let replies = block_after(helper, r#".name(format!("ios-hid-replies-{udid}"))"#);
+        assert!(
+            helper.contains("let fallen = dead.clone();") && replies.contains("fallen"),
+            "only a failed request learns that the helper died, so a corpse \
+             reads as standing until a road pays a frame timeout, a miss \
+             budget and a five-second rest to find out:\n{replies}"
+        );
+        let taking = block_after(helper, "fn take(&self, timeout: Duration)");
+        assert!(
+            taking.contains("if !self.pushing() {"),
+            "a stream nobody is pushing reads as a still screen, so a pane \
+             whose pusher retired draws on the refresh beat alone and nothing \
+             ever re-negotiates:\n{taking}"
+        );
+        // And the two reader answers that mean "look again" stay that way.
+        let reading = block_after(helper, "fn read_frames_from(");
+        assert!(
+            reading.contains("std::io::ErrorKind::Interrupted => continue"),
+            "a signal on the frame thread lets go of a live pusher \
+             again:\n{reading}"
+        );
+        assert!(
+            block_after(helper, "fn serve_frame_socket(")
+                .contains("std::io::ErrorKind::ConnectionAborted"),
+            "a dial that gave up before it was accepted closes this client's \
+             push road for good"
         );
     }
 
@@ -10142,9 +10206,11 @@ mod tests {
         // usage gauge's own period (`releaseAmbient`), never watched.
         // Twelve since t-3191: the update feed's clock (`updateAmbient`) rides
         // the same period; the backend's table decides which knock is a check.
+        // Thirteen since t-5807: the Jev dashboard's slow beat (`jevPoll`),
+        // one zo process every thirty seconds while the tab is on stage.
         assert_eq!(
             window.matches(" = idlePoller({").count(),
-            12,
+            13,
             "a background beat was added or removed without this pin moving with it"
         );
         let poller = block_after(window, "function idlePoller(");
@@ -13292,6 +13358,33 @@ mod tests {
             draining.contains("wordJamos.push(...decomposeHangul(text));"),
             "the drain no longer feeds commits back through the automaton:\n{draining}"
         );
+        // A composition that ENDS with only half a letter in it is not
+        // finished text either, and the drain used to type it at the pty like
+        // any syllable — five of them walked into a shell in one evening
+        // (window-errors.log 2026-09-22, t-5835). It waits for the key that
+        // caused it instead, and there is exactly one holder and one release.
+        assert!(
+            draining.contains("holdHalfLetter(joined);"),
+            "the drain types half a letter straight at the pty again:\n{draining}"
+        );
+        let escort = block_after(window, "function escortHalfLetter() {");
+        assert!(
+            escort.contains("routeText(text)") && escort.contains("reportStrayJamo("),
+            "the held half letter leaves by a door the husk is not watching:\n{escort}"
+        );
+        // Released on every road the person's next act can arrive on, so
+        // nothing they type can overtake the half letter they typed first.
+        for road in [
+            r#"keySink.addEventListener("keydown", (event) => {"#,
+            r#"keySink.addEventListener("compositionstart", () => {"#,
+            r#"keySink.addEventListener("input", () => {"#,
+        ] {
+            let body = block_after(window, road);
+            assert!(
+                body.contains("escortHalfLetter()"),
+                "a half letter can be overtaken on `{road}`:\n{body}"
+            );
+        }
     }
 
     /// Typing in a diff is saved by the save that already exists.
@@ -30630,6 +30723,93 @@ mod tests {
             mounting.find("seatLedgerManagedTerm(term, worktree, agent);")
                 < mounting.find("await refreshWorktrees();"),
             "the worker is painted before its term has a worktree owner:\n{mounting}"
+        );
+    }
+
+    /// The placement seat's label reads the person's moves through one door
+    /// (t-5806): the roads a person takes to move a pane report it, the
+    /// roads the window takes to move one for its own reasons do not, and
+    /// the window remembers a placed worker only while its answer waits.
+    #[test]
+    fn a_placed_workers_move_is_reported_by_the_person_roads_and_no_other() {
+        let window = window_source();
+        let backend = shipped_backend();
+        // The book entry is made where the answer arrives, keyed by the term.
+        let asking = block_after(window, "async function roomForWorker(");
+        assert!(
+            asking.contains("judged?.placed")
+                && asking.contains("placedWorkers.set(term, { worker: seat.worker })"),
+            "the surface no longer remembers which placed worker a term is:\n{asking}"
+        );
+        // One door, and it forgets the worker on the first report.
+        let door = block_after(window, "function noteWorkerRoomChange(term, room) {");
+        assert!(
+            door.contains("placedWorkers.delete(term);")
+                && door.contains(
+                    "invoke(\"note_worker_room_change\", { worker: placed.worker, room })"
+                ),
+            "the move door reports twice, or names the wrong worker:\n{door}"
+        );
+        // The person's roads: a tab dragged (both drops), a tiled pane
+        // closed, a parked worker revealed.
+        let dragged = block_after(window, "function endTabDrag() {");
+        assert_eq!(
+            dragged
+                .matches("noteWorkerRoomChange(draggedTerm, \"tab\")")
+                .count(),
+            2,
+            "a drop no longer reports the placed worker's move:\n{dragged}"
+        );
+        let closed = block_after(window, "function closePaneLeaf(tab, going) {");
+        assert!(
+            closed.contains("noteWorkerRoomChange(going, \"background\")"),
+            "closing a tiled worker no longer reports the move:\n{closed}"
+        );
+        let revealed = block_after(window, "async function focusAgentPane(");
+        assert!(
+            revealed.contains("noteWorkerRoomChange(term, \"tab\")"),
+            "revealing a parked worker no longer reports the move:\n{revealed}"
+        );
+        // The window's own moves are not the person's.
+        for road in [
+            "function reseatWorkerByAnswer(",
+            "function revealListedWorker(",
+            "function parkTeamWorkers(",
+            "function reseatTerm(term, extra) {",
+        ] {
+            assert!(
+                !block_after(window, road).contains("noteWorkerRoomChange("),
+                "a road the window takes on its own reports a person's move: {road}"
+            );
+        }
+        // And a pane that ended is forgotten, so its worker id cannot be
+        // reported for a pane that no longer exists.
+        assert_eq!(
+            window.matches("placedWorkers.delete(term);").count(),
+            2,
+            "the placed book is emptied on the report and on the pane's end, nowhere else"
+        );
+        // The door itself, and the beat that grades the quiet case.
+        let room = block_after(backend, "pub(crate) async fn note_worker_room_change(");
+        assert!(
+            room.contains("room_changed(")
+                && room.contains("&Wire::of_this_machine(),")
+                && room.contains("rooms(),")
+                && room.contains("crate::now_epoch_ms(),"),
+            "the move door no longer grades through the one book:\n{room}"
+        );
+        let graded = block_after(backend, "pub(crate) fn room_changed(");
+        assert!(
+            graded.contains("PLACEMENT_OPTIONS.contains(&room)")
+                && graded.contains("PLACEMENT_LABEL_WINDOW_MS")
+                && graded.contains("crate::systemone::record_rows(&PLACEMENT,"),
+            "a move is graded outside the table's rooms, the seat's window or the seat's ledger road:\n{graded}"
+        );
+        let mark = block_after(backend, "fn label_row(worker: &str, placed: &Placed,");
+        assert!(
+            mark.contains("label[AGREED.canonical] = json!(followed == placed.chosen);")
+                && mark.contains("LABEL.canonical: worker,"),
+            "the placement label spells its mark or its name itself:\n{mark}"
         );
     }
 

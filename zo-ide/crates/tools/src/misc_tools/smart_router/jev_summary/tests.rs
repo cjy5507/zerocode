@@ -5,6 +5,18 @@ use serde_json::json;
 
 use super::*;
 
+/// One seat counted the card's way — its numbers and days, no recent list.
+fn one(
+    seat: &'static JevUse,
+    roots: &[PathBuf],
+    sessions: Option<&Path>,
+    settings: Option<&Value>,
+    now_ms: i64,
+    offset_s: i64,
+) -> SeatReport {
+    super::one_with(seat, roots, sessions, settings, now_ms, offset_s, 0)
+}
+
 fn write(dir: &std::path::Path, name: &str, rows: &[Value]) {
     fs::create_dir_all(dir).expect("dir");
     let mut text = String::new();
@@ -56,7 +68,7 @@ fn every_seat_in_the_table_gets_a_row_whether_or_not_it_has_a_ledger() {
     );
     let seats: Vec<SeatReport> = zerocode_core::jev::JEV_USES
         .iter()
-        .map(|seat| super::one(seat, &roots, None, None, 1_000, 0))
+        .map(|seat| one(seat, &roots, None, None, 1_000, 0))
         .collect();
     assert_eq!(seats.len(), zerocode_core::jev::JEV_USES.len());
     let routing = seats.iter().find(|seat| seat.id == "routing").expect("routing");
@@ -88,7 +100,7 @@ fn a_screen_seats_rows_are_counted_across_its_session_folders() {
         &[json!({"at": 5, "outcome": "no_look"}), json!({"at": 6, "outcome": "answered", "elapsedMs": 60, "requests": 1})],
     );
     write(&sessions.join("20260918-000000-1"), "unrelated.txt", &[json!({"at": 1})]);
-    let report = super::one(seat, &roots, Some(&sessions), None, 1_000, 0);
+    let report = one(seat, &roots, Some(&sessions), None, 1_000, 0);
     assert_eq!(report.week.rows, 3, "every session folder's rows");
     assert_eq!(report.week.answered, 2);
     assert_eq!(report.week.p95_ms, Some(60));
@@ -98,7 +110,7 @@ fn a_screen_seats_rows_are_counted_across_its_session_folders() {
         "named by the oldest session that has the file"
     );
     assert_eq!(
-        super::one(seat, &roots, None, None, 1_000, 0).found,
+        one(seat, &roots, None, None, 1_000, 0).found,
         None,
         "without a sessions folder the seat is as unread as before"
     );
@@ -120,7 +132,7 @@ fn a_screen_seat_is_counted_once_when_its_root_ledger_holds_what_a_session_copie
     write(&roots[0], seat.ledger, &walk);
     write(&sessions.join("20260921-000000-1"), seat.ledger, &walk);
 
-    let report = super::one(seat, &roots, Some(&sessions), None, 1_000, 0);
+    let report = one(seat, &roots, Some(&sessions), None, 1_000, 0);
 
     assert_eq!(report.week.rows, walk.len(), "one ledger, counted once");
     assert_eq!(report.found.as_deref(), Some(roots[0].join(seat.ledger).as_path()));
@@ -153,7 +165,7 @@ fn a_screen_seats_root_ledger_carries_it_to_a_rise_the_card_can_draw() {
         zerocode_core::jev::SMART_SETTINGS_KEY: { seat.setting: JevMode::Auto.key() }
     });
 
-    let report = super::one(seat, &roots, None, Some(&settings), 1_000, 0);
+    let report = one(seat, &roots, None, Some(&settings), 1_000, 0);
 
     let judged = report.judged.as_ref().expect("a rising seat is judged");
     assert_eq!(judged.window_wanted, wanted, "35 walks, not routing's 73");
@@ -178,7 +190,7 @@ fn a_seat_that_never_rises_is_never_asked_to_clear_a_line() {
     #[allow(clippy::explicit_iter_loop)]
     for seat in zerocode_core::jev::JEV_USES.iter() {
         write(home.path(), seat.ledger, &answered);
-        let row = super::one(seat, &roots, None, None, 1_000, 0);
+        let row = one(seat, &roots, None, None, 1_000, 0);
         assert_eq!(
             row.clears_rise_floor.is_some(),
             seat.promotes,
@@ -219,7 +231,7 @@ fn a_seat_starts_recording_and_a_rise_row_in_its_own_ledger_makes_it_act() {
     let auto = json!({ "smart": { seat.setting: "auto" } });
 
     write(home.path(), seat.ledger, &[json!({"at": 1, "outcome": "answered", "elapsedMs": 5})]);
-    let quiet = super::one(seat, &roots, None, Some(&auto), 1_000, 0);
+    let quiet = one(seat, &roots, None, Some(&auto), 1_000, 0);
     assert_eq!(quiet.stand, Stand::Recording);
     assert!(!quiet.applies, "auto starts recording");
 
@@ -228,7 +240,7 @@ fn a_seat_starts_recording_and_a_rise_row_in_its_own_ledger_makes_it_act() {
         seat.ledger,
         &[json!({"at": 1, "outcome": "answered", "elapsedMs": 5}), json!({"at": 2, (TRANSITION.canonical): ROSE})],
     );
-    let raised = super::one(seat, &roots, None, Some(&auto), 1_000, 0);
+    let raised = one(seat, &roots, None, Some(&auto), 1_000, 0);
     assert_eq!(raised.stand, Stand::Applying);
     assert!(raised.applies, "a rise its own ledger recorded makes auto act");
 }
@@ -240,16 +252,16 @@ fn a_thin_window_holds_and_says_which_line_it_is_short_of() {
     let roots = [home.path().to_path_buf()];
     let seat = &zerocode_core::jev::ROUTING;
     write(home.path(), seat.ledger, &[json!({"at": 1, "outcome": "answered", "elapsedMs": 5})]);
-    let row = super::one(seat, &roots, None, None, 1_000, 0);
+    let row = one(seat, &roots, None, None, 1_000, 0);
     assert!(matches!(row.verdict(), Some(Verdict::Hold(Line::TooFewRows { rows: 1, .. }))));
 
-    // And a seat with no rise line is never judged at all. Recall, not an
-    // orchestration seat: those rise now (2026-09-20), on the table's lines.
-    let quiet = super::one(&zerocode_core::jev::RECALL, &roots, None, None, 1_000, 0);
-    assert_eq!(quiet.verdict(), None);
+    // Recall rises too now (t-5806), on its own labels: an empty ledger is a
+    // window short of every row, not a seat nobody judges.
+    let quiet = one(&zerocode_core::jev::RECALL, &roots, None, None, 1_000, 0);
+    assert!(matches!(quiet.verdict(), Some(Verdict::Hold(Line::TooFewRows { rows: 0, .. }))), "{:?}", quiet.verdict());
     // An orchestration seat is judged by the table on its own rows: thin here.
     write(home.path(), zerocode_core::jev::SUMMON.ledger, &[json!({"at": 1, "outcome": "answered", "elapsedMs": 5, "agreed": true})]);
-    let summon = super::one(&zerocode_core::jev::SUMMON, &roots, None, None, 1_000, 0);
+    let summon = one(&zerocode_core::jev::SUMMON, &roots, None, None, 1_000, 0);
     assert!(matches!(summon.verdict(), Some(Verdict::Hold(Line::TooFewRows { rows: 1, .. }))), "{:?}", summon.verdict());
     assert_eq!(summon.judged.as_ref().map(|judged| judged.agreement.compared), Some(1));
 }
@@ -300,7 +312,7 @@ fn the_screen_and_the_judge_read_one_window() {
         .map(|at| compared(at, ["large", "low", "analysis"], Some(["large", "low", "analysis"])))
         .collect();
     write(home.path(), seat.ledger, &rows);
-    let report = super::one(seat, &roots, None, None, i64::MAX / 2, 0);
+    let report = one(seat, &roots, None, None, i64::MAX / 2, 0);
     let judged = report.judged.as_ref().expect("the routing seat is judged");
     assert_eq!(Some(judged.clone()), super::super::decision_shadow::judge_rows(&rows, None));
     assert_eq!(judged.window.rows, 30, "the window is the last rows the floor can be cleared on");
@@ -606,7 +618,7 @@ fn a_control_row_is_compared_beside_its_windows_row_and_counted_nowhere_else() {
     );
 
     // A clock just past the rows, so the day and the week both hold them.
-    let report = super::one(seat, &roots, None, None, 1_000, 0);
+    let report = one(seat, &roots, None, None, 1_000, 0);
     assert_eq!(report.judged, Some(judged));
     assert_eq!(report.asked_ever, 25, "the cadence counted a control row");
     assert_eq!(report.rows_to_next_judgment(), Some(JUDGED_EVERY_ROWS - 25 % JUDGED_EVERY_ROWS));
@@ -627,4 +639,304 @@ fn an_orchestration_seat_has_no_control_rows_to_borrow() {
         .collect();
     let judged = zerocode_core::jev::promote::judge_seat(&zerocode_core::jev::SUMMON, &rows).expect("judged");
     assert_eq!((judged.agreement.compared, judged.control_rows), (3, 0));
+}
+
+/// The trend's buckets: today and the six days before it in the person's
+/// zone, oldest first, each counted by the week's counter over its own rows
+/// — a row at 23:59:59.999 belongs to its day and the next millisecond to
+/// the next (docs/design/jev-dashboard-and-perfection-20260921.md §2 (c)).
+#[test]
+fn a_seats_days_are_seven_local_days_counted_by_the_weeks_own_counter() {
+    let offset = 9 * 3_600;
+    let now_ms = 1_789_700_000_000;
+    let today = start_of_day_ms(now_ms, offset);
+    let rows = [
+        json!({"at": today - 1, "outcome": "answered", "elapsedMs": 300, "agreed": true}),
+        json!({"at": today, "outcome": "answered", "elapsedMs": 100}),
+        json!({"at": today + 5, "outcome": "not_consented"}),
+        json!({"at": today - 6 * MS_PER_DAY + 10, "outcome": "answered", "elapsedMs": 50, "agreed": false}),
+        json!({"at": today - 7 * MS_PER_DAY, "outcome": "answered", "elapsedMs": 999}),
+        json!({"at": today + 3, "label": "k", "agreed": false}),
+    ];
+    let days = days_of(&rows, now_ms, offset);
+    assert_eq!(days.len(), usize::try_from(WINDOW_DAYS).expect("days"));
+    assert_eq!(days.last().expect("today").start_ms, today);
+    assert_eq!(days[0].start_ms, today - 6 * MS_PER_DAY, "oldest first");
+    let last = days.last().expect("today");
+    assert_eq!((last.tally.rows, last.tally.answered, last.tally.refused), (2, 1, 1));
+    assert_eq!(last.tally.p50_ms, Some(100));
+    assert_eq!((last.agreement.compared, last.agreement.agreed), (1, 0), "a label row counts on its own day");
+    let yesterday = &days[5];
+    assert_eq!(yesterday.tally.rows, 1, "the millisecond before midnight is yesterday's");
+    assert_eq!((yesterday.agreement.compared, yesterday.agreement.agreed), (1, 1));
+    assert_eq!((days[0].tally.rows, days[0].agreement.compared), (1, 1));
+    assert!(days.iter().all(|day| day.tally.p50_ms != Some(999)), "a row past the week is in no day");
+}
+
+/// The recent list rides the same rows the numbers were counted from, only
+/// when asked, newest first, with the label a later row left.
+#[test]
+fn the_recent_list_is_read_from_the_same_rows_and_only_when_asked() {
+    let home = tempfile::tempdir().expect("tmp");
+    let roots = [home.path().to_path_buf()];
+    let seat = &zerocode_core::jev::STALL;
+    let key = "dp-1@5";
+    write(
+        home.path(),
+        seat.ledger,
+        &[
+            json!({"at": 5, "stall": key, "dispatch": "dp-1", "worker": "w-2", "outcome": "answered", "elapsedMs": 40,
+                   "requests": 1, "chosen": "waiting_on_person", "confidence": 0.7}),
+            json!({"at": 6, "stall": "dp-3@6", "outcome": "not_consented", "requests": 0}),
+            json!({"at": 9, "label": key, "dispatch": "dp-1", "worker": "w-2", "followed": "worker_done", "agreed": false}),
+        ],
+    );
+    let quiet = one(seat, &roots, None, None, 1_000, 0);
+    assert!(quiet.recent.is_empty(), "the card's ask lists nothing");
+    assert_eq!(quiet.week.rows, 2);
+
+    let asked = report_with_recent(&roots, None, None, 1_000, 0, 5);
+    let stall = asked.iter().find(|row| row.id == seat.id).expect("stall");
+    assert_eq!(stall.week.rows, 2, "the same count");
+    assert_eq!(stall.recent.len(), 2);
+    assert_eq!(stall.recent[0].at, 6, "newest first");
+    assert_eq!(stall.recent[0].outcome, "not_consented");
+    let labelled = &stall.recent[1];
+    assert_eq!(labelled.answered, json!("waiting_on_person"));
+    assert_eq!(labelled.followed.as_deref(), Some("worker_done"));
+    assert_eq!(labelled.agreed, Some(false));
+    assert_eq!(labelled.asked.get("worker"), Some(&json!("w-2")));
+    let one_row = report_with_recent(&roots, None, None, 1_000, 0, 1);
+    assert_eq!(one_row.iter().find(|row| row.id == seat.id).expect("stall").recent.len(), 1);
+    for other in asked.iter().filter(|row| row.id != seat.id) {
+        assert!(other.recent.is_empty(), "{} has no rows to list", other.id);
+        assert_eq!(other.days.len(), usize::try_from(WINDOW_DAYS).expect("days"), "{} still carries its days", other.id);
+    }
+}
+
+/// One reader of a seat's rows: the numbers, the days and the recent list
+/// are read from the file `rows_of` names, and a screen seat's session
+/// copies are read only when the root has no file.
+#[test]
+fn rows_of_names_the_root_first_and_the_session_copies_only_without_it() {
+    let home = tempfile::tempdir().expect("tmp");
+    let roots = [home.path().join("jev")];
+    let sessions = home.path().join("sessions");
+    let seat = &zerocode_core::jev::BROWSER;
+    write(&sessions.join("20260921-000000-1"), seat.ledger, &[json!({"at": 1, "outcome": "answered"})]);
+    let (found, rows) = rows_of(seat, &roots, Some(&sessions));
+    assert_eq!(found.as_deref(), Some(sessions.join("20260921-000000-1").join(seat.ledger).as_path()));
+    assert_eq!(rows.len(), 1);
+    write(&roots[0], seat.ledger, &[json!({"at": 2, "outcome": "answered"}), json!({"at": 3, "outcome": "answered"})]);
+    let (found, rows) = rows_of(seat, &roots, Some(&sessions));
+    assert_eq!(found.as_deref(), Some(roots[0].join(seat.ledger).as_path()));
+    assert_eq!(rows.len(), 2, "the root's rows, not the root's and the copies'");
+    assert_eq!(rows_of(seat, &roots[..0], None), (None, Vec::new()));
+}
+
+/// A routing row of a turn that declared its attempt, as the active road
+/// writes one.
+fn attempted(at: i64, attempt: &str) -> Value {
+    let mut row = active(at, &format!("task-{at}"), ["large", "low", "analysis"]);
+    row["attempt"] = json!(attempt);
+    row
+}
+
+/// The turn label the host writes when the turn ends (t-5806): the route
+/// stood, or a door moved the wire off it first. Written once, only for a
+/// turn the seat was asked about, and read by the judge beside the probe's
+/// axes.
+#[test]
+fn a_turn_the_seat_routed_is_labeled_once_with_what_became_of_its_route() {
+    use super::super::decision_shadow::{decision_shadow_path, note_route_followed, RouteLabelRow, ROUTE_STOOD};
+    let state = tempfile::tempdir().expect("a state home");
+    let work = tempfile::tempdir().expect("a workspace");
+    let _env = crate::tests::EnvGuard::set(core_types::paths::ZO_STATE_DIR_ENV, &state.path().to_string_lossy());
+    let ledger = decision_shadow_path(work.path());
+    let dir = ledger.parent().expect("a ledger dir").to_path_buf();
+    let name = ledger.file_name().and_then(|name| name.to_str()).expect("a ledger name");
+    write(&dir, name, &[attempted(1, "s@1"), attempted(2, "s@1"), attempted(3, "s@2")]);
+
+    // A turn nobody routed leaves no label; an empty attempt asks nothing.
+    assert!(!note_route_followed(work.path(), "s@9", None), "a turn the seat never judged was labeled");
+    assert!(!note_route_followed(work.path(), "  ", None));
+    assert!(read_rows(&ledger).len() == 3);
+
+    // The route stood: the label agrees. Written once.
+    assert!(note_route_followed(work.path(), "s@1", None));
+    assert!(!note_route_followed(work.path(), "s@1", Some(runtime::SwitchTrigger::Quota)), "a second label for one turn");
+    // Another turn's quota wall unseated its route: the label disagrees and
+    // names the door.
+    assert!(note_route_followed(work.path(), "s@2", Some(runtime::SwitchTrigger::Quota)));
+
+    let labels: Vec<RouteLabelRow> = super::super::shadow_ledger::read_shadow_rows(&ledger);
+    assert_eq!(labels.len(), 2, "{labels:?}");
+    assert_eq!((labels[0].label.as_str(), labels[0].attempt.as_str()), ("s@1", "s@1"));
+    assert_eq!((labels[0].followed.as_str(), labels[0].agreed), (ROUTE_STOOD, true));
+    assert_eq!((labels[1].attempt.as_str(), labels[1].followed.as_str(), labels[1].agreed), ("s@2", "quota", false));
+    // A label is not a request: the counter leaves it out of every window.
+    let rows = read_rows(&ledger);
+    assert_eq!(rows.iter().filter(|row| asked_something(row).is_some()).count(), 3);
+    for key in zerocode_core::jev::summary::LEDGER_KEYS {
+        let row = rows.last().expect("the label");
+        if let Some(read) = key.read(row) {
+            assert_eq!(Some(read), row.get(key.canonical), "`{}` read from a spelling the label does not write", key.canonical);
+        }
+    }
+}
+
+/// Which doors unseat a route: a wall, a refusal, a shed tier, the person —
+/// not a leg borrowing a client, not the step governor's rung.
+#[test]
+fn a_route_is_unseated_by_the_forced_doors_and_the_person_and_nothing_else() {
+    use runtime::SwitchTrigger;
+    let unseating: Vec<SwitchTrigger> = SwitchTrigger::ALL
+        .into_iter()
+        .filter(|trigger| super::super::decision_shadow::route_unseated_by(*trigger))
+        .collect();
+    assert_eq!(
+        unseating,
+        [SwitchTrigger::Person, SwitchTrigger::Quota, SwitchTrigger::Refusal, SwitchTrigger::Starvation]
+    );
+}
+
+/// The judge reads a turn label beside the probe's axes: one comparison per
+/// label of an attempt the window holds, and none for a turn whose rows have
+/// left the window. The screen reads the same number.
+#[test]
+fn a_turn_label_is_one_comparison_in_the_window_of_the_turn_it_grades() {
+    use zerocode_core::jev::promote::Agreement;
+    let home = tempfile::tempdir().expect("tmp");
+    let roots = [home.path().to_path_buf()];
+    let seat = &zerocode_core::jev::ROUTING;
+    let mut rows: Vec<Value> = (0..25).map(|at| attempted(at, &format!("s@{}", at / 5))).collect();
+    let label = |at: i64, attempt: &str, agreed: bool| {
+        json!({"at": at, "label": attempt, "attempt": attempt, "followed": if agreed { "stood" } else { "quota" }, "agreed": agreed})
+    };
+    rows.push(label(100, "s@0", true));
+    rows.push(label(101, "s@4", false));
+    rows.push(label(102, "s@77", true));
+    write(home.path(), seat.ledger, &rows);
+
+    let judged = super::super::decision_shadow::judge_rows(&rows, None).expect("routing is judged");
+    assert_eq!(judged.window.rows, 25, "a label was counted as a request");
+    assert_eq!(judged.agreement, Agreement { compared: 2, agreed: 1 }, "two labels of held turns, one of a turn gone");
+    assert_eq!(judged.control_rows, 0, "a label was counted as a control row");
+    let report = one(seat, &roots, None, None, 1_000, 0);
+    assert_eq!(report.judged, Some(judged));
+    assert_eq!(report.asked_ever, 25);
+    // The week counts every mark, held turn or not: three labels, two agreed.
+    assert_eq!(report.agreement_week, Agreement { compared: 3, agreed: 2 });
+}
+
+/// A seat's week of marks is counted beside its judged window (t-5806): the
+/// recall seat's labels are its agreement in both, and the week keeps the
+/// marks the window has let go of.
+#[test]
+fn a_seats_week_of_marks_is_counted_beside_its_judged_window() {
+    use zerocode_core::jev::promote::{Agreement, Line, Verdict};
+    let home = tempfile::tempdir().expect("tmp");
+    let roots = [home.path().to_path_buf()];
+    let seat = &zerocode_core::jev::RECALL;
+    write(
+        home.path(),
+        seat.ledger,
+        &[
+            json!({"at": 1, "outcome": "answered", "elapsed_ms": 5, "applied": false}),
+            json!({"at": 2, "label": "1:2", "query": 1, "notes": 2, "applied": false, "agreed": true, "rank": 0}),
+            json!({"at": 3, "label": "3:4", "query": 3, "notes": 4, "applied": true, "agreed": false}),
+            // Older than the week: not this week's mark.
+            json!({"at": -1_000_000_000_000_i64, "label": "5:6", "query": 5, "notes": 6, "applied": true, "agreed": false}),
+        ],
+    );
+    let report = one(seat, &roots, None, None, 1_000, 0);
+    assert!(matches!(report.verdict(), Some(Verdict::Hold(Line::TooFewRows { rows: 1, .. }))), "{:?}", report.verdict());
+    assert_eq!(report.judged.as_ref().map(|judged| judged.agreement), Some(Agreement { compared: 2, agreed: 1 }));
+    assert_eq!(report.agreement_week, Agreement { compared: 2, agreed: 1 });
+    assert_eq!((report.week.rows, report.asked_ever), (1, 1), "a label was counted as a request");
+}
+
+/// What the labels and the judge cost on real ledgers (t-5806) — run
+/// deliberately, with `--ignored --nocapture` and `ZO_JEV_LEDGER_SOURCE`
+/// naming a project's `state/smart-router` folder: it copies that folder's
+/// routing (measured: 22 KB, 36 rows) and recall (1.4 MB, 1,005 rows)
+/// ledgers into a scratch state directory and times the tail read a route
+/// label pays, the whole-file read the judge pays, and the label append, each
+/// a hundred times. Numbers, not a claim: the report reads them. The folder
+/// comes from the environment because a checked-in path would name a person's
+/// machine.
+#[test]
+#[ignore = "replays this machine's real ledgers; run deliberately"]
+fn measure_what_a_label_and_a_judge_cost_on_this_machines_ledgers() {
+    use std::time::Instant;
+    use super::super::decision_shadow::{decision_shadow_path, note_route_followed};
+    let Some(source) = std::env::var_os("ZO_JEV_LEDGER_SOURCE").map(std::path::PathBuf::from) else {
+        eprintln!("ZO_JEV_LEDGER_SOURCE names no smart-router folder; nothing measured");
+        return;
+    };
+    let source = source.as_path();
+    if !source.join(zerocode_core::jev::ROUTING.ledger).is_file() {
+        eprintln!("no real ledgers under {}; nothing measured", source.display());
+        return;
+    }
+    let state = tempfile::tempdir().expect("a state home");
+    let work = tempfile::tempdir().expect("a workspace");
+    let _env = crate::tests::EnvGuard::set(core_types::paths::ZO_STATE_DIR_ENV, &state.path().to_string_lossy());
+    let routing = decision_shadow_path(work.path());
+    let recall = super::super::rerank_shadow::rerank_shadow_path(work.path());
+    fs::create_dir_all(routing.parent().expect("a dir")).expect("dir");
+    fs::copy(source.join(zerocode_core::jev::ROUTING.ledger), &routing).expect("copy routing");
+    fs::copy(source.join(zerocode_core::jev::RECALL.ledger), &recall).expect("copy recall");
+    let rows = read_rows(&routing);
+    let attempt = rows
+        .iter()
+        .rev()
+        .find_map(|row| row.get("attempt").and_then(Value::as_str))
+        .expect("a routing row with an attempt")
+        .to_string();
+    let runs = 100;
+    let timed = |name: &str, mut body: Box<dyn FnMut()>| {
+        let started = Instant::now();
+        for _ in 0..runs {
+            body();
+        }
+        let each = started.elapsed() / runs;
+        eprintln!("{name}: {} µs each over {runs} runs", each.as_micros());
+    };
+    let bytes = |path: &std::path::Path| fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    eprintln!("routing ledger {} B / {} rows; recall ledger {} B / {} rows", bytes(&routing), rows.len(), bytes(&recall), read_rows(&recall).len());
+    // The route label: a tail read of the ledger and, the first time, one
+    // append; every later call finds the label standing and appends nothing.
+    let cwd = work.path().to_path_buf();
+    let key = attempt.clone();
+    timed(
+        "note_route_followed (tail read, label standing after the first)",
+        Box::new(move || {
+            let _ = note_route_followed(&cwd, &key, None);
+        }),
+    );
+    let held = rows.clone();
+    timed("decision_shadow::judge_rows (routing, in memory)", Box::new(move || {
+        let _ = super::super::decision_shadow::judge_rows(&held, None);
+    }));
+    let ledger = routing.clone();
+    timed("read_rows (routing, whole file)", Box::new(move || {
+        let _ = read_rows(&ledger);
+    }));
+    let ledger = recall.clone();
+    timed("read_rows (recall, whole file)", Box::new(move || {
+        let _ = read_rows(&ledger);
+    }));
+    let ledger = recall.clone();
+    timed("rerank_shadow::judge_ledger (recall, whole file read + judge when due)", Box::new(move || {
+        let _ = super::super::rerank_shadow::judge_ledger(&ledger, 1_800_000_000_000);
+    }));
+    let ledger = recall.clone();
+    timed("append_shadow_row (one recall label)", Box::new(move || {
+        let _ = super::super::shadow_ledger::append_shadow_row(
+            &ledger,
+            &json!({"at": 1, "label": "1:2", "query": 1, "notes": 2, "applied": true, "agreed": true, "rank": 0}),
+            super::super::shadow_ledger::SHADOW_LEDGER_MAX_BYTES,
+        );
+    }));
 }

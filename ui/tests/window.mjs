@@ -39,6 +39,7 @@ import { testAgentConversation } from "./agent-conversation.mjs";
 import { testBrowserRecovery } from "./browser-recovery.mjs";
 import { testBrowserPanesSurvive } from "./browser-panes-survive.mjs";
 import { testCoordinatorPanel } from "./coordinator-panel.mjs";
+import { testJevDashboard, testJevDashboardEvidence } from "./jev-dashboard.mjs";
 
 import { testCrashReport } from "./crash-report.mjs";
 import { testTerminalSelection } from "./terminal-selection.mjs";
@@ -61,6 +62,7 @@ import { testEditorSelection } from "./editor-selection.mjs";
 import { testEditorRecovery } from "./editor-recovery.mjs";
 import { testComposerAttach } from "./attach.mjs";
 import { testComposerMenuPosition } from "./composer-menu-position.mjs";
+import { testImeBrokenCommit } from "./ime-broken-commit.mjs";
 import { testWorkers } from "./workers.mjs";
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
@@ -184,12 +186,17 @@ suite("agent-conversation", ({ browser, origin, ok }) => testAgentConversation(b
 suite("browser-recovery", ({ browser, origin, ok }) => testBrowserRecovery(browser, origin, ok));
 suite("browser-panes-survive", ({ browser, origin, ok }) => testBrowserPanesSurvive(browser, origin, ok));
 suite("coordinator-panel", ({ browser, origin, ok }) => testCoordinatorPanel(browser, origin, ok));
+suite("jev-dashboard", async ({ browser, origin, ok }) => {
+  await testJevDashboard(browser, origin, ok);
+  await testJevDashboardEvidence(browser, origin, ok);
+});
 suite("native-folder-picker", ({ browser, origin, ok }) => testNativeFolderPicker(browser, origin, ok));
 suite("sftp", ({ browser, origin, ok }) => testSftpAndTeam(browser, origin, ok));
 suite("pane-follow", ({ browser, origin, ok }) => testPaneFollowsCwd(browser, origin, ok));
 suite("permission-card", ({ browser, origin, ok }) => testPermissionCard(browser, origin, ok));
 suite("editor-selection", ({ browser, origin, ok }) => testEditorSelection(browser, origin, ok));
 suite("editor-recovery", ({ browser, origin, ok }) => testEditorRecovery(browser, origin, ok));
+suite("ime-broken-commit", ({ browser, origin, ok }) => testImeBrokenCommit(browser, origin, ok));
 suite("vault", async ({ browser, origin }) => {
   const { page } = await openWindowTestPage(browser, origin, {
     before: (surface) => surface.addInitScript(() => { window.__GEMINI_VENDOR_FIXTURE__ = true; }),

@@ -4231,6 +4231,10 @@ function renderTabs() {
   const door = el("nav-agents");
   const pressed = String(activeTabId === "board");
   if (door.getAttribute("aria-pressed") !== pressed) door.setAttribute("aria-pressed", pressed);
+  // The Jev door beside it wears the same fact about its own tab.
+  const jevDoor = el("nav-jev");
+  const jevPressed = String(activeTabId === JEV_TAB.id);
+  if (jevDoor.getAttribute("aria-pressed") !== jevPressed) jevDoor.setAttribute("aria-pressed", jevPressed);
   // The machine figures ride along, bounded — a render is a fine moment to
   // notice they are stale, and a terrible one to spawn `lsof`.
   paintMachineFigures();
@@ -4731,6 +4735,10 @@ function endTabDrag() {
   const tab = tabs.find((held) => held.id === id);
   if (!tab) return;
   const source = tab.pane;
+  // A worker's own tab, dragged by the person: the placement seat's label
+  // reads the move (t-5806). A tab holding a split is the coordinator's.
+  const draggedTerm =
+    tab.kind === "term" && paneLeaves(tab.layout).length === 1 ? paneLeaves(tab.layout)[0] : null;
   // Dropped in another group's middle: the tab joins that group — Orca's
   // `moveUnifiedTabToGroup` — and the group it left folds if it emptied.
   if (target.zone === "center") {
@@ -4741,6 +4749,7 @@ function endTabDrag() {
     renderTabs();
     updateStage();
     persistStageLayouts();
+    if (draggedTerm !== null) noteWorkerRoomChange(draggedTerm, "tab");
     return;
   }
   // Dropped on an edge: the leaf under the pointer becomes a split, the tab
@@ -4764,6 +4773,7 @@ function endTabDrag() {
   renderTabs();
   updateStage();
   persistStageLayouts();
+  if (draggedTerm !== null) noteWorkerRoomChange(draggedTerm, "tab");
 }
 
 window.addEventListener("pointermove", tabDragOver);
@@ -4914,6 +4924,7 @@ function setActiveTab(id) {
   helperClock.sync();
   browserMenuPoll.sync();
   resourcePoll.sync();
+  jevPoll.sync();
 }
 
 /* A tree back from the file may hold leaves whose tabs did not come back
