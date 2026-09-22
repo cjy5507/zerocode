@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use api::{
@@ -53,6 +53,7 @@ use serde::{Deserialize, Serialize};
 use super::jev_gate::{self, JevDoor};
 use super::probe_exec::{remember_bounded, task_fingerprint, PROBE_TIMEOUT};
 use super::settings::rerank_shadow_mode_from;
+use super::turn_reads::read_path;
 use super::shadow_ledger::{
     append_shadow_row, judge_seat_ledger, shadow_ledger_path, SHADOW_LEDGER_MAX_BYTES,
 };
@@ -338,8 +339,8 @@ impl RerankShadow {
 }
 
 impl RecallSeat for RerankShadow {
-    fn settle(&self, query: &str, hits: Vec<MemoryHit>) -> Vec<MemoryHit> {
-        settle(&self.cwd, query, hits)
+    fn settle(&self, attempt: &str, query: &str, hits: Vec<MemoryHit>) -> Vec<MemoryHit> {
+        settle(&self.cwd, attempt, query, hits)
     }
 }
 
@@ -351,6 +352,7 @@ struct Shot {
     query: String,
     hits: Vec<MemoryHit>,
     deadline: Duration,
+    label: ReadingSlot,
 }
 
 /// Where a waiting caller's row comes back. A rendezvous channel with no
@@ -365,7 +367,8 @@ type RowSender = SyncSender<RerankShadowRow>;
 /// The setting is read here, on the thread recall already runs on, because the
 /// answer decides whether anything is cloned or spawned at all — an `off`
 /// recall now copies no hits and starts no task.
-pub(super) fn settle(cwd: &Path, query: &str, hits: Vec<MemoryHit>) -> Vec<MemoryHit> {
+pub(super) fn settle(cwd: &Path, attempt: &str, query: &str, hits: Vec<MemoryHit>) -> Vec<MemoryHit> {
+    let label = reading_slot(cwd, attempt);
     let Some(mode) = asking_mode(cwd, query, &hits) else {
         return hits;
     };
@@ -376,10 +379,10 @@ pub(super) fn settle(cwd: &Path, query: &str, hits: Vec<MemoryHit>) -> Vec<Memor
     // under `auto`: a person's `on` needs no ledger, and `shadow` reads none.
     let raised = mode == zerocode_core::jev::JevMode::Auto && runtime::jev_seat_applies(cwd, &RECALL);
     if !mode.applies_with(raised) {
-        fire(cwd, query, &hits, RERANK_SHADOW_DEADLINE, None);
+        fire(cwd, query, &hits, RERANK_SHADOW_DEADLINE, None, label);
         return hits;
     }
-    apply(cwd, query, hits)
+    apply(cwd, query, hits, &label)
 }
 
 /// Judge the seat on what it has just written — a reading or a label — and
@@ -436,6 +439,7 @@ fn fire(
     hits: &[MemoryHit],
     deadline: Duration,
     answer: Option<RowSender>,
+    label: ReadingSlot,
 ) -> tokio::task::JoinHandle<()> {
     let shot = Shot {
         cwd: cwd.to_path_buf(),
@@ -444,6 +448,7 @@ fn fire(
         query: query.to_string(),
         hits: hits.to_vec(),
         deadline,
+        label,
     };
     shared_agent_runtime().spawn(run(shot, answer))
 }
@@ -455,9 +460,9 @@ fn fire(
 /// that arrived in time, checked out, and could be proved a permutation of what
 /// recall admitted. The row is written by whoever is holding it when the wall
 /// passes, so a late judgment is still recorded, as one that did not apply.
-fn apply(cwd: &Path, query: &str, hits: Vec<MemoryHit>) -> Vec<MemoryHit> {
+fn apply(cwd: &Path, query: &str, hits: Vec<MemoryHit>, label: &ReadingSlot) -> Vec<MemoryHit> {
     let (answer, judged) = sync_channel(0);
-    fire(cwd, query, &hits, RERANK_APPLY_DEADLINE, Some(answer));
+    fire(cwd, query, &hits, RERANK_APPLY_DEADLINE, Some(answer), Arc::clone(label));
     let Ok(mut row) = judged.recv_timeout(RERANK_APPLY_DEADLINE) else {
         return hits;
     };
@@ -469,13 +474,13 @@ fn apply(cwd: &Path, query: &str, hits: Vec<MemoryHit>) -> Vec<MemoryHit> {
     let ledger = rerank_shadow_path(cwd);
     let _ = append_shadow_row(&ledger, &row, SHADOW_LEDGER_MAX_BYTES);
     judge_detached(ledger);
-    note_settled(cwd, &row, &hits);
+    note_settled(label, &row, &hits);
     read.unwrap_or(hits)
 }
 
 /// Open the door, judge the reading, and leave the row with whoever writes it.
 async fn run(shot: Shot, answer: Option<RowSender>) {
-    let Shot { cwd, ledger, config, query, hits, deadline } = shot;
+    let Shot { cwd, ledger, config, query, hits, deadline, label } = shot;
     let opened_at = cwd.clone();
     let Ok(door) = tokio::task::spawn_blocking(move || JevDoor::open(&opened_at)).await else {
         telemetry::attest_failed(telemetry::HarnessFeature::RerankShadow, FAIL_SETTINGS_UNAVAILABLE);
@@ -489,7 +494,7 @@ async fn run(shot: Shot, answer: Option<RowSender>) {
     let Some(row) = kept(row, answer).await else {
         return;
     };
-    note_settled(&cwd, &row, &hits);
+    note_settled(&label, &row, &hits);
     let _ = tokio::task::spawn_blocking(move || {
         let written = append_shadow_row(&ledger, &row, SHADOW_LEDGER_MAX_BYTES);
         judge_ledger(&ledger, now_ms());
@@ -500,15 +505,13 @@ async fn run(shot: Shot, answer: Option<RowSender>) {
 
 /* ---- the label: what the turn then read ----------------------------------- */
 
-/// The last reading this process settled for a project — what a label at the
-/// turn's end is judged against.
+/// The last reading settled for one attempt — what its turn-end label grades.
 ///
 /// In memory and not on disk, for the reason the skill seat gives
 /// (`skill_search::last_answer`): the mark is whether THIS turn went on to
 /// read what THIS reading put first, and an order read back off a ledger row
-/// could be a reading another session settled an hour ago. One per project,
-/// because recall runs once per request and a turn's last settled reading is
-/// the one whose order the turn was handed.
+/// could be a reading another session settled an hour ago. Slots belong to
+/// (project, attempt), and late results keep only their detached slot.
 struct Settled {
     query: u64,
     notes: u64,
@@ -517,15 +520,28 @@ struct Settled {
     proposed: Vec<(String, String)>,
 }
 
-fn last_settled() -> &'static Mutex<HashMap<PathBuf, Settled>> {
-    static SETTLED: OnceLock<Mutex<HashMap<PathBuf, Settled>>> = OnceLock::new();
+type ReadingSlot = Arc<Mutex<Option<Settled>>>;
+type ReadingBook = HashMap<(PathBuf, String), ReadingSlot>;
+
+fn last_settled() -> &'static Mutex<ReadingBook> {
+    static SETTLED: OnceLock<Mutex<ReadingBook>> = OnceLock::new();
     SETTLED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The attempt owns one slot. Replacing or ending it detaches older async
+/// results: they can finish their row but cannot re-enter the label book.
+fn reading_slot(cwd: &Path, attempt: &str) -> ReadingSlot {
+    let slot = Arc::new(Mutex::new(None));
+    if let Ok(mut held) = last_settled().lock() {
+        held.insert((cwd.to_path_buf(), attempt.to_string()), Arc::clone(&slot));
+    }
+    slot
 }
 
 /// Remember the order a reading settled on, when it settled on one: a row
 /// whose judgment failed or could not be ordered proposes nothing, and a turn
 /// that read recall's own order was not asked to agree with anything.
-fn note_settled(cwd: &Path, row: &RerankShadowRow, hits: &[MemoryHit]) {
+fn note_settled(slot: &ReadingSlot, row: &RerankShadowRow, hits: &[MemoryHit]) {
     let Some(judged) = row.judged.as_ref() else {
         return;
     };
@@ -541,11 +557,8 @@ fn note_settled(cwd: &Path, row: &RerankShadowRow, hits: &[MemoryHit]) {
     if proposed.is_empty() {
         return;
     }
-    if let Ok(mut settled) = last_settled().lock() {
-        settled.insert(
-            cwd.to_path_buf(),
-            Settled { query: row.query, notes: row.notes, applied: row.applied, proposed },
-        );
+    if let Ok(mut settled) = slot.lock() {
+        *settled = Some(Settled { query: row.query, notes: row.notes, applied: row.applied, proposed });
     }
 }
 
@@ -575,14 +588,21 @@ pub struct RerankLabelRow {
 
 /// Write the recall seat's mark for the turn that just ended, judged on
 /// `turn` — the messages the turn appended, already in memory — against the
-/// last reading this process settled for `cwd`. A note was touched when a
-/// tool call named its path, or the assistant's own words cited its slug
+/// last reading settled for `(cwd, attempt)`. `None` discards a cancelled
+/// turn's slot without writing a label. A note was touched when a successful
+/// read named its exact path, or the assistant's own words cited its slug
 /// (`[[slug]]`, or the path itself, as `decision_core::dreamer::cited_targets`
 /// reads them). Nothing is written when no reading was settled since the
 /// last label; answers whether a row was written.
 #[must_use]
-pub fn note_recall_read(cwd: &Path, turn: &[ConversationMessage]) -> bool {
-    let Some(settled) = last_settled().lock().ok().and_then(|mut held| held.remove(cwd)) else {
+pub fn note_recall_read(cwd: &Path, attempt: &str, turn: Option<&[ConversationMessage]>) -> bool {
+    let Some(slot) = last_settled().lock().ok().and_then(|mut held| held.remove(&(cwd.to_path_buf(), attempt.to_string()))) else {
+        return false;
+    };
+    let Some(turn) = turn else {
+        return false;
+    };
+    let Some(settled) = slot.lock().ok().and_then(|mut held| held.take()) else {
         return false;
     };
     let row = label_row(&settled, turn);
@@ -614,10 +634,8 @@ fn label_row(settled: &Settled, turn: &[ConversationMessage]) -> RerankLabelRow 
 /// them, each once.
 fn touched_in_order(proposed: &[(String, String)], turn: &[ConversationMessage]) -> Vec<usize> {
     let mut touched = Vec::new();
+    let mut pending = HashMap::new();
     for message in turn {
-        if message.role != MessageRole::Assistant {
-            continue;
-        }
         for block in &message.blocks {
             let mut hit = |rank: usize| {
                 if !touched.contains(&rank) {
@@ -625,14 +643,22 @@ fn touched_in_order(proposed: &[(String, String)], turn: &[ConversationMessage])
                 }
             };
             match block {
-                ContentBlock::ToolUse { input, .. } => {
-                    for (rank, (_, path)) in proposed.iter().enumerate() {
-                        if !path.is_empty() && input.contains(path.as_str()) {
+                ContentBlock::ToolUse { id, name, input } if message.role == MessageRole::Assistant => {
+                    let Some(read) = read_path(name, input) else {
+                        continue;
+                    };
+                    if let Some(rank) = proposed.iter().position(|(_, path)| !path.is_empty() && *path == read) {
+                        pending.insert(id.as_str(), rank);
+                    }
+                }
+                ContentBlock::ToolResult { tool_use_id, is_error, .. } if message.role == MessageRole::Tool => {
+                    if let Some(rank) = pending.remove(tool_use_id.as_str()) {
+                        if !is_error {
                             hit(rank);
                         }
                     }
                 }
-                ContentBlock::Text { text } => {
+                ContentBlock::Text { text } if message.role == MessageRole::Assistant => {
                     for target in decision_core::dreamer::cited_targets(text) {
                         for (rank, (slug, path)) in proposed.iter().enumerate() {
                             if cites(&target, slug, path) {
@@ -773,13 +799,12 @@ pub(super) async fn judge(
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use runtime::memory::rerank::RERANK_LEVELS;
     use runtime::MemoryEntry;
 
+    use super::super::jev_mock::Mock;
     use super::*;
 
     fn hit(slug: &str, summary: &str) -> MemoryHit {
@@ -830,121 +855,6 @@ mod tests {
             "usage": {"input_tokens": 321, "output_tokens": 12}
         })
         .to_string()
-    }
-
-    /// One scripted HTTP answer on a loopback port, recording each request
-    /// body it saw. `std::net` on a thread, because the tools crate's tokio
-    /// has no network driver of its own — the client brings its own.
-    struct Mock {
-        base_url: String,
-        bodies: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl Mock {
-        /// A port that accepts and never answers — a judgment that misses any
-        /// wall put in front of it.
-        fn silent() -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind the mock");
-            let base_url = format!("http://{}", listener.local_addr().expect("mock address"));
-            let bodies = Arc::new(Mutex::new(Vec::new()));
-            std::thread::spawn(move || {
-                let held: Vec<std::net::TcpStream> = listener.incoming().flatten().collect();
-                drop(held);
-            });
-            Self { base_url, bodies }
-        }
-
-        /// A port whose first answer is `delay` late and whose later answers
-        /// come at once — one judgment slow on the wire, its second copy not.
-        ///
-        /// Each connection is answered on its own thread, because a hedge
-        /// holds two of them open at the same moment and a server that
-        /// answered them in turn would be measuring itself.
-        fn slow_first(delay: Duration, body: String) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind the mock");
-            let base_url = format!("http://{}", listener.local_addr().expect("mock address"));
-            let bodies = Arc::new(Mutex::new(Vec::new()));
-            let recorder = Arc::clone(&bodies);
-            std::thread::spawn(move || {
-                for (nth, stream) in listener.incoming().enumerate() {
-                    let Ok(mut stream) = stream else { break };
-                    let recorder = Arc::clone(&recorder);
-                    let body = body.clone();
-                    std::thread::spawn(move || {
-                        let request = read_request(&mut stream);
-                        if let Ok(mut seen) = recorder.lock() {
-                            seen.push(request);
-                        }
-                        if nth == 0 {
-                            std::thread::sleep(delay);
-                        }
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        );
-                        let _ = stream.write_all(response.as_bytes());
-                    });
-                }
-            });
-            Self { base_url, bodies }
-        }
-
-        fn serving(status: u16, body: String) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind the mock");
-            let base_url = format!("http://{}", listener.local_addr().expect("mock address"));
-            let bodies = Arc::new(Mutex::new(Vec::new()));
-            let recorder = Arc::clone(&bodies);
-            std::thread::spawn(move || {
-                for stream in listener.incoming() {
-                    let Ok(mut stream) = stream else { break };
-                    let request = read_request(&mut stream);
-                    if let Ok(mut seen) = recorder.lock() {
-                        seen.push(request);
-                    }
-                    let response = format!(
-                        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                }
-            });
-            Self { base_url, bodies }
-        }
-
-        fn requests(&self) -> Vec<String> {
-            self.bodies.lock().map(|seen| seen.clone()).unwrap_or_default()
-        }
-    }
-
-    /// The body of one HTTP/1.1 request: headers up to the blank line, then
-    /// exactly `Content-Length` bytes.
-    fn read_request(stream: &mut std::net::TcpStream) -> String {
-        let mut buffer = Vec::new();
-        let mut chunk = [0u8; 4096];
-        let header_end = loop {
-            let read = stream.read(&mut chunk).unwrap_or(0);
-            if read == 0 {
-                return String::from_utf8_lossy(&buffer).into_owned();
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-            if let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-                break at + 4;
-            }
-        };
-        let headers = String::from_utf8_lossy(&buffer[..header_end]).to_ascii_lowercase();
-        let length: usize = headers
-            .lines()
-            .find_map(|line| line.strip_prefix("content-length:"))
-            .and_then(|value| value.trim().parse().ok())
-            .unwrap_or(0);
-        while buffer.len() < header_end + length {
-            let read = stream.read(&mut chunk).unwrap_or(0);
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-        }
-        String::from_utf8_lossy(&buffer[header_end..]).into_owned()
     }
 
     /// The workspace every reading here comes from, consented at a door that
@@ -1379,30 +1289,10 @@ mod tests {
     }
 
     /// The whole of what the seat reads: a config home holding one consented
-    /// workspace and the recall switch set to `mode`, a key, and a mock origin.
+    /// workspace and the recall switch set to `mode`, a key, and a mock origin
+    /// — the shared machine (`jev_mock`), told which seat's switch to set.
     fn machine<T>(mode: &str, base_url: &str, body: impl FnOnce(&Path) -> T) -> T {
-        let home = tempfile::tempdir().expect("a config home");
-        let work = tempfile::tempdir().expect("a workspace");
-        // As the filesystem spells it, which is how the door spells a cwd.
-        let cwd = std::fs::canonicalize(work.path()).expect("the workspace resolved");
-        std::fs::write(
-            home.path().join("settings.json"),
-            serde_json::json!({
-                zerocode_core::jev::SMART_SETTINGS_KEY: {
-                    RECALL.setting: mode,
-                    "jev": {"enabled": true, "workspaces": [cwd.to_string_lossy()]},
-                }
-            })
-            .to_string(),
-        )
-        .expect("a settings file");
-        let _env = crate::tests::EnvGuard::set("ZO_CONFIG_HOME", &home.path().to_string_lossy())
-            .set_also("ZO_HOME", home.path())
-            .set_also("HOME", home.path())
-            .set_also(core_types::paths::ZO_STATE_DIR_ENV, home.path())
-            .set_also(api::SYSTEMONE_API_KEY_ENV, "test-key")
-            .set_also(api::SYSTEMONE_BASE_URL_ENV, base_url);
-        body(&cwd)
+        super::super::jev_mock::machine(&RECALL, mode, base_url, body)
     }
 
     fn slugs(hits: &[MemoryHit]) -> Vec<String> {
@@ -1916,18 +1806,107 @@ mod tests {
     }
 
     /// What a turn appended: one assistant message per block.
+    const TEST_ATTEMPT: &str = "session@test-turn";
+
+    fn settle(cwd: &Path, query: &str, hits: Vec<MemoryHit>) -> Vec<MemoryHit> {
+        super::settle(cwd, TEST_ATTEMPT, query, hits)
+    }
+
+    fn note_recall_read(cwd: &Path, turn: &[ConversationMessage]) -> bool {
+        super::note_recall_read(cwd, TEST_ATTEMPT, Some(turn))
+    }
+
     fn turn(blocks: Vec<ContentBlock>) -> Vec<ConversationMessage> {
-        std::iter::once(ConversationMessage::user_text("the question"))
-            .chain(blocks.into_iter().map(|block| ConversationMessage::assistant(vec![block])))
-            .collect()
+        let mut messages = vec![ConversationMessage::user_text("the question")];
+        for block in blocks {
+            let result = match &block {
+                ContentBlock::ToolUse { id, name, .. } => Some(ConversationMessage::tool_result(id, name, "read completed", false)),
+                _ => None,
+            };
+            messages.push(ConversationMessage::assistant(vec![block]));
+            messages.extend(result);
+        }
+        messages
     }
 
     fn read_of(path: &str) -> ContentBlock {
         ContentBlock::ToolUse {
             id: "toolu_1".to_string(),
             name: "Read".to_string(),
-            input: serde_json::json!({"file_path": path}).to_string(),
+            input: serde_json::json!({"path": path}).to_string(),
         }
+    }
+
+    #[test]
+    fn editing_a_proposed_note_is_not_evidence_that_the_turn_read_it() {
+        let proposed = vec![("wiki/note".to_string(), "/vault/wiki/note.md".to_string())];
+        let edit = ContentBlock::ToolUse {
+            id: "toolu_edit".to_string(),
+            name: "Edit".to_string(),
+            input: serde_json::json!({"file_path": proposed[0].1}).to_string(),
+        };
+        assert!(touched_in_order(&proposed, &turn(vec![edit])).is_empty());
+    }
+
+    #[test]
+    fn a_failed_read_does_not_label_the_note_as_read() {
+        let proposed = vec![("wiki/note".to_string(), "/vault/wiki/note.md".to_string())];
+        let messages = vec![
+            ConversationMessage::assistant(vec![read_of(&proposed[0].1)]),
+            ConversationMessage::tool_result("toolu_1", crate::file_tools::READ_FILE_TOOL_NAME, "read denied", true),
+        ];
+        assert!(touched_in_order(&proposed, &messages).is_empty());
+    }
+
+    #[test]
+    fn two_attempts_in_one_project_do_not_take_each_others_reading() {
+        let work = tempfile::tempdir().expect("workspace");
+        let first = reading_slot(work.path(), "first");
+        let second = reading_slot(work.path(), "second");
+        assert!(!super::note_recall_read(work.path(), "first", None));
+        let held = last_settled().lock().expect("book");
+        let remaining = held.get(&(work.path().to_path_buf(), "second".to_string())).expect("second attempt");
+        assert!(Arc::ptr_eq(remaining, &second));
+        assert!(!Arc::ptr_eq(remaining, &first));
+        drop(held);
+        assert!(!super::note_recall_read(work.path(), "second", None));
+    }
+
+    #[test]
+    fn a_tool_call_without_a_successful_result_did_not_read_the_note() {
+        let proposed = vec![("wiki/note".to_string(), "/vault/wiki/note.md".to_string())];
+        let messages = vec![ConversationMessage::assistant(vec![read_of(&proposed[0].1)])];
+        assert!(touched_in_order(&proposed, &messages).is_empty());
+    }
+
+    #[test]
+    fn an_ended_turn_cannot_receive_a_reading_that_settles_later() {
+        let work = tempfile::tempdir().expect("workspace");
+        let slot = reading_slot(work.path(), TEST_ATTEMPT);
+        assert!(!note_recall_read(work.path(), &[]));
+        let hits = three();
+        let mut row = RerankShadowRow::new(
+            MemoKey::for_reading("late reading", &hits),
+            hits.len(),
+            RERANK_OUTCOME_ANSWERED.to_string(),
+        );
+        row.judged = Some(Judged {
+            recalled: vec![hits[0].entry.slug.clone()],
+            proposed: vec![hits[0].entry.slug.clone()],
+            moved: 0, top_changed: false, held_by_graph: Vec::new(),
+            dropped: Vec::new(), kept_by_graph: Vec::new(), readings: Vec::new(),
+        });
+        note_settled(&slot, &row, &hits);
+        assert!(!last_settled().lock().expect("book").contains_key(&(work.path().to_path_buf(), TEST_ATTEMPT.to_string())));
+    }
+
+    #[test]
+    fn reading_a_path_with_the_note_as_a_prefix_does_not_read_the_note() {
+        let proposed = vec![("wiki/note".to_string(), "/vault/wiki/note.md".to_string())];
+        assert!(touched_in_order(
+            &proposed,
+            &turn(vec![read_of("/vault/wiki/note.md.bak")])
+        ).is_empty());
     }
 
     fn said(text: &str) -> ContentBlock {
@@ -2072,9 +2051,22 @@ mod tests {
                 });
                 append_shadow_row(&ledger, &row, SHADOW_LEDGER_MAX_BYTES).expect("a reading");
             }
+            // Dated after the window's first reading — the real one `settle`
+            // wrote on this clock — because the judge reads only the marks
+            // written since the window began; a label dated before it is a
+            // label about some other window (t-6155 F1 made this visible:
+            // until then a hindsight seat rose with no marks counted at all).
+            let after_the_window = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|since| since.as_millis())
+                    .unwrap_or_default(),
+            )
+            .unwrap_or(i64::MAX / 2)
+                + 60_000;
             for at in 0..JUDGED_EVERY_ROWS {
                 let label = serde_json::json!({
-                    "at": 5_000 + at, "label": format!("{at}:{at}"), "query": at, "notes": at,
+                    "at": after_the_window + i64::try_from(at).unwrap_or_default(), "label": format!("{at}:{at}"), "query": at, "notes": at,
                     "applied": false, "agreed": true, "rank": 0,
                 });
                 append_shadow_row(&ledger, &label, SHADOW_LEDGER_MAX_BYTES).expect("a label");

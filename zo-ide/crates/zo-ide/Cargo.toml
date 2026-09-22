@@ -21,6 +21,9 @@ futures-util.workspace = true
 plugins = { path = "../plugins" }
 runtime = { path = "../runtime" }
 tools = { path = "../tools" }
+# `zo vault code` (t-5970) resolves the vault's code mentions against the
+# project's index; the same crate the tools already link.
+codegraph = { path = "../codegraph" }
 pulldown-cmark = "0.13"
 # 코드 담장 문법 강조 — codex `render/highlight.rs` 가 쓰는 그 강조기다
 # (codex-rs/tui/Cargo.toml: `syntect = "5"` + `two-face`). two-face 는 syntect
@@ -49,6 +52,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 shlex = "1"
 tempfile.workspace = true
 url = "2"
+# `zo vault path` is the window's own path calculator, called from a pane
+# (t-5966 G3): the graph scanner and the walk live in zerocode-core, which
+# `runtime` already links for the vault's protocol constants.
+zerocode-core = { path = "../../../crates/zerocode-core" }
 
 [lints]
 workspace = true
@@ -69,7 +76,6 @@ tempfile.workspace = true
 zerocode-harness = { path = "../../../crates/zerocode-harness" }
 # A `/goal --check screen:…` gate line is pinned to the window's own CLI
 # grammar — the one `zerocode-computer` parses.
-zerocode-core = { path = "../../../crates/zerocode-core" }
 
 [target.'cfg(unix)'.dev-dependencies]
 # The e2e driver owns a 120x40 PTY. `openpty` is the same nix API already used

@@ -72,12 +72,14 @@ mod browser_cookies;
 mod browser_diagnose;
 mod browser_guest_runtime;
 mod browser_nav_state;
+mod browser_read;
 mod browser_runtime;
 mod browser_user_agent;
 mod checks_runtime;
 #[cfg(all(target_os = "macos", feature = "chromium-browser"))]
 mod chromium_browser;
 mod claude_tokens;
+mod cli_login;
 mod cmd;
 mod codex_accounts;
 mod codex_queue;
@@ -116,6 +118,7 @@ mod jira_store;
 mod keyboard_input_source;
 mod last_status;
 mod native_tray;
+mod notify_call;
 mod opencode_home;
 mod orchestration;
 mod orchestration_notify;
@@ -226,40 +229,41 @@ use cmd::{
     browser_read, browser_reload, browser_scroll, browser_snapshot, browser_stop, browser_type,
     browser_wait, browser_zoom, build_stamp, cancel_folder_panel, cancel_google_login,
     check_typesafe_key, choose_paths, choose_project, claude_accounts, claude_token_usage,
-    claude_usage, claude_usage_stats, clear_delivered_diff_notes, clear_diff_notes,
-    clipboard_has_image, clone_repository, clone_target_name, close_browser_pane, close_lane,
-    close_onboarding, close_term, codex_account_list, codex_token_usage, codex_usage,
-    codex_usage_stats, commit_failure_card, commit_file_diff, commit_files, commit_staged,
-    computer_awake_status, computer_confirm_answer, computer_guard_status, computer_resume,
-    computer_stop, computer_use_capabilities, computer_use_permission_status,
-    computer_use_skill_report, conflict_card, continuation_source, cookie_sources, crash_bundle,
-    crash_open_log, create_browser_profile, create_project, create_pull_request,
-    create_untitled_markdown, create_worktree, default_project_parent, default_tabs,
-    delete_automation, delete_browser_profile, delete_diff_note, delete_quick_command,
-    delete_untitled_markdown, delete_untracked, developer_permission_statuses, discard_paths,
-    dismiss_external_worktree_prompt, enable_automation, end_all_terminal_sessions,
-    end_terminal_session, file_diff, file_version, floating_workspace_seat, flow_list, flow_set,
-    focus_lane, focus_main, fs_create, fs_duplicate, fs_move, fs_open_default, fs_redo, fs_rename,
-    fs_reveal, fs_trash, fs_undo, gate_lane, generate_branch_name, generate_commit_message,
-    generate_pull_request, get_second_brain_scenes, git_history, github_assignable_users,
-    github_comment_work_item, github_disconnect, github_login_intent, github_merge_pr,
-    github_pr_file_diff, github_preset_query, github_review_states, github_select_account,
-    github_set_reviewers, github_set_work_item_open, github_status, github_test_connection,
-    github_web_urls, github_work_item_detail, github_work_items, gitlab_comment_item,
-    gitlab_inline_comment, gitlab_item_detail, gitlab_job_trace, gitlab_merge_mr, gitlab_mr_review,
-    gitlab_pipeline_jobs, gitlab_project_members, gitlab_retry_job, gitlab_set_item_open,
-    gitlab_set_mr_reviewers, gitlab_status, gitlab_todos, gitlab_update_mr, gitlab_work_items,
-    google_account, google_login_finish, google_login_start, google_logout, grok_usage,
-    hooks_report, hosted_review_eligibility, image_diff, import_browser_cookies,
-    import_cookie_file, import_external_worktrees, install_bundled_skill, install_hooks,
-    jev_summary, judge_worker_room, key_input, kimi_usage, lane_fold, lane_lines, lane_scroll,
-    launch_agent_tab, launch_plan_for_action, launch_recipes, ledger_agents, list_agents,
-    list_automation_runs, list_automations, list_branches, list_claude_sessions, list_diff_notes,
-    list_dir, list_quick_commands, list_run_evidence, list_skills, list_system_fonts,
-    list_worktrees, listening_ports, log_window_error, logout_codex_login,
-    mark_default_tabs_applied, mark_first_run_seen, mark_onboarding, merge_and_remove_worktree,
-    mirror_ready, mouse_input, note_webview_error, note_worker_room_change, notification_probe,
-    open_board_popout, open_browser_pane, open_commit_remote, open_computer_use_permission,
+    claude_usage, claude_usage_stats, clear_delivered_diff_notes, clear_diff_notes, cli_login_list,
+    cli_login_logout, cli_login_start, cli_login_wait, clipboard_has_image, clone_repository,
+    clone_target_name, close_browser_pane, close_lane, close_onboarding, close_term,
+    codex_account_list, codex_token_usage, codex_usage, codex_usage_stats, commit_failure_card,
+    commit_file_diff, commit_files, commit_staged, computer_awake_status, computer_confirm_answer,
+    computer_guard_status, computer_resume, computer_stop, computer_use_capabilities,
+    computer_use_permission_status, computer_use_skill_report, conflict_card, continuation_source,
+    cookie_sources, crash_bundle, crash_open_log, create_browser_profile, create_project,
+    create_pull_request, create_untitled_markdown, create_worktree, default_project_parent,
+    default_tabs, delete_automation, delete_browser_profile, delete_diff_note,
+    delete_quick_command, delete_untitled_markdown, delete_untracked,
+    developer_permission_statuses, discard_paths, dismiss_external_worktree_prompt,
+    enable_automation, end_all_terminal_sessions, end_terminal_session, file_diff, file_version,
+    floating_workspace_seat, flow_list, flow_set, focus_lane, focus_main, fs_create, fs_duplicate,
+    fs_move, fs_open_default, fs_redo, fs_rename, fs_reveal, fs_trash, fs_undo, gate_lane,
+    generate_branch_name, generate_commit_message, generate_pull_request, get_second_brain_scenes,
+    git_history, github_assignable_users, github_comment_work_item, github_disconnect,
+    github_login_intent, github_merge_pr, github_pr_file_diff, github_preset_query,
+    github_review_states, github_select_account, github_set_reviewers, github_set_work_item_open,
+    github_status, github_test_connection, github_web_urls, github_work_item_detail,
+    github_work_items, gitlab_comment_item, gitlab_inline_comment, gitlab_item_detail,
+    gitlab_job_trace, gitlab_merge_mr, gitlab_mr_review, gitlab_pipeline_jobs,
+    gitlab_project_members, gitlab_retry_job, gitlab_set_item_open, gitlab_set_mr_reviewers,
+    gitlab_status, gitlab_todos, gitlab_update_mr, gitlab_work_items, google_account,
+    google_login_finish, google_login_start, google_logout, grok_usage, hooks_report,
+    hosted_review_eligibility, image_diff, import_browser_cookies, import_cookie_file,
+    import_external_worktrees, install_bundled_skill, install_hooks, jev_summary,
+    judge_worker_room, key_input, kimi_usage, lane_fold, lane_lines, lane_scroll, launch_agent_tab,
+    launch_plan_for_action, launch_recipes, ledger_agents, list_agents, list_automation_runs,
+    list_automations, list_branches, list_claude_sessions, list_diff_notes, list_dir,
+    list_quick_commands, list_run_evidence, list_skills, list_system_fonts, list_worktrees,
+    listening_ports, log_window_error, logout_codex_login, mark_default_tabs_applied,
+    mark_first_run_seen, mark_onboarding, merge_and_remove_worktree, mirror_ready, mouse_input,
+    note_webview_error, note_worker_room_change, notification_probe, open_board_popout,
+    open_browser_pane, open_commit_remote, open_computer_use_permission,
     open_developer_permission_settings, open_download, open_lane, open_mirror_term,
     open_path_in_application, open_project, open_remote_server_session,
     open_remote_workspace_terminal, open_ssh_terminal, open_term_tab, open_terminal, open_url,
@@ -287,9 +291,10 @@ use cmd::{
     save_pane_layouts, save_pasted_image, save_quick_command, save_remote_server,
     save_remote_workspace, save_ssh_host, save_stage_layouts, save_typesafe_key,
     save_worktree_prefs, scm_fetch, scm_pull, scm_push, scm_status, scm_tree_rows, search_files,
-    search_text, second_brain_graph, second_brain_link, second_brain_open, second_brain_page,
-    second_brain_relate, second_brain_seat_recalls, second_brain_setup, second_brain_status,
-    select_claude_account, select_codex_account, send_prompt, session_info, set_active_worktree,
+    search_text, second_brain_export_html, second_brain_graph, second_brain_link,
+    second_brain_open, second_brain_page, second_brain_paths, second_brain_relate,
+    second_brain_seat_recalls, second_brain_setup, second_brain_status, select_claude_account,
+    select_codex_account, send_prompt, session_info, set_active_worktree,
     set_agent_activity_display, set_agent_permission_mode, set_agent_teams_mode,
     set_app_font_family, set_browser_default_profile, set_browser_default_zoom,
     set_browser_home_page, set_browser_open_tabs, set_browser_restore_tabs,
@@ -1156,6 +1161,11 @@ struct ShellRuntime {
     inference_sends: Mutex<HashMap<TermId, u64>>,
     /// When each worktree last rang a notification — the cooldown's memory.
     rings: Mutex<zerocode_core::notify::RingLedger>,
+    /// What the notify seat remembers about the rings it asked about: the
+    /// person's last hand on the window, each pane's last rings, the rows
+    /// waiting for their label and the rings held for the next hand
+    /// (t-6043). The decisions live in `notify_call`; this is the lock.
+    notify_book: Mutex<notify_call::NotifyBook>,
     /// The bell's memory of each lane, so a ring follows a CHANGE.
     ///
     /// The decision itself — first appearance, repeat, straggler after death —
@@ -1360,6 +1370,12 @@ impl ShellRuntime {
 
     fn rings(&self) -> MutexGuard<'_, zerocode_core::notify::RingLedger> {
         self.rings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn notify_book(&self) -> MutexGuard<'_, notify_call::NotifyBook> {
+        self.notify_book
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -1728,6 +1744,7 @@ trait ShellStateExt {
     fn previewed_terms(&self) -> MutexGuard<'_, HashMap<String, HashSet<TermId>>>;
     fn hold_terminal(&self, term: TermId, pty: impl Into<PtyHandle>);
     fn rings(&self) -> MutexGuard<'_, zerocode_core::notify::RingLedger>;
+    fn notify_book(&self) -> MutexGuard<'_, notify_call::NotifyBook>;
     fn lane_bell(&self) -> MutexGuard<'_, zerocode_core::notify::LaneBell>;
     fn commit_failure(&self) -> MutexGuard<'_, Option<CommitFailure>>;
     fn deliveries(&self) -> MutexGuard<'_, HashMap<TermId, PromptDelivery>>;
@@ -1865,6 +1882,10 @@ impl ShellStateExt for AppState {
 
     fn rings(&self) -> MutexGuard<'_, zerocode_core::notify::RingLedger> {
         self.shell_runtime().rings()
+    }
+
+    fn notify_book(&self) -> MutexGuard<'_, notify_call::NotifyBook> {
+        self.shell_runtime().notify_book()
     }
 
     fn lane_bell(&self) -> MutexGuard<'_, zerocode_core::notify::LaneBell> {
@@ -2329,6 +2350,7 @@ fn build_app_state(paths: app_paths::AppPaths, root: PathBuf) -> AppState {
         }),
         project_root: root,
         rings: Mutex::new(zerocode_core::notify::RingLedger::default()),
+        notify_book: Mutex::new(notify_call::NotifyBook::default()),
         lane_bell: Mutex::new(zerocode_core::notify::LaneBell::default()),
         native_tray: native_tray::NativeTray::default(),
         awake,
@@ -2590,6 +2612,8 @@ fn main() -> ExitCode {
             second_brain_open,
             second_brain_graph,
             second_brain_page,
+            second_brain_paths,
+            second_brain_export_html,
             second_brain_relate,
             second_brain_seat_recalls,
             get_second_brain_scenes,
@@ -2856,6 +2880,10 @@ fn main() -> ExitCode {
             relogin_codex_account,
             relogin_codex_login,
             logout_codex_login,
+            cli_login_list,
+            cli_login_start,
+            cli_login_logout,
+            cli_login_wait,
             verify_codex_accounts,
             select_codex_account,
             remove_codex_account,

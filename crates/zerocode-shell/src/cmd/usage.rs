@@ -376,12 +376,12 @@ pub(crate) fn opencode_usage(state: State<'_, AppState>, force: bool) -> UsageRe
 #[tauri::command(async)]
 pub(crate) fn grok_usage(state: State<'_, AppState>, force: bool) -> UsageReport {
     let local_data_root = state.local_data_root().to_path_buf();
+    // The same reading of `auth.json` the snapshot's own `account` was
+    // written with, so the comparison below is exact.
     let whose = usage_grok::grok_home()
         .map(|home| usage_grok::auth_file(&home))
-        .and_then(|file| match usage_grok::read_auth(&file, epoch_ms_now()) {
-            usage_grok::Auth::Held(session) => session.email.or(session.user_id),
-            _ => None,
-        });
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .and_then(|text| usage_grok::signed_in_as(&text, epoch_ms_now()));
     usage_report(
         UsageGauge {
             cache: grok_usage_cache(&local_data_root),
@@ -557,6 +557,96 @@ pub(crate) fn logout_codex_login(
     codex_accounts::logout_system(&program)?;
     readiness_runtime::login_moved(Provider::OpenAi);
     Ok(codex_accounts_report(state.config_root()))
+}
+
+/// How this machine names each row's CLI, asked ONCE for the whole card:
+/// the catalog's own detection for a catalog agent (a machine may have it
+/// under an alias, and the scan already knows which name answered), and a
+/// walk of the launch PATH for the two CLIs the catalog does not know.
+///
+/// Once, because the catalog scan walks PATH for every agent it knows: the
+/// card asking it per row made thirty scans of the same PATH.
+fn cli_login_programs() -> impl Fn(&cli_login::CliLogin) -> Option<String> {
+    let detected = detected_agents(false);
+    let path = shell_path::launch_path();
+    move |row| match row.cli {
+        cli_login::Cli::Agent => detected
+            .iter()
+            .find(|found| found.id == row.agent && found.installed)
+            .and_then(|found| found.found_as.clone()),
+        cli_login::Cli::Own { program, .. } => {
+            zerocode_core::agent::resolve_on_path(path.as_deref(), program)
+                .map(|_| program.to_string())
+        }
+    }
+}
+
+/// The CLI login card: every provider whose own CLI signs itself in, as this
+/// machine stands (`cli_login::CLI_LOGINS`). Read live off the witness files
+/// and the CLIs' own status commands; nothing here writes.
+#[tauri::command(async)]
+pub(crate) fn cli_login_list() -> cli_login::Report {
+    cli_login::report(&cli_login_programs(), epoch_ms_now())
+}
+
+/// Sign a provider's login in through its headless verb — the CLI's own
+/// browser round trip in the row's home, this side waiting for the witness.
+/// Long, so it rides the blocking pool with the runner's ceiling inside. A
+/// TUI row is refused by the table itself: its road is the pane's, and the
+/// window walks it with `cli_login_wait`.
+#[tauri::command]
+pub(crate) async fn cli_login_start(agent: String) -> Result<cli_login::Report, String> {
+    let row = cli_login::row(&agent)
+        .ok_or_else(|| format!("{agent}은(는) 로그인 표에 없는 에이전트입니다"))?;
+    let program = cli_login_programs()(row)
+        .ok_or_else(|| format!("이 기계에서 {}을(를) 찾지 못했습니다", row.agent))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        cli_login::login_headless(row, &program, epoch_ms_now())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    readiness_runtime::invalidate(row.agent);
+    Ok(cli_login::report(&cli_login_programs(), epoch_ms_now()))
+}
+
+/// Sign a provider's login out through its headless verb. The CLI removes
+/// its own credential; the witness is the verdict.
+#[tauri::command]
+pub(crate) async fn cli_login_logout(agent: String) -> Result<cli_login::Report, String> {
+    let row = cli_login::row(&agent)
+        .ok_or_else(|| format!("{agent}은(는) 로그인 표에 없는 에이전트입니다"))?;
+    let program = cli_login_programs()(row)
+        .ok_or_else(|| format!("이 기계에서 {}을(를) 찾지 못했습니다", row.agent))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        cli_login::logout_headless(row, &program, epoch_ms_now())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    readiness_runtime::invalidate(row.agent);
+    Ok(cli_login::report(&cli_login_programs(), epoch_ms_now()))
+}
+
+/// Watch a provider's witness until it holds a login (`signed_in`) or stops
+/// holding one — the TUI roads, after the window has opened the CLI in one
+/// of its panes and typed the row's command. Long: a person is reading a
+/// device code off one screen and typing it into another.
+#[tauri::command]
+pub(crate) async fn cli_login_wait(
+    agent: String,
+    signed_in: bool,
+) -> Result<cli_login::Report, String> {
+    let row = cli_login::row(&agent)
+        .ok_or_else(|| format!("{agent}은(는) 로그인 표에 없는 에이전트입니다"))?;
+    // The CLI, when the machine has it: a row proven by a status command
+    // asks it; a row proven by a file needs nobody.
+    let program = cli_login_programs()(row);
+    tauri::async_runtime::spawn_blocking(move || {
+        cli_login::watch(row, program.as_deref(), signed_in, epoch_ms_now())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    readiness_runtime::invalidate(row.agent);
+    Ok(cli_login::report(&cli_login_programs(), epoch_ms_now()))
 }
 
 #[tauri::command(async)]

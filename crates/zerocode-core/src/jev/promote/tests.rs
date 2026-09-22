@@ -8,6 +8,114 @@ fn wanted() -> usize {
     crate::jev::summary::rows_that_can_clear(950)
 }
 
+#[test]
+fn a_no_reader_seat_keeps_its_standing_when_its_first_positive_label_arrives() {
+    for seat in [&crate::jev::RECALL, &crate::jev::PLACEMENT] {
+        let wanted = window_wanted_for(seat).expect("a promoting seat");
+        let mut rows: Vec<Value> = (0..wanted)
+            .map(|at| json!({"at": at, "outcome": "answered", "elapsedMs": 1}))
+            .collect();
+        rows.push(json!({"transition": ROSE}));
+        rows.push(json!({"at": wanted, "label": "request", "agreed": true}));
+        assert_eq!(
+            judge_seat(seat, &rows).expect("judged").verdict,
+            Verdict::Keep,
+            "{}",
+            seat.id
+        );
+    }
+}
+
+#[test]
+fn hindsight_waits_for_the_sample_floor_then_uses_the_same_wilson_line() {
+    for seat in [&crate::jev::RECALL, &crate::jev::PLACEMENT] {
+        let wanted = window_wanted_for(seat).expect("a promoting seat");
+        let floor = seat.agreement_rows_wanted.expect("a label sample floor");
+        for (compared, agreed, falls) in [
+            (floor - 1, false, false),
+            (floor, true, false),
+            (floor, false, true),
+        ] {
+            let mut rows: Vec<Value> = (0..wanted)
+                .map(|at| json!({"at": at, "outcome": "answered", "elapsedMs": 1}))
+                .collect();
+            rows.push(json!({"transition": ROSE}));
+            rows.extend(
+                (0..compared).map(|at| json!({"at": wanted + at, "label": at, "agreed": agreed})),
+            );
+            let verdict = judge_seat(seat, &rows).expect("judged").verdict;
+            assert_eq!(
+                matches!(verdict, Verdict::Fall(Line::Agreement { .. })),
+                falls,
+                "{} {compared} {agreed} {verdict:?}",
+                seat.id
+            );
+        }
+    }
+}
+
+/// No seat rises with no marks to hand, whatever kind its marks are (t-6155
+/// F1): a window of rows answered in time and in shape, and not one
+/// `agreed`, holds every promoting seat at `too_few_compared` — the
+/// compaction seat, whose hindsight kind once let it through to Applying
+/// on twenty answered rows and no mark, with the rest. The same rows with
+/// the floor's worth of agreeing marks rise.
+#[test]
+fn a_seat_with_no_marks_holds_at_the_sample_floor_whatever_its_kind() {
+    use crate::jev::summary::rows_that_can_clear;
+    for seat in crate::jev::JEV_USES.iter().filter(|row| row.promotes) {
+        let wanted = window_wanted_for(seat).expect("a promoting seat");
+        let floor = seat.agreement_rows_wanted.expect("a label sample floor");
+        let rows: Vec<Value> = (0..wanted)
+            .map(|at| json!({"at": at, "outcome": "answered", "elapsedMs": 1}))
+            .collect();
+        assert_eq!(
+            judge_seat(seat, &rows).expect("judged").verdict,
+            Verdict::Hold(Line::TooFewCompared {
+                compared: 0,
+                wanted: floor
+            }),
+            "{}: answer rate, latency and shape alone never make a seat act",
+            seat.id
+        );
+        let marks =
+            rows_that_can_clear(seat.agreement_floor_permille.expect("a budget")).max(floor);
+        let mut marked = rows.clone();
+        marked.extend((0..marks).map(|at| json!({"at": wanted + at, "label": at, "agreed": true})));
+        assert_eq!(
+            judge_seat(seat, &marked).expect("judged").verdict,
+            Verdict::Rise,
+            "{}",
+            seat.id
+        );
+    }
+}
+
+#[test]
+fn one_forgiven_timeout_does_not_forgive_a_second_one() {
+    for seat in [&crate::jev::RECALL, &crate::jev::PLACEMENT] {
+        let wanted = window_wanted_for(seat).expect("a promoting seat");
+        let floor = seat.agreement_rows_wanted.expect("a label sample floor");
+        for misses in [1, 2] {
+            // A window with the floor's worth of marks, so the one line left
+            // to clear is the answer line.
+            let mut rows: Vec<Value> = (0..wanted)
+                .map(|at| json!({"at": at, "outcome": if at < misses {"timeout"} else {"answered"}, "elapsedMs": 1}))
+                .collect();
+            rows.extend(
+                (0..floor).map(|at| json!({"at": wanted + at, "label": at, "agreed": true})),
+            );
+            let verdict = judge_seat(seat, &rows).expect("judged").verdict;
+            assert_eq!(
+                verdict == Verdict::Rise,
+                misses == 1,
+                "{} {verdict:?}",
+                seat.id
+            );
+        }
+    }
+}
+
 fn window(rows: usize, answered: usize, p95_ms: Option<u64>) -> Tally {
     Tally {
         rows,

@@ -150,7 +150,9 @@ pub fn slug_of(node: &GraphNode) -> Option<String> {
                 .to_string(),
         ),
         NodeKind::Ghost => Some(node.id.strip_prefix(GHOST_PREFIX)?.to_string()),
-        NodeKind::Source => None,
+        // Evidence rather than pages to read: a raw file, and the project's
+        // code the layer grafts beside the vault.
+        NodeKind::Source | NodeKind::CodeFile | NodeKind::CodeSymbol => None,
     }
 }
 
@@ -437,7 +439,7 @@ fn index_of(at: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::second_brain_graph::{GraphEdge, GraphNode};
+    use crate::second_brain_graph::{EdgeProvenance, GraphEdge, GraphNode};
 
     fn page(id: &str, title: &str, tags: &[&str]) -> GraphNode {
         GraphNode {
@@ -473,6 +475,11 @@ mod tests {
                     from: *from,
                     to: *to,
                     kind: *kind,
+                    provenance: if *kind == EdgeKind::Mentions {
+                        EdgeProvenance::Inferred
+                    } else {
+                        EdgeProvenance::Declared
+                    },
                 })
                 .collect(),
             ..VaultGraph::default()

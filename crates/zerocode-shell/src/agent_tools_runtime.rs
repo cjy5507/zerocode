@@ -2344,6 +2344,18 @@ pub(super) async fn computer_loop(
                         );
                         let desk =
                             || computer_use::recipe_run::LiveDesk::new().in_window(app.clone());
+                        // The second reader (`--rescue`, t-6132 S3): the
+                        // frontier, headless, under the window's own login —
+                        // built here because only this loop holds the state
+                        // the launch environment is read from.
+                        let rescue = zerocode_core::computer_use::walk_rescues(&command.params)
+                            .then(|| {
+                                computer_use::errand::team::TeamJudge::new(
+                                    app.state::<AppState>().config_root(),
+                                    cwd.as_deref().map(Path::new),
+                                )
+                            })
+                            .flatten();
                         if command.method == zerocode_core::computer_use::ComputerMethod::Walk {
                             run_goal(
                                 &command,
@@ -2352,6 +2364,7 @@ pub(super) async fn computer_loop(
                                 cwd.as_deref().map(Path::new),
                                 roads,
                                 desk,
+                                rescue,
                             )
                         } else {
                             run_recipe(
@@ -2362,6 +2375,7 @@ pub(super) async fn computer_loop(
                                 roads,
                                 desk,
                                 || !reply.is_closed(),
+                                rescue,
                             )
                         }
                     };
@@ -2769,6 +2783,7 @@ where
 /// the folder the walk was asked from, as the Computer Use door said it. A
 /// walk asked from nowhere known is judged for no workspace, which the door
 /// refuses.
+#[allow(clippy::too_many_arguments)] // The walk's roads, its desk, its caller and its second reader are each one seam a test replaces on its own.
 pub(super) fn run_recipe(
     command: &zerocode_core::computer_use::ComputerCommand,
     deadline_ms: u64,
@@ -2786,6 +2801,7 @@ pub(super) fn run_recipe(
     >,
     mut desk_of: impl computer_use::arena::DeskOf,
     caller_waits: impl Fn() -> bool,
+    mut rescue: Option<computer_use::errand::team::TeamJudge>,
 ) -> zerocode_hookd::TeamAnswer {
     use computer_use::arena::{self, Arena, ArenaDesk, Stage};
     use computer_use::recipe_run::{self, Desk as _, Run};
@@ -2991,8 +3007,22 @@ pub(super) fn run_recipe(
                 // questions go down, so the standing and the answers come
                 // from one settings file and one ledger root.
                 let acting = crate::systemone::applies(judge.wire(), seat);
-                let recovered =
-                    computer_use::errand::run(mode, acting, &at, &mut judge, &mut world);
+                let options = computer_use::errand::Options {
+                    overlap: false,
+                    rescue: rescue.is_some(),
+                };
+                let recovered = computer_use::errand::run_with(
+                    mode,
+                    acting,
+                    computer_use::errand::Branching::OFF,
+                    &at,
+                    &mut judge,
+                    &mut world,
+                    options,
+                    rescue
+                        .as_mut()
+                        .map(|team| team as &mut dyn computer_use::errand::ActionJudge),
+                );
                 computer_use::errand::write_rows(
                     seat,
                     judge.wire(),
@@ -3000,6 +3030,7 @@ pub(super) fn run_recipe(
                     &recovered.rows,
                     crate::project_runtime::now_epoch_ms(),
                 );
+                judge.write_memo_rows(dir, crate::project_runtime::now_epoch_ms());
                 if let Some(walked) = recovered.report {
                     report = walked;
                 }
@@ -3064,6 +3095,7 @@ pub(super) fn run_goal(
         impl FnMut(serde_json::Value),
     >,
     mut desk_of: impl computer_use::arena::DeskOf,
+    mut rescue: Option<computer_use::errand::team::TeamJudge>,
 ) -> zerocode_hookd::TeamAnswer {
     use computer_use::errand::{self, desk};
     use computer_use::recipe_run::Desk as _;
@@ -3171,8 +3203,36 @@ pub(super) fn run_goal(
         }));
     }
     let acting = crate::systemone::applies(judge.wire(), seat);
-    let mut world = desk::GoalWorld::new(&mut road, aim, page, word("until"), deadline_ms, 0);
-    let walked = errand::run(mode, acting, &at, &mut judge, &mut world);
+    // The branching seat's standing (t-6044), read off the same wire and the
+    // same settings file as the screen seat's: whether a phone step whose
+    // judgment ranked two or more controls is forked, and whether the
+    // comparison's pick is the one pressed.
+    let forks = &zerocode_core::jev::BRANCHING;
+    let branching = errand::Branching {
+        mode: errand::mode_now(forks),
+        acting: crate::systemone::applies(judge.wire(), forks),
+    };
+    let snapshots: Box<dyn desk::Snapshots> = Box::new(AvdSnapshots {
+        device: word("device").unwrap_or_default(),
+    });
+    let mut world = desk::GoalWorld::new(&mut road, aim, page, word("until"), deadline_ms, 0)
+        .with_snapshots(snapshots);
+    let options = errand::Options {
+        overlap: zerocode_core::computer_use::walk_overlaps(&command.params),
+        rescue: rescue.is_some(),
+    };
+    let walked = errand::run_with(
+        mode,
+        acting,
+        branching,
+        &at,
+        &mut judge,
+        &mut world,
+        options,
+        rescue
+            .as_mut()
+            .map(|team| team as &mut dyn errand::ActionJudge),
+    );
     errand::write_rows(
         seat,
         judge.wire(),
@@ -3180,6 +3240,14 @@ pub(super) fn run_goal(
         &walked.rows,
         crate::project_runtime::now_epoch_ms(),
     );
+    errand::write_rows(
+        forks,
+        judge.wire(),
+        dir,
+        &walked.forks,
+        crate::project_runtime::now_epoch_ms(),
+    );
+    judge.write_memo_rows(dir, crate::project_runtime::now_epoch_ms());
     said(serde_json::json!({
         "goal": goal,
         "mode": mode.key(),
@@ -3187,6 +3255,38 @@ pub(super) fn run_goal(
         "reached": walked.reached.unwrap_or_default(),
         "steps": walked.rows,
     }))
+}
+
+/// An Android AVD's saved states, as a forked step drives them (t-6044): the
+/// device the walk was aimed at by the name `list` shows, resolved to its
+/// live serial the way every other Android verb resolves it
+/// (`active_android_serial`), then the emulator console's own `avd snapshot`
+/// road. Built for every mobile walk; the world keeps it only for Android.
+struct AvdSnapshots {
+    device: String,
+}
+
+impl AvdSnapshots {
+    fn drive(&self, verb: crate::emulator::AvdSnapshot, name: &str) -> Result<u64, String> {
+        let serial = tauri::async_runtime::block_on(active_android_serial(&self.device))?;
+        crate::emulator::android_avd_snapshot(&serial, verb, name)
+    }
+}
+
+impl computer_use::errand::desk::Snapshots for AvdSnapshots {
+    fn save(&mut self, name: &str) -> Result<u64, String> {
+        self.drive(crate::emulator::AvdSnapshot::Save, name)
+    }
+
+    fn load(&mut self, name: &str) -> Result<u64, String> {
+        self.drive(crate::emulator::AvdSnapshot::Load, name)
+    }
+
+    fn delete(&mut self, name: &str) {
+        if let Err(why) = self.drive(crate::emulator::AvdSnapshot::Delete, name) {
+            eprintln!("walk: a fork's snapshot was left on the device: {why}");
+        }
+    }
 }
 
 /// A walk's answer in words, for a caller that did not ask for JSON.
@@ -5364,10 +5464,30 @@ pub(super) fn browser_refused(stderr: impl Into<String>) -> zerocode_hookd::Team
     }
 }
 
-/// A typing's answer, on either road.
+/// A read's words — the page's title and address, then its text, then a
+/// selector read's reduced DOM. The one formatter both read roads print
+/// through, inside the read arm's one fence: the plain read's and the read
+/// seat's, so a page the seat hands back whole is the plain read's bytes.
+fn read_words(report: cmd::browser::BrowserReadReport) -> String {
+    let detail = report
+        .dom
+        .map(|dom| format!("\nDOM:\n{dom}\n"))
+        .unwrap_or_default();
+    format!(
+        "제목: {}\n주소: {}\n\n{}\n{}",
+        report.title, report.url, report.text, detail
+    )
+}
+
+/// A typing's answer, on either road — and the label it leaves on the
+/// pane's last judged read.
 fn typed_answer(
+    label: &str,
     typed: Result<cmd::browser::BrowserInputReport, String>,
 ) -> zerocode_hookd::TeamAnswer {
+    if let Ok(report) = &typed {
+        crate::browser_read::label_press(label, "type", report);
+    }
     match typed {
         Ok(report) => browser_said(format!(
             "{}\n",
@@ -5562,21 +5682,38 @@ pub(super) async fn answer_browser_command(
             ),
             Err(why) => browser_refused(format!("zerocode-browser: {why}\n")),
         },
+        // `read <label> [css]` reads the page or a selector; `read <label>
+        // --full` reads the page whole, whatever the read seat would fold.
+        // The judged road and the plain road print through ONE formatter
+        // (`read_answer`), so a read the seat hands back whole is the plain
+        // read's bytes.
         ("read", 2) | ("read", 3) => {
-            let selector = argv.get(2).map(String::as_str);
-            match cmd::browser::automate_read(app, &state, &argv[1], selector).await {
+            let read = match zerocode_core::agent_browser::parse_read(argv) {
+                Ok(read) => read,
+                Err(why) => return browser_refused(format!("zerocode-browser: {why}\n")),
+            };
+            let mode = zerocode_core::jev::BROWSER_READ
+                .mode_in(&crate::systemone::Wire::of_this_machine().settings_root());
+            let answered = if read.selector.is_none() && !read.full && mode.asks() {
+                // The words' workspace is the checkout the asking pane runs
+                // in — what the door asks the person's consent for.
+                let workspace = pane
+                    .and_then(hooks::term_of_pane_key)
+                    .and_then(|term| state.pane_cwds().get(&term).cloned())
+                    .map(std::path::PathBuf::from);
+                crate::browser_read::read_judged(app, &state, &read.label, workspace, mode).await
+            } else {
+                cmd::browser::automate_read(app, &state, &read.label, read.selector.as_deref())
+                    .await
+            };
+            match answered {
                 Ok(report) => {
-                    let detail = report
-                        .dom
-                        .map(|dom| format!("\nDOM:\n{dom}\n"))
-                        .unwrap_or_default();
-                    page_said(
-                        &argv[1],
-                        format!(
-                            "제목: {}\n주소: {}\n\n{}\n{}",
-                            report.title, report.url, report.text, detail
-                        ),
-                    )
+                    // A whole read after a fold is the fold's own label
+                    // (t-6155 F6): written after the page really was read.
+                    if read.full && read.selector.is_none() && mode.asks() {
+                        crate::browser_read::label_full_read(&read.label, &report.url);
+                    }
+                    page_said(&read.label, read_words(report))
                 }
                 Err(why) => browser_refused(format!("zerocode-browser: {why}\n")),
             }
@@ -5596,10 +5733,13 @@ pub(super) async fn answer_browser_command(
                 Err(why) => return browser_refused(format!("zerocode-browser: {why}\n")),
             };
             match pressed {
-                Ok(report) => browser_said(format!(
-                    "{}\n",
-                    cmd::browser::input_said(cmd::browser::CLICK_SAID, &report)
-                )),
+                Ok(report) => {
+                    crate::browser_read::label_press(&argv[1], "click", &report);
+                    browser_said(format!(
+                        "{}\n",
+                        cmd::browser::input_said(cmd::browser::CLICK_SAID, &report)
+                    ))
+                }
                 Err(why) => browser_refused(format!("zerocode-browser: {why}\n")),
             }
         }
@@ -5609,12 +5749,18 @@ pub(super) async fn answer_browser_command(
         ("type", 4) => {
             let (label, css, text) = (&argv[1], &argv[2], &argv[3]);
             let road = cmd::browser::TypeRoad::Keys;
-            typed_answer(cmd::browser::automate_type(app, &state, label, css, text, road).await)
+            typed_answer(
+                label,
+                cmd::browser::automate_type(app, &state, label, css, text, road).await,
+            )
         }
         ("type", 5) if argv[3] == zerocode_core::agent_browser::TYPE_VALUE_FLAG => {
             let (label, css, text) = (&argv[1], &argv[2], &argv[4]);
             let road = cmd::browser::TypeRoad::Setter;
-            typed_answer(cmd::browser::automate_type(app, &state, label, css, text, road).await)
+            typed_answer(
+                label,
+                cmd::browser::automate_type(app, &state, label, css, text, road).await,
+            )
         }
         ("wait", 3) | ("wait", 4) => {
             let timeout_ms = match argv.get(3) {

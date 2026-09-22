@@ -63,7 +63,16 @@ tools-test:
     python3 tools/tests/test_decision_shadow_summary.py
     python3 tools/tests/test_jev_token_diet_baseline.py
     python3 tools/tests/test_hedge_replay_seed.py
+    python3 tools/tests/test_summon_replay_seed.py
+    python3 tools/tests/test_compaction_replay_seed.py
+    python3 tools/tests/test_agent_tool_replay_seed.py
+    python3 tools/tests/test_browser_read_replay_seed.py
+    python3 tools/tests/test_notify_replay_seed.py
+    python3 tools/tests/test_mention_rerank_replay_seed.py
+    python3 tools/tests/test_branching_replay_seed.py
+    python3 tools/tests/test_judgment_cache_replay_seed.py
     python3 tools/tests/test_claude_code_panel_rules.py
+    python3 tools/tests/test_codegraph_bench.py
 
 # The native helpers' own tests (Swift, 178 + 5 on 2026-09-21): the pure Core
 # the Computer Use helper's main.swift calls and the case tables it shares with

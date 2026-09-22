@@ -76,13 +76,14 @@ pub(crate) use fs::{
 
 pub(crate) use usage::{
     add_claude_account, add_codex_account, antigravity_usage, cancel_google_login, claude_accounts,
-    claude_token_usage, claude_usage, claude_usage_stats, codex_account_list, codex_token_usage,
-    codex_usage, codex_usage_stats, google_account, google_login_finish, google_login_start,
-    google_logout, grok_usage, kimi_usage, logout_codex_login, opencode_usage,
-    opencode_usage_stats, relogin_claude_account, relogin_codex_account, relogin_codex_login,
-    remove_claude_account, remove_codex_account, resolve_claude_account_identity,
-    select_claude_account, select_codex_account, set_opencode_cookie, set_opencode_workspace,
-    stats_summary, use_system_claude_login, verify_claude_accounts, verify_codex_accounts,
+    claude_token_usage, claude_usage, claude_usage_stats, cli_login_list, cli_login_logout,
+    cli_login_start, cli_login_wait, codex_account_list, codex_token_usage, codex_usage,
+    codex_usage_stats, google_account, google_login_finish, google_login_start, google_logout,
+    grok_usage, kimi_usage, logout_codex_login, opencode_usage, opencode_usage_stats,
+    relogin_claude_account, relogin_codex_account, relogin_codex_login, remove_claude_account,
+    remove_codex_account, resolve_claude_account_identity, select_claude_account,
+    select_codex_account, set_opencode_cookie, set_opencode_workspace, stats_summary,
+    use_system_claude_login, verify_claude_accounts, verify_codex_accounts,
 };
 
 pub(crate) use appearance::{
@@ -234,10 +235,10 @@ pub(crate) use session::{
 };
 
 pub(crate) use second_brain::{
-    get_second_brain_scenes, second_brain_graph, second_brain_link, second_brain_open,
-    second_brain_page, second_brain_relate, second_brain_seat_recalls, second_brain_setup,
-    second_brain_status, set_second_brain_explore, set_second_brain_scenes,
-    set_second_brain_weekly_review,
+    get_second_brain_scenes, second_brain_export_html, second_brain_graph, second_brain_link,
+    second_brain_open, second_brain_page, second_brain_paths, second_brain_relate,
+    second_brain_seat_recalls, second_brain_setup, second_brain_status, set_second_brain_explore,
+    set_second_brain_scenes, set_second_brain_weekly_review,
 };
 
 pub(crate) use supply_chain::{supply_chain_graph, supply_chain_report};

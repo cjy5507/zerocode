@@ -316,21 +316,29 @@ fn a_seats_first_judgment_waits_for_a_window_it_can_fill() {
     }
 }
 
-/// The two seats with no reader to be compared against are the two whose
-/// wrong answer the person undoes in one move and whose own mark is that
-/// move — everything else must show a window of comparisons first.
+/// The seats with no reader to be compared against are the ones whose own
+/// mark is a later fact — the person's move, the turn's read, the re-read
+/// after a drop. The table names them for a reader's sake, and the judge
+/// holds them to the same sample floor as everyone else: no seat rises on
+/// answer rate, latency and shape alone (t-6155 F1).
 #[test]
-fn only_the_seats_with_no_reader_to_compare_rise_on_their_own_ledger() {
-    let on_their_own: Vec<&str> = JEV_USES
+fn every_seat_waits_for_a_window_of_marks_whatever_kind_they_are() {
+    // The counter and both writers ask one judge; the sample floor is the
+    // named table field, and the judge reads no kind beside it.
+    let judge = include_str!("promote.rs");
+    assert!(judge.contains("agreement.compared < evidence.agreement_rows_wanted"));
+    assert!(
+        !judge.contains("AgreementKind"),
+        "the judge reads no kind: the floor holds every seat"
+    );
+
+    let hindsight: Vec<&str> = JEV_USES
         .iter()
-        .filter(|row| row.agreement_rows_wanted == Some(NO_READER_TO_COMPARE))
+        .filter(|row| row.agreement_kind == AgreementKind::Hindsight)
         .map(|row| row.id)
         .collect();
-    assert_eq!(on_their_own, vec![RECALL.id, PLACEMENT.id]);
-    for row in JEV_USES
-        .iter()
-        .filter(|row| !on_their_own.contains(&row.id) && row.promotes)
-    {
+    assert_eq!(hindsight, vec![RECALL.id, PLACEMENT.id, COMPACTION.id]);
+    for row in JEV_USES.iter().filter(|row| row.promotes) {
         assert_eq!(
             row.agreement_rows_wanted,
             Some(A_WINDOW_OF_COMPARISONS),
@@ -378,12 +386,47 @@ fn the_placement_seats_line_sits_where_its_negatives_are() {
     );
 }
 
+/// Promotion rises from `auto` to acting, so a use that promotes offers
+/// `auto` — and a word that acts once the judge has raised it, which `auto`
+/// itself is.
 #[test]
 fn a_use_that_promotes_has_somewhere_to_rise_from_and_to() {
     for row in JEV_USES.iter().filter(|row| row.promotes) {
         assert!(row.modes.contains(&JevMode::Auto), "{}", row.id);
-        assert!(row.modes.iter().any(|mode| mode.applies()), "{}", row.id);
+        assert!(
+            row.modes.iter().any(|mode| mode.applies_with(true)),
+            "{}",
+            row.id
+        );
     }
+}
+
+/// The seat contract's third rule (corrected after t-6155 F7): the words a
+/// seat offers are read off whether anything labels it. A labeled seat —
+/// one that promotes — offers all four, `on` being a person's explicit
+/// override and `auto` what its own evidence raises; a seat nothing labels
+/// offers `off | shadow | on`, because an `auto` there could never rise and
+/// would be `shadow` under a name that promises otherwise. One rule for
+/// every row, so a new seat cannot pick a third set: the notify and
+/// branching seats had (t-6155 F7).
+#[test]
+fn a_seats_mode_set_is_read_off_whether_anything_labels_it() {
+    let labeled: &[JevMode] = &JevMode::ALL;
+    let unlabeled: &[JevMode] = &[JevMode::Off, JevMode::Shadow, JevMode::On];
+    for row in JEV_USES.iter() {
+        assert_eq!(
+            row.promotes,
+            row.agreement_rows_wanted.is_some(),
+            "{}: a labeled seat names its label sample floor",
+            row.id
+        );
+        let expected = if row.promotes { labeled } else { unlabeled };
+        assert_eq!(row.modes, expected, "{}", row.id);
+    }
+    assert!(
+        JEV_USES.iter().any(|row| !row.promotes),
+        "the rule is exercised on both kinds of seat"
+    );
 }
 
 #[test]
@@ -405,7 +448,7 @@ fn uses_are_told_apart_by_every_name_they_answer_to() {
             row.id
         );
     }
-    assert_eq!(jev_use("notify"), None);
+    assert_eq!(jev_use("a seat the table does not name"), None);
 }
 
 #[test]
@@ -438,6 +481,81 @@ fn the_builders_cut_at_the_tables_caps() {
     assert!(caps(&SKILLS).contains(&Cap::Items(SKILL_SHARD_TARGET)));
     assert!(caps(&SKILLS).contains(&Cap::Chars(SKILL_DESCRIPTION_CHAR_CAP)));
     assert!(caps(&ZO_STEP_EFFORT).contains(&Cap::Chars(ROUTING_TASK_CHAR_CAP)));
+    assert!(caps(&BROWSER_READ).contains(&Cap::Chars(BROWSER_READ_TITLE_CHAR_CAP)));
+    assert!(caps(&BROWSER_READ).contains(&Cap::Items(BROWSER_READ_BLOCK_CAP)));
+    assert!(caps(&BROWSER_READ).contains(&Cap::Chars(BROWSER_READ_PATH_CHAR_CAP)));
+    assert!(caps(&BROWSER_READ).contains(&Cap::Chars(BROWSER_READ_HEAD_CHAR_CAP)));
+}
+
+/// The browser-read seat folds only on an answer over its own line, sends a
+/// page's title and each block's path and head and never a block's body,
+/// waits one wall for every shard, and rises on the screen seats' answer
+/// line with a stricter route-change budget than theirs — a fold the agent
+/// reached back into costs a whole page, not one press.
+#[test]
+fn the_browser_read_seat_folds_on_its_own_line_and_sends_no_body() {
+    assert_eq!(BROWSER_READ.id, "browser_read");
+    assert_eq!(BROWSER_READ.setting, "jevBrowserRead");
+    assert_eq!(BROWSER_READ.ledger, "browser-read.jsonl");
+    assert_eq!(BROWSER_READ.modes, &JevMode::ALL[..]);
+    const {
+        assert!(BROWSER_READ.promotes);
+        assert!(
+            BROWSER_READ_FOLD_FLOOR_PERMILLE > SCREEN_PRESS_FLOOR_PERMILLE,
+            "a dropped block costs more than a press"
+        );
+        assert!(BROWSER_READ_AGREEMENT_FLOOR_PERMILLE > SCREEN_AGREEMENT_FLOOR_PERMILLE);
+        assert!(BROWSER_READ_SHARD_TARGET * 4 == BROWSER_READ_BLOCK_CAP);
+    }
+    assert_eq!(
+        BROWSER_READ.press_floor_permille,
+        Some(BROWSER_READ_FOLD_FLOOR_PERMILLE)
+    );
+    assert!(BROWSER_READ.permits_press(0.7) && !BROWSER_READ.permits_press(0.69));
+    assert_eq!(
+        BROWSER_READ.answer_floor_permille,
+        Some(BROWSER_READ_ANSWER_FLOOR_PERMILLE)
+    );
+    assert_eq!(
+        BROWSER_READ.agreement_floor_permille,
+        Some(BROWSER_READ_AGREEMENT_FLOOR_PERMILLE)
+    );
+    assert_eq!(
+        BROWSER_READ.apply_deadline_ms,
+        Some(BROWSER_READ_APPLY_DEADLINE_MS)
+    );
+    assert_eq!(BROWSER_READ.agreement_kind, AgreementKind::Comparison);
+    let sent: Vec<&str> = BROWSER_READ.sends.iter().map(|sent| sent.at).collect();
+    assert_eq!(
+        sent,
+        vec![
+            "/state/title",
+            "/state/blocks",
+            "/state/blocks/*/path",
+            "/state/blocks/*/head"
+        ]
+    );
+    assert!(
+        !sent.iter().any(|at| at.ends_with("/text")),
+        "a block's body never leaves"
+    );
+    assert_eq!(BROWSER_READ_OPTIONS, ["content", "chrome"]);
+    assert_eq!(BROWSER_READ_CHROME, "chrome");
+    // The block roots are selectors, each spelled once.
+    let mut roots = BROWSER_READ_BLOCK_ROOTS.to_vec();
+    roots.sort_unstable();
+    roots.dedup();
+    assert_eq!(roots.len(), BROWSER_READ_BLOCK_ROOTS.len());
+    for root in BROWSER_READ_BLOCK_ROOTS {
+        assert!(!root.contains(',') && !root.contains(' '), "{root}");
+    }
+    // The card and the harness read the whole table: the seat is on it.
+    assert!(JEV_USES.contains(&BROWSER_READ));
+    assert_eq!(
+        BROWSER_READ.mode_in(&json!({"smart": {"browserAction": "on"}})),
+        JevMode::Off,
+        "the walk's consent is not the read's"
+    );
 }
 
 /// The skill seat sends a name and a line about each skill, and never a
@@ -562,6 +680,228 @@ fn the_step_effort_seat_reads_the_turn_like_routing_and_rises_on_its_own_marks()
     assert!(
         !ZO_STEP_EFFORT.permits_press(1.0),
         "a step judgment presses nothing"
+    );
+}
+
+/// A tool result about to be summarized away is kept or dropped on the
+/// remaining work, not on its age: the seat sends the goal, the newest words
+/// and each block's head, answers a closed keep/drop, drops only past its
+/// own lean, and rises on the hindsight of the turns after — a dropped block
+/// read again inside the window is the regret its label records.
+#[test]
+fn the_compaction_seat_drops_by_relevance_and_rises_on_its_regret_marks() {
+    assert_eq!(jev_use("compaction"), Some(&COMPACTION));
+    let sent: Vec<&str> = COMPACTION.sends.iter().map(|sent| sent.at).collect();
+    assert_eq!(
+        sent,
+        [
+            "/state/goal",
+            "/state/recent",
+            "/state/blocks",
+            "/state/blocks/*/tool",
+            "/state/blocks/*/input",
+            "/state/blocks/*/head",
+        ],
+        "heads only: a body never leaves, and the tail is not asked about"
+    );
+    let caps = |row: &JevUse| -> Vec<Cap> { row.sends.iter().map(|sent| sent.cap).collect() };
+    assert!(caps(&COMPACTION).contains(&Cap::Chars(COMPACTION_GOAL_CHAR_CAP)));
+    assert!(caps(&COMPACTION).contains(&Cap::Items(COMPACTION_SHARD_TARGET)));
+    assert!(caps(&COMPACTION).contains(&Cap::Bytes(COMPACTION_BLOCK_HEAD_BYTE_CAP)));
+    assert!(caps(&COMPACTION).contains(&Cap::Chars(COMPACTION_INPUT_CHAR_CAP)));
+
+    const { assert!(COMPACTION.promotes) };
+    assert_eq!(COMPACTION.agreement_kind, AgreementKind::Hindsight);
+    assert_eq!(
+        COMPACTION.answer_floor_permille,
+        Some(COMPACTION_ANSWER_FLOOR_PERMILLE)
+    );
+    assert_eq!(
+        COMPACTION.agreement_floor_permille,
+        Some(COMPACTION_AGREEMENT_FLOOR_PERMILLE)
+    );
+    assert_eq!(
+        COMPACTION.apply_deadline_ms,
+        Some(COMPACTION_APPLY_DEADLINE_MS),
+        "the one wall the whole batch waits is the row's"
+    );
+    // A miss costs nothing, so the seat waits longer than a turn's route
+    // and shorter than a summons: it sits beside a summary round-trip.
+    const { assert!(COMPACTION_APPLY_DEADLINE_MS > ROUTING_APPLY_DEADLINE_MS) };
+    const { assert!(COMPACTION_APPLY_DEADLINE_MS < SUMMON_APPLY_DEADLINE_MS) };
+
+    assert_eq!(COMPACTION_OPTIONS, [COMPACTION_KEEP, COMPACTION_DROP]);
+    assert_ne!(COMPACTION_KEEP, COMPACTION_DROP);
+    // The drop lean is a lean: over one half, under certainty.
+    const { assert!(COMPACTION_DROP_FLOOR_PERMILLE > 500 && COMPACTION_DROP_FLOOR_PERMILLE < 1_000) };
+    const { assert!(COMPACTION_REGRET_TURNS > 0) };
+
+    assert!(COMPACTION.mode_of(Some(&json!("on"))).applies());
+    assert!(!COMPACTION.mode_of(Some(&json!("auto"))).applies_with(false));
+    assert!(COMPACTION.mode_of(Some(&json!("auto"))).applies_with(true));
+    assert!(
+        !COMPACTION
+            .mode_of(Some(&json!("shadow")))
+            .applies_with(true)
+    );
+    assert!(
+        !COMPACTION.permits_press(1.0),
+        "a compaction judgment presses nothing"
+    );
+}
+
+/// The notify seat (t-6043) judges one ring — attention, completion or a
+/// push — at the one point today's rule table decides "ring or not", and
+/// rises on the person's own reaction: a pane they turned to within
+/// [`NOTIFY_LABEL_WINDOW_MS`] was one worth the interruption.
+#[test]
+fn the_notify_seat_judges_one_ring_and_rises_on_the_persons_reaction() {
+    assert_eq!(jev_use("notify"), Some(&NOTIFY));
+    assert_eq!(NOTIFY.setting, "jevNotify");
+    // A labeled seat offers the four words every labeled seat offers (the
+    // seat contract's third rule, as corrected after t-6155 F7): `on` is a
+    // person's explicit override, `auto` is what its own evidence raises.
+    assert_eq!(NOTIFY.modes, &JevMode::ALL[..]);
+    assert_eq!(NOTIFY.offered("on"), Some(JevMode::On));
+    let sent: Vec<&str> = NOTIFY.sends.iter().map(|sent| sent.at).collect();
+    assert_eq!(
+        sent,
+        ["/state/pane", "/state/words", "/state/recent"],
+        "the pane's name, one card line of words, and the pane's last rings — nothing else a person wrote"
+    );
+    let caps = |row: &JevUse| -> Vec<Cap> { row.sends.iter().map(|sent| sent.cap).collect() };
+    assert!(caps(&NOTIFY).contains(&Cap::Chars(NOTIFY_WORDS_CHAR_CAP)));
+    assert!(caps(&NOTIFY).contains(&Cap::Items(NOTIFY_RECENT_CAP)));
+    assert_eq!(
+        NOTIFY_WORDS_CHAR_CAP,
+        crate::transcript::SUMMARY_CHARS,
+        "one card line"
+    );
+
+    const { assert!(NOTIFY.promotes) };
+    assert_eq!(NOTIFY.agreement_kind, AgreementKind::Comparison);
+    assert_eq!(
+        NOTIFY.answer_floor_permille,
+        Some(NOTIFY_ANSWER_FLOOR_PERMILLE)
+    );
+    assert_eq!(
+        NOTIFY.agreement_floor_permille,
+        Some(NOTIFY_AGREEMENT_FLOOR_PERMILLE)
+    );
+    assert_eq!(NOTIFY.apply_deadline_ms, Some(NOTIFY_APPLY_DEADLINE_MS));
+    // The wall an attention ring may be held is the wait every completion
+    // ring already sits through before it may ring at all.
+    assert_eq!(
+        NOTIFY_APPLY_DEADLINE_MS,
+        crate::notify::DONE_QUIET_MS.unsigned_abs(),
+        "the seat's wall is the completion's own quiet"
+    );
+    assert_eq!(
+        NOTIFY_OPTIONS,
+        [NOTIFY_INTERRUPT, NOTIFY_BATCH, NOTIFY_IGNORE]
+    );
+    const { assert!(NOTIFY_LABEL_WINDOW_MS == 60 * 1_000) };
+    const { assert!(NOTIFY_ATTENDANCE_WINDOW_MS > NOTIFY_LABEL_WINDOW_MS) };
+    const { assert!(NOTIFY_RECENT_CAP > 0) };
+
+    assert!(
+        NOTIFY.mode_of(Some(&json!("on"))).applies_with(false),
+        "`on` is a person's override: it acts without a rise"
+    );
+    assert!(!NOTIFY.mode_of(Some(&json!("auto"))).applies_with(false));
+    assert!(NOTIFY.mode_of(Some(&json!("auto"))).applies_with(true));
+    assert!(!NOTIFY.mode_of(Some(&json!("shadow"))).applies_with(true));
+    assert!(
+        !NOTIFY.permits_press(1.0),
+        "a notify judgment presses nothing"
+    );
+}
+
+/// A fuzzy page is reordered by what the person is writing, never by a
+/// body: the seat sends the sentence in progress, the token typed and one
+/// page of candidate names with the head each row already shows, asks one
+/// closed choice over them, and rises on the comparison the person makes
+/// with every pick — the row they took against the row the judgment put
+/// first. The wall is the routing seat's, because nothing waits on it: a
+/// late answer is dropped, and the page the person already sees stands.
+#[test]
+fn the_mention_seat_reranks_a_fuzzy_page_and_rises_on_the_persons_pick() {
+    assert_eq!(jev_use("mention_rerank"), Some(&MENTION_RERANK));
+    assert_eq!(MENTION_RERANK.setting, "jevMentionRerank");
+    let sent: Vec<&str> = MENTION_RERANK.sends.iter().map(|sent| sent.at).collect();
+    assert_eq!(
+        sent,
+        [
+            "/state/intent",
+            "/state/query",
+            "/state/candidates",
+            "/state/candidates/*/name",
+            "/state/candidates/*/head",
+        ],
+        "names and heads only: no file body, no page body, no transcript"
+    );
+    let caps: Vec<Cap> = MENTION_RERANK.sends.iter().map(|sent| sent.cap).collect();
+    assert_eq!(caps[0], Cap::Chars(MENTION_INTENT_CHAR_CAP));
+    assert_eq!(
+        caps[1],
+        Cap::Chars(MENTION_INTENT_CHAR_CAP),
+        "the token is part of the same sentence"
+    );
+    assert_eq!(caps[2], Cap::Items(MENTION_CANDIDATE_CAP));
+    assert_eq!(caps[4], Cap::Bytes(MENTION_HEAD_BYTE_CAP));
+    // One page, and one page only: the popup's window (codex
+    // `MAX_POPUP_ROWS`), which zo's own view pins to the same number.
+    const { assert!(MENTION_CANDIDATE_CAP == 8) };
+    assert_eq!(
+        MENTION_INTENT_CHAR_CAP, RECALL_REQUEST_CHAR_CAP,
+        "the same kind of text, the same cap"
+    );
+    assert_eq!(MENTION_HEAD_BYTE_CAP, RECALL_SUMMARY_BYTE_CAP);
+
+    const { assert!(MENTION_RERANK.promotes) };
+    assert_eq!(MENTION_RERANK.agreement_kind, AgreementKind::Comparison);
+    assert_eq!(
+        MENTION_RERANK.answer_floor_permille,
+        Some(MENTION_ANSWER_FLOOR_PERMILLE)
+    );
+    assert_eq!(
+        MENTION_RERANK.agreement_floor_permille,
+        Some(MENTION_AGREEMENT_FLOOR_PERMILLE)
+    );
+    assert_eq!(
+        MENTION_RERANK.apply_deadline_ms,
+        Some(MENTION_APPLY_DEADLINE_MS),
+        "the one wall a late answer is dropped past is the row's"
+    );
+    assert_eq!(MENTION_RERANK.window_forgives, Some(FORGIVES_A_BAD_MINUTE));
+    assert_eq!(
+        MENTION_RERANK.agreement_rows_wanted,
+        Some(A_WINDOW_OF_COMPARISONS)
+    );
+    assert_eq!(
+        MENTION_RERANK.modes,
+        &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
+        "the recall seat's words: a person's on, and an auto that rises on its own labels"
+    );
+    assert!(MENTION_RERANK.mode_of(Some(&json!("on"))).applies());
+    assert!(
+        !MENTION_RERANK
+            .mode_of(Some(&json!("shadow")))
+            .applies_with(true)
+    );
+    assert!(
+        MENTION_RERANK
+            .mode_of(Some(&json!("auto")))
+            .applies_with(true)
+    );
+    assert!(
+        !MENTION_RERANK
+            .mode_of(Some(&json!("auto")))
+            .applies_with(false)
+    );
+    assert!(
+        !MENTION_RERANK.permits_press(1.0),
+        "a rerank presses nothing"
     );
 }
 
@@ -821,4 +1161,217 @@ fn only_auto_changes_its_mind_when_the_judge_speaks() {
     }
     assert!(JevMode::On.applies_with(false));
     assert!(!JevMode::Shadow.applies_with(true));
+}
+
+/// The seat an agent asks on purpose (t-6040): a tool and a CLI, never a
+/// stage of the product's own. It names the wire's own bounds for what one
+/// question may carry, offers no `auto` — nothing labels it, so `auto` could
+/// never rise and would be `shadow` under a name that promises otherwise —
+/// and never promotes, so every rise line on its row is empty.
+#[test]
+fn the_agent_tool_seat_names_the_wires_bounds_and_never_rises() {
+    let row = jev_use(AGENT_TOOL.id).expect("the agent tool row");
+    assert_eq!(row.id, "agent_tool");
+    assert_eq!(row.setting, "agentTool");
+    assert_eq!(row.modes, &[JevMode::Off, JevMode::Shadow, JevMode::On]);
+    assert!(!row.promotes);
+    assert_eq!(row.answer_floor_permille, None);
+    assert_eq!(row.agreement_floor_permille, None);
+    assert_eq!(row.apply_deadline_ms, None);
+    assert_eq!(row.window_forgives, None);
+    assert_eq!(row.agreement_rows_wanted, None);
+    assert_eq!(row.press_floor_permille, None);
+
+    // What one question may carry: the caller's words, every one of them
+    // cleared and cut where the door reads them.
+    let at: Vec<&str> = row.sends.iter().map(|sent| sent.at).collect();
+    assert_eq!(
+        at,
+        vec![
+            "/state/question",
+            "/state/context",
+            "/state/items",
+            "/state/items/*",
+            "/questions/*/criteria/*",
+        ]
+    );
+    for sent in row.sends {
+        match sent.at {
+            "/state/items" => assert_eq!(sent.cap, Cap::Items(SKILL_SHARD_TARGET)),
+            _ => assert_eq!(
+                sent.cap,
+                Cap::Chars(AGENT_TOOL_TEXT_CHAR_CAP),
+                "{}",
+                sent.at
+            ),
+        }
+    }
+    assert_eq!(AGENT_TOOL_TEXT_CHAR_CAP, ROUTING_TASK_CHAR_CAP);
+    // The wire's own ceilings (docs.typesafe.ai: a choice takes up to 255
+    // options, a score between two and ten levels), spelled once here.
+    assert_eq!(AGENT_TOOL_OPTION_CAP, 255);
+    assert_eq!(AGENT_TOOL_LEVELS, 2..=10);
+    assert_eq!(
+        AGENT_TOOL_ITEM_CAP % SKILL_SHARD_TARGET,
+        0,
+        "items are even shards"
+    );
+    assert_eq!(AGENT_TOOL_DEADLINE_MS, SKILL_SEARCH_APPLY_DEADLINE_MS);
+    assert_eq!(AGENT_TOOL_ASK_OPTIONS, ["yes", "no"]);
+    assert_eq!(JEV_USES.len(), 18);
+}
+
+/// The branching seat (t-6044) forks one phone step — the emulator seat's
+/// top candidates each tried on a saved device and the results compared —
+/// and rises on the walk's own next step.
+#[test]
+fn the_branching_seat_forks_a_phone_step_and_rises_on_the_walks_next_step() {
+    assert_eq!(jev_use("branching"), Some(&BRANCHING));
+    assert_eq!(BRANCHING.setting, "jevBranching");
+    assert_eq!(BRANCHING.ledger, "branching.jsonl");
+    // A labeled seat offers the four words every labeled seat offers (the
+    // seat contract's third rule, as corrected after t-6155 F7).
+    assert_eq!(BRANCHING.modes, &JevMode::ALL[..]);
+    assert_eq!(BRANCHING.offered("on"), Some(JevMode::On));
+    assert!(
+        BRANCHING.mode_of(Some(&json!("on"))).applies_with(false),
+        "`on` is a person's override: it acts without a rise"
+    );
+    assert!(!BRANCHING.mode_of(Some(&json!("auto"))).applies_with(false));
+    assert!(BRANCHING.mode_of(Some(&json!("auto"))).applies_with(true));
+    assert_eq!(
+        BRANCHING.mode_in(&json!({"smart": {"emulatorAction": "auto"}})),
+        JevMode::Off,
+        "the emulator seat's consent is not the fork's"
+    );
+    assert_ne!(BRANCHING.setting, EMULATOR.setting);
+    assert_ne!(BRANCHING.ledger, EMULATOR.ledger);
+
+    // What is sent: the goal, the phone's address, the screen before and each
+    // candidate's action and the controls it led to — never a body.
+    let sent: Vec<&str> = BRANCHING.sends.iter().map(|sent| sent.at).collect();
+    assert_eq!(
+        sent,
+        [
+            "/state/goal",
+            "/state/where/platform",
+            "/state/where/device",
+            "/state/before",
+            "/state/before/*",
+            "/state/candidates",
+            "/state/candidates/*/action",
+            "/state/candidates/*/result/controls",
+            "/state/candidates/*/result/controls/*",
+            "/questions/*/criteria/*",
+        ]
+    );
+    let caps = |row: &JevUse| -> Vec<Cap> { row.sends.iter().map(|sent| sent.cap).collect() };
+    assert!(caps(&BRANCHING).contains(&Cap::Chars(GOAL_CHAR_CAP)));
+    assert!(caps(&BRANCHING).contains(&Cap::Items(BRANCHING_K_CAP)));
+    assert!(caps(&BRANCHING).contains(&Cap::Items(SCREEN_CANDIDATE_CAP)));
+
+    // k is one number in the table, at least two and never past what the
+    // question carries.
+    const {
+        assert!(BRANCHING_K == 2);
+        assert!(BRANCHING_K_CAP == 3);
+        assert!(BRANCHING_K <= BRANCHING_K_CAP);
+        assert!(BRANCHING.promotes);
+    }
+    assert_eq!(BRANCHING.agreement_kind, AgreementKind::Comparison);
+    assert_eq!(
+        BRANCHING.answer_floor_permille,
+        Some(BRANCHING_ANSWER_FLOOR_PERMILLE)
+    );
+    assert_eq!(
+        BRANCHING.agreement_floor_permille,
+        Some(BRANCHING_AGREEMENT_FLOOR_PERMILLE)
+    );
+    assert_eq!(
+        BRANCHING.apply_deadline_ms,
+        Some(BRANCHING_APPLY_DEADLINE_MS)
+    );
+    assert_eq!(BRANCHING.window_forgives, Some(FORGIVES_A_BAD_MINUTE));
+    assert_eq!(
+        BRANCHING.agreement_rows_wanted,
+        Some(A_WINDOW_OF_COMPARISONS)
+    );
+    // The comparison's pick is pressed at the screen seats' own confidence
+    // line; under it the first candidate stands, as today.
+    assert_eq!(
+        BRANCHING.press_floor_permille,
+        Some(SCREEN_PRESS_FLOOR_PERMILLE)
+    );
+    assert!(BRANCHING.permits_press(0.5) && !BRANCHING.permits_press(0.49));
+    assert_eq!(BRANCHING_APPLY_DEADLINE_MS, 1_500);
+}
+
+/// The judgment cache (t-6132) is a seat with no question of its own: it
+/// sends nothing, presses nothing, and rises on the memo's own comparison —
+/// the remembered choice against the fresh one the wire gave for the same
+/// bytes. A labeled seat: all four words, `on` the person's own.
+#[test]
+fn the_judgment_cache_sends_nothing_and_rises_on_the_memos_own_comparison() {
+    assert_eq!(jev_use("judgment_cache"), Some(&JUDGMENT_CACHE));
+    assert_eq!(JUDGMENT_CACHE.setting, "jevJudgmentCache");
+    assert_eq!(
+        JUDGMENT_CACHE.modes,
+        &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto]
+    );
+    assert_eq!(JUDGMENT_CACHE.offered("on"), Some(JevMode::On));
+    assert!(JUDGMENT_CACHE.mode_of(Some(&json!("on"))).applies());
+    assert!(
+        JUDGMENT_CACHE.sends.is_empty(),
+        "a memo hit leaves the machine no bytes; there is nothing to cap"
+    );
+    assert_eq!(JUDGMENT_CACHE.ledger, "judgment-cache.jsonl");
+    const { assert!(JUDGMENT_CACHE.promotes) };
+    assert_eq!(JUDGMENT_CACHE.agreement_kind, AgreementKind::Comparison);
+    assert_eq!(
+        JUDGMENT_CACHE.answer_floor_permille,
+        Some(JUDGMENT_CACHE_ANSWER_FLOOR_PERMILLE)
+    );
+    assert_eq!(
+        JUDGMENT_CACHE.agreement_floor_permille,
+        Some(JUDGMENT_CACHE_AGREEMENT_FLOOR_PERMILLE)
+    );
+    // Held above the screen seats' line: the same reader against itself.
+    const { assert!(JUDGMENT_CACHE_AGREEMENT_FLOOR_PERMILLE > SCREEN_AGREEMENT_FLOOR_PERMILLE) };
+    assert_eq!(
+        JUDGMENT_CACHE.apply_deadline_ms,
+        Some(JUDGMENT_MEMO_DEADLINE_MS)
+    );
+    const { assert!(JUDGMENT_MEMO_DEADLINE_MS < SCREEN_APPLY_DEADLINE_MS) };
+    assert_eq!(JUDGMENT_CACHE.window_forgives, Some(FORGIVES_NOTHING));
+    assert!(
+        !JUDGMENT_CACHE.permits_press(1.0),
+        "the memo presses nothing; the screen seat's own rule reads the remembered confidence"
+    );
+    assert!(JUDGMENT_CACHE.mode_of(Some(&json!("on"))).asks());
+    assert!(
+        !JUDGMENT_CACHE
+            .mode_of(Some(&json!("auto")))
+            .applies_with(false)
+    );
+    assert!(
+        JUDGMENT_CACHE
+            .mode_of(Some(&json!("auto")))
+            .applies_with(true)
+    );
+    // The door asks the memo after its own four questions and before it
+    // counts — held as a statement order in the door's source.
+    let door = include_str!("door.rs");
+    let passing = &door[door
+        .find("pub fn pass_remembering(")
+        .expect("the memo road")..];
+    let asked = passing
+        .find("let cleared = ask(&asking)?;")
+        .expect("the four questions");
+    let looked = passing
+        .find("memo::recall(memo.path, &key)")
+        .expect("the lookup");
+    let counted = passing
+        .find("take_a_place(settings, requests)")
+        .expect("the count");
+    assert!(asked < looked && looked < counted, "{passing}");
 }

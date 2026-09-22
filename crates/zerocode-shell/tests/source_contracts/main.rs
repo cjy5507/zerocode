@@ -1,5 +1,6 @@
 mod agent_capabilities;
 mod bundle_resources;
+mod cli_login;
 mod computer_use_mirrors;
 mod crash_report;
 mod fixture_cases;
@@ -20366,19 +20367,30 @@ mod tests {
         let core = include_str!("../../../zerocode-core/src/notify.rs");
         let (rules, _) = core.split_once("#[cfg(test)]").unwrap_or((core, ""));
 
-        // Suppression first, cooldown second — as STATEMENTS in that order.
+        // Suppression first, cooldown second — as STATEMENTS in that order:
+        // the bell asks whether the person is watching and returns before
+        // it walks the last rungs, where the cooldown is spent (t-6043 put
+        // the notify seat between the two; a watched screen is not asked).
         let ringing = block_after(shipped, "fn ring_now(");
         let suppressing = ringing
             .find("notify::suppressed(worktree, &active, focused)")
             .expect("the ring no longer asks whether the person is watching");
-        let cooling = ringing
-            .find(".rings().may_ring(worktree, epoch_ms_now())")
-            .expect("the ring no longer keeps a cooldown");
+        let returning = ringing
+            .find("if watched {\n        return;\n    }")
+            .expect("a watched screen no longer turns the ring back");
+        let last = ringing
+            .find("ring_composed(app, worktree, term, &composed);")
+            .expect("the ring no longer walks the last rungs");
         assert!(
-            suppressing < cooling,
-            "the cooldown is spent before suppression is asked, so watching \
+            suppressing < returning && returning < last,
+            "the last rungs run before suppression is asked, so watching \
              the active screen silences its worktree's next genuine \
              ring:\n{ringing}"
+        );
+        let composed = block_after(shipped, "fn ring_composed(");
+        assert!(
+            composed.contains(".rings().may_ring(worktree, epoch_ms_now())"),
+            "the ring no longer keeps a cooldown:\n{composed}"
         );
 
         // The cooldown's memory is keyed by worktree, not one global stamp.
@@ -32567,6 +32579,141 @@ mod tests {
         );
     }
 
+    /// t-5966 G1: a line's provenance is one enum in core, spelled on the
+    /// wire by serde, and read — never derived — by the window.
+    ///
+    /// The window's table holds the enum's names in the enum's order, the
+    /// model takes each line's road from the answer (`edge.provenance`) and
+    /// nowhere from its kind, and the shell backend names a road by the
+    /// enum's variants rather than by a string a refactor could miss.
+    #[test]
+    fn edge_provenance_is_one_enum_read_off_the_wire() {
+        let core = include_str!("../../../zerocode-core/src/second_brain_graph.rs");
+        let window = crate::ui_source::window_source();
+
+        // The enum's wire spellings, from its own `as_str` table.
+        let held = core
+            .split("impl EdgeProvenance {")
+            .nth(1)
+            .expect("the provenance enum's impl");
+        let spelled = &held[..held.find("\n}\n").unwrap_or(held.len())];
+        let wire: Vec<&str> = spelled
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let (_, rest) = line.split_once("Self::")?;
+                let (_, word) = rest.split_once("=> \"")?;
+                word.strip_suffix("\",")
+            })
+            .collect();
+        assert_eq!(
+            wire,
+            ["measured", "declared", "inferred"],
+            "the provenance enum's wire spellings moved:\n{spelled}"
+        );
+
+        // The window's table names exactly those roads, in that order.
+        let table = block_after(window, "const KNOWLEDGE_EDGE_PROVENANCES = Object.freeze([");
+        let ids: Vec<&str> = table
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("{ id: \""))
+            .filter_map(|rest| rest.split_once('"').map(|(id, _)| id))
+            .collect();
+        assert_eq!(
+            ids, wire,
+            "the window's provenance table drifted from the enum"
+        );
+
+        // The model reads the road from the answer and derives none.
+        let model = block_after(window, "function knowledgeModel(report) {");
+        assert!(
+            model.contains("knowledgeEdgeProvenanceCode(edge)"),
+            "the model no longer reads `edge.provenance` through the one reader"
+        );
+        let reader = block_after(window, "function knowledgeEdgeProvenanceCode(edge) {");
+        assert!(
+            reader.contains("KNOWLEDGE_EDGE_PROVENANCE_CODE[edge.provenance]")
+                && !reader.contains("edge.kind"),
+            "the reader derives a road from the kind instead of the answer:\n{reader}"
+        );
+        for road in &wire {
+            assert!(
+                !strip_comments(model).contains(&format!("\"{road}\"")),
+                "`knowledgeModel` spells the road `{road}` itself — roads come off the wire"
+            );
+        }
+
+        // The one backend file that touches the graph spells no road as a
+        // string: the enum's names, or nothing.
+        let graph_commands = BACKEND_PARTS
+            .iter()
+            .find(|(name, _)| *name == "cmd/second_brain.rs")
+            .map(|(_, text)| *text)
+            .expect("cmd/second_brain.rs is a shipped part");
+        let shipped = strip_rust_comments(graph_commands);
+        for road in &wire {
+            assert!(
+                !shipped.contains(&format!("\"{road}\"")),
+                "cmd/second_brain.rs spells the road `{road}` as a string — name \
+                 `EdgeProvenance::` instead"
+            );
+        }
+    }
+
+    /// t-5966 G3/G4: the path calculator is core's and the window holds
+    /// none; the export renders in core and publishes through the store's
+    /// one door.
+    ///
+    /// The window used to run a breadth-first search of its own over the
+    /// lens's subset; two calculators over two pictures answered two
+    /// things. Now Shift-click and the ask form both go through
+    /// `second_brain_paths`, the backend walks the cached picture off the
+    /// window's thread with `second_brain_paths::report`, and the export
+    /// command renders with `second_brain_export::render` and publishes
+    /// with `Store::publish_page` — the gallery, its versions and its
+    /// thumbnails need nothing new.
+    #[test]
+    fn paths_are_counted_in_core_and_the_export_goes_through_the_artifact_door() {
+        let window = crate::ui_source::window_source();
+        let code = strip_comments(window);
+        assert!(
+            !code.contains("function findKnowledgeShortestPath("),
+            "the window grew a path calculator of its own again"
+        );
+        let asking = block_after(window, "async function runKnowledgeShortestPath(");
+        assert!(
+            asking.contains("invoke(\"second_brain_paths\"") && !asking.contains("neighbour["),
+            "Shift-click no longer asks the backend for the path:\n{asking}"
+        );
+        let routing = block_after(window, "function knowledgeRoute(model, path) {");
+        assert!(
+            routing.contains("path.report.paths[path.picked]")
+                && routing.contains("model.keys.indexOf("),
+            "the route no longer maps the answer's ids onto this picture:\n{routing}"
+        );
+
+        let backend = shipped_backend();
+        let paths = block_after(backend, "pub(crate) async fn second_brain_paths(");
+        assert!(
+            paths.contains("spawn_blocking")
+                && paths.contains("scanned_graph(")
+                && paths.contains("second_brain_paths::report("),
+            "the path command left the cached picture, the blocking pool or core's calculator:\n{paths}"
+        );
+        let export = block_after(backend, "pub(crate) async fn second_brain_export_html(");
+        assert!(
+            export.contains("spawn_blocking")
+                && export.contains("second_brain_export::render(")
+                && export.contains(".publish_page(")
+                && export.contains("CHANGED_EVENT"),
+            "the export command left core's renderer, the store's publish door or the changed event:\n{export}"
+        );
+        assert!(
+            !export.contains("<html") && !export.contains("<script"),
+            "the export command writes markup of its own — the page is core's template"
+        );
+    }
+
     /// t-4140 S2: which mode the knowledge graph opens in is a rule about
     /// where the person came from and what this vault remembers — never a
     /// rule about how big the graph is. The design (docs/design/
@@ -35996,8 +36143,26 @@ fn the_emulator_pane_opens_on_a_resumed_device() {
     // waits inside a named limit rather than a number written here.
     let saved_exit = support::block_after(android, "fn ask_for_a_saved_exit(");
     assert!(
-        saved_exit.contains("\"emu\", \"kill\"") && saved_exit.contains("SNAPSHOT_SAVE_LIMIT"),
+        saved_exit.contains("emu_console(&sdk.adb, &serial, &[\"kill\"])")
+            && saved_exit.contains("SNAPSHOT_SAVE_LIMIT"),
         "the saved exit is no longer `adb emu kill` inside a named limit:\n{saved_exit}"
+    );
+    // The console is one road (t-6044): the saved exit's `kill` and a forked
+    // step's `avd snapshot save|load|delete` both walk `adb -s <serial> emu …`
+    // through `emu_console`, and a load waits for the bridge inside the same
+    // named limit the exit waits for its save.
+    let console = support::block_after(android, "fn emu_console(");
+    assert!(
+        console.contains("[\"-s\", serial, \"emu\"]") && console.contains(".args(words)"),
+        "the console road no longer spells `adb emu` once:\n{console}"
+    );
+    let snapshot_road = support::block_after(android, "pub(crate) fn android_avd_snapshot(");
+    assert!(
+        snapshot_road
+            .contains("emu_console(&sdk.adb, serial, &[\"avd\", \"snapshot\", verb.word(), name])")
+            && snapshot_road.contains("SNAPSHOT_SAVE_LIMIT")
+            && snapshot_road.contains("device_presence(&sdk.adb, serial)"),
+        "a fork's snapshot no longer walks the console road and waits for the bridge:\n{snapshot_road}"
     );
     let stop = support::block_after(android, "fn stop(&self) -> bool {");
     let asked = stop

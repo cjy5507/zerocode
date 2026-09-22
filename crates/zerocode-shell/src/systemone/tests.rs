@@ -19,8 +19,43 @@ pub(crate) struct Endpoint {
 }
 
 impl Endpoint {
-    /// Answer `status` with `body`, after `hold_ms` milliseconds each time.
+    /// Answer `status` with `body`, after `hold_ms` milliseconds each time —
+    /// one request at a time, which is what every seat that asks once needs.
     pub(crate) fn serving(status: &'static str, body: String, hold_ms: u64) -> Self {
+        Self::listening(
+            status,
+            Arc::new(move |_: &str| body.clone()),
+            hold_ms,
+            false,
+        )
+    }
+
+    /// The same endpoint answering every connection on a thread of its own,
+    /// so requests that leave side by side are held side by side — what a
+    /// test of a seat that asks in shards needs: on the serial endpoint two
+    /// shards held 300 ms each would come back after 600 whether or not the
+    /// seat asked them together.
+    pub(crate) fn serving_each(status: &'static str, body: String, hold_ms: u64) -> Self {
+        Self::listening(status, Arc::new(move |_: &str| body.clone()), hold_ms, true)
+    }
+
+    /// An endpoint whose body is chosen by the request it read — head and
+    /// body as they arrived — each connection on a thread of its own: what a
+    /// walk that asks two different questions of one endpoint needs.
+    pub(crate) fn answering_each(
+        status: &'static str,
+        answer: impl Fn(&str) -> String + Send + Sync + 'static,
+        hold_ms: u64,
+    ) -> Self {
+        Self::listening(status, Arc::new(answer), hold_ms, true)
+    }
+
+    fn listening(
+        status: &'static str,
+        body: Arc<dyn Fn(&str) -> String + Send + Sync>,
+        hold_ms: u64,
+        each: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback seat");
         let addr = listener.local_addr().expect("its address");
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -30,17 +65,27 @@ impl Endpoint {
                 let Ok(mut socket) = socket else {
                     return;
                 };
-                let request = read_request(&mut socket);
-                heard.lock().expect("the record").push(request);
-                if hold_ms > 0 {
-                    thread::sleep(Duration::from_millis(hold_ms));
+                let heard = Arc::clone(&heard);
+                let body = Arc::clone(&body);
+                let mut answer = move || {
+                    let request = read_request(&mut socket);
+                    let body = body(&request);
+                    heard.lock().expect("the record").push(request);
+                    if hold_ms > 0 {
+                        thread::sleep(Duration::from_millis(hold_ms));
+                    }
+                    let answer = format!(
+                        "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(answer.as_bytes());
+                    let _ = socket.flush();
+                };
+                if each {
+                    thread::spawn(answer);
+                } else {
+                    answer();
                 }
-                let answer = format!(
-                    "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = socket.write_all(answer.as_bytes());
-                let _ = socket.flush();
             }
         });
         Self { addr, seen }
@@ -251,11 +296,14 @@ fn a_second_warm_up_inside_the_pools_idle_window_opens_no_socket() {
 /// transition row in 1,147 requests (t-5875).
 ///
 /// The placement seat, because it is the one whose rows say what the road is
-/// for: 38 real requests, one timeout, no reader to be compared against.
+/// for: 38 real requests, one timeout, and marks that are hindsight — the
+/// pane left where it was put — which the seat waits a window of before it
+/// may rise (t-6155 F1): its own rows alone never carry it up.
 #[test]
 fn a_seat_on_auto_rises_on_its_own_rows_and_is_read_back_as_acting() {
     use serde_json::json;
     use zerocode_core::jev::promote::{ROSE, Stand, stand_from, window_wanted_for};
+    use zerocode_core::jev::summary::rows_that_can_clear;
     use zerocode_core::jev::{JevMode, PLACEMENT};
 
     let home = tempfile::tempdir().expect("a zo home");
@@ -267,6 +315,19 @@ fn a_seat_on_auto_rises_on_its_own_rows_and_is_read_back_as_acting() {
     for at in 0..wanted as i64 - 1 {
         record_rows(&PLACEMENT, &ledger, &[answered(at)], at);
     }
+    // The marks the seat's own later facts wrote: a window's worth, and
+    // enough agreeing ones to clear its budget, dated inside the window.
+    let marks = rows_that_can_clear(PLACEMENT.agreement_floor_permille.expect("a budget"))
+        .max(PLACEMENT.agreement_rows_wanted.expect("a sample floor"));
+    let labels: Vec<serde_json::Value> = (0..marks)
+        .map(|n| json!({"at": 1, "label": format!("placement-{n}"), "agreed": true}))
+        .collect();
+    record_rows(&PLACEMENT, &ledger, &labels, 1);
+    assert_eq!(
+        stand_from(&read_rows(&ledger)),
+        Stand::Recording,
+        "marks alone do not fill the window"
+    );
     assert_eq!(stand_from(&read_rows(&ledger)), Stand::Recording);
     assert!(
         !read_rows(&ledger)

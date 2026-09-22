@@ -15,6 +15,8 @@ use runtime::{
     FileReadRegistry, GrepSearchInput, PermissionMode,
 };
 
+pub(crate) const READ_FILE_TOOL_NAME: &str = "read_file";
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ReadFileInput {
     pub path: String,
@@ -99,7 +101,7 @@ pub(crate) struct DebugHypothesisInput {
 pub(crate) fn tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
-            name: "read_file",
+            name: READ_FILE_TOOL_NAME,
             description: "Read workspace text, PDF pages, or notebook cells and outputs. Read one generous range and batch independent files. Do not reread after a successful edit unless disk may have changed. A whole code-file read ends with [neighbours].",
             input_schema: json!({
                 "type": "object",
@@ -269,7 +271,7 @@ pub(crate) fn dispatch(
     input: &Value,
 ) -> Option<Result<String, ToolError>> {
     match name {
-        "read_file" => Some(
+        READ_FILE_TOOL_NAME => Some(
             maybe_enforce_permission_check(enforcer, name, input).and_then(|()| {
                 from_value::<ReadFileInput>(input).and_then(|inp| {
                     run_read_file(
@@ -279,6 +281,7 @@ pub(crate) fn dispatch(
                         ctx.workspace_root.as_deref(),
                         ctx.cwd.as_deref(),
                         &ctx.file_reads,
+                        Some(&ctx.codegraph),
                     )
                 })
             }),
@@ -620,6 +623,9 @@ fn resolve_against_cwd(path: &str, cwd: Option<&Path>) -> Option<std::path::Path
     (!candidate.is_absolute()).then(|| cwd.join(candidate))
 }
 
+/// `codegraph` is the session's index slot: a whole-file code read adds what
+/// the index links the file to (`codegraph_tools::neighbours_for_read`) after
+/// the neighbours its own text names. `None` reads without it.
 pub(crate) fn run_read_file(
     input: &ReadFileInput,
     enforcer: Option<&PermissionEnforcer>,
@@ -627,6 +633,7 @@ pub(crate) fn run_read_file(
     workspace_root: Option<&Path>,
     cwd: Option<&Path>,
     file_reads: &std::sync::Mutex<FileReadRegistry>,
+    codegraph: Option<&std::sync::Mutex<Option<codegraph::CodeGraph>>>,
 ) -> Result<String, ToolError> {
     // Read-only boundary check: symlink-escape and `../` traversal can
     // exfiltrate files outside the workspace even in ReadOnly mode.
@@ -635,7 +642,22 @@ pub(crate) fn run_read_file(
     let target = resolved
         .or_else(|| resolve_against_cwd(&input.path, cwd))
         .map_or_else(|| input.path.clone(), |p| p.to_string_lossy().into_owned());
-    let output = read_file(&target, input.offset, input.limit)?;
+    let mut output = read_file(&target, input.offset, input.limit)?;
+    let read_path = std::path::PathBuf::from(&output.file.file_path);
+    if let Some(slot) = codegraph.filter(|_| {
+        runtime::file_neighbours::wants_neighbours(&read_path, input.offset)
+    }) {
+        if let Some(index) =
+            crate::codegraph_tools::neighbours_for_read(slot, cwd, workspace_root, &read_path)
+        {
+            output.file.neighbours = runtime::file_neighbours::with_index_links(
+                &read_path,
+                std::mem::take(&mut output.file.neighbours),
+                &index.uses,
+                &index.tested_by,
+            );
+        }
+    }
     // 성공한 읽기를 대화 스코프 레지스트리에 등재 — 이후 edit/write 가드의
     // 기준 상태. 부분 읽기(offset/limit)여도 파일 전체 스냅샷을 기록한다
     // (CC 패리티: 부분 Read도 "읽음"으로 친다).
@@ -2261,6 +2283,7 @@ mod boundary_tests {
             Some(&workspace),
             None,
             &reads(),
+            None,
         );
         assert!(
             result.is_ok(),
@@ -2298,6 +2321,7 @@ mod boundary_tests {
             Some(&workspace),
             None,
             &registry,
+            None,
         )
         .expect("read should succeed");
 
@@ -2340,6 +2364,7 @@ mod boundary_tests {
             Some(&workspace),
             None,
             &reads(),
+            None,
         );
         let output = result.expect("danger-full-access must allow an outside read");
         assert!(
@@ -2370,6 +2395,7 @@ mod boundary_tests {
             Some(&workspace),
             None,
             &reads(),
+            None,
         );
         assert!(
             matches!(result, Err(ToolError::PermissionDenied { .. })),
@@ -2529,6 +2555,7 @@ mod boundary_tests {
             None,
             Some(&dir),
             &reads(),
+            None,
         )
         .expect("relative read should resolve against cwd");
         assert!(result.contains("hi from cwd"), "got: {result}");
@@ -2574,6 +2601,7 @@ mod read_guard_tests {
             None,
             None,
             &ctx.file_reads,
+            None,
         )
     }
 
@@ -2784,6 +2812,7 @@ mod read_guard_tests {
             None,
             None,
             &ctx.file_reads,
+            None,
         )
         .expect("windowed read");
         edit(&ctx, &path, "l3", "L3").expect("edit outside the read window is still allowed");

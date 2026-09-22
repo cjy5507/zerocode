@@ -4,7 +4,10 @@
 //! Two programs ask. zo asks about a task it is routing and about the notes a
 //! recall found; the window asks which control a walk should press next — on a
 //! page or on the desktop — about a worker whose pane went quiet, about where
-//! a worker's window belongs and about which agent a summons should start.
+//! a worker's window belongs, about which agent a summons should start,
+//! about which blocks of a page an agent's browser read should fold away
+//! about whether a ring is worth interrupting the person for, and about
+//! which of the screens a forked phone step led to is the one to keep.
 //! Each keeps its own wire — the two Cargo workspaces carry different `reqwest` majors
 //! (docs/design/jev-browser-action-20260917.md §1.4) — so what must not fork
 //! lives here, in the one crate both already read:
@@ -27,6 +30,7 @@ pub mod choice;
 pub mod count;
 pub mod door;
 pub mod hedge;
+pub mod memo;
 pub mod promote;
 pub mod recent;
 pub mod shard;
@@ -271,8 +275,11 @@ pub struct JevUse {
     /// a floor on a seat that never rises is a number nobody reads, and a
     /// rising seat with no floor is a promotion with nothing to pass.
     pub answer_floor_permille: Option<u16>,
-    /// Minimum confidence for a screen press, distinct from the answer-rate
-    /// promotion floor. None means this seat has no authority to press.
+    /// Minimum confidence for the seat to act on ONE answer alone — a screen
+    /// press, or a block the browser read folds away — distinct from the
+    /// answer-rate promotion floor. None means this seat acts on no single
+    /// answer's confidence: it has no authority to press, or it applies
+    /// whatever it answers.
     pub press_floor_permille: Option<u16>,
     /// The share of compared axes on which the judgment must bound above in
     /// naming what the reader it replaces named, per thousand, before `auto`
@@ -298,23 +305,14 @@ pub struct JevUse {
     /// A use that does not promote forgives nothing, because nothing is
     /// judged.
     pub window_forgives: Option<usize>,
-    /// How many comparisons must be in hand before the route-change budget
-    /// ([`Self::agreement_floor_permille`]) binds — and, when that many are
-    /// not, whether the seat waits for them or is judged on its own ledger.
-    ///
-    /// Zero says the seat has no reader to be compared against, so the budget
-    /// has no subject and the seat rises on what its ledger alone shows: that
-    /// it answers, in time, well-formed. A comparison it does have is still
-    /// read, and one that says the seat is wrong takes it back down.
-    ///
-    /// It is the use's own for the same reason the floors are. `too_few_
-    /// compared` is the only line in §4 with no road out — a seat whose rows
-    /// carry no mark is held by it forever, which is the door with no handle
-    /// the labels rule was rewritten to remove. Recall's ledger cleared its
-    /// answer line at 18 of the 50 judgments in its 1,005 rows and was held
-    /// at `0 of 20` on every one of them (2026-09-22). A use that does not
-    /// promote names none.
+    /// The sample floor at which the agreement line may speak: until this
+    /// many marks are in hand the seat is held at `too_few_compared`,
+    /// whatever kind of mark it writes ([`AgreementKind`]). A thinner
+    /// sample never promotes (t-6155 F1).
     pub agreement_rows_wanted: Option<usize>,
+    /// Where the seat's `agreed` marks come from: a second reader, or a
+    /// later fact.
+    pub agreement_kind: AgreementKind,
 }
 
 /// What a seat forgives whose miss the product was going to cover anyway: one
@@ -342,14 +340,19 @@ pub const FORGIVES_NOTHING: usize = 0;
 /// ([`JevUse::agreement_rows_wanted`]).
 pub const A_WINDOW_OF_COMPARISONS: usize = summary::JUDGED_EVERY_ROWS;
 
-/// What a seat with no reader to be compared against must show: nothing.
-///
-/// Not a lowered bar — there is no probe beside these judgments and no rule
-/// they overrule, so the route-change budget has nothing to be a budget of.
-/// What the seat is held to instead is every other line of §4, and the marks
-/// its own writer leaves once they exist: the moment one arrives that says the
-/// seat was wrong, the agreement line binds and takes it back down.
-pub const NO_READER_TO_COMPARE: usize = 0;
+/// Where a seat's `agreed` marks come from — a second reader answering the
+/// same question, or a later fact grading the answer. A description of the
+/// mark for a reader and a screen; the judge holds both kinds to the same
+/// sample floor and the same Wilson line ([`crate::jev::promote`]), so a
+/// hindsight seat with no marks yet is held exactly as a comparison seat
+/// with none (t-6155 F1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgreementKind {
+    /// A replacement reader needs comparison evidence before it may act.
+    Comparison,
+    /// Later outcome labels grade an otherwise eligible seat once populated.
+    Hindsight,
+}
 
 /// The routing seat's route-change budget: four compared axes in five must
 /// agree with the chat probe, as a 95% lower bound.
@@ -407,6 +410,36 @@ pub const SCREEN_AGREEMENT_FLOOR_PERMILLE: u16 = 800;
 /// than the fallback it would replace.
 pub const SCREEN_APPLY_DEADLINE_MS: u64 = 1_500;
 
+/// The share of memo answers that must name what a fresh answer named, per
+/// thousand, before the judgment cache's `auto` answers a walk from the memo
+/// alone ([`JUDGMENT_CACHE`]): nine in ten.
+///
+/// The label is a comparison the seat makes itself under `shadow`: the memo
+/// held an answer for these exact bytes, the wire was asked anyway, and the
+/// two chose the same number or did not. A cache whose answers disagree with
+/// a fresh judgment more than one time in ten is a stale cache, and the walk
+/// it would be answering is a real pointer on a real screen. Held above the
+/// screen seats' own line ([`SCREEN_AGREEMENT_FLOOR_PERMILLE`]) because what
+/// is compared here is the same reader against itself — the notify seat's
+/// replay put Jev's repeatability on identical inputs at 96.5% (t-6043), so
+/// nine in ten is a line a working memo clears with room.
+pub const JUDGMENT_CACHE_AGREEMENT_FLOOR_PERMILLE: u16 = 900;
+
+/// The share of memo lookups that must answer, per thousand, before the
+/// judgment cache's `auto` rises — the screen seats' own line, because a memo
+/// hit stands in for a screen question and is held to what that question is
+/// held to. A hit that no longer reads (a remembered body the question's own
+/// rules refuse) is the miss this floor counts.
+pub const JUDGMENT_CACHE_ANSWER_FLOOR_PERMILLE: u16 = SCREEN_ANSWER_FLOOR_PERMILLE;
+
+/// The wall one memo lookup may hold a walk, in milliseconds — the latency
+/// line the judge holds the cache seat to. A memo is one local file of at
+/// most [`memo::MEMO_ROWS_CAP`] rows read whole (measured 2026-09-22: 2,000
+/// rows of ~400 bytes read and scanned in under 5 ms on this machine); a
+/// lookup past this wall is a memo that has stopped being cheaper than the
+/// question it answers for.
+pub const JUDGMENT_MEMO_DEADLINE_MS: u64 = 50;
+
 /// zo's routing judgment: a task's complexity, risk and intent beside the
 /// chat probe's (docs/design/jev-decision-shadow-20260917.md).
 ///
@@ -435,6 +468,7 @@ pub const ROUTING: JevUse = JevUse {
     apply_deadline_ms: Some(ROUTING_APPLY_DEADLINE_MS),
     window_forgives: Some(FORGIVES_NOTHING),
     agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Comparison,
 };
 
 /// The wall zo's routing waits for a judgment when the seat acts: the batch
@@ -508,6 +542,8 @@ pub const RECALL_AGREEMENT_FLOOR_PERMILLE: u16 = SKILL_AGREEMENT_FLOOR_PERMILLE;
 /// [`RECALL_ANSWER_FLOOR_PERMILLE`] and [`RECALL_AGREEMENT_FLOOR_PERMILLE`];
 /// the judge writes the rise in the seat's own ledger, and the seat reads it
 /// back per recall (`rerank_shadow::settle`).
+/// Hindsight labels enter that decision only at [`A_WINDOW_OF_COMPARISONS`];
+/// below the sample floor, the answer, latency and schema lines decide alone.
 ///
 /// The apply also LEAVES OUT the notes the judgment put on its bottom level —
 /// *nothing in it bears on the request* — which the same ledger says is 24.5%
@@ -559,7 +595,8 @@ pub const RECALL: JevUse = JevUse {
     // seat against the wall the stage actually holds.
     apply_deadline_ms: Some(ROUTING_APPLY_DEADLINE_MS),
     window_forgives: Some(FORGIVES_A_BAD_MINUTE),
-    agreement_rows_wanted: Some(NO_READER_TO_COMPARE),
+    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Hindsight,
 };
 
 /// What every screen question carries, whichever surface answered it
@@ -657,6 +694,7 @@ pub const BROWSER: JevUse = JevUse {
     apply_deadline_ms: Some(SCREEN_APPLY_DEADLINE_MS),
     window_forgives: Some(FORGIVES_A_BAD_MINUTE),
     agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Comparison,
 };
 
 /// The window's desktop walk: which numbered control of an app's
@@ -692,6 +730,7 @@ pub const DESKTOP: JevUse = JevUse {
     apply_deadline_ms: Some(SCREEN_APPLY_DEADLINE_MS),
     window_forgives: Some(FORGIVES_A_BAD_MINUTE),
     agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Comparison,
 };
 
 /// A mobile screen is a separate consent and evidence surface. Existing
@@ -724,6 +763,7 @@ pub const EMULATOR: JevUse = JevUse {
     apply_deadline_ms: Some(SCREEN_APPLY_DEADLINE_MS),
     window_forgives: Some(FORGIVES_A_BAD_MINUTE),
     agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Comparison,
 };
 
 /// The window's stall sweep: why a quiet worker stopped when the measured
@@ -753,6 +793,7 @@ pub const STALL: JevUse = JevUse {
     apply_deadline_ms: Some(STALL_APPLY_DEADLINE_MS),
     window_forgives: Some(FORGIVES_A_BAD_MINUTE),
     agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Comparison,
 };
 
 /// What the placement seat's answers must bound above before `auto` rises to
@@ -780,6 +821,8 @@ pub const PLACEMENT_ANSWER_FLOOR_PERMILLE: u16 = 800;
 
 /// The window's worker placement: which of [`PLACEMENT_OPTIONS`] a worker it
 /// just started belongs in.
+/// Its hindsight marks bind only at [`A_WINDOW_OF_COMPARISONS`]. Before then,
+/// even a mixed thin sample leaves the other eligibility lines to decide.
 ///
 /// The measured rule (`tilePlacement`, `ui/shell-term.js`) answers a
 /// different question well — given that a pane IS being cut, which way and
@@ -835,7 +878,8 @@ pub const PLACEMENT: JevUse = JevUse {
     agreement_floor_permille: Some(ORCHESTRATION_AGREEMENT_FLOOR_PERMILLE),
     apply_deadline_ms: Some(PLACEMENT_APPLY_DEADLINE_MS),
     window_forgives: Some(FORGIVES_A_BAD_MINUTE),
-    agreement_rows_wanted: Some(NO_READER_TO_COMPARE),
+    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Hindsight,
 };
 
 /// The summons' agent choice: which of the agents this window could start
@@ -924,6 +968,7 @@ pub const SUMMON: JevUse = JevUse {
     apply_deadline_ms: Some(SUMMON_APPLY_DEADLINE_MS),
     window_forgives: Some(FORGIVES_A_BAD_MINUTE),
     agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Comparison,
 };
 
 /// Characters of the repeated tool call one step-effort question carries —
@@ -978,6 +1023,7 @@ pub const STEP_EFFORT: JevUse = JevUse {
     apply_deadline_ms: Some(STEP_EFFORT_APPLY_DEADLINE_MS),
     window_forgives: Some(FORGIVES_A_BAD_MINUTE),
     agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Comparison,
 };
 
 /// Characters of the task a skill ranking reads — what the turn is about, in
@@ -1141,6 +1187,7 @@ pub const SKILLS: JevUse = JevUse {
     apply_deadline_ms: Some(SKILL_SEARCH_APPLY_DEADLINE_MS),
     window_forgives: Some(FORGIVES_A_BAD_MINUTE),
     agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Comparison,
 };
 
 /// The wall zo's step effort governor holds a step judgment to, in
@@ -1191,10 +1238,940 @@ pub const ZO_STEP_EFFORT: JevUse = JevUse {
     apply_deadline_ms: Some(ZO_STEP_EFFORT_APPLY_DEADLINE_MS),
     window_forgives: Some(FORGIVES_NOTHING),
     agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Comparison,
+};
+
+/// Characters of the person's last request one compaction judgment reads
+/// as the goal the remaining work serves — the routing seat's cap, for the
+/// routing seat's reason: the head of a request is what says what it is
+/// about, and a second number on the same words would be a second answer
+/// to how much of a person's work leaves the machine.
+pub const COMPACTION_GOAL_CHAR_CAP: usize = ROUTING_TASK_CHAR_CAP;
+
+/// Characters of the assistant's newest words one compaction judgment reads
+/// as where the work stands — the recall seat's request cap, because the two
+/// are the same kind of text read for the same purpose: the sentence or two
+/// that says what is being done right now.
+pub const COMPACTION_RECENT_CHAR_CAP: usize = RECALL_REQUEST_CHAR_CAP;
+
+/// Characters of one tool call's input a compaction judgment carries beside
+/// the result it produced — the step-effort seat's card-line cap, which is
+/// what a call's name and target take on the board. Measured on this
+/// machine's 1,091 transcripts (2026-09-22): tool inputs run to 122
+/// characters at the median and 324 at p75; 68% fit whole, and the rest are
+/// a body (a file's new content, a long command) whose head is the target.
+pub const COMPACTION_INPUT_CHAR_CAP: usize = STEP_EFFORT_REPEATED_CHAR_CAP;
+
+/// Bytes of one tool result's head a compaction judgment carries — the recall
+/// seat's summary cap, for the same reason: a head is what a reader skims to
+/// know what a result was about, never the result. Measured on this machine's
+/// 14,509 clearable tool results (2026-09-22, bodies of 240 B and over):
+/// 320 bytes holds their first five lines at the median and two at p10,
+/// against bodies of 1,995 B (p50) and 8,561 B (p90).
+pub const COMPACTION_BLOCK_HEAD_BYTE_CAP: usize = RECALL_SUMMARY_BYTE_CAP;
+
+/// Tool results one compaction request asks about ([`shard::even_shards`]'s
+/// target) — the skill seat's number, because the two requests have the same
+/// shape: one state written once and a line-long question per item, so the
+/// shard that decides the answer is the one that is asked, not the longest.
+pub const COMPACTION_SHARD_TARGET: usize = SKILL_SHARD_TARGET;
+
+/// The closed answer every compaction question offers, spelled once: keep the
+/// block for the summary to read, or drop it. A third word would be an answer
+/// nothing could act on.
+pub const COMPACTION_OPTIONS: [&str; 2] = [COMPACTION_KEEP, COMPACTION_DROP];
+
+/// The word that keeps a block in the summary's input.
+pub const COMPACTION_KEEP: &str = "keep";
+
+/// The word that takes a block out of the summary's input.
+pub const COMPACTION_DROP: &str = "drop";
+
+/// What a `drop` answer's own probability must reach, per thousand, before
+/// the block is dropped at all.
+///
+/// The two sides of this question are not symmetric. A block kept costs the
+/// summary a few hundred tokens of input once; a block dropped is one the
+/// summary never sees — recoverable from the vault by `session_recall`, but
+/// not from the summary — so the judgment has to be more than half sure
+/// before it takes one out. Seven in ten is the skill seat's line for the
+/// same lean ([`SKILL_RELEVANCE_FLOOR_PERMILLE`], "the expected level must
+/// lean toward covers this directly"), written here in the units this table
+/// writes its other lines in.
+pub const COMPACTION_DROP_FLOOR_PERMILLE: u16 = 700;
+
+/// What the compaction seat's answers must bound above before `auto` rises
+/// to dropping (§4): nine in ten.
+///
+/// The skill seat's reasoning, reached from this seat's own side: a question
+/// that does not come back costs the compaction nothing it was not already
+/// going to pay — every block is kept and the summary reads what it read
+/// before the seat existed ([`ROUTE_USE_FALLBACK`]). Written as its own
+/// number rather than read from [`SKILL_ANSWER_FLOOR_PERMILLE`]: two lines
+/// that coincide are still two policies.
+pub const COMPACTION_ANSWER_FLOOR_PERMILLE: u16 = 900;
+
+/// The compaction seat's route-change budget (§4): four dropped blocks in
+/// five must be ones the turns after never went back for.
+///
+/// What this seat has in place of a probe is hindsight: a block dropped and
+/// then read again within [`COMPACTION_REGRET_TURNS`] turns — the same path
+/// opened, or the same call made — was a block the work still needed, and
+/// the label says so (`regret`). Held to the same budget as every other seat
+/// that takes a decision off a reader: one in five wrong is not a rate at
+/// which to take blocks away from the summary unasked.
+pub const COMPACTION_AGREEMENT_FLOOR_PERMILLE: u16 = 800;
+
+/// The wall one compaction waits for its judgments, in milliseconds — one
+/// number for the whole batch, every shard leaving together and the slowest
+/// of them being what the boundary waits.
+///
+/// Three seconds: twice the routing seat's wall, because a compaction request
+/// carries up to [`COMPACTION_SHARD_TARGET`] questions over a state of some
+/// 16 KiB where routing carries five over 2,000 characters, and a compaction
+/// is not a turn's wait but a boundary that already sits through a summary
+/// round-trip measured in tens of seconds. Past it every unanswered block is
+/// kept, which is exactly what a compaction did before the seat existed.
+pub const COMPACTION_APPLY_DEADLINE_MS: u64 = 3_000;
+
+/// Turns after a compaction inside which reading a dropped block again counts
+/// against the judgment that dropped it (the seat's hindsight label).
+///
+/// Five is a policy line, not a measured one: long enough that the turn
+/// resuming from the summary and the few after it — where a missing fact
+/// shows as a re-read — are inside it, short enough that a file opened an
+/// hour later for another reason is not charged to a decision it had nothing
+/// to do with (the placement seat's window, [`PLACEMENT_LABEL_WINDOW_MS`],
+/// is drawn the same way). A label is written once per dropped block: at the
+/// turn that read it again, or at the fifth turn that did not.
+pub const COMPACTION_REGRET_TURNS: u32 = 5;
+
+/// zo's relevance compaction: for each tool result about to be summarized
+/// out of a session, whether the summary still needs to read it (t-6039).
+///
+/// Compaction used to trim by age alone — microcompact clears the OLDEST
+/// results — and the summary read everything the tail did not keep. The
+/// idea is jevable's "instant compaction": ask, per tool result, whether the
+/// remaining work needs it, and summarize only what is left. A drop reuses
+/// the microcompact machinery whole: the original is sealed to the vault
+/// first, the summary's copy carries the placeholder, and the eviction seal
+/// heals the placeholder back before the raw record is written — so the
+/// vault stays lossless and `session_recall` can still read a dropped block.
+///
+/// What is sent is the head of the person's last request, the head of the
+/// assistant's newest words, and for each block its tool's name, the head of
+/// its input and the head of its output — never a body, never the tail.
+/// Every request passes the door; a refusal, a timeout or a reply that
+/// breaks the contract keeps every block it covered.
+///
+/// `on` and a risen `auto` are the apply stage: the dropped blocks leave the
+/// summary's input. `shadow` asks and records what it would have dropped and
+/// the summary reads what it read before. The `agreed` rule is hindsight
+/// ([`COMPACTION_REGRET_TURNS`]): one label per dropped block, `false` when
+/// a turn inside the window read the same path or made the same call again
+/// (regret), `true` at the window's end otherwise.
+pub const COMPACTION: JevUse = JevUse {
+    id: "compaction",
+    setting: "jevCompaction",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
+    sends: &[
+        Sent {
+            at: "/state/goal",
+            cap: Cap::Chars(COMPACTION_GOAL_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/recent",
+            cap: Cap::Chars(COMPACTION_RECENT_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/blocks",
+            cap: Cap::Items(COMPACTION_SHARD_TARGET),
+        },
+        Sent {
+            at: "/state/blocks/*/tool",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/state/blocks/*/input",
+            cap: Cap::Chars(COMPACTION_INPUT_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/blocks/*/head",
+            cap: Cap::Bytes(COMPACTION_BLOCK_HEAD_BYTE_CAP),
+        },
+    ],
+    ledger: "compaction-relevance.jsonl",
+    promotes: true,
+    answer_floor_permille: Some(COMPACTION_ANSWER_FLOOR_PERMILLE),
+    press_floor_permille: None,
+    agreement_floor_permille: Some(COMPACTION_AGREEMENT_FLOOR_PERMILLE),
+    apply_deadline_ms: Some(COMPACTION_APPLY_DEADLINE_MS),
+    window_forgives: Some(FORGIVES_A_BAD_MINUTE),
+    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Hindsight,
+};
+
+/// Characters of one text an agent's own question carries — the question,
+/// its context, an option, a level, an item (t-6040).
+///
+/// The routing seat's cap and not a second number, for the reason
+/// [`SKILL_TASK_CHAR_CAP`] is: the head of a text is what a question reads,
+/// and a second cap on a caller's words would be a second answer to how much
+/// of them leaves the machine.
+pub const AGENT_TOOL_TEXT_CHAR_CAP: usize = ROUTING_TASK_CHAR_CAP;
+
+/// The most options one `choose` may offer: the wire's own ceiling
+/// (docs.typesafe.ai/primitives/choice — "up to 255 options"), spelled once
+/// here so the tool and the CLI refuse the same list.
+pub const AGENT_TOOL_OPTION_CAP: usize = 255;
+
+/// How many levels one `score` may name: the wire's own bounds
+/// (docs.typesafe.ai/primitives/score — "at least two levels; the API accepts
+/// up to 10").
+pub const AGENT_TOOL_LEVELS: std::ops::RangeInclusive<usize> = 2..=10;
+
+/// The most items one `score` call takes, asked as even shards of
+/// [`SKILL_SHARD_TARGET`] at once ([`shard::even_shards`], the skill seat's
+/// own arithmetic). Five shards, because that is what the largest batch
+/// measured here wanted — the 240-page classification golden of t-6040 — and
+/// a caller with more pipes twice; each shard is one request against the
+/// day's budget.
+pub const AGENT_TOOL_ITEM_CAP: usize = 5 * SKILL_SHARD_TARGET;
+
+/// The wall one agent question may hold the tool call or the shell that asked
+/// it: the skill seat's, for the skill seat's reason — a tool result is what
+/// a model is waiting for, so the wall is the one a person notices.
+pub const AGENT_TOOL_DEADLINE_MS: u64 = SKILL_SEARCH_APPLY_DEADLINE_MS;
+
+/// The two options an `ask` is a choice over, the affirmative first. Spelled
+/// once: the tool's answer and the CLI's exit code both read it.
+pub const AGENT_TOOL_ASK_OPTIONS: [&str; 2] = ["yes", "no"];
+
+/// The seat an agent asks on purpose: zo's `Jev` tool and `zo jev
+/// ask|choose|score`, which a worker or an agent in a pane calls instead of
+/// spending its own model's tokens on a classification, a pick or a grading
+/// (t-6040; the vault's "a Jev showcase maps to our eleven seats and leaves
+/// compaction and an agent door").
+///
+/// It is not a stage of the product's own: nothing falls back to it and
+/// nothing it answers is compared with a reader it would replace, so it has
+/// no label, never promotes, and offers no `auto` — an `auto` that can never
+/// rise is `shadow` under a name that promises otherwise. `shadow` asks and
+/// writes the row and hands the caller nothing, so a person can read what an
+/// agent's questions cost before letting agents act on the answers; `on`
+/// hands the answer over. `off`, the default, is the tool refusing and the
+/// CLI exiting 2 with nothing sent and nothing written.
+///
+/// What is sent is the caller's own words — the question, its context, the
+/// options or levels, the items — each cut to [`AGENT_TOOL_TEXT_CHAR_CAP`]
+/// and cleared of credential lines where the door reads it. The option and
+/// level words ride the questions' criteria (a choice's descriptions, a
+/// score's levels), so the door reads that path too, as the screen seats do.
+/// The rows only count: caller, shape, size, tokens and latency
+/// (docs: the seat is "집계만").
+pub const AGENT_TOOL: JevUse = JevUse {
+    id: "agent_tool",
+    setting: "agentTool",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On],
+    sends: &[
+        Sent {
+            at: "/state/question",
+            cap: Cap::Chars(AGENT_TOOL_TEXT_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/context",
+            cap: Cap::Chars(AGENT_TOOL_TEXT_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/items",
+            cap: Cap::Items(SKILL_SHARD_TARGET),
+        },
+        Sent {
+            at: "/state/items/*",
+            cap: Cap::Chars(AGENT_TOOL_TEXT_CHAR_CAP),
+        },
+        Sent {
+            at: "/questions/*/criteria/*",
+            cap: Cap::Chars(AGENT_TOOL_TEXT_CHAR_CAP),
+        },
+    ],
+    ledger: "agent-tool.jsonl",
+    promotes: false,
+    answer_floor_permille: None,
+    press_floor_permille: None,
+    agreement_floor_permille: None,
+    apply_deadline_ms: None,
+    window_forgives: None,
+    agreement_rows_wanted: None,
+    agreement_kind: AgreementKind::Comparison,
+};
+
+/// Characters of a page's title one browser-read question carries — the head
+/// of what the tab says the page is, which is what bands a block's words:
+/// "Sign in" under a title that is a product page is a chrome block, and the
+/// same two words under "Sign in" are the page.
+pub const BROWSER_READ_TITLE_CHAR_CAP: usize = 200;
+
+/// Blocks one browser read asks about ([`Sent`] `Items` cap on
+/// `/state/blocks`). A page past it keeps its remaining blocks unjudged and
+/// unfolded: a block nobody asked about is content, because the fallback of
+/// this seat is the whole page ([`BROWSER_READ`]).
+///
+/// Forty-eight is four requests of [`BROWSER_READ_SHARD_TARGET`], which is
+/// the most the read's one wall ([`BROWSER_READ_APPLY_DEADLINE_MS`]) is asked
+/// to carry side by side; a page that cuts into more blocks than that is a
+/// page whose tail is already past the read's own text cap.
+pub const BROWSER_READ_BLOCK_CAP: usize = 48;
+
+/// Characters of one block's text head a browser-read question carries. The
+/// head is what names a block — "Accept all cookies", "Related articles",
+/// "Skip to content" — and the body under it is never sent: it is read from
+/// the page this machine already holds and handed to the agent or folded.
+pub const BROWSER_READ_HEAD_CHAR_CAP: usize = 240;
+
+/// Characters of one block's tag path a browser-read question carries —
+/// `body>main>article>aside[role=complementary]` — the structural address
+/// that says what the page's author called the block.
+pub const BROWSER_READ_PATH_CHAR_CAP: usize = 160;
+
+/// Blocks one browser-read request asks about ([`shard::even_shards`]'s
+/// target): twelve choice questions over one state, the same width a screen
+/// question offers controls ([`SCREEN_CANDIDATE_CAP`]) and for the same
+/// reason — past it a request is longer than the answer it decides. Written
+/// as its own number because the two are two policies.
+pub const BROWSER_READ_SHARD_TARGET: usize = 12;
+
+/// The structural selectors a page is cut into blocks at, in the browser
+/// door's read: HTML's own landmarks and sectioning elements, and the ARIA
+/// roles that name the same things on a page built of `div`s. One list, here
+/// and nowhere else: the page script that cuts blocks reads it from the
+/// request, and the click and type scripts that name the block a press
+/// landed in read the same list, so a fold and a label cannot disagree about
+/// where a block begins.
+pub const BROWSER_READ_BLOCK_ROOTS: [&str; 20] = [
+    "main",
+    "article",
+    "section",
+    "nav",
+    "header",
+    "footer",
+    "aside",
+    "form",
+    "dialog",
+    "[role=main]",
+    "[role=navigation]",
+    "[role=banner]",
+    "[role=contentinfo]",
+    "[role=complementary]",
+    "[role=dialog]",
+    "[role=alertdialog]",
+    "[role=search]",
+    "[role=region]",
+    "[role=form]",
+    "[role=article]",
+];
+
+/// The two answers a block can be: the page's own substance, or the
+/// furniture around it. Spelled once, because the question offers exactly
+/// these and the fold acts on exactly one of them.
+pub const BROWSER_READ_OPTIONS: [&str; 2] = ["content", "chrome"];
+
+/// [`BROWSER_READ_OPTIONS`]'s word for a block the fold may drop.
+pub const BROWSER_READ_CHROME: &str = BROWSER_READ_OPTIONS[1];
+
+/// [`BROWSER_READ_OPTIONS`]'s word for a block the read keeps.
+pub const BROWSER_READ_CONTENT: &str = BROWSER_READ_OPTIONS[0];
+
+/// The wall one browser read waits for its blocks' judgments, in
+/// milliseconds — every shard side by side, one clock. A read is a tool
+/// result the agent is waiting on, so the wall is a screen question's
+/// ([`SCREEN_APPLY_DEADLINE_MS`], 280 ms at the median on this wire) and
+/// not a summons' ten seconds; past it the read hands back the whole page,
+/// which is what it handed back before the seat existed. Its own number, for
+/// the reason every other coinciding wall in this table is.
+pub const BROWSER_READ_APPLY_DEADLINE_MS: u64 = 1_500;
+
+/// What a browser-read seat's answers must bound above before `auto` rises
+/// to folding (§4): nine in ten — the screen seats' line, arrived at from
+/// the read's own side: a judgment that does not come back costs the agent
+/// nothing but the wall, because the whole page is what it reads then.
+pub const BROWSER_READ_ANSWER_FLOOR_PERMILLE: u16 = 900;
+
+/// The browser-read seat's route-change budget (§4): nine folds in ten must
+/// be ones the agent never reached back into.
+///
+/// Stricter than the screen seats' four in five, because this seat's wrong
+/// answer is not one press but a page the agent has to read twice — the
+/// fold, then `read --full` — and the label that says so is the agent's own
+/// next move ([`AgreementKind::Comparison`]: the block a `click` or `type`
+/// then landed in was one the judgment called chrome, or it was not).
+pub const BROWSER_READ_AGREEMENT_FLOOR_PERMILLE: u16 = 900;
+
+/// The least confidence a block's `chrome` answer must carry before the
+/// fold drops it, per thousand — read through [`JevUse::permits_press`], the
+/// same gate a screen press passes, because it is the same question: is
+/// this one answer sure enough to act on alone.
+///
+/// A policy line, not a calibrated accuracy claim, like
+/// [`SCREEN_PRESS_FLOOR_PERMILLE`], and above it: a press the walk can undo
+/// costs one more press, a block the fold dropped costs the agent the page.
+/// The measurement this seat is held to says the line has to sit where no
+/// content block of the golden pages falls under it (t-6041).
+pub const BROWSER_READ_FOLD_FLOOR_PERMILLE: u16 = 700;
+
+/// The window's browser read: which blocks of a page's text an agent's
+/// `zerocode-browser read` should hand over, and which it should fold away
+/// (t-6041).
+///
+/// The read gives the agent the page's visible text whole, and most of a
+/// page is not what the agent came for — the site's navigation, its header
+/// and footer, a cookie banner, the sponsored rail, the related-links
+/// column. The page script cuts the body into blocks at
+/// [`BROWSER_READ_BLOCK_ROOTS`], and one question per block asks whether the
+/// block is the page ([`BROWSER_READ_CONTENT`]) or its furniture
+/// ([`BROWSER_READ_CHROME`]). What is sent is each block's tag path and the
+/// head of its text, and the page's title; a block's body never leaves.
+///
+/// `on`, and an `auto` its own evidence raised, fold the chrome blocks into
+/// one line that says how many were left out and what kinds, and how to
+/// read them anyway (`read --full`). `shadow` records the same judgment and
+/// hands over the whole page. A judgment that does not come back inside
+/// [`BROWSER_READ_APPLY_DEADLINE_MS`], or that breaks the closed choice's
+/// rules on any block, hands over the whole page too: the seat's fallback is
+/// exactly the read that existed before it.
+///
+/// The `agreed` rule: the judgment agreed when the agent's next `click` or
+/// `type` on that pane, on that same page, landed outside every block the
+/// judgment called chrome, and disagreed when it landed inside one — under
+/// `shadow` as much as under `on`, since what is compared is the judgment
+/// and not the fold. One label per read, written by the window at the press;
+/// a read the agent never pressed after leaves no label, and a read on a page
+/// the pane had left by the press leaves none either.
+pub const BROWSER_READ: JevUse = JevUse {
+    id: "browser_read",
+    setting: "jevBrowserRead",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
+    sends: &[
+        Sent {
+            at: "/state/title",
+            cap: Cap::Chars(BROWSER_READ_TITLE_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/blocks",
+            cap: Cap::Items(BROWSER_READ_BLOCK_CAP),
+        },
+        Sent {
+            at: "/state/blocks/*/path",
+            cap: Cap::Chars(BROWSER_READ_PATH_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/blocks/*/head",
+            cap: Cap::Chars(BROWSER_READ_HEAD_CHAR_CAP),
+        },
+    ],
+    ledger: "browser-read.jsonl",
+    promotes: true,
+    answer_floor_permille: Some(BROWSER_READ_ANSWER_FLOOR_PERMILLE),
+    press_floor_permille: Some(BROWSER_READ_FOLD_FLOOR_PERMILLE),
+    agreement_floor_permille: Some(BROWSER_READ_AGREEMENT_FLOOR_PERMILLE),
+    apply_deadline_ms: Some(BROWSER_READ_APPLY_DEADLINE_MS),
+    window_forgives: Some(FORGIVES_A_BAD_MINUTE),
+    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Comparison,
+};
+
+/// The closed answer every notify question offers, spelled once: ring now,
+/// hold it for the next moment the person turns to the window, or say
+/// nothing. A fourth word would be an answer nothing could act on.
+pub const NOTIFY_OPTIONS: [&str; 3] = [NOTIFY_INTERRUPT, NOTIFY_BATCH, NOTIFY_IGNORE];
+
+/// The word that rings the person now — what today's rule does with every
+/// ring it does not suppress.
+pub const NOTIFY_INTERRUPT: &str = "interrupt";
+
+/// The word that holds a ring for the next moment the person is at the
+/// window, where every held ring is folded into one notice.
+pub const NOTIFY_BATCH: &str = "batch";
+
+/// The word that drops a ring.
+pub const NOTIFY_IGNORE: &str = "ignore";
+
+/// How long after a ring the person's hand on that pane counts as the
+/// ring's label, in milliseconds (t-6043).
+///
+/// One minute is a policy line, not a measured one — the brief's own
+/// number: long enough to walk back to the desk after a lock-screen
+/// notification and click the pane it named, short enough that a pane
+/// opened later for another reason is not charged to a ring it had nothing
+/// to do with (the placement seat's window,
+/// [`PLACEMENT_LABEL_WINDOW_MS`], is drawn the same way at five). The seat
+/// writes the label at the first hand inside it, or once it has passed.
+pub const NOTIFY_LABEL_WINDOW_MS: i64 = 60 * 1_000;
+
+/// How long since the person's last hand on the window they still count as
+/// present at it, in milliseconds — the one attendance fact the question
+/// carries beside the window's focus.
+///
+/// The placement seat's window, read from there rather than respelled: the
+/// same question, asked the other way round. That seat asks how long after a
+/// pane appeared a person's move still counts against it — "long enough for
+/// somebody who was typing elsewhere to turn to the new pane" — and this one
+/// asks how long since they last typed anywhere they should still be counted
+/// as somebody who could turn. A focused window nobody has touched for longer
+/// than this is a desk somebody left, and a ring there is a lock-screen
+/// ring.
+pub const NOTIFY_ATTENDANCE_WINDOW_MS: i64 = PLACEMENT_LABEL_WINDOW_MS;
+
+/// Characters of the ring's words one notify question carries — the
+/// question the agent stopped on, or its last words — which is the
+/// notification's own body: one card line
+/// (`crate::transcript::SUMMARY_CHARS`), read through the step-effort seat's
+/// cap because the two are the same cut of the same kind of text, and a
+/// second number on it would be a second answer to how much of an agent's
+/// words leave the machine per ring.
+pub const NOTIFY_WORDS_CHAR_CAP: usize = STEP_EFFORT_REPEATED_CHAR_CAP;
+
+/// Rings of the same pane one notify question carries as its context —
+/// each as its event word, how long ago, and whether the person turned to
+/// the pane inside [`NOTIFY_LABEL_WINDOW_MS`] of it.
+///
+/// Six is a policy line: the per-worktree cooldown
+/// (`crate::notify::COOLDOWN_MS`, five seconds) bounds a pane to twelve
+/// rings a minute, so six is the busiest half-minute a pane can have had —
+/// enough to show a pane that has finished four times without a response,
+/// and not a history. Older rings are not what makes this one worth an
+/// interruption.
+pub const NOTIFY_RECENT_CAP: usize = 6;
+
+/// The wall the bell holds an attention ring for the seat's answer, in
+/// milliseconds, when the seat acts.
+///
+/// The completion's own quiet (`crate::notify::DONE_QUIET_MS`), which every
+/// completion ring already waits before it may ring at all: an answer inside
+/// it delays an attention ring by no more than every "finished" is already
+/// delayed, and a completion's question is asked beside its quiet rather
+/// than after it. Past the wall today's rule rings, exactly as it did before
+/// the seat existed. Written as the completion's number and not read from
+/// [`ROUTING_APPLY_DEADLINE_MS`], which happens to coincide: that is a
+/// turn's wait, this is a bell's, and two policies that coincide are still
+/// two policies.
+pub const NOTIFY_APPLY_DEADLINE_MS: u64 = crate::notify::DONE_QUIET_MS.unsigned_abs();
+
+/// What the notify seat's answers must bound above before `auto` rises to
+/// holding and dropping rings (§4): nine in ten.
+///
+/// The orchestration seats' reasoning, reached from this seat's own side: a
+/// question that does not come back costs the person nothing they were not
+/// already going to get — today's rule rings, as it did before the seat
+/// existed — and every answer that does come back can take a ring away.
+/// Written as its own number rather than read from
+/// [`ORCHESTRATION_ANSWER_FLOOR_PERMILLE`]: two lines that coincide are
+/// still two policies.
+pub const NOTIFY_ANSWER_FLOOR_PERMILLE: u16 = 900;
+
+/// The notify seat's route-change budget (§4): four calls in five must have
+/// been what the person's own hand then said — a ring they turned to within
+/// the minute was worth an interruption, one they did not turn to while at
+/// the window was not. Held to the same budget as every other seat that
+/// takes a decision off a reader: one ring in five wrongly dropped is an
+/// agent waiting on a person who was never told.
+pub const NOTIFY_AGREEMENT_FLOOR_PERMILLE: u16 = 800;
+
+/// The window's ring judgment: whether one notification is worth the
+/// interruption — ring now, hold it for the next moment the person turns to
+/// the window, or say nothing (t-6043, `crate::notify_call`).
+///
+/// Today one rule table decides: a stopped or finished pane rings unless it
+/// is the screen being watched, and a per-worktree cooldown thins the rest
+/// (`crate::notify`). What the table cannot read is whether THIS ring is one
+/// the person needs this second — the fourth "finished" in ten minutes from
+/// a worker nobody has turned to, a "needs input" while three other panes
+/// already wait, a completion at two in the morning. The seat is asked at
+/// the one point the table decides "ring or not", about the ring's kind
+/// ([`crate::notify::verb`]'s word), the pane's name, whether the person is
+/// present at the window or away, one card line of the ring's words, the
+/// pane's last rings and whether each was turned to, and how many panes
+/// wait. A watched screen is today's own ignore and is not a question.
+///
+/// Under `off`, `shadow`, a timeout or a refusal the bell rings exactly as
+/// today; only a person's `on`, or an `auto` its own evidence raised, lets
+/// `batch` and `ignore` change what the OS shows and what the tab strip
+/// marks. A held ring is
+/// folded with every other held ring into one notice at the person's next
+/// hand on the window (`crate::notify::batched`).
+///
+/// The `agreed` rule: a Comparison label written by the person's own hand.
+/// A key or a paste into the ring's pane within [`NOTIFY_LABEL_WINDOW_MS`]
+/// says the ring was worth the interruption — `agreed` iff the call was
+/// [`NOTIFY_INTERRUPT`]. No hand inside the window while the person was
+/// present at it says it was not — `agreed` iff the call was not. No hand
+/// while they were away says nothing either way, and leaves no mark: a
+/// person who was not there could not have turned to it. One label row per
+/// answered row, keyed by the row's own `notify` key.
+pub const NOTIFY: JevUse = JevUse {
+    id: "notify",
+    setting: "jevNotify",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
+    sends: &[
+        Sent {
+            at: "/state/pane",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/state/words",
+            cap: Cap::Chars(NOTIFY_WORDS_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/recent",
+            cap: Cap::Items(NOTIFY_RECENT_CAP),
+        },
+    ],
+    ledger: "notify-call.jsonl",
+    promotes: true,
+    answer_floor_permille: Some(NOTIFY_ANSWER_FLOOR_PERMILLE),
+    press_floor_permille: None,
+    agreement_floor_permille: Some(NOTIFY_AGREEMENT_FLOOR_PERMILLE),
+    apply_deadline_ms: Some(NOTIFY_APPLY_DEADLINE_MS),
+    window_forgives: Some(FORGIVES_A_BAD_MINUTE),
+    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Comparison,
+};
+
+/// Characters of the sentence a person is writing that one mention
+/// judgment reads as their intent — the composer's text around the `@`
+/// token, or the words typed into the `/resume` search. The recall seat's
+/// request cap, because it is the same kind of text read for the same
+/// purpose: the sentence or two that says what the person is after.
+pub const MENTION_INTENT_CHAR_CAP: usize = RECALL_REQUEST_CHAR_CAP;
+
+/// Candidate rows one mention judgment is asked about: one page of the
+/// popup — the eight rows a person sees without scrolling (codex
+/// `MAX_POPUP_ROWS`, which zo's view pins to this number). A ninth row is one
+/// the person has not seen, and a judgment that puts it first would be
+/// reordering a list the person was never shown.
+pub const MENTION_CANDIDATE_CAP: usize = 8;
+
+/// Bytes of one candidate's head a mention judgment carries — a skill's
+/// description, a session's first prompt as its row shows it. The recall
+/// seat's summary cap: a head is what a reader skims to tell rows apart,
+/// never a body. A file or a page carries no head at all, only its name.
+pub const MENTION_HEAD_BYTE_CAP: usize = RECALL_SUMMARY_BYTE_CAP;
+
+/// What the mention seat's answers must bound above before `auto` rises to
+/// reordering the page (§4): nine in ten — the recall seat's line, read from
+/// there because the two are the same kind: a ranking a reader falls back
+/// from at no cost (the fuzzy page stands when the judgment does not come
+/// back, as recall's own order stands). One name, so a re-measurement moves
+/// this seat's line alone.
+pub const MENTION_ANSWER_FLOOR_PERMILLE: u16 = RECALL_ANSWER_FLOOR_PERMILLE;
+
+/// The mention seat's route-change budget (§4): four picks in five must be
+/// the row the judgment put first — the comparison the person makes with
+/// every completion, which is what this seat has in place of a probe. The
+/// recall seat's budget, for the reason its answer floor is.
+pub const MENTION_AGREEMENT_FLOOR_PERMILLE: u16 = RECALL_AGREEMENT_FLOOR_PERMILLE;
+
+/// The wall past which a mention answer is dropped, in milliseconds — the
+/// latency line the judge reads a rising seat against.
+///
+/// Nothing waits on this seat: the fuzzy page is drawn the moment the
+/// person types, and the judgment lands on it afterwards, only while the
+/// selection still sits on the first row. The wall is therefore not a wait
+/// but a staleness line — an answer that arrives after it is for a page the
+/// person has been looking at too long to move under them. The routing
+/// seat's wall, because it is the same wire and the same question of how
+/// long a Jev answer may hold the thing it is deciding, and the wire's
+/// measured p95 sits well inside it (337 ms over 240 single-choice answers
+/// on 2026-09-22, t-6040; this seat's own replay is in
+/// `tools/mention-rerank-replay`). Written as its own number rather than read from
+/// [`ROUTING_APPLY_DEADLINE_MS`]: two lines that coincide are still two
+/// policies, and a page that learns to tolerate a later reorder should move
+/// this one alone.
+pub const MENTION_APPLY_DEADLINE_MS: u64 = 1_500;
+
+/// zo's mention rerank: which row of the `@` popup, or of the `/resume`
+/// list, the person means — read off the sentence they are writing
+/// (t-6042).
+///
+/// The `@` popup (t-5871) and the `/resume` picker rank by fuzzy score and
+/// recency; neither knows what the person is writing. The idea is jevable's
+/// "Jev Search"/"Upweight": the fuzzy page is drawn first, exactly as today,
+/// and one closed choice over its rows — asked off the key path — may put
+/// the row the sentence is about first. The answer lands only while the
+/// selection still sits on the first row; a person who has moved it has
+/// already chosen a page, and a page is not moved under them. A newer
+/// keystroke discards the older question: one question in flight, ever.
+///
+/// What is sent is the head of the sentence, the token typed, and one page
+/// of candidate names with the head each row already shows on screen.
+/// Nothing is read from disk for it: no file body, no page body, no
+/// transcript. Every request passes the door; a refusal, a timeout or a
+/// reply that breaks the contract leaves the fuzzy page as it was.
+///
+/// `on` and a risen `auto` are the apply stage: the page's rows take the
+/// judgment's order. `shadow` asks and records what it would have put first
+/// and the page stands. The `agreed` rule is a comparison, made by the
+/// person: one label per completion, `true` when the row they took was the
+/// row the judgment put first, `false` otherwise, with `rank` the place the
+/// judgment gave the row they took; a pick outside the page the judgment
+/// saw is written down as not compared, since the seat never offered it.
+pub const MENTION_RERANK: JevUse = JevUse {
+    id: "mention_rerank",
+    setting: "jevMentionRerank",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
+    sends: &[
+        Sent {
+            at: "/state/intent",
+            cap: Cap::Chars(MENTION_INTENT_CHAR_CAP),
+        },
+        // The token is a piece of the same sentence, under the same cap —
+        // a second cap on the same words would be a second answer to how
+        // much of a person's writing leaves the machine.
+        Sent {
+            at: "/state/query",
+            cap: Cap::Chars(MENTION_INTENT_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/candidates",
+            cap: Cap::Items(MENTION_CANDIDATE_CAP),
+        },
+        Sent {
+            at: "/state/candidates/*/name",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/state/candidates/*/head",
+            cap: Cap::Bytes(MENTION_HEAD_BYTE_CAP),
+        },
+    ],
+    ledger: "mention-rerank.jsonl",
+    promotes: true,
+    answer_floor_permille: Some(MENTION_ANSWER_FLOOR_PERMILLE),
+    press_floor_permille: None,
+    agreement_floor_permille: Some(MENTION_AGREEMENT_FLOOR_PERMILLE),
+    apply_deadline_ms: Some(MENTION_APPLY_DEADLINE_MS),
+    window_forgives: Some(FORGIVES_A_BAD_MINUTE),
+    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Comparison,
+};
+
+/// How many of the emulator seat's candidates a forked phone step tries
+/// before one is made canonical (t-6044, [`BRANCHING`]).
+///
+/// Two is the brief's number and the smallest fork there is: the press the
+/// emulator seat would have made anyway, and the one it ranked next. Every
+/// candidate past the first costs the walk a press, a look and a snapshot
+/// load — on the AVD saves this window has measured, 1.4–2.0 s each for the
+/// load alone (`emulator::android::SNAPSHOT_SAVE_LIMIT`'s note) — so the
+/// count is a policy line on the walk's clock, not an accuracy claim. It is
+/// read through [`crate::branching::top_k`], never respelled.
+pub const BRANCHING_K: usize = 2;
+
+/// The most candidates a forked step may ever try, whatever a later reading
+/// of [`BRANCHING_K`] says: the question offers at most this many results
+/// ([`Sent`] `Items` cap on `/state/candidates`), so a `k` above it would be
+/// a candidate explored and never judged.
+pub const BRANCHING_K_CAP: usize = 3;
+const _: () = assert!(
+    BRANCHING_K >= 2 && BRANCHING_K <= BRANCHING_K_CAP,
+    "a fork tries at least two candidates and never more than the question can carry"
+);
+
+/// How far the emulator seat's first choice must lead its runner-up, in
+/// parts per thousand of the answer's mass, for the step to be a single
+/// press: a lead under this forks (`crate::branching::fork_wanted`), as does
+/// a leader under the seat's own press floor ([`SCREEN_PRESS_FLOOR_PERMILLE`])
+/// whatever its lead.
+///
+/// One in five, a policy line and not a calibrated claim, like every other
+/// line in this table: without it a fork was taken at every step whose
+/// answer gave a second control any weight at all (t-6155 F3), which on the
+/// fake desk is every step and on a real device is ×4.82 the clock of the
+/// step it replaces. One fifth is the same one-in-five the route-change
+/// budgets are cut at (800‰): a leader the seat itself is not four-in-five
+/// sure of over its runner-up is the answer a fork is for. Two of this
+/// machine's phone presses to date carried a weighted runner-up, so the
+/// line waits for `branching.jsonl` to move it.
+pub const BRANCHING_FORK_MARGIN_PERMILLE: u16 = 200;
+const _: () = assert!(
+    BRANCHING_FORK_MARGIN_PERMILLE > 0 && BRANCHING_FORK_MARGIN_PERMILLE < 1_000,
+    "a margin of nothing never forks and a margin of everything always does"
+);
+
+/// The wall the forked step holds a walk for the comparison's answer, in
+/// milliseconds — the screen seats' wall, written as this seat's own number
+/// for the reason every coinciding wall in this table is: the screen
+/// question is asked BEFORE anything is pressed, this one after `k` presses
+/// have already been tried and undone, and two policies that coincide today
+/// are still two policies. Past it the first candidate — the emulator seat's
+/// own press — is made canonical, which is exactly the step a walk without
+/// this seat would have taken.
+pub const BRANCHING_APPLY_DEADLINE_MS: u64 = 1_500;
+
+/// What the branching seat's answers must bound above before `auto` rises to
+/// choosing the canonical candidate (§4): nine in ten — the screen seats'
+/// line, reached from this seat's own side: a comparison that does not come
+/// back costs the walk the fork's clock and nothing else, because the first
+/// candidate is then pressed as it would have been without the seat.
+pub const BRANCHING_ANSWER_FLOOR_PERMILLE: u16 = 900;
+
+/// The branching seat's route-change budget (§4): four canonical picks in
+/// five must have been ones the walk then went on from. Held to the screen
+/// seats' budget because the negative is the same kind: a pick the walk had
+/// to undo or retry is one more press on a screen, and one in five wrong is
+/// not a rate at which to hand the canonical step to a comparison unasked.
+pub const BRANCHING_AGREEMENT_FLOOR_PERMILLE: u16 = 800;
+
+/// The window's forked phone step (t-6044, `crate::branching`): when the
+/// emulator seat's answer is torn between two or more controls — its first
+/// choice leading the runner-up by under [`BRANCHING_FORK_MARGIN_PERMILLE`],
+/// or sitting under the press floor itself — the walk saves the
+/// Android device where it stands, presses each of the top [`BRANCHING_K`]
+/// in turn, reads the screen each one leads to, puts the device back, and
+/// asks Jev which RESULT is the closest to the goal — the candidate it names
+/// is the one pressed for real. jevable's "Mario Never Dies" idea, on the
+/// state rather than on the request: the hedge (`crate::jev::hedge`) copies a
+/// question, this copies a world.
+///
+/// It has a seat of its own and not a flag on the emulator row because it
+/// sends what that row never does — the screens a press LED TO, which a
+/// person consenting to "judge which control to press" did not consent to
+/// having explored on their device — and because the two are judged apart:
+/// the emulator seat's mark is whether the press it chose reached the goal,
+/// this seat's is whether a comparison of results picked better than that
+/// press would have.
+///
+/// What is sent: the goal, the device's platform and name, the controls of
+/// the screen before the fork, and per candidate the legend line that was
+/// pressed and — when the fork explored — the legend lines of the screen it
+/// led to and whether the screen moved. Never a screenshot, never a control's
+/// body beyond its legend line.
+///
+/// `off` is today's walk byte for byte. `shadow` explores nothing: it asks
+/// the same question over the candidates' actions alone, records what it
+/// would have made canonical beside what the emulator seat pressed, and
+/// presses the emulator seat's choice. Only a person's `on`, or an `auto`
+/// this seat's own ledger raised, saves, explores and presses the
+/// comparison's pick; a timeout, a
+/// refusal, an answer under [`SCREEN_PRESS_FLOOR_PERMILLE`], a device that
+/// cannot be saved (iOS has no snapshot road) or a fork past its clock all
+/// press the first candidate — the emulator seat's own — as today. A step at
+/// which the person's turn stands is never forked: the errand's own gates
+/// bar it before any candidate exists.
+///
+/// The `agreed` rule (a Comparison label, one per forked step, written by the
+/// walk's own next step): the canonical pick agreed when the walk went on
+/// from it — the caller's condition held, or the next look showed a screen
+/// that moved and the next judgment chose a control on it — and disagreed
+/// when the next step was a retry (the same screen again) or the judgment
+/// gave up on what the pick led to. Under `shadow` the comparison is graded
+/// against the emulator seat's press: the same pick shares its fate, a
+/// different pick is wrong when the press went on fine, and says nothing
+/// when the press failed — an alternative nobody tried is not evidence
+/// (`crate::branching::agreed`).
+pub const BRANCHING: JevUse = JevUse {
+    id: "branching",
+    setting: "jevBranching",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
+    sends: &[
+        Sent {
+            at: "/state/goal",
+            cap: Cap::Chars(GOAL_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/where/platform",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/state/where/device",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/state/before",
+            cap: Cap::Items(SCREEN_CANDIDATE_CAP),
+        },
+        Sent {
+            at: "/state/before/*",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/state/candidates",
+            cap: Cap::Items(BRANCHING_K_CAP),
+        },
+        Sent {
+            at: "/state/candidates/*/action",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/state/candidates/*/result/controls",
+            cap: Cap::Items(SCREEN_CANDIDATE_CAP),
+        },
+        Sent {
+            at: "/state/candidates/*/result/controls/*",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/questions/*/criteria/*",
+            cap: Cap::Uncut,
+        },
+    ],
+    ledger: "branching.jsonl",
+    promotes: true,
+    answer_floor_permille: Some(BRANCHING_ANSWER_FLOOR_PERMILLE),
+    press_floor_permille: Some(SCREEN_PRESS_FLOOR_PERMILLE),
+    agreement_floor_permille: Some(BRANCHING_AGREEMENT_FLOOR_PERMILLE),
+    apply_deadline_ms: Some(BRANCHING_APPLY_DEADLINE_MS),
+    window_forgives: Some(FORGIVES_A_BAD_MINUTE),
+    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Comparison,
+};
+
+/// The judgment cache: a memo in front of the wire that answers a screen
+/// question the door already cleared once with the very same bytes
+/// (docs/design/stagehand-v4-jev-review-20260922.md, t-6132).
+///
+/// It is a seat with no question of its own. What it sends is nothing — a
+/// hit leaves the machine no bytes and takes no place in the day's count —
+/// and what it decides is whether the walk may take the memo's answer
+/// instead of the wire's. Its rows are lookups: one per hit under `shadow`
+/// and `auto`, carrying the memo's own `agreed` — the remembered choice
+/// against the fresh one the wire gave for the same bytes — and one row per
+/// hit answered under a risen `auto`, carrying `routeUse: applied`. A miss
+/// is written beside them without an `outcome`, so a reader can count the
+/// hit rate and the judge counts only what the memo answered.
+///
+/// `off` is today's walk to the byte: no lookup, no memo file, no row.
+/// `shadow` asks the wire as today and records whether the memo would have
+/// agreed. `on` is the person's own word: a hit answers with no evidence
+/// asked for. `auto` answers from the memo only once its own comparisons
+/// bound above [`JUDGMENT_CACHE_AGREEMENT_FLOOR_PERMILLE`] over a window
+/// ([`promote`]), and either falls back to the wire the moment a remembered
+/// body stops reading (the seat contract's third rule, second correction:
+/// a labeled seat offers all four words).
+///
+/// The memo's key is the seat the question belongs to and the bytes the door
+/// let through — after every withheld line and every cap — so two questions
+/// share an answer exactly when the wire would have seen the same request
+/// ([`memo::key_of`]). The rubric's words are inside those bytes, so a word
+/// changed without a version bump is a different key rather than a stale hit.
+pub const JUDGMENT_CACHE: JevUse = JevUse {
+    id: "judgment_cache",
+    setting: "jevJudgmentCache",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
+    sends: &[],
+    ledger: "judgment-cache.jsonl",
+    promotes: true,
+    answer_floor_permille: Some(JUDGMENT_CACHE_ANSWER_FLOOR_PERMILLE),
+    press_floor_permille: None,
+    agreement_floor_permille: Some(JUDGMENT_CACHE_AGREEMENT_FLOOR_PERMILLE),
+    apply_deadline_ms: Some(JUDGMENT_MEMO_DEADLINE_MS),
+    window_forgives: Some(FORGIVES_NOTHING),
+    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Comparison,
 };
 
 /// Every place this product asks Jev something.
-pub static JEV_USES: [JevUse; 11] = [
+pub static JEV_USES: [JevUse; 18] = [
     ROUTING,
     RECALL,
     SKILLS,
@@ -1206,6 +2183,13 @@ pub static JEV_USES: [JevUse; 11] = [
     SUMMON,
     STEP_EFFORT,
     ZO_STEP_EFFORT,
+    COMPACTION,
+    AGENT_TOOL,
+    BROWSER_READ,
+    NOTIFY,
+    MENTION_RERANK,
+    BRANCHING,
+    JUDGMENT_CACHE,
 ];
 
 impl JevUse {
@@ -1380,16 +2364,26 @@ pub fn brief_shape(brief: &str, cap: Cap) -> (String, usize) {
     (door::cut(brief, cap), brief.chars().count())
 }
 
-/// The first sixteen hex digits of the SHA-256 of a question's defining
-/// words — what a question's rubric version is pinned to, so a word changed
-/// without a version bump is a red test rather than a quiet drift.
+/// The first sixteen hex digits of the SHA-256 of `words` — what a ledger
+/// row carries in place of a string it must not carry (a page's path, a
+/// walk's goal, t-6155 F8/F12), and what a question's rubric version is
+/// pinned to. One producer, so two rows that name the same thing agree
+/// exactly and a reader can group them without ever seeing the words.
 #[must_use]
-pub fn rubric_fingerprint(words: impl FnOnce() -> String) -> String {
-    Sha256::digest(words().as_bytes())
+pub fn fingerprint_of(words: &str) -> String {
+    Sha256::digest(words.as_bytes())
         .iter()
         .take(8)
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// [`fingerprint_of`] a question's defining words — what a rubric version
+/// is pinned to, so a word changed without a version bump is a red test
+/// rather than a quiet drift.
+#[must_use]
+pub fn rubric_fingerprint(words: impl FnOnce() -> String) -> String {
+    fingerprint_of(&words())
 }
 
 #[cfg(test)]

@@ -1,10 +1,15 @@
+mod agent_tool;
 mod apply;
 mod canonical;
+mod compaction_seat;
 mod decision_report;
 mod decision_shadow;
 mod evidence;
 mod infer;
 mod jev_gate;
+#[cfg(test)]
+mod jev_mock;
+mod mention_rerank;
 mod metadata;
 pub mod jev_summary;
 mod plan_shadow;
@@ -19,10 +24,15 @@ mod shape;
 mod shape_words;
 mod step_effort;
 mod turn;
+mod turn_reads;
 
 #[cfg(test)]
 mod tests;
 
+pub use agent_tool::{
+    agent_tool_path, decide as jev_decide, AgentToolRow, JevAnswer, JevCaller, JevInvalid,
+    JevQuestion, JevShape, JevVerdict, ScoredItem, AGENT_TOOL_FILE, AGENT_TOOL_OUTCOME_ANSWERED,
+};
 pub(crate) use apply::{
     apply_smart_models_to_spawn_input_with_auto_types, route_source_label, smart_parent_model_for_agent,
     smart_parent_model_for_agent_with_auto_type,
@@ -45,6 +55,16 @@ pub use rerank_shadow::{
     note_recall_read, rerank_shadow_path, Judged, RerankLabelRow, RerankShadow, RerankShadowRow,
     RERANK_OUTCOME_ANSWERED, RERANK_OUTCOME_UNORDERABLE, RERANK_SHADOW_FILE,
 };
+pub use compaction_seat::{
+    compaction_relevance_path, note_compaction_reread, CompactionJudge, CompactionLabelRow,
+    CompactionRow, COMPACTION_JUDGMENT_DEADLINE, COMPACTION_OUTCOME_ANSWERED,
+    COMPACTION_RELEVANCE_FILE,
+};
+pub use mention_rerank::{
+    mention_rerank_path, MentionAnswer, MentionAsk, MentionCandidate, MentionJudged, MentionLabelRow,
+    MentionRerank, MentionRerankRow, MentionSurface, MENTION_OUTCOME_ANSWERED, MENTION_RERANK_DEADLINE,
+    MENTION_RERANK_FILE, MENTION_RUBRIC_VERSION,
+};
 pub use skill_search::{
     note_loaded_skill, note_search_answer, search as skill_search,
     skill_search_path, Chosen, Searched, SkillLabelRow, SkillSearchRow, SKILL_OUTCOME_ANSWERED,
@@ -63,8 +83,11 @@ pub use plan_shadow::{
 };
 pub(crate) use settings::live_agent_model_policy;
 pub use settings::{
-    decision_shadow_mode_from, rerank_shadow_mode_from, skill_search_mode_from,
-    DecisionShadowMode, DECISION_SHADOW_SETTING, RERANK_SHADOW_SETTING, SKILL_SEARCH_SETTING,
+    agent_tool_mode_from, decision_shadow_mode_from, jev_compaction_mode_from,
+    jev_mention_rerank_mode_from, rerank_shadow_mode_from, skill_search_mode_from,
+    DecisionShadowMode, AGENT_TOOL_SETTING, DECISION_SHADOW_SETTING, JEV_COMPACTION_SETTING,
+    JEV_MENTION_RERANK_SETTING,
+    RERANK_SHADOW_SETTING, SKILL_SEARCH_SETTING,
     conversation_anchor_ttl_for, conversation_anchor_ttl_from_root, CACHE_ANCHOR_TTL_ENV,
     smart_deep_tier_models, smart_deep_tier_models_for, smart_exec_swap, smart_setting_defaults,
     smart_turn_routing_and_inventory_for, smart_turn_routing_for, DeepTierModelsSetting,

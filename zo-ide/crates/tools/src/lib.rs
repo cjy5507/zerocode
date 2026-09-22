@@ -56,6 +56,7 @@ mod worktree_tools;
 
 // Public API.
 pub use tool_digest::{configure_tool_digest, ToolDigestMode, TOOL_DIGEST_ENV};
+pub use codegraph_tools::codegraph_cache_path;
 pub use aliases::canonical_tool_name;
 pub use computer_tools::COMPUTER_SHIM;
 pub use artifacts::ARTIFACT_STORE_ENV;
@@ -91,6 +92,11 @@ pub use hunk_attribution::{
 pub use misc_tools::agent_store_dir;
 pub use misc_tools::jev_summary;
 pub use misc_tools::{
+    agent_tool_mode_from, agent_tool_path, jev_decide, AgentToolRow, JevAnswer, JevCaller,
+    JevInvalid, JevQuestion, JevShape, JevVerdict, ScoredItem, AGENT_TOOL_FILE,
+    AGENT_TOOL_OUTCOME_ANSWERED, AGENT_TOOL_SETTING,
+};
+pub use misc_tools::{
     basis_points, check_system_one, decision_shadow_mode_from, decision_shadow_path,
     evaluate_decision_labels, note_recall_read, note_route_followed, read_shadow_rows,
     rerank_shadow_mode_from, rerank_shadow_path, route_unseated_by, summarize_decision_shadow,
@@ -101,6 +107,17 @@ pub use misc_tools::{
     RERANK_OUTCOME_ANSWERED, RERANK_OUTCOME_UNORDERABLE, RERANK_SHADOW_FILE,
     RERANK_SHADOW_SETTING, ROUTE_STOOD,
     merged_settings_root,
+};
+pub use misc_tools::{
+    jev_mention_rerank_mode_from, mention_rerank_path, MentionAnswer, MentionAsk, MentionCandidate,
+    MentionJudged, MentionLabelRow, MentionRerank, MentionRerankRow, MentionSurface,
+    JEV_MENTION_RERANK_SETTING, MENTION_OUTCOME_ANSWERED, MENTION_RERANK_DEADLINE, MENTION_RERANK_FILE,
+    MENTION_RUBRIC_VERSION,
+};
+pub use misc_tools::{
+    compaction_relevance_path, jev_compaction_mode_from, note_compaction_reread, CompactionJudge,
+    CompactionLabelRow, CompactionRow, COMPACTION_JUDGMENT_DEADLINE, COMPACTION_OUTCOME_ANSWERED,
+    COMPACTION_RELEVANCE_FILE, JEV_COMPACTION_SETTING,
 };
 pub use misc_tools::{
     note_loaded_skill, note_search_answer, skill_search, skill_search_mode_from,
