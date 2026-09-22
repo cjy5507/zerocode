@@ -8,6 +8,7 @@
 mod built_runtime;
 mod agent_completion_pump;
 mod dreamer_hook;
+pub(crate) mod file_search;
 mod lsp_runtime;
 mod mcp_runtime;
 mod orchestration;
@@ -16,6 +17,7 @@ pub mod process_lifecycle;
 pub mod permission_bridge;
 pub mod plain_session;
 mod request_types;
+pub(crate) mod route_fact;
 pub mod runtime_bridge;
 mod runtime_builder;
 mod smart_runtime;

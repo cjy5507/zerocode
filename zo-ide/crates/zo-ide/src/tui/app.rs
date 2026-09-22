@@ -57,8 +57,10 @@ use super::pending_input::PendingInputs;
 use super::permissions::{self, active_permission_label, permission_rank};
 use super::question;
 use super::sessions;
+use super::mention::{self, MentionKey, Mentions};
 use super::slash;
 use super::summary::{self, SessionSummary};
+use super::thinking;
 use super::tools::{Explored, Outcome, ToolCall, ToolGroup, ToolKind};
 use super::view::{
     self, Dialog, Frame, Picker, PickerRow, Popup, PopupRow, Status, StatusDetailsCapitalization,
@@ -77,6 +79,8 @@ use crate::ide::prompt::PendingPrompt;
 use crate::ide::reporter::HookReporter;
 use crate::ide::run_loop::ExitReason;
 use crate::session::plain_session::{LaunchFlags, OpenOptions, PlainSession, ReplayItem};
+use crate::session::route_fact::{RouteFact, RouteFactReceiver};
+use crate::session::file_search::{FileSearchManager, FileSearchResult};
 use crate::session::subagent_progress::{SubagentProgress, SubagentProgressWatcher};
 use crate::session::turn_scaffold::TurnScaffold;
 use crate::session::{AgentCompletionPump, AgentFollowup};
@@ -227,7 +231,7 @@ pub async fn run_with_last_message(
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     // 상태기계 future 는 30KB 남짓이다 — select! 가 그걸 스택에 얹으면
     // 재귀 호출부에서 부담이 되므로 힙에 둔다.
-    let outcome = match App::new(session, flags) {
+    let outcome = match App::new(session, thinking_flags(flags)) {
         Ok(app) => Box::pin(app.drive()).await,
         Err(error) => Err(error),
     };
@@ -280,7 +284,7 @@ pub async fn run_teammate(
 ) -> Result<TeammateLife, Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
-    let outcome = match App::new(session, flags) {
+    let outcome = match App::new(session, thinking_flags(flags)) {
         Ok(app) => Box::pin(app.drive_teammate(prompt, banner, lifecycle)).await,
         Err(error) => Err(error),
     };
@@ -289,6 +293,21 @@ pub async fn run_teammate(
     let (summary, life) = outcome?;
     print_exit_summary(summary);
     Ok(life)
+}
+
+/// The interactive front's `show_thinking`: the flag when it was given,
+/// else the person's `showThinking` setting, else
+/// [`thinking::SHOW_BY_DEFAULT`]. The pipe front keeps the flag's own
+/// default — `codex exec` runs with reasoning summaries off, and its golden
+/// bytes say so.
+fn thinking_flags(flags: RenderFlags) -> RenderFlags {
+    RenderFlags {
+        show_thinking: flags.show_thinking
+            || crate::preferences::load()
+                .show_thinking
+                .unwrap_or(thinking::SHOW_BY_DEFAULT),
+        ..flags
+    }
 }
 
 /// 지금 열려 있는 스트리밍 세그먼트.
@@ -515,15 +534,21 @@ struct Ui {
     subagent_wave: SubagentWave,
     /// Last activity object sent, including an explicit idle clear.
     published_activity: PublishedActivity,
-    /// Reasoning text of the block in flight, kept only until its first bold
-    /// heading closes. That heading becomes the shimmer word — see
-    /// [`first_bold_heading`] — so it is collected even when the thinking body
-    /// itself is hidden: "what is it doing" is the question a long unattended
-    /// run needs answered, and it must not depend on `--show-thinking`.
+    /// Reasoning text of the block in flight, read for the shimmer word —
+    /// [`thinking::live_heading`]: codex's first bold heading when one
+    /// closes, else the newest complete sentence. Collected even when the
+    /// thinking body itself is hidden: "what is it doing" is the question a
+    /// long unattended run needs answered, and it must not depend on
+    /// `--show-thinking`.
     ///
-    /// `Some((id, Some(buf)))` is still looking inside block `id`;
-    /// `Some((id, None))` already took that block's heading and stops buffering.
+    /// `Some((id, Some(buf)))` is still reading block `id`; `Some((id, None))`
+    /// took that block's bold heading and stops buffering — a title the model
+    /// wrote is not replaced by its sentences.
     reasoning_scan: Option<(u64, Option<String>)>,
+    /// The route the seats chose this turn (t-5872) — the status row's
+    /// inline word beside the interrupt hint, replaced as the step governor
+    /// moves the wire, cleared when the turn ends.
+    route_fact: Option<RouteFact>,
     parked: Option<Parked>,
     picker: Option<ModelPicker>,
     /// 떠 있는 `/resume` 화면 — codex `resume_picker.rs` 를 옮긴 것
@@ -556,6 +581,17 @@ struct Ui {
     /// 자동완성 팝업에서 고른 줄. 팝업 자체는 컴포저 원문에서 매번 다시
     /// 만든다 — 상태로 남길 것은 커서뿐이다.
     popup_selected: usize,
+    /// The `@` popup and what it remembers between keys — codex
+    /// `popups.active` · `dismissed_mention_token` · `current_file_query`
+    /// ([`Mentions`]). Unlike the slash popup it is state: its rows arrive
+    /// from a search thread, not from the composer text alone.
+    mentions: Mentions,
+    /// The skills the `@` popup lists, read from disk once per conversation
+    /// the first time a popup opens.
+    skill_catalog: Option<Vec<mention::Candidate>>,
+    /// The file search behind the `@` popup: one walk per query run, and the
+    /// files this conversation's tools read or wrote, which it ranks first.
+    file_search: FileSearchManager,
     reporter: Option<HookReporter>,
     model: String,
     /// The model actually on the wire when it is not `model` — a
@@ -633,10 +669,16 @@ struct App {
     /// the turn-local watcher used for paint, this remains alive while a
     /// detached child outlives its spawning foreground turn.
     subagent_frame_relay: Option<events::SubagentFrameRelay>,
+    /// The turn's route facts (t-5872), read between frames while a turn
+    /// runs. Re-subscribed whenever the session is replaced.
+    route_fact: RouteFactReceiver,
     /// A parent's `teammate.close` that arrived mid-turn (t-2513 §2.2): the
     /// turn was cancelled, and the teammate loop reads the reason here to
     /// write its closing document instead of waiting for the next word.
     close_requested: Option<String>,
+    /// Snapshots from the `@` file search — codex `AppEvent::FileSearchResult`
+    /// — selected on beside keys and blocks so a result never waits for one.
+    file_search_rx: tokio::sync::mpsc::UnboundedReceiver<FileSearchResult>,
     ui: Ui,
 }
 
@@ -823,7 +865,7 @@ fn status_detail_for(kind: &ToolKind) -> String {
 /// is THIS one doing", so the count leads and the label — already in the cell
 /// header above the row — is left out.
 fn subagent_cell_progress(progress: &SubagentProgress) -> String {
-    subagent_progress_line(progress)
+    subagent_progress_line(progress, true)
 }
 
 /// One helper's line under `Working`: `label · activity · elapsed`, then the
@@ -831,7 +873,7 @@ fn subagent_cell_progress(progress: &SubagentProgress) -> String {
 /// uses"), then a quiet warning. The count is what moves while the activity
 /// line stands still, so a person can tell a helper at work from one stuck.
 fn subagent_status_detail(progress: &SubagentProgress) -> String {
-    let mut line = subagent_progress_line(progress);
+    let mut line = subagent_progress_line(progress, false);
     if let Some(quiet) = progress.no_new_output_for {
         line.push_str(core_types::helper_run::FACT_SEPARATOR);
         let _ = write!(
@@ -843,10 +885,49 @@ fn subagent_status_detail(progress: &SubagentProgress) -> String {
     line
 }
 
-fn subagent_progress_line(progress: &SubagentProgress) -> String {
+/// The row's parts are the snapshot's own fields, spelled once in
+/// [`super::strings::helper`]: the label, the model the helper resolved to,
+/// its tool count, its age, what it is doing now and — inside the spawn cell
+/// only, where there is room under `└` — the last line it has said so far.
+fn subagent_progress_line(progress: &SubagentProgress, with_output_tail: bool) -> String {
     let label = crate::util::ansi::sanitize_inline(&progress.label);
+    let model = progress
+        .model
+        .as_deref()
+        .map(crate::util::ansi::sanitize_inline);
     let activity = super::activity::Activity::from_said(&progress.activity);
-    super::strings::helper(&label, progress.tool_calls, progress.elapsed, &activity)
+    let tail = with_output_tail
+        .then(|| last_output_line(&progress.output_tail))
+        .flatten();
+    super::strings::helper(
+        &label,
+        model.as_deref(),
+        progress.tool_calls,
+        progress.elapsed,
+        &activity,
+        tail.as_deref(),
+    )
+}
+
+/// The columns a helper's last output line may take on its live row. The
+/// row already carries five facts before it; the line is a glimpse, and the
+/// `/agents` picker has the whole tail.
+const HELPER_OUTPUT_TAIL_MAX_COLUMNS: usize = 60;
+
+/// The last non-empty line a helper streamed, cut to
+/// [`HELPER_OUTPUT_TAIL_MAX_COLUMNS`].
+fn last_output_line(output_tail: &str) -> Option<String> {
+    let line = output_tail
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let line = crate::util::ansi::sanitize_inline(line);
+    Some(
+        Line::from_text(line)
+            .truncated(HELPER_OUTPUT_TAIL_MAX_COLUMNS)
+            .plain(),
+    )
 }
 
 fn subagent_event_arrived(before: &[SubagentProgress], after: &[SubagentProgress]) -> bool {
@@ -926,35 +1007,6 @@ fn write_permission_cell(
     };
     *slot = Some(mode);
     true
-}
-
-/// The first `**bold**` heading in `text`, if one has closed yet.
-///
-/// codex's rule (`chatwidget.rs::extract_first_bold`) verbatim, including the
-/// two refusals that matter while a stream is still arriving: an **unclosed**
-/// `**` returns `None` so the header waits for more deltas instead of flashing
-/// a half-written phrase, and an empty `****` returns `None` rather than
-/// blanking the shimmer.
-fn first_bold_heading(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'*' && bytes[i + 1] == b'*' {
-            let start = i + 2;
-            let mut j = start;
-            while j + 1 < bytes.len() {
-                if bytes[j] == b'*' && bytes[j + 1] == b'*' {
-                    let trimmed = text[start..j].trim();
-                    return (!trimmed.is_empty()).then_some(trimmed);
-                }
-                j += 1;
-            }
-            // No closing marker yet — wait rather than guess.
-            return None;
-        }
-        i += 1;
-    }
-    None
 }
 
 /// The plan-submission tool whose result gets its own screen.
@@ -1199,11 +1251,13 @@ impl Ui {
         }
     }
 
-    /// Feed a stable reasoning heading to the status header.
+    /// Feed the reasoning block's word to the status header
+    /// ([`thinking::live_heading`]).
     ///
-    /// The header remains `Working` until a closed `**heading**` arrives. A
-    /// partial reasoning sentence is neither stable task status nor worth a
-    /// repaint on every streaming delta.
+    /// The header remains `Working` until a closed `**heading**` or a complete
+    /// sentence arrives; a half-written sentence is neither stable task status
+    /// nor worth a repaint. The header is replaced only when the word changes,
+    /// so a block that streams hundreds of deltas repaints it once a sentence.
     fn absorb_reasoning_heading(&mut self, id: u64, text: &str, done: bool) {
         if done {
             self.reasoning_scan = None;
@@ -1213,12 +1267,11 @@ impl Ui {
             return;
         }
         match &mut self.reasoning_scan {
-            // Already took this block's closed heading — stop buffering it.
+            // Already took this block's bold heading — stop buffering it.
             Some((scan_id, None)) if *scan_id == id => return,
             Some((scan_id, Some(buffer))) if *scan_id == id => {
-                if buffer.len() < 256 {
-                    buffer.push_str(text);
-                }
+                buffer.push_str(text);
+                thinking::bound_scan(buffer, thinking::SCAN_KEEP_BYTES);
             }
             // A new block starts its own search, and its own heading.
             _ => self.reasoning_scan = Some((id, Some(text.to_string()))),
@@ -1226,14 +1279,51 @@ impl Ui {
         let Some((_, Some(buffer))) = &self.reasoning_scan else {
             return;
         };
-        if let Some(heading) = first_bold_heading(buffer) {
-            let heading = heading.to_string();
+        let titled = thinking::leading_bold_heading(buffer).is_some();
+        let Some(heading) = thinking::live_heading(buffer, thinking::LIVE_HEADING_MAX_COLUMNS)
+        else {
+            return;
+        };
+        if titled {
             if let Some((_, slot)) = self.reasoning_scan.as_mut() {
                 *slot = None;
             }
-            if let Some(status) = self.status.as_mut() {
+        }
+        if let Some(status) = self.status.as_mut() {
+            if status.header != heading {
                 status.set_header(Some(&heading));
             }
+        }
+    }
+
+    /// `/thinking`: show or hide thinking cells from here on. Screen-only,
+    /// so it answers at once, mid-turn or idle; the block already open keeps
+    /// the setting it started with.
+    fn toggle_thinking(&mut self) {
+        self.flags.show_thinking = !self.flags.show_thinking;
+        let word = if self.flags.show_thinking {
+            super::strings::THINKING_SHOWN
+        } else {
+            super::strings::THINKING_HIDDEN
+        };
+        self.note(SystemLevel::Info, word);
+    }
+
+    /// The route fact the turn's seats published (t-5872), onto the status
+    /// row's inline slot — codex's place for optional context after the
+    /// interrupt hint. `None` clears it.
+    fn set_route_fact(&mut self, fact: Option<RouteFact>) {
+        self.route_fact = fact;
+        let word = self.route_fact.as_ref().map(|fact| {
+            super::strings::route_fact(
+                fact.who.word(),
+                fact.model.as_deref(),
+                fact.effort,
+                fact.reason,
+            )
+        });
+        if let Some(status) = self.status.as_mut() {
+            status.set_inline_message(word);
         }
     }
 
@@ -1434,6 +1524,9 @@ impl Ui {
         self.agents = None;
         self.last_commit = None;
         self.effort_effect = None;
+        self.mentions.close();
+        self.skill_catalog = None;
+        self.file_search.forget_touched();
     }
 
     /// 화면이 이미 아는 것만으로 세운 `/status` 재료.
@@ -1542,7 +1635,8 @@ impl Ui {
             || self.sessions.is_some()
             || pager.is_some()
             || question.is_some()
-            || popup.is_some();
+            || popup.is_some()
+            || self.mentions.is_open();
         let max_rows = if whole {
             self.painter.popup_budget()
         } else {
@@ -1564,6 +1658,7 @@ impl Ui {
             sessions: self.sessions.as_ref(),
             pager: pager.as_deref(),
             popup: popup.as_ref(),
+            mention: self.mentions.popup(),
             shortcuts: shortcuts.as_deref(),
             model: footer_model,
             effort: &display_effort,
@@ -1782,6 +1877,7 @@ impl Ui {
             || self.sessions.is_some()
             || self.parked.is_some()
             || self.agents.is_some()
+            || self.mentions.is_open()
         {
             return None;
         }
@@ -1845,6 +1941,7 @@ impl Ui {
                 if !self.composer.handle_paste_image_path(text) {
                     self.composer.insert_pasted(text);
                 }
+                self.sync_mentions();
                 KeyOutcome::Nothing
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -1874,10 +1971,53 @@ impl Ui {
                     self.parked_key(*key);
                     return KeyOutcome::Nothing;
                 }
-                self.idle_key(*key)
+                let outcome = self.idle_key(*key);
+                self.sync_mentions();
+                outcome
             }
             _ => KeyOutcome::Nothing,
         }
+    }
+
+    /// codex `sync_popups`: after every event that may have moved the
+    /// composer, the `@` popup follows the token under the cursor — opened
+    /// the moment one appears, fed the file search, closed when it goes. A
+    /// surface that owns the keys (a picker, a dialog, the agents overview
+    /// with its own composer) gets no popup under it.
+    fn sync_mentions(&mut self) {
+        if self.overlay().is_some()
+            || self.sessions.is_some()
+            || self.parked.is_some()
+            || self.agents.is_some()
+            || self.transcript.is_some()
+        {
+            self.mentions.close();
+            self.file_search.on_user_query("");
+            return;
+        }
+        let Ui {
+            mentions,
+            composer,
+            file_search,
+            skill_catalog,
+            session_cwd,
+            ..
+        } = self;
+        mentions.sync(composer, file_search, || {
+            skill_catalog
+                .get_or_insert_with(|| {
+                    mention::build_search_catalog(&runtime::discover_skills(session_cwd))
+                })
+                .clone()
+        });
+    }
+
+    /// codex `apply_file_search_result` → `on_file_search_result`: a snapshot
+    /// from the search thread lands in the popup when the person is still on
+    /// the token it answers.
+    fn on_file_search_result(&mut self, result: FileSearchResult) {
+        self.mentions
+            .on_file_search_result(&self.composer, &result.query, result.matches);
     }
 
     #[allow(clippy::too_many_lines)] // 평평한 키 match — 한 arm 씩.
@@ -1890,6 +2030,13 @@ impl Ui {
             && self.pending_input.edit_latest_queued(&mut self.composer)
         {
             return KeyOutcome::Nothing;
+        }
+        // The `@` popup reads its keys first — codex
+        // `handle_key_event_with_mentions_v2_popup`. Enter with nothing to
+        // insert closes it and submits the line as it is.
+        match self.mentions.key(&key, &mut self.composer) {
+            MentionKey::Consumed => return KeyOutcome::Nothing,
+            MentionKey::Submit | MentionKey::Passed => {}
         }
         match key.code {
             _ if transcript::is_open_key(&key) => {
@@ -2886,11 +3033,14 @@ impl Ui {
                 if !self.composer.handle_paste_image_path(text) {
                     self.composer.insert_pasted(text);
                 }
+                self.sync_mentions();
                 true
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 tools::KeyboardPresence::process().note_input();
-                self.turn_key(key, turn, exit_after)
+                let handled = self.turn_key(key, turn, exit_after);
+                self.sync_mentions();
+                handled
             }
             _ => false,
         }
@@ -2963,6 +3113,16 @@ impl Ui {
         {
             return true;
         }
+        // The `@` popup consumes its keys — Esc closes it before it could
+        // read as an interrupt, exactly as codex's composer does.
+        match self.mentions.key(key, &mut self.composer) {
+            MentionKey::Consumed => return true,
+            MentionKey::Submit => {
+                self.submit_composer_during_turn(turn, exit_after);
+                return true;
+            }
+            MentionKey::Passed => {}
+        }
         if interrupt {
             if self.pending_input.has_pending_steers() {
                 self.pending_input.interrupt_and_submit_steers();
@@ -3033,6 +3193,7 @@ impl Ui {
             self.turn_slash(command);
             return;
         }
+        let trimmed = mention::expand_page_mentions(&trimmed, self.file_search.roots());
         // The runtime steering queue is text-only. Preserve a mid-turn image
         // as an ordinary queued follow-up instead of dropping its attachment.
         if !submission.image_paths.is_empty() {
@@ -3101,6 +3262,7 @@ impl Ui {
                     self.note(SystemLevel::Info, fast::UNSUPPORTED_COMMAND_MESSAGE);
                 }
             }
+            Some(Slash::Thinking) => self.toggle_thinking(),
             Some(Slash::Permissions) if arg.is_empty() => {
                 self.open_permissions_picker();
             }
@@ -3271,6 +3433,16 @@ impl Ui {
                 // concrete work and its orphan cell earns the turn separator.
                 self.had_work_activity = true;
                 let announced = self.tools.remove(&tool_call_id.0);
+                // A file a tool read or wrote stands first in the `@` popup
+                // from now on.
+                if let Some(path) = announced
+                    .as_ref()
+                    .filter(|_| !is_error)
+                    .map(|pending| pending.path.as_str())
+                    .filter(|path| !path.is_empty())
+                {
+                    self.file_search.note_touched(std::path::Path::new(path));
+                }
                 // A result that came before its call was seated: the call
                 // lands as its own committed cell (or is discarded as a
                 // transient) and never needs the slot.
@@ -3535,6 +3707,14 @@ impl Ui {
             Segment::Text(_, stream) => (stream.finish(), None),
             Segment::Reasoning(_, stream) => {
                 let tail = stream.finish();
+                // A headerless block — Anthropic thinking — commits as a
+                // titled, previewed (or folded) cell; a summary with codex's
+                // own heading keeps codex's cell.
+                let tail = if stream.finished_headerless_thinking() {
+                    thinking::cell(tail, self.fold_mode, &mut self.folds)
+                } else {
+                    tail
+                };
                 (tail, stream.take_reasoning_transcript())
             }
         };
@@ -3902,6 +4082,9 @@ impl App {
         let cwd = view::short_cwd(&session_cwd.to_string_lossy());
         let worktree_context = worktree_context(&session_cwd);
         let footer_location = view::footer_location(&cwd, worktree_context.as_deref());
+        let route_fact = session.route_fact_receiver();
+        let (file_search_tx, file_search_rx) = tokio::sync::mpsc::unbounded_channel();
+        let file_search = FileSearchManager::new(session_cwd.clone(), file_search_tx);
         Ok(Self {
             ui: Ui {
                 flags,
@@ -3930,6 +4113,7 @@ impl App {
                 subagent_wave: SubagentWave::default(),
                 published_activity: PublishedActivity::Never,
                 reasoning_scan: None,
+                route_fact: None,
                 parked: None,
                 picker: None,
                 sessions: None,
@@ -3941,6 +4125,9 @@ impl App {
                 transcript_bytes: 0,
                 last_answer: String::new(),
                 popup_selected: 0,
+                mentions: Mentions::default(),
+                skill_catalog: None,
+                file_search,
                 reporter: HookReporter::from_env(),
                 model,
                 fast,
@@ -3969,7 +4156,9 @@ impl App {
             session: Some(session),
             agent_completion_pump,
             subagent_frame_relay,
+            route_fact,
             close_requested: None,
+            file_search_rx,
             signals: TerminationSignals::install(),
         })
     }
@@ -4051,6 +4240,10 @@ impl App {
                     Some(Err(_)) | None => break ExitReason::UserExit,
                 },
                 () = TerminationSignals::delivered(&mut self.signals) => break ExitReason::UserExit,
+                Some(result) = self.file_search_rx.recv() => {
+                    self.ui.on_file_search_result(result);
+                    self.ui.draw();
+                }
                 followup = recv_agent_followup(&mut self.agent_completion_pump) => {
                     let prompt = Submission {
                         text: followup.text.clone(),
@@ -4259,6 +4452,10 @@ impl App {
                 },
                 () = TerminationSignals::delivered(&mut self.signals) => {
                     return IdleOutcome::Close(CloseReason::UserExit);
+                }
+                Some(result) = self.file_search_rx.recv() => {
+                    self.ui.on_file_search_result(result);
+                    self.ui.draw();
                 }
                 command = crate::ide::events::next_command(crate::ide::events::channel()) => match command {
                     Command::Steer { text } => return IdleOutcome::NextTurn(text),
@@ -4474,7 +4671,7 @@ impl App {
                 let text = unescaped.to_string();
                 self.ui.user_cell(&text);
                 return Some(Submission {
-                    text,
+                    text: mention::expand_page_mentions(&text, self.ui.file_search.roots()),
                     image_paths: submission.image_paths.clone(),
                 });
             }
@@ -4486,8 +4683,10 @@ impl App {
             slash::Line::Plain | slash::Line::Path => {}
         }
         self.ui.user_cell(trimmed);
+        // A `@wiki/…` mention becomes its page's body here — the screen shows
+        // what the person typed, the model reads the page.
         Some(Submission {
-            text: trimmed.to_string(),
+            text: mention::expand_page_mentions(trimmed, self.ui.file_search.roots()),
             image_paths: submission.image_paths.clone(),
         })
     }
@@ -4527,6 +4726,7 @@ impl App {
                 let enabled = !self.ui.fast;
                 self.set_fast_mode(enabled);
             }
+            Some(Slash::Thinking) => self.ui.toggle_thinking(),
             Some(Slash::New) => {
                 self.start_fresh_session((!arg.is_empty()).then_some(arg), false);
             }
@@ -4809,6 +5009,7 @@ impl App {
                 });
                 let agent_completion_pump = session.start_agent_completion_pump();
                 self.session = Some(session);
+                self.route_fact = self.session().route_fact_receiver();
                 self.agent_completion_pump = agent_completion_pump;
                 self.subagent_frame_relay = events::start_subagent_frame_relay(
                     events::channel(),
@@ -4827,6 +5028,9 @@ impl App {
                 self.ui.footer_location = view::footer_location(&cwd, context.as_deref());
                 self.ui.cwd = cwd;
                 self.ui.session_cwd = cwd_path;
+                self.ui
+                    .file_search
+                    .update_search_dir(self.ui.session_cwd.clone());
                 self.ui.session_id = self.session().handle.id.clone();
                 self.ui.registry = self.session().registry();
                 self.session_card();
@@ -4908,6 +5112,7 @@ impl App {
                 // cannot cross the `/resume` boundary.
                 let agent_completion_pump = session.start_agent_completion_pump();
                 self.session = Some(session);
+                self.route_fact = self.session().route_fact_receiver();
                 self.agent_completion_pump = agent_completion_pump;
                 self.subagent_frame_relay = events::start_subagent_frame_relay(
                     events::channel(),
@@ -4926,6 +5131,9 @@ impl App {
                 self.ui.footer_location = view::footer_location(&cwd, context.as_deref());
                 self.ui.cwd = cwd;
                 self.ui.session_cwd = cwd_path;
+                self.ui
+                    .file_search
+                    .update_search_dir(self.ui.session_cwd.clone());
                 self.ui.session_id = self.session().handle.id.clone();
                 self.ui.registry = self.session().registry();
                 self.session_card();
@@ -5121,6 +5329,7 @@ impl App {
         ui.subagent_wave = SubagentWave::default();
         ui.published_activity = PublishedActivity::Never;
         ui.set_subagent_progress(Vec::new());
+        ui.set_route_fact(None);
         ui.status = Some(Status::working(Duration::ZERO));
         ui.publish_working_activity(turn_scaffold.ide);
         ui.draw_with_queue(|| block_rx.len());
@@ -5137,6 +5346,11 @@ impl App {
         let mut subagent_watcher =
             SubagentProgressWatcher::start(std::sync::Arc::clone(&registry), session_id.clone());
         let mut subagent_watcher_open = true;
+        let route_fact = &mut self.route_fact;
+        // Whatever the previous turn last published is seen now, so this
+        // turn's first `changed()` is its own opening fact, not a stale word.
+        let _ = route_fact.borrow_and_update();
+        let mut route_fact_open = true;
         let mut turn = turn_scaffold
             .launch()
             .spawn(session, input.text.clone(), images);
@@ -5204,6 +5418,21 @@ impl App {
                     } else {
                         subagent_watcher_open = false;
                     }
+                }
+                changed = route_fact.changed(), if route_fact_open => {
+                    if changed.is_ok() {
+                        let fact = route_fact.borrow_and_update().clone();
+                        ui.set_route_fact(fact);
+                        ui.draw_with_queue(|| block_rx.len());
+                    } else {
+                        // The turn's session is gone with its sender; the
+                        // last fact stands until the row does.
+                        route_fact_open = false;
+                    }
+                }
+                Some(result) = self.file_search_rx.recv() => {
+                    ui.on_file_search_result(result);
+                    ui.draw_with_queue(|| block_rx.len());
                 }
                 Some(answer) = events::wait_answer(turn_scaffold.ide, waiting) => {
                     // IDE 모달이 먼저 답했다 — 패인의 다이얼로그를 그 답으로 닫는다.
@@ -5557,6 +5786,7 @@ fn test_ui() -> Ui {
         subagent_wave: SubagentWave::default(),
         published_activity: PublishedActivity::Never,
         reasoning_scan: None,
+        route_fact: None,
         parked: None,
         picker: None,
         sessions: None,
@@ -5568,6 +5798,12 @@ fn test_ui() -> Ui {
         last_answer: String::new(),
         transcript_bytes: 0,
         popup_selected: 0,
+        mentions: Mentions::default(),
+        skill_catalog: None,
+        file_search: FileSearchManager::new(
+            std::env::temp_dir(),
+            tokio::sync::mpsc::unbounded_channel().0,
+        ),
         reporter: None,
         model: "test-model".to_string(),
         fast: false,
@@ -6816,20 +7052,6 @@ mod tests {
     /// while deltas are still arriving: an unclosed `**` waits instead of
     /// flashing half a phrase, and an empty `****` never blanks the shimmer.
     #[test]
-    fn the_shimmer_word_waits_for_a_closed_heading() {
-        use super::first_bold_heading;
-
-        assert_eq!(first_bold_heading("**Checking the test**\nbody"), Some("Checking the test"));
-        assert_eq!(first_bold_heading("intro **Second** and **Third**"), Some("Second"));
-        assert_eq!(first_bold_heading("  **  padded  **"), Some("padded"));
-
-        assert_eq!(first_bold_heading("**still writing the head"), None);
-        assert_eq!(first_bold_heading("****"), None);
-        assert_eq!(first_bold_heading("no markers at all"), None);
-        assert_eq!(first_bold_heading(""), None);
-    }
-
-    #[test]
     fn partial_reasoning_never_churns_the_status_heading() {
         let mut ui = test_ui();
         ui.status = Some(crate::tui::view::Status::working(Duration::ZERO));
@@ -7481,6 +7703,7 @@ mod tests {
             sessions: None,
             pager: None,
             popup: None,
+            mention: None,
             shortcuts: None,
             model: "test-model",
             effort: "",

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use e2e::contract::{self, Rule};
 use e2e::harness::{history_rows_raw, run_pipe, run_pipe_with_env, visible_row_occupancy, PtyRun, Screen};
-use e2e::scripted::ScriptedAnthropicService;
+use e2e::scripted::{user_text_contains, ScriptedAnthropicService};
 use mock_anthropic_service::{CapturedRequest, MockAnthropicService};
 use tempfile::TempDir;
 use zerocode_harness::{method, Client};
@@ -1774,6 +1774,134 @@ async fn e2e_a_delegation_cell_shows_its_task_not_its_arguments() {
             "result envelope keys reached the screen ({syntax:?})"
         );
     }
+}
+
+/// Anthropic thinking has no bold heading, so the status row said `Working`
+/// for the whole block and the body never reached the screen (2026-09-22,
+/// "thinking 중에 뭘 하는지 확인이 안 됨"). Now the row says the newest
+/// complete sentence and the block commits as a titled thinking cell; a
+/// `/thinking` keeps the row's word and drops the cell (t-5872).
+///
+/// The delta-to-screen latency is measured, not assumed: the script writes
+/// one SSE event per sentence with its instant, and the screen is polled
+/// until the sentence's word stands on the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_headerless_thinking_names_the_status_row_and_commits_a_titled_cell() {
+    let layout = Layout::new();
+    let sentences = [
+        "The person wants the fixture summarised. ",
+        "Let me read the fixture before answering. ",
+        "It is three lines long, so one sentence will do.",
+    ];
+    let words = [
+        "The person wants the fixture summarised",
+        "Let me read the fixture before answering",
+        "It is three lines long, so one sentence will do",
+    ];
+    let gap = Duration::from_millis(400);
+    let service = ScriptedAnthropicService::thinking(&sentences, gap, "### Summary\n\n- three lines\n")
+        .await
+        .expect("start thinking script");
+    let mut run = pty(&layout, service.base_url(), &interactive_args());
+    let timeout = Duration::from_secs(20);
+
+    run.wait_for("directory:", TEST_TIMEOUT);
+    run.send(b"Summarise the fixture\r").expect("send prompt");
+
+    // Each sentence's word on the status row, and how long after its delta
+    // left the server. The shimmer styles every glyph, so the row is read
+    // through the screen, never as raw bytes.
+    let mut latencies_ms = Vec::new();
+    for (index, word) in words.iter().enumerate() {
+        let deadline = Instant::now() + timeout;
+        let seen_at = loop {
+            let mut screen = Screen::new(40);
+            screen.feed(&run.snapshot_output());
+            let visible = screen.visible();
+            if visible
+                .iter()
+                .any(|row| row.contains("esc to interrupt") && row.contains(word))
+            {
+                break Instant::now();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sentence {index} never reached the status row: {visible:#?}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        // Event 0 of request 0 is `message_start`, 1 is the block start, so
+        // sentence `index` is event `index + 2`.
+        let sent_at = service
+            .event_marks()
+            .into_iter()
+            .find(|mark| mark.request_index == 0 && mark.event_index == index + 2)
+            .map(|mark| mark.at)
+            .expect("the sentence's event mark");
+        latencies_ms.push(seen_at.saturating_duration_since(sent_at).as_secs_f64() * 1000.0);
+    }
+    eprintln!("thinking delta → status row (ms): {latencies_ms:.1?}");
+    // A frame is 32 ms and the poll adds 2 ms; measured alone this is under
+    // 50 ms. The bound is a second because this binary's PTY cases run
+    // beside one another under `just test`: a stall is what it refuses, not
+    // a loaded scheduler.
+    assert!(
+        latencies_ms.iter().all(|ms| *ms < 1_000.0),
+        "the status word lagged its delta: {latencies_ms:?}"
+    );
+
+    // The block ends: a titled thinking cell with the sentences under it,
+    // then the answer.
+    run.wait_for_history_row("Thinking", timeout);
+    run.wait_for_history_row("three lines", timeout);
+    let mut screen = Screen::new(40);
+    screen.feed(&run.snapshot_output());
+    let transcript = screen.transcript();
+    let title = transcript
+        .iter()
+        .position(|row| row.trim() == "• Thinking")
+        .unwrap_or_else(|| panic!("no thinking title row: {transcript:#?}"));
+    assert!(
+        transcript[title + 1].contains("The person wants the fixture summarised"),
+        "the body follows the title: {transcript:#?}"
+    );
+    assert!(
+        transcript
+            .iter()
+            .position(|row| row.contains("three lines"))
+            .is_some_and(|answer| answer > title),
+        "the answer follows the thinking cell: {transcript:#?}"
+    );
+
+    // `/thinking` hides the next block's cell; the row still gets its word.
+    run.send(b"/thinking\r").expect("send /thinking");
+    run.wait_for_history_row("thinking hidden", timeout);
+    let cells_before = {
+        let mut screen = Screen::new(40);
+        screen.feed(&run.snapshot_output());
+        screen.transcript().iter().filter(|row| row.trim() == "• Thinking").count()
+    };
+    run.send(b"Summarise it again\r").expect("send second prompt");
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut screen = Screen::new(40);
+        screen.feed(&run.snapshot_output());
+        if screen
+            .visible()
+            .iter()
+            .any(|row| row.contains("esc to interrupt") && row.contains(words[0]))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the hidden block still names the row");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    run.wait_for_history_row("three lines", timeout);
+    let mut screen = Screen::new(40);
+    screen.feed(&run.snapshot_output());
+    let cells_after = screen.transcript().iter().filter(|row| row.trim() == "• Thinking").count();
+    assert_eq!(cells_after, cells_before, "a hidden block commits no thinking cell");
+    let _ = run.finish();
 }
 
 /// One turn, one spawn, four ledgers — joined by equality on the attempt key.
@@ -6748,4 +6876,205 @@ fn e2e_mcp_add_reaches_the_doctor_and_remove_takes_it_back_out() {
     assert_eq!(missing.status.code(), Some(1), "{:?}", missing.status);
     let stderr = String::from_utf8_lossy(&missing.stderr);
     assert!(stderr.contains("no MCP server named"), "stderr was:\n{stderr}");
+}
+
+/// Files a test's workspace holds, written before zo starts so the walker
+/// finds them on its first pass.
+fn write_workspace_files(layout: &Layout, files: &[(&str, &str)]) {
+    for (path, body) in files {
+        let path = layout.cwd.join(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("workspace directory");
+        }
+        fs::write(path, body).expect("workspace file");
+    }
+}
+
+/// The user text of the one request the provider saw.
+async fn only_request_body(service: &ScriptedAnthropicService) -> serde_json::Value {
+    let bodies = service.request_bodies().await;
+    assert_eq!(bodies.len(), 1, "one submitted line is one request");
+    serde_json::from_str(&bodies[0]).expect("the request body is JSON")
+}
+
+/// The `@` popup — codex `mentions_v2`: `@comp` lists the files the fuzzy
+/// search found under the composer (name, dim directory, `File` tag, the key
+/// footer), Tab puts the selected path into the line over the token, and
+/// the submitted prompt carries that path as text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_at_popup_lists_files_and_tab_inserts_the_selected_path() {
+    let layout = Layout::new();
+    write_workspace_files(
+        &layout,
+        &[
+            ("src/composer.rs", "fn composer() {}\n"),
+            ("src/compose_tests.rs", "#[test]\nfn t() {}\n"),
+            ("README.md", "# readme\n"),
+        ],
+    );
+    let service = ScriptedAnthropicService::text("### Seen\n\n- the path arrived\n")
+        .await
+        .expect("start provider");
+    let args = interactive_args();
+    // A controlling pty, so the test can resize it: the painter repaints only
+    // the rows that changed, which spreads a popup whose rows arrive after
+    // its footer over several frames; a resize repaints the whole viewport
+    // in one frame, and that frame is the golden.
+    let mut run = PtyRun::spawn_controlling_sized(
+        40,
+        120,
+        &layout.cwd,
+        &layout.home,
+        &layout.sessions,
+        &layout.state,
+        service.base_url(),
+        &args,
+        &[],
+    )
+    .expect("spawn zo on a controlling pty");
+
+    run.wait_for("directory:", TEST_TIMEOUT);
+    run.send(b"look at @comp").expect("type a mention");
+    // Both files match `comp` at the same place and score alike; codex
+    // `filter.rs::sort_rows` then orders by name, so `compose_tests.rs` is
+    // first. The name column is as wide as the widest visible name (16), so
+    // `composer.rs` is padded to it before the two-column gap.
+    run.wait_for("> compose_tests.rs  src/", TEST_TIMEOUT);
+    run.wait_for("switch search modes", TEST_TIMEOUT);
+    // An unselected row changes style between its name and its path, so it
+    // is never one contiguous run of bytes — read it off the screen model.
+    run.wait_until(0, TEST_TIMEOUT, |bytes| {
+        let mut screen = Screen::new(40);
+        screen.feed(bytes);
+        screen
+            .visible()
+            .iter()
+            .any(|row| row.starts_with("  composer.rs       src/"))
+    });
+    run.send(b"\x1b[B").expect("move the selection down");
+    let popup_seen = run.wait_for("> composer.rs       src/", TEST_TIMEOUT);
+    run.resize(41, 120).expect("resize the pty by one row");
+    let repainted = run.wait_for_after("Filesystem Only    Skills", popup_seen, TEST_TIMEOUT);
+    run.send(b"\t").expect("accept the selected file");
+    run.wait_for_after("look at src/composer.rs", repainted, TEST_TIMEOUT);
+    run.send(b"\r").expect("submit");
+    run.wait_for_history_row("the path arrived", TEST_TIMEOUT);
+    let capture = run.finish();
+    if let Ok(path) = std::env::var("ZO_E2E_DUMP") {
+        fs::write(format!("{path}.bin"), &capture).expect("dump the @ popup capture");
+    }
+
+    // From the composer text of the repainted popup frame (its border, both
+    // rows, the blank, the footer with its mode indicator) — the footer slot
+    // holds no cwd. The caret and the border are styled runs of their own,
+    // so the anchor is the typed text, which is one run.
+    assert_block_golden(
+        &capture,
+        "at-popup",
+        "@ popup",
+        &layout,
+        b"look at @comp",
+        b"Filesystem Only    Skills",
+    );
+    let body = only_request_body(&service).await;
+    assert!(
+        user_text_contains(&body, "look at src/composer.rs"),
+        "the completed path reaches the model as text: {body}"
+    );
+}
+
+/// zo's own row: with a second brain configured, `@` also finds the vault's
+/// `wiki/` pages (`Vault` tag), inserts one as `@wiki/<page>`, and the
+/// submitted prompt carries the page's body under the mention.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_at_popup_offers_vault_pages_and_the_submitted_mention_carries_the_page_body() {
+    let layout = Layout::new();
+    write_workspace_files(&layout, &[("main.rs", "fn main() {}\n")]);
+    let vault = layout.root.path().join("vault");
+    fs::create_dir_all(vault.join("wiki")).expect("vault wiki");
+    fs::write(
+        vault.join("wiki/alpha-notes.md"),
+        "# Alpha\n\nzo vault body line\n",
+    )
+    .expect("vault page");
+    let service = ScriptedAnthropicService::text("### Seen\n\n- the page arrived\n")
+        .await
+        .expect("start provider");
+    let args = interactive_args();
+    let vault_text = vault.to_string_lossy().into_owned();
+    let mut run = PtyRun::spawn_with_env(
+        &layout.cwd,
+        &layout.home,
+        &layout.sessions,
+        &layout.state,
+        service.base_url(),
+        &args,
+        &[("ZEROCODE_SECOND_BRAIN", vault_text.as_str())],
+    )
+    .expect("spawn zo with a vault");
+
+    run.wait_for("directory:", TEST_TIMEOUT);
+    run.send(b"@alpha-n").expect("type a page mention");
+    let row_seen = run.wait_for("> alpha-notes.md  wiki/", TEST_TIMEOUT);
+    // The popup is drawn over the rows above the composer and given back
+    // when it closes, so the tag is read while the popup stands.
+    run.wait_until(0, TEST_TIMEOUT, |bytes| {
+        let mut screen = Screen::new(40);
+        screen.feed(bytes);
+        screen
+            .visible()
+            .iter()
+            .any(|row| row.starts_with("> alpha-notes.md  wiki/") && row.ends_with("Vault"))
+    });
+    run.send(b"\t").expect("accept the page");
+    run.wait_for_after("@wiki/alpha-notes.md", row_seen, TEST_TIMEOUT);
+    run.send(b"\r").expect("submit");
+    run.wait_for_history_row("the page arrived", TEST_TIMEOUT);
+    let _ = run.finish();
+
+    let body = only_request_body(&service).await;
+    for needle in [
+        "@wiki/alpha-notes.md",
+        "[second brain page: wiki/alpha-notes.md]",
+        "zo vault body line",
+    ] {
+        assert!(user_text_contains(&body, needle), "{needle:?} missing from {body}");
+    }
+}
+
+/// zo's own order: a file a tool read in this conversation stands first in
+/// the `@` popup, above a file the matcher alone would have put first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_a_file_the_turn_read_stands_first_in_the_at_popup() {
+    let layout = Layout::new();
+    layout.fixture("fixture content for the deterministic read\n");
+    write_workspace_files(&layout, &[("fix.txt", "the closer match nobody touched\n")]);
+    let service = ScriptedAnthropicService::bash_read("### Tool answer\n\n- fixture read\n")
+        .await
+        .expect("start bash/read script");
+    let args = interactive_args();
+    let mut run = pty(&layout, service.base_url(), &args);
+
+    run.wait_for("directory:", TEST_TIMEOUT);
+    run.send(b"Run Bash once and Read fixture.txt once, then summarize\r")
+        .expect("send tool prompt");
+    run.wait_for_history_row("fixture read", TEST_TIMEOUT);
+    run.send(b"@fix.t").expect("type a mention both files match");
+    run.wait_until(0, TEST_TIMEOUT, |bytes| {
+        let mut screen = Screen::new(40);
+        screen.feed(bytes);
+        let visible = screen.visible();
+        visible.iter().any(|row| row.starts_with("> fixture.txt  ./"))
+            && visible.iter().any(|row| row.starts_with("  fix.txt") && row.contains("  ./"))
+    });
+    // Esc closes the popup and Ctrl-U clears the line — so `/exit` below
+    // lands on an empty composer and nothing else is submitted. (Two Esc
+    // bytes back to back read as one escape sequence, not two keys.) The
+    // placeholder was on screen at boot too, so the wait starts here.
+    let before_esc = run.output_len();
+    run.send(b"\x1b").expect("close the popup");
+    run.send(b"\x15").expect("clear the composer");
+    run.wait_for_after("Ask zo to do anything", before_esc, TEST_TIMEOUT);
+    let _ = run.finish();
+    assert_eq!(service.request_bodies().await.len(), 2, "the tool turn only");
 }

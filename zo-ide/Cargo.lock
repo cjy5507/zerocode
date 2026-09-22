@@ -89,7 +89,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "api"
-version = "1.1.13"
+version = "1.1.14"
 dependencies = [
  "base64 0.22.1",
  "core-types",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph"
-version = "1.1.13"
+version = "1.1.14"
 dependencies = [
  "ignore",
  "rayon",
@@ -475,7 +475,7 @@ checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
 
 [[package]]
 name = "commands"
-version = "1.1.13"
+version = "1.1.14"
 dependencies = [
  "core-types",
  "plugins",
@@ -576,7 +576,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core-types"
-version = "1.1.13"
+version = "1.1.14"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -641,6 +641,7 @@ dependencies = [
  "crossterm_winapi",
  "derive_more",
  "document-features",
+ "filedescriptor",
  "futures-core",
  "mio",
  "parking_lot",
@@ -727,7 +728,7 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
 name = "decision-core"
-version = "1.1.13"
+version = "1.1.14"
 dependencies = [
  "serde",
  "serde_json",
@@ -1016,6 +1017,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
+]
+
+[[package]]
+name = "filedescriptor"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e40758ed24c9b2eeb76c35fb0aebc66c626084edd827e07e1552279814c6682d"
+dependencies = [
+ "libc",
+ "thiserror 1.0.69",
+ "winapi",
 ]
 
 [[package]]
@@ -1987,7 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "mock-anthropic-service"
-version = "1.1.13"
+version = "1.1.14"
 dependencies = [
  "api",
  "serde_json",
@@ -1996,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "model-prices"
-version = "1.1.13"
+version = "1.1.14"
 dependencies = [
  "serde",
  "serde_json",
@@ -2140,6 +2152,27 @@ name = "noop_proc_macro"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
+
+[[package]]
+name = "nucleo"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5262af4c94921c2646c5ac6ff7900c2af9cbb08dc26a797e18130a7019c039d4"
+dependencies = [
+ "nucleo-matcher",
+ "parking_lot",
+ "rayon",
+]
+
+[[package]]
+name = "nucleo-matcher"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf33f538733d1a5a3494b836ba913207f14d9d4a1d3cd67030c5061bdd2cac85"
+dependencies = [
+ "memchr",
+ "unicode-segmentation",
+]
 
 [[package]]
 name = "num-bigint"
@@ -2474,7 +2507,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "1.1.13"
+version = "1.1.14"
 dependencies = [
  "nix 0.29.0",
  "serde",
@@ -2990,7 +3023,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "1.1.13"
+version = "1.1.14"
 dependencies = [
  "api",
  "base64 0.22.1",
@@ -3004,6 +3037,7 @@ dependencies = [
  "ignore",
  "image",
  "nix 0.29.0",
+ "nucleo",
  "pdf-extract",
  "plugins",
  "process-wrap",
@@ -3256,7 +3290,7 @@ dependencies = [
 
 [[package]]
 name = "session-corpus"
-version = "1.1.13"
+version = "1.1.14"
 dependencies = [
  "core-types",
 ]
@@ -3767,7 +3801,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "tools"
-version = "1.1.13"
+version = "1.1.14"
 dependencies = [
  "api",
  "base64 0.22.1",
@@ -4845,7 +4879,7 @@ dependencies = [
 
 [[package]]
 name = "zerocode-core"
-version = "1.1.13"
+version = "1.1.14"
 dependencies = [
  "serde",
  "serde_json",
@@ -4858,7 +4892,7 @@ dependencies = [
 
 [[package]]
 name = "zerocode-harness"
-version = "1.1.13"
+version = "1.1.14"
 dependencies = [
  "serde",
  "serde_json",
@@ -4954,7 +4988,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zo-ide"
-version = "1.1.13"
+version = "1.1.14"
 dependencies = [
  "api",
  "arboard",
@@ -4988,7 +5022,7 @@ dependencies = [
 
 [[package]]
 name = "zo-telemetry"
-version = "1.1.13"
+version = "1.1.14"
 dependencies = [
  "serde",
  "serde_json",
