@@ -22,14 +22,36 @@ fn screen_press_confidence_is_distinct_from_the_promotion_answer_rate() {
             (-0.1, false),
         ] {
             assert_eq!(
-                seat.permits_press(confidence),
+                seat.permits_press(confidence, crate::guarded::ControlKind::Plain),
                 permitted,
                 "{} {confidence}",
                 seat.id
             );
         }
     }
-    assert!(!ROUTING.permits_press(1.0));
+    assert!(!ROUTING.permits_press(1.0, crate::guarded::ControlKind::Plain));
+}
+
+/// A control a press cannot take back asks nine in ten of every screen seat,
+/// whatever its own press floor (t-6187); a plain one asks that floor. A
+/// seat that presses nothing presses neither.
+#[test]
+fn a_destructive_control_asks_nine_in_ten_of_every_screen_seat() {
+    use crate::guarded::ControlKind::{Destructive, Plain};
+    let destructive = f64::from(SCREEN_DESTRUCTIVE_PRESS_FLOOR_PERMILLE) / 1_000.0;
+    for seat in [&BROWSER, &DESKTOP, &EMULATOR, &BRANCHING] {
+        let plain = f64::from(seat.press_floor_permille.expect("a screen seat presses")) / 1_000.0;
+        assert!(plain < destructive, "{}", seat.id);
+        assert!(seat.permits_press(plain, Plain), "{}", seat.id);
+        assert!(!seat.permits_press(plain, Destructive), "{}", seat.id);
+        assert!(
+            !seat.permits_press(destructive - ANSWER_STEP, Destructive),
+            "{}",
+            seat.id
+        );
+        assert!(seat.permits_press(destructive, Destructive), "{}", seat.id);
+    }
+    assert!(!ROUTING.permits_press(1.0, Destructive));
 }
 
 #[test]
@@ -337,7 +359,10 @@ fn every_seat_waits_for_a_window_of_marks_whatever_kind_they_are() {
         .filter(|row| row.agreement_kind == AgreementKind::Hindsight)
         .map(|row| row.id)
         .collect();
-    assert_eq!(hindsight, vec![RECALL.id, PLACEMENT.id, COMPACTION.id]);
+    assert_eq!(
+        hindsight,
+        vec![RECALL.id, PLACEMENT.id, COMPACTION.id, PATCH_REVIEW.id]
+    );
     for row in JEV_USES.iter().filter(|row| row.promotes) {
         assert_eq!(
             row.agreement_rows_wanted,
@@ -511,7 +536,10 @@ fn the_browser_read_seat_folds_on_its_own_line_and_sends_no_body() {
         BROWSER_READ.press_floor_permille,
         Some(BROWSER_READ_FOLD_FLOOR_PERMILLE)
     );
-    assert!(BROWSER_READ.permits_press(0.7) && !BROWSER_READ.permits_press(0.69));
+    assert!(
+        BROWSER_READ.permits_press(0.7, crate::guarded::ControlKind::Plain)
+            && !BROWSER_READ.permits_press(0.69, crate::guarded::ControlKind::Plain)
+    );
     assert_eq!(
         BROWSER_READ.answer_floor_permille,
         Some(BROWSER_READ_ANSWER_FLOOR_PERMILLE)
@@ -678,7 +706,7 @@ fn the_step_effort_seat_reads_the_turn_like_routing_and_rises_on_its_own_marks()
             .applies_with(true)
     );
     assert!(
-        !ZO_STEP_EFFORT.permits_press(1.0),
+        !ZO_STEP_EFFORT.permits_press(1.0, crate::guarded::ControlKind::Plain),
         "a step judgment presses nothing"
     );
 }
@@ -745,7 +773,7 @@ fn the_compaction_seat_drops_by_relevance_and_rises_on_its_regret_marks() {
             .applies_with(true)
     );
     assert!(
-        !COMPACTION.permits_press(1.0),
+        !COMPACTION.permits_press(1.0, crate::guarded::ControlKind::Plain),
         "a compaction judgment presses nothing"
     );
 }
@@ -812,7 +840,7 @@ fn the_notify_seat_judges_one_ring_and_rises_on_the_persons_reaction() {
     assert!(NOTIFY.mode_of(Some(&json!("auto"))).applies_with(true));
     assert!(!NOTIFY.mode_of(Some(&json!("shadow"))).applies_with(true));
     assert!(
-        !NOTIFY.permits_press(1.0),
+        !NOTIFY.permits_press(1.0, crate::guarded::ControlKind::Plain),
         "a notify judgment presses nothing"
     );
 }
@@ -900,7 +928,7 @@ fn the_mention_seat_reranks_a_fuzzy_page_and_rises_on_the_persons_pick() {
             .applies_with(false)
     );
     assert!(
-        !MENTION_RERANK.permits_press(1.0),
+        !MENTION_RERANK.permits_press(1.0, crate::guarded::ControlKind::Plain),
         "a rerank presses nothing"
     );
 }
@@ -1218,7 +1246,7 @@ fn the_agent_tool_seat_names_the_wires_bounds_and_never_rises() {
     );
     assert_eq!(AGENT_TOOL_DEADLINE_MS, SKILL_SEARCH_APPLY_DEADLINE_MS);
     assert_eq!(AGENT_TOOL_ASK_OPTIONS, ["yes", "no"]);
-    assert_eq!(JEV_USES.len(), 18);
+    assert_eq!(JEV_USES.len(), 20);
 }
 
 /// The branching seat (t-6044) forks one phone step — the emulator seat's
@@ -1302,7 +1330,10 @@ fn the_branching_seat_forks_a_phone_step_and_rises_on_the_walks_next_step() {
         BRANCHING.press_floor_permille,
         Some(SCREEN_PRESS_FLOOR_PERMILLE)
     );
-    assert!(BRANCHING.permits_press(0.5) && !BRANCHING.permits_press(0.49));
+    assert!(
+        BRANCHING.permits_press(0.5, crate::guarded::ControlKind::Plain)
+            && !BRANCHING.permits_press(0.49, crate::guarded::ControlKind::Plain)
+    );
     assert_eq!(BRANCHING_APPLY_DEADLINE_MS, 1_500);
 }
 
@@ -1344,7 +1375,7 @@ fn the_judgment_cache_sends_nothing_and_rises_on_the_memos_own_comparison() {
     const { assert!(JUDGMENT_MEMO_DEADLINE_MS < SCREEN_APPLY_DEADLINE_MS) };
     assert_eq!(JUDGMENT_CACHE.window_forgives, Some(FORGIVES_NOTHING));
     assert!(
-        !JUDGMENT_CACHE.permits_press(1.0),
+        !JUDGMENT_CACHE.permits_press(1.0, crate::guarded::ControlKind::Plain),
         "the memo presses nothing; the screen seat's own rule reads the remembered confidence"
     );
     assert!(JUDGMENT_CACHE.mode_of(Some(&json!("on"))).asks());
@@ -1374,4 +1405,139 @@ fn the_judgment_cache_sends_nothing_and_rises_on_the_memos_own_comparison() {
         .find("take_a_place(settings, requests)")
         .expect("the count");
     assert!(asked < looked && looked < counted, "{passing}");
+}
+
+/// The patch review seat (t-6203) asks four Noul questions of a patch an edit
+/// has just written — its hunks, the person's words and the evidence the edit
+/// followed, never the file around them — and rises on hindsight: whether the
+/// same lines were edited again inside its window.
+#[test]
+fn the_patch_review_seat_sends_a_patch_and_its_evidence_and_rises_on_hindsight() {
+    assert_eq!(jev_use("patch_review"), Some(&PATCH_REVIEW));
+    assert_eq!(PATCH_REVIEW.setting, "jevPatchReview");
+    assert_eq!(PATCH_REVIEW.ledger, "patch-review.jsonl");
+    assert_eq!(
+        PATCH_REVIEW.modes,
+        &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
+        "a labeled seat offers all four words (seat contract, second correction)"
+    );
+    let sent: Vec<(&str, Cap)> = PATCH_REVIEW
+        .sends
+        .iter()
+        .map(|sent| (sent.at, sent.cap))
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            ("/state/task", Cap::Chars(PATCH_REVIEW_TASK_CHAR_CAP)),
+            ("/state/patch", Cap::Bytes(PATCH_REVIEW_PATCH_BYTE_CAP)),
+            (
+                "/state/evidence",
+                Cap::Bytes(PATCH_REVIEW_EVIDENCE_BYTE_CAP)
+            ),
+            ("/state/path", Cap::Uncut),
+        ],
+        "the hunks and the evidence's tail: no file body, and the path only as a fingerprint"
+    );
+    assert_eq!(PATCH_REVIEW_TASK_CHAR_CAP, ROUTING_TASK_CHAR_CAP);
+
+    const { assert!(PATCH_REVIEW.promotes) };
+    assert_eq!(PATCH_REVIEW.agreement_kind, AgreementKind::Hindsight);
+    assert_eq!(
+        PATCH_REVIEW.answer_floor_permille,
+        Some(PATCH_REVIEW_ANSWER_FLOOR_PERMILLE)
+    );
+    assert_eq!(PATCH_REVIEW_ANSWER_FLOOR_PERMILLE, 900);
+    assert_eq!(
+        PATCH_REVIEW.agreement_floor_permille,
+        Some(PATCH_REVIEW_AGREEMENT_FLOOR_PERMILLE)
+    );
+    assert_eq!(
+        PATCH_REVIEW.apply_deadline_ms,
+        Some(PATCH_REVIEW_APPLY_DEADLINE_MS)
+    );
+    assert_eq!(PATCH_REVIEW.window_forgives, Some(FORGIVES_A_BAD_MINUTE));
+    assert_eq!(
+        PATCH_REVIEW.agreement_rows_wanted,
+        Some(A_WINDOW_OF_COMPARISONS)
+    );
+    // The permit line is the reference harness's own 0.8, and it is not the
+    // seat's answer rate: one says how sure one review must be, the other how
+    // often the seat must answer at all.
+    assert_eq!(PATCH_REVIEW_PERMIT_FLOOR_PERMILLE, 800);
+    const {
+        assert!(
+            PATCH_REVIEW_PERMIT_FLOOR_PERMILLE > 500 && PATCH_REVIEW_PERMIT_FLOOR_PERMILLE < 1_000
+        )
+    };
+    const { assert!(PATCH_REVIEW_REGRET_TURNS == 5) };
+    assert!(
+        !PATCH_REVIEW.permits_press(1.0, crate::guarded::ControlKind::Plain),
+        "a review presses nothing and blocks nothing"
+    );
+
+    assert!(PATCH_REVIEW.mode_of(Some(&json!("on"))).applies());
+    assert!(
+        !PATCH_REVIEW
+            .mode_of(Some(&json!("shadow")))
+            .applies_with(true)
+    );
+    assert!(
+        !PATCH_REVIEW
+            .mode_of(Some(&json!("auto")))
+            .applies_with(false)
+    );
+    assert!(
+        PATCH_REVIEW
+            .mode_of(Some(&json!("auto")))
+            .applies_with(true)
+    );
+    assert_eq!(PATCH_REVIEW.mode_in(&json!({})), JevMode::Off);
+    // The twentieth row, after the challenger seat's (t-6151).
+    assert_eq!(JEV_USES.last(), Some(&PATCH_REVIEW));
+    assert_eq!(JEV_USES[JEV_USES.len() - 2], CHALLENGER);
+}
+
+/// A request's receipt is the whole SHA-256 of the seat, the rubric version,
+/// the model asked for and the cleared bytes — each part framed by its
+/// length, so no two different requests share one digest by sliding bytes
+/// from one part into the next.
+#[test]
+fn a_request_digest_vouches_for_the_seat_the_rubric_the_model_and_the_bytes() {
+    let digest = digest_of("patch_review", 1, "jev-1.13.0", br#"{"state":{}}"#);
+    assert_eq!(digest.len(), 64, "the whole SHA-256: {digest}");
+    assert!(
+        digest
+            .chars()
+            .all(|glyph| glyph.is_ascii_hexdigit() && !glyph.is_ascii_uppercase())
+    );
+    assert_eq!(
+        digest,
+        digest_of("patch_review", 1, "jev-1.13.0", br#"{"state":{}}"#),
+        "the same request, the same receipt"
+    );
+    for other in [
+        digest_of("compaction", 1, "jev-1.13.0", br#"{"state":{}}"#),
+        digest_of("patch_review", 2, "jev-1.13.0", br#"{"state":{}}"#),
+        digest_of("patch_review", 1, "jev-latest", br#"{"state":{}}"#),
+        digest_of("patch_review", 1, "jev-1.13.0", br#"{"state":{"a":1}}"#),
+    ] {
+        assert_ne!(digest, other, "every part is in the receipt");
+    }
+    // Framed: a byte moved from one part into the next is another request.
+    assert_ne!(digest_of("ab", 1, "c", b"d"), digest_of("a", 1, "bc", b"d"));
+    assert_ne!(digest_of("a", 1, "b", b"cd"), digest_of("a", 1, "bc", b"d"));
+    // Pinned, so an offline replay that frames the parts as the doc says
+    // reproduces it byte for byte.
+    assert_eq!(
+        digest_of("", 0, "", b""),
+        "353e4a6a2987c8ad2380e1971e961cfe482d00e5e599e3e1a296ea28a5374ddc"
+    );
+    // The fingerprint beside it is the same hasher, cut to sixteen digits.
+    assert_eq!(fingerprint_of("").len(), 16);
+    assert_eq!(
+        fingerprint_of(""),
+        "e3b0c44298fc1c14",
+        "SHA-256 of nothing, cut"
+    );
 }

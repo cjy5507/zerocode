@@ -1,8 +1,9 @@
 //! Jev — TypeSafe's System One — as this product asks it: the one table of
 //! every place that asks (docs/design/jev-settings-20260917.md §2).
 //!
-//! Two programs ask. zo asks about a task it is routing and about the notes a
-//! recall found; the window asks which control a walk should press next — on a
+//! Two programs ask. zo asks about a task it is routing, about the notes a
+//! recall found and about a patch an edit has just written; the window asks
+//! which control a walk should press next — on a
 //! page or on the desktop — about a worker whose pane went quiet, about where
 //! a worker's window belongs, about which agent a summons should start,
 //! about which blocks of a page an agent's browser read should fold away
@@ -26,11 +27,13 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+pub mod challenger;
 pub mod choice;
 pub mod count;
 pub mod door;
 pub mod hedge;
 pub mod memo;
+pub mod noul;
 pub mod promote;
 pub mod recent;
 pub mod shard;
@@ -38,6 +41,60 @@ pub mod summary;
 
 /// The object zo's settings keep every Jev switch under.
 pub const SMART_SETTINGS_KEY: &str = "smart";
+
+/// The key under [`SMART_SETTINGS_KEY`] naming the model every Jev request
+/// asks for (t-6187): the vendor's alias unless a person pinned a version.
+///
+/// One switch for every seat of both programs, because what it decides is
+/// not a seat's: an alias answers with whatever version the vendor ships
+/// under it, and a floor or a promotion window fitted to one version
+/// silently measures the next. A person who wants the numbers to stay put
+/// pins the version the rows say answered (`jev-1.13.0`). The door writes
+/// it into every request it clears ([`door::may_send`]), so no seat can ask
+/// under another.
+pub const MODEL_SETTING: &str = "jevModel";
+
+/// The model a request names when nobody pinned one: the vendor's alias —
+/// the word the SDKs call by default, which named `jev-1.13.0` as the
+/// answering version on every one of the 3,179 routing, recall and step
+/// rows zo had recorded a version on by 2026-09-23. The window's wire and
+/// zo's client spell the alias as this word; a contract holds zo's copy,
+/// which cannot read this crate, to it.
+pub const DEFAULT_MODEL: &str = "jev-latest";
+
+/// The model a settings document pins (`smart.jevModel`), or
+/// [`DEFAULT_MODEL`] when it pins none. A value that is not a pin
+/// ([`pinned_model`]) reads as no pin, as an unknown mode word reads as
+/// `off`: a slip never sends a model nobody named.
+#[must_use]
+pub fn model_in(root: &Value) -> &str {
+    pin_in(root).unwrap_or(DEFAULT_MODEL)
+}
+
+/// The pin a settings document holds, if it holds one ([`model_in`] without
+/// the alias behind it) — what a screen reads to say whether the model it
+/// shows was a person's choice.
+#[must_use]
+pub fn pin_in(root: &Value) -> Option<&str> {
+    root.get(SMART_SETTINGS_KEY)
+        .and_then(|smart| smart.get(MODEL_SETTING))
+        .and_then(Value::as_str)
+        .and_then(pinned_model)
+}
+
+/// `word` as a pin: trimmed, and one word — not empty, no space and no
+/// control character in it, which is the shape of every model id the
+/// vendor names. The settings writer refuses what this refuses, so a pin
+/// the reader would ignore is never written.
+#[must_use]
+pub fn pinned_model(word: &str) -> Option<&str> {
+    let word = word.trim();
+    (!word.is_empty()
+        && !word
+            .chars()
+            .any(|glyph| glyph.is_whitespace() || glyph.is_control()))
+    .then_some(word)
+}
 
 /// Characters of a task a routing judgment reads — the chat probe's prompt and
 /// Jev's state alike. The head of a brief is what bands it; the cap bounds
@@ -370,6 +427,40 @@ pub const ROUTE_AGREEMENT_FLOOR_PERMILLE: u16 = 800;
 /// Initial conservative screen-press floor, above the observed wrong choice
 /// at confidence 0.29. This is a policy line, not a calibrated accuracy claim.
 pub const SCREEN_PRESS_FLOOR_PERMILLE: u16 = 500;
+
+/// What either of the two guards a screen question carries beside its
+/// choice must reach, per thousand, before a seat that is pressing presses
+/// nothing and steps back to the person (t-6187,
+/// `crate::screen_action::Guard`): seven in ten that the screen's own text
+/// tells an assistant what to do, or that the screen is a wall — a sign-in,
+/// a captcha, an error dialog — in front of the page the goal expects.
+///
+/// A policy line, not a calibrated accuracy claim, like
+/// [`SCREEN_PRESS_FLOOR_PERMILLE`]. A Noul near a half says yes and no are
+/// about as likely, so the line sits where yes clearly leads — the lean the
+/// skill seat's relevance floor is drawn at
+/// ([`SKILL_RELEVANCE_FLOOR_PERMILLE`]), written as this seat's own number
+/// because two lines that coincide are still two policies. The two guards
+/// share it because they are one judgment's two halves: this is not a
+/// screen to press on unasked. The guards cost the request nothing but
+/// their own two lines — the state is charged once.
+pub const SCREEN_INSTRUCTED_FLOOR_PERMILLE: u16 = 700;
+
+/// What a seat's answer must reach, per thousand, before it presses a
+/// control that cannot be taken back — one that pays, moves money, deletes,
+/// sends, submits or settles something ([`crate::guarded::kind_of`], t-6187):
+/// nine in ten, where a plain control asks the seat's own press floor.
+///
+/// A policy line, not a calibrated accuracy claim, like
+/// [`SCREEN_PRESS_FLOOR_PERMILLE`] — the line the vendor's own guide draws
+/// for destructive actions (reads at a half, destructive at nine in ten), and
+/// the one this table already asks of a seat's answers before it may act at
+/// all ([`SCREEN_ANSWER_FLOOR_PERMILLE`]). A plain press the walk gets wrong
+/// costs one more press; a delete or a payment it gets wrong is the person's
+/// to undo, if it can be undone. Under this line the walk does what it does
+/// with any answer under its floor: the second reader, when it was handed
+/// one, or the person.
+pub const SCREEN_DESTRUCTIVE_PRESS_FLOOR_PERMILLE: u16 = 900;
 
 /// What a screen seat's answers must bound above before `auto` rises to
 /// pressing (docs/design/jev-seats-accuracy-wave-20260921.md §4): nine in ten.
@@ -2170,8 +2261,268 @@ pub const JUDGMENT_CACHE: JevUse = JevUse {
     agreement_kind: AgreementKind::Comparison,
 };
 
+/// How many of a role's eligible attempts try the model nobody has evidence
+/// for: one in five (user decision 2026-09-22, relayed m-6151).
+///
+/// A model discovery has never routed to earns no outcome rows, and a model
+/// with no rows can never clear [`promote`]'s window — so the lineup this
+/// machine believes in is the one it believed in the day the catalog was
+/// written. One in five is the smallest share that fills a comparison window
+/// inside a working day at this machine's measured rate (4,093 route
+/// outcomes to 2026-09-22), and small enough that four of five attempts are
+/// still the incumbent's.
+pub const CHALLENGER_ONE_IN: u64 = 5;
+
+/// The most of a day's model spend the challenger arm may be: one tenth
+/// (same decision).
+///
+/// Counted by the price table, over the day's own rows, so a quiet day buys
+/// a small experiment and a busy one a larger — a fixed dollar ceiling would
+/// mean either no evidence on a quiet day or a runaway on a busy one.
+pub const CHALLENGER_DAY_SPEND_PERMILLE: u16 = 100;
+
+/// What a design question may carry of the work it is about.
+///
+/// The request in the person's own words, capped as the mention seat caps a
+/// sentence: a judge comparing two answers needs the question, never the
+/// repository.
+pub const CHALLENGER_TASK_CHAR_CAP: usize = MENTION_INTENT_CHAR_CAP;
+
+/// How many designs a comparison carries: two, the incumbent's and the
+/// challenger's. A third would not be a comparison.
+pub const CHALLENGER_DESIGN_CAP: usize = 2;
+
+/// How much of each design the judge reads — a plan, not a patch. The stall
+/// seat's transcript cap, which is the largest piece of a person's own text
+/// this product already sends through the door.
+pub const CHALLENGER_DESIGN_BYTE_CAP: usize = STALL_TRANSCRIPT_BYTE_CAP;
+
+/// What the challenger seat's answers must bound above before `auto` scores
+/// a comparison that moves a role's model: nine in ten, the recall seat's
+/// line, because a judgment that does not come back costs nothing here —
+/// the incumbent acted either way and the row is simply unlabeled.
+pub const CHALLENGER_ANSWER_FLOOR_PERMILLE: u16 = RECALL_ANSWER_FLOOR_PERMILLE;
+
+/// The challenger seat's agreement line (§4): four in five of its scored
+/// comparisons must name the design the verification loop later vindicated.
+/// The recall seat's budget, for the same reason — a seat that names the
+/// winner four times in five is reading quality; one that names it half the
+/// time is a coin this product would be spending money to flip.
+pub const CHALLENGER_AGREEMENT_FLOOR_PERMILLE: u16 = RECALL_AGREEMENT_FLOOR_PERMILLE;
+
+/// The wall past which a comparison is dropped, in milliseconds.
+///
+/// Nothing waits on it: the incumbent's design is what the attempt acts on,
+/// and the score lands afterwards on a row already written. Two seconds is
+/// therefore a staleness line rather than a wait — past it the attempt has
+/// usually moved on and the row is better left unlabeled than labeled late.
+pub const CHALLENGER_APPLY_DEADLINE_MS: u64 = 2_000;
+
+/// Whether a model nobody has evidence for is worth what it costs to find
+/// out — the challenger arm (user decision 2026-09-22, relayed m-6151).
+///
+/// Discovery moves a family alias to the newest release on its own
+/// (`model_discovery`), and the router learns from outcomes on its own
+/// (`model_router::learned`), but nothing in between ever tries a model the
+/// catalog ranks below the incumbent. So a new release is either adopted
+/// wholesale by an alias move or never measured at all, and "Fable outranks
+/// Opus" stays a sentence in a shipped table rather than a thing this
+/// machine has observed.
+///
+/// This seat closes that gap the way the pool seats close theirs. One in
+/// [`CHALLENGER_ONE_IN`] eligible attempts asks the challenger for the same
+/// design the incumbent is about to act on; the attempt acts on the
+/// INCUMBENT's design either way, and the two — anonymized, so the judge
+/// scores the plan rather than the name — are put to Jev as a closed
+/// comparison. The label is quality: the verification loop's own verdict
+/// where the attempt has one, and the anonymized comparison where it does
+/// not. A finished attempt is never a win by itself
+/// ([[agent-turn-done-is-not-task-verified]]).
+///
+/// What it sends is the request and two designs. What it decides is nothing
+/// a person waits on: `shadow` records the score, `on` is the person's own
+/// word, and `auto` lets a role's model move only once the seat's own
+/// comparisons clear its line over a window and the challenger's Wilson
+/// lower bound passes the incumbent's rate for THAT role ([`promote`]) —
+/// which is also what takes it back down.
+///
+/// Held back on purpose: verification, review, the release lane and guarded
+/// flows (payment, operator) never draw a challenger, and neither does a
+/// retry or a handover — a second opinion is not what a retry needs.
+pub const CHALLENGER: JevUse = JevUse {
+    id: "challenger",
+    setting: "jevChallenger",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
+    sends: &[
+        Sent {
+            at: "/state/task",
+            cap: Cap::Chars(CHALLENGER_TASK_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/designs",
+            cap: Cap::Items(CHALLENGER_DESIGN_CAP),
+        },
+        Sent {
+            at: "/state/designs/*/body",
+            cap: Cap::Bytes(CHALLENGER_DESIGN_BYTE_CAP),
+        },
+    ],
+    ledger: "challenger.jsonl",
+    promotes: true,
+    answer_floor_permille: Some(CHALLENGER_ANSWER_FLOOR_PERMILLE),
+    press_floor_permille: None,
+    agreement_floor_permille: Some(CHALLENGER_AGREEMENT_FLOOR_PERMILLE),
+    apply_deadline_ms: Some(CHALLENGER_APPLY_DEADLINE_MS),
+    window_forgives: Some(FORGIVES_A_BAD_MINUTE),
+    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Comparison,
+};
+
+/// Characters of the person's words one patch review reads as the task the
+/// patch is for — the routing seat's cap, for the routing seat's reason: the
+/// head of a request is what says what it asks, and a second number on the
+/// same words would be a second answer to how much of a person's work leaves
+/// the machine. Measured on the 1,673 patches this machine's zo sessions wrote
+/// (147 transcripts, their vaults read too, 2026-09-23): the person's newest
+/// words ran to 50 characters at the median — a pasted brief to 6,152 at p90
+/// — and 2,000 held 87.3% of them whole.
+pub const PATCH_REVIEW_TASK_CHAR_CAP: usize = ROUTING_TASK_CHAR_CAP;
+
+/// Bytes of one patch's unified diff a review carries — its hunks with their
+/// context lines, and nothing of the file around them. Measured on the same
+/// 1,673 patches: the rendered hunks ran to 1,037 B at the median, 5,424 B at
+/// p90 and 7,743 B at p95. 8 KiB holds 95.3% of them whole; past it a patch is
+/// a rewrite, and its head is what a review of it can still read.
+pub const PATCH_REVIEW_PATCH_BYTE_CAP: usize = 8 * 1024;
+
+/// Bytes of evidence one review carries: the newest lines of the tool result
+/// the edit followed — a test's output, a read, a search — kept from the end,
+/// because a check prints its verdict last. Measured on the same 1,673
+/// patches: that result ran to 1,399 B at the median and 4,627 B at p90; 4 KiB
+/// holds 88.3% of them whole and the newest lines of the rest.
+pub const PATCH_REVIEW_EVIDENCE_BYTE_CAP: usize = 4 * 1024;
+
+/// How far each of a review's four answers must lean toward the side that lets
+/// a patch stand, per thousand, before the code calls it a `permit` — the
+/// probability that it addresses the task and that the evidence supports it
+/// at least this, and that it carries unrelated changes or needed a question
+/// first at most one minus this (t-6203).
+///
+/// A policy line and not a calibrated accuracy claim: it is the line the
+/// reference harness this seat borrows its four questions from draws
+/// (TypeSafeAI/jev-harness, "0.8, uncalibrated default"), written in this
+/// table's units. It is not [`PATCH_REVIEW_ANSWER_FLOOR_PERMILLE`], which is a
+/// line under how often the SEAT answers at all.
+pub const PATCH_REVIEW_PERMIT_FLOOR_PERMILLE: u16 = 800;
+
+/// What the patch review seat's answers must bound above before `auto` rises
+/// to noting (§4): nine in ten. The orchestration seats' reasoning, reached
+/// from this seat's own side: a review that does not come back costs the edit
+/// nothing — it was written before the question left, and its result reads
+/// as it did before the seat existed. Its own number, because two lines that
+/// coincide are still two policies.
+pub const PATCH_REVIEW_ANSWER_FLOOR_PERMILLE: u16 = 900;
+
+/// The patch review seat's route-change budget (§4): four verdicts in five
+/// must be the ones hindsight then gave ([`PATCH_REVIEW_REGRET_TURNS`]) — a
+/// `permit` on a patch that stood, a `proposal_only` on one that was undone
+/// or fixed again. Held to the same budget as every other seat that takes a
+/// decision off a reader: a note that is wrong one time in five is a note a
+/// model learns to read past.
+pub const PATCH_REVIEW_AGREEMENT_FLOOR_PERMILLE: u16 = 800;
+
+/// The wall a review may hold an edit's result, in milliseconds, when the seat
+/// acts — the latency line the judge holds a rising seat to.
+///
+/// A tool result is what the model is waiting on, so the wall is a screen
+/// question's: one request of four questions over one state, answered at the
+/// wire's measured median of a few hundred milliseconds (280 ms for a screen
+/// question, §2.1). Past it the result goes back as it would have without
+/// the seat. A recording seat never holds the result at all: it asks beside
+/// the turn and writes its row when the answer comes. Its own number, for the
+/// reason every coinciding wall in this table is.
+pub const PATCH_REVIEW_APPLY_DEADLINE_MS: u64 = 1_500;
+
+/// Turns after a reviewed patch inside which editing the same lines of the
+/// same file again — a fix of the fix, or an undo — counts as the patch's
+/// regret (the seat's hindsight label, t-6203).
+///
+/// Five is a policy line, not a measured one, drawn the way
+/// [`COMPACTION_REGRET_TURNS`] is: long enough that the turns which test a
+/// change and repair it are inside it, short enough that the same lines
+/// reworked an hour later for another reason are not charged to a review
+/// that had nothing to do with it. A check that ran green after the turn's
+/// last edit settles the label first — the harness's own receipt (r43).
+pub const PATCH_REVIEW_REGRET_TURNS: u32 = 5;
+
+/// zo's patch review: every patch an edit tool has just written — `edit_file`,
+/// `write_file`, `MultiEdit`, anything whose result carries a structured
+/// patch — put to four Noul questions before the model reads the result
+/// (t-6203; the questions are TypeSafeAI/jev-harness's): does it address the
+/// task, does the evidence support it, does it carry changes the task did not
+/// ask for, should the agent have asked first. One code judgment reads the
+/// four against [`PATCH_REVIEW_PERMIT_FLOOR_PERMILLE`]: `permit`,
+/// `proposal_only`, or `unavailable` when nothing answered.
+///
+/// What is sent is the head of the person's newest words, the patch's hunks
+/// with their context lines, the newest lines of the tool result the edit
+/// followed, and the path's fingerprint ([`fingerprint_of`]) — never the
+/// path, never the file around the hunks.
+///
+/// Nothing blocks. The edit is written before the question leaves: this
+/// product is not a sandbox, and a patch it held back would be one the model
+/// believes it made. Under a person's `on`, or an `auto` its own evidence
+/// raised, a `proposal_only` adds one line to the result the model reads —
+/// which question leaned the wrong way, how far, and what to do about it —
+/// and the row carries the verdict. `shadow` asks beside the turn, records,
+/// and changes neither the result nor its timing. `off` is today's result to
+/// the byte.
+///
+/// The `agreed` rule is hindsight, one label per answered review: the patch
+/// stood when a check ran green after the turn's last edit (the harness's
+/// receipt, which settles it first) or when [`PATCH_REVIEW_REGRET_TURNS`]
+/// turns passed without its lines being edited again; it was regretted when
+/// an edit inside the window touched the same lines of the same file — a fix
+/// of the fix, or an undo. A `permit` agreed when the patch stood, a
+/// `proposal_only` when it was regretted.
+pub const PATCH_REVIEW: JevUse = JevUse {
+    id: "patch_review",
+    setting: "jevPatchReview",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
+    sends: &[
+        Sent {
+            at: "/state/task",
+            cap: Cap::Chars(PATCH_REVIEW_TASK_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/patch",
+            cap: Cap::Bytes(PATCH_REVIEW_PATCH_BYTE_CAP),
+        },
+        Sent {
+            at: "/state/evidence",
+            cap: Cap::Bytes(PATCH_REVIEW_EVIDENCE_BYTE_CAP),
+        },
+        // A fingerprint the product wrote, cleared like everything else the
+        // door reads: declared so a reader of this table sees every key the
+        // state carries.
+        Sent {
+            at: "/state/path",
+            cap: Cap::Uncut,
+        },
+    ],
+    ledger: "patch-review.jsonl",
+    promotes: true,
+    answer_floor_permille: Some(PATCH_REVIEW_ANSWER_FLOOR_PERMILLE),
+    press_floor_permille: None,
+    agreement_floor_permille: Some(PATCH_REVIEW_AGREEMENT_FLOOR_PERMILLE),
+    apply_deadline_ms: Some(PATCH_REVIEW_APPLY_DEADLINE_MS),
+    window_forgives: Some(FORGIVES_A_BAD_MINUTE),
+    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Hindsight,
+};
+
 /// Every place this product asks Jev something.
-pub static JEV_USES: [JevUse; 18] = [
+pub static JEV_USES: [JevUse; 20] = [
     ROUTING,
     RECALL,
     SKILLS,
@@ -2190,15 +2541,28 @@ pub static JEV_USES: [JevUse; 18] = [
     MENTION_RERANK,
     BRANCHING,
     JUDGMENT_CACHE,
+    CHALLENGER,
+    PATCH_REVIEW,
 ];
 
 impl JevUse {
-    /// Whether a validated screen choice meets this seat's press policy.
+    /// Whether a validated screen choice meets this seat's press policy for
+    /// a control of `kind`: the seat's own press floor for a plain one, and
+    /// never less than [`SCREEN_DESTRUCTIVE_PRESS_FLOOR_PERMILLE`] for one a
+    /// press cannot take back (t-6187). A seat with no press floor presses
+    /// nothing, of either kind.
     #[must_use]
-    pub fn permits_press(&self, confidence: f64) -> bool {
-        self.press_floor_permille.is_some_and(|floor| {
-            (0.0..=1.0).contains(&confidence) && confidence >= f64::from(floor) / 1_000.0
-        })
+    pub fn permits_press(&self, confidence: f64, kind: crate::guarded::ControlKind) -> bool {
+        self.press_floor_permille
+            .map(|floor| match kind {
+                crate::guarded::ControlKind::Plain => floor,
+                crate::guarded::ControlKind::Destructive => {
+                    floor.max(SCREEN_DESTRUCTIVE_PRESS_FLOOR_PERMILLE)
+                }
+            })
+            .is_some_and(|floor| {
+                (0.0..=1.0).contains(&confidence) && confidence >= f64::from(floor) / 1_000.0
+            })
     }
 
     /// The mode `value` names for this use: one of this use's own words,
@@ -2371,11 +2735,44 @@ pub fn brief_shape(brief: &str, cap: Cap) -> (String, usize) {
 /// exactly and a reader can group them without ever seeing the words.
 #[must_use]
 pub fn fingerprint_of(words: &str) -> String {
-    Sha256::digest(words.as_bytes())
-        .iter()
-        .take(8)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex_of(&Sha256::digest(words.as_bytes())[..FINGERPRINT_BYTES])
+}
+
+/// The bytes of a SHA-256 a fingerprint keeps: sixteen hex digits, enough to
+/// tell apart everything one ledger names and short enough to read.
+const FINGERPRINT_BYTES: usize = 8;
+
+/// The whole SHA-256, in hex, of what one request was — the seat that asked,
+/// the version of its rubric, the model it asked for, and the body's bytes as
+/// the door let them through (after every withheld line and every cut): a
+/// row's receipt (`requestDigest`, t-6203). Two rows carry the same digest
+/// exactly when the wire was handed the same question, so a replay can check
+/// a recorded answer against the request it answered without the row ever
+/// holding the words.
+///
+/// The same hasher as [`fingerprint_of`], whole rather than cut: a
+/// fingerprint names a thing to group rows by, a digest vouches for bytes.
+/// Each part goes in behind its length (eight bytes, little-endian) — the
+/// version as its decimal digits — so no two different tuples hash as one.
+#[must_use]
+pub fn digest_of(seat: &str, rubric_version: u32, model: &str, request: &[u8]) -> String {
+    let version = rubric_version.to_string();
+    let mut hasher = Sha256::new();
+    for part in [
+        seat.as_bytes(),
+        version.as_bytes(),
+        model.as_bytes(),
+        request,
+    ] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    hex_of(&hasher.finalize())
+}
+
+/// Bytes as lowercase hex — the one spelling a fingerprint and a digest share.
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// [`fingerprint_of`] a question's defining words — what a rubric version
