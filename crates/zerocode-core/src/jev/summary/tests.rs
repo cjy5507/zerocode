@@ -310,6 +310,30 @@ fn a_control_row_is_not_a_request_and_is_counted_nowhere_but_by_name() {
     );
 }
 
+/// The rows the judge weighs are the requests, the marks and the control
+/// rows; the judge's own note and a seat's bookkeeping between them are not
+/// (t-6284) — zo's step governor files a `step` row, with no outcome and no
+/// mark, for every request of a turn.
+#[test]
+fn a_request_a_mark_and_a_control_row_are_weighed_and_a_note_or_a_step_is_not() {
+    let weighed = [
+        json!({"at": 1, "outcome": "answered", "model": "jev-1.13.0"}),
+        json!({"at": 2, "outcome": "no_key"}),
+        json!({"at": 3, "label": "s@1", "agreed": false}),
+        json!({"at": 4, "outcome": CONTROL, "task": 5}),
+    ];
+    let not_weighed = [
+        json!({"at": 5, (TRANSITION.canonical): "rise", "rows": 20}),
+        json!({"at": 6, "kind": "step", "model": "claude-opus-5", "delta": 1}),
+    ];
+    for row in &weighed {
+        assert!(is_request_or_mark(row), "{row}");
+    }
+    for row in &not_weighed {
+        assert!(!is_request_or_mark(row), "{row}");
+    }
+}
+
 #[test]
 fn the_rows_whose_answer_was_acted_on_are_counted_off_whichever_word_the_seat_spelled() {
     let rows = [
@@ -364,4 +388,114 @@ fn an_agreement_over_rows_already_picked_out_reads_the_same_marks() {
     let agreement = agreement_rows(held.iter().copied(), i64::MIN);
     assert_eq!((agreement.compared, agreement.agreed), (2, 2));
     assert_eq!(agreement_since(&rows, 0), agreement_rows(rows.iter(), 0));
+}
+
+/// What a screen seat's guards stopped and what it handed to the person are
+/// counted once, here, off the rows' own words (t-6187's `barred` and
+/// `controlKind`, the dashboard's drawer, t-6277 D6): a press the screen's own
+/// text ordered is `instructed`, one a wall stood in front of is `walled`, and
+/// a control a press cannot take back that an acting seat did not press is
+/// `destructive_held` — a recording seat's row pressed nothing because it
+/// only records, which hands nothing to anybody. `named` is every row that
+/// named a control at all, so a reader can tell a seat that presses from one
+/// that never does.
+#[test]
+fn a_screen_seats_guards_and_the_controls_it_handed_over_are_counted_once_per_row() {
+    use crate::guarded::ControlKind;
+    use crate::jev::{ROUTE_USE_APPLIED, ROUTE_USE_FALLBACK};
+    use crate::screen_action::Stopped;
+    let row = |extra: Value| {
+        let mut row = json!({ "at": 5, "outcome": ANSWERED, "elapsedMs": 200, "requests": 1 });
+        for (key, value) in extra.as_object().expect("an object") {
+            row[key] = value.clone();
+        }
+        row
+    };
+    let destructive = ControlKind::Destructive.word();
+    let plain = ControlKind::Plain.word();
+    let rows = [
+        row(
+            json!({ "barred": Stopped::Injected.word(), "controlKind": plain, "routeUse": ROUTE_USE_FALLBACK }),
+        ),
+        row(
+            json!({ "barred": Stopped::Injected.word(), "controlKind": destructive, "routeUse": ROUTE_USE_FALLBACK }),
+        ),
+        row(
+            json!({ "barred": Stopped::Walled.word(), "controlKind": plain, "routeUse": ROUTE_USE_FALLBACK }),
+        ),
+        row(
+            json!({ "barred": "low_confidence", "controlKind": destructive, "routeUse": ROUTE_USE_FALLBACK }),
+        ),
+        row(json!({ "controlKind": destructive, "routeUse": ROUTE_USE_APPLIED, "pressed": true })),
+        row(json!({ "controlKind": destructive, "routeUse": crate::jev::JevMode::Shadow.key() })),
+        row(json!({ "controlKind": plain, "routeUse": ROUTE_USE_APPLIED })),
+        // A walk barred before it asked names no control and no guard.
+        json!({ "at": 5, "outcome": "barred", "barred": "no_budget", "requests": 0 }),
+        // A row from before the window is not the window's.
+        row(
+            json!({ "at": 1, "barred": Stopped::Walled.word(), "controlKind": destructive, "routeUse": ROUTE_USE_FALLBACK }),
+        ),
+    ];
+    let tally = summarize(&rows, 2);
+    assert_eq!(
+        tally.guards,
+        Guards {
+            instructed: 2,
+            walled: 1
+        }
+    );
+    assert_eq!(
+        tally.controls,
+        Controls {
+            named: 7,
+            destructive_held: 2
+        }
+    );
+    let quiet = summarize(&[json!({ "at": 5, "outcome": ANSWERED })], 0);
+    assert_eq!(quiet.guards, Guards::default());
+    assert_eq!(quiet.controls, Controls::default());
+}
+
+/// A seat's graded answers counted per fifth of confidence — the curve a
+/// band's lines are read off — and per band of the seat's own lines
+/// (t-6342). A reading outside `0..=1` is counted nowhere; `1.0` is the top
+/// fifth's.
+#[test]
+fn graded_answers_are_counted_per_fifth_of_confidence_and_per_band() {
+    let graded = [
+        (0.05, false),
+        (0.39, true),
+        (0.41, false),
+        (0.59, true),
+        (0.6, true),
+        (0.84, false),
+        (0.85, true),
+        (1.0, true),
+        (1.2, true),
+        (f64::NAN, true),
+    ];
+    let curve = confidence_curve(graded);
+    let tally = |marks, agreed| ConfidenceTally { marks, agreed };
+    assert_eq!(
+        curve,
+        [
+            tally(1, 0),
+            tally(1, 1),
+            tally(2, 1),
+            tally(1, 1),
+            tally(3, 2)
+        ]
+    );
+    // The confidence-routing pattern's lines: under 0.6, 0.6 to 0.85, from
+    // 0.85.
+    assert_eq!(
+        band_tally(&crate::jev::STALL, graded),
+        Some([tally(4, 2), tally(2, 1), tally(2, 2)])
+    );
+    // A seat whose lines meet has nothing between.
+    assert_eq!(
+        band_tally(&crate::jev::PLACEMENT, graded),
+        Some([tally(4, 2), tally(0, 0), tally(4, 3)])
+    );
+    assert_eq!(band_tally(&crate::jev::AGENT_TOOL, graded), None);
 }

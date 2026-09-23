@@ -1564,6 +1564,23 @@ pub fn walk_rescues(params: &Value) -> bool {
     params.get(WALK_RESCUE_PARAM) == Some(&Value::Bool(true))
 }
 
+/// `walk --replay`: this walk repeats one walked before — a QA run, a Flow
+/// walked again (t-6385) — so the uses the Jev table moves in a repeated run
+/// stand where it says (`jev::JevUse::repeat`): the judgment cache answers a
+/// question it has answered before rather than only recording it.
+pub const WALK_REPLAY_FLAG: &str = "replay";
+pub const WALK_REPLAY_PARAM: &str = "replay";
+
+/// The run a walk was asked in: repeated when it said `--replay`.
+#[must_use]
+pub fn walk_run(params: &Value) -> crate::jev::Run {
+    if params.get(WALK_REPLAY_PARAM) == Some(&Value::Bool(true)) {
+        crate::jev::Run::Repeated
+    } else {
+        crate::jev::Run::Fresh
+    }
+}
+
 #[must_use]
 pub fn walk_steps(params: &Value) -> usize {
     params
@@ -2322,8 +2339,18 @@ pub struct EmulatorCommand {
     pub out: Option<String>,
     pub mark: Option<usize>,
     pub look: Option<String>,
+    /// `click … --preview`: answer the marks the screen the press settled on
+    /// would carry ([`EMULATOR_PREVIEW_FLAG`]).
+    pub preview: bool,
     pub json: bool,
 }
+
+/// `zerocode-emulator click … --preview` (t-6385): besides the press, answer
+/// the marks the screen it settled on would carry, numbered off the tree the
+/// press waited on, under the answer's own key of the same word. Not a look —
+/// nothing in it can be pressed: a walk begins its next judgment on it while
+/// the look is taken.
+pub const EMULATOR_PREVIEW_FLAG: &str = "preview";
 
 /// Parse the built-in-emulator CLI without forwarding unknown or partial
 /// gestures. Coordinates are normalized because both pane backends speak the
@@ -2348,8 +2375,17 @@ pub fn parse_emulator_command(argv: &[String]) -> Result<EmulatorCommand, String
     let allowed: &[&str] = match method {
         EmulatorMethod::List => &["json"],
         EmulatorMethod::Open => &["json", "platform", "device"],
-        EmulatorMethod::Tree | EmulatorMethod::Marks => &["json", "platform", "device"],
-        EmulatorMethod::Click => &["json", "platform", "device", "mark", "look"],
+        EmulatorMethod::Tree => &["json", "platform", "device"],
+        EmulatorMethod::Marks => &["json", "platform", "device", "text"],
+        EmulatorMethod::Click => &[
+            "json",
+            "platform",
+            "device",
+            "mark",
+            "look",
+            "text",
+            EMULATOR_PREVIEW_FLAG,
+        ],
         EmulatorMethod::Tap => &["json", "platform", "device", "x", "y"],
         EmulatorMethod::Swipe => &["json", "platform", "device", "x1", "y1", "x2", "y2", "ms"],
         EmulatorMethod::Text | EmulatorMethod::Find => &["json", "platform", "device", "text"],
@@ -2425,6 +2461,11 @@ pub fn parse_emulator_command(argv: &[String]) -> Result<EmulatorCommand, String
                 return Err("--text must not be empty".into());
             }
         }
+        EmulatorMethod::Marks | EmulatorMethod::Click
+            if text.as_deref().is_some_and(|value| value.trim().is_empty()) =>
+        {
+            return Err("--text must not be empty".into());
+        }
         EmulatorMethod::Foreground => {
             let value = app.as_deref().ok_or("missing required --app")?;
             if value.trim().is_empty() {
@@ -2475,6 +2516,7 @@ pub fn parse_emulator_command(argv: &[String]) -> Result<EmulatorCommand, String
         out,
         mark,
         look,
+        preview: flags.contains_key(EMULATOR_PREVIEW_FLAG),
         json: flags.contains_key("json"),
     })
 }
@@ -2949,6 +2991,7 @@ pub fn parse_command(argv: &[String]) -> Result<ComputerCommand, String> {
         ("repeat", "repeat"),
         (WALK_OVERLAP_FLAG, WALK_OVERLAP_PARAM),
         (WALK_RESCUE_FLAG, WALK_RESCUE_PARAM),
+        (WALK_REPLAY_FLAG, WALK_REPLAY_PARAM),
     ] {
         if flags.contains_key(flag) {
             params.insert(key.into(), Value::Bool(true));
@@ -3039,6 +3082,8 @@ fn flags(argv: &[String]) -> Result<BTreeMap<String, Option<String>>, String> {
                 | "repeat"
                 | WALK_OVERLAP_FLAG
                 | WALK_RESCUE_FLAG
+                | WALK_REPLAY_FLAG
+                | EMULATOR_PREVIEW_FLAG
         );
         if flags.contains_key(name) {
             return Err(format!("duplicate --{name}"));
@@ -3311,6 +3356,7 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
             "steps",
             WALK_OVERLAP_FLAG,
             WALK_RESCUE_FLAG,
+            WALK_REPLAY_FLAG,
         ],
         ComputerMethod::Compare => &[
             "json", "baseline", "against", "region", "display", "max-diff",
@@ -4011,7 +4057,8 @@ pub fn usage() -> String {
         "  zerocode-computer recipe-list [--json]",
         "  zerocode-computer recipe-show --name <name> [--json]",
         "  zerocode-computer recipe-run --name <name> [--params '{\"name\":\"value\"}'] [--start N] [--end N] [--confirm <txn>] [--repeat [--until <HH:MM|N>]] [--arena <evidence dir>] [--rescue] [--json]",
-        "  zerocode-computer walk --goal <what to reach> (--app <app> | --pane <browser pane> | --platform <ios|android> --device <id>) [--until <text on screen when it worked>] [--steps N] [--overlap] [--rescue] [--json]",
+        "  zerocode-computer walk --goal <what to reach> (--app <app> | --pane <browser pane> | --platform <ios|android> --device <id>) [--until <text on screen when it worked>] [--steps N] [--overlap] [--rescue] [--replay] [--json]",
+        "      (--replay: this walk repeats one walked before, so a question it asked then is answered from the judgment memo)",
         "      (walks the steps in one call, filling {{name}} from --params; stops at the person's turn or last step,",
         "       a step naming the saved screen's element or window, a check the screen fails, an act that changed",
         "       nothing, or a person's hand on the pointer — and answers the step to resume from; a guarded Flow's",
@@ -4081,12 +4128,16 @@ pub fn emulator_usage() -> String {
         "  zerocode-emulator list [--json]",
         "  zerocode-emulator open --platform ios|android [--device <id>] [--json]",
         "  zerocode-emulator tree --platform ios|android --device <id> [--json]",
-        "  zerocode-emulator marks --platform ios|android --device <id> [--json]",
+        "  zerocode-emulator marks --platform ios|android --device <id> [--text <fragment>] [--json]",
+        "    --text also counts, in the same look, what find would (count; 0 means absent).",
         "  zerocode-emulator find --platform ios|android --device <id> --text <fragment> [--json]",
         "  zerocode-emulator foreground --platform ios|android --device <id> --app <package|bundle> [--json]",
         "    Checks answer count (0 means absent). find matches a case-insensitive name fragment.",
         "    foreground requires an exported app package; unavailable metadata is an error (including iOS).",
-        "  zerocode-emulator click --platform ios|android --device <id> --mark <n> --look <id> [--json]",
+        "  zerocode-emulator click --platform ios|android --device <id> --mark <n> --look <id> [--text <fragment>] [--preview] [--json]",
+        "    On iOS a click answers once the screen it led to stops changing; --text counts what find would",
+        "    in the tree it stopped on (count; 0 is not proof of absence — look with marks --text); --preview",
+        "    answers the marks that screen would carry (not a look: look again before pressing one).",
         "  zerocode-emulator tap --platform ios|android --device <id> --x <0..1> --y <0..1> [--json]",
         "  zerocode-emulator swipe --platform ios|android --device <id> --x1 N --y1 N --x2 N --y2 N [--ms N] [--json]",
         "  zerocode-emulator text --platform ios|android --device <id> (--text <text>|--text-stdin) [--json]",
@@ -4115,7 +4166,10 @@ pub fn emulator_shim_script(
 }
 
 /// The emulator door on the shared chassis: it says where its caller stands
-/// for the verbs that write where they are told ([`EMULATOR_CWD_VERBS`]).
+/// for the verbs that write where they are told ([`EMULATOR_CWD_VERBS`]), and
+/// which pane asked, in the browser door's own header — the mirror an agent
+/// opens is seated in that pane's checkout, not beside whatever the person
+/// happens to be looking at (t-6379).
 fn emulator_door<'a>(
     manual: &'a str,
     prefix: &'a str,
@@ -4125,6 +4179,7 @@ fn emulator_door<'a>(
 ) -> PowerShellBridgeShim<'a> {
     PowerShellBridgeShim {
         cwd_verbs: EMULATOR_CWD_VERBS,
+        pane_header: Some(crate::agent_browser::PANE_HEADER),
         ..computer_route_shim(
             "zerocode-emulator",
             manual,
@@ -4210,8 +4265,9 @@ pub(crate) struct PowerShellBridgeShim<'a> {
     pub deadline_seconds: u64,
     /// Whether `--text-stdin`/`--value-stdin` read the payload from stdin.
     pub stdin_flags: bool,
-    /// Whether the pane key rides along as a header (the browser door seats
-    /// an agent-opened tab in the asking pane's checkout).
+    /// Whether the pane key rides along as a header (the browser and
+    /// emulator doors seat an agent-opened tab in the asking pane's
+    /// checkout).
     pub pane_header: Option<&'a str>,
     /// The verbs whose request carries the shell's working directory as a
     /// header ([`CWD_HEADER`], spelled in hex) — for a window that must know
@@ -4576,7 +4632,7 @@ mod windows_shim_tests {
         );
         assert!(
             !computer.contains("x-zerocode-pane"),
-            "only the browser seats a pane"
+            "the Computer Use door opens nothing the person sees, so it seats no pane"
         );
         assert!(computer.contains("$body = ''"));
 
@@ -4584,6 +4640,11 @@ mod windows_shim_tests {
         assert!(
             emulator.contains(&format!("$body = 'emulator{ARGV_SEPARATOR}'")),
             "{emulator}"
+        );
+        assert!(
+            emulator.contains("$env:ZEROCODE_PANE_KEY")
+                && emulator.contains("'x-zerocode-pane', $pane"),
+            "the emulator door seats the mirror it opens in the asking pane's checkout:\n{emulator}"
         );
         assert!(emulator.contains("zerocode-emulator — control ZeroCode"));
         let ssh = ssh_shim_script_powershell("P", "C", "H");
@@ -5889,6 +5950,80 @@ mod tests {
         }
     }
 
+    /// A click may count a check's words in the tree it settled on (t-6385),
+    /// and refuses an empty fragment as a look does.
+    #[test]
+    fn an_emulator_click_counts_words_in_its_settled_screen_only_when_it_names_some() {
+        let click = |text: &str| {
+            parse_emulator_command(&words(&[
+                "click",
+                "--platform",
+                "ios",
+                "--device",
+                "phone",
+                "--mark",
+                "2",
+                "--look",
+                "L1",
+                "--text",
+                text,
+                "--json",
+            ]))
+        };
+        assert_eq!(click("iOS 버전").unwrap().text.as_deref(), Some("iOS 버전"));
+        assert!(click(" ").unwrap_err().contains("--text"));
+        assert!(emulator_usage().contains("--look <id> [--text <fragment>]"));
+    }
+
+    /// A look may also count a check's words in the same tree (t-6385); an
+    /// empty fragment counts nothing and is refused as `find` refuses it.
+    #[test]
+    fn an_emulator_look_counts_words_only_when_it_names_some() {
+        let look = |text: &str| {
+            parse_emulator_command(&words(&[
+                "marks",
+                "--platform",
+                "ios",
+                "--device",
+                "phone",
+                "--text",
+                text,
+                "--json",
+            ]))
+        };
+        assert_eq!(look("iOS 버전").unwrap().text.as_deref(), Some("iOS 버전"));
+        assert!(look("  ").unwrap_err().contains("--text"));
+        let plain =
+            parse_emulator_command(&words(&["marks", "--platform", "ios", "--device", "phone"]))
+                .unwrap();
+        assert_eq!(plain.text, None);
+        assert!(emulator_usage().contains("marks --platform ios|android --device <id> [--text"));
+    }
+
+    /// A click may ask for a preview of the screen it settles on (t-6385);
+    /// a plain click asks for none.
+    #[test]
+    fn an_emulator_click_asks_for_a_preview_only_when_it_says_so() {
+        let click = |more: &[&str]| {
+            let mut line = vec![
+                "click",
+                "--platform",
+                "ios",
+                "--device",
+                "phone",
+                "--mark",
+                "2",
+                "--look",
+                "L1",
+            ];
+            line.extend_from_slice(more);
+            parse_emulator_command(&words(&line)).unwrap()
+        };
+        assert!(click(&["--preview", "--json"]).preview);
+        assert!(!click(&["--json"]).preview);
+        assert!(emulator_usage().contains("[--preview]"));
+    }
+
     #[test]
     fn emulator_click_refuses_zero_mark_by_name() {
         emulator_click_refusal(&["--mark", "0", "--look", "L1"], "--mark");
@@ -6025,50 +6160,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_computer_door_says_where_a_recipe_walk_was_asked_from_whatever_the_folder_is_called() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let scratch = tempfile::tempdir().expect("scratch");
-        let bin = scratch.path().join("bin");
-        std::fs::create_dir_all(&bin).expect("bin");
-        let shim = bin.join(COMPUTER_CLI);
-        std::fs::write(&shim, shim_script("PORT_V", "COMPUTER_V", "HOOK_V")).expect("shim");
-        let kept = scratch.path().join("headers");
-        let curl = bin.join("curl");
-        std::fs::write(
-            &curl,
-            format!(
-                "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = -K ]; then cp \"$2\" '{}'; fi\n  shift\ndone\ncat >/dev/null\nprintf '{{}}\\n200'\n",
-                kept.display()
-            ),
-        )
-        .expect("curl");
-        for path in [&shim, &curl] {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        }
-        let folder = scratch.path().join(format!(
+        let rig = DoorRig::new();
+        let shim = rig.install(COMPUTER_CLI, &shim_script("PORT_V", "COMPUTER_V", "HOOK_V"));
+        let folder = rig.path().join(format!(
             "작업 \"폴더\" \\\nurl = example.invalid\n#{}",
             "a".repeat(48)
         ));
         std::fs::create_dir_all(&folder).expect("a folder with a hostile name");
         // The header file curl was handed for one call from the folder.
-        let headers_of_door = |shim: &std::path::Path, argv: &[&str]| {
-            let run = std::process::Command::new("sh")
-                .arg(shim)
-                .args(argv)
-                .current_dir(&folder)
-                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-                .env("PORT_V", "1")
-                .env("COMPUTER_V", "capability")
-                .env("HOOK_V", "hook")
-                .env_remove(RUN_EVIDENCE_DIR_ENV)
-                .output()
-                .expect("sh");
-            assert!(
-                run.status.success(),
-                "{}",
-                String::from_utf8_lossy(&run.stderr)
-            );
-            std::fs::read_to_string(&kept).expect("curl was handed its header file")
-        };
+        let headers_of_door =
+            |shim: &std::path::Path, argv: &[&str]| rig.headers(shim, &folder, argv, &[]);
         let headers_of = |argv: &[&str]| headers_of_door(&shim, argv);
         let prefix = format!("header = \"{CWD_HEADER}: ");
 
@@ -6111,13 +6212,10 @@ mod tests {
         // The emulator door names the folder for the one verb that writes a
         // file where it is told — `screenshot --out <relative>` — and for no
         // other.
-        let emulator = bin.join("zerocode-emulator");
-        std::fs::write(
-            &emulator,
-            emulator_shim_script("PORT_V", "COMPUTER_V", "HOOK_V"),
-        )
-        .expect("emulator shim");
-        std::fs::set_permissions(&emulator, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let emulator = rig.install(
+            "zerocode-emulator",
+            &emulator_shim_script("PORT_V", "COMPUTER_V", "HOOK_V"),
+        );
         let shot = headers_of_door(
             &emulator,
             &[
@@ -6149,6 +6247,124 @@ mod tests {
             "{powershell}"
         );
         assert_eq!(EMULATOR_CWD_VERBS, ["screenshot"]);
+    }
+
+    /// The emulator door names the pane that asked (t-6379), the way the
+    /// browser door does: the window seats the mirror an agent opens in that
+    /// pane's checkout instead of beside whatever the person is looking at
+    /// (09-23 14:14·14:34·14:49, three mirrors on another project's stage).
+    /// The name rides the guarded header file like the tokens, only when the
+    /// shell has one; the Computer Use door opens nothing the person sees
+    /// and still names no pane.
+    #[cfg(unix)]
+    #[test]
+    fn the_emulator_door_names_the_pane_that_asked_and_the_computer_door_does_not() {
+        use crate::agent_browser::PANE_HEADER;
+        let rig = DoorRig::new();
+        let emulator = rig.install(
+            "zerocode-emulator",
+            &emulator_shim_script("PORT_V", "COMPUTER_V", "HOOK_V"),
+        );
+        let computer = rig.install(COMPUTER_CLI, &shim_script("PORT_V", "COMPUTER_V", "HOOK_V"));
+        let open = [
+            EmulatorMethod::Open.verb_name(),
+            "--platform",
+            "ios",
+            "--json",
+        ];
+        let asked = [(crate::hook::PANE_KEY_ENV, "term-7")];
+
+        let seated = rig.headers(&emulator, rig.path(), &open, &asked);
+        let named = format!("header = \"{PANE_HEADER}: term-7\"");
+        assert!(
+            seated.lines().any(|line| line == named),
+            "the emulator door did not name the pane that asked:\n{seated}"
+        );
+        let nameless = rig.headers(&emulator, rig.path(), &open, &[]);
+        assert!(!nameless.contains(PANE_HEADER), "{nameless}");
+        let desktop = rig.headers(
+            &computer,
+            rig.path(),
+            &[ComputerMethod::ListApps.verb_name(), "--json"],
+            &asked,
+        );
+        assert!(!desktop.contains(PANE_HEADER), "{desktop}");
+        let powershell = emulator_shim_script_powershell("P", "C", "H");
+        assert!(
+            powershell.contains(&format!("'{PANE_HEADER}', $pane")),
+            "{powershell}"
+        );
+    }
+
+    /// A door run as what it is: `sh` against a `curl` that keeps the header
+    /// file it was handed and answers 200, with the bridge's three variables
+    /// set and nothing else a window gives a pane — no run folder, no pane
+    /// key — unless a test names it.
+    #[cfg(unix)]
+    struct DoorRig {
+        scratch: tempfile::TempDir,
+        bin: std::path::PathBuf,
+        kept: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl DoorRig {
+        fn new() -> Self {
+            let scratch = tempfile::tempdir().expect("scratch");
+            let bin = scratch.path().join("bin");
+            std::fs::create_dir_all(&bin).expect("bin");
+            let kept = scratch.path().join("headers");
+            let rig = Self { scratch, bin, kept };
+            rig.install(
+                "curl",
+                &format!(
+                    "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = -K ]; then cp \"$2\" '{}'; fi\n  shift\ndone\ncat >/dev/null\nprintf '{{}}\\n200'\n",
+                    rig.kept.display()
+                ),
+            );
+            rig
+        }
+
+        fn path(&self) -> &std::path::Path {
+            self.scratch.path()
+        }
+
+        fn install(&self, name: &str, script: &str) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt as _;
+            let path = self.bin.join(name);
+            std::fs::write(&path, script).expect("door");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            path
+        }
+
+        /// The header file curl was handed for one call from `cwd`.
+        fn headers(
+            &self,
+            door: &std::path::Path,
+            cwd: &std::path::Path,
+            argv: &[&str],
+            env: &[(&str, &str)],
+        ) -> String {
+            let run = std::process::Command::new("sh")
+                .arg(door)
+                .args(argv)
+                .current_dir(cwd)
+                .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
+                .env("PORT_V", "1")
+                .env("COMPUTER_V", "capability")
+                .env("HOOK_V", "hook")
+                .env_remove(RUN_EVIDENCE_DIR_ENV)
+                .env_remove(crate::hook::PANE_KEY_ENV)
+                .envs(env.iter().copied())
+                .output()
+                .expect("sh");
+            assert!(
+                run.status.success(),
+                "{}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+            std::fs::read_to_string(&self.kept).expect("curl was handed its header file")
+        }
     }
 
     /// A working directory reads back only from the spelling a door writes:
@@ -7347,6 +7563,24 @@ mod tests {
         for shown in ["--repeat [--until <HH:MM|N>]", "--arena <evidence dir>"] {
             assert!(usage.contains(shown), "{shown} is not in the manual");
         }
+    }
+
+    /// `--replay` (t-6385) is a walk's own word too: it says the walk runs
+    /// in a repeated run, and a plain walk runs fresh.
+    #[test]
+    fn a_walk_may_say_it_repeats_one_walked_before_and_a_plain_walk_does_not() {
+        let argv = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
+        let plain =
+            parse_command(&argv(&["walk", "--goal", "pay", "--pane", "b"])).expect("a walk");
+        assert_eq!(walk_run(&plain.params), crate::jev::Run::Fresh);
+        let replay = parse_command(&argv(&["walk", "--goal", "pay", "--pane", "b", "--replay"]))
+            .expect("a replayed walk");
+        assert_eq!(walk_run(&replay.params), crate::jev::Run::Repeated);
+        assert!(usage().contains("[--replay]"));
+        assert!(
+            parse_command(&argv(&["click", "--x", "1", "--y", "2", "--replay"])).is_err(),
+            "no other verb takes it"
+        );
     }
 
     /// `--overlap` (t-6132 S2) is a walk's own word: the walk reads it, the

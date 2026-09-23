@@ -1789,7 +1789,7 @@ svg.wt-agent-dot {
   content: "";
 }
 
-.wt-agent.is-live .wt-agent-meta > * + *::before {
+.wt-agent.is-live .wt-agent-meta > :not(:first-child)::before {
   content: " · ";
 }
 
@@ -6192,7 +6192,7 @@ body.is-dragging-pane {
 }
 
 .nb-display + .nb-display,
-.nb-outputs > * + * {
+.nb-outputs > :not(:first-child) {
   border-top: var(--rule-width) solid color-mix(in srgb, var(--edge-rule) 60%, transparent);
 }
 
@@ -13670,6 +13670,55 @@ details.worker-command {
   background: var(--chat-code-bg);
 }
 
+/* A code block's wrapper (`codeBlockWrapper`, t-6323 A9) keeps the block's
+ * place and hangs the copy over its top right corner, 4px in, shown while
+ * the block is under the pointer — or while the copy has the keyboard's
+ * focus, which the extension's leaves unseen. A pressed copy wears a check
+ * for 2 s. */
+.is-chat-page .helper-said .helper-code {
+  position: relative;
+  margin: var(--space-2) 0;
+}
+
+.is-chat-page .helper-said .helper-code > pre {
+  margin: 0;
+}
+
+.helper-code-copy {
+  position: absolute;
+  top: var(--chat-code-copy-inset);
+  right: var(--chat-code-copy-inset);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--chat-code-copy-pad);
+  border: 1px solid var(--chat-composer-edge);
+  border-radius: var(--chat-radius-small);
+  background: var(--surface-raised);
+  color: var(--chat-work-ink);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--motion-fast) var(--ease-standard), background-color var(--motion-fast) var(--ease-standard);
+}
+
+.helper-code:hover > .helper-code-copy,
+.helper-code-copy:focus-visible {
+  opacity: 1;
+}
+
+.helper-code-copy:hover {
+  background: var(--chat-pill-bg);
+}
+
+.helper-code-copy:active {
+  opacity: var(--chat-copy-pressed-alpha);
+}
+
+.helper-code-copy .icon {
+  width: var(--chat-code-copy-icon);
+  height: var(--chat-code-copy-icon);
+}
+
 /* 인라인 코드는 둥근 칩 — 블록(`pre`) 안의 코드는 제 우물의 옷을 입는다. */
 .is-chat-page .helper-said :not(pre) > code {
   padding: 0 0.35em;
@@ -13877,6 +13926,30 @@ details.worker-command {
   cursor: pointer;
 }
 
+/* What the person said, taller than the extension's clip: 60px of its words
+ * (the box keeps its padding and edge around them), the last 50px fading to
+ * the box's ground, the door over the fade (`EV0`). */
+.helper-turn.is-user > .helper-said.is-clipped:not(.is-open) {
+  position: relative;
+  max-height: calc(var(--chat-user-clip-h) + 2 * (var(--chat-bubble-pad-y) + 1px));
+  overflow: hidden;
+}
+
+.helper-turn.is-user > .helper-said.is-clipped:not(.is-open)::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: var(--chat-user-clip-fade);
+  background: linear-gradient(to bottom, transparent, var(--chat-composer-bg));
+  pointer-events: none;
+}
+
+.helper-turn.is-user > .helper-said.is-clipped:not(.is-open) + .helper-expand {
+  bottom: calc(var(--chat-sticky-pad-bottom) + var(--space-1));
+}
+
 .helper-who {
   flex: none;
   font-family: var(--font-ui);
@@ -13909,9 +13982,11 @@ details.worker-command {
 }
 
 /* A call still out: the agent's accent with its halo, blinking at the
- * extension's beat (`dotProgress`: 1s, linear). */
+ * extension's beat (`dotProgress`: 1s, linear) — and a helper at work
+ * wears the same dot (t-6323 A6). */
 .helper-turn.is-tool.is-live::before,
-.helper-group.is-live::before {
+.helper-group.is-live::before,
+.helper-agent-dot {
   background: var(--chat-accent);
   box-shadow: 0 0 0 var(--chat-dot-halo) color-mix(in srgb, var(--chat-accent) 18%, transparent);
   animation: helper-live-pulse 1s linear infinite;
@@ -13954,6 +14029,26 @@ details.worker-command {
   color: var(--chat-link);
 }
 
+/* The target as a door to its file (t-6323 A2) — the extension's link in the
+ * tool header — and the lines a read covered beside it, in the header's own
+ * type rather than the target's mono. */
+.helper-tool-arg.is-door {
+  cursor: pointer;
+  text-decoration: none;
+  transition: text-decoration-color var(--motion-fast) var(--ease-standard);
+}
+
+.helper-tool-arg.is-door:hover {
+  text-decoration: underline;
+}
+
+.helper-tool-where {
+  flex: none;
+  font-family: var(--font-ui);
+  font-size: var(--chat-prose-size);
+  color: var(--chat-work-ink);
+}
+
 /* What came back, in one line under the call — the extension's secondary
  * line (`secondaryLine`): the window's type in the quieter ink. */
 .helper-tool-result {
@@ -13972,19 +14067,12 @@ details.worker-command {
 }
 
 /* The rest — an input past its first line, an output past its first line —
- * behind one fold, in the window's words on the cap; opened, the wells are
- * the extension's tool body (`toolBody`): one bordered box, a row per
- * side, each with its label (`IN` / `OUT`) in a mono column at the left. */
-.helper-tool-more {
-  font-size: var(--chat-prose-size);
-  color: var(--chat-work-ink);
-}
-
-.helper-tool-more > .helper-cap .helper-cue {
-  font-family: var(--font-ui);
-}
-
-.helper-tool-more-body {
+ * in the extension's tool body (`toolBody`), standing under the call with no
+ * fold to press first: one bordered box, a row per side, each with its label
+ * (`IN` / `OUT`) in a mono column at the left. A side that is long by the
+ * extension's test stops at the clip, its last lines fading out, with its
+ * door after it (t-6323 A1); opened, it is the well it always was. */
+.helper-tool-body {
   display: grid;
   gap: 0;
   min-width: 0;
@@ -13993,17 +14081,79 @@ details.worker-command {
   border: 1px solid var(--chat-composer-edge);
   border-radius: var(--chat-radius-tool);
   background: var(--chat-tool-bg);
+  font-size: var(--chat-prose-size);
+  color: var(--chat-work-ink);
 }
 
-.helper-tool-more-body > .helper-fold-body {
+.helper-tool-well {
+  position: relative;
+  min-width: 0;
+}
+
+.helper-tool-well[hidden] {
+  display: none;
+}
+
+.helper-tool-well:not([hidden]) ~ .helper-tool-well:not([hidden]) {
+  border-top: 1px solid var(--chat-composer-edge);
+}
+
+.helper-tool-well > .helper-fold-body {
   display: grid;
   grid-template-columns: var(--chat-tool-label) minmax(0, 1fr);
   margin: 0;
   padding: var(--space-1) var(--space-2) var(--space-1) 0;
 }
 
-.helper-tool-more-body > .helper-fold-body + .helper-fold-body {
-  border-top: 1px solid var(--chat-composer-edge);
+/* Cut at the clip: the words' own height (the extension's box is sized by
+ * its content, not its padding), the last stretch fading out. */
+.helper-tool-well > .helper-fold-body.is-clipped:not(.is-open) {
+  box-sizing: content-box;
+  max-height: var(--chat-tool-clip-h);
+  overflow: hidden;
+  mask-image: linear-gradient(
+    to bottom,
+    var(--ink-chalk) calc(var(--chat-tool-clip-h) - var(--chat-tool-clip-fade)),
+    transparent var(--chat-tool-clip-h)
+  );
+}
+
+/* The door after a clipped thing — 「더 보기」 over the cut while the pointer
+ * or the focus is on what it opens (the extension shows its own only then),
+ * and 「접기」 under the thing once it is open. */
+.helper-expand {
+  display: flex;
+  width: fit-content;
+  margin: var(--space-1) 0 0 auto;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--chat-composer-edge);
+  border-radius: var(--chat-radius-small);
+  background: var(--surface-raised);
+  color: var(--ink-chalk);
+  font: inherit;
+  font-family: var(--font-ui);
+  font-size: var(--text-2xs);
+  cursor: pointer;
+  transition: opacity var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard);
+}
+
+.helper-expand:hover {
+  border-color: var(--edge-glint);
+}
+
+.is-clipped:not(.is-open) + .helper-expand {
+  position: absolute;
+  right: var(--space-1);
+  bottom: var(--space-1);
+  margin: 0;
+  opacity: 0;
+}
+
+.helper-tool-well:hover > .is-clipped:not(.is-open) + .helper-expand,
+.helper-tool-diff-file:hover > .is-clipped:not(.is-open) + .helper-expand,
+.helper-turn.is-user:hover > .is-clipped:not(.is-open) + .helper-expand,
+.is-clipped:not(.is-open) + .helper-expand:focus-visible {
+  opacity: 1;
 }
 
 .helper-tool-input::before,
@@ -14024,10 +14174,6 @@ details.worker-command {
   content: "OUT";
 }
 
-.helper-tool-input[hidden],
-.helper-tool-output[hidden] {
-  display: none;
-}
 
 /* The inline diff under an edit's row — the extension's block beneath
  * `● Write`: the review surface's rows (`.diff-line`, `.diff-word`) in a
@@ -14039,7 +14185,13 @@ details.worker-command {
   min-width: 0;
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  line-height: 1.5;
+  line-height: var(--chat-diff-leading);
+}
+
+/* One file's rows and the door after them. */
+.helper-tool-diff-file {
+  position: relative;
+  min-width: 0;
 }
 
 .helper-tool-diff-path {
@@ -14057,6 +14209,26 @@ details.worker-command {
   border: var(--rule-width) solid var(--edge-rule);
   border-radius: var(--radius-sm);
   background: var(--chat-bubble);
+}
+
+/* A diff taller than the extension's 200px box stops there, its foot fading
+ * into the well (`truncationGradient`) — the rows behind the fade are built
+ * only when the door opens it (`diffRowsNode`). */
+.helper-tool-diff-rows.is-clipped:not(.is-open) {
+  position: relative;
+  max-height: var(--chat-diff-clip-h);
+  overflow: hidden;
+}
+
+.helper-tool-diff-rows.is-clipped:not(.is-open)::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: var(--chat-diff-clip-fade);
+  background: linear-gradient(to bottom, transparent, var(--chat-bubble));
+  pointer-events: none;
 }
 
 .helper-tool-diff .diff-num {
@@ -14176,6 +14348,240 @@ details.worker-command {
  * 같은 이유로 제 규칙을 갖는다). */
 .helper-turn[hidden] {
   display: none;
+}
+
+/* A helper at work (t-6323 A6), the extension's live helper row
+ * (`focusFoldRow` with `dotProgress`): on the step's own rule — its gutter,
+ * and its dot where the rail's dot stands — what it is doing, cut to one
+ * line, then its measure in the quiet ink. */
+.helper-agent {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--chat-row-pad) 0 var(--chat-row-pad) var(--chat-gutter);
+  font-size: var(--chat-prose-size);
+  line-height: var(--chat-prose-leading);
+  color: var(--chat-work-ink);
+}
+
+.helper-agent-dot {
+  position: absolute;
+  left: var(--chat-rail-dot-x);
+  top: calc(var(--chat-row-pad) + var(--chat-rail-dot-y));
+  width: var(--chat-dot);
+  height: var(--chat-dot);
+  border-radius: 50%;
+}
+
+.helper-agent-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-chalk);
+}
+
+.helper-agent-meta {
+  flex: none;
+}
+
+/* An image a message carries (t-6323 A8), the extension's pill (`pill`,
+ * `thumbIcon`, `label`, `meta`): a 12px thumbnail, its name and — once the
+ * picture has loaded — its size, in a 24px box a shade off the input's
+ * ground; the person's pills stand in a row above their words
+ * (`userMessageAttachments`), a tool's under the line that says what it
+ * handed back. A pill whose picture could not be read keeps its name. */
+.helper-images {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: var(--chat-image-gap);
+  max-width: 100%;
+  padding-bottom: var(--chat-image-under);
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.helper-image {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--chat-image-gap);
+  flex: none;
+  min-width: 0;
+  max-width: var(--chat-image-pill-max);
+  height: var(--chat-image-pill-h);
+  padding: var(--chat-image-pad) var(--chat-image-pad-end) var(--chat-image-pad) var(--chat-image-pad);
+  overflow: hidden;
+  border: 1px solid var(--chat-composer-edge);
+  border-radius: var(--chat-radius-small);
+  background: color-mix(in srgb, var(--chat-composer-bg) 85%, var(--chat-work-ink));
+  color: var(--ink-chalk);
+  font: inherit;
+  cursor: pointer;
+  transition: border-color var(--motion-fast) var(--ease-standard);
+}
+
+.helper-image:hover {
+  border-color: color-mix(in srgb, var(--chat-composer-edge) 60%, var(--ink-chalk));
+}
+
+.helper-image-thumb {
+  flex: none;
+  width: var(--chat-image-thumb);
+  height: var(--chat-image-thumb);
+  border-radius: var(--chat-image-thumb-radius);
+  object-fit: cover;
+}
+
+/* No picture yet: the thumbnail's place stands empty, not a broken image. */
+.helper-image-thumb:not([src]) {
+  visibility: hidden;
+}
+
+.helper-image-name {
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--text-2xs);
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.helper-image-size {
+  flex: none;
+  font-size: var(--text-2xs);
+  color: var(--chat-work-ink);
+  opacity: var(--chat-image-meta-alpha);
+  white-space: nowrap;
+}
+
+.helper-image.is-missing .helper-image-thumb {
+  display: none;
+}
+
+/* The picture whole, over everything (the extension's `previewOverlay`). */
+.chat-image-preview {
+  position: fixed;
+  inset: 0;
+  z-index: var(--chat-preview-layer);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--chat-preview-ground);
+}
+
+.chat-image-preview-frame {
+  position: relative;
+  max-width: var(--chat-preview-max);
+  max-height: var(--chat-preview-max-h);
+  cursor: default;
+}
+
+.chat-image-preview-image {
+  display: block;
+  max-width: var(--chat-preview-max);
+  max-height: var(--chat-preview-max-h);
+  border-radius: var(--chat-preview-radius);
+  object-fit: contain;
+  box-shadow: var(--chat-preview-shadow);
+}
+
+.chat-image-preview-close {
+  position: absolute;
+  top: var(--chat-preview-close-out);
+  right: var(--chat-preview-close-out);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--chat-preview-close);
+  height: var(--chat-preview-close);
+  padding: 0;
+  border: 1px solid var(--chat-composer-edge);
+  border-radius: 50%;
+  background: var(--surface-raised);
+  color: var(--ink-chalk);
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.chat-image-preview-close:hover {
+  background: var(--chat-composer-bg);
+}
+
+.chat-image-preview-close .icon {
+  width: var(--chat-preview-close-icon);
+  height: var(--chat-preview-close-icon);
+}
+
+/* A todo call's list (t-6323 A7), the extension's `todoList`: the items
+ * stacked a little apart, each a box beside its words; a done item faded
+ * and struck through in the quiet ink. The box is the extension's disabled
+ * checkbox, drawn by hand — a tick when done, `✽` a size smaller while under
+ * way, empty while it waits. */
+.helper-todos {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: var(--space-2) 0;
+  list-style: none;
+}
+
+.helper-todo {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  border-radius: var(--radius-xs);
+  font-size: var(--chat-prose-size);
+  line-height: var(--chat-prose-leading);
+  color: var(--ink-chalk);
+}
+
+.helper-todo-box {
+  appearance: none;
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 1em;
+  height: 1em;
+  margin: var(--chat-todo-box-gap);
+  border: 1px solid var(--chat-composer-edge);
+  border-radius: var(--radius-xs);
+  background: var(--chat-composer-bg);
+  font-size: inherit;
+  line-height: 1;
+  color: var(--ink-chalk);
+}
+
+.helper-todo-box:checked {
+  opacity: var(--chat-todo-done-alpha);
+}
+
+.helper-todo-box:checked::after {
+  content: "✓";
+  font-size: 0.9em;
+}
+
+.helper-todo-box:indeterminate::after {
+  content: "✽";
+  font-size: 0.8em;
+}
+
+.helper-todo-content {
+  flex: 1;
+  min-width: 0;
+  word-break: break-word;
+}
+
+.helper-todo.is-completed {
+  opacity: var(--chat-todo-done-alpha);
+}
+
+.helper-todo.is-completed .helper-todo-content {
+  text-decoration: line-through;
+  color: var(--chat-work-ink);
+  opacity: var(--chat-todo-done-alpha);
 }
 
 /* 묶음 머리는 도구 행의 자를 그대로 쓴다: `.is-step`이 여백과 레일과 점을
@@ -15096,7 +15502,7 @@ button.worker-composer-pill:hover {
 /* 이 페이지의 키보드 초점 — 플랫폼 계약의 잉크 외곽선. 입력 상자만 전역
  * 규칙의 액센트 테두리를 그대로 쓴다(`.worker-composer-box:focus-visible`). */
 .worker-view
-  :is(.helper-cap, .helper-turns, button.worker-where.is-door, .worker-open-live, .worker-composer-door, .worker-composer-agent, .worker-composer-mode, .worker-composer-slash, .worker-composer-send, .composer-attach-plus, .composer-attach-drop, .composer-menu-item, .composer-slash-row, .helper-link, .helper-copy, .helper-preview-lid, .helper-preview-door):focus-visible {
+  :is(.helper-cap, .helper-turns, button.worker-where.is-door, .worker-open-live, .worker-composer-door, .worker-composer-agent, .worker-composer-mode, .worker-composer-slash, .worker-composer-send, .composer-attach-plus, .composer-attach-drop, .composer-menu-item, .composer-slash-row, .helper-link, .helper-copy, .helper-expand, .helper-tool-arg.is-door, .helper-preview-lid, .helper-preview-door):focus-visible {
   outline: 2px solid var(--ink-chalk);
   outline-offset: 2px;
 }
@@ -15114,6 +15520,7 @@ button.worker-composer-pill:hover {
   button.worker-where.is-door,
   .helper-preview-door,
   .helper-copy,
+  .helper-expand,
   .composer-menu-item,
   .composer-slash-row,
   .worker-composer-slash {
@@ -15122,6 +15529,7 @@ button.worker-composer-pill:hover {
 
   .helper-turn.is-tool.is-live::before,
   .helper-group.is-live::before,
+  .helper-agent-dot,
   .helper-status-mark {
     animation: none;
   }
@@ -16707,7 +17115,7 @@ button.worker-composer-pill:hover {
   padding: var(--space-2) var(--space-3);
 }
 
-.integration-facts > div + div {
+.integration-facts > div:not(:first-child) {
   border-left: var(--rule-width) solid var(--edge-rule);
 }
 
@@ -18827,31 +19235,80 @@ button.worker-composer-pill:hover {
   overflow-wrap: anywhere;
 }
 
-/* ---- the seats Jev sits in, one row each -----------------------------
- *
- * Five seats stood as five [label, switch, paragraph] stacks, and the five
- * paragraphs were 616px of the 844px card. A row is now the seat's name, one
- * line saying what it sends, and the mode — and the paragraph is behind the
- * same fold the status line uses. The rows, and their order, are what the use
- * table answered (`paintTypeSafe` reads `switches`), so `order` has to be
- * something this box honours. */
-.settings-jev-list {
+/* ---- Jev on the settings card (2026-09-23, docs/design/jev-settings-20260917.md
+ * §6.1): one switch a person turns on and off, the key, a line to the
+ * dashboard, and what is rarely changed folded under 고급. The switch is the
+ * card's largest row — it is the one decision the card asks for. */
+.settings-jev-switch {
+  margin: var(--space-3) var(--space-4) 0;
+  padding: var(--space-2) var(--space-3);
+  border: var(--rule-width) solid var(--edge-rule);
+  border-radius: var(--radius-md);
+  background: var(--surface-well);
+}
+
+.settings-jev-switch .settings-label {
+  font-size: var(--text-md);
+  font-weight: var(--jev-weight-strong);
+}
+
+/* On, with consent for some folders only: the sentence and the one press
+ * that consents every folder, on one line while there is room. */
+.settings-notice.settings-jev-partial {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
 }
 
-.settings-jev-row {
+/* Where each feature stands is the dashboard's: one quiet line, and the way
+ * there is a link in it rather than a second button above the card's own. */
+.settings-jev-dashboard {
+  margin: var(--space-3) var(--space-4) 0;
+}
+
+.settings-jev-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink-chalk);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: var(--jev-link-offset);
+  cursor: pointer;
+  transition: text-decoration-thickness var(--motion-fast) var(--ease-standard);
+}
+
+.settings-jev-link:hover {
+  text-decoration-thickness: var(--jev-link-hover-thickness);
+}
+
+.settings-jev-advanced {
+  margin: var(--space-3) var(--space-4) 0;
+}
+
+/* What the fold holds is fields, not the quiet paragraph a fold holds
+ * elsewhere on this screen: they keep their own size, ink and width. */
+.settings-jev-advanced > :not(summary) {
+  max-width: none;
+  color: inherit;
+  font-size: inherit;
+}
+
+.settings-jev-classifier {
   display: grid;
-  gap: 2px;
-  padding-block: var(--space-2);
-}
-
-.settings-jev-row + .settings-jev-row {
+  gap: var(--space-1);
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
   border-top: var(--rule-width) solid var(--edge-rule);
 }
 
-.settings-jev-row > .settings-fold {
-  padding-inline: var(--space-4);
+.settings-jev-advanced-title {
+  margin: 0;
+  color: var(--ink-chalk);
+  font-size: var(--text-sm);
+  font-weight: var(--jev-weight-strong);
 }
 
 /* A row whose mode nothing can reach says so where the mode is, not in a
@@ -18887,7 +19344,7 @@ button.worker-composer-pill:hover {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .integration-facts > div + div {
+  .integration-facts > div:not(:first-child) {
     border-top: var(--rule-width) solid var(--edge-rule);
     border-left: 0;
   }
@@ -30432,7 +30889,7 @@ details.task-board-section > summary {
   background: var(--surface-well);
 }
 
-.board-ask-rows > * + * {
+.board-ask-rows > :not(:first-child) {
   border-top: var(--rule-width) solid var(--edge-rule);
 }
 
@@ -37633,6 +38090,151 @@ h4.knowledge-inspector-head::after {
   margin: 0;
 }
 
+/* A feature's row opens its drawer (t-6277 D6): the name is the button, and
+   the whole row answers a pointer. */
+.jev-table tbody tr[data-jev-dash-row] {
+  cursor: pointer;
+}
+
+.jev-table tbody tr[data-jev-dash-row] td {
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.jev-table tbody tr[data-jev-dash-row]:hover td {
+  background: var(--row-hover);
+}
+
+.jev-table tbody tr.is-open td {
+  background: color-mix(in srgb, var(--jev-progress-ink) var(--jev-tint-open), transparent);
+}
+
+.jev-row-open {
+  display: block;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+/* The feature's id under its name, small (t-6277 D7): the word its settings
+   key and its ledger rows are found by. */
+.jev-row-id {
+  display: block;
+  color: var(--ink-mist);
+  font-family: var(--font-mono);
+  font-size: var(--jev-meta-size);
+  font-weight: var(--jev-weight-plain);
+}
+
+/* The drawer rides a dock pinned to the top of the page's window, so it
+   stays where the eye is while the table scrolls under it; the dock takes
+   no room of its own. A sticky inset is read inside the page's padding, so
+   the dock sticks where it starts, and the drawer reaches back over the
+   padding to the page's own edges. */
+.jev-drawer-dock {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  height: 0;
+  margin-block-end: calc(-1 * var(--space-4));
+}
+
+.jev-drawer {
+  position: absolute;
+  top: calc(-1 * var(--space-5));
+  right: calc(-1 * var(--space-5));
+  width: min(var(--jev-drawer-width), calc(100% + var(--space-5)));
+  height: var(--jev-drawer-height, 70vh);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  overflow: auto;
+  border-left: var(--jev-line) solid var(--edge-rule);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-2);
+}
+
+.jev-drawer-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.jev-drawer-title {
+  margin: 0;
+  font-size: var(--jev-drawer-title-size);
+}
+
+.jev-drawer-id {
+  margin: var(--space-1) 0 0;
+  color: var(--ink-mist);
+  font-family: var(--font-mono);
+  font-size: var(--jev-meta-size);
+}
+
+.jev-drawer-summary, .jev-drawer-written, .jev-drawer-text {
+  margin: 0;
+  line-height: var(--leading-body);
+}
+
+.jev-drawer-written {
+  color: var(--jev-tone-under);
+  font-size: var(--jev-meta-size);
+}
+
+.jev-drawer-part {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.jev-drawer-heading {
+  margin: 0;
+  color: var(--ink-mist);
+  font-size: var(--jev-meta-size);
+  font-weight: var(--jev-weight-strong);
+}
+
+.jev-drawer-facts {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+}
+
+.jev-drawer-facts dt {
+  color: var(--ink-mist);
+}
+
+.jev-drawer-facts dd {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.jev-drawer-text {
+  color: var(--ink-mist);
+  font-size: var(--jev-meta-size);
+}
+
+/* The settings card's switch, worn over the table (§6.1): the same framed
+   row and the same line under it, standing at the page's edges as the strip
+   and the table do. The row's frame is the one frame — a panel around it
+   would be a box around a box (t-6277 D10). */
+.jev-switch {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.jev-switch .settings-jev-switch,
+.jev-switch .settings-notice {
+  margin: 0;
+}
+
 .jev-error {
   color: var(--signal-halt);
 }
@@ -37657,19 +38259,31 @@ h4.knowledge-inspector-head::after {
   background: var(--surface-well);
 }
 
+/* The figure is what the strip is read for: large; its label small and quiet
+   above it (t-6277 D10). */
 .jev-stat dt {
   display: flex;
   align-items: center;
   gap: var(--space-1);
   color: var(--ink-mist);
-  font-size: var(--jev-meta-size);
+  font-size: var(--jev-stat-label-size);
 }
 
 .jev-stat dd {
   margin: 0;
   font-size: var(--jev-stat-size);
-  font-weight: 600;
+  font-weight: var(--jev-weight-strong);
+  line-height: var(--leading-tight);
   font-variant-numeric: tabular-nums;
+}
+
+/* The states start a group of their own after the sums. */
+.jev-stat[data-group="states"] {
+  background: var(--surface-deck);
+}
+
+.jev-stat.jev-stat--lead {
+  margin-inline-start: var(--space-3);
 }
 
 /* A state's count wears the state's tone — the tone its rows wear. */
@@ -37686,7 +38300,15 @@ h4.knowledge-inspector-head::after {
 .jev-view [data-status="recording"] { --jev-tone: var(--jev-tone-recording); }
 .jev-view [data-status="under"] { --jev-tone: var(--jev-tone-under); }
 .jev-view [data-status="blocked"] { --jev-tone: var(--jev-tone-blocked); }
-.jev-view [data-status="unused"] { --jev-tone: var(--jev-tone-unused); }
+.jev-view [data-status="dormant"] { --jev-tone: var(--jev-tone-dormant); }
+
+/* What the table says when no feature was asked all week (t-6277 D10):
+   whether Jev is off, or on and quiet. */
+.jev-empty-row td {
+  padding: var(--space-4) var(--jev-cell-pad);
+  color: var(--ink-mist);
+  text-align: center;
+}
 
 /* The row the unused features fold into: one line, one press. */
 .jev-fold-row td {
@@ -37717,7 +38339,11 @@ h4.knowledge-inspector-head::after {
    scrolling inside a page that also scrolls is two scrollbars for one list. */
 .jev-table-wrap {
   flex: none;
-  overflow-x: auto;
+  /* Clipped, not scrolled: a wrap that scrolls sideways is a scroll
+     container, and the head could then stick only inside it — which never
+     scrolls down. The table fits a 1080p stage (t-6243 D1), so nothing is
+     lost to the clip, and the head sticks to the page (t-6277 D10). */
+  overflow-x: clip;
   border: var(--jev-line) solid var(--edge-rule);
   border-radius: var(--radius-md);
 }
@@ -37729,7 +38355,8 @@ h4.knowledge-inspector-head::after {
 }
 
 .jev-table th, .jev-table td {
-  padding: var(--space-2);
+  padding: var(--jev-cell-pad);
+  line-height: var(--jev-cell-leading);
   text-align: left;
   vertical-align: top;
   border-bottom: var(--jev-line) solid var(--edge-rule);
@@ -37754,7 +38381,7 @@ h4.knowledge-inspector-head::after {
 }
 
 .jev-fact-strong {
-  font-weight: 600;
+  font-weight: var(--jev-weight-strong);
 }
 
 .jev-fact-mist {
@@ -37762,13 +38389,17 @@ h4.knowledge-inspector-head::after {
   font-size: var(--jev-meta-size);
 }
 
+/* The head stays at the page's top edge while the rows scroll under it: a
+   sticky inset is read inside the page's padding, so it reaches back over
+   it (t-6277 D10). */
 .jev-table th {
   color: var(--ink-mist);
-  font-weight: 500;
+  font-weight: var(--jev-weight-medium);
   font-size: var(--jev-meta-size);
   background: var(--surface-well);
   position: sticky;
-  top: 0;
+  top: calc(-1 * var(--space-5));
+  z-index: 2;
 }
 
 .jev-table tbody tr:last-child td {
@@ -37780,24 +38411,11 @@ h4.knowledge-inspector-head::after {
 }
 
 .jev-table tr.is-applying [data-jev-cell="seat"] {
-  font-weight: 600;
-}
-
-.jev-view select.jev-mode {
-  background-color: var(--surface-well);
-  color: var(--ink-chalk);
-  border: var(--jev-line) solid var(--edge-mark);
-  border-radius: var(--radius-sm);
-  padding: var(--space-1) var(--space-2);
-  font: inherit;
-  font-size: var(--jev-meta-size);
-  /* A width of its own: the shared field width is a share of the cell, and
-     a table cell sized by a share clips the longest mode word. */
-  width: var(--jev-mode-width);
+  font-weight: var(--jev-weight-strong);
 }
 
 .jev-share {
-  font-weight: 600;
+  font-weight: var(--jev-weight-strong);
 }
 
 /* The week as one picture of two lines, each line's latest value under it,
@@ -37825,7 +38443,7 @@ h4.knowledge-inspector-head::after {
 .jev-trend-last::before {
   content: "";
   width: var(--space-3);
-  border-top: 2px solid var(--jev-trend);
+  border-top: var(--jev-trend-stroke) solid var(--jev-trend);
 }
 
 .jev-trend-agreement::before {
@@ -37872,29 +38490,35 @@ h4.knowledge-inspector-head::after {
 .jev-chip {
   display: inline-flex;
   align-items: center;
-  padding: 1px var(--space-2);
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--jev-tone) 12%, transparent);
+  padding: var(--jev-chip-pad-block) var(--space-2);
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--jev-tone) var(--jev-tint), transparent);
   color: var(--jev-tone);
-  font-weight: 600;
+  font-weight: var(--jev-weight-strong);
   white-space: nowrap;
 }
 
 /* A light tint keeps the chip's ink at AA on the light panel, as the
    settings card's state pill does. */
 :root[data-theme="light"] .jev-chip {
-  background: color-mix(in srgb, var(--jev-tone) 6%, transparent);
+  background: color-mix(in srgb, var(--jev-tone) var(--jev-tint-quiet), transparent);
 }
 
-/* Not in use says itself in words alone. */
-.jev-chip[data-status="unused"] {
+/* A feature that asks nothing says so in words alone. */
+.jev-chip[data-status="dormant"] {
   padding-inline: 0;
   background: none;
-  font-weight: 500;
+  font-weight: var(--jev-weight-medium);
 }
 
 .jev-status-reason, .jev-status-fact {
   margin: 0;
+}
+
+/* A recording feature measured under its bar says why in the tone of a miss
+   (t-6277 D8): the chip stays one of four, the sentence carries the rest. */
+.jev-status-reason.is-under {
+  color: var(--jev-tone-under);
 }
 
 .jev-status-fact {
@@ -37913,8 +38537,8 @@ h4.knowledge-inspector-head::after {
   flex: none;
   width: var(--jev-progress-width);
   height: var(--jev-progress-height);
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--ink-mist) 24%, transparent);
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--ink-mist) var(--jev-tint-track), transparent);
   overflow: hidden;
 }
 
@@ -37940,7 +38564,7 @@ h4.knowledge-inspector-head::after {
 
 .jev-refused {
   color: var(--jev-tone-blocked);
-  font-weight: 600;
+  font-weight: var(--jev-weight-strong);
 }
 
 /* What did not come back, by token (t-6243 D5): a quiet word for the wire's
@@ -37953,11 +38577,13 @@ h4.knowledge-inspector-head::after {
   white-space: normal;
 }
 
-/* One text line tall, so a row of them costs a line and not a box. */
+/* One text line tall, so a row of them costs a line and not a box. A word
+   starts where the count above it starts; a button's tint is what lines up,
+   so its words sit inside it (t-6277 D10). */
 .jev-token {
   display: inline-flex;
   align-items: center;
-  padding: 0 var(--space-1);
+  padding: 0;
   border: 0;
   border-radius: var(--radius-sm);
   background: none;
@@ -37969,7 +38595,8 @@ h4.knowledge-inspector-head::after {
 }
 
 button.jev-token {
-  background: color-mix(in srgb, var(--jev-tone-blocked) 12%, transparent);
+  padding-inline: var(--space-1);
+  background: color-mix(in srgb, var(--jev-tone-blocked) var(--jev-tint), transparent);
   color: var(--jev-tone-blocked);
   cursor: pointer;
   transition:
@@ -37978,7 +38605,7 @@ button.jev-token {
 }
 
 button.jev-token:hover {
-  background: color-mix(in srgb, var(--jev-tone-blocked) 22%, transparent);
+  background: color-mix(in srgb, var(--jev-tone-blocked) var(--jev-tint-hover), transparent);
 }
 
 .jev-spark {
@@ -37990,7 +38617,7 @@ button.jev-token:hover {
 .jev-spark-line {
   fill: none;
   stroke: var(--jev-trend);
-  stroke-width: 1.5;
+  stroke-width: var(--jev-trend-stroke);
   stroke-linejoin: round;
   stroke-linecap: round;
 }
@@ -38008,33 +38635,6 @@ button.jev-token:hover {
   fill: var(--jev-trend-accuracy);
 }
 
-.jev-recent {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-}
-
-.jev-recent-head {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  flex-wrap: wrap;
-}
-
-.jev-recent-title {
-  font-size: var(--jev-body-size);
-  margin: 0;
-}
-
-.jev-view select.jev-recent-seat {
-  background-color: var(--surface-well);
-  color: var(--ink-chalk);
-  border: var(--jev-line) solid var(--edge-mark);
-  border-radius: var(--radius-sm);
-  padding: var(--space-1) var(--space-2);
-  font: inherit;
-}
-
 .jev-recent-list {
   list-style: none;
   margin: 0;
@@ -38044,18 +38644,31 @@ button.jev-token:hover {
   gap: var(--space-1);
 }
 
+/* One judgment in the drawer's width: when, what became of it and its
+   marks on the first line; what it was asked, then what it answered, under
+   them. */
 .jev-decision {
   display: grid;
-  grid-template-columns: auto auto minmax(0, 2fr) minmax(0, 1fr) auto;
-  gap: var(--space-3);
+  grid-template-columns: auto auto minmax(0, 1fr);
+  grid-template-areas:
+    "when outcome marks"
+    "asked asked asked"
+    "answer answer answer";
+  gap: var(--space-1) var(--space-2);
   align-items: baseline;
   padding: var(--space-2) var(--space-3);
   border: var(--jev-line) solid var(--edge-rule);
   border-radius: var(--radius-sm);
 }
 
+.jev-decision-when { grid-area: when; }
+.jev-decision-outcome { grid-area: outcome; }
+.jev-decision-marks { grid-area: marks; text-align: right; }
+.jev-decision-asked { grid-area: asked; }
+.jev-decision-answer { grid-area: answer; }
+
 .jev-decision-outcome {
-  font-weight: 600;
+  font-weight: var(--jev-weight-strong);
 }
 
 .jev-decision[data-outcome]:not([data-outcome="answered"]) .jev-decision-outcome {

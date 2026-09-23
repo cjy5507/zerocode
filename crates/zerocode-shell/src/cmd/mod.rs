@@ -12,8 +12,8 @@ pub(crate) mod console;
 pub(crate) use console::{agent_models, slash_commands};
 pub(crate) mod wire;
 pub(crate) use wire::{
-    wire_answer, wire_interrupt, wire_log, wire_models, wire_send, wire_set_mode, wire_set_model,
-    wire_start, wire_stop,
+    wire_answer, wire_image, wire_interrupt, wire_log, wire_models, wire_send, wire_set_mode,
+    wire_set_model, wire_start, wire_stop,
 };
 pub(crate) mod browser;
 pub(crate) mod fs;
@@ -138,12 +138,12 @@ pub(crate) use api_routers::{
 
 pub(crate) mod typesafe;
 pub(crate) use typesafe::{
-    check_typesafe_key, jev_day, jev_summary, remove_typesafe_key, save_typesafe_key, set_jev_mode,
-    set_jev_model, set_route_classifier, typesafe_settings,
+    check_typesafe_key, jev_day, jev_summary, remove_typesafe_key, save_typesafe_key,
+    set_jev_enabled, set_jev_model, set_route_classifier, typesafe_settings,
 };
 
 pub(crate) mod worker_room;
-pub(crate) use worker_room::{judge_worker_room, note_worker_room_change};
+pub(crate) use worker_room::{judge_worker_room, note_worker_room_change, note_worker_room_seen};
 
 pub(crate) use github_pr::{github_pr_file_diff, github_set_reviewers};
 
@@ -176,8 +176,8 @@ pub(crate) use terminal::{
     agent_terms, answer_approval, answer_ask, close_lane, close_term, end_all_terminal_sessions,
     end_terminal_session, focus_lane, key_input, lane_fold, lane_lines, lane_scroll,
     launch_agent_tab, mirror_ready, mouse_input, open_mirror_term, open_term_tab, open_terminal,
-    pane_log, paste_input, resize_lane, send_prompt, subagent_log, term_focus, term_fold,
-    term_has_running_process, term_key, term_lines, term_mouse, term_paste, term_resize,
+    pane_image, pane_log, paste_input, resize_lane, send_prompt, subagent_log, term_focus,
+    term_fold, term_has_running_process, term_key, term_lines, term_mouse, term_paste, term_resize,
     term_scroll, term_search, term_text, term_view_to_line, terminal_sessions, text_input,
 };
 

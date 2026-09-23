@@ -571,7 +571,8 @@ fn preboot_candidate(local_data_root: &Path, now_ms: i64) -> Option<String> {
 }
 
 fn forget_managed_process(process: &Arc<ManagedEmulatorProcess>) {
-    let token = process.record().token;
+    let record = process.record();
+    let token = record.token;
     let removed = {
         let mut devices = held(managed_devices());
         if devices
@@ -586,6 +587,24 @@ fn forget_managed_process(process: &Arc<ManagedEmulatorProcess>) {
     };
     if removed {
         let _ = write_managed_records(&process.local_data_root);
+        // Its process is gone — put away by one of this window's roads, or
+        // gone on its own: whoever it was lent to, it is nobody's loan now.
+        super::loan_put_down(EmulatorPlatform::Android, &record.avd);
+    }
+}
+
+/// Put a lent AVD away (t-6336) — the saved exit every other road takes
+/// ([`ManagedEmulatorProcess::stop`]). An AVD this window is not running is
+/// already away.
+pub(super) fn put_away(local_data_root: &Path, avd: &str) -> Result<(), String> {
+    let Some(process) = managed_process_for_avd(local_data_root, avd) else {
+        return Ok(());
+    };
+    if process.stop() {
+        forget_managed_process(&process);
+        Ok(())
+    } else {
+        Err(format!("the emulator process for {avd} would not stop"))
     }
 }
 
@@ -1293,6 +1312,9 @@ fn android_running(adb: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// What a read of the AVD behind a serial answers when it names none.
+const AVD_UNAVAILABLE: &str = "Android AVD identity is unavailable";
+
 fn android_avd_name(adb: &Path, serial: &str) -> Result<String, String> {
     let bytes = accessibility::run(
         adb,
@@ -1304,7 +1326,7 @@ fn android_avd_name(adb: &Path, serial: &str) -> Result<String, String> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && *line != "OK");
-    let name = names.next().ok_or("Android AVD identity is unavailable")?;
+    let name = names.next().ok_or(AVD_UNAVAILABLE)?;
     if names.next().is_some() {
         return Err("Android AVD identity is ambiguous".into());
     }
@@ -1993,12 +2015,17 @@ fn pump_android_frames(
     let _ = std::fs::remove_file(frame);
 }
 
+/// `borrower` is the terminal whose agent asked for this AVD through the
+/// emulator door (the window passes it only for an agent's `open`); none is
+/// the person. An AVD this start launches for a borrower is lent to it
+/// (t-6336) and goes down when that pane's work ends.
 #[tauri::command]
 pub(crate) async fn start_android_stream(
     app: AppHandle,
     webview: tauri::Webview,
     avd: Option<String>,
     on_frame: BinaryChannel,
+    borrower: Option<u32>,
 ) -> Result<EmulatorStream, String> {
     crate::from_the_main_webview(&webview)?;
     // The same door as iOS's, warmed for the same reason (t-5535): a walk on
@@ -2008,14 +2035,18 @@ pub(crate) async fn start_android_stream(
         let sdk = android_sdk().map_err(|search| search.to_string())?;
         reconcile_managed_devices_now(app.state::<crate::AppState>().local_data_root());
         let chosen = selected_android_device(&list_android_devices()?, avd.as_deref())?;
+        let local_data_root = app
+            .state::<crate::AppState>()
+            .local_data_root()
+            .to_path_buf();
         // Before the claim, because a pane handed an existing session returns
         // from inside it — and a device somebody just opened a second pane on
-        // is exactly the one the next window should put up (D4).
-        note_last_used_device(
-            app.state::<crate::AppState>().local_data_root(),
-            &chosen.avd,
-            crate::now_epoch_ms(),
-        );
+        // is exactly the one the next window should put up (D4). The
+        // person's device, never an agent's: an audit's AVD written down
+        // here was put up by every window for two days after it (t-6336).
+        if borrower.is_none() {
+            note_last_used_device(&local_data_root, &chosen.avd, crate::now_epoch_ms());
+        }
         let lease = match registry().claim(SessionKey::frames(
             EmulatorPlatform::Android,
             chosen.avd.clone(),
@@ -2024,11 +2055,32 @@ pub(crate) async fn start_android_stream(
                 // Same rule as iOS: the reused session adopts the newest
                 // caller's door, or it posts into one that is already closed.
                 registry().hand_frames_to(&stream.stream, on_frame);
+                // Up already: another pane joins a loan, or the person keeps it.
+                super::note_start(
+                    &app,
+                    EmulatorPlatform::Android,
+                    &chosen.avd,
+                    &chosen.avd,
+                    borrower,
+                    false,
+                );
                 return Ok(stream);
             }
             StartClaim::Acquired(lease) => lease,
         };
+        // Whether this start is what puts the AVD up: nothing running it, and
+        // no launch of this window's (a preboot) already on its way.
+        let launched_here = chosen.serial.is_none()
+            && managed_process_for_avd(&local_data_root, &chosen.avd).is_none();
         let serial = boot_android_device(&app, &sdk, &chosen)?;
+        super::note_start(
+            &app,
+            EmulatorPlatform::Android,
+            &chosen.avd,
+            &chosen.avd,
+            borrower,
+            launched_here,
+        );
         let stream_id = crate::hooks::random_token().ok_or("스트림 id를 만들 수 없습니다")?;
         let descriptor = EmulatorStream {
             stream: stream_id.clone(),
@@ -2475,16 +2527,81 @@ fn tap_at(sdk: &AndroidSdk, serial: &str, x: f64, y: f64, size: (u32, u32)) -> R
     Ok(())
 }
 
+/// What a tree is refused with when the display read beside its dump is
+/// not the one it was dumped in, or changed across the dump.
+const DISPLAY_CHANGED: &str = "Android display changed while reading the tree; run marks again";
+
+/// What a read answers when the thread that took it stopped.
+const READ_STOPPED: &str = "Android device read stopped";
+
+/// The display, and the AVD when `named`, read side by side.
+fn read_side_by_side(
+    sdk: &AndroidSdk,
+    serial: &str,
+    named: bool,
+) -> (
+    Result<display::Geometry, String>,
+    Option<Result<String, String>>,
+) {
+    std::thread::scope(|scope| {
+        let avd = named.then(|| scope.spawn(|| android_avd_name(&sdk.adb, serial)));
+        let display = read_android_display(sdk, serial);
+        (display, avd.map(|avd| joined(avd.join())))
+    })
+}
+
+/// A read a scoped thread answered; one that panicked answers nothing.
+fn joined<T>(answer: std::thread::Result<Result<T, String>>) -> Result<T, String> {
+    answer.unwrap_or_else(|_| Err(READ_STOPPED.into()))
+}
+
+/// A dump, the display it was taken in and the AVD behind it.
+///
+/// The display, and for a look the AVD, are read beside the dump (t-6385):
+/// `dumpsys input` and `emu avd name` take ~20 ms of a dump's ~1.9 s, and a
+/// look used to wait for a display read before its dump and another and the
+/// AVD after it. The dump names the rotation it was taken in (`<hierarchy
+/// rotation>`, the input viewport's own on all four rotations measured): a
+/// look numbers its tree in the display read beside it when that display is
+/// in the dump's rotation, and refuses the tree otherwise. Where the dump
+/// names no rotation, and always before a press's tap, the display is read
+/// again after the dump — a press's AVD beside it — and the tree stands only
+/// if nothing changed across the dump, as every read once did. Nothing is
+/// kept past the read that asked: the display and the AVD stay live reads.
 fn marks_snapshot(
     sdk: &AndroidSdk,
     serial: &str,
-) -> Result<(super::marks::Snapshot, (u32, u32)), String> {
-    let display = read_android_display(sdk, serial)?;
-    let tree = serde_json::to_value(accessibility::snapshot(&sdk.adb, serial)?)
-        .map_err(|error| error.to_string())?;
-    if read_android_display(sdk, serial)? != display {
-        return Err("Android display changed while reading the tree; run marks again".into());
-    }
+    pressing: bool,
+) -> Result<(super::marks::Snapshot, (u32, u32), String), String> {
+    let (dumped, (beside, avd)) = std::thread::scope(|scope| {
+        let beside = scope.spawn(|| read_side_by_side(sdk, serial, !pressing));
+        let dumped = accessibility::snapshot(&sdk.adb, serial);
+        let beside = beside
+            .join()
+            .unwrap_or_else(|_| (Err(READ_STOPPED.into()), None));
+        (dumped, beside)
+    });
+    let (dumped, beside) = (dumped?, beside?);
+    let (display, identity) = match (avd, dumped.rotation()) {
+        (Some(avd), Some(rotation)) => {
+            if rotation != beside.rotation() {
+                return Err(DISPLAY_CHANGED.into());
+            }
+            (beside, avd?)
+        }
+        (avd, rotation) => {
+            let (after, avd_after) = read_side_by_side(sdk, serial, avd.is_none());
+            let after = after?;
+            if after != beside || rotation.is_some_and(|rotation| rotation != after.rotation()) {
+                return Err(DISPLAY_CHANGED.into());
+            }
+            let avd = avd
+                .or(avd_after)
+                .unwrap_or_else(|| Err(AVD_UNAVAILABLE.into()));
+            (after, avd?)
+        }
+    };
+    let tree = serde_json::to_value(dumped).map_err(|error| error.to_string())?;
     let size = display.size;
     let screen = zerocode_core::computer_use_protocol::render::Rect::new(
         0.0,
@@ -2497,7 +2614,7 @@ fn marks_snapshot(
         &tree,
         screen,
     )
-    .map(|snapshot| (snapshot, size))
+    .map(|snapshot| (snapshot, size, identity))
 }
 
 pub(super) async fn marks_snapshot_direct(
@@ -2506,8 +2623,8 @@ pub(super) async fn marks_snapshot_direct(
 ) -> Result<super::marks::Snapshot, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let (sdk, _control) = android_control(&serial)?;
-        let (snapshot, _) = marks_snapshot(&sdk, &serial)?;
-        if android_avd_name(&sdk.adb, &serial)? != identity {
+        let (snapshot, _, read_from) = marks_snapshot(&sdk, &serial, false)?;
+        if read_from != identity {
             return Err("Android device changed while reading the tree; run marks again".into());
         }
         Ok(snapshot)
@@ -2519,17 +2636,24 @@ pub(super) async fn marks_snapshot_direct(
 pub(super) async fn click_mark_direct(
     serial: String,
     request: super::marks::PinnedTap,
-) -> Result<(), zerocode_core::computer_use_protocol::ProviderError> {
-    use super::marks::backend_error;
+) -> Result<super::marks::Pressed, zerocode_core::computer_use_protocol::ProviderError> {
+    use super::marks::{Pressed, Proof, backend_error};
     tauri::async_runtime::spawn_blocking(move || {
         let (sdk, control) = android_control(&serial).map_err(backend_error)?;
         let input = control.input().map_err(backend_error)?;
-        let (snapshot, size) = marks_snapshot(&sdk, &serial).map_err(backend_error)?;
-        let identity = android_avd_name(&sdk.adb, &serial).map_err(backend_error)?;
+        let (snapshot, size, identity) =
+            marks_snapshot(&sdk, &serial, true).map_err(backend_error)?;
         request.on_device(&identity, || {
-            request.perform_in(&input, &snapshot.faces, snapshot.screen, |x, y| {
-                tap_at(&sdk, &serial, x, y, size).map_err(backend_error)
-            })
+            request
+                .perform_in(&input, &snapshot.faces, snapshot.screen, |x, y| {
+                    tap_at(&sdk, &serial, x, y, size).map_err(backend_error)
+                })
+                // Android's press does not wait for its screen yet: a walk
+                // reads that from the answer and checks the old way.
+                .map(|()| Pressed {
+                    proof: Proof::Tree,
+                    settled: None,
+                })
         })
     })
     .await
@@ -2904,6 +3028,46 @@ mod tests {
             }
         }
         assert!(held(&process.child).is_none());
+    }
+
+    /// A lent AVD is put away by the saved-exit road every other road takes,
+    /// and only the one lent (t-6336): the stand-in for its emulator stops and
+    /// its row is forgotten, while a second AVD this window runs for the
+    /// person keeps running — and an AVD this window is not running is
+    /// already away.
+    #[cfg(unix)]
+    #[test]
+    fn a_lent_avd_is_put_away_and_the_persons_keeps_running() {
+        let root = tempfile::tempdir().expect("local data root");
+        let running = |avd: &str, token: char| {
+            let child = crate::proc::quiet_command("sleep")
+                .arg("30")
+                .spawn()
+                .expect("a stand-in emulator");
+            let process = ManagedEmulatorProcess::new_launch(
+                root.path().to_path_buf(),
+                avd.to_string(),
+                token.to_string().repeat(48),
+            );
+            let pid = child.id();
+            {
+                let mut record = held(&process.record);
+                record.pid = Some(pid);
+                record.started = crate::resource_usage::process_start_identity(pid).ok();
+            }
+            *held(&process.child) = Some(child);
+            process.launching.store(false, Ordering::Release);
+            held(managed_devices()).insert(process.record().token, process.clone());
+            process
+        };
+        let lent = running("lent_avd", 'e');
+        let persons = running("persons_avd", 'f');
+        assert_eq!(put_away(root.path(), "lent_avd"), Ok(()));
+        assert!(!lent.is_running() && managed_process_for_avd(root.path(), "lent_avd").is_none());
+        assert!(persons.is_running());
+        assert_eq!(put_away(root.path(), "never_run"), Ok(()));
+        assert!(persons.stop());
+        forget_managed_process(&persons);
     }
 
     fn managed_record(token: char) -> ManagedEmulatorRecord {

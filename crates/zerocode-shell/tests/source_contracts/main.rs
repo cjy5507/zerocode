@@ -5817,13 +5817,16 @@ mod tests {
              single view, the combined view and the conversation's inline diff \
              lose them together:\n{lines}\n{row}"
         );
-        // The conversation's inline diff draws that same row, and the
-        // approval card draws the edit it asks about with it.
+        // The conversation's inline diff draws that same row — the rows its
+        // clip shows first, the rest when its door opens them (t-6323) —
+        // and the approval card draws the edit it asks about with it.
         let inline = block_after(window, "function toolDiffNode(edits, spoken = \"\") {");
+        let cut = block_after(window, "function diffRowsNode(edit, words) {");
         assert!(
             inline.contains("const words = diffWordSpans(edit.lines);")
-                && inline.contains("diffLineNode(line, words.get(index))"),
-            "the inline diff under an edit row grew its own row painter:\n{inline}"
+                && inline.contains("diffRowsNode(edit, words)")
+                && cut.contains("diffLineNode(edit.lines[at], words.get(at))"),
+            "the inline diff under an edit row grew its own row painter:\n{inline}\n{cut}"
         );
         let approving = block_after(window, "function approvalPanelNode(card, draft) {");
         assert!(
@@ -7969,7 +7972,7 @@ mod tests {
             "a bare click on a terminal URL lost its action popover"
         );
         assert!(
-            block_after(window, "function mdLink(label, href) {")
+            block_after(window, "function mdLink(label, href, line = undefined) {")
                 .contains("routeHttpLink(href, event)"),
             "Markdown URLs bypass Browser Link Routing"
         );
@@ -8859,6 +8862,91 @@ mod tests {
         );
     }
 
+    /// A device the emulator door booted for an agent's pane goes down when
+    /// that pane's work ends (t-6336), and every way it ends reaches the one
+    /// return: the pane closing (the door every terminal ending passes), its
+    /// worker's `worker_done` once the ledger took it, and its agent's
+    /// `SessionEnd`. The door's own verbs move a loan's last use, and the
+    /// status bar can ask the book when the window opens.
+    #[test]
+    fn every_end_of_a_borrowers_work_returns_what_it_borrowed() {
+        let shell = shipped_backend();
+        let closing = block_after(shell, "fn forget_term_state(");
+        assert!(
+            closing.contains(
+                "crate::emulator::borrower_gone(term, crate::emulator::LoanEnd::PaneClosed)"
+            ),
+            "a pane that closes keeps the devices it borrowed:\n{closing}"
+        );
+        let team = block_after(shell, "fn answer_team_command(");
+        assert!(
+            team.contains("is_worker_done(&request.argv)")
+                && team.contains(
+                    "crate::emulator::borrower_gone(term, crate::emulator::LoanEnd::WorkerDone)"
+                ),
+            "a worker that reports done keeps the devices it borrowed:\n{team}"
+        );
+        let hooks = block_after(shell, "async fn hook_loop(");
+        assert!(
+            hooks.contains("hooks::session_end_of(&envelope")
+                && hooks.contains(
+                    "crate::emulator::borrower_gone(term, crate::emulator::LoanEnd::SessionEnded)"
+                ),
+            "an agent whose session ends keeps the devices it borrowed"
+        );
+        let door = block_after(shell, "async fn answer_emulator_command(");
+        assert!(
+            door.contains("crate::emulator::used_through_the_door("),
+            "the door's verbs no longer move a loan's last use:\n{door}"
+        );
+        assert!(
+            shell.contains("emulator_loans,"),
+            "the status bar cannot ask the loan book"
+        );
+        let book = include_str!("../../src/emulator/mod.rs");
+        assert!(
+            block_after(book, "pub(crate) fn emulator_loans(")
+                .contains("from_the_main_webview(&webview)?"),
+            "the loan line's command stopped asking who is calling"
+        );
+    }
+
+    /// The window's half of a loan (t-6336): only an agent's open names the
+    /// pane it borrows for, a returned device takes that pane's mirrors off
+    /// the strip, and the status bar counts what is lent — in every catalog.
+    #[test]
+    fn an_agents_borrowed_devices_leave_the_strip_and_the_status_bar_counts_them() {
+        let window = window_source();
+        let opening = block_after(window, "async function openEmulatorTab(");
+        assert!(
+            opening.contains("borrower: caller === null ? null : from"),
+            "an agent's open no longer names the pane it borrows for:\n{opening}"
+        );
+        let switching = block_after(window, "async function switchEmulatorDevice(");
+        assert!(
+            switching.matches("...lent,").count() == 2,
+            "a stream start stopped carrying its borrower on one platform:\n{switching}"
+        );
+        let returned = block_after(window, r#"listen("emulator:loan-returned""#);
+        assert!(
+            returned.contains("one.borrower != null") && returned.contains("closeTab(tab.id)"),
+            "a returned device leaves its borrower's mirror standing:\n{returned}"
+        );
+        let markup = include_str!("../../../../ui/index.html");
+        assert!(
+            markup.contains(r#"<span class="sb-item" id="sb-loans" hidden>"#),
+            "the status bar lost its loan line, or shows it with nothing lent"
+        );
+        let i18n = include_str!("../../../../ui/shell-i18n.js");
+        for key in ["emulator.loans", "emulator.loansNow"] {
+            assert_eq!(
+                i18n.matches(&format!("\"{key}\":")).count(),
+                4,
+                "`{key}` is missing from one of the en/ja/zh/es catalogs"
+            );
+        }
+    }
+
     #[test]
     fn computer_use_routes_pages_and_devices_to_zerocodes_owned_surfaces() {
         let shell = shipped_backend();
@@ -8896,6 +8984,9 @@ mod tests {
             "mobile_emulators_direct()",
             "android_emulators_direct()",
             r#"emit_to("main", "emulator:agent-open""#,
+            // Seated in the asking pane's checkout (t-6379): the payload
+            // names the terminal the door's pane key reads as.
+            "AgentOpen::asked(platform, device, pane)",
             "ios_accessibility_tree_direct",
             "android_accessibility_tree_direct",
             "ios_tap_direct",
@@ -8956,8 +9047,29 @@ mod tests {
         let listener = block_after(window, r#"listen("emulator:agent-open""#);
         assert!(
             listener.contains(r#"platform !== "ios" && platform !== "android""#)
-                && listener.contains("openEmulatorTab(platform, device)"),
+                && listener.contains("openEmulatorTab(platform, device, { from, agent: true })"),
             "the window stopped validating and opening the built-in emulator request:\n{listener}"
+        );
+        // Seated in the asking pane's checkout (t-6379): an agent's mirror
+        // never turns the person's head from another checkout, and one whose
+        // pane is unknown says where it went, in every catalog.
+        let opening = block_after(window, "async function openEmulatorTab(");
+        for owned in [
+            "tabOfTerm(from)",
+            "standBeside(caller.pane)",
+            "{ focus: !away }",
+            "\"emulator.agentOpenUnseated\"",
+        ] {
+            assert!(
+                opening.contains(owned),
+                "an agent's mirror lost {owned}:\n{opening}"
+            );
+        }
+        let i18n = include_str!("../../../../ui/shell-i18n.js");
+        assert_eq!(
+            i18n.matches("\"emulator.agentOpenUnseated\":").count(),
+            4,
+            "`emulator.agentOpenUnseated` is missing from one of the en/ja/zh/es catalogs"
         );
         assert!(
             skill.contains("Website or web app: use `zerocode-browser")
@@ -10209,9 +10321,12 @@ mod tests {
         // the same period; the backend's table decides which knock is a check.
         // Thirteen since t-5807: the Jev dashboard's slow beat (`jevPoll`),
         // one zo process every thirty seconds while the tab is on stage.
+        // Fourteen since t-6336: the loan line's minute (`emulatorLoansTick`),
+        // an in-memory read that runs only while an agent's pane has a device
+        // lent.
         assert_eq!(
             window.matches(" = idlePoller({").count(),
-            13,
+            14,
             "a background beat was added or removed without this pin moving with it"
         );
         let poller = block_after(window, "function idlePoller(");
@@ -12875,7 +12990,7 @@ mod tests {
         // A link that leaves the project is drawn as text. An `<a href>` in a
         // webview navigates the window away from the application, which is
         // not a thing a viewer should be able to do to you.
-        let link = block_after(window, "function mdLink(label, href) {");
+        let link = block_after(window, "function mdLink(label, href, line = undefined) {");
         assert!(
             !link.contains("\"a\""),
             "a markdown link is an anchor, which would navigate the app \
@@ -16088,12 +16203,14 @@ mod tests {
             "a nested run is registered before the envelope is known to speak \
              for the pane:\n{looping}"
         );
-        // THREE roads ask, through one door: the tool call, the helper
+        // FOUR roads ask, through one door: the tool call, the helper
         // lifecycle (which also ends in a `continue`, so an ungated child put a
-        // row on the lead's card and left), and the report itself.
+        // row on the lead's card and left), the session's end (a nested run's
+        // `SessionEnd` must not return what the pane borrowed, t-6336), and
+        // the report itself.
         assert_eq!(
             looping.matches("speaks_for_its_pane(").count(),
-            3,
+            4,
             "a road into the pane's facts stopped asking whose word it \
              is:\n{looping}"
         );
@@ -30750,13 +30867,15 @@ mod tests {
         let asking = block_after(window, "async function roomForWorker(");
         assert!(
             asking.contains("judged?.placed")
-                && asking.contains("placedWorkers.set(term, { worker: seat.worker })"),
-            "the surface no longer remembers which placed worker a term is:\n{asking}"
+                && asking.contains(
+                    "placedWorkers.set(term, { worker: seat.worker, seenAfterMs: judged.seenAfterMs,"
+                ),
+            "the surface no longer remembers which placed worker a term is, or the dwell the door named:\n{asking}"
         );
         // One door, and it forgets the worker on the first report.
         let door = block_after(window, "function noteWorkerRoomChange(term, room) {");
         assert!(
-            door.contains("placedWorkers.delete(term);")
+            door.contains("forgetPlacedWorker(term);")
                 && door.contains(
                     "invoke(\"note_worker_room_change\", { worker: placed.worker, room })"
                 ),
@@ -30795,9 +30914,15 @@ mod tests {
             );
         }
         // And a pane that ended is forgotten, so its worker id cannot be
-        // reported for a pane that no longer exists.
+        // reported for a pane that no longer exists — through the one helper
+        // that also stops the pane's sight clock.
         assert_eq!(
             window.matches("placedWorkers.delete(term);").count(),
+            1,
+            "the placed book is emptied in one place"
+        );
+        assert_eq!(
+            window.matches("forgetPlacedWorker(term);").count(),
             2,
             "the placed book is emptied on the report and on the pane's end, nowhere else"
         );
@@ -30812,16 +30937,63 @@ mod tests {
         );
         let graded = block_after(backend, "pub(crate) fn room_changed(");
         assert!(
-            graded.contains("PLACEMENT_OPTIONS.contains(&room)")
+            graded.contains("Placement::of(room)")
                 && graded.contains("PLACEMENT_LABEL_WINDOW_MS")
+                && graded.contains("worker_placement::stood_in(placed.chosen, placed.applied)")
                 && graded.contains("crate::systemone::record_rows(&PLACEMENT,"),
             "a move is graded outside the table's rooms, the seat's window or the seat's ledger road:\n{graded}"
         );
-        let mark = block_after(backend, "fn label_row(worker: &str, placed: &Placed,");
+        let mark = block_after(backend, "fn label_row(");
         assert!(
-            mark.contains("label[AGREED.canonical] = json!(followed == placed.chosen);")
+            mark.contains("worker_placement::mark(placed.chosen, ended_in, seen)")
+                && mark.contains("NOT_COMPARED.canonical")
                 && mark.contains("LABEL.canonical: worker,"),
             "the placement label spells its mark or its name itself:\n{mark}"
+        );
+    }
+
+    /// A pane nobody moved is graded only if a person was in front of it
+    /// (t-6342): the surface reports a placed worker's pane once it has stood
+    /// on the stage, with the window in front, for the dwell the door named —
+    /// asked where the stage declares what it shows and where the window
+    /// gains or loses focus, and through one door.
+    #[test]
+    fn a_placed_workers_sight_is_reported_once_from_the_stage_and_the_focus() {
+        let window = window_source();
+        let backend = shipped_backend();
+        let seen = block_after(window, "function notePlacedWorkersSeen() {");
+        assert!(
+            seen.contains("document.hasFocus()")
+                && seen.contains("readingTerms()")
+                && seen.contains("placed.seenAfterMs")
+                && seen.contains("placed.seen = true;")
+                && seen.contains("invoke(\"note_worker_room_seen\", { worker: placed.worker })"),
+            "a placed worker's sight is reported without the stage, the focus or the dwell:\n{seen}"
+        );
+        assert_eq!(
+            window.matches("invoke(\"note_worker_room_seen\"").count(),
+            1,
+            "a sight is reported through one door"
+        );
+        let declared = block_after(window, "function syncWatchedTerms() {");
+        assert!(
+            declared.contains("notePlacedWorkersSeen();"),
+            "the stage's declaration no longer asks whether a placed pane is on it:\n{declared}"
+        );
+        assert!(
+            window.contains("window.addEventListener(\"focus\", notePlacedWorkersSeen);")
+                && window.contains("window.addEventListener(\"blur\", notePlacedWorkersSeen);"),
+            "the window's focus no longer moves a placed pane's sight clock"
+        );
+        let door = block_after(backend, "pub(crate) fn note_worker_room_seen(");
+        assert!(
+            door.contains("room_seen(rooms(),") && door.contains("crate::now_epoch_ms()"),
+            "the sight door no longer marks the one book:\n{door}"
+        );
+        let marked = block_after(backend, "pub(crate) fn room_seen(");
+        assert!(
+            marked.contains("PLACEMENT_LABEL_WINDOW_MS") && marked.contains("placed.seen = true;"),
+            "a sight is taken outside the label's window:\n{marked}"
         );
     }
 
@@ -34131,11 +34303,38 @@ mod tests {
             reading.contains("if !is_subagent_id(&id) {"),
             "the helper id reaches a file name unchecked:\n{reading}"
         );
+        // The helper's file is found from the pane, in one place that the
+        // page's two doors to it share — its conversation and its images
+        // (t-6323 A8).
+        let finding = block_after(shipped, "fn helper_transcript_path(");
         assert!(
             !reading.contains("path: String")
-                && reading.contains("session.transcript_path.clone()"),
+                && reading.contains("helper_transcript_path(&state, term, &id)")
+                && finding.contains("session.transcript_path.clone()"),
             "the window names the file to read, instead of the pane whose \
-             agent reported one:\n{reading}"
+             agent reported one:\n{reading}\n{finding}"
+        );
+        let image = block_after(shipped, "fn pane_image(");
+        assert!(
+            !image.contains("path: String")
+                && image.contains("if !is_subagent_id(&id) {")
+                && image.contains("helper_transcript_path(&state, term, &id)")
+                && image.contains("session.transcript_path.clone()")
+                && image.contains("payload_at(&path, &at)"),
+            "the image door names a file, or reads a helper's id unchecked:\n{image}"
+        );
+        // A session's page asks by session and place, and a place in the
+        // pane's transcript is read through the same check.
+        let wire_door = block_after(include_str!("../../src/cmd/wire.rs"), "fn wire_image(");
+        assert!(
+            !wire_door.contains("path: String")
+                && wire_door.contains("crate::cmd::terminal::payload_at(&path, &at)"),
+            "the session's image door names a file, or reads a place unchecked:\n{wire_door}"
+        );
+        let place = block_after(shipped, "fn payload_at(");
+        assert!(
+            place.contains("zerocode_core::transcript::is_payload(&payload)"),
+            "a place hands back what is not a payload:\n{place}"
         );
         // Both doors read down one road: the helper's file and the pane's own
         // transcript (`pane_log`, the terminal's conversation view) go through
@@ -34154,11 +34353,17 @@ mod tests {
         let reading = block_after(shipped, "fn transcript_log_at(");
         // Core owns complete byte records and the bounded oversized-line
         // escape. The shell must decode and advance from that same answer.
+        // The payloads step aside before the words are read, leaving their
+        // place in the file (t-6323 A8), and a line past the read is read
+        // whole instead of dropped.
         assert!(
             reading.contains("zerocode_core::transcript::complete_transcript_chunk(")
-                && reading.contains("String::from_utf8_lossy(chunk.bytes)")
-                && reading.contains("u64::try_from(chunk.consumed)"),
-            "a half-written line is handed over as though it were a turn:\n{reading}"
+                && reading.contains("zerocode_core::transcript::elide_payloads(chunk.bytes, base)")
+                && reading.contains("String::from_utf8_lossy(&bytes)")
+                && reading.contains("u64::try_from(chunk.consumed)")
+                && reading
+                    .contains("long_line_log(&mut file, from, starts_mid_line, size, folded)"),
+            "a half-written line is handed over as though it were a turn, or a payload is read as words:\n{reading}"
         );
         let chunking = block_after(
             include_str!("../../../zerocode-core/src/transcript.rs"),

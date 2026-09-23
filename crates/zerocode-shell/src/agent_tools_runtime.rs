@@ -1972,6 +1972,15 @@ pub(super) fn answer_team_command(
             &request.argv,
             now_epoch_ms(),
         );
+        // A worker that reported done has no more use for what it borrowed
+        // (t-6336): the devices the emulator door booted for its pane go
+        // down now, not when somebody notices the memory they hold.
+        if answer.exit_code == 0
+            && is_worker_done(&request.argv)
+            && let Some(term) = term
+        {
+            crate::emulator::borrower_gone(term, crate::emulator::LoanEnd::WorkerDone);
+        }
         if answer.exit_code == 0
             && verb == Some("run-use")
             && let Some(term) = term
@@ -2236,6 +2245,7 @@ pub(super) async fn computer_loop(
             }
             let evidence = request.evidence;
             let cwd = request.cwd;
+            let pane = request.pane;
             let reply = request.answer;
             // A walk — a batch, a recipe — is the loop's to run: each step
             // goes down the lone command's road, and the loop knows when its
@@ -2309,9 +2319,13 @@ pub(super) async fn computer_loop(
                                         logged,
                                     ))
                                 }
+                                // A walk is asked through the Computer Use
+                                // door, which names no pane: like its browser
+                                // steps, its `open` has no checkout to go to.
                                 zerocode_core::computer_recipe::RecipeTool::Emulator => {
                                     tauri::async_runtime::block_on(emulator_step(
                                         &app,
+                                        None,
                                         dir.as_deref(),
                                         cwd.as_deref().map(Path::new),
                                         step,
@@ -2419,6 +2433,7 @@ pub(super) async fn computer_loop(
                 let dir = run_evidence::fenced_dir(&local_data_root, evidence.as_deref());
                 emulator_step(
                     &steering,
+                    pane.as_deref(),
                     dir.as_deref(),
                     cwd.as_deref().map(Path::new),
                     &argv[1..],
@@ -2626,9 +2641,11 @@ pub(super) async fn browser_step(
 /// the door (no `emulator`); `logged` is what the log keeps — a recipe's own
 /// words, so a value the walk was given never reaches the log. `cwd` is where
 /// the shell that asked stands, when its door said so: a relative `--out`
-/// is taken from there.
+/// is taken from there. `pane` is the pane key that door named, as on
+/// [`browser_step`]: an `open` is seated in that pane's checkout.
 pub(super) async fn emulator_step(
     app: &AppHandle,
+    pane: Option<&str>,
     dir: Option<&Path>,
     cwd: Option<&Path>,
     argv: &[String],
@@ -2636,7 +2653,7 @@ pub(super) async fn emulator_step(
 ) -> zerocode_hookd::TeamAnswer {
     let observation = run_evidence::observation();
     let began = std::time::Instant::now();
-    let answer = answer_emulator_command(app, argv, cwd).await;
+    let answer = answer_emulator_command(app, argv, cwd, pane).await;
     if let Some(dir) = dir {
         evidence_runtime::leave_emulator_evidence(
             dir,
@@ -2957,11 +2974,15 @@ pub(super) fn run_recipe(
             // and a walk's workspace is the folder it was asked from; asked
             // from nowhere known, the door refuses and the row says so
             // (docs/design/jev-settings-20260917.md §3).
+            // A recipe walked again is a repeated run by what it is: its
+            // stopped step asks the questions a walk of it asked before
+            // (t-6385).
             let mut judge = computer_use::errand::live::LiveJudge::new(
                 &crate::api_routers::Keychain::of_this_machine(),
                 workspace,
                 seat,
-            );
+            )
+            .in_run(zerocode_core::jev::Run::Repeated);
             // No key, nothing to ask — and so no reason to measure the page or
             // number its controls first.
             if let Some(read) =
@@ -3190,7 +3211,8 @@ pub(super) fn run_goal(
         &crate::api_routers::Keychain::of_this_machine(),
         workspace,
         seat,
-    );
+    )
+    .in_run(zerocode_core::computer_use::walk_run(&command.params));
     if mode == errand::Mode::Off || !judge.armed() {
         // Off is today's product exactly: no look is taken, nothing is sent,
         // and the answer says plainly that nothing walked.
@@ -3215,12 +3237,13 @@ pub(super) fn run_goal(
     let snapshots: Box<dyn desk::Snapshots> = Box::new(AvdSnapshots {
         device: word("device").unwrap_or_default(),
     });
-    let mut world = desk::GoalWorld::new(&mut road, aim, page, word("until"), deadline_ms, 0)
-        .with_snapshots(snapshots);
     let options = errand::Options {
         overlap: zerocode_core::computer_use::walk_overlaps(&command.params),
         rescue: rescue.is_some(),
     };
+    let mut world = desk::GoalWorld::new(&mut road, aim, page, word("until"), deadline_ms, 0)
+        .with_snapshots(snapshots)
+        .previewing(options.overlap);
     let walked = errand::run_with(
         mode,
         acting,
@@ -3444,6 +3467,7 @@ pub(super) async fn answer_emulator_command(
     app: &AppHandle,
     argv: &[String],
     cwd: Option<&Path>,
+    pane: Option<&str>,
 ) -> zerocode_hookd::TeamAnswer {
     use zerocode_core::computer_use::{
         EmulatorMethod, EmulatorPlatform, emulator_usage, parse_emulator_command,
@@ -3462,6 +3486,9 @@ pub(super) async fn answer_emulator_command(
     };
     let platform = command.platform;
     let device = command.device.clone();
+    if let (Some(platform), Some(device)) = (platform, device.as_deref()) {
+        crate::emulator::used_through_the_door(platform, device);
+    }
     let result: Result<serde_json::Value, String> = match command.method {
         EmulatorMethod::Marks
         | EmulatorMethod::Click
@@ -3483,10 +3510,9 @@ pub(super) async fn answer_emulator_command(
         }
         EmulatorMethod::Open => {
             let platform = platform.expect("parser requires a platform");
-            let payload = json!({
-                "platform": platform.as_str(),
-                "device": device,
-            });
+            // Seated where it was asked for, not where the person is looking
+            // (t-6379), the way the browser door's `open` is.
+            let payload = crate::emulator::AgentOpen::asked(platform, device, pane);
             app.emit_to("main", "emulator:agent-open", payload)
                 .map(|()| {
                     json!({
@@ -3587,7 +3613,7 @@ pub(super) async fn answer_emulator_command(
     )
 }
 
-async fn answer_emulator_observation(
+pub(super) async fn answer_emulator_observation(
     command: zerocode_core::computer_use::EmulatorCommand,
 ) -> zerocode_hookd::TeamAnswer {
     use crate::emulator::marks;
@@ -3613,7 +3639,9 @@ async fn answer_emulator_observation(
             },
         };
         match command.method {
-            EmulatorMethod::Marks => marks::observe(platform, device).await,
+            EmulatorMethod::Marks => {
+                marks::observe(platform, device, command.text.as_deref()).await
+            }
             EmulatorMethod::Find | EmulatorMethod::Foreground => {
                 crate::emulator::checks::observe(
                     platform,
@@ -3634,6 +3662,8 @@ async fn answer_emulator_observation(
                     device,
                     command.mark.unwrap_or_default(),
                     command.look.as_deref().unwrap_or_default(),
+                    command.text.as_deref(),
+                    command.preview,
                 )
                 .await
             }

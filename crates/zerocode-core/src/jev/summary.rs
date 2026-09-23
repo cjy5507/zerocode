@@ -139,6 +139,29 @@ pub const LABEL: LedgerKey = LedgerKey {
     canonical: "label",
     also: &[],
 };
+/// Why a row that grades a request carries no [`AGREED`] mark, as a word —
+/// the side of the comparison that had nothing to say (t-6342).
+///
+/// A label rule that finds nothing to compare writes this in place of a mark
+/// it has no right to: a silence whose answer named no cause, a recall turn
+/// that touched no note, a summons whose agent was never offered. The judge
+/// reads only [`AGREED`]; this is for the reader who asks why a seat has so
+/// few marks, and it is how a label that could not say no stops passing for
+/// one that said yes.
+pub const NOT_COMPARED: LedgerKey = LedgerKey {
+    canonical: "notCompared",
+    also: &[],
+};
+/// Whether the seat's cheapest baseline ([`crate::jev::Baseline`]) would have
+/// been right on the fact a label row grades (t-6342) — written beside
+/// [`AGREED`] by the writer that knows both, or alone on a row whose act was
+/// the baseline's own (an effort move the rule made and carried). The judge
+/// holds the seat's lower bound over its marks to this mark's share
+/// ([`crate::jev::promote::Line::Baseline`]).
+pub const BASELINE_AGREED: LedgerKey = LedgerKey {
+    canonical: "baselineAgreed",
+    also: &[],
+};
 
 /// The model that answered, as the response named it — the version, not the
 /// alias the request asked for (`jev-1.13.0` for `jev-latest`). Written on
@@ -147,9 +170,39 @@ pub const LABEL: LedgerKey = LedgerKey {
 ///
 /// Read by the judge ([`crate::jev::promote::on_the_newest_version`]): an
 /// alias moves when the vendor ships a version, and a floor or a window
-/// fitted to one version silently measures the next (t-6187).
+/// fitted to one version silently measures the next (t-6187). Read off a
+/// request or a mark alone ([`is_request_or_mark`]): a row that is neither
+/// names no version, whatever it carries under this key.
 pub const MODEL: LedgerKey = LedgerKey {
     canonical: "model",
+    also: &[],
+};
+
+/// The model a step of a zo turn ran on, on the step governor's own rows —
+/// never the version that answered anything, which is [`MODEL`]'s alone.
+///
+/// Those rows named it under [`MODEL`] until 2026-09-23 (t-6284), between
+/// the step seat's judgments and its labels, one for every request of a
+/// turn; read as versions, each step's chat model cut the seat's marks away.
+/// Not read here — spelled here so the two keys are told apart in one table.
+/// The rows already written are left out by [`is_request_or_mark`].
+pub const STEP_MODEL: LedgerKey = LedgerKey {
+    canonical: "stepModel",
+    also: &[],
+};
+
+/// Why a screen walk's hand never went out although the judgment named a
+/// control — the walk's own word for the stop; the two guards' words are the
+/// core's ([`crate::screen_action::Stopped::word`], t-6187).
+pub const BARRED: LedgerKey = LedgerKey {
+    canonical: "barred",
+    also: &[],
+};
+/// The kind of control a screen judgment named
+/// ([`crate::guarded::ControlKind::word`], t-6187): what the press rule read,
+/// and what a reader counts the controls a seat handed over by.
+pub const CONTROL_KIND: LedgerKey = LedgerKey {
+    canonical: "controlKind",
     also: &[],
 };
 
@@ -168,7 +221,11 @@ pub const LEDGER_KEYS: &[LedgerKey] = &[
     APPLIED,
     PRESSED,
     LABEL,
+    NOT_COMPARED,
+    BASELINE_AGREED,
     MODEL,
+    BARRED,
+    CONTROL_KIND,
 ];
 
 /// The word a row carries when its judgment answered and passed its checks.
@@ -224,6 +281,62 @@ pub struct Tally {
     /// Nearest-rank percentiles of the calls' elapsed milliseconds.
     pub p50_ms: Option<u64>,
     pub p95_ms: Option<u64>,
+    /// Presses a screen seat's two guards stopped (t-6187), off the rows'
+    /// [`BARRED`] — what the dashboard's drawer says of a screen seat
+    /// (t-6277 D6), counted here once for every reader.
+    pub guards: Guards,
+    /// The controls a screen seat's rows named ([`CONTROL_KIND`]), and the
+    /// ones a press cannot take back that it handed to the person.
+    pub controls: Controls,
+}
+
+/// Presses a screen seat's two guards stopped, by guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Guards {
+    /// The screen's own text told an assistant what to do
+    /// ([`crate::screen_action::Stopped::Injected`]).
+    pub instructed: usize,
+    /// The screen was a wall in front of the page the goal expects
+    /// ([`crate::screen_action::Stopped::Walled`]).
+    pub walled: usize,
+}
+
+/// The controls a screen seat's rows named, and the ones it handed over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Controls {
+    /// Rows that named a control at all — a seat whose rows name none is not
+    /// one that presses, which is how a reader tells the two apart without a
+    /// list of seats of its own.
+    pub named: usize,
+    /// Controls a press cannot take back that an acting seat did not press
+    /// and stepped back to the person with — under its floor, or stopped by
+    /// a guard ([`crate::jev::ROUTE_USE_FALLBACK`]). A recording seat's row
+    /// pressed nothing because it only records, and hands nothing over.
+    pub destructive_held: usize,
+}
+
+impl Controls {
+    fn count(&mut self, row: &Value) {
+        let Some(kind) = CONTROL_KIND.read(row).and_then(Value::as_str) else {
+            return;
+        };
+        self.named += 1;
+        let fell_back =
+            ROUTE_USE.read(row).and_then(Value::as_str) == Some(crate::jev::ROUTE_USE_FALLBACK);
+        self.destructive_held +=
+            usize::from(kind == crate::guarded::ControlKind::Destructive.word() && fell_back);
+    }
+}
+
+impl Guards {
+    fn count(&mut self, row: &Value) {
+        use crate::screen_action::Stopped;
+        match BARRED.read(row).and_then(Value::as_str) {
+            Some(word) if word == Stopped::Injected.word() => self.instructed += 1,
+            Some(word) if word == Stopped::Walled.word() => self.walled += 1,
+            _ => {}
+        }
+    }
 }
 
 impl Tally {
@@ -389,6 +502,22 @@ pub fn is_control_row(row: &Value) -> bool {
     OUTCOME.read(row).and_then(Value::as_str) == Some(CONTROL)
 }
 
+/// Whether a row is one the judge weighs: a request ([`asked_something`]), a
+/// mark that grades one ([`AGREED`]), or a control row the routing seat
+/// joins to its agreement ([`is_control_row`]).
+///
+/// A ledger holds other lines beside them — the judge's own notes, and a
+/// seat's bookkeeping that nobody asked or graded, such as the `step` row
+/// zo's step governor files for every request of a turn between its seat's
+/// judgments and labels. None of those is evidence of anything that
+/// answered, so the version a row names ([`MODEL`]) is read off these rows
+/// alone: every step row written before 2026-09-23 still names the chat
+/// model it ran on there (t-6284).
+#[must_use]
+pub fn is_request_or_mark(row: &Value) -> bool {
+    asked_something(row).is_some() || is_control_row(row) || AGREED.read(row).is_some()
+}
+
 /// The last `n` requests, counted — the window §4 judges on.
 ///
 /// A count and not a clock: a seat asked twice a day and one asked twice a
@@ -438,7 +567,9 @@ pub fn failures_in_a_row(rows: &[Value]) -> u32 {
 
 /// How often, at or after `since_ms`, a row said the judgment agreed with the
 /// reader it would replace — one comparison per row that carries
-/// [`AGREED`], asked rows and label rows alike.
+/// [`AGREED`], asked rows and label rows alike — beside what the seat's
+/// baseline said ([`BASELINE_AGREED`]) and how many rows said why they
+/// compare nothing ([`NOT_COMPARED`], t-6342).
 #[must_use]
 pub fn agreement_since(rows: &[Value], since_ms: i64) -> crate::jev::promote::Agreement {
     agreement_rows(rows.iter(), since_ms)
@@ -453,16 +584,79 @@ pub fn agreement_rows<'a>(
 ) -> crate::jev::promote::Agreement {
     let mut agreement = crate::jev::promote::Agreement::default();
     for row in rows {
-        let Some(agreed) = AGREED.read(row).and_then(Value::as_bool) else {
-            continue;
-        };
         if AT.read(row).and_then(Value::as_i64).unwrap_or(0) < since_ms {
             continue;
         }
-        agreement.compared += 1;
-        agreement.agreed += usize::from(agreed);
+        let agreed = AGREED.read(row).and_then(Value::as_bool);
+        if let Some(agreed) = agreed {
+            agreement.compared += 1;
+            agreement.agreed += usize::from(agreed);
+        } else if NOT_COMPARED.read(row).is_some() {
+            agreement.not_compared += 1;
+        }
+        if let Some(baseline) = BASELINE_AGREED.read(row).and_then(Value::as_bool) {
+            agreement.baseline_compared += 1;
+            agreement.baseline_agreed += usize::from(baseline);
+        }
     }
     agreement
+}
+
+/// How many of a seat's graded answers fell in one stretch of confidence,
+/// and how many of those agreed (t-6342).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConfidenceTally {
+    pub marks: usize,
+    pub agreed: usize,
+}
+
+/// The stretches a seat's confidence curve is drawn over: five fifths.
+pub const CONFIDENCE_CURVE_BINS: usize = 5;
+
+/// A seat's graded answers — each its confidence and whether its mark
+/// agreed — counted per fifth of confidence (t-6342): the curve TypeSafe's
+/// guide reads a threshold off ("plot confidence against accuracy on your
+/// data"), and the evidence a seat's [`crate::jev::ConfidenceBands`] are
+/// moved on. A reading outside `0..=1` is counted nowhere; `1.0` is the top
+/// fifth's.
+#[must_use]
+pub fn confidence_curve(
+    graded: impl IntoIterator<Item = (f64, bool)>,
+) -> [ConfidenceTally; CONFIDENCE_CURVE_BINS] {
+    let mut curve = [ConfidenceTally::default(); CONFIDENCE_CURVE_BINS];
+    for (confidence, agreed) in graded {
+        if !(0.0..=1.0).contains(&confidence) {
+            continue;
+        }
+        let fifth =
+            ((confidence * CONFIDENCE_CURVE_BINS as f64) as usize).min(CONFIDENCE_CURVE_BINS - 1);
+        curve[fifth].marks += 1;
+        curve[fifth].agreed += usize::from(agreed);
+    }
+    curve
+}
+
+/// The same graded answers counted per band of `seat`'s own lines, in
+/// [`crate::jev::Band::ALL`]'s order — `None` for a seat that names no
+/// bands.
+#[must_use]
+pub fn band_tally(
+    seat: &crate::jev::JevUse,
+    graded: impl IntoIterator<Item = (f64, bool)>,
+) -> Option<[ConfidenceTally; 3]> {
+    let bands = seat.confidence_bands?;
+    let mut tally = [ConfidenceTally::default(); 3];
+    for (confidence, agreed) in graded {
+        let Some(band) = bands.band_of(confidence) else {
+            continue;
+        };
+        let Some(slot) = crate::jev::Band::ALL.iter().position(|each| *each == band) else {
+            continue;
+        };
+        tally[slot].marks += 1;
+        tally[slot].agreed += usize::from(agreed);
+    }
+    Some(tally)
 }
 
 /// Whether a row's answer is what the product did, read off whichever of the
@@ -524,6 +718,8 @@ pub fn summarize_rows<'a>(rows: impl IntoIterator<Item = &'a Value>, since_ms: i
             .and_then(Value::as_u64)
             .unwrap_or(0);
         tally.input_tokens += INPUT_TOKENS.read(row).and_then(Value::as_u64).unwrap_or(0);
+        tally.guards.count(row);
+        tally.controls.count(row);
         let outcome = OUTCOME
             .read(row)
             .and_then(Value::as_str)

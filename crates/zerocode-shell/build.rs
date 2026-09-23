@@ -146,6 +146,7 @@ const UI_FILES: &[&str] = &[
     "shell-explorer-tree.js",
     "shell-attach.js",
     "shell-composer.js",
+    "shell-conversation-view.js",
     "shell-path-browser.js",
     "shell-remote.js",
     "shell-sftp.js",
@@ -360,6 +361,7 @@ fn build_ios_emulator_helper() {
         helper.join("main.swift"),
         helper.join("AccessibilityBridge.swift"),
         helper.join("Sources/ZeroCodeIosEmulatorHelperCore/AccessibilityChildTally.swift"),
+        helper.join("Sources/ZeroCodeIosEmulatorHelperCore/AccessibilityLeaf.swift"),
     ];
     for input in &inputs {
         println!("cargo:rerun-if-changed={}", input.display());
