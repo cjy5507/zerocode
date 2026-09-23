@@ -485,7 +485,7 @@ impl CustomProviderConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum OpenAiCompatAuth {
     /// No authentication header (custom/self-hosted endpoints only).
     None,
@@ -495,6 +495,29 @@ enum OpenAiCompatAuth {
     /// Resolve a fresh Google OAuth access token for Gemini requests from ADC
     /// or gcloud, using the cache in `google_auth` to avoid per-request mints.
     GoogleGeminiOAuth,
+}
+
+/// A client's debug line names how it authenticates, never with what: a
+/// bearer is a key or a login token, and a `{client:?}` in a panic or a log
+/// must not carry it (a test's expect message once did).
+/// Whether a client authenticates with exactly `bearer` — the answer a test
+/// needs from a client whose debug line names no secret.
+#[cfg(test)]
+impl OpenAiCompatClient {
+    #[must_use]
+    pub(crate) fn speaks_with_bearer(&self, bearer: &str) -> bool {
+        matches!(&self.auth, OpenAiCompatAuth::StaticBearer(held) if held == bearer)
+    }
+}
+
+impl std::fmt::Debug for OpenAiCompatAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::StaticBearer(_) => f.write_str("StaticBearer(<redacted>)"),
+            Self::GoogleGeminiOAuth => f.write_str("GoogleGeminiOAuth"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -535,9 +558,7 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let Some(api_key) = read_env_non_empty(config.api_key_env)?
-            .or_else(|| read_saved_api_key_non_empty(config.api_key_env))
-        else {
+        let Some(api_key) = read_api_key(config.api_key_env)? else {
             return Err(ApiError::missing_credentials(
                 config.provider_name,
                 config.credential_env_vars(),
@@ -1875,11 +1896,14 @@ fn parse_stream_error_frame(payload: &str) -> Option<ApiError> {
 
 #[must_use]
 pub fn has_api_key(key: &str) -> bool {
-    read_env_non_empty(key)
-        .ok()
-        .and_then(std::convert::identity)
-        .or_else(|| read_saved_api_key_non_empty(key))
-        .is_some()
+    read_api_key(key).ok().flatten().is_some()
+}
+
+/// An API key named `key`: the environment ladder first, then zo's saved
+/// key — the one order every OpenAI-compatible client and the credentials
+/// that stand beside one (the Grok CLI's, for xAI) read it in.
+pub(crate) fn read_api_key(key: &str) -> Result<Option<String>, ApiError> {
+    Ok(read_env_non_empty(key)?.or_else(|| read_saved_api_key_non_empty(key)))
 }
 
 fn read_saved_api_key_non_empty(key: &str) -> Option<String> {
