@@ -182,6 +182,8 @@ fn every_use_is_off_until_a_person_says_otherwise() {
 /// use offers it, and the agent's own tool, which has nothing to rise on,
 /// answers the agent.
 ///
+/// `shadow` for the one seat that only ever records — the vault pair review,
+/// whose proposals a person reads at the weekly review and which never rises.
 /// `off` only for a seat stopped on its own evidence until it is redesigned
 /// (docs/design/jev-engineering-review-20260923.md §7, t-6342): the patch
 /// review and the window's worker effort. Anywhere else a switch turned on
@@ -189,6 +191,7 @@ fn every_use_is_off_until_a_person_says_otherwise() {
 #[test]
 fn every_use_recommends_one_of_its_own_modes_and_off_only_where_stopped() {
     let stopped = [PATCH_REVIEW.id, STEP_EFFORT.id];
+    let recording = [VAULT_PAIRS.id];
     for row in &JEV_USES {
         assert!(
             row.modes.contains(&row.recommended),
@@ -198,6 +201,8 @@ fn every_use_recommends_one_of_its_own_modes_and_off_only_where_stopped() {
         );
         let expected = if stopped.contains(&row.id) {
             JevMode::Off
+        } else if recording.contains(&row.id) {
+            JevMode::Shadow
         } else if row.modes.contains(&JevMode::Auto) {
             JevMode::Auto
         } else {
@@ -522,7 +527,17 @@ fn every_seat_waits_for_a_window_of_marks_whatever_kind_they_are() {
         .collect();
     assert_eq!(
         hindsight,
-        vec![RECALL.id, PLACEMENT.id, COMPACTION.id, PATCH_REVIEW.id]
+        vec![
+            RECALL.id,
+            PLACEMENT.id,
+            COMPACTION.id,
+            PATCH_REVIEW.id,
+            CLAIM.id,
+            VAULT_PAIRS.id,
+            FILE_PICK.id,
+            COMMAND_GUARD.id,
+            TOOL_TEXT_GUARD.id,
+        ]
     );
     for row in JEV_USES.iter().filter(|row| row.promotes) {
         assert_eq!(
@@ -664,7 +679,8 @@ fn the_builders_cut_at_the_tables_caps() {
     assert!(caps(&PLACEMENT).contains(&Cap::Chars(PLACEMENT_BRIEF_CHAR_CAP)));
     assert!(caps(&SUMMON).contains(&Cap::Chars(SUMMON_BRIEF_CHAR_CAP)));
     assert!(caps(&SKILLS).contains(&Cap::Chars(SKILL_TASK_CHAR_CAP)));
-    assert!(caps(&SKILLS).contains(&Cap::Items(SKILL_SHARD_TARGET)));
+    assert!(caps(&SKILLS).contains(&Cap::Items(SKILL_SUGGESTION_CATALOG_CAP)));
+    assert!(caps(&SKILLS).contains(&Cap::Items(SKILL_SUGGESTION_SHORTLIST)));
     assert!(caps(&SKILLS).contains(&Cap::Chars(SKILL_DESCRIPTION_CHAR_CAP)));
     assert!(caps(&ZO_STEP_EFFORT).contains(&Cap::Chars(ROUTING_TASK_CHAR_CAP)));
     assert!(caps(&BROWSER_READ).contains(&Cap::Chars(BROWSER_READ_TITLE_CHAR_CAP)));
@@ -747,12 +763,9 @@ fn the_browser_read_seat_folds_on_its_own_line_and_sends_no_body() {
     );
 }
 
-/// The skill seat sends a name and a line about each skill, and never a
-/// skill's body: the body is read off this machine's own disk and handed to
-/// the model as a tool result, so what leaves is a list and what the turn
-/// reads is a document.
+/// The second pass sends a bounded instruction excerpt for three candidates.
 #[test]
-fn the_skill_seat_sends_names_and_descriptions_and_never_a_body() {
+fn the_skill_seat_discloses_the_bounded_second_pass() {
     let sent: Vec<&str> = SKILLS.sends.iter().map(|sent| sent.at).collect();
     assert_eq!(
         sent,
@@ -761,14 +774,14 @@ fn the_skill_seat_sends_names_and_descriptions_and_never_a_body() {
             "/state/skills",
             "/state/skills/*/name",
             "/state/skills/*/description",
+            "/state/candidates",
+            "/state/candidates/*/excerpt",
+            "/state/candidates/*/description",
+            "/questions/which/criteria/*",
+            "/questions/*/instructions",
         ]
     );
-    assert!(
-        !sent
-            .iter()
-            .any(|at| at.contains("body") || at.contains("prompt")),
-        "a skill's body never leaves: {sent:?}"
-    );
+    assert!(!sent.iter().any(|at| at.contains("prompt")));
 }
 
 /// The skill search's own floor is a line under one skill's relevance, and
@@ -834,6 +847,28 @@ fn the_skill_seat_rises_on_its_own_lines() {
     }
 }
 
+/// The routing seat sends the head of the task under its cap, by the
+/// pointer the catalog's own state key makes, and the facts code wrote whole
+/// (t-6346) — the door cuts a string only where a pointer names it.
+#[test]
+fn the_routing_seat_sends_the_task_under_its_cap_and_its_facts_whole() {
+    use crate::jev::questions::{ROUTING_STATE_FACTS, ROUTING_STATE_TASK};
+    let sent: Vec<(&str, Cap)> = ROUTING
+        .sends
+        .iter()
+        .map(|sent| (sent.at, sent.cap))
+        .collect();
+    let task = format!("/state/{ROUTING_STATE_TASK}");
+    let facts = format!("/state/{ROUTING_STATE_FACTS}");
+    assert_eq!(
+        sent,
+        vec![
+            (task.as_str(), Cap::Chars(ROUTING_TASK_CHAR_CAP)),
+            (facts.as_str(), Cap::Uncut),
+        ]
+    );
+}
+
 /// The step governor's seat sends the same head of a turn the routing seat
 /// sends, rises on its own progress marks, and offers every word — a seat
 /// whose answer moves a request field is one a person can switch on and one
@@ -841,7 +876,22 @@ fn the_skill_seat_rises_on_its_own_lines() {
 #[test]
 fn the_step_effort_seat_reads_the_turn_like_routing_and_rises_on_its_own_marks() {
     assert_eq!(jev_use("step_effort"), Some(&ZO_STEP_EFFORT));
-    assert_eq!(ZO_STEP_EFFORT.sends, ROUTING.sends);
+    // The same head of the turn under the same cap — as the probe rubric's
+    // plain string, where the routing seat's second version sends it inside
+    // an object beside its facts (t-6346).
+    assert_eq!(
+        ZO_STEP_EFFORT.sends,
+        &[Sent {
+            at: "/state",
+            cap: Cap::Chars(ROUTING_TASK_CHAR_CAP),
+        }]
+    );
+    assert!(
+        ROUTING
+            .sends
+            .iter()
+            .any(|sent| sent.cap == Cap::Chars(ROUTING_TASK_CHAR_CAP))
+    );
     const { assert!(ZO_STEP_EFFORT.promotes) };
     assert_eq!(
         ZO_STEP_EFFORT.answer_floor_permille,
@@ -1277,14 +1327,17 @@ fn the_classifier_words_are_the_ones_zo_routes_on() {
     );
 }
 
-/// Only the probing word asks the routing seat anything.
+/// Every word but `off` asks the routing seat; only the probing word calls
+/// the chat probe (t-4727, t-6346).
 ///
 /// This is the fact the card has to say out loud, so it is held to zo's
-/// source: the decision shadow is fired from `probe_and_shadow` alone, and the
-/// probe is called only under `Probed`. If zo ever fires the shadow from
-/// somewhere else, the card's notice becomes a lie and this goes red first.
+/// source: the decision shadow is fired from `probe_and_shadow` alone, the
+/// spawn road reads a task whenever automatic routing runs and the seat asks
+/// (`spawn_is_read`), and the probe inside that road waits on `Probed`. If zo
+/// ever gates the judgment on the probe again, the card's notice becomes a lie
+/// and this goes red first.
 #[test]
-fn the_routing_seat_is_only_asked_under_the_probing_word() {
+fn the_routing_seat_is_asked_under_every_word_but_off() {
     let probe_exec =
         include_str!("../../../../zo-ide/crates/tools/src/misc_tools/smart_router/probe_exec.rs");
     let apply =
@@ -1304,15 +1357,32 @@ fn the_routing_seat_is_only_asked_under_the_probing_word() {
         1,
         "the shadow's active road has more than one entrance"
     );
+    let reads = &product(apply)[product(apply)
+        .find("fn spawn_is_read(")
+        .expect("the spawn road's one gate")..];
+    let reads = &reads[..reads.find("\n}\n").expect("the gate closes")];
+    assert!(
+        reads.contains("RouteAutoClassifierMode::Off") && reads.contains("asks_here()"),
+        "the spawn road reads a task for the seat under a word other than `off`:\n{reads}"
+    );
     for entry in ["route_probe_assessment(", "route_probe_assessments("] {
         for at in product(apply).match_indices(entry).map(|(at, _)| at) {
             let before = &product(apply)[..at];
             let gate = before
-                .rfind("RouteAutoClassifierMode::Probed")
-                .expect("a probe call with no Probed gate above it");
+                .rfind("spawn_is_read(")
+                .expect("a spawn read with no gate above it");
             assert!(
                 before.len() - gate < 800,
-                "a `{entry}` call is not under a Probed gate"
+                "a `{entry}` call is not under the spawn road's gate"
+            );
+            let admitted = &product(apply)[at..];
+            let admitted = &admitted[..admitted
+                .find(')')
+                .map_or(admitted.len(), |close| close + 200)
+                .min(admitted.len())];
+            assert!(
+                admitted.contains("Admitted::spawn(probes)"),
+                "a spawn read lets the probe run without the probing word"
             );
         }
     }
@@ -1324,6 +1394,14 @@ fn the_routing_seat_is_only_asked_under_the_probing_word() {
             == 1,
         "more than one word claims to probe"
     );
+    for mode in ClassifierMode::ALL {
+        assert_eq!(
+            mode.reaches(),
+            mode.runs(),
+            "`{}`: the seat is asked exactly where routing runs",
+            mode.key()
+        );
+    }
     assert!(ROUTING.modes.iter().copied().any(JevMode::applies));
 }
 
@@ -1407,7 +1485,7 @@ fn the_agent_tool_seat_names_the_wires_bounds_and_never_rises() {
     );
     assert_eq!(AGENT_TOOL_DEADLINE_MS, SKILL_SEARCH_APPLY_DEADLINE_MS);
     assert_eq!(AGENT_TOOL_ASK_OPTIONS, ["yes", "no"]);
-    assert_eq!(JEV_USES.len(), 20);
+    assert_eq!(JEV_USES.len(), 25);
 }
 
 /// The branching seat (t-6044) forks one phone step — the emulator seat's
@@ -1654,9 +1732,201 @@ fn the_patch_review_seat_sends_a_patch_and_its_evidence_and_rises_on_hindsight()
             .applies_with(true)
     );
     assert_eq!(PATCH_REVIEW.mode_in(&json!({})), JevMode::Off);
-    // The twentieth row, after the challenger seat's (t-6151).
-    assert_eq!(JEV_USES.last(), Some(&PATCH_REVIEW));
-    assert_eq!(JEV_USES[JEV_USES.len() - 2], CHALLENGER);
+    // The patch review remains before claim, the vault-pair seat, the
+    // file-pick seat and the two guards.
+    assert_eq!(JEV_USES[JEV_USES.len() - 6], PATCH_REVIEW);
+    assert_eq!(JEV_USES[JEV_USES.len() - 7], CHALLENGER);
+}
+
+#[test]
+fn vault_pairs_are_recorded_for_review_without_automatic_promotion() {
+    let row = jev_use("vault_pairs").expect("vault-pair seat");
+    assert_eq!(row, &VAULT_PAIRS);
+    assert_eq!(row.recommended, JevMode::Shadow);
+    assert_eq!(row.modes, &[JevMode::Off, JevMode::Shadow, JevMode::On]);
+    assert!(!row.promotes);
+    assert_eq!(row.baseline, Baseline::AlwaysSame("none"));
+    assert!(
+        row.sends
+            .iter()
+            .any(|sent| sent.at == "/state/page_a/summary"
+                && sent.cap == Cap::Bytes(VAULT_PAIR_SUMMARY_BYTE_CAP))
+    );
+}
+
+#[test]
+fn the_file_pick_seat_rises_only_by_the_judge_and_compares_with_recent_edits() {
+    use crate::jev::{FILE_PICK, FILE_PICK_ANSWER_FLOOR_PERMILLE, FILE_PICK_MATCH_FLOOR_PERMILLE};
+
+    assert_eq!(jev_use("file_pick"), Some(&FILE_PICK));
+    assert_eq!(FILE_PICK.setting, "jevFilePick");
+    assert_eq!(FILE_PICK.ledger, "file-pick.jsonl");
+    assert_eq!(FILE_PICK.recommended, JevMode::Auto);
+    assert!(jev_use("file_pick").is_some_and(|row| row.promotes));
+    assert_eq!(FILE_PICK.repeat, None);
+    assert_eq!(FILE_PICK.baseline, Baseline::TodaysRule);
+    assert_eq!(FILE_PICK.negatives_wanted, Some(NEGATIVES_WANTED));
+    assert_eq!(
+        FILE_PICK.answer_floor_permille,
+        Some(FILE_PICK_ANSWER_FLOOR_PERMILLE)
+    );
+    assert_eq!(FILE_PICK.agreement_floor_permille, Some(600));
+    assert_eq!(
+        FILE_PICK.confidence_bands,
+        Some(ConfidenceBands::on_a_noul(
+            700,
+            FILE_PICK_MATCH_FLOOR_PERMILLE
+        ))
+    );
+    assert_eq!(FILE_PICK.sends.len(), 4);
+    assert_eq!(FILE_PICK.sends[0].at, "/state/request");
+    assert_eq!(FILE_PICK.sends[0].cap, Cap::Chars(2_000));
+    assert_eq!(FILE_PICK.sends[1].at, "/state/files");
+    assert_eq!(FILE_PICK.sends[1].cap, Cap::Items(30));
+    assert_eq!(FILE_PICK.sends[2].at, "/state/files/*/path");
+    assert_eq!(FILE_PICK.sends[2].cap, Cap::Uncut);
+    assert_eq!(FILE_PICK.sends[3].at, "/state/files/*/about");
+    assert_eq!(FILE_PICK.sends[3].cap, Cap::Bytes(200));
+    assert_eq!(JEV_USES.len(), 25);
+    assert_eq!(JEV_USES.get(JEV_USES.len() - 3), Some(&FILE_PICK));
+}
+
+#[test]
+fn completion_claims_are_a_recording_hindsight_seat_with_bounded_evidence() {
+    assert_eq!(jev_use("claim"), Some(&CLAIM));
+    assert_eq!(CLAIM.setting, "jevClaimCheck");
+    assert_eq!(CLAIM.recommended, JevMode::Auto);
+    assert_eq!(CLAIM.ledger, "claim-check.jsonl");
+    assert_eq!(CLAIM.agreement_kind, AgreementKind::Hindsight);
+    assert_eq!(CLAIM.baseline, Baseline::AlwaysSame(CLAIM_CRITERIA[0].0));
+    assert_eq!(CLAIM.negatives_wanted, Some(NEGATIVES_WANTED));
+    assert_eq!(CLAIM.sends[0].cap, Cap::Items(CLAIM_LIMIT));
+    assert_eq!(CLAIM.sends[1].cap, Cap::Chars(CLAIM_TEXT_CHAR_CAP));
+    assert_eq!(CLAIM.sends[2].cap, Cap::Bytes(CLAIM_EVIDENCE_BYTE_CAP));
+    assert_eq!(JEV_USES.get(JEV_USES.len() - 5), Some(&CLAIM));
+}
+
+/// The command guard (t-6348): right before zo runs a shell command, the
+/// command, the folder it runs in and the first line of the person's newest
+/// words are put to two Nouls in one request — cannot it be undone, does it
+/// change something outside the project. It records first, is graded by
+/// what became of the command, and is held to today's rule: the destructive
+/// and path tables zo already warns from, and the Computer Use table of
+/// words a control that cannot be taken back carries.
+#[test]
+fn the_command_guard_sends_a_command_its_folder_and_a_task_line_and_rises_on_hindsight() {
+    use crate::jev::questions::COMMAND_GUARD_STATE_KEYS;
+
+    assert_eq!(jev_use("command_guard"), Some(&COMMAND_GUARD));
+    assert_eq!(COMMAND_GUARD.setting, "jevCommandGuard");
+    assert_eq!(COMMAND_GUARD.ledger, "command-guard.jsonl");
+    assert_eq!(COMMAND_GUARD.modes, &JevMode::ALL[..]);
+    assert_eq!(COMMAND_GUARD.recommended, JevMode::Auto);
+    assert_eq!(COMMAND_GUARD.repeat, None);
+    assert!(jev_use("command_guard").is_some_and(|row| row.promotes));
+    assert_eq!(COMMAND_GUARD.agreement_kind, AgreementKind::Hindsight);
+    assert_eq!(COMMAND_GUARD.baseline, Baseline::TodaysRule);
+    assert_eq!(COMMAND_GUARD.negatives_wanted, Some(NEGATIVES_WANTED));
+    assert_eq!(COMMAND_GUARD.press_floor_permille, None);
+    assert_eq!(
+        COMMAND_GUARD.answer_floor_permille,
+        Some(COMMAND_GUARD_ANSWER_FLOOR_PERMILLE)
+    );
+    assert_eq!(
+        COMMAND_GUARD.agreement_floor_permille,
+        Some(COMMAND_GUARD_AGREEMENT_FLOOR_PERMILLE)
+    );
+    assert_eq!(
+        COMMAND_GUARD.apply_deadline_ms,
+        Some(COMMAND_GUARD_APPLY_DEADLINE_MS)
+    );
+    assert_eq!(
+        COMMAND_GUARD.confidence_bands,
+        Some(ConfidenceBands::on_a_noul(
+            NOUL_UNCERTAIN_TO_PERMILLE,
+            COMMAND_GUARD_FLAG_FLOOR_PERMILLE
+        ))
+    );
+    let sent: Vec<(&str, Cap)> = COMMAND_GUARD
+        .sends
+        .iter()
+        .map(|sent| (sent.at, sent.cap))
+        .collect();
+    assert_eq!(
+        sent,
+        vec![
+            ("/state/command", Cap::Chars(COMMAND_GUARD_COMMAND_CHAR_CAP)),
+            ("/state/cwd", Cap::Uncut),
+            ("/state/task", Cap::Chars(COMMAND_GUARD_TASK_CHAR_CAP)),
+        ]
+    );
+    // The pointers are the catalog's own state keys, in its order.
+    for (sent, key) in COMMAND_GUARD.sends.iter().zip(COMMAND_GUARD_STATE_KEYS) {
+        assert_eq!(sent.at, format!("/state/{key}"));
+    }
+    // A thousand characters holds 91.0% of this machine's 2,318 commands of a
+    // week whole; the task line is a goal's sentence or two.
+    assert_eq!(COMMAND_GUARD_COMMAND_CHAR_CAP, RECALL_REQUEST_CHAR_CAP);
+    assert_eq!(COMMAND_GUARD_TASK_CHAR_CAP, GOAL_CHAR_CAP);
+    assert_eq!(COMMAND_GUARD.mode_in(&json!({})), JevMode::Off);
+    assert_eq!(JEV_USES.get(JEV_USES.len() - 2), Some(&COMMAND_GUARD));
+}
+
+/// The tool text guard (t-6348): the screen's instructions guard asked of
+/// every block a file read, a web fetch, the window's browser or an MCP tool
+/// hands back — the head of the block and the kind of tool, one Noul, the
+/// screen's own line. It records first, is graded by whether the agent's next
+/// call carried out what the block said, and is held to today's rule: the
+/// fence the window already puts around the words it did not write.
+#[test]
+fn the_tool_text_guard_sends_a_block_head_and_its_source_and_rises_on_hindsight() {
+    use crate::jev::questions::TOOL_TEXT_GUARD_STATE_KEYS;
+
+    assert_eq!(jev_use("tool_text_guard"), Some(&TOOL_TEXT_GUARD));
+    assert_eq!(TOOL_TEXT_GUARD.setting, "jevToolTextGuard");
+    assert_eq!(TOOL_TEXT_GUARD.ledger, "tool-text-guard.jsonl");
+    assert_eq!(TOOL_TEXT_GUARD.modes, &JevMode::ALL[..]);
+    assert_eq!(TOOL_TEXT_GUARD.recommended, JevMode::Auto);
+    assert_eq!(TOOL_TEXT_GUARD.repeat, None);
+    assert!(jev_use("tool_text_guard").is_some_and(|row| row.promotes));
+    assert_eq!(TOOL_TEXT_GUARD.agreement_kind, AgreementKind::Hindsight);
+    assert_eq!(TOOL_TEXT_GUARD.baseline, Baseline::TodaysRule);
+    assert_eq!(TOOL_TEXT_GUARD.negatives_wanted, Some(NEGATIVES_WANTED));
+    assert_eq!(TOOL_TEXT_GUARD.press_floor_permille, None);
+    assert_eq!(
+        TOOL_TEXT_GUARD.apply_deadline_ms,
+        Some(TOOL_TEXT_GUARD_APPLY_DEADLINE_MS)
+    );
+    // The screen's question asked of another text is held to the screen's line.
+    assert_eq!(
+        TOOL_TEXT_INSTRUCTED_FLOOR_PERMILLE,
+        SCREEN_INSTRUCTED_FLOOR_PERMILLE
+    );
+    assert_eq!(
+        TOOL_TEXT_GUARD.confidence_bands,
+        Some(ConfidenceBands::on_a_noul(
+            NOUL_UNCERTAIN_TO_PERMILLE,
+            TOOL_TEXT_INSTRUCTED_FLOOR_PERMILLE
+        ))
+    );
+    let sent: Vec<(&str, Cap)> = TOOL_TEXT_GUARD
+        .sends
+        .iter()
+        .map(|sent| (sent.at, sent.cap))
+        .collect();
+    assert_eq!(
+        sent,
+        vec![
+            ("/state/source", Cap::Uncut),
+            ("/state/text", Cap::Chars(TOOL_TEXT_GUARD_TEXT_CHAR_CAP)),
+        ]
+    );
+    for (sent, key) in TOOL_TEXT_GUARD.sends.iter().zip(TOOL_TEXT_GUARD_STATE_KEYS) {
+        assert_eq!(sent.at, format!("/state/{key}"));
+    }
+    assert_eq!(TOOL_TEXT_GUARD_TEXT_CHAR_CAP, ROUTING_TASK_CHAR_CAP);
+    assert_eq!(TOOL_TEXT_GUARD.mode_in(&json!({})), JevMode::Off);
+    assert_eq!(JEV_USES.last(), Some(&TOOL_TEXT_GUARD));
 }
 
 /// A request's receipt is the whole SHA-256 of the seat, the rubric version,
@@ -1703,14 +1973,15 @@ fn a_request_digest_vouches_for_the_seat_the_rubric_the_model_and_the_bytes() {
     );
 }
 
-/// Every seat that may rise names the cheapest reader it is held against,
-/// how many times its label must have said no, and the confidence bands its
-/// answers fall in (t-6342); a seat that never rises names none of them.
+/// A seat with comparison labels names the cheapest reader, the negative
+/// sample requirement, and its confidence bands. Vault pairs records those
+/// facts for weekly review even though it never promotes automatically.
 #[test]
 fn every_promoting_row_names_a_baseline_and_an_abstain_band() {
     for row in &JEV_USES {
+        let compared = row.promotes || row.id == VAULT_PAIRS.id;
         assert_eq!(
-            row.promotes,
+            compared,
             row.negatives_wanted.is_some(),
             "{} promotes={} negatives={:?}",
             row.id,
@@ -1718,7 +1989,7 @@ fn every_promoting_row_names_a_baseline_and_an_abstain_band() {
             row.negatives_wanted
         );
         assert_eq!(
-            row.promotes,
+            compared,
             row.confidence_bands.is_some(),
             "{} promotes={} bands={:?}",
             row.id,
@@ -1736,7 +2007,7 @@ fn every_promoting_row_names_a_baseline_and_an_abstain_band() {
         if let Some(wanted) = row.negatives_wanted {
             assert_eq!(wanted, NEGATIVES_WANTED, "{}", row.id);
         }
-        if !row.promotes {
+        if !compared {
             assert_eq!(row.baseline, Baseline::None, "{}", row.id);
         }
         if let Baseline::AlwaysSame(word) = row.baseline {
@@ -1847,4 +2118,51 @@ fn an_answer_falls_in_one_band_by_its_confidence() {
     );
     // A seat that never rises reads no band.
     assert_eq!(AGENT_TOOL.band_of(0.99), None);
+}
+
+/// The language column (t-6324 §6-1, t-6346): how much of a request's
+/// letters are Hangul, per thousand — counted by code, so a seat's agreement
+/// can be read apart by language without keeping a word of the text.
+#[test]
+fn a_requests_hangul_share_is_counted_over_its_letters() {
+    assert_eq!(
+        hangul_share_permille("이 함수의 버그를 수정해줘"),
+        Some(1_000)
+    );
+    assert_eq!(hangul_share_permille("fix the bug"), Some(0));
+    assert_eq!(
+        hangul_share_permille("fix 버그"),
+        Some(400),
+        "two of five letters"
+    );
+    assert_eq!(
+        hangul_share_permille("ㄱㄴ ab"),
+        Some(500),
+        "jamo are Hangul too"
+    );
+    assert_eq!(
+        hangul_share_permille("123 !? -"),
+        None,
+        "no letters, no share"
+    );
+    assert_eq!(hangul_share_permille(""), None);
+}
+
+/// A seat that never rises names no apply wall (the column's own contract,
+/// [`JevUse::apply_deadline_ms`]): the wall is the latency line a rising seat
+/// is judged against, and a number nobody is judged on only tells a screen
+/// there is a stage to time. zo's summary already held every row to it; the
+/// vault-pair seat broke it on arrival (t-6345) and no core test said so.
+#[test]
+fn a_seat_that_never_rises_names_no_apply_wall() {
+    for row in &JEV_USES {
+        assert_eq!(
+            row.apply_deadline_ms.is_some(),
+            row.promotes,
+            "{} promotes={} wall={:?}",
+            row.id,
+            row.promotes,
+            row.apply_deadline_ms
+        );
+    }
 }

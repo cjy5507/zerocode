@@ -87,11 +87,11 @@ pub(crate) use usage::{
 };
 
 pub(crate) use appearance::{
-    apply_ghostty_import, apply_ui_zoom, computer_awake_status, listening_ports, log_window_error,
-    patch_left_sidebar_appearance, patch_terminal_prefs, preview_ghostty_import,
-    preview_warp_terminal_themes, process_memory, relaunch_window, resource_snapshot,
-    set_agent_activity_display, set_app_font_family, set_compact_worktree_cards,
-    set_computer_awake_mode, set_locale, set_minimize_to_tray_on_close,
+    apply_ghostty_import, apply_ui_zoom, busy_census, computer_awake_status, leave_cancel,
+    leave_now, leave_when_idle, listening_ports, log_window_error, patch_left_sidebar_appearance,
+    patch_terminal_prefs, preview_ghostty_import, preview_warp_terminal_themes, process_memory,
+    relaunch_window, resource_snapshot, set_agent_activity_display, set_app_font_family,
+    set_compact_worktree_cards, set_computer_awake_mode, set_locale, set_minimize_to_tray_on_close,
     set_refresh_local_base_ref_on_worktree_create, set_setup_script_launch_mode,
     set_show_git_ignored_files, set_show_menu_bar_icon, set_show_titlebar_app_name,
     set_source_control_compare_base, set_source_control_group_order, set_status_bar_item,
@@ -113,14 +113,14 @@ pub(crate) use agent_launch::{
 };
 
 pub(crate) use board::{
-    ack_board_agent, agent_icon, board_columns, board_snapshot, claim_coordinator_seat,
+    ack_board_agent, agent_icon, board_columns, board_desk, board_snapshot, claim_coordinator_seat,
     clipboard_has_image, continuation_source, coordinator_handover_status, coordinator_seat_runs,
-    create_untitled_markdown, delete_untitled_markdown, hooks_report, install_hooks, ledger_agents,
-    open_board_popout, orchestration_accuracy, pane_activities, pane_agents, pane_sessions,
-    pane_subagents, release_untitled_markdown, resume_session, reveal_board_agent,
-    save_clipboard_image, save_pasted_image, set_coordinator_handover, set_dock_badge,
-    set_hooks_enabled, set_previewed_terms, set_watched_terms, term_pull, term_snapshot,
-    worker_screen,
+    create_untitled_markdown, delete_untitled_markdown, desk_ack, desk_checkouts, desk_reply,
+    hooks_report, install_hooks, ledger_agents, machine_load, open_board_popout,
+    orchestration_accuracy, pane_activities, pane_agents, pane_sessions, pane_subagents,
+    release_untitled_markdown, resume_session, reveal_board_agent, save_clipboard_image,
+    save_pasted_image, set_coordinator_handover, set_dock_badge, set_hooks_enabled,
+    set_previewed_terms, set_watched_terms, term_pull, term_snapshot, worker_screen,
 };
 
 pub(crate) use review::{

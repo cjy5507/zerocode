@@ -39,9 +39,24 @@ pub use smart_router::{
     MENTION_RUBRIC_VERSION,
 };
 pub use smart_router::{
+    claim_check_path, jev_claim_mode_from, note_claim_turn, ClaimCheckRow, ClaimLabelRow,
+    judge_vault_pairs, mark_vault_pair, recorded_vault_pair_proposals,
+    PairJudgment, PairLabel, PairRun,
     jev_patch_review_mode_from, note_patch_review_turn, patch_review_path, PatchReviewJudge,
     PatchReviewLabelRow, PatchReviewRow, JEV_PATCH_REVIEW_SETTING, PATCH_REVIEW_DEADLINE,
     PATCH_REVIEW_FILE, PATCH_REVIEW_OUTCOME_ANSWERED,
+};
+pub use smart_router::{
+    file_pick_path, jev_file_pick_mode_from, note_file_pick_turn, FilePickJudge,
+    FilePickLabelRow, FilePickRow, JEV_FILE_PICK_SETTING, FILE_PICK_FILE,
+    FILE_PICK_OUTCOME_ANSWERED,
+};
+pub use smart_router::{
+    command_guard_path, jev_command_guard_mode_from, jev_tool_text_guard_mode_from,
+    note_tool_guard_turn, tool_text_guard_path, CommandGuardLabelRow, CommandGuardRow,
+    ToolGuardJudge, ToolTextGuardLabelRow, ToolTextGuardRow, COMMAND_GUARD_FILE,
+    JEV_COMMAND_GUARD_SETTING, JEV_TOOL_TEXT_GUARD_SETTING, TOOL_GUARD_OUTCOME_ANSWERED,
+    TOOL_TEXT_GUARD_FILE,
 };
 pub use smart_router::{
     compaction_relevance_path, jev_compaction_mode_from, note_compaction_reread, CompactionJudge,
@@ -65,7 +80,7 @@ pub use smart_router::{
     AGENT_TOOL_SETTING,
 };
 pub use smart_router::{
-    note_loaded_skill, note_search_answer, skill_search, skill_search_mode_from,
+    note_loaded_skill, note_search_answer, skill_search, skill_search_mode_from, SkillSuggestionJudge,
     skill_search_path,
     Chosen, Searched, SkillLabelRow, SkillSearchRow,
     SKILL_OUTCOME_ANSWERED, SKILL_SEARCH_DEADLINE, SKILL_SEARCH_FILE, SKILL_SEARCH_SETTING,

@@ -938,7 +938,11 @@ fn all_ledger_image_readers_use_the_revision_cache() {
     // The background publisher and two fresh readers reach the same door. Named here
     // rather than left out, because "does not call `Ledger::rebuild`" is
     // satisfied by a reader that calls nothing at all.
-    for delegating in ["refresh_board_ledger", "ledger_agents", "live_worker_count"] {
+    for delegating in [
+        "refresh_board_ledger",
+        "ledger_agents",
+        "seated_live_workers",
+    ] {
         let start = shipped
             .find(&format!("fn {delegating}()"))
             .unwrap_or_else(|| panic!("missing reader {delegating}"));
@@ -1051,6 +1055,212 @@ fn ledger_state_for_a_reused_seat_comes_from_its_current_worker() {
         Some(WorkerState::Active.as_str()),
         "a released history row overrode the worker currently in the pane"
     );
+}
+
+/// The desk's mail follows the coordinator's own inbox (t-6588): a question
+/// and a notice stand `pending` until the coordinator's `check` hands them
+/// over, `delivered` in the batch it holds (named, with its size — the unit
+/// an acknowledgement takes), and after the ack the notice is gone while the
+/// question stays, `acked`, until the coordinator's `reply` answers it.
+#[test]
+fn the_desks_mail_is_the_coordinators_inbox_letter_by_letter() {
+    use zerocode_core::agent_teams::Team;
+    use zerocode_core::orchestration::{Draft, MessageKind, Priority, Text};
+    const LEADER_TERM: u32 = 9_410;
+    /// One verb from the leader's seat, as the coordinator types it.
+    fn verb(held: &mut Ledger, table: &mut Team, argv: &[String], at: i64) -> String {
+        let decided = zerocode_core::orchestration::plan(
+            held,
+            table,
+            &Catalog::new(Vec::new()),
+            argv,
+            zerocode_core::agent_teams::LEADER_PANE,
+            at,
+            Some(&test_actor(LEADER_TERM)),
+        );
+        assert_eq!(
+            decided.reply.exit_code, 0,
+            "{argv:?}: {}",
+            decided.reply.stderr
+        );
+        decided.reply.stdout
+    }
+    let mut held = Ledger::new();
+    let mut table = Team::new("team-desk-mail", TEST_CAPABILITY, LEADER_TERM);
+    let opened: serde_json::Value = serde_json::from_str(&verb(
+        &mut held,
+        &mut table,
+        &words("run-create --name desk-mail"),
+        1_000,
+    ))
+    .expect("a run");
+    let run_id = opened["runId"].as_str().expect("a run id").to_string();
+    let address = held.run(&run_id).expect("the run").address();
+    // From a teammate's seat rather than a worker row: the reply below is
+    // filed to whoever asked, and a seat is answerable without a summons.
+    let letter = |kind: MessageKind, body: &str| Draft {
+        from: "pane:team-desk-mail/%7".to_string(),
+        to: address.clone(),
+        kind,
+        body: Text::from(body),
+        subject: Text::default(),
+        priority: Priority::Normal,
+        payload: Text::default(),
+        thread: None,
+        task: None,
+        dispatch: None,
+    };
+    let question = held
+        .post(
+            &run_id,
+            letter(MessageKind::Question, "main에 올려도 될까요?"),
+            1_100,
+        )
+        .expect("a question");
+    held.post(
+        &run_id,
+        letter(
+            MessageKind::WentQuiet,
+            r#"{"workerId":"w-9","reason":"stalled"}"#,
+        ),
+        1_200,
+    )
+    .expect("a notice");
+    let mail = |ledger: &Ledger| super::desk::desk_mail(ledger.run(&run_id).expect("the run"));
+
+    let pending = mail(&held);
+    assert_eq!(pending.len(), 2, "{pending:?}");
+    assert!(pending.iter().all(|one| one.delivery == "pending"));
+    assert_eq!(pending[1].reason.as_deref(), Some("stalled"));
+    assert_eq!(pending[1].worker.as_deref(), Some("w-9"));
+
+    let looked: serde_json::Value =
+        serde_json::from_str(&verb(&mut held, &mut table, &words("check"), 1_300))
+            .expect("a delivery");
+    let delivery = looked["deliveryId"]
+        .as_str()
+        .expect("a delivery id")
+        .to_string();
+    let handed = mail(&held);
+    assert!(
+        handed.iter().all(|one| one.delivery == "delivered"
+            && one.delivery_id.as_deref() == Some(delivery.as_str())
+            && one.batch == Some(2)),
+        "{handed:?}"
+    );
+
+    verb(
+        &mut held,
+        &mut table,
+        &words(&format!("check --ack {delivery} --peek")),
+        1_400,
+    );
+    let acked = mail(&held);
+    assert_eq!(
+        acked.len(),
+        1,
+        "the notice left and the question stayed: {acked:?}"
+    );
+    assert_eq!(acked[0].id, question);
+    assert_eq!(acked[0].delivery, "acked");
+
+    verb(
+        &mut held,
+        &mut table,
+        &[
+            "reply".to_string(),
+            "--to-message".to_string(),
+            question.clone(),
+            "--body".to_string(),
+            "올리세요".to_string(),
+            "--retry-request".to_string(),
+            "desk-mail-reply".to_string(),
+        ],
+        1_500,
+    );
+    assert!(
+        mail(&held).is_empty(),
+        "an answered question is owed nothing"
+    );
+}
+
+/// A worker's row carries what the task board's roster reads its health from
+/// (t-6588): the question it is waiting on (`Run::awaiting_reply`), the newest
+/// quota wall its attempt met as the ledger reads it back (`newest_wall`), and
+/// its pane inside the team — and nothing about a wall another attempt met.
+#[test]
+fn a_workers_row_carries_its_question_its_wall_and_its_pane() {
+    use zerocode_core::orchestration::{Draft, MessageKind, Priority, Text};
+    let mut ledger = Ledger::new();
+    let run = ledger.create_run("roster", 1);
+    let task = ledger
+        .create_task(&run, "do".into(), "roster task".into(), vec![], None, 2)
+        .expect("a task");
+    let started = ledger
+        .start_worker(&run, "codex", ("team-roster", "%2"), Some(&task), 3)
+        .expect("a worker");
+    let dispatch = started.dispatch.clone().expect("it carries the task");
+    let address = ledger.run(&run).expect("the run").address();
+    let row = |ledger: &Ledger| {
+        super::ledger_agents_for_seats(ledger, &super::TeamSeatIndex::new())
+            .into_iter()
+            .find(|one| one.worker == started.worker)
+            .expect("the worker's row")
+    };
+    let quiet = row(&ledger);
+    assert!(!quiet.asking && quiet.wall.is_none(), "{quiet:?}");
+    assert_eq!(quiet.pane, "%2");
+
+    let from = zerocode_core::orchestration::worker_address(&started.worker);
+    let letter = |kind: MessageKind, body: String| Draft {
+        from: from.clone(),
+        to: address.clone(),
+        kind,
+        body: Text::from(body),
+        subject: Text::default(),
+        priority: Priority::Normal,
+        payload: Text::default(),
+        thread: None,
+        task: Some(task.clone()),
+        dispatch: Some(dispatch.clone()),
+    };
+    ledger
+        .post(
+            &run,
+            letter(MessageKind::Question, "which base?".into()),
+            10,
+        )
+        .expect("a question");
+    ledger
+        .post(
+            &run,
+            letter(
+                MessageKind::QuotaWalled,
+                serde_json::json!({ "observedAtMs": 20, "resetsAtMs": 2_700_020 }).to_string(),
+            ),
+            20,
+        )
+        .expect("a wall");
+    let walled = row(&ledger);
+    assert!(walled.asking, "{walled:?}");
+    let wall = walled.wall.expect("the wall is read back");
+    assert_eq!(wall.resets_at_ms, Some(2_700_020));
+    assert!(wall.stands_until_ms > 2_700_020, "{wall:?}");
+}
+
+/// The desk calls a run's coordinator seat this window's only where the pane
+/// the seat names (`team/pane`) is in this window's pane table (t-6588) —
+/// the seat a reply from the board is written as.
+#[test]
+fn a_seat_is_held_only_where_this_window_holds_its_pane() {
+    let seats = super::TeamSeatIndex::from([(
+        "team-1".to_string(),
+        std::collections::HashMap::from([("%0".to_string(), 7_u32)]),
+    )]);
+    assert!(super::seat_is_held(&seats, "team-1/%0"));
+    assert!(!super::seat_is_held(&seats, "team-1/%2"));
+    assert!(!super::seat_is_held(&seats, "team-2/%0"));
+    assert!(!super::seat_is_held(&seats, "team-1"));
 }
 
 /// What the board's ledger readings cost, on this window's real shape.
@@ -1887,6 +2097,8 @@ struct AtTheWall {
     onto: Mutex<u32>,
     checkout: &'static str,
     markers: Mutex<std::collections::HashMap<u32, zerocode_core::orchestration::QuotaWallMarker>>,
+    /// Every gauge the beat asked the window to read again (t-6427).
+    asked: Mutex<Vec<String>>,
 }
 
 impl AtTheWall {
@@ -1905,6 +2117,21 @@ impl AtTheWall {
                     line: zerocode_core::orchestration::Text::from(line),
                 },
             );
+    }
+
+    /// The pane's own words moved past its wall.
+    fn screen_clears(&self, term: u32) {
+        self.markers
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .remove(&term);
+    }
+
+    fn asked(&self) -> Vec<String> {
+        self.asked
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .clone()
     }
 }
 
@@ -1969,6 +2196,12 @@ impl Host for AtTheWall {
     }
     fn actor_for(&self, term: u32) -> Option<String> {
         Some(test_actor(term))
+    }
+    fn ask_usage(&self, gauge: &str) {
+        self.asked
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .push(gauge.to_string());
     }
 }
 
@@ -2146,6 +2379,7 @@ impl Walled {
             onto: Mutex::new(leader_term + 1),
             checkout,
             markers: Mutex::new(std::collections::HashMap::new()),
+            asked: Mutex::new(Vec::new()),
         };
         let leader = zerocode_core::agent_teams::LEADER_PANE;
         let verb = |line: &str, at: i64| {
@@ -2233,7 +2467,7 @@ impl Walled {
         let rows = super::cached_ledger(&held, &image).expect("the rows");
         rows.runs()
             .iter()
-            .find_map(zerocode_core::orchestration::next_handover)
+            .find_map(|run| zerocode_core::orchestration::next_handover(run, self.began + 20_000))
             .expect("a handover to walk")
     }
 
@@ -2674,6 +2908,7 @@ fn the_beat_writes_quota_walled_news_only_with_both_witnesses_and_settles_nothin
         onto: Mutex::new(CODEX_TERM),
         checkout: "/wt/walled",
         markers: Mutex::new(std::collections::HashMap::new()),
+        asked: Mutex::new(Vec::new()),
     };
     let leader = zerocode_core::agent_teams::LEADER_PANE;
     let verb = |line: &str, at: i64| {
@@ -2790,6 +3025,187 @@ fn the_beat_writes_quota_walled_news_only_with_both_witnesses_and_settles_nothin
         (lifecycle(&codex_worker), lifecycle(&claude_worker)),
         before
     );
+}
+
+/// A wall stands until its reset and the slack after it, and no longer
+/// (t-6427). Every worker this machine walled continued by itself a minute
+/// after its reset, and two of them later died on a network error the sweep
+/// never reported: the attempt's wall row silenced it for good (dp-6390 and
+/// dp-6393, 2026-09-23 — 42 and 77 minutes until somebody looked). While the
+/// wall stands its silence is the wall's; after it, a worker whose own words
+/// moved past the wall is a quiet worker like any other, and one walled
+/// again in the next window is walled news again.
+#[test]
+fn a_walled_attempts_later_silence_is_news_once_its_wall_stops_standing() {
+    const LEADER_TERM: u32 = 85_600;
+    const WORKER_TERM: u32 = LEADER_TERM + 1;
+    let stood = Walled::stand(LEADER_TERM, "/wt/after-the-wall", "");
+    stood.wall_it();
+    let began = stood.began;
+    let reset = began + 42 * 60_000;
+    let next_reset = reset + 5 * 60 * 60_000;
+    let stops_standing = reset + zerocode_core::orchestration::QUOTA_WAIT_POLICY.slack_ms;
+    let stalls = |at: i64| -> Vec<serde_json::Value> {
+        stood.json("check --peek --types went_quiet", at)["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|message| {
+                serde_json::from_str::<serde_json::Value>(message["body"].as_str().expect("a body"))
+                    .expect("json")
+            })
+            .filter(|body| body["workerId"] == stood.worker.as_str())
+            .collect()
+    };
+    let codex_at = |used: u8, updated: i64| {
+        vec![(
+            "codex",
+            usage_snapshot(
+                "codex",
+                Some((used, Some(next_reset))),
+                Some((40, None)),
+                updated,
+            ),
+        )]
+    };
+
+    // While the wall stands, the silence is the wall's.
+    notify_stalled_workers(&stood.host, stops_standing - 1);
+    assert!(stalls(stops_standing - 1).is_empty());
+
+    // It went on after its reset and stopped on something else.
+    stood.host.screen_clears(WORKER_TERM);
+    stood.window.set_usage(codex_at(3, reset + 60_000));
+    notify_stalled_workers(&stood.host, stops_standing);
+    let told = stalls(stops_standing + 1);
+    assert_eq!(
+        told.len(),
+        1,
+        "a silence after the wall was not news: {told:?}"
+    );
+    assert_eq!(told[0]["reason"], "stalled");
+
+    // And the next window's wall is news of its own.
+    stood.host.screen_says(
+        WORKER_TERM,
+        "screen",
+        "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage",
+    );
+    stood
+        .window
+        .set_usage(codex_at(98, stops_standing + 60_000));
+    notify_stalled_workers(&stood.host, stops_standing + 120_000);
+    assert_eq!(
+        stood.json(
+            "check --peek --types quota_walled",
+            stops_standing + 120_001
+        )["count"],
+        2
+    );
+}
+
+/// Under a declared wait, a worker still stopped at its wall once the wall
+/// has lifted is the coordinator's news, once (t-6427) — Claude Code
+/// continues by itself about a minute after its reset, so this is the notice
+/// for the walls nobody continued: a CLI that does not wait, or a countdown
+/// somebody cancelled. From the reset on, the beat asks the window's gauge
+/// for a reading after it; with none yet it says nothing and waits for one,
+/// and with a number under the wall it tells the lift with that number.
+#[test]
+fn a_worker_still_at_its_wall_after_the_lift_is_told_once_under_a_wait() {
+    const LEADER_TERM: u32 = 85_700;
+    let stood = Walled::stand(LEADER_TERM, "/wt/lifted", "--on-quota-wall wait");
+    stood.wall_it();
+    let began = stood.began;
+    let reset = began + 42 * 60_000;
+    let stops_standing = reset + zerocode_core::orchestration::QUOTA_WAIT_POLICY.slack_ms;
+    let notices = |at: i64| -> Vec<serde_json::Value> {
+        stood.json("check --peek --types went_quiet", at)["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|message| {
+                serde_json::from_str::<serde_json::Value>(message["body"].as_str().expect("a body"))
+                    .expect("json")
+            })
+            .filter(|body| body["workerId"] == stood.worker.as_str())
+            .collect()
+    };
+
+    // Before the reset nothing is asked; from it, the gauge is.
+    notify_stalled_workers(&stood.host, reset - 1_000);
+    assert!(stood.host.asked().is_empty(), "{:?}", stood.host.asked());
+    notify_stalled_workers(&stood.host, reset + 1_000);
+    assert_eq!(stood.host.asked(), vec!["codex".to_string()]);
+
+    // Past the slack, with no reading since the reset: waited for, unsaid.
+    notify_stalled_workers(&stood.host, stops_standing);
+    assert!(
+        notices(stops_standing).is_empty(),
+        "{:?}",
+        notices(stops_standing)
+    );
+    assert_eq!(stood.host.asked().len(), 2);
+
+    // The reading comes, under the wall: told once, with its number.
+    stood.window.set_usage(vec![(
+        "codex",
+        usage_snapshot(
+            "codex",
+            Some((3, Some(reset + 5 * 60 * 60_000))),
+            Some((40, None)),
+            stops_standing + 1_000,
+        ),
+    )]);
+    notify_stalled_workers(&stood.host, stops_standing + 2_000);
+    let told = notices(stops_standing + 2_001);
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert_eq!(
+        told[0]["reason"],
+        zerocode_core::orchestration::QUOTA_LIFTED_REASON
+    );
+    assert_eq!(told[0]["rung"], "wait");
+    // The binding window after the reset is the fuller one: the week's.
+    assert_eq!(told[0]["gauge"]["usedPercent"], 40);
+    assert_eq!(told[0]["gauge"]["window"], "weekly");
+    notify_stalled_workers(&stood.host, stops_standing + 3_000);
+    assert_eq!(notices(stops_standing + 3_001).len(), 1, "told twice");
+}
+
+/// The wait rung waits for a number read after the reset exactly as long as
+/// a re-read it asks for can take to be allowed (t-6427): the ledger's table
+/// and the window's refetch floor are one number.
+#[test]
+fn the_wait_rung_waits_one_refetch_floor_for_a_number_read_after_the_reset() {
+    assert_eq!(
+        zerocode_core::orchestration::QUOTA_WAIT_POLICY.lift_read_ms,
+        i64::try_from(crate::usage::MIN_REFETCH.as_millis()).expect("a floor in ms"),
+    );
+}
+
+/// Every gauge the ledger's table can name for an agent is one the beat can
+/// ask the window to read again (t-6427): a gauge with no ask would leave a
+/// lifted wall unread until the rung stopped waiting for its number.
+#[test]
+fn every_gauge_the_ledger_reads_is_one_the_window_can_ask_again() {
+    let asks: Vec<&str> = crate::cmd::usage::USAGE_ASKS
+        .iter()
+        .map(|(gauge, _)| *gauge)
+        .collect();
+    let mut named = 0;
+    for spec in zerocode_core::agent::AGENT_SPECS {
+        for model in [None, Some("claude"), Some("gpt")] {
+            if let Some(gauge) = zerocode_core::orchestration::quota_gauge_for(spec.id, model) {
+                named += 1;
+                assert!(
+                    asks.contains(&gauge),
+                    "{} names the gauge `{gauge}`, which nothing asks again",
+                    spec.id
+                );
+            }
+        }
+    }
+    assert!(named > 0, "no agent named a gauge");
 }
 
 /* ---- the transient-error continuation (t-4537) ----------------------- */
@@ -9958,6 +10374,369 @@ fn a_working_claude_pane_is_pointed_at_through_its_own_hook_and_never_its_compos
     crate::orchestration_pointer_mailbox::forget_term(LEADER);
 }
 
+/// A coordinator's pane as a CLI at its wall keeps it (t-6560): every line
+/// typed there opens a turn, and the CLI answers that turn itself, at once,
+/// with the wall — no model is asked.
+///
+/// The order is the real window's, and the loop lives in it: the prompt's
+/// own report (`pane_turn_began`) arrives before any beat has read the
+/// pump's receipt, and it strikes the pointer's marks out; the turn ends
+/// (`StopFailure`, measured as an ordinary end); and the next beat at rest
+/// finds nothing written down about the line it typed a moment ago.
+struct AtItsWall {
+    term: u32,
+    /// Every line typed, by terminal: a beat walks every run in the
+    /// process's ledger, and another scenario's pane is not this one's.
+    typed: Mutex<Vec<(u32, String)>>,
+    /// The receipt of the line in flight, answered when the pane hears it.
+    in_flight: Mutex<Option<std::sync::mpsc::SyncSender<zerocode_pty::DeliveryOutcome>>>,
+    /// Whether the pane's last answer is a wall — and the next one will be.
+    walled: std::sync::atomic::AtomicBool,
+    cause: crate::quota_wall::StallCause,
+}
+
+impl AtItsWall {
+    /// How long each look at the wall says it still stands. Short, so a
+    /// hold's own deadline passes during the test and is looked at again.
+    const STANDS_FOR_MS: i64 = 1_500;
+
+    fn new(term: u32, cause: crate::quota_wall::StallCause, walled: bool) -> Self {
+        Self {
+            term,
+            typed: Mutex::new(Vec::new()),
+            in_flight: Mutex::new(None),
+            walled: std::sync::atomic::AtomicBool::new(walled),
+            cause,
+        }
+    }
+
+    fn typed(&self) -> usize {
+        self.typed
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .iter()
+            .filter(|(term, _)| *term == self.term)
+            .count()
+    }
+
+    fn wall_lifts(&self) {
+        self.walled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// What the pane does with the line in flight, if any: the prompt's
+    /// report, the pump's receipt, and the turn's end — at the wall, when a
+    /// wall answers every prompt here.
+    fn answers(&self, meets_the_wall: bool) {
+        let Some(settle) = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .take()
+        else {
+            return;
+        };
+        super::pane_turn_began(self.term);
+        let _ = settle.send(zerocode_pty::DeliveryOutcome::Delivered);
+        super::pane_turn_ended(self.term, clock(), false, clock());
+        if meets_the_wall {
+            self.walled.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl Host for AtItsWall {
+    fn split(
+        &self,
+        _team: &str,
+        _leader_term: u32,
+        _from_term: u32,
+        _pane: &str,
+        _direction: zerocode_core::agent_teams::Direction,
+        _command: &str,
+        _token: &str,
+    ) -> Option<u32> {
+        None
+    }
+    fn send(&self, _term: u32, _text: &str) -> bool {
+        true
+    }
+    fn point(
+        &self,
+        term: u32,
+        line: &str,
+        _submit: bool,
+    ) -> Option<std::sync::mpsc::Receiver<zerocode_pty::DeliveryOutcome>> {
+        self.typed
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .push((term, line.to_string()));
+        let (settle, receipt) = std::sync::mpsc::sync_channel(1);
+        if term == self.term {
+            *self
+                .in_flight
+                .lock()
+                .unwrap_or_else(|held| held.into_inner()) = Some(settle);
+        }
+        Some(receipt)
+    }
+    fn capture(&self, _term: u32) -> Option<String> {
+        None
+    }
+    fn focus(&self, _term: u32) -> bool {
+        false
+    }
+    fn close(&self, _term: u32) {}
+    fn actor_for(&self, term: u32) -> Option<String> {
+        Some(test_actor(term))
+    }
+    fn agent_of(&self, _term: u32) -> Option<String> {
+        Some(zerocode_core::AgentKind::Claude.slug().to_string())
+    }
+    fn pane_wall(&self, term: u32, agent: &str) -> Option<crate::quota_wall::PaneWall> {
+        assert_eq!(agent, zerocode_core::AgentKind::Claude.slug());
+        // The CLI's own sentences, as the coordinator's transcript has them.
+        let said = match self.cause {
+            crate::quota_wall::StallCause::LoginWall => "Login expired · Please run /login",
+            _ => "You've hit your session limit · resets 6:30pm (Asia/Seoul)",
+        };
+        (term == self.term && self.walled.load(std::sync::atomic::Ordering::SeqCst)).then(|| {
+            crate::quota_wall::PaneWall {
+                cause: self.cause,
+                line: zerocode_core::orchestration::Text::from(said.to_string()),
+                stands_until_ms: clock() + Self::STANDS_FOR_MS,
+            }
+        })
+    }
+}
+
+/// Twenty letters to a pane standing at its wall: the pointer is typed at
+/// most once while the wall stands — the line that found it — and once when
+/// it stops standing (t-6560).
+///
+/// Before, every beat at rest typed the same line again: the coordinator's
+/// pane took it 1,391 times in four days, every two to five seconds, and
+/// each one that met a quota wall was a request the provider refused. The
+/// wall is read off the pane's own last answer and held for as long as the
+/// wall's own window (`QUOTA_WAIT_POLICY`) says; a hold whose window runs
+/// out looks again, and a wall that no longer answers is the lift.
+#[test]
+fn a_pane_at_its_wall_is_told_once_while_it_stands_and_once_when_it_lifts() {
+    const LEADER: u32 = 11_560;
+    const WORKER: u32 = 11_561;
+    const LETTERS: usize = 20;
+    let _window = the_window();
+    let _turn = one_beat_at_a_time();
+    let team = format!("team-walled-{LEADER}");
+    let (run_id, worker, pane) = a_worker_carrying_work(&team, LEADER, WORKER);
+    let host = AtItsWall::new(LEADER, crate::quota_wall::StallCause::QuotaWall, false);
+    let held = crate::agent_teams::current_pane_capability(&team, &pane)
+        .expect("the split minted the worker a capability");
+    let post = |n: usize| {
+        let posted = run(
+            &host,
+            Vec::new(),
+            &team,
+            &pane,
+            &held,
+            &words(&format!(
+                "send --type status --body letter-{n} --retry-request walled-{worker}-{n}"
+            )),
+            clock(),
+        );
+        assert_eq!(posted.exit_code, 0, "{}", posted.stderr);
+    };
+    // Three beats a letter, the pane answering at its wall between them.
+    let beats = |host: &AtItsWall| {
+        for _ in 0..3 {
+            super::tick(host, &[], clock());
+            host.answers(true);
+        }
+    };
+    let blackbox = super::BLACKBOX
+        .get()
+        .expect("the bench window's black box")
+        .join("window-errors.log");
+    let counted = |needle: &str| -> usize {
+        std::fs::read_to_string(&blackbox)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(needle))
+            .count()
+    };
+    let held_line =
+        format!("mail waiting for run:{run_id} in {run_id} is held at terminal {LEADER}");
+    let lifted_line = format!("terminal {LEADER}'s quota wall stopped standing");
+
+    // The coordinator finished a turn in the ordinary way; nothing walls it.
+    super::pane_turn_began(LEADER);
+    super::pane_turn_ended(LEADER, clock(), false, clock());
+
+    // The first letter finds a pane nobody knows is walled — and the line
+    // typed about it is the turn that meets the wall.
+    post(1);
+    beats(&host);
+    assert_eq!(
+        host.typed(),
+        1,
+        "the first letter, before any wall, was not pointed at exactly once"
+    );
+    for n in 2..=LETTERS {
+        post(n);
+        beats(&host);
+    }
+    let while_it_stood = host.typed();
+    assert!(
+        while_it_stood <= 1,
+        "the pointer was typed {while_it_stood} times at a pane standing at its wall, \
+         for {LETTERS} letters"
+    );
+    assert!(
+        counted(&held_line) >= 1,
+        "the black box never said why nothing was typed"
+    );
+
+    // The wall stops standing: its window ran out and the pane's last answer,
+    // looked at again, is no wall. One line — and only one.
+    host.wall_lifts();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while host.typed() == while_it_stood && std::time::Instant::now() < deadline {
+        super::tick(&host, &[], clock());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        host.typed(),
+        while_it_stood + 1,
+        "the pane was not told about its mail once its wall had lifted"
+    );
+    assert_eq!(
+        counted(&lifted_line),
+        1,
+        "the lift was not written down once"
+    );
+
+    /* The agent reads what the line pointed at: its turn is a real one now.
+     * The mail is acknowledged, and nothing is typed after it. */
+    host.answers(false);
+    let leader_seat = zerocode_core::agent_teams::LEADER_PANE;
+    let read = run(
+        &host,
+        Vec::new(),
+        &team,
+        leader_seat,
+        TEST_CAPABILITY,
+        &words("check"),
+        clock(),
+    );
+    assert_eq!(read.exit_code, 0, "{}", read.stderr);
+    let read: serde_json::Value = serde_json::from_str(&read.stdout).expect("a delivery");
+    assert_eq!(
+        read["count"], LETTERS,
+        "the letters were not all handed over"
+    );
+    let delivery = read["deliveryId"].as_str().expect("a delivery id");
+    let acked = run(
+        &host,
+        Vec::new(),
+        &team,
+        leader_seat,
+        TEST_CAPABILITY,
+        &words(&format!("check --ack {delivery}")),
+        clock(),
+    );
+    assert_eq!(acked.exit_code, 0, "{}", acked.stderr);
+    for _ in 0..3 {
+        super::tick(&host, &[], clock());
+    }
+    assert_eq!(
+        host.typed(),
+        while_it_stood + 1,
+        "read mail was pointed at again"
+    );
+
+    super::pane_turn_began(LEADER);
+    crate::agent_teams::forget_term(LEADER);
+    crate::agent_teams::forget_term(WORKER);
+    crate::orchestration_pointer_mailbox::forget_term(LEADER);
+}
+
+/// A pane whose last answer was already its login wall is not typed at
+/// when mail comes — not even once — and is told the moment it answers
+/// again (t-6560).
+///
+/// The login that expired on 2026-09-20 12:10 took nine lines in twenty
+/// seconds, each answered by the CLI itself with `Login expired · Please
+/// run /login`. The person signs in, their own turn goes through, and that
+/// turn's end is where the pointer speaks — once.
+#[test]
+fn mail_for_a_pane_already_at_its_login_wall_waits_for_its_next_answer() {
+    const LEADER: u32 = 11_562;
+    const WORKER: u32 = 11_563;
+    let _window = the_window();
+    let _turn = one_beat_at_a_time();
+    let team = format!("team-login-wall-{LEADER}");
+    let (run_id, worker, pane) = a_worker_carrying_work(&team, LEADER, WORKER);
+    let host = AtItsWall::new(LEADER, crate::quota_wall::StallCause::LoginWall, true);
+    let held = crate::agent_teams::current_pane_capability(&team, &pane)
+        .expect("the split minted the worker a capability");
+    super::pane_turn_began(LEADER);
+    super::pane_turn_ended(LEADER, clock(), false, clock());
+
+    for n in 1..=5 {
+        let posted = run(
+            &host,
+            Vec::new(),
+            &team,
+            &pane,
+            &held,
+            &words(&format!(
+                "send --type status --body login-{n} --retry-request login-wall-{worker}-{n}"
+            )),
+            clock(),
+        );
+        assert_eq!(posted.exit_code, 0, "{}", posted.stderr);
+        for _ in 0..3 {
+            super::tick(&host, &[], clock());
+            host.answers(true);
+        }
+    }
+    assert_eq!(
+        host.typed(),
+        0,
+        "the pointer was typed at a pane whose own last answer was its login wall"
+    );
+    let blackbox = super::BLACKBOX
+        .get()
+        .expect("the bench window's black box")
+        .join("window-errors.log");
+    let log = std::fs::read_to_string(&blackbox).unwrap_or_default();
+    assert!(
+        log.lines().any(|line| line.contains(&format!(
+            "mail waiting for run:{run_id} in {run_id} is held at terminal {LEADER}"
+        )) && line.contains("login wall")),
+        "the black box never named the login wall"
+    );
+
+    // The person signs in and their own turn goes through: the turn begins,
+    // ends, and its last answer is no wall. The next beat at rest speaks.
+    host.wall_lifts();
+    super::pane_turn_began(LEADER);
+    super::pane_turn_ended(LEADER, clock(), false, clock());
+    for _ in 0..3 {
+        super::tick(&host, &[], clock());
+    }
+    assert_eq!(
+        host.typed(),
+        1,
+        "the pane was not told once its login answered again"
+    );
+
+    super::pane_turn_began(LEADER);
+    crate::agent_teams::forget_term(LEADER);
+    crate::agent_teams::forget_term(WORKER);
+    crate::orchestration_pointer_mailbox::forget_term(LEADER);
+}
+
 /// A pane a person interrupted is theirs, and stays theirs until they
 /// finish a turn in it — so its door, like an unheard pane's, is one no
 /// beat opens on its own. The pointer must not type there either, and the
@@ -10428,7 +11207,11 @@ fn a_window_exiting_puts_the_seat_to_sleep_before_its_pane_exits() {
         .and_then(|held| held.dispatch.clone())
         .expect("the dispatch");
 
-    super::window_exiting(clock());
+    super::window_exiting(
+        clock(),
+        crate::exit_runtime::ExitRoad::App,
+        &super::restart_census::RestartCensus::default,
+    );
     // The pane reaper reaches the seat afterwards, as it always could.
     super::terminal_gone(WORKER, clock());
 
@@ -10462,6 +11245,76 @@ fn a_window_exiting_puts_the_seat_to_sleep_before_its_pane_exits() {
     crate::agent_teams::forget_term(WORKER);
 }
 
+/// t-6428 ①: the goodbye names what it cuts. Before any seat sleeps the
+/// census reads the worker's turn and the commands under its pane — here a
+/// codex worker mid-turn, with a gate its native binary started under its
+/// Node launcher — and the window's log says the road once and the worker
+/// once. The census only reads: the seat still sleeps.
+#[test]
+fn the_goodbye_names_its_road_and_what_it_cuts_under_each_worker() {
+    const LEADER: u32 = 93_070;
+    const WORKER: u32 = 93_071;
+    const ROOT: u32 = 64_280;
+    let (_window, _store) = PrivateWindow::boot();
+    let host = Seating {
+        onto: WORKER,
+        checkout: "/tmp",
+    };
+    let (_team, _task, worker) =
+        a_seated_worker_with_a_session(&host, LEADER, WORKER, "session-goodbye");
+    super::pane_turn_began(WORKER);
+    let listing = format!(
+        "501 {ROOT} 1 {ROOT} 0 1 Thu Sep 24 01:00:00 2026 node /opt/homebrew/bin/codex resume s\n\
+         501 64281 {ROOT} {ROOT} 0 1 Thu Sep 24 01:00:00 2026 /opt/codex/vendor/bin/codex resume s\n\
+         501 64282 64281 64282 0 1 Thu Sep 24 01:00:00 2026 /bin/zsh -lc just shell-test\n"
+    );
+    let census = || {
+        super::restart_census::take(&|term| (term == WORKER).then_some(ROOT), &|| {
+            Ok(crate::resource_usage::ProcessSample::from_ps_listing(
+                &listing,
+            ))
+        })
+    };
+
+    super::window_exiting(clock(), crate::exit_runtime::ExitRoad::Close, &census);
+
+    let blackbox = super::BLACKBOX
+        .get()
+        .expect("the bench window's black box")
+        .join("window-errors.log");
+    let log = std::fs::read_to_string(&blackbox).unwrap_or_default();
+    let named = format!(
+        "exit: worker {worker} on terminal {WORKER} (codex) · turn running · 1 command(s): \
+         just shell-test"
+    );
+    assert_eq!(
+        log.lines().filter(|line| line.ends_with(&named)).count(),
+        1,
+        "the goodbye did not name the worker once:\n{log}"
+    );
+    assert!(
+        log.lines()
+            .any(|line| line.contains("exit by close · workers 1 · mid-turn 1 · background 0")),
+        "the goodbye did not say its road and numbers:\n{log}"
+    );
+    let slept = the_rows()
+        .workers
+        .iter()
+        .find(|held| held.id == worker)
+        .map(|held| held.state);
+    assert_eq!(slept, Some(WorkerState::Sleeping));
+    // A second goodbye on the same way out finds nobody live to name.
+    super::window_exiting(clock(), crate::exit_runtime::ExitRoad::App, &census);
+    let again = std::fs::read_to_string(&blackbox).unwrap_or_default();
+    assert_eq!(
+        again.lines().filter(|line| line.ends_with(&named)).count(),
+        1,
+        "the worker was named twice"
+    );
+    crate::agent_teams::forget_term(LEADER);
+    crate::agent_teams::forget_term(WORKER);
+}
+
 /// t-3058 (1), the witness road through the production doors. After the
 /// exit the next window resumes the same conversation into the same
 /// checkout — the person's own restored tab, a leader of its own team —
@@ -10480,7 +11333,11 @@ fn a_resumed_pane_is_seated_as_the_sleeper_it_is_and_reports_done_from_there() {
     };
     let (_team, task, worker) =
         a_seated_worker_with_a_session(&host, LEADER, WORKER, "session-witness");
-    super::window_exiting(clock());
+    super::window_exiting(
+        clock(),
+        crate::exit_runtime::ExitRoad::App,
+        &super::restart_census::RestartCensus::default,
+    );
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(WORKER);
 
@@ -10573,7 +11430,11 @@ fn a_sleeper_nobody_resumed_dies_on_the_beat_after_the_grace() {
         .find(|held| held.id == worker)
         .and_then(|held| held.dispatch.clone())
         .expect("the dispatch");
-    super::window_exiting(clock());
+    super::window_exiting(
+        clock(),
+        crate::exit_runtime::ExitRoad::App,
+        &super::restart_census::RestartCensus::default,
+    );
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(WORKER);
 
@@ -13388,6 +14249,7 @@ fn coordinator_handover_native_order_walks_once_and_persists_in_the_store() {
         onto: Mutex::new(0),
         checkout: "/unused",
         markers: Mutex::new(std::collections::HashMap::new()),
+        asked: Mutex::new(Vec::new()),
     });
     let answer = run(
         &host,
@@ -13487,6 +14349,7 @@ fn coordinator_handover_cli_cannot_declare_a_human_order() {
         onto: Mutex::new(0),
         checkout: "/unused",
         markers: Mutex::new(std::collections::HashMap::new()),
+        asked: Mutex::new(Vec::new()),
     });
     let answer = run(
         &host,
@@ -13513,6 +14376,7 @@ fn coordinator_manual_native_picker_and_claim_are_durable_and_retryable() {
         onto: Mutex::new(0),
         checkout: "/unused",
         markers: Mutex::new(std::collections::HashMap::new()),
+        asked: Mutex::new(Vec::new()),
     });
     let made = run(
         &host,
@@ -13593,6 +14457,7 @@ fn coordinator_manual_native_claim_is_available_when_the_source_pane_is_gone() {
         onto: Mutex::new(0),
         checkout: "/unused",
         markers: Mutex::new(std::collections::HashMap::new()),
+        asked: Mutex::new(Vec::new()),
     });
     let made = run(
         &host,
@@ -13641,6 +14506,7 @@ fn coordinator_handover_can_disable_after_source_capability_disappears() {
         onto: Mutex::new(0),
         checkout: "/unused",
         markers: Mutex::new(std::collections::HashMap::new()),
+        asked: Mutex::new(Vec::new()),
     });
     let made = run(
         &host,

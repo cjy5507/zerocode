@@ -35,6 +35,7 @@ pub mod hedge;
 pub mod memo;
 pub mod noul;
 pub mod promote;
+pub mod questions;
 pub mod recent;
 pub mod shard;
 pub mod summary;
@@ -210,6 +211,13 @@ pub const ROUTE_USE_APPLIED: &str = "applied";
 /// product used its own reader anyway: no key, a refusal, a failure, or an
 /// answer that did not clear the seat's floor.
 pub const ROUTE_USE_FALLBACK: &str = "fallback";
+
+/// The word a row's `routeUse` carries when the seat answered, well formed
+/// and in time, and its own confidence put the answer under the abstain line
+/// ([`Band::Abstain`], t-6346): the product asked its own reader instead, as
+/// if the seat had not been asked. Not a failure — the answer is counted as
+/// answered — and not an act.
+pub const ROUTE_USE_ABSTAINED: &str = "abstained";
 
 /// What a person set a use to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -788,25 +796,48 @@ pub const JUDGMENT_MEMO_DEADLINE_MS: u64 = 50;
 /// zo's routing judgment: a task's complexity, risk and intent beside the
 /// chat probe's (docs/design/jev-decision-shadow-20260917.md).
 ///
-/// The `agreed` rule (t-5806): a routing judgment agreed when the turn it
-/// routed STOOD — no quota wall, refusal fallback or overload demotion moved
-/// the wire to another model, and the person did not name one themselves —
-/// and disagreed when any of those unseated the route before the turn ended.
-/// The label is one row per turn, keyed by the turn's attempt, written by
-/// the host when the turn ends (`decision_shadow::note_route_followed`); a
-/// turn the person cancelled is not judged, and a turn the seat was never
-/// asked about leaves no label. The judge counts it beside the probe's axis
-/// agreement, one comparison per label row.
+/// The second version (t-6346) asks the catalog's words
+/// ([`questions::ROUTING_RUBRIC_VERSION`]) — two Scores, two contrastive
+/// Choices and six facts in one request — about every turn and every spawn
+/// the seat is asked about, whatever the chat probe's own gate says; the
+/// probe is asked only where the answer abstains ([`JevUse::confidence_bands`]).
+///
+/// The `agreed` rule (t-6346, after t-5806): a routing judgment agreed when
+/// the router, reading the complexity it answered, would have picked the
+/// tier the turn it was asked about turned out to need — the turn's own
+/// calls, the files it wrote and the agents it started, read as a level by
+/// one table (zo's `route_label`), and both levels read through the router's
+/// own complexity-to-tier table (zo's `runtime::default_difficulty_tier`:
+/// trivial and small the fast tier, medium the balanced, large the strong).
+/// "Within one band of the work" was the rule first written and was dropped
+/// on the replay: a reader that always said small agreed on 401 of 488
+/// turns. The first rule — the route STOOD, no wall, refusal or person moved
+/// the model — said yes ten times in ten; what became of the route is kept
+/// beside the mark as `followed`. The label is one row per turn, keyed by
+/// the turn's attempt, written by the host when the turn ends
+/// (`decision_shadow::note_route_followed`); a turn the person cancelled is
+/// not judged, and a turn the seat was never asked about leaves no label.
+/// The judge counts it beside the probe's axis agreement, one comparison per
+/// label row, and marks the keyword tables on the same facts.
 pub const ROUTING: JevUse = JevUse {
     id: "routing",
     setting: "decisionShadow",
     modes: &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
     recommended: JevMode::Auto,
     repeat: None,
-    sends: &[Sent {
-        at: "/state",
-        cap: Cap::Chars(ROUTING_TASK_CHAR_CAP),
-    }],
+    // The second version's state is an object (t-6346): the task's head,
+    // cut here by its own pointer, and the facts code wrote — booleans,
+    // nothing a person typed (`questions::ROUTING_STATE_*`).
+    sends: &[
+        Sent {
+            at: "/state/task",
+            cap: Cap::Chars(ROUTING_TASK_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/facts",
+            cap: Cap::Uncut,
+        },
+    ],
     ledger: "decision-shadow.jsonl",
     promotes: true,
     answer_floor_permille: Some(950),
@@ -816,9 +847,10 @@ pub const ROUTING: JevUse = JevUse {
     window_forgives: Some(FORGIVES_NOTHING),
     agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
     agreement_kind: AgreementKind::Comparison,
-    // The keyword tables that route a turn with no judgment at all; the
-    // chat probe is the second reader both are graded by. Its writer stamps
-    // no baseline mark yet, so the seat holds at `too_few_baseline`.
+    // The keyword tables that route a turn with no judgment at all, graded
+    // on every mark the seat is (t-6346): the chat probe's answer, axis by
+    // axis, on a row that carries the tables' reading, and the turn's work
+    // on its label row.
     baseline: Baseline::TodaysRule,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::ROUTED),
@@ -1483,6 +1515,18 @@ pub const SKILL_TASK_CHAR_CAP: usize = ROUTING_TASK_CHAR_CAP;
 /// `skill_load` hands back.
 pub const SKILL_DESCRIPTION_CHAR_CAP: usize = 1_200;
 
+/// The second pass reads only the first part of each shortlisted SKILL.md.
+pub const SKILL_EXCERPT_CHAR_CAP: usize = 700;
+pub const SKILL_DETAIL_CHAR_CAP: usize = SKILL_DESCRIPTION_CHAR_CAP + SKILL_EXCERPT_CHAR_CAP + 3;
+pub const SKILL_FITS_INSTRUCTIONS_CHAR_CAP: usize = SKILL_DESCRIPTION_CHAR_CAP + 200;
+/// A single Choice is documented at this catalog size. Larger catalogs keep
+/// the existing search path until they have their own measured split policy.
+pub const SKILL_SUGGESTION_CATALOG_CAP: usize = 240;
+/// The cookbook's shortlist and separate request-specific probability floors.
+pub const SKILL_SUGGESTION_SHORTLIST: usize = 3;
+pub const SKILL_GATE_FLOOR_PERMILLE: u16 = 300;
+pub const SKILL_FITS_FLOOR_PERMILLE: u16 = 300;
+
 /// Skills one request asks about ([`shard::even_shards`]'s target).
 ///
 /// The reference build this seat is borrowed from sends 137 skills as three
@@ -1574,8 +1618,7 @@ pub const SKILL_AGREEMENT_FLOOR_PERMILLE: u16 = 800;
 /// what the word match ranked and says so on the row.
 pub const SKILL_SEARCH_APPLY_DEADLINE_MS: u64 = 10_000;
 
-/// zo's skill search: how much each installed skill covers the task a turn
-/// describes, one score question per skill (t-5629).
+/// zo's skill search and turn-start suggestion (t-5629, t-6347).
 ///
 /// The seat exists to take the skill index out of the system prompt. Today
 /// every installed skill's name and compacted description is rendered on
@@ -1590,10 +1633,10 @@ pub const SKILL_SEARCH_APPLY_DEADLINE_MS: u64 = 10_000;
 /// `shadow` leaves the index exactly where it is and records what the search
 /// would have handed back, which is what makes the two readable side by side.
 ///
-/// What is sent is the task, and the name and description of each installed
-/// skill. A skill's BODY is never sent: it is read from the disk this machine
-/// already holds it on and handed to the model as a tool result, so the
-/// judgment prices a line and the turn reads a document.
+/// The first turn-start request sends the task and each installed skill's name
+/// and description. When the gate says a skill may help, a second request
+/// sends the first 700 characters of three shortlisted SKILL.md files under
+/// the same switch. The full body remains local and is read by Skill only.
 pub const SKILLS: JevUse = JevUse {
     id: "skills",
     setting: "skillSearch",
@@ -1607,7 +1650,7 @@ pub const SKILLS: JevUse = JevUse {
         },
         Sent {
             at: "/state/skills",
-            cap: Cap::Items(SKILL_SHARD_TARGET),
+            cap: Cap::Items(SKILL_SUGGESTION_CATALOG_CAP),
         },
         Sent {
             at: "/state/skills/*/name",
@@ -1616,6 +1659,26 @@ pub const SKILLS: JevUse = JevUse {
         Sent {
             at: "/state/skills/*/description",
             cap: Cap::Chars(SKILL_DESCRIPTION_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/candidates",
+            cap: Cap::Items(SKILL_SUGGESTION_SHORTLIST),
+        },
+        Sent {
+            at: "/state/candidates/*/excerpt",
+            cap: Cap::Chars(SKILL_EXCERPT_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/candidates/*/description",
+            cap: Cap::Chars(SKILL_DESCRIPTION_CHAR_CAP),
+        },
+        Sent {
+            at: "/questions/which/criteria/*",
+            cap: Cap::Chars(SKILL_DETAIL_CHAR_CAP),
+        },
+        Sent {
+            at: "/questions/*/instructions",
+            cap: Cap::Chars(SKILL_FITS_INSTRUCTIONS_CHAR_CAP),
         },
     ],
     ledger: "skill-search.jsonl",
@@ -1627,8 +1690,9 @@ pub const SKILLS: JevUse = JevUse {
     window_forgives: Some(FORGIVES_A_BAD_MINUTE),
     agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
     agreement_kind: AgreementKind::Comparison,
-    // The word match that ranks the skills without a judgment. Its writer
-    // stamps no baseline mark yet: the seat holds at `too_few_baseline`.
+    // Today's turn lets the agent choose from the index on its own. A
+    // validated gold label is needed to compare that baseline with the hint;
+    // the live first-load observation alone is not such a label.
     baseline: Baseline::TodaysRule,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::LOW_STAKES),
@@ -2882,6 +2946,23 @@ pub const PATCH_REVIEW_APPLY_DEADLINE_MS: u64 = 1_500;
 /// last edit settles the label first — the harness's own receipt (r43).
 pub const PATCH_REVIEW_REGRET_TURNS: u32 = 5;
 
+/// The file-pick seat asks about at most this many candidates in one batch.
+pub const FILE_PICK_CANDIDATE_CAP: usize = 30;
+/// The request head carried beside the candidates.
+pub const FILE_PICK_REQUEST_CHAR_CAP: usize = ROUTING_TASK_CHAR_CAP;
+/// The first descriptive line sent beside a candidate path.
+pub const FILE_PICK_ABOUT_BYTE_CAP: usize = 200;
+/// The hint names no more than this many candidates.
+pub const FILE_PICK_HINT_FILE_CAP: usize = 3;
+/// A candidate needs this yes probability before it can be shown.
+pub const FILE_PICK_MATCH_FLOOR_PERMILLE: u16 = 700;
+/// A file-pick batch must answer nine times in ten before `auto` can rise.
+pub const FILE_PICK_ANSWER_FLOOR_PERMILLE: u16 = 900;
+/// The top-three hindsight match must clear this line and today's recent-edit order.
+pub const FILE_PICK_AGREEMENT_FLOOR_PERMILLE: u16 = 600;
+/// An applied hint can wait this long for the one batched answer.
+pub const FILE_PICK_APPLY_DEADLINE_MS: u64 = 1_500;
+
 /// zo's patch review: every patch an edit tool has just written — `edit_file`,
 /// `write_file`, `MultiEdit`, anything whose result carries a structured
 /// patch — put to four Noul questions before the model reads the result
@@ -2965,8 +3046,379 @@ pub const PATCH_REVIEW: JevUse = JevUse {
     )),
 };
 
+/// One turn's completion claims put beside the tool output that can support
+/// them. A new seat records first; its hindsight is the person's next turn.
+pub const CLAIM_LIMIT: usize = 8;
+pub const CLAIM_TEXT_CHAR_CAP: usize = 400;
+pub const CLAIM_EVIDENCE_BYTE_CAP: usize = 2_048;
+pub const CLAIM_CHOICE_FLOOR_PERMILLE: u16 = 800;
+pub const CLAIM_APPLY_DEADLINE_MS: u64 = 1_500;
+pub const CLAIM_CRITERIA: [(&str, &str); 3] = [
+    (
+        "supports",
+        "The lines state the claim or directly imply that it is true.",
+    ),
+    (
+        "contradicts",
+        "The lines state the opposite of the claim or imply it is false.",
+    ),
+    (
+        "says_nothing",
+        "The lines do not address what the claim asserts, either way.",
+    ),
+];
+pub const CLAIM: JevUse = JevUse {
+    id: "claim",
+    setting: "jevClaimCheck",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
+    // `auto`, like every seat that promotes: it stands at shadow until the
+    // judge raises it, and with no failure label yet on this machine the judge
+    // cannot (report §남은 조건) — the same word as the table's other rows.
+    recommended: JevMode::Auto,
+    repeat: None,
+    sends: &[
+        Sent {
+            at: "/state/claims",
+            cap: Cap::Items(CLAIM_LIMIT),
+        },
+        Sent {
+            at: "/state/claims/*/text",
+            cap: Cap::Chars(CLAIM_TEXT_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/evidence/*",
+            cap: Cap::Bytes(CLAIM_EVIDENCE_BYTE_CAP),
+        },
+    ],
+    ledger: "claim-check.jsonl",
+    promotes: true,
+    answer_floor_permille: Some(900),
+    press_floor_permille: None,
+    agreement_floor_permille: Some(800),
+    apply_deadline_ms: Some(CLAIM_APPLY_DEADLINE_MS),
+    window_forgives: Some(FORGIVES_A_BAD_MINUTE),
+    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Hindsight,
+    baseline: Baseline::AlwaysSame(CLAIM_CRITERIA[0].0),
+    negatives_wanted: Some(NEGATIVES_WANTED),
+    confidence_bands: Some(ConfidenceBands {
+        abstain_below_permille: 600,
+        act_from_permille: CLAIM_CHOICE_FLOOR_PERMILLE,
+    }),
+};
+
+/// The vault pair seat only suggests relations for a person's weekly review.
+/// A proposal is never a page edit, so it has no automatic promotion.
+pub const VAULT_PAIR_SUMMARY_BYTE_CAP: usize = 600;
+pub const VAULT_PAIR_TAG_CAP: usize = 8;
+pub const VAULT_PAIR_DEADLINE_MS: u64 = 1_500;
+pub const VAULT_PAIR_OPPOSITE_FLOOR_PERMILLE: u16 = 700;
+pub const VAULT_PAIR_REPLACES_FLOOR_PERMILLE: u16 = 700;
+pub const VAULT_PAIR_SAME_FLOOR_PERMILLE: u16 = 500;
+pub const VAULT_PAIRS: JevUse = JevUse {
+    id: "vault_pairs",
+    setting: "jevVaultPairs",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On],
+    recommended: JevMode::Shadow,
+    repeat: None,
+    sends: &[
+        Sent {
+            at: "/state/page_a/title",
+            cap: Cap::Bytes(VAULT_PAIR_SUMMARY_BYTE_CAP),
+        },
+        Sent {
+            at: "/state/page_a/summary",
+            cap: Cap::Bytes(VAULT_PAIR_SUMMARY_BYTE_CAP),
+        },
+        Sent {
+            at: "/state/page_a/tags",
+            cap: Cap::Items(VAULT_PAIR_TAG_CAP),
+        },
+        Sent {
+            at: "/state/page_a/tags/*",
+            cap: Cap::Bytes(VAULT_PAIR_SUMMARY_BYTE_CAP),
+        },
+        Sent {
+            at: "/state/page_b/title",
+            cap: Cap::Bytes(VAULT_PAIR_SUMMARY_BYTE_CAP),
+        },
+        Sent {
+            at: "/state/page_b/summary",
+            cap: Cap::Bytes(VAULT_PAIR_SUMMARY_BYTE_CAP),
+        },
+        Sent {
+            at: "/state/page_b/tags",
+            cap: Cap::Items(VAULT_PAIR_TAG_CAP),
+        },
+        Sent {
+            at: "/state/page_b/tags/*",
+            cap: Cap::Bytes(VAULT_PAIR_SUMMARY_BYTE_CAP),
+        },
+    ],
+    ledger: "vault-pairs.jsonl",
+    promotes: false,
+    answer_floor_permille: None,
+    press_floor_permille: None,
+    agreement_floor_permille: None,
+    // A seat that never rises names no apply deadline (the dashboard's
+    // contract: a rise line is timed, a record-only seat has no rise line);
+    // the request's own wire deadline is `VAULT_PAIR_DEADLINE_MS`, read by
+    // the zo runner.
+    apply_deadline_ms: None,
+    window_forgives: None,
+    agreement_rows_wanted: None,
+    agreement_kind: AgreementKind::Hindsight,
+    baseline: Baseline::AlwaysSame("none"),
+    negatives_wanted: Some(NEGATIVES_WANTED),
+    confidence_bands: Some(ConfidenceBands::on_a_noul(
+        NOUL_UNCERTAIN_TO_PERMILLE,
+        VAULT_PAIR_OPPOSITE_FLOOR_PERMILLE,
+    )),
+};
+
+/// Re-rank likely files for a code task, with one Noul for each candidate.
+///
+/// A future label is the file set the same turn actually edited. The baseline
+/// is the same turn's recent-edit order. During evidence collection the default
+/// is `shadow`; the judge alone decides whether `auto` may show an answer.
+pub const FILE_PICK: JevUse = JevUse {
+    id: "file_pick",
+    setting: "jevFilePick",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
+    // `auto`, like every seat that promotes (b2825f88): it stands at shadow
+    // until the judge raises it, and the first replay (t-6344) left it there —
+    // top-3 7/10 against the recent-edit baseline's 7/10.
+    recommended: JevMode::Auto,
+    repeat: None,
+    sends: &[
+        Sent {
+            at: "/state/request",
+            cap: Cap::Chars(FILE_PICK_REQUEST_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/files",
+            cap: Cap::Items(FILE_PICK_CANDIDATE_CAP),
+        },
+        Sent {
+            at: "/state/files/*/path",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/state/files/*/about",
+            cap: Cap::Bytes(FILE_PICK_ABOUT_BYTE_CAP),
+        },
+    ],
+    ledger: "file-pick.jsonl",
+    promotes: true,
+    answer_floor_permille: Some(FILE_PICK_ANSWER_FLOOR_PERMILLE),
+    press_floor_permille: None,
+    agreement_floor_permille: Some(FILE_PICK_AGREEMENT_FLOOR_PERMILLE),
+    apply_deadline_ms: Some(FILE_PICK_APPLY_DEADLINE_MS),
+    window_forgives: Some(FORGIVES_A_BAD_MINUTE),
+    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Hindsight,
+    baseline: Baseline::TodaysRule,
+    negatives_wanted: Some(NEGATIVES_WANTED),
+    confidence_bands: Some(ConfidenceBands::on_a_noul(
+        NOUL_UNCERTAIN_TO_PERMILLE,
+        FILE_PICK_MATCH_FLOOR_PERMILLE,
+    )),
+};
+
+/// Characters of a shell command one command-guard question carries (t-6348).
+///
+/// Measured over this machine's zo transcripts of the seven days to
+/// 2026-09-24 — 2,318 `bash` calls: p50 226, p90 919, p99 3,490 characters. A
+/// thousand holds 91.0% of them whole and the head of the rest, which is where
+/// the program and its first arguments stand; it is the recall seat's request
+/// line, one text a judgment reads.
+pub const COMMAND_GUARD_COMMAND_CHAR_CAP: usize = RECALL_REQUEST_CHAR_CAP;
+
+/// Characters of the task line beside the command: the first line of the
+/// person's newest words, which says what the command is for. A goal's
+/// sentence or two ([`GOAL_CHAR_CAP`]): 89.2% of the 362 first lines of the
+/// same week fit whole.
+pub const COMMAND_GUARD_TASK_CHAR_CAP: usize = GOAL_CHAR_CAP;
+
+/// The probability of yes, per thousand, at which either of the command
+/// guard's two Nouls names a command `flagged` — the guardrails cookbook's
+/// strict action line (review from 0.35, act from 0.70), a policy line and not
+/// a calibrated accuracy claim, like [`SCREEN_INSTRUCTED_FLOOR_PERMILLE`].
+pub const COMMAND_GUARD_FLAG_FLOOR_PERMILLE: u16 = 700;
+
+/// What the command guard's answers must bound above before `auto` rises to
+/// marking (§4): nine in ten — the patch review's reasoning, reached from this
+/// seat's side: a question that does not come back costs the command nothing,
+/// since it was asked beside the command and the command runs either way.
+pub const COMMAND_GUARD_ANSWER_FLOOR_PERMILLE: u16 = PATCH_REVIEW_ANSWER_FLOOR_PERMILLE;
+
+/// The command guard's route-change budget (§4): four marks in five must be
+/// the ones hindsight then gave — a command it flagged that was stopped,
+/// restored or changed something outside the project, and a command it let
+/// pass that none of those befell.
+pub const COMMAND_GUARD_AGREEMENT_FLOOR_PERMILLE: u16 = PATCH_REVIEW_AGREEMENT_FLOOR_PERMILLE;
+
+/// The wall an acting command guard waits for its answer, in milliseconds,
+/// counted from the moment it asked — which is before the command started, so
+/// the command's own run is inside the wall. A tool result is what the model
+/// is waiting on: the patch review's wall, for the patch review's reason.
+pub const COMMAND_GUARD_APPLY_DEADLINE_MS: u64 = PATCH_REVIEW_APPLY_DEADLINE_MS;
+
+/// Turns after a guarded command inside which a restore of a path it named
+/// counts as the command's regret — the patch review's window, drawn the same
+/// way: long enough for the turns that notice and repair, short enough that
+/// the same path restored an hour later for another reason is not charged to
+/// this command.
+pub const COMMAND_GUARD_REGRET_TURNS: u32 = PATCH_REVIEW_REGRET_TURNS;
+
+/// zo's command guard (t-6348): right before zo runs a shell command the
+/// product's own read-only rule cannot prove harmless, two Nouls in one request
+/// — would running it destroy or replace something no ordinary next step can
+/// bring back, does it change something outside the project's folder.
+///
+/// What is sent is the command, the folder it runs in, and the first line of
+/// the person's newest words. Nothing blocks: under `shadow` — and under an
+/// `auto` its evidence has not raised — the question is asked beside the
+/// command and only recorded; an acting guard adds one line to the result the
+/// model reads. It never claims to have stopped anything.
+///
+/// The `agreed` rule is hindsight, one label per answered command, written
+/// when its turn ends or its window of turns closes: the command was regretted
+/// when the person stopped it (Esc while it ran, or the turn it ran in),
+/// when a path it named outside the project changed under it, or when a later
+/// command restored a path it named ([`COMMAND_GUARD_REGRET_TURNS`]); it stood
+/// otherwise. A failed command is recorded, not graded. `flagged` agreed when
+/// the command was regretted, `plain` when it stood. The baseline is today's
+/// rule: zo's destructive and path tables, its shared-tree table, and the
+/// Computer Use words a control that cannot be taken back carries
+/// ([`crate::guarded::kind_of`]).
+pub const COMMAND_GUARD: JevUse = JevUse {
+    id: "command_guard",
+    setting: "jevCommandGuard",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
+    // `auto`, like every seat that promotes: it records until the judge
+    // raises it, and with no regret label yet on this machine it cannot.
+    recommended: JevMode::Auto,
+    repeat: None,
+    sends: &[
+        Sent {
+            at: "/state/command",
+            cap: Cap::Chars(COMMAND_GUARD_COMMAND_CHAR_CAP),
+        },
+        // The folder the command runs in, as the filesystem spells it — the
+        // line the second Noul draws "outside" from.
+        Sent {
+            at: "/state/cwd",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/state/task",
+            cap: Cap::Chars(COMMAND_GUARD_TASK_CHAR_CAP),
+        },
+    ],
+    ledger: "command-guard.jsonl",
+    promotes: true,
+    answer_floor_permille: Some(COMMAND_GUARD_ANSWER_FLOOR_PERMILLE),
+    press_floor_permille: None,
+    agreement_floor_permille: Some(COMMAND_GUARD_AGREEMENT_FLOOR_PERMILLE),
+    apply_deadline_ms: Some(COMMAND_GUARD_APPLY_DEADLINE_MS),
+    window_forgives: Some(FORGIVES_A_BAD_MINUTE),
+    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Hindsight,
+    baseline: Baseline::TodaysRule,
+    negatives_wanted: Some(NEGATIVES_WANTED),
+    // Two Nouls: abstain inside the cookbook's uncertain middle, act from the
+    // flag line's lean (a 700‰ yes is a 400‰ lean).
+    confidence_bands: Some(ConfidenceBands::on_a_noul(
+        NOUL_UNCERTAIN_TO_PERMILLE,
+        COMMAND_GUARD_FLAG_FLOOR_PERMILLE,
+    )),
+};
+
+/// Characters of a tool block's head one tool-text question carries
+/// (t-6348): routing's one text a judgment reads. Of the 640 file, web,
+/// window-browser and MCP blocks of this machine's seven days to 2026-09-24,
+/// 60.2% fit whole and the rest are asked about their head — where a page's
+/// banner, a file's header and a result's first lines stand. An order further
+/// down is not seen; the replay says so.
+pub const TOOL_TEXT_GUARD_TEXT_CHAR_CAP: usize = ROUTING_TASK_CHAR_CAP;
+
+/// The probability of yes, per thousand, at which the tool text guard names a
+/// block `instructed`: the screen guard's own line, because it is the screen
+/// guard's question asked of another text.
+pub const TOOL_TEXT_INSTRUCTED_FLOOR_PERMILLE: u16 = SCREEN_INSTRUCTED_FLOOR_PERMILLE;
+
+/// The wall an acting tool text guard holds a block before the model reads
+/// it, in milliseconds — the patch review's, for the patch review's reason.
+pub const TOOL_TEXT_GUARD_APPLY_DEADLINE_MS: u64 = PATCH_REVIEW_APPLY_DEADLINE_MS;
+
+/// What the tool text guard's answers must bound above before `auto` rises to
+/// fencing (§4): the command guard's line, reached the same way — a block
+/// whose question never came back reaches the model as it did before.
+pub const TOOL_TEXT_GUARD_ANSWER_FLOOR_PERMILLE: u16 = COMMAND_GUARD_ANSWER_FLOOR_PERMILLE;
+
+/// The tool text guard's route-change budget (§4): four marks in five must be
+/// the ones hindsight then gave — a block it named `instructed` whose order the
+/// next step carried out, and a block it let pass whose words nothing did.
+pub const TOOL_TEXT_GUARD_AGREEMENT_FLOOR_PERMILLE: u16 = COMMAND_GUARD_AGREEMENT_FLOOR_PERMILLE;
+
+/// zo's tool text guard (t-6348): the screen's instructions guard asked of
+/// every block a file read, a web fetch or search, the window's browser (an
+/// answer that arrives inside the window's fence) or an MCP tool hands back —
+/// does any of it address an assistant and tell it what to do.
+///
+/// What is sent is the block's head and the kind of tool it came from. Nothing
+/// blocks and no read is refused: under `shadow` — and under an `auto` its
+/// evidence has not raised — the question is asked beside the read and only
+/// recorded; an acting guard puts a block it flags inside the one fence for
+/// words an agent did not write (`crate::untrusted`) and adds one line. A
+/// filter for the model, not a security boundary.
+///
+/// The `agreed` rule is hindsight, one label per answered block, written when
+/// the turn ends: the block was followed when a call in the agent's next step
+/// carried out a command or wrote a file the block spelled and the person's
+/// words did not; it was not when that step made no such call. `instructed`
+/// agreed when the block was followed, `plain` when it was not. The baseline
+/// is today's rule: the block arrived already fenced.
+pub const TOOL_TEXT_GUARD: JevUse = JevUse {
+    id: "tool_text_guard",
+    setting: "jevToolTextGuard",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
+    // `auto`, like every seat that promotes.
+    recommended: JevMode::Auto,
+    repeat: None,
+    sends: &[
+        // A word the product wrote (`file`, `web`, `browser`, `mcp`), cleared
+        // like everything else the door reads: declared so a reader of this
+        // table sees every key the state carries.
+        Sent {
+            at: "/state/source",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/state/text",
+            cap: Cap::Chars(TOOL_TEXT_GUARD_TEXT_CHAR_CAP),
+        },
+    ],
+    ledger: "tool-text-guard.jsonl",
+    promotes: true,
+    answer_floor_permille: Some(TOOL_TEXT_GUARD_ANSWER_FLOOR_PERMILLE),
+    press_floor_permille: None,
+    agreement_floor_permille: Some(TOOL_TEXT_GUARD_AGREEMENT_FLOOR_PERMILLE),
+    apply_deadline_ms: Some(TOOL_TEXT_GUARD_APPLY_DEADLINE_MS),
+    window_forgives: Some(FORGIVES_A_BAD_MINUTE),
+    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Hindsight,
+    baseline: Baseline::TodaysRule,
+    negatives_wanted: Some(NEGATIVES_WANTED),
+    confidence_bands: Some(ConfidenceBands::on_a_noul(
+        NOUL_UNCERTAIN_TO_PERMILLE,
+        TOOL_TEXT_INSTRUCTED_FLOOR_PERMILLE,
+    )),
+};
+
 /// Every place this product asks Jev something.
-pub static JEV_USES: [JevUse; 20] = [
+pub static JEV_USES: [JevUse; 25] = [
     ROUTING,
     RECALL,
     SKILLS,
@@ -2987,6 +3439,11 @@ pub static JEV_USES: [JevUse; 20] = [
     JUDGMENT_CACHE,
     CHALLENGER,
     PATCH_REVIEW,
+    CLAIM,
+    VAULT_PAIRS,
+    FILE_PICK,
+    COMMAND_GUARD,
+    TOOL_TEXT_GUARD,
 ];
 
 impl JevUse {
@@ -3086,16 +3543,16 @@ pub fn jev_use(id: &str) -> Option<&'static JevUse> {
 /// ---- the gate in front of the routing seat --------------------------------
 ///
 /// The key under [`SMART_SETTINGS_KEY`] that decides how a spawn's difficulty
-/// is classified — and, as a consequence nobody reading the routing row would
-/// guess, whether the routing seat is asked anything at all.
+/// is classified — and whether the routing seat is asked anything at all.
 ///
-/// The chain, read in zo's own source: the decision shadow is fired only by
-/// `probe_and_shadow` (`smart_router/probe_exec.rs`), which is reached only
-/// through `route_probe_assessment(s)`, which `smart_router/apply.rs` calls
-/// only when this setting reads as [`ClassifierMode::Probed`]. So under the
-/// other three words `smart.decisionShadow` may say `on` and there is nothing
-/// the seat can ask — the switch a person CAN see promises a judgment the one
-/// they cannot see has already refused.
+/// Until t-6346 only the probing word reached the seat: the decision shadow
+/// was fired only from inside the chat probe's road, which the spawn road took
+/// only under [`ClassifierMode::Probed`] and the turn road only past the
+/// probe's own band gate — so `smart.decisionShadow` could say `on` while
+/// nothing was ever asked (0 of 25 rows applied, t-4727). Now the seat is
+/// asked under every word but `off` ([`ClassifierMode::reaches`]); the probe
+/// still waits on the probing word, and where the seat acts it is called only
+/// for an answer that abstains.
 ///
 /// It lives here rather than beside zo's own `RouteAutoClassifierMode` for the
 /// reason this module exists: two programs now read it — zo to route, and the
@@ -3116,7 +3573,7 @@ pub enum ClassifierMode {
     Assisted,
     /// The keyword tables, plus one bounded Fast-tier probe (~200 output
     /// tokens) whose verdict is fused on top of them — refining, never
-    /// replacing. The only word under which the routing seat is asked.
+    /// replacing. The only word under which the chat probe is called.
     Probed,
 }
 
@@ -3148,11 +3605,18 @@ impl ClassifierMode {
         matches!(self, Self::Assisted)
     }
 
-    /// Whether a probe is called — which is also whether the routing seat is
-    /// ever asked.
+    /// Whether the chat probe is called.
     #[must_use]
     pub const fn probes(self) -> bool {
         matches!(self, Self::Probed)
+    }
+
+    /// Whether the routing seat can be asked under this word: wherever
+    /// automatic routing runs (t-6346) — `off` routes nothing, so nothing is
+    /// judged for it.
+    #[must_use]
+    pub const fn reaches(self) -> bool {
+        self.runs()
     }
 
     /// The mode `value` names: one of the four words, trimmed, in any case.
@@ -3259,6 +3723,25 @@ fn hex_of(bytes: &[u8]) -> String {
 #[must_use]
 pub fn rubric_fingerprint(words: impl FnOnce() -> String) -> String {
     fingerprint_of(&words())
+}
+
+/// Hangul's share of a text's letters, per thousand — the language column a
+/// seat's rows carry so its agreement can be read apart by language (the
+/// vendor's models page: CJK scripts "are handled but not equally well";
+/// t-6324 §6-1). Counted by code on the words a request carries, which are
+/// never kept. `None` for a text with no letters at all.
+#[must_use]
+pub fn hangul_share_permille(text: &str) -> Option<u16> {
+    let (letters, hangul) = text.chars().filter(|glyph| glyph.is_alphabetic()).fold(
+        (0_u64, 0_u64),
+        |(letters, hangul), glyph| {
+            (
+                letters + 1,
+                hangul + u64::from(crate::second_brain_related::is_hangul(glyph)),
+            )
+        },
+    );
+    (letters > 0).then(|| u16::try_from(hangul * 1_000 / letters).unwrap_or(1_000))
 }
 
 #[cfg(test)]

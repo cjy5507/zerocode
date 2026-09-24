@@ -220,9 +220,11 @@ pub(crate) fn claude_usage(state: State<'_, AppState>, force: bool) -> UsageRepo
     let local_data_root = state.local_data_root().to_path_buf();
     usage_report(
         UsageGauge {
+            provider: "claude",
             cache: claude_usage_cache(&local_data_root),
             file: claude_usage_file(&local_data_root),
             scanning: &CLAUDE_USAGE_SCANNING,
+            log_root: local_data_root,
         },
         // A percentage belongs to one login. A snapshot read as somebody else
         // is not a stale answer to this question, it is an answer to a
@@ -233,6 +235,32 @@ pub(crate) fn claude_usage(state: State<'_, AppState>, force: bool) -> UsageRepo
         force,
         move || scan_claude_usage_now(&config_root),
     )
+}
+
+/// One gauge's ask, as the status bar makes it.
+type AskUsage = for<'a> fn(State<'a, AppState>, bool) -> UsageReport;
+
+/// Every gauge the ledger reads, by the name its table answers
+/// (`zerocode_core::orchestration::quota_gauge_for`), and the command the
+/// status bar asks it through — one table, so the beat's re-read and the
+/// cache it reads name the same gauges (t-6427).
+pub(crate) const USAGE_ASKS: [(&str, AskUsage); 6] = [
+    ("claude", claude_usage),
+    ("codex", codex_usage),
+    ("opencode", opencode_usage),
+    ("grok", grok_usage),
+    ("kimi", kimi_usage),
+    ("antigravity", antigravity_usage),
+];
+
+/// Ask one gauge to read its provider again, never forced: the refetch
+/// floor, the failure backoff and one scan at a time all hold
+/// ([`usage_report`]), and nothing waits on the answer (t-6427). A name with
+/// no gauge here asks nothing.
+pub(crate) fn ask_usage(state: State<'_, AppState>, gauge: &str) {
+    if let Some((_, ask)) = USAGE_ASKS.iter().find(|(name, _)| *name == gauge) {
+        let _ = ask(state, false);
+    }
 }
 
 /// The same contract as [`claude_usage`], against Codex's own screen: never
@@ -250,9 +278,11 @@ pub(crate) fn codex_usage(state: State<'_, AppState>, force: bool) -> UsageRepor
     let local_data_root = state.local_data_root().to_path_buf();
     usage_report(
         UsageGauge {
+            provider: "codex",
             cache: codex_usage_cache(&local_data_root),
             file: codex_usage_file(&local_data_root),
             scanning: &CODEX_USAGE_SCANNING,
+            log_root: local_data_root,
         },
         // The same rule the Claude side learned, for the same reason.
         |snapshot| snapshot.account == whose,
@@ -346,21 +376,23 @@ pub(crate) fn opencode_usage(state: State<'_, AppState>, force: bool) -> UsageRe
         .flatten();
     usage_report(
         UsageGauge {
+            provider: "opencode",
             cache: opencode_usage_cache(&local_data_root),
             file: opencode_usage_file(&local_data_root),
             scanning: &OPENCODE_USAGE_SCANNING,
+            log_root: local_data_root,
         },
         // A reading taken with a cookie that has since been cleared is not an
         // answer to the question being asked now.
         move |snapshot| configured || snapshot.status == "unavailable",
         force,
         move || {
-            usage_opencode::scan(
+            Scanned::api(usage_opencode::scan(
                 cookie.as_deref().map_or("", |held| held.as_str()),
                 (!workspace.is_empty()).then_some(workspace.as_str()),
                 &server_fn_instance(),
                 epoch_ms_now(),
-            )
+            ))
         },
     )
 }
@@ -384,13 +416,15 @@ pub(crate) fn grok_usage(state: State<'_, AppState>, force: bool) -> UsageReport
         .and_then(|text| usage_grok::signed_in_as(&text, epoch_ms_now()));
     usage_report(
         UsageGauge {
+            provider: "grok",
             cache: grok_usage_cache(&local_data_root),
             file: grok_usage_file(&local_data_root),
             scanning: &GROK_USAGE_SCANNING,
+            log_root: local_data_root,
         },
         move |snapshot| snapshot.account == whose,
         force,
-        move || usage_grok::scan(epoch_ms_now()),
+        move || Scanned::api(usage_grok::scan(epoch_ms_now())),
     )
 }
 
@@ -406,13 +440,15 @@ pub(crate) fn kimi_usage(state: State<'_, AppState>, force: bool) -> UsageReport
     let local_data_root = state.local_data_root().to_path_buf();
     usage_report(
         UsageGauge {
+            provider: "kimi",
             cache: kimi_usage_cache(&local_data_root),
             file: kimi_usage_file(&local_data_root),
             scanning: &KIMI_USAGE_SCANNING,
+            log_root: local_data_root,
         },
         |_| true,
         force,
-        move || usage_kimi::scan(epoch_ms_now()),
+        move || Scanned::api(usage_kimi::scan(epoch_ms_now())),
     )
 }
 

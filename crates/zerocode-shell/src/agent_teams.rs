@@ -867,6 +867,18 @@ pub trait Host {
         None
     }
 
+    /// The wall this pane's own conversation last ended at, when it ended at
+    /// one: a quota or a login that the next prompt would only meet again
+    /// (t-6560, `quota_wall.rs`).
+    ///
+    /// Asked by the mail pointer at the moment it would type a fresh line,
+    /// never once a beat: the real window reads the tail of the pane's
+    /// transcript here. Test and tmux-only hosts default to no observation
+    /// rather than inventing a wall.
+    fn pane_wall(&self, _term: u32, _agent: &str) -> Option<crate::quota_wall::PaneWall> {
+        None
+    }
+
     /// Observe a quiet worker's own quota marker while holding the activity
     /// locks that can invalidate it. Call `commit` at most once, and keep the
     /// locks until it returns. This is asked after the actor dequeues terminal
@@ -880,6 +892,18 @@ pub trait Host {
         _commit: &mut dyn FnMut(zerocode_core::orchestration::QuotaWallMarker),
     ) {
     }
+
+    /// Ask the window's usage gauge `gauge` to read its provider again, the
+    /// way the status bar asks — never forced, so at most one read runs at a
+    /// time, none inside its refetch floor and none while a failed read
+    /// backs off (t-6427). Nothing waits on it: the answer lands in the
+    /// cache the beat reads.
+    ///
+    /// The wait rung asks, from a held wall's reset on: the lift is judged
+    /// by a number read after the reset, and the window's own poll stops
+    /// while nobody looks at the window. Test and tmux-only hosts read
+    /// nothing.
+    fn ask_usage(&self, _gauge: &str) {}
 
     /// Publish a restored worker only after its durable seat has moved. Fake
     /// hosts need no renderer surface and therefore default to doing nothing.

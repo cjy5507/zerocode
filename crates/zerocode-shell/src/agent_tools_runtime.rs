@@ -1492,6 +1492,10 @@ impl agent_teams::Host for TeamWindow {
         Some(text)
     }
 
+    fn ask_usage(&self, gauge: &str) {
+        crate::cmd::usage::ask_usage(self.app.state::<AppState>(), gauge);
+    }
+
     fn quota_wall_marker(
         &self,
         term: TermId,
@@ -1508,6 +1512,14 @@ impl agent_teams::Host for TeamWindow {
             .map(std::path::PathBuf::from);
         let screen = self.capture(term);
         crate::quota_wall::marker_for(agent, screen.as_deref(), transcript.as_deref())
+    }
+
+    fn pane_wall(&self, term: TermId, agent: &str) -> Option<crate::quota_wall::PaneWall> {
+        // The table is asked inside, before the file is opened: an agent
+        // whose walls are screen words only, or that nobody measured, costs
+        // a map lookup and no read.
+        let transcript = self.provider_session(term)?.transcript_path?;
+        crate::quota_wall::pane_wall_for(agent, std::path::Path::new(&transcript))
     }
 
     fn with_quota_wall_observation(
@@ -1726,6 +1738,10 @@ pub(super) fn beat_standing_orders(app: &AppHandle) {
         // answer cannot go stale between the asking and the acting.
         let now_ms = now_epoch_ms();
         orchestration::tick(&window, &overrides, now_ms);
+        // The way out, on the same beat (t-6428): a 「끝나면」 armed goes at
+        // the first gap the census finds, and a question nobody answers
+        // goes when its time is up.
+        crate::cmd::appearance::beat_leaving(&beating);
         // The crash that becomes a task (t-3014 §2.4), on this same beat and
         // through the same road: it presents a seated leader's capability
         // the way the beat above presents one for `worker-start`.

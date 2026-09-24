@@ -466,6 +466,157 @@ fn recall_hint_runtime(session: Session) -> ConversationRuntime<StopApiClient, S
     )
 }
 
+type FilePickLabelObservations = Arc<Mutex<Vec<(String, Vec<String>, Option<usize>)>>>;
+
+#[derive(Clone)]
+struct FixedFilePickSeat {
+    asked: Arc<Mutex<Vec<crate::FilePickAsk>>>,
+    labels: FilePickLabelObservations,
+    hint: Option<crate::FilePickHint>,
+}
+
+impl crate::FilePickSeat for FixedFilePickSeat {
+    fn suggest(
+        &self,
+        ask: crate::FilePickAsk,
+    ) -> futures_util::future::BoxFuture<'_, Option<crate::FilePickHint>> {
+        if let Ok(mut asked) = self.asked.lock() {
+            asked.push(ask);
+        }
+        let hint = self.hint.clone();
+        Box::pin(async move { hint })
+    }
+
+    fn label(&self, attempt: &str, edited_paths: &[String], search_calls_before_first_edit: Option<usize>) {
+        if let Ok(mut labels) = self.labels.lock() {
+            labels.push((
+                attempt.to_string(),
+                edited_paths.to_vec(),
+                search_calls_before_first_edit,
+            ));
+        }
+    }
+}
+
+struct FixedSkillSuggestionSeat {
+    asked: Arc<Mutex<Vec<String>>>,
+    finished: Arc<Mutex<usize>>,
+    note: Option<String>,
+}
+
+impl crate::skill_rank::SkillSuggestionSeat for FixedSkillSuggestionSeat {
+    fn suggest(&self, request: String) -> futures_util::future::BoxFuture<'_, Option<String>> {
+        self.asked.lock().expect("asked lock").push(request);
+        let note = self.note.clone();
+        Box::pin(async move { note })
+    }
+
+    fn finish(&self, _turn: &[crate::session::ConversationMessage]) {
+        *self.finished.lock().expect("finished lock") += 1;
+    }
+}
+
+#[test]
+fn a_skill_hint_rides_after_the_cache_breakpoint() {
+    let mut runtime = recall_hint_runtime(Session::new());
+    runtime.session.push_user_text("Earlier request").expect("prior message");
+    let before = runtime.build_request(None).expect("request before hint");
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let finished = Arc::new(Mutex::new(0));
+    runtime.set_skill_suggestion_seat(Some(Arc::new(FixedSkillSuggestionSeat {
+        asked: Arc::clone(&asked),
+        finished: Arc::clone(&finished),
+        note: Some(crate::skill_rank::suggestion_note(Some("docx"))),
+    })));
+    runtime.inject_skill_suggestion("Create a Word document");
+    let after = runtime.build_request(None).expect("request after hint");
+    assert_eq!(after.system_prompt.as_ref(), before.system_prompt.as_ref());
+    assert_eq!(&after.messages[..before.messages.len()], before.messages.as_slice());
+    assert!(after.messages.iter().any(|message| {
+        message.role == MessageRole::System && message.blocks.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text } if text.starts_with(crate::skills::SKILL_RECOMMENDATION_REMINDER_PREFIX))
+        })
+    }));
+    assert_eq!(asked.lock().expect("asked lock").as_slice(), ["Create a Word document"]);
+    runtime.finish_skill_suggestion_turn();
+    assert_eq!(*finished.lock().expect("finished lock"), 1);
+}
+
+fn request_has_current_turn_skill_note(runtime: &mut ConversationRuntime<StopApiClient, StaticToolExecutor>) -> bool {
+    let request = runtime.build_request(None).expect("request");
+    let current_turn_start = request.messages.iter().rposition(|message| message.role == MessageRole::User)
+        .expect("a user turn") + 1;
+    request.messages.iter().skip(current_turn_start).any(|message| {
+        message.role == MessageRole::System && message.blocks.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text }
+                if text.starts_with(crate::skills::SKILL_RECOMMENDATION_REMINDER_PREFIX))
+        })
+    })
+}
+
+fn assert_no_transient_skill_note(runtime: &ConversationRuntime<StopApiClient, StaticToolExecutor>) {
+    assert!(
+        runtime
+            .transient_reminders
+            .iter()
+            .all(|reminder| !reminder.starts_with(crate::skills::SKILL_RECOMMENDATION_REMINDER_PREFIX)),
+        "a previous turn's skill note remains in the current reminder set: {:?}",
+        runtime.transient_reminders
+    );
+}
+
+#[test]
+fn a_skill_note_from_the_last_turn_is_gone_when_this_turn_has_none() {
+    let mut runtime = recall_hint_runtime(Session::new());
+    runtime.session.push_user_text("Earlier request").expect("first turn message");
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let finished = Arc::new(Mutex::new(0));
+    runtime.set_skill_suggestion_seat(Some(Arc::new(FixedSkillSuggestionSeat {
+        asked: Arc::clone(&asked),
+        finished: Arc::clone(&finished),
+        note: Some(crate::skill_rank::suggestion_note(Some("docx"))),
+    })));
+    runtime.inject_skill_suggestion("Create a document");
+    assert!(request_has_current_turn_skill_note(&mut runtime));
+
+    runtime.set_skill_suggestion_seat(Some(Arc::new(FixedSkillSuggestionSeat {
+        asked,
+        finished,
+        note: None,
+    })));
+    runtime.session.push_user_text("Next request").expect("second turn message");
+    runtime.clear_turn_start_transient_reminders();
+    runtime.inject_skill_suggestion("Create another document");
+    assert_no_transient_skill_note(&runtime);
+    assert!(runtime.session.messages.iter().any(|message| {
+        message.role == MessageRole::System && message.blocks.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text }
+                if text.contains(crate::skills::SKILL_RECOMMENDATION_REMINDER_PREFIX))
+        })
+    }), "the earlier System note remains in the append-only transcript");
+    assert!(!request_has_current_turn_skill_note(&mut runtime));
+}
+
+#[test]
+fn an_unseated_turn_clears_a_note_the_seat_left() {
+    let mut runtime = recall_hint_runtime(Session::new());
+    runtime.session.push_user_text("Earlier request").expect("first turn message");
+    runtime.set_skill_suggestion_seat(Some(Arc::new(FixedSkillSuggestionSeat {
+        asked: Arc::new(Mutex::new(Vec::new())),
+        finished: Arc::new(Mutex::new(0)),
+        note: Some(crate::skill_rank::suggestion_note(Some("docx"))),
+    })));
+    runtime.inject_skill_suggestion("Create a document");
+    assert!(request_has_current_turn_skill_note(&mut runtime));
+
+    runtime.set_skill_suggestion_seat(None);
+    runtime.session.push_user_text("Next request").expect("second turn message");
+    runtime.clear_turn_start_transient_reminders();
+    runtime.inject_skill_suggestion("Another turn");
+    assert_no_transient_skill_note(&runtime);
+    assert!(!request_has_current_turn_skill_note(&mut runtime));
+}
+
 #[test]
 fn verify_intent_defaults_to_other_and_is_installed_per_turn() {
     // Every host that never installs a probed intent — headless, serve,
@@ -600,6 +751,95 @@ fn recall_hint_injects_on_past_reference_and_clears_per_turn() {
             "hint is cleared at turn start for {input:?}"
         );
     }
+}
+
+#[test]
+fn the_hint_rides_after_the_cache_breakpoint_and_labels_the_turn_edits() {
+    let mut runtime = recall_hint_runtime(Session::new());
+    runtime
+        .session
+        .push_user_text("Earlier request")
+        .expect("prior message");
+    let before = runtime.build_request(None).expect("request before the hint");
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let labels = Arc::new(Mutex::new(Vec::new()));
+    runtime.set_file_pick_seat(Some(Arc::new(FixedFilePickSeat {
+        asked: Arc::clone(&asked),
+        labels: Arc::clone(&labels),
+        hint: Some(crate::FilePickHint {
+            text: "[zo:file-pick] Likely files for this request: \"src/target.rs\" (suggestions; verify or ignore).".to_string(),
+        }),
+    })));
+
+    runtime.inject_file_pick_hint("Please fix the parser in src/target.rs");
+    let after = runtime.build_request(None).expect("request with the hint");
+
+    assert_eq!(
+        after.system_prompt.as_ref(),
+        before.system_prompt.as_ref(),
+        "the base system prompt is byte-identical"
+    );
+    assert!(after.wire_reminders.is_empty());
+    assert_eq!(
+        &after.messages[..before.messages.len()],
+        before.messages.as_slice(),
+        "the hint only appends after the prior cacheable message prefix"
+    );
+    // The note is persisted inside the reminder wrapper (`<system-reminder>`),
+    // so the prefix is read through it, the way the recall hint's test reads
+    // its own line — not off the block's first byte.
+    assert!(after.messages.iter().any(|message| {
+        message.role == MessageRole::System
+            && message.blocks.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text } if text.contains(crate::FILE_PICK_NOTE_PREFIX))
+            })
+    }));
+    assert_eq!(asked.lock().expect("the seat was asked").len(), 1);
+
+    runtime
+        .session
+        .push_message(ConversationMessage::tool_result(
+            "read-1",
+            "Read",
+            "{}".to_string(),
+            false,
+        ))
+        .expect("search result");
+    runtime
+        .session
+        .push_message(ConversationMessage::tool_result(
+            "edit-1",
+            "edit_file",
+            serde_json::json!({
+                "filePath": "src/target.rs",
+                "structuredPatch": [{"oldStart": 1, "oldLines": 0, "newStart": 1, "newLines": 1, "lines": ["+fn target() {}"]}]
+            })
+            .to_string(),
+            false,
+        ))
+        .expect("edit result");
+    runtime.finish_file_pick_turn();
+    let labels = labels.lock().expect("the turn was labeled");
+    assert_eq!(labels.len(), 1);
+    assert_eq!(labels[0].1, ["src/target.rs"]);
+    assert_eq!(labels[0].2, Some(1));
+}
+
+#[test]
+fn an_unseated_file_pick_keeps_the_request_byte_identical() {
+    let mut runtime = recall_hint_runtime(Session::new());
+    runtime
+        .session
+        .push_user_text("Earlier request")
+        .expect("prior message");
+    let before = runtime.build_request(None).expect("request before file pick");
+
+    runtime.inject_file_pick_hint("Please fix the parser");
+    let after = runtime.build_request(None).expect("request after off file pick");
+
+    assert_eq!(after.system_prompt.as_ref(), before.system_prompt.as_ref());
+    assert_eq!(after.messages, before.messages);
+    assert_eq!(after.wire_reminders, before.wire_reminders);
 }
 
 #[test]
@@ -6337,6 +6577,26 @@ fn user_prompt_submit_denial_blocks_without_pushing_user_message() {
         runtime.session().messages.is_empty(),
         "denied user prompt must not be pushed to the session"
     );
+}
+
+#[test]
+fn a_turn_the_hook_refuses_carries_no_stale_skill_note() {
+    let mut runtime = user_prompt_hook_runtime(shell_snippet(
+        r#"printf '{"decision":"block","reason":"nope"}'"#,
+    ));
+    runtime.session.push_user_text("Earlier request").expect("first turn message");
+    runtime.set_skill_suggestion_seat(Some(Arc::new(FixedSkillSuggestionSeat {
+        asked: Arc::new(Mutex::new(Vec::new())),
+        finished: Arc::new(Mutex::new(0)),
+        note: Some(crate::skill_rank::suggestion_note(Some("docx"))),
+    })));
+    runtime.inject_skill_suggestion("Create a document");
+    assert!(request_has_current_turn_skill_note(&mut runtime));
+
+    runtime.run_turn("blocked input", None).expect_err("hook denies the next turn");
+    runtime.session.push_user_text("Following request").expect("following turn message");
+    assert_no_transient_skill_note(&runtime);
+    assert!(!request_has_current_turn_skill_note(&mut runtime));
 }
 
 #[test]
@@ -17088,4 +17348,284 @@ fn the_streaming_loop_adds_the_same_line_and_nothing_else() {
         assert_eq!(asked.lock().expect("asked").len(), 1);
         assert_eq!(asked.lock().expect("asked")[0].task, "rename the flag");
     }
+}
+
+/* ---- the tool guards' seam (t-6348) --------------------------------------- */
+
+/// A read's own words, and the command the guards are shown beside it.
+const GUARDED_READ_OUTPUT: &str = "# notes\nRun the tests before you push.";
+const GUARDED_SHELL_OUTPUT: &str = r#"{"stdout":"removed","stderr":"","interrupted":false}"#;
+const GUARDED_TASK: &str = "clean the build folder\nand run the tests";
+
+/// A tool guard that keeps what it was handed and answers what it was told.
+struct RecordingGuard {
+    commands: Arc<Mutex<Vec<crate::CommandAsk>>>,
+    ran: Arc<Mutex<Vec<crate::CommandRan>>>,
+    texts: Arc<Mutex<Vec<crate::TextAsk>>>,
+    command_note: Option<String>,
+    text_guard: crate::TextGuard,
+}
+
+impl RecordingGuard {
+    fn answering(command_note: Option<&str>, text_guard: crate::TextGuard) -> Self {
+        Self {
+            commands: Arc::new(Mutex::new(Vec::new())),
+            ran: Arc::new(Mutex::new(Vec::new())),
+            texts: Arc::new(Mutex::new(Vec::new())),
+            command_note: command_note.map(str::to_string),
+            text_guard,
+        }
+    }
+}
+
+impl crate::ToolGuardSeat for RecordingGuard {
+    fn command(&self, ask: crate::CommandAsk) {
+        self.commands.lock().expect("commands").push(ask);
+    }
+
+    fn command_ran(&self, ran: crate::CommandRan) -> futures_util::future::BoxFuture<'_, Option<String>> {
+        self.ran.lock().expect("ran").push(ran);
+        let note = self.command_note.clone();
+        Box::pin(async move { note })
+    }
+
+    fn text(&self, ask: crate::TextAsk) -> futures_util::future::BoxFuture<'_, crate::TextGuard> {
+        self.texts.lock().expect("texts").push(ask);
+        let guard = self.text_guard.clone();
+        Box::pin(async move { guard })
+    }
+}
+
+/// One step that runs a shell command, a read-only one and a read side by
+/// side, then a plain word.
+fn guarded_calls() -> Vec<AssistantEvent> {
+    vec![
+        AssistantEvent::ToolUse {
+            id: "shell-1".to_string(),
+            name: "bash".to_string(),
+            input: r#"{"command":"rm -rf build"}"#.to_string(),
+        },
+        AssistantEvent::ToolUse {
+            id: "shell-2".to_string(),
+            name: "bash".to_string(),
+            input: r#"{"command":"git status"}"#.to_string(),
+        },
+        AssistantEvent::ToolUse {
+            id: "read-1".to_string(),
+            name: "read_file".to_string(),
+            input: r#"{"path":"notes.md"}"#.to_string(),
+        },
+        AssistantEvent::MessageStop,
+    ]
+}
+
+struct GuardedOnceClient {
+    calls: usize,
+}
+
+impl ApiClient for GuardedOnceClient {
+    fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        self.calls += 1;
+        Ok(if self.calls == 1 {
+            guarded_calls()
+        } else {
+            vec![AssistantEvent::TextDelta("ok".to_string()), AssistantEvent::MessageStop]
+        })
+    }
+}
+
+fn guarded_runtime(seat: Option<Arc<dyn crate::ToolGuardSeat>>) -> ConversationRuntime<GuardedOnceClient, StaticToolExecutor> {
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        GuardedOnceClient { calls: 0 },
+        StaticToolExecutor::new()
+            .register("bash", |_| Ok(GUARDED_SHELL_OUTPUT.to_string()))
+            .register("read_file", |_| Ok(GUARDED_READ_OUTPUT.to_string())),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["system".to_string()],
+    );
+    runtime.set_tool_guard_seat(seat);
+    runtime
+}
+
+/// Each call's result as the session holds it — what the model reads.
+fn guarded_outputs(messages: &[ConversationMessage]) -> Vec<(String, String)> {
+    messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, output, .. } => Some((tool_use_id.clone(), output.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What an acting seat hands back in both tests: a fence and a line for the
+/// read, a line for the command.
+fn acting_guard() -> (crate::TextGuard, &'static str) {
+    (
+        crate::TextGuard {
+            fence: Some("read_file".to_string()),
+            note: Some("[zo:tool-text-guard] fenced".to_string()),
+        },
+        "[zo:command-guard] flagged",
+    )
+}
+
+fn acting_outputs() -> Vec<(String, String)> {
+    let (guard, command_note) = acting_guard();
+    let fenced = zerocode_core::untrusted::fence("read_file", GUARDED_READ_OUTPUT, usize::MAX);
+    vec![
+        ("shell-1".to_string(), format!("{GUARDED_SHELL_OUTPUT}\n\n{command_note}")),
+        ("shell-2".to_string(), format!("{GUARDED_SHELL_OUTPUT}\n\n{command_note}")),
+        (
+            "read-1".to_string(),
+            format!("{}\n\n{}", fenced.trim_end_matches('\n'), guard.note.expect("a line")),
+        ),
+    ]
+}
+
+/// The synchronous loop's seam: with no seat, or a seat that answers nothing,
+/// every result the model reads is the tool's own output to the byte. The
+/// command guard is handed the command today's rule cannot prove read-only —
+/// with its folder and the first line of the person's words — before it runs,
+/// and every shell call's facts after; the text guard is handed the read. An
+/// acting seat's fence and lines join the model-facing results.
+#[test]
+fn the_tool_guards_leave_every_result_to_the_byte_unless_they_act() {
+    let _todo_store = HermeticTodoStore::pin();
+    let own = vec![
+        ("shell-1".to_string(), GUARDED_SHELL_OUTPUT.to_string()),
+        ("shell-2".to_string(), GUARDED_SHELL_OUTPUT.to_string()),
+        ("read-1".to_string(), GUARDED_READ_OUTPUT.to_string()),
+    ];
+    let mut runtime = guarded_runtime(None);
+    runtime.run_turn(GUARDED_TASK, None).expect("turn runs");
+    assert_eq!(guarded_outputs(&runtime.session.messages), own, "no seat: the tools' own bytes");
+
+    let silent = Arc::new(RecordingGuard::answering(None, crate::TextGuard::default()));
+    let mut runtime = guarded_runtime(Some(Arc::clone(&silent) as Arc<dyn crate::ToolGuardSeat>));
+    runtime.run_turn(GUARDED_TASK, None).expect("turn runs");
+    assert_eq!(guarded_outputs(&runtime.session.messages), own, "a seat that answers nothing");
+    {
+        let commands = silent.commands.lock().expect("commands");
+        assert_eq!(commands.len(), 1, "the read-only command is never handed over");
+        assert_eq!(commands[0].tool_use_id, "shell-1");
+        assert_eq!(commands[0].command, "rm -rf build");
+        assert_eq!(commands[0].task, "clean the build folder");
+        assert_eq!(commands[0].cwd, std::env::current_dir().expect("cwd"));
+        let ran: Vec<(String, bool, bool)> = silent
+            .ran
+            .lock()
+            .expect("ran")
+            .iter()
+            .map(|ran| (ran.tool_use_id.clone(), ran.failed, ran.cancelled))
+            .collect();
+        assert_eq!(
+            ran,
+            [("shell-1".to_string(), false, false), ("shell-2".to_string(), false, false)]
+        );
+        let texts = silent.texts.lock().expect("texts");
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].tool_use_id, "read-1");
+        assert_eq!(texts[0].source, crate::TextSource::File);
+        assert_eq!(texts[0].head, GUARDED_READ_OUTPUT);
+        assert!(!texts[0].fenced);
+    }
+
+    let (guard, command_note) = acting_guard();
+    let acting = Arc::new(RecordingGuard::answering(Some(command_note), guard));
+    let mut runtime = guarded_runtime(Some(acting as Arc<dyn crate::ToolGuardSeat>));
+    runtime.run_turn(GUARDED_TASK, None).expect("turn runs");
+    assert_eq!(guarded_outputs(&runtime.session.messages), acting_outputs());
+}
+
+#[test]
+fn a_command_guard_observes_the_cwd_the_bash_executor_uses() {
+    struct PinnedExecutor(std::path::PathBuf);
+    impl ToolExecutor for PinnedExecutor {
+        fn execution_cwd(&self) -> Option<&std::path::Path> { Some(&self.0) }
+        fn execute(&mut self, _: &str, _: &str) -> Result<String, ToolError> { Ok(String::new()) }
+    }
+    let seat = Arc::new(RecordingGuard::answering(None, crate::TextGuard::default()));
+    let mut runtime = ConversationRuntime::new(
+        Session::new(), GuardedOnceClient { calls: 0 }, PinnedExecutor("/work/context".into()),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess), vec!["system".to_string()],
+    );
+    runtime.set_tool_guard_seat(Some(Arc::clone(&seat) as Arc<dyn crate::ToolGuardSeat>));
+    runtime.guard_command("shell-context", "bash", r#"{"command":"rm -rf build"}"#);
+    runtime.guard_command("shell-pinned", "bash", r#"{"command":"rm -rf build","cwd":"/work/pinned"}"#);
+    let commands = seat.commands.lock().expect("commands");
+    assert_eq!(commands[0].cwd, std::path::Path::new("/work/context"));
+    assert_eq!(commands[1].cwd, std::path::Path::new("/work/pinned"));
+}
+
+/// The streaming loop's seam — where a tool is dispatched, and the one place
+/// every result is finalized — makes the same promise.
+#[test]
+fn the_streaming_loop_guards_the_same_calls_and_nothing_else() {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use crate::message_stream::types::{BlockId, RenderBlock};
+    use crate::permission::{
+        PermissionDecision as AsyncPermissionDecision, PermissionError,
+        PermissionPrompter as AsyncPermissionPrompter, PermissionRequest as AsyncPermissionRequest,
+    };
+
+    struct Allow;
+    impl AsyncPermissionPrompter for Allow {
+        fn decide<'a>(
+            &'a self,
+            _request: AsyncPermissionRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<AsyncPermissionDecision, PermissionError>> + Send + 'a>> {
+            Box::pin(async { Ok(AsyncPermissionDecision::Allow) })
+        }
+    }
+
+    struct GuardedOnceAsync;
+    impl AsyncApiClient for GuardedOnceAsync {
+        fn stream_async<'a>(
+            &'a self,
+            request: ApiRequest,
+            _render_tx: tokio::sync::mpsc::Sender<RenderBlock>,
+            _text_block_id: BlockId,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<AssistantEvent>, RuntimeError>> + Send + 'a>> {
+            let answered = request.messages.iter().any(|message| message.role == MessageRole::Tool);
+            Box::pin(async move {
+                Ok(if answered {
+                    vec![AssistantEvent::TextDelta("ok".to_string()), AssistantEvent::MessageStop]
+                } else {
+                    guarded_calls()
+                })
+            })
+        }
+    }
+
+    let _todo_store = HermeticTodoStore::pin();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let (guard, command_note) = acting_guard();
+    let seat = Arc::new(RecordingGuard::answering(Some(command_note), guard));
+    let mut runtime = guarded_runtime(Some(Arc::clone(&seat) as Arc<dyn crate::ToolGuardSeat>))
+        .with_async_api_client(Arc::new(GuardedOnceAsync));
+    let summary = rt.block_on(async {
+        let (render_tx, mut render_rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move { while render_rx.recv().await.is_some() {} });
+        let prompter: Arc<dyn AsyncPermissionPrompter> = Arc::new(Allow);
+        runtime
+            .run_turn_streaming_maybe_deep(GUARDED_TASK, Vec::new(), render_tx, prompter)
+            .await
+            .expect("the turn runs")
+    });
+    assert_eq!(guarded_outputs(&summary.tool_results), acting_outputs());
+    let commands = seat.commands.lock().expect("commands");
+    assert_eq!(commands.len(), 1, "the read-only command is never handed over");
+    assert_eq!(commands[0].command, "rm -rf build");
+    assert_eq!(commands[0].task, "clean the build folder");
+    assert_eq!(seat.ran.lock().expect("ran").len(), 2);
+    assert_eq!(seat.texts.lock().expect("texts").len(), 1);
 }

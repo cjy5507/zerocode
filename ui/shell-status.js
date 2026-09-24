@@ -739,6 +739,23 @@ let opencodeFetching = false;
  * and settle at their own speeds; a single timer would let whichever answered
  * first cancel the other's follow-up and leave its segment saying ··· forever. */
 const usageAskTimers = new Map();
+/* 공급자마다 지금 나가 있는 읽기가 언제 나갔는지 — 다음 물음의 간격을 정한다. */
+const usageReadsOut = new Map();
+/* 읽기가 나가 있는 동안 다시 묻는 간격(t-6583).
+ *
+ * OAuth 한 왕복은 300~450 ms(2026-09-24 실측)인데 고정 2초 간격은 그 답을 1.5초
+ * 넘게 화면 밖에 세워 두었다 — 「새로 고침을 눌러도 늦다」의 절반이 여기였다. 그래서
+ * 읽기가 나간 뒤 `quickForMs` 동안은 `quickMs`마다 묻고, 그 뒤로는 통계 창과 같은
+ * `USAGE_STATS_RETRY_MS`로 돌아간다 — 읽기가 나간 시각에서 센 그 눈금에 맞춰서,
+ * 그래서 숨은 터미널처럼 긴 읽기는 예전과 같은 순간에 그려진다. 나가 있는 읽기에
+ * 대한 물음은 백엔드가 캐시로 답하는 IPC 한 번이다. */
+const USAGE_FOLLOW_UP = { quickMs: 250, quickForMs: 2000 };
+
+function usageFollowUpMs(outForMs) {
+  if (outForMs < USAGE_FOLLOW_UP.quickForMs) return USAGE_FOLLOW_UP.quickMs;
+  const toTick = USAGE_STATS_RETRY_MS - (outForMs % USAGE_STATS_RETRY_MS);
+  return Math.max(USAGE_FOLLOW_UP.quickMs, toTick);
+}
 /* Which provider the panel is showing. The bar has two segments and one panel,
  * so the panel has to remember whose it is — otherwise the refresh button
  * re-reads Claude while the person is looking at Codex. */
@@ -3337,12 +3354,20 @@ async function refreshProviderUsage(provider, force) {
   // scans run against two different CLIs, and a shared timer would let the
   // faster one cancel the slower one's follow-up.
   clearTimeout(usageAskTimers.get(provider.id));
-  if (fetching) {
-    usageAskTimers.set(
-      provider.id,
-      setTimeout(() => refreshProviderUsage(provider, false), USAGE_STATS_RETRY_MS),
-    );
+  if (!fetching) {
+    usageReadsOut.delete(provider.id);
+    return;
   }
+  // A press starts the quick asking over: it is the moment somebody is
+  // looking at this segment and waiting for it.
+  if (force || !usageReadsOut.has(provider.id)) usageReadsOut.set(provider.id, Date.now());
+  usageAskTimers.set(
+    provider.id,
+    setTimeout(
+      () => refreshProviderUsage(provider, false),
+      usageFollowUpMs(Date.now() - usageReadsOut.get(provider.id)),
+    ),
+  );
 }
 
 function refreshClaudeUsage(force) {
@@ -3445,21 +3470,38 @@ const usageAmbient = idlePoller({
  * anything (PRODUCT §10); the folder-panel toast is the shape — a toast
  * that stands for a condition and leaves with it. */
 let releaseNotice = null;
-/* How many workers are at work in this window's panes, by the ledger, as
- * `release_status` last answered (t-3058). A restart cuts every one of them
- * — they sleep and are seated again, but their turn is cut short — so the
- * app notice says so beside its button and recommends restarting after they
- * land. Zero says nothing. */
-let releaseWorkers = 0;
+/* Who a restart would cut, as the one census answered it through
+ * `release_status` (t-3058, t-6428): workers mid-turn, background jobs
+ * under workers at rest, workers the window could not read. A restart cuts
+ * every one of them — a turn sleeps and is seated again, a job dies — so
+ * the app notice says so beside its button. Nothing busy says nothing. */
+let releaseBusy = null;
+/* The lane's own `status.json` as that same answer carried it — sha, version,
+ * phase, outcome — for the task board's release card (t-6588,
+ * `paintDeskRelease`). Kept here because this is the one reader of the file;
+ * the card only draws what was read. `null` is "no lane here" or "unread". */
+let releaseLane = null;
 const noticedBuilds = new Set();
 let updateToast = null;
 let updateToastKey = null;
 
-/* The suffix the app notice carries while workers are at work — one t() in
- * five catalogs, shared by the toast and the settings notice. */
+/* The census in words (t-6428): each part through t() in five catalogs,
+ * and only when it counts; nothing when nothing would be cut. One builder
+ * for the notice here and for every question asked before the window is
+ * left. */
+function busyWords(busy) {
+  if (!busy?.busy) return "";
+  const parts = [];
+  if (busy.turning > 0) parts.push(t("exit.busyTurning", "워커 {{n}}명 턴 중", { n: busy.turning }));
+  if (busy.background > 0) parts.push(t("exit.busyBackground", "배경 작업 {{n}}개", { n: busy.background }));
+  if (busy.unknown > 0) parts.push(t("exit.busyUnknown", "상태를 모르는 워커 {{n}}명", { n: busy.unknown }));
+  return parts.join(" · ");
+}
+
+/* The suffix the app notice carries while a restart would cut work — the
+ * census's words, shared by the toast and the settings notice. */
 function updateWorkersWords() {
-  if (!(releaseWorkers > 0)) return "";
-  return t("update.workersBusy", "워커 {{n}}개 진행 중 — 착지 뒤 재시작 권장", { n: releaseWorkers });
+  return busyWords(releaseBusy);
 }
 
 /* The app sentence (t-3237): the change the backend named picks it. A
@@ -3518,7 +3560,7 @@ function updateReadyZoWords(zo) {
 function updateToastAppWords(app) {
   const { sentence, aux } = updateReadyAppWords(app);
   const busy = updateWorkersWords();
-  return { text: busy ? `${sentence} ${busy}` : sentence, aux };
+  return { text: busy ? `${sentence} — ${busy}` : sentence, aux };
 }
 
 /* Words with a dim auxiliary after them — the sha beside 「새 버전
@@ -3570,7 +3612,7 @@ function raiseUpdateToast() {
       aux,
       action: {
         label: t("update.restart", "다시 시작"),
-        run: () => void invoke("relaunch_window").catch(showError),
+        run: () => void askBeforeRestart("update-toast"),
       },
     });
   } else {
@@ -3582,11 +3624,12 @@ function raiseUpdateToast() {
 
 function absorbReleaseStatus(answer) {
   releaseNotice = answer?.notice ?? null;
-  releaseWorkers = Number.isInteger(answer?.workers) ? answer.workers : 0;
+  releaseBusy = answer?.busy ?? null;
+  releaseLane = answer?.status && typeof answer.status === "object" ? answer.status : null;
   paintUpdateNotice();
   raiseUpdateToast();
   // A toast already standing for this pair keeps saying the truth: the
-  // worker count moves while the sha does not, and the sentence follows it.
+  // census moves while the sha does not, and the sentence follows it.
   const app = releaseNotice?.app ?? null;
   if (app && updateToast?.isConnected && updateToastKey === updateNoticeKey(releaseNotice)) {
     const node = updateToast.querySelector(".toast-text");

@@ -1,5 +1,152 @@
 # Changelog
 
+## [1.1.23] — 2026-09-24
+
+_since v1.1.22 (48 commits)_
+
+### feat
+- feat(zo): the two tool guards — a shell command is handed to the command guard right before it runs and each file, web, window-browser or MCP text before the model reads it; shadow asks beside the call and holds nothing, hindsight labels what became of each (t-6348)
+- feat(jev): two guard rows — command_guard asks two Nouls of a shell command before it runs, tool_text_guard asks the screen's instructions guard of every block a tool hands back; both record first, rise on hindsight and are held to today's rule (t-6348, Jev plan 7/8)
+- feat(ui): a conversation opens at its foot, keeps its reader's place when looked at again, and a reader above gets a button back to the foot (t-6824)
+- feat(settings): the classifier card says what the routing feature now needs — every way but Off reaches it, only the probing way calls the Fast-tier model, and the warning stands for Off alone, in five languages (t-6346)
+- feat(router): the routing seat's label reads what the turn did — its calls, the files it wrote, the agents it started, as a level within a band of the judgment's — and marks the keyword tables on every fact the seat is marked on (t-6346)
+- feat(router): the routing seat judges every turn and spawn it is asked about — one gate table, the probe only where the answer abstains, and a person's named model never walked down (t-6346, folds t-4727)
+- feat(jev): a language column — Hangul's share of a request's letters, per thousand, counted by code over the one Hangul table the vault tokenizer already kept (t-6346)
+- feat(router): read the routing seat's second version — Scores along their levels, contrastive Choices on their options, facts on their own lines, and the band the complexity answer falls in as the authority it routes with (t-6346)
+- feat(api): a contrastive choice — each option described by what it covers, what it is not for and examples, read back by one `options()`/`levels()` pair (t-6346)
+- feat(jev): the routing seat's second-version words in the catalog — two Scores, a ten-intent contrastive Choice with its way out, a kind-of-thinking Choice and six facts, one version and one pinned fingerprint (t-6346)
+- feat(jev): suggest skills at turn start with two-stage gate
+
+### fix
+- fix(jev): the tool text guard's rubric moves to version 2 where its baseline changed meaning — "fenced before" is the host's own fence now, never a phrase in the body, so rows judged against the old rule never pool into this window; the two private intra-doc links in the label row become code spans (zo doc under -D warnings) (t-6982 follow-up, run-6774 R1)
+- fix(zo): keep tool guard fences and Bash cwd host-owned
+- fix(zo): the tool guards pass clippy's pedantic set — a path's stamp is Absent or Present rather than an Option of an Option, the two records of independent facts say why they hold four bools, and a refusal's token is named, not wrapped; plus the command path's cost, measured (t-6348)
+- fix(ui): the foot's button moves the focus to the list only when it held the focus itself (t-6824)
+- fix(router): the routing memo is keyed by the facts beside the words — a spawn retried after a failed attempt carries `retry_of_failed_attempt`, which the complexity question reads, so the same description and prompt under that fact is another state and the first attempt's remembered answer is not recalled for it; `RoutingFacts` derives `Hash` to sit in the key, the regression drives the spawn judgment three times through the fake System One (asked, recalled, asked again), and the model-literal contract now reads a `*_tests.rs` module file as the test source it is declared as (run-6774 V1, t-6346 follow-up)
+- fix(orchestration): `check` reads every word before it acknowledges — `--types` was parsed after the acknowledgement, so a kind nobody spelled refused the command with the delivery already retired in memory, behind a refusal that carries no receipt and asks for no durable write, for the next durable write to persist; the words are read first now, a refused command changes nothing, and the regression test replays the still-open batch after the refusal (run-6774 F1)
+- fix(router): the routing label agrees when the router would have picked the tier the work needed — trivial and small the fast tier's, medium the balanced, large the strong, read through the router's own table — because within one band a reader that always said small agreed on 401 of 488 turns (t-6346)
+- fix(jev): a recording skill suggestion does not hold the turn — the seat's line is shown only when it acts, so only then does the turn wait for its two requests; a shadow or unrisen auto turn hands the judgment to the runtime's worker threads (the patch-review seat's `detach`) and goes on. The pending entry is seated before the judgment so a load early in the turn is still its first-load label, `judged` says whether the judgment landed while the turn was open, and a turn that ends without one writes no label. The mode is read before the skills are discovered, so a seat that is off costs a turn no directory walk; the suggestion note carries the reminder prefix by its constant (t-6347 follow-up)
+
+### perf
+- perf(router): a turn the routing seat only records pays 2.4 ms at its start, not 14.1 — the question leaves detached before any reader's check or model list is built, and `auto` reads its standing off the transition lines alone (36.4 → 2.3 ms on a full ledger) (t-6346)
+
+### docs
+- docs(jev): the text guard's version 2 marks its rows but does not yet keep the old series out of the window — the shared promotion reader still windows by model alone, and per-version reading is t-6877's contract (t-6982 follow-up, astra m-7097)
+- docs(zo): the text guard's baseline comment says what the comparison does — the rule agreed when an unfenced block was not followed (t-6982 follow-up, astra m-7094)
+
+### test
+- test: expose stale skill notes in transient state
+- test: isolate skill suggestion rows and scope turn notes
+- test(jev): the tool guards' replay — sixty-four cases of each kind (irreversible and safe commands, injected and plain texts) asked through the production door and wire, against today's rule, with bands, latency, bytes and a day's cost read off this machine's week of transcripts (t-6348)
+- test(router): the memo regression's closure is not mutable — clippy under -D warnings (t-6346 follow-up)
+- test(ui): red — a conversation opens at its foot, a reader above gets a way back, and a conversation looked at again keeps its reader's place (t-6824)
+- test(router): the memo regression names the runtime's model inventory by its crate path — the sibling test module has no such name in its parent (t-6346 follow-up)
+- test(router): the routing seat replayed on this machine's turns — both versions asked through a door of their own, graded on what each turn did beside the keyword tables and a constant reader, with the probe's recorded answers, calls and turn-start model (t-6346)
+- test(jev): a seat that never rises names no apply wall — a core contract for the column, beside main's own fix of the vault-pair row (3e92ec3d); zo's summary test was the only one that held every row to it (t-6346)
+- test(ui): the code layer's frame gap is judged against the same number of pages, not an absolute thousand-point budget — the 1,131-node grafted scene's worst gap sits at 97–105 ms on a quiet machine against a 96 ms budget that its own control scene (113 ms) does not meet either, so the bound was measuring the scene's size rather than the graft's cost; the contract's own words hold (grafting costs no more than as many pages would, within the same slack), and the absolute budget stays with the thousand-point scene beside it (t-5970 G2 follow-up)
+- test(ui): a frame budget reads the machine's load when it is judged, not once at import — a knowledge run beside three worker builds saw the one-minute load climb from 11 to 37, and the import-time reading judged a 100 ms path-lighting frame against a quiet-machine budget that no longer applied (the v1.1.22 lane's red and two solo reruns); machine-load.mjs now reads the load at judgment time, keeps the import-time value for a runner that judges a whole run by it, and the three wall-clock guards added today read it the same way
+- test(ui): a frame budget reads the machine's load when it is judged, not once at import — a knowledge run beside three worker builds saw the one-minute load climb from 11 to 37, and the import-time reading judged a 100 ms path-lighting frame against a quiet-machine budget that no longer applied (the v1.1.22 lane's red and two solo reruns); machine-load.mjs now reads the load at judgment time, keeps the import-time value for a runner that judges a whole run by it, and the three wall-clock guards added today read it the same way
+- test(ui): the thousand-page halo paint ratio is judged only on a quiet machine — the circle-versus-filter paint ratio (1.12 at load 12.6 on 12 cores, bound 1.1) is a wall-clock comparison like the two guarded beside it; recorded, and judged only when the one-minute load is within the core count (machine-load.mjs)
+- test(ui): the thousand-page halo paint ratio is judged only on a quiet machine — the circle-versus-filter paint ratio (1.12 at load 12.6 on 12 cores, bound 1.1) is a wall-clock comparison like the two guarded beside it; recorded, and judged only when the one-minute load is within the core count (machine-load.mjs)
+- test(zo): the file-pick hint test reads its note through the persisted reminder wrapper — the seat's line is persisted as a System message inside `<system-reminder>` tags, so the prefix is not the block's first byte; the assertion looked for it there and has been red since the seat landed (t-6344 follow-up)
+- test(ui): the knowledge graph's two wall-clock checks are judged only on a quiet machine — the code layer's first-paint ratio (t-5970 G2) and the path route's 2 ms bound flipped under load 26 (the v1.1.22 lane's solo rerun) and load 60 while passing at load 17; both now follow machine-load.mjs like the frame budgets beside them, recording the number and judging only the functional parts when the one-minute load exceeds the core count
+- test(ui): the knowledge graph's two wall-clock checks are judged only on a quiet machine — the code layer's first-paint ratio (t-5970 G2) and the path route's 2 ms bound flipped under load 26 (the v1.1.22 lane's solo rerun) and load 60 while passing at load 17; both now follow machine-load.mjs like the frame budgets beside them, recording the number and judging only the functional parts when the one-minute load exceeds the core count
+
+### bench
+- bench(speed): measure isolated game and browser control paths
+
+### tools
+- tools: add own-window realtime capture and pointer probes
+
+### wip
+- wip: guard skill suggestion generations and clear stale notes
+
+### other
+- Merge branch 'wt/t-6876/h1-h2-stale-sol-high-2' — the skill suggestion seat's two stale paths from the independent audit: a late judgment carries the generation it was asked in and only that generation's pending row takes it (H1, the A/B rendezvous regression), and the conversation sets or clears its skill suggestion note every turn so a recommendation never outlives the turn that earned it (H2, the lingering-note regression); the tests assert the transient state itself — the old product fails all three H2 cases at the transient assertion (rc 101) and the fixed one passes 323/323 with skill_search 12 (t-6876)
+- Merge branch 'wt/t-6982/t-6348-p1-bash-cwd-p2' — Jev plan 7/8, the two tool guards: `command_guard` asks two Nouls of a shell command right before it runs (irreversible? outside the project?) and `tool_text_guard` asks the screen's instructions question of every file, web, window-browser or MCP text before the model reads it; both record first (`auto` rising only on hindsight), hold nothing, and are held to today's rule; the replay of 384 real judgments read 67.2 % / 4.8 % (commands) and 75.0 % / 3.2 % (texts) against 53.1 % / 3.2 % and 25.0 % / 25.4 %, at about $0.010 a day; the text guard reads the lossless model-facing view rather than the tool's JSON envelope (an envelope is one line, and one credential word hid it whole); and, after the closing partner's review, a fence is proven by the host that wrapped the block rather than by a phrase in the body, and the command guard observes the cwd the Bash executor uses with hindsight kept per session; the text guard's rubric is version 2 from where its baseline changed meaning, a mark on every row — the shared promotion reader still windows by model alone, and reading the two series apart is t-6877's contract (t-6348, t-6982)
+- Merge branch 'wt/t-6824/opus-high-ui' — a conversation opens at its foot and keeps its reader's place when looked at again (the list watches its own box, so a page built off screen still lands at the foot and a shrunk window keeps it there), and a reader above gets a 「맨 아래로」 button back to the foot — one class toggle, five languages, no title, focus moved only when the button held it; the extension-parity pin now names the button as the person's own request (09-24); delta paint p50 unchanged at 2.90 ms Chromium / 2.00 ms WebKit (t-6824)
+- Merge branch 'wt/t-6346/jev-5-8-routing-2' — the routing seat's second version: two Scores, a ten-intent contrastive Choice with its way out, a kind-of-thinking Choice and six facts in one request (a version and a pinned fingerprint), one gate table for every turn and spawn (folding t-4727), the probe only where the answer abstains and a person's named model never walked down, a label that reads what the turn did against the router's own tiers, the settings card in five languages, a hashed replay seed, and a recording turn that pays 2.4 ms at its start instead of 14.1; the replay of 527 tasks left the seat recording — its tier agreement (43.5 %, lower bound 39.2) does not clear the constant reader (41.6 %) (t-6346)
+- Merge branch 'wt/t-6347/jev-6-8-skills-2' — the skill seat's two-stage turn-start suggestion (a gate of three Nouls and a whole-catalog Choice, then a re-check of the top three with a bounded excerpt), its first-load and unused-load labels, the consent text in five languages and a hashed replay seed; the coordinator's follow-ups: a recording turn no longer waits for the two requests (detached like the patch-review seat, with a `judged` mark so a turn that ends without a judgment writes no label), the reminder prefix by its constant, and the file-pick hint test reading its note through the persisted wrapper (red since the seat landed) (t-6347)
+- Merge branch 'wt/t-6723/astro' — the realtime Computer Use co-design's probe harness: an own-window ScreenCaptureKit capture probe (30 vs 60 fps ABBA: latest-frame age p95 33 → 17.4 ms at 3.4–3.9 % of one core) and the pointer-path summariser (public CLI 80-point move, 12/24 waypoints observed at p50 8.06/8.24 ms, 4 ms position samples), product code untouched; the design review itself lives outside the tree (t-6723)
+- Merge branch 'wt/t-6701/astro' — the speed investigation's probe harness: an isolated SpriteKit board, a local page and the ABBA probes that timed the game and browser control paths (image loop 2,203 → local pixel reflex 35 ms; independent stimulus 37/37 at 221.9 APM, p50 34 ms; web step big model 2,616 → Jev 525 → memo 251 ms; generated input 1,056 ms on the small model), product code untouched (t-6701)
+
+## [1.1.22] — 2026-09-24
+
+_since v1.1.21 (15 commits)_
+
+### feat
+- feat(jev): add file-pick shadow seat
+
+### fix
+- fix(jev): the vault pair seat names no apply deadline — a seat that never rises has no rise line to time, and the dashboard's contract (`a_seat_that_can_rise_has_a_stage_to_time_it`) reddened the v1.1.21 lane on it; the request's own wire deadline stays in the zo runner (t-6345 follow-up)
+- fix: F1 keep arbitrary usage errors out of the window log
+- fix: F4 require a successful current gauge before reporting quota lifted
+- fix: F3 elide transcript data only after proving its image context
+- fix: F2 keep vault proposal writes away from linked sources
+
+### docs
+- docs: F6 distinguish observed quota recovery from automatic continuation
+- docs: F8 remove a private link from the public worktree room contract
+
+### test
+- test(jev): the file-pick seat's promotion is read off the table's own lookup, not asserted on the constant — clippy's assertions_on_constants under `-D warnings` (t-6344 follow-up)
+- test: record independent load checks for the two shell timing flakes
+- test: F7 reject empty or unsuccessful phone speed measurements
+- test: F5 include vault pair replay validation in tools-test
+
+## [1.1.21] — 2026-09-24
+
+_since v1.1.20 (48 commits)_
+
+### feat
+- feat(jev): record versioned vault pair proposals for review
+- feat(board): the desk's worker roster answers worker-list — every worker the ledger still summons, unhealthy first, by one health word from the ledger's own facts (pane gone, quota wall with its reset, waiting for an answer, asleep) or its pane's own state (in a turn, idle), with its last activity, agent, model and effort, pane, checkout, commits past its base and changed files (t-6588)
+- feat(crash): a hang first seen unanswered says how long it really lasted when it ends (t-6388)
+- feat(board): the desk answers check --peek — the mail each run's coordinator owes, oldest first, with where each letter stands in its inbox; a question is answered where it stands and a held batch acknowledged whole, both as the coordinator seat through the ledger's own verbs, and the screen invents neither (t-6588)
+- feat(board): the desk's task flow answers task-list — every task of the runs in play by one stage word from the ledger's own facts, counted by the backend, the stuck stages (gate with its id and question, blocked with the failed prerequisite, failed) in their signal and opened first (t-6588)
+- feat(board): the desk's machine strip answers df, uptime and simctl — the ledger's volume with the verdict the next --worktree summons would meet, the load against the cores, the booted simulators and emulators, and the status bar's own loan sentence (t-6588)
+- feat(board): the task board's coordinator desk opens with the release lane's own status — version, sha, the phase running and for how long, the lane's verdict and why a phase was skipped (t-6588)
+- feat(usage): every usage read leaves one line in the window's log — the road that answered, what the fast road failed of, how long it took and why, never a token or whose login (t-6583)
+- feat(settings): describe claim check in five locales
+- feat(zo): record claim checks and next-turn labels
+- feat(zo): select same-turn evidence for completion claims
+- feat(jev): register bounded completion claim seat
+- feat(restart-nudge): a resumed worker is told which commands the restart cut under its pane — 「Commands still running under you when the window restarted were cut: `…` — run again whichever you still need」 (t-6428 5)
+- feat(exit): closing the window asks the same census — 「지금 닫으면 도는 일이 끊깁니다 — [끝나면 종료] [지금 종료]」 — and a close nobody answers still closes after a minute (t-6428 5)
+- feat(exit): every restart door asks the one census first — 「워커 N명 턴 중 · 배경 작업 M개 — [끝나면 다시 시작] [지금 다시 시작]」 — and a wait stands as one line the beat keeps true (t-6428 3)
+- feat(exit): 「끝나면」 waits on the beat for the first gap — nothing running under any worker's pane, nothing unread — and asks again or goes when its road's one table says (t-6428 4)
+- feat(exit): the 「새 빌드 준비됨」 notice says the one census — workers mid-turn, background jobs, workers nobody could read — instead of counting live workers a second way (t-6428 2)
+- feat(orchestration): under a declared wait, a worker still stopped at its wall after the wall lifted is the coordinator's news, once — the wall's follow-up on the same two-witness rule, and nothing is typed (t-6427)
+- feat(orchestration): `--on-quota-wall` takes the closed word `wait`, and a wall's order is walked as a ladder — the wait for a verified reset before any handover (t-6427)
+- feat(exit): the window's goodbye names the road it leaves by and, for every live worker, the turn and the commands it cuts (t-6428 1)
+
+### fix
+- fix(orchestration): the mail pointer holds its line at a pane whose own last answer was a wall — once while it stands, once when it lifts (t-6560)
+- fix(board): the desk fits the first screen — a letter and a worker are two lines, the inbox state is a short word with its sentence as the tip, the seat note stands once, and the task flow breaks between its flow and its stuck stages (t-6588)
+- fix(jev): the claim seat recommends `auto` like every seat that promotes, and the Hindsight inventory names it (t-6343 follow-up)
+- fix(status): a usage read that lands in half a second is on the bar in half a second — the gauge asks every 250 ms for the first two seconds a read is out, then on the old two-second ticks (t-6583)
+- fix(usage): a Codex usage read asks with the copy the panes refreshed — the shared runtime home's, when it holds the same login provably fresher (t-6583)
+- fix(usage): the Claude OAuth read asks with the login the CLI keeps refreshing — the selected store's scoped keychain item, through `keychain_says` — before the copy the last switch wrote (t-6583)
+- fix(awake): the awake standing is asked off the main thread — it waits on the keeper, and the window asks on every resume (t-6388)
+- fix(crash): the hang sampler finds the main thread by its dyld root when the queue label is not the main queue's (t-6388)
+- fix(crash): the hang watchdog testifies only for time it was there for — a late nap, a sleep between beats or no screen awake withdraws the judgment (t-6388)
+- fix(orchestration): a quota wall stands until its reset and the stall grace after it, not for the rest of the attempt — a walled attempt's later silence is news again, and the next window's wall is walled news again (t-6427)
+
+### perf
+- perf(board): the desk stands in the board's first frame — its ledger reading is asked before the board awaits its own two, so the task list never jumps down under a person's eye (first task row shift 1170 → 0 px) (t-6588)
+- perf(board): a board repaint writes only what moved — a quiet ledger beat 3 → 0 mutations, a beat that moved one worker's words 32 → 2 (t-6588)
+
+### docs
+- docs(orchestration): `WorktreeRoom`'s doc names its private reader in code font instead of linking it — rustdoc under `-D warnings` refuses a public doc that links a private item (t-6588 follow-up)
+- docs(orchestration): the closed-word parse names its private checker in plain code — rustdoc refuses a public page that links a private item (t-6427)
+
+### test
+- test(quota-wall): replay a transcript's typed pointers through the wall hold (t-6560)
+- test(board): the task board's weight on one fixture — sixty tasks, five workers, twenty letters: first paint, paint per poll, mutations per poll, elements (t-6588)
+- test(jev): seed completion claim transcript replay
+- test(orchestration): the wait rung's `lift_read_ms` is the window's usage refetch floor, pinned — the ledger's table and the gauge's floor are one number (t-6427)
+- test(orchestration): a bench for the stall sweep's wall question on an attempt that never walled — one newest-first scan of ten thousand rows (t-6427)
+
 ## [1.1.20] — 2026-09-24
 
 _since v1.1.19 (47 commits)_

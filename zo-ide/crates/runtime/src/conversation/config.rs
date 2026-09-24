@@ -324,6 +324,28 @@ where
         self.patch_review_seat = seat;
     }
 
+    /// Seat the two tool guards (t-6348): handed every shell command before it
+    /// runs and every text a file read, a web tool, the window's browser or an
+    /// MCP tool hands back before the model reads it. They record in shadow;
+    /// in the modes that act, one line — and a fence around a text read as an
+    /// order to the agent — joins the result the model reads.
+    pub fn set_tool_guard_seat(&mut self, seat: Option<Arc<dyn crate::ToolGuardSeat>>) {
+        self.tool_guard_seat = seat;
+    }
+
+    /// Seat a file-pick judgment beside each public user turn. It records in
+    /// shadow and gives the agent a hint only when the mode acts.
+    pub fn set_file_pick_seat(&mut self, seat: Option<Arc<dyn crate::FilePickSeat>>) {
+        self.file_pick_seat = seat;
+    }
+
+    pub fn set_skill_suggestion_seat(
+        &mut self,
+        seat: Option<Arc<dyn crate::skill_rank::SkillSuggestionSeat>>,
+    ) {
+        self.skill_suggestion_seat = seat;
+    }
+
     pub fn set_auto_compaction_enabled(&mut self, enabled: bool) {
         self.auto_compaction_enabled = enabled;
         if !enabled {

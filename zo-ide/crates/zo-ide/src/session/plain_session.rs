@@ -928,6 +928,8 @@ impl PlainSession {
             let _ = tools::note_recall_read(&self.cwd, &attempt, None);
             let _ = tools::note_compaction_reread(&self.cwd, None);
             let _ = tools::note_patch_review_turn(&self.cwd, None);
+            // A turn the person stopped stops the commands it ran (t-6348).
+            let _ = tools::note_tool_guard_turn(&self.cwd, &inner.session().session_id, None);
             return;
         }
         let messages = Arc::clone(&inner.session().messages);
@@ -940,7 +942,8 @@ impl PlainSession {
                 .unwrap_or(0)
         };
         // Whether a row was written is the ledger's business, not the turn's.
-        let _ = tools::note_route_followed(&self.cwd, &attempt, unseated);
+        // The routing seat's label reads what the turn did (t-6346).
+        let _ = tools::note_route_followed(&self.cwd, &attempt, unseated, Some(&messages[from..]));
         let _ = tools::note_recall_read(&self.cwd, &attempt, Some(&messages[from..]));
         // And the compaction seat's: whether a block a compaction dropped was
         // read again inside its window (t-6039).
@@ -948,6 +951,12 @@ impl PlainSession {
         // And the patch review seat's: whether a patch's lines were edited
         // again, or a check ran green after the turn's last edit (t-6203).
         let _ = tools::note_patch_review_turn(&self.cwd, Some(&messages[from..]));
+        // And the tool guards': what became of each guarded command, and
+        // whether the next step carried out a guarded text (t-6348).
+        let _ = tools::note_tool_guard_turn(&self.cwd, &inner.session().session_id, Some(&messages[from..]));
+        // The same turn's completion claims and tool lines meet beside r43;
+        // the next person's turn labels the preceding answer.
+        tools::note_claim_turn(&self.cwd, &self.handle.path, &attempt, &messages[from..]);
     }
 
     /// 턴 후 영속 — 메시지는 이미 append 됐고, 헤더/압축 변경만 스냅샷.

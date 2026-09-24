@@ -21,6 +21,7 @@ mod helpers;
 mod reminders;
 mod repetition;
 mod reviewed_edit;
+mod guarded_tool;
 mod step_effort;
 mod streaming;
 mod streaming_turn;
@@ -29,6 +30,7 @@ mod tool;
 mod tool_call_salvage;
 mod turn_end;
 mod turn_end_gate;
+pub mod claim_check;
 mod turn_support;
 mod verified_state;
 mod verify_treadmill;
@@ -73,7 +75,7 @@ pub use reminders::{
     build_design_guidance_reminder, DESIGN_GUIDANCE_REMINDER_PREFIX, PRELUDE_FANNED_OUT_REMINDER,
     ROUTE_HINT_REMINDER_PREFIX,
 };
-pub use tool::{ConcurrentDispatchFn, LongRunningPredicate, StaticToolExecutor, ToolExecutor};
+pub use tool::{is_fan_out_tool, ConcurrentDispatchFn, LongRunningPredicate, StaticToolExecutor, ToolExecutor};
 use tool::rides_a_wave;
 
 use helpers::{
@@ -612,6 +614,11 @@ fn user_prompt_submit_denial_message(reason: Option<&str>) -> String {
 
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
+struct FilePickPendingTurn {
+    attempt: String,
+    message_count_before: usize,
+}
+
 #[allow(clippy::struct_excessive_bools)] // each bool is an independent feature gate threaded from settings, not a state machine
 pub struct ConversationRuntime<C, T> {
     session: Session,
@@ -695,6 +702,17 @@ pub struct ConversationRuntime<C, T> {
     /// of the patch before the model reads the result. See
     /// [`crate::PatchReviewSeat`].
     patch_review_seat: Option<Arc<dyn crate::PatchReviewSeat>>,
+    /// Seated at the public turn boundary to rank candidate files. The row
+    /// only shows a hint when its mode acts; otherwise the seat records it.
+    file_pick_seat: Option<Arc<dyn crate::FilePickSeat>>,
+    skill_suggestion_seat: Option<Arc<dyn crate::skill_rank::SkillSuggestionSeat>>,
+    skill_suggestion_turn_start: Option<usize>,
+    /// The start-of-turn reading awaiting its actual edited-file label.
+    file_pick_pending_turn: Option<FilePickPendingTurn>,
+    /// Seated beside the tools and handed each shell command before it runs
+    /// and each text a tool hands back before the model reads it. See
+    /// [`crate::ToolGuardSeat`].
+    tool_guard_seat: Option<Arc<dyn crate::ToolGuardSeat>>,
     max_iterations: usize,
     /// Optional wall-clock deadline for the turn. Two callers set it: spawned
     /// sub-agents bound a straggler that overran its caller's wait window, and
@@ -1688,6 +1706,11 @@ where
             recall_seat: None,
             compaction_seat: None,
             patch_review_seat: None,
+            file_pick_seat: None,
+            skill_suggestion_seat: None,
+            skill_suggestion_turn_start: None,
+            file_pick_pending_turn: None,
+            tool_guard_seat: None,
             max_iterations: default_max_iterations(),
             deadline: None,
             deadline_extension: None,
@@ -1853,6 +1876,88 @@ where
         PromptSubmitDecision::Proceed
     }
 
+    /// Ask the installed file-pick seat at the one public turn boundary. A
+    /// recording mode returns without waiting; an acting mode may give the
+    /// agent one line to consider before the request is sent.
+    fn inject_file_pick_hint(&mut self, user_input: &str) {
+        self.finish_file_pick_turn();
+        self.replace_transient_system_reminder_by_prefix(
+            crate::FILE_PICK_NOTE_PREFIX,
+            None,
+        );
+        if !crate::file_pick::is_code_edit_intent(user_input) {
+            return;
+        }
+        let Some(seat) = self.file_pick_seat.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let attempt = self.next_attempt();
+        let ask = crate::FilePickAsk {
+            attempt: attempt.clone(),
+            session_id: self.session.session_id.clone(),
+            request: user_input.to_string(),
+        };
+        let hint = ::api::sync_bridge::run_blocking(seat.suggest(ask));
+        if let Some(hint) = hint {
+            self.replace_transient_system_reminder_by_prefix(
+                crate::FILE_PICK_NOTE_PREFIX,
+                Some(&hint.text),
+            );
+        }
+        self.file_pick_pending_turn = Some(FilePickPendingTurn {
+            attempt,
+            message_count_before: self.session.messages.len(),
+        });
+    }
+
+    /// Ask about skills at the public turn boundary, including turns whose
+    /// prompt index fits. Recording mode keeps the existing hint unchanged.
+    fn inject_skill_suggestion(&mut self, user_input: &str) {
+        self.finish_skill_suggestion_turn();
+        let note = self.skill_suggestion_seat.as_ref().map(Arc::clone).and_then(|seat| {
+            self.skill_suggestion_turn_start = Some(self.session.messages.len());
+            ::api::sync_bridge::run_blocking(seat.suggest(user_input.to_string()))
+        });
+        self.replace_transient_system_reminder_by_prefix(
+            crate::skills::SKILL_RECOMMENDATION_REMINDER_PREFIX,
+            note.as_deref(),
+        );
+    }
+
+    pub(super) fn finish_skill_suggestion_turn(&mut self) {
+        let Some(start) = self.skill_suggestion_turn_start.take() else {
+            return;
+        };
+        if let Some(seat) = &self.skill_suggestion_seat {
+            seat.finish(self.session.messages.get(start..).unwrap_or_default());
+        }
+    }
+
+    pub(super) fn finish_turn_seats(&mut self) {
+        self.finish_file_pick_turn();
+        self.finish_skill_suggestion_turn();
+    }
+
+    /// Label a settled public turn with only the paths its edit results say it
+    /// changed. No edit means there is no file-match comparison to record.
+    pub(super) fn finish_file_pick_turn(&mut self) {
+        let Some(pending) = self.file_pick_pending_turn.take() else {
+            return;
+        };
+        let Some(seat) = self.file_pick_seat.as_ref() else {
+            return;
+        };
+        let Some(turn) = self.session.messages.get(pending.message_count_before..) else {
+            return;
+        };
+        let edited_paths = crate::edited_file_paths(turn);
+        seat.label(
+            &pending.attempt,
+            &edited_paths,
+            crate::file_pick::search_calls_before_first_edit(turn),
+        );
+    }
+
     /// Run the streaming user-entry lifecycle policy without recording telemetry
     /// or pushing a user message. Deep-mode orchestration calls this once for the
     /// outer, user-submitted prompt before its program-generated internal subturns;
@@ -1879,6 +1984,8 @@ where
                 // covers the whole streaming dispatcher.
                 self.inject_verified_state_reminder();
                 self.install_turn_budget_continuation_reminder();
+                self.inject_file_pick_hint(user_input);
+                self.inject_skill_suggestion(user_input);
                 Ok(())
             }
             PromptSubmitDecision::Denied { reason } => Err(StreamingTurnError::runtime(
@@ -1949,6 +2056,7 @@ where
             }
         };
         self.settle_team_inbox_turn_for_result(&result);
+        self.finish_skill_suggestion_turn();
         result
     }
 
@@ -2029,6 +2137,9 @@ where
         // report.
         self.inject_verified_state_reminder();
         self.install_turn_budget_continuation_reminder();
+        if !is_continuation {
+            self.inject_skill_suggestion(&user_input);
+        }
         // Before the user message is pushed: the ordinal this mints counts the
         // turns already taken, and this one is the next.
         self.begin_attempt();
@@ -2792,6 +2903,9 @@ where
                                 Vec::new(),
                             )
                         } else {
+                            // The command guard hears a shell command right
+                            // before it runs (t-6348); it never holds it.
+                            self.guard_command(&p.tool_use_id, &p.tool_name, p.effective_input.as_ref());
                             self.record_tool_started(iterations, &p.tool_name);
                         let tool_start = std::time::Instant::now();
                         let (mut output, mut is_error) =
@@ -2815,6 +2929,9 @@ where
                         // review seat reads the tool's own envelope (t-6203).
                         let reviewed = (!is_error && self.reviews_edits_of(&p.tool_name))
                             .then(|| output.clone());
+                        // So does the text guard (t-6348).
+                        let text_asked =
+                            self.text_guard_ask(&p.tool_use_id, &p.tool_name, &output, is_error);
                         output = merge_hook_feedback(p.pre_hook_result.messages(), output, false);
 
                         let post_hook_result = if is_error {
@@ -2874,6 +2991,14 @@ where
                             );
                             output = reviewed_edit::with_review_note(output, note);
                         }
+                        // The tool guards' fence and lines (t-6348).
+                        output = self.guarded_result_blocking(
+                            &p.tool_use_id,
+                            &p.tool_name,
+                            text_asked,
+                            output,
+                            is_error,
+                        );
 
                         // Drain any images the tool staged (single-threaded: image
                         // tools run on this serial path). Drained unconditionally so

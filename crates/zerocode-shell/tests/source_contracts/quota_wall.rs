@@ -48,6 +48,13 @@ fn the_wall_witness_is_asked_beside_the_stall_probe_and_outside_the_team_table()
         "held.actor.quota_walls(",
         "held.actor.quiet_sweep(",
         "walled_already",
+        // A wall silences its attempt while it stands, and no longer; the
+        // wait rung asks the gauge from the reset on and judges the lift with
+        // both witnesses before the silence is anything else (t-6427).
+        "zerocode_core::orchestration::wall_phase(run, worker, &dispatch.id, now_ms)",
+        "zerocode_core::orchestration::read_lift(",
+        "held.actor.quota_lifts(",
+        "host.ask_usage(gauge);",
     ] {
         assert!(
             sweep.contains(needed),
@@ -166,10 +173,32 @@ fn the_wall_witness_is_asked_beside_the_stall_probe_and_outside_the_team_table()
             "the shared quota gauge lost {needed}"
         );
     }
+    // How long a wall stands is one reading of its own row against one table
+    // (t-6427): its reset and the slack when that reset is waitable, the
+    // longest wait from its witness otherwise.
+    let wall = super::support::block_after(&core, "pub fn newest_wall(");
+    assert!(
+        wall.contains("MessageKind::QuotaWalled")
+            && wall.contains("wall_window(observed_at_ms, resets_at_ms)"),
+        "the wall's own reading lost its row or its window:\n{wall}"
+    );
+    let window = super::support::block_after(&core, "fn wall_window(");
+    for needed in [
+        "QUOTA_WAIT_POLICY.slack_ms",
+        "QUOTA_WAIT_POLICY.max_wait_ms",
+    ] {
+        assert!(
+            window.contains(needed),
+            "the wall's window lost `{needed}`:\n{window}"
+        );
+    }
     let news = super::support::block_after(&core, "pub fn workers_quota_walled(");
     assert!(
-        news.contains("MessageKind::QuotaWalled") && news.contains("worker.taken_over"),
-        "the notice road lost its kind or its takeover rule:\n{news}"
+        news.contains("MessageKind::QuotaWalled")
+            && news.contains("worker.taken_over")
+            && news
+                .contains("newest_wall(run, &dispatch.id).is_some_and(|wall| wall.stands(now_ms))"),
+        "the notice road lost its kind, its takeover rule or its one wall per window:\n{news}"
     );
     assert!(
         !news.contains("end_attempt(") && !news.contains("TaskStatus::"),
@@ -268,6 +297,8 @@ fn the_handover_walk_is_three_argv_steps_through_the_one_door_in_order() {
         "worker.taken_over",
         "handover_consumes_attempt",
         "QUOTA_POLICY.handover_max",
+        // The ladder's earlier rungs hold it (t-6427).
+        "ladder_holds(run, worker, dispatch_id, QuotaWallRung::Handover, now_ms)",
         "effective_handover_order(run, worker)",
     ] {
         assert!(
@@ -279,6 +310,24 @@ fn the_handover_walk_is_three_argv_steps_through_the_one_door_in_order() {
     assert!(
         restart.contains("HANDOVER_INTERRUPTED") && restart.contains("deliver_receipt("),
         "a restart no longer reports a half-walked handover:\n{restart}"
+    );
+    // One ladder, walked from its own table, and one table of closed words.
+    assert_eq!(
+        core.matches("pub const QUOTA_WALL_LADDER: [QuotaWallRung; 2] =")
+            .count(),
+        1,
+        "the ladder is one table"
+    );
+    let holds = super::support::block_after(&core, "fn ladder_holds(");
+    assert!(
+        holds.contains("QUOTA_WALL_LADDER") && holds.contains(".take_while("),
+        "the hold stopped reading the ladder's order:\n{holds}"
+    );
+    let named =
+        super::support::block_after(&core, "pub fn named(value: &str) -> Result<Self, String> {");
+    assert!(
+        named.contains("QuotaWallRung::word") && named.contains("named_alternative(piece)"),
+        "--on-quota-wall stopped reading the one table of words:\n{named}"
     );
 }
 
@@ -301,6 +350,13 @@ fn the_orchestration_guide_teaches_the_handover_order_and_its_flags() {
         "at most\ntwice",
         "`interrupted`",
         "TWO witnesses",
+        // The ladder (t-6427): the closed word, its order and its receipts.
+        "closed word `wait`",
+        "`wait,<agent[:model[:effort]]>`",
+        "`run-show.handover.ladder`",
+        "`rung: \"handover\"`",
+        "`reason: \"quota_lifted\"`",
+        "Nothing is typed for you.",
     ] {
         assert!(
             skill.contains(needed),
@@ -430,7 +486,7 @@ fn the_transient_error_continuation_rides_the_stall_sweep_through_the_pointers_d
         "Some(OnTransientError::Resume)",
         "worker.taken_over",
         "awaiting_reply(run, &worker.id)",
-        "MessageKind::QuotaWalled",
+        "newest_wall(run, &dispatch.id).is_some_and(|wall| wall.stands(now_ms))",
         "Err(NotResumed::InFlight)",
         "RESUME_POLICY.attempts_max",
         "resume_may_have_typed(body)",
@@ -474,4 +530,70 @@ fn the_orchestration_guide_teaches_the_transient_error_order() {
             "the orchestration guide no longer teaches `{needed}`"
         );
     }
+}
+
+/// The mail pointer's hold at a pane standing at its wall (t-6560): the
+/// pane's own record is read in ONE place, where the pass would type a fresh
+/// line — after the running-turn road, after a held wall's own deadline — so
+/// a held pane costs no read a beat, and the window it holds for is the one
+/// wall table's. The real host reads the transcript's bounded tail, and the
+/// table is asked before the file is opened.
+#[test]
+fn the_pointer_reads_a_panes_wall_once_where_it_would_type_a_fresh_line() {
+    let orchestration = shell_source("orchestration.rs");
+    let pass = super::support::block_after(&orchestration, "fn point_at_waiting_mail(");
+    let at = |needle: &str| {
+        pass.find(needle)
+            .unwrap_or_else(|| panic!("the pointer pass lost `{needle}`:\n{pass}"))
+    };
+    let running = at("matches!(heard, Some(PaneTurn::Running))");
+    let deadline = at("Some(Standing::Walled { until_ms, .. }) if now_ms < until_ms => continue");
+    let asked = at(".pane_wall(term, &agent)");
+    assert!(
+        running < deadline && deadline < asked,
+        "the wall is read before the running road or a held wall's deadline:\n{pass}"
+    );
+    assert_eq!(
+        pass.matches(".pane_wall(").count(),
+        1,
+        "the pass reads a pane's wall in more than one place"
+    );
+    assert!(
+        pass.contains(".filter(|wall| wall.stands(now_ms))"),
+        "the hold stopped asking whether the wall still stands"
+    );
+
+    let tools = shell_source("agent_tools_runtime.rs");
+    let host = super::support::block_after(
+        &tools,
+        "fn pane_wall(&self, term: TermId, agent: &str) -> Option<crate::quota_wall::PaneWall> {",
+    );
+    assert!(
+        host.contains("transcript_path") && host.contains("quota_wall::pane_wall_for("),
+        "the real host does not read the pane's own transcript:\n{host}"
+    );
+    let table = shell_source("quota_wall.rs");
+    let road = super::support::block_after(&table, "pub(crate) fn pane_wall_for(");
+    let table_first = road
+        .find("reads_pane_walls(agent)")
+        .expect("the road asks the marker table");
+    let file_read = road
+        .find("tail_lines(")
+        .expect("the road reads the transcript's tail");
+    assert!(
+        table_first < file_read,
+        "the transcript is opened before the table is asked:\n{road}"
+    );
+    let reader = super::support::block_after(&table, "pub(crate) fn pane_wall_in(");
+    assert!(
+        reader.contains("zerocode_core::orchestration::wall_stands_until("),
+        "the hold's window left the one wall table:\n{reader}"
+    );
+
+    let core = core_source("orchestration.rs");
+    let window = super::support::block_after(&core, "pub fn wall_stands_until(");
+    assert!(
+        window.contains("wall_window(observed_at_ms, resets_at_ms)"),
+        "the pane's wall no longer reads the ledger row's window:\n{window}"
+    );
 }

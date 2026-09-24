@@ -26,6 +26,8 @@
 //! [`RuntimeActor`]: zerocode_orchestrator::runtime_actor::RuntimeActor
 
 pub(crate) mod coordinator_handover;
+pub(crate) mod desk;
+pub(crate) mod restart_census;
 mod stall_cause;
 mod step_effort;
 mod summon_choice;
@@ -482,8 +484,14 @@ pub(crate) fn reseat_sleeping(
             continue;
         }
         // The same words a resumed pane's witness road carries (t-3058):
-        // the seat sentence, and where the checkout stands by git's word.
+        // the seat sentence, where the checkout stands by git's word, and
+        // the commands the restart cut under its pane (t-6428 ⑤).
+        let cut = BLACKBOX
+            .get()
+            .map(|root| restart_census::take_cut(root, &worker))
+            .unwrap_or_default();
         let nudge = crate::restart_nudge_runtime::resume_nudge(
+            true,
             true,
             checkout
                 .as_deref()
@@ -494,6 +502,7 @@ pub(crate) fn reseat_sleeping(
                     )
                 })
                 .as_ref(),
+            &cut,
         );
         let decided = match held.actor.prepare_worker_reseat(
             &run_id,
@@ -976,6 +985,26 @@ pub(crate) struct LedgerAgent {
     /// rather than drawing the agent twice.
     pub(crate) term: Option<u32>,
     pub(crate) at: i64,
+    /// What the summons asked it to run as — the launch receipt `worker-list`
+    /// prints, `None` where the agent's own default was taken. The task
+    /// board's worker roster reads these and the facts below (t-6588).
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+    /// The pane id inside its team (`%3`) — the half of the seat a person
+    /// types `worker-read` with when this window holds no terminal for it.
+    pub(crate) pane: String,
+    /// Whether it asked a question nobody has answered yet
+    /// (`Run::awaiting_reply`, the silence the stall sweep keeps quiet).
+    pub(crate) asking: bool,
+    /// The newest quota wall its current attempt met, as the ledger reads it
+    /// back (`newest_wall`): the reset the provider named and until when the
+    /// wall explains its silence. Standing is the reader's `now` against
+    /// `stands_until_ms`.
+    pub(crate) wall: Option<zerocode_core::orchestration::WallAt>,
+    /// The last quiet turn its hook reported (`Worker::quiet_at`).
+    pub(crate) quiet_at: Option<i64>,
+    /// The reconciler's proof that its pane is gone (`Worker::pane_missing_since_ms`).
+    pub(crate) pane_missing_since_ms: Option<i64>,
 }
 
 /// Volatile relations layered over the board's two permanent graph edges.
@@ -1248,6 +1277,13 @@ pub(crate) struct BoardLedgerSnapshot {
     pub(crate) agents: Arc<Vec<LedgerAgent>>,
     states: Arc<std::collections::HashMap<u32, LedgerPaneState>>,
     overlays: Arc<GraphOverlaySnapshot>,
+    /// The checkouts live workers hold, counted the way a `--worktree`
+    /// summons counts them ([`zerocode_core::orchestration::held_checkouts`]) —
+    /// what the task board's machine strip judges the disk beside (t-6588).
+    pub(crate) held_checkouts: usize,
+    /// The task board's coordinator desk: the runs in play, their tasks by
+    /// pipeline stage (t-6588, [`desk::desk_snapshot`]).
+    pub(crate) desk: Arc<desk::DeskSnapshot>,
 }
 
 pub(crate) fn board_ledger_snapshot() -> Arc<BoardLedgerSnapshot> {
@@ -1265,6 +1301,10 @@ pub(crate) fn refresh_board_ledger() {
         agents: Arc::new(ledger_agents_for_seats(ledger, seats)),
         states: Arc::new(ledger_states_for_seats(ledger, seats)),
         overlays: Arc::new(graph_overlay_snapshot_for_seats(ledger, seats)),
+        held_checkouts: zerocode_core::orchestration::held_checkouts(ledger).len(),
+        desk: Arc::new(desk::desk_snapshot(ledger, |seat| {
+            seat_is_held(seats, seat)
+        })),
     }) else {
         return;
     };
@@ -1391,6 +1431,14 @@ fn ledger_agents_for_seats(ledger: &Ledger, seats: &TeamSeatIndex) -> Vec<Ledger
                 review,
                 term,
                 at: worker.started_ms,
+                model: worker.model.clone(),
+                effort: worker.effort.clone(),
+                pane: worker.pane.clone(),
+                asking: run.awaiting_reply(&worker.id),
+                wall: dispatch
+                    .and_then(|one| zerocode_core::orchestration::newest_wall(run, &one.id)),
+                quiet_at: worker.quiet_at,
+                pane_missing_since_ms: worker.pane_missing_since_ms,
             });
         }
     }
@@ -1408,6 +1456,15 @@ pub(crate) fn ledger_revision() -> Option<u64> {
 }
 
 type TeamSeatIndex = std::collections::HashMap<String, std::collections::HashMap<String, u32>>;
+
+/// Whether this window holds the pane a seat names (`team/pane`).
+fn seat_is_held(seats: &TeamSeatIndex, seat: &str) -> bool {
+    seat.split_once('/').is_some_and(|(team, pane)| {
+        seats
+            .get(team)
+            .is_some_and(|panes| panes.contains_key(pane))
+    })
+}
 
 fn index_team_seats(
     teams: &std::collections::HashMap<String, zerocode_core::agent_teams::Team>,
@@ -1512,6 +1569,12 @@ fn host_epoch() -> Option<&'static str> {
 /// honest remainder.
 static BLACKBOX: OnceLock<std::path::PathBuf> = OnceLock::new();
 
+/// Whether this process has said its goodbye's road line (t-6428). The
+/// goodbye is heard up to three times on one way out — a close, the
+/// embedded browser's own `app.exit(0)`, tauri's `Exit` — and the road is
+/// said once; the workers are named whenever a call still finds them.
+static GOODBYE_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The authority store this window opened, for readers that only read it.
 ///
 /// Set once, where the store is opened, and never derived a second time: a
@@ -1589,6 +1652,54 @@ fn note_pointer_uncollected(run: &str, address: &str, term: u32) {
         &format!(
             "orchestration: terminal {term}'s turn-end hook never collected the \
              pointer for {address} in {run}; the composer road has it back"
+        ),
+    );
+}
+
+/// Mail is waiting for a pane whose own last answer was a wall, and the
+/// pointer holds its line back (t-6560).
+///
+/// Said when the hold begins — for this mail, at this pane — and not once a
+/// beat: the reader looking for why a coordinator at its limit was not told
+/// about its mail needs the wall's own words and how long the window will
+/// wait on them, once.
+fn note_pointer_walled(
+    run: &str,
+    address: &str,
+    term: u32,
+    wall: &crate::quota_wall::PaneWall,
+    now_ms: i64,
+) {
+    let Some(root) = BLACKBOX.get() else { return };
+    let minutes =
+        zerocode_core::orchestration::minutes_up(wall.stands_until_ms.saturating_sub(now_ms));
+    crate::note_window_event(
+        root,
+        &format!(
+            "orchestration: mail waiting for {address} in {run} is held at terminal \
+             {term}: its last answer was its {} wall (\"{}\"), and a line typed there \
+             would only meet it again — nothing is typed until it answers again, or \
+             for {minutes} min at most",
+            wall.cause.word(),
+            wall.line.as_str()
+        ),
+    );
+}
+
+/// A held pointer's wall stopped standing: the pane is pointed at again, once.
+fn note_pointer_wall_lifted(
+    run: &str,
+    address: &str,
+    term: u32,
+    cause: crate::quota_wall::StallCause,
+) {
+    let Some(root) = BLACKBOX.get() else { return };
+    crate::note_window_event(
+        root,
+        &format!(
+            "orchestration: terminal {term}'s {} wall stopped standing; the pointer \
+             for {address} in {run} is offered again",
+            cause.word()
         ),
     );
 }
@@ -1979,7 +2090,7 @@ fn with_usage_headroom<R>(
 ///
 /// `None` is "nobody looked": a path that does not exist, a NUL in it, a
 /// platform with no `statvfs` — all answered as unmeasured, never as empty.
-fn free_bytes_at(path: &Path) -> Option<u64> {
+pub(crate) fn free_bytes_at(path: &Path) -> Option<u64> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -2668,6 +2779,21 @@ enum Standing {
     /// terminal to try. Only `check` can reach this mail now, and only from a
     /// pane that comes back.
     Seatless,
+    /// The pane's own last answer was a wall that answers every prompt the
+    /// same way — a quota, an expired login (t-6560) — and the window has
+    /// said so once. Nothing is typed: a line typed there opens a turn the
+    /// CLI ends at once, that turn's own start strikes these marks out, and
+    /// the next beat at rest used to type the same line again — every two to
+    /// five seconds, 1,391 times on the coordinator's pane in four days.
+    ///
+    /// Held until `until_ms`, the wall's own window (`QUOTA_WAIT_POLICY`,
+    /// through `wall_stands_until`), and looked at again only then: a pane
+    /// that answers again or new mail strikes the mark out and is looked at
+    /// afresh, and a wall still standing at its deadline is held anew.
+    Walled {
+        until_ms: i64,
+        cause: crate::quota_wall::StallCause,
+    },
 }
 
 fn pointed() -> &'static Mutex<std::collections::HashMap<(String, String), Pointed>> {
@@ -3106,7 +3232,40 @@ pub(crate) fn pane_taken_over(term: u32, now_ms: i64) {
 /// dead (`the terminal holding this worker exited`, a gate on its task)
 /// while the next window resumed the very same conversation into the very
 /// same checkout with no seat to report from.
-pub(crate) fn window_exiting(now_ms: i64) {
+///
+/// And before any seat sleeps, the census is read (t-6428): the goodbye
+/// names the road the window is leaving by and, for every live worker, the
+/// turn and the commands it cuts — `census` is the window's reading
+/// ([`restart_census::take`]), asked on every call and cheap on every call
+/// after the first, when nobody live is left to read.
+pub(crate) fn window_exiting(
+    now_ms: i64,
+    road: crate::exit_runtime::ExitRoad,
+    census: &dyn Fn() -> restart_census::RestartCensus,
+) {
+    let taken = census();
+    // Once per exit for the road, and whenever there are workers to name:
+    // the first call is the one that finds them, before they sleep.
+    let first = !GOODBYE_SAID.swap(true, std::sync::atomic::Ordering::SeqCst);
+    if (first || !taken.workers.is_empty())
+        && let Some(root) = BLACKBOX.get()
+    {
+        // What each worker's wake will be told was cut (t-6428 ⑤) — left
+        // before the lines, and replaced whole: an older note is stale.
+        if let Err(error) = restart_census::leave_cut(root, &taken) {
+            crate::note_window_event(
+                root,
+                &format!("exit: the cut commands were not left for the wakes: {error}"),
+            );
+        }
+        for line in restart_census::goodbye_lines(
+            &road.to_string(),
+            crate::exit_runtime::choice().word(),
+            &taken,
+        ) {
+            crate::note_window_event(root, &line);
+        }
+    }
     if unavailable().is_some() {
         return;
     }
@@ -3306,25 +3465,31 @@ fn expire_sleepers(host: &dyn Host, now_ms: i64) {
     }
 }
 
-/// How many workers are at work in THIS window's panes right now — what the
-/// 「새 빌드 준비됨」 notice reads before it recommends a restart (t-3058).
-/// A live row with a seat this window maps; sleepers, orphans nobody maps
-/// and released rows are not panes a restart would cut.
-pub(crate) fn live_worker_count() -> usize {
+/// The live workers seated in THIS window's panes, each with the terminal
+/// that holds it — who leaving the window would cut (t-3058, t-6428). A live
+/// row with a seat this window maps; sleepers, orphans nobody maps and
+/// released rows are not panes a restart would cut. The restart census
+/// ([`restart_census::take`]) reads its workers here and nowhere else.
+pub(crate) fn seated_live_workers() -> Vec<restart_census::Seated> {
     with_ledger_seats(|ledger, seats| {
         ledger
             .runs()
             .iter()
             .flat_map(|run| run.workers.iter())
             .filter(|worker| worker.state.is_live() && worker.state.may_occupy_pane())
-            .filter(|worker| {
-                seats
+            .filter_map(|worker| {
+                let term = seats
                     .get(worker.team.as_str())
-                    .is_some_and(|panes| panes.contains_key(worker.pane.as_str()))
+                    .and_then(|panes| panes.get(worker.pane.as_str()))?;
+                Some(restart_census::Seated {
+                    worker: worker.id.clone(),
+                    agent: worker.agent.clone(),
+                    term: *term,
+                })
             })
-            .count()
+            .collect()
     })
-    .unwrap_or(0)
+    .unwrap_or_default()
 }
 
 /// A hook observed a provider session in this terminal.
@@ -3788,9 +3953,16 @@ struct Stalled {
     term: u32,
     agent: String,
     model: Option<String>,
-    /// Whether this attempt's wall is already written down — a walled
-    /// worker is not asked again, and is not ALSO a quiet one.
+    /// Whether this attempt's wall is already written down and still stands
+    /// — a walled worker is not asked again, and is not ALSO a quiet one,
+    /// until its wall stops standing (t-6427).
     walled_already: bool,
+    /// Its newest wall and what the beat owes it now (t-6427): the wait
+    /// rung's gauge question while it stands, its word about the lift after.
+    wall: Option<(
+        zerocode_core::orchestration::WallAt,
+        zerocode_core::orchestration::WallPhase,
+    )>,
     /// Whether the run declared `--on-transient-error resume` — asked before
     /// a transcript is read, so an undeclared run costs nothing more.
     resume_declared: bool,
@@ -3846,9 +4018,14 @@ fn notify_stalled_workers(host: &dyn Host, now_ms: i64) {
                     .get(worker.pane.as_str())
                     .copied()?;
                 let since_ms = host.quiet_since(term, worker.started_ms, now_ms)?;
-                let walled_already = run.messages().iter().any(|held| {
-                    held.kind == zerocode_core::orchestration::MessageKind::QuotaWalled
-                        && held.dispatch.as_deref() == Some(dispatch.id.as_str())
+                let wall =
+                    zerocode_core::orchestration::wall_phase(run, worker, &dispatch.id, now_ms);
+                let walled_already = wall.as_ref().is_some_and(|(_, phase)| {
+                    matches!(
+                        phase,
+                        zerocode_core::orchestration::WallPhase::Stands { .. }
+                            | zerocode_core::orchestration::WallPhase::Lifting
+                    )
                 });
                 Some(Stalled {
                     run: run.id.clone(),
@@ -3858,6 +4035,7 @@ fn notify_stalled_workers(host: &dyn Host, now_ms: i64) {
                     agent: worker.agent.clone(),
                     model: worker.model.clone(),
                     walled_already,
+                    wall,
                     resume_declared: run
                         .handover
                         .as_ref()
@@ -3898,11 +4076,57 @@ fn notify_stalled_workers(host: &dyn Host, now_ms: i64) {
     let mut stopped: Vec<(Stalled, zerocode_core::orchestration::TransientErrorMarker)> =
         Vec::new();
     let mut unmarked: Vec<stall_cause::Silence> = Vec::new();
+    let mut lifted: Vec<zerocode_core::orchestration::QuotaLift> = Vec::new();
+    let mut asks: Vec<&'static str> = Vec::new();
     for one in stalled {
-        if one.walled_already {
-            continue;
+        use zerocode_core::orchestration::{LiftReading, WallPhase};
+        let ask = |asks: &mut Vec<&'static str>| {
+            if let Some(gauge) =
+                zerocode_core::orchestration::quota_gauge_for(&one.agent, one.model.as_deref())
+                && !asks.contains(&gauge)
+            {
+                asks.push(gauge);
+            }
+        };
+        /* The wall's own road first (t-6427): while it stands the silence is
+         * the wall's, and under a declared wait the gauge is asked for a
+         * reading from the reset on; once it stops standing the wait rung
+         * judges the lift — words still at the wall and a number read after
+         * the reset under it are told, a number not read yet is waited for,
+         * and anything else is the ordinary road below. */
+        let mut read_already = None;
+        match &one.wall {
+            Some((_, WallPhase::Stands { reread })) => {
+                if *reread {
+                    ask(&mut asks);
+                }
+                continue;
+            }
+            Some((wall, WallPhase::Lifting)) => {
+                let marker = host.quota_wall_marker(one.term, &one.agent);
+                let headroom = usage_headroom(&held.usage, &one.agent, one.model.as_deref());
+                match zerocode_core::orchestration::read_lift(
+                    &one.worker,
+                    wall,
+                    one.since_ms,
+                    marker.clone(),
+                    headroom.as_ref(),
+                    now_ms,
+                ) {
+                    LiftReading::Lifted(lift) => {
+                        lifted.push(lift);
+                        continue;
+                    }
+                    LiftReading::Unread => {
+                        ask(&mut asks);
+                        continue;
+                    }
+                    LiftReading::StillWalled | LiftReading::MovedOn => read_already = Some(marker),
+                }
+            }
+            Some((_, WallPhase::Past)) | None => {}
         }
-        let marker = host.quota_wall_marker(one.term, &one.agent);
+        let marker = read_already.unwrap_or_else(|| host.quota_wall_marker(one.term, &one.agent));
         // The wall's own words name the silence even when the provider's
         // number does not make it news.
         let wall_words = marker.is_some();
@@ -3978,6 +4202,16 @@ fn notify_stalled_workers(host: &dyn Host, now_ms: i64) {
         if let Ok((told, _)) = held.actor.quota_walls(workers.to_vec(), now_ms) {
             moved |= told;
         }
+    }
+    for lifts in lifted.chunks(zerocode_core::orchestration::MAX_LIST) {
+        if let Ok((told, _)) = held.actor.quota_lifts(lifts.to_vec(), now_ms) {
+            moved |= told;
+        }
+    }
+    // Never forced, never waited on: the answer is the cache a later beat
+    // reads (t-6427).
+    for gauge in asks {
+        host.ask_usage(gauge);
     }
     moved |= resume_stalled_workers(host, stopped, &mut quiet, now_ms);
     for workers in quiet.chunks(zerocode_core::orchestration::MAX_LIST) {
@@ -4346,6 +4580,16 @@ pub(crate) fn tick(host: &dyn Host, overrides: &[(String, LaunchOverride)], now_
 /// the same line about the same message into the same composer again: that
 /// was the pointer's one repeated cost, and a window that restarts several
 /// times a day paid it several times a day.
+///
+/// And one refusal about the pane's own last answer (t-6560). A pane whose
+/// CLI answered its last prompt with a wall — a quota, an expired login —
+/// answers the next one the same way, at once, without asking any model: a
+/// line typed there is a turn that ends before the next beat, and that turn's
+/// own start strikes the marks this pass keeps. The coordinator's pane took
+/// the same line 1,391 times in four days that way, every two to five
+/// seconds. So a fresh line is not typed at a pane standing at its wall
+/// ([`Standing::Walled`]): the window says so once, and speaks again when the
+/// pane answers again or the wall's own window runs out.
 fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
     let Some(held) = runtime() else {
         return;
@@ -4721,6 +4965,8 @@ fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
                             }
                         }
                     }
+                    // Held at a wall whose own window has not run out.
+                    Some(Standing::Walled { until_ms, .. }) if now_ms < until_ms => continue,
                     /* New mail, a new pane, nothing yet — or an advice line
                      * that no road would carry, which is the same beat over
                      * again minus the black-box line it has already earned.
@@ -4731,14 +4977,57 @@ fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
                      * there was a different line about a different failure.
                      * `Withheld` is the same beat over again too: what the
                      * guard refused clears on its own, and the guard is the
-                     * door that will know. */
+                     * door that will know. A wall whose window ran out lands
+                     * here as well, to be looked at again. */
                     Some(
                         Standing::Unreachable
                         | Standing::Withheld
                         | Standing::Unattended
-                        | Standing::Seatless,
+                        | Standing::Seatless
+                        | Standing::Walled { .. },
                     )
                     | None => {
+                        /* The wall's door (t-6560), asked where this pass
+                         * would type a FRESH line — new mail, a pane just
+                         * become pointable, a wall whose window ran out — and
+                         * never on a retry of a line the guard or the roads
+                         * refused, which this same look already let through:
+                         * the pane's record moves only with a turn, and a
+                         * turn strikes the mark out. One bounded read of the
+                         * pane's transcript, never once a beat. */
+                        let was_walled = match standing {
+                            Some(Standing::Walled { cause, .. }) => Some(cause),
+                            _ => None,
+                        };
+                        let fresh = matches!(
+                            standing,
+                            None | Some(Standing::Unattended | Standing::Walled { .. })
+                        );
+                        if fresh
+                            && let Some(wall) = host
+                                .agent_of(term)
+                                .and_then(|agent| host.pane_wall(term, &agent))
+                                .filter(|wall| wall.stands(now_ms))
+                        {
+                            if was_walled.is_none() {
+                                note_pointer_walled(&run.id, &address, term, &wall, now_ms);
+                            }
+                            marks.insert(
+                                key,
+                                Pointed {
+                                    newest,
+                                    term: Some(term),
+                                    standing: Standing::Walled {
+                                        until_ms: wall.stands_until_ms,
+                                        cause: wall.cause,
+                                    },
+                                },
+                            );
+                            continue;
+                        }
+                        if let Some(cause) = was_walled {
+                            note_pointer_wall_lifted(&run.id, &address, term, cause);
+                        }
                         let notice = crate::orchestration_notify::has_route(term)
                             .then(|| {
                                 zerocode_hookd::session_notify::PointerNotice::new(
@@ -5098,7 +5387,7 @@ fn walk_handovers(host: &dyn Host, overrides: &[(String, LaunchOverride)], now_m
     };
     let mut candidates = Vec::new();
     for run in rows.runs() {
-        let _ = zerocode_core::orchestration::next_handover_witnessed(run, |plan| {
+        let _ = zerocode_core::orchestration::next_handover_witnessed(run, now_ms, |plan| {
             candidates.push(plan.clone());
             false
         });

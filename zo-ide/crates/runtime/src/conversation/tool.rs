@@ -16,6 +16,7 @@
 //!    seam.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +44,9 @@ pub type LongRunningPredicate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub trait ToolExecutor {
     /// Reset evidence scoped to one user turn; internal continuations keep it.
     fn begin_user_turn(&mut self) {}
+
+    /// Server-pinned working directory used by Bash when input has no cwd.
+    fn execution_cwd(&self) -> Option<&Path> { None }
 
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
 
@@ -225,7 +229,8 @@ pub(super) fn is_long_running(tool_name: &str) -> bool {
 /// model order. Four `Agent` calls in one message ran one after another
 /// before, each waiting for the previous to finish ("병렬로 돌리지 않음",
 /// 2026-09-03).
-pub(super) fn is_fan_out_tool(tool_name: &str) -> bool {
+#[must_use]
+pub fn is_fan_out_tool(tool_name: &str) -> bool {
     matches!(tool_name, "Agent" | "Task" | "SpawnMultiAgent" | "Workflow")
 }
 

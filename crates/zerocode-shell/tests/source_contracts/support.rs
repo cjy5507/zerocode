@@ -58,6 +58,7 @@ pub(crate) const BACKEND_PARTS: &[(&str, &str)] = &[
         "evidence_runtime.rs",
         include_str!("../../src/evidence_runtime.rs"),
     ),
+    ("exit_runtime.rs", include_str!("../../src/exit_runtime.rs")),
     (
         "artifact_runtime.rs",
         include_str!("../../src/artifact_runtime.rs"),
@@ -639,6 +640,10 @@ pub(crate) const WINDOW_PARTS: &[(&str, &str)] = &[
     (
         "shell-conversation-view.js",
         include_str!("../../../../ui/shell-conversation-view.js"),
+    ),
+    (
+        "shell-board.js",
+        include_str!("../../../../ui/shell-board.js"),
     ),
     ("shell.js", include_str!("../../../../ui/shell.js")),
 ];

@@ -252,7 +252,12 @@ listen("ledger:changed", () => {
  * not "awaiting review" — nothing was handed in. */
 function paneLedgerWord(term) {
   const facts = paneLedger.get(term);
-  if (!facts) return "";
+  return facts ? ledgerReviewWord(facts) : "";
+}
+
+/* The same words for any ledger row — a seated pane's (above) or one the
+ * task board's worker roster draws (t-6588). */
+function ledgerReviewWord(facts) {
   const review = facts.review ?? {};
   if (review.deployed) return t("board.deployed", "배포됨");
   if (review.merged) return t("board.merged", "병합됨");
@@ -2326,8 +2331,8 @@ function wireBoardHead(view) {
   // that corner (AgentDashboardToolbar.tsx:100-117). Spelled by the window's
   // one chord speller, so Linux reads Ctrl+K.
   const keys = view.querySelector(".board-search-keys");
-  keys.textContent = chordLabel("mod+k");
-  keys.hidden = boardQuery !== "";
+  writeTextContent(keys, chordLabel("mod+k"));
+  writeHidden(keys, boardQuery !== "");
   query.oninput = (event) => {
     boardQuery = event.target.value;
     keys.hidden = boardQuery !== "";
@@ -5099,7 +5104,7 @@ function paintAgentInspectorGlyph(view, relation, entity) {
   const tile = view.querySelector(".agent-inspector-icon");
   if (!tile) return;
   const subject = relation ? `relation:${relation.type}` : entity ? `${entity.type}:${entity.type === "agent" ? entity.card.agent : ""}` : "";
-  tile.hidden = subject === "";
+  writeHidden(tile, subject === "");
   if (tile.dataset.subject === subject) return;
   tile.dataset.subject = subject;
   if (relation) tile.innerHTML = icon("link");
@@ -6616,9 +6621,9 @@ function updateTaskBoardRow(row, group, view) {
   });
   reconcileElementOrder(host, members);
   // One agent already speaks in the headline. A team exposes the distribution.
-  host.hidden = group.members.length < 2;
+  writeHidden(host, group.members.length < 2);
   const message = row.querySelector(".task-board-message");
-  message.hidden = !group.message || group.message === group.activity;
+  writeHidden(message, !group.message || group.message === group.activity);
   writeTextContent(message.firstElementChild, t("board.tasks.message", "최근 메시지"));
   writeTextContent(message.lastElementChild, group.message);
   writeTextContent(row.querySelector(".task-board-when"), [
@@ -6694,7 +6699,7 @@ function paintTaskBoardInspector(view, tasks) {
   const body = view.querySelector(".agent-inspector-body");
   agentGraphInspectorViews.delete(body);
   const tabs = view.querySelector(".agent-inspector-tabs");
-  if (tabs) tabs.hidden = true;
+  if (tabs) writeHidden(tabs, true);
   paintAgentInspectorGlyph(view, null, null);
   const actions = view.querySelector(".agent-inspector-actions");
   writeTextContent(view.querySelector(".agent-inspector-kind"), t("board.tasks.details", "작업 자세히 보기"));
@@ -6702,7 +6707,7 @@ function paintTaskBoardInspector(view, tasks) {
   writeTextContent(view.querySelector(".agent-inspector-meta"), entry
     ? [group.project, entry.workspace.label, entry.facts.model].filter(Boolean).join(" · ")
     : t("board.tasks.selectCopy", "현재 활동과 응답, 확인이 필요한 내용을 여기서 볼 수 있어요."));
-  actions.hidden = !entry;
+  writeHidden(actions, !entry);
   if (!entry) {
     body.replaceChildren();
     delete body.dataset.taskSignature;
@@ -6779,9 +6784,12 @@ function paintTaskBoard(view, model) {
   const choices = [{ id: "all", word: t("board.tasks.all", "전체") }, ...sections];
   const filterNodes = new Map([...filters.children].map((node) => [node.dataset.taskFilter, node]));
   reconcileElementOrder(filters, choices.map(({ id, word }) => {
-    const button = filterNodes.get(id) || taskBoardElement("button", "task-board-filter");
-    button.type = "button";
-    button.dataset.taskFilter = id;
+    let button = filterNodes.get(id);
+    if (!button) {
+      button = taskBoardElement("button", "task-board-filter");
+      button.type = "button";
+      button.dataset.taskFilter = id;
+    }
     button.onclick = () => {
       taskBoardFilter = id;
       paintTaskBoard(view, agentGraphModels.get(view));
@@ -6829,14 +6837,16 @@ function paintTaskBoard(view, model) {
   }
   reconcileElementOrder(host, wanted);
   const empty = surface.querySelector(".task-board-empty");
-  empty.hidden = shown > 0;
+  writeHidden(empty, shown > 0);
   writeTextContent(empty, tasks.groups.length === 0 ? t("board.tasks.empty", "에이전트에게 일을 맡기면 여기에 표시돼요.")
     : t("board.tasks.noMatch", "이 조건에 맞는 작업이 없어요."));
   const results = view.querySelector(".board-results");
-  results.hidden = !model.searchActive;
+  writeHidden(results, !model.searchActive);
   if (!results.hidden) writeTextContent(results, t("board.results", "총 {{total}}개 중 {{shown}}개 표시", {
     total: tasks.groups.length, shown,
   }));
+  // The coordinator's desk above the list (t-6588, shell-board.js).
+  paintCoordinatorDesk(view);
   paintTaskBoardInspector(view, tasks);
   // The inspector's existing Escape/scrim controls apply to either view.
   wireAgentGraphCanvas(view);
@@ -6866,8 +6876,8 @@ function paintAgentGraph(view, model) {
   view.classList.toggle("is-task-board", taskMode);
   view.classList.toggle("is-scoped-relations", !taskMode && agentGraphScopeKey !== "");
   view.classList.toggle("is-detailed-relations", agentGraphCardDetails);
-  view.querySelector(".task-board-surface").hidden = !taskMode;
-  view.querySelector(".agent-graph-surface").hidden = taskMode;
+  writeHidden(view.querySelector(".task-board-surface"), !taskMode);
+  writeHidden(view.querySelector(".agent-graph-surface"), taskMode);
   const heading = view.querySelector(".board-title");
   writeAttribute(heading, "data-i18n", taskMode ? "board.tasks.heading" : "board.graph.heading");
   writeTextContent(heading, taskMode
@@ -7171,6 +7181,7 @@ async function paintAgentGraphView(
   }
   try {
     wireBoardHead(view);
+    if (agentBoardMode === "tasks") primeCoordinatorDesk();
     const cards = snapshot?.cards ?? await boardCards();
     const reviews = new Map();
     const checkouts = new Set();
@@ -7224,9 +7235,9 @@ async function paintAgentGraphView(
     const said = agentGraphSaid(answer.columns, reviews, places, now);
     if (!force && view.dataset.said === said) return { cards, answer };
     view.dataset.said = said;
-    view.querySelector(".agent-graph-layout").hidden = false;
+    writeHidden(view.querySelector(".agent-graph-layout"), false);
     const broken = view.querySelector(".board-broken");
-    if (broken) broken.hidden = true;
+    if (broken) writeHidden(broken, true);
     const model = agentGraphModel(
       answer.columns,
       places,
@@ -7245,12 +7256,12 @@ async function paintAgentGraphView(
       ? model.searchMatchCount
       : answer.columns.reduce((total, column) => total + column.cards.length, 0);
     const results = view.querySelector(".board-results");
-    results.hidden = boardQuery.trim() === "";
+    writeHidden(results, boardQuery.trim() === "");
     if (!results.hidden) {
-      results.textContent = t("board.results", "총 {{total}}개 중 {{shown}}개 표시", {
+      writeTextContent(results, t("board.results", "총 {{total}}개 중 {{shown}}개 표시", {
         total: taskCounts ? taskCounts.groups.length : answer.total_count,
         shown,
-      });
+      }));
     }
     void askBoardReviews([...checkouts]);
     agentGraphClockBeat(answer.columns);
@@ -13060,6 +13071,9 @@ function paintHelperPage(host, tab) {
     if (run.wire) paintWireAsk(host, run);
     return;
   }
+  // The page that stood here keeps its reader's place for when it is looked
+  // at again (t-6824).
+  keepChatPlace(held?.turns);
   dropWorkerScreen(tab.pane);
   host.__dockWatch?.disconnect();
   host.classList.add("is-chat-page");
@@ -13071,7 +13085,7 @@ function paintHelperPage(host, tab) {
   // and stands under the last of them.
   const status = helperStatusNode(run);
   turns.appendChild(status);
-  host.append(head, turns);
+  host.append(head, turns, chatFootDoorNode(turns));
   // 문맥은 입력줄의 알약이 말한다. 부모가 없으면 입력줄도 없으므로 그 사실
   // 한 줄만 남는다 — 선 위의 세션은 부모 없이도 제 입력줄을 가진다(보내기가
   // 선으로 간다). The composer floats over the list's foot in the
@@ -13079,8 +13093,9 @@ function paintHelperPage(host, tab) {
   if (owner || run.wire) host.appendChild(chatDockNode(host, workerComposerNode(run, owner)));
   else host.insertBefore(workerWhereNode(run, null), turns);
   if (run.wire) paintWireAsk(host, run);
-  // 처음 서는 페이지는 끝에서 연다 — 사람이 읽는 것은 언제나 끝이다.
-  turns.scrollTop = turns.scrollHeight;
+  // 처음 서는 페이지는 끝에서 연다 — 사람이 읽는 것은 언제나 끝이다. 읽던
+  // 사람이 위에 두고 간 페이지는 그 행에서 연다(t-6824).
+  standChatPlace(turns);
   host.__helperPage = { id: tab.id, owned: Boolean(owner), locale, head, turns, status, run };
   // A plain Esc on the page interrupts its turn (t-6323 A3).
   interruptOnEscape(host);
@@ -13104,6 +13119,7 @@ function releaseWorkerPage(tab) {
   stopStatusCycle(held.status);
   held.turns.__shelf?.disconnect();
   held.turns.__imageWatch?.disconnect();
+  held.turns.__footWatch?.disconnect();
   host.__dockWatch?.disconnect();
   host.__dockWatch = null;
   host.__helperPage = null;
@@ -13151,6 +13167,7 @@ function paintWorkerView(tab) {
   // 앞 그림이 이 호스트에 걸어 둔 것을 먼저 놓아 준다 — 노드가 사라지는 줄이
   // 바로 다음 줄이다. 헬퍼의 뼈대도 같은 순간에 놓인다: 이 호스트는 이제
   // 다른 페이지의 것이다.
+  keepChatPlace(host.__helperPage?.turns);
   dropWorkerScreen(tab.pane);
   host.__helperPage = null;
   host.classList.remove("is-chat-page");

@@ -2,6 +2,7 @@ mod agent_capabilities;
 mod bundle_resources;
 mod cli_login;
 mod computer_use_mirrors;
+mod coordinator_desk;
 mod crash_report;
 mod fixture_cases;
 mod quiet_children;
@@ -46,8 +47,13 @@ mod tests {
         );
         let command = block_after(backend, "pub(crate) fn release_status(");
         assert!(
-            command.contains("answer.workers = crate::orchestration::live_worker_count();"),
-            "the notice's worker count is the ledger's, read by the command (t-3058):\n{command}"
+            command.contains("answer.busy = crate::cmd::appearance::take_census(&app).busy();"),
+            "the notice's words are the one census's, read by the command (t-3058, \
+             t-6428):\n{command}"
+        );
+        assert!(
+            !backend.contains("fn live_worker_count("),
+            "a second count of the work a restart would cut (t-6428)"
         );
         assert!(
             command.contains("zo_integration_runtime::running_zo_builds(&state)")
@@ -80,12 +86,42 @@ mod tests {
         );
 
         let window = window_source();
+        // One question before every restart (t-6428): the four doors — the
+        // update toast's action, the update pane's `restartToInstall`
+        // (t-3191), the settings notice's button and the window material's
+        // relaunch — each ask `askBeforeRestart` with their own word, and
+        // only it reaches the one restart road, when nothing is busy.
         assert_eq!(
-            window.matches("invoke(\"relaunch_window\")").count(),
-            4,
-            "blur-restart, the update toast's action, the settings notice's button, and \
-             the update pane's `restartToInstall` (t-3191) — one road, four doors"
+            window.matches("invoke(\"relaunch_window\"").count(),
+            1,
+            "a door restarts without the one question"
         );
+        let asking = block_after(window, "async function askBeforeRestart(");
+        assert!(
+            asking.contains("invoke(\"busy_census\", { road: \"restart\", door })")
+                && asking.contains("if (census && !census.busy?.busy) {")
+                && asking.contains("invoke(\"relaunch_window\", { door })"),
+            "the restart question lost its census or its road:\n{asking}"
+        );
+        let doors = include_str!("../../src/exit_runtime.rs");
+        for door in [
+            "update-toast",
+            "update-install",
+            "settings-notice",
+            "window-material",
+        ] {
+            assert_eq!(
+                window
+                    .matches(&format!("askBeforeRestart(\"{door}\")"))
+                    .count(),
+                1,
+                "the {door} door asks once"
+            );
+            assert!(
+                doors.contains(&format!(", \"{door}\"),")),
+                "the {door} door is not a word of the backend's one table"
+            );
+        }
         assert!(
             !window.contains("invoke(\"restart")
                 && !window.contains("app.restart")
@@ -104,7 +140,7 @@ mod tests {
         let toast = block_after(window, "function raiseUpdateToast(");
         for needle in [
             "sticky: true",
-            "invoke(\"relaunch_window\")",
+            "askBeforeRestart(\"update-toast\")",
             "updateToastAppWords(",
             "updateReadyZoWords(",
             "update.restart",
@@ -154,15 +190,29 @@ mod tests {
             1,
             "settings.update.running is spoken from one place"
         );
-        let busy = block_after(window, "function updateWorkersWords(");
+        // The census's words are built once (t-6428): each part through
+        // t() only when it counts, nothing at all when nothing would be cut.
+        let busy = block_after(window, "function busyWords(");
         assert!(
-            busy.contains("t(\"update.workersBusy\", \"워커 {{n}}개 진행 중 — 착지 뒤 재시작 권장\", { n: releaseWorkers })")
-                && busy.contains("if (!(releaseWorkers > 0)) return \"\";"),
-            "the worker suffix is not the one t() over the ledger's count:\n{busy}"
+            busy.contains("if (!busy?.busy) return \"\";")
+                && busy.contains(
+                    "t(\"exit.busyTurning\", \"워커 {{n}}명 턴 중\", { n: busy.turning })"
+                )
+                && busy.contains(
+                    "t(\"exit.busyBackground\", \"배경 작업 {{n}}개\", { n: busy.background })"
+                )
+                && busy.contains(
+                    "t(\"exit.busyUnknown\", \"상태를 모르는 워커 {{n}}명\", { n: busy.unknown })"
+                ),
+            "the census's words lost their one builder:\n{busy}"
         );
         assert!(
-            block_after(window, "function absorbReleaseStatus(").contains("releaseWorkers = "),
-            "the worker count is not read off the release_status answer"
+            block_after(window, "function updateWorkersWords(").contains("busyWords(releaseBusy)"),
+            "the notice's suffix is not the census's words"
+        );
+        assert!(
+            block_after(window, "function absorbReleaseStatus(").contains("releaseBusy = "),
+            "the census is not read off the release_status answer"
         );
         assert!(
             !window.contains("localStorage.setItem(\"update"),
@@ -211,7 +261,9 @@ mod tests {
             "update.readyZoVersion",
             "update.readyZoBuild",
             "update.restart",
-            "update.workersBusy",
+            "exit.busyTurning",
+            "exit.busyBackground",
+            "exit.busyUnknown",
             "settings.update.title",
             "settings.update.running",
         ] {
@@ -228,6 +280,8 @@ mod tests {
             "update.readyZo",
             "settings.update.app",
             "settings.update.zo",
+            // The worker count the census replaced (t-6428).
+            "update.workersBusy",
         ] {
             assert_eq!(
                 i18n.matches(&format!("\"{key}\"")).count(),
@@ -389,6 +443,10 @@ mod tests {
                             // t-3996: the readiness probe's three verdicts and
                             // its table are tested beside the probe.
                             | "readiness_runtime.rs"
+                            // t-6428: the roads out of the window and their
+                            // first-named-wins rule are tested beside the one
+                            // table that names them.
+                            | "exit_runtime.rs"
                             // 2026-09-15: the wire adapters are pure functions
                             // over the state, tested beside them with the two
                             // protocols' own messages and no child process.
@@ -10324,9 +10382,12 @@ mod tests {
         // Fourteen since t-6336: the loan line's minute (`emulatorLoansTick`),
         // an in-memory read that runs only while an agent's pane has a device
         // lent.
+        // Fifteen since t-6588: the task board desk's minute (`deskAmbient`),
+        // the release lane and the machine strip, only while the desk is on
+        // screen.
         assert_eq!(
             window.matches(" = idlePoller({").count(),
-            14,
+            15,
             "a background beat was added or removed without this pin moving with it"
         );
         let poller = block_after(window, "function idlePoller(");
@@ -18886,6 +18947,84 @@ mod tests {
                  already answered:\n{scanning}"
             );
         }
+    }
+
+    /// The Claude usage read asks with the login the CLI keeps refreshing — the
+    /// item scoped to the store the READING door names — through the one
+    /// keychain reader, and it only ever looks (t-6583).
+    ///
+    /// The runtime home's file is the copy the last switch wrote, and it had
+    /// expired: every read of it came back 401 while the store's item answered
+    /// 200. What this must never become on the way to fixing that is a road
+    /// to the person's own login — the unsuffixed item their terminal's CLI
+    /// keeps, or anything at all once they chose the system default — or a
+    /// credential write on a fifteen-minute timer.
+    #[test]
+    fn the_usage_login_is_the_reading_doors_store_and_only_ever_a_look() {
+        let accounts = include_str!("../../src/accounts.rs");
+        let shipped = &accounts[..accounts.find("mod tests {").unwrap_or(accounts.len())];
+        let looking = block_after(shipped, "pub(crate) fn usage_login(");
+        // The one reader, of the store the environment names.
+        assert!(
+            looking.contains("zerocode_core::account::SECURE_STORAGE_CONFIG_DIR_VAR")
+                && looking.contains("keychain_says(&store)"),
+            "the usage login grew a keychain reader of its own, or reads a \
+             store the CLI does not:\n{looking}"
+        );
+        // In the order the one table states.
+        assert!(
+            looking.contains("USAGE_LOGIN_ORDER.into_iter()"),
+            "the usage login stopped walking its order table:\n{looking}"
+        );
+        // A look: nothing written, seeded, materialized or asked of the tool
+        // directly.
+        for writer in [
+            "write_keychain",
+            "write_private",
+            "seed_scoped_keychain",
+            "materialize",
+            "security_command",
+            "std::fs::write",
+        ] {
+            assert!(
+                !looking.contains(writer),
+                "the usage login writes (`{writer}`), and it runs on a timer:\n{looking}"
+            );
+        }
+        // Never the person's own item: the unsuffixed name stays inside the
+        // one function that spells the scoped name from it.
+        assert!(
+            !looking.contains("Claude Code-credentials"),
+            "the usage login names the person's own keychain item:\n{looking}"
+        );
+        // Asked with the READING door's environment, which is empty for the
+        // system default — so that selection reads no login at all.
+        let backend = shipped_backend();
+        let scanning = block_after(backend, "fn scan_claude_usage_now(");
+        assert!(
+            scanning.contains(
+                "accounts::usage_login(&accounts::reading_env_for(config_root, \"claude\"))"
+            ),
+            "the usage read looks for its login somewhere other than the \
+             reading door:\n{scanning}"
+        );
+        let deciding = block_after(shipped, "fn runtime_env_for(");
+        assert!(
+            deciding.contains(
+                "if store.selection.system_default {\n        return (Vec::new(), None);"
+            ),
+            "the reading door names a home for the system default, so a usage \
+             read could reach the person's own login:\n{deciding}"
+        );
+        // And the OAuth road reads no Claude file of its own any more: which
+        // login is the caller's question, answered in one place.
+        let oauth = include_str!("../../src/usage_oauth.rs");
+        let (road, _) = oauth.split_once("#[cfg(test)]").unwrap_or((oauth, ""));
+        assert!(
+            !road.contains(".credentials.json")
+                && road.contains("pub fn claude(login: Option<&str>"),
+            "the Claude OAuth road picks its own credentials file again"
+        );
     }
 
     /// A second prompt WAITS, and a parked one starts on a fresh clock
@@ -31201,9 +31340,10 @@ mod tests {
         let core = include_str!("../../../zerocode-core/src/orchestration.rs");
         let arm = block_after(core, "\"worker-start\" => {");
         // The alternative is cloned into the gate since t-3059: the same
-        // word is also the worker row's standing order for its own wall.
+        // word is also the worker row's standing order for its own wall —
+        // and since t-6427 only the order's alternative, never its `wait`.
         let gate = arm
-            .find("quota_gate(launcher, now_ms, requested, on_quota_wall.clone())?")
+            .find("quota_gate(launcher, now_ms, requested, alternative.clone())?")
             .expect("the quota gate left the worker-start arm");
         for later in [
             "ledger.prepare_worker_start(WorkerStartRequest {",
@@ -31240,8 +31380,8 @@ mod tests {
             "agent-list rows lost their headroom:\n{rows}"
         );
         assert!(
-            core.contains("[--on-quota-wall <agent[:model[:effort]]>]"),
-            "the verb table no longer says --on-quota-wall"
+            core.contains("[--on-quota-wall wait|<agent[:model[:effort]]>]"),
+            "the verb table no longer says --on-quota-wall and its closed word"
         );
 
         let shell = include_str!("../../src/orchestration.rs");
@@ -34666,6 +34806,14 @@ mod tests {
         assert!(
             shipped.contains("computer_awake_status,"),
             "the awake standing is not registered for the window"
+        );
+        // ...off the main thread (t-6388): the reading waits for the keeper,
+        // and the window asks on every resume, when the keeper is busiest.
+        // A hang report on 2026-09-23 found the main thread 15,055 ms inside
+        // this command, waiting on a keeper a DarkWake had stopped.
+        assert!(
+            shipped.contains("#[tauri::command(async)]\npub(crate) fn computer_awake_status("),
+            "the awake standing is asked on the main thread, where it waits on the keeper"
         );
         // ...and a push from BOTH hot gates — the settings write and the
         // pane-state note the keeper hears. One count short means a gate

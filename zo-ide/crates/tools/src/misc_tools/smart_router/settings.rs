@@ -395,6 +395,41 @@ pub fn jev_patch_review_mode_from(loader: &runtime::ConfigLoader) -> Option<Deci
     merged_settings_root_from(loader).map(|root| zerocode_core::jev::PATCH_REVIEW.mode_in(&root))
 }
 
+/// Mode of the completion-claim seat, read from the same merged settings as
+/// every other zo Jev seat.
+#[must_use]
+pub fn jev_claim_mode_from(loader: &runtime::ConfigLoader) -> Option<DecisionShadowMode> {
+    merged_settings_root_from(loader).map(|root| zerocode_core::jev::CLAIM.mode_in(&root))
+}
+
+/// `smart.jevFilePick` from the same merged settings root as the other Jev
+/// seats. The table's `recommended` word keeps a new seat in record-only mode.
+pub const JEV_FILE_PICK_SETTING: &str = zerocode_core::jev::FILE_PICK.setting;
+
+#[must_use]
+pub fn jev_file_pick_mode_from(loader: &runtime::ConfigLoader) -> Option<DecisionShadowMode> {
+    merged_settings_root_from(loader).map(|root| zerocode_core::jev::FILE_PICK.mode_in(&root))
+}
+
+/// `smart.jevCommandGuard`: whether a shell command is put to the command
+/// guard before it runs (t-6348), from the same merged root as the other Jev
+/// seats — `None` when the settings cannot be read.
+pub const JEV_COMMAND_GUARD_SETTING: &str = zerocode_core::jev::COMMAND_GUARD.setting;
+
+#[must_use]
+pub fn jev_command_guard_mode_from(loader: &runtime::ConfigLoader) -> Option<DecisionShadowMode> {
+    merged_settings_root_from(loader).map(|root| zerocode_core::jev::COMMAND_GUARD.mode_in(&root))
+}
+
+/// `smart.jevToolTextGuard`: whether a text a tool hands back is put to the
+/// tool text guard before the model reads it (t-6348).
+pub const JEV_TOOL_TEXT_GUARD_SETTING: &str = zerocode_core::jev::TOOL_TEXT_GUARD.setting;
+
+#[must_use]
+pub fn jev_tool_text_guard_mode_from(loader: &runtime::ConfigLoader) -> Option<DecisionShadowMode> {
+    merged_settings_root_from(loader).map(|root| zerocode_core::jev::TOOL_TEXT_GUARD.mode_in(&root))
+}
+
 /// `smart.agentTool`: whether an agent's own question — zo's `Jev` tool, `zo
 /// jev ask|choose|score` — is put to a System One judgment (t-6040). Its own
 /// switch, because it sends something else off the machine again: not the
