@@ -1359,8 +1359,19 @@ impl Message {
     /// It also subsumes the rule this replaces — an author appending to their
     /// own thread is more question, not an answer — because a question
     /// addressed to its own author is not a shape any road can post.
+    ///
+    /// And a third fact, since the ledger itself writes into a question's
+    /// thread (t-6740): what the asker is told about its receiver — its turn
+    /// ended, it was stopped — is threaded on the question so it can be read
+    /// back from it, and it is never the answer. The address alone could not
+    /// say so: a question wears whatever `--to` it was given, and a row in
+    /// the ledger's voice, or of a kind only the ledger writes, is an
+    /// observation about the receiver, not a word from it.
     fn answers(&self, question: &Message) -> bool {
-        self.thread.as_deref() == Some(question.id.as_str()) && self.from == question.to
+        self.thread.as_deref() == Some(question.id.as_str())
+            && self.from == question.to
+            && self.from != LEDGER_ITSELF
+            && !self.kind.is_the_ledgers_own()
     }
 }
 
@@ -3876,6 +3887,48 @@ const TERMINAL_EXITED: &str = "the terminal holding this worker exited";
 pub const NOT_RESUMED: &str =
     "the window restarted and nothing resumed this worker's conversation within the grace";
 
+/// The final word an ending is to the askers of the worker it ended: a
+/// terminal that died or a sleeper the restart lost EXITED, and everything
+/// else — a stop, an abandon — is its coordinator CANCELLING it. Read off
+/// the ending's own sentence, which is the one fact both roads already
+/// carry, so a third spelling of "why" never has to be kept in step.
+fn ending_news(reason: &str) -> ReceiverNews {
+    if reason == TERMINAL_EXITED || RESTART_LOSSES.contains(&reason) {
+        ReceiverNews::Exited
+    } else {
+        ReceiverNews::Cancelled
+    }
+}
+
+/// Why a sleeper whose conversation was never recorded is written down as
+/// it is (t-7812): there is no provider session to resume, and a fresh
+/// launch in its place would be an empty conversation where the work was.
+pub const NO_SESSION_RECORDED: &str = "the window restarted and this worker's conversation was \
+     never recorded, so there was nothing to resume";
+
+/// Why a sleeper whose recorded conversation file is not on disk is written
+/// down as it is (t-7812): its agent would be resumed into a conversation it
+/// cannot find, and the pane would die a second later or come up empty.
+pub const CONVERSATION_FILE_GONE: &str = "the window restarted and this worker's conversation \
+     file is not on disk, so there was nothing to resume";
+
+/// Why a sleeper whose conversation this window has no way to resume is
+/// written down as it is (t-7812): a fresh launch in its place would be a new
+/// conversation where the work was, told nothing of it.
+pub const RESUME_UNSUPPORTED: &str = "the window restarted and this worker's conversation is \
+     one this window cannot resume";
+
+/// Every ending a window restart gives a sleeper it could not bring back
+/// (t-3058, t-7812) — in one table, because an asker waiting on that worker
+/// hears each of them the same way ([`ending_news`]): the restart lost it,
+/// nobody cancelled it.
+const RESTART_LOSSES: [&str; 4] = [
+    NOT_RESUMED,
+    NO_SESSION_RECORDED,
+    CONVERSATION_FILE_GONE,
+    RESUME_UNSUPPORTED,
+];
+
 /// Whether a `worker_done` says the work succeeded.
 ///
 /// Read as JSON rather than looked for as a byte sequence. The version that
@@ -4046,6 +4099,634 @@ fn quiet_rollup(episode: QuietEpisode) -> serde_json::Value {
         "quietTurns": episode.turns,
         "suppressedTurns": episode.turns.saturating_sub(episode.notified_through),
     })
+}
+
+/* ---- what an asker is told about its receiver (t-6740) ----------------- */
+
+/// One thing the ledger observed about the seat a question was asked of,
+/// while the question stood unanswered.
+///
+/// The measured hole (t-6740 baseline, 189 questions over 29 days of this
+/// machine's ledger): an asker learned NOTHING about its receiver until the
+/// answer came or its own budget ran out. The turn facts the ledger kept
+/// (`went_quiet`) are written only for a worker carrying an open dispatch,
+/// and 42 of the 45 worker receivers carried none; one question stood
+/// unanswered for as long as the ledger ran on after its receiver's attempt
+/// had ended, and nothing in its thread ever said so.
+///
+/// So the asker is told, one line per change in the ledger's own voice,
+/// threaded on the question — `Ledger::receivers_told`, under the one rule
+/// `notice_owed` — and the words are this table. Two kinds of word: a
+/// **final** one means no road will ever sign the receiver's address again,
+/// so the blocked `ask` wakes on it (the woken look, `thread_look`) and a
+/// resume answers it at once; every other word is news the asker reads at
+/// its own pace, and the deadline answer carries the last of them
+/// ([`deadline_look`]). Neither kind closes the question,
+/// answers it, spends an attempt or summons anybody: the observation is the
+/// ledger's, what to do with it is the asker's, and a replacement is its
+/// coordinator's call alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiverNews {
+    /// The receiver's turn ended and the thread holds no word from it. Not
+    /// final, and in a supervised run not even bad news: the pointer pass
+    /// types the waiting question into a pane at rest, so a turn that ended
+    /// is a turn that is about to read the question.
+    TurnEnded,
+    /// The person stopped the receiver's turn (Ctrl+C).
+    Interrupted,
+    /// The receiver's composer holds a question for the PERSON (the hook
+    /// bridge's `NeedsAttention`), stamped with when that wait began.
+    AwaitingInput,
+    /// The window measured the receiver's pane quiet past the stall grace.
+    Stalled,
+    /// The stall seat (`zerocode_core::jev::STALL`) named why the receiver
+    /// stopped — the cause word rides as the reason, so a coordinator's
+    /// existing `stall-cause` judgment is reused rather than asked twice.
+    Judged(String),
+    /// Two witnesses put the receiver at its provider's quota wall.
+    QuotaWalled,
+    /// A person's hand landed in the receiver's pane.
+    TakenOver,
+    /// The receiver reported its task done without answering. Not final: a
+    /// reclaimable worker still reads its mail, and still answers.
+    Finished,
+    /// The run's coordinator seat was vacated — a leader exit or a window
+    /// restart. Not final: the run's address routes to whoever sits next.
+    SeatVacated,
+    /// The receiver's coordinator ended it — a stop, an abandon, a release.
+    /// Final, and the one word that carries advice.
+    Cancelled,
+    /// The receiver's terminal died, or the restart could not bring it
+    /// back. Final; the coordinator holds `worker_died` and the decision.
+    Exited,
+}
+
+impl ReceiverNews {
+    /// The reason word a notice carries. A judged cause is its own word
+    /// (`crate::stall_cause::Cause::word`), so the two tables never drift.
+    pub fn word(&self) -> &str {
+        match self {
+            Self::TurnEnded => "turn_ended",
+            Self::Interrupted => "interrupted",
+            Self::AwaitingInput => "awaiting_input",
+            Self::Stalled => "stalled",
+            Self::Judged(cause) => cause,
+            Self::QuotaWalled => "quota_walled",
+            Self::TakenOver => "taken_over",
+            Self::Finished => "finished",
+            Self::SeatVacated => "seat_vacated",
+            Self::Cancelled => "cancelled",
+            Self::Exited => "exited",
+        }
+    }
+
+    /// Whether the receiver can never answer after this: a worker's
+    /// address is signed only by the worker in its pane, and a released one
+    /// is never in a pane again.
+    pub const fn is_final(&self) -> bool {
+        matches!(self, Self::Cancelled | Self::Exited)
+    }
+
+    /// The sentence an asker needs beside the word, when there is one.
+    pub const fn advice(&self) -> Option<&'static str> {
+        match self {
+            Self::Cancelled => Some(RECEIVER_CANCELLED_ADVICE),
+            _ => None,
+        }
+    }
+}
+
+/// What a cancelled receiver's asker is told to do, which is nothing: the
+/// question is not re-sent, and no replacement is summoned for the seat.
+/// Traycer's `receiver-cancelled` says the same, and for the same reason —
+/// the coordinator ended that seat on purpose, and an asker that reacts by
+/// asking a fresh worker for the same thing has undone the decision.
+pub const RECEIVER_CANCELLED_ADVICE: &str = "the seat this question was asked of was ended by \
+    its coordinator and will never answer it — do not ask it again, and do not summon a \
+    replacement for it; whether the work goes on is its coordinator's decision";
+
+/// How many non-final lines one question's thread may carry.
+///
+/// Derived from the two clocks the lines already keep: a state seen again
+/// inside `QUIET_REMINDER_MS` is the same line, so the longest `ask`
+/// budget ([`ASK_BUDGET_MAX_MS`]) can earn one line per cadence plus the
+/// first, plus one for a change of state on either edge. Past the bound a
+/// question nobody is waiting on stops costing rows; a final word still
+/// lands, because it is the one that ends the waiting.
+pub const RECEIVER_NOTICE_CAP: usize = (ASK_BUDGET_MAX_MS as i64 / QUIET_REMINDER_MS) as usize + 2;
+
+/// The seat a question was asked of, as it stood when the observed fact
+/// BEGAN — the generation the observation is about, so an event from a
+/// pane's former occupant, a run's former coordinator, or an attempt that
+/// has since ended is never pinned on the current one. A hook report can
+/// reach the ledger after its seat changed hands; the stamp it carries is
+/// what says whose it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReceiverSeat {
+    /// A worker: its id is minted once per summons, and the attempt it was
+    /// carrying when the fact began (if any) tells a re-dispatched seat
+    /// from its earlier self.
+    Worker {
+        id: String,
+        dispatch: Option<String>,
+    },
+    /// The run's coordinator, at the generation holding the chair.
+    Coordinator { seat: String, generation: u32 },
+}
+
+impl ReceiverSeat {
+    /// A worker as it stood at `fact_ms`: the attempt it carried then, not
+    /// the one it carries when the report lands.
+    fn of_worker(run: &Run, worker: &Worker, fact_ms: i64) -> Self {
+        Self::Worker {
+            id: worker.id.clone(),
+            dispatch: carried_at(run, &worker.id, fact_ms),
+        }
+    }
+
+    /// The same seat as it stood when a question was put to it at
+    /// `asked_ms` — a worker with the attempt it carried THEN. A chair is
+    /// not derived again: [`receivers_at`] names a chair only if it held the
+    /// seat since before the fact, so for a fact older than the question —
+    /// the one case [`notice_owed`] reads this for — it held it when the
+    /// question was asked too.
+    fn as_asked(&self, run: &Run, asked_ms: i64) -> Self {
+        match self {
+            Self::Worker { id, .. } => Self::Worker {
+                id: id.clone(),
+                dispatch: carried_at(run, id, asked_ms),
+            },
+            Self::Coordinator { .. } => self.clone(),
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        match self {
+            Self::Worker { id, dispatch } => {
+                serde_json::json!({ "workerId": id, "dispatchId": dispatch })
+            }
+            Self::Coordinator { seat, generation } => {
+                serde_json::json!({ "seat": seat, "generation": generation })
+            }
+        }
+    }
+}
+
+/// The attempt a worker was carrying at `at_ms`: begun by then and not
+/// ended before it — the latest such, since one attempt can end in the
+/// very millisecond the next begins.
+fn carried_at(run: &Run, worker_id: &str, at_ms: i64) -> Option<String> {
+    run.dispatches
+        .iter()
+        .filter(|one| {
+            one.worker == worker_id
+                && one.started_ms <= at_ms
+                && one.ended_ms.is_none_or(|ended| at_ms <= ended)
+        })
+        .max_by_key(|one| one.started_ms)
+        .map(|one| one.id.clone())
+}
+
+/// The worker a fact that began at `fact_ms` in `team/pane` is about, in
+/// this run: the one sitting there now, if it already held the seat when
+/// the fact began. A worker summoned after that moment is not the fact's —
+/// the next occupant never inherits the last one's late turn end, late
+/// wait on the person or late sound — and a seat whose occupant has gone
+/// is nobody's.
+///
+/// The one boundary every reading of a pane's fact shares, so a fact is
+/// never two workers' at once: whom it tells ([`receivers_at`]), whose
+/// silence it records ([`Ledger::worker_fell_silent`], which also asks
+/// [`carried_at`] for the attempt) and whose readiness window it retires
+/// ([`Ledger::worker_spoke`]).
+///
+/// The worker's summons time stands for when it took the seat: the ledger
+/// keeps no seating time of its own, and a worker seated again after a
+/// restart ([`Ledger::worker_reseated`], [`Ledger::worker_pane_resumed`])
+/// keeps its summons stamp — a fresh pane the ledger cut, or the pane of
+/// the very conversation it resumed.
+fn occupant_at<'run>(run: &'run Run, team: &str, pane: &str, fact_ms: i64) -> Option<&'run Worker> {
+    run.worker_in_pane(team, pane)
+        .filter(|worker| worker.started_ms <= fact_ms)
+}
+
+/// Whom a fact that began at `fact_ms` in `team/pane` is about, in this
+/// run: the worker occupying the pane ([`occupant_at`]), and the run's
+/// coordinator when that pane is its chair — each only if it already held
+/// the seat when the fact began. A chair taken after that moment is not the
+/// fact's receiver either. A pane that is neither is nobody's receiver.
+fn receivers_at(run: &Run, team: &str, pane: &str, fact_ms: i64) -> Vec<(String, ReceiverSeat)> {
+    let mut held = Vec::new();
+    if let Some(worker) = occupant_at(run, team, pane, fact_ms) {
+        held.push((
+            worker_address(&worker.id),
+            ReceiverSeat::of_worker(run, worker, fact_ms),
+        ));
+    }
+    let seat = format!("{team}/{pane}");
+    if let Some(chair) = run
+        .coordinator_live()
+        .filter(|chair| chair.seat == seat && chair.since_ms <= fact_ms)
+    {
+        held.push((
+            run.address(),
+            ReceiverSeat::Coordinator {
+                seat: chair.seat.clone(),
+                generation: chair.generation,
+            },
+        ));
+    }
+    held
+}
+
+/// The same for a worker named by id — the stall sweep and the endings
+/// know the worker, not the pane — under the same rule: a fact that began
+/// before the worker was summoned is not about it.
+fn receiver_of_worker(run: &Run, worker_id: &str, fact_ms: i64) -> Option<(String, ReceiverSeat)> {
+    let worker = run
+        .worker(worker_id)
+        .filter(|worker| worker.started_ms <= fact_ms)?;
+    Some((
+        worker_address(&worker.id),
+        ReceiverSeat::of_worker(run, worker, fact_ms),
+    ))
+}
+
+/// The root questions in this run addressed to `to` that nobody has
+/// answered and nobody has closed. Read off the mail, like
+/// [`awaiting_reply`]: no table of open questions to fall out of step.
+fn open_questions_to<'a>(run: &'a Run, to: &str) -> Vec<&'a Message> {
+    run.messages
+        .iter()
+        .filter(|held| held.kind == MessageKind::Question && held.thread.is_none() && held.to == to)
+        .filter(|question| {
+            thread_answer(run, question).is_none() && !question_closed(run, question)
+        })
+        .collect()
+}
+
+/// The ledger's own lines in a question's thread, oldest first, each with
+/// the facts it carried. The lines are the record: dedupe, cadence, the
+/// bound and the deadline answer all read them back rather than a counter
+/// kept beside them.
+fn receiver_notices<'a>(
+    run: &'a Run,
+    question: &'a Message,
+) -> impl Iterator<Item = (&'a Message, serde_json::Value)> + 'a {
+    run.messages
+        .iter()
+        .filter(move |held| {
+            held.from == LEDGER_ITSELF
+                && held.kind == MessageKind::Status
+                && held.thread.as_deref() == Some(question.id.as_str())
+        })
+        .filter_map(|held| {
+            serde_json::from_str::<serde_json::Value>(held.body.as_str())
+                .ok()
+                .filter(|body| body["reason"].is_string())
+                .map(|body| (held, body))
+        })
+}
+
+/// What the ledger last observed about a question's receiver, for the
+/// asker's deadline answer and the woken look: the last line in the
+/// thread — which [`notice_owed`] keeps the last state OBSERVED, never an
+/// earlier fact seen again — or, derived rather than stored, a worker
+/// receiver that no longer reads mail and was never written up, which is
+/// final all the same. `None` when nothing has been observed.
+fn receiver_standing(run: &Run, question: &Message) -> Option<serde_json::Value> {
+    let last = receiver_notices(run, question).last().map(|(_, body)| body);
+    if last.as_ref().is_some_and(|body| body["final"] == true) {
+        return last;
+    }
+    if let Some(id) = question.to.strip_prefix(WORKER_ADDRESS_PREFIX)
+        && let Some(worker) = run.worker(id)
+        && !worker.state.reads_mail()
+    {
+        let news = ReceiverNews::Cancelled;
+        return Some(serde_json::json!({
+            "questionId": question.id,
+            "receiver": question.to,
+            "receiverSeat": ReceiverSeat::Worker { id: worker.id.clone(), dispatch: None }.json(),
+            "reason": news.word(),
+            "final": true,
+            "advice": news.advice(),
+            "derived": true,
+        }));
+    }
+    last
+}
+
+/// Whether a question whose thread already carries `told` is owed a line
+/// saying `news` about `seat` — a fact that began at `fact_ms`, seen at
+/// `now_ms` — when the question was put at `asked_ms` to the receiver as
+/// it stood then, `asked_seat` ([`ReceiverSeat::as_asked`]). The whole
+/// rule, here and nowhere else:
+///
+/// 1. A final line ends the telling: nothing is written after it.
+/// 2. A final word is written once, past the bound too — it is the line
+///    that ends the waiting.
+/// 3. A question hears how its receiver has stood SINCE it was asked
+///    (t-6740 r3). A fact that began before the question is its news only
+///    while the receiver still stands as it did when asked — the same
+///    seat, and for a worker the same attempt: a state that began inside
+///    the attempt the question was put to is still how the receiver stands.
+///    A fact of an attempt that was over before the question was put — its
+///    turn end reported late, after the same worker took its next attempt —
+///    is how that attempt ended, not how the receiver stands, and is not
+///    the question's news. A fact that began after the question was asked,
+///    in whichever attempt, always is.
+/// 4. The same fact — the same seat, word and `factMs` — anywhere in the
+///    record is the same line, however late it comes again and whatever
+///    was told in between. The stall sweep hands over the same silence
+///    every beat and the stall seat's judged cause lands between two beats;
+///    a turn's end can be reported twice with another word between. A line
+///    of another word does not make the second sighting of a fact news.
+/// 5. The same word about the same seat inside [`QUIET_REMINDER_MS`] of the
+///    last line is the same line: a fresh fact of the word just said waits
+///    out the cadence.
+/// 6. At most [`RECEIVER_NOTICE_CAP`] lines that are not final.
+///
+/// What that makes the thread mean: its lines stand in the order the ledger
+/// OBSERVED them and each fact stands once, so the last line is the last
+/// state the ledger saw the receiver in — never an earlier fact seen again.
+/// `factMs` is when that state BEGAN, which is what identifies it; it does
+/// not order the thread, because a later state can have begun earlier (a
+/// stall's quiet starts at the pane's last output, which can come a hair
+/// before the hook reports the turn end it follows — and the stall is still
+/// the newer thing to know).
+fn notice_owed(
+    told: &[(&Message, serde_json::Value)],
+    seat: &serde_json::Value,
+    news: &ReceiverNews,
+    fact_ms: i64,
+    now_ms: i64,
+    (asked_ms, asked_seat): (i64, &serde_json::Value),
+) -> bool {
+    if told.iter().any(|(_, body)| body["final"] == true) {
+        return false;
+    }
+    if news.is_final() {
+        return true;
+    }
+    if fact_ms < asked_ms && asked_seat != seat {
+        return false;
+    }
+    let same_word =
+        |body: &serde_json::Value| body["reason"] == news.word() && body["receiverSeat"] == *seat;
+    if told
+        .iter()
+        .any(|(_, body)| same_word(body) && body["factMs"] == fact_ms)
+    {
+        return false;
+    }
+    if let Some((last, body)) = told.last()
+        && same_word(body)
+        && now_ms >= last.created_ms
+        && now_ms - last.created_ms < QUIET_REMINDER_MS
+    {
+        return false;
+    }
+    told.len() < RECEIVER_NOTICE_CAP
+}
+
+impl Ledger {
+    /// Tell every asker with an open question to `receiver` what the ledger
+    /// just observed about it — one line each, threaded on the question, in
+    /// the ledger's voice, where [`notice_owed`] says one is owed. Answers
+    /// how many lines were written. An asker with no reader left is told
+    /// nothing, silently — the post refuses the address, and there is
+    /// nobody to refuse to.
+    fn receivers_told(
+        &mut self,
+        run_id: &str,
+        receiver: &(String, ReceiverSeat),
+        news: &ReceiverNews,
+        fact_ms: i64,
+        now_ms: i64,
+    ) -> usize {
+        let (address, seat) = receiver;
+        let seat_json = seat.json();
+        let drafts: Vec<Draft> = {
+            let Some(run) = self.run(run_id) else {
+                return 0;
+            };
+            open_questions_to(run, address)
+                .into_iter()
+                .filter(|question| {
+                    let told: Vec<(&Message, serde_json::Value)> =
+                        receiver_notices(run, question).collect();
+                    let asked = seat.as_asked(run, question.created_ms).json();
+                    notice_owed(
+                        &told,
+                        &seat_json,
+                        news,
+                        fact_ms,
+                        now_ms,
+                        (question.created_ms, &asked),
+                    )
+                })
+                .map(|question| {
+                    let body = serde_json::json!({
+                        "questionId": question.id,
+                        "receiver": address,
+                        "receiverSeat": seat_json,
+                        "reason": news.word(),
+                        "final": news.is_final(),
+                        "advice": news.advice(),
+                        "factMs": fact_ms,
+                        "observedAtMs": now_ms,
+                        "notification": true,
+                    });
+                    Draft {
+                        from: LEDGER_ITSELF.to_string(),
+                        to: question.from.clone(),
+                        kind: MessageKind::Status,
+                        body: body.to_string().into(),
+                        subject: Text::default(),
+                        priority: Priority::Normal,
+                        payload: Text::default(),
+                        thread: Some(question.id.clone()),
+                        task: question.task.clone(),
+                        dispatch: question.dispatch.clone(),
+                    }
+                })
+                .collect()
+        };
+        drafts
+            .into_iter()
+            .filter(|draft| self.post(run_id, draft.clone(), now_ms).is_ok())
+            .count()
+    }
+
+    /// The same, for whoever a `team/pane` seat is the receiver of, in every
+    /// run — the worker in the pane, the coordinator whose chair it is — as
+    /// the seat stood when the fact began ([`receivers_at`]).
+    fn receivers_at_seat_told(
+        &mut self,
+        seat: (&str, &str),
+        news: &ReceiverNews,
+        fact_ms: i64,
+        now_ms: i64,
+    ) -> usize {
+        let (team, pane) = seat;
+        let found: Vec<(String, (String, ReceiverSeat))> = self
+            .runs
+            .iter()
+            .flat_map(|run| {
+                receivers_at(run, team, pane, fact_ms)
+                    .into_iter()
+                    .map(move |receiver| (run.id.clone(), receiver))
+            })
+            .collect();
+        found
+            .iter()
+            .map(|(run_id, receiver)| self.receivers_told(run_id, receiver, news, fact_ms, now_ms))
+            .sum()
+    }
+
+    /// The same, for a worker named by id.
+    fn receiver_worker_told(
+        &mut self,
+        worker_id: &str,
+        news: &ReceiverNews,
+        fact_ms: i64,
+        now_ms: i64,
+    ) -> usize {
+        let Some((run_id, receiver)) = self.runs.iter().find_map(|run| {
+            receiver_of_worker(run, worker_id, fact_ms).map(|receiver| (run.id.clone(), receiver))
+        }) else {
+            return 0;
+        };
+        self.receivers_told(&run_id, &receiver, news, fact_ms, now_ms)
+    }
+
+    /// A turn ended in a seat, or the person cut it short: every asker
+    /// waiting on that seat is told. Beside [`Self::worker_fell_silent`]
+    /// rather than inside it, because that road writes a worker's OWN
+    /// silence and stays quiet for a worker carrying nothing — while a
+    /// receiver carrying nothing is exactly the one the baseline found
+    /// unobserved.
+    ///
+    /// `turn_ended_ms` is the moment the turn ENDED — the pane's own clock
+    /// for the rest it came to ([`crate::hook::state_clock`]), which starts
+    /// when the rest does and stands still while the rest is reported again.
+    /// So it is the fact's time and, with the seat and the word, the same
+    /// fact's identity however often the rest is reported; the turn's start
+    /// is not carried, and nothing here would read it.
+    pub fn receivers_told_turn_ended(
+        &mut self,
+        seat: (&str, &str),
+        turn_ended_ms: i64,
+        interrupted: bool,
+        now_ms: i64,
+    ) -> usize {
+        if now_ms < 0 || turn_ended_ms < 0 {
+            return 0;
+        }
+        let news = if interrupted {
+            ReceiverNews::Interrupted
+        } else {
+            ReceiverNews::TurnEnded
+        };
+        self.receivers_at_seat_told(seat, &news, turn_ended_ms, now_ms)
+    }
+
+    /// A seat's composer holds a question for the person, since `since_ms`
+    /// (the hook bridge's `NeedsAttention`, stamped once per wait).
+    pub fn receivers_told_awaiting_input(
+        &mut self,
+        seat: (&str, &str),
+        since_ms: i64,
+        now_ms: i64,
+    ) -> usize {
+        if now_ms < 0 || since_ms < 0 {
+            return 0;
+        }
+        self.receivers_at_seat_told(seat, &ReceiverNews::AwaitingInput, since_ms, now_ms)
+    }
+
+    /// The stall sweep's quiet workers, as receivers: told whether or not
+    /// the silence is news to the coordinator ([`Self::workers_stalled`]
+    /// keeps its own rules about that — an open dispatch, no question of the
+    /// worker's own — and an asker is owed the fact under neither).
+    pub fn receivers_told_stalled(&mut self, stalled: &[(String, i64)], now_ms: i64) -> usize {
+        if now_ms < 0 {
+            return 0;
+        }
+        stalled
+            .iter()
+            .filter(|(_, since_ms)| *since_ms >= 0)
+            .map(|(worker, since_ms)| {
+                self.receiver_worker_told(worker, &ReceiverNews::Stalled, *since_ms, now_ms)
+            })
+            .sum()
+    }
+
+    /// The stall seat's judged causes, as receivers' reasons.
+    pub fn receivers_told_judged(&mut self, judged: &[StallJudged], now_ms: i64) -> usize {
+        if now_ms < 0 {
+            return 0;
+        }
+        judged
+            .iter()
+            .filter(|one| one.stalled_since_ms >= 0 && !one.cause.is_empty())
+            .map(|one| {
+                self.receiver_worker_told(
+                    &one.worker,
+                    &ReceiverNews::Judged(one.cause.clone()),
+                    one.stalled_since_ms,
+                    now_ms,
+                )
+            })
+            .sum()
+    }
+
+    /// A person's hand landed in a seat.
+    pub fn receivers_told_taken_over(&mut self, seat: (&str, &str), now_ms: i64) -> usize {
+        if now_ms < 0 {
+            return 0;
+        }
+        self.receivers_at_seat_told(seat, &ReceiverNews::TakenOver, now_ms, now_ms)
+    }
+
+    /// The level-triggered half: every open question whose worker receiver
+    /// no longer reads mail — released, or a release nobody heard back from
+    /// — is told the final word once. Called by the roads that end a worker
+    /// without passing [`Self::end_attempt`] (a release completing, a
+    /// restart converging), and safe to call from anywhere: a receiver
+    /// already written up is skipped. Answers how many lines were written.
+    pub fn receivers_reconciled(&mut self, now_ms: i64) -> usize {
+        if now_ms < 0 {
+            return 0;
+        }
+        /* From the QUESTIONS, not the workers: a ledger holds hundreds of
+         * released rows and a handful of open questions, and this runs on
+         * every release. One pass over each run's mail names the receivers
+         * worth telling; the telling itself re-reads what it must. */
+        let gone: Vec<String> = self
+            .runs
+            .iter()
+            .flat_map(|run| {
+                run.messages
+                    .iter()
+                    .filter(|held| held.kind == MessageKind::Question && held.thread.is_none())
+                    .filter_map(|held| held.to.strip_prefix(WORKER_ADDRESS_PREFIX))
+                    .filter(|id| {
+                        run.worker(id)
+                            .is_some_and(|worker| !worker.state.reads_mail())
+                    })
+                    .map(str::to_string)
+            })
+            .collect::<std::collections::BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        gone.iter()
+            .map(|worker| {
+                self.receiver_worker_told(worker, &ReceiverNews::Cancelled, now_ms, now_ms)
+            })
+            .sum()
+    }
 }
 
 struct QuietClosure {
@@ -4257,6 +4938,12 @@ pub struct Ledger {
     /// before this existed reads back as never swept, which is true.
     #[serde(default)]
     swept_at_ms: i64,
+    /// How often each verb was asked, by UTC day (t-6742) — see
+    /// [`VerbTally`]. Counted by the runtime that carries every verb, not
+    /// by [`plan`], so a plan stays the pure decision it is; kept here so
+    /// the count rides every durable write and comes back with the rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    verb_tallies: Vec<VerbTally>,
 }
 
 impl Default for Ledger {
@@ -4274,9 +4961,40 @@ impl Default for Ledger {
             next_binding_revision: 0,
             retention_days: RETENTION_DEFAULT_DAYS,
             swept_at_ms: 0,
+            verb_tallies: Vec::new(),
         }
     }
 }
+
+/// How often one verb was asked on one UTC day, and how often it was
+/// refused at the plan (t-6742).
+///
+/// The instrumentation `served` cannot be: a receipt is filed only for a
+/// verb that takes a retry name, and the reads a coordinator makes most —
+/// `worker-read`, and now `worker-transcript` — refuse one, so no receipt
+/// ever says how often a screen was asked for. This row does, for every
+/// verb of [`VERBS`], counting CALLS that reached the plan: a retry
+/// replayed from its receipt is a call; a refusal at the plan (an unknown
+/// worker, a retry name on a read, a window the verb cannot read) is a call
+/// AND a refusal; what the window did with a planned effect afterwards — a
+/// capture of a pane that vanished between plan and read — is not seen
+/// here and not claimed. `calls - refused` is therefore "reads planned",
+/// an upper bound on reads answered.
+///
+/// Bounded twice over: one row per verb per day, and only the newest
+/// [`VERB_TALLY_DAYS`] days.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerbTally {
+    pub verb: String,
+    /// The UTC day, as the epoch milliseconds it began at.
+    pub day_start_ms: i64,
+    pub calls: u64,
+    pub refused: u64,
+}
+
+/// How many days of verb tallies a ledger keeps.
+pub const VERB_TALLY_DAYS: i64 = 31;
 
 impl std::fmt::Debug for Ledger {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -4291,6 +5009,7 @@ impl std::fmt::Debug for Ledger {
             .field("runs", &self.runs.len())
             .field("bound", &self.bound.len())
             .field("served", &self.served.len())
+            .field("verb_tallies", &self.verb_tallies.len())
             .field("next_id", &self.next_id)
             .field("retention_days", &self.retention_days)
             .finish_non_exhaustive()
@@ -4606,6 +5325,15 @@ struct Served {
     answer: ServedAnswer,
     /// Absent only in a ledger an older window wrote.
     fingerprint: Option<String>,
+    /// Which VERB this receipt answered — one word out of [`VERBS`], and
+    /// nothing else about the request (t-6742). Structural metadata for a
+    /// frequency table: how often each receipt-filing verb is asked, by
+    /// day, read off the store without opening a single answer. Never the
+    /// argv, the body or the answer — those stay where they were. Absent
+    /// on a row an older window wrote, which reads as "unknown" and is not
+    /// inferred from the answer's shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verb: Option<String>,
     /// When this receipt was filed, so retention can tell an answer that is
     /// months old from one that is minutes old. Absent only in a ledger an
     /// older window wrote — and an unstamped row is treated as filed at the
@@ -4760,6 +5488,8 @@ impl<'de> serde::Deserialize<'de> for Served {
             #[serde(default)]
             fingerprint: Option<String>,
             #[serde(default)]
+            verb: Option<String>,
+            #[serde(default)]
             filed_ms: Option<i64>,
             #[serde(default)]
             expired: bool,
@@ -4776,6 +5506,7 @@ impl<'de> serde::Deserialize<'de> for Served {
                 request,
                 answer,
                 fingerprint,
+                verb,
                 filed_ms,
                 expired,
             }) => Self {
@@ -4783,6 +5514,7 @@ impl<'de> serde::Deserialize<'de> for Served {
                 request,
                 answer,
                 fingerprint,
+                verb,
                 filed_ms,
                 expired,
             },
@@ -4791,6 +5523,7 @@ impl<'de> serde::Deserialize<'de> for Served {
                 request,
                 answer: ServedAnswer::Inline(answer),
                 fingerprint: None,
+                verb: None,
                 filed_ms: None,
                 expired: false,
             },
@@ -4809,6 +5542,9 @@ pub struct ReceiptKey {
     caller: String,
     /// The caller's own name for this attempt.
     pub request: String,
+    /// The verb the receipt will name — the one structural fact a served
+    /// row keeps about its request (`Served::verb`).
+    verb: String,
     /// The durable, redacted name of this request.
     durable: DurableRetryIdentity,
 }
@@ -4818,6 +5554,7 @@ impl ReceiptKey {
         Self {
             caller: caller.to_string(),
             request: request.to_string(),
+            verb: verb.to_string(),
             durable: DurableRetryIdentity::of(request, caller, verb, words),
         }
     }
@@ -5506,6 +6243,7 @@ impl Ledger {
         let prefix = format!("{team}/");
         let mut moved = false;
         let mut interrupted = Vec::new();
+        let mut vacated = Vec::new();
         for run in &mut self.runs {
             if let Some(held) = run
                 .coordinator
@@ -5519,20 +6257,42 @@ impl Ledger {
                     policy.status = coordinator_handover::SeatHandoverStatus::Interrupted;
                     interrupted.push((run.id.clone(), policy.request.clone(), held.generation));
                 }
+                vacated.push((run.id.clone(), held.seat.clone(), held.generation));
                 moved = true;
             }
         }
         coordinator_handover::interrupted(self, interrupted, now_ms);
+        self.seats_vacated_told(vacated, now_ms);
         moved
+    }
+
+    /// Every asker waiting on a vacated chair is told so — the run's
+    /// address routes on to whoever sits next, so the word is not final.
+    fn seats_vacated_told(&mut self, vacated: Vec<(String, String, u32)>, now_ms: i64) {
+        for (run_id, seat, generation) in vacated {
+            let receiver = (
+                format!("{RUN_ADDRESS_PREFIX}{run_id}"),
+                ReceiverSeat::Coordinator { seat, generation },
+            );
+            self.receivers_told(
+                &run_id,
+                &receiver,
+                &ReceiverNews::SeatVacated,
+                now_ms,
+                now_ms,
+            );
+        }
     }
 
     /// Every seat is vacated — the window restarted, and every pane with it.
     fn vacate_every_seat(&mut self, now_ms: i64) -> bool {
         let mut moved = false;
         let mut interrupted = Vec::new();
+        let mut vacated = Vec::new();
         for run in &mut self.runs {
             if let Some(held) = run.coordinator.as_mut().filter(|held| held.is_held()) {
                 held.vacated_ms = Some(now_ms);
+                vacated.push((run.id.clone(), held.seat.clone(), held.generation));
                 if let Some(policy) = held.handover.as_mut()
                     && policy.status == coordinator_handover::SeatHandoverStatus::Armed
                 {
@@ -5543,6 +6303,7 @@ impl Ledger {
             }
         }
         coordinator_handover::interrupted(self, interrupted, now_ms);
+        self.seats_vacated_told(vacated, now_ms);
         moved
     }
 
@@ -5668,6 +6429,18 @@ impl Ledger {
             message.payload.clone(),
         );
         let message_created_ms = message.created_ms;
+        // A worker that reports done while somebody's question to it stands
+        // open: told after the report is filed, so the report's own row
+        // comes first in the log (t-6740).
+        let finished = worker_done
+            .is_some()
+            .then(|| {
+                message
+                    .from
+                    .strip_prefix(WORKER_ADDRESS_PREFIX)
+                    .map(str::to_string)
+            })
+            .flatten();
         // A ring of waiting cannot form without a question landing, so the one
         // shape worth looking at is asked here and the rest of the mail pays
         // nothing for it.
@@ -5713,6 +6486,14 @@ impl Ledger {
                 closure.dispatch,
                 message_created_ms,
                 true,
+            );
+        }
+        if let Some(worker) = finished {
+            self.receiver_worker_told(
+                &worker,
+                &ReceiverNews::Finished,
+                message_created_ms,
+                message_created_ms,
             );
         }
         Ok(id)
@@ -6328,6 +7109,7 @@ impl Ledger {
             request: key.request.clone(),
             answer,
             fingerprint: Some(key.durable.fingerprint().to_string()),
+            verb: Some(key.verb.clone()),
             /* Stamped here and nowhere else, because here is the only moment
              * that knows WHEN the answer was true. A negative clock is read as
              * "no stamp" rather than as a date before the epoch — the sweep
@@ -6347,6 +7129,51 @@ impl Ledger {
             let spill = self.served.len() - (SERVED_MAX - SERVED_PRUNE_BATCH);
             self.served.drain(..spill);
         }
+    }
+
+    /// Count one call of `verb` on the UTC day of `now_ms` — see
+    /// [`VerbTally`]. A verb the table does not know is not counted, and a
+    /// negative clock (a stamp nobody has) counts nothing rather than a day
+    /// before the epoch. Rows older than [`VERB_TALLY_DAYS`] before the
+    /// newest day go.
+    pub fn note_verb(&mut self, verb: &str, refused: bool, now_ms: i64) {
+        if now_ms < 0 || doing(verb).is_none() {
+            return;
+        }
+        let day_start_ms = now_ms.div_euclid(DAY_MS) * DAY_MS;
+        match self
+            .verb_tallies
+            .iter_mut()
+            .find(|row| row.day_start_ms == day_start_ms && row.verb == verb)
+        {
+            Some(row) => {
+                row.calls = row.calls.saturating_add(1);
+                if refused {
+                    row.refused = row.refused.saturating_add(1);
+                }
+            }
+            None => self.verb_tallies.push(VerbTally {
+                verb: verb.to_string(),
+                day_start_ms,
+                calls: 1,
+                refused: u64::from(refused),
+            }),
+        }
+        let newest = self
+            .verb_tallies
+            .iter()
+            .map(|row| row.day_start_ms)
+            .max()
+            .unwrap_or(day_start_ms);
+        let oldest_kept = newest.saturating_sub(VERB_TALLY_DAYS.saturating_mul(DAY_MS));
+        self.verb_tallies
+            .retain(|row| row.day_start_ms > oldest_kept);
+    }
+
+    /// The verb tallies as they stand, in the order they were opened.
+    #[must_use]
+    pub fn verb_tallies(&self) -> &[VerbTally] {
+        &self.verb_tallies
     }
 
     /// Write a task down.
@@ -7126,6 +7953,7 @@ impl Ledger {
         ) {
             let at = self.locate(&worker).ok()?;
             self.runs[at.0].workers[at.1].state = WorkerState::Released;
+            self.receivers_reconciled(now_ms);
             return Some(worker);
         }
         if !was.is_live() {
@@ -8949,6 +9777,9 @@ impl Ledger {
                 self.runs[at.0].workers[at.1].state = WorkerState::Released;
             }
         }
+        if settled {
+            self.receivers_reconciled(now_ms);
+        }
         /* Asleep, not ended: the dispatch stays open, the task stays
          * `dispatched`, and its failure counter does not move. A window that
          * exited is not an attempt that failed, and counting it as one is how
@@ -9227,6 +10058,15 @@ impl Ledger {
     ///   worker is not waiting.
     /// - **the same turn twice** — one turn's end can arrive as several events,
     ///   and the ledger should record it once. See [`Worker::quiet_at`].
+    /// - **another attempt's turn** — the turn is the silence of the worker
+    ///   and the attempt it ENDED in, never of whoever sits in the pane when
+    ///   the report lands (t-6740 r3). A report can arrive after the pane's
+    ///   next worker was seated, or after the same worker took its next
+    ///   attempt; that turn is not the next one's silence, and it moves
+    ///   neither its episode nor its watermark. The same boundary as the
+    ///   asker's line about the same turn
+    ///   ([`Self::receivers_told_turn_ended`]), so one turn is one
+    ///   attempt's.
     ///
     /// Notification belongs to [`Self::workers_stalled`], whose input is the
     /// window's conjunction of hook rest, PTY quiet, a live terminal and the
@@ -9235,12 +10075,16 @@ impl Ledger {
     /// frequent mail. A worker-authored message or a dispatch ending closes
     /// the episode. Silence alone never ends work or spends an attempt.
     ///
+    /// `turn_ended_ms` is the moment the turn ended — the pane's clock for
+    /// the rest it came to ([`crate::hook::state_clock`]) — which is what
+    /// `turnEndedMs` says and what the [`Worker::quiet_at`] watermark keeps.
+    ///
     /// Answers the id of the fact it recorded, or `None` when it recorded
     /// nothing.
     pub fn worker_fell_silent(
         &mut self,
         seat: (&str, &str),
-        turn_started_ms: i64,
+        turn_ended_ms: i64,
         interrupted: bool,
         now_ms: i64,
     ) -> Option<String> {
@@ -9248,24 +10092,30 @@ impl Ledger {
             return None;
         }
         let (team, pane) = seat;
-        let run_id = self
-            .runs
-            .iter()
-            .find(|run| run.worker_in_pane(team, pane).is_some())
-            .map(|run| run.id.clone())?;
+        let (run_id, worker_id) = self.runs.iter().find_map(|run| {
+            occupant_at(run, team, pane, turn_ended_ms)
+                .map(|worker| (run.id.clone(), worker.id.clone()))
+        })?;
         let (told, task_id, dispatch_id) = {
             let run = self.run(&run_id)?;
-            let worker = run.worker_in_pane(team, pane)?;
-            if worker.quiet_at == Some(turn_started_ms) {
+            let worker = run.worker(&worker_id)?;
+            if worker.quiet_at == Some(turn_ended_ms) {
                 return None;
             }
             let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
-            if !dispatch.is_open() || awaiting_reply(run, &worker.id) {
+            // The attempt the worker carries NOW must be the one the turn
+            // ended in: a turn from an attempt already over is not this
+            // one's silence.
+            if !dispatch.is_open()
+                || carried_at(run, &worker.id, turn_ended_ms).as_deref()
+                    != Some(dispatch.id.as_str())
+                || awaiting_reply(run, &worker.id)
+            {
                 return None;
             }
             let episode = quiet_episode(run, &worker.id, &dispatch.id);
             let turns = episode.map_or(1, |held| held.turns + 1);
-            let episode_started = episode.map_or(turn_started_ms, |held| held.first_turn_ms);
+            let episode_started = episode.map_or(turn_ended_ms, |held| held.first_turn_ms);
             let suppressed = episode.map_or(1, |held| {
                 held.turns.saturating_sub(held.notified_through) + 1
             });
@@ -9275,9 +10125,9 @@ impl Ledger {
                 "pane": worker.pane,
                 "taskId": dispatch.task,
                 "dispatchId": dispatch.id,
-                "turnEndedMs": turn_started_ms,
+                "turnEndedMs": turn_ended_ms,
                 "episodeStartedMs": episode_started,
-                "lastTurnEndedMs": turn_started_ms,
+                "lastTurnEndedMs": turn_ended_ms,
                 "quietTurns": turns,
                 "suppressedTurns": suppressed,
                 "notification": false,
@@ -9285,24 +10135,22 @@ impl Ledger {
             (told, dispatch.task.clone(), dispatch.id.clone())
         };
         let run = self.run_mut(&run_id)?;
-        /* The worker there NOW — and only a worker that is still there.
+        /* The worker there NOW — and only a worker that is still there, and
+         * was already there when the turn ended (`occupant_at` above).
          *
          * A turn ending in a REUSED pane is the current agent's silence, not
          * the released one's: this walked the rows in the order they were
-         * written and wrote the news against whoever sat there first.
+         * written and wrote the news against whoever sat there first. And
+         * the turn a released one ended before the current agent was seated
+         * is not the current agent's either (t-6740 r3).
          *
          * And a seat whose every row is released has nobody to go quiet:
          * silence is something a worker DOES, and a released worker is not
          * there to do it. That is now the rule everywhere — see
          * `Run::worker_in_pane`, which has no fallback either.
          */
-        let worker = {
-            let at = run.workers.iter().position(|one| {
-                one.team == team && one.pane == pane && one.state.may_occupy_pane()
-            })?;
-            &mut run.workers[at]
-        };
-        worker.quiet_at = Some(turn_started_ms);
+        let worker = run.workers.iter_mut().find(|one| one.id == worker_id)?;
+        worker.quiet_at = Some(turn_ended_ms);
         self.record_quiet_observation(&run_id, told, task_id, dispatch_id, now_ms, false)
     }
 
@@ -9473,6 +10321,12 @@ impl Ledger {
         }
         let mut told = 0;
         for witness in walled {
+            told += self.receiver_worker_told(
+                &witness.worker,
+                &ReceiverNews::QuotaWalled,
+                now_ms,
+                now_ms,
+            );
             let Some((run_id, draft)) = self.runs.iter().find_map(|run| {
                 let worker = run.worker(&witness.worker)?;
                 if !worker.state.is_live() || !worker.state.may_occupy_pane() || worker.taken_over {
@@ -10194,22 +11048,36 @@ impl Ledger {
     /// whether anything moved, so a caller can skip the write-through when
     /// nothing did — this rides every turn's end, most of them long past
     /// their window's retirement.
-    pub fn worker_spoke(&mut self, seat: (&str, &str)) -> bool {
+    ///
+    /// `heard_ms` is when the sound's state began — the pane's own clock
+    /// ([`crate::hook::state_clock`]), for a turn's end the moment it ended.
+    /// A sound is the occupant's only if the occupant already sat there
+    /// then (t-6740 r3): a report that reaches the ledger after the pane's
+    /// next worker was seated is the last one's sound, and the next one has
+    /// not been heard from — its window stays open and its channel mark
+    /// stands. The same boundary the turn's silence and its askers' lines
+    /// read ([`Self::worker_fell_silent`],
+    /// [`Self::receivers_told_turn_ended`]).
+    pub fn worker_spoke(&mut self, seat: (&str, &str), heard_ms: i64) -> bool {
         let (team, pane) = seat;
-        for run in &mut self.runs {
-            for worker in &mut run.workers {
-                if worker.team == team
-                    && worker.pane == pane
-                    && worker.state.may_occupy_pane()
-                    && (worker.ready_by_ms.is_some() || worker.hook_unreachable_since_ms.is_some())
-                {
-                    worker.ready_by_ms = None;
-                    worker.hook_unreachable_since_ms = None;
-                    return true;
-                }
-            }
+        let Some((run_at, worker_id)) = self.runs.iter().enumerate().find_map(|(at, run)| {
+            occupant_at(run, team, pane, heard_ms).map(|worker| (at, worker.id.clone()))
+        }) else {
+            return false;
+        };
+        let Some(worker) = self.runs[run_at]
+            .workers
+            .iter_mut()
+            .find(|one| one.id == worker_id)
+        else {
+            return false;
+        };
+        if worker.ready_by_ms.is_none() && worker.hook_unreachable_since_ms.is_none() {
+            return false;
         }
-        false
+        worker.ready_by_ms = None;
+        worker.hook_unreachable_since_ms = None;
+        true
     }
 
     /// The installed hook script could not deliver a payload for this pane.
@@ -10431,6 +11299,16 @@ impl Ledger {
     /// replaces terminal routing metadata, not the dispatch carrying the work.
     /// The new seat is bound to the same run in the same write, so the first
     /// bare verb the restored agent sends lands back in its own run.
+    ///
+    /// A person's hand on the pane does not stop a SLEEPER (t-7812). The
+    /// window never writes a ledger-seated tab into its own layout, so the
+    /// person's window had no record to bring a taken-over worker back from,
+    /// and the grace ended every one of them (2026-09-25 01:13: w-7570 and
+    /// w-7631, both `takenOver`). The mark stays on the row — the hand is
+    /// still the person's — and one conversation is still one process, which
+    /// the reseat road asks the window before it cuts the pane. A taken-over
+    /// ORPHAN is still refused: its pane may be running with the person in
+    /// it, and a second pane would be a second process on their conversation.
     pub fn worker_reseated(
         &mut self,
         worker_id: &str,
@@ -10453,7 +11331,7 @@ impl Ledger {
                 worker.state.as_str()
             ));
         }
-        if worker.taken_over {
+        if worker.taken_over && worker.state == WorkerState::Orphaned {
             return Err(format!(
                 "worker {worker_id}'s pane was taken over by the person — a person's \
                  conversation is not the ledger's to reopen in another pane"
@@ -10558,6 +11436,20 @@ impl Ledger {
         })
     }
 
+    /// The launch words the sleeper `worker_id` comes back with (t-7812):
+    /// `kept_worker_tuning`'s, asked by the window's resume road so the pane
+    /// it opens for a sleeper's conversation is the launch the ledger's own
+    /// reseat would have cut. A read; nothing moves.
+    pub fn sleeper_resume_tuning(&self, worker_id: &str) -> Result<Vec<String>, String> {
+        self.runs
+            .iter()
+            .find_map(|run| {
+                run.worker(worker_id)
+                    .map(|worker| kept_worker_tuning(&run.id, worker))
+            })
+            .unwrap_or_else(|| Err(format!("unknown worker: {worker_id}")))
+    }
+
     /// The window resumed a conversation into a checkout, and a sleeper is
     /// that conversation: seat it there, as the same worker (t-3058).
     ///
@@ -10574,8 +11466,9 @@ impl Ledger {
     /// A taken-over sleeper comes back this way too, and STAYS taken over:
     /// the window that reopened the person's conversation is the person's,
     /// and the ledger records the seat it was shown without claiming the
-    /// pane. This is the one road that seats a person's worker again, which
-    /// is why `worker_reseated` may keep refusing it.
+    /// pane. It is no longer the only road for one (t-7812): the ledger's own
+    /// reseat brings a taken-over sleeper back as well, because the window
+    /// never keeps a ledger-seated tab in its layout to reopen.
     ///
     /// Answers the worker seated, or `None` for a pane that is nobody's
     /// sleeper — the ordinary case for every conversation a person reopens.
@@ -10628,6 +11521,41 @@ impl Ledger {
         Some(worker_id)
     }
 
+    /// The pane a witness seated a sleeper in never started (t-7812): the
+    /// sleeper goes back to sleep as the goodbye left it — dispatch open,
+    /// task dispatched, attempt unspent — so the next road that asks, the
+    /// ledger's reseat or another door, brings it back.
+    ///
+    /// The window seats a sleeper's conversation before its process starts
+    /// ([`Self::worker_pane_resumed`]), so nothing in that pane can type or
+    /// report before the seat is durable; a spawn the host then refused
+    /// leaves a seat nobody sits in, and a worker written down as seated in
+    /// it would be ended by the reconciler for a pane that never was. Only
+    /// that seat goes: the row must still be active in it. Whether the seat
+    /// is open is the caller's question to answer first — the pane table is
+    /// not the ledger's to read.
+    ///
+    /// Answers whether the sleeper went back.
+    pub fn resumed_pane_never_started(&mut self, worker_id: &str) -> bool {
+        let Ok((run_at, worker_at)) = self.locate(worker_id) else {
+            return false;
+        };
+        let run_id = self.runs[run_at].id.clone();
+        let worker = &mut self.runs[run_at].workers[worker_at];
+        if worker.state != WorkerState::Active {
+            return false;
+        }
+        worker.state = WorkerState::Sleeping;
+        let seat = format!("{}/{}", worker.team, worker.pane);
+        // The seat's address named this run only for the pane that never
+        // started; a later occupant's binding is not this road's to drop.
+        if self.bound_run(&seat) == Some(run_id.as_str()) {
+            self.bound.retain(|(caller, _)| caller != &seat);
+            self.binding_revisions.retain(|(caller, _)| caller != &seat);
+        }
+        true
+    }
+
     /// A sleeper the grace ran out on: nothing resumed its conversation, so
     /// the restart lost it after all (t-3058).
     ///
@@ -10643,6 +11571,32 @@ impl Ledger {
     /// Refused for anything but a sleeper: a live worker is not overdue, and
     /// a released one has already been here.
     pub fn sleeper_expired(&mut self, worker_id: &str, now_ms: i64) -> Result<(), String> {
+        self.sleeper_given_up(worker_id, NOT_RESUMED, now_ms)
+    }
+
+    /// A sleeper that cannot come back, said the moment that is known rather
+    /// than when the grace runs out (t-7812): the same ending and the same one
+    /// announcement as [`Self::sleeper_expired`], carrying `reason` instead.
+    ///
+    /// The road is a sleeper whose conversation was never recorded
+    /// ([`NO_SESSION_RECORDED`]). Starting its agent anyway opened an empty
+    /// conversation where the work had been and said nothing to the run; the
+    /// run hears it once instead, with the dispatch id a `--retry-of` needs.
+    pub fn sleeper_unrecoverable(
+        &mut self,
+        worker_id: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.sleeper_given_up(worker_id, reason, now_ms)
+    }
+
+    fn sleeper_given_up(
+        &mut self,
+        worker_id: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
         let (run_at, worker_at) = self.locate(worker_id)?;
         let worker = &self.runs[run_at].workers[worker_at];
         if worker.state != WorkerState::Sleeping {
@@ -10664,14 +11618,14 @@ impl Ledger {
                 )
             })
         });
-        self.finish_sleeping_reseat(worker_id, NOT_RESUMED, now_ms)?;
+        self.finish_sleeping_reseat(worker_id, reason, now_ms)?;
         if let Some((run_id, dispatch_id, task_id, quiet)) = carried {
             self.announce_a_death(
                 &run_id,
                 worker_id,
                 &dispatch_id,
                 &task_id,
-                NOT_RESUMED,
+                reason,
                 quiet,
                 now_ms,
             );
@@ -10739,21 +11693,7 @@ impl Ledger {
             .checkout
             .clone()
             .ok_or_else(|| format!("{kept} worker {worker_id} has no checkout"))?;
-        let mut tuning = launch_tuning(
-            &worker.agent,
-            worker.model.as_deref(),
-            worker.effort.as_deref(),
-        )?;
-        if let Some(peer) = provider_peer(&worker.agent, run_id, worker_id) {
-            peer.append_launch_tuning(&mut tuning);
-        }
-        // A restored worker carries a dispatch, so it is told what its first
-        // launch was (t-6747) — the pinned column for a pinned one (t-7153).
-        continue_past_classifier_declines(
-            &worker.agent,
-            summons_pins_a_model(worker.model.as_deref()),
-            &mut tuning,
-        );
+        let tuning = kept_worker_tuning(run_id, worker)?;
         /* Resume the conversation without starting the interrupted work yet.
          *
          * The host has to spawn the process before `worker_reseated` can prove
@@ -11473,7 +12413,11 @@ impl Ledger {
         // Written after the dispatch closes: `close_dispatch` hands a live
         // worker back as reclaimable, and this is the answer that outranks it.
         run.workers[at].state = ending.leaves();
-        Ok(run.workers[at].state)
+        let state = run.workers[at].state;
+        // And only now the askers, in that order on purpose: the final word
+        // is about a seat that has ended, and it names the state it left.
+        self.receiver_worker_told(worker_id, &ending_news(reason), now_ms, now_ms);
+        Ok(state)
     }
 
     /// A sleeping worker cannot be seated again, and this is the end of it.
@@ -11586,7 +12530,9 @@ impl Ledger {
             }
         }
         run.workers[at].state = ending.leaves();
-        Ok(run.workers[at].state)
+        let state = run.workers[at].state;
+        self.receiver_worker_told(worker_id, &ending_news(reason), now_ms, now_ms);
+        Ok(state)
     }
 
     /// Keep a worker's terminal. A later release will not take it.
@@ -14395,6 +15341,36 @@ fn continue_past_classifier_declines(agent: &str, pinned: bool, words: &mut Vec<
     }
 }
 
+/// The launch words a kept worker — a sleeper, an orphan — comes back with:
+/// the model and effort its row holds and the peer name its run gave it
+/// (t-7812).
+///
+/// One answer for both roads that bring such a worker back — the ledger's
+/// own reseat and the window's resumed pane — so a pane the window reopened
+/// is the launch the ledger would have cut. The launch that came back
+/// without them on 2026-09-25 was a default-model CLI nobody had summoned.
+/// The row's values win: an effort changed inside the pane reaches no hook,
+/// so the row's effort stands, and a value the row never held is not filled
+/// in — an agent summoned without tuning comes back without it.
+fn kept_worker_tuning(run_id: &str, worker: &Worker) -> Result<Vec<String>, String> {
+    let mut tuning = launch_tuning(
+        &worker.agent,
+        worker.model.as_deref(),
+        worker.effort.as_deref(),
+    )?;
+    if let Some(peer) = provider_peer(&worker.agent, run_id, &worker.id) {
+        peer.append_launch_tuning(&mut tuning);
+    }
+    // A restored worker carries a dispatch, so it is told what its first
+    // launch was (t-6747) — the pinned column for a pinned one (t-7153).
+    continue_past_classifier_declines(
+        &worker.agent,
+        summons_pins_a_model(worker.model.as_deref()),
+        &mut tuning,
+    );
+    Ok(tuning)
+}
+
 /// Assemble a reserved worker's command or put the reservation back exactly.
 ///
 /// The stable peer name needs the worker id, and the worker id exists only
@@ -14726,8 +15702,8 @@ impl Doing {
                  again is the same as asking once",
             ),
             Self::HostRead => Some(
-                "it reads a pane's screen and writes nothing down, so there is \
-                 no answer to file and nothing to repeat",
+                "it reads a pane's screen or transcript and writes nothing down, so \
+                 there is no answer to file and nothing to repeat",
             ),
             Self::Mutation | Self::Inbox | Self::Attach | Self::Policy => None,
         }
@@ -14746,6 +15722,10 @@ fn doing(verb: &str) -> Option<Doing> {
 /// arm and the window's carrying of it all say it, and a verb spelled three
 /// times is a verb that is one typo away from answering nobody.
 pub const WORKTREE_EVIDENCE_VERB: &str = "worktree-evidence";
+
+/// The read of a worker's conversation as structured turns (t-6742).
+/// Named once, for the same reason as [`WORKTREE_EVIDENCE_VERB`].
+pub const WORKER_TRANSCRIPT_VERB: &str = "worker-transcript";
 
 /// A refusal of [`WORKTREE_EVIDENCE_VERB`] in the one shape that verb answers
 /// failures in: `{code, message, retryable}` and nothing else. Every other
@@ -14911,12 +15891,20 @@ pub const VERBS: &[(&str, &str, Doing)] = &[
     (
         "ask",
         "--body <question> [--to <address>] [--timeout-ms <ms>] | --resume <questionId> · \
-         a question you are blocked on — waits for its answer",
+         a question you are blocked on — waits for its answer; the deadline answer and your \
+         inbox say how the receiver stands (turn ended, stalled, cancelled — never an answer)",
         Doing::Mutation,
     ),
     (
         "worker-read",
         "--worker <id> [--lines <n>] · that worker's screen, as bytes",
+        Doing::HostRead,
+    ),
+    (
+        WORKER_TRANSCRIPT_VERB,
+        "--worker <id> [--turns <n> | --since <ms>] [--json] · that worker's conversation as \
+         structured turns — who spoke, what ran and what came back, when — out of the transcript \
+         its agent reported; never its screen",
         Doing::HostRead,
     ),
     (
@@ -15416,6 +16404,7 @@ impl std::fmt::Debug for Decided {
             Effect::Capture { .. } => "capture",
             Effect::CaptureSeat { .. } => "capture-seat",
             Effect::WorktreeEvidence { .. } => "worktree-evidence",
+            Effect::WorkerTranscript { .. } => "worker-transcript",
             Effect::WorkerTerminal { .. } => "worker-terminal",
             Effect::Focus { .. } => "focus",
             Effect::Close { .. } => "close",
@@ -15910,7 +16899,58 @@ fn thread_look(ledger: &Ledger, run_id: &str, question: &str) -> Option<Decided>
             "closed": true,
         })));
     }
+    /* And the receiver being GONE (t-6740): a seat no road will ever sign
+     * for again is not going to answer, and holding the asker to the
+     * deadline would be waiting on the gone — the same reason a closed
+     * question wakes it. Not a closing: the question stands, unanswered,
+     * and what the asker does about it is the asker's. A word that is not
+     * final (a turn ended, a stall) does not wake anybody; it rides the
+     * deadline answer instead. */
+    if let Some(standing) = receiver_standing(run, asked)
+        && standing["final"] == true
+    {
+        return Some(said(serde_json::json!({
+            "questionId": question,
+            "answered": false,
+            "receiver": standing,
+            "resumeWith": question,
+        })));
+    }
     None
+}
+
+/// The deadline's answer for a blocking `ask` (t-6740): the woken look once
+/// more, and only a question still waiting times out.
+///
+/// One read settles the deadline, in the woken look's own order — an answer
+/// that landed after the sleeper's last empty look outranks the clock, then
+/// the question closing, then a receiver that is gone — because the wait
+/// looks before it checks the clock, and a reply that beat the deadline by
+/// a hair is a reply, never a timeout said over an answer already in the
+/// log. Only then is the question still open, and the answer says so: not
+/// answered, how to come back to it, and the LAST thing the ledger observed
+/// about its receiver — stamped with when it was seen, never restated as
+/// current. `None` for a wait that is not a question's, and the caller
+/// answers that the way it always did.
+///
+/// A read, like the woken look: nothing is leased and nothing moves. What
+/// it answers is what the caller goes home with, so the window files THIS
+/// as the ask's receipt, in the same transition — a replay of the same
+/// named ask says the same thing the first caller was told.
+pub fn deadline_look(ledger: &Ledger, waiting: &Waiting) -> Option<Decided> {
+    let question = waiting.thread.as_deref()?;
+    if let Some(settled) = thread_look(ledger, &waiting.run, question) {
+        return Some(settled);
+    }
+    let run = ledger.run(&waiting.run)?;
+    let asked = run.message(question)?;
+    Some(said(serde_json::json!({
+        "questionId": question,
+        "answered": false,
+        "resumeWith": question,
+        "timedOut": true,
+        "receiver": receiver_standing(run, asked),
+    })))
 }
 
 /// The word in a question's thread from the seat it was asked of — its answer.
@@ -16195,6 +17235,41 @@ fn formatted_over(decided: &mut Decided) {
     };
     answer["formatted"] = serde_json::Value::String(frame);
     decided.reply.stdout = format!("{answer}\n");
+}
+
+/// The transcript `worker-transcript` reads for `worker`: the row's OWN
+/// reported session's file, or why there is none. Three absences, each
+/// opening with [`crate::worker_transcript::UNAVAILABLE`] so a caller can
+/// branch on the word: an agent that reports no session at all, a row whose
+/// agent will report one and has not yet, and a session reported without a
+/// transcript file. None of them is answered from anything else.
+fn transcript_source_of(worker: &Worker) -> Result<String, String> {
+    use crate::worker_transcript::UNAVAILABLE;
+    match worker.session.as_ref() {
+        Some(session) => match session
+            .transcript_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            Some(path) => Ok(path.to_string()),
+            None => Err(format!(
+                "{UNAVAILABLE}: worker {} reported a session but no transcript file — {} \
+                 keeps none this window can read; `worker-read` shows its screen",
+                worker.id, worker.agent
+            )),
+        },
+        None if !crate::provider_session::session_will_come(&worker.agent) => Err(format!(
+            "{UNAVAILABLE}: worker {} runs {}, which reports no session and no transcript; \
+             `worker-read` shows its screen",
+            worker.id, worker.agent
+        )),
+        None => Err(format!(
+            "{UNAVAILABLE}: worker {} ({}) has not reported its session yet — ask again after \
+             its first hook, or read its screen with `worker-read`",
+            worker.id, worker.agent
+        )),
+    }
 }
 
 fn said(value: serde_json::Value) -> Decided {
@@ -18319,13 +19394,19 @@ fn plan_inner(
             } else {
                 // Not yet. The id IS the resume handle: the answer arrives
                 // as a reply in this thread, and `check --types status` will
-                // not hide it because a question is its own type. This same
-                // line is what the deadline answers, so a timed-out asker
-                // reads its own way back.
+                // not hide it because a question is its own type. The
+                // deadline answers through `deadline_look`, which looks
+                // once more and reads the last word about the receiver
+                // — and a resume reads that word here, stamped, rather
+                // than sleeping on it as if nothing had been seen.
+                let standing = ledger
+                    .run(&run_id)
+                    .and_then(|run| receiver_standing(run, run.message(&question)?));
                 let mut decided = said(serde_json::json!({
                     "questionId": question,
                     "answered": false,
                     "resumeWith": question,
+                    "receiver": standing,
                 }));
                 decided.waiting = Some(Waiting {
                     run: run_id,
@@ -18409,6 +19490,44 @@ fn plan_inner(
                 planned.effect = Effect::Capture { term, lines };
             }
             Decided::said(planned)
+        }
+
+        /* A worker's conversation as structured turns (t-6742).
+         *
+         * A read, like `worker-read`, and answered the same way — the plan
+         * names the source and the NUL placeholder, the window reads and
+         * fills. What the ledger's half decides is WHICH file: the worker
+         * row's own reported session and nothing else. Not the pane's
+         * current session (a pane is reused, a row is not), not the newest
+         * file in some home, and never the screen a release archived — a
+         * screen is not a transcript, and the archived road `worker-read`
+         * keeps is exactly the fallback this verb refuses. A row with no
+         * file says which absence it is, so the caller can tell
+         * "unavailable" from "wrong". */
+        WORKER_TRANSCRIPT_VERB => {
+            let run_id = bound(ledger, &words, &caller, &seat)?;
+            let id = words
+                .value("--worker")
+                .ok_or("worker-transcript needs --worker")?;
+            let ask = crate::worker_transcript::TranscriptAsk::of(
+                words.value("--turns"),
+                words.value("--since"),
+                words.has("--json"),
+            )?;
+            let run = ledger.run(&run_id).ok_or_else(|| unknown_run(&run_id))?;
+            let worker = run
+                .worker(id)
+                .ok_or_else(|| format!("unknown worker: {id}"))?;
+            let path = transcript_source_of(worker)?;
+            let mut planned = said(serde_json::Value::Null);
+            planned.reply = Reply::ok("\u{0}");
+            planned.effect = Effect::WorkerTranscript {
+                worker: id.to_string(),
+                agent: worker.agent.clone(),
+                path,
+                ask,
+            };
+            planned
         }
 
         /* What one CHECKOUT can prove about itself.
@@ -19522,6 +20641,9 @@ pub struct LedgerProjectionV1 {
     /// back as never, which is what it was.
     #[serde(default)]
     pub swept_at_ms: i64,
+    /// See [`VerbTally`]. Empty on a store written before it was counted.
+    #[serde(default)]
+    pub verb_tallies: Vec<VerbTally>,
 }
 
 /// Turn only unverifiable **legacy** check receipts into tombstones.
@@ -19938,6 +21060,11 @@ pub struct ServedRow {
     pub request: Text,
     pub answer: ServedAnswer,
     pub fingerprint: Option<Text>,
+    /// The verb the receipt answered (`Served::verb`): a word of [`VERBS`],
+    /// public by construction, so a plain `String` rather than a [`Text`].
+    /// `None` on a row an older window wrote — unknown, never inferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verb: Option<String>,
     /// When the answer was filed, so retention can tell an old one from a new
     /// one. Absent on every row an older window wrote, and such a row is never
     /// expired by age — see [`Ledger::sweep_retention`].
@@ -20124,6 +21251,7 @@ impl Ledger {
                     request: Text(held.request.clone()),
                     answer: held.answer.clone(),
                     fingerprint: held.fingerprint.clone().map(Text),
+                    verb: held.verb.clone(),
                     filed_ms: held.filed_ms,
                     expired: held.expired,
                 })
@@ -20132,6 +21260,7 @@ impl Ledger {
             gates: Vec::new(),
             retention_days: self.retention_days,
             swept_at_ms: self.swept_at_ms,
+            verb_tallies: self.verb_tallies.clone(),
         };
 
         for run in &self.runs {
@@ -20304,6 +21433,7 @@ impl Ledger {
                     request: row.request.into_string(),
                     answer: row.answer,
                     fingerprint: row.fingerprint.map(Text::into_string),
+                    verb: row.verb,
                     filed_ms: row.filed_ms,
                     expired: row.expired,
                 })
@@ -20313,6 +21443,7 @@ impl Ledger {
             next_binding_revision: 0,
             retention_days: projected.retention_days,
             swept_at_ms: projected.swept_at_ms,
+            verb_tallies: projected.verb_tallies,
         };
 
         for row in projected.runs {

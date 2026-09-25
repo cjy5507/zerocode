@@ -1729,9 +1729,11 @@ mod tests {
             window.contains("if (!force && view.dataset.said === said) return { cards, answer };"),
             "every ledger beat rebuilds every card — the flicker report"
         );
+        // The live map's wait words ride the same signature (t-7288), so the
+        // function also takes the ledger rows its paint asked beside the cards.
         let said = block_after(
             window,
-            "function agentGraphSaid(columns, reviews, places, now) {",
+            "function agentGraphSaid(columns, reviews, places, now, ledger = null) {",
         );
         assert!(
             said.contains("const { at, changed_at, ...visible } = card;")
@@ -18236,7 +18238,7 @@ mod tests {
         //     window restart resumes its leaders, and a leader that split
         //     panes yesterday and backgrounds its teammates the morning after
         //     ("소넷은 왜 안보이는거지") reads as broken, not as off.
-        for road in ["fn resume_session(", "fn spawn_shell("] {
+        for road in ["impl WakeWindow for ResumeDoor<'_> {", "fn spawn_shell("] {
             let there = block_after(shipped, road);
             assert!(
                 there.contains("state.local_data_root(),")
@@ -19098,7 +19100,10 @@ mod tests {
     fn the_trust_menu_is_answered_before_the_prompt_can_reach_it() {
         let backend = shipped_backend();
         let (shipped, _) = backend.split_once("#[cfg(test)]").unwrap_or((backend, ""));
-        for road in ["fn launch_agent_tab(", "fn resume_session("] {
+        for road in [
+            "fn launch_agent_tab(",
+            "impl WakeWindow for ResumeDoor<'_> {",
+        ] {
             let walking = block_after(shipped, road);
             let marked = walking
                 .find("agent_trust_presets::mark_workspace_trusted(")
@@ -19288,17 +19293,19 @@ mod tests {
         );
         let shell = include_str!("../../src/orchestration.rs");
         let walking = block_after(shell, "Effect::Split {");
+        // The continuation spends the goodbye's word about this very worker
+        // as it is handed over (t-7812 R2), so the call names the worker.
+        let continuing = "deliver_continuation(host, term, &prepared.prompt, &prepared.worker)";
         assert!(
             walking.contains("prepared_worker_reseat")
                 && walking.contains("WorkerHostPlacement::Existing")
                 && walking.contains("actor.worker_reseated(")
-                && walking.contains("host.paste(term, &prepared.prompt)")
+                && walking.contains(continuing)
                 && walking.contains("host.announce_reseated_worker("),
             "the sleeping worker bypasses the split fence or announces before rebind:\n{walking}"
         );
         assert!(
-            walking.find("actor.worker_reseated(")
-                < walking.find("host.paste(term, &prepared.prompt)"),
+            walking.find("actor.worker_reseated(") < walking.find(continuing),
             "the restored worker sees its task before its durable seat moves:\n{walking}"
         );
         let spawning = block_after(shipped_backend(), "let readiness = worker_host");
@@ -23413,10 +23420,12 @@ mod tests {
              measured table and launch plan:\n{command}"
         );
 
-        // The Tauri wrapper still owns reporting identity, cwd, account/team
-        // environment and the actual spawn. Its Codex mirror lease must live
-        // across that spawn, not be dropped by an env-only helper.
-        let reopening = block_after(source, "pub(crate) fn resume_session(");
+        // The Tauri command's own window still owns reporting identity, cwd,
+        // account/team environment and the actual spawn (t-7812: the wake's
+        // decisions are `wake_conversation`'s, its effects this impl's). Its
+        // Codex mirror lease must live across that spawn, not be dropped by an
+        // env-only helper: it rides the prepared launch into the spawn.
+        let reopening = block_after(source, "impl WakeWindow for ResumeDoor<'_> {");
         assert!(
             reopening.contains("hooks::pty_env(")
                 && reopening.contains("&hooks::pane_key_of(term)")
@@ -23435,11 +23444,17 @@ mod tests {
     #[test]
     fn a_provider_session_never_enters_a_spawn_log() {
         let board = include_str!("../../src/cmd/board.rs");
-        let interactive = block_after(board, "pub(crate) fn resume_session(");
-        assert!(
-            !interactive.contains("{args:?}"),
-            "interactive resume logs its raw session argv:\n{interactive}"
-        );
+        for road in [
+            "pub(crate) fn resume_session(",
+            "pub(crate) fn wake_conversation<",
+            "impl WakeWindow for ResumeDoor<'_> {",
+        ] {
+            let interactive = block_after(board, road);
+            assert!(
+                !interactive.contains("{args:?}"),
+                "interactive resume logs its raw session argv:\n{interactive}"
+            );
+        }
 
         let host = block_after(shipped_backend(), "impl agent_teams::Host for TeamWindow {");
         assert!(
@@ -27438,7 +27453,10 @@ mod tests {
                 "fn launch_agent_tab(",
                 include_str!("../../src/cmd/terminal.rs"),
             ),
-            ("fn resume_session(", include_str!("../../src/cmd/board.rs")),
+            (
+                "impl WakeWindow for ResumeDoor<'_> {",
+                include_str!("../../src/cmd/board.rs"),
+            ),
         ] {
             let body = block_after(file, road);
             let replay_at = body.find("replay_stored_screen(");
@@ -27480,7 +27498,7 @@ mod tests {
         );
         let leaf = block_after(window, "async function spawnStoredLeaf(");
         assert!(
-            leaf.contains("!!wake.interrupted, restore)")
+            leaf.contains("{ rows, cols }, restore)")
                 && leaf.contains(r#"rows, cols, restore })"#)
                 && leaf
                     .contains(r#"invoke("open_term_tab", { rows, cols, plain: true, restore })"#),
@@ -27644,7 +27662,7 @@ mod tests {
 
         for (source, road) in [
             (terminal, "pub(crate) fn launch_agent_tab("),
-            (board, "pub(crate) fn resume_session("),
+            (board, "impl WakeWindow for ResumeDoor<'_> {"),
         ] {
             let there = block_after(source, road);
             let team_at = there
@@ -28112,6 +28130,8 @@ mod tests {
         );
         // 사이드바의 두 행은 한 문을 지나고, 그 문은 제 활성화가 시작한 복원이
         // 끝난 뒤에 묻는다 — 답이 가리키는 판이 탭에 서 있어야 갈 수 있다.
+        // 그 활성화는 첫 터미널을 세우지 않는다(t-7812 A): 문이 여는 대화가
+        // 그 체크아웃의 첫 터미널이고, 세웠다면 빈 에이전트가 그 옆에 선다.
         let reopening = block_after(window, "async function reopenConversationIn(path, known) {");
         let settled = reopening
             .find("storedWakesSettled(path)")
@@ -28120,9 +28140,11 @@ mod tests {
             .find("resumeSession(known)")
             .expect("the door no longer opens through the judged road");
         assert!(
-            reopening.contains("activateWorktree(path)") && settled < asked,
+            reopening.contains("activateWorktree(path, { firstTerminal: false })")
+                && settled < asked,
             "a sidebar row for an absent conversation opens it in the wrong \
-             checkout, or asks while its own restore is still waking it:\n{reopening}"
+             checkout, starts an empty agent beside it, or asks while its own \
+             restore is still waking it:\n{reopening}"
         );
         for row in [
             "function makeSurvivorRow(one) {",
@@ -34500,19 +34522,75 @@ mod tests {
                 && pane.contains("transcript_log_at(&path, after)"),
             "the pane's conversation door names a file, or reads it down another road:\n{pane}"
         );
-        let reading = block_after(shipped, "fn transcript_log_at(");
+        // `transcript_log_at` is the page's chunk of the one windowed reader,
+        // clipped for its cells and with its long-line road; and
+        // `worker-transcript` reads down that same reader (t-6742) — never a
+        // walk of its own over the file — with the texts whole for its
+        // masks, and no road past its own budget.
+        let door = block_after(shipped, "fn transcript_log_at(");
+        assert!(
+            door.contains("transcript_log_window(")
+                && door.contains("SUBAGENT_LOG_CHUNK,")
+                && door.contains("Some(LONG_LINE_CAP),")
+                && door.contains("zerocode_core::transcript::Detail::Clipped"),
+            "the page's read no longer goes down the windowed reader:\n{door}"
+        );
+        // The verb opens its file ONCE and takes its size from that open
+        // file; every read of the call is made on it (t-6742 R3).
+        let walk = block_after(shipped, "fn transcript_turns_back(");
+        assert!(
+            walk.matches("File::open(").count() == 1
+                && walk.contains("file.metadata()?.len()")
+                && walk.contains("transcript_turns_through("),
+            "worker-transcript opens its transcript more than once, or measures it apart from the file it reads:\n{walk}"
+        );
+        // Every open of the call reads through one meter, and every meter
+        // counts into the call's one budget — a retry reads on what the
+        // first open left, and the answer's count is the meter's (R2).
+        let through = block_after(shipped, "fn transcript_turns_through<");
+        let metered = through.find("let mut spent = 0;");
+        let opens = through.find("for _ in 0..TRANSCRIPT_OPENS");
+        assert!(
+            metered.is_some_and(|metered| opens.is_some_and(|opens| metered < opens))
+                && through.contains("spent: &mut spent,")
+                && through.contains("budget: TRANSCRIPT_READ_BUDGET,")
+                && through.contains("transcript_turns_in(&mut file, size, ask)"),
+            "worker-transcript gives an open a budget of its own, or reads past the meter:\n{through}"
+        );
+        let reads = block_after(shipped, "fn transcript_turns_in<");
+        assert!(
+            reads.contains("file: &mut Metered<'_, F>,")
+                && reads.contains("read_bytes: *file.spent,")
+                && reads.contains("tail_window_within(TRANSCRIPT_WIDEST, size, file.left())"),
+            "worker-transcript's answer counts apart from the meter, or its wider read ignores what is left:\n{reads}"
+        );
+        assert!(
+            reads.contains("transcript_log_window(")
+                && reads.contains("zerocode_core::transcript::Detail::Whole")
+                && !reads.contains("LONG_LINE_CAP")
+                && !reads.contains("File::open")
+                && !reads.contains("metadata(")
+                && !reads.contains("turns_in("),
+            "worker-transcript reads a transcript down a road of its own, or past its budget:\n{reads}"
+        );
+        let reading = block_after(shipped, "fn transcript_log_window<");
         // Core owns complete byte records and the bounded oversized-line
         // escape. The shell must decode and advance from that same answer.
         // The payloads step aside before the words are read, leaving their
         // place in the file (t-6323 A8), and a line past the read is read
-        // whole instead of dropped.
+        // whole instead of dropped — on the road that names a cap for it.
+        // The reader is handed its file and never opens one.
         assert!(
             reading.contains("zerocode_core::transcript::complete_transcript_chunk(")
                 && reading.contains("zerocode_core::transcript::elide_payloads(chunk.bytes, base)")
                 && reading.contains("String::from_utf8_lossy(&bytes)")
                 && reading.contains("u64::try_from(chunk.consumed)")
-                && reading
-                    .contains("long_line_log(&mut file, from, starts_mid_line, size, folded)"),
+                && reading.contains("&& let Some(cap) = long_lines")
+                && reading.contains(
+                    "long_line_log(file, from, starts_mid_line, size, folded, cap, detail)"
+                )
+                && !reading.contains("File::open")
+                && !reading.contains("metadata("),
             "a half-written line is handed over as though it were a turn, or a payload is read as words:\n{reading}"
         );
         let chunking = block_after(
@@ -34528,8 +34606,7 @@ mod tests {
         // the last chunk — and the answer says what stood above it is folded.
         assert!(
             reading.contains("Some(after) => (if after > size { 0 } else { after }, false),")
-                && reading.contains("size.saturating_sub(SUBAGENT_LOG_CHUNK),")
-                && reading.contains("size > SUBAGENT_LOG_CHUNK,"),
+                && reading.contains("None => (size.saturating_sub(window), size > window),"),
             "a replaced transcript is read from a stale offset, or a cursorless read no longer opens at the tail:\n{reading}"
         );
 
@@ -34542,7 +34619,7 @@ mod tests {
         // What a line MEANS is core's, not this file's: one owner for the
         // shape of a transcript.
         assert!(
-            reading.contains("zerocode_core::transcript::turns_in("),
+            reading.contains("zerocode_core::transcript::turns_in_with(&text, detail)"),
             "the shell grew its own reader of a transcript line:\n{reading}"
         );
     }
@@ -35150,10 +35227,16 @@ mod tests {
     #[test]
     fn restart_nudges_share_the_live_prompt_door_and_leave_one_receipt_line() {
         let backend = shipped_backend();
-        let resumed = block_after(backend, "fn resume_session(");
+        let resumed = block_after(backend, "fn wake_conversation<");
         assert!(
-            resumed.contains("restart_nudge_runtime::register_wake("),
-            "resume_session no longer registers a receipt before returning:\n{resumed}"
+            resumed.contains("restart_nudge_runtime::place_words(")
+                && resumed.contains("window.arm(term, pending, delivery);"),
+            "the resume road no longer registers a receipt before returning:\n{resumed}"
+        );
+        assert!(
+            block_after(backend, "impl WakeWindow for ResumeDoor<'_> {")
+                .contains("restart_nudge_runtime::arm_in_window("),
+            "the window's own wake no longer watches its receipt"
         );
         let noting = block_after(backend, "fn note_pane_state(");
         assert!(
@@ -35184,10 +35267,25 @@ mod tests {
         );
         let nudge = block_after(backend, "fn deliver_composer(");
         assert!(
-            nudge.contains("type_prompt_at_term(")
-                && nudge.contains("PromptReadiness::Mounting")
-                && nudge.contains("PromptReadiness::Resting"),
+            nudge.contains("type_prompt_at_term(") && nudge.contains("PromptReadiness::Mounting"),
             "restart delivery left the shared ready/composer road:\n{nudge}"
+        );
+        // The one fallback rides the same door, at rest and beside whatever
+        // a person left on the line — never clearing it (t-7812 R2).
+        let fallback = backend
+            .split_once("impl WakeReceipts for WindowReceipts {")
+            .expect("the window's own receipts")
+            .1
+            .split_once("fn type_again(")
+            .expect("the one fallback")
+            .1
+            .split_once("fn note(")
+            .expect("the next receipts method")
+            .0;
+        assert!(
+            fallback.contains("type_prompt_at_term(")
+                && fallback.contains("PromptReadiness::RestingBesideADraft"),
+            "the restart fallback left the shared composer road, or clears a person's line:\n{fallback}"
         );
 
         let constants = block_after(backend, "const RESUME_NUDGE_RECEIPT_MS:");

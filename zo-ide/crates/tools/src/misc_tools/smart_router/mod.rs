@@ -29,6 +29,8 @@ mod rerank_shadow;
 mod roads_tests;
 mod route_label;
 #[cfg(test)]
+mod question_discovery;
+#[cfg(test)]
 mod routing_replay;
 mod skill_search;
 mod shape;
@@ -64,7 +66,7 @@ pub use decision_shadow::{
 };
 pub use probe_exec::task_fingerprint;
 pub use rerank_shadow::{
-    note_recall_read, rerank_shadow_path, Judged, RerankLabelRow, RerankShadow, RerankShadowRow,
+    note_recall_read, rerank_shadow_path, Judged, RerankLabelRow, RerankShadow, RerankShadowRow, ShownNote,
     RERANK_OUTCOME_ANSWERED, RERANK_OUTCOME_UNORDERABLE, RERANK_SHADOW_FILE,
 };
 pub use compaction_seat::{

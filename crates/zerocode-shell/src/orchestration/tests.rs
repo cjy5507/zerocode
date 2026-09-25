@@ -393,6 +393,7 @@ impl PrivateWindow {
             .unwrap_or_else(|held| held.into_inner())
             .take();
         super::install_runtime(actor, overrides, usage);
+        forget_the_goodbyes_note();
         (
             Self {
                 _root: root,
@@ -401,6 +402,21 @@ impl PrivateWindow {
             },
             store,
         )
+    }
+}
+
+/// A private window is a window of its own (t-7812): a goodbye's note left
+/// in this process's shared data root by another scenario names another
+/// ledger's workers, whose ids this one mints again from `w-1`. Forgotten as
+/// the window opens and again as it closes, so no scenario's owed words
+/// reach another's wake.
+fn forget_the_goodbyes_note() {
+    if let Some(root) = super::BLACKBOX.get() {
+        let _ = super::restart_census::leave_cut(
+            root,
+            &super::restart_census::RestartCensus::default(),
+            &|_| false,
+        );
     }
 }
 
@@ -416,6 +432,7 @@ impl PrivateWindow {
 
 impl Drop for PrivateWindow {
     fn drop(&mut self) {
+        forget_the_goodbyes_note();
         *super::runtime_cell()
             .lock()
             .unwrap_or_else(|held| held.into_inner()) = self.previous.take();
@@ -5908,7 +5925,7 @@ fn a_stop_nobody_declared_one_a_person_or_a_question_holds_and_a_wall_are_never_
         let stood = StoppedWorker::stand(96_220, "--on-transient-error resume", Vec::new());
         stood.stops_on(&stopped, stood.began + 9_000);
         // Its own question parked in the composer: the hook said so.
-        super::pane_turn_began(stood.host.worker_term);
+        super::pane_turn_began(stood.host.worker_term, stood.began + 9_000);
         silent(&stood, "a question of its own");
     }
     {
@@ -7007,7 +7024,7 @@ fn a_turn_start_retires_the_workers_never_spoke_window() {
         .and_then(|row| row.ready_by_ms)
         .expect("the worker's readiness deadline");
 
-    pane_turn_began(WORKER_TERM);
+    pane_turn_began(WORKER_TERM, clock());
     tick(&Nowhere, &[], deadline.saturating_add(1));
 
     let rows = the_rows();
@@ -10927,12 +10944,12 @@ fn a_worker_observation_carries_the_windows_wait_verdict() {
     );
     // Evaluated and quiet: an explicit null, which must not print the
     // same as never-looked.
-    super::pane_attention_noted(WORKER, None);
+    super::pane_attention_noted(WORKER, None, 4_000);
     let seen = show();
     assert!(seen.get("agentWait").is_some());
     assert!(seen["agentWait"].is_null());
     // Waiting on the person: the evidence and its clock.
-    super::pane_attention_noted(WORKER, Some(4_242));
+    super::pane_attention_noted(WORKER, Some(4_242), 4_300);
     let seen = show();
     assert_eq!(seen["agentWait"]["source"], "hook");
     assert_eq!(seen["agentWait"]["since"], 4_242);
@@ -11094,7 +11111,7 @@ fn a_zo_workers_wait_names_the_event_channel_as_its_source() {
     let started: serde_json::Value = serde_json::from_str(&started.stdout).expect("a worker");
     let worker = started["workerId"].as_str().expect("a worker id");
 
-    super::pane_attention_noted(WORKER, Some(4_243));
+    super::pane_attention_noted(WORKER, Some(4_243), 4_300);
     let shown = run(
         &host,
         Vec::new(),
@@ -11275,7 +11292,7 @@ fn the_beat_points_an_idle_coordinator_at_its_mail_and_enters_once() {
     super::tick(&host, &[], clock());
     assert_eq!(typed(&host).len(), before, "a leased batch was pointed at");
 
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(WORKER);
 }
@@ -11399,7 +11416,7 @@ fn a_pointer_that_reached_enter_is_not_typed_again_after_a_restart() {
         "fresh mail after the restart was not pointed at"
     );
 
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(WORKER);
 }
@@ -11512,7 +11529,7 @@ fn mail_older_than_the_news_window_is_left_to_check() {
         ]
     );
 
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(WORKER);
 }
@@ -11627,7 +11644,7 @@ fn the_pointer_yields_to_people_sleepers_and_self_submitting_composers() {
         "a self-submitting composer was handed an Enter"
     );
 
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(WORKER);
 }
@@ -11749,7 +11766,7 @@ fn the_pointer_is_never_typed_into_a_shell_its_agent_has_left() {
     // An agent holds the terminal again and ends a turn: pointed, once.
     host.shell_in_front
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     super::pane_turn_ended(LEADER, 151, false, clock());
     super::tick(&host, &[], clock());
     let advice = zerocode_core::orchestration::pointer_text(1);
@@ -11759,7 +11776,7 @@ fn the_pointer_is_never_typed_into_a_shell_its_agent_has_left() {
         "the returned agent was not told about its mail"
     );
 
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(WORKER);
 }
@@ -11926,7 +11943,7 @@ fn a_report_that_lands_behind_an_unacknowledged_lease_is_still_pointed_at() {
              not hand over"
     );
 
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(FIRST);
     crate::agent_teams::forget_term(SECOND);
@@ -12060,7 +12077,7 @@ fn a_pointer_no_road_will_carry_is_retried_and_written_down_once() {
     assert_eq!(tried(&host).len(), 4, "a settled pointer kept typing");
     assert_eq!(complaints(), 1);
 
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(WORKER);
 }
@@ -12157,7 +12174,7 @@ fn a_coordinator_that_came_back_under_a_new_session_is_still_seated() {
     );
     assert!(!run_id.is_empty());
 
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(WORKER);
 }
@@ -12370,7 +12387,7 @@ fn a_pane_the_window_never_heard_is_told_apart_from_one_at_work() {
     // Now the window HEARS the pane, at work. That is a different fact:
     // this turn will end and be measured, so the pointer waits — and the
     // black box is not told, because a working pane is not an alarm.
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     for _ in 0..5 {
         super::tick(&host, &[], clock());
     }
@@ -12398,7 +12415,7 @@ fn a_pane_the_window_never_heard_is_told_apart_from_one_at_work() {
         "a pane that was pointed at was complained about"
     );
 
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(WORKER);
 }
@@ -12499,7 +12516,7 @@ fn a_working_claude_pane_is_pointed_at_through_its_own_hook_and_never_its_compos
     };
 
     // The pane is at work when the worker's report lands.
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     let held = crate::agent_teams::current_pane_capability(&team, &pane)
         .expect("the split minted the worker a capability");
     let done = run(
@@ -12627,7 +12644,7 @@ fn a_working_claude_pane_is_pointed_at_through_its_own_hook_and_never_its_compos
         "acknowledged mail was still being pointed at"
     );
 
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(WORKER);
     crate::orchestration_pointer_mailbox::forget_term(LEADER);
@@ -12695,7 +12712,7 @@ impl AtItsWall {
         else {
             return;
         };
-        super::pane_turn_began(self.term);
+        super::pane_turn_began(self.term, clock());
         let _ = settle.send(zerocode_pty::DeliveryOutcome::Delivered);
         super::pane_turn_ended(self.term, clock(), false, clock());
         if meets_the_wall {
@@ -12788,6 +12805,13 @@ fn a_pane_at_its_wall_is_told_once_while_it_stands_and_once_when_it_lifts() {
     let _turn = one_beat_at_a_time();
     let team = format!("team-walled-{LEADER}");
     let (run_id, worker, pane) = a_worker_carrying_work(&team, LEADER, WORKER);
+    // The worker sending the letters is a working agent: its pane's hook says
+    // a turn began, as a summoned worker's does, and the first beat retires
+    // its readiness window. Unheard, that window ran on the wall clock, and a
+    // body the machine's load stretched past its minute found the ledger's
+    // `never_spoke` news among the letters — 21 handed over where 20 were
+    // sent — in parallel runs only.
+    super::pane_turn_began(WORKER, clock());
     let host = AtItsWall::new(LEADER, crate::quota_wall::StallCause::QuotaWall, false);
     let held = crate::agent_teams::current_pane_capability(&team, &pane)
         .expect("the split minted the worker a capability");
@@ -12828,7 +12852,7 @@ fn a_pane_at_its_wall_is_told_once_while_it_stands_and_once_when_it_lifts() {
     let lifted_line = format!("terminal {LEADER}'s quota wall stopped standing");
 
     // The coordinator finished a turn in the ordinary way; nothing walls it.
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     super::pane_turn_ended(LEADER, clock(), false, clock());
 
     // The first letter finds a pane nobody knows is walled — and the line
@@ -12913,7 +12937,7 @@ fn a_pane_at_its_wall_is_told_once_while_it_stands_and_once_when_it_lifts() {
         "read mail was pointed at again"
     );
 
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(WORKER);
     crate::orchestration_pointer_mailbox::forget_term(LEADER);
@@ -12938,7 +12962,7 @@ fn mail_for_a_pane_already_at_its_login_wall_waits_for_its_next_answer() {
     let host = AtItsWall::new(LEADER, crate::quota_wall::StallCause::LoginWall, true);
     let held = crate::agent_teams::current_pane_capability(&team, &pane)
         .expect("the split minted the worker a capability");
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     super::pane_turn_ended(LEADER, clock(), false, clock());
 
     for n in 1..=5 {
@@ -12979,7 +13003,7 @@ fn mail_for_a_pane_already_at_its_login_wall_waits_for_its_next_answer() {
     // The person signs in and their own turn goes through: the turn begins,
     // ends, and its last answer is no wall. The next beat at rest speaks.
     host.wall_lifts();
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     super::pane_turn_ended(LEADER, clock(), false, clock());
     for _ in 0..3 {
         super::tick(&host, &[], clock());
@@ -12990,7 +13014,7 @@ fn mail_for_a_pane_already_at_its_login_wall_waits_for_its_next_answer() {
         "the pane was not told once its login answered again"
     );
 
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(WORKER);
     crate::orchestration_pointer_mailbox::forget_term(LEADER);
@@ -13119,7 +13143,7 @@ fn mail_behind_an_interrupted_turn_is_named_and_still_never_typed_at() {
         "the black box was told twice about one watermark"
     );
 
-    super::pane_turn_began(LEADER);
+    super::pane_turn_began(LEADER, clock());
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(WORKER);
 }
@@ -13247,7 +13271,7 @@ fn confirmed_native_pointer_suppresses_pty_and_unknown_falls_back_without_retry(
     );
 
     drop(unknown_lease);
-    pane_turn_began(LEADER);
+    pane_turn_began(LEADER, clock());
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(WORKER);
 }
@@ -13521,7 +13545,7 @@ fn the_goodbye_names_its_road_and_what_it_cuts_under_each_worker() {
     };
     let (_team, _task, worker) =
         a_seated_worker_with_a_session(&host, LEADER, WORKER, "session-goodbye");
-    super::pane_turn_began(WORKER);
+    super::pane_turn_began(WORKER, clock());
     let listing = format!(
         "501 {ROOT} 1 {ROOT} 0 1 Thu Sep 24 01:00:00 2026 node /opt/homebrew/bin/codex resume s\n\
          501 64281 {ROOT} {ROOT} 0 1 Thu Sep 24 01:00:00 2026 /opt/codex/vendor/bin/codex resume s\n\
@@ -13612,17 +13636,17 @@ fn a_resumed_pane_is_seated_as_the_sleeper_it_is_and_reports_done_from_there() {
     // No seat yet: nothing is written.
     assert_eq!(
         super::pane_resumed(RESUMED, "/tmp", "codex", "session-witness", clock()),
-        None
+        Ok(None)
     );
     let resumed_team = format!("team-t3058-resumed-{RESUMED}");
     seat_a_team(&resumed_team, RESUMED);
     assert_eq!(
-        super::pane_resumed(RESUMED, "/tmp/", "codex", "session-witness", clock()).as_deref(),
-        Some(worker.as_str())
+        super::pane_resumed(RESUMED, "/tmp/", "codex", "session-witness", clock()),
+        Ok(Some(worker.clone()))
     );
     assert_eq!(
         super::pane_resumed(RESUMED, "/tmp", "codex", "session-witness", clock()),
-        None,
+        Ok(None),
         "the same witness seated the worker twice"
     );
     let rows = the_rows();
@@ -14148,15 +14172,15 @@ fn a_restored_worker_reports_done_through_the_live_verb_after_durable_reseat() {
             clock(),
         )
         .expect("store the resumable session");
-    assert_eq!(
-        held.actor
-            .window_restarted(clock())
-            .expect("sleep the worker")
-            .0
-            .sleeping,
-        1
-    );
-    crate::agent_teams::forget_term(OLD_WORKER);
+    // The window goes with this worker's turn under way, so its reseat
+    // carries a continuation (t-7812 E) — the words this worker answers with
+    // its report. A worker the goodbye found at rest is typed nothing.
+    super::pane_turn_began(OLD_WORKER, clock());
+    restore::the_window_goes(&restore::census_without_commands, &[OLD_WORKER]);
+    assert_eq!(restore::row(&worker).state, WorkerState::Sleeping);
+    held.actor
+        .window_restarted(clock())
+        .expect("the next boot's sweep");
     crate::agent_teams::forget_term(OLD_LEADER);
 
     let new_team = format!("team-live-report-new-{NEW_LEADER}");
@@ -15658,6 +15682,434 @@ fn a_worker_read_interrupted_by_a_seat_change_files_nothing() {
             "{case}: something other than the host answered the retry"
         );
     }
+}
+
+/// `worker-transcript` answers the worker ROW's own transcript as
+/// structured turns (t-6742): the file its pane reported, read by the
+/// conversation view's reader and shaped by core — the screen is never
+/// captured, the path never printed, a credential in the file never
+/// answered, and the read moves nothing: not the rows, not the file, and
+/// no receipt. A file the window cannot open is said as unavailable.
+#[test]
+fn a_worker_transcript_reads_the_rows_own_file_and_never_the_screen() {
+    const LEADER_TERM: u32 = 90_140;
+    const WORKER_TERM: u32 = 90_141;
+    let _window = the_window();
+    let team = format!("team-transcript-{LEADER_TERM}");
+    let (run_id, worker, _pane) = a_worker_in_a_pane(&team, LEADER_TERM, WORKER_TERM);
+    let temp = tempfile::tempdir().expect("a transcript folder");
+    let path = temp.path().join("w.jsonl");
+    std::fs::write(
+        &path,
+        [
+            r#"{"type":"user","timestamp":"2026-09-24T12:00:00.000Z","message":{"role":"user","content":"run the tests with --password hunter2"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-09-24T12:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Running them."},{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"cargo test -p x"}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-09-24T12:00:09.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"ok · 12 passed"}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-09-24T12:00:10.000Z","message":{"role":"assistant","content":[{"type":"text","text":"All green."}]}}"#,
+            "",
+        ]
+        .join("\n"),
+    )
+    .expect("the transcript");
+    let written = std::fs::metadata(&path).expect("stat");
+    super::pane_session_reported(
+        WORKER_TERM,
+        &zerocode_core::ProviderSession {
+            key: zerocode_core::provider_session::SessionKey::SessionId,
+            id: "session-of-the-row".to_string(),
+            transcript_path: Some(path.to_string_lossy().into_owned()),
+        },
+        clock(),
+    );
+    let host = Reading::quiet("THE SCREEN NOBODY ASKED FOR");
+    let shadow = a_runs_shadow(&run_id);
+    let receipts = the_rows().served.len();
+
+    let answered = run(
+        &host,
+        Vec::new(),
+        &team,
+        zerocode_core::agent_teams::LEADER_PANE,
+        TEST_CAPABILITY,
+        &words(&format!(
+            "worker-transcript --run {run_id} --worker {worker} --json"
+        )),
+        clock(),
+    );
+    assert_eq!(answered.exit_code, 0, "{}", answered.stderr);
+    let json: serde_json::Value = serde_json::from_str(&answered.stdout).expect("a record");
+    assert_eq!(json["worker"], worker);
+    assert_eq!(json["agent"], "claude");
+    assert_eq!(
+        json["found"], 3,
+        "the prompt, the call's step, the words after"
+    );
+    assert_eq!(json["turns"][0]["role"], "user");
+    assert_eq!(json["turns"][1]["role"], "assistant");
+    assert_eq!(json["turns"][2]["text"]["text"], "All green.");
+    assert_eq!(json["turns"][1]["tools"][0]["name"], "Bash");
+    assert_eq!(json["turns"][1]["tools"][0]["callId"], "call-1");
+    assert_eq!(
+        json["turns"][1]["tools"][0]["result"]["text"],
+        "ok · 12 passed"
+    );
+    assert_eq!(json["turns"][1]["atMs"], 1_790_251_201_000_i64);
+    assert_eq!(json["scan"]["fileBytes"], written.len());
+    assert!(
+        !answered.stdout.contains("hunter2"),
+        "a credential was answered"
+    );
+    assert!(answered.stdout.contains("[redacted]"));
+    assert!(
+        !answered
+            .stdout
+            .contains(temp.path().to_str().expect("utf8")),
+        "the path escaped"
+    );
+    assert!(!answered.stdout.contains("NOBODY ASKED FOR"));
+    assert_eq!(host.captures(), 0, "the screen was captured");
+
+    let text = run(
+        &host,
+        Vec::new(),
+        &team,
+        zerocode_core::agent_teams::LEADER_PANE,
+        TEST_CAPABILITY,
+        &words(&format!(
+            "worker-transcript --run {run_id} --worker {worker}"
+        )),
+        clock(),
+    );
+    assert_eq!(text.exit_code, 0, "{}", text.stderr);
+    assert!(
+        text.stdout
+            .contains("↳ Bash · cargo test -p x → ok · 12 passed"),
+        "{}",
+        text.stdout
+    );
+    assert!(!text.stdout.contains("hunter2"));
+
+    // A read: the rows did not move, no receipt was filed, the file was
+    // not touched.
+    assert_eq!(a_runs_shadow(&run_id), shadow, "a read moved the run");
+    assert_eq!(the_rows().served.len(), receipts, "a read filed a receipt");
+    let after = std::fs::metadata(&path).expect("stat");
+    assert_eq!(after.len(), written.len());
+    assert_eq!(after.modified().ok(), written.modified().ok());
+
+    // The file gone: unavailable, said without the path, never the screen.
+    std::fs::remove_file(&path).expect("gone");
+    let gone = run(
+        &host,
+        Vec::new(),
+        &team,
+        zerocode_core::agent_teams::LEADER_PANE,
+        TEST_CAPABILITY,
+        &words(&format!(
+            "worker-transcript --run {run_id} --worker {worker}"
+        )),
+        clock(),
+    );
+    assert_eq!(gone.exit_code, 1, "{gone:?}");
+    assert!(gone.stdout.is_empty());
+    assert!(
+        gone.stderr.contains(TRANSCRIPT_UNAVAILABLE),
+        "{}",
+        gone.stderr
+    );
+    assert!(!gone.stderr.contains(temp.path().to_str().expect("utf8")));
+    assert_eq!(host.captures(), 0);
+}
+
+/// The word a `worker-transcript` refusal for a transcript it cannot read
+/// opens with (`zerocode_core::worker_transcript::UNAVAILABLE`), spelled as a
+/// caller branching on it sees it — so the tests below name no module of the
+/// verb's, compile against a window that has no such verb, and fail there on
+/// their assertions rather than on the build (t-6742 R4).
+const TRANSCRIPT_UNAVAILABLE: &str = "transcript unavailable";
+
+/// `worker-transcript` of a worker whose row reported `transcript` as its
+/// file, asked twice — `--json`, and the text rendering of the same record —
+/// down the verb's own road (t-6742): the plan names the row's file, the
+/// window reads it with the conversation view's reader, core shapes what was
+/// read. The screen is never captured and the file's path never answered.
+/// Each caller names terms of its own.
+fn transcript_answers(
+    leader_term: u32,
+    worker_term: u32,
+    transcript: &str,
+) -> (serde_json::Value, String) {
+    let _window = the_window();
+    let team = format!("team-transcript-{leader_term}");
+    let (run_id, worker, _pane) = a_worker_in_a_pane(&team, leader_term, worker_term);
+    let temp = tempfile::tempdir().expect("a transcript folder");
+    let path = temp.path().join("w.jsonl");
+    std::fs::write(&path, transcript).expect("the transcript");
+    super::pane_session_reported(
+        worker_term,
+        &zerocode_core::ProviderSession {
+            key: zerocode_core::provider_session::SessionKey::SessionId,
+            id: format!("session-{worker_term}"),
+            transcript_path: Some(path.to_string_lossy().into_owned()),
+        },
+        clock(),
+    );
+    let host = Reading::quiet("THE SCREEN NOBODY ASKED FOR");
+    let asked = |rendering: &str| {
+        run(
+            &host,
+            Vec::new(),
+            &team,
+            zerocode_core::agent_teams::LEADER_PANE,
+            TEST_CAPABILITY,
+            &words(&format!(
+                "worker-transcript --run {run_id} --worker {worker} {rendering}"
+            )),
+            clock(),
+        )
+    };
+    let json = asked("--json");
+    assert_eq!(json.exit_code, 0, "{}", json.stderr);
+    let text = asked("");
+    assert_eq!(text.exit_code, 0, "{}", text.stderr);
+    assert_eq!(host.captures(), 0, "the screen was captured");
+    let folder = temp.path().to_string_lossy().into_owned();
+    for said in [&json.stdout, &text.stdout] {
+        assert!(!said.contains("NOBODY ASKED FOR") && !said.contains(&folder));
+    }
+    (
+        serde_json::from_str(&json.stdout).expect("a record"),
+        text.stdout,
+    )
+}
+
+/// One transcript line, from its JSON.
+fn a_transcript_line(row: &serde_json::Value) -> String {
+    format!("{row}\n")
+}
+
+/// The brief's first red (t-6742), end to end: a transcript's texts come
+/// out of the verb masked in both renderings — the person's prompt, the
+/// assistant's words, a call's input, its result — and a result past the
+/// digest's cap is cut, says it was, and says how long it was.
+#[test]
+fn a_transcript_result_is_cut_at_the_digest_cap_and_masked() {
+    let result = format!(
+        "{} DB_PASSWORD=sekretvalue1234567890 {}",
+        "x".repeat(390),
+        "y".repeat(600)
+    );
+    let transcript = [
+        serde_json::json!({"type":"user","timestamp":"2026-09-24T12:00:00.000Z","message":{"role":"user","content":"deploy with --password hunter2 please"}}),
+        serde_json::json!({"type":"assistant","timestamp":"2026-09-24T12:00:01.000Z","message":{"role":"assistant","content":[
+            {"type":"text","text":"Using Bearer abc.def now"},
+            {"type":"tool_use","id":"c","name":"Bash","input":{"command":"curl -H 'Authorization: Bearer abc.def' https://user:tok3n@host.test/x"}}
+        ]}}),
+        serde_json::json!({"type":"user","timestamp":"2026-09-24T12:00:02.000Z","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"c","content": result}
+        ]}}),
+    ]
+    .iter()
+    .map(a_transcript_line)
+    .collect::<String>();
+    let (json, text) = transcript_answers(90_150, 90_151, &transcript);
+    for said in [json.to_string(), text.clone()] {
+        for secret in ["hunter2", "abc.def", "tok3n", "sekretvalue"] {
+            assert!(!said.contains(secret), "{secret} escaped: {said}");
+        }
+        assert!(
+            said.contains(zerocode_core::credential::MASK),
+            "nothing was masked: {said}"
+        );
+    }
+    let cut = &json["turns"][1]["tools"][0]["result"];
+    let kept = cut["text"].as_str().expect("a result").chars().count();
+    let chars = cut["chars"].as_u64().expect("its length");
+    assert_eq!(cut["truncated"], true, "{cut}");
+    assert_eq!(
+        chars,
+        result.chars().count() as u64,
+        "the length said is the text's own"
+    );
+    assert!((kept as u64) < chars, "{kept} of {chars}");
+    assert_eq!(json["truncated"], true);
+    assert!(text.contains(&format!("…(of {chars} chars)")), "{text}");
+}
+
+/// A call's name and id are texts too (t-6742 R1): masked by the same table
+/// in both renderings, while a result still finds its own call — the join is
+/// on the ids as written, so two ids the mask folds into one `[redacted]`
+/// never trade results.
+#[test]
+fn transcript_metadata_is_masked_in_both_renderings() {
+    let mask = zerocode_core::credential::MASK;
+    let first = format!("ghp_{}", "a1".repeat(18));
+    let second = format!("ghp_{}", "b2".repeat(18));
+    let named = format!("deploy_sk-{}", "c3".repeat(12));
+    let transcript = [
+        serde_json::json!({"type":"user","message":{"role":"user","content":"go"}}),
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[
+            {"type":"tool_use","id": first,"name": named,"input":{"command":"one"}},
+            {"type":"tool_use","id": second,"name":"Bash","input":{"command":"two"}}
+        ]}}),
+        serde_json::json!({"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id": second,"content":"result of two"},
+            {"type":"tool_result","tool_use_id": first,"content":"result of one"}
+        ]}}),
+    ]
+    .iter()
+    .map(a_transcript_line)
+    .collect::<String>();
+    let (json, text) = transcript_answers(90_152, 90_153, &transcript);
+    for said in [json.to_string(), text.clone()] {
+        for secret in [first.as_str(), second.as_str(), named.as_str()] {
+            assert!(!said.contains(secret), "{secret} escaped: {said}");
+        }
+    }
+    let calls = &json["turns"][1]["tools"];
+    assert_eq!(calls[0]["callId"], mask, "{calls}");
+    assert_eq!(calls[1]["callId"], mask, "{calls}");
+    assert_eq!(calls[0]["name"], mask, "{calls}");
+    assert_eq!(
+        calls[1]["name"], "Bash",
+        "a name that is no credential stays"
+    );
+    assert_eq!(
+        calls[0]["result"]["text"], "result of one",
+        "a result joined on the masked id: {calls}"
+    );
+    assert_eq!(calls[1]["result"]["text"], "result of two", "{calls}");
+    assert!(
+        text.contains(&format!("↳ {mask} · one → result of one"))
+            && text.contains("↳ Bash · two → result of two"),
+        "{text}"
+    );
+}
+
+/// The conversation view's 16 KiB cell never stands in front of a digest
+/// (t-6742 R1): the length a digest says is its text's whole length, not the
+/// view's cut of it, and a header whose value runs past that cut keeps the
+/// lines after it — masked whole first, then cut.
+#[test]
+fn a_digest_keeps_the_shared_readers_prior_cut_visible() {
+    let rows: String = (0..1_000)
+        .map(|at| format!("row {at:04} of the listing\n"))
+        .collect();
+    let header = format!(
+        "Authorization: Bearer {}\nthen: cargo test -p x",
+        "q".repeat(17_000)
+    );
+    let transcript = [
+        serde_json::json!({"type":"user","message":{"role":"user","content":"go"}}),
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[
+            {"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"ls -R"}},
+            {"type":"tool_use","id":"call-2","name":"Bash","input":{"command": header}}
+        ]}}),
+        serde_json::json!({"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"call-1","content": rows},
+            {"type":"tool_result","tool_use_id":"call-2","content":"ok"}
+        ]}}),
+    ]
+    .iter()
+    .map(a_transcript_line)
+    .collect::<String>();
+    assert!(rows.chars().count() > 16 * 1024 && header.chars().count() > 16 * 1024);
+    let (json, text) = transcript_answers(90_154, 90_155, &transcript);
+    let listing = &json["turns"][1]["tools"][0]["result"];
+    assert_eq!(
+        listing["chars"],
+        rows.chars().count(),
+        "the length said is a cut's, not the text's: {listing}"
+    );
+    assert_eq!(listing["truncated"], true);
+    assert!(
+        text.contains(&format!("…(of {} chars)", rows.chars().count())),
+        "{text}"
+    );
+    let input = &json["turns"][1]["tools"][1]["input"];
+    assert_eq!(input["chars"], header.chars().count(), "{input}");
+    assert!(
+        input["text"]
+            .as_str()
+            .is_some_and(|kept| kept.contains("then: cargo test -p x")),
+        "the line after the header was lost: {input}"
+    );
+    assert!(!json.to_string().contains("qqqqqqqq") && !text.contains("qqqqqqqq"));
+}
+
+/// A URL whose `@` stands past the conversation view's cut still loses its
+/// userinfo (t-6742 R1): masked while the `@` is there to mark it, then cut —
+/// in a call's input and in its result, in both renderings.
+#[test]
+fn a_url_cut_before_its_at_sign_still_hides_its_userinfo() {
+    let url = format!("https://demo:{}@host.test/x", "z".repeat(20_000));
+    let transcript = [
+        serde_json::json!({"type":"user","message":{"role":"user","content":"go"}}),
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[
+            {"type":"tool_use","id":"call-1","name":"Bash","input":{"command": format!("curl {url}")}}
+        ]}}),
+        serde_json::json!({"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"call-1","content": format!("fetched {url}")}
+        ]}}),
+    ]
+    .iter()
+    .map(a_transcript_line)
+    .collect::<String>();
+    let (json, text) = transcript_answers(90_156, 90_157, &transcript);
+    for said in [json.to_string(), text] {
+        assert!(
+            !said.contains("demo:") && !said.contains("zzzzzzzz"),
+            "the userinfo escaped: {}",
+            &said[..said.len().min(600)]
+        );
+        assert!(said.contains("https://***@host.test/x"), "{said}");
+    }
+}
+
+/// A line longer than both of the verb's reads is said, not read whole
+/// (t-6742 R2): the answer holds no turn out of it, says a line was skipped,
+/// and says it read exactly its budget — a chunk and the wider read, each
+/// with the byte before it. A line inside the wider read is read whole, for
+/// the same budget.
+#[test]
+fn a_worker_transcript_says_a_line_past_its_read_budget_instead_of_reading_it() {
+    let chunk = crate::shell_runtime::SUBAGENT_LOG_CHUNK;
+    let widest = zerocode_core::worker_transcript::SCAN_CHUNKS * chunk;
+    let budget = chunk + 1 + widest + 1;
+    let prompts: String = (0..20_000)
+        .map(|at| {
+            a_transcript_line(
+                &serde_json::json!({"type":"user","message":{"role":"user","content":format!("prompt {at:05}")}}),
+            )
+        })
+        .collect();
+    let with_a_result = |len: u64| {
+        prompts.clone()
+            + &a_transcript_line(
+                &serde_json::json!({"type":"user","message":{"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call-1","content": "s".repeat(usize::try_from(len).expect("a length"))}
+                ]}}),
+            )
+    };
+
+    let (json, text) = transcript_answers(90_158, 90_159, &with_a_result(2 * widest));
+    assert_eq!(json["found"], 0, "a line past the budget was answered");
+    assert_eq!(json["scan"]["skipped"], true, "{}", json["scan"]);
+    assert_eq!(json["scan"]["readBytes"], budget, "{}", json["scan"]);
+    assert!(text.contains("a line skipped"), "{text}");
+
+    let (json, _) = transcript_answers(90_160, 90_161, &with_a_result(chunk + 40_000));
+    assert_eq!(json["scan"]["skipped"], false, "{}", json["scan"]);
+    assert_eq!(json["scan"]["readBytes"], budget, "{}", json["scan"]);
+    let last = json["turns"]
+        .as_array()
+        .and_then(|turns| turns.last())
+        .expect("a turn");
+    assert_eq!(
+        last["tools"][0]["result"]["chars"],
+        chunk + 40_000,
+        "the long line, whole"
+    );
 }
 
 /// A `worker-read` that arrives with a retry name is refused, and the
@@ -18241,7 +18693,7 @@ fn a_turn_runs_then_ends(stood: &StoppedWorker, rows: &[String], began_at: i64, 
     std::fs::write(&stood.host.transcript, format!("{}\n", rows.join("\n")))
         .expect("the transcript");
     *stood.host.busy.lock().unwrap() = true;
-    super::pane_turn_began(stood.host.worker_term);
+    super::pane_turn_began(stood.host.worker_term, began_at);
     tick(&stood.host, &[], began_at);
     let owned: Vec<&str> = rows.iter().map(String::as_str).collect();
     stood.stops_on(&owned, at);
@@ -18454,7 +18906,7 @@ fn a_busy_composer_and_a_taken_over_pane_get_no_effort_keys() {
     std::fs::write(&stood.host.transcript, format!("{}\n", next.join("\n")))
         .expect("the transcript");
     *stood.host.busy.lock().unwrap() = true;
-    super::pane_turn_began(stood.host.worker_term);
+    super::pane_turn_began(stood.host.worker_term, began + 3_000);
     tick(&stood.host, &[], began + 3_000);
     tick(&stood.host, &[], began + 4_000);
     assert!(
@@ -18657,3 +19109,328 @@ fn a_workers_claimed_merge_reaches_the_roster_row_as_a_claim() {
         );
     }
 }
+
+/// What the window SAW is not what the ledger was TOLD (astra R1a,
+/// t-6740 r2). A wait on the person that the disk refused to write down is
+/// told on the next sighting of the same wait — the window's map of what it
+/// saw no longer stands between that sighting and the actor — and it is
+/// told ONCE: the ledger's own record of the fact, not the window's memory,
+/// answers every sighting after that.
+#[test]
+fn a_refused_attention_notice_is_told_on_the_next_sighting() {
+    const LEADER: u32 = 11_116;
+    const WORKER: u32 = 11_117;
+    let (window, store) = PrivateWindow::boot();
+    let team = format!("team-attention-retry-{LEADER}");
+    let (_run, worker, _pane) = a_worker_carrying_work(&team, LEADER, WORKER);
+    // The coordinator asks the worker; the shortest budget runs out and the
+    // question stands, unanswered.
+    let asked = run(
+        &Nowhere,
+        Vec::new(),
+        &team,
+        zerocode_core::agent_teams::LEADER_PANE,
+        TEST_CAPABILITY,
+        &words(&format!(
+            "ask --to worker:{worker} --body which-branch --timeout-ms {}",
+            zerocode_core::orchestration::WAIT_BUDGET_MIN_MS
+        )),
+        clock(),
+    );
+    assert_eq!(asked.exit_code, 0, "{}", asked.stderr);
+    let asked: serde_json::Value = serde_json::from_str(&asked.stdout).expect("an answer");
+    let question = asked["questionId"]
+        .as_str()
+        .expect("a question")
+        .to_string();
+    let told = || -> Vec<serde_json::Value> {
+        the_rows()
+            .messages
+            .iter()
+            .filter(|row| {
+                row.from == zerocode_core::orchestration::LEDGER_ITSELF
+                    && row.thread.as_deref() == Some(question.as_str())
+            })
+            .map(|row| serde_json::from_str(row.body.as_str()).expect("a notice is JSON"))
+            .collect()
+    };
+
+    let connection = store
+        .fault_connection_for_tests()
+        .expect("fault connection");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER refuse_attention_write
+                    AFTER UPDATE OF revision ON orchestration_ledger_heads
+                    BEGIN SELECT RAISE(ABORT, 'injected attention refusal'); END;",
+        )
+        .expect("the disk refuses the notice");
+    let since = clock();
+    super::pane_attention_noted(WORKER, Some(since), since + 1);
+    assert!(
+        told().is_empty(),
+        "a notice the disk refused stood in the rows"
+    );
+
+    connection
+        .execute_batch("DROP TRIGGER refuse_attention_write;")
+        .expect("the disk comes back");
+    super::pane_attention_noted(WORKER, Some(since), since + 2);
+    let lines = told();
+    assert_eq!(
+        lines.len(),
+        1,
+        "a wait the disk refused was never told: {lines:?}"
+    );
+    assert_eq!(
+        lines[0]["reason"],
+        zerocode_core::orchestration::ReceiverNews::AwaitingInput.word()
+    );
+    assert_eq!(lines[0]["factMs"], since);
+    // Seen again: the ledger's record answers, and nothing is added.
+    super::pane_attention_noted(WORKER, Some(since), since + 3);
+    assert_eq!(told().len(), 1, "one wait was told twice");
+
+    // The terminal changes hands: its worker is stopped and the terminal is
+    // gone, and another worker is seated in a pane that reuses the number.
+    // The last owner's wait, sighted again late, is not the new owner's —
+    // and the new owner's own wait is its asker's news.
+    let host = Splitting::onto(WORKER);
+    let leader = zerocode_core::agent_teams::LEADER_PANE;
+    let stopped = run(
+        &host,
+        Vec::new(),
+        &team,
+        leader,
+        TEST_CAPABILITY,
+        &words(&format!("worker-stop --worker {worker} --reason moved")),
+        clock(),
+    );
+    assert_eq!(stopped.exit_code, 0, "{}", stopped.stderr);
+    crate::agent_teams::forget_term(WORKER);
+    let started = run(
+        &host,
+        Vec::new(),
+        &team,
+        leader,
+        TEST_CAPABILITY,
+        &words("worker-start --agent claude"),
+        clock(),
+    );
+    assert_eq!(started.exit_code, 0, "{}", started.stderr);
+    let started: serde_json::Value = serde_json::from_str(&started.stdout).expect("a worker");
+    let next = started["workerId"].as_str().expect("a worker id");
+    let asked = run(
+        &Nowhere,
+        Vec::new(),
+        &team,
+        leader,
+        TEST_CAPABILITY,
+        &words(&format!(
+            "ask --to worker:{next} --body which-tag --timeout-ms {}",
+            zerocode_core::orchestration::WAIT_BUDGET_MIN_MS
+        )),
+        clock(),
+    );
+    assert_eq!(asked.exit_code, 0, "{}", asked.stderr);
+    let asked: serde_json::Value = serde_json::from_str(&asked.stdout).expect("an answer");
+    let next_question = asked["questionId"]
+        .as_str()
+        .expect("a question")
+        .to_string();
+    let told_next = || {
+        the_rows()
+            .messages
+            .iter()
+            .filter(|row| {
+                row.from == zerocode_core::orchestration::LEDGER_ITSELF
+                    && row.thread.as_deref() == Some(next_question.as_str())
+            })
+            .count()
+    };
+    super::pane_attention_noted(WORKER, Some(since), clock());
+    assert_eq!(
+        told_next(),
+        0,
+        "the new owner was told the last owner's wait"
+    );
+    let own = clock();
+    super::pane_attention_noted(WORKER, Some(own), own + 1);
+    assert_eq!(told_next(), 1, "the new owner's own wait was not told");
+
+    super::forget_pane_attention(WORKER);
+    crate::agent_teams::forget_term(WORKER);
+    crate::agent_teams::forget_term(LEADER);
+    drop(window);
+}
+
+/// The deadline's answer and the ask's receipt are ONE result (astra R2,
+/// t-6740 r2): the caller went home with the timed-out answer, so the same
+/// request asked again replays those bytes — never the first empty look the
+/// wait began from, which said nothing about a deadline.
+#[test]
+fn a_timed_out_ask_replays_the_answer_it_went_home_with() {
+    const LEADER: u32 = 11_118;
+    const WORKER: u32 = 11_119;
+    let (window, _store) = PrivateWindow::boot();
+    let team = format!("team-ask-deadline-{LEADER}");
+    let (_run, worker, _pane) = a_worker_carrying_work(&team, LEADER, WORKER);
+    let line = format!(
+        "ask --to worker:{worker} --body which-branch --timeout-ms {} \
+         --retry-request ask-deadline-{LEADER}",
+        zerocode_core::orchestration::WAIT_BUDGET_MIN_MS
+    );
+    let ask = || {
+        run(
+            &Nowhere,
+            Vec::new(),
+            &team,
+            zerocode_core::agent_teams::LEADER_PANE,
+            TEST_CAPABILITY,
+            &words(&line),
+            clock(),
+        )
+    };
+    let first = ask();
+    assert_eq!(first.exit_code, 0, "{}", first.stderr);
+    let said: serde_json::Value = serde_json::from_str(&first.stdout).expect("an answer");
+    assert_eq!(said["timedOut"], true, "{said}");
+    let again = ask();
+    assert_eq!(again.exit_code, 0, "{}", again.stderr);
+    assert_eq!(
+        again.stdout, first.stdout,
+        "the same request replayed another answer than the one its caller went home with"
+    );
+
+    crate::agent_teams::forget_term(WORKER);
+    crate::agent_teams::forget_term(LEADER);
+    drop(window);
+}
+
+/// A late turn end is never the next occupant's sound (astra R3, t-6740
+/// r3) — on either road the window hears it by: the turn-end report
+/// itself, and the beat's readiness sweep, which drains the same sound.
+/// The last worker in a terminal comes to rest; it is stopped, and a new
+/// worker on work of its own is seated in a pane that reuses the number;
+/// only then is the rest reported. The new worker's readiness window stays
+/// open through the report and the beat after it, no `went_quiet` names its
+/// attempt, and its asker hears nothing — until its own turn ends.
+#[test]
+fn a_late_turn_end_is_never_the_next_occupants_sound() {
+    const LEADER: u32 = 11_160;
+    const WORKER: u32 = 11_161;
+    let (window, _store) = PrivateWindow::boot();
+    let _beat = one_beat_at_a_time();
+    let team = format!("team-late-sound-{LEADER}");
+    let (_run, last, _pane) = a_worker_carrying_work(&team, LEADER, WORKER);
+    let leader = zerocode_core::agent_teams::LEADER_PANE;
+    let host = Splitting::onto(WORKER);
+    // Every step on its own millisecond, so "after" is never "the same".
+    let base = clock() + 1_000;
+    let verb = |line: &str, at: i64| -> serde_json::Value {
+        let said = run(
+            &host,
+            Vec::new(),
+            &team,
+            leader,
+            TEST_CAPABILITY,
+            &words(line),
+            at,
+        );
+        assert_eq!(said.exit_code, 0, "`{line}`: {}", said.stderr);
+        serde_json::from_str(&said.stdout).expect("JSON")
+    };
+
+    // The last occupant comes to rest at `rested`; the report will be late.
+    let rested = base + 1;
+    verb(
+        &format!("worker-stop --worker {last} --reason moved"),
+        base + 2,
+    );
+    crate::agent_teams::forget_term(WORKER);
+    let task = verb("task-create --spec next", base + 3)["taskId"]
+        .as_str()
+        .expect("a task id")
+        .to_string();
+    let started = verb(
+        &format!("worker-start --agent claude --task {task}"),
+        base + 4,
+    );
+    let next = started["workerId"]
+        .as_str()
+        .expect("a worker id")
+        .to_string();
+    let asked = verb(
+        &format!(
+            "ask --to worker:{next} --body which-tag --timeout-ms {}",
+            zerocode_core::orchestration::WAIT_BUDGET_MIN_MS
+        ),
+        base + 5,
+    );
+    let question = asked["questionId"]
+        .as_str()
+        .expect("a question")
+        .to_string();
+    let standing = || {
+        let rows = the_rows();
+        let held = rows
+            .workers
+            .iter()
+            .find(|row| row.id == next)
+            .expect("the next occupant's row")
+            .clone();
+        let attempt = held.dispatch.clone().expect("the next occupant's attempt");
+        let quiet = rows
+            .messages
+            .iter()
+            .filter(|row| {
+                row.kind == zerocode_core::orchestration::MessageKind::WentQuiet
+                    && row.dispatch.as_deref() == Some(attempt.as_str())
+            })
+            .count();
+        let told = rows
+            .messages
+            .iter()
+            .filter(|row| {
+                row.from == zerocode_core::orchestration::LEDGER_ITSELF
+                    && row.thread.as_deref() == Some(question.as_str())
+                    && row.body.as_str().contains("\"turn_ended\"")
+            })
+            .count();
+        (held.ready_by_ms, held.quiet_at, quiet, told)
+    };
+    let before = standing();
+    assert!(
+        before.0.is_some(),
+        "the next occupant has no readiness window"
+    );
+    assert_eq!(before, (before.0, None, 0, 0));
+
+    super::pane_turn_ended(WORKER, rested, false, base + 6);
+    let after_report = standing();
+    tick(&Nowhere, &[], base + 7);
+    let after_beat = standing();
+    assert_eq!(
+        (after_report, after_beat),
+        (before, before),
+        "the last occupant's late rest moved the next one"
+    );
+
+    // Its own turn end is its sound, its silence and its asker's news.
+    let own = base + 8;
+    super::pane_turn_ended(WORKER, own, false, base + 9);
+    assert_eq!(standing(), (None, Some(own), 1, 1));
+
+    crate::agent_teams::forget_term(WORKER);
+    crate::agent_teams::forget_term(LEADER);
+    drop(window);
+}
+
+/// t-7812: the window restart restore roads, driven through the production
+/// doors of a private window (`tests/restore.rs`).
+mod restore;
+/// t-7812 r2: the window's own resume road through a fake launcher, beside
+/// the ledger's reseat (`tests/restore_door.rs`).
+mod restore_door;
+/// t-7812: the host seams those roads added (`tests/restore_seams.rs`).
+mod restore_seams;

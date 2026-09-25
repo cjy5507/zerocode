@@ -15,7 +15,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "1.1.24"
+version = "1.1.25"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -53,6 +53,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Host-side workspace freshness.
 gix = { version = "=0.84.0", default-features = false, features = ["status", "sha1", "parallel"] }
 notify = "=8.2.0"
+
+# Markdown — CommonMark, as the renderer draws an answer and the recall seat
+# reads one (what it quotes, what it shows as code).
+pulldown-cmark = "0.13"
 
 # Test harness
 tempfile = "3"
