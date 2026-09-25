@@ -107,7 +107,7 @@ pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use compact::relevance as compaction_relevance;
 pub use patch_review::{PatchAsk, PatchReview, PatchReviewSeat, PATCH_REVIEW_RUBRIC_VERSION};
 pub use file_pick::{FilePickAsk, FilePickHint, FilePickSeat, FILE_PICK_NOTE_PREFIX};
-pub use tool_guard::{CommandAsk, CommandRan, TextAsk, TextGuard, TextSource, ToolGuardSeat};
+pub use tool_guard::{CommandAsk, CommandRan, HostFraming, TextAsk, TextGuard, TextSource, ToolGuardSeat};
 pub use compact::relevance::{
     BlockHead, CompactionAsk, CompactionJudgment, CompactionSeat, COMPACTION_RUBRIC_VERSION,
 };
@@ -157,10 +157,11 @@ pub use conversation::{AgentNotification, AgentNotificationInbox, AgentNotificat
 pub use conversation::{
     auto_compaction_tail_budget, auto_compaction_threshold_for_model, auto_compaction_threshold_from_env, bash_result_exited_zero, MICROCOMPACT_MIN_OUTPUT_BYTES,
     detect_check_command,
-    declare_attendance, declared_attendance, env_deadline_extension, env_turn_budgets,
-    final_assistant_text, read_only_bash_allow_rules,
+    declare_attendance, declare_classifier_fallback, declared_attendance,
+    declared_classifier_fallback, env_deadline_extension, env_turn_budgets,
+    final_assistant_text, read_only_bash_allow_rules, ClassifierFallback,
     take_verifier_calibration_events, VerifierCalibrationEvent,
-    flush_pending_tool_events, prompt_cache_record_to_event, record_non_anthropic_prompt_cache_usage, push_output_block, redacted_thinking_data_to_string, response_to_events, ApiClient, ApiRequest,
+    flush_pending_tool_events, prompt_cache_record_to_event, record_non_anthropic_prompt_cache_usage, push_output_block, push_refusal_category, redacted_thinking_data_to_string, refusal_category_of, response_to_events, ApiClient, ApiRequest,
     AssistantEvent, AsyncApiClient, Attendance, AutoCompactionEvent, BudgetExhausted,
     ConcurrentDispatchFn, ConversationRuntime, DeepGateConfig, DeepMode,
     DeepOutcome, ExecContract, PromptCacheEvent, ProviderStateBlob, RuntimeError, StaticToolExecutor,

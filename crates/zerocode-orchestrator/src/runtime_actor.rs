@@ -385,6 +385,21 @@ pub enum RuntimeRequest {
         lifted: Vec<zerocode_core::orchestration::QuotaLift>,
         now_ms: i64,
     },
+    /// Workers the window found stopped at a safety classifier's decline —
+    /// with BOTH witnesses already in hand (`classifier_decline_witness`
+    /// builds nothing with one, t-6747). The ledger revalidates lifecycle and
+    /// writes one notice per attempt.
+    ClassifierDeclines {
+        declined: Vec<zerocode_core::orchestration::ClassifierDeclineWitness>,
+        now_ms: i64,
+    },
+    /// Switches of model the window read in workers' own records — declines
+    /// their CLIs answered on the category's route (t-6747). The ledger
+    /// writes one row per switch.
+    ModelDeviations {
+        deviated: Vec<zerocode_core::orchestration::ModelDeviation>,
+        now_ms: i64,
+    },
     /// What the stall seat read off quiet panes this beat, when the seat
     /// acts. The ledger revalidates lifecycle and writes one notice per
     /// silence.
@@ -683,6 +698,17 @@ impl std::fmt::Debug for RuntimeRequest {
             Self::QuotaLifts { lifted, now_ms } => formatter
                 .debug_struct("RuntimeRequest::QuotaLifts")
                 .field("workers", &lifted.len())
+                .field("now_ms", now_ms)
+                .finish(),
+            // Counts, for the same reason: both carry the agent's words.
+            Self::ClassifierDeclines { declined, now_ms } => formatter
+                .debug_struct("RuntimeRequest::ClassifierDeclines")
+                .field("workers", &declined.len())
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::ModelDeviations { deviated, now_ms } => formatter
+                .debug_struct("RuntimeRequest::ModelDeviations")
+                .field("switches", &deviated.len())
                 .field("now_ms", now_ms)
                 .finish(),
             Self::StallCauses { judged, now_ms } => formatter
@@ -1700,6 +1726,33 @@ impl RuntimeActor {
         now_ms: i64,
     ) -> Result<(bool, u64), RuntimeError> {
         match self.request(RuntimeRequest::QuotaLifts { lifted, now_ms })? {
+            RuntimeReply::Settled { moved, revision } => Ok((moved, revision)),
+            _ => Err(RuntimeError::AuthorityRejected),
+        }
+    }
+
+    /// The beat's classifier-decline witnesses (t-6747). Answers whether a
+    /// notice was written, and the revision that answer speaks for; the same
+    /// decline on the next beat is the same fact and moves nothing.
+    pub fn classifier_declines(
+        &self,
+        declined: Vec<zerocode_core::orchestration::ClassifierDeclineWitness>,
+        now_ms: i64,
+    ) -> Result<(bool, u64), RuntimeError> {
+        match self.request(RuntimeRequest::ClassifierDeclines { declined, now_ms })? {
+            RuntimeReply::Settled { moved, revision } => Ok((moved, revision)),
+            _ => Err(RuntimeError::AuthorityRejected),
+        }
+    }
+
+    /// The switches of model the beat read (t-6747). Answers whether a row
+    /// was written; a switch already written moves nothing.
+    pub fn model_deviations(
+        &self,
+        deviated: Vec<zerocode_core::orchestration::ModelDeviation>,
+        now_ms: i64,
+    ) -> Result<(bool, u64), RuntimeError> {
+        match self.request(RuntimeRequest::ModelDeviations { deviated, now_ms })? {
             RuntimeReply::Settled { moved, revision } => Ok((moved, revision)),
             _ => Err(RuntimeError::AuthorityRejected),
         }
@@ -2776,6 +2829,12 @@ impl RuntimeState {
             RuntimeRequest::QuietSweep { stalled, now_ms } => self.quiet_swept(&stalled, now_ms),
             RuntimeRequest::QuotaWalls { walled, now_ms } => self.quota_walled(&walled, now_ms),
             RuntimeRequest::QuotaLifts { lifted, now_ms } => self.quota_lifted(&lifted, now_ms),
+            RuntimeRequest::ClassifierDeclines { declined, now_ms } => {
+                self.classifier_declined(&declined, now_ms)
+            }
+            RuntimeRequest::ModelDeviations { deviated, now_ms } => {
+                self.model_deviated(&deviated, now_ms)
+            }
             RuntimeRequest::StallCauses { judged, now_ms } => {
                 self.stall_causes_judged(&judged, now_ms)
             }
@@ -3778,6 +3837,71 @@ impl RuntimeState {
             return Err(RuntimeError::RecoveryRequired);
         }
         let told = self.ledger.workers_quota_lifted(lifted, now_ms);
+        if told == 0 {
+            return Ok(RuntimeReply::Settled {
+                moved: false,
+                revision: self.revision,
+            });
+        }
+        let revision = self.write_through(now_ms)?;
+        Ok(RuntimeReply::Settled {
+            moved: true,
+            revision,
+        })
+    }
+
+    fn classifier_declined(
+        &mut self,
+        declined: &[zerocode_core::orchestration::ClassifierDeclineWitness],
+        now_ms: i64,
+    ) -> Result<RuntimeReply, RuntimeError> {
+        if now_ms < 0
+            || declined.len() > MAX_LIST
+            || declined.iter().any(|one| {
+                [&one.worker, &one.record.source, &one.record.key]
+                    .iter()
+                    .any(|name| name.is_empty() || name.len() > MAX_NAME)
+                    || one
+                        .record
+                        .category
+                        .as_ref()
+                        .is_some_and(|word| word.len() > MAX_NAME)
+                    || [&one.screen, &one.record.line]
+                        .iter()
+                        .any(|line| line.as_str().len() > MAX_PROSE)
+            })
+        {
+            return Err(RuntimeError::InvalidInput);
+        }
+        if !self.recovery_permits.is_empty() {
+            return Err(RuntimeError::RecoveryRequired);
+        }
+        let told = self.ledger.workers_classifier_declined(declined, now_ms);
+        if told == 0 {
+            return Ok(RuntimeReply::Settled {
+                moved: false,
+                revision: self.revision,
+            });
+        }
+        let revision = self.write_through(now_ms)?;
+        Ok(RuntimeReply::Settled {
+            moved: true,
+            revision,
+        })
+    }
+
+    fn model_deviated(
+        &mut self,
+        deviated: &[zerocode_core::orchestration::ModelDeviation],
+        now_ms: i64,
+    ) -> Result<RuntimeReply, RuntimeError> {
+        if now_ms < 0 || deviated.len() > MAX_LIST || deviated.iter().any(|one| !one.fits()) {
+            return Err(RuntimeError::InvalidInput);
+        }
+        if !self.recovery_permits.is_empty() {
+            return Err(RuntimeError::RecoveryRequired);
+        }
+        let told = self.ledger.workers_model_deviated(deviated, now_ms);
         if told == 0 {
             return Ok(RuntimeReply::Settled {
                 moved: false,
@@ -5739,6 +5863,137 @@ mod tests {
         ));
     }
 
+    /// The coordinator made its review command while the actor was waiting;
+    /// the worker's hand-in entered the mailbox first. The actor must compare
+    /// the review with the source it has WHEN it commits the command (t-6815).
+    #[test]
+    fn a_queued_review_cannot_approve_the_source_that_preceded_a_hand_in() {
+        let fixture = Fixture::new();
+        let actor = start_with(
+            &fixture,
+            cutover(Some(a_seated_legacy()), 10),
+            a_seated_table(),
+            Box::new(NoLauncher),
+        );
+        let image = actor.view().expect("the seated run");
+        let run = image.projection().runs[0].id.clone();
+        let task = image.projection().tasks[0].id.clone();
+        let attempt = image.projection().dispatches[0].id.clone();
+        let (seated, _) = actor
+            .plan(a_command(
+                &["run-use", &run, "--retry-request", "seat-for-review"],
+                11,
+            ))
+            .expect("the leader seats the legacy run");
+        assert_eq!(seated.reply.exit_code, 0, "{}", seated.reply.stderr);
+        let stale_review = a_command(
+            &[
+                "task-update",
+                "--run",
+                &run,
+                "--task",
+                &task,
+                "--result",
+                r#"{"verified":true,"testedHead":"abc1234"}"#,
+                "--attempt",
+                &attempt,
+                "--source",
+                "abc1234",
+                "--retry-request",
+                "queued-review",
+            ],
+            31,
+        );
+        let hand_in = PlanCommand::checked(
+            vec![
+                "send".to_string(),
+                "--run".to_string(),
+                run.clone(),
+                "--type".to_string(),
+                "worker_done".to_string(),
+                "--body".to_string(),
+                r#"{"ok":true,"head":"def5678"}"#.to_string(),
+                "--retry-request".to_string(),
+                "queued-hand-in".to_string(),
+            ],
+            "team-1",
+            "%2",
+            capability_of("%2"),
+            Some(format!("actor-v1:{}", "b".repeat(64))),
+            30,
+        )
+        .expect("the worker's command");
+
+        let sender = actor.sender.as_ref().expect("actor sender");
+        let (entered, entered_rx) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::sync_channel(1);
+        let (finished, finished_rx) = mpsc::sync_channel(1);
+        sender
+            .try_send(ActorCommand::Hold {
+                entered,
+                release: release_rx,
+                finished,
+            })
+            .expect("hold the actor");
+        entered_rx.recv().expect("actor is held");
+        let (report_reply, reported) = mpsc::sync_channel(1);
+        sender
+            .try_send(ActorCommand::Request {
+                request: Box::new(RuntimeRequest::Plan(hand_in)),
+                reply: report_reply,
+            })
+            .expect("the hand-in stands first");
+        let (review_reply, reviewed) = mpsc::sync_channel(1);
+        sender
+            .try_send(ActorCommand::Request {
+                request: Box::new(RuntimeRequest::Plan(stale_review)),
+                reply: review_reply,
+            })
+            .expect("the earlier observation stands second");
+        release.send(()).expect("release the actor");
+        finished_rx.recv().expect("actor has resumed");
+        let RuntimeReply::Planned {
+            decided: report,
+            revision: report_revision,
+        } = reported
+            .recv()
+            .expect("hand-in reply")
+            .expect("hand-in decision")
+        else {
+            panic!("the hand-in was not planned");
+        };
+        assert_eq!(report.reply.exit_code, 0, "{}", report.reply.stderr);
+        let RuntimeReply::Planned {
+            decided: review,
+            revision: review_revision,
+        } = reviewed
+            .recv()
+            .expect("review reply")
+            .expect("review decision")
+        else {
+            panic!("the review was not planned");
+        };
+        assert_ne!(review.reply.exit_code, 0, "the old source was accepted");
+        assert!(
+            review.reply.stderr.contains("source"),
+            "{}",
+            review.reply.stderr
+        );
+        assert_eq!(
+            review_revision, report_revision,
+            "a refusal wrote a success receipt"
+        );
+        let image = actor.view().expect("the ledger after both requests");
+        let task_row = image
+            .projection()
+            .tasks
+            .iter()
+            .find(|one| one.id == task)
+            .expect("the task");
+        assert!(task_row.result.as_str().contains("def5678"));
+        actor.shutdown().expect("join the actor");
+    }
+
     #[test]
     fn a_live_actor_fences_external_authority_claims() {
         let fixture = Fixture::new();
@@ -7048,9 +7303,11 @@ mod tests {
             task: task.id.clone(),
             spec: task.spec.clone(),
             checkout: "/tmp".to_string(),
-            provider: "codex".to_string(),
-            used_percent: 98,
-            resets_at_ms: Some(60),
+            cause: zerocode_core::orchestration::HandoverCause::QuotaWall {
+                provider: "codex".to_string(),
+                used_percent: 98,
+                resets_at_ms: Some(60),
+            },
             to: policy.on_quota_wall.clone().unwrap(),
             wip_commit: policy.wip_commit,
             team: "team-1".to_string(),
@@ -7394,6 +7651,7 @@ mod tests {
                 &task,
                 None,
                 Some(r#"{"note":"original","ok":false}"#.into()),
+                zerocode_core::orchestration::ResultAuthor::Ledger,
             )
             .expect("prior result");
         let other = ledger

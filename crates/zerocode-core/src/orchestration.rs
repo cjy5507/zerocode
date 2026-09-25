@@ -420,6 +420,27 @@ pub enum MessageKind {
     /// continuation typed on its behalf is not a silence nor a handover. The
     /// road that writes it is `Ledger::resume_begin`.
     Resumed,
+    /// Nobody said this either: the LEDGER was handed TWO witnesses that a
+    /// worker's last request was declined by its provider's safety
+    /// classifier and the worker stopped there (t-6747) — the CLI's own
+    /// decline sentence still standing on the pane's screen, AND the
+    /// conversation's own record of the decline: its error kind and, when
+    /// the provider named one, its category.
+    ///
+    /// Its own kind, for [`Self::QuotaWalled`]'s reason: a declined worker is
+    /// neither silent nor walled — nothing lifts by itself, and waiting,
+    /// retyping and a person's "continue" meet the same classifier — and a
+    /// coordinator has to be able to ASK for it. News, never a settlement;
+    /// the road that writes it is [`Ledger::workers_classifier_declined`].
+    ClassifierDeclined,
+    /// Nobody said this either: the LEDGER read in a worker's own record
+    /// that its CLI answered a classifier decline on another model — the
+    /// category's route — so the worker left the model its summons bound
+    /// (t-6747). A summons' model is a binding choice; leaving it is written
+    /// down where the coordinator reads, with the two models, the category,
+    /// how long the CLI keeps the switch, and why. The road that writes it is
+    /// [`Ledger::workers_model_deviated`].
+    ModelDeviated,
 }
 
 impl MessageKind {
@@ -440,6 +461,8 @@ impl MessageKind {
             Self::QuotaWalled => "quota_walled",
             Self::Handover => "handover",
             Self::Resumed => "resumed",
+            Self::ClassifierDeclined => "classifier_declined",
+            Self::ModelDeviated => "model_deviated",
         }
     }
 
@@ -462,6 +485,8 @@ impl MessageKind {
                 | Self::QuotaWalled
                 | Self::Handover
                 | Self::Resumed
+                | Self::ClassifierDeclined
+                | Self::ModelDeviated
         )
     }
 }
@@ -486,6 +511,8 @@ impl std::str::FromStr for MessageKind {
             "quota_walled" => Self::QuotaWalled,
             "handover" => Self::Handover,
             "resumed" => Self::Resumed,
+            "classifier_declined" => Self::ClassifierDeclined,
+            "model_deviated" => Self::ModelDeviated,
             _ => return Err(format!("unknown message type: {word}")),
         })
     }
@@ -584,10 +611,81 @@ pub struct Task {
     /// fourth into the same wall.
     pub failures: u32,
     pub created_ms: i64,
+    /// Who wrote `result` last — see [`ResultAuthor`]. `None` for every row
+    /// written before authorship was recorded, which [`Run::review_of`] reads
+    /// as "nobody known": the keys in such a result are claims, not facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_author: Option<ResultAuthor>,
+}
+
+/// Who wrote a task's `result` last — the provenance [`ReviewFacts`] asks
+/// about before it believes a key.
+///
+/// The independent audit of 2026-09-24 (t-6780, F3) found the review labels
+/// read out of `Task::result` without asking who wrote it: a worker's own
+/// `worker_done` body saying `"verified": true` drew as 검증됨, the word the
+/// board reserves for a coordinator's judgement, with no coordinator having
+/// looked. So every road that writes `result` now says which seat it was —
+/// and only the coordinator's road makes a fact.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResultAuthor {
+    /// The worker carrying the task wrote it — its `worker_done` body, the
+    /// one road a worker has onto `result`. Its own claim. `worker` is the
+    /// ledger's worker id where the dispatch resolved to one, and otherwise
+    /// the address the report was signed with.
+    Worker {
+        worker: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatch: Option<String>,
+    },
+    /// The run's live coordinator seat wrote it by `task-update`.
+    /// `generation` is the seat's sitting (`None` only on a row written
+    /// before a correction needed a live seat); `attempt` is the newest
+    /// dispatch the task had when the correction was written, and `source`
+    /// the commit or report the correction named with `--source` — a
+    /// review is bound to both, so neither a later attempt nor a later
+    /// hand-in on the same attempt inherits it ([`Run::review_of`]).
+    Coordinator {
+        seat: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+    /// The ledger's own note — a stop, an abandon, a death it witnessed.
+    Ledger,
+}
+
+impl ResultAuthor {
+    /// The one word a reader needs: which kind of seat wrote it.
+    #[must_use]
+    pub fn kind(&self) -> ReviewAuthor {
+        match self {
+            Self::Worker { .. } => ReviewAuthor::Worker,
+            Self::Coordinator { .. } => ReviewAuthor::Coordinator,
+            Self::Ledger => ReviewAuthor::Ledger,
+        }
+    }
+}
+
+/// Which kind of seat wrote the result a [`ReviewFacts`] was read from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAuthor {
+    Coordinator,
+    Worker,
+    Ledger,
+    /// A row written before authorship was recorded.
+    #[default]
+    Unknown,
 }
 
 /// What a COORDINATOR has written about a task's outcome, beyond the worker's
-/// own word — read out of [`Task::result`].
+/// own word — read out of [`Task::result`], and believed only where
+/// [`Task::result_author`] is the coordinator seat ([`Self::written_by`]).
 ///
 /// A provider's turn ending is not a task finishing; a `worker_done` is the
 /// worker's claim, not a verification; and neither is a merge. The ledger has
@@ -617,9 +715,70 @@ pub struct ReviewFacts {
     /// The coordinator wrote at least one of the keys above — the difference
     /// between "unverified" and "nobody has said".
     pub written: bool,
+    /// The same three keys as a WORKER wrote them — or as somebody nobody
+    /// knows wrote them — read as its claim, which the board shows in the
+    /// claim's own words and never as the fact (t-6815).
+    #[serde(default)]
+    pub claimed_verified: bool,
+    #[serde(default)]
+    pub claimed_merged: bool,
+    #[serde(default)]
+    pub claimed_deployed: bool,
+    /// Who wrote the result these were read from.
+    #[serde(default)]
+    pub author: ReviewAuthor,
+    /// The attempt a coordinator's review was written against, when the
+    /// task had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<String>,
+    /// The task's newest attempt, when it is not the one the review was
+    /// written against — the facts above are then withheld, because a
+    /// review of one attempt says nothing about the next
+    /// ([`Run::review_of`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    /// The source a coordinator's review named — the commit, or the report,
+    /// it looked at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// What the reviewed attempt has handed in, when that is not the source
+    /// the review named — the facts above are then withheld too: a review
+    /// of one commit says nothing about the next, however the task and the
+    /// attempt are spelled ([`Run::review_of`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_now: Option<String>,
 }
 
 impl ReviewFacts {
+    /// The keys as facts or as claims, by who wrote the result.
+    ///
+    /// Only the coordinator seat's writing makes `verified`, `merged` and
+    /// `deployed` true. A worker's — and a row nobody is known to have
+    /// written — keeps the same keys under `claimed_*`, so a board can say
+    /// "the worker says merged" without ever saying "merged". A `false`
+    /// from a worker is still nothing: a claim of NOT is not a review.
+    #[must_use]
+    pub fn written_by(result: &str, author: Option<&ResultAuthor>) -> Self {
+        let read = Self::from_result(result);
+        match author {
+            Some(ResultAuthor::Coordinator {
+                attempt, source, ..
+            }) => Self {
+                author: ReviewAuthor::Coordinator,
+                attempt: attempt.clone(),
+                source: source.clone(),
+                ..read
+            },
+            other => Self {
+                claimed_verified: read.verified,
+                claimed_merged: read.merged,
+                claimed_deployed: read.deployed,
+                author: other.map_or(ReviewAuthor::Unknown, ResultAuthor::kind),
+                ..Self::default()
+            },
+        }
+    }
+
     /// Read the coordinator's keys out of a result the worker or the
     /// coordinator wrote. Anything that is not a JSON object answers the
     /// default: nothing written.
@@ -634,13 +793,7 @@ impl ReviewFacts {
                 .as_str()
                 .is_some_and(|text| !text.trim().is_empty() && text.trim() != "false")
         };
-        let sha = |value: &serde_json::Value| {
-            value
-                .as_str()
-                .map(str::trim)
-                .filter(|text| text.len() >= 7 && text.chars().all(|c| c.is_ascii_hexdigit()))
-                .map(str::to_string)
-        };
+        let sha = |value: &serde_json::Value| value.as_str().and_then(commit_named);
         let verified_keys = ["verified", "reviewedBy", "coordinatorTests", "testedHead"];
         let merged_keys = ["merged", "mergeHead", "mergedInto"];
         // Explicit decisions override older metadata left on the result.
@@ -668,18 +821,55 @@ impl ReviewFacts {
             merge_head,
             deployed,
             written,
+            ..Self::default()
         }
     }
 }
 
-impl Task {
-    /// What a coordinator has written about this task's outcome, beyond the
-    /// worker's own word. See [`ReviewFacts`].
-    #[must_use]
-    pub fn review(&self) -> ReviewFacts {
-        ReviewFacts::from_result(&self.result)
-    }
+/// The key a worker's report names the commit it hands in under — read by
+/// the ledger when the report lands (`handed_in_source`) and spelled in the
+/// briefing that asks for it ([`worker_briefing`]), from this one place.
+pub const HANDED_IN_HEAD: &str = "head";
 
+/// The `--attempt` word for "this task has no attempt": a correction of work
+/// nobody was dispatched on still names what it looked at, and the word is
+/// refused the moment an attempt exists.
+pub const NO_ATTEMPT: &str = "none";
+
+/// A commit, as a person or an agent writes one: seven hex digits or more.
+/// Anything else is not a commit — a report id, a branch name, a sentence.
+fn commit_named(text: &str) -> Option<String> {
+    let text = text.trim();
+    (text.len() >= 7 && text.chars().all(|c| c.is_ascii_hexdigit())).then(|| text.to_string())
+}
+
+/// Whether two source names are the same. An abbreviated hash is a different
+/// name until git has resolved it; a shared prefix alone does not prove that
+/// two reports refer to the same commit.
+fn same_source(one: &str, other: &str) -> bool {
+    match (commit_named(one), commit_named(other)) {
+        (Some(one), Some(other)) => one.eq_ignore_ascii_case(&other),
+        _ => one.trim() == other.trim(),
+    }
+}
+
+/// What an attempt handed in for review, as the ledger names it (t-6815):
+/// the commit its report named under [`HANDED_IN_HEAD`], or — for work that
+/// is not a commit, and for a report that named none — the report itself,
+/// by the message id this ledger minted for it. Written when the report
+/// lands, from the host-authenticated road, so a review can be bound to it.
+fn handed_in_source(body: &str, report: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|said| {
+            said.get(HANDED_IN_HEAD)
+                .and_then(serde_json::Value::as_str)
+                .and_then(commit_named)
+        })
+        .unwrap_or_else(|| report.to_string())
+}
+
+impl Task {
     /// The name a roster row shows. Never empty, so a row cannot render blank.
     pub fn display_name(&self) -> &str {
         if !self.title.is_empty() {
@@ -752,6 +942,13 @@ pub struct Dispatch {
     /// dispatch written before federation existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteSeat>,
+    /// What this attempt handed in for review — `handed_in_source` of the
+    /// report that ended it: the commit it named, or the report's own id.
+    /// `None` while nothing has been handed in (open, or ended without a
+    /// report), and on every row written before hand-ins were recorded. A
+    /// coordinator's review is bound to it ([`Run::review_of`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl Dispatch {
@@ -2087,6 +2284,14 @@ pub struct HandoverPolicy {
     /// transient order's reason.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quota_wait: bool,
+    /// `--on-classifier-decline <agent[:model[:effort]]>` (t-6747): the
+    /// handover rung of [`CLASSIFIER_DECLINE_LADDER`] — who a worker whose
+    /// request its provider's safety classifier declined hands its task to,
+    /// in the same checkout. A part the declaration leaves out is the
+    /// declined worker's own. Skipped when absent, for the transient order's
+    /// reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_classifier_decline: Option<Pinned>,
     pub armed_ms: i64,
 }
 
@@ -2100,6 +2305,13 @@ impl HandoverPolicy {
             "onQuotaWall": self.on_quota_wall.as_ref().map(Pinned::json),
             "wipCommit": self.wip_commit,
             "onTransientError": self.on_transient_error.map(OnTransientError::json),
+            "onClassifierDecline": self.on_classifier_decline.as_ref().map(|to| {
+                serde_json::json!({
+                    "to": to.json(),
+                    "ladder": CLASSIFIER_DECLINE_LADDER.map(ClassifierDeclineRung::as_str),
+                    "routedCategories": ROUTED_DECLINE_CATEGORIES,
+                })
+            }),
             // The wall's rungs as the beat walks them, and the table's numbers
             // the wait walks under, so a coordinator sees what it armed.
             "ladder": order.ladder(),
@@ -2183,8 +2395,109 @@ impl WorkerSeat {
     }
 }
 
+/// Why a handover walks — the news row it follows, and what that row said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoverCause {
+    /// A `quota_walled` row (§2.3): the provider's number, as it said it.
+    QuotaWall {
+        provider: String,
+        used_percent: u8,
+        resets_at_ms: Option<i64>,
+    },
+    /// A `classifier_declined` row (t-6747): the category the provider
+    /// declined the request under — always a routed one
+    /// ([`decline_is_routed`]); an unrouted decline plans no handover — and
+    /// the key of the conversation's own record that witnessed it (t-7153):
+    /// the handover ends the worker only while THAT record, in THAT
+    /// category, is still what its pane stands at
+    /// ([`HandoverCause::is_witnessed_by`]). A decline the screen alone
+    /// witnessed has no such record and plans no handover.
+    ClassifierDecline {
+        category: String,
+        record_key: String,
+    },
+}
+
+impl HandoverCause {
+    /// The news row a handover of this cause follows.
+    pub const fn news(&self) -> MessageKind {
+        match self {
+            Self::QuotaWall { .. } => MessageKind::QuotaWalled,
+            Self::ClassifierDecline { .. } => MessageKind::ClassifierDeclined,
+        }
+    }
+
+    /// The word `worker-stop --reason` carries for it, and a receipt.
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::QuotaWall { .. } => "quota-wall",
+            Self::ClassifierDecline { .. } => "classifier-decline",
+        }
+    }
+
+    /// The cause as a receipt carries it.
+    fn json(&self) -> serde_json::Value {
+        match self {
+            Self::QuotaWall {
+                provider,
+                used_percent,
+                resets_at_ms,
+            } => serde_json::json!({
+                "reason": self.reason(),
+                "provider": provider,
+                "usedPercent": used_percent,
+                "resetsAtMs": resets_at_ms,
+            }),
+            Self::ClassifierDecline {
+                category,
+                record_key,
+            } => serde_json::json!({
+                "reason": self.reason(),
+                "category": category,
+                "recordKey": record_key,
+            }),
+        }
+    }
+
+    fn bytes_held(&self) -> usize {
+        match self {
+            Self::QuotaWall { provider, .. } => provider.len(),
+            Self::ClassifierDecline {
+                category,
+                record_key,
+            } => category.len() + record_key.len(),
+        }
+    }
+
+    /// Whether `witness`, read off the pane NOW, is the decline this
+    /// handover was planned for (t-7153, P1-4): the conversation's own
+    /// record — never the screen alone — with the same key, naming the same
+    /// category, and that category still routed. Asked at every boundary of
+    /// the walk and last inside the actor's fence, where the stop commits:
+    /// a decline whose category reads as none, another request's record, or
+    /// a category the provider routes nowhere is not this plan's, and the
+    /// beat plans again from what it reads next. A wall's cause is never
+    /// witnessed by a decline.
+    #[must_use]
+    pub fn is_witnessed_by(&self, witness: &ClassifierDeclineWitness) -> bool {
+        match self {
+            Self::ClassifierDecline {
+                category,
+                record_key,
+            } => {
+                witness.record.may_stop()
+                    && witness.record.key == *record_key
+                    && witness.record.category.as_deref() == Some(category.as_str())
+                    && decline_is_routed(Some(category))
+            }
+            Self::QuotaWall { .. } => false,
+        }
+    }
+}
+
 /// One handover the beat is to walk — what [`next_handover`] makes of a
-/// `quota_walled` row under a declared standing order (§2.3).
+/// `quota_walled` row (§2.3) or a `classifier_declined` one (t-6747) under a
+/// declared standing order.
 ///
 /// A plan and not an action, for [`Dispatchable`]'s reason: the window walks
 /// it OUTSIDE the ledger's locks — a git commit, two verbs through the one
@@ -2194,21 +2507,21 @@ impl WorkerSeat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandoverPlan {
     pub run: String,
-    /// The walled worker, its agent, and the open attempt it carries.
+    /// The stopped worker, its agent, and the open attempt it carries.
     pub worker: String,
     pub agent: String,
     pub dispatch: String,
     pub task: String,
     pub spec: Text,
     /// The checkout the replacement inherits — reported by the window when
-    /// the walled pane was seated; a worker with none is not handed over.
+    /// the stopped pane was seated; a worker with none is not handed over.
     pub checkout: String,
-    /// The provider's number, as the `quota_walled` row said it.
-    pub provider: String,
-    pub used_percent: u8,
-    pub resets_at_ms: Option<i64>,
-    /// Exactly who the task goes to: the summons' own `--on-quota-wall`, or
-    /// the run's policy.
+    /// Why it walks, as the news row said it.
+    pub cause: HandoverCause,
+    /// Exactly who the task goes to: for a wall, the summons' own
+    /// `--on-quota-wall` or the run's policy; for a decline, the run's
+    /// `--on-classifier-decline`, the parts it left out filled from the
+    /// declined worker's own.
     pub to: Pinned,
     /// Whether step ① may commit the tree (`handover-policy --wip-commit`).
     pub wip_commit: bool,
@@ -2241,7 +2554,6 @@ impl HandoverPlan {
             &self.task,
             self.spec.as_str(),
             &self.checkout,
-            &self.provider,
             &self.team,
             &self.pane,
             &self.worker_team,
@@ -2250,12 +2562,15 @@ impl HandoverPlan {
         .iter()
         .map(|value| value.len())
         .sum::<usize>()
+            + self.cause.bytes_held()
             + pinned(&self.to)
-            + self
-                .policy
-                .as_ref()
-                .and_then(|policy| policy.on_quota_wall.as_ref())
-                .map_or(0, pinned)
+            + self.policy.as_ref().map_or(0, |policy| {
+                [&policy.on_quota_wall, &policy.on_classifier_decline]
+                    .into_iter()
+                    .flatten()
+                    .map(pinned)
+                    .sum()
+            })
     }
 }
 
@@ -2417,13 +2732,28 @@ pub fn handover_paragraph(
     recap: Option<&HandoverRecap>,
     now_ms: i64,
 ) -> String {
-    let resets = plan
-        .resets_at_ms
-        .map(|at| at.saturating_sub(now_ms))
-        .filter(|remaining| *remaining > 0)
-        .map_or_else(String::new, |remaining| {
-            format!(", resets in {} min", minutes_up(remaining))
-        });
+    let stopped = match &plan.cause {
+        HandoverCause::QuotaWall {
+            provider,
+            used_percent,
+            resets_at_ms,
+        } => {
+            let resets = resets_at_ms
+                .map(|at| at.saturating_sub(now_ms))
+                .filter(|remaining| *remaining > 0)
+                .map_or_else(String::new, |remaining| {
+                    format!(", resets in {} min", minutes_up(remaining))
+                });
+            format!("stopped at the {provider} quota wall ({used_percent}% used{resets})")
+        }
+        // The declined request itself is not repeated here, and its words
+        // are not in the recap (`speaks_in_a_recap`): the replacement
+        // continues the task, in a conversation of its own.
+        HandoverCause::ClassifierDecline { category, .. } => format!(
+            "stopped when its provider's safety classifier declined a request (`{category}`) \
+             and its own CLI could not continue on a fallback model"
+        ),
+    };
     let tree = match wip_sha {
         Some(sha) => format!(
             "its uncommitted work was committed for you as wip(handover) {sha} — read that \
@@ -2435,14 +2765,12 @@ pub fn handover_paragraph(
     };
     let mut said = format!(
         "Handover: you are taking over task {task} from worker {worker} ({agent}), which \
-         stopped at the {provider} quota wall ({used}% used{resets}). You sit in its checkout \
-         {checkout} — the same tree it worked in; {tree}. Read `git status` and `git log -3`, \
-         then CONTINUE the task below from where it stands; do not start over.\n\n",
+         {stopped}. You sit in its checkout {checkout} — the same tree it worked in; {tree}. \
+         Read `git status` and `git log -3`, then CONTINUE the task below from where it \
+         stands; do not start over.\n\n",
         task = plan.task,
         worker = plan.worker,
         agent = plan.agent,
-        provider = plan.provider,
-        used = plan.used_percent,
         checkout = plan.checkout,
     );
     if let Some(recap) = recap {
@@ -2564,14 +2892,48 @@ struct HandoverCandidate<'a> {
     wip_commit: bool,
 }
 
-fn effective_handover_order<'a>(run: &'a Run, worker: &'a Worker) -> Option<(&'a Pinned, bool)> {
-    let (_, to) = standing_order(run, worker);
+/// Who a stopped worker's task goes to for the `news` it stopped on, and
+/// whether step ① may commit its tree: a wall's standing order
+/// ([`standing_order`]), or the run's `--on-classifier-decline` with the
+/// parts it left out filled from the declined worker's own ([`inherited`]).
+fn effective_handover_order(
+    run: &Run,
+    worker: &Worker,
+    news: MessageKind,
+) -> Option<(Pinned, bool)> {
+    let to = match news {
+        MessageKind::QuotaWalled => standing_order(run, worker).1?.clone(),
+        MessageKind::ClassifierDeclined => inherited(
+            run.handover.as_ref()?.on_classifier_decline.as_ref()?,
+            worker,
+        ),
+        _ => return None,
+    };
     Some((
-        to?,
+        to,
         run.handover
             .as_ref()
             .is_some_and(|policy| policy.wip_commit),
     ))
+}
+
+/// A declaration's missing parts, filled from the worker it stands for —
+/// the same agent keeps its own model and effort unless the declaration
+/// names others; another agent's are nothing to this one. An effort rides
+/// only beside a model, the rule `--effort` follows on a summons.
+fn inherited(declared: &Pinned, worker: &Worker) -> Pinned {
+    if declared.agent != worker.agent {
+        return declared.clone();
+    }
+    let model = declared.model.clone().or_else(|| worker.model.clone());
+    let effort = model
+        .as_ref()
+        .and(declared.effort.clone().or_else(|| worker.effort.clone()));
+    Pinned {
+        agent: declared.agent.clone(),
+        model,
+        effort,
+    }
 }
 
 /// Why a rung earlier on the ladder than `rung` still holds `dispatch_id`'s
@@ -2614,6 +2976,7 @@ fn ladder_holds(
 fn handover_candidate<'a>(
     run: &'a Run,
     dispatch_id: &str,
+    news: MessageKind,
     now_ms: i64,
 ) -> Result<HandoverCandidate<'a>, String> {
     let dispatch = run
@@ -2662,10 +3025,13 @@ fn handover_candidate<'a>(
             dispatch.task
         ));
     }
-    if let Some(why) = ladder_holds(run, worker, dispatch_id, QuotaWallRung::Handover, now_ms) {
+    // The wait rung is a wall's own; a decline has nothing to wait out.
+    if news == MessageKind::QuotaWalled
+        && let Some(why) = ladder_holds(run, worker, dispatch_id, QuotaWallRung::Handover, now_ms)
+    {
         return Err(why);
     }
-    let (to, wip_commit) = effective_handover_order(run, worker)
+    let (to, wip_commit) = effective_handover_order(run, worker, news)
         .ok_or_else(|| "no standing order names an alternative".to_string())?;
     let task = run
         .task(&dispatch.task)
@@ -2675,23 +3041,55 @@ fn handover_candidate<'a>(
         dispatch,
         task,
         checkout,
-        to: to.clone(),
+        to,
         wip_commit,
     })
 }
 
+/// What a news row says a handover would follow — `None` for a row no
+/// handover follows: another kind; a decline in a category the provider
+/// routes nowhere ([`decline_is_routed`]), whose answer stands; or a decline
+/// the screen alone witnessed ([`decline_source_may_stop`]), which is
+/// diagnostic news and no authority to end a worker (t-7153).
+fn handover_cause(news: &Message) -> Option<HandoverCause> {
+    let said: serde_json::Value = serde_json::from_str(news.body.as_str()).ok()?;
+    match news.kind {
+        MessageKind::QuotaWalled => Some(HandoverCause::QuotaWall {
+            provider: said["provider"].as_str().unwrap_or_default().to_string(),
+            used_percent: u8::try_from(said["usedPercent"].as_u64().unwrap_or(0))
+                .unwrap_or(u8::MAX),
+            resets_at_ms: said["resetsAtMs"].as_i64(),
+        }),
+        MessageKind::ClassifierDeclined => {
+            let category = said["category"].as_str()?;
+            let record = &said["record"];
+            let record_key = record["key"].as_str().filter(|key| !key.is_empty())?;
+            if !decline_source_may_stop(record["source"].as_str()?) {
+                return None;
+            }
+            decline_is_routed(Some(category)).then(|| HandoverCause::ClassifierDecline {
+                category: category.to_string(),
+                record_key: record_key.to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// The handover this run's beat should walk now, if any (§2.3).
 ///
-/// Pure, for [`next_dispatch`]'s reason. Reads the `quota_walled` rows oldest
-/// first and answers the first whose attempt is still open, whose worker is
-/// live, not the person's, and seated in a known checkout, that no earlier
-/// walk has touched (one handover per attempt — a walk the window died
-/// inside of is reported by the restart, never resumed here), whose task is
-/// under the table's ceiling, and for which somebody DECLARED an alternative:
-/// the summons' own `--on-quota-wall` first, the run's `handover-policy`
-/// second. Nothing else walks — news alone is the hand recipe. The seat the
-/// verbs are presented from is the run's live coordinator seat; a run whose
-/// seat is empty walks nothing until somebody sits.
+/// Pure, for [`next_dispatch`]'s reason. Reads the `quota_walled` and
+/// `classifier_declined` rows oldest first and answers the first whose
+/// attempt is still open, whose worker is live, not the person's, and seated
+/// in a known checkout, that no earlier walk has touched (one handover per
+/// attempt — a walk the window died inside of is reported by the restart,
+/// never resumed here), whose task is under the table's ceiling, and for
+/// which somebody DECLARED an alternative: for a wall the summons' own
+/// `--on-quota-wall` first, the run's `handover-policy` second; for a
+/// decline in a routed category, the run's `--on-classifier-decline`.
+/// Nothing else walks — news alone is the hand recipe. The seat the verbs
+/// are presented from is the run's live coordinator seat; a run whose seat
+/// is empty walks nothing until somebody sits.
 pub fn next_handover(run: &Run, now_ms: i64) -> Option<HandoverPlan> {
     next_handover_witnessed(run, now_ms, |_| true)
 }
@@ -2705,37 +3103,31 @@ pub fn next_handover_witnessed(
 ) -> Option<HandoverPlan> {
     let seat = run.coordinator_live()?;
     let (team, pane) = seat.seat.split_once('/')?;
-    run.messages
-        .iter()
-        .filter(|held| held.kind == MessageKind::QuotaWalled)
-        .find_map(|news| {
-            let dispatch_id = news.dispatch.as_deref()?;
-            let candidate = handover_candidate(run, dispatch_id, now_ms).ok()?;
-            let said: serde_json::Value = serde_json::from_str(news.body.as_str()).ok()?;
-            let plan = HandoverPlan {
-                run: run.id.clone(),
-                worker: candidate.worker.id.clone(),
-                agent: candidate.worker.agent.clone(),
-                dispatch: candidate.dispatch.id.clone(),
-                task: candidate.task.id.clone(),
-                spec: candidate.task.spec.clone(),
-                checkout: candidate.checkout,
-                provider: said["provider"].as_str().unwrap_or_default().to_string(),
-                used_percent: u8::try_from(said["usedPercent"].as_u64().unwrap_or(0))
-                    .unwrap_or(u8::MAX),
-                resets_at_ms: said["resetsAtMs"].as_i64(),
-                to: candidate.to,
-                wip_commit: candidate.wip_commit,
-                team: team.to_string(),
-                pane: pane.to_string(),
-                worker_team: candidate.worker.team.clone(),
-                worker_pane: candidate.worker.pane.clone(),
-                worker_started_ms: candidate.worker.started_ms,
-                policy: run.handover.clone(),
-                coordinator_generation: seat.generation,
-            };
-            witnessed(&plan).then_some(plan)
-        })
+    run.messages.iter().find_map(|news| {
+        let cause = handover_cause(news)?;
+        let dispatch_id = news.dispatch.as_deref()?;
+        let candidate = handover_candidate(run, dispatch_id, news.kind, now_ms).ok()?;
+        let plan = HandoverPlan {
+            run: run.id.clone(),
+            worker: candidate.worker.id.clone(),
+            agent: candidate.worker.agent.clone(),
+            dispatch: candidate.dispatch.id.clone(),
+            task: candidate.task.id.clone(),
+            spec: candidate.task.spec.clone(),
+            checkout: candidate.checkout,
+            cause,
+            to: candidate.to,
+            wip_commit: candidate.wip_commit,
+            team: team.to_string(),
+            pane: pane.to_string(),
+            worker_team: candidate.worker.team.clone(),
+            worker_pane: candidate.worker.pane.clone(),
+            worker_started_ms: candidate.worker.started_ms,
+            policy: run.handover.clone(),
+            coordinator_generation: seat.generation,
+        };
+        witnessed(&plan).then_some(plan)
+    })
 }
 
 fn handover_consumes_attempt(message: &Message) -> bool {
@@ -2759,14 +3151,14 @@ pub fn handover_order_current(run: &Run, plan: &HandoverPlan, stopped: bool) -> 
     let Some(task) = run.task(&plan.task) else {
         return false;
     };
-    let Some((to, wip_commit)) = effective_handover_order(run, worker) else {
+    let Some((to, wip_commit)) = effective_handover_order(run, worker, plan.cause.news()) else {
         return false;
     };
     run.id == plan.run
         && seat.seat == format!("{}/{}", plan.team, plan.pane)
         && seat.generation == plan.coordinator_generation
         && run.handover == plan.policy
-        && to == &plan.to
+        && to == plan.to
         && wip_commit == plan.wip_commit
         && worker.team == plan.worker_team
         && worker.pane == plan.worker_pane
@@ -2841,6 +3233,59 @@ impl Run {
         self.tasks.iter().find(|task| task.id == id)
     }
 
+    /// The task's newest attempt, open or ended — the one a review is
+    /// written against, and the one a review is measured against.
+    pub fn newest_attempt(&self, task_id: &str) -> Option<&Dispatch> {
+        self.dispatches.iter().rev().find(|one| one.task == task_id)
+    }
+
+    /// What stands about a task's outcome NOW: the coordinator's facts while
+    /// the attempt AND the source they were written against are still what
+    /// the task's newest attempt is and handed in, the worker's claims kept
+    /// apart from them, and nothing inherited — a task id, an author or an
+    /// attempt staying the same is not a reason for a review of one thing to
+    /// dress another ([`ReviewFacts::written_by`], t-6815).
+    ///
+    /// The one reader. `Task` alone cannot answer, because the attempts and
+    /// what they handed in are the run's rows; a reading that skipped them
+    /// would be the inheritance this exists to refuse.
+    #[must_use]
+    pub fn review_of(&self, task: &Task) -> ReviewFacts {
+        let facts = ReviewFacts::written_by(&task.result, task.result_author.as_ref());
+        if facts.author != ReviewAuthor::Coordinator {
+            return facts;
+        }
+        let newest = self.newest_attempt(&task.id);
+        let newest_id = newest.map(|one| one.id.as_str());
+        let attempt_moved = newest.is_some() && facts.attempt.as_deref() != newest_id;
+        /* A hand-in the review did not name: the attempt handed in a commit
+         * or a report, and the review named another one — or none. Before
+         * anything is handed in, the source the review named is the only
+         * witness, and it stands. */
+        let handed = newest.and_then(|one| one.source.as_deref());
+        let source_moved = handed.is_some_and(|now| {
+            !facts
+                .source
+                .as_deref()
+                .is_some_and(|named| same_source(named, now))
+        });
+        if !attempt_moved && !source_moved {
+            return facts;
+        }
+        ReviewFacts {
+            verified: false,
+            merged: false,
+            merge_head: None,
+            deployed: false,
+            written: false,
+            superseded_by: attempt_moved
+                .then(|| newest_id.map(str::to_string))
+                .flatten(),
+            source_now: source_moved.then(|| handed.map(str::to_string)).flatten(),
+            ..facts
+        }
+    }
+
     /// The seat somebody is sitting in right now, or `None` for a run whose
     /// seat is empty or vacated — and for every run written before seats
     /// existed, which reads under the old rule.
@@ -2876,10 +3321,55 @@ impl Run {
         thread_answer(self, question)
     }
 
-    /// Whether a question can no longer be answered — its asker's dispatch
-    /// ended — by the rule the `reply` verb refuses by.
+    /// Whether the asker's dispatch ended. This narrower fact remains
+    /// available to callers that need dispatch closure; use
+    /// [`Self::question_is_answerable`] before offering a new reply.
     pub fn question_is_closed(&self, question: &Message) -> bool {
         question_closed(self, question)
+    }
+
+    /// Whether a new answer can reach this question's asker. A standing
+    /// answer is handled before this check by `reply` so retries still work.
+    pub fn question_is_answerable(&self, question: &Message) -> Result<(), String> {
+        if question_closed(self, question) {
+            return Err(format!(
+                "question {} is closed — its dispatch ended \
+                 before an answer landed, and the asker is gone",
+                question.id
+            ));
+        }
+        self.direct_address(&question.from, &question.to)
+            .unwrap_or_else(|| Err(format!("unroutable address: {}", question.from)))
+            .map(|_| ())
+    }
+
+    /// The direct mail reader shared by routing and answerability. Groups
+    /// have their own membership rule; a question has one direct asker.
+    fn direct_address(&self, to: &str, from: &str) -> Option<Result<Vec<String>, String>> {
+        if to == self.address() || to == format!("run:{}", self.id) {
+            return Some(Ok(vec![self.address()]));
+        }
+        if let Some(id) = to.strip_prefix(WORKER_ADDRESS_PREFIX) {
+            return Some(match self.worker(id) {
+                Some(worker) if worker.state.reads_mail() => Ok(vec![to.to_string()]),
+                Some(worker) => Err(format!(
+                    "worker {id} is {} — its inbox has no reader left, and mail \
+                     filed there would be delivered to nobody",
+                    worker.state.as_str()
+                )),
+                None => Err(format!("unknown worker: {id}")),
+            });
+        }
+        if to.starts_with(PANE_ADDRESS_PREFIX) {
+            let spoken = self.messages.iter().any(|held| held.from == to);
+            return Some(match spoken || from == LEDGER_ITSELF {
+                true => Ok(vec![to.to_string()]),
+                false => Err(format!(
+                    "unroutable address: {to} — a seat is answerable once it has spoken"
+                )),
+            });
+        }
+        None
     }
 
     pub fn dispatch(&self, id: &str) -> Option<&Dispatch> {
@@ -5117,11 +5607,37 @@ impl Ledger {
         let id = message.id.clone();
         if let Some(ok) = worker_done {
             let ended = message.created_ms;
+            /* The body is the WORKER's writing, whatever keys it carries: the
+             * dispatch names the worker where it resolves, and the signature
+             * the report wore stands in where it does not (t-6815). */
+            let author = match message.dispatch.as_deref().and_then(|id| run.dispatch(id)) {
+                Some(held) => ResultAuthor::Worker {
+                    worker: held.worker.clone(),
+                    dispatch: Some(held.id.clone()),
+                },
+                None => ResultAuthor::Worker {
+                    worker: message.from.clone(),
+                    dispatch: message.dispatch.clone(),
+                },
+            };
             if let Some(dispatch_id) = message.dispatch.clone() {
+                /* What the attempt handed in — the commit its report named,
+                 * or the report itself — written on the attempt the report
+                 * ends, so a coordinator's review is bound to the thing it
+                 * looked at and not merely to the task's name (t-6815). Only
+                 * an OPEN attempt takes one: the report that ended it is the
+                 * hand-in, and nothing after can rewrite it. */
+                if let Some(held) = run
+                    .dispatches
+                    .iter_mut()
+                    .find(|one| one.id == dispatch_id && one.is_open())
+                {
+                    held.source = Some(handed_in_source(message.body.as_str(), &id));
+                }
                 Self::close_dispatch(run, &dispatch_id, Some(ok), ended);
             }
             if let Some(task_id) = message.task.clone() {
-                Self::finish_task(run, &task_id, ok, &message.body);
+                Self::finish_task(run, &task_id, ok, &message.body, author);
             }
         }
         /* Asked AFTER the completion above has shut the dispatch, and that
@@ -5358,8 +5874,10 @@ impl Ledger {
         }
     }
 
-    /// Write a task's ending, and free whatever was waiting on it.
-    fn finish_task(run: &mut Run, task_id: &str, ok: bool, result: &str) {
+    /// Write a task's ending, and free whatever was waiting on it. `author`
+    /// is who wrote the result — the worker whose report this is, or the
+    /// ledger for an ending it witnessed itself.
+    fn finish_task(run: &mut Run, task_id: &str, ok: bool, result: &str, author: ResultAuthor) {
         let Some(at) = run.tasks.iter().position(|task| task.id == task_id) else {
             return;
         };
@@ -5367,6 +5885,7 @@ impl Ledger {
             return;
         }
         run.tasks[at].result = result.into();
+        run.tasks[at].result_author = Some(author);
         if ok {
             run.tasks[at].status = TaskStatus::Completed;
             run.tasks[at].failures = 0;
@@ -5431,61 +5950,8 @@ impl Ledger {
         let run = self
             .run(run_id)
             .ok_or_else(|| format!("unknown run: {run_id}"))?;
-        if to == run.address() || to == format!("run:{run_id}") {
-            return Ok(vec![run.address()]);
-        }
-        /* A worker's own address, and only while somebody is behind it.
-         *
-         * This resolved whatever had become of the worker, so a coordinator
-         * could file a dispatch into a released seat's inbox and be told
-         * "Sent" — the message stood in the log addressed to nobody, and the
-         * sender had no way to know. That is the same lie the two refusals
-         * around it already name, and it is refused the same way: the group
-         * road will not deliver to an empty crowd, and the seat road will not
-         * deliver to a pane that has never spoken.
-         *
-         * [`WorkerState::reads_mail`] rather than `is_live`, because the
-         * question here is whether a reader will ever open the inbox — not
-         * whether a process is running right now. A `Sleeping` worker has no
-         * pane and is still read the moment its coordinator seats it again.
-         * That is not a quarrel with the group rule below: a group is who to
-         * ASK, and asking a seat that cannot answer now is pointless, while a
-         * direct address is a deliberate choice to leave mail for a seat that
-         * is coming back.
-         */
-        if let Some(id) = to.strip_prefix(WORKER_ADDRESS_PREFIX) {
-            return match run.worker(id) {
-                Some(worker) if worker.state.reads_mail() => Ok(vec![to.to_string()]),
-                Some(worker) => Err(format!(
-                    "worker {id} is {} — its inbox has no reader left, and mail \
-                     filed there would be delivered to nobody",
-                    worker.state.as_str()
-                )),
-                None => Err(format!("unknown worker: {id}")),
-            };
-        }
-        /* A seat that is nobody's worker — a teammate pane, a seat whose
-         * worker went to sleep. It is answerable, because a question asked
-         * from one takes an answer like any other, and the ledger holds no
-         * seat table to check it against: what it holds is whether this seat
-         * has ever SPOKEN here. That is the right question anyway. An address
-         * nobody has used names an inbox nobody reads, and "Sent" over one is
-         * the same lie as "Sent" over an empty group. */
-        if to.starts_with(PANE_ADDRESS_PREFIX) {
-            /* The one exception is the ledger writing to a seat it has just
-             * unseated (`take_over_coordinator`): that pane spoke as `run:`
-             * for as long as it held the chair, so its own pane address has
-             * never appeared as a `from` — and its own pane inbox is exactly
-             * where its next `check` reads. A receipt that could not be filed
-             * would leave the former coordinator reading an empty inbox with
-             * no sentence saying why. */
-            let spoken = run.messages.iter().any(|held| held.from == to);
-            return match spoken || from == LEDGER_ITSELF {
-                true => Ok(vec![to.to_string()]),
-                false => Err(format!(
-                    "unroutable address: {to} — a seat is answerable once it has spoken"
-                )),
-            };
+        if let Some(address) = run.direct_address(to, from) {
+            return address;
         }
         if let Some(group) = to.strip_prefix('@') {
             // The original's fourth group resolves against the seat report:
@@ -5910,6 +6376,7 @@ impl Ledger {
             result: Text::from(String::new()),
             failures: 0,
             created_ms: now_ms,
+            result_author: None,
         };
         let status = if run.deps_met(&task) {
             TaskStatus::Ready
@@ -5926,12 +6393,18 @@ impl Ledger {
     /// is a worker saying so — this is for the cases a worker cannot speak to:
     /// a run abandoned by a person, a status set wrong, work done outside a
     /// dispatch entirely.
+    ///
+    /// `author` is who is writing, and is written down beside a `result` so
+    /// [`Run::review_of`] can tell a coordinator's judgement from a worker's
+    /// claim. Who MAY write is the verb's question — `correction_author`
+    /// answers it for `task-update` — and this road trusts its caller.
     pub fn update_task(
         &mut self,
         run_id: &str,
         task_id: &str,
         status: Option<TaskStatus>,
         result: Option<String>,
+        author: ResultAuthor,
     ) -> Result<TaskStatus, String> {
         let run = self.run_mut(run_id).ok_or_else(|| unknown_run(run_id))?;
         let at = run
@@ -5968,6 +6441,7 @@ impl Ledger {
         }
         if let Some(result) = result {
             run.tasks[at].result = result.into();
+            run.tasks[at].result_author = Some(author);
         }
         if let Some(status) = status {
             run.tasks[at].status = status;
@@ -6204,6 +6678,7 @@ impl Ledger {
             succeeded: None,
             retry_of: None,
             remote: None,
+            source: None,
         });
         let at = run
             .workers
@@ -6378,6 +6853,7 @@ impl Ledger {
                 succeeded: None,
                 retry_of: tuning.retry_of,
                 remote: None,
+                source: None,
             });
             // The set half of the compare-and-set above. Unconditional here is
             // right BECAUSE the compare already happened, under this same
@@ -9079,6 +9555,225 @@ impl Ledger {
         told
     }
 
+    /// Workers whose provider's safety classifier declined their last
+    /// request and who stopped there, each with BOTH witnesses (t-6747): one
+    /// `classifier_declined` notice per attempt, to the run's coordinator.
+    ///
+    /// The ledger revalidates what it owns — a live worker in its seat, no
+    /// person's hand on the pane, an open attempt, THIS record not told
+    /// already — and says which rung comes next
+    /// ([`CLASSIFIER_DECLINE_LADDER`]): the handover when the run declared
+    /// one and the category is routed, the coordinator otherwise. A notice
+    /// is one record's (t-7153, R4): the same record on the next beat is
+    /// the same fact and is not told again; a later record of the same
+    /// attempt — another request declined, or the record a dialog leaves
+    /// once a key answers it — is news of its own, told and planned from
+    /// what the pane shows now, where before one notice, whatever it
+    /// witnessed, closed the attempt to every reading after it. Answers how
+    /// many were told.
+    pub fn workers_classifier_declined(
+        &mut self,
+        declined: &[ClassifierDeclineWitness],
+        now_ms: i64,
+    ) -> usize {
+        if now_ms < 0 {
+            return 0;
+        }
+        let mut told = 0;
+        for witness in declined {
+            let Some((run_id, draft)) = self.runs.iter().find_map(|run| {
+                let worker = run.worker(&witness.worker)?;
+                if !worker.state.is_live() || !worker.state.may_occupy_pane() || worker.taken_over {
+                    return None;
+                }
+                let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
+                if !dispatch.is_open() || decline_told(run, &dispatch.id, &witness.record.key) {
+                    return None;
+                }
+                let category = witness.record.category.as_deref();
+                let routed = decline_is_routed(category);
+                let declared = run
+                    .handover
+                    .as_ref()
+                    .and_then(|policy| policy.on_classifier_decline.as_ref());
+                // A decline the screen alone witnessed is told and walked
+                // nowhere, whatever the run declared (t-7153, P1-3): the
+                // record is the witness that ends a worker, and a screen
+                // can be quoted.
+                let stops = witness.record.may_stop();
+                let (rung, next) = match (stops, routed, declared) {
+                    (false, _, _) => (
+                        ClassifierDeclineRung::Notify,
+                        "nothing was settled, and nothing will be by itself: this decline was \
+                         read off the pane's SCREEN only — Claude Code's pause dialog, which \
+                         writes no record until a key answers it — and a screen is not a \
+                         witness that ends a worker. Read the pane (`worker-read`); if it \
+                         stands at the dialog, hand the task over yourself (`worker-stop \
+                         --worker <id> --reason classifier-decline`, then `worker-start \
+                         --agent <alt> --task <same> --retry-of <dispatchId> \
+                         --inherit-checkout`, on the rung you choose), or answer the dialog \
+                         by hand",
+                    ),
+                    (true, true, Some(_)) => (
+                        ClassifierDeclineRung::Handover,
+                        "nothing was settled: the run's `handover-policy \
+                         --on-classifier-decline` hands this task to a fresh worker in the \
+                         same checkout, and the beat leaves a `handover` receipt",
+                    ),
+                    (true, true, None) => (
+                        ClassifierDeclineRung::Notify,
+                        "nothing was settled: the attempt is open and the task is carried. \
+                         Its CLI could not continue the declined turn on a fallback model. \
+                         Hand it over yourself (`worker-stop --worker <id> --reason \
+                         classifier-decline`, then `worker-start --agent <alt> --task <same> \
+                         --retry-of <dispatchId> --inherit-checkout`), or arm `handover-policy \
+                         --on-classifier-decline <agent[:model[:effort]]>` and the beat walks \
+                         that road",
+                    ),
+                    (true, false, _) => (
+                        ClassifierDeclineRung::Notify,
+                        "nothing was settled: the provider routes this category nowhere, so \
+                         its answer stands — no worker is handed the declined request. Read \
+                         the task with the person; do not paste a picture of the declined \
+                         screen into a conversation, read its words",
+                    ),
+                };
+                let body = serde_json::json!({
+                    "workerId": worker.id,
+                    "agent": worker.agent,
+                    "model": worker.model,
+                    "pane": worker.pane,
+                    "taskId": dispatch.task,
+                    "dispatchId": dispatch.id,
+                    "checkout": worker.checkout,
+                    "category": category,
+                    "routed": routed,
+                    "screenOnly": !stops,
+                    "screen": witness.screen,
+                    "record": {
+                        "source": witness.record.source,
+                        "line": witness.record.line,
+                        "key": witness.record.key,
+                    },
+                    "observedAtMs": now_ms,
+                    "rung": rung.as_str(),
+                    "ladder": CLASSIFIER_DECLINE_LADDER.map(ClassifierDeclineRung::as_str),
+                    "next": next,
+                });
+                Some((
+                    run.id.clone(),
+                    Draft {
+                        from: LEDGER_ITSELF.to_string(),
+                        to: run.address(),
+                        kind: MessageKind::ClassifierDeclined,
+                        body: body.to_string().into(),
+                        subject: Text::default(),
+                        priority: Priority::Normal,
+                        payload: Text::default(),
+                        thread: None,
+                        task: Some(dispatch.task.clone()),
+                        dispatch: Some(dispatch.id.clone()),
+                    },
+                ))
+            }) else {
+                continue;
+            };
+            if self.post(&run_id, draft, now_ms).is_ok() {
+                told += 1;
+            }
+        }
+        told
+    }
+
+    /// Switches a worker's own CLI recorded — a classifier decline answered
+    /// on the category's route instead of the model its summons bound
+    /// (t-6747): one `model_deviated` row per switch, to the run's
+    /// coordinator. A summons' model is a binding choice, so leaving it is
+    /// written where it is read, whoever left it and however well: the two
+    /// models, the category, how long the CLI keeps the switch, and why.
+    ///
+    /// A row is the ATTEMPT's the switch was read under, or nobody's
+    /// (t-7153, R3, [`ModelDeviation::is_bound_to`]): the ledger writes it
+    /// only while the worker still carries that very dispatch, the switch is
+    /// dated inside it, and the file it was read from is the one the ledger
+    /// knows the worker writes — a reading the ledger moved past between the
+    /// scan and this fence (the attempt ended, the pane handed a second
+    /// task) is written nowhere, where before the row was written for
+    /// whatever dispatch the worker carried NOW, and a switch of a worker's
+    /// first attempt, read again after a restart, landed as its second's.
+    /// Answers how many were written.
+    pub fn workers_model_deviated(&mut self, deviated: &[ModelDeviation], now_ms: i64) -> usize {
+        if now_ms < 0 {
+            return 0;
+        }
+        let mut told = 0;
+        for deviation in deviated {
+            let Some((run_id, draft)) = self.runs.iter().find_map(|run| {
+                let worker = run.worker(&deviation.worker)?;
+                let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
+                if !deviation.is_bound_to(worker, dispatch)
+                    || run.messages.iter().any(|held| {
+                        held.kind == MessageKind::ModelDeviated
+                            && held.dispatch.as_deref() == Some(dispatch.id.as_str())
+                            && serde_json::from_str::<serde_json::Value>(held.body.as_str())
+                                .is_ok_and(|body| body["key"] == deviation.key.as_str())
+                    })
+                {
+                    return None;
+                }
+                let category = deviation.category.as_deref();
+                let summary = format!(
+                    "model binding left: {} → {} for {} — the provider's safety classifier \
+                     declined a request on {}, and the CLI continued on the category's route \
+                     instead of stopping",
+                    category.unwrap_or("an unnamed category"),
+                    deviation.to,
+                    deviation.lasts(),
+                    deviation.from,
+                );
+                let body = serde_json::json!({
+                    "workerId": worker.id,
+                    "agent": worker.agent,
+                    "taskId": dispatch.task,
+                    "dispatchId": dispatch.id,
+                    "boundModel": worker.model,
+                    "from": deviation.from,
+                    "to": deviation.to,
+                    "category": category,
+                    "scope": deviation.scope,
+                    "lasts": deviation.lasts(),
+                    "key": deviation.key,
+                    "source": deviation.source,
+                    "sinceMs": deviation.at_ms,
+                    "observedAtMs": now_ms,
+                    "rung": ClassifierDeclineRung::Fallback.as_str(),
+                    "summary": summary,
+                });
+                Some((
+                    run.id.clone(),
+                    Draft {
+                        from: LEDGER_ITSELF.to_string(),
+                        to: run.address(),
+                        kind: MessageKind::ModelDeviated,
+                        body: body.to_string().into(),
+                        subject: Text::default(),
+                        priority: Priority::Normal,
+                        payload: Text::default(),
+                        thread: None,
+                        task: Some(dispatch.task.clone()),
+                        dispatch: Some(dispatch.id.clone()),
+                    },
+                ))
+            }) else {
+                continue;
+            };
+            if self.post(&run_id, draft, now_ms).is_ok() {
+                told += 1;
+            }
+        }
+        told
+    }
+
     /// A wall the wait rung held lifted while its worker stayed stopped at
     /// it: the coordinator is told, once per wall (t-6427).
     ///
@@ -9188,13 +9883,25 @@ impl Ledger {
             if !handover_order_current(run, plan, false) {
                 return Err("handover order or seat changed — plan again".into());
             }
-            let candidate = handover_candidate(run, &plan.dispatch, now_ms)?;
-            serde_json::json!({
+            let candidate = handover_candidate(run, &plan.dispatch, plan.cause.news(), now_ms)?;
+            // The rung this receipt is, on the ladder its cause walks
+            // (t-6427, t-6747) — the same two fields the news carries.
+            let (rung, ladder) = match &plan.cause {
+                HandoverCause::QuotaWall { .. } => (
+                    QuotaWallRung::Handover.as_str(),
+                    QuotaWallOrder::standing(run, candidate.worker).ladder(),
+                ),
+                HandoverCause::ClassifierDecline { .. } => (
+                    ClassifierDeclineRung::Handover.as_str(),
+                    CLASSIFIER_DECLINE_LADDER
+                        .map(ClassifierDeclineRung::as_str)
+                        .to_vec(),
+                ),
+            };
+            let mut body = serde_json::json!({
                 "status": HANDOVER_WALKING,
-                // The rung this receipt is, on the ladder the order declared
-                // (t-6427) — the same two fields a wall's news carries.
-                "rung": QuotaWallRung::Handover.as_str(),
-                "ladder": QuotaWallOrder::standing(run, candidate.worker).ladder(),
+                "rung": rung,
+                "ladder": ladder,
                 "from": {
                     "workerId": candidate.worker.id,
                     "agent": candidate.worker.agent,
@@ -9212,15 +9919,37 @@ impl Ledger {
                     "dispatchId": serde_json::Value::Null,
                 },
                 "taskId": candidate.task.id,
-                "provider": plan.provider,
-                "usedPercent": plan.used_percent,
-                "resetsAtMs": plan.resets_at_ms,
                 "wipCommit": plan.wip_commit,
                 "coordinatorGeneration": plan.coordinator_generation,
                 "policy": plan.policy.as_ref().map(HandoverPolicy::json),
                 "steps": [],
                 "beganMs": now_ms,
-            })
+            });
+            // The cause's own fields beside the rest, where a wall's receipt
+            // always carried its provider's number.
+            if let (Some(fields), serde_json::Value::Object(cause)) =
+                (body.as_object_mut(), plan.cause.json())
+            {
+                fields.extend(cause);
+                // A replacement that runs another agent or model than the
+                // summons bound leaves that binding, and says so (t-6747).
+                if plan.to.agent != candidate.worker.agent
+                    || plan.to.model != candidate.worker.model
+                {
+                    fields.insert(
+                        "modelDeviation".to_string(),
+                        serde_json::json!({
+                            "from": {
+                                "agent": candidate.worker.agent,
+                                "model": candidate.worker.model,
+                            },
+                            "to": { "agent": plan.to.agent, "model": plan.to.model },
+                            "reason": plan.cause.reason(),
+                        }),
+                    );
+                }
+            }
+            body
         };
         let id = self.mint("m-");
         let run = self
@@ -10018,6 +10747,13 @@ impl Ledger {
         if let Some(peer) = provider_peer(&worker.agent, run_id, worker_id) {
             peer.append_launch_tuning(&mut tuning);
         }
+        // A restored worker carries a dispatch, so it is told what its first
+        // launch was (t-6747) — the pinned column for a pinned one (t-7153).
+        continue_past_classifier_declines(
+            &worker.agent,
+            summons_pins_a_model(worker.model.as_deref()),
+            &mut tuning,
+        );
         /* Resume the conversation without starting the interrupted work yet.
          *
          * The host has to spawn the process before `worker_reseated` can prove
@@ -10142,6 +10878,7 @@ impl Ledger {
                 outbox: Vec::new(),
                 exported_seq: 0,
             }),
+            source: None,
         });
         if let Some(one) = run.tasks.iter_mut().find(|task| task.id == task_id) {
             one.status = TaskStatus::Dispatched;
@@ -10730,7 +11467,7 @@ impl Ledger {
                 // we stopped watching are both attempts nothing can be
                 // harvested from, and a task that did not count them would be
                 // dispatched forever.
-                Self::finish_task(run, &task_id, false, &note);
+                Self::finish_task(run, &task_id, false, &note, ResultAuthor::Ledger);
             }
         }
         // Written after the dispatch closes: `close_dispatch` hands a live
@@ -10845,7 +11582,7 @@ impl Ledger {
                 .find(|one| one.id == dispatch_id)
                 .map(|one| one.task.clone());
             if let Some(task_id) = task {
-                Self::finish_task(run, &task_id, false, &note);
+                Self::finish_task(run, &task_id, false, &note, ResultAuthor::Ledger);
             }
         }
         run.workers[at].state = ending.leaves();
@@ -12334,21 +13071,29 @@ impl Pinned {
 /// An effort needs a model beside it, the same rule `--effort` follows on the
 /// summons itself: `agent::high` is an effort with nothing to dial.
 pub fn parse_on_quota_wall(word: &str) -> Result<Pinned, String> {
+    parse_alternative("--on-quota-wall", word)
+}
+
+/// One `<agent[:model[:effort]]>` as the flag that carried it spells it —
+/// `--on-quota-wall`'s, and `--on-classifier-decline`'s (t-6747).
+fn parse_alternative(flag: &str, word: &str) -> Result<Pinned, String> {
     let parts: Vec<&str> = word.split(':').collect();
     if parts.len() > 3 {
         return Err(format!(
-            "--on-quota-wall takes <agent[:model[:effort]]>, and `{word}` has more than three parts"
+            "{flag} takes <agent[:model[:effort]]>, and `{word}` has more than three parts"
         ));
     }
     let agent = parts.first().copied().unwrap_or_default();
     if agent.is_empty() {
-        return Err("--on-quota-wall names no agent — write <agent[:model[:effort]]>".to_string());
+        return Err(format!(
+            "{flag} names no agent — write <agent[:model[:effort]]>"
+        ));
     }
     let model = parts.get(1).copied().filter(|held| !held.is_empty());
     let effort = parts.get(2).copied().filter(|held| !held.is_empty());
     if effort.is_some() && model.is_none() {
         return Err(format!(
-            "--on-quota-wall `{word}` names an effort with no model — an effort needs a model \
+            "{flag} `{word}` names an effort with no model — an effort needs a model \
              beside it, write <agent:model:effort>"
         ));
     }
@@ -12494,6 +13239,330 @@ impl QuotaWallOrder {
             handover: handover.cloned(),
         }
     }
+}
+
+/* ---- the classifier decline's ladder (t-6747) ------------------------- */
+
+/// One rung of a safety classifier's decline: what happens when a worker's
+/// provider declines its request (`stop_reason: "refusal"`) in words like
+/// "Fable 5.1's safeguards flagged this message".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassifierDeclineRung {
+    /// The worker's own CLI answers the declined turn on its fallback model —
+    /// told so at launch by `DECLINE_CONTINUE_WORDS`. Nothing waits and
+    /// nothing is typed; the conversation goes on and the ledger hears
+    /// nothing, because nothing stopped.
+    Fallback,
+    /// A fresh worker takes the task in the same checkout, under a declared
+    /// `--on-classifier-decline` — only for a category the provider routes to
+    /// another model ([`ROUTED_DECLINE_CATEGORIES`]).
+    Handover,
+    /// The coordinator's inbox: the `classifier_declined` notice, and the
+    /// person behind it.
+    Notify,
+}
+
+impl ClassifierDeclineRung {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fallback => "fallback",
+            Self::Handover => "handover",
+            Self::Notify => "notify",
+        }
+    }
+}
+
+/// The ladder, first to last — the one table a decline is walked by.
+///
+/// Measured on this machine's own records, 2026-09-10..24: 33 declines in
+/// Claude Code transcripts (cyber 23, reasoning_extraction 10) and none in
+/// 95 Codex rollouts. The request after a decline went through on the SAME
+/// model 6 times in 15, and on the CLI's fallback model 15 times in 15 — and
+/// the provider's own guide says a refused request re-sent to the same model
+/// "usually earns another refusal". So the first rung is the fallback, not a
+/// retry; the CLI does it inside the turn, before anything is quiet. Opus 5
+/// and 5.5 carry the same classifiers (10 of the 33 declines were theirs),
+/// so "the fallback" is the model the CLI routes the category to, never a
+/// family name. What still stops — a category routed nowhere, or a route
+/// the CLI could not take — is the coordinator's to hear, and to hand over
+/// when it declared who takes it.
+pub const CLASSIFIER_DECLINE_LADDER: [ClassifierDeclineRung; 3] = [
+    ClassifierDeclineRung::Fallback,
+    ClassifierDeclineRung::Handover,
+    ClassifierDeclineRung::Notify,
+];
+
+/// The decline categories the provider continues on another model — the
+/// categories Claude Code 2.1.281 routes anywhere (its per-model table:
+/// `cyber` → Opus 4.8 from every lineup, `bio` and `frontier_llm` → Opus 5
+/// from the lineups that route them). Every other category — the provider
+/// names `reasoning_extraction` and `general_harms`, and a decline may name
+/// none — the provider leaves standing, so a handover would only route
+/// around its own answer: the notice is the whole ladder for it.
+pub const ROUTED_DECLINE_CATEGORIES: [&str; 3] = ["cyber", "bio", "frontier_llm"];
+
+/// Whether a decline of `category` has a handover rung at all.
+#[must_use]
+pub fn decline_is_routed(category: Option<&str>) -> bool {
+    category.is_some_and(|word| ROUTED_DECLINE_CATEGORIES.contains(&word))
+}
+
+/// The record keys of the attempt's `classifier_declined` notices — one
+/// notice per record (t-7153, R4): the same decline seen on the next beat
+/// is the same fact, a decline on another record of the same attempt is
+/// news of its own, and a replacement is a new attempt with notices of its
+/// own. A notice written before the key rode in the body names none.
+#[must_use]
+pub fn declines_told(run: &Run, dispatch_id: &str) -> Vec<String> {
+    run.messages
+        .iter()
+        .filter(|held| {
+            held.kind == MessageKind::ClassifierDeclined
+                && held.dispatch.as_deref() == Some(dispatch_id)
+        })
+        .filter_map(|held| {
+            serde_json::from_str::<serde_json::Value>(held.body.as_str())
+                .ok()?
+                .get("record")?
+                .get("key")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Whether the attempt's decline on `record_key` was told already
+/// ([`declines_told`]).
+#[must_use]
+pub fn decline_told(run: &Run, dispatch_id: &str, record_key: &str) -> bool {
+    declines_told(run, dispatch_id)
+        .iter()
+        .any(|told| told == record_key)
+}
+
+/// The key of a decline the pause dialog alone witnessed: the attempt's,
+/// one dialog notice per attempt — two readings of one dialog are one fact
+/// however the pty's clock moved between them.
+#[must_use]
+pub fn decline_dialog_key(dispatch: &str) -> String {
+    format!("{DECLINE_DIALOG_SOURCE}:{dispatch}")
+}
+
+/// A worker's OWN record that its provider's safety classifier declined its
+/// last request, as the window's marker table read it off the transcript
+/// tail — the conversation's last word, never a line the worker quoted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifierDeclineMarker {
+    /// Where it was read: `transcript`, or [`DECLINE_DIALOG_SOURCE`] for a
+    /// pause dialog that stood past [`DECLINE_DIALOG_UNANSWERED_MS`].
+    pub source: String,
+    /// The CLI's own sentence about the decline.
+    pub line: Text,
+    /// The provider's category word, when the record names one — the
+    /// record's OWN word, bound to its request; never another request's.
+    pub category: Option<String>,
+    /// The record's own identity, so one decline is told once, and so a
+    /// handover planned on it ends the worker only while it stands
+    /// ([`HandoverCause::is_witnessed_by`]).
+    pub key: String,
+}
+
+impl ClassifierDeclineMarker {
+    /// Whether this marker may end a worker ([`decline_source_may_stop`]).
+    #[must_use]
+    pub fn may_stop(&self) -> bool {
+        decline_source_may_stop(&self.source)
+    }
+}
+
+/// Whether a decline read from `source` is a witness that may END a worker
+/// (t-7153, P1-3): the conversation's own record is; the screen alone
+/// ([`DECLINE_DIALOG_SOURCE`]) is not — a pause dialog writes no record, and
+/// a screen's words can be quoted by a tool result or a brief, so what the
+/// screen alone says is told as diagnostic news and settles nothing.
+#[must_use]
+pub fn decline_source_may_stop(source: &str) -> bool {
+    source != DECLINE_DIALOG_SOURCE
+}
+
+/// What a quiet worker's screen shows of a decline: the CLI's own sentence,
+/// and whether it stands in the CLI's pause dialog (its choices on screen,
+/// waiting for a key) rather than printed as the turn's error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclineScreen {
+    pub line: Text,
+    pub dialog: bool,
+    /// The category the dialog names (`Details: [cyber]`), when it does.
+    pub category: Option<String>,
+}
+
+/// The marker source for a decline witnessed by a pause dialog that stood
+/// unanswered, rather than by a record: the dialog writes none until
+/// somebody answers it.
+pub const DECLINE_DIALOG_SOURCE: &str = "screen-dialog";
+
+/// How long a pause dialog stands before it is a dialog nobody is watching —
+/// the second witness for a decline whose CLI wrote no record yet.
+///
+/// Measured on this machine's three declined workers (t-6747): the dialogs a
+/// person answered stood about 104 s (w-5797, 2026-09-21) and at most 551 s
+/// (w-6270, 2026-09-23 — the bound includes the declined request's own
+/// time); the one nobody answered stood 136 minutes (w-5770) until its
+/// coordinator read the pane. Ten minutes is the first whole ten minutes
+/// past every answered dialog.
+pub const DECLINE_DIALOG_UNANSWERED_MS: i64 = 10 * 60 * 1000;
+// The table's number is the measurement's: past the longest dialog a person
+// answered here (551 s), short of the one nobody did (136 min).
+const _: () =
+    assert!(DECLINE_DIALOG_UNANSWERED_MS > 551_000 && DECLINE_DIALOG_UNANSWERED_MS < 136 * 60_000);
+
+/// A switch a worker's own CLI recorded: a classifier decline it answered on
+/// the category's route rather than on the model its summons bound (t-6747)
+/// — read off the worker's transcript, one per record, and bound to the
+/// ATTEMPT it was read under (t-7153, R3): the reading names the worker,
+/// the dispatch that was open when it read, and the file it read, and the
+/// ledger writes the row only while that binding still holds
+/// ([`Ledger::workers_model_deviated`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelDeviation {
+    pub worker: String,
+    /// The attempt that was open when the switch was read: a row is that
+    /// attempt's or nobody's — never the next attempt's of the same worker,
+    /// however the ledger moved between the reading and the writing.
+    pub dispatch: String,
+    /// The transcript the switch was read from — the provider session's
+    /// path — so a reading of one conversation is never written as another's.
+    pub source: String,
+    /// The record's own identity, so one switch is written once.
+    pub key: String,
+    /// The model the declined request was sent to, and the one that answered.
+    pub from: String,
+    pub to: String,
+    pub category: Option<String>,
+    /// How long the CLI keeps the switch, in its own word: `session` or
+    /// `local`, or nothing from a CLI older than the field.
+    pub scope: Option<String>,
+    pub at_ms: Option<i64>,
+}
+
+impl ModelDeviation {
+    /// How long the switch lasts. Claude Code 2.1.281's own schema: "When
+    /// `scope` is "session" (or absent — older CLIs), the swap is made
+    /// persistent for the session; when `scope` is "local", only that
+    /// subagent/side-question response came from the fallback model".
+    #[must_use]
+    pub fn lasts(&self) -> &'static str {
+        match self.scope.as_deref() {
+            Some("local") => "one response",
+            _ => "the rest of this conversation",
+        }
+    }
+
+    /// Whether the ledger can hold this row at all: every name it is keyed
+    /// and read by present and within [`MAX_NAME`], and its words within it
+    /// too. The one rule the actor refuses a request on, and the beat drops
+    /// a switch on — a row the ledger would refuse forever is never asked,
+    /// so it cannot hold back the switches read after it.
+    #[must_use]
+    pub fn fits(&self) -> bool {
+        [
+            &self.worker,
+            &self.dispatch,
+            &self.key,
+            &self.from,
+            &self.to,
+        ]
+        .iter()
+        .all(|name| !name.is_empty() && name.len() <= MAX_NAME)
+            && [&self.category, &self.scope]
+                .iter()
+                .all(|word| word.as_ref().is_none_or(|held| held.len() <= MAX_NAME))
+    }
+
+    /// Whether this switch is `dispatch`'s to write (t-7153, R3): the
+    /// attempt it was read under, still open, dated inside that attempt
+    /// ([`switch_is_the_attempts`]), and — when the ledger knows where that
+    /// worker's conversation is written — read from that very file. A file
+    /// the ledger does not know disputes nothing; a dispatch or a file it
+    /// knows to be another does. The ledger's fence: the beat, which has
+    /// no rows to read, filters on the time rule alone and names the rest.
+    #[must_use]
+    pub fn is_bound_to(&self, worker: &Worker, dispatch: &Dispatch) -> bool {
+        dispatch.is_open()
+            && dispatch.id == self.dispatch
+            && switch_is_the_attempts(self.at_ms, dispatch.started_ms)
+            && worker
+                .session
+                .as_ref()
+                .and_then(|session| session.transcript_path.as_deref())
+                .is_none_or(|known| known == self.source)
+    }
+}
+
+/// Whether a switch written at `at_ms` belongs to the attempt that began at
+/// `attempt_started_ms` (t-7153, R3): the time is the attempt's own
+/// interval's, never the worker's summons — a worker handed a second task
+/// (`dispatch --to`) keeps its summons time, and the first attempt's switches
+/// read again after a restart are dated before the second began. A record
+/// with no time of its own cannot say whose it is, and is nobody's.
+#[must_use]
+pub fn switch_is_the_attempts(at_ms: Option<i64>, attempt_started_ms: i64) -> bool {
+    at_ms.is_some_and(|at_ms| at_ms >= attempt_started_ms)
+}
+
+/// Both witnesses to one worker's decline. Only
+/// [`classifier_decline_witness`] builds one, and only
+/// [`Ledger::workers_classifier_declined`] reads one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifierDeclineWitness {
+    pub worker: String,
+    /// The CLI's decline sentence, standing on the pane's screen now.
+    pub screen: Text,
+    pub record: ClassifierDeclineMarker,
+}
+
+/// Two witnesses or nothing.
+///
+/// The screen alone is a worker that reads, quotes or was briefed with the
+/// words — this task's own briefing carries them. The record alone is a
+/// decline the worker may already have moved past: the CLI's fallback
+/// answers inside the turn, and a person may have typed. The screen says the
+/// pane still stands at a decline; the record says it is this conversation's
+/// last request that was declined, and what for. A pause dialog writes no
+/// record until somebody answers it, so for a dialog the second witness is
+/// time: the dialog on screen, and the pane quiet longer than any dialog a
+/// person answered here ([`DECLINE_DIALOG_UNANSWERED_MS`]) — a witness that
+/// is told, and that ends no worker ([`decline_source_may_stop`]): its key
+/// is the attempt's ([`decline_dialog_key`]), one dialog notice per attempt.
+#[must_use]
+pub fn classifier_decline_witness(
+    worker: &str,
+    dispatch: &str,
+    screen: Option<DeclineScreen>,
+    record: Option<ClassifierDeclineMarker>,
+    quiet_since_ms: i64,
+    now_ms: i64,
+) -> Option<ClassifierDeclineWitness> {
+    let screen = screen.filter(|seen| !seen.line.as_str().trim().is_empty())?;
+    let record = match record.filter(|record| !record.key.is_empty()) {
+        Some(record) => record,
+        None if screen.dialog
+            && now_ms.saturating_sub(quiet_since_ms) >= DECLINE_DIALOG_UNANSWERED_MS =>
+        {
+            ClassifierDeclineMarker {
+                source: DECLINE_DIALOG_SOURCE.to_string(),
+                line: screen.line.clone(),
+                category: screen.category.clone(),
+                key: decline_dialog_key(dispatch),
+            }
+        }
+        None => return None,
+    };
+    Some(ClassifierDeclineWitness {
+        worker: worker.to_string(),
+        screen: screen.line,
+        record,
+    })
 }
 
 /// [`QuotaWallOrder::standing`], borrowed: whether it waits, and who it
@@ -12818,7 +13887,12 @@ pub fn quota_verdict(
 /// catalog and dials, so a name nobody knows or an effort its CLI does not
 /// take is refused at the flag rather than the day the wall is reached.
 fn named_alternative(word: &str) -> Result<Pinned, String> {
-    let named = parse_on_quota_wall(word)?;
+    named_alternative_for("--on-quota-wall", word)
+}
+
+/// [`named_alternative`], for whichever flag carried it.
+fn named_alternative_for(flag: &str, word: &str) -> Result<Pinned, String> {
+    let named = parse_alternative(flag, word)?;
     if !crate::agent::AGENT_SPECS
         .iter()
         .any(|spec| spec.id == named.agent)
@@ -13245,6 +14319,82 @@ pub fn provider_peer(agent: &str, run_id: &str, worker_id: &str) -> Option<Provi
     })
 }
 
+/// What a summoned worker's own CLI is told so a safety classifier's decline
+/// is answered on its fallback model rather than at a question nobody is
+/// watching (t-6747) — rung ① of [`CLASSIFIER_DECLINE_LADDER`], one row per
+/// CLI and measured one CLI at a time, like [`TUNABLE`]:
+///
+/// - claude 2.1.281: `switchModelsOnFlag`, whose own schema says "When
+///   safeguards flag a message, automatically switch to a different model to
+///   keep chatting. When off, your session will pause instead." The window's
+///   Claude home carries the person's `false`, so a flagged worker stood at
+///   the `Session paused` dialog — a dialog ends no turn and writes no
+///   record, so w-5770 (2026-09-21) stood there 136 minutes with no
+///   `went_quiet` until its coordinator read the pane. `--settings` is
+///   Claude's flag layer, merged over the user file (user, project, local,
+///   flag, policy), so only the summons changes and every pane a person
+///   opens keeps the person's choice. The CLI then continues THAT turn on its
+///   own per-category route (cyber → Opus 4.8 on every one of the 15 switches
+///   it recorded here in fourteen days) and leaves the categories it routes
+///   nowhere to stand.
+/// - zo: `--classifier-fallback auto` — the flag layer over the
+///   `smart.classifierFallback` setting, whose `ask` waits for a person.
+///
+/// Only a summons that carries a task: a bare pane is a person's to answer.
+///
+/// And only a summons that pinned nothing (t-7153, P1-1; the coordinator's
+/// ruling m-7091): a `--model` or `--effort` on the summons is a binding
+/// choice, and the CLI's own route (cyber → Opus 4.8, for the rest of the
+/// conversation) is neither the model that was bound nor a rung anybody
+/// declared. A pinned worker's CLI is told the opposite, in the same flag
+/// layer — Claude's switch OFF, zo's ladder `off` — whatever the person's
+/// file says, so the pin holds however the file is set; where its task goes
+/// when its request is declined is the run's `handover-policy
+/// --on-classifier-decline <agent[:model[:effort]]>`, walked by the ledger
+/// to that exact rung on the conversation's own record, or the coordinator's
+/// hand on the `classifier_declined` notice. A declaration never turns the
+/// CLI's switch back on: it names where the LEDGER hands the task, not a
+/// licence for the CLI to pick a model of its own.
+const DECLINE_CONTINUE_WORDS: &[DeclineWords] = &[
+    DeclineWords {
+        agent: "zo",
+        unpinned: &["--classifier-fallback", "auto"],
+        pinned: &["--classifier-fallback", "off"],
+    },
+    DeclineWords {
+        agent: "claude",
+        unpinned: &["--settings", r#"{"switchModelsOnFlag":true}"#],
+        pinned: &["--settings", r#"{"switchModelsOnFlag":false}"#],
+    },
+];
+
+/// One CLI's row of [`DECLINE_CONTINUE_WORDS`]: what a summons that pinned
+/// nothing is told, and what one that pinned a model or an effort is told.
+struct DeclineWords {
+    agent: &'static str,
+    unpinned: &'static [&'static str],
+    pinned: &'static [&'static str],
+}
+
+/// Whether a summons pinned the worker to a model: a pinned worker's CLI
+/// never leaves it by itself ([`DECLINE_CONTINUE_WORDS`]). The `--model` is
+/// the pin; an `--effort` rides only beside one (`--effort requires
+/// --model`, refused at the verb), so it never pins alone.
+fn summons_pins_a_model(model: Option<&str>) -> bool {
+    model.is_some()
+}
+
+/// Append [`DECLINE_CONTINUE_WORDS`]' row for `agent`, when it has one — the
+/// pinned column or the unpinned one — on both launch roads, the fresh
+/// summons and the restored one, so a worker a restart seats again is told
+/// what its first launch was.
+fn continue_past_classifier_declines(agent: &str, pinned: bool, words: &mut Vec<String>) {
+    if let Some(row) = DECLINE_CONTINUE_WORDS.iter().find(|row| row.agent == agent) {
+        let said = if pinned { row.pinned } else { row.unpinned };
+        words.extend(said.iter().map(|word| (*word).to_string()));
+    }
+}
+
 /// Assemble a reserved worker's command or put the reservation back exactly.
 ///
 /// The stable peer name needs the worker id, and the worker id exists only
@@ -13256,9 +14406,13 @@ fn command_for_reserved_worker(
     launcher: &dyn Launcher,
     prepared: &PreparedWorkerStart,
     mut words: Vec<String>,
+    pinned: bool,
 ) -> Result<String, String> {
     if let Some(peer) = provider_peer(&prepared.agent, &prepared.run, &prepared.worker) {
         peer.append_launch_tuning(&mut words);
+    }
+    if prepared.task.is_some() {
+        continue_past_classifier_declines(&prepared.agent, pinned, &mut words);
     }
     match launcher.command_for(&prepared.agent, "", &words) {
         Ok(command) => Ok(command),
@@ -13656,10 +14810,13 @@ pub const VERBS: &[(&str, &str, Doing)] = &[
     (
         "handover-policy",
         "[--on-quota-wall wait|<agent[:model[:effort]]> [--wip-commit]] [--on-transient-error \
-         resume] | --off · when a worker is witnessed at its quota wall, wait out a verified \
-         reset first (`wait`), and hand its task to this alternative in the same checkout \
-         (`wait,<alt>` does both, the wait first); when its last turn died on a transient API \
-         error, type a continuation into its composer",
+         resume] [--on-classifier-decline <agent[:model[:effort]]>] | --off · when a worker is \
+         witnessed at its quota wall, wait out a verified reset first (`wait`), and hand its \
+         task to this alternative in the same checkout (`wait,<alt>` does both, the wait \
+         first); when its last turn died on a transient API error, type a continuation into its \
+         composer; when its provider's safety classifier declined a request in a category the \
+         provider routes elsewhere and its CLI could not continue, hand its task to this \
+         alternative (a part left out is the worker's own)",
         Doing::Mutation,
     ),
     (
@@ -13674,7 +14831,11 @@ pub const VERBS: &[(&str, &str, Doing)] = &[
     ),
     (
         "task-update",
-        "--task <id> [--status <s>] [--result <json>] · correct the record",
+        "--task <id> [--status <s>] [--result <json>] [--attempt <dispatch|none> --source \
+         <commit|report>] · correct the record, from the run's live coordinator seat; a \
+         result carrying a review (verified, merged, deployed…) names the attempt and the \
+         source it reviewed — task-list shows both — and is refused when either is missing \
+         or has moved",
         Doing::Mutation,
     ),
     (
@@ -14355,8 +15516,9 @@ pub fn worker_briefing(task: &str, title: &str) -> String {
         "You are a worker in this window's orchestration, carrying task {carrying}. \
 When your work is done, run: zerocode-orc send --type worker_done \
 --retry-request done-{task} --body \
-'{{\"ok\":true,\"summary\":\"<what changed and how you verified it>\"}}' \
-— with \"ok\":false instead if you could not finish. If you are blocked, run: \
+'{{\"ok\":true,\"summary\":\"<what changed and how you verified it>\",\"{head}\":\"<the commit you hand in, when the work is code>\"}}' \
+— with \"ok\":false instead if you could not finish; the coordinator reviews \
+the commit you name. If you are blocked, run: \
 zerocode-orc ask --retry-request <a name of your own> --body '<your question>' \
 — it waits for the answer itself (ten minutes; on a timeout, return with \
 `ask --resume <questionId>`) rather than asking the person, whose screen \
@@ -14374,6 +15536,7 @@ a new request. `zerocode-orc help` lists the rest. {purpose}\n\n{contract}\n\n{w
         worker_gate = WORKER_GATE_CONTEXT,
         contract = crate::delegation::AGENT_SELECTION_CONTEXT,
         trust = trust,
+        head = HANDED_IN_HEAD,
     )
 }
 
@@ -14401,8 +15564,9 @@ pub fn federated_briefing(home_dispatch: &str) -> String {
         "You are a worker borrowed by another window's orchestration \
 (remote dispatch {home_dispatch}). When your work is done, run: zerocode-orc \
 send --type worker_done --retry-request done-{home_dispatch} --body \
-\'{{\"ok\":true,\"summary\":\"<what changed and how you verified it>\"}}\' \
-— with \"ok\":false instead if you could not finish. If you are blocked, run: \
+\'{{\"ok\":true,\"summary\":\"<what changed and how you verified it>\",\"{head}\":\"<the commit you hand in, when the work is code>\"}}\' \
+— with \"ok\":false instead if you could not finish; the coordinator reviews \
+the commit you name. If you are blocked, run: \
 zerocode-orc ask --retry-request <a name of your own> --body '<your question>' \
 — it waits for the answer itself; your questions and reports travel to the \
 home window on their own. Never raise your own CLI's question prompt: \
@@ -14415,6 +15579,7 @@ worktree, because the home window is not on this machine. Every command that CHA
         worker_gate = WORKER_GATE_CONTEXT,
         contract = crate::delegation::AGENT_SELECTION_CONTEXT,
         trust = trust,
+        head = HANDED_IN_HEAD,
     )
 }
 
@@ -15806,20 +16971,32 @@ fn plan_inner(
                     .value("--on-transient-error")
                     .map(parse_on_transient_error)
                     .transpose()?;
-                if !order.wait && order.handover.is_none() && on_transient_error.is_none() {
+                let on_classifier_decline = words
+                    .value("--on-classifier-decline")
+                    .map(|word| named_alternative_for("--on-classifier-decline", word))
+                    .transpose()?;
+                if !order.wait
+                    && order.handover.is_none()
+                    && on_transient_error.is_none()
+                    && on_classifier_decline.is_none()
+                {
                     return Err(
                         "handover-policy needs --on-quota-wall wait|<agent[:model[:effort]]> — \
                          the wait for a verified reset, the alternative the wall hands over \
-                         to, or both — and/or --on-transient-error resume, or --off"
+                         to, or both — and/or --on-transient-error resume, and/or \
+                         --on-classifier-decline <agent[:model[:effort]]>, or --off"
                             .into(),
                     );
                 }
-                // The commit is step ① of a WALL's handover; armed without an
+                // The commit is step ① of a handover; armed without an
                 // alternative it would be a flag nothing ever reads.
-                if words.has("--wip-commit") && order.handover.is_none() {
+                if words.has("--wip-commit")
+                    && order.handover.is_none()
+                    && on_classifier_decline.is_none()
+                {
                     return Err(
-                        "--wip-commit is step ① of a quota-wall handover — name the \
-                         alternative with --on-quota-wall beside it"
+                        "--wip-commit is step ① of a handover — name the alternative with \
+                         --on-quota-wall or --on-classifier-decline beside it"
                             .into(),
                     );
                 }
@@ -15828,6 +17005,7 @@ fn plan_inner(
                     wip_commit: words.has("--wip-commit"),
                     on_transient_error,
                     quota_wait: order.wait,
+                    on_classifier_decline,
                     armed_ms: now_ms,
                 };
                 let run = ledger
@@ -16033,7 +17211,15 @@ fn plan_inner(
             // Never acknowledge a field this mutation cannot apply. In
             // particular, --deps belongs to task-create; ignoring it can
             // launch dependent work before its supposed prerequisites.
-            let accepted = ["--task", "--status", "--result", "--run", "--retry-request"];
+            let accepted = [
+                "--task",
+                "--status",
+                "--result",
+                "--attempt",
+                "--source",
+                "--run",
+                "--retry-request",
+            ];
             if let Some(flag) = words
                 .values
                 .iter()
@@ -16058,8 +17244,44 @@ fn plan_inner(
                 None => None,
             };
             let result = words.value("--result").map(str::to_string);
-            let now = ledger.update_task(&run_id, task_id, status, result)?;
-            said(serde_json::json!({ "taskId": task_id, "status": now.as_str() }))
+            /* Whether this correction vouches for anything is read with the
+             * same keys the board reads it with ([`ReviewFacts::from_result`]
+             * `written`): one table, so a key the reader believes is a key
+             * the writer asks about. */
+            let observed = Observed {
+                attempt: words.value("--attempt"),
+                source: words
+                    .value("--source")
+                    .filter(|named| !named.trim().is_empty()),
+                review: result
+                    .as_deref()
+                    .is_some_and(|said| ReviewFacts::from_result(said).written),
+                tested_head: result
+                    .as_deref()
+                    .and_then(|said| serde_json::from_str::<serde_json::Value>(said).ok())
+                    .and_then(|said| {
+                        said.get("testedHead")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    }),
+            };
+            // Asked before anything moves: a refusal here leaves the run
+            // exactly as it found it, and files no receipt.
+            let author = correction_author(
+                ledger,
+                &team.leader_pane,
+                &run_id,
+                task_id,
+                (&team.id, pane),
+                observed,
+            )?;
+            let signed = author.kind();
+            let now = ledger.update_task(&run_id, task_id, status, result, author)?;
+            said(serde_json::json!({
+                "taskId": task_id,
+                "status": now.as_str(),
+                "author": signed,
+            }))
         }
 
         // The sixth noun's three verbs. Opening and answering a decision are
@@ -16676,8 +17898,13 @@ fn plan_inner(
             // it through process listings and let startup/login screens consume
             // it as positional arguments. If the provider catalog refuses the
             // command, the helper uses this reservation's exact rollback.
-            let command =
-                command_for_reserved_worker(ledger, launcher, &prepared_worker_start, tuning)?;
+            let command = command_for_reserved_worker(
+                ledger,
+                launcher,
+                &prepared_worker_start,
+                tuning,
+                summons_pins_a_model(model.as_deref()),
+            )?;
             let provider_peer = provider_peer(&agent, &run_id, &started.worker);
             Decided {
                 answered_from: None,
@@ -17472,12 +18699,7 @@ fn plan_inner(
                         held.body.as_str() == words.value("--body").unwrap_or_default(),
                     )),
                     None => {
-                        if question_closed(run, answered) {
-                            return Err(format!(
-                                "question {thread} is closed — its dispatch ended \
-                                 before an answer landed, and the asker is gone"
-                            ));
-                        }
+                        run.question_is_answerable(answered)?;
                         None
                     }
                 },
@@ -17849,6 +19071,179 @@ fn inbox_of(ledger: &Ledger, leader_pane: &str, run_id: &str, seat: (&str, &str)
     sender(ledger, leader_pane, run_id, seat)
 }
 
+/// What a `task-update` says it looked at: the attempt and the source.
+///
+/// A correction that carries a review — any of the keys [`ReviewFacts`]
+/// reads — is a coordinator vouching for one thing it saw, so it has to say
+/// which: `--attempt` the dispatch (or [`NO_ATTEMPT`] for work nobody was
+/// dispatched on) and `--source` the commit, or the report, it reviewed. A
+/// status or a progress note vouches for nothing and may name neither.
+#[derive(Debug, Clone, Default)]
+struct Observed<'a> {
+    attempt: Option<&'a str>,
+    source: Option<&'a str>,
+    /// Whether the correction's result carries a review.
+    review: bool,
+    tested_head: Option<String>,
+}
+
+/// Who may correct a task's record with `task-update`, and as whom.
+///
+/// The independent audit of 2026-09-24 (t-6780, F2) found the verb read
+/// `bound` and wrote: any pane that could name the run — a worker of it, a
+/// worker of another run, a former coordinator whose pane outlived a
+/// takeover — could settle somebody else's attempt and free its dependents.
+/// The record is the coordinator's, so the correction is the LIVE
+/// coordinator seat's verb and nobody else's. A run whose seat is empty or
+/// vacated has nobody to correct it until somebody sits: the legacy
+/// leader-pane rule [`sender`] still keeps for signing mail is not an
+/// authority over the record, because it cannot tell the run's own leader
+/// from any other team's never-worker leader naming the run with `--run`
+/// (astra's R1 on a5cb2793). The road back is explicit and leaves a record:
+/// `run-use` sits the caller in the empty or vacated seat under a new
+/// generation, and the correction follows from the seat. A worker — even
+/// the one carrying the task — has one road onto the record, its
+/// `worker_done`; once its attempt has ended it says what it has to say in
+/// a status mail, and the coordinator corrects. Everybody else is refused
+/// by name, before anything moves, and the refusal files no receipt (the
+/// acceptance of m-7276: the audit's "without mutation or receipt").
+///
+/// Asked of [`sender`] as well as of the seat, so a pane that cannot sign
+/// as the coordinator cannot correct as one either.
+///
+/// And the correction is checked against what it says it looked at, here —
+/// at the commit point, after whatever else the actor did first
+/// ([`Observed`]). A review is of one attempt and one source: a
+/// coordinator that read the result while a retry started, or before the
+/// attempt handed in what it handed in, would otherwise approve the new
+/// thing with its observation of the old. A review that does not say what
+/// it looked at is refused rather than filled in with whatever is newest
+/// now (astra's R2 on a5cb2793): filling it in is exactly how a stale
+/// observation became the newest approval.
+fn correction_author(
+    ledger: &Ledger,
+    leader_pane: &str,
+    run_id: &str,
+    task_id: &str,
+    seat: (&str, &str),
+    observed: Observed<'_>,
+) -> Result<ResultAuthor, String> {
+    let run = ledger.run(run_id).ok_or_else(|| unknown_run(run_id))?;
+    if run.task(task_id).is_none() {
+        return Err(format!("unknown task: {task_id}"));
+    }
+    let signed = sender(ledger, leader_pane, run_id, seat);
+    let carrier = run
+        .dispatches
+        .iter()
+        .find(|one| one.task == task_id && one.is_open());
+    let who = match signed.strip_prefix(WORKER_ADDRESS_PREFIX) {
+        Some(worker) if carrier.is_some_and(|held| held.worker == worker) => format!(
+            "worker {worker}, which is carrying it and reports it with `send --type \
+             worker_done`"
+        ),
+        Some(worker) => format!("worker {worker}"),
+        None => format!("pane {}/{}", seat.0, seat.1),
+    };
+    let Some(held) = run.coordinator_live() else {
+        let last = match run.coordinator.as_ref() {
+            Some(gone) => format!(
+                "its seat {} (generation {}) was vacated",
+                gone.seat, gone.generation
+            ),
+            None => "it has never had a seat".to_string(),
+        };
+        return Err(format!(
+            "task-update is the live coordinator seat's verb, and run {run_id} has nobody \
+             sitting: {last} — {who} corrects nothing from outside the seat; sit first with \
+             `run-use {run_id}` (an empty or vacated seat takes its caller under a new \
+             generation) and correct from there"
+        ));
+    };
+    if signed != run.address() {
+        let carried = match carrier {
+            Some(open) => format!(
+                "carried by worker {} under dispatch {}",
+                open.worker, open.id
+            ),
+            None => "carried by nobody".to_string(),
+        };
+        return Err(format!(
+            "task-update is the coordinator's verb: run {run_id} is coordinated from {} \
+             (generation {}), task {task_id} is {carried}, and {who} is not that seat — a \
+             worker's word on its own work is its `worker_done` (a status mail once its \
+             attempt has ended), and the coordinator corrects the record",
+            held.seat, held.generation
+        ));
+    }
+    let newest = run.newest_attempt(task_id);
+    let newest_id = newest.map(|one| one.id.as_str());
+    let handed = newest.and_then(|one| one.source.as_deref());
+    let standing = format!(
+        "task {task_id} is at attempt {}{}",
+        newest_id.unwrap_or(NO_ATTEMPT),
+        handed.map_or_else(
+            || ", which has handed nothing in".to_string(),
+            |source| format!(", which handed in {source}")
+        )
+    );
+    if observed.review && (observed.attempt.is_none() || observed.source.is_none()) {
+        return Err(format!(
+            "a review names what it reviewed — `--attempt <dispatch|{NO_ATTEMPT}>` and \
+             `--source <commit|report>` — and this one named {}: {standing}; look at that and \
+             write the review against it, because a review with the blanks filled in by \
+             whatever is newest now approves what nobody looked at",
+            match (observed.attempt, observed.source) {
+                (None, None) => "neither",
+                (None, Some(_)) => "no attempt",
+                _ => "no source",
+            }
+        ));
+    }
+    if let (Some(tested), Some(named)) = (observed.tested_head.as_deref(), observed.source)
+        && !same_source(tested, named)
+    {
+        return Err(format!(
+            "task-update result says testedHead {tested}, but --source names {named} — \
+             the tested commit must be the source reviewed"
+        ));
+    }
+    if let Some(named) = observed.attempt {
+        let same = match named {
+            NO_ATTEMPT => newest.is_none(),
+            _ => newest_id == Some(named),
+        };
+        if !same {
+            return Err(format!(
+                "task-update names attempt {named}, and {standing} — a correction made \
+                 against an attempt the task has moved past would dress the new attempt in \
+                 the old observation; look at the newest attempt and correct against that"
+            ));
+        }
+    }
+    if let Some(named) = observed.source
+        && let Some(now) = handed
+        && !same_source(named, now)
+    {
+        return Err(format!(
+            "task-update names source {named}, and {standing} — a review of one source \
+             says nothing about another, whatever the task and the attempt are called; \
+             look at what was handed in and review that"
+        ));
+    }
+    if observed.review && newest.is_some() && handed.is_none() {
+        return Err(format!(
+            "task-update cannot review {standing}: the attempt has not handed in a source yet"
+        ));
+    }
+    Ok(ResultAuthor::Coordinator {
+        seat: held.seat.clone(),
+        generation: Some(held.generation),
+        attempt: newest_id.map(str::to_string),
+        source: observed.source.map(|named| named.trim().to_string()),
+    })
+}
+
 /// The task and dispatch the pane's worker is currently carrying.
 ///
 /// `(None, None)` for the coordinator's own pane, and for a worker between
@@ -17871,6 +19266,7 @@ fn carried_by(
 }
 
 fn task_json(run: &Run, task: &Task) -> serde_json::Value {
+    let newest = run.newest_attempt(&task.id);
     serde_json::json!({
         "taskId": task.id,
         "title": task.display_name(),
@@ -17885,6 +19281,14 @@ fn task_json(run: &Run, task: &Task) -> serde_json::Value {
         "blockedBy": run.blocked_by(task),
         "parent": task.parent,
         "result": task.result,
+        // Who wrote that result, and what it amounts to: a coordinator's
+        // facts, or a worker's claims kept apart from them (t-6815).
+        "resultAuthor": task.result_author,
+        "review": run.review_of(task),
+        // What a review of this task names (t-6815): its newest attempt, and
+        // what that attempt handed in — `null` while nothing has been.
+        "attempt": newest.map(|one| one.id.as_str()),
+        "source": newest.and_then(|one| one.source.as_deref()),
         "failures": task.failures,
     })
 }
@@ -18386,6 +19790,10 @@ pub struct TaskRow {
     pub result: Text,
     pub failures: u32,
     pub created_ms: i64,
+    /// Absent from every store written before authorship was recorded, read
+    /// back as nobody known (t-6815).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_author: Option<ResultAuthor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -18416,6 +19824,10 @@ pub struct DispatchRow {
     pub retry_of: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteSeat>,
+    /// What the attempt handed in, on the same posture: absent from every
+    /// store written before hand-ins were recorded (t-6815).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -18744,6 +20156,7 @@ impl Ledger {
                     result: task.result.clone(),
                     failures: task.failures,
                     created_ms: task.created_ms,
+                    result_author: task.result_author.clone(),
                 });
             }
             for dispatch in &run.dispatches {
@@ -18757,6 +20170,7 @@ impl Ledger {
                     succeeded: dispatch.succeeded,
                     retry_of: dispatch.retry_of.clone(),
                     remote: dispatch.remote.clone(),
+                    source: dispatch.source.clone(),
                 });
             }
             for worker in &run.workers {
@@ -18951,6 +20365,7 @@ impl Ledger {
                 result: row.result,
                 failures: row.failures,
                 created_ms: row.created_ms,
+                result_author: row.result_author,
             });
         }
         for row in projected.dispatches {
@@ -18965,6 +20380,7 @@ impl Ledger {
                     succeeded: row.succeeded,
                     retry_of: row.retry_of,
                     remote: row.remote,
+                    source: row.source,
                 });
         }
         for row in projected.attachments {

@@ -26,9 +26,10 @@ import { testKnowledgeLive } from "./knowledge-live.mjs";
 import { testArtifactCatalog, testArtifactChrome, testArtifactPages, testArtifactStudio, testArtifactStudioFold, testArtifactStudioLayout, testArtifactStudioOwnership } from "./artifact-gallery.mjs";
 
 import { testLedgerPoll } from "./ledger-poll.mjs";
-import { testUsageRefresh } from "./usage-refresh.mjs";
+import { testUsageRefresh, testUsageWords } from "./usage-refresh.mjs";
 import { testTaskBoard } from "./task-board.mjs";
 import { testCoordinatorDesk } from "./coordinator-desk.mjs";
+import { testCoordinatorDeskLayout } from "./coordinator-desk-layout.mjs";
 import { testAgentRelations, testAgentRelationsForm } from "./agent-relations.mjs";
 import { testAutonomyBoard } from "./autonomy-board.mjs";
 import { testConnectedWorkbench } from "./connected-workbench.mjs";
@@ -174,12 +175,16 @@ suite("explorer", async ({ browser, origin, ok }) => {
 });
 suite("crash", ({ browser, origin, ok }) => testCrashReport(browser, origin, standBackend, ok));
 suite("ledger-poll", ({ browser, origin, ok }) => testLedgerPoll(browser, origin, standBackend, ok));
-suite("usage-refresh", ({ browser, origin, ok }) => testUsageRefresh(browser, origin, standBackend, ok));
+suite("usage-refresh", async ({ browser, origin, ok }) => {
+  await testUsageRefresh(browser, origin, standBackend, ok);
+  await testUsageWords(browser, origin, standBackend, ok);
+});
 suite("board-waits", ({ browser, origin, ok }) => testBoardWaits(browser, origin, ok));
 // Vault state stays local to this fixture, just like the explorer fixture.
 suite("task-board", ({ browser, origin, ok }) => testTaskBoard(browser, origin, ok));
 // The coordinator's desk above the task list (t-6588, docs/design/agent-board-round4.md).
 suite("coordinator-desk", ({ browser, origin, ok }) => testCoordinatorDesk(browser, origin, ok));
+suite("coordinator-desk-layout", ({ browser, origin, ok }) => testCoordinatorDeskLayout(browser, origin, ok));
 suite("agent-relations", async ({ browser, origin, ok }) => {
   await testAgentRelations(browser, origin, ok);
   await testAgentRelationsForm(browser, origin, ok);
@@ -23143,7 +23148,9 @@ const planFaces = await page.evaluate(async () => {
     quiet: await face(26, 12),
     warn: await face(65, 12),
     hot: await face(30, 88),
-    waiting: document.getElementById("sb-claude-wait").hidden,
+    // The 「···」 span is gone (t-7170): the one figure slot carries a figure
+    // or a word, and a settled read shows no 「확인 중…」 in it.
+    settled: document.getElementById("sb-claude-pct").textContent !== t("usage.loading", "확인 중…"),
   };
 });
 ok(
@@ -23153,7 +23160,7 @@ ok(
     planFaces.warn.tone === undefined && planFaces.warn.figure === "65% used 4h 28m · 12% used wk" &&
     planFaces.hot.width === "88%" && planFaces.hot.tone === undefined &&
     planFaces.hot.figure === "30% used 4h 28m · 88% used wk" &&
-    planFaces.hot.figureTone === undefined && planFaces.waiting &&
+    planFaces.hot.figureTone === undefined && planFaces.settled &&
     planFaces.hot.box > 0 &&
     planFaces.hot.paint === planFaces.quiet.paint &&
     planFaces.warn.paint === planFaces.hot.paint &&
@@ -47572,6 +47579,43 @@ const activeHistory = await page.evaluate(async () => {
     seen.mergedFromLedger =
       merged.querySelector(".wt-agent-state")?.textContent === t("board.merged", "병합됨") &&
       merged.classList.contains("is-verified");
+    // A worker's own keys are its claim (t-6815): the word says the worker
+    // says so, and the check stays quiet — verified/merged/deployed are the
+    // coordinator's alone.
+    paneLedger.set(7912, {
+      run: "run-1", worker: "w-1", task: "navigator cleanup", taskId: "t-9",
+      ledger: "active", reported: true,
+      review: { verified: false, merged: false, deployed: false, written: false,
+        claimed_verified: true, claimed_merged: true, claimed_deployed: false, author: "worker" },
+    });
+    const claimed = makeAgentRow(rows.find((row) => row.term === 7912 && !row.sub), true);
+    // Keep the actual state and served renderer beside the assertion: the
+    // first whole-window pass once missed only this claim, without recording
+    // which side of the comparison was wrong (t-6815 E1).
+    const fingerprint = (value) => {
+      let hash = 2166136261;
+      for (const byte of new TextEncoder().encode(value)) {
+        hash = Math.imul(hash ^ byte, 16777619) >>> 0;
+      }
+      return hash.toString(16).padStart(8, "0");
+    };
+    seen.claimWord = claimed.querySelector(".wt-agent-state")?.textContent ?? null;
+    seen.claimExpected = t("board.claimedMerged", "병합됐다 함");
+    seen.claimClass = claimed.className;
+    seen.claimState = claimed.querySelector(".wt-agent-state")?.outerHTML ?? null;
+    seen.claimReview = paneLedger.get(7912)?.review ?? null;
+    seen.claimWordFunction = typeof ledgerReviewWord === "function"
+      ? fingerprint(ledgerReviewWord.toString()) : "missing";
+    try {
+      const served = await fetch("/shell.js", { cache: "no-store" });
+      seen.claimServedShell = served.ok ? fingerprint(await served.text()) : `http-${served.status}`;
+      const servedI18n = await fetch("/shell-i18n.js", { cache: "no-store" });
+      seen.claimServedI18n = servedI18n.ok ? fingerprint(await servedI18n.text()) : `http-${servedI18n.status}`;
+    } catch (error) {
+      seen.claimServedShell = `fetch-error:${String(error)}`;
+    }
+    seen.claimIsNotVerified =
+      seen.claimWord === seen.claimExpected && !claimed.classList.contains("is-verified");
     // A pane the ledger never seated keeps the vendor as its second word
     // and its done turn says nothing about review.
     paneLedger.delete(7912);
@@ -47586,14 +47630,26 @@ const activeHistory = await page.evaluate(async () => {
     window.__LEDGER__ = [{
       run: "run-2", worker: "w-2", agent: "claude", state: "working", ledger: "active",
       hearing: "heard", hearing_at: 1, checkout: "/tmp/history-proj", task: "wire the beat",
-      task_id: "t-10", reported: false,
-      review: { verified: false, merged: false, deployed: false, written: false }, term: 7911, at: 1,
+      task_id: "t-10", reported: true,
+      review: { verified: false, merged: false, deployed: false, written: false,
+        claimed_verified: true, claimed_merged: true, author: "worker" }, term: 7911, at: 1,
     }];
     for (const listener of window.__LISTENERS__["ledger:changed"] ?? []) listener({ payload: 7 });
-    for (let tries = 0; tries < 40 && !paneLedger.has(7911); tries += 1) {
+    // Await the refresh EFFECT, not just the event dispatch. The backend
+    // answer must reach paneLedger before a claim word is asserted.
+    for (let tries = 0; tries < 40 &&
+      !(paneLedger.get(7911)?.task === "wire the beat" &&
+        paneLedger.get(7911)?.review?.claimed_merged); tries += 1) {
       await new Promise((done) => setTimeout(done, 25));
     }
     seen.ledgerFollows = paneLedger.get(7911)?.task === "wire the beat";
+    const refreshedRow = worktreeAgentRows("/tmp/history-proj")
+      .find((row) => row.term === 7911 && !row.sub);
+    const refreshed = refreshedRow ? makeAgentRow(refreshedRow, true) : null;
+    seen.effectWord = refreshed?.querySelector(".wt-agent-state")?.textContent ?? null;
+    seen.effectClass = refreshed?.className ?? null;
+    seen.claimAfterLedgerEffect =
+      seen.effectWord === seen.claimExpected && !refreshed?.classList.contains("is-verified");
   } finally {
     window.__LEDGER__ = [];
     paneLedger.delete(7911);
@@ -47610,14 +47666,29 @@ const activeHistory = await page.evaluate(async () => {
   }
   return seen;
 });
+console.log(`T6815_CLAIM_DIAG ${JSON.stringify({
+  word: activeHistory.claimWord,
+  expected: activeHistory.claimExpected,
+  className: activeHistory.claimClass,
+  state: activeHistory.claimState,
+  review: activeHistory.claimReview,
+  wordFunction: activeHistory.claimWordFunction,
+  servedShell: activeHistory.claimServedShell,
+  servedI18n: activeHistory.claimServedI18n,
+  assertion: activeHistory.claimIsNotVerified,
+  effectWord: activeHistory.effectWord,
+  effectClass: activeHistory.effectClass,
+  effectAssertion: activeHistory.claimAfterLedgerEffect,
+})}`);
 ok(
-  "a live descendant survives its parent's fold, settled history folds to an exact count, and verified/merged come only from the ledger",
+  "a live descendant survives its parent's fold, settled history folds to an exact count, and verified/merged come only from the ledger — a worker's claim is a claim",
   activeHistory.historyFolded && activeHistory.historyDrawn && activeHistory.historyOpens &&
     activeHistory.signatureSeesHistory && activeHistory.flipRemembers &&
     activeHistory.liveSurvivesFold && activeHistory.ancestryDrawn &&
     activeHistory.groupLiveByMembers && activeHistory.taskTitleFirst &&
     activeHistory.mergedFromLedger && activeHistory.doneIsNotVerified &&
-    activeHistory.ledgerFollows,
+    activeHistory.claimIsNotVerified && activeHistory.ledgerFollows &&
+    activeHistory.claimAfterLedgerEffect,
   JSON.stringify(activeHistory),
 );
 

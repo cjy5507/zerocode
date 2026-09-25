@@ -49,7 +49,12 @@ export function coordinatorDeskFixture({ tasks = 60, workers = 5, mail = 20, now
       checkout: checkout(n), task: title, task_id: `t-${n}`,
       reported: word === "idle", dispatch_id: `dp-${n}`, dispatch_started_ms: now - (30 + n) * minute,
       retry_of: null,
-      review: { verified: false, merged: false, deployed: false, written: false },
+      /* The first worker's report carried its own `merged: true`: the
+       * ledger keeps that as the worker's claim (t-6815), never the fact. */
+      review: n === 1
+        ? { verified: false, merged: false, deployed: false, written: false,
+          claimed_verified: true, claimed_merged: true, claimed_deployed: false, author: "worker" }
+        : { verified: false, merged: false, deployed: false, written: false },
       term: seated ? term : null, at: now - (40 + n) * minute,
       model: models[(n - 1) % models.length], effort: n % 2 ? "max" : "xhigh", pane: `%${n}`,
       asking: word === "asking",
@@ -351,6 +356,30 @@ export async function testCoordinatorDesk(browser, origin, ok) {
       letter("m-901").act === "답하기" && letter("m-903").act === "확인 · 이 묶음 6통" &&
       letter("m-902").act === "" && letter("m-904").act === "", JSON.stringify(mail.letters));
 
+    /* 분류기 거절과 그 때문에 바뀐 모델(t-6747): 둘째 줄은 원장이 적은 사실 그대로 —
+     * 분류, 거절 뒤에 무엇이 서 있는지, 어느 모델로 얼마 동안 바뀌었는지. */
+    const declined = await page.evaluate(() => {
+      const now = Date.now();
+      return {
+        kind: t(DESK_MAIL.classifier_declined.key, DESK_MAIL.classifier_declined.word),
+        switchKind: t(DESK_MAIL.model_deviated.key, DESK_MAIL.model_deviated.word),
+        stands: deskLetterDetail({ kind: "classifier_declined", category: "reasoning_extraction", routed: false, rung: "notify" }, now),
+        handover: deskLetterDetail({ kind: "classifier_declined", category: "cyber", routed: true, rung: "handover" }, now),
+        undeclared: deskLetterDetail({ kind: "classifier_declined", category: "cyber", routed: true, rung: "notify" }, now),
+        unnamed: deskLetterDetail({ kind: "classifier_declined", category: null, routed: false, rung: "notify" }, now),
+        switched: deskLetterDetail({ kind: "model_deviated", category: "cyber", switched_to: "claude-opus-4-8", scope: "session" }, now),
+        local: deskLetterDetail({ kind: "model_deviated", category: "cyber", switched_to: "claude-opus-4-8", scope: "local" }, now),
+      };
+    });
+    ok("a classifier's decline and the switch of model it caused say their category, what stands and for how long",
+      declined.kind === "분류기 거절" && declined.switchKind === "모델 바뀜" &&
+      declined.stands === "reasoning_extraction · 다른 모델로 가지 않는 분류라 거절이 그대로예요" &&
+      declined.handover === "cyber · 선언된 워커에게 넘기는 중" &&
+      declined.undeclared === "cyber · 넘길 워커를 선언하지 않았어요" &&
+      declined.unnamed === "분류 없음 · 다른 모델로 가지 않는 분류라 거절이 그대로예요" &&
+      declined.switched === "cyber → claude-opus-4-8 · 이 대화 끝까지" &&
+      declined.local === "cyber → claude-opus-4-8 · 응답 하나만", JSON.stringify(declined));
+
     await page.click('#board-view [data-letter="run-desk/m-901"] .board-desk-letter-act');
     await page.fill('#board-view [data-letter="run-desk/m-901"] .board-desk-reply-field', "그대로 main에 올리세요.");
     const drafted = await page.evaluate(async () => {
@@ -455,10 +484,12 @@ export async function testCoordinatorDesk(browser, origin, ok) {
       roster.rows["w-3"].health === "답 기다림" && roster.rows["w-5"].health === "잠듦" &&
       roster.rows["w-1"].health === "턴 중" && roster.rows["w-2"].health === "유휴" &&
       /^\d+분 전$/.test(roster.rows["w-1"].age), JSON.stringify(roster.rows));
-    ok("each worker says its agent, model and effort, pane, checkout, commits ahead and changed files, and the ledger's review word",
+    ok("each worker says its agent, model and effort, pane, checkout, commits ahead and changed files, and the ledger's review word — a worker's own claim in the claim's words",
       roster.rows["w-1"].facts === "Claude · claude-opus-5-5 · max · 판 201 · t-1 · 커밋 1개 앞섬 · 바뀐 파일 2" &&
       roster.rows["w-5"].facts.includes("%5") && roster.rows["w-5"].facts.includes("t-5") &&
-      roster.rows["w-2"].task === "데스크 과업 2 · 검증 대기" && roster.rows["w-5"].disabled && !roster.rows["w-3"].disabled,
+      roster.rows["w-2"].task === "데스크 과업 2 · 검증 대기" &&
+      roster.rows["w-1"].task === "데스크 과업 1 · 병합됐다 함" &&
+      roster.rows["w-5"].disabled && !roster.rows["w-3"].disabled,
       JSON.stringify(roster.rows));
     await page.click('#board-view [data-worker="run-desk/w-3"] .board-desk-worker-main');
     const picked = await page.evaluate(() => ({

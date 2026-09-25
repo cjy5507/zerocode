@@ -71,8 +71,21 @@ fn review_facts_read_only_what_a_coordinator_wrote() {
         result: r#"{"merged":true}"#.into(),
         failures: 0,
         created_ms: 0,
+        result_author: Some(ResultAuthor::Coordinator {
+            seat: "team-1/%1".into(),
+            generation: Some(1),
+            attempt: Some("dp-1".into()),
+            source: None,
+        }),
     };
-    assert!(task.review().merged);
+    let facts = ReviewFacts::written_by(task.result.as_str(), task.result_author.as_ref());
+    assert!(facts.merged && !facts.claimed_merged);
+    assert_eq!(facts.author, ReviewAuthor::Coordinator);
+    assert_eq!(facts.attempt.as_deref(), Some("dp-1"));
+    // The same bytes with nobody known to have written them are a claim.
+    let facts = ReviewFacts::written_by(task.result.as_str(), None);
+    assert!(!facts.merged && facts.claimed_merged && !facts.written);
+    assert_eq!(facts.author, ReviewAuthor::Unknown);
 }
 
 /// A launcher that starts exactly the agents a test says exist.
@@ -1853,6 +1866,7 @@ fn worker_worktree_titles_keep_the_id_across_free_form_task_titles() {
         result: Text::default(),
         failures: 0,
         created_ms: 0,
+        result_author: None,
     };
 
     let korean = task(
@@ -2840,6 +2854,7 @@ fn a_task_ended_by_hand_leaves_a_ledger_this_window_still_opens() {
                 &task,
                 Some(ending),
                 Some("somebody finished it by hand".into()),
+                ResultAuthor::Ledger,
             )
             .expect("a hand ending");
         if let Err(wrong) = bench.ledger.validate_loaded() {
@@ -6089,6 +6104,7 @@ fn an_agents_words_never_reach_a_debug_rendering() {
                 result: Text::default(),
                 failures: 0,
                 created_ms: 1,
+                result_author: None,
             },
         }
     );
@@ -6471,6 +6487,8 @@ fn a_worker_cannot_speak_as_the_ledger_by_naming_its_notice() {
         MessageKind::QuotaWalled,
         MessageKind::Handover,
         MessageKind::Resumed,
+        MessageKind::ClassifierDeclined,
+        MessageKind::ModelDeviated,
     ] {
         assert!(kind.is_the_ledgers_own(), "{}", kind.as_str());
         let typed = bench.at(
@@ -8301,6 +8319,7 @@ fn boot_repair_respects_unfinished_failed_and_missing_dependencies() {
                 &dependency,
                 Some(dependency_status.unwrap_or(TaskStatus::Completed)),
                 None,
+                ResultAuthor::Ledger,
             )
             .unwrap();
         let task = ledger
@@ -8352,7 +8371,13 @@ fn boot_repair_respects_unfinished_failed_and_missing_dependencies() {
             assert_eq!(rebuilt.export(), before, "refused start changed the ledger");
             if dependency_run == run {
                 rebuilt
-                    .update_task(&run, &dependency, Some(TaskStatus::Completed), None)
+                    .update_task(
+                        &run,
+                        &dependency,
+                        Some(TaskStatus::Completed),
+                        None,
+                        ResultAuthor::Ledger,
+                    )
                     .unwrap();
                 rebuilt
                     .start_worker(&run, "codex", ("team", "%2"), Some(&task), 6)
@@ -10282,11 +10307,19 @@ fn a_question_takes_one_answer_and_closes_with_its_dispatch() {
     );
     let late = bench.run(&format!("reply --to-message {orphaned} --body too-late"));
     assert_eq!(late.reply.exit_code, 1);
+    let run = &bench.ledger.runs()[0];
+    let closed_reason = run
+        .question_is_answerable(run.message(&orphaned).expect("question"))
+        .expect_err("closed dispatch");
+    assert!(late.reply.stderr.contains(&closed_reason));
     assert!(
         late.reply.stderr.contains("closed"),
         "{}",
         late.reply.stderr
     );
+    let same_after_close = bench.json(&format!("reply --to-message {question} --body left"));
+    assert_eq!(same_after_close["messageId"], standing);
+    assert_eq!(same_after_close["already"], true);
 
     // Closure is an answer to `--resume` too — said at once, not slept to
     // the deadline.
@@ -10324,6 +10357,108 @@ fn a_question_takes_one_answer_and_closes_with_its_dispatch() {
         "{}",
         smuggled.reply.stderr
     );
+}
+
+#[test]
+fn a_question_reader_uses_the_direct_mail_rule_at_reply_time() {
+    let mut bench = Bench::new();
+    let run_id = bench.json("run-create --name reader")["runId"]
+        .as_str()
+        .expect("run")
+        .to_string();
+    let (_worker, pane) = bench.seat("worker-start --agent codex");
+    let question = bench.json_at(&pane, "ask --body answer-me")["questionId"]
+        .as_str()
+        .expect("question")
+        .to_string();
+    let answered = bench.json_at(&pane, "ask --body answered-before-release")["questionId"]
+        .as_str()
+        .expect("question")
+        .to_string();
+    let answer_id = bench.json(&format!("reply --to-message {answered} --body yes"))["messageId"]
+        .as_str()
+        .expect("answer")
+        .to_string();
+    let run = bench.ledger.run(&run_id).expect("run");
+    let asked = run.message(&question).expect("question");
+    assert_eq!(run.question_is_answerable(asked), Ok(()));
+    let mut missing = asked.clone();
+    missing.from = "worker:w-missing".into();
+    assert_eq!(
+        run.question_is_answerable(&missing),
+        Err("unknown worker: w-missing".into())
+    );
+
+    for (state, readable) in [
+        (WorkerState::ReleasePending, true),
+        (WorkerState::Orphaned, true),
+        (WorkerState::Sleeping, true),
+        (WorkerState::ReleaseUnknown, false),
+        (WorkerState::Released, false),
+    ] {
+        bench.ledger.runs[0].workers[0].state = state;
+        let run = bench.ledger.run(&run_id).expect("run");
+        let asked = run.message(&question).expect("question");
+        assert_eq!(
+            run.question_is_answerable(asked).is_ok(),
+            readable,
+            "{state:?}"
+        );
+    }
+    let run = bench.ledger.run(&run_id).expect("run");
+    let reason = run
+        .question_is_answerable(run.message(&question).expect("question"))
+        .expect_err("released reader");
+    let before = run.messages().len();
+    let refused = bench.run(&format!("reply --to-message {question} --body too-late"));
+    assert_eq!(refused.reply.exit_code, 1);
+    assert!(
+        refused.reply.stderr.contains(&reason),
+        "{}",
+        refused.reply.stderr
+    );
+    assert_eq!(
+        bench.ledger.run(&run_id).expect("run").messages().len(),
+        before
+    );
+    let retried = bench.json(&format!("reply --to-message {answered} --body yes"));
+    assert_eq!(retried["messageId"], answer_id);
+    assert_eq!(retried["already"], true);
+    let different = bench.run(&format!("reply --to-message {answered} --body no"));
+    assert!(different.reply.stderr.contains("different answer"));
+    assert_eq!(
+        bench.ledger.run(&run_id).expect("run").messages().len(),
+        before
+    );
+
+    // A pane that spoke in the run remains a direct reader even without a
+    // worker row or a task dispatch.
+    let pane_question = bench
+        .ledger
+        .post(
+            &run_id,
+            Draft {
+                from: "pane:team-1/%9".into(),
+                to: format!("run:{run_id}"),
+                kind: MessageKind::Question,
+                body: "pane?".into(),
+                subject: "".into(),
+                priority: Priority::Normal,
+                payload: "".into(),
+                thread: None,
+                task: None,
+                dispatch: None,
+            },
+            4,
+        )
+        .expect("pane question");
+    let run = bench.ledger.run(&run_id).expect("run");
+    assert_eq!(
+        run.question_is_answerable(run.message(&pane_question).expect("pane")),
+        Ok(())
+    );
+    let delivered = bench.run(&format!("reply --to-message {pane_question} --body here"));
+    assert_eq!(delivered.reply.exit_code, 0, "{}", delivered.reply.stderr);
 }
 
 /// A question binds its ANSWERER, not just its delivery.
@@ -10769,6 +10904,248 @@ fn a_non_claude_worker_receives_no_provider_peer_name_flag() {
             serde_json::Value::Null,
         ],
     );
+}
+
+/// A summoned worker never stops at a classifier-decline question nobody is
+/// watching (t-6747): the task-carrying summons carries the measured words
+/// that make the agent's own CLI continue on its fallback, the person's bare
+/// pane does not, and an agent nobody measured is told nothing.
+#[test]
+fn a_task_carrying_summons_is_told_to_continue_past_a_classifier_decline() {
+    let mut bench = Bench::new();
+    bench.launcher = Catalog(&["claude", "codex", "zo"]);
+    bench.json("run-create --name decline-words");
+    let summoned = |bench: &mut Bench, line: &str| {
+        let planned = bench.run(line);
+        assert_eq!(
+            planned.reply.exit_code, 0,
+            "{line}: {}",
+            planned.reply.stderr
+        );
+        let Effect::Split { command, .. } = planned.effect else {
+            panic!("{line} did not plan a split: {:?}", planned.effect);
+        };
+        command
+    };
+    let task = |bench: &mut Bench| {
+        bench.json("task-create --spec decline")["taskId"]
+            .as_str()
+            .expect("an id")
+            .to_string()
+    };
+
+    let claude_task = task(&mut bench);
+    let claude = summoned(
+        &mut bench,
+        &format!("worker-start --agent claude --task {claude_task}"),
+    );
+    let zo_task = task(&mut bench);
+    let zo = summoned(
+        &mut bench,
+        &format!("worker-start --agent zo --task {zo_task}"),
+    );
+    let codex_task = task(&mut bench);
+    let codex = summoned(
+        &mut bench,
+        &format!("worker-start --agent codex --task {codex_task}"),
+    );
+    let bare = summoned(&mut bench, "worker-start --agent claude");
+
+    assert_eq!(
+        command_flag(&claude, "--settings"),
+        Some(r#"{"switchModelsOnFlag":true}"#),
+        "{claude}"
+    );
+    assert_eq!(
+        command_flag(&zo, "--classifier-fallback"),
+        Some("auto"),
+        "{zo}"
+    );
+    assert_eq!(command_flag(&codex, "--settings"), None, "{codex}");
+    assert_eq!(
+        command_flag(&codex, "--classifier-fallback"),
+        None,
+        "{codex}"
+    );
+    assert_eq!(
+        command_flag(&bare, "--settings"),
+        None,
+        "a bare pane is the person's: {bare}"
+    );
+}
+
+/// A summons that pins a model is a binding choice (t-7153, P1-1): its CLI
+/// is told NOT to leave the model by itself on a classifier decline —
+/// Claude's switch off, zo's ladder `off` — whether or not the run declared
+/// `--on-classifier-decline`, because the declaration names the exact rung
+/// the LEDGER hands the task to, never a licence for the CLI's own route.
+/// An unpinned summons keeps the switch on (an `--effort` never pins alone:
+/// the verb refuses it without a `--model`). Both launch roads say the
+/// same: the fresh summons and the restart's reseat.
+#[test]
+fn a_pinned_summons_is_never_told_to_switch_models_by_itself() {
+    const OFF: &str = r#"{"switchModelsOnFlag":false}"#;
+    const ON: &str = r#"{"switchModelsOnFlag":true}"#;
+    let mut bench = Bench::new();
+    bench.launcher = Catalog(&["claude", "codex", "zo"]);
+    bench.json("run-create --name pinned-words");
+    let task = |bench: &mut Bench| {
+        bench.json("task-create --spec decline")["taskId"]
+            .as_str()
+            .expect("an id")
+            .to_string()
+    };
+    let summoned = |bench: &mut Bench, line: &str| {
+        let planned = bench.run(line);
+        assert_eq!(
+            planned.reply.exit_code, 0,
+            "{line}: {}",
+            planned.reply.stderr
+        );
+        let Effect::Split { command, .. } = planned.effect else {
+            panic!("{line} did not plan a split: {:?}", planned.effect);
+        };
+        command
+    };
+
+    for declared in [false, true] {
+        if declared {
+            bench.json("handover-policy --on-classifier-decline claude:claude-opus-4-8");
+        }
+        let why = if declared {
+            "under a declared order"
+        } else {
+            "with no order declared"
+        };
+        let model_task = task(&mut bench);
+        let by_model = summoned(
+            &mut bench,
+            &format!("worker-start --agent claude --model fable --task {model_task}"),
+        );
+        assert_eq!(
+            command_flag(&by_model, "--settings"),
+            Some(OFF),
+            "a model pin {why}: {by_model}"
+        );
+        let effort_task = task(&mut bench);
+        let by_effort = summoned(
+            &mut bench,
+            &format!("worker-start --agent claude --model fable --effort max --task {effort_task}"),
+        );
+        assert_eq!(
+            command_flag(&by_effort, "--settings"),
+            Some(OFF),
+            "a model pin with its effort {why}: {by_effort}"
+        );
+        let zo_task = task(&mut bench);
+        let zo = summoned(
+            &mut bench,
+            &format!("worker-start --agent zo --model fable --effort high --task {zo_task}"),
+        );
+        assert_eq!(
+            command_flag(&zo, "--classifier-fallback"),
+            Some("off"),
+            "a pinned zo {why}: {zo}"
+        );
+        let free_task = task(&mut bench);
+        let free = summoned(
+            &mut bench,
+            &format!("worker-start --agent claude --task {free_task}"),
+        );
+        assert_eq!(
+            command_flag(&free, "--settings"),
+            Some(ON),
+            "an unpinned summons {why}: {free}"
+        );
+        let bare = summoned(&mut bench, "worker-start --agent claude --model fable");
+        assert_eq!(
+            command_flag(&bare, "--settings"),
+            None,
+            "a bare pane is the person's, pinned or not: {bare}"
+        );
+    }
+
+    // The restart's road: a pinned sleeper is reseated with the switch off,
+    // an unpinned one with it on.
+    let mut restored = Bench::new();
+    restored.launcher = Catalog(&["claude", "codex", "zo"]);
+    let run = restored.json("run-create --name pinned-reseat")["runId"]
+        .as_str()
+        .expect("a run id")
+        .to_string();
+    let mut seated = Vec::new();
+    for (index, line) in [
+        "worker-start --agent claude --model fable --effort max --task",
+        "worker-start --agent claude --task",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let task = task(&mut restored);
+        let fresh = restored.run(&format!("{line} {task}"));
+        assert_eq!(fresh.reply.exit_code, 0, "{}", fresh.reply.stderr);
+        let said: serde_json::Value =
+            serde_json::from_str(&fresh.reply.stdout).expect("a start receipt");
+        let worker = said["workerId"].as_str().expect("a worker id").to_string();
+        let Effect::Split {
+            pane,
+            from,
+            direction,
+            ..
+        } = &fresh.effect
+        else {
+            panic!("the worker did not plan a split: {:?}", fresh.effect);
+        };
+        restored.team.record_split(
+            pane,
+            71 + u32::try_from(index).expect("small"),
+            from,
+            *direction,
+        );
+        assert!(
+            restored
+                .ledger
+                .worker_seated(("team-1", pane), "/wt/pinned")
+        );
+        let at = restored.ledger.locate(&worker).expect("the worker");
+        restored.ledger.runs[at.0].workers[at.1].session = Some(ProviderSession {
+            key: SessionKey::SessionId,
+            id: format!("claude-session-{index}"),
+            transcript_path: None,
+        });
+        seated.push(worker);
+    }
+    assert_eq!(restored.ledger.window_restarted(2_000).sleeping, 2);
+    let mut replacement_team = Team::new("team-after-restart", "token", 80);
+    assert!(
+        restored
+            .ledger
+            .coordinator_returned(&run, "team-after-restart/%1", None, 2_001)
+    );
+    for (worker, expected) in seated.iter().zip([OFF, ON]) {
+        let resumed = restored
+            .ledger
+            .prepare_worker_reseat(
+                &run,
+                worker,
+                &mut replacement_team,
+                agent_teams::LEADER_PANE,
+                &restored.launcher,
+                "continue",
+            )
+            .expect("a resume split");
+        let Effect::Split { command, .. } = &resumed.effect else {
+            panic!(
+                "the worker did not plan a resume split: {:?}",
+                resumed.effect
+            );
+        };
+        assert_eq!(
+            command_flag(command, "--settings"),
+            Some(expected),
+            "the reseat of {worker}: {command}"
+        );
+    }
 }
 
 #[test]
@@ -12970,6 +13347,698 @@ fn a_walled_worker(
     (worker, pane, dispatch)
 }
 
+/* ---- the classifier decline (t-6747) ---------------------------------- */
+
+/// Claude Code's own sentence, as the 18 decline records on this machine
+/// carry it (2026-09-10..24).
+const DECLINED: &str = "API Error: Fable 5.1's safeguards flagged this message \
+                        (https://www.anthropic.com/legal/aup).";
+
+fn a_decline_record(category: Option<&str>, key: &str) -> ClassifierDeclineMarker {
+    ClassifierDeclineMarker {
+        source: "transcript".to_string(),
+        line: Text::from(DECLINED),
+        category: category.map(str::to_string),
+        key: key.to_string(),
+    }
+}
+
+fn a_decline_screen(dialog: bool, category: Option<&str>) -> DeclineScreen {
+    DeclineScreen {
+        line: Text::from("Fable 5.1's safeguards flagged this message."),
+        dialog,
+        category: category.map(str::to_string),
+    }
+}
+
+/// Two witnesses or nothing: the CLI's sentence on the screen AND its
+/// record as the conversation's last word — or, for the pause dialog that
+/// writes no record until answered, the dialog on screen and a silence
+/// longer than any dialog a person answered here.
+#[test]
+fn a_classifier_decline_is_judged_by_two_witnesses() {
+    const NOW: i64 = 90_000_000;
+    let quiet = NOW - 60_000;
+    let judged = |screen, record, since| {
+        classifier_decline_witness("w-1", "dp-1", screen, record, since, NOW)
+    };
+    // One witness is none: a worker reading or briefed with the words, or a
+    // decline its CLI answered and moved past.
+    assert!(judged(Some(a_decline_screen(false, None)), None, quiet).is_none());
+    assert!(judged(None, Some(a_decline_record(Some("cyber"), "u-1")), quiet).is_none());
+    // Both: the record's category and key ride on.
+    let both = judged(
+        Some(a_decline_screen(false, None)),
+        Some(a_decline_record(Some("cyber"), "u-1")),
+        quiet,
+    )
+    .expect("two witnesses");
+    assert_eq!(both.worker, "w-1");
+    assert_eq!(both.record.category.as_deref(), Some("cyber"));
+    assert_eq!(both.record.key, "u-1");
+    // A record with no identity cannot be told once.
+    assert!(
+        judged(
+            Some(a_decline_screen(false, None)),
+            Some(a_decline_record(Some("cyber"), "")),
+            quiet
+        )
+        .is_none()
+    );
+    // The dialog: its second witness is time, measured.
+    let dialog = || Some(a_decline_screen(true, Some("cyber")));
+    let answered_here = NOW - DECLINE_DIALOG_UNANSWERED_MS + 1;
+    assert!(judged(dialog(), None, answered_here).is_none());
+    let unanswered = judged(dialog(), None, NOW - DECLINE_DIALOG_UNANSWERED_MS)
+        .expect("a dialog nobody answered");
+    assert_eq!(unanswered.record.source, DECLINE_DIALOG_SOURCE);
+    assert_eq!(unanswered.record.category.as_deref(), Some("cyber"));
+    // One dialog is one fact, however the pty's clock moved between two
+    // readings of it; and a screen alone ends no worker (t-7153).
+    assert_eq!(
+        unanswered.record.key,
+        format!("{DECLINE_DIALOG_SOURCE}:dp-1")
+    );
+    assert!(!unanswered.record.may_stop());
+    assert!(a_decline_record(Some("cyber"), "u-1").may_stop());
+    // A printed error with no record is no dialog, however long it stands.
+    assert!(judged(Some(a_decline_screen(false, None)), None, 0).is_none());
+}
+
+/// A handover's cause knows the decline it was planned for (t-7153, P1-4):
+/// the same record, in the same routed category, witnesses it; a record
+/// with no category, another record, an unrouted category, a screen-only
+/// reading, or a wall's cause do not.
+#[test]
+fn a_handover_cause_is_witnessed_only_by_the_decline_it_was_planned_for() {
+    const NOW: i64 = 90_000_000;
+    let witness = |category: Option<&str>, key: &str| {
+        classifier_decline_witness(
+            "w-1",
+            "dp-1",
+            Some(a_decline_screen(false, None)),
+            Some(a_decline_record(category, key)),
+            NOW - 60_000,
+            NOW,
+        )
+        .expect("two witnesses")
+    };
+    let cause = HandoverCause::ClassifierDecline {
+        category: "cyber".to_string(),
+        record_key: "u-1".to_string(),
+    };
+    assert!(cause.is_witnessed_by(&witness(Some("cyber"), "u-1")));
+    assert!(
+        !cause.is_witnessed_by(&witness(None, "u-1")),
+        "a category that reads as none was taken for the plan's"
+    );
+    assert!(
+        !cause.is_witnessed_by(&witness(Some("cyber"), "u-2")),
+        "another request's record was taken for the plan's"
+    );
+    assert!(
+        !cause.is_witnessed_by(&witness(Some("reasoning_extraction"), "u-1")),
+        "a category the provider routes nowhere was taken for the plan's"
+    );
+    let dialog = classifier_decline_witness(
+        "w-1",
+        "dp-1",
+        Some(a_decline_screen(true, Some("cyber"))),
+        None,
+        NOW - DECLINE_DIALOG_UNANSWERED_MS,
+        NOW,
+    )
+    .expect("the dialog and its silence");
+    let planned_on_a_screen = HandoverCause::ClassifierDecline {
+        category: "cyber".to_string(),
+        record_key: dialog.record.key.clone(),
+    };
+    assert!(
+        !planned_on_a_screen.is_witnessed_by(&dialog),
+        "a screen-only reading witnessed a stop"
+    );
+    let wall = HandoverCause::QuotaWall {
+        provider: "claude".to_string(),
+        used_percent: 99,
+        resets_at_ms: None,
+    };
+    assert!(!wall.is_witnessed_by(&witness(Some("cyber"), "u-1")));
+}
+
+/// A declined worker's notice is written once per attempt, names the rung
+/// that comes next, and a routed decline under a declared order plans a
+/// handover to the declared alternative — the parts it left out the
+/// worker's own — in the same checkout. A category the provider routes
+/// nowhere is news and nothing more.
+#[test]
+fn a_declined_worker_is_told_once_and_a_routed_decline_plans_the_declared_handover() {
+    const NOW: i64 = 5_000_000;
+    let mut bench = Bench::new();
+    bench.json("run-create --name declines");
+    let task = bench.json("task-create --spec build-it")["taskId"]
+        .as_str()
+        .expect("a task")
+        .to_string();
+    let (worker, pane) = bench.seat(&format!(
+        "worker-start --agent claude --model fable --effort max --task {task}"
+    ));
+    assert!(
+        bench
+            .ledger
+            .worker_seated(("team-1", &pane), "/wt/declined")
+    );
+    let witness = |worker: &str, dispatch: &str, category: &str, key: &str| {
+        classifier_decline_witness(
+            worker,
+            dispatch,
+            Some(a_decline_screen(false, None)),
+            Some(a_decline_record(Some(category), key)),
+            NOW - 60_000,
+            NOW,
+        )
+        .expect("two witnesses")
+    };
+    let dispatch = bench.ledger.runs()[0]
+        .worker(&worker)
+        .and_then(|held| held.dispatch.clone())
+        .expect("the attempt");
+    let cyber = witness(&worker, &dispatch, "cyber", "u-1");
+    assert_eq!(
+        bench
+            .ledger
+            .workers_classifier_declined(std::slice::from_ref(&cyber), NOW),
+        1
+    );
+    // The same decline on the next beat is the same fact.
+    assert_eq!(
+        bench.ledger.workers_classifier_declined(&[cyber], NOW + 1),
+        0
+    );
+    let news = bench.json("check --peek --types classifier_declined");
+    assert_eq!(news["count"], 1, "{news}");
+    let body: serde_json::Value =
+        serde_json::from_str(news["messages"][0]["body"].as_str().expect("a body")).expect("json");
+    assert_eq!(body["category"], "cyber");
+    assert_eq!(body["routed"], true);
+    assert_eq!(body["rung"], "notify", "no order declared yet: {body}");
+    assert_eq!(body["dispatchId"], dispatch.as_str());
+    // News alone walks nothing.
+    assert!(next_handover(&bench.ledger.runs()[0], NOW).is_none());
+    bench.json("handover-policy --on-classifier-decline claude:claude-opus-4-8");
+    let plan = next_handover(&bench.ledger.runs()[0], NOW).expect("a plan under the order");
+    assert_eq!(
+        plan.cause,
+        HandoverCause::ClassifierDecline {
+            category: "cyber".to_string(),
+            record_key: "u-1".to_string(),
+        },
+        "the plan carries the record that witnessed it (t-7153)"
+    );
+    assert_eq!(
+        plan.to,
+        pinned("claude", Some("claude-opus-4-8"), Some("max")),
+        "the effort the declaration left out is the worker's own"
+    );
+    assert_eq!(plan.checkout, "/wt/declined");
+    assert_eq!(plan.dispatch, dispatch);
+    assert!(handover_order_current(
+        &bench.ledger.runs()[0],
+        &plan,
+        false
+    ));
+    assert!(handover_paragraph(&plan, None, None, NOW).contains("safety classifier declined"));
+    // An unrouted category is told, and walks nothing.
+    let other = bench.json("task-create --spec read-it")["taskId"]
+        .as_str()
+        .expect("a task")
+        .to_string();
+    let (held, held_pane) = bench.seat(&format!("worker-start --agent claude --task {other}"));
+    assert!(
+        bench
+            .ledger
+            .worker_seated(("team-1", &held_pane), "/wt/reasoning")
+    );
+    let held_dispatch = bench.ledger.runs()[0]
+        .worker(&held)
+        .and_then(|one| one.dispatch.clone())
+        .expect("the attempt");
+    let reasoning = witness(&held, &held_dispatch, "reasoning_extraction", "u-2");
+    assert_eq!(
+        bench.ledger.workers_classifier_declined(&[reasoning], NOW),
+        1
+    );
+    let told = bench.json("check --peek --types classifier_declined");
+    let newest: serde_json::Value = serde_json::from_str(
+        told["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| message["dispatchId"] == held_dispatch.as_str())
+            .expect("the unrouted notice")["body"]
+            .as_str()
+            .expect("a body"),
+    )
+    .expect("json");
+    assert_eq!(newest["routed"], false);
+    assert_eq!(newest["rung"], "notify");
+    assert!(
+        next_handover_witnessed(&bench.ledger.runs()[0], NOW, |plan| {
+            plan.dispatch == held_dispatch
+        })
+        .is_none(),
+        "an unrouted decline was planned"
+    );
+}
+
+/// A decline witnessed by the screen alone — the pause dialog, which writes
+/// no record until a key answers it — is diagnostic news and nothing more
+/// (t-7153, P1-3): told once, on the `notify` rung whatever the run
+/// declared, marked `screenOnly`, naming the hand road; and it plans no
+/// handover, because a screen is not a witness that ends a worker.
+#[test]
+fn a_screen_only_decline_is_diagnostic_news_and_plans_no_handover() {
+    const NOW: i64 = 6_000_000;
+    let mut bench = Bench::new();
+    bench.json("run-create --name dialogs");
+    bench.json("handover-policy --on-classifier-decline claude:claude-opus-4-8");
+    let task = bench.json("task-create --spec build-it")["taskId"]
+        .as_str()
+        .expect("a task")
+        .to_string();
+    let (worker, pane) = bench.seat(&format!(
+        "worker-start --agent claude --model fable --effort max --task {task}"
+    ));
+    assert!(bench.ledger.worker_seated(("team-1", &pane), "/wt/paused"));
+    let dispatch = bench.ledger.runs()[0]
+        .worker(&worker)
+        .and_then(|held| held.dispatch.clone())
+        .expect("the attempt");
+    let paused = classifier_decline_witness(
+        &worker,
+        &dispatch,
+        Some(a_decline_screen(true, Some("cyber"))),
+        None,
+        NOW - DECLINE_DIALOG_UNANSWERED_MS,
+        NOW,
+    )
+    .expect("the dialog and its silence");
+    assert_eq!(paused.record.source, DECLINE_DIALOG_SOURCE);
+    assert_eq!(
+        bench
+            .ledger
+            .workers_classifier_declined(std::slice::from_ref(&paused), NOW),
+        1
+    );
+    let news = bench.json("check --peek --types classifier_declined");
+    assert_eq!(news["count"], 1, "{news}");
+    let body: serde_json::Value =
+        serde_json::from_str(news["messages"][0]["body"].as_str().expect("a body")).expect("json");
+    assert_eq!(body["category"], "cyber");
+    assert_eq!(body["routed"], true);
+    assert_eq!(body["screenOnly"], true, "{body}");
+    assert_eq!(
+        body["rung"], "notify",
+        "a screen-only decline stood on the handover rung: {body}"
+    );
+    assert!(
+        body["next"]
+            .as_str()
+            .is_some_and(|next| next.contains("worker-read")),
+        "{body}"
+    );
+    assert!(
+        next_handover(&bench.ledger.runs()[0], NOW).is_none(),
+        "a screen-only decline planned a handover"
+    );
+}
+
+/// A notice is one record's (t-7153, R4): the same witness on the next
+/// beat is told nothing again; a decline the screen alone witnessed, told,
+/// closes the attempt to nothing — the record that follows it is told and
+/// planned; and a later record of the same attempt is told and planned on
+/// its own key, where the earlier plan still stands for its own.
+#[test]
+fn a_declined_attempt_is_told_again_on_a_new_record_and_never_twice_on_one() {
+    const NOW: i64 = 7_000_000;
+    let mut bench = Bench::new();
+    bench.json("run-create --name records");
+    bench.json("handover-policy --on-classifier-decline claude:claude-opus-4-8");
+    let task = bench.json("task-create --spec build-it")["taskId"]
+        .as_str()
+        .expect("a task")
+        .to_string();
+    let (worker, pane) = bench.seat(&format!(
+        "worker-start --agent claude --model fable --effort max --task {task}"
+    ));
+    assert!(bench.ledger.worker_seated(("team-1", &pane), "/wt/records"));
+    let dispatch = bench.ledger.runs()[0]
+        .worker(&worker)
+        .and_then(|held| held.dispatch.clone())
+        .expect("the attempt");
+    let dialog = classifier_decline_witness(
+        &worker,
+        &dispatch,
+        Some(a_decline_screen(true, Some("cyber"))),
+        None,
+        NOW - DECLINE_DIALOG_UNANSWERED_MS,
+        NOW,
+    )
+    .expect("the dialog and its silence");
+    let record = |category: Option<&str>, key: &str, at: i64| {
+        classifier_decline_witness(
+            &worker,
+            &dispatch,
+            Some(a_decline_screen(false, None)),
+            Some(a_decline_record(category, key)),
+            at - 60_000,
+            at,
+        )
+        .expect("two witnesses")
+    };
+    let told = |bench: &mut Bench, witness: &ClassifierDeclineWitness, at: i64| {
+        bench
+            .ledger
+            .workers_classifier_declined(std::slice::from_ref(witness), at)
+    };
+    assert_eq!(told(&mut bench, &dialog, NOW), 1);
+    assert_eq!(
+        told(&mut bench, &dialog, NOW + 1),
+        0,
+        "the same dialog told twice"
+    );
+    assert!(next_handover(&bench.ledger.runs()[0], NOW + 1).is_none());
+
+    let first = record(Some("cyber"), "u-1", NOW + 2);
+    assert_eq!(
+        told(&mut bench, &first, NOW + 2),
+        1,
+        "the record after the dialog's notice was not told"
+    );
+    assert_eq!(
+        told(&mut bench, &first, NOW + 3),
+        0,
+        "the same record told twice"
+    );
+    let plan = next_handover(&bench.ledger.runs()[0], NOW + 3).expect("a plan on the record");
+    assert_eq!(
+        plan.cause,
+        HandoverCause::ClassifierDecline {
+            category: "cyber".to_string(),
+            record_key: "u-1".to_string(),
+        }
+    );
+
+    let second = record(Some("cyber"), "u-2", NOW + 4);
+    assert_eq!(
+        told(&mut bench, &second, NOW + 4),
+        1,
+        "a later record of the same attempt was not told"
+    );
+    let news = bench.json("check --peek --types classifier_declined");
+    assert_eq!(news["count"], 3, "{news}");
+    let planned = |key: &str| {
+        next_handover_witnessed(&bench.ledger.runs()[0], NOW + 5, |plan| {
+            plan.cause
+                == HandoverCause::ClassifierDecline {
+                    category: "cyber".to_string(),
+                    record_key: key.to_string(),
+                }
+        })
+        .is_some()
+    };
+    assert!(
+        planned("u-2"),
+        "the later record was not planned on its own key"
+    );
+    assert!(
+        planned("u-1"),
+        "the earlier record's plan, for its own key, was lost"
+    );
+    assert!(
+        !planned(&dialog.record.key),
+        "a screen-only notice was planned"
+    );
+}
+
+/// A switch of model a worker's CLI recorded is written once, with the
+/// binding it left: the two models, the category, how long the CLI keeps
+/// it, and why.
+#[test]
+fn a_switch_of_model_is_written_once_with_the_binding_it_left() {
+    const NOW: i64 = 5_000_000;
+    let mut bench = Bench::new();
+    bench.json("run-create --name switches");
+    let task = bench.json("task-create --spec build-it")["taskId"]
+        .as_str()
+        .expect("a task")
+        .to_string();
+    let (worker, pane) = bench.seat(&format!(
+        "worker-start --agent claude --model fable --effort max --task {task}"
+    ));
+    assert!(
+        bench
+            .ledger
+            .worker_seated(("team-1", &pane), "/wt/switched")
+    );
+    let dispatch = bench.ledger.runs()[0]
+        .worker(&worker)
+        .and_then(|held| held.dispatch.clone())
+        .expect("the attempt");
+    let switch = ModelDeviation {
+        worker: worker.clone(),
+        dispatch,
+        source: "/transcripts/switched.jsonl".to_string(),
+        key: "uuid-fallback".to_string(),
+        from: "claude-fable-5-1".to_string(),
+        to: "claude-opus-4-8".to_string(),
+        category: Some("cyber".to_string()),
+        scope: Some("session".to_string()),
+        at_ms: Some(NOW - 5_000),
+    };
+    assert_eq!(
+        bench
+            .ledger
+            .workers_model_deviated(std::slice::from_ref(&switch), NOW),
+        1
+    );
+    assert_eq!(
+        bench
+            .ledger
+            .workers_model_deviated(std::slice::from_ref(&switch), NOW + 1),
+        0
+    );
+    let rows = bench.json("check --peek --types model_deviated");
+    assert_eq!(rows["count"], 1, "{rows}");
+    let body: serde_json::Value =
+        serde_json::from_str(rows["messages"][0]["body"].as_str().expect("a body")).expect("json");
+    assert_eq!(body["boundModel"], "fable");
+    assert_eq!(body["from"], "claude-fable-5-1");
+    assert_eq!(body["to"], "claude-opus-4-8");
+    assert_eq!(body["category"], "cyber");
+    assert_eq!(body["lasts"], "the rest of this conversation");
+    assert!(
+        body["summary"]
+            .as_str()
+            .is_some_and(|said| said.starts_with("model binding left: cyber → claude-opus-4-8")),
+        "{body}"
+    );
+    let local = ModelDeviation {
+        key: "uuid-local".to_string(),
+        scope: Some("local".to_string()),
+        ..switch
+    };
+    assert_eq!(local.lasts(), "one response");
+}
+
+/// A switch is written for the ATTEMPT it was read under, or for nobody
+/// (t-7153, R3): the ledger's fence re-reads the binding the reading
+/// carries — the dispatch, its interval, the file — against its own rows
+/// as it writes. A reading bound to another dispatch, dated before the
+/// attempt began, or undated, is written nowhere; a file the ledger knows
+/// the worker writes disputes a reading of another file, and a file it does
+/// not know disputes nothing. The same worker handed a second task keeps
+/// its summons time, and its first attempt's switch — read again after a
+/// restart, or held over from before the hand — is never the second's.
+#[test]
+fn a_switch_is_written_for_the_attempt_it_was_read_under_or_for_nobody() {
+    const NOW: i64 = 5_000_000;
+    let mut bench = Bench::new();
+    bench.json("run-create --name bindings");
+    let task = bench.json("task-create --spec build-it")["taskId"]
+        .as_str()
+        .expect("a task")
+        .to_string();
+    let (worker, pane) = bench.seat(&format!("worker-start --agent claude --task {task}"));
+    assert!(bench.ledger.worker_seated(("team-1", &pane), "/wt/bound"));
+    let attempt = |bench: &Bench| {
+        let run = &bench.ledger.runs()[0];
+        let held = run.worker(&worker).expect("the worker");
+        run.dispatch(held.dispatch.as_deref().expect("an open attempt"))
+            .expect("the dispatch")
+            .clone()
+    };
+    let first = attempt(&bench);
+    let reading = |dispatch: &str, source: &str, key: &str, at_ms: Option<i64>| ModelDeviation {
+        worker: worker.clone(),
+        dispatch: dispatch.to_string(),
+        source: source.to_string(),
+        key: key.to_string(),
+        from: "claude-fable-5-1".to_string(),
+        to: "claude-opus-4-8".to_string(),
+        category: Some("cyber".to_string()),
+        scope: Some("session".to_string()),
+        at_ms,
+    };
+    let written = |bench: &mut Bench, switch: ModelDeviation, at: i64| {
+        bench
+            .ledger
+            .workers_model_deviated(std::slice::from_ref(&switch), at)
+    };
+    let rows = |bench: &mut Bench| -> Vec<(String, String)> {
+        bench.json("check --peek --types model_deviated")["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|message| {
+                let body: serde_json::Value =
+                    serde_json::from_str(message["body"].as_str().expect("a body")).expect("json");
+                (
+                    body["dispatchId"].as_str().expect("a dispatch").to_string(),
+                    body["key"].as_str().expect("a key").to_string(),
+                )
+            })
+            .collect()
+    };
+    let inside = Some(first.started_ms + 1);
+
+    // Another attempt's reading, an earlier or undated switch: nobody's.
+    assert_eq!(
+        written(
+            &mut bench,
+            reading("dp-elsewhere", "/t/a.jsonl", "s-other", inside),
+            NOW
+        ),
+        0,
+        "a reading bound to another attempt was written as this one's"
+    );
+    assert_eq!(
+        written(
+            &mut bench,
+            reading(
+                &first.id,
+                "/t/a.jsonl",
+                "s-early",
+                Some(first.started_ms - 1)
+            ),
+            NOW
+        ),
+        0,
+        "a switch dated before the attempt began was written as its own"
+    );
+    assert_eq!(
+        written(
+            &mut bench,
+            reading(&first.id, "/t/a.jsonl", "s-undated", None),
+            NOW
+        ),
+        0,
+        "an undated switch was written"
+    );
+    // A file the ledger does not know disputes nothing.
+    assert_eq!(
+        written(
+            &mut bench,
+            reading(&first.id, "/t/a.jsonl", "s-1", inside),
+            NOW
+        ),
+        1
+    );
+    // A file it knows disputes another.
+    assert!(bench.ledger.worker_session_reported(
+        ("team-1", &pane),
+        crate::ProviderSession {
+            key: crate::provider_session::SessionKey::SessionId,
+            id: "session-1".to_string(),
+            transcript_path: Some("/t/a.jsonl".to_string()),
+        },
+    ));
+    assert_eq!(
+        written(
+            &mut bench,
+            reading(&first.id, "/t/b.jsonl", "s-2", inside),
+            NOW + 1
+        ),
+        0,
+        "a reading of another file was written as this conversation's"
+    );
+    assert_eq!(
+        written(
+            &mut bench,
+            reading(&first.id, "/t/a.jsonl", "s-2", inside),
+            NOW + 2
+        ),
+        1
+    );
+    assert_eq!(
+        rows(&mut bench),
+        [
+            (first.id.clone(), "s-1".to_string()),
+            (first.id.clone(), "s-2".to_string())
+        ]
+    );
+
+    // The same worker, handed a second task: its summons time stands, the
+    // first attempt's switches are not the second's.
+    bench.json_at(
+        &pane,
+        &format!("send --type worker_done --body {{\"ok\":true}} --retry-request done-{worker}"),
+    );
+    let again = bench.json("task-create --spec build-it-again")["taskId"]
+        .as_str()
+        .expect("a task")
+        .to_string();
+    bench.json(&format!("dispatch --task {again} --to {pane}"));
+    let second = attempt(&bench);
+    assert_ne!(second.id, first.id);
+    assert!(second.started_ms > first.started_ms);
+    let then = second.started_ms + 10;
+    assert_eq!(
+        written(
+            &mut bench,
+            reading(&first.id, "/t/a.jsonl", "s-3", inside),
+            then
+        ),
+        0,
+        "a reading of the ended attempt was written as the next one's"
+    );
+    assert_eq!(
+        written(
+            &mut bench,
+            reading(&second.id, "/t/a.jsonl", "s-1", Some(first.started_ms + 2)),
+            then
+        ),
+        0,
+        "the first attempt's switch, read again, was written as the second's"
+    );
+    assert_eq!(
+        written(
+            &mut bench,
+            reading(&second.id, "/t/a.jsonl", "s-4", Some(second.started_ms)),
+            then
+        ),
+        1,
+        "the second attempt's own switch was refused"
+    );
+    assert_eq!(
+        rows(&mut bench),
+        [
+            (first.id.clone(), "s-1".to_string()),
+            (first.id.clone(), "s-2".to_string()),
+            (second.id.clone(), "s-4".to_string())
+        ]
+    );
+}
+
 /// The beat walks a handover only under a DECLARED order — the summons'
 /// own `--on-quota-wall` first, the run's policy second — from the run's
 /// live coordinator seat, once per attempt, never for a person's pane,
@@ -13000,9 +14069,14 @@ fn next_handover_walks_one_witnessed_wall_under_a_declared_order() {
     assert_eq!(plan.task, task);
     assert_eq!(plan.spec.as_str(), "build-it");
     assert_eq!(plan.checkout, "/wt/walled");
-    assert_eq!(plan.provider, "codex");
-    assert_eq!(plan.used_percent, 98);
-    assert_eq!(plan.resets_at_ms, Some(NOW + 42 * 60_000));
+    assert_eq!(
+        plan.cause,
+        HandoverCause::QuotaWall {
+            provider: "codex".to_string(),
+            used_percent: 98,
+            resets_at_ms: Some(NOW + 42 * 60_000),
+        }
+    );
     assert_eq!(plan.to, pinned("claude", None, None));
     assert!(plan.wip_commit);
     assert_eq!(
@@ -13308,9 +14382,11 @@ fn handover_paragraph_names_the_worker_the_wall_the_checkout_and_the_wip() {
         task: "t-7".to_string(),
         spec: Text::from("build-it"),
         checkout: "/wt/t-7".to_string(),
-        provider: "codex".to_string(),
-        used_percent: 98,
-        resets_at_ms: Some(NOW + 42 * 60_000),
+        cause: HandoverCause::QuotaWall {
+            provider: "codex".to_string(),
+            used_percent: 98,
+            resets_at_ms: Some(NOW + 42 * 60_000),
+        },
         to: pinned("claude", Some("fable-5-1"), None),
         wip_commit: true,
         team: "team-1".to_string(),
@@ -13340,7 +14416,11 @@ fn handover_paragraph_names_the_worker_the_wall_the_checkout_and_the_wip() {
     );
     let bare = handover_paragraph(
         &HandoverPlan {
-            resets_at_ms: None,
+            cause: HandoverCause::QuotaWall {
+                provider: "codex".to_string(),
+                used_percent: 98,
+                resets_at_ms: None,
+            },
             ..plan
         },
         None,
@@ -13365,9 +14445,11 @@ fn walled_plan() -> HandoverPlan {
         task: "t-7".to_string(),
         spec: Text::from("build-it"),
         checkout: "/wt/t-7".to_string(),
-        provider: "codex".to_string(),
-        used_percent: 98,
-        resets_at_ms: None,
+        cause: HandoverCause::QuotaWall {
+            provider: "codex".to_string(),
+            used_percent: 98,
+            resets_at_ms: None,
+        },
         to: pinned("claude", Some("fable-5-1"), None),
         wip_commit: false,
         team: "team-1".to_string(),
@@ -20715,4 +21797,649 @@ fn a_pinned_model_offers_only_agents_that_run_it_and_asks_nothing_when_one_remai
         crate::summon_choice::ask(&look, &options).is_none(),
         "one agent left is not a question"
     );
+}
+
+/* ---- t-6815: the record is the coordinator's (audit t-6780 F2·F3) ----- */
+
+/// The record is the coordinator's, and a worker has no `task-update` at all.
+///
+/// The independent audit of 2026-09-24 (t-6780, F2): `task-update` read
+/// `bound` and wrote, so any pane that could name the run — worker A about
+/// worker B's task, A about its own, a worker whose attempt had already
+/// ended — could settle an attempt and free its dependents. The acceptance
+/// (m-7276, `result.refined`): only the run's live coordinator seat corrects;
+/// a worker's word on its own work is its `worker_done`, and once its
+/// attempt has ended it says what it has to say in a status mail and the
+/// coordinator corrects. Refused by name, and the run is asserted unchanged
+/// rather than merely refused: a refusal that half-happened is the failure
+/// mode this family of gates exists to prevent.
+#[test]
+fn a_task_update_from_a_worker_pane_is_refused_by_name() {
+    let mut bench = Bench::new();
+    bench.json("run-create --name authority");
+    let first = bench.json("task-create --spec first")["taskId"]
+        .as_str()
+        .expect("a task id")
+        .to_string();
+    let second = bench.json("task-create --spec second")["taskId"]
+        .as_str()
+        .expect("a task id")
+        .to_string();
+    let follower = bench.json(&format!("task-create --spec follower --deps {second}"))["taskId"]
+        .as_str()
+        .expect("a task id")
+        .to_string();
+    let (a, a_pane) = bench.seat(&format!("worker-start --agent claude --task {first}"));
+    let (b, _) = bench.seat(&format!("worker-start --agent codex --task {second}"));
+    let before = bench.ledger.export();
+    let unchanged = |bench: &Bench, what: &str| {
+        let after = bench.ledger.export();
+        assert_eq!(
+            after.tasks, before.tasks,
+            "{what}: a refused correction moved a task"
+        );
+        assert_eq!(
+            after.dispatches, before.dispatches,
+            "{what}: a refused correction moved an attempt"
+        );
+        assert_eq!(
+            after.served, before.served,
+            "{what}: a refusal filed a receipt"
+        );
+    };
+
+    // Worker A, about worker B's task: refused, naming everybody involved.
+    let refused = bench.at(
+        &a_pane,
+        &format!("task-update --task {second} --status completed"),
+    );
+    assert_ne!(refused.reply.exit_code, 0, "{:?}", refused.reply);
+    for named in [a.as_str(), b.as_str(), "team-1/%1", second.as_str()] {
+        assert!(
+            refused.reply.stderr.contains(named),
+            "the refusal did not name {named}: {}",
+            refused.reply.stderr
+        );
+    }
+    unchanged(&bench, "another worker's task");
+    assert_eq!(
+        bench.ledger.runs()[0]
+            .task(&follower)
+            .expect("the follower")
+            .status,
+        TaskStatus::Pending,
+        "a refused completion freed its dependents"
+    );
+
+    // Worker A about its OWN task — status or result — is refused too: its
+    // word on its own work is `worker_done`, and the refusal says so.
+    for line in [
+        format!("task-update --task {first} --status completed"),
+        format!("task-update --task {first} --result {{\"verified\":true}}"),
+    ] {
+        let refused = bench.at(&a_pane, &line);
+        assert_ne!(refused.reply.exit_code, 0, "`{line}`: {:?}", refused.reply);
+        assert!(
+            refused
+                .reply
+                .stderr
+                .contains(&format!("worker {a}, which is carrying it"))
+                && refused.reply.stderr.contains("worker_done"),
+            "`{line}`: {}",
+            refused.reply.stderr
+        );
+        unchanged(&bench, &line);
+    }
+
+    // A worker whose attempt ended carries nothing; the road back is the
+    // worker_died shape — a status mail from the pane, then the coordinator
+    // corrects the record.
+    bench.json(&format!(
+        "worker-stop --worker {a} --reason ended-elsewhere"
+    ));
+    let refused = bench.at(
+        &a_pane,
+        &format!("task-update --task {first} --status completed"),
+    );
+    assert_ne!(refused.reply.exit_code, 0, "{:?}", refused.reply);
+    assert!(
+        refused.reply.stderr.contains("carried by nobody")
+            && refused.reply.stderr.contains("is not that seat"),
+        "{}",
+        refused.reply.stderr
+    );
+    let told = bench.at(
+        &a_pane,
+        "send --type status --body the-work-landed-before-the-pane-died",
+    );
+    assert_eq!(told.reply.exit_code, 0, "{}", told.reply.stderr);
+    let ended = bench.json(&format!("task-update --task {first} --status completed"));
+    assert_eq!(ended["status"], "completed", "{ended}");
+    assert_eq!(ended["author"], "coordinator", "{ended}");
+    let run = &bench.ledger.runs()[0];
+    let held = run.task(&first).expect("the task");
+    assert!(
+        !run.review_of(held).verified,
+        "a status correction is no review"
+    );
+    bench
+        .ledger
+        .validate_loaded()
+        .expect("every refusal above left a ledger this window rebuilds");
+}
+
+/// A former coordinator and another run's worker are nonholders too.
+///
+/// The audit's narrow fix: authorize against the ACTUAL live seat of the
+/// named run, not against "is this pane a worker of the run" — a former
+/// coordinator whose pane outlived a takeover, and a worker of some other
+/// run naming this one with `--run`, are both strangers at the record.
+#[test]
+fn a_former_coordinator_or_another_runs_worker_cannot_correct_the_record() {
+    let mut bench = Bench::new();
+    let run_id = bench.json("run-create --name first-run")["runId"]
+        .as_str()
+        .expect("a run id")
+        .to_string();
+    let task = bench.json("task-create --spec the-work")["taskId"]
+        .as_str()
+        .expect("a task id")
+        .to_string();
+
+    // Another run's worker, naming this run by hand.
+    bench.json("run-create --name other-run");
+    let elsewhere = bench.json("task-create --spec elsewhere")["taskId"]
+        .as_str()
+        .expect("a task id")
+        .to_string();
+    let (_, stranger_pane) = bench.seat(&format!("worker-start --agent claude --task {elsewhere}"));
+    let before = bench.ledger.export();
+    let refused = bench.at(
+        &stranger_pane,
+        &format!("task-update --run {run_id} --task {task} --status completed"),
+    );
+    assert_ne!(refused.reply.exit_code, 0, "{:?}", refused.reply);
+    assert!(
+        refused
+            .reply
+            .stderr
+            .contains(&format!("pane team-1/{stranger_pane}")),
+        "{}",
+        refused.reply.stderr
+    );
+    assert_eq!(bench.ledger.export().tasks, before.tasks);
+
+    // The first coordinator, after a takeover: its pane is alive, still
+    // bound, and no longer the seat.
+    let mut other = Team::new("team-2", "second", 70);
+    std::mem::swap(&mut bench.team, &mut other);
+    let taken = bench.json(&format!(
+        "run-takeover --run {run_id} --from %1 --reason the-first-stalled-on-quota"
+    ));
+    assert_eq!(taken["generation"], 2, "{taken}");
+    std::mem::swap(&mut bench.team, &mut other);
+    let refused = bench.at(
+        agent_teams::LEADER_PANE,
+        &format!("task-update --run {run_id} --task {task} --status completed"),
+    );
+    assert_ne!(refused.reply.exit_code, 0, "{:?}", refused.reply);
+    assert!(
+        refused.reply.stderr.contains("team-2/%1") && refused.reply.stderr.contains("generation 2"),
+        "the refusal did not name the live seat: {}",
+        refused.reply.stderr
+    );
+    assert_eq!(bench.ledger.export().tasks, before.tasks);
+
+    // The live seat corrects, and the correction says which sitting wrote it.
+    std::mem::swap(&mut bench.team, &mut other);
+    let ended = bench.json(&format!(
+        "task-update --run {run_id} --task {task} --status completed --result {{\"verified\":true}} --attempt none --source abc1234"
+    ));
+    assert_eq!(ended["author"], "coordinator", "{ended}");
+    let run = bench.ledger.run(&run_id).expect("the run");
+    let held = run.task(&task).expect("the task");
+    assert_eq!(
+        held.result_author,
+        Some(ResultAuthor::Coordinator {
+            seat: "team-2/%1".to_string(),
+            generation: Some(2),
+            attempt: None,
+            source: Some("abc1234".to_string()),
+        })
+    );
+    assert!(run.review_of(held).verified);
+}
+
+/// Mail's legacy leader signature cannot stand in for a live task-correction
+/// seat. In particular another team's never-worker leader used to satisfy
+/// that signature on a vacated run named with --run (astra R1).
+#[test]
+fn a_seatless_run_refuses_every_leader_until_one_sits() {
+    let mut bench = Bench::new();
+    let run_id = bench.json("run-create --name seatless")["runId"]
+        .as_str()
+        .expect("run id")
+        .to_string();
+    let task = bench.json("task-create --spec work")["taskId"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+    let mut other = Team::new("team-2", "stranger", 70);
+
+    // A run written before coordinator seats existed.
+    bench.ledger.run_mut(&run_id).expect("run").coordinator = None;
+    let before = bench.ledger.export();
+    std::mem::swap(&mut bench.team, &mut other);
+    let denied = bench.run(&format!(
+        "task-update --run {run_id} --task {task} --status completed"
+    ));
+    assert_ne!(denied.reply.exit_code, 0);
+    assert!(
+        denied.reply.stderr.contains("nobody sitting"),
+        "{}",
+        denied.reply.stderr
+    );
+    assert_eq!(
+        bench.ledger.export(),
+        before,
+        "a refused correction left a success receipt"
+    );
+    std::mem::swap(&mut bench.team, &mut other);
+    let denied = bench.run(&format!(
+        "task-update --run {run_id} --task {task} --status completed"
+    ));
+    assert_ne!(
+        denied.reply.exit_code, 0,
+        "the former leader is no seat either"
+    );
+    assert_eq!(bench.ledger.export(), before);
+
+    bench.json("run-create --name other-work");
+    let other_task = bench.json("task-create --spec elsewhere")["taskId"]
+        .as_str()
+        .expect("other task")
+        .to_string();
+    let (_, worker_pane) = bench.seat(&format!("worker-start --agent claude --task {other_task}"));
+    let before = bench.ledger.export();
+    let denied = bench.at(
+        &worker_pane,
+        &format!("task-update --run {run_id} --task {task} --status completed"),
+    );
+    assert_ne!(
+        denied.reply.exit_code, 0,
+        "a worker cannot repair the vacant seat"
+    );
+    assert_eq!(bench.ledger.export(), before);
+
+    // Vacating a known seat is the same authority boundary.
+    bench.json(&format!("run-use {run_id}"));
+    bench.ledger.team_dissolved("team-1", 5_000);
+    let before = bench.ledger.export();
+    std::mem::swap(&mut bench.team, &mut other);
+    let denied = bench.run(&format!(
+        "task-update --run {run_id} --task {task} --status completed"
+    ));
+    assert_ne!(denied.reply.exit_code, 0);
+    assert!(denied.reply.stderr.contains("vacated"));
+    assert_eq!(bench.ledger.export(), before);
+    std::mem::swap(&mut bench.team, &mut other);
+    let denied = bench.run(&format!(
+        "task-update --run {run_id} --task {task} --status completed"
+    ));
+    assert_ne!(
+        denied.reply.exit_code, 0,
+        "the vacated coordinator has no seat"
+    );
+    assert_eq!(bench.ledger.export(), before);
+    std::mem::swap(&mut bench.team, &mut other);
+    // The explicit recovery creates a live generation, which can correct.
+    let seated = bench.json(&format!("run-use {run_id}"));
+    assert_eq!(seated["seated"], true);
+    let corrected = bench.json(&format!(
+        "task-update --run {run_id} --task {task} --status completed"
+    ));
+    assert_eq!(corrected["author"], "coordinator");
+}
+
+/// A worker's `verified`/`merged`/`deployed` are its claim, shown as one —
+/// through the real road: `worker_done` → stored → rebuilt → read.
+///
+/// The independent audit of 2026-09-24 (t-6780, F3): a legitimate worker
+/// carrying its own dispatch reported `{"ok":true,"verified":true,
+/// "merged":true,"deployed":true}` and every review label came on with no
+/// coordinator having looked. The body is still stored verbatim — it is the
+/// worker's report — but the ledger writes down WHO wrote it, from the pane
+/// the host authenticated and never from a key in the body, and the review
+/// reads the keys as claims until the coordinator seat writes its own, bound
+/// to the attempt it reviewed. Both survive a rebuild: the claim as a claim,
+/// the coordinator's row as the fact.
+#[test]
+fn a_workers_claimed_verification_is_shown_as_a_claim() {
+    let mut bench = Bench::new();
+    bench.json("run-create --name claims");
+    let task = bench.json("task-create --spec ship-it")["taskId"]
+        .as_str()
+        .expect("a task id")
+        .to_string();
+    let (worker, pane) = bench.seat(&format!("worker-start --agent claude --task {task}"));
+    let dispatch = bench.ledger.runs()[0].dispatches[0].id.clone();
+
+    // Every review key a worker could think of, old and new — including a
+    // forged author — in the body it is entitled to send.
+    bench.json_at(
+        &pane,
+        "send --type worker_done --body {\"ok\":true,\"summary\":\"checked-locally\",\"verified\":true,\"reviewedBy\":\"me\",\"merged\":true,\"deployed\":true,\"author\":\"coordinator\",\"resultAuthor\":{\"kind\":\"coordinator\"}}",
+    );
+    let (status, author, facts) = {
+        let run = &bench.ledger.runs()[0];
+        let held = run.task(&task).expect("the task");
+        (held.status, held.result_author.clone(), run.review_of(held))
+    };
+    assert_eq!(
+        status,
+        TaskStatus::Completed,
+        "the report is still the completion"
+    );
+    assert_eq!(
+        author,
+        Some(ResultAuthor::Worker {
+            worker: worker.clone(),
+            dispatch: Some(dispatch.clone()),
+        })
+    );
+    assert!(
+        !facts.verified && !facts.merged && !facts.deployed && !facts.written,
+        "a worker's keys were read as the coordinator's facts: {facts:?}"
+    );
+    assert!(
+        facts.claimed_verified && facts.claimed_merged && facts.claimed_deployed,
+        "the worker's claim was dropped rather than kept apart: {facts:?}"
+    );
+    assert_eq!(facts.author, ReviewAuthor::Worker);
+
+    // The roster reads the same row the board does.
+    let listed = bench.json("task-list");
+    let row = listed["tasks"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row["taskId"] == task.as_str())
+        .expect("the task's row")
+        .clone();
+    assert_eq!(row["review"]["verified"], false, "{row}");
+    assert_eq!(row["review"]["claimed_verified"], true, "{row}");
+    assert_eq!(row["resultAuthor"]["kind"], "worker", "{row}");
+
+    // Stored and rebuilt, the claim is still a claim.
+    let carried = Ledger::rebuild(bench.ledger.export()).expect("a readable ledger");
+    let run = &carried.runs()[0];
+    let held = run.task(&task).expect("the task");
+    assert_eq!(held.result_author, author);
+    assert!(!run.review_of(held).verified && run.review_of(held).claimed_verified);
+
+    // The coordinator's own word, and only that, makes the fact — bound to
+    // the attempt it reviewed — and it too survives a rebuild.
+    let source = bench.ledger.runs()[0].dispatches[0]
+        .source
+        .clone()
+        .expect("hand-in");
+    bench.json(&format!(
+        "task-update --task {task} --result {{\"verified\":true,\"mergeHead\":\"3a0a289bb5f3\"}} --attempt {dispatch} --source {source}"
+    ));
+    for ledger in [
+        &bench.ledger,
+        &Ledger::rebuild(bench.ledger.export()).expect("readable"),
+    ] {
+        let run = &ledger.runs()[0];
+        let held = run.task(&task).expect("the task");
+        let facts = run.review_of(held);
+        assert!(facts.verified && facts.merged && facts.written, "{facts:?}");
+        assert!(
+            !facts.claimed_verified && !facts.claimed_merged,
+            "{facts:?}"
+        );
+        assert_eq!(facts.author, ReviewAuthor::Coordinator);
+        assert_eq!(facts.attempt.as_deref(), Some(dispatch.as_str()));
+        assert_eq!(
+            held.result_author,
+            Some(ResultAuthor::Coordinator {
+                seat: "team-1/%1".to_string(),
+                generation: Some(1),
+                attempt: Some(dispatch.clone()),
+                source: Some(source.clone()),
+            })
+        );
+    }
+}
+
+/// A review is of an attempt; the next attempt inherits nothing.
+///
+/// The acceptance (m-7276): when the attempt changes, the old accepted facts
+/// do not attach to the new result — a task id staying the same is not a
+/// reason. Two doors: the reading withholds a coordinator's facts once the
+/// task has a newer attempt than the one reviewed, and the writing refuses
+/// a correction that names an attempt the task has moved past, so a
+/// coordinator that read the old result while a retry was starting cannot
+/// approve the new attempt with its observation of the old. A correction of
+/// the record that names no attempt — a status, a progress note — is not a
+/// review of a source and goes through as it always did.
+#[test]
+fn a_coordinators_review_is_bound_to_the_attempt_it_reviewed_and_a_new_attempt_inherits_nothing() {
+    let mut bench = Bench::new();
+    bench.json("run-create --name attempts");
+    let task = bench.json("task-create --spec flaky-build")["taskId"]
+        .as_str()
+        .expect("a task id")
+        .to_string();
+    let (_, first_pane) = bench.seat(&format!("worker-start --agent claude --task {task}"));
+    let first = bench.ledger.runs()[0].dispatches[0].id.clone();
+    bench.json_at(
+        &first_pane,
+        "send --type worker_done --body {\"ok\":true,\"head\":\"abc1234\"}",
+    );
+    bench.json(&format!(
+        "task-update --task {task} --result {{\"verified\":true,\"testedHead\":\"abc1234\"}} --attempt {first} --source abc1234"
+    ));
+    let facts = {
+        let run = &bench.ledger.runs()[0];
+        run.review_of(run.task(&task).expect("the task"))
+    };
+    assert!(facts.verified && facts.superseded_by.is_none(), "{facts:?}");
+
+    // Sent again: the review stood for the first attempt only.
+    bench.json(&format!("task-update --task {task} --status ready"));
+    let (_, second_pane) = bench.seat(&format!("worker-start --agent codex --task {task}"));
+    let second = bench.ledger.runs()[0].dispatches[1].id.clone();
+    assert_ne!(first, second);
+    let (facts, author) = {
+        let run = &bench.ledger.runs()[0];
+        let held = run.task(&task).expect("the task");
+        (run.review_of(held), held.result_author.clone())
+    };
+    assert!(
+        !facts.verified && !facts.written,
+        "a review of the first attempt dressed the second: {facts:?}"
+    );
+    assert_eq!(facts.superseded_by.as_deref(), Some(second.as_str()));
+    assert_eq!(facts.attempt.as_deref(), Some(first.as_str()));
+    assert_eq!(facts.author, ReviewAuthor::Coordinator);
+    assert!(
+        matches!(author, Some(ResultAuthor::Coordinator { .. })),
+        "the record itself is untouched — only the reading withholds: {author:?}"
+    );
+    let listed = bench.json("task-list");
+    let row = listed["tasks"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row["taskId"] == task.as_str())
+        .expect("the task's row")
+        .clone();
+    assert_eq!(row["review"]["verified"], false, "{row}");
+    assert_eq!(row["review"]["superseded_by"], second.as_str(), "{row}");
+
+    // A correction made against the first attempt is refused at the commit
+    // point, by name, and moves nothing.
+    let before = bench.ledger.export();
+    let stale = bench.run(&format!(
+        "task-update --task {task} --result {{\"verified\":true}} --attempt {first} --source abc1234"
+    ));
+    assert_ne!(stale.reply.exit_code, 0, "{:?}", stale.reply);
+    assert!(
+        stale.reply.stderr.contains(&first) && stale.reply.stderr.contains(&second),
+        "{}",
+        stale.reply.stderr
+    );
+    assert_eq!(bench.ledger.export().tasks, before.tasks);
+
+    // Against the newest attempt's hand-in it goes through, and the facts stand again.
+    bench.json_at(
+        &second_pane,
+        "send --type worker_done --body {\"ok\":true,\"head\":\"def5678\"}",
+    );
+    bench.json(&format!(
+        "task-update --task {task} --result {{\"verified\":true,\"testedHead\":\"def5678\"}} --attempt {second} --source def5678"
+    ));
+    let facts = {
+        let run = &bench.ledger.runs()[0];
+        run.review_of(run.task(&task).expect("the task"))
+    };
+    assert!(facts.verified && facts.superseded_by.is_none(), "{facts:?}");
+    assert_eq!(facts.attempt.as_deref(), Some(second.as_str()));
+
+    // A review cannot be pasted onto the other source even under the same attempt.
+    let stale = bench.run(&format!(
+        "task-update --task {task} --result {{\"verified\":true}} --attempt {second} --source abc1234"
+    ));
+    assert_ne!(stale.reply.exit_code, 0);
+}
+
+/// A request queued before a hand-in or a retry must carry the source it
+/// actually saw. The actor checks both observations when it applies the
+/// correction; it never fills either blank with the newest row (astra R2).
+#[test]
+fn a_review_needs_the_observed_attempt_and_source_at_commit() {
+    let mut bench = Bench::new();
+    bench.json("run-create --name source-check");
+    let task = bench.json("task-create --spec code-change")["taskId"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+    let (_, pane) = bench.seat(&format!("worker-start --agent claude --task {task}"));
+    let attempt = bench.ledger.runs()[0].dispatches[0].id.clone();
+    let review = format!(
+        "task-update --task {task} --result {{\"verified\":true,\"testedHead\":\"abc1234\"}}"
+    );
+    let before = bench.ledger.export();
+    for line in [
+        review.clone(),
+        format!("{review} --attempt {attempt}"),
+        format!("{review} --source abc1234"),
+        format!("{review} --attempt {attempt} --source abc1234"),
+    ] {
+        let denied = bench.run(&line);
+        assert_ne!(denied.reply.exit_code, 0, "{line}: {:?}", denied.reply);
+        assert_eq!(bench.ledger.export(), before, "{line} changed the ledger");
+    }
+
+    bench.json_at(
+        &pane,
+        "send --type worker_done --body {\"ok\":true,\"head\":\"def5678\"}",
+    );
+    let before = bench.ledger.export();
+    for line in [
+        review.clone(),
+        format!("{review} --attempt {attempt}"),
+        format!("{review} --attempt {attempt} --source abc1234"),
+        format!("{review} --attempt {attempt} --source def5678"),
+    ] {
+        let denied = bench.run(&line);
+        assert_ne!(denied.reply.exit_code, 0, "{line}: {:?}", denied.reply);
+        assert_eq!(bench.ledger.export(), before, "{line} changed the ledger");
+    }
+    let accepted = bench.json(&format!(
+        "task-update --task {task} --result {{\"verified\":true,\"testedHead\":\"def5678\"}} --attempt {attempt} --source def5678"
+    ));
+    assert_eq!(accepted["author"], "coordinator");
+    let run = &bench.ledger.runs()[0];
+    assert!(run.review_of(run.task(&task).expect("task")).verified);
+
+    // A newer source on the SAME attempt invalidates the old review even
+    // when the task id, author, and dispatch id have stayed the same.
+    let mut moved = bench.ledger.export();
+    moved
+        .dispatches
+        .iter_mut()
+        .find(|row| row.id == attempt)
+        .expect("attempt")
+        .source = Some("123abcd".to_string());
+    let moved = Ledger::rebuild(moved).expect("a readable changed hand-in");
+    let run = &moved.runs()[0];
+    let facts = run.review_of(run.task(&task).expect("task"));
+    assert!(!facts.verified && !facts.written, "{facts:?}");
+    assert_eq!(facts.source_now.as_deref(), Some("123abcd"));
+}
+
+/// A result nobody is known to have written is a claim, however it is
+/// spelled — and a coordinator's row stays the fact across a rebuild.
+///
+/// The acceptance (m-7276): no serde default or migration may promote a
+/// legacy result to coordinator authorship. The rows this machine wrote
+/// before authorship was recorded carry `verified`/`merged` in the
+/// coordinator's own spelling, and the ledger still cannot say who wrote
+/// them, so it does not.
+#[test]
+fn a_legacy_result_with_no_author_reads_as_a_claim_and_a_coordinators_row_survives_a_rebuild() {
+    let mut bench = Bench::new();
+    bench.json("run-create --name legacy");
+    let legacy = bench.json("task-create --spec old-work")["taskId"]
+        .as_str()
+        .expect("a task id")
+        .to_string();
+    let reviewed = bench.json("task-create --spec new-work")["taskId"]
+        .as_str()
+        .expect("a task id")
+        .to_string();
+    for id in [&legacy, &reviewed] {
+        bench.json(&format!(
+            "task-update --task {id} --status completed --result {{\"verified\":true,\"mergeHead\":\"3a0a289bb5f3\",\"deployed\":true}} --attempt none --source 3a0a289bb5f3"
+        ));
+    }
+    // The store as an older window wrote it: the same bytes, no author.
+    let mut projection = bench.ledger.export();
+    let row = projection
+        .tasks
+        .iter_mut()
+        .find(|row| row.id == legacy)
+        .expect("the legacy row");
+    assert!(
+        row.result_author.is_some(),
+        "the fixture wrote as the coordinator"
+    );
+    row.result_author = None;
+    let carried = Ledger::rebuild(projection).expect("a readable ledger");
+    let run = &carried.runs()[0];
+
+    let old = run.review_of(run.task(&legacy).expect("the legacy task"));
+    assert!(
+        !old.verified && !old.merged && !old.deployed && !old.written,
+        "a legacy result was promoted to the coordinator's facts: {old:?}"
+    );
+    assert!(
+        old.claimed_verified && old.claimed_merged && old.claimed_deployed,
+        "{old:?}"
+    );
+    assert_eq!(old.author, ReviewAuthor::Unknown);
+    assert_eq!(
+        run.task(&legacy).expect("the legacy task").result_author,
+        None
+    );
+
+    let new = run.review_of(run.task(&reviewed).expect("the reviewed task"));
+    assert!(
+        new.verified && new.merged && new.deployed && new.written,
+        "{new:?}"
+    );
+    assert_eq!(new.merge_head.as_deref(), Some("3a0a289bb5f3"));
+    assert_eq!(new.author, ReviewAuthor::Coordinator);
 }
