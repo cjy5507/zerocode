@@ -128,6 +128,11 @@ pub use misc_tools::{
     FILE_PICK_OUTCOME_ANSWERED,
 };
 pub use misc_tools::{
+    challenger_path, jev_challenger_mode_from, note_challenger_verdicts, read_learning_outcomes,
+    ChallengerRow, CHALLENGER_FILE, CHALLENGER_ROUTE_SOURCE, CHALLENGER_RUBRIC_VERSION,
+    JEV_CHALLENGER_SETTING,
+};
+pub use misc_tools::{
     command_guard_path, jev_command_guard_mode_from, jev_tool_text_guard_mode_from,
     note_tool_guard_turn, tool_text_guard_path, CommandGuardLabelRow, CommandGuardRow,
     ToolGuardJudge, ToolTextGuardLabelRow, ToolTextGuardRow, COMMAND_GUARD_FILE,
@@ -142,8 +147,8 @@ pub use misc_tools::{
 pub use misc_tools::{
     note_loaded_skill, note_search_answer, skill_search, skill_search_mode_from,
     skill_search_path,
-    Chosen, Searched, SkillLabelRow, SkillSearchRow, SkillSuggestionJudge,
-    SKILL_OUTCOME_ANSWERED, SKILL_SEARCH_DEADLINE, SKILL_SEARCH_FILE, SKILL_SEARCH_SETTING,
+    Chosen, Searched, SkillLabelRow, SkillRequestName, SkillSearchRow, SkillSuggestionJudge,
+    SKILL_OUTCOME_ANSWERED, SKILL_SEARCH_DEADLINE, SKILL_SEARCH_FILE, SKILL_SEARCH_SETTING, SKILL_SUGGESTION_SETTING,
     judge_step_effort_ledger, record_step_event, step_effort_path, step_effort_raised,
     step_effort_word, step_effort_word_in, StepEffortWord, StepJudgmentRow, StepSeat,
     JUDGMENT_ROW_KIND, STEP_EFFORT_FILE, STEP_EFFORT_SETTING, STEP_JUDGMENT_DEADLINE,

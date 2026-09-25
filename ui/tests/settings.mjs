@@ -53,12 +53,14 @@ const TYPESAFE_DECISION_MODES = Object.freeze([
    seat offers all four, a seat nothing labels offers no `auto` — and the mode
    it stands at while Jev is switched on and nobody wrote a word for it
    (`JevUse::recommended`) — `off` for the two seats stopped on their own
-   evidence (t-6342). `typesafe_settings.rs` holds this list against the
-   table. */
+   evidence (t-6342) — and, for a seat split off another, the setting whose
+   word it reads while it has none of its own (`JevUse::follows`, t-6877).
+   `typesafe_settings.rs` holds this list against the table. */
 const JEV_SEATS = Object.freeze([
   Object.freeze({ id: "routing", setting: "decisionShadow", modes: "off shadow on auto", recommended: "auto" }),
   Object.freeze({ id: "recall", setting: "rerankShadow", modes: "off shadow on auto", recommended: "auto" }),
   Object.freeze({ id: "skills", setting: "skillSearch", modes: "off shadow on auto", recommended: "auto" }),
+  Object.freeze({ id: "skill_suggestion", setting: "skillSuggestion", modes: "off shadow on auto", recommended: "auto", follows: "skillSearch" }),
   Object.freeze({ id: "browser", setting: "browserAction", modes: "off shadow on auto", recommended: "auto" }),
   Object.freeze({ id: "desktop", setting: "desktopAction", modes: "off shadow on auto", recommended: "auto" }),
   Object.freeze({ id: "emulator", setting: "emulatorAction", modes: "off shadow on auto", recommended: "auto" }),
@@ -81,6 +83,7 @@ const JEV_SEATS = Object.freeze([
   Object.freeze({ id: "file_pick", setting: "jevFilePick", modes: "off shadow on auto", recommended: "auto" }),
   Object.freeze({ id: "command_guard", setting: "jevCommandGuard", modes: "off shadow on auto", recommended: "auto" }),
   Object.freeze({ id: "tool_text_guard", setting: "jevToolTextGuard", modes: "off shadow on auto", recommended: "auto" }),
+  Object.freeze({ id: "reflex_decide", setting: "jevReflexDecide", modes: "off shadow", recommended: "shadow" }),
 ]);
 /* The door's object under `smart` and the one word its folder list may hold
    that is not a folder (`zerocode_core::jev::door::JEV_SETTINGS_KEY`,
@@ -298,12 +301,14 @@ const RUST_DEFAULT_DOCUMENT_JSON = String.raw`{
   "window_material": { "terminal_opacity": 1.0, "blur": false },
   "default_agent": { "kind": "auto" },
   "agent_teams_mode": "panes",
+  "claude_autoswitch_mode": "ask",
   "worktree_prefs": { "branch_prefix": "git-username" },
   "notifications": { "enabled": true, "agent_attention": true, "agent_completion": true },
   "computer_awake_mode": "off",
   "computer_confirm_payment": true,
   "computer_confirm_transfer": true,
   "computer_confirm_delete": true,
+  "computer_live_reflex": false,
   "emulator.keepBooted": true,
   "emulator.prebootLastUsed": true,
   "emulator.idleShutdownMinutes": 30,
@@ -705,7 +710,7 @@ const SETTINGS_MUTATION_COMMANDS = new Set([
   "set_notification_preference", "set_browser_home_page", "set_browser_search_engine",
   "patch_browser_link_routing", "patch_browser_user_agents", "set_browser_restore_tabs", "set_browser_default_zoom", "set_browser_open_tabs",
   "set_terminal_opacity",
-  "set_window_blur", "set_agent_teams_mode", "set_default_agent",
+  "set_window_blur", "set_agent_teams_mode", "set_claude_autoswitch_mode", "set_default_agent",
   "set_shortcut_visibility", "set_task_source_visibility", "set_keybinding",
   "set_diff_side_by_side", "set_conversation_focus_view", "set_confirm_close_pinned",
   "set_skip_close_terminal_with_running_process_confirm", "set_ctrl_tab_order_mode",
@@ -1542,6 +1547,11 @@ class StatefulBackend {
         this.settings.agent_teams_mode = args.mode;
         keys = ["agent_teams_mode"];
         break;
+      case "set_claude_autoswitch_mode":
+        if (!["off", "ask", "auto"].includes(args.mode)) throw new Error(`${args.mode}는 이 창이 아는 자동 전환 낱말이 아닙니다 (off|ask|auto)`);
+        this.settings.claude_autoswitch_mode = args.mode;
+        keys = ["claude_autoswitch_mode"];
+        break;
       case "set_default_agent":
         this.settings.default_agent = clone(args.preference);
         keys = ["default_agent"];
@@ -1939,6 +1949,28 @@ class StatefulBackend {
         return this.grokUsage ? clone(this.grokUsage) : { usage: null, fetching: false };
       case "opencode_usage":
         return { usage: null, fetching: false };
+      // 계정마다 제 게이지와 전환 표의 판정(t-7538) — 계정이 없는 이 픽스처에서는
+      // 「혼자」이고 아무것도 나가지 않는다. 모드는 설정 문서의 것.
+      case "claude_account_usage":
+        return {
+          accounts: [],
+          plan: {
+            mode: this.settings.claude_autoswitch_mode,
+            active: null,
+            decision: { kind: "stay", why: "alone" },
+            landing: null,
+            fitness: [],
+            next: null,
+            walled: [],
+            last_switch_ms: null,
+            cooldown_until_ms: null,
+            failed_recently: [],
+            token: "settings-fixture",
+            now_ms: 0,
+          },
+          sent: 0,
+          fetching: false,
+        };
       // 토큰 원장은 게이지와 다른 물음이라 답의 모양도 다르다 — 아직 스캔이
       // 없는 상태가 이 픽스처의 기본값이다.
       // 머리의 세 figure는 파생이 아니라 센 값이라 자기 문으로 온다.
@@ -2251,6 +2283,7 @@ class StatefulBackend {
       case "terminal_command": return this.settings.terminal_command;
       case "terminal_command_argv": return [this.settings.terminal_command];
       case "agent_teams_mode": return this.settings.agent_teams_mode;
+      case "claude_autoswitch_mode": return this.settings.claude_autoswitch_mode;
       case "project_scripts":
         return {
           root: BOOT_BASE.project_root,
@@ -2728,8 +2761,13 @@ class StatefulBackend {
     /* `door::switched_on`: the switch written, and true. */
     const switchedOn = door?.enabled === true;
     /* Every seat reads its own row's words and anything else is off; a seat
-       nobody wrote a word for stands at its recommendation while the switch is
-       on and is off otherwise: `JevUse::mode_in`. */
+       split off another reads the word written for that other while it has
+       none of its own (`JevUse::word_in`); a seat nobody wrote a word for
+       stands at its recommendation while the switch is on and is off
+       otherwise: `JevUse::mode_in`. */
+    const wordOf = (seat) => smart[seat.setting] !== undefined || seat.follows === undefined
+      ? smart[seat.setting]
+      : smart[seat.follows];
     const mode = (seat, given) => {
       const offered = seat.modes.split(" ");
       if (given === undefined) return switchedOn ? seat.recommended : offered[0];
@@ -2739,9 +2777,9 @@ class StatefulBackend {
     const switches = JEV_SEATS.map((seat) => ({
       id: seat.id,
       setting: seat.setting,
-      mode: mode(seat, smart[seat.setting]),
+      mode: mode(seat, wordOf(seat)),
       modes: clone(jevSeatModes(seat)),
-      written: smart[seat.setting] !== undefined,
+      written: wordOf(seat) !== undefined,
     }));
     /* `JevSwitch::of`: the door lets a request through (unset is on, anything
        but `true` is off), some seat asks, and some folder is consented. */
@@ -3012,6 +3050,7 @@ const controlValue = async (page, kind) => page.evaluate((name) => {
     opacity: () => Number(document.getElementById("window-opacity")?.value),
     blur: () => document.getElementById("window-blur")?.checked,
     teams: () => document.getElementById("orch-teams-mode")?.value,
+    claude_autoswitch: () => document.getElementById("account-autoswitch")?.value,
     setup_script_launch_mode: () => document.querySelector(
       "[data-setup-launch-mode][aria-pressed='true']",
     )?.dataset.setupLaunchMode,
@@ -3131,6 +3170,7 @@ const chooseControl = async (page, kind, value) => {
       value,
     );
     case "teams": return page.selectOption("#orch-teams-mode", value);
+    case "claude_autoswitch": return page.selectOption("#account-autoswitch", value);
     case "setup_script_launch_mode": return page.click(
       `[data-setup-launch-mode="${value}"]`,
     );
@@ -5039,6 +5079,38 @@ await test("TypeSafe 키는 키체인에만 가고, Jev는 스위치 하나로 �
   await pageA.evaluate(() => refreshApiRouters());
   assert(!(await pageA.locator("#typesafe-key-input").isDisabled()), "a machine with a keychain was left without the key field");
   return `one switch · ${selects.total} select under 고급 · 0 visible`;
+});
+
+await test("분리 전에 손으로 끈 스킬 검색은 업데이트 뒤에도 스킬 제안을 끈 채로 둔다 — 제안은 제 낱말이 생길 때까지 검색의 낱말을 따른다", async () => {
+  await openSettings(pageA, "api-routers");
+  backend.keychain.set(TYPESAFE_SERVICE, "apikey_fixture");
+  const toggle = pageA.locator("#jev-enabled");
+  const suggestion = JEV_SEATS.find((seat) => seat.id === "skill_suggestion");
+  const search = JEV_SEATS.find((seat) => seat.id === "skills");
+  // A file written before the skill suggestion was a seat of its own: Jev on
+  // in every folder and every feature turned off by hand, the skill search
+  // among them, and no word for the suggestion, which read the search's
+  // until the split (t-6877, the coordinator's migration contract m-8181).
+  const byHand = Object.fromEntries(
+    JEV_SEATS.filter((seat) => seat !== suggestion).map((seat) => [seat.setting, "off"]),
+  );
+  try {
+    backend.zoSettings.smart = { ...byHand, [JEV_SETTINGS_KEY]: { enabled: true, workspaces: [JEV_EVERY_WORKSPACE] } };
+    await pageA.evaluate(() => refreshApiRouters());
+    await renderSettled(pageA);
+    assert(!(await toggle.isChecked()), "the update turned the suggestion on though its person had turned the search off");
+    // A word of the suggestion's own is its own: it asks, and the switch
+    // says Jev is in use, while the search's own word stands.
+    backend.zoSettings.smart = { ...backend.zoSettings.smart, [suggestion.setting]: "auto" };
+    await pageA.evaluate(() => refreshApiRouters());
+    await pageA.waitForFunction(() => document.getElementById("jev-enabled")?.checked === true, null, { timeout: UI_TIMEOUT });
+    assertEqual(backend.zoSettings.smart[search.setting], "off", "the search's own word moved");
+  } finally {
+    delete backend.zoSettings.smart;
+    backend.keychain.delete(TYPESAFE_SERVICE);
+  }
+  await pageA.evaluate(() => refreshApiRouters());
+  return `${suggestion.id} follows ${search.setting} until it has a word of its own`;
 });
 
 await test("카드가 제시하는 판단은 실제로 불릴 수 있어야 한다 — 분류기가 라우팅 자리 앞에 선다", async () => {
@@ -6959,6 +7031,7 @@ await test("non-default writes become canonical state before the second window b
     ["opacity", "set_terminal_opacity", 0.7, "appearance"],
     ["blur", "set_window_blur", true, "appearance"],
     ["teams", "set_agent_teams_mode", "off", "orchestration"],
+    ["claude_autoswitch", "set_claude_autoswitch_mode", "auto", "provider-accounts"],
     ["setup_script_launch_mode", "set_setup_script_launch_mode", "split-horizontal", "terminal"],
     ["terminal_shortcut_policy", "set_terminal_shortcut_policy", "terminal-first", "shortcuts"],
     ["workspace_directory", "patch_workspace_creation_prefs", "/tmp/zerocode-workspaces", "general"],
@@ -7449,6 +7522,7 @@ const ROLLBACKS = [
   { kind: "opacity", command: "set_terminal_opacity", pane: "appearance", asked: 0.2, canonical: 0.65 },
   { kind: "blur", command: "set_window_blur", pane: "appearance", asked: false, canonical: true },
   { kind: "teams", command: "set_agent_teams_mode", pane: "orchestration", asked: "panes", canonical: "off" },
+  { kind: "claude_autoswitch", command: "set_claude_autoswitch_mode", pane: "provider-accounts", asked: "off", canonical: "auto" },
   {
     kind: "setup_script_launch_mode", command: "set_setup_script_launch_mode", pane: "terminal",
     asked: "split-vertical", canonical: "split-horizontal",
@@ -7540,6 +7614,7 @@ for (const row of ROLLBACKS) {
           delete_worktree_confirm: () => document.getElementById("ask-before-delete-worktree")?.checked,
           delete_automation_confirm: () => document.getElementById("ask-before-delete-automation")?.checked,
     artifacts_retention: () => Number(document.getElementById("artifacts-retention-days")?.value),
+          claude_autoswitch: () => document.getElementById("account-autoswitch")?.value,
           default_agent: () => ({ auto: pressed("auto"), blank: pressed("blank"), codex: pressed("codex") }),
         }[kind]();
         return JSON.stringify(actual) === JSON.stringify(canonical);

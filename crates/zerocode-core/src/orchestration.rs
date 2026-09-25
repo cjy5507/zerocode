@@ -441,6 +441,15 @@ pub enum MessageKind {
     /// how long the CLI keeps the switch, and why. The road that writes it is
     /// [`Ledger::workers_model_deviated`].
     ModelDeviated,
+    /// Nobody said this either: the LEDGER's receipt that the window moved
+    /// a Claude account (t-7538) — the default every NEW launch runs as,
+    /// or one walled worker seated again on another account with the same
+    /// worker id, dispatch and conversation. Written only from the window's
+    /// own switch road, never from a peer's `send`: a body wearing this
+    /// kind from a worker would be a switch nobody made. The row carries
+    /// account ids, percentages and the reason; never a credential, never
+    /// an email. The road that writes it is [`Ledger::account_switched`].
+    AccountSwitched,
 }
 
 impl MessageKind {
@@ -463,6 +472,7 @@ impl MessageKind {
             Self::Resumed => "resumed",
             Self::ClassifierDeclined => "classifier_declined",
             Self::ModelDeviated => "model_deviated",
+            Self::AccountSwitched => "account_switched",
         }
     }
 
@@ -487,6 +497,7 @@ impl MessageKind {
                 | Self::Resumed
                 | Self::ClassifierDeclined
                 | Self::ModelDeviated
+                | Self::AccountSwitched
         )
     }
 }
@@ -513,6 +524,7 @@ impl std::str::FromStr for MessageKind {
             "resumed" => Self::Resumed,
             "classifier_declined" => Self::ClassifierDeclined,
             "model_deviated" => Self::ModelDeviated,
+            "account_switched" => Self::AccountSwitched,
             _ => return Err(format!("unknown message type: {word}")),
         })
     }
@@ -1219,6 +1231,29 @@ pub struct Worker {
     /// over the run's ([`QuotaWallOrder::standing`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quota_wait: bool,
+    /// The program of this worker's last pane, while nobody has seen it
+    /// leave (t-7538, astra R3): written in the same transition that rests
+    /// the worker for an account switch, BEFORE its pane is closed, and let
+    /// go only by [`Ledger::worker_exit_seen`] once a look sees that program
+    /// gone. While it stands no road opens the conversation again — the
+    /// ledger's reseat, a door's witness, the grace — because a second
+    /// process on the same transcript beside one that may still write is
+    /// the thing the switch must never make. Durable so a window that
+    /// restarts, or a journal that could not be written, holds it the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_unconfirmed: Option<ExitWitness>,
+}
+
+/// What a later look asks about a program that may have outlived its pane's
+/// close (t-7538): its process group, and its leader's start identity when
+/// the process table could read it — so a pid the system has since handed to
+/// another program is never taken for the one that did not leave. Ids only.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExitWitness {
+    pub group: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<String>,
 }
 
 impl std::fmt::Debug for Worker {
@@ -1246,6 +1281,7 @@ impl std::fmt::Debug for Worker {
             .field("adopted_by", &self.adopted_by)
             .field("on_quota_wall", &self.on_quota_wall)
             .field("quota_wait", &self.quota_wait)
+            .field("exit_unconfirmed", &self.exit_unconfirmed)
             .finish()
     }
 }
@@ -3589,7 +3625,7 @@ impl Run {
     ///
     /// The idleness is the window's fact and arrives from outside; this is
     /// the ledger's half of the question, pure so it can be tested without a
-    /// pane. `None` is the usual answer, and each reason is a door:
+    /// pane. `None` is the usual answer, and its reason is a door:
     ///
     /// - **Nothing waiting unhanded.** Advice about no mail is noise, and an
     ///   open delivery is mail the holder has already been handed: while
@@ -3597,9 +3633,18 @@ impl Run {
     ///   is in it, and a pointer on top of it would be nagging mid-recovery
     ///   (Orca's own guard). The count is therefore what is queued and
     ///   unhanded — never the open batch, which needs no announcing.
-    /// - **An unanswered question of its own.** A holder that asked and has
-    ///   no reply yet is waiting on purpose, and typing at it would answer
-    ///   its question with our advice (the work order's third condition).
+    ///
+    /// What is NOT a door is a question of the holder's own that has no answer
+    /// yet. It was one, read as "an asker is waiting on purpose" — and the
+    /// ledger cannot see a wait. An `ask` that reached its deadline lets its
+    /// sleeper go and leaves the question standing, and a question asked twice
+    /// is answered once; either kept this door shut over every later message,
+    /// for good. A Codex reviewer's second copy of one question went
+    /// unanswered and three messages to it sat unannounced for two hours, and
+    /// a coordinator's question to another run's pane silenced its own address
+    /// from the moment it was asked (t-8938). An asker held inside its own
+    /// wait is mid-turn, and the window, which runs that wait, holds the
+    /// pointer for exactly as long as the wait lasts.
     ///
     /// What an open delivery must NOT silence is the mail queued BEHIND it.
     /// The lease arm of this door used to answer `None` on the lease alone,
@@ -3626,32 +3671,6 @@ impl Run {
             .find(|(held, _)| held == address)
             .map(|(_, inbox)| inbox)?;
         if inbox.pending.is_empty() {
-            return None;
-        }
-        /* One walk for the answered threads, one for the questions — never a
-         * walk per question. This runs on every beat for every address, and
-         * a run's mail grows without a bound, so the quadratic shape would
-         * be paid exactly where it hurts: forever, on the clock that types
-         * at people's panes.
-         *
-         * The set holds the two facts [`Message::answers`] asks for, which is
-         * that rule said in the shape a single walk can use: a message is an
-         * answer when it is in the question's thread AND comes from the seat
-         * the question was asked of. Matched on the thread alone, a
-         * bystander's `send --thread-id` retired a wait nobody had answered.
-         */
-        let answered: std::collections::HashSet<(&str, &str)> = self
-            .messages
-            .iter()
-            .filter_map(|reply| Some((reply.thread.as_deref()?, reply.from.as_str())))
-            .collect();
-        let asked_and_unanswered = self.messages.iter().any(|question| {
-            question.kind == MessageKind::Question
-                && question.thread.is_none()
-                && question.from == address
-                && !answered.contains(&(question.id.as_str(), question.to.as_str()))
-        });
-        if asked_and_unanswered {
             return None;
         }
         /* Mail this SEAT wrote is not news to it, and it is the same rule
@@ -3928,6 +3947,23 @@ const RESTART_LOSSES: [&str; 4] = [
     CONVERSATION_FILE_GONE,
     RESUME_UNSUPPORTED,
 ];
+
+/// Why a ledger whose window has said its goodbye neither ends a sleeper at
+/// the grace nor cuts one a pane (t-9091).
+///
+/// The goodbye puts the seated workers to sleep for the NEXT window, and the
+/// window saying it keeps beating for as long as its way out takes. On
+/// 2026-09-25 that beat measured the grace from its own boot — 10.4 and 72.2
+/// minutes back — and ended all five workers its goodbye had just put to
+/// sleep, 0.36 to 1.19 s after it (`sleeping worker … was not resumed within
+/// the grace`, then `event loop exited`); the next windows had nobody left
+/// to bring back.
+fn said_goodbye_refusal(worker_id: &str) -> String {
+    format!(
+        "worker {worker_id} sleeps for the next window: this one has said its goodbye, \
+         and the grace and the reseat are that window's"
+    )
+}
 
 /// Whether a `worker_done` says the work succeeded.
 ///
@@ -4927,6 +4963,21 @@ pub struct Ledger {
     binding_revisions: Vec<(String, u64)>,
     #[serde(skip)]
     next_binding_revision: u64,
+    /// Whether the window holding this ledger has said its goodbye
+    /// ([`Self::window_exiting`]) — and so is on its way out (t-9091).
+    ///
+    /// In-process, like the binding revisions: a goodbye never crosses a
+    /// restart, and the ledger the next window reads back has not said one.
+    /// From here on every sleeper is the next window's to bring back, and so
+    /// is the grace that could end one ([`Self::sleeper_expired`],
+    /// [`Self::prepare_worker_reseat`]).
+    #[serde(skip)]
+    said_goodbye: bool,
+    /// Named `ask`s whose wait has not settled yet ([`Asking`]). In-process
+    /// for the reason above: the wait lives in this window and never crosses
+    /// a restart.
+    #[serde(skip)]
+    asking: Vec<Asking>,
     /// How long a finished run keeps its detail rows. One of
     /// [`RETENTION_CHOICES`], and [`RETENTION_DEFAULT_DAYS`] in every ledger
     /// written before this existed — which is what those ledgers effectively
@@ -4959,11 +5010,36 @@ impl Default for Ledger {
             next_id: 0,
             binding_revisions: Vec::new(),
             next_binding_revision: 0,
+            said_goodbye: false,
+            asking: Vec::new(),
             retention_days: RETENTION_DEFAULT_DAYS,
             swept_at_ms: 0,
             verb_tallies: Vec::new(),
         }
     }
+}
+
+/// A named `ask` whose wait is still out: the question it posted, under the
+/// name and the fingerprint it was asked with (t-8938).
+///
+/// An `ask`'s receipt is the answer its wait goes home with, so it is filed
+/// when the wait settles — and until then a retry under the same name found
+/// no receipt and posted a second question. That is how one reviewer's
+/// question stood twice: the coordinator answered the first copy, the second
+/// was never answered, and the retry's wait timed out on a thread nobody
+/// was writing in. A retry while the first wait is out JOINS it instead —
+/// the same question, waited on again — and one that asks something else
+/// under the name is refused, as a mismatched replay is.
+///
+/// Forgotten when the name's receipt is filed ([`Ledger::remember`]), which
+/// is the moment the replay road takes over.
+#[derive(Debug)]
+struct Asking {
+    caller: String,
+    request: String,
+    fingerprint: String,
+    run: String,
+    question: String,
 }
 
 /// How often one verb was asked on one UTC day, and how often it was
@@ -5808,6 +5884,11 @@ fn fingerprint_of(caller: &str, verb: &str, words: &Words) -> String {
 
 /// The flag that names a retry, spelled once.
 const RETRY_REQUEST: &str = "--retry-request";
+
+/// What a retry under a name already in use has to be — said once for both
+/// roads that refuse one: a name already answered, and a name whose `ask` is
+/// still waiting ([`Asking`]).
+const A_RETRY_REPEATS_ITS_REQUEST: &str = "a retry has to repeat the request it retries";
 
 /// Whether this command line is one the road will refuse for want of a name.
 ///
@@ -7059,6 +7140,46 @@ impl Ledger {
             .find(|held| held.request == request && held.belongs_to(caller))
     }
 
+    /// The question a named `ask` still waiting under this name posted —
+    /// `None` when no wait is out under it, and a refusal when the name is
+    /// out asking something else ([`Asking`]).
+    fn joining(&self, key: &ReceiptKey, run_id: &str) -> Result<Option<String>, String> {
+        let Some(held) = self
+            .asking
+            .iter()
+            .find(|held| held.caller == key.caller && held.request == key.request)
+        else {
+            return Ok(None);
+        };
+        if held.fingerprint != key.durable.fingerprint() {
+            return Err(format!(
+                "{RETRY_REQUEST} {} is still waiting on a different question — \
+                 {A_RETRY_REPEATS_ITS_REQUEST}",
+                key.request
+            ));
+        }
+        /* A question in another run, or one retention has taken since, is no
+         * wait to join: the name asks afresh. */
+        Ok((held.run == run_id
+            && self
+                .run(run_id)
+                .is_some_and(|run| run.message(&held.question).is_some()))
+        .then(|| held.question.clone()))
+    }
+
+    /// Write down that a named `ask` posted `question` and goes to wait on it.
+    fn now_asking(&mut self, key: &ReceiptKey, run_id: &str, question: &str) {
+        self.asking
+            .retain(|held| held.caller != key.caller || held.request != key.request);
+        self.asking.push(Asking {
+            caller: key.caller.clone(),
+            request: key.request.clone(),
+            fingerprint: key.durable.fingerprint().to_string(),
+            run: run_id.to_string(),
+            question: question.to_string(),
+        });
+    }
+
     /// File the receipt for a verb whose effect actually happened.
     ///
     /// The one place that knows the rule, so the window and the bench cannot
@@ -7101,6 +7222,10 @@ impl Ledger {
     }
 
     fn remember(&mut self, key: &ReceiptKey, answer: ServedAnswer, now_ms: i64) {
+        // A named `ask` whose wait settles hands its name to the replay road
+        // — whichever of its joined waits settled first.
+        self.asking
+            .retain(|held| held.caller != key.caller || held.request != key.request);
         if self.already_served(&key.caller, &key.request).is_some() {
             return;
         }
@@ -7669,6 +7794,7 @@ impl Ledger {
             adopted_by: None,
             on_quota_wall: tuning.on_quota_wall,
             quota_wait: tuning.quota_wait,
+            exit_unconfirmed: None,
         });
         if let (Some(task_id), Some(dispatch)) = (task, dispatch_id.as_ref()) {
             run.dispatches.push(Dispatch {
@@ -9684,8 +9810,13 @@ impl Ledger {
     /// sweep, which is still the one authority on "the window is gone"; and
     /// the seats, the pending releases and the standing orders stay as they
     /// are, because the window that vacates them is the next one.
+    ///
+    /// And the goodbye is remembered in-process ([`Self::said_goodbye`],
+    /// t-9091): the sleepers it made are the next window's to seat and to
+    /// time, so this ledger refuses both from here on.
     pub fn window_exiting(&mut self, now_ms: i64) -> Restarted {
         let _ = now_ms;
+        self.said_goodbye = true;
         let (sleeping, _) = self.kept_and_lost_by_the_window();
         let asleep = sleeping.len();
         for worker in sleeping {
@@ -9698,6 +9829,14 @@ impl Ledger {
             sleeping: asleep,
             moved: asleep > 0,
         }
+    }
+
+    /// Whether this ledger's window has said its goodbye (t-9091): read by
+    /// the runtime's image, so a beat on the way out knows it has no sleeper
+    /// to seat or to end.
+    #[must_use]
+    pub const fn said_goodbye(&self) -> bool {
+        self.said_goodbye
     }
 
     /// Every live worker's terminal died with the window that held it.
@@ -9722,6 +9861,10 @@ impl Ledger {
     /// the exit signal never reached — a crash's — and it keeps for them the
     /// same bargain it always made.
     pub fn window_restarted(&mut self, now_ms: i64) -> Restarted {
+        // A boot: this is the next window's ledger, and it has said no
+        // goodbye — the sleepers are its own to seat, and the grace its own
+        // to spend (t-9091).
+        self.said_goodbye = false;
         // Every leader pane died with the window, so every coordinator seat
         // is empty — and says so, rather than naming a pane the next window
         // will never have (t-2512).
@@ -11482,6 +11625,9 @@ impl Ledger {
     ) -> Option<String> {
         let worker_id = self
             .sleeper_awaiting(checkout, agent, session_id)
+            // A sleeper whose last program was not seen to leave is not
+            // seated in a second pane beside it (t-7538, astra R3).
+            .filter(|worker| worker.exit_unconfirmed.is_none())
             .map(|worker| worker.id.clone())?;
         if self
             .runs
@@ -11569,8 +11715,13 @@ impl Ledger {
     /// was what made the first restart of the day unrecoverable by any verb.
     ///
     /// Refused for anything but a sleeper: a live worker is not overdue, and
-    /// a released one has already been here.
+    /// a released one has already been here. Refused, too, by a ledger that
+    /// has said its window's goodbye (`said_goodbye_refusal`): the grace is
+    /// the time the NEXT window has to bring its sleepers back.
     pub fn sleeper_expired(&mut self, worker_id: &str, now_ms: i64) -> Result<(), String> {
+        if self.said_goodbye {
+            return Err(said_goodbye_refusal(worker_id));
+        }
         self.sleeper_given_up(worker_id, NOT_RESUMED, now_ms)
     }
 
@@ -11605,6 +11756,11 @@ impl Ledger {
                  restart put to sleep",
                 worker.state.as_str()
             ));
+        }
+        // Not one nothing seated: one whose last program may still be at its
+        // attempt (t-7538, astra R3). It waits for that program.
+        if worker.exit_unconfirmed.is_some() {
+            return Err(exit_unconfirmed_refusal(worker_id));
         }
         // Read before the ending erases it, for `terminal_gone`'s reason.
         let carried = worker.dispatch.as_deref().and_then(|dispatch_id| {
@@ -11650,6 +11806,10 @@ impl Ledger {
         launcher: &dyn Launcher,
         resume_nudge: &str,
     ) -> Result<Decided, String> {
+        // A pane cut now would start in a window on its way out (t-9091).
+        if self.said_goodbye {
+            return Err(said_goodbye_refusal(worker_id));
+        }
         let run = self.run(run_id).ok_or_else(|| unknown_run(run_id))?;
         if run.seat_is_coordinator(&format!("{}/{}", team.id, coordinator_pane)) != Some(true) {
             return Err(format!(
@@ -11665,6 +11825,9 @@ impl Ledger {
                  sleeper or an orphan — can be restored",
                 worker.state.as_str()
             ));
+        }
+        if worker.exit_unconfirmed.is_some() {
+            return Err(exit_unconfirmed_refusal(worker_id));
         }
         let kept = worker.state.as_str();
         let dispatch_id = worker
@@ -12420,6 +12583,272 @@ impl Ledger {
         Ok(state)
     }
 
+    /// Put a walled worker to sleep so the window can seat it again on
+    /// another account — same worker id, same dispatch, same conversation
+    /// (t-7538).
+    ///
+    /// The transition a window restart makes for every live worker
+    /// ([`Self::window_exiting`]), made for ONE worker on the window's word
+    /// that its pane is about to close: the row goes `Sleeping` with its
+    /// attempt open and its task carried, the pane's exit then finds an
+    /// empty seat ([`Run::worker_in_pane`] never answers a sleeper) and
+    /// settles nothing — no attempt spent, no `worker_died` — and the
+    /// coordinator's ordinary restore road ([`Self::prepare_worker_reseat`],
+    /// [`Self::worker_reseated`]) opens the replacement pane with
+    /// `--resume`, the row's model and effort, in the row's checkout.
+    ///
+    /// The ledger is the authority on WHETHER, not the caller
+    /// ([`Self::may_rest_for_account_switch`]): only the worker, attempt and
+    /// coordinator generation the switch was approved for, live in its own
+    /// seat, with a checkout to return to, whose newest `quota_walled` row
+    /// still stands. Refusals name the state; a caller that hears one closes
+    /// nothing.
+    ///
+    /// The pane's model and effort ride in the SAME transition (astra R5):
+    /// the row the restore launches from carries what the pane really ran,
+    /// or the worker was not rested at all — there is no state in which the
+    /// pane is gone and the row still names the summons' values.
+    ///
+    /// Answers the dispatch the worker keeps, so the receipt can name it.
+    pub fn worker_rested_for_account_switch(
+        &mut self,
+        rest: &SwitchRest,
+        now_ms: i64,
+    ) -> Result<String, String> {
+        let dispatch_id = self.may_rest_for_account_switch(rest, now_ms)?;
+        let at = self.locate(&rest.worker)?;
+        let worker = &mut self.runs[at.0].workers[at.1];
+        worker.model = Some(rest.model.trim().to_string());
+        worker.effort = Some(rest.effort.trim().to_string());
+        worker.state = WorkerState::Sleeping;
+        worker.quiet_at = None;
+        // Held before the pane is closed, in the same write (astra R3): a
+        // window that dies between this and the close, or whose journal
+        // cannot be written, boots with the hold on the row.
+        worker.exit_unconfirmed.clone_from(&rest.exit);
+        Ok(dispatch_id)
+    }
+
+    /// A look saw the program a switch's close left behind gone (t-7538,
+    /// astra R3): the hold on `worker_id`'s conversation goes, and the roads
+    /// that bring a sleeper back may open it again — once, as the same
+    /// worker on the same attempt. Only the witness the row holds lifts it:
+    /// a look at another program is not a look at this one.
+    ///
+    /// Answers whether a hold was lifted.
+    pub fn worker_exit_seen(&mut self, worker_id: &str, witness: &ExitWitness) -> bool {
+        let Ok((run_at, worker_at)) = self.locate(worker_id) else {
+            return false;
+        };
+        let worker = &mut self.runs[run_at].workers[worker_at];
+        if worker.exit_unconfirmed.as_ref() != Some(witness) {
+            return false;
+        }
+        worker.exit_unconfirmed = None;
+        true
+    }
+
+    /// Whether [`Self::worker_rested_for_account_switch`] would rest this
+    /// worker, asked without moving anything — the window reads it off its
+    /// ledger image before it touches a pane, so a refusal reaches the
+    /// person in the ledger's own words (the actor's refusal is a kind, not
+    /// a sentence). Answers the dispatch the worker keeps.
+    ///
+    /// Everything the switch was APPROVED on is compared with the row as it
+    /// stands (astra R2): the attempt it carries and the generation of its
+    /// run's coordinator seat — a worker dispatched again, or a coordinator
+    /// taken over, since the plan is another situation, and the approval
+    /// was not for it. The conversation is the one the window sees in the
+    /// pane now: a row with none would start empty (a restart's last
+    /// resort, not a move — astra B4), and a row naming another — a
+    /// `/clear` the hook has not reported yet — would resume the wrong one.
+    /// And the model and effort are words a launch can carry: a relaunch
+    /// the restore road would refuse after the pane is gone is refused
+    /// here, before it closes.
+    pub fn may_rest_for_account_switch(
+        &self,
+        rest: &SwitchRest,
+        now_ms: i64,
+    ) -> Result<String, String> {
+        let worker_id = rest.worker.as_str();
+        let at = self.locate(worker_id)?;
+        let run = &self.runs[at.0];
+        let worker = &run.workers[at.1];
+        if !worker.state.is_live() || !worker.state.may_occupy_pane() {
+            return Err(format!(
+                "worker {worker_id} is {}, and only a live worker in its seat can be rested \
+                 for an account switch",
+                worker.state.as_str()
+            ));
+        }
+        if worker.taken_over {
+            return Err(format!(
+                "worker {worker_id}'s pane was taken over by the person — a person's \
+                 conversation is not the ledger's to move to another account"
+            ));
+        }
+        if run
+            .worker_in_pane(&worker.team, &worker.pane)
+            .is_none_or(|current| current.id != worker_id)
+        {
+            return Err(format!(
+                "worker {worker_id} is not the worker in its own pane any more"
+            ));
+        }
+        if worker.checkout.is_none() {
+            return Err(format!(
+                "worker {worker_id} reported no checkout, so there is nowhere to seat it again"
+            ));
+        }
+        match worker.session.as_ref() {
+            None => {
+                return Err(format!(
+                    "worker {worker_id} reported no conversation, so a restore would start it \
+                     empty — not moved"
+                ));
+            }
+            Some(held) if held.id != rest.session => {
+                return Err(format!(
+                    "worker {worker_id}'s recorded conversation is not the one its pane is in \
+                     now — not moved"
+                ));
+            }
+            Some(_) => {}
+        }
+        let dispatch_id = worker
+            .dispatch
+            .as_deref()
+            .ok_or_else(|| format!("worker {worker_id} carries no attempt"))?
+            .to_string();
+        if dispatch_id != rest.dispatch {
+            return Err(format!(
+                "worker {worker_id} carries attempt {dispatch_id} now, not {} the switch was \
+                 approved for — not moved",
+                rest.dispatch
+            ));
+        }
+        let dispatch = run
+            .dispatch(&dispatch_id)
+            .ok_or_else(|| format!("worker {worker_id} names an unknown dispatch"))?;
+        if !dispatch.is_open() || dispatch.remote.is_some() {
+            return Err(format!(
+                "dispatch {dispatch_id} is not an open attempt of this window's own"
+            ));
+        }
+        if run.task(&dispatch.task).map(|task| task.status) != Some(TaskStatus::Dispatched) {
+            return Err(format!(
+                "the task dispatch {dispatch_id} carries is not dispatched"
+            ));
+        }
+        if run.coordinator_live().map(|seat| seat.generation) != rest.generation {
+            return Err(format!(
+                "run {}'s coordinator seat is not the one the switch was approved under — not \
+                 moved",
+                run.id
+            ));
+        }
+        launch_tuning(
+            &worker.agent,
+            Some(rest.model.trim()),
+            Some(rest.effort.trim()),
+        )
+        .map_err(|why| {
+            format!(
+                "worker {worker_id}'s pane runs a model or effort no relaunch can carry \
+                 ({why}) — not moved"
+            )
+        })?;
+        if !newest_wall(run, &dispatch_id).is_some_and(|wall| wall.stands(now_ms)) {
+            return Err(format!(
+                "worker {worker_id} stands at no quota wall the ledger has witnessed — only a \
+                 walled worker is moved to another account; a working one keeps its own"
+            ));
+        }
+        Ok(dispatch_id)
+    }
+
+    /// The receipt for one account move (t-7538), in the ledger's own voice,
+    /// to every run it concerns — once per `key`, however many times the
+    /// window asks: a retry after a crash finds its row and writes nothing.
+    ///
+    /// A DEFAULT move concerns every run holding a live worker of the
+    /// provider (their next summons runs as the new account); a PANE move
+    /// concerns the run whose worker moved. A window with no run to tell
+    /// writes nothing and answers an empty list, which is not a failure —
+    /// the switch itself is the window's fact, and its own log keeps it.
+    /// Answers the rows written.
+    pub fn account_switched(
+        &mut self,
+        receipt: &AccountSwitchReceipt,
+        now_ms: i64,
+    ) -> Result<Vec<String>, String> {
+        if receipt.key.trim().is_empty() {
+            return Err("an account switch receipt needs a key".to_string());
+        }
+        let concerned: Vec<(String, Option<String>, Option<String>)> = match &receipt.moved {
+            AccountMove::Default => self
+                .runs
+                .iter()
+                .filter(|run| {
+                    run.workers
+                        .iter()
+                        .any(|worker| worker.state.is_live() && worker.agent == receipt.agent)
+                })
+                .map(|run| (run.id.clone(), None, None))
+                .collect(),
+            AccountMove::Pane { worker, .. } => self
+                .runs
+                .iter()
+                .find_map(|run| {
+                    let seat = run.worker(worker)?;
+                    let dispatch = seat.dispatch.clone();
+                    let task = dispatch
+                        .as_deref()
+                        .and_then(|id| run.dispatch(id))
+                        .map(|held| held.task.clone());
+                    Some((run.id.clone(), task, dispatch))
+                })
+                .into_iter()
+                .collect(),
+        };
+        let mut written = Vec::new();
+        for (run_id, task, dispatch) in concerned {
+            let already = self.run(&run_id).is_some_and(|run| {
+                run.messages.iter().any(|row| {
+                    row.kind == MessageKind::AccountSwitched
+                        && serde_json::from_str::<serde_json::Value>(row.body.as_str())
+                            .ok()
+                            .and_then(|body| body["key"].as_str().map(str::to_string))
+                            .as_deref()
+                            == Some(receipt.key.as_str())
+                })
+            });
+            if already {
+                continue;
+            }
+            let Some(to) = self.run(&run_id).map(Run::address) else {
+                continue;
+            };
+            let body = receipt.body(now_ms);
+            let draft = Draft {
+                from: LEDGER_ITSELF.to_string(),
+                to,
+                kind: MessageKind::AccountSwitched,
+                body: body.to_string().into(),
+                subject: Text::default(),
+                priority: Priority::Normal,
+                payload: Text::default(),
+                thread: None,
+                task,
+                dispatch,
+            };
+            if let Ok(id) = self.post(&run_id, draft, now_ms) {
+                written.push(id);
+            }
+        }
+        Ok(written)
+    }
+
     /// A sleeping worker cannot be seated again, and this is the end of it.
     ///
     /// [`Self::end_attempt`] refuses this worker — it asks `is_live`, and a
@@ -12687,7 +13116,7 @@ impl Ledger {
     }
 
     /// Which run and which slot a worker sits in.
-    fn locate(&mut self, worker_id: &str) -> Result<(usize, usize), String> {
+    fn locate(&self, worker_id: &str) -> Result<(usize, usize), String> {
         for (run_at, run) in self.runs.iter().enumerate() {
             if let Some(at) = run.workers.iter().position(|one| one.id == worker_id) {
                 return Ok((run_at, at));
@@ -13616,6 +14045,135 @@ pub enum WallPhase {
 /// The `reason` a quiet notice carries when it is the wait rung's word
 /// about a wall that lifted while its worker stayed stopped at it.
 pub const QUOTA_LIFTED_REASON: &str = "quota_lifted";
+
+/// Which of the two things an account switch moved (t-7538).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AccountMove {
+    /// The account every new launch runs as. No pane was touched.
+    Default,
+    /// One walled worker, seated again on the new account — the same
+    /// worker id and dispatch, the old pane and the new one.
+    Pane {
+        worker: String,
+        from_pane: String,
+        to_pane: String,
+    },
+}
+
+/// The one sentence every road that would open a held worker's conversation
+/// again answers with (t-7538, astra R3).
+fn exit_unconfirmed_refusal(worker_id: &str) -> String {
+    format!(
+        "worker {worker_id}'s last pane's program was not seen to leave — its conversation is \
+         not opened again, and its attempt not ended, while that program may still write"
+    )
+}
+
+/// What an account switch was approved to move (t-7538), carried to the
+/// ledger's rest of ONE walled worker so the rest is of exactly that: the
+/// worker, the attempt it carried and the coordinator generation its run
+/// had when the plan was made (astra R2), the conversation the window sees
+/// in its pane, and the model and effort the pane really runs — read off
+/// the pane's own transcript at the move, never filled in from the summons
+/// (astra R5), and written onto the row in the same transition that rests
+/// it ([`Ledger::worker_rested_for_account_switch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchRest {
+    pub worker: String,
+    pub dispatch: String,
+    pub generation: Option<u32>,
+    pub session: String,
+    pub model: String,
+    pub effort: String,
+    /// The program in the pane about to close, read before the rest: held
+    /// on the row by the same transition ([`Worker::exit_unconfirmed`]) until
+    /// a look sees it leave. `None` for a pane the window saw no program in.
+    pub exit: Option<ExitWitness>,
+}
+
+/// One account move, as the window reports it for the receipt row.
+///
+/// Ids and numbers only. The window builds it from the account store's ids
+/// and the usage cache's percentages; nothing here can hold a token or an
+/// address, and the body is written with exactly these fields.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AccountSwitchReceipt {
+    /// The window's own idempotency key for this move — the same move asked
+    /// twice writes one row.
+    pub key: String,
+    /// `claude` — the agent whose launches the account serves.
+    pub agent: String,
+    pub moved: AccountMove,
+    /// The account ids, the store's own; `None` for the machine's own login.
+    pub from_account: Option<String>,
+    pub to_account: Option<String>,
+    /// `person` for the settings picker, `auto` for the beat, `ask` for a
+    /// proposal the person accepted.
+    pub by: String,
+    /// The table's reason word (`near_limit`, `walled`, `picked`).
+    pub reason: String,
+    /// The source's fullest window and its percentage when the decision
+    /// was made, when the window had a reading.
+    pub observed_percent: Option<u8>,
+    pub observed_window: Option<String>,
+    /// The coordinator generation the decision was made under, when the
+    /// window knew one — a late answer to an older proposal is refused by
+    /// the window, and the receipt says which one it was.
+    pub generation: Option<u32>,
+    /// How many panes the move touched: 0 for a default move.
+    pub panes_moved: u32,
+    /// The walled panes this switch set out to move that are still asleep
+    /// for the restore road when the receipt is written — each writes a
+    /// receipt of its own when it lands, so a default's receipt counts what
+    /// has moved so far and says how many are still coming (astra R4).
+    pub panes_pending: u32,
+}
+
+impl AccountSwitchReceipt {
+    fn body(&self, now_ms: i64) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "key": self.key,
+            "agent": self.agent,
+            "fromAccount": self.from_account,
+            "toAccount": self.to_account,
+            "by": self.by,
+            "reason": self.reason,
+            "observedPercent": self.observed_percent,
+            "observedWindow": self.observed_window,
+            "generation": self.generation,
+            "panesMoved": self.panes_moved,
+            "panesPending": self.panes_pending,
+            "policy": crate::account_autoswitch::POLICY_WORD,
+            "switchedAtMs": now_ms,
+        });
+        match &self.moved {
+            AccountMove::Default => {
+                body["moved"] = serde_json::json!("default");
+                body["next"] = serde_json::json!(
+                    "your panes keep running on the login they were started with; every \
+                     new summons runs as `toAccount`"
+                );
+            }
+            AccountMove::Pane {
+                worker,
+                from_pane,
+                to_pane,
+            } => {
+                body["moved"] = serde_json::json!("pane");
+                body["workerId"] = serde_json::json!(worker);
+                body["fromPane"] = serde_json::json!(from_pane);
+                body["toPane"] = serde_json::json!(to_pane);
+                body["next"] = serde_json::json!(
+                    "the same worker id and dispatch continue in `toPane` with their \
+                     conversation resumed as `toAccount`; nothing was settled and no \
+                     replacement is needed"
+                );
+            }
+        }
+        body
+    }
+}
 
 /// A wall's lift, with both witnesses (t-6427): the agent's own words still
 /// at the wall, and the provider's number read after the reset, under it.
@@ -16017,9 +16575,11 @@ pub struct SummonShadow {
     ///
     /// A model a person pinned in their own turn nails the spawn down, so an
     /// apply stage would leave such a summons alone. The shadow asks anyway
-    /// and records the flag: a row nobody would have acted on is still
-    /// evidence about the judgment, and separating the two is the reader's
-    /// job, not the asker's.
+    /// and records the flag, and the row carries no `agreed` mark for it
+    /// (`summon_choice::PINNED`, t-9087): the judge reads marks and nothing
+    /// else, so a mark on a pinned summons was counted as the seat's evidence
+    /// — 121 of 121 on this machine's ledger (2026-09-25), all agreeing with
+    /// the pin's own CLI.
     pub model_was_pinned: bool,
     /// Whether the seat itself chose the agent (`--agent auto`): the row then
     /// carries no `agreed` mark, because there was no coordinator's word to
@@ -17660,7 +18220,7 @@ fn plan_inner(
             if !agrees {
                 return Err(format!(
                     "--retry-request {request} was already answered for a different \
-                     caller, verb or payload — a retry has to repeat the request it retries"
+                     caller, verb or payload — {A_RETRY_REPEATS_ITS_REQUEST}"
                 ));
             }
             /* And the binding is NOT touched.
@@ -19369,20 +19929,41 @@ fn plan_inner(
                         Some(named) => named.to_string(),
                         None => format!("run:{run_id}"),
                     };
-                    let carried = carried_by(ledger, &run_id, (&team.id, pane));
-                    let draft = Draft {
-                        from: me.clone(),
-                        to,
-                        kind: MessageKind::Question,
-                        body: body.into(),
-                        subject: Text::default(),
-                        priority: Priority::Normal,
-                        payload: Text::default(),
-                        thread: None,
-                        task: carried.0.clone(),
-                        dispatch: carried.1.clone(),
+                    /* A retry of a named ask whose wait is still out IS that
+                     * ask (t-8938): it joins the question the first call
+                     * posted rather than posting a second one nobody will
+                     * answer. Its receipt is filed only when a wait settles,
+                     * so the replay road above cannot see it yet. */
+                    let named = words
+                        .value(RETRY_REQUEST)
+                        .map(|request| ReceiptKey::of(request, actor, verb, &words));
+                    let joined = match named.as_ref() {
+                        Some(key) => ledger.joining(key, &run_id)?,
+                        None => None,
                     };
-                    ledger.post_as(&run_id, draft, Some(&seat), now_ms)?
+                    match joined {
+                        Some(question) => question,
+                        None => {
+                            let carried = carried_by(ledger, &run_id, (&team.id, pane));
+                            let draft = Draft {
+                                from: me.clone(),
+                                to,
+                                kind: MessageKind::Question,
+                                body: body.into(),
+                                subject: Text::default(),
+                                priority: Priority::Normal,
+                                payload: Text::default(),
+                                thread: None,
+                                task: carried.0.clone(),
+                                dispatch: carried.1.clone(),
+                            };
+                            let posted = ledger.post_as(&run_id, draft, Some(&seat), now_ms)?;
+                            if let Some(key) = named.as_ref() {
+                                ledger.now_asking(key, &run_id, &posted);
+                            }
+                            posted
+                        }
+                    }
                 }
             };
             // The answer may already be in the log — the whole point of
@@ -20993,6 +21574,10 @@ pub struct WorkerRow {
     /// And its own `wait`, same posture (t-6427).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quota_wait: bool,
+    /// The program a switch's close has not seen leave, same posture
+    /// (t-7538, astra R3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_unconfirmed: Option<ExitWitness>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -21326,6 +21911,7 @@ impl Ledger {
                     adopted_by: worker.adopted_by,
                     on_quota_wall: worker.on_quota_wall.clone(),
                     quota_wait: worker.quota_wait,
+                    exit_unconfirmed: worker.exit_unconfirmed.clone(),
                 });
             }
             for attachment in &run.attachments {
@@ -21441,6 +22027,8 @@ impl Ledger {
             next_id: projected.next_id,
             binding_revisions: Vec::new(),
             next_binding_revision: 0,
+            said_goodbye: false,
+            asking: Vec::new(),
             retention_days: projected.retention_days,
             swept_at_ms: projected.swept_at_ms,
             verb_tallies: projected.verb_tallies,
@@ -21566,6 +22154,7 @@ impl Ledger {
                     adopted_by: row.adopted_by,
                     on_quota_wall: row.on_quota_wall,
                     quota_wait: row.quota_wait,
+                    exit_unconfirmed: row.exit_unconfirmed,
                 });
         }
         for row in projected.messages {

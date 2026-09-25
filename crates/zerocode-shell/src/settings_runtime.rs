@@ -90,6 +90,9 @@ pub(super) mod setting_key {
     pub const WINDOW_MATERIAL: &str = "window_material";
     pub const DEFAULT_AGENT: &str = "default_agent";
     pub const AGENT_TEAMS_MODE: &str = "agent_teams_mode";
+    /// `accounts.claudeAutoSwitch` in the briefing's words: whether the
+    /// window may move the Claude account by itself (t-7538).
+    pub const CLAUDE_AUTOSWITCH_MODE: &str = "claude_autoswitch_mode";
     pub const HIDDEN_SHORTCUTS: &str = "hidden_shortcuts";
     pub const KEYBINDINGS: &str = "keybindings";
     pub const HIDDEN_TASK_SOURCES: &str = "hidden_task_sources";
@@ -107,6 +110,7 @@ pub(super) mod setting_key {
     pub const COMPUTER_CONFIRM_PAYMENT: &str = "computer_confirm_payment";
     pub const COMPUTER_CONFIRM_TRANSFER: &str = "computer_confirm_transfer";
     pub const COMPUTER_CONFIRM_DELETE: &str = "computer_confirm_delete";
+    pub const COMPUTER_LIVE_REFLEX: &str = "computer_live_reflex";
     pub const OPENCODE_COOKIE_CONFIGURED: &str = "opencode_cookie_configured";
     pub const OPENCODE_WORKSPACE: &str = "opencode_workspace";
     pub const CONFIRM_CLOSE_PINNED: &str = "confirm_close_pinned";
@@ -1793,6 +1797,15 @@ impl SettingsDocument {
     }
 }
 
+/// Whether a live reflex run may start (`computer_live_reflex`), read from the
+/// settings now — the reflex door asks it when a start comes, and nothing
+/// else keeps a copy of it.
+pub(crate) fn computer_live_reflex(repository: &settings::SettingsRepository) -> bool {
+    load_settings_resilient(repository)
+        .document
+        .computer_live_reflex
+}
+
 pub(super) const fn enabled_by_default() -> bool {
     true
 }
@@ -2219,6 +2232,11 @@ pub(super) struct SettingsDocument {
     pub(super) default_agent: zerocode_core::DefaultAgentPreference,
     #[serde(default)]
     pub(super) agent_teams_mode: TeamsMode,
+    /// Whether the window may switch the Claude account by itself when the
+    /// selected one nears its limit or a worker stands at its wall (t-7538):
+    /// `off`, `ask` (the default — a line and a button), `auto`.
+    #[serde(default)]
+    pub(super) claude_autoswitch_mode: zerocode_core::account_autoswitch::AutoSwitchMode,
     #[serde(default)]
     pub(super) worktree_prefs: WorktreePrefs,
     #[serde(default)]
@@ -2237,6 +2255,11 @@ pub(super) struct SettingsDocument {
     pub(super) computer_confirm_transfer: bool,
     #[serde(default = "enabled_by_default")]
     pub(super) computer_confirm_delete: bool,
+    /// Whether a live reflex run may start on this desktop (realtime v1,
+    /// t-9205). Off for a person who never chose: a run holds the hand and
+    /// presses at its own pace, so it is theirs to turn on.
+    #[serde(default)]
+    pub(super) computer_live_reflex: bool,
     #[serde(default)]
     pub(super) browser: BrowserPrefs,
     /// Whether the emulators this window started stay up when it exits
@@ -2397,12 +2420,14 @@ impl Default for SettingsDocument {
             window_material: WindowMaterial::default(),
             default_agent: zerocode_core::DefaultAgentPreference::Auto,
             agent_teams_mode: TeamsMode::default(),
+            claude_autoswitch_mode: zerocode_core::account_autoswitch::AutoSwitchMode::default(),
             worktree_prefs: WorktreePrefs::default(),
             notifications: NotificationPrefs::default(),
             computer_awake_mode: awake::ComputerAwakeMode::default(),
             computer_confirm_payment: true,
             computer_confirm_transfer: true,
             computer_confirm_delete: true,
+            computer_live_reflex: false,
             browser: BrowserPrefs::default(),
             emulator_keep_booted: true,
             emulator_preboot_last_used: true,

@@ -27,6 +27,7 @@ import { testArtifactCatalog, testArtifactChrome, testArtifactPages, testArtifac
 
 import { testLedgerPoll } from "./ledger-poll.mjs";
 import { testUsageRefresh, testUsageWords } from "./usage-refresh.mjs";
+import { testAccountSwitch } from "./account-switch.mjs";
 import { testTaskBoard } from "./task-board.mjs";
 import { testCoordinatorDesk } from "./coordinator-desk.mjs";
 import { testCoordinatorDeskLayout } from "./coordinator-desk-layout.mjs";
@@ -45,7 +46,7 @@ import { testBrowserPanesSurvive } from "./browser-panes-survive.mjs";
 import { testEmulatorSeat } from "./emulator-seat.mjs";
 import { testEmulatorLoans } from "./emulator-loans.mjs";
 import { testCoordinatorPanel } from "./coordinator-panel.mjs";
-import { testJevDashboard, testJevDashboardEvidence } from "./jev-dashboard.mjs";
+import { testJevDashboard, testJevDashboardEvidence, testJevDashboardScope } from "./jev-dashboard.mjs";
 
 import { testCrashReport } from "./crash-report.mjs";
 import { testTerminalSelection } from "./terminal-selection.mjs";
@@ -180,6 +181,7 @@ suite("usage-refresh", async ({ browser, origin, ok }) => {
   await testUsageRefresh(browser, origin, standBackend, ok);
   await testUsageWords(browser, origin, standBackend, ok);
 });
+suite("account-switch", ({ browser, origin, ok }) => testAccountSwitch(browser, origin, standBackend, ok));
 suite("board-waits", ({ browser, origin, ok }) => testBoardWaits(browser, origin, ok));
 // Vault state stays local to this fixture, just like the explorer fixture.
 suite("task-board", ({ browser, origin, ok }) => testTaskBoard(browser, origin, ok));
@@ -207,6 +209,7 @@ suite("emulator-loans", ({ browser, origin, ok }) => testEmulatorLoans(browser, 
 suite("coordinator-panel", ({ browser, origin, ok }) => testCoordinatorPanel(browser, origin, ok));
 suite("jev-dashboard", async ({ browser, origin, ok }) => {
   await testJevDashboard(browser, origin, ok);
+  await testJevDashboardScope(browser, origin, ok);
   await testJevDashboardEvidence(browser, origin, ok);
 });
 suite("native-folder-picker", ({ browser, origin, ok }) => testNativeFolderPicker(browser, origin, ok));

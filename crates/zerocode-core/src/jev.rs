@@ -37,6 +37,7 @@ pub mod noul;
 pub mod promote;
 pub mod questions;
 pub mod recent;
+pub mod reflex_decide;
 pub mod shard;
 pub mod summary;
 
@@ -266,7 +267,8 @@ impl JevMode {
     /// Whether a use acts, given what the judge last decided for it (§4).
     ///
     /// `raised` is the seat's standing, read back from the transitions its own
-    /// ledger recorded ([`crate::jev::promote::stand_from`]). A person's `on`
+    /// ledger recorded under the words it asks now
+    /// ([`crate::jev::promote::standing`]). A person's `on`
     /// outranks it in both directions: they said act, and no window of rows
     /// takes that back; `off` and `shadow` are theirs the same way.
     #[must_use]
@@ -439,6 +441,95 @@ pub struct JevUse {
     /// ([`ConfidenceBands`], t-6342). Recorded, not yet read. `None` for a
     /// seat that never rises.
     pub confidence_bands: Option<ConfidenceBands>,
+    /// The version of the words this use asks now (t-6877) — the
+    /// `*_RUBRIC_VERSION` its writer stamps on every request row
+    /// ([`summary::RUBRIC_VERSION`]), named here by that constant and never
+    /// by a number of the row's own. One version for one seat: a seat is
+    /// one question, and two questions asked into one ledger were two seats
+    /// counted as one (the skills seat, until this column was one number —
+    /// its turn-boundary suggestion is [`SKILL_SUGGESTION`] now). The judge
+    /// reads a seat's ledger as this rubric's series alone
+    /// ([`promote::on_the_newest_version`]): a request asked under other
+    /// words, the marks that grade it and the rise they earned are another
+    /// question's evidence, and a seat whose words moved on records again
+    /// until its own words have earned their place. A seat whose writer has
+    /// never versioned its words asks [`questions::UNVERSIONED_RUBRIC`],
+    /// which is what a row that names none is read as.
+    pub rubric_version: u32,
+    /// The keys a request row of this use carries its own name under — what
+    /// a label row repeats under [`summary::LABEL`] to say which request it
+    /// grades, joined by `:` when there are two (`query:notes`). The judge
+    /// joins a label to its request by it and by the request's time when
+    /// the label carries it ([`summary::REQUEST_AT`], t-6877), as
+    /// [`Self::names`] says the name picks a request out: the request is
+    /// the authority on the label's rubric and on the version that answered
+    /// it, a label that names no request — none on the ledger, or more than
+    /// one it could mean — grades nothing, and of two labels naming one
+    /// request (and one part of it, [`Self::label_part`]) the newest
+    /// counts. Empty for a use whose marks sit on the request row itself
+    /// (the screen seats', the summons') or that writes none: a label row
+    /// of such a use names nothing and grades nothing.
+    pub request_name: &'static [&'static str],
+    /// What the name under [`Self::request_name`] picks out (t-6877 round
+    /// 3, astra R1b): one request, one asking of words that may be asked
+    /// again, or one turn of several rows — and so which request a label
+    /// repeating it can mean ([`Naming`]). [`Naming::Request`] for a use
+    /// whose labels name nothing.
+    pub names: Naming,
+    /// The keys a label row of this use names the part of its request it
+    /// grades under, where one request has several (t-6877 round 3): the
+    /// compaction seat labels each block a compaction dropped, under
+    /// `block`, and each block is one comparison — of two labels naming one
+    /// request and one part, the newest counts. Empty for a use whose label
+    /// grades its request whole.
+    pub label_part: &'static [&'static str],
+    /// The settings key of the use this one was split from, whose word this
+    /// one reads while nobody wrote a word of its own (t-6877 round 3, the
+    /// coordinator's migration contract m-8181): the skill suggestion read
+    /// `smart.skillSearch` until it was a seat of its own, and a person who
+    /// wrote `off` there wrote it for both — an update must not turn it
+    /// back on. A word written for this use is its own; with neither word
+    /// written it stands where it stood before the split, at the switch's
+    /// recommendation ([`Self::mode_in`]). `None` for a use nobody split.
+    pub follows: Option<&'static str>,
+}
+
+/// What a request's name picks out ([`JevUse::request_name`]), and so which
+/// request a label repeating it grades (t-6877 round 3, astra R1b).
+///
+/// A label names a request by the name the request row carries and, when it
+/// carries it, the time the request was asked ([`summary::REQUEST_AT`]).
+/// Whether the name alone picks one request out depends on what the writer
+/// named: an id it made for that request, the words that were asked, or a
+/// turn that asked several things. The reader guesses none of them: where
+/// the name and the time could mean two requests, the label grades neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Naming {
+    /// One request: an id the writer made for it alone — a guard's
+    /// `judged`, a stall's key, a placed worker. A label grades the one
+    /// request above it carrying the name (asked at the time it names, when
+    /// it names one); two carrying it are two requests nothing tells apart
+    /// — a replay, or a turn key a compaction minted again — and the label
+    /// grades neither.
+    Request,
+    /// One asking of words that may be asked again: the fingerprints of
+    /// what was asked (recall's `query:notes`, the skills' `task:catalog`),
+    /// which the same words asked again carry again (on this machine,
+    /// 2026-09-25: 86 of the recall seat's 124 labels named words asked
+    /// more than once above them). The name picks out no asking on its own,
+    /// so a label grades only the one asking made at the time it names; a
+    /// label naming no time — every one written before t-6877 round 2 —
+    /// grades nothing, because the asking it meant may have been trimmed
+    /// away with another asking of the same words left in its place.
+    Words,
+    /// One turn: the routing seat's attempt, carried by every judgment the
+    /// turn asked — its own, and the agents it spawned — and a label grades
+    /// the turn. The rows carrying the name are that one turn while they
+    /// could hand the label nothing different — one rubric, one answering
+    /// version, one side of the series' start — and the newest stands for
+    /// them; rows that disagree could be two turns, and the label grades
+    /// neither.
+    Turn,
 }
 
 /// What a seat forgives whose miss the product was going to cover anyway: one
@@ -854,6 +945,11 @@ pub const ROUTING: JevUse = JevUse {
     baseline: Baseline::TodaysRule,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::ROUTED),
+    rubric_version: questions::ROUTING_RUBRIC_VERSION,
+    request_name: &["attempt"],
+    names: Naming::Turn,
+    label_part: &[],
+    follows: None,
 };
 
 /// The wall zo's routing waits for a judgment when the seat acts: the batch
@@ -1008,6 +1104,11 @@ pub const RECALL: JevUse = JevUse {
     baseline: Baseline::TodaysRule,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::LOW_STAKES),
+    rubric_version: questions::RECALL_RUBRIC_VERSION,
+    request_name: &["query", "notes"],
+    names: Naming::Words,
+    label_part: &[],
+    follows: None,
 };
 
 /// What every screen question carries, whichever surface answered it
@@ -1112,6 +1213,11 @@ pub const BROWSER: JevUse = JevUse {
     baseline: Baseline::None,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::pressing(SCREEN_PRESS_FLOOR_PERMILLE)),
+    rubric_version: crate::screen_action::SCREEN_ACTION_RUBRIC_VERSION,
+    request_name: &[],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// The window's desktop walk: which numbered control of an app's
@@ -1154,6 +1260,11 @@ pub const DESKTOP: JevUse = JevUse {
     baseline: Baseline::None,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::pressing(SCREEN_PRESS_FLOOR_PERMILLE)),
+    rubric_version: crate::screen_action::SCREEN_ACTION_RUBRIC_VERSION,
+    request_name: &[],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// A mobile screen is a separate consent and evidence surface. Existing
@@ -1193,6 +1304,11 @@ pub const EMULATOR: JevUse = JevUse {
     baseline: Baseline::None,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::pressing(SCREEN_PRESS_FLOOR_PERMILLE)),
+    rubric_version: crate::screen_action::SCREEN_ACTION_RUBRIC_VERSION,
+    request_name: &[],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// The window's stall sweep: why a quiet worker stopped when the measured
@@ -1229,6 +1345,11 @@ pub const STALL: JevUse = JevUse {
     baseline: Baseline::AlwaysSame(crate::stall_cause::Cause::LongRunningTool.word()),
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::ROUTED),
+    rubric_version: crate::stall_cause::STALL_CAUSE_RUBRIC_VERSION,
+    request_name: &["stall"],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// What the placement seat's answers must bound above before `auto` rises to
@@ -1329,6 +1450,11 @@ pub const PLACEMENT: JevUse = JevUse {
     baseline: Baseline::TodaysRule,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::LOW_STAKES),
+    rubric_version: crate::worker_placement::WORKER_PLACEMENT_RUBRIC_VERSION,
+    request_name: &["placement"],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// The summons' agent choice: which of the agents this window could start
@@ -1375,6 +1501,11 @@ pub const PLACEMENT: JevUse = JevUse {
 /// - A summons whose own agent was never offered is not a comparison either;
 ///   the row says [`crate::summon_choice::NOT_OFFERED`] under
 ///   [`crate::summon_choice::NOT_COMPARED_KEY`] instead of a mark.
+/// - Nor is a summons whose model was pinned ([`crate::summon_choice::PINNED`],
+///   t-9087): the pin is the person's word and an apply stage leaves it
+///   alone. All 121 marked summonses of the fourth words on this machine
+///   (2026-09-25) were pinned and landed on the pin's own CLI, so the
+///   baseline stood at 1,000‰ over the marks — a line no bound can clear.
 ///
 /// What the rule does NOT count as disagreement: a person taking the pane
 /// over (`taken_over`), the worker being stopped, or the work failing. Those
@@ -1424,6 +1555,11 @@ pub const SUMMON: JevUse = JevUse {
     baseline: Baseline::TodaysRule,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::ROUTED),
+    rubric_version: crate::summon_choice::SUMMON_CHOICE_RUBRIC_VERSION,
+    request_name: &[],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// Characters of the repeated tool call one step-effort question carries —
@@ -1493,6 +1629,11 @@ pub const STEP_EFFORT: JevUse = JevUse {
     baseline: Baseline::TodaysRule,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::ROUTED),
+    rubric_version: crate::step_effort::STEP_EFFORT_RUBRIC_VERSION,
+    request_name: &["move"],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// Characters of the task a skill ranking reads — what the turn is about, in
@@ -1618,7 +1759,58 @@ pub const SKILL_AGREEMENT_FLOOR_PERMILLE: u16 = 800;
 /// what the word match ranked and says so on the row.
 pub const SKILL_SEARCH_APPLY_DEADLINE_MS: u64 = 10_000;
 
-/// zo's skill search and turn-start suggestion (t-5629, t-6347).
+/// What both skills seats send off the machine, cut where the door cuts it
+/// (t-6877): the task, and each installed skill's name and description —
+/// the explicit search's whole catalog in shards, the turn-start
+/// suggestion's catalog in one request and then three shortlisted skills'
+/// first 700 characters of SKILL.md. One list for two seats, because the
+/// two questions read the same catalog and a cap named twice is a cap that
+/// drifts.
+const SKILL_SENDS: &[Sent] = &[
+    Sent {
+        at: "/state/task",
+        cap: Cap::Chars(SKILL_TASK_CHAR_CAP),
+    },
+    Sent {
+        at: "/state/skills",
+        cap: Cap::Items(SKILL_SUGGESTION_CATALOG_CAP),
+    },
+    Sent {
+        at: "/state/skills/*/name",
+        cap: Cap::Uncut,
+    },
+    Sent {
+        at: "/state/skills/*/description",
+        cap: Cap::Chars(SKILL_DESCRIPTION_CHAR_CAP),
+    },
+    Sent {
+        at: "/state/candidates",
+        cap: Cap::Items(SKILL_SUGGESTION_SHORTLIST),
+    },
+    Sent {
+        at: "/state/candidates/*/excerpt",
+        cap: Cap::Chars(SKILL_EXCERPT_CHAR_CAP),
+    },
+    Sent {
+        at: "/state/candidates/*/description",
+        cap: Cap::Chars(SKILL_DESCRIPTION_CHAR_CAP),
+    },
+    Sent {
+        at: "/questions/which/criteria/*",
+        cap: Cap::Chars(SKILL_DETAIL_CHAR_CAP),
+    },
+    Sent {
+        at: "/questions/*/instructions",
+        cap: Cap::Chars(SKILL_FITS_INSTRUCTIONS_CHAR_CAP),
+    },
+];
+
+/// The keys a skills request row carries its name under, and a label of
+/// either skills seat repeats (t-6877): the fingerprint of the task and the
+/// fingerprint of the catalog it was ranked against.
+const SKILL_REQUEST_NAME: &[&str] = &["task", "catalog"];
+
+/// zo's skill search (t-5629): the `skill_search` tool an agent calls.
 ///
 /// The seat exists to take the skill index out of the system prompt. Today
 /// every installed skill's name and compacted description is rendered on
@@ -1633,54 +1825,19 @@ pub const SKILL_SEARCH_APPLY_DEADLINE_MS: u64 = 10_000;
 /// `shadow` leaves the index exactly where it is and records what the search
 /// would have handed back, which is what makes the two readable side by side.
 ///
-/// The first turn-start request sends the task and each installed skill's name
-/// and description. When the gate says a skill may help, a second request
-/// sends the first 700 characters of three shortlisted SKILL.md files under
-/// the same switch. The full body remains local and is read by Skill only.
+/// The turn-start suggestion that once shared this row's ledger and standing
+/// is a seat of its own ([`SKILL_SUGGESTION`], t-6877): it asks other words
+/// ([`questions::SKILL_SUGGESTION_RUBRIC_VERSION`] against this seat's
+/// [`questions::SKILL_SEARCH_RUBRIC_VERSION`]), and a seat is judged on one
+/// question's evidence and stands on its own — a rise the search earned is
+/// not a rise for the suggestion, nor the other way round.
 pub const SKILLS: JevUse = JevUse {
     id: "skills",
     setting: "skillSearch",
     modes: &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
     recommended: JevMode::Auto,
     repeat: None,
-    sends: &[
-        Sent {
-            at: "/state/task",
-            cap: Cap::Chars(SKILL_TASK_CHAR_CAP),
-        },
-        Sent {
-            at: "/state/skills",
-            cap: Cap::Items(SKILL_SUGGESTION_CATALOG_CAP),
-        },
-        Sent {
-            at: "/state/skills/*/name",
-            cap: Cap::Uncut,
-        },
-        Sent {
-            at: "/state/skills/*/description",
-            cap: Cap::Chars(SKILL_DESCRIPTION_CHAR_CAP),
-        },
-        Sent {
-            at: "/state/candidates",
-            cap: Cap::Items(SKILL_SUGGESTION_SHORTLIST),
-        },
-        Sent {
-            at: "/state/candidates/*/excerpt",
-            cap: Cap::Chars(SKILL_EXCERPT_CHAR_CAP),
-        },
-        Sent {
-            at: "/state/candidates/*/description",
-            cap: Cap::Chars(SKILL_DESCRIPTION_CHAR_CAP),
-        },
-        Sent {
-            at: "/questions/which/criteria/*",
-            cap: Cap::Chars(SKILL_DETAIL_CHAR_CAP),
-        },
-        Sent {
-            at: "/questions/*/instructions",
-            cap: Cap::Chars(SKILL_FITS_INSTRUCTIONS_CHAR_CAP),
-        },
-    ],
+    sends: SKILL_SENDS,
     ledger: "skill-search.jsonl",
     promotes: true,
     answer_floor_permille: Some(SKILL_ANSWER_FLOOR_PERMILLE),
@@ -1696,6 +1853,59 @@ pub const SKILLS: JevUse = JevUse {
     baseline: Baseline::TodaysRule,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::LOW_STAKES),
+    rubric_version: questions::SKILL_SEARCH_RUBRIC_VERSION,
+    request_name: SKILL_REQUEST_NAME,
+    names: Naming::Words,
+    label_part: &[],
+    follows: None,
+};
+
+/// zo's turn-start skill suggestion (t-6347): the two-stage question asked
+/// at the boundary of every turn, whether or not the agent ever searches.
+///
+/// The first request sends the task and each installed skill's name and
+/// description. When the gate says a skill may help, a second request sends
+/// the first 700 characters of three shortlisted SKILL.md files under the
+/// same switch. The full body remains local and is read by Skill only. `on`
+/// and a risen `auto` hand the turn a note naming the skill; `shadow` and
+/// a recording `auto` write the row and hand the turn nothing.
+///
+/// Its own row and its own ledger (t-6877): until then it wrote into the
+/// search's ledger under the search's switch, and the one judge read the
+/// two questions' rows as one series — the search's thick first-rubric
+/// sample would have carried the suggestion up, and a rise either earned
+/// stood for both. Its lines are the search's: the same floors, the same
+/// wall, the same window, because the two questions are asked of the same
+/// catalog and answered by the same door. Its switch follows the search's
+/// word until it has one of its own ([`JevUse::follows`], the coordinator's
+/// migration contract m-8181): a person who turned the search off before
+/// the split turned the suggestion off with it.
+pub const SKILL_SUGGESTION: JevUse = JevUse {
+    id: "skill_suggestion",
+    setting: "skillSuggestion",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
+    recommended: JevMode::Auto,
+    repeat: None,
+    sends: SKILL_SENDS,
+    ledger: "skill-suggestion.jsonl",
+    promotes: true,
+    answer_floor_permille: Some(SKILL_ANSWER_FLOOR_PERMILLE),
+    press_floor_permille: None,
+    agreement_floor_permille: Some(SKILL_AGREEMENT_FLOOR_PERMILLE),
+    apply_deadline_ms: Some(SKILL_SEARCH_APPLY_DEADLINE_MS),
+    window_forgives: Some(FORGIVES_A_BAD_MINUTE),
+    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Comparison,
+    // The turn's first load, against what the suggestion named — the
+    // search's baseline, for the same reason.
+    baseline: Baseline::TodaysRule,
+    negatives_wanted: Some(NEGATIVES_WANTED),
+    confidence_bands: Some(ConfidenceBands::LOW_STAKES),
+    rubric_version: questions::SKILL_SUGGESTION_RUBRIC_VERSION,
+    request_name: SKILL_REQUEST_NAME,
+    names: Naming::Words,
+    label_part: &[],
+    follows: Some(SKILLS.setting),
 };
 
 /// The wall zo's step effort governor holds a step judgment to, in
@@ -1757,6 +1967,14 @@ pub const ZO_STEP_EFFORT: JevUse = JevUse {
     baseline: Baseline::TodaysRule,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::ROUTED),
+    rubric_version: questions::UNVERSIONED_RUBRIC,
+    // A progress mark names the judgment it grades by the turn's attempt and
+    // the step that judgment was asked at (t-6877): the label's own `step`
+    // is the one the answer was consulted at, which is later.
+    request_name: &["attempt", "step"],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// Characters of the person's last request one compaction judgment reads
@@ -1934,6 +2152,11 @@ pub const COMPACTION: JevUse = JevUse {
     baseline: Baseline::TodaysRule,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::ROUTED),
+    rubric_version: questions::COMPACTION_RUBRIC_VERSION,
+    request_name: &["judged"],
+    names: Naming::Request,
+    label_part: &["block"],
+    follows: None,
 };
 
 /// Characters of one text an agent's own question carries — the question,
@@ -2034,6 +2257,11 @@ pub const AGENT_TOOL: JevUse = JevUse {
     baseline: Baseline::None,
     negatives_wanted: None,
     confidence_bands: None,
+    rubric_version: questions::AGENT_TOOL_RUBRIC_VERSION,
+    request_name: &[],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// Characters of a page's title one browser-read question carries — the head
@@ -2214,6 +2442,11 @@ pub const BROWSER_READ: JevUse = JevUse {
     baseline: Baseline::None,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::pressing(BROWSER_READ_FOLD_FLOOR_PERMILLE)),
+    rubric_version: crate::browser_read::BROWSER_READ_RUBRIC_VERSION,
+    request_name: &["read"],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// The closed answer every notify question offers, spelled once: ring now,
@@ -2381,6 +2614,11 @@ pub const NOTIFY: JevUse = JevUse {
     baseline: Baseline::TodaysRule,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::ROUTED),
+    rubric_version: crate::notify_call::NOTIFY_CALL_RUBRIC_VERSION,
+    request_name: &["notify"],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// Characters of the sentence a person is writing that one mention
@@ -2505,6 +2743,11 @@ pub const MENTION_RERANK: JevUse = JevUse {
     baseline: Baseline::TodaysRule,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::LOW_STAKES),
+    rubric_version: questions::MENTION_RERANK_RUBRIC_VERSION,
+    request_name: &["query", "notes"],
+    names: Naming::Words,
+    label_part: &[],
+    follows: None,
 };
 
 /// How many of the emulator seat's candidates a forked phone step tries
@@ -2683,6 +2926,11 @@ pub const BRANCHING: JevUse = JevUse {
     baseline: Baseline::TodaysRule,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::pressing(SCREEN_PRESS_FLOOR_PERMILLE)),
+    rubric_version: crate::branching::BRANCHING_RUBRIC_VERSION,
+    request_name: &[],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// The judgment cache: a memo in front of the wire that answers a screen
@@ -2739,6 +2987,11 @@ pub const JUDGMENT_CACHE: JevUse = JevUse {
     negatives_wanted: Some(NEGATIVES_WANTED),
     // The screen seats' line: the answer it hands back is pressed under theirs.
     confidence_bands: Some(ConfidenceBands::pressing(SCREEN_PRESS_FLOOR_PERMILLE)),
+    rubric_version: questions::UNVERSIONED_RUBRIC,
+    request_name: &[],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// How many of a role's eligible attempts try the model nobody has evidence
@@ -2776,6 +3029,35 @@ pub const CHALLENGER_DESIGN_CAP: usize = 2;
 /// seat's transcript cap, which is the largest piece of a person's own text
 /// this product already sends through the door.
 pub const CHALLENGER_DESIGN_BYTE_CAP: usize = STALL_TRANSCRIPT_BYTE_CAP;
+
+/// The most tokens a challenger may write for its design — the request's
+/// `max_tokens`, and so the one hard bound the day's reservation stands on.
+///
+/// Derived from the byte cap the judge reads at, not written as its own
+/// number: a token of ASCII is at most four bytes, so this many tokens is
+/// the fewest that can fill the cap, and any more would be words the judge
+/// never sees and the share still pays for. A design in a denser script
+/// fills the cap with fewer tokens and stops sooner; nothing here pays for
+/// a byte the door would cut.
+pub const CHALLENGER_DESIGN_MAX_TOKENS: usize = CHALLENGER_DESIGN_BYTE_CAP / ASCII_BYTES_PER_TOKEN;
+
+/// The most bytes one token of ASCII text can be, for a bound read from a
+/// byte cap.
+const ASCII_BYTES_PER_TOKEN: usize = 4;
+
+/// The wall past which a challenger's design request is dropped, in
+/// milliseconds — and the attempt, which acts on the incumbent's design
+/// anyway, has waited on nothing.
+///
+/// Ninety seconds: the incumbent's own first turn — the plan the design is
+/// compared with — is what the comparison waits for regardless, and this
+/// machine's implementation spawns take longer than that to their first
+/// message more often than not (p50 of 56 minutes to a turn's end); a wall
+/// shorter than a paragraph's worth of reasoning tokens at a provider's slow
+/// hour would drop designs for lateness the comparison never felt. Past it
+/// the row says `timeout`, the reservation settles at what was reserved, and
+/// the incumbent is not compared with a design that never came.
+pub const CHALLENGER_DESIGN_WALL_MS: u64 = 90_000;
 
 /// What the challenger seat's answers must bound above before `auto` scores
 /// a comparison that moves a role's model: nine in ten, the recall seat's
@@ -2862,6 +3144,11 @@ pub const CHALLENGER: JevUse = JevUse {
     baseline: Baseline::TodaysRule,
     negatives_wanted: Some(NEGATIVES_WANTED),
     confidence_bands: Some(ConfidenceBands::ROUTED),
+    rubric_version: questions::CHALLENGER_RUBRIC_VERSION,
+    request_name: &[challenger::ATTEMPT.canonical],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// Characters of the person's words one patch review reads as the task the
@@ -3044,6 +3331,11 @@ pub const PATCH_REVIEW: JevUse = JevUse {
         NOUL_UNCERTAIN_TO_PERMILLE,
         PATCH_REVIEW_PERMIT_FLOOR_PERMILLE,
     )),
+    rubric_version: questions::PATCH_REVIEW_RUBRIC_VERSION,
+    request_name: &["judged"],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// One turn's completion claims put beside the tool output that can support
@@ -3105,6 +3397,11 @@ pub const CLAIM: JevUse = JevUse {
         abstain_below_permille: 600,
         act_from_permille: CLAIM_CHOICE_FLOOR_PERMILLE,
     }),
+    rubric_version: questions::CLAIM_RUBRIC_VERSION,
+    request_name: &["judged"],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// The vault pair seat only suggests relations for a person's weekly review.
@@ -3174,6 +3471,11 @@ pub const VAULT_PAIRS: JevUse = JevUse {
         NOUL_UNCERTAIN_TO_PERMILLE,
         VAULT_PAIR_OPPOSITE_FLOOR_PERMILLE,
     )),
+    rubric_version: questions::VAULT_PAIR_RUBRIC_VERSION,
+    request_name: &[],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// Re-rank likely files for a code task, with one Noul for each candidate.
@@ -3223,6 +3525,11 @@ pub const FILE_PICK: JevUse = JevUse {
         NOUL_UNCERTAIN_TO_PERMILLE,
         FILE_PICK_MATCH_FLOOR_PERMILLE,
     )),
+    rubric_version: questions::FILE_PICK_RUBRIC_VERSION,
+    request_name: &["judged"],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// Characters of a shell command one command-guard question carries (t-6348).
@@ -3286,8 +3593,9 @@ pub const COMMAND_GUARD_REGRET_TURNS: u32 = PATCH_REVIEW_REGRET_TURNS;
 /// when its turn ends or its window of turns closes: the command was regretted
 /// when the person stopped it (Esc while it ran, or the turn it ran in),
 /// when a path it named outside the project changed under it, or when a later
-/// command restored a path it named ([`COMMAND_GUARD_REGRET_TURNS`]); it stood
-/// otherwise. A failed command is recorded, not graded. `flagged` agreed when
+/// command restored a path it named and changed
+/// ([`COMMAND_GUARD_REGRET_TURNS`], t-9087); it stood otherwise. A failed
+/// command is recorded, not graded. `flagged` agreed when
 /// the command was regretted, `plain` when it stood. The baseline is today's
 /// rule: zo's destructive and path tables, its shared-tree table, and the
 /// Computer Use words a control that cannot be taken back carries
@@ -3333,6 +3641,11 @@ pub const COMMAND_GUARD: JevUse = JevUse {
         NOUL_UNCERTAIN_TO_PERMILLE,
         COMMAND_GUARD_FLAG_FLOOR_PERMILLE,
     )),
+    rubric_version: questions::COMMAND_GUARD_RUBRIC_VERSION,
+    request_name: &["judged"],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// Characters of a tool block's head one tool-text question carries
@@ -3417,13 +3730,90 @@ pub const TOOL_TEXT_GUARD: JevUse = JevUse {
         NOUL_UNCERTAIN_TO_PERMILLE,
         TOOL_TEXT_INSTRUCTED_FLOOR_PERMILLE,
     )),
+    rubric_version: questions::TOOL_TEXT_GUARD_RUBRIC_VERSION,
+    request_name: &["judged"],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
+};
+
+/// The wall one reflex decision waits for its answer, in milliseconds: one
+/// lease's length (`reflex::LIMITS.max_lease_ns`). A wall on the wire only —
+/// whether an answer still fits the run's scene when it lands is the runner's
+/// to judge, against the state it asked about.
+pub const REFLEX_DECIDE_DEADLINE_MS: u64 =
+    crate::computer_use_protocol::reflex::LIMITS.max_lease_ns / 1_000_000;
+
+/// The reflex decision (t-9205): while a live reflex run acts on the desktop,
+/// what should it do next — keep acting, pause, or have its plan rewritten —
+/// asked of the run's typed state alone: each detector's newest sighting (its
+/// value or why it is unknown, the track it follows, how old its frame is)
+/// and how the run's actions ended so far. No pixel, no screen's words and no
+/// app's name is sent; detector names are the plan's own ids.
+///
+/// Record-only: `shadow` is the most it offers, it never promotes and nothing
+/// it answers reaches the hand — its rows are the teacher's labels a local
+/// stand-in is later fitted on. Its consent is its own word: another seat's —
+/// the desktop's included — never switches it on.
+pub const REFLEX_DECIDE: JevUse = JevUse {
+    id: "reflex_decide",
+    setting: "jevReflexDecide",
+    modes: &[JevMode::Off, JevMode::Shadow],
+    recommended: JevMode::Shadow,
+    repeat: None,
+    sends: &[
+        Sent {
+            at: "/state/sightings",
+            cap: Cap::Items(crate::computer_use_protocol::reflex::LIMITS.max_detectors as usize),
+        },
+        // A detector's name is the plan's id: the plan's bound, cut the way
+        // any text the product did not write is.
+        Sent {
+            at: "/state/sightings/*/detector",
+            cap: Cap::Bytes(crate::computer_use_protocol::reflex::MAX_IDENTIFIER_BYTES),
+        },
+        // Why a reading is unknown: a word of the contract's closed set,
+        // declared so a reader of this table sees every key the state carries.
+        Sent {
+            at: "/state/sightings/*/unknown",
+            cap: Cap::Uncut,
+        },
+        // How the actions ended: the receipts' closed outcome words, each
+        // with a count.
+        Sent {
+            at: "/state/outcomes",
+            cap: Cap::Uncut,
+        },
+    ],
+    ledger: "reflex-decide.jsonl",
+    promotes: false,
+    answer_floor_permille: None,
+    press_floor_permille: None,
+    agreement_floor_permille: None,
+    // A seat that never rises names no apply deadline; the request's own wire
+    // deadline is `REFLEX_DECIDE_DEADLINE_MS`.
+    apply_deadline_ms: None,
+    window_forgives: None,
+    agreement_rows_wanted: None,
+    agreement_kind: AgreementKind::Comparison,
+    baseline: Baseline::None,
+    negatives_wanted: None,
+    confidence_bands: None,
+    rubric_version: questions::REFLEX_DECIDE_RUBRIC_VERSION,
+    // Its marks — the teacher's answer — sit on the request row itself: no
+    // label row names one of its requests.
+    request_name: &[],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
 };
 
 /// Every place this product asks Jev something.
-pub static JEV_USES: [JevUse; 25] = [
+pub static JEV_USES: [JevUse; 27] = [
     ROUTING,
     RECALL,
     SKILLS,
+    SKILL_SUGGESTION,
     BROWSER,
     DESKTOP,
     EMULATOR,
@@ -3446,6 +3836,7 @@ pub static JEV_USES: [JevUse; 25] = [
     FILE_PICK,
     COMMAND_GUARD,
     TOOL_TEXT_GUARD,
+    REFLEX_DECIDE,
 ];
 
 impl JevUse {
@@ -3505,10 +3896,11 @@ impl JevUse {
         }
     }
 
-    /// This use's mode in a settings document: the word written under
-    /// `smart.<setting>` when a person wrote one — theirs, whatever the switch
-    /// says, and read by [`Self::mode_of`] — and otherwise the switch's
-    /// (§6.1): [`Self::recommended`] while Jev is switched on
+    /// This use's mode in a settings document: the word a person wrote for
+    /// it ([`Self::word_in`] — its own, or the one written for the use it
+    /// was split from) — theirs, whatever the switch says, and read by
+    /// [`Self::mode_of`] — and otherwise the switch's (§6.1):
+    /// [`Self::recommended`] while Jev is switched on
     /// ([`door::switched_on`]), `off` while it is off or nobody has touched
     /// it. A machine that has never met Jev asks nothing.
     #[must_use]
@@ -3520,12 +3912,17 @@ impl JevUse {
         }
     }
 
-    /// The word a settings document holds for this use under
-    /// `smart.<setting>`, as written — `None` when nobody wrote one.
+    /// The word a settings document holds for this use, as written: its
+    /// own under `smart.<setting>`, or — while nobody wrote one — the word
+    /// under the setting of the use it was split from ([`Self::follows`],
+    /// t-6877). `None` when neither was written. One reader for everything
+    /// that asks — zo's seat, the window's card, the switch's own reading
+    /// of whether anything asks — so an update reads a person's old word
+    /// the same way everywhere.
     #[must_use]
     pub fn word_in<'root>(&self, root: &'root Value) -> Option<&'root Value> {
-        root.get(SMART_SETTINGS_KEY)
-            .and_then(|smart| smart.get(self.setting))
+        let smart = root.get(SMART_SETTINGS_KEY)?;
+        smart.get(self.setting).or_else(|| smart.get(self.follows?))
     }
 
     /// The mode a writer was handed, spelled exactly as this use offers it —

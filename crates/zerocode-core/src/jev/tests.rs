@@ -191,7 +191,7 @@ fn every_use_is_off_until_a_person_says_otherwise() {
 #[test]
 fn every_use_recommends_one_of_its_own_modes_and_off_only_where_stopped() {
     let stopped = [PATCH_REVIEW.id, STEP_EFFORT.id];
-    let recording = [VAULT_PAIRS.id];
+    let recording = [VAULT_PAIRS.id, REFLEX_DECIDE.id];
     for row in &JEV_USES {
         assert!(
             row.modes.contains(&row.recommended),
@@ -339,6 +339,87 @@ fn a_use_with_no_word_of_its_own_follows_the_switch() {
             JevMode::Shadow,
             "{}: a written word stands with the switch untouched",
             row.id
+        );
+    }
+}
+
+/// The skill suggestion keeps the word its person wrote for the skill
+/// search until they write one of its own (t-6877 round 3, the
+/// coordinator's migration contract m-8181): it read `smart.skillSearch`
+/// until it was a seat of its own, so a file that says `off` there asks no
+/// suggestion after the update, and `shadow`, `on` and `auto` stand as
+/// written — a slip reads as `off` for both, as it did; with neither word
+/// written it stands where it stood before the split, the search's reading,
+/// whatever the switch says; and a word written for the suggestion is its
+/// own, whatever the search's says. The search never reads the
+/// suggestion's word.
+#[test]
+fn the_skill_suggestion_keeps_the_word_written_for_the_skill_search() {
+    let document = |switch: Option<bool>, search: Option<&str>, suggestion: Option<&str>| {
+        let mut smart = serde_json::Map::new();
+        if let Some(on) = switch {
+            smart.insert(
+                door::JEV_SETTINGS_KEY.to_string(),
+                json!({ door::ENABLED_SETTING: on }),
+            );
+        }
+        if let Some(word) = search {
+            smart.insert(SKILLS.setting.to_string(), json!(word));
+        }
+        if let Some(word) = suggestion {
+            smart.insert(SKILL_SUGGESTION.setting.to_string(), json!(word));
+        }
+        json!({ SMART_SETTINGS_KEY: smart })
+    };
+    // The contract's three cases, under the switch.
+    assert_eq!(
+        SKILL_SUGGESTION.mode_in(&document(Some(true), Some("off"), None)),
+        JevMode::Off,
+        "a search turned off by hand keeps the suggestion off after the update"
+    );
+    assert_eq!(
+        SKILL_SUGGESTION.mode_in(&document(Some(true), Some("off"), Some("auto"))),
+        JevMode::Auto,
+        "a word of the suggestion's own is its own"
+    );
+    assert_eq!(
+        SKILL_SUGGESTION.mode_in(&document(Some(true), None, None)),
+        SKILLS.mode_in(&document(Some(true), None, None)),
+        "with neither word written, where it stood before the split"
+    );
+    for switch in [Some(true), Some(false), None] {
+        let neither = document(switch, None, None);
+        assert_eq!(
+            SKILL_SUGGESTION.mode_in(&neither),
+            SKILLS.mode_in(&neither),
+            "{switch:?}: neither word written reads as the search did"
+        );
+        for search in ["off", "shadow", "on", "auto", "shadwo"] {
+            let before = document(switch, Some(search), None);
+            assert_eq!(
+                SKILL_SUGGESTION.mode_in(&before),
+                SKILLS.mode_in(&before),
+                "{switch:?} {search}: the search's word stands for the suggestion"
+            );
+            for own in ["off", "shadow", "on", "auto"] {
+                let split = document(switch, Some(search), Some(own));
+                assert_eq!(
+                    SKILL_SUGGESTION.mode_in(&split),
+                    SKILL_SUGGESTION.mode_of(Some(&json!(own))),
+                    "{switch:?} {search} {own}: the suggestion's own word"
+                );
+                assert_eq!(
+                    SKILLS.mode_in(&split),
+                    SKILLS.mode_in(&before),
+                    "{switch:?} {search} {own}: the search reads its own word alone"
+                );
+            }
+        }
+        let only_the_suggestion = document(switch, None, Some("off"));
+        assert_eq!(
+            SKILLS.mode_in(&only_the_suggestion),
+            SKILLS.mode_in(&neither),
+            "{switch:?}: the search never follows the suggestion"
         );
     }
 }
@@ -610,10 +691,18 @@ fn a_use_that_promotes_has_somewhere_to_rise_from_and_to() {
 /// would be `shadow` under a name that promises otherwise. One rule for
 /// every row, so a new seat cannot pick a third set: the notify and
 /// branching seats had (t-6155 F7).
+///
+/// One named exception, for the same reason turned the other way: a seat
+/// whose answer nothing in the product carries out yet — the reflex decision,
+/// whose apply stage is a later version's (t-9205) — offers `off | shadow`,
+/// because an `on` it cannot carry out would be `shadow` under a name that
+/// promises otherwise.
 #[test]
 fn a_seats_mode_set_is_read_off_whether_anything_labels_it() {
     let labeled: &[JevMode] = &JevMode::ALL;
     let unlabeled: &[JevMode] = &[JevMode::Off, JevMode::Shadow, JevMode::On];
+    let recorded: &[JevMode] = &[JevMode::Off, JevMode::Shadow];
+    let nothing_applies = [REFLEX_DECIDE.id];
     for row in JEV_USES.iter() {
         assert_eq!(
             row.promotes,
@@ -621,7 +710,13 @@ fn a_seats_mode_set_is_read_off_whether_anything_labels_it() {
             "{}: a labeled seat names its label sample floor",
             row.id
         );
-        let expected = if row.promotes { labeled } else { unlabeled };
+        let expected = if row.promotes {
+            labeled
+        } else if nothing_applies.contains(&row.id) {
+            recorded
+        } else {
+            unlabeled
+        };
         assert_eq!(row.modes, expected, "{}", row.id);
     }
     assert!(
@@ -1485,7 +1580,7 @@ fn the_agent_tool_seat_names_the_wires_bounds_and_never_rises() {
     );
     assert_eq!(AGENT_TOOL_DEADLINE_MS, SKILL_SEARCH_APPLY_DEADLINE_MS);
     assert_eq!(AGENT_TOOL_ASK_OPTIONS, ["yes", "no"]);
-    assert_eq!(JEV_USES.len(), 25);
+    assert_eq!(JEV_USES.len(), 27);
 }
 
 /// The branching seat (t-6044) forks one phone step — the emulator seat's
@@ -1733,9 +1828,9 @@ fn the_patch_review_seat_sends_a_patch_and_its_evidence_and_rises_on_hindsight()
     );
     assert_eq!(PATCH_REVIEW.mode_in(&json!({})), JevMode::Off);
     // The patch review remains before claim, the vault-pair seat, the
-    // file-pick seat and the two guards.
-    assert_eq!(JEV_USES[JEV_USES.len() - 6], PATCH_REVIEW);
-    assert_eq!(JEV_USES[JEV_USES.len() - 7], CHALLENGER);
+    // file-pick seat, the two guards and the reflex decision.
+    assert_eq!(JEV_USES[JEV_USES.len() - 7], PATCH_REVIEW);
+    assert_eq!(JEV_USES[JEV_USES.len() - 8], CHALLENGER);
 }
 
 #[test]
@@ -1787,8 +1882,8 @@ fn the_file_pick_seat_rises_only_by_the_judge_and_compares_with_recent_edits() {
     assert_eq!(FILE_PICK.sends[2].cap, Cap::Uncut);
     assert_eq!(FILE_PICK.sends[3].at, "/state/files/*/about");
     assert_eq!(FILE_PICK.sends[3].cap, Cap::Bytes(200));
-    assert_eq!(JEV_USES.len(), 25);
-    assert_eq!(JEV_USES.get(JEV_USES.len() - 3), Some(&FILE_PICK));
+    assert_eq!(JEV_USES.len(), 27);
+    assert_eq!(JEV_USES.get(JEV_USES.len() - 4), Some(&FILE_PICK));
 }
 
 #[test]
@@ -1803,7 +1898,7 @@ fn completion_claims_are_a_recording_hindsight_seat_with_bounded_evidence() {
     assert_eq!(CLAIM.sends[0].cap, Cap::Items(CLAIM_LIMIT));
     assert_eq!(CLAIM.sends[1].cap, Cap::Chars(CLAIM_TEXT_CHAR_CAP));
     assert_eq!(CLAIM.sends[2].cap, Cap::Bytes(CLAIM_EVIDENCE_BYTE_CAP));
-    assert_eq!(JEV_USES.get(JEV_USES.len() - 5), Some(&CLAIM));
+    assert_eq!(JEV_USES.get(JEV_USES.len() - 6), Some(&CLAIM));
 }
 
 /// The command guard (t-6348): right before zo runs a shell command, the
@@ -1869,7 +1964,7 @@ fn the_command_guard_sends_a_command_its_folder_and_a_task_line_and_rises_on_hin
     assert_eq!(COMMAND_GUARD_COMMAND_CHAR_CAP, RECALL_REQUEST_CHAR_CAP);
     assert_eq!(COMMAND_GUARD_TASK_CHAR_CAP, GOAL_CHAR_CAP);
     assert_eq!(COMMAND_GUARD.mode_in(&json!({})), JevMode::Off);
-    assert_eq!(JEV_USES.get(JEV_USES.len() - 2), Some(&COMMAND_GUARD));
+    assert_eq!(JEV_USES.get(JEV_USES.len() - 3), Some(&COMMAND_GUARD));
 }
 
 /// The tool text guard (t-6348): the screen's instructions guard asked of
@@ -1926,7 +2021,225 @@ fn the_tool_text_guard_sends_a_block_head_and_its_source_and_rises_on_hindsight(
     }
     assert_eq!(TOOL_TEXT_GUARD_TEXT_CHAR_CAP, ROUTING_TASK_CHAR_CAP);
     assert_eq!(TOOL_TEXT_GUARD.mode_in(&json!({})), JevMode::Off);
-    assert_eq!(JEV_USES.last(), Some(&TOOL_TEXT_GUARD));
+    assert_eq!(JEV_USES.get(JEV_USES.len() - 2), Some(&TOOL_TEXT_GUARD));
+}
+
+/// The reflex decision (t-9205): a live reflex run's typed state — each
+/// detector's newest sighting and how its actions ended — put to one closed
+/// choice, `continue`, `pause` or `replan`. It records the teacher's answer
+/// and nothing else: `shadow` is the most it offers, it never promotes, names
+/// no floor, wall or band, and its wire waits one lease.
+#[test]
+fn the_reflex_decision_records_teacher_labels_and_never_rises() {
+    use crate::computer_use_protocol::reflex::LIMITS;
+    use crate::jev::questions::{REFLEX_DECIDE_OPTIONS, REFLEX_DECIDE_STATE_KEYS};
+
+    assert_eq!(jev_use("reflex_decide"), Some(&REFLEX_DECIDE));
+    assert_eq!(REFLEX_DECIDE.setting, "jevReflexDecide");
+    assert_eq!(REFLEX_DECIDE.ledger, "reflex-decide.jsonl");
+    assert_eq!(REFLEX_DECIDE.modes, &[JevMode::Off, JevMode::Shadow]);
+    assert_eq!(REFLEX_DECIDE.recommended, JevMode::Shadow);
+    assert_eq!(REFLEX_DECIDE.repeat, None);
+    const { assert!(!REFLEX_DECIDE.promotes) };
+    assert!(
+        REFLEX_DECIDE
+            .modes
+            .iter()
+            .all(|mode| !mode.applies_with(true)),
+        "no mode it offers acts"
+    );
+    assert_eq!(REFLEX_DECIDE.apply_deadline_ms, None);
+    assert_eq!(REFLEX_DECIDE.confidence_bands, None);
+    assert_eq!(
+        REFLEX_DECIDE_DEADLINE_MS * 1_000_000,
+        LIMITS.max_lease_ns,
+        "one lease on the wire"
+    );
+    assert_eq!(
+        REFLEX_DECIDE_OPTIONS.map(|(word, _)| word),
+        ["continue", "pause", "replan"]
+    );
+    for key in REFLEX_DECIDE_STATE_KEYS {
+        assert!(
+            REFLEX_DECIDE
+                .sends
+                .iter()
+                .any(|sent| sent.at == format!("/state/{key}")),
+            "{key}"
+        );
+    }
+    assert_eq!(JEV_USES.last(), Some(&REFLEX_DECIDE));
+}
+
+/// The desktop's consent — its word, whatever it says — never switches the
+/// reflex decision on, and neither does any other seat's: only its own word
+/// or the one switch does, and even then it only records. A word it does not
+/// offer (`on`, `auto`) reads as off.
+#[test]
+fn desktop_consent_never_enables_reflex_decide() {
+    for row in JEV_USES.iter().filter(|row| row.id != REFLEX_DECIDE.id) {
+        for word in ["on", "auto", "shadow"] {
+            let root = json!({ SMART_SETTINGS_KEY: { row.setting: word } });
+            assert_eq!(
+                REFLEX_DECIDE.mode_in(&root),
+                JevMode::Off,
+                "{} {word}",
+                row.id
+            );
+        }
+    }
+    let desktop = json!({ SMART_SETTINGS_KEY: { DESKTOP.setting: "on", EMULATOR.setting: "on" } });
+    assert_eq!(DESKTOP.mode_in(&desktop), JevMode::On);
+    assert_eq!(
+        REFLEX_DECIDE.mode_in(&desktop),
+        JevMode::Off,
+        "the desktop's `on` is the desktop's"
+    );
+    for (word, mode) in [
+        ("shadow", JevMode::Shadow),
+        ("on", JevMode::Off),
+        ("auto", JevMode::Off),
+        ("off", JevMode::Off),
+    ] {
+        let root = json!({ SMART_SETTINGS_KEY: { REFLEX_DECIDE.setting: word } });
+        assert_eq!(REFLEX_DECIDE.mode_in(&root), mode, "{word}");
+    }
+    // The one switch stands it at its recommendation, which only records.
+    let on =
+        json!({ SMART_SETTINGS_KEY: { door::JEV_SETTINGS_KEY: { door::ENABLED_SETTING: true } } });
+    assert_eq!(REFLEX_DECIDE.mode_in(&on), JevMode::Shadow);
+    assert!(!REFLEX_DECIDE.mode_in(&on).applies_with(true));
+}
+
+/// An answer is read by the option's word — whatever place that option stood
+/// in when it was asked — and a position, a letter or any label the question
+/// never offered is refused, never mapped onto an option: reordering or
+/// relabelling the options cannot point an answer at another action.
+#[test]
+fn choice_label_permutation_cannot_retarget_an_action() {
+    use crate::jev::questions::{
+        REFLEX_DECIDE_ASKS, REFLEX_DECIDE_OPTIONS, REFLEX_DECIDE_QUESTION,
+    };
+    use std::collections::BTreeSet;
+
+    let offered: BTreeSet<String> = REFLEX_DECIDE_OPTIONS
+        .iter()
+        .map(|(word, _)| (*word).to_string())
+        .collect();
+    let orders: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    for order in orders {
+        let criteria: serde_json::Map<String, Value> = order
+            .iter()
+            .map(|at| {
+                let (word, covers) = REFLEX_DECIDE_OPTIONS[*at];
+                (word.to_string(), Value::from(covers))
+            })
+            .collect();
+        let asked = choice::asked(REFLEX_DECIDE_QUESTION, REFLEX_DECIDE_ASKS, criteria);
+        let named: BTreeSet<String> = asked[REFLEX_DECIDE_QUESTION]["criteria"]
+            .as_object()
+            .expect("criteria")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(named, offered, "{order:?}: every option asked by its word");
+        for (word, _) in REFLEX_DECIDE_OPTIONS {
+            let probabilities: serde_json::Map<String, Value> = order
+                .iter()
+                .map(|at| {
+                    let (other, _) = REFLEX_DECIDE_OPTIONS[*at];
+                    (
+                        other.to_string(),
+                        json!(if other == word { 0.8 } else { 0.1 }),
+                    )
+                })
+                .collect();
+            let answer = json!({ REFLEX_DECIDE_QUESTION: {
+                "type": "choice", "choice": word, "probabilities": probabilities, "confidence": 0.7
+            } });
+            let read = choice::read(&answer, REFLEX_DECIDE_QUESTION, &offered)
+                .expect("a well-formed answer");
+            assert_eq!(read.chosen, word, "{order:?}");
+        }
+    }
+    for label in ["0", "1", "2", "A", "B", "C", "option_1", "Continue", ""] {
+        let answer = json!({ REFLEX_DECIDE_QUESTION: {
+            "type": "choice", "choice": label,
+            "probabilities": { "continue": 0.8, "pause": 0.1, "replan": 0.1 }, "confidence": 0.7
+        } });
+        assert_eq!(
+            choice::read(&answer, REFLEX_DECIDE_QUESTION, &offered),
+            Err(choice::ChoiceRefusal::UnknownOption),
+            "{label:?} names no option"
+        );
+    }
+}
+
+/// What a reflex decision sends is the run's typed state and nothing else:
+/// the table declares only the sightings and the outcome counts, a detector's
+/// name is cut at the plan's own id bound and the list at the plan's detector
+/// bound — the door's own clearing — and no pointer reaches a pixel, a
+/// screen's words or an app.
+#[test]
+fn reflex_decide_sends_no_pixels_text_or_app_names() {
+    use crate::computer_use_protocol::reflex::{LIMITS, MAX_IDENTIFIER_BYTES};
+
+    let pointers: Vec<&str> = REFLEX_DECIDE.sends.iter().map(|sent| sent.at).collect();
+    assert_eq!(
+        pointers,
+        [
+            "/state/sightings",
+            "/state/sightings/*/detector",
+            "/state/sightings/*/unknown",
+            "/state/outcomes",
+        ]
+    );
+    for sent in REFLEX_DECIDE.sends {
+        for word in [
+            "pixel", "image", "png", "text", "title", "app", "window", "scope", "target", "screen",
+            "label",
+        ] {
+            assert!(!sent.at.contains(word), "{} names {word}", sent.at);
+        }
+    }
+    assert_eq!(
+        REFLEX_DECIDE.sends[0].cap,
+        Cap::Items(LIMITS.max_detectors as usize)
+    );
+    assert_eq!(REFLEX_DECIDE.sends[1].cap, Cap::Bytes(MAX_IDENTIFIER_BYTES));
+    // Through the real door: a list past the plan's detectors and a name past
+    // the id bound are cut where the table says.
+    let settings = door::JevSettings::from_root(&json!({ SMART_SETTINGS_KEY: {
+        door::JEV_SETTINGS_KEY: { door::ENABLED_SETTING: true, door::WORKSPACES_SETTING: [door::EVERY_WORKSPACE] }
+    } }));
+    let long = "d".repeat(MAX_IDENTIFIER_BYTES * 3);
+    let sightings: Vec<Value> = (0..LIMITS.max_detectors + 4)
+        .map(|_| json!({ "detector": long, "value": 1, "unknown": null, "track": 5, "age_ms": 3 }))
+        .collect();
+    let body = json!({ "state": { "sightings": sightings, "outcomes": { "done": 12 } } });
+    let asking = door::Asking {
+        key: true,
+        settings: &settings,
+        workspace: Some("/any"),
+        sent_today: 0,
+    };
+    let cleared = door::may_send(&REFLEX_DECIDE, &asking, body).expect("the door lets it through");
+    let sent: Value = serde_json::from_slice(cleared.bytes()).expect("json");
+    let kept = sent["state"]["sightings"].as_array().expect("sightings");
+    assert_eq!(kept.len() as u64, LIMITS.max_detectors);
+    let name = kept[0]["detector"].as_str().expect("a name");
+    assert!(
+        name.len() <= MAX_IDENTIFIER_BYTES + CUT_MARK.len(),
+        "{} bytes",
+        name.len()
+    );
 }
 
 /// A request's receipt is the whole SHA-256 of the seat, the rubric version,
@@ -2165,4 +2478,147 @@ fn a_seat_that_never_rises_names_no_apply_wall() {
             row.apply_deadline_ms
         );
     }
+}
+
+/// Every seat's row names the words it asks now and how its labels name a
+/// request (t-6877): one rubric version — a version, never zero — and
+/// naming keys that are plain words. The judge reads a seat's ledger as
+/// one rubric's series by these two columns; a seat is one question, so no
+/// two seats write one ledger, and the skills seat's two questions are two
+/// rows, each pointing at the constant its writer stamps.
+#[test]
+fn every_seat_names_its_rubric_and_how_its_labels_name_a_request() {
+    use crate::jev::questions::UNVERSIONED_RUBRIC;
+    assert_eq!(
+        UNVERSIONED_RUBRIC, 1,
+        "a row that names no version is the first rubric's"
+    );
+    for row in &JEV_USES {
+        assert!(
+            row.rubric_version >= UNVERSIONED_RUBRIC,
+            "{}: zero is not a version",
+            row.id
+        );
+        for key in row.request_name {
+            assert!(
+                !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric()),
+                "{}: {key:?} is not a key a request row carries",
+                row.id
+            );
+        }
+    }
+    assert_eq!(
+        SKILLS.rubric_version,
+        questions::SKILL_SEARCH_RUBRIC_VERSION
+    );
+    assert_eq!(
+        SKILL_SUGGESTION.rubric_version,
+        questions::SKILL_SUGGESTION_RUBRIC_VERSION
+    );
+    assert_ne!(
+        SKILLS.rubric_version, SKILL_SUGGESTION.rubric_version,
+        "two questions, two rubrics"
+    );
+    assert_ne!(SKILLS.ledger, SKILL_SUGGESTION.ledger, "and two ledgers");
+    assert_eq!(SKILLS.sends, SKILL_SUGGESTION.sends, "cut at one door");
+    assert_eq!(SKILLS.request_name, &["task", "catalog"]);
+    assert_eq!(SKILL_SUGGESTION.request_name, SKILLS.request_name);
+    assert_eq!(
+        TOOL_TEXT_GUARD.rubric_version,
+        questions::TOOL_TEXT_GUARD_RUBRIC_VERSION
+    );
+    assert_eq!(TOOL_TEXT_GUARD.request_name, &["judged"]);
+    assert_eq!(ROUTING.rubric_version, questions::ROUTING_RUBRIC_VERSION);
+    assert_eq!(
+        CHALLENGER.rubric_version,
+        questions::CHALLENGER_RUBRIC_VERSION,
+        "the number the arm stamps on every row that asked"
+    );
+    assert_eq!(RECALL.request_name, &["query", "notes"]);
+    assert_eq!(
+        ZO_STEP_EFFORT.request_name,
+        &["attempt", "step"],
+        "a progress mark names the judgment it grades by the turn and the step it was asked at"
+    );
+}
+
+/// What a request's name picks out is the table's to say, seat by seat
+/// (t-6877 round 3, astra R1b): the routing seat's attempt names a turn of
+/// several judgments; the recall, mention and both skills seats name the
+/// words asked, which the same words asked again carry again — so their
+/// labels name the time of the asking they grade; every other seat's name
+/// is an id its writer made for one request. A label grades a part of its
+/// request only where the request has several — the compaction seat's
+/// dropped blocks — and a part's keys are keys a label row carries.
+#[test]
+fn every_seat_says_what_its_request_name_picks_out() {
+    for row in &JEV_USES {
+        let expected = match row.id {
+            id if id == ROUTING.id => Naming::Turn,
+            id if [RECALL.id, MENTION_RERANK.id, SKILLS.id, SKILL_SUGGESTION.id].contains(&id) => {
+                Naming::Words
+            }
+            _ => Naming::Request,
+        };
+        assert_eq!(row.names, expected, "{}", row.id);
+        if row.names != Naming::Request {
+            assert!(
+                !row.request_name.is_empty(),
+                "{}: a name that picks out words or a turn is carried under some key",
+                row.id
+            );
+        }
+        for key in row.label_part {
+            assert!(
+                !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric()),
+                "{}: {key:?} is not a key a label row carries",
+                row.id
+            );
+        }
+        let parts: &[&str] = if row.id == COMPACTION.id {
+            &["block"]
+        } else {
+            &[]
+        };
+        assert_eq!(row.label_part, parts, "{}", row.id);
+    }
+}
+
+/// A seat split off another follows a word written for the other, and only
+/// a seat that was (t-6877 round 3, m-8181): the skill suggestion follows
+/// the search's setting — another row's, never its own — reads every word
+/// the search offers as the search reads it, and the search follows
+/// nothing, so a word is followed one step and never round a circle.
+#[test]
+fn a_seat_follows_only_the_seat_it_was_split_from() {
+    for row in &JEV_USES {
+        let Some(followed) = row.follows else {
+            continue;
+        };
+        assert_eq!(
+            (row.id, followed),
+            (SKILL_SUGGESTION.id, SKILLS.setting),
+            "only the skill suggestion was split from another seat"
+        );
+        let from = JEV_USES
+            .iter()
+            .find(|other| other.setting == followed)
+            .expect("the followed setting is a row's");
+        assert_ne!(from.id, row.id, "a seat does not follow itself");
+        assert_eq!(
+            from.follows, None,
+            "{}: a followed seat follows nothing",
+            from.id
+        );
+        for mode in from.modes {
+            assert!(
+                row.modes.contains(mode),
+                "{}: {} is a word {} offers and this seat would read as off",
+                row.id,
+                mode.key(),
+                from.id
+            );
+        }
+    }
+    assert_eq!(SKILL_SUGGESTION.follows, Some(SKILLS.setting));
 }

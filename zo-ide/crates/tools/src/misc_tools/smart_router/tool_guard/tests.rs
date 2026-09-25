@@ -142,19 +142,157 @@ fn the_places_a_command_names_outside_its_task_are_the_ones_stamped() {
     assert_eq!(resolve_place("src/*.rs", cwd), None);
 }
 
-/// A later `git restore` or `git checkout -- <path>` of a path the guarded
-/// command named puts it back — the command's regret; a restore elsewhere and
-/// every other command do not.
+/// A later `git restore` or `git checkout -- <path>` putting back what the
+/// guarded command changed is the command's regret: the file it wrote, a
+/// folder holding it, a path under a folder it removed. A restore elsewhere,
+/// a path under a folder whose listing alone it moved (t-9087, astra
+/// R-GUARD-1), and every other command are not.
 #[test]
 fn a_later_git_restore_of_a_named_path_is_a_regret() {
     let cwd = Path::new("/work/zo");
-    let named = [cwd.join("build"), cwd.join("src/flag.rs")];
-    assert!(restores("git checkout -- build/a.rs", &named, cwd));
-    assert!(restores("git restore src/flag.rs", &named, cwd));
-    assert!(restores("cd /work/zo && git checkout .", &named, cwd), "a restore of the whole folder");
-    assert!(!restores("git restore docs/readme.md", &named, cwd));
-    assert!(!restores("git status", &named, cwd));
-    assert!(!restores("rm -rf build", &named, cwd));
+    let changed = [
+        // A folder the command removed, and a file it wrote.
+        Changed { path: cwd.join("build"), entry_moved: true },
+        Changed { path: cwd.join("src/flag.rs"), entry_moved: false },
+    ];
+    assert!(restores("git checkout -- build/a.rs", &changed, cwd));
+    assert!(restores("git restore src/flag.rs", &changed, cwd));
+    assert!(restores("git checkout -- src", &changed, cwd), "a restore of a folder holding it");
+    assert!(restores("cd /work/zo && git checkout .", &changed, cwd), "a restore of the whole folder");
+    assert!(!restores("git restore docs/readme.md", &changed, cwd));
+    assert!(!restores("git restore src/other.rs", &changed, cwd), "another file beside it");
+    assert!(!restores("git status", &changed, cwd));
+    assert!(!restores("rm -rf build", &changed, cwd));
+
+    // A folder whose listing moved — another file made in it — puts back
+    // nothing under it but itself.
+    let listing = [Changed { path: cwd.join("src"), entry_moved: false }];
+    assert!(!restores("git checkout -- src/a.rs", &listing, cwd));
+    assert!(restores("git checkout -- src", &listing, cwd));
+    assert!(restores("git checkout .", &listing, cwd));
+}
+
+/// A later restore puts back what a command changed, not every folder it
+/// named (t-9087). This machine's ledger (2026-09-25) holds 51 `restored`
+/// labels written in two seconds by two `git checkout <one file>` calls, 49
+/// of them for commands that never spelled the file — a `cd` into the
+/// checkout, a `tr /`, an `ls` of a folder above it — which is 49 of the
+/// seat's 59 disagreements. A command that changed the file is regretted by
+/// its restore; one that only named folders holding it keeps waiting.
+#[test]
+fn a_restore_regrets_the_command_that_changed_what_it_put_back_and_no_other() {
+    let mock = Mock::serving(200, reply(&[(COMMAND_GUARD_IRREVERSIBLE, 0.1), (COMMAND_GUARD_OUTSIDE, 0.1)]));
+    machine(&COMMAND_GUARD, JevMode::Shadow.key(), &mock.base_url, |cwd| {
+        forget_waiting(cwd);
+        std::fs::create_dir_all(cwd.join("src")).expect("a source folder");
+        std::fs::write(cwd.join("src/a.rs"), "fn a() {}\n").expect("a source file");
+        let judge = ToolGuardJudge::at(cwd);
+        let ran = |id: &str| CommandRan {
+            owner: "turn-1".to_string(),
+            tool_use_id: id.to_string(),
+            failed: false,
+            cancelled: false,
+        };
+        // Names the folder it runs in, the root and the folder holding the
+        // file, and changes none of them.
+        let looked = "cd . && ls / src | tr / _";
+        judge.command(command_ask(cwd, "shell-1", looked));
+        assert_eq!(api::sync_bridge::run_blocking(judge.command_ran(ran("shell-1"))), None);
+        // Changes the file: the runtime runs it between the two calls.
+        let edited = "sed -i '' s/a/b/ src/a.rs";
+        judge.command(command_ask(cwd, "shell-2", edited));
+        std::fs::write(cwd.join("src/a.rs"), "fn b() { 1 }\n").expect("the command's edit");
+        assert_eq!(api::sync_bridge::run_blocking(judge.command_ran(ran("shell-2"))), None);
+        // Both answered: each verdict is in the book before the turn ends.
+        assert_eq!(rows_of(&command_guard_path(cwd), 2).len(), 2);
+
+        let shell = |id: &str, command: &str| call(id, SHELL_TOOL, &serde_json::json!({"command": command}));
+        let turn = vec![
+            user("fix a"),
+            shell("shell-1", looked),
+            shell("shell-2", edited),
+            shell("shell-3", "git checkout -- src/a.rs"),
+            said("put it back"),
+        ];
+        assert_eq!(note_tool_guard_turn(cwd, "turn-1", Some(&turn)), 1, "the edit alone was put back");
+        let labels: Vec<CommandGuardLabelRow> = read_shadow_rows::<Value>(&command_guard_path(cwd))
+            .into_iter()
+            .filter_map(|row| serde_json::from_value(row).ok())
+            .collect();
+        let edit = task_fingerprint("turn-1", "shell-2").to_string();
+        assert_eq!(
+            labels.iter().map(|label| (label.label.as_str(), label.hindsight.as_str())).collect::<Vec<_>>(),
+            vec![(edit.as_str(), "restored")]
+        );
+        let waiting = command_book().lock().expect("book");
+        assert_eq!(
+            waiting[cwd].iter().map(|one| one.tool_use_id.as_str()).collect::<Vec<_>>(),
+            vec!["shell-1"],
+            "the look waits on its own window"
+        );
+        drop(waiting);
+        forget_waiting(cwd);
+    });
+}
+
+/// A folder that changed is not every file in it changed (t-9087, astra
+/// R-GUARD-1): a command that runs in the checkout's root and makes or
+/// removes another file there moves the root's own stamp — its listing
+/// changed — and a later restore of a file it never touched is no regret of
+/// it. Whether the restored path moved is what the stamps can say; that one
+/// of a folder's children did says nothing of which.
+#[test]
+fn a_restore_of_one_file_regrets_no_command_that_only_changed_another_in_its_folder() {
+    let mock = Mock::serving(200, reply(&[(COMMAND_GUARD_IRREVERSIBLE, 0.1), (COMMAND_GUARD_OUTSIDE, 0.1)]));
+    machine(&COMMAND_GUARD, JevMode::Shadow.key(), &mock.base_url, |cwd| {
+        forget_waiting(cwd);
+        std::fs::create_dir_all(cwd.join("src")).expect("a source folder");
+        std::fs::write(cwd.join("src/a.rs"), "fn a() {}\n").expect("a source file");
+        let a_rs = std::fs::read(cwd.join("src/a.rs")).expect("the file's bytes");
+        let judge = ToolGuardJudge::at(cwd);
+        let ran = |id: &str| CommandRan {
+            owner: "turn-1".to_string(),
+            tool_use_id: id.to_string(),
+            failed: false,
+            cancelled: false,
+        };
+        // Makes another file in the root: the runtime runs it between the
+        // two calls, and the root's stamp moves with its listing.
+        let made = "cd . && touch other.tmp";
+        let root_before = stamp(cwd);
+        judge.command(command_ask(cwd, "shell-1", made));
+        std::fs::write(cwd.join("other.tmp"), "").expect("the command's file");
+        assert_eq!(api::sync_bridge::run_blocking(judge.command_ran(ran("shell-1"))), None);
+        let root_made = stamp(cwd);
+        assert_ne!(root_made, root_before, "the root's own stamp moved");
+        // Removes it again: the root moves once more.
+        let removed = "cd . && rm other.tmp";
+        judge.command(command_ask(cwd, "shell-2", removed));
+        std::fs::remove_file(cwd.join("other.tmp")).expect("the command's removal");
+        assert_eq!(api::sync_bridge::run_blocking(judge.command_ran(ran("shell-2"))), None);
+        assert_ne!(stamp(cwd), root_made, "the root's own stamp moved again");
+        assert_eq!(std::fs::read(cwd.join("src/a.rs")).expect("the file's bytes"), a_rs, "neither touched it");
+        // Both answered: each verdict is in the book before the turn ends.
+        assert_eq!(rows_of(&command_guard_path(cwd), 2).len(), 2);
+
+        let shell = |id: &str, command: &str| call(id, SHELL_TOOL, &serde_json::json!({"command": command}));
+        let turn = vec![
+            user("tidy up"),
+            shell("shell-1", made),
+            shell("shell-2", removed),
+            shell("shell-3", "git checkout -- src/a.rs"),
+            said("put it back"),
+        ];
+        assert_eq!(note_tool_guard_turn(cwd, "turn-1", Some(&turn)), 0, "a restore of a file neither changed regrets neither");
+        let waiting = command_book().lock().expect("book");
+        assert_eq!(
+            waiting[cwd].iter().map(|one| one.tool_use_id.as_str()).collect::<Vec<_>>(),
+            vec!["shell-1", "shell-2"],
+            "each waits on its own window"
+        );
+        drop(waiting);
+        forget_waiting(cwd);
+    });
 }
 
 /// A text was followed when the agent's next step ran a command it spelled —
@@ -393,7 +531,9 @@ fn waiting_command(judged: u64, id: &str, cwd: &Path, rule_flagged: bool, verdic
         owner: "turn-1".to_string(),
         tool_use_id: id.to_string(),
         cwd: cwd.to_path_buf(),
-        named: vec![cwd.join("build")],
+        // A command that removed the folder it named.
+        named: vec![(cwd.join("build"), Stamp::Present { dir: true, len: 64, modified: None })],
+        changed: vec![Changed { path: cwd.join("build"), entry_moved: true }],
         outside: Vec::new(),
         rule_flagged,
         verdict: Some(verdict),
@@ -618,4 +758,266 @@ fn the_command_path_pays_microseconds_for_a_recording_guard() {
         eprintln!("{mode}: p50 {} us, p95 {} us, max {} us over {n} commands", spent[n / 2], spent[n * 95 / 100], spent[n - 1]);
     }
     eprintln!("load after: {}", load());
+}
+
+/* ---- one rubric's evidence is not another's, at the guard's own judge ------- */
+
+/// The version that answers every request of these ledgers.
+pub(super) const ANSWERING: &str = "jev-1.13.0";
+
+/// A text guard request row as `judge_text` files it, reduced to what the
+/// judge reads: its name, its rubric, the version that answered — none for a
+/// timeout — and its outcome.
+pub(super) fn guard_request(at: u64, judged: u64, rubric: u32, model: Option<&str>, outcome: &str) -> Value {
+    let mut row = serde_json::json!({
+        "at": at, "judged": judged, "rubricVersion": rubric, "outcome": outcome, "elapsedMs": 400, "requests": 1,
+    });
+    if let Some(model) = model {
+        row[zerocode_core::jev::summary::MODEL.canonical] = serde_json::json!(model);
+    }
+    row
+}
+
+/// The label `write_text_labels` files for the request named `judged`.
+fn guard_label(at: u64, judged: u64, agreed: bool) -> Value {
+    serde_json::json!({
+        "kind": runtime::LABEL_ROW_KIND, "at": at, "label": judged.to_string(), "agreed": agreed, "baselineAgreed": at.is_multiple_of(2),
+    })
+}
+
+/// A full window answered under `rubric`, then the marks that clear every
+/// line of the guard, each naming a request of the window.
+fn guard_window_that_rises(rubric: u32, first: u64, at: u64) -> Vec<Value> {
+    use zerocode_core::jev::promote::{marks_that_can_clear, window_wanted_for};
+    let wanted = u64::try_from(window_wanted_for(&TOOL_TEXT_GUARD).expect("the guard rises")).expect("small");
+    let misses = u64::try_from(TOOL_TEXT_GUARD.negatives_wanted.expect("negatives")).expect("small");
+    let marks = u64::try_from(marks_that_can_clear(&TOOL_TEXT_GUARD).expect("a width")).expect("small");
+    let mut rows: Vec<Value> =
+        (0..wanted).map(|n| guard_request(at + n, first + n, rubric, Some(ANSWERING), TOOL_GUARD_OUTCOME_ANSWERED)).collect();
+    rows.extend((0..marks).map(|n| guard_label(at + wanted + n, first + n, n >= misses)));
+    rows
+}
+
+/// The text guard's own ledger under `cwd`, holding `rows` as its writer
+/// appends them.
+pub(super) fn guard_ledger_with(cwd: &Path, rows: &[Value]) -> PathBuf {
+    let ledger = tool_text_guard_path(cwd);
+    for row in rows {
+        append_shadow_row(&ledger, row, SHADOW_LEDGER_MAX_BYTES).expect("a row");
+    }
+    ledger
+}
+
+/// The transition rows the judge wrote on `ledger`.
+pub(super) fn transitions_in(ledger: &Path) -> Vec<Value> {
+    read_shadow_rows::<Value>(ledger)
+        .into_iter()
+        .filter(|row| zerocode_core::jev::summary::TRANSITION.read(row).is_some())
+        .collect()
+}
+
+/// The words the guard's row asks today, and the version before them — what
+/// these tests read at the guard's own judge, whatever the row asks.
+pub(super) fn today_and_before() -> (u32, u32) {
+    let today = TOOL_TEXT_GUARD.rubric_version;
+    (today, today - 1)
+}
+
+/// A change of rubric returns a risen seat to recording at the guard's
+/// cache (t-6877, astra §2): a rise the judge wrote under version 1 — before
+/// transitions named a rubric — is not a rise of the words the guard asks
+/// today, with nothing yet asked under them; a rise naming today's words is.
+#[test]
+fn a_rubric_change_returns_a_risen_seat_to_recording() {
+    use zerocode_core::jev::promote::ROSE;
+    use zerocode_core::jev::summary::TRANSITION;
+    let (today, _) = today_and_before();
+    machine(&TOOL_TEXT_GUARD, JevMode::Auto.key(), "http://127.0.0.1:9", |cwd| {
+        let mut rows = guard_window_that_rises(1, 1, 0);
+        rows.push(serde_json::json!({"at": 5_000, (TRANSITION.canonical): ROSE}));
+        let ledger = guard_ledger_with(cwd, &rows);
+        assert!(!runtime::jev_seat_applies(cwd, &TOOL_TEXT_GUARD), "version 1's rise is not today's words'");
+        refresh_standing(cwd, &TOOL_TEXT_GUARD);
+        assert!(!raised(cwd, &TEXT), "nor for the guard's cache");
+
+        append_shadow_row(
+            &ledger,
+            &serde_json::json!({"at": 6_000, (TRANSITION.canonical): ROSE, "rubricVersions": [today]}),
+            SHADOW_LEDGER_MAX_BYTES,
+        )
+        .expect("a rise");
+        assert!(runtime::jev_seat_applies(cwd, &TOOL_TEXT_GUARD), "a rise naming today's words stands");
+        refresh_standing(cwd, &TOOL_TEXT_GUARD);
+        assert!(raised(cwd, &TEXT));
+    });
+}
+
+/// Today's words rise again on their own sample, through the guard's judge
+/// (t-6877, the positive control): the older words' window, marks and rise
+/// on the ledger, then today's own — the judge is due on today's count,
+/// says rise, and the transition it writes names the rubric it was decided
+/// on.
+#[test]
+fn todays_words_rise_again_on_their_own_sample() {
+    use zerocode_core::jev::promote::{Verdict, ROSE};
+    use zerocode_core::jev::summary::TRANSITION;
+    let (today, before) = today_and_before();
+    machine(&TOOL_TEXT_GUARD, JevMode::Auto.key(), "http://127.0.0.1:9", |cwd| {
+        let mut rows = guard_window_that_rises(before, 1, 0);
+        rows.push(serde_json::json!({"at": 5_000, (TRANSITION.canonical): ROSE, "rubricVersions": [before]}));
+        rows.extend(guard_window_that_rises(today, 1_000, 10_000));
+        let ledger = guard_ledger_with(cwd, &rows);
+        let verdict = super::super::shadow_ledger::judge_seat_ledger(&TOOL_TEXT_GUARD, &ledger, 99_999);
+        assert_eq!(verdict, Some(Verdict::Rise), "today's own window and marks");
+        let written = transitions_in(&ledger);
+        assert_eq!(written.len(), 2, "the older words' rise, and now today's");
+        assert_eq!(TRANSITION.read(&written[1]).and_then(Value::as_str), Some(ROSE));
+        assert_eq!(written[1]["rubricVersions"], serde_json::json!([today]), "the transition names its rubric");
+        assert!(runtime::jev_seat_applies(cwd, &TOOL_TEXT_GUARD));
+    });
+}
+
+/// A timeout names no model and stays the current rubric's failure at the
+/// guard's judge (t-6877, astra m-7141): an acting guard on today's words
+/// that times out three times running is ended now, and the fall names the
+/// rubric.
+#[test]
+fn a_no_model_timeout_stays_in_the_current_rubrics_requests() {
+    use zerocode_core::jev::promote::{Line, Verdict, FALLBACKS_THAT_END_IT, FELL, ROSE};
+    use zerocode_core::jev::summary::TRANSITION;
+    let (today, _) = today_and_before();
+    machine(&TOOL_TEXT_GUARD, JevMode::Auto.key(), "http://127.0.0.1:9", |cwd| {
+        let mut rows = guard_window_that_rises(today, 1_000, 10_000);
+        rows.push(serde_json::json!({"at": 15_000, (TRANSITION.canonical): ROSE, "rubricVersions": [today]}));
+        rows.extend((0..u64::from(FALLBACKS_THAT_END_IT)).map(|n| guard_request(20_000 + n, 5_000 + n, today, None, "timeout")));
+        let ledger = guard_ledger_with(cwd, &rows);
+        assert!(runtime::jev_seat_applies(cwd, &TOOL_TEXT_GUARD), "acting, until the wire fails three times");
+        let verdict = super::super::shadow_ledger::judge_seat_ledger(&TOOL_TEXT_GUARD, &ledger, 99_999);
+        assert_eq!(
+            verdict,
+            Some(Verdict::Fall(Line::Fallbacks { in_a_row: FALLBACKS_THAT_END_IT })),
+            "three timeouts of today's words are today's failures"
+        );
+        let written = transitions_in(&ledger);
+        assert_eq!(TRANSITION.read(&written[1]).and_then(Value::as_str), Some(FELL));
+        assert_eq!(written[1]["rubricVersions"], serde_json::json!([today]));
+        assert!(!runtime::jev_seat_applies(cwd, &TOOL_TEXT_GUARD));
+    });
+}
+
+/// What the guard's judge and the two standing readers cost on a full ledger
+/// of the guard's own shape (t-6877) — a measurement, not a check: the
+/// series is now cut by rubric and its labels joined to their requests, and
+/// the join must not have put the whole-file parse back on the hot path
+/// (t-6346 took the standing read from 35.6 ms to 2.3 ms by parsing only
+/// transition lines). Twenty repetitions each, the median and the worst
+/// printed, through the real entrypoints: `judge_seat_ledger` at a judgment
+/// boundary (the whole judge), `runtime::jev_seat_applies` (every row
+/// parsed, then the standing) and `jev_summary::raised_in` (transition lines
+/// only).
+#[test]
+#[ignore = "a measurement: prints what the judge and the standing reads cost on a full ledger"]
+fn what_a_full_ledger_costs_the_guards_judge_and_standing() {
+    use zerocode_core::jev::promote::window_wanted_for;
+    const REQUESTS: u64 = 16_000;
+    const REPS: usize = 20;
+    machine(&TOOL_TEXT_GUARD, JevMode::Auto.key(), "http://127.0.0.1:9", |cwd| {
+        let wanted = u64::try_from(window_wanted_for(&TOOL_TEXT_GUARD).expect("the guard rises")).expect("small");
+        // Requests as the guard files them — the flattened `asked` columns
+        // and all — every other one labelled, the count landing on the
+        // judge's cadence so the whole judge runs; the marks are thin, so
+        // it holds and writes nothing.
+        let total = wanted + (REQUESTS - wanted) / 20 * 20;
+        let mut text = String::new();
+        for n in 0..total {
+            let request = serde_json::json!({
+                "at": 1_700_000_000_000_u64 + n * 1_000, "attempt": format!("turn-{}", n / 7), "judged": 10_000 + n,
+                "rubricVersion": TOOL_TEXT_GUARD.rubric_version, "tool": "read_file", "source": "file", "textChars": 1_024 + n % 900, "fencedBefore": n.is_multiple_of(5),
+                "verdict": "plain", "fenced": false, "noted": false, "outcome": TOOL_GUARD_OUTCOME_ANSWERED,
+                "answers": {INSTRUCTED: 0.04}, "routeUse": "shadow", "applied": false, "elapsedMs": 380 + n % 200, "retries": 0,
+                "requests": 1, "redactedLines": 0, "model": ANSWERING, "inputTokens": 640 + n % 300, "requestBytes": 2_048 + n % 500,
+                "requestDigest": format!("{:064x}", n),
+            });
+            text.push_str(&request.to_string());
+            text.push('\n');
+            if n.is_multiple_of(2) && n + 1 < total.saturating_sub(wanted) {
+                let label = serde_json::json!({
+                    "kind": runtime::LABEL_ROW_KIND, "at": 1_700_000_000_000_u64 + n * 1_000 + 500, "label": (10_000 + n).to_string(),
+                    "verdict": "plain", "applied": false, "agreed": true, "baselineAgreed": n.is_multiple_of(4), "hindsight": IGNORED,
+                    "nextTool": "shell", "confidence": 0.04,
+                });
+                text.push_str(&label.to_string());
+                text.push('\n');
+            }
+        }
+        let ledger = tool_text_guard_path(cwd);
+        std::fs::create_dir_all(ledger.parent().expect("a parent")).expect("dir");
+        std::fs::write(&ledger, &text).expect("the ledger writes");
+        let rows = text.lines().count();
+        let timed = |read: &dyn Fn()| {
+            let mut took: Vec<u128> = (0..REPS)
+                .map(|_| {
+                    let started = Instant::now();
+                    read();
+                    started.elapsed().as_micros()
+                })
+                .collect();
+            took.sort_unstable();
+            (took[took.len() / 2], took[took.len() - 1])
+        };
+        let (judge_p50, judge_max) = timed(&|| {
+            let verdict = super::super::shadow_ledger::judge_seat_ledger(&TOOL_TEXT_GUARD, &ledger, 99);
+            assert!(verdict.is_some(), "the count lands on the cadence: the whole judge runs");
+        });
+        assert_eq!(
+            std::fs::read_to_string(&ledger).expect("read").lines().count(),
+            rows,
+            "a hold writes nothing"
+        );
+        let (applies_p50, applies_max) = timed(&|| {
+            assert!(!runtime::jev_seat_applies(cwd, &TOOL_TEXT_GUARD));
+        });
+        let (lines_p50, lines_max) = timed(&|| {
+            assert!(!super::super::jev_summary::raised_in(&TOOL_TEXT_GUARD, &ledger));
+        });
+        println!(
+            "ledger {} B, {rows} rows ({total} requests) · judge_seat_ledger p50 {judge_p50} µs (max {judge_max}) · jev_seat_applies p50 {applies_p50} µs (max {applies_max}) · raised_in p50 {lines_p50} µs (max {lines_max})",
+            text.len()
+        );
+    });
+}
+
+/// A late label of a request an older version answered is not the newer
+/// version's comparison at the guard's judge (t-6877 round 2, astra R1a):
+/// a window of today's words answered by one model, then the same window
+/// again answered by the next, then the forty marks of the FIRST window's
+/// requests arriving late — carrying no model, as the guard's labels never
+/// do. The judge is due on the second model's count and holds with nothing
+/// compared: the late marks grade the first model's requests, and the
+/// first model's rise is not written on them.
+#[test]
+fn a_late_label_of_the_older_model_does_not_rise_the_newer_one() {
+    use zerocode_core::jev::promote::{marks_that_can_clear, window_wanted_for, Line, Verdict};
+    let (today, _) = today_and_before();
+    machine(&TOOL_TEXT_GUARD, JevMode::Auto.key(), "http://127.0.0.1:9", |cwd| {
+        let wanted = u64::try_from(window_wanted_for(&TOOL_TEXT_GUARD).expect("the guard rises")).expect("small");
+        let misses = u64::try_from(TOOL_TEXT_GUARD.negatives_wanted.expect("negatives")).expect("small");
+        let marks = u64::try_from(marks_that_can_clear(&TOOL_TEXT_GUARD).expect("a width")).expect("small");
+        let mut rows: Vec<Value> =
+            (0..wanted).map(|n| guard_request(n, 1 + n, today, Some("jev-1.12.0"), TOOL_GUARD_OUTCOME_ANSWERED)).collect();
+        rows.extend((0..wanted).map(|n| guard_request(1_000 + n, 1_000 + n, today, Some(ANSWERING), TOOL_GUARD_OUTCOME_ANSWERED)));
+        rows.extend((0..marks).map(|n| guard_label(5_000 + n, 1 + n, n >= misses)));
+        let ledger = guard_ledger_with(cwd, &rows);
+        let verdict = super::super::shadow_ledger::judge_seat_ledger(&TOOL_TEXT_GUARD, &ledger, 99_999);
+        assert_eq!(
+            verdict,
+            Some(Verdict::Hold(Line::TooFewCompared {
+                compared: 0,
+                wanted: TOOL_TEXT_GUARD.agreement_rows_wanted.expect("a sample floor")
+            })),
+            "the late marks grade the older model's requests"
+        );
+        assert!(transitions_in(&ledger).is_empty(), "no rise was written on them");
+        assert!(!runtime::jev_seat_applies(cwd, &TOOL_TEXT_GUARD));
+    });
 }

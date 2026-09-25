@@ -139,6 +139,21 @@ pub const LABEL: LedgerKey = LedgerKey {
     canonical: "label",
     also: &[],
 };
+/// When the request a label row grades was made — that request row's
+/// [`AT`], copied by the writer that knows which request it graded
+/// (t-6877). A name alone ([`LABEL`]) picks out one request only while it
+/// is asked once: the recall and mention seats name a request by the
+/// fingerprints of what was asked, and the same words asked again carry
+/// the same name. With the time beside the name a label grades one
+/// occurrence of a request and no other; a label that carries none grades a
+/// request only where the seat's name picks one out without it — an id, or
+/// a turn — and never for a seat that names a request by the words asked
+/// ([`crate::jev::JevUse::names`], t-6877 round 3,
+/// [`crate::jev::promote::on_the_newest_version`]).
+pub const REQUEST_AT: LedgerKey = LedgerKey {
+    canonical: "requestAt",
+    also: &[],
+};
 /// Why a row that grades a request carries no [`AGREED`] mark, as a word —
 /// the side of the comparison that had nothing to say (t-6342).
 ///
@@ -206,6 +221,33 @@ pub const CONTROL_KIND: LedgerKey = LedgerKey {
     also: &[],
 };
 
+/// The version of the words that asked a request — the seat's rubric as its
+/// row names it ([`crate::jev::JevUse::rubric_version`]), written by the
+/// writer that asked, on every request and control row. Read by the judge
+/// to keep one rubric's evidence apart from another's (t-6877): a request
+/// asked under other words answered another question, and its answer, its
+/// marks and the rise they earned say nothing about the words the seat asks
+/// now. A row that names none is the first rubric's
+/// ([`crate::jev::questions::UNVERSIONED_RUBRIC`]) — every row written
+/// before versions were recorded, and every row of a seat whose writer has
+/// never versioned its words; a row that names something that is not a
+/// version — null, a word, a negative — names no rubric at all and is no
+/// series' evidence. A label row carries none of its own: the request it
+/// names carries it ([`crate::jev::JevUse::request_name`]).
+pub const RUBRIC_VERSION: LedgerKey = LedgerKey {
+    canonical: "rubricVersion",
+    also: &["rubric_version"],
+};
+/// The rubrics a transition was decided on — every version the seat asked
+/// at the time, as its row said ([`crate::jev::promote::transition_row`],
+/// t-6877). A seat stands on a transition only while it asks exactly those
+/// words: a rise earned under other words is not its rise, and a transition
+/// that names none was decided under the first rubric.
+pub const RUBRIC_VERSIONS: LedgerKey = LedgerKey {
+    canonical: "rubricVersions",
+    also: &[],
+};
+
 /// Every key this module reads, so a contract can walk them.
 pub const LEDGER_KEYS: &[LedgerKey] = &[
     AT,
@@ -221,11 +263,14 @@ pub const LEDGER_KEYS: &[LedgerKey] = &[
     APPLIED,
     PRESSED,
     LABEL,
+    REQUEST_AT,
     NOT_COMPARED,
     BASELINE_AGREED,
     MODEL,
     BARRED,
     CONTROL_KIND,
+    RUBRIC_VERSION,
+    RUBRIC_VERSIONS,
 ];
 
 /// The word a row carries when its judgment answered and passed its checks.
@@ -534,8 +579,15 @@ pub fn summarize_last(rows: &[Value], n: usize) -> Tally {
 /// (what each answered, beside what the probe answered).
 #[must_use]
 pub fn last_asked(rows: &[Value], n: usize) -> Vec<&Value> {
+    last_asked_of(rows.iter(), n)
+}
+
+/// [`last_asked`] over rows already picked out — one seat's series
+/// ([`crate::jev::promote::OnVersion::requests`]), held by reference.
+#[must_use]
+pub fn last_asked_of<'a>(rows: impl IntoIterator<Item = &'a Value>, n: usize) -> Vec<&'a Value> {
     let asked: Vec<&Value> = rows
-        .iter()
+        .into_iter()
         .filter(|row| asked_something(row).is_some())
         .collect();
     let from = asked.len().saturating_sub(n);
@@ -553,8 +605,15 @@ pub fn last_asked(rows: &[Value], n: usize) -> Vec<&Value> {
 /// is the person's to lift, and the seat is not what it says anything about.
 #[must_use]
 pub fn failures_in_a_row(rows: &[Value]) -> u32 {
+    failures_in_a_row_of(rows.iter())
+}
+
+/// [`failures_in_a_row`] over rows already picked out — one seat's series,
+/// held by reference.
+#[must_use]
+pub fn failures_in_a_row_of<'a>(rows: impl DoubleEndedIterator<Item = &'a Value>) -> u32 {
     let mut held = 0;
-    for row in rows.iter().rev() {
+    for row in rows.rev() {
         match asked_something(row) {
             None => continue,
             Some(ANSWERED) => break,
@@ -573,6 +632,47 @@ pub fn failures_in_a_row(rows: &[Value]) -> u32 {
 #[must_use]
 pub fn agreement_since(rows: &[Value], since_ms: i64) -> crate::jev::promote::Agreement {
     agreement_rows(rows.iter(), since_ms)
+}
+
+/// Where a judgment window's marks are counted from (t-9087): the window's
+/// first request, `since_ms` — reached back, when fewer than `wanted` marks
+/// ([`AGREED`]) were written since, to the time of the `wanted`th newest, or
+/// to the first row when the rows hold fewer. A time is a cut, so marks
+/// sharing the time the cut falls on all count: a window reached back holds
+/// at least `wanted` marks, not always exactly that many.
+///
+/// `rows` are one seat's series ([`crate::jev::promote::OnVersion::marks`]):
+/// the reach back is as far as the marks of the words the seat asks now and
+/// the version answering now go, and a ledger's raw rows would carry it into
+/// other words' marks.
+///
+/// The window is a count of requests, as wide as the seat's answer floor
+/// needs; how many marks those requests earn is the seat's own. The notify
+/// seat marks a ring only when the person was at the window or turned to it
+/// — 110 of the 444 rings this machine's ledger held on 2026-09-25 — so its
+/// 53-ring window held 15 marks, and the judge said `too_few_compared` with
+/// 110 in hand; the placement seat's 25 requests held 9 of its 87. The
+/// sample floor asks for marks in hand, and a window that already holds it
+/// reads its own marks alone.
+#[must_use]
+pub fn marks_from<'a>(
+    rows: impl IntoIterator<Item = &'a Value>,
+    since_ms: i64,
+    wanted: usize,
+) -> i64 {
+    // Read the way [`agreement_rows`] reads a mark's time.
+    let mut marked: Vec<i64> = rows
+        .into_iter()
+        .filter(|row| AGREED.read(row).and_then(Value::as_bool).is_some())
+        .map(|row| AT.read(row).and_then(Value::as_i64).unwrap_or(0))
+        .collect();
+    if marked.iter().filter(|at| **at >= since_ms).count() >= wanted {
+        return since_ms;
+    }
+    marked.sort_unstable_by(|older, newer| newer.cmp(older));
+    marked
+        .get(wanted.saturating_sub(1))
+        .map_or(i64::MIN, |at| (*at).min(since_ms))
 }
 
 /// [`agreement_since`] over rows already picked out — one local day of a
