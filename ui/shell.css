@@ -27929,6 +27929,260 @@ input[type="search"]::-webkit-search-cancel-button {
   font-size: var(--text-3xs);
 }
 
+/* ---- 관계의 행성계 (t-9444) ------------------------------------------------
+ *
+ * 관계 그림의 두 번째 보기(`ui/shell-board-orbit.js`). 캔버스 한 장이 항성·궤도·
+ * 링크·입자·행성을 그리고, 그 위의 버튼(`.agent-orbit-label`)이 이름과 상태 칩을
+ * 들고 누름·손·초점을 받는다. 캔버스가 읽는 색은 아래 `--agent-orbit-*` 토큰이다 —
+ * 역할 토큰에서 오므로 라이트·다크가 함께 뒤집히고, 캔버스는 테마가 바뀌면 한 번
+ * 다시 읽는다. 바탕의 우주(성운 한 겹과 먼지 두 겹)는 CSS가 그린다: 프레임마다
+ * 다시 그릴 까닭이 없는 것은 캔버스에 두지 않는다. */
+.agent-orbit {
+  --agent-orbit-working: var(--signal-ready);
+  --agent-orbit-attention: var(--signal-wait);
+  --agent-orbit-idle: var(--ink-mist);
+  --agent-orbit-done: var(--signal-done);
+  --agent-orbit-failed: var(--signal-halt);
+  --agent-orbit-ring: var(--ink-mist);
+  --agent-orbit-link: var(--ink-mist);
+  --agent-orbit-mail: var(--ink-chalk);
+  --agent-orbit-unread: var(--signal-wait);
+  --agent-orbit-select: var(--ink-chalk);
+  --agent-orbit-core: var(--ink-chalk);
+  --agent-orbit-lane-1: var(--lane-1);
+  --agent-orbit-lane-2: var(--lane-2);
+  --agent-orbit-lane-3: var(--lane-3);
+  --agent-orbit-lane-4: var(--lane-4);
+  --agent-orbit-lane-5: var(--lane-5);
+  --agent-orbit-nebula: color-mix(in srgb, var(--lane-2) 9%, transparent);
+  --agent-orbit-dust: color-mix(in srgb, var(--ink-chalk) 22%, transparent);
+  --agent-orbit-halo: var(--surface-well);
+  /* 라벨의 높이는 누를 자리의 높이다 — 한 칸(`--space-5`)이면 움직이는 과녁도 손에
+   * 잡힌다. 폭은 카드 레인 하나를 넘지 않는다. 먼지 두 겹은 캔버스 모눈의 눈금을
+   * 어긋나게 늘린 것이라 모눈처럼 읽히지 않는다. */
+  --agent-orbit-label-height: var(--space-5);
+  --agent-orbit-label-width: var(--agent-graph-agent-width);
+  --agent-orbit-label-gap: var(--space-1);
+  --agent-orbit-dust-near: calc(var(--agent-graph-grid) * 1.8);
+  --agent-orbit-dust-far: calc(var(--agent-graph-grid) * 3);
+  grid-row: 2;
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse at 50% 42%, var(--agent-orbit-nebula), transparent 70%),
+    radial-gradient(circle, var(--agent-orbit-dust) calc(var(--rule-width) * 0.6),
+      transparent calc(var(--rule-width) * 1.2)) 0 0 / var(--agent-orbit-dust-near) var(--agent-orbit-dust-near),
+    radial-gradient(circle, var(--agent-orbit-dust) calc(var(--rule-width) * 0.5),
+      transparent calc(var(--rule-width) * 1.1))
+      calc(var(--agent-orbit-dust-near) * 0.4) calc(var(--agent-orbit-dust-near) * 0.7)
+      / var(--agent-orbit-dust-far) var(--agent-orbit-dust-far),
+    var(--surface-well);
+  cursor: grab;
+  touch-action: none;
+  /* 라벨 열여섯이 프레임마다 움직여도 판 밖의 배치와 칠을 건드리지 않게. */
+  contain: layout paint;
+}
+
+/* 흰 바닥의 별은 속이 비어 보여야 읽힌다 — 속은 판의 흰색, 테가 제 빛깔이다. 먼지와
+ * 성운은 한 단 옅게: 흰 종이 위의 점은 어두운 하늘의 점보다 크게 읽힌다. */
+:root[data-theme="light"] .agent-orbit {
+  --agent-orbit-core: var(--surface-deck);
+  --agent-orbit-mail: var(--ink-label);
+  --agent-orbit-nebula: color-mix(in srgb, var(--lane-1) 6%, transparent);
+  --agent-orbit-dust: color-mix(in srgb, var(--ink-mist) 16%, transparent);
+  --agent-orbit-halo: var(--surface-deck);
+}
+
+.agent-orbit[hidden] {
+  display: none;
+}
+
+.agent-orbit.is-panning {
+  cursor: grabbing;
+}
+
+.agent-orbit-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* 라벨의 판은 손을 받지 않는다 — 빈 곳을 끄는 손은 무대의 것이다. 라벨만 받는다. */
+.agent-orbit-labels {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* 라벨 하나: 왼쪽의 빈 자리가 몸을 덮는 누를 자리이고(`--orbit-body`, 몸의 반지름에
+ * 여유를 더한 것 — `agentOrbitLayout`이 적는다), 그 오른쪽에 이름, 그리고 상태
+ * 칩(`::after`). 자리는 프레임이 `translate` 하나로 옮긴다. */
+.agent-orbit-label {
+  /* 몸을 덮는 누를 자리의 반지름 — 그리는 손이 적기 전의 자리값. */
+  --orbit-body: var(--space-2);
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: var(--agent-orbit-label-width);
+  height: var(--agent-orbit-label-height);
+  margin: calc(var(--agent-orbit-label-height) / -2) 0 0 calc(var(--orbit-body) * -1);
+  padding: 0 var(--space-1) 0 calc(var(--orbit-body) * 2 + var(--agent-orbit-label-gap));
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: none;
+  color: var(--ink-label);
+  font: inherit;
+  font-size: var(--text-3xs);
+  line-height: 1;
+  white-space: nowrap;
+  translate: -100vw -100vh;
+  pointer-events: auto;
+  cursor: pointer;
+  /* 색과 불투명도만 옮긴다 — 자리(`translate`)는 프레임이 쓰므로 전이를 걸면
+   * 라벨이 몸보다 늦게 따라온다. */
+  transition:
+    color var(--motion-fast) var(--ease-standard),
+    opacity var(--motion-fast) var(--ease-standard);
+  will-change: translate;
+}
+
+.agent-orbit-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-shadow:
+    0 0 calc(var(--rule-width) * 2) var(--agent-orbit-halo),
+    0 0 var(--space-1) var(--agent-orbit-halo);
+}
+
+.agent-orbit-label::after {
+  content: attr(data-chip);
+  display: none;
+  flex: none;
+  padding: var(--agent-graph-chip-inset);
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, currentColor 16%, var(--agent-orbit-halo));
+  font-size: var(--text-3xs);
+}
+
+.agent-orbit-label.is-working {
+  color: var(--ink-chalk);
+}
+
+.agent-orbit-label.is-needs-attention {
+  color: var(--signal-wait-ink);
+}
+
+.agent-orbit-label.is-failed {
+  color: var(--signal-halt-ink);
+}
+
+.agent-orbit-label.is-needs-attention::after,
+.agent-orbit-label.is-failed::after,
+.agent-orbit-label:hover::after,
+.agent-orbit-label:focus-visible::after,
+.agent-orbit-label[aria-pressed="true"]::after {
+  display: inline-block;
+}
+
+.agent-orbit-label:hover,
+.agent-orbit-label:focus-visible,
+.agent-orbit-label[aria-pressed="true"] {
+  z-index: 1;
+  color: var(--ink-chalk);
+}
+
+.agent-orbit-label:focus-visible {
+  outline: calc(var(--rule-width) * 2) solid var(--ring);
+  outline-offset: var(--rule-width);
+}
+
+.agent-orbit-label.is-moon {
+  font-size: var(--agent-graph-text-floor-line);
+}
+
+.agent-orbit-label.is-search-dimmed {
+  opacity: 0.35;
+}
+
+/* 작은 배율: 이름은 사람이 봐야 할 것만 — 확인 필요·실패·고른 것·손이 오른 것과
+ * 항성의 이름. 누를 자리는 그대로 남아, 손을 올리면 이름이 선다. 위성은 어느
+ * 배율에서나 그렇다: 부모 곁 몇 픽셀을 도는 몸의 이름은 늘 부모의 이름 위에 선다. */
+.agent-orbit.is-lod .agent-orbit-label:not(:hover, :focus-visible, [aria-pressed="true"],
+  .is-needs-attention, .is-failed, .is-star) .agent-orbit-name,
+.agent-orbit.is-crowded .agent-orbit-label.is-idle:not(:hover, :focus-visible, [aria-pressed="true"]) .agent-orbit-name,
+.agent-orbit.is-crowded .agent-orbit-label.is-paused:not(:hover, :focus-visible, [aria-pressed="true"]) .agent-orbit-name,
+.agent-orbit.is-crowded .agent-orbit-label.is-done:not(:hover, :focus-visible, [aria-pressed="true"]) .agent-orbit-name,
+.agent-orbit-label.is-moon:not(:hover, :focus-visible, [aria-pressed="true"],
+  .is-needs-attention, .is-failed) .agent-orbit-name {
+  opacity: 0;
+}
+
+/* 궤도의 서쪽 반에 선 몸: 이름이 바깥(왼쪽)으로 선다. 누를 자리는 오른쪽 끝에서
+ * 몸을 덮고, 칩은 이름의 바깥쪽에 온다. */
+.agent-orbit-label.is-west {
+  flex-direction: row-reverse;
+  margin-left: var(--orbit-body);
+  padding: 0 calc(var(--orbit-body) * 2 + var(--agent-orbit-label-gap)) 0 var(--space-1);
+  transform: translateX(-100%);
+}
+
+/* 항성의 라벨은 별 아래에 선다: 위의 빈 자리가 별을 덮고, 이름과 에이전트 수가
+ * 그 밑에 가운데로. */
+.agent-orbit-label.is-star {
+  flex-direction: column;
+  height: auto;
+  margin: calc(var(--orbit-body) * -1) 0 0;
+  padding: calc(var(--orbit-body) * 2 + var(--agent-orbit-label-gap)) var(--space-1) 0;
+  transform: translateX(-50%);
+  color: var(--ink-chalk);
+  font-family: var(--font-display);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+}
+
+.agent-orbit-label.is-star::after {
+  background: none;
+  color: var(--ink-mist);
+  font-family: var(--font-ui);
+  font-weight: 400;
+}
+
+/* 행성계에는 카드의 손잡이 둘이 없다 — 오버레이 고르개(행성계는 우편을 늘 그린다)와
+ * 카드 정보 펼치기. 범례는 카드의 모양 둘 대신 궤도의 차례 한 줄을 든다. */
+.agent-board.is-orbit .agent-graph-overlays,
+.agent-board.is-orbit .agent-graph-density,
+.agent-board.is-orbit .agent-graph-legend-list.is-nodes,
+.agent-board.is-orbit .agent-graph-legend-list.is-relations {
+  display: none;
+}
+
+/* 보기 토글은 그림의 머리 오른쪽, 에이전트 수 곁에 선다 — 수가 남는 폭을 먹어 둘을
+ * 오른쪽으로 민다. 높이는 수의 칩과 같은 줄에 맞춘다. */
+.agent-graph-canvas-head .agent-graph-scope-count {
+  margin-left: auto;
+}
+
+.agent-graph-canvas-head .agent-relations-view {
+  margin-top: calc(var(--space-5) - var(--space-1));
+}
+
+.agent-orbit-legend {
+  display: none;
+  margin: 0;
+  color: var(--ink-mist);
+  font-size: var(--text-3xs);
+}
+
+.agent-board.is-orbit .agent-orbit-legend {
+  display: block;
+}
+
 /* ---- the lane strip ----------------------------------------------------- */
 
 /* Sticks to the top of the scrollport, which is the scroll container's PADDING
@@ -30221,12 +30475,37 @@ details.task-board-section > summary {
   cursor: pointer;
 }
 
+/* 소식(t-9456): 답을 기다리지 않는 원장의 알림이라 레일은 조용한 선이고, 끝난
+ * 워커만 멈춤의 잉크를 지킨다. 소식의 머리 줄과 접힌 개수는 조용한 작은 글자다. */
+.board-desk-letters.is-news .board-desk-letter {
+  box-shadow: inset var(--rail-width) 0 0 var(--edge-rule);
+}
+
+.board-desk-letters.is-news .board-desk-letter.is-worker_died {
+  box-shadow: inset var(--rail-width) 0 0 var(--signal-halt);
+}
+
+.board-desk-news-head,
+.board-desk-news-folded {
+  margin: var(--space-3) 0 var(--space-2);
+  color: var(--ink-label);
+  font-size: var(--text-2xs);
+  overflow-wrap: anywhere;
+}
+
+.board-desk-news-folded {
+  margin: var(--space-2) 0 0;
+}
+
 .board-desk-letter-body[hidden],
 .board-desk-letter-act[hidden],
 .board-desk-letter-note[hidden],
 .board-desk-unseated[hidden],
 .board-desk-reply[hidden],
 .board-desk-reply-error[hidden],
+.board-desk-letters[hidden],
+.board-desk-news-head[hidden],
+.board-desk-news-folded[hidden],
 .board-desk-letters-more[hidden] {
   display: none;
 }
@@ -38988,6 +39267,7 @@ h4.knowledge-inspector-head::after {
    Geometry from tokens.css (--jev-*); colours from the semantic palette. */
 .jev-view {
   position: relative;
+  container: jev / inline-size;
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
@@ -39059,7 +39339,7 @@ h4.knowledge-inspector-head::after {
 }
 
 .jev-table tbody tr.is-open td {
-  background: color-mix(in srgb, var(--jev-progress-ink) var(--jev-tint-open), transparent);
+  background: color-mix(in srgb, var(--jev-chart-accent) var(--jev-tint-open), transparent);
 }
 
 .jev-row-open {
@@ -39441,8 +39721,10 @@ h4.knowledge-inspector-head::after {
   font-weight: var(--jev-weight-strong);
 }
 
-/* The week as one picture of two lines, each line's latest value under it,
-   marked the way its line is drawn (t-6243 D4). */
+/* A feature's week in its row (t-6243 D4, t-9633 (a)(b)): the accuracy
+   picture over the strip of days — one width, so a day's point stands over
+   its day's cell — and beside them each line's latest value, marked the way
+   its line is drawn. */
 .jev-trends {
   display: flex;
   align-items: center;
@@ -39451,7 +39733,13 @@ h4.knowledge-inspector-head::after {
   font-size: var(--jev-meta-size);
 }
 
-/* Beside the picture, one line per line of it — the row keeps its height. */
+.jev-trend-pictures {
+  display: grid;
+  gap: var(--jev-plot-gap);
+  justify-items: start;
+}
+
+/* Beside the pictures, one line per line of them — the row keeps its height. */
 .jev-trend-legend {
   display: grid;
 }
@@ -39466,12 +39754,12 @@ h4.knowledge-inspector-head::after {
 .jev-trend-last::before {
   content: "";
   width: var(--space-3);
-  border-top: var(--jev-trend-stroke) solid var(--jev-trend);
+  border-top: var(--jev-trend-stroke) solid var(--jev-chart-accent);
 }
 
-.jev-trend-agreement::before {
+.jev-trend-baseline::before {
   border-top-style: dashed;
-  border-top-color: var(--jev-trend-accuracy);
+  border-top-color: var(--jev-chart-context);
 }
 
 .jev-table [data-jev-cell="status"] {
@@ -39548,28 +39836,10 @@ h4.knowledge-inspector-head::after {
   color: var(--ink-mist);
 }
 
+/* What a feature still owes the judge, in words; the bar is the chart's
+   over the table (t-9633 (c)). */
 .jev-owed {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
   color: var(--ink-mist);
-}
-
-.jev-progress {
-  position: relative;
-  flex: none;
-  width: var(--jev-progress-width);
-  height: var(--jev-progress-height);
-  border-radius: var(--radius-pill);
-  background: color-mix(in srgb, var(--ink-mist) var(--jev-tint-track), transparent);
-  overflow: hidden;
-}
-
-.jev-progress-fill {
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: calc(var(--jev-filled, 0) * 100%);
-  background: var(--jev-progress-ink);
 }
 
 /* A lower bound under the line for acting by itself wears the tone of a
@@ -39631,31 +39901,509 @@ button.jev-token:hover {
   background: color-mix(in srgb, var(--jev-tone-blocked) var(--jev-tint-hover), transparent);
 }
 
-.jev-spark {
-  width: var(--jev-spark-width);
-  height: var(--jev-spark-height);
+/* ---- the pictures' marks (t-9633) ----
+   Every colour a mark wears is a `--jev-chart-*` role, declared for both
+   treatments; a picture carries none of its own. A row's pictures keep their
+   box's proportions (their height follows their width); a chart's and the
+   drawer's fill the width they are given and keep their strokes and dots at
+   their own size. */
+.jev-spark, .jev-strip, .jev-latency-picture {
+  display: block;
+  height: auto;
   overflow: visible;
 }
 
-.jev-spark-line {
+.jev-spark, .jev-strip {
+  width: var(--jev-spark-width);
+}
+
+.jev-latency-picture {
+  flex: none;
+  width: var(--jev-plot-latency-width);
+}
+
+.jev-spark-line, .jev-latency-line {
   fill: none;
-  stroke: var(--jev-trend);
+  stroke: var(--jev-chart-accent);
   stroke-width: var(--jev-trend-stroke);
   stroke-linejoin: round;
   stroke-linecap: round;
 }
 
-.jev-spark-dot {
-  fill: var(--jev-trend);
+.jev-spark-band {
+  fill: var(--jev-chart-wash);
 }
 
-.jev-spark-agreement .jev-spark-line {
-  stroke: var(--jev-trend-accuracy);
+.jev-spark-baseline {
+  fill: none;
+  stroke: var(--jev-chart-context);
+  stroke-width: var(--jev-line);
   stroke-dasharray: var(--jev-trend-dash);
 }
 
-.jev-spark-agreement .jev-spark-dot {
-  fill: var(--jev-trend-accuracy);
+/* A dot is a stroke of no length its round cap draws round; a day graded on
+   fewer marks than the sample floor is a faint one. */
+.jev-spark-dots, .jev-latency-dots {
+  fill: none;
+  stroke: var(--jev-chart-accent);
+  stroke-width: var(--jev-plot-dot);
+  stroke-linecap: round;
+}
+
+.jev-spark-dots.is-thin {
+  stroke: var(--jev-chart-thin);
+}
+
+/* The drawer's week, large: the days' comparisons under the lines and the
+   sample floor across them. */
+.jev-spark-wide {
+  width: 100%;
+  height: var(--jev-plot-wide-height);
+}
+
+.jev-spark-wide path {
+  vector-effect: non-scaling-stroke;
+}
+
+.jev-spark-samples {
+  fill: var(--jev-chart-quiet);
+}
+
+/* The sample floor is a line to clear, not a grid: dashed, as a threshold. */
+.jev-spark-floor {
+  fill: none;
+  stroke: var(--jev-chart-context);
+  stroke-width: var(--jev-line);
+  stroke-dasharray: var(--jev-trend-dash);
+}
+
+/* The strip of days: a faint cell for every day, filled by what the day did,
+   and the dot of where the feature stands now in its state's tone. */
+.jev-strip-track {
+  fill: none;
+  stroke: var(--jev-chart-grid);
+}
+
+.jev-strip-day[data-state="recorded"] { fill: var(--jev-chart-quiet); }
+.jev-strip-day[data-state="thin"] { fill: var(--jev-chart-thin); }
+.jev-strip-day[data-state="measured"] { fill: var(--jev-chart-accent); }
+.jev-strip-day[data-state="behind"] { fill: var(--jev-chart-behind); }
+
+.jev-strip-now {
+  fill: none;
+  stroke: var(--jev-tone);
+  stroke-width: var(--jev-plot-now);
+  stroke-linecap: round;
+}
+
+/* A day's typical answer as a line and its slow one as a whisker above it. */
+.jev-latency-range {
+  fill: none;
+  stroke: var(--jev-chart-range);
+  stroke-width: var(--jev-trend-stroke);
+  stroke-linecap: round;
+}
+
+/* How long a feature's answers take: the picture of its days, then the
+   week's typical wait over its slow one. */
+.jev-latency {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.jev-latency-words {
+  display: grid;
+  white-space: nowrap;
+}
+
+/* ---- the charts over the table (t-9633 (c)(e)) ----
+   Cards side by side while each has its room, one under the other when
+   not; each reads like a figure of the strip — a small title, the figure it
+   is read for, a line under it — over its picture. */
+.jev-charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--jev-plot-card-min)), 1fr));
+  gap: var(--space-3);
+}
+
+.jev-chart {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  grid-template-areas: "head" "plot";
+  gap: var(--space-2);
+  min-width: 0;
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  border: var(--jev-line) solid var(--edge-rule);
+  border-radius: var(--radius-md);
+  background: var(--surface-deck);
+}
+
+.jev-chart-head {
+  grid-area: head;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 var(--space-2);
+}
+
+.jev-chart-title {
+  flex: 1 0 100%;
+  color: var(--ink-mist);
+  font-size: var(--jev-stat-label-size);
+  font-weight: var(--jev-weight-medium);
+  line-height: var(--leading-tight);
+}
+
+.jev-chart-figure {
+  font-size: var(--jev-stat-size);
+  font-weight: var(--jev-weight-strong);
+  line-height: var(--leading-tight);
+}
+
+.jev-chart-sub {
+  color: var(--ink-mist);
+  font-size: var(--jev-meta-size);
+}
+
+.jev-chart-body, .jev-chart-empty {
+  grid-area: plot;
+  min-width: 0;
+}
+
+.jev-chart-body {
+  display: grid;
+  align-content: end;
+  gap: var(--space-1);
+}
+
+.jev-chart-empty {
+  align-self: center;
+  margin: 0;
+  color: var(--ink-mist);
+  font-size: var(--jev-meta-size);
+}
+
+.jev-chart-picture {
+  display: block;
+  width: 100%;
+  height: var(--jev-plot-height);
+  overflow: visible;
+}
+
+.jev-chart-picture path {
+  vector-effect: non-scaling-stroke;
+}
+
+.jev-chart-rule {
+  fill: none;
+  stroke: var(--jev-chart-grid);
+  stroke-width: var(--jev-line);
+}
+
+/* A column is a stroke from the baseline that keeps its thickness however
+   wide the chart is; it lets a pointer through to its day's slot, which lifts
+   under it and says the day's numbers. */
+.jev-chart-columns {
+  fill: none;
+  stroke: var(--jev-chart-accent);
+  stroke-width: var(--jev-plot-column);
+  stroke-linecap: butt;
+  pointer-events: none;
+}
+
+.jev-chart-picture[data-dense] .jev-chart-columns {
+  stroke-width: var(--jev-plot-column-dense);
+}
+
+.jev-chart-hit {
+  fill: transparent;
+  transition: fill var(--motion-fast) var(--ease-standard);
+}
+
+.jev-chart-hit:hover {
+  fill: var(--jev-chart-track);
+}
+
+.jev-chart-axis {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+  color: var(--ink-mist);
+  font-size: var(--jev-stat-label-size);
+}
+
+/* The features nearest their next judgment. Where the card has the room
+   (32em of its own text), one line a feature — its name, its bar and what
+   remains, the bars in one column so their lengths compare; where it has
+   not, the name and what remains over the bar. */
+.jev-chart {
+  container: jev-chart / inline-size;
+}
+
+.jev-judgment {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.jev-judgment-row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  grid-template-areas: "name owed" "bar bar";
+  row-gap: var(--space-1);
+  align-items: baseline;
+}
+
+@container jev-chart (width >= 32em) {
+  .jev-judgment {
+    grid-template-columns: minmax(0, max-content) minmax(var(--jev-plot-bar-min), 1fr) max-content;
+  }
+
+  .jev-judgment-row {
+    grid-template-areas: "name bar owed";
+    align-items: center;
+  }
+}
+
+.jev-judgment-name {
+  grid-area: name;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.jev-judgment-owed {
+  grid-area: owed;
+  color: var(--ink-mist);
+  font-size: var(--jev-meta-size);
+  text-align: right;
+}
+
+.jev-judgment-bar {
+  grid-area: bar;
+  display: block;
+  width: 100%;
+  height: var(--jev-progress-height);
+  background: var(--jev-chart-track);
+  clip-path: inset(0 round var(--radius-pill));
+}
+
+.jev-judgment-fill {
+  fill: var(--jev-chart-accent);
+}
+
+/* The drawer's week: the picture, the key to its marks and the table of its
+   days. */
+.jev-days-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  color: var(--ink-mist);
+  font-size: var(--jev-meta-size);
+}
+
+.jev-days-key {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.jev-days-key::before {
+  content: "";
+  flex: none;
+  width: var(--space-3);
+  border-top: var(--jev-trend-stroke) solid var(--jev-chart-accent);
+}
+
+.jev-days-key.is-band::before {
+  height: var(--space-2);
+  border-top: 0;
+  background: var(--jev-chart-wash);
+}
+
+.jev-days-key.is-baseline::before {
+  border-top: var(--jev-line) dashed var(--jev-chart-context);
+}
+
+.jev-days-key.is-samples::before {
+  height: var(--space-2);
+  border-top: var(--jev-line) dashed var(--jev-chart-context);
+  background: var(--jev-chart-quiet);
+}
+
+.jev-days-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--jev-meta-size);
+  font-variant-numeric: tabular-nums;
+}
+
+.jev-days-table th, .jev-days-table td {
+  padding: var(--space-1) var(--space-1);
+  border-bottom: var(--jev-line) solid var(--edge-rule);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.jev-days-table th:first-child, .jev-days-table td:first-child {
+  text-align: left;
+}
+
+.jev-days-table thead th {
+  color: var(--ink-mist);
+  font-weight: var(--jev-weight-medium);
+  white-space: normal;
+}
+
+/* The scope just chosen is being counted: what stands counted the other one
+   and steps back until the answer lands. */
+.jev-view[data-jev-stale] :is(.jev-summary, .jev-charts, .jev-table-wrap) {
+  opacity: var(--jev-stale-opacity);
+}
+
+.jev-summary, .jev-charts, .jev-table-wrap {
+  transition: opacity var(--motion-fast) var(--ease-standard);
+}
+
+/* ---- the width the dashboard is given (t-9633) ----
+   The view is its own container, so what decides is the width it is given
+   — a split, the side panels open — and not the screen's. The widths below
+   are the width inside the view's padding, in the view's own text (`em`,
+   its 13-pixel body): what the table needs is a length of words, which grows
+   with the text, and a query cannot read a token. Three widths:
+
+   From 90em a row has the room for its latency picture beside its words
+   (the table's narrowest with it, measured with the gate's fixture: 1066
+   pixels in English and 1149 in Spanish); under it the table says its
+   latency in words — 930, 1012 and 1093 pixels in Korean, English and
+   Spanish, each narrower than before the pictures — and a 1080p stage with
+   both side panels open (1241 pixels) holds it with its pictures.
+
+   Under 85em the table no longer fits, and every row stands as a card: its
+   name over it, each number under its column's name in as many columns as
+   the card has room for, the state and the week across the whole card. The
+   head row goes, and each cell says its column's name itself, to the eye and
+   to a screen reader alike; the cells keep their roles (`role` on each, as a
+   table that stops displaying as one can lose them).
+
+   Under 58em the head stacks over its side and the strip's figures stand in
+   even columns. */
+/* Where a row's latency picture stands the table says so to the script
+   that draws it (`jevLatencyShown`), which then draws it; where it does not,
+   it is neither drawn nor shown. */
+.jev-table {
+  --jev-latency-shown: 0;
+}
+
+.jev-table .jev-latency-picture {
+  display: none;
+}
+
+@container jev (width >= 90em) {
+  .jev-table {
+    --jev-latency-shown: 1;
+  }
+
+  .jev-table .jev-latency-picture {
+    display: block;
+  }
+}
+
+@container jev (width < 85em) {
+  .jev-table, .jev-table tbody, .jev-table caption {
+    display: block;
+  }
+
+  .jev-table thead {
+    display: none;
+  }
+
+  .jev-table tbody tr[data-jev-dash-row] {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(var(--jev-stat-min), 1fr));
+    gap: var(--space-2) var(--space-3);
+    padding: var(--space-3);
+    border-bottom: var(--jev-line) solid var(--edge-rule);
+  }
+
+  .jev-table tbody tr[data-jev-dash-row] td {
+    display: block;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+  }
+
+  .jev-table tbody tr[data-jev-dash-row] td::before {
+    display: block;
+    color: var(--ink-mist);
+    font-size: var(--jev-stat-label-size);
+    font-weight: var(--jev-weight-plain);
+    white-space: normal;
+  }
+
+  /* Each column's name, as the table says it (`jevNameColumns`). */
+  .jev-table td[data-jev-cell="rows"]::before { content: var(--jev-label-rows, none); }
+  .jev-table td[data-jev-cell="answered"]::before { content: var(--jev-label-answered, none); }
+  .jev-table td[data-jev-cell="latency"]::before { content: var(--jev-label-latency, none); }
+  .jev-table td[data-jev-cell="acted"]::before { content: var(--jev-label-acted, none); }
+  .jev-table td[data-jev-cell="cost"]::before { content: var(--jev-label-cost, none); }
+  .jev-table td[data-jev-cell="status"]::before { content: var(--jev-label-status, none); }
+  .jev-table td[data-jev-cell="trend"]::before { content: var(--jev-label-trend, none); }
+
+  .jev-table td[data-jev-cell="seat"],
+  .jev-table td[data-jev-cell="status"],
+  .jev-table td[data-jev-cell="trend"] {
+    grid-column: 1 / -1;
+  }
+
+
+  .jev-table [data-jev-cell="status"] {
+    min-width: 0;
+  }
+
+  .jev-table {
+    --jev-latency-shown: 1;
+  }
+
+  .jev-table .jev-latency-picture {
+    display: block;
+  }
+
+  .jev-table .jev-empty-row, .jev-table .jev-fold-row,
+  .jev-table .jev-empty-row td, .jev-table .jev-fold-row td {
+    display: block;
+  }
+}
+
+@container jev (width < 58em) {
+  .jev-head, .jev-head-side {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .jev-scope {
+    justify-content: flex-start;
+  }
+
+  /* The freshness line over the two presses, which then fit beside each
+     other; the strip's figures in even columns. */
+  .jev-freshness {
+    flex: 1 0 100%;
+  }
+
+  .jev-summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(calc(var(--jev-stat-min) * 1.25), 1fr));
+  }
+
+  .jev-stat.jev-stat--lead {
+    margin-inline-start: 0;
+  }
 }
 
 .jev-recent-list {
@@ -41115,8 +41863,47 @@ body.sftp-active #ask-scrim { z-index: var(--sftp-confirm-layer); }
   gap: var(--space-2);
 }
 .computer-use-permission .computer-permission-actions,
+.computer-use-tcc-rows,
 .computer-permission-hint {
   grid-column: 2 / -1;
+}
+/* What the TCC database records for each bundle's row (t-6058): one line per
+   row, the judged one first; only a stale row carries buttons. */
+.computer-use-tcc-rows {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.computer-use-tcc-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  color: var(--ink-mist);
+  font-size: var(--text-xs);
+  line-height: var(--leading-body);
+}
+.computer-use-tcc-name {
+  color: var(--ink-label);
+  font-weight: 600;
+}
+.computer-use-tcc-judged {
+  padding: 0 var(--space-1);
+  border: 1px solid var(--edge-rule);
+  border-radius: 999px;
+  color: var(--ink-mist);
+  font-size: var(--text-3xs);
+}
+.computer-use-tcc-grant {
+  overflow-wrap: anywhere;
+}
+.computer-use-tcc-row[data-grant="granted"] .computer-use-tcc-grant {
+  color: var(--signal-ready);
+}
+.computer-use-tcc-row[data-grant="stale"] .computer-use-tcc-grant {
+  color: var(--signal-wait-ink);
 }
 .computer-permission-hint {
   margin: 0;

@@ -57,6 +57,7 @@
     <script defer src="./shell-conversation-view.js"></script>
     <script defer src="./shell-board.js"></script>
     <script defer src="./shell-board-live.js"></script>
+    <script defer src="./shell-board-orbit.js"></script>
     <script defer src="./shell.js"></script>
   </head>
   <body>
@@ -1716,7 +1717,22 @@
                   <p class="agent-graph-scope-copy"></p>
                 </div>
                 <span class="agent-graph-scope-count"></span>
+                <!-- 그림의 두 보기 (t-9444): 행성계와 카드. 그림의 머리에 서는 것은 이것이
+                     그림을 바꾸는 손이기 때문이다 — 툴바의 손들은 무엇을 그릴지를 고른다.
+                     고른 것은 로컬 설정 한 키에 남는다(`setAgentOrbitChoice`). -->
+                <div class="board-mode agent-relations-view" role="group" data-i18n-aria="board.orbit.view" aria-label="관계 보기">
+                  <button type="button" data-relations-view="orbit" aria-pressed="true" data-i18n="board.orbit.orbit">행성계</button>
+                  <button type="button" data-relations-view="cards" aria-pressed="false" data-i18n="board.orbit.cards">카드</button>
+                </div>
               </header>
+              <!-- 행성계 (t-9444). 캔버스 한 장이 항성·궤도·링크·입자·행성을 그리고, 그 위의
+                   버튼들이 이름과 상태 칩을 들고 누름·손·초점을 받는다. 요약 이름표는
+                   그리는 손이 수를 세어 단다(`agentOrbitApply`). 카드 그림과 한 칸을
+                   나눠 쓰고, 한 번에 하나만 선다. -->
+              <div class="agent-orbit" hidden>
+                <canvas class="agent-orbit-canvas" role="img"></canvas>
+                <div class="agent-orbit-labels"></div>
+              </div>
               <div class="agent-graph-scroll">
                 <div class="agent-graph-canvas" role="tree">
                   <svg class="agent-graph-edges" aria-hidden="true">
@@ -1785,6 +1801,7 @@
                   <li><i class="agent-graph-pip is-failed" aria-hidden="true"></i>
                       <span data-i18n="board.graph.failed">실패</span></li>
                 </ul>
+                <p class="agent-orbit-legend" data-i18n="board.orbit.rings">안쪽 궤도부터 작업 중 · 확인 필요 · 대기 · 완료 — 흐르는 점은 우편, 밝으면 미확인</p>
               </aside>
               <span class="agent-graph-gesture-hint" data-i18n="board.graph.gestureHint">카드와 연결선을 눌러보세요</span>
               <!-- 많은 프로젝트를 한 번에 보는 유일한 방법. 축소는 변형이 아니라
@@ -4163,7 +4180,7 @@
           <div data-jev-feature="browser">
             <span data-jev-name data-i18n="settings.typesafe.browser">브라우저 자동 조작</span>
             <span data-jev-summary data-i18n="settings.typesafe.browserSummary">웹페이지에서 다음에 누를 버튼이나 링크를 고릅니다. 켜면 멈춘 자동화와 목표를 받은 자동 조작이 그 선택대로 누릅니다.</span>
-            <p data-jev-hint data-i18n="settings.typesafe.browserHint">웹페이지에서 다음에 누를 버튼이나 링크 하나를 고릅니다. 화면이 바뀌어 자동화가 멈췄을 때와 목표를 주고 자동으로 조작하게 했을 때 판단을 요청합니다. 켜면 그 선택대로 누르되, 화면이 이미 번호를 붙인 컨트롤만 고를 수 있어 주소·셀렉터·입력값을 지어낼 수 없고, 누르기만 할 뿐 입력하지 않습니다. 보내는 것은 그 화면의 컨트롤 목록(최대 12개), 목표 한 문장, 호스트와 경로이며, 페이지 본문·입력값·주소의 쿼리는 보내지 않습니다. 멈춘 자동화는 최대 두 번 눌러 보고, 목표 조작은 같은 화면에서 두 번 나아가지 못하면 멈춥니다. 응답이 1.5초를 넘기면 누르지 않고 멈추며, 결제가 걸린 자동화는 자동으로 조작하지 않습니다.</p>
+            <p data-jev-hint data-i18n="settings.typesafe.browserHint">웹페이지에서 다음에 누를 버튼이나 링크 하나를 고릅니다. 화면이 바뀌어 자동화가 멈췄을 때와 목표를 주고 자동으로 조작하게 했을 때 판단을 요청합니다. 켜면 그 선택대로 누르되, 화면이 이미 번호를 붙인 컨트롤만 고를 수 있어 주소나 셀렉터를 지어낼 수 없습니다. 글자 입력은 제품 키 저장소에 값 생성기 키를 둔 경우에만 켜지며, 그때도 화면이 읽은 일반 글자 칸에만 그 생성기가 쓴 한 줄을 넣고 비밀번호 칸에는 넣지 않습니다. Jev에 보내는 것은 그 화면의 컨트롤 목록(최대 12개), 목표 한 문장, 호스트와 경로이고, 화면이 결과 목록·그림·항목까지 읽은 경우에는 그 짧은 설명(각각 최대 12개)도 함께 보냅니다. 글자 입력 때는 목표 한 문장과 그 칸의 이름·안내 글·옆 글을 그 생성기에 보냅니다. 페이지 본문 전체·칸에 이미 든 값·주소의 쿼리는 보내지 않습니다. 멈춘 자동화는 최대 두 번 눌러 보고, 목표 조작은 같은 화면에서 두 번 나아가지 못하면 멈춥니다. 응답이 1.5초를 넘기면 누르거나 입력하지 않고 멈추며, 결제가 걸린 자동화는 자동으로 조작하지 않습니다.</p>
           </div>
           <div data-jev-feature="desktop">
             <span data-jev-name data-i18n="settings.typesafe.desktop">데스크톱 자동 조작</span>
@@ -5925,6 +5942,7 @@
               <button class="btn" type="button" data-permission-check="accessibility" data-i18n="computerUse.checkAgain">다시 확인</button>
               <button class="btn" type="button" data-permission-reset="accessibility" data-i18n="computerUse.resetPermission">권한 재설정</button>
               </div>
+              <ul class="computer-use-tcc-rows" id="computer-use-accessibility-tcc" data-i18n-aria="computerUse.tccRows" aria-label="TCC 기록" hidden></ul>
               <p class="computer-permission-hint" id="computer-use-accessibility-hint"></p>
             </div>
             <div class="computer-use-permission" role="listitem" data-permission="screenshots">
@@ -5944,6 +5962,7 @@
               <button class="btn" type="button" data-permission-check="screenshots" data-i18n="computerUse.checkAgain">다시 확인</button>
               <button class="btn" type="button" data-permission-reset="screenshots" data-i18n="computerUse.resetPermission">권한 재설정</button>
               </div>
+              <ul class="computer-use-tcc-rows" id="computer-use-screenshots-tcc" data-i18n-aria="computerUse.tccRows" aria-label="TCC 기록" hidden></ul>
               <p class="computer-permission-hint" id="computer-use-screenshots-hint"></p>
             </div>
           </div>

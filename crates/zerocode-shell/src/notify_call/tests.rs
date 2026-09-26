@@ -121,14 +121,26 @@ fn a_handoff_never_loses_the_row() {
 
 /// The bell acts on an answer only when the seat acts AND the answer came:
 /// off, shadow, an unraised auto, a timeout and a refusal are today's rule.
+/// And where the seat's labels drew an act line (t-9468), only an answer
+/// that reaches it: one under it rings today's way, as an unanswered ring
+/// does; with no line every answer is acted on, as before.
 #[test]
 fn the_bell_rings_todays_way_unless_the_seat_acts_and_answered() {
     for call in Call::ALL {
-        assert_eq!(chosen(true, Some(call)), (call, true));
-        assert_eq!(chosen(false, Some(call)), (Call::today(), false));
+        assert_eq!(chosen(true, Some((call, 0.1)), None), (call, true));
+        assert_eq!(
+            chosen(false, Some((call, 0.9)), None),
+            (Call::today(), false)
+        );
+        assert_eq!(chosen(true, Some((call, 0.7)), Some(700)), (call, true));
+        assert_eq!(
+            chosen(true, Some((call, 0.69)), Some(700)),
+            (Call::today(), false),
+            "under the line the labels drew"
+        );
     }
-    assert_eq!(chosen(true, None), (Call::today(), false));
-    assert_eq!(chosen(false, None), (Call::today(), false));
+    assert_eq!(chosen(true, None, None), (Call::today(), false));
+    assert_eq!(chosen(false, None, Some(700)), (Call::today(), false));
     assert_eq!(Call::today(), Call::Interrupt);
 }
 
@@ -184,6 +196,7 @@ fn waiting(term: TermId, asked_ms: i64, call: Call, attendance: Attendance) -> W
         term,
         asked_ms,
         call,
+        confidence: 0.9,
         attendance,
     }
 }
@@ -239,7 +252,10 @@ fn a_hand_inside_the_minute_labels_the_panes_rows_as_reacted() {
 }
 
 /// The clock closes the windows nobody's hand landed in: present says the
-/// call was right iff it did not ring; away leaves no mark.
+/// call was right iff it did not ring; away leaves no mark, and says why —
+/// the person was away (t-9427): 325 of this machine's 460 label rows
+/// (2026-09-26) compared nothing and named no reason, so the judge counted
+/// none of them as rows that compare nothing.
 #[test]
 fn a_closed_window_labels_the_rows_nobody_turned_to() {
     let mut book = NotifyBook::default();
@@ -273,6 +289,12 @@ fn a_closed_window_labels_the_rows_nobody_turned_to() {
     assert!(
         by_term(9).get(AGREED.canonical).is_none(),
         "away says nothing either way"
+    );
+    assert!(by_term(9).get(BASELINE_AGREED.canonical).is_none());
+    assert_eq!(
+        by_term(9)[zerocode_core::jev::summary::NOT_COMPARED.canonical],
+        Attendance::Away.word(),
+        "and says why"
     );
     assert_eq!(book.waiting_len(), 1);
     assert_eq!(book.rings_of(7), vec![(asked, Some(false))]);
@@ -328,7 +350,10 @@ fn an_answered_question_is_a_row_and_a_wait_and_shadow_changes_nothing() {
     assert_eq!(body["state"]["words"], "tests green; ready to merge");
     assert_eq!(body["questions"]["call"]["type"], "choice");
     // Shadow: the answer is a row, never an order.
-    assert_eq!(chosen(false, Some(waiting.call)), (Call::Interrupt, false));
+    assert_eq!(
+        chosen(false, Some((waiting.call, waiting.confidence)), None),
+        (Call::Interrupt, false)
+    );
 }
 
 /// A refusal, a wire failure and an answer out of shape are rows with the
@@ -383,7 +408,7 @@ fn a_refused_or_broken_answer_is_a_row_with_no_wait() {
     let (row, waiting) = settle(&wire, a_question(&workspace, asked_ms + 2));
     assert_eq!(row["outcome"], "http_503");
     assert!(waiting.is_none());
-    assert_eq!(chosen(true, None), (Call::Interrupt, false));
+    assert_eq!(chosen(true, None, None), (Call::Interrupt, false));
 }
 
 /// An answer slower than the wall is a timeout row, and the bell has rung
@@ -429,7 +454,7 @@ fn an_answer_past_the_wall_is_a_timeout_and_the_bell_rang_todays_way() {
     };
     assert_eq!(row["outcome"], crate::systemone::TIMEOUT);
     assert!(waiting.is_none());
-    assert_eq!(chosen(true, None), (Call::Interrupt, false));
+    assert_eq!(chosen(true, None, None), (Call::Interrupt, false));
 }
 
 /// A window that restarts reads the rows it left without a label back off
@@ -804,12 +829,12 @@ fn the_calls_this_machine_would_have_made() {
                 hit_by_pass[pass].compared += 1;
                 hit_by_pass[pass].agreed += usize::from(call.rings());
             }
-            if let Some(mark) = notify_call::agreed(call, reacted, attendance) {
+            if let Ok(mark) = notify_call::agreed(call, reacted, attendance) {
                 mark_by_pass[pass].compared += 1;
                 mark_by_pass[pass].agreed += usize::from(mark);
             }
             if pass == 0 {
-                if let Some(mark) = notify_call::agreed(Call::today(), reacted, attendance) {
+                if let Ok(mark) = notify_call::agreed(Call::today(), reacted, attendance) {
                     todays_mark.compared += 1;
                     todays_mark.agreed += usize::from(mark);
                 }

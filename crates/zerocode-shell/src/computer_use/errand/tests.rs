@@ -38,6 +38,9 @@ pub(super) struct FakeJudge {
     pub(super) begun: Vec<Vec<usize>>,
     /// The state of each question begun ahead, as the wire would carry it.
     pub(super) begun_state: Vec<Value>,
+    /// Every question's heads as the wire would carry them, asked in turn
+    /// or begun ahead, in the order they were asked (t-6720).
+    pub(super) questions: Vec<Value>,
     /// Whether it answers from the judgment memo ([`ActionJudge::cached`]),
     /// in turn or ahead — a test's stand-in for the cache seat's hit.
     pub(super) cached: bool,
@@ -53,7 +56,7 @@ impl FakeJudge {
     pub(super) fn chose(marks: &[usize]) -> Self {
         Self::saying(marks.iter().map(|mark| pick(*mark)).collect())
     }
-    fn saying(answers: Vec<Judged>) -> Self {
+    pub(super) fn saying(answers: Vec<Judged>) -> Self {
         Self {
             answers,
             asked: Vec::new(),
@@ -62,6 +65,7 @@ impl FakeJudge {
             compared_state: Vec::new(),
             begun: Vec::new(),
             begun_state: Vec::new(),
+            questions: Vec::new(),
             cached: false,
             overlaps: true,
             latency: Duration::ZERO,
@@ -82,19 +86,38 @@ impl FakeJudge {
     }
 }
 
+/// A validated choice to type into the field `field`, as the pure module
+/// would have read one: the action head said [`TYPE_TEXT`] and the field's
+/// head named `field` (t-6720).
+pub(super) fn entry(field: usize) -> Judged {
+    Judged::Chose(
+        ActionChoice {
+            chosen: Chosen::Type(field),
+            probabilities: BTreeMap::new(),
+            confidence: 0.7,
+            guard: None,
+        }
+        .into(),
+    )
+}
+
 /// A validated choice of `mark`, as the pure module would have read one.
 pub(super) fn pick(mark: usize) -> Judged {
-    Judged::Chose(ActionChoice {
-        chosen: Chosen::Mark(mark),
-        probabilities: BTreeMap::new(),
-        confidence: 0.7,
-        guard: None,
-    })
+    Judged::Chose(
+        ActionChoice {
+            chosen: Chosen::Mark(mark),
+            probabilities: BTreeMap::new(),
+            confidence: 0.7,
+            guard: None,
+        }
+        .into(),
+    )
 }
 
 impl ActionJudge for FakeJudge {
     fn choose(&mut self, ask: &ActionAsk) -> Judged {
         self.asked.push(ask.marks().to_vec());
+        self.questions.push(ask.questions.clone());
         std::thread::sleep(self.latency);
         self.next_answer()
     }
@@ -105,6 +128,7 @@ impl ActionJudge for FakeJudge {
         }
         self.begun.push(ask.marks().to_vec());
         self.begun_state.push(ask.state.clone());
+        self.questions.push(ask.questions.clone());
         let judged = self.next_answer();
         let latency = self.latency;
         let cached = self.cached;
@@ -139,6 +163,73 @@ impl ActionJudge for FakeJudge {
             self.compares.remove(0)
         }
     }
+}
+
+// ---- A value seat of the test's own (t-6720) ----
+
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
+use zerocode_core::type_value::{FieldLook, ValueRow};
+
+use super::value::{ValueWriter, Values, Written};
+
+/// The words each of a [`Pen`]'s writes was asked about.
+pub(super) type AskedAbout = Rc<RefCell<Vec<String>>>;
+
+/// A writer that writes what the test says, counts every write and keeps
+/// the words each write was asked about.
+pub(super) struct Pen {
+    value: String,
+    writes: Rc<Cell<usize>>,
+    asked: AskedAbout,
+}
+
+impl Pen {
+    pub(super) fn writing(value: &str) -> (Self, Rc<Cell<usize>>, AskedAbout) {
+        let writes = Rc::new(Cell::new(0));
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        (
+            Self {
+                value: value.to_string(),
+                writes: Rc::clone(&writes),
+                asked: Rc::clone(&asked),
+            },
+            writes,
+            asked,
+        )
+    }
+}
+
+impl ValueWriter for Pen {
+    fn row(&self) -> Option<&'static ValueRow> {
+        zerocode_core::type_value::chosen()
+    }
+
+    /// A writer the test set up.
+    fn ready(&self) -> bool {
+        true
+    }
+
+    fn write(&mut self, look: &FieldLook<'_>, _left: Duration) -> Result<Written, String> {
+        self.writes.set(self.writes.get() + 1);
+        self.asked
+            .borrow_mut()
+            .push(zerocode_core::type_value::render(look));
+        Ok(Written {
+            value: self.value.clone(),
+            model: self.row().map(|row| row.model.clone()).unwrap_or_default(),
+            ms: 5,
+        })
+    }
+}
+
+/// A memory of the test's own, as large as the window's.
+pub(super) fn memory() -> Arc<Mutex<Values>> {
+    Arc::new(Mutex::new(Values::new(
+        zerocode_core::computer_use::WALK_STEPS_MAX,
+    )))
 }
 
 /// A world that answers what the test says and remembers what was done to it —
@@ -199,6 +290,26 @@ pub(super) struct FakeWorld {
     /// How long one look holds the walk — what a judgment begun on a settled
     /// screen runs behind.
     pub(super) look_holds: Duration,
+    /// What a press that answers before its page settles says of the settle
+    /// once it is waited for (a page's `--settle-later`, t-9712): `None` is a
+    /// world whose press settles before it answers, or needs no settle.
+    pub(super) settles_later: Option<Value>,
+    /// What the page shows the moment the press is made, when that is not
+    /// what it settles on (a late result, a page still moving).
+    pub(super) unsettled_items: Option<Vec<Value>>,
+    /// Whether the page the press left still shows what it showed before the
+    /// press — a result a fetch renders after the press answered — so each
+    /// press sets `unsettled_items` to the page it was made on.
+    pub(super) unsettled_lags: bool,
+    /// How long waiting for that settle holds the walk — what a judgment
+    /// begun on the page the press left runs behind.
+    pub(super) settle_holds: Duration,
+    /// Whether the last press left its settle for later, and how many such
+    /// settles the walk waited for.
+    settling: bool,
+    pub(super) settles_waited: usize,
+    /// How many looks the walk took.
+    pub(super) looks: usize,
 }
 
 impl FakeWorld {
@@ -211,6 +322,7 @@ impl FakeWorld {
                     path: "/settings".into(),
                 },
                 items: marks.iter().map(|mark| control(*mark, "저장")).collect(),
+                snapshot: Snapshot::default(),
             }),
             presses: Vec::new(),
             observed: Vec::new(),
@@ -235,6 +347,13 @@ impl FakeWorld {
             preview_items: None,
             asks_before_press: true,
             look_holds: Duration::ZERO,
+            settles_later: None,
+            unsettled_items: None,
+            unsettled_lags: false,
+            settle_holds: Duration::ZERO,
+            settling: false,
+            settles_waited: 0,
+            looks: 0,
         }
     }
 
@@ -292,6 +411,7 @@ impl FakeWorld {
 
 impl World for FakeWorld {
     fn look(&mut self) -> Option<Screen> {
+        self.looks += 1;
         self.spend(self.look_ms);
         std::thread::sleep(self.look_holds);
         self.screen.clone()
@@ -299,6 +419,10 @@ impl World for FakeWorld {
     fn press(&mut self, mark: usize) -> bool {
         self.observed.push(crate::run_evidence::observation());
         self.presses.push(mark);
+        self.settling = self.press_takes && self.settles_later.is_some();
+        if self.unsettled_lags {
+            self.unsettled_items = self.screen.as_ref().map(|screen| screen.items.clone());
+        }
         // Time first — the world's own clock, then the door's landing — then
         // whether the screen moved, then where the press led.
         self.spend(self.press_ms);
@@ -372,6 +496,28 @@ impl World for FakeWorld {
             });
         Some(Settled { note, screen })
     }
+    fn unsettled(&mut self) -> Option<Screen> {
+        if !self.settling {
+            return None;
+        }
+        let mut screen = self.screen.clone()?;
+        if let Some(items) = &self.unsettled_items {
+            screen.items.clone_from(items);
+        }
+        Some(screen)
+    }
+    fn settle(&mut self) -> Option<Settled> {
+        if !std::mem::take(&mut self.settling) {
+            return None;
+        }
+        let note = self.settles_later.clone()?;
+        self.settles_waited += 1;
+        std::thread::sleep(self.settle_holds);
+        Some(Settled {
+            note,
+            screen: self.screen.clone(),
+        })
+    }
     fn asks_ahead_of_the_press(&self) -> bool {
         self.asks_before_press
     }
@@ -430,7 +576,7 @@ fn mobile_and_other_surfaces_refuse_low_confidence() {
         },
     ] {
         let mut judge = FakeJudge::chose(&[1]);
-        let Judged::Chose(choice) = &mut judge.answers[0] else {
+        let Judged::Chose(ActionRead { choice, .. }) = &mut judge.answers[0] else {
             unreachable!()
         };
         choice.confidence = 0.29;
@@ -699,12 +845,15 @@ fn an_unusable_answer_leaves_the_walk_where_it_stopped() {
 
 #[test]
 fn giving_up_presses_nothing() {
-    let mut judge = FakeJudge::saying(vec![Judged::Chose(ActionChoice {
-        chosen: Chosen::GiveUp,
-        probabilities: BTreeMap::new(),
-        confidence: 0.3,
-        guard: None,
-    })]);
+    let mut judge = FakeJudge::saying(vec![Judged::Chose(
+        ActionChoice {
+            chosen: Chosen::GiveUp,
+            probabilities: BTreeMap::new(),
+            confidence: 0.3,
+            guard: None,
+        }
+        .into(),
+    )]);
     let mut world = FakeWorld::showing(&[1, 2]);
 
     let recovered = run(
@@ -1055,12 +1204,15 @@ fn the_callers_own_condition_ends_a_goal_walk_and_the_judgments_word_is_the_weak
     // and the row says which of the two ends it was.
     let mut judge = FakeJudge::saying(vec![
         pick(1),
-        Judged::Chose(ActionChoice {
-            chosen: Chosen::Done,
-            probabilities: BTreeMap::new(),
-            confidence: 0.9,
-            guard: None,
-        }),
+        Judged::Chose(
+            ActionChoice {
+                chosen: Chosen::Done,
+                probabilities: BTreeMap::new(),
+                confidence: 0.9,
+                guard: None,
+            }
+            .into(),
+        ),
     ]);
     let mut world = FakeWorld::that_moves(&[1, 2]);
 
@@ -1211,6 +1363,7 @@ fn two_looks_are_the_same_screen_when_the_question_would_read_the_same_words() {
         },
         items: vec![control(1, label)],
         shows: Vec::new(),
+        snapshot: Snapshot::default(),
     };
     assert!(page("a.local", "저장").same_as(&page("a.local", "저장")));
     assert!(!page("a.local", "저장").same_as(&page("a.local", "삭제")));
@@ -1235,6 +1388,7 @@ fn two_looks_are_the_same_screen_when_the_question_would_read_the_same_words() {
         },
         items: vec![control(1, "보내기")],
         shows: Vec::new(),
+        snapshot: Snapshot::default(),
     };
     assert!(desk("카카오톡").same_as(&desk("카카오톡")));
     assert!(!desk("카카오톡").same_as(&desk("Finder")));
@@ -1340,12 +1494,15 @@ fn a_walk_nothing_checked_is_left_out_of_the_agreement_rather_than_guessed_at() 
     // walk, it does not testify about the press before it.
     let mut judge = FakeJudge::saying(vec![
         pick(1),
-        Judged::Chose(ActionChoice {
-            chosen: Chosen::Done,
-            probabilities: BTreeMap::new(),
-            confidence: 0.9,
-            guard: None,
-        }),
+        Judged::Chose(
+            ActionChoice {
+                chosen: Chosen::Done,
+                probabilities: BTreeMap::new(),
+                confidence: 0.9,
+                guard: None,
+            }
+            .into(),
+        ),
     ]);
     let mut world = FakeWorld::that_moves(&[1, 2]);
 
@@ -1573,6 +1730,7 @@ fn a_judgment_begun_on_the_last_look_answers_the_next_look_that_asks_the_same_qu
         Options {
             overlap: true,
             rescue: false,
+            act_line: None,
         },
         None,
     );
@@ -1606,6 +1764,7 @@ fn a_judgment_begun_ahead_is_dropped_when_the_next_look_asks_another_question() 
         Options {
             overlap: true,
             rescue: false,
+            act_line: None,
         },
         None,
     );
@@ -1636,6 +1795,7 @@ fn nothing_is_begun_ahead_where_the_next_screen_is_another_page_or_the_walk_ends
         Options {
             overlap: true,
             rescue: false,
+            act_line: None,
         },
         None,
     );
@@ -1657,6 +1817,7 @@ fn nothing_is_begun_ahead_where_the_next_screen_is_another_page_or_the_walk_ends
         Options {
             overlap: true,
             rescue: false,
+            act_line: None,
         },
         None,
     );
@@ -1676,6 +1837,7 @@ fn nothing_is_begun_ahead_where_the_next_screen_is_another_page_or_the_walk_ends
         Options {
             overlap: true,
             rescue: false,
+            act_line: None,
         },
         None,
     );
@@ -1695,6 +1857,7 @@ fn nothing_is_begun_ahead_where_the_next_screen_is_another_page_or_the_walk_ends
         Options {
             overlap: true,
             rescue: false,
+            act_line: None,
         },
         None,
     );
@@ -1730,6 +1893,7 @@ fn a_phone_walk_asks_its_next_question_on_the_screen_its_press_settled_on() {
         Options {
             overlap: true,
             rescue: false,
+            act_line: None,
         },
         None,
     );
@@ -1769,6 +1933,7 @@ fn a_preview_the_full_look_disagrees_with_is_dropped_and_the_look_asked_again() 
         Options {
             overlap: true,
             rescue: false,
+            act_line: None,
         },
         None,
     );
@@ -1796,6 +1961,7 @@ fn a_world_that_asks_after_its_press_never_asks_before_it() {
         Options {
             overlap: true,
             rescue: false,
+            act_line: None,
         },
         None,
     );
@@ -1828,6 +1994,7 @@ fn a_judgment_asked_on_the_settled_screen_hides_behind_the_look() {
             Options {
                 overlap,
                 rescue: false,
+                act_line: None,
             },
             None,
         );
@@ -1859,6 +2026,388 @@ fn a_judgment_asked_on_the_settled_screen_hides_behind_the_look() {
     );
 }
 
+// ---- a page's settle, waited for behind the next judgment (t-9712) --------------
+
+/// What a page's settle says once it is waited for: ready, still moving at the
+/// wall, another document, or a settle nobody heard end — the door's words.
+fn settle_ready() -> Value {
+    zerocode_core::agent_browser::settle_said(
+        zerocode_core::agent_browser::Settle::Ready,
+        zerocode_core::agent_browser::SettleWhy::Quiet,
+        52,
+    )
+}
+
+fn settle_failures() -> [Value; 3] {
+    use zerocode_core::agent_browser::{Settle, SettleWhy, settle_said, settle_unheard};
+    [
+        settle_said(Settle::NotReady, SettleWhy::Moving, 250),
+        settle_said(Settle::Invalidated, SettleWhy::Replaced, 3),
+        settle_unheard(),
+    ]
+}
+
+/// A page world whose press answers the moment it is made — its settle left
+/// for later — and asks nothing ahead of a press (t-9712).
+fn a_page_that_settles_later(world: FakeWorld, note: Value) -> FakeWorld {
+    FakeWorld {
+        settles_later: Some(note),
+        asks_before_press: false,
+        ..world
+    }
+}
+
+/// A page's press that answers before it settles (t-9712): the next question
+/// is begun on the page the press left, the settle is waited for behind it,
+/// and when the settled page asks the very same question its answer is used.
+/// Every press's row says how its page settled, in the door's own words.
+#[test]
+fn a_page_press_that_settles_later_is_judged_on_the_page_it_left_behind_its_settle() {
+    let mut judge = FakeJudge::chose(&[1, 1, 1]);
+    let mut world = a_page_that_settles_later(FakeWorld::that_moves(&[1, 2]), settle_ready());
+    let walked = run_with(
+        Mode::On,
+        true,
+        Branching::OFF,
+        &goal(3),
+        &mut judge,
+        &mut world,
+        Options {
+            overlap: true,
+            rescue: false,
+            act_line: None,
+        },
+        None,
+    );
+    assert_eq!(world.presses, vec![1, 1, 1]);
+    assert_eq!(judge.asked.len(), 1, "only the first page is asked in turn");
+    assert_eq!(
+        judge.begun.len(),
+        2,
+        "begun on the page each of the first two presses left, not the last"
+    );
+    assert_eq!(judge.finished, 2);
+    assert_eq!(
+        (walked.overlapped, walked.discarded, walked.cancelled),
+        (2, 0, 0)
+    );
+    assert_eq!(
+        world.settles_waited, 3,
+        "every press's settle was waited for"
+    );
+    for row in &walked.rows {
+        assert_eq!(row[SETTLE], settle_ready(), "{row}");
+    }
+    assert!(walked.rows[0].get(OVERLAP).is_none());
+    assert_eq!(walked.rows[1][OVERLAP], json!(OVERLAP_USED));
+    assert_eq!(walked.rows[2][OVERLAP], json!(OVERLAP_USED));
+    assert_eq!(
+        SETTLE,
+        zerocode_core::agent_browser::BROWSER_SETTLE_KEY,
+        "the row keeps the look's settle under the look's own key"
+    );
+}
+
+/// A settle that did not end `ready` — a page still moving at the wall,
+/// another document, a settle nobody heard end — cancels the judgment begun
+/// on the page the press left: its answer is never used, the next row says
+/// it was cancelled, and the page is asked in turn once it is looked at again.
+#[test]
+fn a_settle_that_did_not_end_ready_cancels_the_judgment_begun_on_the_page_and_asks_again() {
+    for note in settle_failures() {
+        let mut judge = FakeJudge::chose(&[1, 1, 1]);
+        let mut world = a_page_that_settles_later(FakeWorld::that_moves(&[1, 2]), note.clone());
+        let walked = run_with(
+            Mode::On,
+            true,
+            Branching::OFF,
+            &goal(2),
+            &mut judge,
+            &mut world,
+            Options {
+                overlap: true,
+                rescue: false,
+                act_line: None,
+            },
+            None,
+        );
+        assert_eq!(world.presses, vec![1, 1], "{note}");
+        assert_eq!(
+            judge.begun.len(),
+            1,
+            "begun on the page the first press left: {note}"
+        );
+        assert_eq!(
+            judge.finished, 0,
+            "a cancelled judgment is never used: {note}"
+        );
+        assert_eq!(judge.asked.len(), 2, "the next page asked in turn: {note}");
+        assert_eq!(
+            (walked.overlapped, walked.discarded, walked.cancelled),
+            (0, 0, 1),
+            "{note}"
+        );
+        assert_eq!(walked.rows[0][SETTLE], note);
+        assert_eq!(walked.rows[1][OVERLAP], json!(OVERLAP_CANCELLED), "{note}");
+        assert_eq!(world.looks, 2, "{note}");
+    }
+}
+
+/// A page that settled on something other than what the press left — a late
+/// result — asks another question: the answer begun on the first look of it
+/// is dropped and the settled page asked in turn.
+#[test]
+fn a_page_that_settled_on_another_question_drops_the_judgment_begun_on_it() {
+    let mut judge = FakeJudge::chose(&[1, 1, 1]);
+    let mut world = a_page_that_settles_later(FakeWorld::that_moves(&[1, 2]), settle_ready());
+    world.unsettled_items = Some(vec![control(1, "누른 순간")]);
+    let walked = run_with(
+        Mode::On,
+        true,
+        Branching::OFF,
+        &goal(2),
+        &mut judge,
+        &mut world,
+        Options {
+            overlap: true,
+            rescue: false,
+            act_line: None,
+        },
+        None,
+    );
+    assert_eq!(judge.begun.len(), 1);
+    assert_eq!(judge.asked.len(), 2, "both pages asked in turn");
+    assert_eq!(judge.finished, 0);
+    assert_eq!(
+        (walked.overlapped, walked.discarded, walked.cancelled),
+        (0, 1, 0)
+    );
+    assert_eq!(walked.rows[1][OVERLAP], json!(OVERLAP_DISCARDED));
+}
+
+/// A page whose press changes it only after the press answered — a result a
+/// fetch renders — still shows, the moment the press is made, the page it was
+/// made on (t-9712 r2): a question begun there is one the settled page no
+/// longer asks, so nothing is begun, and the look after the settle asks in
+/// turn — one request a step, as a walk that does not ask ahead spends. The
+/// same page changed by its press at once is asked on as it was left.
+#[test]
+fn a_page_that_changes_after_its_press_answered_begins_nothing_on_the_page_it_was_pressed_on() {
+    let walk = |lags: bool| {
+        let mut judge = FakeJudge::chose(&[1; 5]);
+        let mut world = a_page_that_settles_later(FakeWorld::that_moves(&[1, 2]), settle_ready());
+        world.unsettled_lags = lags;
+        let walked = run_with(
+            Mode::On,
+            true,
+            Branching::OFF,
+            &goal(3),
+            &mut judge,
+            &mut world,
+            Options {
+                act_line: None,
+                overlap: true,
+                rescue: false,
+            },
+            None,
+        );
+        (walked, judge, world)
+    };
+
+    let (walked, judge, world) = walk(true);
+    assert_eq!(world.presses, vec![1, 1, 1]);
+    // Begun, used, dropped, cancelled: none of them.
+    assert_eq!(
+        (
+            judge.begun.len(),
+            walked.overlapped,
+            walked.discarded,
+            walked.cancelled
+        ),
+        (0, 0, 0, 0),
+        "nothing is begun on the page a press was made on: {:?}",
+        judge.begun
+    );
+    assert_eq!(
+        judge.asked.len(),
+        3,
+        "each settled page asked in turn, once"
+    );
+    assert_eq!(
+        world.settles_waited, 3,
+        "every press's settle was waited for"
+    );
+    for row in &walked.rows {
+        assert_eq!(row[SETTLE], settle_ready(), "{row}");
+        assert!(row.get(OVERLAP).is_none(), "{row}");
+    }
+
+    let (walked, judge, world) = walk(false);
+    assert_eq!(world.presses, vec![1, 1, 1]);
+    assert_eq!(
+        judge.begun.len(),
+        2,
+        "begun on the page each of the first two presses changed"
+    );
+    assert_eq!(judge.asked.len(), 1, "only the first page is asked in turn");
+    assert_eq!(
+        (walked.overlapped, walked.discarded, walked.cancelled),
+        (2, 0, 0)
+    );
+}
+
+/// A phone's press waits for its screen to stop changing (t-6385), so the
+/// screen it hands back is the one it settled on: a screen that did not move
+/// is asked on as before, its pressed number spent, and the answer used —
+/// the page's rule for the page it was pressed on is the page's alone.
+#[test]
+fn a_phone_screen_its_press_left_where_it_was_is_still_asked_on() {
+    let mut judge = FakeJudge::chose(&[1, 2]);
+    let mut world = a_phone_that_settles(FakeWorld::showing(&[1, 2]));
+    let walked = run_with(
+        Mode::On,
+        true,
+        Branching::OFF,
+        &goal(3),
+        &mut judge,
+        &mut world,
+        Options {
+            act_line: None,
+            overlap: true,
+            rescue: false,
+        },
+        None,
+    );
+    assert_eq!(world.presses, vec![1, 2]);
+    assert_eq!(judge.asked, vec![vec![1, 2]], "asked in turn once");
+    assert_eq!(
+        judge.begun,
+        vec![vec![2]],
+        "begun on the settled screen: mark 1 spent"
+    );
+    assert_eq!((walked.overlapped, walked.discarded), (1, 0));
+    assert_eq!(walked.rows[1][OVERLAP], json!(OVERLAP_USED));
+    assert_eq!(walked.rows[2]["outcome"], json!("stuck"));
+}
+
+/// A press that left its settle for later is settled whether or not the walk
+/// asks ahead, and on a link too — only the asking ahead stops there: a
+/// link's page is another page's, and a walk that does not ask ahead begins
+/// nothing. No press's settle goes unwaited for, or unsaid on its row.
+#[test]
+fn every_press_that_settles_later_is_settled_but_only_a_walk_that_asks_ahead_begins_on_it() {
+    let mut judge = FakeJudge::chose(&[1, 1]);
+    let mut world = a_page_that_settles_later(FakeWorld::that_moves(&[1, 2]), settle_ready());
+    world.screen.as_mut().unwrap().items[0]["role"] = json!("link");
+    let walked = run_with(
+        Mode::On,
+        true,
+        Branching::OFF,
+        &goal(2),
+        &mut judge,
+        &mut world,
+        Options {
+            overlap: true,
+            rescue: false,
+            act_line: None,
+        },
+        None,
+    );
+    assert!(judge.begun.is_empty(), "a link's page is another's");
+    assert_eq!(world.settles_waited, 2);
+    assert!(walked.rows.iter().all(|row| row[SETTLE] == settle_ready()));
+
+    let mut judge = FakeJudge::chose(&[1, 1]);
+    let mut world = a_page_that_settles_later(FakeWorld::that_moves(&[1, 2]), settle_ready());
+    let walked = run(Mode::On, true, &goal(2), &mut judge, &mut world);
+    assert!(
+        judge.begun.is_empty(),
+        "a walk that does not ask ahead begins nothing"
+    );
+    assert_eq!(world.settles_waited, 2);
+    assert!(walked.rows.iter().all(|row| row[SETTLE] == settle_ready()));
+    assert_eq!(
+        (walked.overlapped, walked.discarded, walked.cancelled),
+        (0, 0, 0)
+    );
+}
+
+/// The measurement leaving the settle for later is for: a page walk whose
+/// judgments take the wire's time and whose every press changes the page,
+/// the settle held inside the press as v1.1.27 holds it (the judgment begun
+/// before the press asks about a page the press then changes) against the
+/// settle waited for behind the judgment begun on the page the press left.
+/// Printed, and held on the count: every judgment after the first was used,
+/// and each ran behind a whole settle.
+#[test]
+fn a_settle_waited_for_behind_the_next_judgment_is_hidden_from_the_walk() {
+    const JUDGE_MS: u64 = 60;
+    const SETTLE_MS: u64 = 40;
+    const STEPS: usize = 6;
+    let walk = |later: bool| {
+        let mut judge = FakeJudge::chose(&[1; STEPS * 2]).slow(JUDGE_MS);
+        let mut world = if later {
+            let mut world =
+                a_page_that_settles_later(FakeWorld::that_moves(&[1, 2]), settle_ready());
+            world.settle_holds = Duration::from_millis(SETTLE_MS);
+            world
+        } else {
+            FakeWorld::that_moves(&[1, 2]).holding(SETTLE_MS)
+        };
+        let began = std::time::Instant::now();
+        let walked = run_with(
+            Mode::On,
+            true,
+            Branching::OFF,
+            &goal(STEPS),
+            &mut judge,
+            &mut world,
+            Options {
+                overlap: true,
+                rescue: false,
+                act_line: None,
+            },
+            None,
+        );
+        (
+            began.elapsed().as_millis(),
+            walked,
+            judge.asked.len() + judge.begun.len(),
+        )
+    };
+    let (before_ms, held, held_asks) = walk(false);
+    let (after_ms, later, later_asks) = walk(true);
+    assert_eq!((held.pressed, later.pressed), (STEPS, STEPS));
+    assert_eq!(
+        (held.overlapped, held.discarded),
+        (0, STEPS - 1),
+        "a judgment begun before a press that changes the page is dropped"
+    );
+    assert_eq!(
+        (later.overlapped, later.discarded, later.cancelled),
+        (STEPS - 1, 0, 0)
+    );
+    assert_eq!(held_asks, 2 * STEPS - 1);
+    assert_eq!(
+        later_asks, STEPS,
+        "asking on the page the press left asks no more"
+    );
+    let hidden: Vec<u64> = later
+        .rows
+        .iter()
+        .filter_map(|row| row["hiddenMs"].as_u64())
+        .collect();
+    assert_eq!(hidden.len(), STEPS - 1);
+    assert!(
+        hidden.iter().all(|ms| *ms >= SETTLE_MS),
+        "every judgment used ran behind a whole settle: {hidden:?}"
+    );
+    println!(
+        "measure: settle behind the judgment steps={STEPS} judge_ms={JUDGE_MS} settle_ms={SETTLE_MS} before_ms={before_ms} after_ms={after_ms} overlapped={} discarded_before={} hidden_ms={hidden:?}",
+        later.overlapped, held.discarded
+    );
+}
+
 /// The measurement asking ahead is for: a walk whose presses hold the door's
 /// own landing and whose judgments take the wire's own time, with and
 /// without the judgment begun ahead — on a screen that stays after every
@@ -1883,6 +2432,7 @@ fn a_judgment_hidden_behind_the_press_shortens_the_walk_by_what_it_hid() {
             Options {
                 overlap,
                 rescue: false,
+                act_line: None,
             },
             None,
         );
@@ -1952,7 +2502,7 @@ fn a_judgment_hidden_behind_the_press_shortens_the_walk_by_what_it_hid() {
 fn unsure(marks: &[usize]) -> FakeJudge {
     let mut judge = FakeJudge::chose(marks);
     for answer in &mut judge.answers {
-        if let Judged::Chose(choice) = answer {
+        if let Judged::Chose(ActionRead { choice, .. }) = answer {
             choice.confidence = 0.29;
         }
     }
@@ -1962,7 +2512,7 @@ fn unsure(marks: &[usize]) -> FakeJudge {
 fn sure(marks: &[usize]) -> FakeJudge {
     let mut judge = FakeJudge::chose(marks);
     for answer in &mut judge.answers {
-        if let Judged::Chose(choice) = answer {
+        if let Judged::Chose(ActionRead { choice, .. }) = answer {
             choice.confidence = 0.9;
         }
     }
@@ -2016,6 +2566,7 @@ fn a_judgment_under_the_floor_is_pressed_for_by_the_second_reader_when_it_is_sur
         Options {
             overlap: false,
             rescue: true,
+            act_line: None,
         },
         Some(&mut team),
     );
@@ -2049,22 +2600,28 @@ fn a_second_reader_that_cannot_press_leaves_the_walk_where_today_leaves_it() {
         ("timeout", FakeJudge::saying(Vec::new()), None),
         (
             "give_up",
-            FakeJudge::saying(vec![Judged::Chose(ActionChoice {
-                chosen: Chosen::GiveUp,
-                probabilities: BTreeMap::new(),
-                confidence: 0.9,
-                guard: None,
-            })]),
+            FakeJudge::saying(vec![Judged::Chose(
+                ActionChoice {
+                    chosen: Chosen::GiveUp,
+                    probabilities: BTreeMap::new(),
+                    confidence: 0.9,
+                    guard: None,
+                }
+                .into(),
+            )]),
             None,
         ),
         (
             "done",
-            FakeJudge::saying(vec![Judged::Chose(ActionChoice {
-                chosen: Chosen::Done,
-                probabilities: BTreeMap::new(),
-                confidence: 0.9,
-                guard: None,
-            })]),
+            FakeJudge::saying(vec![Judged::Chose(
+                ActionChoice {
+                    chosen: Chosen::Done,
+                    probabilities: BTreeMap::new(),
+                    confidence: 0.9,
+                    guard: None,
+                }
+                .into(),
+            )]),
             None,
         ),
         ("link", sure(&[2]), Some("link")),
@@ -2085,6 +2642,7 @@ fn a_second_reader_that_cannot_press_leaves_the_walk_where_today_leaves_it() {
             Options {
                 overlap: false,
                 rescue: true,
+                act_line: None,
             },
             Some(&mut team),
         );
@@ -2126,6 +2684,7 @@ fn a_recovery_under_the_floor_is_pressed_for_and_the_document_walked_again() {
         Options {
             overlap: false,
             rescue: true,
+            act_line: None,
         },
         Some(&mut team),
     );
@@ -2152,6 +2711,7 @@ fn a_sure_judgment_never_asks_the_second_reader() {
         Options {
             overlap: false,
             rescue: true,
+            act_line: None,
         },
         Some(&mut team),
     );
@@ -2172,7 +2732,7 @@ fn the_second_rung_presses_for_the_steps_the_seat_left_and_costs_its_own_turn() 
     let seat = || {
         let mut judge = FakeJudge::chose(&[1, 1, 1, 1, 1, 1]).slow(JUDGE_MS);
         for (n, answer) in judge.answers.iter_mut().enumerate() {
-            if let Judged::Chose(choice) = answer {
+            if let Judged::Chose(ActionRead { choice, .. }) = answer {
                 choice.confidence = if n % 2 == 0 { 0.9 } else { 0.29 };
             }
         }
@@ -2213,6 +2773,7 @@ fn the_second_rung_presses_for_the_steps_the_seat_left_and_costs_its_own_turn() 
         Options {
             overlap: false,
             rescue: true,
+            act_line: None,
         },
         Some(&mut team),
     );
@@ -2240,6 +2801,7 @@ fn the_second_rung_presses_for_the_steps_the_seat_left_and_costs_its_own_turn() 
         Options {
             overlap: false,
             rescue: true,
+            act_line: None,
         },
         Some(&mut team),
     );
@@ -2285,15 +2847,18 @@ fn yes(holds: bool) -> f64 {
 /// A judge that picks the fixture's first control, sure of it, with both
 /// guards saying what the fixture is.
 fn judging(fixture: &Fixture) -> FakeJudge {
-    FakeJudge::saying(vec![Judged::Chose(ActionChoice {
-        chosen: Chosen::Mark(1),
-        probabilities: BTreeMap::new(),
-        confidence: 0.9,
-        guard: Some(Guard {
-            instructed: yes(fixture.injected),
-            walled: yes(fixture.walled),
-        }),
-    })])
+    FakeJudge::saying(vec![Judged::Chose(
+        ActionChoice {
+            chosen: Chosen::Mark(1),
+            probabilities: BTreeMap::new(),
+            confidence: 0.9,
+            guard: Some(Guard {
+                instructed: yes(fixture.injected),
+                walled: yes(fixture.walled),
+            }),
+        }
+        .into(),
+    )])
 }
 
 /// An acting seat presses nothing on a screen whose text tells an assistant
@@ -2403,12 +2968,15 @@ fn a_recording_walk_writes_both_guards_and_refuses_nothing() {
 #[test]
 fn a_destructive_control_at_eight_in_ten_goes_to_the_person_and_a_plain_one_is_pressed() {
     let sure = |confidence: f64| {
-        FakeJudge::saying(vec![Judged::Chose(ActionChoice {
-            chosen: Chosen::Mark(1),
-            probabilities: BTreeMap::new(),
-            confidence,
-            guard: None,
-        })])
+        FakeJudge::saying(vec![Judged::Chose(
+            ActionChoice {
+                chosen: Chosen::Mark(1),
+                probabilities: BTreeMap::new(),
+                confidence,
+                guard: None,
+            }
+            .into(),
+        )])
     };
     let on = |label: &str| {
         let mut world = FakeWorld::showing(&[]);
@@ -2416,6 +2984,7 @@ fn a_destructive_control_at_eight_in_ten_goes_to_the_person_and_a_plain_one_is_p
             at: Seen::default(),
             items: vec![control(1, label), control(2, "닫기")],
             shows: Vec::new(),
+            snapshot: Snapshot::default(),
         });
         world
     };
@@ -2474,12 +3043,15 @@ fn the_destructive_presses_under_nine_in_ten_on_the_fixture_screens_before_and_a
                 steps += 1;
                 let mut world = FakeWorld::showing(&[]);
                 world.screen_is(screen.clone());
-                let mut judge = FakeJudge::saying(vec![Judged::Chose(ActionChoice {
-                    chosen: Chosen::Mark(mark),
-                    probabilities: BTreeMap::new(),
-                    confidence,
-                    guard: None,
-                })]);
+                let mut judge = FakeJudge::saying(vec![Judged::Chose(
+                    ActionChoice {
+                        chosen: Chosen::Mark(mark),
+                        probabilities: BTreeMap::new(),
+                        confidence,
+                        guard: None,
+                    }
+                    .into(),
+                )]);
                 let walked = run(Mode::On, true, &goal_on(fixture), &mut judge, &mut world);
                 let pressed_now = walked.pressed == 1;
                 // Today's rule was the plain floor for every control.
@@ -2519,5 +3091,402 @@ fn the_destructive_presses_under_nine_in_ten_on_the_fixture_screens_before_and_a
         plain_kept,
         steps - destructive,
         "a plain control's press moved"
+    );
+}
+
+/// Asking ahead (t-6132 S2) and asking every head in one request (t-6720)
+/// add up to one round trip a step, never two: the question begun on the
+/// last look carries the very heads the next look's own question asks — the
+/// containers, images and rows the look read — so the next step uses the
+/// answer in flight instead of asking again.
+#[test]
+fn asking_ahead_with_every_head_is_still_one_request_a_step() {
+    let mut judge = FakeJudge::chose(&[1, 2]);
+    let mut world = FakeWorld::showing(&[1, 2]);
+    let mut screen = world.look_now();
+    screen.snapshot = Snapshot {
+        containers: vec![
+            json!({ "label": "Results", "role": "list", "count": 2, "selector": "#results" }),
+        ],
+        images: vec![json!({ "alt": "a picture", "width": 10, "height": 10 })],
+        rows: vec![json!({ "text": "row one" })],
+        ..Snapshot::default()
+    };
+    world.screen_is(screen);
+    let walked = run_with(
+        Mode::On,
+        true,
+        Branching::OFF,
+        &goal(3),
+        &mut judge,
+        &mut world,
+        Options {
+            overlap: true,
+            rescue: false,
+            act_line: None,
+        },
+        None,
+    );
+    assert_eq!(world.presses, vec![1, 2]);
+    assert_eq!(
+        judge.asked.len() + judge.begun.len(),
+        2,
+        "two steps, two requests: one asked in turn, one begun ahead and used"
+    );
+    assert_eq!((walked.overlapped, walked.discarded), (1, 0));
+    assert_eq!(judge.questions.len(), 2);
+    for questions in &judge.questions {
+        for head in [
+            "action",
+            "container",
+            "image",
+            "row",
+            "instructed",
+            "walled",
+        ] {
+            assert!(
+                questions.get(head).is_some(),
+                "a question begun or asked without its {head} head: {questions}"
+            );
+        }
+    }
+}
+
+/// The window's own walk types (t-6720): the product door's goal walk —
+/// `run_goal`, the one road `zerocode-computer walk` takes — hands the world
+/// it walks the value seat's writer, the window's own (`LiveWriter::window`,
+/// the key a person set in the window's key store). Read from the source, as
+/// the other contracts on the walk's wiring are: the loop does not run
+/// without a window, and a walk that is never handed a writer never offers
+/// an entry.
+#[test]
+fn the_windows_walk_hands_its_world_the_windows_writer() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agent_tools_runtime.rs"),
+    )
+    .expect("the loop's source");
+    let goal = &source[source
+        .find("pub(super) fn run_goal(")
+        .expect("the goal walk")..];
+    let body = &goal[..goal.find("\n}\n").expect("its end")];
+    assert!(
+        body.contains("writer: computer_use::errand::value::LiveWriter,"),
+        "run_goal is handed the writer"
+    );
+    let world = &body[body
+        .find("desk::GoalWorld::new(")
+        .expect("the world the walk walks")..];
+    let world = &world[..world.find(';').expect("the world's statement")];
+    assert!(
+        world.contains(".writing(Box::new(writer))"),
+        "the world the walk walks is handed the writer: {world}"
+    );
+    let branch = &source[source
+        .find("ComputerMethod::Walk {")
+        .expect("the walk verb's branch")..];
+    let branch = &branch[..branch.find("} else {").expect("its end")];
+    for needle in [
+        "computer_use::errand::value::LiveWriter::window()",
+        "run_goal(",
+        "writer,",
+    ] {
+        assert!(
+            branch.contains(needle),
+            "the walk verb's branch lost `{needle}`:\n{branch}"
+        );
+    }
+}
+
+/// The walk verb types through `run_goal` itself (t-6721, the review t-6720
+/// left open): a walk read from the CLI's own words; a page answered by the
+/// browser door's own reader and writer (`look_of` → `marks_json`) with the
+/// field it read; a judge and the value seat each across a real socket; zo's
+/// settings in a folder of the case's own. With a key a person set, the one
+/// request offers the entry and a `type --value` goes down the road; with
+/// none, the request offers no entry and nothing is typed. No keychain, no
+/// screen, no person's settings or ledger. And the switches the walk reads
+/// come from the file its judge asks through — for the window's judge, the
+/// very file `mode_now` reads, through the same reader.
+#[test]
+fn a_walk_verb_types_through_run_goal_only_with_a_key_a_person_set() {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    use zerocode_core::computer_recipe::RecipeTool;
+    use zerocode_core::computer_use_protocol::frame::ShotFrame;
+    use zerocode_core::screen_action::snapshot;
+    use zerocode_hookd::TeamAnswer;
+
+    use super::live::{Doorway, LiveJudge};
+    use super::value::LiveWriter;
+    use super::value::tests::{store, wrote};
+    use crate::agent_tools_runtime::{RecipeRoads, run_goal};
+    use crate::systemone::tests::{ANSWERING_VERSION, Endpoint};
+
+    let _hand = crate::tests::computer_desktop_wait::ONE_HAND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // The window's judge reads where `mode_now` reads: the same file (no
+    // file is read here) through the same reader.
+    let window = crate::systemone::Wire::new(&crate::api_routers::HeldKeys::default());
+    assert_eq!(
+        window.config_home().map(Path::to_path_buf),
+        crate::api_routers::zo_settings_path()
+            .and_then(|file| file.parent().map(Path::to_path_buf)),
+        "the window's judge and `mode_now` read one settings file"
+    );
+    let source = |file: &str, from: &str| {
+        let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file))
+            .expect("a source");
+        let at = text
+            .find(from)
+            .unwrap_or_else(|| panic!("{from} in {file}"));
+        let body = &text[at..];
+        body[..body.find("\n}\n").expect("its end")].to_string()
+    };
+    for (file, from) in [
+        ("src/computer_use/errand.rs", "pub fn mode_now("),
+        ("src/systemone.rs", "pub fn settings_root("),
+    ] {
+        assert!(
+            source(file, from).contains("read_zo_settings_root"),
+            "{from} stopped reading through the one reader"
+        );
+    }
+    assert!(
+        source("src/systemone.rs", "pub fn new(keys").contains("zo_settings_path()"),
+        "the window's wire stopped reading zo's own settings file"
+    );
+    let goal = source("src/agent_tools_runtime.rs", "pub(super) fn run_goal(");
+    assert!(
+        goal.contains("let settings = judge.wire().settings_root();")
+            && goal.contains("seat.mode_in(&settings)")
+            && goal.contains("forks.mode_in(&settings)")
+            && !goal.contains("mode_now("),
+        "the walk reads its switches from its judge's settings file"
+    );
+
+    // The page as the browser door answers it — the page's own pass, read
+    // and written by the door.
+    let page = json!({
+        "faces": [
+            { "tag": "input", "role": "textbox", "label": "City", "selector": "#destination",
+              "x": 20.0, "y": 20.0, "width": 200.0, "height": 30.0, "hit": true,
+              "field": { "kind": "text", "masked": false, "label": "Destination",
+                         "placeholder": "City", "near": "Flight search", "value": "" },
+              "valueDigest": "0:811c9dc5" },
+            { "tag": "button", "role": "button", "label": "Search", "selector": "#search",
+              "x": 240.0, "y": 20.0, "width": 80.0, "height": 30.0, "hit": true },
+        ],
+        "viewport": { "width": 900.0, "height": 600.0, "dpr": 2.0 },
+        "snapshot": { (snapshot::EPOCH_KEY): "doc-1" },
+    });
+    let marks = crate::cmd::browser::marks_json(
+        &crate::cmd::browser::look_of(&page, 0).expect("the door reads the page"),
+    )
+    .to_string();
+
+    // The judgment: every head the request asked, over exactly the options
+    // it offered — an entry where one is offered, else the search button.
+    let judging = |request: &str| {
+        let sent: Value = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .and_then(|body| serde_json::from_str(body).ok())
+            .unwrap_or(Value::Null);
+        let mut answers = serde_json::Map::new();
+        for (name, question) in sent["questions"].as_object().into_iter().flatten() {
+            let answer = if question["type"] == json!("noul") {
+                json!({ "type": "noul", "noul": 0.02 })
+            } else {
+                let offered: Vec<&str> = question["criteria"]
+                    .as_object()
+                    .map(|criteria| criteria.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                let choice = ["type_text", "mark:2", "mark:1"]
+                    .into_iter()
+                    .find(|option| offered.contains(option))
+                    .or_else(|| offered.first().copied())
+                    .unwrap_or_default();
+                #[allow(clippy::cast_precision_loss)]
+                let rest = 0.1 / offered.len().saturating_sub(1).max(1) as f64;
+                let lead = if offered.len() == 1 { 1.0 } else { 0.9 };
+                let probabilities: serde_json::Map<String, Value> = offered
+                    .iter()
+                    .map(|option| {
+                        let share = if *option == choice { lead } else { rest };
+                        ((*option).to_string(), json!(share))
+                    })
+                    .collect();
+                json!({ "type": "choice", "choice": choice,
+                        "probabilities": probabilities, "confidence": 0.9 })
+            };
+            answers.insert(name.clone(), answer);
+        }
+        json!({ "model": ANSWERING_VERSION, "answers": answers,
+                "usage": { "input_tokens": 120, "output_tokens": 0 } })
+        .to_string()
+    };
+
+    /// A desk that knows only the pane's page: no pointer, no picture.
+    struct PaneDesk;
+    impl crate::computer_use::recipe_run::Desk for PaneDesk {
+        fn pointer(&mut self) -> Option<(f64, f64)> {
+            None
+        }
+        fn picture(&mut self, _: [f64; 4]) -> Option<(Vec<u8>, ShotFrame)> {
+            None
+        }
+        fn changed(&self, _: &[u8], _: &[u8], _: ShotFrame) -> Option<bool> {
+            None
+        }
+        fn elapsed_ms(&self) -> u64 {
+            0
+        }
+        fn now_epoch_ms(&self) -> i64 {
+            0
+        }
+        fn pause(&mut self, _: Duration) {}
+        fn pages(&mut self) -> Vec<(String, String)> {
+            vec![("browser-9".into(), "https://flights.example/search".into())]
+        }
+    }
+
+    let walk = |with_key: bool| {
+        let home = tempfile::tempdir().expect("a zo home");
+        let work = home.path().join("work");
+        std::fs::create_dir_all(&work).expect("a workspace");
+        let settings = home.path().join("settings.json");
+        std::fs::write(
+            &settings,
+            json!({ "smart": {
+                (zerocode_core::jev::BROWSER.setting): zerocode_core::jev::JevMode::On.key(),
+                "jev": { "workspaces": [work.display().to_string()] },
+            } })
+            .to_string(),
+        )
+        .expect("zo's settings");
+        let jev = Endpoint::answering_each("HTTP/1.1 200 OK", judging, 0);
+        let value = Endpoint::serving("HTTP/1.1 200 OK", wrote("London"), 0);
+        let words: Vec<String> = [
+            "walk",
+            "--pane",
+            "browser-9",
+            "--goal",
+            "Search flights to London",
+            "--steps",
+            "1",
+            "--json",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let command = zerocode_core::computer_use::parse_command(&words).expect("a walk");
+        let sent: RefCell<Vec<Vec<String>>> = RefCell::new(Vec::new());
+        let answer = run_goal(
+            &command,
+            60_000,
+            None,
+            Some(&work),
+            RecipeRoads::new(
+                |_: RecipeTool, argv: &[String], _: &[String]| {
+                    sent.borrow_mut().push(argv.to_vec());
+                    TeamAnswer {
+                        exit_code: 0,
+                        stdout: match argv[0].as_str() {
+                            "marks" => marks.clone(),
+                            "find" => r#"{"count":0}"#.to_string(),
+                            _ => "{}".to_string(),
+                        },
+                        stderr: String::new(),
+                    }
+                },
+                |_: &[String], _: &[String], _: &TeamAnswer| {},
+                |_| {},
+                |_| {},
+            ),
+            || PaneDesk,
+            None,
+            LiveWriter::at(&format!("{}/v1/messages", value.base()), store(with_key)),
+            Some(LiveJudge::at(
+                &jev.base(),
+                "test-key",
+                Doorway {
+                    settings: Some(settings.clone()),
+                    workspace: Some(work.clone()),
+                    seat: &zerocode_core::jev::BROWSER,
+                },
+            )),
+        );
+        let asked: Vec<Value> = jev
+            .asked()
+            .iter()
+            .filter_map(|request| serde_json::from_str(request.split("\r\n\r\n").nth(1)?).ok())
+            .collect();
+        (asked, value.asked(), sent.into_inner(), answer)
+    };
+
+    let (asked, values, sent, answer) = walk(true);
+    assert_eq!(answer.exit_code, 0, "{}", answer.stdout);
+    assert_eq!(asked.len(), 1, "one judgment: {asked:?}");
+    assert!(
+        asked[0]["questions"].get("type_target").is_some()
+            && asked[0]["questions"]["action"]["criteria"]
+                .get("type_text")
+                .is_some(),
+        "with a key a person set, the one request offers the entry"
+    );
+    assert!(
+        values.iter().any(|request| request.starts_with("POST")),
+        "the value seat was asked: {values:?}"
+    );
+    assert!(
+        sent.contains(&vec![
+            "type".to_string(),
+            "browser-9".to_string(),
+            "#destination".to_string(),
+            zerocode_core::agent_browser::TYPE_VALUE_FLAG.to_string(),
+            "London".to_string(),
+        ]),
+        "the walk typed the written value into the field the look read: {sent:?}"
+    );
+
+    let (asked, values, sent, answer) = walk(false);
+    assert_eq!(answer.exit_code, 0, "{}", answer.stdout);
+    assert_eq!(asked.len(), 1, "one judgment: {asked:?}");
+    assert!(
+        asked[0]["questions"].get("type_target").is_none()
+            && asked[0]["questions"]["action"]["criteria"]
+                .get("type_text")
+                .is_none(),
+        "without a key, no entry is offered"
+    );
+    assert!(values.is_empty(), "the value seat was asked: {values:?}");
+    assert!(
+        !sent.iter().any(|argv| argv[0] == "type"),
+        "nothing was typed: {sent:?}"
+    );
+    // A page's walk judges ahead unasked (t-9712): its press answers before
+    // it settles, and the pane's next look finishes the settle.
+    let pressed = sent
+        .iter()
+        .position(|argv| {
+            argv[..]
+                == [
+                    "click",
+                    "browser-9",
+                    "--mark",
+                    "2",
+                    zerocode_core::agent_browser::BROWSER_SETTLE_LATER_FLAG,
+                ]
+        })
+        .unwrap_or_else(|| {
+            panic!("the search button, its settle left for the next look: {sent:?}")
+        });
+    assert_eq!(
+        sent.get(pressed + 1).map(|argv| argv[0].as_str()),
+        Some("marks"),
+        "the next look finishes the settle: {sent:?}"
     );
 }

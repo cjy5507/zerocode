@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Value, json};
-use zerocode_core::jev::summary::{AGREED, APPLIED, BASELINE_AGREED, LABEL};
+use zerocode_core::jev::summary::{AGREED, APPLIED, BASELINE_AGREED, LABEL, NOT_COMPARED};
 use zerocode_core::jev::{JevMode, NOTIFY, NOTIFY_APPLY_DEADLINE_MS, NOTIFY_RECENT_CAP};
 use zerocode_core::notify::{self, Notice, Ring};
 use zerocode_core::notify_call::{
@@ -99,6 +99,9 @@ struct Waiting {
     term: TermId,
     asked_ms: i64,
     call: Call,
+    /// How sure the answer was of `call` — what the seat's act line is read
+    /// against at the bell (t-9468).
+    confidence: f64,
     attendance: Attendance,
 }
 
@@ -239,7 +242,7 @@ impl NotifyBook {
 
 /// The label row for one waiting row: the person's reaction, how long after
 /// the ring, the attendance the ring was judged under, and the mark — when
-/// the rule leaves one.
+/// the rule leaves one, and why not when it leaves none (t-9427).
 fn label_row(one: &Waiting, reacted: bool, now_ms: i64) -> Value {
     let mut label = json!({
         "at": now_ms,
@@ -251,12 +254,15 @@ fn label_row(one: &Waiting, reacted: bool, now_ms: i64) -> Value {
         "reacted": reacted,
         "afterMs": now_ms.saturating_sub(one.asked_ms),
     });
-    if let Some(agreed) = notify_call::agreed(one.call, reacted, one.attendance) {
-        label[AGREED.canonical] = json!(agreed);
-        // Today's rule on the same ring: the seat's baseline (t-6342).
-        if let Some(baseline) = notify_call::agreed(Call::today(), reacted, one.attendance) {
-            label[BASELINE_AGREED.canonical] = json!(baseline);
+    match notify_call::agreed(one.call, reacted, one.attendance) {
+        Ok(agreed) => {
+            label[AGREED.canonical] = json!(agreed);
+            // Today's rule on the same ring: the seat's baseline (t-6342).
+            if let Ok(baseline) = notify_call::agreed(Call::today(), reacted, one.attendance) {
+                label[BASELINE_AGREED.canonical] = json!(baseline);
+            }
         }
+        Err(why) => label[NOT_COMPARED.canonical] = json!(why),
     }
     label
 }
@@ -355,11 +361,18 @@ impl<T> Handoff<T> {
 }
 
 /// What the bell does with the seat's answer, given whether the seat acts
-/// and whether an answer arrived inside the wall: the answer's call when
-/// both, today's otherwise — and whether the row says `applied`.
-pub(crate) fn chosen(applies: bool, answered: Option<Call>) -> (Call, bool) {
+/// and whether an answer arrived inside the wall — the call, and how sure
+/// the answer was of it: the answer's call when the seat acts and the answer
+/// reaches its act line (`line`, the line its labels drew, t-9468; every
+/// answer while they drew none), today's otherwise — and whether the row
+/// says `applied`.
+pub(crate) fn chosen(
+    applies: bool,
+    answered: Option<(Call, f64)>,
+    line: Option<u16>,
+) -> (Call, bool) {
     match answered {
-        Some(call) if applies => (call, true),
+        Some((call, confidence)) if applies && NOTIFY.acts_on(confidence, line) => (call, true),
         _ => (Call::today(), false),
     }
 }
@@ -382,6 +395,7 @@ pub(crate) fn call_at_the_bell(app: &AppHandle, bell: &Bell<'_>) -> Call {
         return today;
     };
     let applies = crate::systemone::applies(&wire, &NOTIFY);
+    let line = crate::systemone::act_line(&wire, &NOTIFY);
     let now_ms = crate::usage_runtime::epoch_ms_now();
     sweep_after_boot(app, &ledger, now_ms);
     let state = app.state::<AppState>();
@@ -447,7 +461,11 @@ pub(crate) fn call_at_the_bell(app: &AppHandle, bell: &Bell<'_>) -> Call {
     let Some((mut row, waiting)) = handoff.take(NOTIFY_CALL_DEADLINE) else {
         return today;
     };
-    let (call, applied) = chosen(true, waiting.as_ref().map(|one| one.call));
+    let (call, applied) = chosen(
+        true,
+        waiting.as_ref().map(|one| (one.call, one.confidence)),
+        line,
+    );
     row[APPLIED.canonical] = json!(applied);
     record(app, &ledger, row, waiting);
     call
@@ -513,6 +531,7 @@ fn settle(wire: &Wire, question: Question) -> Settled {
                 term,
                 asked_ms,
                 call: choice.call,
+                confidence: choice.confidence,
                 attendance,
             };
             (row, Some(waiting))

@@ -443,7 +443,7 @@ fn recall_acts_when_a_person_says_on_or_its_labels_raised_it() {
     );
     assert_eq!(
         row.apply_deadline_ms,
-        Some(ROUTING_APPLY_DEADLINE_MS),
+        Some(RECALL_APPLY_DEADLINE_MS),
         "the judge times recall against the wall its apply road waits inside"
     );
 }
@@ -2379,6 +2379,89 @@ fn a_pressing_seat_acts_from_its_press_floor_with_nothing_between() {
             assert_ne!(row.band_of(confidence), Some(Band::Confirm), "{}", row.id);
         }
     }
+}
+
+/// A seat's act line moves what its stage acts on and nothing else
+/// (t-9468). With no line every seat acts exactly as it did: a band is its
+/// bands', a press is its press floor's, and a seat with no press floor acts
+/// on whatever it answered. With a line, an answer acts from the line — a
+/// band's act line moves and its abstain line never rises over it, a plain
+/// press asks the line and a destructive one still asks nine in ten, and a
+/// seat with no press floor still presses nothing. Only a seat that promotes
+/// and names bands has a stage that reads a line.
+#[test]
+fn an_act_line_moves_what_a_stage_acts_on_and_nothing_else() {
+    use crate::guarded::ControlKind::{Destructive, Plain};
+    let confidences = [
+        0.0, 0.29, 0.3, 0.499_999, 0.5, 0.6, 0.699_999, 0.7, 0.85, 0.9, 1.0,
+    ];
+    for row in &JEV_USES {
+        for confidence in confidences {
+            assert_eq!(
+                row.band_at(confidence, None),
+                row.band_of(confidence),
+                "{}",
+                row.id
+            );
+            assert_eq!(
+                row.acts_on(confidence, None),
+                row.press_floor_permille.is_none() || row.permits_press(confidence, Plain),
+                "{} at {confidence}: today's gate",
+                row.id
+            );
+            for kind in [Plain, Destructive] {
+                assert_eq!(
+                    row.permits_press_at(confidence, kind, None),
+                    row.permits_press(confidence, kind),
+                    "{}",
+                    row.id
+                );
+            }
+            let line = 300;
+            assert_eq!(
+                row.acts_on(confidence, Some(line)),
+                reaches(confidence, line),
+                "{}",
+                row.id
+            );
+            assert_eq!(
+                row.permits_press_at(confidence, Plain, Some(line)),
+                row.press_floor_permille.is_some() && reaches(confidence, line),
+                "{}: a line grants no press",
+                row.id
+            );
+            assert_eq!(
+                row.permits_press_at(confidence, Destructive, Some(line)),
+                row.press_floor_permille.is_some()
+                    && reaches(confidence, SCREEN_DESTRUCTIVE_PRESS_FLOOR_PERMILLE),
+                "{}: a press that cannot be taken back asks nine in ten",
+                row.id
+            );
+            if let Some(bands) = row.confidence_bands {
+                let band = row.band_at(confidence, Some(line));
+                assert_eq!(
+                    band == Some(Band::Act),
+                    reaches(confidence, line),
+                    "{}",
+                    row.id
+                );
+                assert_eq!(
+                    band == Some(Band::Abstain),
+                    !reaches(confidence, line.min(bands.abstain_below_permille)),
+                    "{} at {confidence}",
+                    row.id
+                );
+            }
+        }
+        if row.reads_act_line {
+            assert!(
+                row.promotes && row.confidence_bands.is_some(),
+                "{}: a stage that reads a line has one to read",
+                row.id
+            );
+        }
+    }
+    assert!(!reaches(f64::NAN, 0) && !reaches(1.01, 0) && reaches(1.0, 1_000));
 }
 
 /// One answer's confidence falls in exactly one band: under the first line

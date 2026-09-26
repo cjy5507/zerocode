@@ -9,9 +9,16 @@
 //!
 //! What a goal walk may NOT do is as load-bearing as what it may:
 //!
-//! - It presses. It does not type, navigate, run a script or set a value —
-//!   the answer space is a number and nothing else, so there is no road from
-//!   a judgment to a value, a selector or an address.
+//! - It presses, and — on a page, when its look read a field it may type
+//!   into (t-6720) — it types. It does not navigate, run a script or set a
+//!   value of its own choosing: the answer space is a number and nothing
+//!   else, so there is no road from a judgment to a value, a selector or an
+//!   address. A typed value is the value seat's
+//!   ([`super::value::ValueWriter`]), entered into the field the look itself
+//!   numbered: pressed first by its pinned number, then typed through the
+//!   look's own selector for it down the door's value road
+//!   (`type <pane> <selector> --value`, the shape the stdin road sends), with
+//!   the log keeping `[n chars]` in its place.
 //! - It stays where it was aimed. A desktop walk names one app and looks only
 //!   at that app's tree; a pane walk names one pane. A press that carries the
 //!   screen somewhere else shows up as a screen that changed, which the walk
@@ -21,17 +28,28 @@
 //!   walk started; no screen's text is compiled in here, and the judgment's
 //!   own `done` is recorded as the weaker end that it is.
 
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use zerocode_core::agent_browser::{
+    BROWSER_SETTLE_KEY, BROWSER_SETTLE_LATER_FLAG, TYPE_VALUE_FLAG, settle_said_ready,
+    settle_unheard,
+};
 use zerocode_core::computer_recipe::{RecipeTool, recipe_line_holds_ms};
 use zerocode_core::computer_use::{
     EMULATOR_PREVIEW_FLAG, EmulatorPlatform, FLOW_BASELINE_PROBE_MS,
 };
 use zerocode_core::computer_use_protocol::marks::{ITEMS_KEY, LOOK_ID_KEY};
+use zerocode_core::screen_action::snapshot;
+use zerocode_core::type_value::{FieldLook, ValueInput};
 use zerocode_hookd::TeamAnswer;
 
-use super::{Saved, Screen, Seen, Settled, Surface, World};
+use super::value::{ValueWriter, Values, held, window_values};
+use super::{
+    NO_FIELD, NO_TYPING, PRESS_REFUSED, Saved, Screen, Seen, Settled, Snapshot, Surface,
+    TYPE_REFUSED, Typed, ValueSource, World,
+};
 
 /// The flag every road here asks its answer as JSON with — the word both
 /// CLIs already take, spelled once.
@@ -261,6 +279,7 @@ pub fn screen_of(aim: &Aim, said: &Value) -> Option<(Screen, String)> {
                     },
                     items: said.get(ITEMS_KEY)?.as_array()?.clone(),
                     shows: Vec::new(),
+                    snapshot: Snapshot::default(),
                 },
                 look.to_string(),
             ))
@@ -273,6 +292,11 @@ pub fn screen_of(aim: &Aim, said: &Value) -> Option<(Screen, String)> {
                 at: Seen::default(),
                 items: said.get(ITEMS_KEY)?.as_array()?.clone(),
                 shows: Vec::new(),
+                // What the page read beside its numbers in the same pass
+                // (t-6721 U4) — the fields a walk may type into and the
+                // candidates the observation heads ask about. A marks answer
+                // that carries none walks as it always did.
+                snapshot: Snapshot::of(said),
             },
             String::new(),
         )),
@@ -294,6 +318,7 @@ pub fn screen_of(aim: &Aim, said: &Value) -> Option<(Screen, String)> {
                     },
                     items: marks.get(ITEMS_KEY)?.as_array()?.clone(),
                     shows: Vec::new(),
+                    snapshot: Snapshot::default(),
                 },
                 marks
                     .get(LOOK_ID_KEY)
@@ -302,6 +327,59 @@ pub fn screen_of(aim: &Aim, said: &Value) -> Option<(Screen, String)> {
                     .to_string(),
             ))
         }
+    }
+}
+
+/// A field one look read, as an entry into it needs it: the control's own
+/// selector, the words around it, what it holds, and the document it was
+/// read in — every piece the look's own, none composed here.
+struct Entry {
+    selector: String,
+    label: String,
+    placeholder: String,
+    near: String,
+    now: String,
+    epoch: String,
+    /// The field's identity in its document: its selector, tag and role as
+    /// the look wrote them — what tells one field from another for a value
+    /// written before.
+    target: String,
+}
+
+impl Entry {
+    /// The field `mark` names on `seen`, when the look read it as one: a
+    /// numbered control with a selector of its own and the page's facts
+    /// about it.
+    fn read(seen: &Screen, mark: usize) -> Option<Self> {
+        let numbered =
+            |value: &Value| value.get("mark").and_then(Value::as_u64) == u64::try_from(mark).ok();
+        let item = seen.items.iter().find(|item| numbered(item))?;
+        let field = seen.snapshot.fields.iter().find(|field| numbered(field))?;
+        let said = |value: &Value, key: &str| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let selector = said(item, snapshot::SELECTOR_KEY);
+        if selector.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            target: json!([
+                selector,
+                said(item, snapshot::TAG_KEY),
+                said(item, snapshot::ROLE_KEY)
+            ])
+            .to_string(),
+            selector,
+            label: said(field, snapshot::LABEL_KEY),
+            placeholder: said(field, snapshot::FIELD_PLACEHOLDER_KEY),
+            near: said(field, snapshot::FIELD_NEAR_KEY),
+            now: said(field, snapshot::FIELD_VALUE_KEY),
+            epoch: seen.snapshot.epoch.clone(),
+        })
     }
 }
 
@@ -326,10 +404,16 @@ pub struct GoalWorld<'a, Road> {
     /// What the last press said of its screen settling, when its door waits
     /// for the screen to stop changing (a phone's, t-6385).
     settled: Option<Settled>,
-    /// Whether a press asks for a preview of the screen it settles on
-    /// (`click --preview`, t-6385) — what a walk that asks ahead begins its
-    /// next judgment on.
+    /// Whether a press hands back the screen a walk that asks ahead begins
+    /// its next judgment on: a phone's, the screen it settled on (`click
+    /// --preview`, t-6385); a page's, the page as the press left it, its
+    /// settle left for the next look (`click --settle-later`, t-9712).
     previewing: bool,
+    /// The page as the last press left it, the moment it was made — a
+    /// settle-later press's own answer (t-9712), taken once.
+    unsettled: Option<Screen>,
+    /// Whether the last press left its settle for the pane's next look.
+    settling: bool,
     /// How many of the caller's words that press counted in the tree it
     /// settled on — the walk alone, so a count proves they are there and a
     /// zero proves nothing.
@@ -338,6 +422,17 @@ pub struct GoalWorld<'a, Road> {
     /// for the step that looks next: the screen is still, so one tree read
     /// serves both (t-6385).
     kept: Option<(Screen, String)>,
+    /// The screen the last look handed the walk — the fields an entry types
+    /// into are that look's, by its own numbers and its own selectors.
+    seen: Option<Screen>,
+    /// Who writes a value a field needs (t-6720): the value seat's writer,
+    /// handed in by the caller that holds the login. `None`, the world
+    /// types nothing and no question offers an entry.
+    writer: Option<Box<dyn ValueWriter>>,
+    /// Values written before, for a retry or a replay to type again.
+    values: Arc<Mutex<Values>>,
+    /// Whether the writer's road was opened ahead of this walk's first entry.
+    warmed: bool,
 }
 
 impl<'a, Road> GoalWorld<'a, Road> {
@@ -361,14 +456,40 @@ impl<'a, Road> GoalWorld<'a, Road> {
             snapshots: None,
             settled: None,
             previewing: false,
+            unsettled: None,
+            settling: false,
             counted: None,
             kept: None,
+            seen: None,
+            writer: None,
+            values: window_values(),
+            warmed: false,
         }
     }
 
-    /// The same world, asking each press for a preview of the screen it
-    /// settles on (t-6385) — for a walk that begins its next judgment there
-    /// ([`super::Options::overlap`]). Only a phone's door answers one.
+    /// The same world, able to type into a page's fields the value `writer`
+    /// writes (t-6720). Only a pane types; a desktop or a phone keeps the
+    /// writer and never offers an entry.
+    #[must_use]
+    pub fn writing(mut self, writer: Box<dyn ValueWriter>) -> Self {
+        self.writer = Some(writer);
+        self
+    }
+
+    /// The same world, remembering written values in `values` rather than
+    /// the window's — how a test holds a memory of its own.
+    #[cfg(test)]
+    #[must_use]
+    pub fn remembering(mut self, values: Arc<Mutex<Values>>) -> Self {
+        self.values = values;
+        self
+    }
+
+    /// The same world, asking each press for the screen a walk that asks
+    /// ahead begins its next judgment on ([`super::Options::overlap`]): a
+    /// phone's press for a preview of the screen it settles on (t-6385), a
+    /// page's to answer before it settles, with the page it left (t-9712).
+    /// The desktop's door answers neither.
     #[must_use]
     pub const fn previewing(mut self, on: bool) -> Self {
         self.previewing = on;
@@ -387,7 +508,67 @@ impl<'a, Road> GoalWorld<'a, Road> {
             },
             items: preview.get(ITEMS_KEY)?.as_array()?.clone(),
             shows: Vec::new(),
+            snapshot: Snapshot::default(),
         })
+    }
+
+    /// Press `mark` by number down the surface's own door — a page's press
+    /// `later` answering before it settles, with the page it left (t-9712).
+    fn press_by(&mut self, mark: usize, later: bool) -> bool
+    where
+        Road: FnMut(RecipeTool, &[String], &[String]) -> TeamAnswer,
+    {
+        // By number, never by selector or a point: the surface re-measures the
+        // element it handed that number to and refuses a press whose pin no
+        // longer holds. A phone's press is asked to count the caller's words
+        // in the screen it settles on, so a walk that got there looks no more.
+        let mut argv = self.aim.press_argv(mark, &self.look);
+        if let (Aim::Phone { .. }, Some(until)) = (&self.aim, &self.until) {
+            argv.extend(["--text".to_string(), until.clone()]);
+        }
+        if self.previewing && matches!(self.aim, Aim::Phone { .. }) {
+            argv.push(format!("--{EMULATOR_PREVIEW_FLAG}"));
+        }
+        let later = later && matches!(self.aim, Aim::Pane { .. });
+        if later {
+            argv.push(BROWSER_SETTLE_LATER_FLAG.to_string());
+        }
+        let holds = recipe_line_holds_ms(self.aim.tool(), &argv);
+        let left = self.left_ms();
+        if left == 0 || left < holds {
+            return false;
+        }
+        self.kept = None;
+        self.unsettled = None;
+        let answer = (self.road)(self.aim.tool(), &argv, &argv);
+        let said = answer_value(&answer);
+        self.settled = said.as_ref().and_then(|said| {
+            Some(Settled {
+                note: said
+                    .get(zerocode_core::agent_emulator::EMULATOR_SETTLE_KEY)?
+                    .clone(),
+                screen: said
+                    .get(EMULATOR_PREVIEW_FLAG)
+                    .and_then(|preview| self.preview_screen(preview)),
+            })
+        });
+        self.counted = said
+            .as_ref()
+            .and_then(|said| said.get(crate::emulator::checks::COUNT_KEY)?.as_u64());
+        // A page's press that answered before it settled (t-9712): the page it
+        // left, read as a look of it would be, and a settle the next look
+        // finishes — held from the moment the door took the press.
+        if later {
+            self.unsettled = said
+                .as_ref()
+                .and_then(|said| screen_of(&self.aim, said))
+                .map(|(mut screen, _)| {
+                    screen.at = self.page.clone();
+                    screen
+                });
+            self.settling = answer.exit_code == 0;
+        }
+        answer.exit_code == 0
     }
 
     /// The same world, able to save and load the device it is aimed at — an
@@ -416,6 +597,7 @@ where
     fn look(&mut self) -> Option<Screen> {
         if let Some((screen, look)) = self.kept.take() {
             self.look = look;
+            self.seen = Some(screen.clone());
             return Some(screen);
         }
         let argv = self.aim.look_argv();
@@ -435,51 +617,169 @@ where
                 .unwrap_or_default();
         }
         self.look = look;
+        self.seen = Some(screen.clone());
+        // The first look that read a field opens the value seat's road, so a
+        // first entry is written over a connection the judgment's own wait
+        // has already paid for.
+        if !self.warmed
+            && self.types()
+            && let Some(writer) = &self.writer
+        {
+            writer.warm();
+            self.warmed = true;
+        }
         Some(screen)
     }
 
     fn press(&mut self, mark: usize) -> bool {
-        // By number, never by selector or a point: the surface re-measures the
-        // element it handed that number to and refuses a press whose pin no
-        // longer holds. A phone's press is asked to count the caller's words
-        // in the screen it settles on, so a walk that got there looks no more.
-        let mut argv = self.aim.press_argv(mark, &self.look);
-        if let (Aim::Phone { .. }, Some(until)) = (&self.aim, &self.until) {
-            argv.extend(["--text".to_string(), until.clone()]);
-        }
-        if self.previewing && matches!(self.aim, Aim::Phone { .. }) {
-            argv.push(format!("--{EMULATOR_PREVIEW_FLAG}"));
-        }
-        let holds = recipe_line_holds_ms(self.aim.tool(), &argv);
-        let left = self.left_ms();
-        if left == 0 || left < holds {
-            return false;
-        }
-        self.kept = None;
-        let answer = (self.road)(self.aim.tool(), &argv, &argv);
-        let said = answer_value(&answer);
-        self.settled = said.as_ref().and_then(|said| {
-            Some(Settled {
-                note: said
-                    .get(zerocode_core::agent_emulator::EMULATOR_SETTLE_KEY)?
-                    .clone(),
-                screen: said
-                    .get(EMULATOR_PREVIEW_FLAG)
-                    .and_then(|preview| self.preview_screen(preview)),
-            })
-        });
-        self.counted = said
-            .as_ref()
-            .and_then(|said| said.get(crate::emulator::checks::COUNT_KEY)?.as_u64());
-        answer.exit_code == 0
+        // A walk that asks ahead has a page's press answer before it settles
+        // (t-9712); an entry's own press settles as ever ([`Self::type_into`]).
+        let later = self.previewing && matches!(self.aim, Aim::Pane { .. });
+        self.press_by(mark, later)
     }
 
     fn settled(&mut self) -> Option<Settled> {
         self.settled.clone()
     }
 
+    fn unsettled(&mut self) -> Option<Screen> {
+        self.unsettled.take()
+    }
+
+    /// The pane's next look finishes the settle its last press left (t-9712):
+    /// the look is taken now, while the walk's judgment runs, and it says how
+    /// the settle ended. A settled page's look is kept for the step that looks
+    /// next — the page is still, so one read serves both; a page that did not
+    /// settle, or a look that failed (a settle nobody heard end), keeps
+    /// nothing, and the next look reads the page again.
+    fn settle(&mut self) -> Option<Settled> {
+        if !std::mem::take(&mut self.settling) {
+            return None;
+        }
+        let argv = self.aim.look_argv();
+        let answer = read_unjudged(self.road, self.aim.tool(), &argv);
+        let said = answer_value(&answer);
+        let note = said
+            .as_ref()
+            .and_then(|said| said.get(BROWSER_SETTLE_KEY))
+            .cloned()
+            .unwrap_or_else(settle_unheard);
+        let looked = said.as_ref().and_then(|said| screen_of(&self.aim, said));
+        let screen = looked.as_ref().map(|(screen, _)| {
+            let mut screen = screen.clone();
+            screen.at = self.page.clone();
+            screen
+        });
+        self.kept = screen
+            .clone()
+            .zip(looked.map(|(_, look)| look))
+            .filter(|_| settle_said_ready(&note));
+        Some(Settled { note, screen })
+    }
+
+    /// A page whose last look read a field, with a writer a person set up —
+    /// in that order, so a page with no field never touches the key store.
+    fn types(&self) -> bool {
+        matches!(self.aim, Aim::Pane { .. })
+            && self
+                .seen
+                .as_ref()
+                .is_some_and(|seen| !seen.snapshot.fields.is_empty())
+            && self.writer.as_ref().is_some_and(|writer| writer.ready())
+    }
+
+    fn type_into(&mut self, mark: usize, goal: &str) -> Typed {
+        let Aim::Pane { label } = &self.aim else {
+            return Typed::Refused(NO_TYPING.to_string());
+        };
+        let pane = label.clone();
+        let Some(entry) = self.seen.as_ref().and_then(|seen| Entry::read(seen, mark)) else {
+            return Typed::Refused(NO_FIELD.to_string());
+        };
+        // The wall a value is written within: the seat's own, never more than
+        // the call has left.
+        let left = Duration::from_millis(self.left_ms()).min(Duration::from_millis(
+            zerocode_core::type_value::seat().deadline_ms,
+        ));
+        let Some(writer) = self.writer.as_mut() else {
+            return Typed::Refused(NO_TYPING.to_string());
+        };
+        let look = FieldLook {
+            goal,
+            label: &entry.label,
+            placeholder: &entry.placeholder,
+            near: &entry.near,
+        };
+        let identity = writer.row().and_then(|row| {
+            zerocode_core::type_value::identity(
+                &ValueInput {
+                    look,
+                    now: &entry.now,
+                    epoch: &entry.epoch,
+                    target: &entry.target,
+                },
+                row,
+            )
+        });
+        let remembered = identity
+            .as_deref()
+            .and_then(|identity| held(&self.values).recall(identity));
+        let (value, source) = if let Some(value) = remembered {
+            (value, ValueSource::Reused)
+        } else {
+            match writer.write(&look, left) {
+                Ok(written) => {
+                    if let Some(identity) = identity {
+                        held(&self.values).keep(identity, written.value.clone());
+                    }
+                    (
+                        written.value,
+                        ValueSource::Written {
+                            model: written.model,
+                            ms: written.ms,
+                        },
+                    )
+                }
+                Err(token) => return Typed::Refused(token),
+            }
+        };
+        // The field is pressed by its pinned number first — the pin and the
+        // look's age stand in front of an entry as they stand in front of a
+        // press — and typed at once, by the look's own selector for it: a
+        // press that settles before it answers, since the typing follows it.
+        if !self.press_by(mark, false) {
+            return Typed::Refused(PRESS_REFUSED.to_string());
+        }
+        let argv = vec![
+            "type".to_string(),
+            pane,
+            entry.selector,
+            TYPE_VALUE_FLAG.to_string(),
+            value,
+        ];
+        let logged = crate::run_evidence::redacted(RecipeTool::Browser.as_str(), &argv);
+        let holds = recipe_line_holds_ms(RecipeTool::Browser, &argv);
+        let left = self.left_ms();
+        if left == 0 || left < holds {
+            return Typed::Refused(TYPE_REFUSED.to_string());
+        }
+        let chars = argv[4].chars().count();
+        if (self.road)(RecipeTool::Browser, &argv, &logged).exit_code != 0 {
+            return Typed::Refused(TYPE_REFUSED.to_string());
+        }
+        Typed::Typed { source, chars }
+    }
+
     fn asks_ahead_of_the_press(&self) -> bool {
-        !matches!(self.aim, Aim::Phone { .. })
+        // A phone asks on the screen its press settled on (t-6385); a page
+        // that answers before it settles asks on the page its press left
+        // (t-9712) — a question begun before either press is about a screen
+        // the press is about to change.
+        match self.aim {
+            Aim::Phone { .. } => false,
+            Aim::Pane { .. } => !self.previewing,
+            Aim::App { .. } => true,
+        }
     }
 
     fn reached(&mut self) -> Option<bool> {

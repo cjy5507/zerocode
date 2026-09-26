@@ -142,6 +142,11 @@ pub struct ComputerPermissionReport {
     /// permission.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub judged_rows: Vec<ComputerPermissionRow>,
+    /// What the TCC database records for this app's rows — both bundles, for
+    /// each permission — read against the signatures they carry now. Empty
+    /// where there is no TCC database (every platform but macOS).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tcc_rows: Vec<ComputerPermissionTccRow>,
 }
 
 /// One System Settings row: which bundle a permission list judges, what the
@@ -154,6 +159,149 @@ pub struct ComputerPermissionRow {
     pub path: String,
 }
 
+/// What the TCC database records for one System Settings row — a bundle's
+/// grant for one service — read against the signature that bundle carries
+/// now.
+///
+/// A switch that stays on in System Settings is not a grant. The row keeps
+/// the code requirement it was recorded under, and macOS grants only code
+/// that satisfies it: a grant recorded under an ad-hoc build is pinned to
+/// that build's `cdhash`, and every build after it reads denied under a
+/// switch that still shows on (2026-09-22: the window's own Accessibility
+/// row, pinned to a 2026-09-08 build, t-6058).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComputerPermissionGrant {
+    /// Allowed under a requirement the bundle satisfies as it is signed now —
+    /// or macOS itself answered granted for the process this row judges.
+    Granted,
+    /// Allowed, but under a requirement the bundle no longer satisfies: an
+    /// older build's signature. Only removing the row and adding the app
+    /// again records the signature it carries now.
+    Stale,
+    /// No row, a row that refuses, or macOS refused the process this row
+    /// judges.
+    Denied,
+    /// The database could not be read — the row's `unreadable` says why. A
+    /// row that could not be read is never a grant.
+    Unreadable,
+}
+
+/// Why a TCC row could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComputerPermissionUnreadable {
+    /// Opening the database was refused: this window has no Full Disk Access.
+    NoFullDiskAccess,
+    /// The database would not open or answer for another reason.
+    Database,
+    /// The row's recorded requirement is not one the Security framework reads.
+    Requirement,
+    /// The bundle's own signature could not be read, so the row's requirement
+    /// had nothing to be compared with.
+    Signature,
+}
+
+/// What a row's recorded requirement binds its grant to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComputerPermissionPin {
+    /// `cdhash H"…"`: one build's code directory — how an ad-hoc build's
+    /// grant is recorded, and satisfied by no other build.
+    Cdhash,
+    /// `identifier "…" and … certificate …`: a signing identity, satisfied by
+    /// every build that identity signs.
+    Signature,
+    /// Any other requirement.
+    Other,
+}
+
+/// A button a TCC row offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComputerPermissionRowAction {
+    /// `tccutil reset <service> <bundle id>` — this one row, never every
+    /// app's row for the service.
+    Reset,
+    /// The service's pane in System Settings, where the app is added again.
+    OpenSettings,
+}
+
+/// Every grant a TCC row reads as, and the buttons it offers — the one table
+/// both the report and the reset door read. Only a stale row offers a reset:
+/// it is the one grant that removing the row repairs, and a reset from any
+/// other row would take away a grant that works or change nothing. The
+/// window's words for each grant are the catalog's, one entry per row here
+/// (a source contract holds the two together).
+pub const COMPUTER_PERMISSION_GRANTS: [(ComputerPermissionGrant, &[ComputerPermissionRowAction]);
+    4] = [
+    (ComputerPermissionGrant::Granted, &[]),
+    (
+        ComputerPermissionGrant::Stale,
+        &[
+            ComputerPermissionRowAction::Reset,
+            ComputerPermissionRowAction::OpenSettings,
+        ],
+    ),
+    (ComputerPermissionGrant::Denied, &[]),
+    (ComputerPermissionGrant::Unreadable, &[]),
+];
+
+impl ComputerPermissionGrant {
+    /// The buttons [`COMPUTER_PERMISSION_GRANTS`] gives this grant.
+    #[must_use]
+    pub fn actions(self) -> &'static [ComputerPermissionRowAction] {
+        COMPUTER_PERMISSION_GRANTS
+            .iter()
+            .find(|(grant, _)| *grant == self)
+            .map_or(&[], |(_, actions)| *actions)
+    }
+}
+
+/// One TCC row as the window read it: the System Settings row, whether
+/// Computer Use is judged on it, and what the database records for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputerPermissionTccRow {
+    #[serde(flatten)]
+    pub row: ComputerPermissionRow,
+    /// Whether this is the row the permission is judged on (its
+    /// `judged_rows` entry) — the other bundle's row is read beside it.
+    pub judged: bool,
+    pub grant: ComputerPermissionGrant,
+    /// Why the row could not be read, when its grant is `unreadable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<ComputerPermissionUnreadable>,
+    /// What the row's recorded requirement binds its grant to, when a row
+    /// allowing it was read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<ComputerPermissionPin>,
+    /// The buttons the row offers: its grant's, from
+    /// [`COMPUTER_PERMISSION_GRANTS`].
+    #[serde(default)]
+    pub actions: Vec<ComputerPermissionRowAction>,
+}
+
+impl ComputerPermissionTccRow {
+    /// A row read as `grant`; its buttons are the table's for that grant.
+    #[must_use]
+    pub fn new(
+        row: ComputerPermissionRow,
+        judged: bool,
+        grant: ComputerPermissionGrant,
+        unreadable: Option<ComputerPermissionUnreadable>,
+        pin: Option<ComputerPermissionPin>,
+    ) -> Self {
+        Self {
+            row,
+            judged,
+            grant,
+            unreadable,
+            pin,
+            actions: grant.actions().to_vec(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComputerPermissionSetup {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,6 +310,9 @@ pub struct ComputerPermissionSetup {
     pub helper_app_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub judged_rows: Vec<ComputerPermissionRow>,
+    /// The report's TCC rows (see [`ComputerPermissionReport::tcc_rows`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tcc_rows: Vec<ComputerPermissionTccRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_id: Option<ComputerPermissionId>,
     #[serde(default)]
@@ -1552,10 +1703,22 @@ pub const WALK_STEPS_MAX: usize = 40;
 pub const WALK_OVERLAP_FLAG: &str = "overlap";
 pub const WALK_OVERLAP_PARAM: &str = "overlap";
 
-/// Whether a walk was asked to judge ahead of its looks (`--overlap`).
+/// The surfaces whose walk judges ahead unasked, by the parameter a walk
+/// names its surface with (t-9712): a page's. Its press answers the moment it
+/// is made, the next judgment is begun on the page the press left, and the
+/// settle every press by number waits for is waited for behind it — measured on the walk probe (ABBA, n=8 a cell): a press step p50 376 → 293 ms, a three-press walk 1,189 → 922 ms, one more question a walk.
+/// The cost is the judgment begun after the walk's last press, which nothing
+/// asks. A window's and a phone's walk judge ahead only when asked.
+pub const WALK_OVERLAP_UNASKED: &[&str] = &["pane"];
+
+/// Whether a walk judges ahead of its looks: asked (`--overlap`), or a walk
+/// at a surface that does so unasked ([`WALK_OVERLAP_UNASKED`]).
 #[must_use]
 pub fn walk_overlaps(params: &Value) -> bool {
     params.get(WALK_OVERLAP_PARAM) == Some(&Value::Bool(true))
+        || WALK_OVERLAP_UNASKED
+            .iter()
+            .any(|surface| params.get(*surface).is_some())
 }
 
 /// `walk --rescue` / `recipe-run --rescue`: when the screen seat's judgment
@@ -4789,6 +4952,68 @@ mod tests {
         input.iter().map(|word| (*word).to_string()).collect()
     }
 
+    /// One row per grant, and only a stale row offers a reset (t-6058): a
+    /// reset from a granted row would take a working grant away, and one from
+    /// a denied or unreadable row repairs nothing. A row's buttons are the
+    /// table's, and they reach the wire in its words.
+    #[test]
+    fn a_tcc_row_offers_the_buttons_its_grant_has_in_the_one_table() {
+        use ComputerPermissionGrant::{Denied, Granted, Stale, Unreadable};
+        use ComputerPermissionRowAction::{OpenSettings, Reset};
+        for grant in [Granted, Stale, Denied, Unreadable] {
+            assert_eq!(
+                COMPUTER_PERMISSION_GRANTS
+                    .iter()
+                    .filter(|(held, _)| *held == grant)
+                    .count(),
+                1,
+                "{grant:?} needs exactly one row"
+            );
+        }
+        let resets = COMPUTER_PERMISSION_GRANTS
+            .iter()
+            .filter(|(_, actions)| actions.contains(&Reset))
+            .map(|(grant, _)| *grant)
+            .collect::<Vec<_>>();
+        assert_eq!(resets, [Stale], "only a stale row is reset");
+        assert_eq!(Stale.actions(), [Reset, OpenSettings]);
+        let row = ComputerPermissionTccRow::new(
+            ComputerPermissionRow {
+                id: ComputerPermissionId::Accessibility,
+                bundle_id: "dev.zerocode.app".into(),
+                name: "ZeroCode".into(),
+                path: "/Applications/ZeroCode.app".into(),
+            },
+            false,
+            Stale,
+            None,
+            Some(ComputerPermissionPin::Cdhash),
+        );
+        assert_eq!(
+            serde_json::to_value(&row).unwrap(),
+            json!({
+                "id": "accessibility",
+                "bundle_id": "dev.zerocode.app",
+                "name": "ZeroCode",
+                "path": "/Applications/ZeroCode.app",
+                "judged": false,
+                "grant": "stale",
+                "pin": "cdhash",
+                "actions": ["reset", "open-settings"],
+            })
+        );
+        let unread = ComputerPermissionTccRow::new(
+            row.row.clone(),
+            true,
+            Unreadable,
+            Some(ComputerPermissionUnreadable::NoFullDiskAccess),
+            None,
+        );
+        let wire = serde_json::to_value(&unread).unwrap();
+        assert_eq!(wire["unreadable"], "no-full-disk-access");
+        assert_eq!(wire["actions"], json!([]));
+    }
+
     /// A click by a mark's number names the look it read, and nothing the
     /// mark already says; a look carries marks only when asked.
     #[test]
@@ -7680,10 +7905,34 @@ mod tests {
     #[test]
     fn a_walk_may_be_asked_to_judge_ahead_of_its_looks_and_nothing_else_may() {
         let argv = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
-        let plain =
-            parse_command(&argv(&["walk", "--goal", "pay", "--pane", "b"])).expect("a walk");
+        let plain = parse_command(&argv(&["walk", "--goal", "pay", "--app", "Calculator"]))
+            .expect("a walk");
         assert!(!walk_overlaps(&plain.params), "off unless asked");
         assert!(plain.params.get(WALK_OVERLAP_PARAM).is_none());
+        let phone = parse_command(&argv(&[
+            "walk",
+            "--goal",
+            "pay",
+            "--platform",
+            "ios",
+            "--device",
+            "phone",
+        ]))
+        .expect("a phone walk");
+        assert!(
+            !walk_overlaps(&phone.params),
+            "a phone's walk is off unless asked"
+        );
+        // A page's walk judges ahead unasked (t-9712): its settle hides
+        // behind the judgment begun on the page its press left.
+        let page =
+            parse_command(&argv(&["walk", "--goal", "pay", "--pane", "b"])).expect("a page walk");
+        assert!(
+            walk_overlaps(&page.params),
+            "a page's walk judges ahead unasked"
+        );
+        assert!(page.params.get(WALK_OVERLAP_PARAM).is_none());
+        assert_eq!(WALK_OVERLAP_UNASKED, ["pane"]);
         let ahead = parse_command(&argv(&[
             "walk",
             "--goal",

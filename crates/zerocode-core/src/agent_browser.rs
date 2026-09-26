@@ -178,9 +178,11 @@ pub const BROWSER_VERBS: [BrowserVerb; 18] = [
     // `read <label> [css]` or `read <label> --full` — the same read, whole
     // when the agent says so (`parse_read`).
     verb("read", 1, 2, BROWSER_CALLBACK_DEADLINE_MS),
-    // `click <label> <css>` or `click <label> --mark <n>` — the same press
-    // named by a selector or by a number the pane's last `marks` handed out.
-    act_verb("click", 2, 3, BROWSER_CALLBACK_DEADLINE_MS),
+    // `click <label> <css>` or `click <label> --mark <n> [--settle-later]` —
+    // the same press named by a selector or by a number the pane's last
+    // `marks` handed out; a press by number may leave its settle to the
+    // pane's next `marks` (t-9712).
+    act_verb("click", 2, 4, BROWSER_CALLBACK_DEADLINE_MS),
     act_verb("type", 3, 4, BROWSER_CALLBACK_DEADLINE_MS),
     check_verb("wait", 2, 3, BROWSER_WAIT_MAX_MS),
     // `screenshot <label> [--out <path>] [--json] [--marks]` — `--marks`
@@ -319,26 +321,43 @@ pub fn parse_marks(argv: &[String]) -> Result<MarksCommand, String> {
 pub enum ClickTarget {
     Css(String),
     Mark(usize),
+    /// `--mark <n> --settle-later` (t-9712): the same press by number,
+    /// answered the moment it is made with the page as the press left it;
+    /// the pane's next `marks` finishes the settle
+    /// ([`BROWSER_SETTLE_LATER_FLAG`]).
+    MarkSettleLater(usize),
 }
 
-/// Read `click <label> <css>` or `click <label> --mark <n>` — the arity is
-/// already checked, so this only tells the two shapes apart and refuses a
-/// number that is not one, or a selector shaped like a flag.
+/// Read `click <label> <css>` or `click <label> --mark <n> [--settle-later]`
+/// — the arity is already checked, so this only tells the shapes apart and
+/// refuses a number that is not one, a word after the number that is not the
+/// settle's, or a selector shaped like a flag.
 pub fn parse_click(argv: &[String]) -> Result<ClickTarget, String> {
     if argv.first().map(String::as_str) != Some("click") {
         return Err(usage());
     }
-    match (argv.get(2).map(String::as_str), argv.get(3)) {
-        (Some("--mark"), Some(number)) if argv.len() == 4 => number
+    let mark = |number: &String| {
+        number
             .parse::<usize>()
             .ok()
             .filter(|mark| *mark >= 1)
-            .map(ClickTarget::Mark)
-            .ok_or_else(|| "a mark is a positive whole number".to_string()),
-        (Some("--mark"), _) => {
-            Err("click --mark takes one number (zerocode-browser click <label> --mark <n>)".into())
+            .ok_or_else(|| "a mark is a positive whole number".to_string())
+    };
+    match (
+        argv.get(2).map(String::as_str),
+        argv.get(3),
+        argv.get(4).map(String::as_str),
+    ) {
+        (Some("--mark"), Some(number), None) if argv.len() == 4 => {
+            mark(number).map(ClickTarget::Mark)
         }
-        (Some(css), None) if !css.is_empty() && !css.starts_with("--") => {
+        (Some("--mark"), Some(number), Some(BROWSER_SETTLE_LATER_FLAG)) if argv.len() == 5 => {
+            mark(number).map(ClickTarget::MarkSettleLater)
+        }
+        (Some("--mark"), _, _) => Err(format!(
+            "click --mark takes one number, then {BROWSER_SETTLE_LATER_FLAG} or nothing ({BROWSER_CLI} click <label> --mark <n> [{BROWSER_SETTLE_LATER_FLAG}])"
+        )),
+        (Some(css), None, None) if !css.is_empty() && !css.starts_with("--") => {
             Ok(ClickTarget::Css(css.to_string()))
         }
         _ => Err(
@@ -466,12 +485,9 @@ impl BrowserMark {
 /// deterministic — the same faces always give the same numbers.
 #[must_use]
 pub fn number_marks(faces: &[BrowserFace]) -> Vec<BrowserMark> {
-    faces
-        .iter()
-        .filter(|face| face.hit)
-        .enumerate()
-        .map(|(at, face)| BrowserMark {
-            mark: at + 1,
+    numbered_faces(faces)
+        .map(|(_, mark, face)| BrowserMark {
+            mark,
             tag: face.tag.clone(),
             role: face.role.clone(),
             label: face.label.clone(),
@@ -482,6 +498,21 @@ pub fn number_marks(faces: &[BrowserFace]) -> Vec<BrowserMark> {
             height: face.height,
         })
         .collect()
+}
+
+/// The one numbering [`number_marks`] gives: each hittable face's place
+/// among the faces the page walked, the number it presses by, and the face —
+/// for a caller that carries what the page said beside a face (a field's
+/// words, its value's digest) over to the number it went to.
+pub fn numbered_faces(
+    faces: &[BrowserFace],
+) -> impl Iterator<Item = (usize, usize, &BrowserFace)> + '_ {
+    faces
+        .iter()
+        .enumerate()
+        .filter(|(_, face)| face.hit)
+        .enumerate()
+        .map(|(at, (place, face))| (place, at + 1, face))
 }
 
 /// The control re-measured at a mark's selector, as the click's page script
@@ -527,6 +558,351 @@ pub fn mark_still_holds(mark: &BrowserMark, now: &BrowserRemeasure) -> Result<()
     } else {
         Err(pin_broken(mark.mark))
     }
+}
+
+// ---- One look's snapshot, a press's settle and the look's pin (t-6721) ----
+//
+// A walk reads a page once a step (`marks --json`) and presses by number
+// (`click --mark N`). What the page holds beside its numbers — its document,
+// the fields a value may go into, the containers, images and rows the goal
+// may be about — is read in the same synchronous pass as the numbers, under
+// the keys the walk's question reads them by
+// ([`crate::screen_action::snapshot`]), so no answer mixes two states of the
+// page. A press by number then waits a bounded moment for the page to settle
+// on what it did — by the page's own document standing still, never by a
+// painted frame, which a hidden tab never paints — and the number is pinned to
+// the document it was read in and to what a field held.
+
+/// The key a look carries the window's clock under: when the page's answer
+/// was heard, in milliseconds since the Unix epoch — the one key of the
+/// snapshot the walk's question does not read, for a reader that ages a look.
+pub const AT_MS_KEY: &str = "atMs";
+
+/// The containers a look reports beside its numbers, as CSS selectors: the
+/// lists, tables and grids a page shows results in, said in the ARIA roles
+/// and the elements that carry them implicitly. One table, like
+/// [`BROWSER_MARKABLE`]: the page script walks exactly this list.
+pub const BROWSER_OBSERVED_CONTAINERS: &[&str] = &[
+    "[role=list]",
+    "[role=listbox]",
+    "[role=grid]",
+    "[role=table]",
+    "[role=feed]",
+    "ul",
+    "ol",
+    "table",
+];
+
+/// The rows a look reports — and counts inside a container: one entry of a
+/// list, an option, a table or grid row, an article in a feed.
+pub const BROWSER_OBSERVED_ROWS: &[&str] = &[
+    "[role=listitem]",
+    "[role=option]",
+    "[role=row]",
+    "[role=article]",
+    "li",
+    "tr",
+];
+
+/// The pictures a look reports.
+pub const BROWSER_OBSERVED_IMAGES: &[&str] = &["img", "[role=img]"];
+
+/// The page's own chrome — its navigation, its banner and footer, its menus
+/// and tab strips. What sits inside one is the page's furniture, not a result
+/// a goal is about, so no container, image or row is reported from inside it;
+/// its controls are still numbered and pressed like any other.
+pub const BROWSER_OBSERVED_CHROME: &[&str] = &[
+    "nav",
+    "header",
+    "footer",
+    "[role=navigation]",
+    "[role=banner]",
+    "[role=contentinfo]",
+    "[role=menu]",
+    "[role=menubar]",
+    "[role=tablist]",
+];
+
+/// The smallest side, in CSS pixels, of a picture a look reports: an icon, a
+/// spacer or a tracking pixel is not the picture of an item.
+pub const BROWSER_OBSERVED_IMAGE_MIN_PX: f64 = 32.0;
+
+/// Where a field's nearby words are looked for — the region around it, then
+/// the heading of that region: the words a value seat reads beside a label.
+pub const BROWSER_FIELD_REGIONS: &[&str] = &[
+    "fieldset",
+    "form",
+    "dialog",
+    "section",
+    "main",
+    "[role=form]",
+    "[role=search]",
+    "[role=dialog]",
+];
+pub const BROWSER_FIELD_HEADINGS: &[&str] = &["legend", "h1", "h2", "h3", "h4", "[role=heading]"];
+
+/// The most a press by number waits for its page to settle before it
+/// answers: a quarter second on the wall, hidden tab or not. The door's
+/// explicit `wait` keeps its own ceiling ([`BROWSER_WAIT_MAX_MS`]); a settle
+/// never shortens it.
+pub const BROWSER_SETTLE_MS: u64 = 250;
+
+/// How long a page's document must stand still to be settled: fifty
+/// milliseconds, the short settle `jev-ultrafast` gives an ordinary action
+/// (two frames or fifty milliseconds) — said here in the document's own
+/// mutations, because a hidden tab paints no frame (its two
+/// `requestAnimationFrame`s did not come in seven seconds, 6/6, t-6701).
+pub const BROWSER_SETTLE_QUIET_MS: u64 = 50;
+
+/// What says a page is still at work though its document stands still: an
+/// element it marked busy, while one is on screen.
+pub const BROWSER_SETTLE_BUSY: &[&str] = &["[aria-busy=\"true\"]"];
+
+/// `click <label> --mark <n> --settle-later` (t-9712): the press answers the
+/// moment it is made, with the page as the press left it — what a
+/// `marks --json` would answer then — and leaves its settle to the pane's
+/// next `marks`, which finishes it before it reads and says how it ended
+/// under [`BROWSER_SETTLE_KEY`]. A walk that judges ahead begins its next
+/// judgment on that first look and waits for the settle behind it; a press by
+/// number without the flag settles before it answers, as it always has.
+pub const BROWSER_SETTLE_LATER_FLAG: &str = "--settle-later";
+
+/// The key a look says under how the pane's settle-later press settled before
+/// the look was read (t-9712), and the keys of what it says there: how it
+/// ended ([`Settle::word`]), why ([`SettleWhy::word`]) and how long it took on
+/// the wall. A walk's row keeps the same words under the same key.
+pub const BROWSER_SETTLE_KEY: &str = "settle";
+pub const BROWSER_SETTLE_STATE_KEY: &str = "state";
+pub const BROWSER_SETTLE_WHY_KEY: &str = "why";
+pub const BROWSER_SETTLE_MS_KEY: &str = "ms";
+
+/// How a settle ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settle {
+    /// The document the press was made in stood still for the quiet window
+    /// and says it is not busy. Not a goal reached: only that a look now
+    /// reads what the press left.
+    Ready,
+    /// The wall ran out first. Never a success — a caller looks at a page
+    /// still moving, and knows it.
+    NotReady,
+    /// The document the press was made in is gone, or its pane is: the
+    /// look's numbers mean nothing there.
+    Invalidated,
+    /// No look finished the settle of a press made with
+    /// [`BROWSER_SETTLE_LATER_FLAG`]: its pane closed, or the look meant to
+    /// finish it never answered (t-9712). Never a verdict of
+    /// [`settle_verdict`] — the word for a settle nobody heard end, so none
+    /// is dropped without saying so.
+    Unknown,
+}
+
+impl Settle {
+    /// The word the press's answer says it with.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::NotReady => "not_ready",
+            Self::Invalidated => "invalidated",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// A settle's words as a look carries them under [`BROWSER_SETTLE_KEY`]
+/// (t-9712): how it ended, why and its wall milliseconds — the one writer the
+/// door answers with, beside the one reader a walk decides by
+/// ([`settle_said_ready`]).
+#[must_use]
+pub fn settle_said(state: Settle, why: SettleWhy, ms: u64) -> serde_json::Value {
+    serde_json::json!({
+        BROWSER_SETTLE_STATE_KEY: state.word(),
+        BROWSER_SETTLE_WHY_KEY: why.word(),
+        BROWSER_SETTLE_MS_KEY: ms,
+    })
+}
+
+/// What is said of a settle-later press whose settle no look finished
+/// ([`Settle::Unknown`]).
+#[must_use]
+pub fn settle_unheard() -> serde_json::Value {
+    serde_json::json!({ BROWSER_SETTLE_STATE_KEY: Settle::Unknown.word() })
+}
+
+/// Whether a settle's words say its page settled: [`Settle::Ready`] alone
+/// does. `not_ready`, `invalidated`, `unknown` and words that are not a
+/// settle's all say it did not — what a walk reads before it uses a judgment
+/// begun on the page its press left (t-9712).
+#[must_use]
+pub fn settle_said_ready(said: &serde_json::Value) -> bool {
+    said.get(BROWSER_SETTLE_STATE_KEY)
+        .and_then(serde_json::Value::as_str)
+        == Some(Settle::Ready.word())
+}
+
+/// Why a settle ended as it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettleWhy {
+    /// The document stood still for the quiet window.
+    Quiet,
+    /// It was still changing when the wall ran out.
+    Moving,
+    /// It stood still but said it was busy (loading, or marked busy).
+    Busy,
+    /// The page did not answer inside the wall.
+    Unanswered,
+    /// No watch could be kept on the page's document.
+    Unwatched,
+    /// Another document stands in the pane.
+    Replaced,
+    /// The pane is gone.
+    Gone,
+}
+
+impl SettleWhy {
+    /// The word the press's answer says it with.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Quiet => "quiet",
+            Self::Moving => "moving",
+            Self::Busy => "busy",
+            Self::Unanswered => "unanswered",
+            Self::Unwatched => "unwatched",
+            Self::Replaced => "replaced",
+            Self::Gone => "gone",
+        }
+    }
+}
+
+/// What a page says of itself on one settle poll, on its own clock
+/// (`performance.now()`): its document, the time, when its document last
+/// changed (or when the watch began, whichever is later), and whether it is
+/// busy. `hidden` is reported and never judged.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettleFacts {
+    #[serde(default)]
+    pub document_epoch: String,
+    #[serde(default)]
+    pub now: f64,
+    #[serde(default)]
+    pub last: f64,
+    #[serde(default)]
+    pub busy: bool,
+    #[serde(default)]
+    pub hidden: bool,
+    /// Whether the page keeps the watch between polls. A page whose document
+    /// refused it cannot say how long it has stood still.
+    #[serde(default)]
+    pub watched: bool,
+}
+
+/// The settle's verdict on one poll of the document a press was made in
+/// (`epoch`), counting stillness from `since` on the page's clock (the
+/// press): `Some` once the answer is known, `None` while it is still to come.
+///
+/// Another document is `invalidated` whatever else it says; a page that kept
+/// no watch cannot say how long it stood still (`not_ready`, at once); a busy
+/// page is not settled however still; a still one is `ready` once it has
+/// stood still for [`BROWSER_SETTLE_QUIET_MS`] since the later of its last
+/// change and the press. Whether the page was hidden is never read: a painted
+/// page still changing is not settled, a hidden one that stood still is.
+#[must_use]
+pub fn settle_verdict(facts: &SettleFacts, epoch: &str, since: f64) -> Option<(Settle, SettleWhy)> {
+    if facts.document_epoch != epoch {
+        return Some((Settle::Invalidated, SettleWhy::Replaced));
+    }
+    if !facts.watched {
+        return Some((Settle::NotReady, SettleWhy::Unwatched));
+    }
+    if facts.busy {
+        return None;
+    }
+    (still_for(facts, since) >= quiet_ms()).then_some((Settle::Ready, SettleWhy::Quiet))
+}
+
+/// How long to wait before the next poll, in milliseconds: the time left
+/// until the quiet window could be whole, or the whole window while busy —
+/// never less than a millisecond, never more than the window.
+#[must_use]
+pub fn settle_wait_ms(facts: &SettleFacts, since: f64) -> u64 {
+    if facts.busy {
+        return BROWSER_SETTLE_QUIET_MS;
+    }
+    let left = (quiet_ms() - still_for(facts, since))
+        .ceil()
+        .clamp(1.0, quiet_ms());
+    // Whole milliseconds inside the window, so the cast keeps them.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let left = left as u64;
+    left
+}
+
+/// How long, on the page's clock, the document has stood still since the
+/// later of its last change and the press.
+fn still_for(facts: &SettleFacts, since: f64) -> f64 {
+    facts.now - facts.last.max(since)
+}
+
+/// The quiet window on the page's clock.
+#[allow(clippy::cast_precision_loss)]
+fn quiet_ms() -> f64 {
+    BROWSER_SETTLE_QUIET_MS as f64
+}
+
+/// What a look knew about one mark beyond its face: the document it was
+/// read in and, for a field, the digest of what the field held (a secret's
+/// is a constant, never its fingerprint).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BrowserLookPin {
+    pub document_epoch: String,
+    pub value_digest: Option<String>,
+}
+
+/// What the re-measure says of the page and the control now, beside its face
+/// ([`BrowserRemeasure`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserRemeasureContext {
+    #[serde(default)]
+    pub document_epoch: String,
+    #[serde(default)]
+    pub value_digest: Option<String>,
+}
+
+/// Whether a mark still names what the look read, just before the press:
+/// the control's own pin ([`mark_still_holds`]), then the document it was
+/// read in, then — for a field — what the field held.
+pub fn look_still_holds(
+    mark: &BrowserMark,
+    drawn: &BrowserLookPin,
+    now: &BrowserRemeasure,
+    context: &BrowserRemeasureContext,
+) -> Result<(), ProviderError> {
+    mark_still_holds(mark, now)?;
+    if context.document_epoch != drawn.document_epoch {
+        return Err(ProviderError::new(
+            crate::computer_use_protocol::error_code::ELEMENT_NOT_FOUND,
+            format!(
+                "element {} was read in another document (the page was replaced since that look); look again with `{BROWSER_CLI} marks`",
+                mark.mark
+            ),
+        ));
+    }
+    if let Some(digest) = &drawn.value_digest
+        && context.value_digest.as_ref() != Some(digest)
+    {
+        return Err(ProviderError::new(
+            crate::computer_use_protocol::error_code::ELEMENT_NOT_FOUND,
+            format!(
+                "element {} holds another value than its look read (it changed since that look); look again with `{BROWSER_CLI} marks`",
+                mark.mark
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The viewport presets, by id — the window's `BROWSER_VIEWPORT_PRESETS`
@@ -827,8 +1203,8 @@ pub fn usage() -> String {
         "  zerocode-browser read <label> [css]   보이는 텍스트와 고른 DOM (본문 소음 판정이 켜져 있으면 nav·footer 같은 블록은 한 줄로 접음)",
         "  zerocode-browser read <label> --full  판정 없이 페이지 전체 텍스트",
         "  zerocode-browser click <label> <css>  보이는 첫 요소를 클릭",
-        "  zerocode-browser click <label> --mark <n>",
-        "                                             마지막 marks의 번호 n을 누름 (움직였거나 바뀌었으면 거절)",
+        "  zerocode-browser click <label> --mark <n> [--settle-later]",
+        "                                             마지막 marks의 번호 n을 누름 (움직였거나 바뀌었으면 거절; --settle-later: 누른 즉시 그 자리의 marks --json으로 답하고 정착은 판의 다음 marks가 끝냄)",
         "  zerocode-browser type <label> <css> <text>",
         "                                             요소 내용을 바꾸고 입력 이벤트 (비밀번호 칸은 거절)",
         "  zerocode-browser type <label> <css> --value-stdin",
@@ -1293,6 +1669,7 @@ mod tests {
             &["marks", "b"],
             &["marks", "b", "--json"],
             &["click", "b", "--mark", "3"],
+            &["click", "b", "--mark", "3", BROWSER_SETTLE_LATER_FLAG],
         ] {
             assert_eq!(arity_ok(&argv(ok)), Ok(()), "{ok:?}");
         }
@@ -1307,7 +1684,7 @@ mod tests {
             &["click", "b"],
             &["marks"],
             &["marks", "b", "x", "y"],
-            &["click", "b", "--mark", "3", "x"],
+            &["click", "b", "--mark", "3", BROWSER_SETTLE_LATER_FLAG, "x"],
         ] {
             assert!(arity_ok(&argv(refused)).is_err(), "{refused:?}");
         }
@@ -1343,9 +1720,10 @@ mod tests {
         assert_eq!(marks.hold_ms, BROWSER_CALLBACK_DEADLINE_MS);
         assert!(!marks.check && !marks.acts);
         assert!(VERBS.contains(&"marks"));
-        // `click` still presses, and now takes a third word for `--mark <n>`.
+        // `click` still presses, and takes a third word for `--mark <n>` and
+        // a fourth for `--settle-later` (t-9712).
         let click = browser_verb("click").expect("click is a verb");
-        assert_eq!(click.arity, Arity { min: 2, max: 3 });
+        assert_eq!(click.arity, Arity { min: 2, max: 4 });
         assert!(click.acts);
 
         let argv = |line: &[&str]| line.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
@@ -1377,6 +1755,43 @@ mod tests {
         assert!(parse_click(&argv(&["click", "b", "--mark", "x"])).is_err());
         assert!(parse_click(&argv(&["click", "b", "--mark"])).is_err());
         assert!(parse_click(&argv(&["click", "b", "--other"])).is_err());
+    }
+
+    /// A press by number may leave its settle to the pane's next `marks`
+    /// (t-9712) — said by one flag after the number and nowhere else: not
+    /// on a press by selector, not before the number, not beside another
+    /// word, and never changing what the plain press by number reads as.
+    #[test]
+    fn a_press_by_number_leaves_its_settle_for_later_only_when_it_says_so() {
+        let argv = |line: &[&str]| line.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_click(&argv(&[
+                "click",
+                "b",
+                "--mark",
+                "7",
+                BROWSER_SETTLE_LATER_FLAG
+            ])),
+            Ok(ClickTarget::MarkSettleLater(7))
+        );
+        assert_eq!(
+            parse_click(&argv(&["click", "b", "--mark", "7"])),
+            Ok(ClickTarget::Mark(7)),
+            "the plain press by number is read as it always was"
+        );
+        for refused in [
+            &["click", "b", "--mark", "0", BROWSER_SETTLE_LATER_FLAG][..],
+            &["click", "b", "--mark", "7", "--json"],
+            &["click", "b", "--mark", BROWSER_SETTLE_LATER_FLAG, "7"],
+            &["click", "b", "#save", BROWSER_SETTLE_LATER_FLAG],
+            &["click", "b", BROWSER_SETTLE_LATER_FLAG],
+        ] {
+            assert!(parse_click(&argv(refused)).is_err(), "{refused:?}");
+        }
+        assert!(
+            usage().contains(&format!("--mark <n> [{BROWSER_SETTLE_LATER_FLAG}]")),
+            "the manual names the flag where the press by number is taught"
+        );
     }
 
     /// The faces the page gathers become marks 1..N over the hittable ones, in
@@ -1453,6 +1868,229 @@ mod tests {
                 crate::computer_use_protocol::error_code::ELEMENT_NOT_FOUND
             );
             assert!(refusal.message.contains('3'), "names the mark: {refusal:?}");
+        }
+    }
+
+    /// A number is pinned to the look it came from, not only to the control's
+    /// face: the document it was read in and, for a field, what the field
+    /// held. Another document with the same layout, or a field whose value
+    /// changed under the walk while its words stayed, is refused; a control
+    /// that is no field pins no value; and the face's own pin still stands in
+    /// front of both.
+    #[test]
+    fn value_change_or_occlusion_invalidates_selected_target() {
+        let mark = BrowserMark {
+            mark: 2,
+            tag: "input".into(),
+            role: "textbox".into(),
+            label: Some("Destination".into()),
+            selector: "#destination".into(),
+            x: 10.0,
+            y: 20.0,
+            width: 200.0,
+            height: 30.0,
+        };
+        let face = BrowserRemeasure {
+            found: true,
+            tag: "input".into(),
+            role: "textbox".into(),
+            label: Some("Destination".into()),
+            x: 10.0,
+            y: 20.0,
+            width: 200.0,
+            height: 30.0,
+        };
+        let drawn = BrowserLookPin {
+            document_epoch: "1790000000000.25".into(),
+            value_digest: Some("3:9a1f".into()),
+        };
+        let same = BrowserRemeasureContext {
+            document_epoch: drawn.document_epoch.clone(),
+            value_digest: drawn.value_digest.clone(),
+        };
+        assert_eq!(look_still_holds(&mark, &drawn, &face, &same), Ok(()));
+
+        let replaced = BrowserRemeasureContext {
+            document_epoch: "1790000009999.5".into(),
+            ..same.clone()
+        };
+        let typed = BrowserRemeasureContext {
+            value_digest: Some("7:44c0".into()),
+            ..same.clone()
+        };
+        for now in [&replaced, &typed] {
+            let refusal =
+                look_still_holds(&mark, &drawn, &face, now).expect_err("the look no longer holds");
+            assert_eq!(
+                refusal.code,
+                crate::computer_use_protocol::error_code::ELEMENT_NOT_FOUND
+            );
+            assert!(refusal.message.contains('2'), "names the mark: {refusal:?}");
+        }
+        assert_ne!(
+            look_still_holds(&mark, &drawn, &face, &replaced),
+            look_still_holds(&mark, &drawn, &face, &typed),
+            "a replaced document and a changed value say different things"
+        );
+
+        let button = BrowserLookPin {
+            value_digest: None,
+            ..drawn.clone()
+        };
+        assert_eq!(look_still_holds(&mark, &button, &face, &typed), Ok(()));
+
+        let moved = BrowserRemeasure {
+            y: 300.0,
+            ..face.clone()
+        };
+        assert!(look_still_holds(&mark, &drawn, &moved, &same).is_err());
+    }
+
+    /// The settle's verdict is the document's word, bounded by the wall the
+    /// shell keeps: another document is `invalidated` at once; a document
+    /// still changing, or still but busy, is not yet settled and says how
+    /// long to wait; stillness counts from the press, never from before it;
+    /// a page that keeps no watch cannot be called still.
+    #[test]
+    fn hidden_surface_short_settle_has_a_wall_deadline() {
+        let epoch = "1790000000000.25";
+        let facts = |now: f64, last: f64, busy: bool| SettleFacts {
+            document_epoch: epoch.into(),
+            now,
+            last,
+            busy,
+            hidden: true,
+            watched: true,
+        };
+        let quiet = BROWSER_SETTLE_QUIET_MS;
+
+        let moving = facts(1_040.0, 1_035.0, false);
+        assert_eq!(settle_verdict(&moving, epoch, 1_000.0), None);
+        assert_eq!(settle_wait_ms(&moving, 1_000.0), quiet - 5);
+
+        let busy = facts(1_200.0, 1_000.0, true);
+        assert_eq!(settle_verdict(&busy, epoch, 1_000.0), None);
+        assert_eq!(settle_wait_ms(&busy, 1_000.0), quiet);
+
+        let since_the_press = facts(1_010.0, 200.0, false);
+        assert_eq!(settle_verdict(&since_the_press, epoch, 1_000.0), None);
+        assert_eq!(settle_wait_ms(&since_the_press, 1_000.0), quiet - 10);
+
+        #[allow(clippy::cast_precision_loss)]
+        let whole = facts(1_000.0 + quiet as f64, 1_000.0, false);
+        assert_eq!(
+            settle_verdict(&whole, epoch, 1_000.0),
+            Some((Settle::Ready, SettleWhy::Quiet))
+        );
+
+        let replaced = SettleFacts {
+            document_epoch: "1790000009999.5".into(),
+            ..facts(1_000.0, 1_000.0, true)
+        };
+        assert_eq!(
+            settle_verdict(&replaced, epoch, 1_000.0),
+            Some((Settle::Invalidated, SettleWhy::Replaced))
+        );
+
+        let unwatched = SettleFacts {
+            watched: false,
+            ..facts(1_500.0, 1_000.0, false)
+        };
+        assert_eq!(
+            settle_verdict(&unwatched, epoch, 1_000.0),
+            Some((Settle::NotReady, SettleWhy::Unwatched))
+        );
+
+        const {
+            assert!(BROWSER_SETTLE_QUIET_MS * 2 < BROWSER_SETTLE_MS);
+            assert!(BROWSER_SETTLE_MS < BROWSER_CALLBACK_DEADLINE_MS);
+            assert!(BROWSER_SETTLE_MS < BROWSER_WAIT_MAX_MS);
+        }
+    }
+
+    /// Visible is not settled and settled is not done: the verdict never
+    /// reads whether the page was hidden — a painted page still changing is
+    /// not ready, a hidden one that stood still is — and its three words say
+    /// what the page did, never that a goal was reached.
+    #[test]
+    fn visibility_is_not_confused_with_task_completion() {
+        let epoch = "e";
+        let seen_moving = SettleFacts {
+            document_epoch: epoch.into(),
+            now: 1_200.0,
+            last: 1_198.0,
+            busy: false,
+            hidden: false,
+            watched: true,
+        };
+        let hidden_still = SettleFacts {
+            now: 1_120.0,
+            last: 1_000.0,
+            hidden: true,
+            ..seen_moving.clone()
+        };
+        assert_eq!(settle_verdict(&seen_moving, epoch, 1_000.0), None);
+        assert_eq!(
+            settle_verdict(&hidden_still, epoch, 1_000.0),
+            Some((Settle::Ready, SettleWhy::Quiet))
+        );
+        for facts in [&seen_moving, &hidden_still] {
+            let flipped = SettleFacts {
+                hidden: !facts.hidden,
+                ..facts.clone()
+            };
+            assert_eq!(
+                settle_verdict(facts, epoch, 1_000.0),
+                settle_verdict(&flipped, epoch, 1_000.0),
+                "visibility is reported, never judged"
+            );
+        }
+        assert_eq!(
+            [
+                Settle::Ready.word(),
+                Settle::NotReady.word(),
+                Settle::Invalidated.word(),
+                Settle::Unknown.word()
+            ],
+            ["ready", "not_ready", "invalidated", "unknown"]
+        );
+    }
+
+    /// A settle is said in one shape and read by one rule (t-9712): the
+    /// door writes how it ended, why and its wall milliseconds under the
+    /// table's keys, a settle nobody heard end is `unknown`, and only
+    /// `ready` reads as settled — so a walk never uses a judgment begun on a
+    /// page that had not stopped.
+    #[test]
+    fn a_settle_is_said_in_one_shape_and_only_ready_reads_as_settled() {
+        let said = settle_said(Settle::Ready, SettleWhy::Quiet, 52);
+        assert_eq!(said[BROWSER_SETTLE_STATE_KEY], Settle::Ready.word());
+        assert_eq!(said[BROWSER_SETTLE_WHY_KEY], SettleWhy::Quiet.word());
+        assert_eq!(said[BROWSER_SETTLE_MS_KEY], 52);
+        assert!(settle_said_ready(&said));
+        for (state, why) in [
+            (Settle::NotReady, SettleWhy::Moving),
+            (Settle::NotReady, SettleWhy::Busy),
+            (Settle::Invalidated, SettleWhy::Replaced),
+            (Settle::Invalidated, SettleWhy::Gone),
+        ] {
+            assert!(
+                !settle_said_ready(&settle_said(state, why, 250)),
+                "{state:?}"
+            );
+        }
+        assert_eq!(
+            settle_unheard()[BROWSER_SETTLE_STATE_KEY],
+            Settle::Unknown.word()
+        );
+        assert!(!settle_said_ready(&settle_unheard()));
+        for stranger in [
+            serde_json::Value::Null,
+            serde_json::json!("ready"),
+            serde_json::json!({ BROWSER_SETTLE_WHY_KEY: SettleWhy::Quiet.word() }),
+            serde_json::json!({ BROWSER_SETTLE_STATE_KEY: "still" }),
+        ] {
+            assert!(!settle_said_ready(&stranger), "{stranger}");
         }
     }
 

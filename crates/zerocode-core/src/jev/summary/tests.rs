@@ -70,6 +70,30 @@ fn a_memo_hit_answered_without_asking_so_it_leaves_the_latency_alone() {
     assert_eq!(tally.p95_ms, Some(800));
 }
 
+/// Only an answer has an answer's time (t-9427). A timeout's row carries the
+/// wall its stage gave up at, and every call that did not answer is the
+/// answered share's to count — a latency sample of it counts the same miss a
+/// second time. Each is still a call.
+#[test]
+fn a_call_that_did_not_answer_leaves_the_latency_to_the_answers() {
+    let rows = [
+        json!({"at": 1, "outcome": "answered", "elapsedMs": 300}),
+        json!({"at": 2, "outcome": "answered", "elapsedMs": 700}),
+        json!({"at": 3, "outcome": "timeout", "elapsedMs": 1_502}),
+        json!({"at": 4, "outcome": "schema", "elapsedMs": 400}),
+        json!({"at": 5, "outcome": "transport", "elapsedMs": 90}),
+    ];
+    let tally = summarize(&rows, 0);
+    assert_eq!(tally.called, 5, "every one of them went over the wire");
+    assert_eq!((tally.p50_ms, tally.p95_ms), (Some(300), Some(700)));
+    let unanswered = summarize(&rows[2..], 0);
+    assert_eq!(
+        (unanswered.called, unanswered.p50_ms, unanswered.p95_ms),
+        (3, None, None),
+        "calls with no answer have no answer time"
+    );
+}
+
 #[test]
 fn a_door_refusal_is_counted_by_its_own_token_and_never_as_an_answer() {
     let rows = [
@@ -290,10 +314,12 @@ fn a_control_row_is_not_a_request_and_is_counted_nowhere_but_by_name() {
     assert!(is_control_row(&rows[1]) && !is_control_row(&rows[0]) && !is_control_row(&rows[2]));
     let tally = summarize(&rows, 0);
     assert_eq!((tally.rows, tally.answered, tally.called), (2, 1, 2));
+    // The one answer is the latency: a control row's zero would pull the
+    // median to it, and the timeout's wall is no answer's time (t-9427).
     assert_eq!(
-        tally.p95_ms,
-        Some(1_500),
-        "a control row's zero joined the latency"
+        (tally.p50_ms, tally.p95_ms),
+        (Some(10), Some(10)),
+        "a control row's zero, or the timeout's wall, joined the latency"
     );
     let window = last_asked(&rows, 3);
     assert_eq!(
@@ -388,6 +414,40 @@ fn an_agreement_over_rows_already_picked_out_reads_the_same_marks() {
     let agreement = agreement_rows(held.iter().copied(), i64::MIN);
     assert_eq!((agreement.compared, agreement.agreed), (2, 2));
     assert_eq!(agreement_since(&rows, 0), agreement_rows(rows.iter(), 0));
+}
+
+/// Why the rows compared nothing is counted word by word over the rows the
+/// agreement counts as `not_compared` (t-9556): a row that carries a mark is
+/// a mark whatever else it spells, a row before the cut is not counted, and
+/// a value that is not a word is keyed by its own JSON — so the words always
+/// add up to the count, and no reader spells a word of its own.
+#[test]
+fn the_rows_that_compared_nothing_are_told_apart_by_the_word_they_wrote() {
+    use crate::worker_placement::{NOT_CARRIED, UNSEEN};
+    let rows = [
+        json!({"at": 1, "label": "a", "notCompared": UNSEEN}),
+        json!({"at": 5, "label": "b", "notCompared": UNSEEN}),
+        json!({"at": 6, "label": "c", "notCompared": NOT_CARRIED}),
+        json!({"at": 7, "label": "d", "agreed": false, "notCompared": NOT_CARRIED}),
+        json!({"at": 8, "label": "e", "notCompared": 3}),
+        json!({"at": 9, "label": "f"}),
+    ];
+    let words = not_compared_words(rows.iter(), 5);
+    assert_eq!(
+        words,
+        BTreeMap::from([
+            (UNSEEN.to_string(), 1),
+            (NOT_CARRIED.to_string(), 1),
+            ("3".to_string(), 1)
+        ])
+    );
+    assert_eq!(
+        words.values().sum::<usize>(),
+        agreement_rows(rows.iter(), 5).not_compared,
+        "the words add up to the count"
+    );
+    assert_eq!(not_compared_words(rows.iter(), i64::MIN)[UNSEEN], 2);
+    assert!(not_compared_words([].iter(), i64::MIN).is_empty());
 }
 
 /// What a screen seat's guards stopped and what it handed to the person are

@@ -1,7 +1,9 @@
+mod act_lines;
 mod agent_capabilities;
 mod bundle_resources;
 mod cli_login;
 mod computer_use_mirrors;
+mod computer_use_tcc;
 mod coordinator_desk;
 mod crash_report;
 mod fixture_cases;
@@ -31239,7 +31241,7 @@ mod tests {
         );
         let mark = block_after(backend, "fn label_row(");
         assert!(
-            mark.contains("worker_placement::mark(placed.chosen, ended_in, seen)")
+            mark.contains("worker_placement::mark(placed.chosen, ended_in, moved, seen)")
                 && mark.contains("NOT_COMPARED.canonical")
                 && mark.contains("LABEL.canonical: worker,"),
             "the placement label spells its mark or its name itself:\n{mark}"

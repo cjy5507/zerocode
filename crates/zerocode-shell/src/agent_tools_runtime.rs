@@ -2544,6 +2544,9 @@ pub(super) async fn computer_loop(
                             })
                             .flatten();
                         if command.method == zerocode_core::computer_use::ComputerMethod::Walk {
+                            // The value seat's writer (t-6720): the key a person set for it,
+                            // read only when a walk's look has a field to type into.
+                            let writer = computer_use::errand::value::LiveWriter::window();
                             run_goal(
                                 &command,
                                 deadline_ms,
@@ -2552,6 +2555,9 @@ pub(super) async fn computer_loop(
                                 roads,
                                 desk,
                                 rescue,
+                                writer,
+                                // The window's own judge, built by the walk.
+                                None,
                             )
                         } else {
                             run_recipe(
@@ -3204,6 +3210,7 @@ pub(super) fn run_recipe(
                 let options = computer_use::errand::Options {
                     overlap: false,
                     rescue: rescue.is_some(),
+                    act_line: crate::systemone::act_line(judge.wire(), seat),
                 };
                 let recovered = computer_use::errand::run_with(
                     mode,
@@ -3273,6 +3280,7 @@ pub(super) fn run_recipe(
 /// The seat is the surface's, never the verb's: a walk at a browser pane is
 /// under the browser row of the Jev use table and a walk at an app is under
 /// the desktop row, so neither switch can turn the other's surface on.
+#[allow(clippy::too_many_arguments)] // Its roads, desk, second reader, value writer and judge are each one seam.
 pub(super) fn run_goal(
     command: &zerocode_core::computer_use::ComputerCommand,
     deadline_ms: u64,
@@ -3290,6 +3298,8 @@ pub(super) fn run_goal(
     >,
     mut desk_of: impl computer_use::arena::DeskOf,
     mut rescue: Option<computer_use::errand::team::TeamJudge>,
+    writer: computer_use::errand::value::LiveWriter,
+    judge: Option<computer_use::errand::live::LiveJudge>,
 ) -> zerocode_hookd::TeamAnswer {
     use computer_use::errand::{self, desk};
     use computer_use::recipe_run::Desk as _;
@@ -3367,7 +3377,6 @@ pub(super) fn run_goal(
         }
     };
     let seat = errand::seat_of(aim.surface());
-    let mode = errand::mode_now(seat);
     let at = errand::Errand {
         goal: &goal,
         why: errand::Why::Goal {
@@ -3380,12 +3389,24 @@ pub(super) fn run_goal(
         // it can only press, never type an amount or a recipient.
         moves_money: false,
     };
-    let mut judge = errand::live::LiveJudge::new(
-        &crate::api_routers::Keychain::of_this_machine(),
-        workspace,
-        seat,
-    )
-    .in_run(zerocode_core::computer_use::walk_run(&command.params));
+    // The judge this walk asks: one its caller built — a test's, across a
+    // socket of its own — else the window's, the key the settings pane keeps,
+    // for the folder the walk was asked from and the surface's own seat.
+    let mut judge = judge
+        .unwrap_or_else(|| {
+            errand::live::LiveJudge::new(
+                &crate::api_routers::Keychain::of_this_machine(),
+                workspace,
+                seat,
+            )
+        })
+        .in_run(zerocode_core::computer_use::walk_run(&command.params));
+    // Every switch this walk reads, it reads from the settings file its judge
+    // asks through — for the window's judge the file `errand::mode_now`
+    // reads (`zo_settings_path`), so the seat's mode and whether it acts come
+    // from one reading of one file.
+    let settings = judge.wire().settings_root();
+    let mode = seat.mode_in(&settings);
     if mode == errand::Mode::Off || !judge.armed() {
         // Off is today's product exactly: no look is taken, nothing is sent,
         // and the answer says plainly that nothing walked.
@@ -3404,8 +3425,9 @@ pub(super) fn run_goal(
     // comparison's pick is the one pressed.
     let forks = &zerocode_core::jev::BRANCHING;
     let branching = errand::Branching {
-        mode: errand::mode_now(forks),
+        mode: forks.mode_in(&settings),
         acting: crate::systemone::applies(judge.wire(), forks),
+        act_line: crate::systemone::act_line(judge.wire(), forks),
     };
     let snapshots: Box<dyn desk::Snapshots> = Box::new(AvdSnapshots {
         device: word("device").unwrap_or_default(),
@@ -3413,10 +3435,12 @@ pub(super) fn run_goal(
     let options = errand::Options {
         overlap: zerocode_core::computer_use::walk_overlaps(&command.params),
         rescue: rescue.is_some(),
+        act_line: crate::systemone::act_line(judge.wire(), seat),
     };
     let mut world = desk::GoalWorld::new(&mut road, aim, page, word("until"), deadline_ms, 0)
         .with_snapshots(snapshots)
-        .previewing(options.overlap);
+        .previewing(options.overlap)
+        .writing(Box::new(writer));
     let walked = errand::run_with(
         mode,
         acting,
@@ -5939,8 +5963,10 @@ pub(super) async fn answer_browser_command(
         }
         // `click <label> <css>` presses the first element a selector names;
         // `click <label> --mark <n>` presses the control numbered n on the
-        // pane's last `marks`, pinned so a moved or changed control is refused.
-        ("click", 3) | ("click", 4) => {
+        // pane's last `marks`, pinned so a moved or changed control is refused;
+        // `--settle-later` answers at once with the page the press left, its
+        // settle finished by the pane's next `marks` (t-9712).
+        ("click", 3) | ("click", 4) | ("click", 5) => {
             use zerocode_core::agent_browser::ClickTarget;
             let pressed = match zerocode_core::agent_browser::parse_click(argv) {
                 Ok(ClickTarget::Css(css)) => {
@@ -5948,6 +5974,18 @@ pub(super) async fn answer_browser_command(
                 }
                 Ok(ClickTarget::Mark(mark)) => {
                     cmd::browser::automate_click_mark(app, &state, &argv[1], mark).await
+                }
+                Ok(ClickTarget::MarkSettleLater(mark)) => {
+                    let later =
+                        cmd::browser::automate_click_mark_later(app, &state, &argv[1], mark);
+                    return match later.await {
+                        Ok((report, look)) => {
+                            crate::browser_read::label_press(&argv[1], "click", &report);
+                            let answer = cmd::browser::settle_later_json(&report, look.as_ref());
+                            browser_said(format!("{answer}\n"))
+                        }
+                        Err(why) => browser_refused(format!("zerocode-browser: {why}\n")),
+                    };
                 }
                 Err(why) => return browser_refused(format!("zerocode-browser: {why}\n")),
             };
