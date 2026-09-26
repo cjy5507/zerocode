@@ -27414,6 +27414,17 @@ input[type="search"]::-webkit-search-cancel-button {
   flex: none;
 }
 
+/* 누를 수 없는 손잡이 (t-9532) — 행성계가 선 판의 실시간 지도. `disabled`가 아니라
+ * `aria-disabled`인 것은 초점과 손을 받아 팁이 까닭을 말하게 하려서다. 모양은 이 창에서
+ * 아직 열 수 없는 문이 입는 그 한 벌이다(`.workbench-related-*:disabled`): 잉크가 물러서고
+ * 채움이 물러선다. 손이 얹혀도 그대로다 — 이 판 머리의 문맥이 hover 규칙보다 한 단 좁아서
+ * 따로 hover를 적지 않는다. */
+.agent-graph-head-tools > .icon-btn[aria-disabled="true"] {
+  background: transparent;
+  color: var(--ink-disabled);
+  cursor: default;
+}
+
 /* 서랍 티어의 손잡이. 넓은 판의 곁판은 늘 서 있으므로 여기서는 없다. */
 .icon-btn.agent-inspector-toggle {
   display: none;
@@ -30044,6 +30055,7 @@ details.task-board-section > summary {
 
 .task-board-members[hidden],
 .task-board-message[hidden],
+.task-board-cost[hidden],
 .task-board-empty[hidden] { display: none; }
 
 .task-board-member {
@@ -30072,7 +30084,8 @@ details.task-board-section > summary {
 .task-board-member-work { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-board-member-status { flex: none; font-size: var(--text-2xs); }
 
-.task-board-message {
+.task-board-message,
+.task-board-cost {
   display: flex;
   gap: var(--space-3);
   margin: 0;
@@ -30194,7 +30207,7 @@ details.task-board-section > summary {
   .task-board-main { grid-template-columns: minmax(0, 1fr); padding-inline: var(--space-4); }
   .task-board-state { grid-column: 1; grid-row: 3; }
   .task-board-title { font-size: var(--text-md); }
-  .task-board-members, .task-board-message, .task-board-foot { padding-inline: var(--space-4); }
+  .task-board-members, .task-board-message, .task-board-cost, .task-board-foot { padding-inline: var(--space-4); }
 }
 
 /* ---- 코디네이터 데스크 (t-6588) --------------------------------------------
@@ -30497,6 +30510,12 @@ details.task-board-section > summary {
   margin: var(--space-2) 0 0;
 }
 
+/* The acknowledgement of a batch whose notices all folded stands beside the
+ * folded count (t-9548) — the letter's own door, a word's width away. */
+.board-desk-news-folded-ack {
+  margin-inline-start: var(--space-2);
+}
+
 .board-desk-letter-body[hidden],
 .board-desk-letter-act[hidden],
 .board-desk-letter-note[hidden],
@@ -30712,7 +30731,8 @@ details.task-board-section > summary {
   white-space: nowrap;
 }
 
-.board-desk-task-note {
+.board-desk-task-note,
+.board-desk-task-cost {
   grid-column: 2;
   color: var(--ink-label);
   overflow-wrap: anywhere;
@@ -30726,6 +30746,7 @@ details.task-board-section > summary {
 
 .board-desk-tasks[hidden],
 .board-desk-task-note[hidden],
+.board-desk-task-cost[hidden],
 .board-desk-more[hidden] {
   display: none;
 }
@@ -39822,7 +39843,7 @@ h4.knowledge-inspector-head::after {
   font-weight: var(--jev-weight-medium);
 }
 
-.jev-status-reason, .jev-status-fact {
+.jev-status-reason, .jev-status-fact, .jev-why {
   margin: 0;
 }
 
@@ -39837,8 +39858,9 @@ h4.knowledge-inspector-head::after {
 }
 
 /* What a feature still owes the judge, in words; the bar is the chart's
-   over the table (t-9633 (c)). */
-.jev-owed {
+   over the table (t-9633 (c)) — and, on the line under it, why its rows
+   compared nothing (t-9935). */
+.jev-owed, .jev-why {
   color: var(--ink-mist);
 }
 
@@ -40323,12 +40345,21 @@ button.jev-token:hover {
     display: none;
   }
 
+  /* Each row as one compact card: the feature and its state on the first
+     line, its five figures in a line under them, and the week's picture at
+     the side spanning both — three lines where the stacked grid took four
+     labelled blocks, so a window this wide shows twice the features. */
   .jev-table tbody tr[data-jev-dash-row] {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(var(--jev-stat-min), 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr)) auto;
+    grid-template-areas:
+      "seat seat seat seat seat trend"
+      "rows answered latency acted cost trend"
+      "status status status status status trend";
     gap: var(--space-2) var(--space-3);
     padding: var(--space-3);
     border-bottom: var(--jev-line) solid var(--edge-rule);
+    align-items: start;
   }
 
   .jev-table tbody tr[data-jev-dash-row] td {
@@ -40338,6 +40369,15 @@ button.jev-token:hover {
     border: 0;
   }
 
+  .jev-table td[data-jev-cell="seat"] { grid-area: seat; }
+  .jev-table td[data-jev-cell="rows"] { grid-area: rows; }
+  .jev-table td[data-jev-cell="answered"] { grid-area: answered; }
+  .jev-table td[data-jev-cell="latency"] { grid-area: latency; }
+  .jev-table td[data-jev-cell="acted"] { grid-area: acted; }
+  .jev-table td[data-jev-cell="cost"] { grid-area: cost; }
+  .jev-table td[data-jev-cell="status"] { grid-area: status; }
+  .jev-table td[data-jev-cell="trend"] { grid-area: trend; }
+
   .jev-table tbody tr[data-jev-dash-row] td::before {
     display: block;
     color: var(--ink-mist);
@@ -40346,26 +40386,23 @@ button.jev-token:hover {
     white-space: normal;
   }
 
-  /* Each column's name, as the table says it (`jevNameColumns`). */
+  /* The five figures wear their column's name, as the table says it
+     (`jevNameColumns`); the state's chip and the week's picture say what
+     they are themselves. */
   .jev-table td[data-jev-cell="rows"]::before { content: var(--jev-label-rows, none); }
   .jev-table td[data-jev-cell="answered"]::before { content: var(--jev-label-answered, none); }
   .jev-table td[data-jev-cell="latency"]::before { content: var(--jev-label-latency, none); }
   .jev-table td[data-jev-cell="acted"]::before { content: var(--jev-label-acted, none); }
   .jev-table td[data-jev-cell="cost"]::before { content: var(--jev-label-cost, none); }
-  .jev-table td[data-jev-cell="status"]::before { content: var(--jev-label-status, none); }
-  .jev-table td[data-jev-cell="trend"]::before { content: var(--jev-label-trend, none); }
-
-  .jev-table td[data-jev-cell="seat"],
-  .jev-table td[data-jev-cell="status"],
-  .jev-table td[data-jev-cell="trend"] {
-    grid-column: 1 / -1;
-  }
-
+  .jev-table td[data-jev-cell="status"]::before,
+  .jev-table td[data-jev-cell="trend"]::before { content: none; }
 
   .jev-table [data-jev-cell="status"] {
     min-width: 0;
   }
 
+  /* A card has room under its figures for the latency picture the table
+     shows only from 90em. */
   .jev-table {
     --jev-latency-shown: 1;
   }
@@ -40381,6 +40418,26 @@ button.jev-token:hover {
 }
 
 @container jev (width < 58em) {
+  /* Too narrow for a line of five figures: the card stacks them, each
+     under its name, with the state and the week across the whole card. */
+  .jev-table tbody tr[data-jev-dash-row] {
+    grid-template-columns: repeat(auto-fill, minmax(var(--jev-stat-min), 1fr));
+    grid-template-areas: none;
+  }
+
+  .jev-table tbody tr[data-jev-dash-row] td {
+    grid-area: auto;
+  }
+
+  .jev-table td[data-jev-cell="seat"],
+  .jev-table td[data-jev-cell="status"],
+  .jev-table td[data-jev-cell="trend"] {
+    grid-column: 1 / -1;
+  }
+
+  .jev-table td[data-jev-cell="status"]::before { content: var(--jev-label-status, none); }
+  .jev-table td[data-jev-cell="trend"]::before { content: var(--jev-label-trend, none); }
+
   .jev-head, .jev-head-side {
     flex-direction: column;
     align-items: flex-start;
@@ -41891,8 +41948,8 @@ body.sftp-active #ask-scrim { z-index: var(--sftp-confirm-layer); }
 }
 .computer-use-tcc-judged {
   padding: 0 var(--space-1);
-  border: 1px solid var(--edge-rule);
-  border-radius: 999px;
+  border: var(--rule-width) solid var(--edge-rule);
+  border-radius: var(--radius-pill);
   color: var(--ink-mist);
   font-size: var(--text-3xs);
 }
@@ -41926,7 +41983,7 @@ body.sftp-active #ask-scrim { z-index: var(--sftp-confirm-layer); }
   z-index: var(--computer-permission-recovery-layer);
   width: min(var(--computer-permission-recovery-width), calc(100% - var(--space-6)));
   padding: var(--space-3);
-  border: 1px solid var(--edge-rule);
+  border: var(--rule-width) solid var(--edge-rule);
   border-radius: var(--radius-edge);
   background: var(--surface-raised);
   color: var(--ink-label);

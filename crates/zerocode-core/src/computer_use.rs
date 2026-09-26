@@ -173,7 +173,9 @@ pub struct ComputerPermissionRow {
 #[serde(rename_all = "kebab-case")]
 pub enum ComputerPermissionGrant {
     /// Allowed under a requirement the bundle satisfies as it is signed now —
-    /// or macOS itself answered granted for the process this row judges.
+    /// or macOS itself answered granted for the process this row judges — or
+    /// allowed by a row that records no requirement, which TCC matches by the
+    /// client's identifier alone ([`COMPUTER_PERMISSION_GRANTS`]).
     Granted,
     /// Allowed, but under a requirement the bundle no longer satisfies: an
     /// older build's signature. Only removing the row and adding the app
@@ -232,7 +234,10 @@ pub enum ComputerPermissionRowAction {
 /// it is the one grant that removing the row repairs, and a reset from any
 /// other row would take away a grant that works or change nothing. The
 /// window's words for each grant are the catalog's, one entry per row here
-/// (a source contract holds the two together).
+/// (a source contract holds the two together). A row that records no
+/// requirement (an empty `csreq`) reads granted: TCC matches it by the
+/// client's identifier — bundle id or path — alone, with no signature to
+/// check, so no build ever makes it stale.
 pub const COMPUTER_PERMISSION_GRANTS: [(ComputerPermissionGrant, &[ComputerPermissionRowAction]);
     4] = [
     (ComputerPermissionGrant::Granted, &[]),
@@ -1705,7 +1710,7 @@ pub const WALK_OVERLAP_PARAM: &str = "overlap";
 
 /// The surfaces whose walk judges ahead unasked, by the parameter a walk
 /// names its surface with (t-9712): a page's. Its press answers the moment it
-/// is made, the next judgment is begun on the page the press left, and the
+/// is made, the next judgment is begun on the page the press changed, and the
 /// settle every press by number waits for is waited for behind it — measured on the walk probe (ABBA, n=8 a cell): a press step p50 376 → 293 ms, a three-press walk 1,189 → 922 ms, one more question a walk.
 /// The cost is the judgment begun after the walk's last press, which nothing
 /// asks. A window's and a phone's walk judge ahead only when asked.
