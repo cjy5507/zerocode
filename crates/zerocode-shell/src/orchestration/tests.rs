@@ -12497,6 +12497,57 @@ fn a_pane_the_window_never_heard_is_told_apart_from_one_at_work() {
     crate::agent_teams::forget_term(WORKER);
 }
 
+/// Sends land; the pane holds the measured provider.
+#[derive(Default)]
+struct Pointing {
+    sent: Mutex<Vec<(u32, String)>>,
+}
+
+impl Pointing {
+    /// Every line typed so far, by terminal.
+    fn typed(&self) -> Vec<(u32, String)> {
+        self.sent
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .clone()
+    }
+}
+
+impl Host for Pointing {
+    fn split(
+        &self,
+        _team: &str,
+        _leader_term: u32,
+        _from_term: u32,
+        _pane: &str,
+        _direction: zerocode_core::agent_teams::Direction,
+        _command: &str,
+        _token: &str,
+    ) -> Option<u32> {
+        None
+    }
+    fn send(&self, term: u32, text: &str) -> bool {
+        self.sent
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .push((term, text.to_string()));
+        true
+    }
+    fn capture(&self, _term: u32) -> Option<String> {
+        None
+    }
+    fn focus(&self, _term: u32) -> bool {
+        false
+    }
+    fn close(&self, _term: u32) {}
+    fn actor_for(&self, term: u32) -> Option<String> {
+        Some(test_actor(term))
+    }
+    fn agent_of(&self, _term: u32) -> Option<String> {
+        Some(zerocode_core::AgentKind::Claude.slug().to_string())
+    }
+}
+
 /// A WORKING pane of a measured provider is reached without a keystroke.
 ///
 /// This is the whole of the default-coordination answer. Mail that arrives
@@ -12530,53 +12581,8 @@ fn a_working_claude_pane_is_pointed_at_through_its_own_hook_and_never_its_compos
     let team = format!("team-parked-{LEADER}");
     let (run_id, worker, pane) = a_worker_carrying_work(&team, LEADER, WORKER);
 
-    /// Sends land; the pane holds the measured provider.
-    struct Pointing {
-        sent: Mutex<Vec<(u32, String)>>,
-    }
-    impl Host for Pointing {
-        fn split(
-            &self,
-            _team: &str,
-            _leader_term: u32,
-            _from_term: u32,
-            _pane: &str,
-            _direction: zerocode_core::agent_teams::Direction,
-            _command: &str,
-            _token: &str,
-        ) -> Option<u32> {
-            None
-        }
-        fn send(&self, term: u32, text: &str) -> bool {
-            self.sent
-                .lock()
-                .unwrap_or_else(|held| held.into_inner())
-                .push((term, text.to_string()));
-            true
-        }
-        fn capture(&self, _term: u32) -> Option<String> {
-            None
-        }
-        fn focus(&self, _term: u32) -> bool {
-            false
-        }
-        fn close(&self, _term: u32) {}
-        fn actor_for(&self, term: u32) -> Option<String> {
-            Some(test_actor(term))
-        }
-        fn agent_of(&self, _term: u32) -> Option<String> {
-            Some(zerocode_core::AgentKind::Claude.slug().to_string())
-        }
-    }
-    let host = Pointing {
-        sent: Mutex::new(Vec::new()),
-    };
-    let typed = |host: &Pointing| -> Vec<(u32, String)> {
-        host.sent
-            .lock()
-            .unwrap_or_else(|held| held.into_inner())
-            .clone()
-    };
+    let host = Pointing::default();
+    let typed = Pointing::typed;
     let blackbox = super::BLACKBOX
         .get()
         .expect("the bench window's black box")
@@ -12733,6 +12739,171 @@ fn a_working_claude_pane_is_pointed_at_through_its_own_hook_and_never_its_compos
     crate::agent_teams::forget_term(LEADER);
     crate::agent_teams::forget_term(WORKER);
     crate::orchestration_pointer_mailbox::forget_term(LEADER);
+}
+
+/// The bound past which a turn nothing has spoken for is not a turn, as a
+/// duration on the clock the turn facts are stamped on.
+fn stale_turn() -> std::time::Duration {
+    std::time::Duration::from_millis(zerocode_core::interrupt::STALE_AFTER_MS.unsigned_abs())
+}
+
+/// A coordinator at rest beside its own background work is told about its
+/// mail at its composer (t-11233).
+///
+/// The real window's order: the coordinator's turn starts an `until` shell
+/// in the background and ends; the hook loop holds that `Stop` back so the
+/// card does not ring over a shell still running, and hands the window the
+/// lead's rest instead ([`super::pane_lead_rested`]); a worker's question
+/// lands. Written down as a running turn, the pointer parked this mail for a
+/// turn end that never came — two hours on 2026-09-27, with the worker's
+/// measurement window lost to it. At rest, the next beat types the line and
+/// its Enter, exactly as for a turn that ended with nothing running.
+#[test]
+fn a_lead_at_rest_beside_its_own_background_work_is_pointed_at_through_its_composer() {
+    const LEADER: u32 = 11_233;
+    const WORKER: u32 = 11_234;
+    let _window = the_window();
+    let _turn = one_beat_at_a_time();
+    let _stood = crate::standing_clock::stand_still();
+    let team = format!("team-rested-{LEADER}");
+    let (_run_id, worker, pane) = a_worker_carrying_work(&team, LEADER, WORKER);
+    let host = Pointing::default();
+
+    super::pane_turn_began(LEADER, clock());
+    super::pane_lead_rested(LEADER, clock(), false);
+    let held = crate::agent_teams::current_pane_capability(&team, &pane)
+        .expect("the split minted the worker a capability");
+    let asked = run(
+        &host,
+        Vec::new(),
+        &team,
+        &pane,
+        &held,
+        &words(&format!(
+            "send --type status --body question --retry-request rested-{worker}"
+        )),
+        clock(),
+    );
+    assert_eq!(asked.exit_code, 0, "{}", asked.stderr);
+    super::tick(&host, &[], clock());
+    assert_eq!(
+        host.typed(),
+        vec![
+            (LEADER, zerocode_core::orchestration::pointer_text(1)),
+            (LEADER, "\r".to_string())
+        ],
+        "a lead at its prompt beside a running shell was not told about its mail"
+    );
+
+    super::pane_turn_began(LEADER, clock());
+    crate::agent_teams::forget_term(LEADER);
+    crate::agent_teams::forget_term(WORKER);
+    crate::orchestration_pointer_mailbox::forget_term(LEADER);
+}
+
+/// A turn whose ending never reached the window stops holding its mail once
+/// it has said nothing for the stale bound (t-11233).
+///
+/// The hook script gives a turn end a second and a half to reach the window
+/// and says nothing when a loaded machine does not answer in time. The pane
+/// then reads as running forever, and a pointer parked for its turn end waits
+/// for a knock that already came. A turn at work speaks at every tool it
+/// reaches for, so one silent for half an hour is read at rest: the parked
+/// pointer is taken back, and the composer road speaks.
+#[test]
+fn a_turn_silent_past_the_stale_bound_hands_its_parked_pointer_to_the_composer() {
+    const LEADER: u32 = 11_235;
+    const WORKER: u32 = 11_236;
+    let _window = the_window();
+    let _turn = one_beat_at_a_time();
+    let _stood = crate::standing_clock::stand_still();
+    let team = format!("team-silent-{LEADER}");
+    let (run_id, worker, pane) = a_worker_carrying_work(&team, LEADER, WORKER);
+    let host = Pointing::default();
+
+    super::pane_turn_began(LEADER, clock());
+    let held = crate::agent_teams::current_pane_capability(&team, &pane)
+        .expect("the split minted the worker a capability");
+    let asked = run(
+        &host,
+        Vec::new(),
+        &team,
+        &pane,
+        &held,
+        &words(&format!(
+            "send --type status --body question --retry-request silent-{worker}"
+        )),
+        clock(),
+    );
+    assert_eq!(asked.exit_code, 0, "{}", asked.stderr);
+    super::tick(&host, &[], clock());
+    assert_eq!(
+        host.typed(),
+        Vec::new(),
+        "a turn that is still speaking was typed at"
+    );
+
+    // Nothing more is heard from the pane, and its turn end is lost.
+    let long_ago = crate::standing_clock::now()
+        .checked_sub(stale_turn() * 2)
+        .expect("the machine has been up past the stale bound twice");
+    super::pane_turns()
+        .lock()
+        .unwrap_or_else(|held| held.into_inner())
+        .insert(LEADER, super::PaneTurn::Running { heard: long_ago });
+    crate::orchestration_pointer_mailbox::age_parked(LEADER, stale_turn());
+    super::tick(&host, &[], clock());
+    assert_eq!(
+        host.typed(),
+        vec![
+            (LEADER, zerocode_core::orchestration::pointer_text(1)),
+            (LEADER, "\r".to_string())
+        ],
+        "mail parked for a turn end that never came waited on"
+    );
+    let blackbox = super::BLACKBOX
+        .get()
+        .expect("the bench window's black box")
+        .join("window-errors.log");
+    let taken_back = std::fs::read_to_string(&blackbox)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            line.contains(&format!(
+                "terminal {LEADER}'s turn-end hook never collected the pointer for \
+                 run:{run_id} in {run_id}"
+            ))
+        })
+        .count();
+    assert_eq!(taken_back, 1, "the black box was not told the road changed");
+
+    super::pane_turn_began(LEADER, clock());
+    crate::agent_teams::forget_term(LEADER);
+    crate::agent_teams::forget_term(WORKER);
+    crate::orchestration_pointer_mailbox::forget_term(LEADER);
+}
+
+/// The stale bound decays a running turn and nothing else: a turn heard
+/// inside it stays running, and an end — at rest or under a person's hand —
+/// is read as it was measured.
+#[test]
+fn only_a_running_turn_silent_past_the_stale_bound_reads_at_rest() {
+    let _stood = crate::standing_clock::stand_still();
+    let now = crate::standing_clock::now();
+    let inside = now.checked_sub(stale_turn()).expect("an uptime");
+    let past = now.checked_sub(stale_turn() * 2).expect("an uptime");
+    assert!(matches!(
+        super::PaneTurn::Running { heard: inside }.as_read(),
+        super::PaneTurn::Running { .. }
+    ));
+    assert!(matches!(
+        super::PaneTurn::Running { heard: past }.as_read(),
+        super::PaneTurn::Ended { interrupted: false }
+    ));
+    assert!(matches!(
+        super::PaneTurn::Ended { interrupted: true }.as_read(),
+        super::PaneTurn::Ended { interrupted: true }
+    ));
 }
 
 /// A coordinator's pane as a CLI at its wall keeps it (t-6560): every line
@@ -19011,6 +19182,146 @@ fn relation_rows_keep_a_closed_attempts_identity_while_its_worker_is_still_summo
         "an ended attempt must keep naming its task and dispatch: without them the \
          board cannot group the finished worker under its task, nor tell a previous \
          attempt from the current one"
+    );
+}
+
+/* ---- t-10993: 끝난 작업은 끝났다고 보인다 ----------------------------------
+ *
+ * 2026-09-27 14:0x 설치본 1.1.33: 워커 둘이 `worker_done`(ok)을 보냈고, 창은 그
+ * 판을 곧바로 은퇴시켰고, 원장은 워커를 `released`로 적었다. `ledger_agents`는
+ * released 행을 빼므로 사이드바는 과업 제목·「검증 대기」 대신 브랜치 이름과 붙여
+ * 넣은 프롬프트의 틀을 그렸고, 작업 상황판에서는 카드가 칸을 옮기는 대신 사라졌다.
+ * 그 작업은 아직 체크아웃에 서 있고, 코디의 검토를 기다린다. */
+
+/// A worker the ledger released after it FINISHED is still listed while its
+/// work stands in a checkout nobody else holds, in a run still in play — with
+/// its task, its report, whether the report was a failure, what the
+/// coordinator wrote, and the conversation it ran in. It has no seat (its
+/// pane is gone), and says so: `settled`, so the roster of summoned workers
+/// can leave it out.
+#[test]
+fn a_finished_worker_is_listed_while_its_checkout_stands() {
+    use zerocode_core::orchestration::{Ledger, MessageKind, WorkerState, worker_address};
+    let standing = tempfile::tempdir().expect("the finished worker's checkout");
+    let standing = standing.path().to_string_lossy().into_owned();
+    let failing = tempfile::tempdir().expect("the failed worker's checkout");
+    let failing = failing.path().to_string_lossy().into_owned();
+    let reclaimed = format!("{standing}-reclaimed");
+    let history = tempfile::tempdir().expect("a finished run's checkout");
+    let history = history.path().to_string_lossy().into_owned();
+
+    let mut ledger = Ledger::new();
+    let finish = |ledger: &mut Ledger, run: &str, pane: &str, checkout: &str, ok: bool, at: i64| {
+        let task = ledger
+            .create_task(run, "do".into(), format!("task {pane}"), vec![], None, at)
+            .unwrap();
+        let worker = ledger
+            .start_worker(run, "claude", ("team", pane), Some(&task), at + 1)
+            .unwrap()
+            .worker;
+        assert!(ledger.worker_seated(("team", pane), checkout));
+        assert!(ledger.worker_session_reported(
+            ("team", pane),
+            zerocode_core::ProviderSession {
+                key: zerocode_core::provider_session::SessionKey::SessionId,
+                id: format!("s{pane}"),
+                transcript_path: None,
+            },
+        ));
+        let dispatch = ledger
+            .run(run)
+            .unwrap()
+            .worker(&worker)
+            .unwrap()
+            .dispatch
+            .clone();
+        ledger
+            .send(
+                run,
+                zerocode_core::orchestration::Message {
+                    dispatch,
+                    task: Some(task.clone()),
+                    ..relation_test_message(
+                        &worker_address(&worker),
+                        &format!("run:{run}"),
+                        MessageKind::WorkerDone,
+                        &format!("{{\"ok\":{ok}}}"),
+                        at + 2,
+                    )
+                },
+            )
+            .unwrap();
+        ledger.begin_release(&worker).unwrap();
+        assert_eq!(ledger.finish_release(&worker, None), WorkerState::Released);
+        (task, worker)
+    };
+
+    let run = ledger.create_run("finished work", 1);
+    // Somebody still works for this run: it is in play.
+    let carrying = ledger
+        .create_task(&run, "do".into(), "still going".into(), vec![], None, 2)
+        .unwrap();
+    ledger
+        .start_worker(&run, "codex", ("team", "%9"), Some(&carrying), 3)
+        .unwrap();
+    let (done, done_worker) = finish(&mut ledger, &run, "%2", &standing, true, 10);
+    let (failed, _) = finish(&mut ledger, &run, "%3", &failing, false, 20);
+    let (gone, _) = finish(&mut ledger, &run, "%4", &reclaimed, true, 30);
+    // A run with nobody at it is history, as the desk reads it.
+    let old = ledger.create_run("history", 40);
+    let (past, _) = finish(&mut ledger, &old, "%5", &history, true, 41);
+
+    let seats = super::TeamSeatIndex::new();
+    let rows = super::ledger_agents_for_seats(&ledger, &seats);
+    let row = |task: &str| rows.iter().find(|row| row.task_id == task);
+    let finished = row(&done).expect("the finished worker is listed while its checkout stands");
+    assert_eq!(
+        (
+            finished.worker.as_str(),
+            finished.task.as_str(),
+            finished.reported,
+            finished.failed,
+            finished.settled,
+            finished.term,
+            finished.ledger.as_str(),
+            finished.session.as_deref(),
+            finished.at,
+        ),
+        (
+            done_worker.as_str(),
+            "task %2",
+            true,
+            false,
+            true,
+            None,
+            "released",
+            Some("s%2"),
+            12
+        ),
+        "{finished:?}"
+    );
+    let failure = row(&failed).expect("a failed report is listed too, as a failure");
+    assert!(
+        failure.reported && failure.failed && failure.settled,
+        "{failure:?}"
+    );
+    assert!(
+        row(&gone).is_none(),
+        "a checkout that is gone holds no work to show"
+    );
+    assert!(row(&past).is_none(), "a run nobody is at is history");
+    let live = row(&carrying).expect("the summoned worker");
+    assert!(!live.settled && !live.failed, "{live:?}");
+
+    // A newer summons in the same checkout speaks for it.
+    ledger
+        .start_worker(&run, "codex", ("team", "%6"), None, 50)
+        .unwrap();
+    assert!(ledger.worker_seated(("team", "%6"), &standing));
+    let rows = super::ledger_agents_for_seats(&ledger, &seats);
+    assert!(
+        !rows.iter().any(|row| row.task_id == done),
+        "a checkout somebody was summoned into again is theirs"
     );
 }
 

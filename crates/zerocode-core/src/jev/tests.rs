@@ -5,9 +5,9 @@ use serde_json::json;
 use super::*;
 
 #[test]
-fn summon_difficulty_learns_the_pin_against_always_high() {
+fn summon_difficulty_grades_executed_outcomes() {
     let seat = jev_use("summon_difficulty").expect("a distinct difficulty seat");
-    assert_eq!(seat.agreement_kind, AgreementKind::Comparison);
+    assert_eq!(seat.agreement_kind, AgreementKind::Hindsight);
     assert_eq!(seat.baseline, Baseline::AlwaysSame("high"));
     assert_eq!(seat.request_name, &["dispatch"]);
     assert_eq!(seat.apply_deadline_ms, Some(2_000));
@@ -192,8 +192,9 @@ fn every_use_is_off_until_a_person_says_otherwise() {
 /// use offers it, and the agent's own tool, which has nothing to rise on,
 /// answers the agent.
 ///
-/// `shadow` for the one seat that only ever records — the vault pair review,
-/// whose proposals a person reads at the weekly review and which never rises.
+/// `shadow` for the seats that only ever record — the vault pair review,
+/// whose proposals a person reads at the weekly review and which never rises,
+/// and the mail triage, whose answers nothing carries out yet.
 /// `off` only for a seat stopped on its own evidence until it is redesigned
 /// (docs/design/jev-engineering-review-20260923.md §7, t-6342): the patch
 /// review and the window's worker effort. Anywhere else a switch turned on
@@ -201,7 +202,7 @@ fn every_use_is_off_until_a_person_says_otherwise() {
 #[test]
 fn every_use_recommends_one_of_its_own_modes_and_off_only_where_stopped() {
     let stopped = [PATCH_REVIEW.id, STEP_EFFORT.id];
-    let recording = [VAULT_PAIRS.id];
+    let recording = [VAULT_PAIRS.id, MAIL_TRIAGE.id];
     for row in &JEV_USES {
         assert!(
             row.modes.contains(&row.recommended),
@@ -621,6 +622,7 @@ fn every_seat_waits_for_a_window_of_marks_whatever_kind_they_are() {
         vec![
             RECALL.id,
             PLACEMENT.id,
+            SUMMON_DIFFICULTY.id,
             COMPACTION.id,
             PATCH_REVIEW.id,
             CLAIM.id,
@@ -634,7 +636,11 @@ fn every_seat_waits_for_a_window_of_marks_whatever_kind_they_are() {
     for row in JEV_USES.iter().filter(|row| row.promotes) {
         assert_eq!(
             row.agreement_rows_wanted,
-            Some(A_WINDOW_OF_COMPARISONS),
+            Some(if row.id == SUMMON_DIFFICULTY.id {
+                crate::summon_difficulty::outcomes::MIN_EXECUTIONS
+            } else {
+                A_WINDOW_OF_COMPARISONS
+            }),
             "{}",
             row.id
         );
@@ -703,10 +709,18 @@ fn a_use_that_promotes_has_somewhere_to_rise_from_and_to() {
 /// every row, so a new seat cannot pick a third set: the notify and
 /// branching seats had (t-6155 F7), and so had the reflex decision until the
 /// autopilot carried its answers out (t-10223).
+///
+/// A named exception, for the same reason turned the other way: a seat whose
+/// answer nothing in the product carries out yet — the mail triage, whose
+/// desk order is a later version's (t-9471) — offers `off | shadow`, because
+/// an `on` it cannot carry out would be `shadow` under a name that promises
+/// otherwise.
 #[test]
 fn a_seats_mode_set_is_read_off_whether_anything_labels_it() {
     let labeled: &[JevMode] = &JevMode::ALL;
     let unlabeled: &[JevMode] = &[JevMode::Off, JevMode::Shadow, JevMode::On];
+    let recorded: &[JevMode] = &[JevMode::Off, JevMode::Shadow];
+    let nothing_applies = [MAIL_TRIAGE.id];
     for row in JEV_USES.iter() {
         assert_eq!(
             row.promotes,
@@ -714,7 +728,13 @@ fn a_seats_mode_set_is_read_off_whether_anything_labels_it() {
             "{}: a labeled seat names its label sample floor",
             row.id
         );
-        let expected = if row.promotes { labeled } else { unlabeled };
+        let expected = if row.promotes {
+            labeled
+        } else if nothing_applies.contains(&row.id) {
+            recorded
+        } else {
+            unlabeled
+        };
         assert_eq!(row.modes, expected, "{}", row.id);
     }
     assert!(
@@ -1633,7 +1653,7 @@ fn the_agent_tool_seat_names_the_wires_bounds_and_never_rises() {
     );
     assert_eq!(AGENT_TOOL_DEADLINE_MS, SKILL_SEARCH_APPLY_DEADLINE_MS);
     assert_eq!(AGENT_TOOL_ASK_OPTIONS, ["yes", "no"]);
-    assert_eq!(JEV_USES.len(), 28);
+    assert_eq!(JEV_USES.len(), 29);
 }
 
 /// The branching seat (t-6044) forks one phone step — the emulator seat's
@@ -1935,7 +1955,7 @@ fn the_file_pick_seat_rises_only_by_the_judge_and_compares_with_recent_edits() {
     assert_eq!(FILE_PICK.sends[2].cap, Cap::Uncut);
     assert_eq!(FILE_PICK.sends[3].at, "/state/files/*/about");
     assert_eq!(FILE_PICK.sends[3].cap, Cap::Bytes(200));
-    assert_eq!(JEV_USES.len(), 28);
+    assert_eq!(JEV_USES.len(), 29);
     assert_eq!(JEV_USES.get(JEV_USES.len() - 4), Some(&FILE_PICK));
 }
 
@@ -2335,6 +2355,79 @@ fn reflex_decide_sends_no_pixels_text_or_app_names() {
     );
 }
 
+/// The mail triage (t-9471): every letter a coordinator is handed, put to one
+/// closed choice and one Noul beside it, recorded and never acted on —
+/// `shadow` is the most it offers, it never rises, names no floor, wall or
+/// band, and its wire waits its own five seconds. It stands right before the
+/// challenger, so every seat the table pins by its distance from the end
+/// stands where it stood; it stamps the task a letter concerns, so a task's
+/// cost counts its requests; and every text its state carries is declared,
+/// each a word or an id the product wrote — never a letter's words.
+#[test]
+fn the_mail_triage_records_every_letter_and_never_rises() {
+    use crate::mail_triage::{MAIL_TRIAGE_RUBRIC_VERSION, STATE_KEYS};
+    use crate::orchestration::task_cost::TASK_STAMPED;
+
+    assert_eq!(jev_use("mail_triage"), Some(&MAIL_TRIAGE));
+    assert_eq!(MAIL_TRIAGE.setting, "jevMailTriage");
+    assert_eq!(MAIL_TRIAGE.ledger, "mail-triage.jsonl");
+    assert_eq!(MAIL_TRIAGE.modes, &[JevMode::Off, JevMode::Shadow]);
+    assert_eq!(MAIL_TRIAGE.recommended, JevMode::Shadow);
+    assert_eq!(MAIL_TRIAGE.repeat, None);
+    const { assert!(!MAIL_TRIAGE.promotes) };
+    assert!(
+        MAIL_TRIAGE
+            .modes
+            .iter()
+            .all(|mode| !mode.applies_with(true)),
+        "no mode it offers acts"
+    );
+    assert_eq!(MAIL_TRIAGE.apply_deadline_ms, None);
+    assert_eq!(MAIL_TRIAGE.confidence_bands, None);
+    assert_eq!(MAIL_TRIAGE.baseline, Baseline::None);
+    const { assert!(!MAIL_TRIAGE.reads_act_line) };
+    assert_eq!(MAIL_TRIAGE.rubric_version, MAIL_TRIAGE_RUBRIC_VERSION);
+    assert_eq!(MAIL_TRIAGE.request_name, &["mail"]);
+    assert_eq!(MAIL_TRIAGE.names, Naming::Request);
+    assert_eq!(MAIL_TRIAGE_DEADLINE_MS, 5_000);
+    let at = JEV_USES
+        .iter()
+        .position(|row| row.id == MAIL_TRIAGE.id)
+        .expect("the table names it");
+    assert_eq!(JEV_USES[at - 1], JUDGMENT_CACHE);
+    assert_eq!(JEV_USES[at + 1], CHALLENGER);
+
+    let pointers: Vec<&str> = MAIL_TRIAGE.sends.iter().map(|sent| sent.at).collect();
+    assert_eq!(
+        pointers,
+        [
+            "/state/kind",
+            "/state/from",
+            "/state/worker",
+            "/state/task",
+            "/state/taskStatus",
+            "/state/priority",
+        ]
+    );
+    for sent in MAIL_TRIAGE.sends {
+        assert_eq!(sent.cap, Cap::Uncut, "{}", sent.at);
+        let key = sent.at.trim_start_matches("/state/");
+        assert!(
+            STATE_KEYS.contains(&key),
+            "{key} is not a key the state carries"
+        );
+        for word in [
+            "body", "subject", "payload", "words", "text", "title", "summary",
+        ] {
+            assert!(!sent.at.contains(word), "{} names {word}", sent.at);
+        }
+    }
+    assert!(
+        TASK_STAMPED.iter().any(|seat| seat.id == MAIL_TRIAGE.id),
+        "a task's cost counts the letters it was triaged in"
+    );
+}
+
 /// A request's receipt is the whole SHA-256 of the seat, the rubric version,
 /// the model asked for and the cleared bytes — each part framed by its
 /// length, so no two different requests share one digest by sliding bytes
@@ -2411,7 +2504,16 @@ fn every_promoting_row_names_a_baseline_and_an_abstain_band() {
             );
         }
         if let Some(wanted) = row.negatives_wanted {
-            assert_eq!(wanted, NEGATIVES_WANTED, "{}", row.id);
+            assert_eq!(
+                wanted,
+                if row.id == SUMMON_DIFFICULTY.id {
+                    crate::summon_difficulty::outcomes::MIN_NEGATIVES
+                } else {
+                    NEGATIVES_WANTED
+                },
+                "{}",
+                row.id
+            );
         }
         if !compared {
             assert_eq!(row.baseline, Baseline::None, "{}", row.id);
@@ -2984,6 +3086,28 @@ fn asked_here(row: &JevUse) -> Option<Vec<Value>> {
                 .questions,
             ]
         }
+        id if id == MAIL_TRIAGE.id => {
+            use crate::mail_triage::{MailLook, ask};
+            use crate::orchestration::MessageKind;
+            vec![
+                ask(&MailLook {
+                    kind: MessageKind::Question,
+                    from: "worker",
+                    worker: Some("w-7"),
+                    task: Some("t-3"),
+                    task_status: Some("dispatched"),
+                    priority: "normal",
+                    awaits_answer: true,
+                    thread_depth: 0,
+                    age_ms: 42_500,
+                    delivered: false,
+                    repeats: 0,
+                    coordinator_busy: None,
+                    open_questions: 1,
+                })
+                .questions,
+            ]
+        }
         id if id == CHALLENGER.id => vec![
             challenger::ask(
                 "dp-1",
@@ -3002,12 +3126,12 @@ fn asked_here(row: &JevUse) -> Option<Vec<Value>> {
 }
 
 /// Where every seat of the table is asked, and what it offers: the audit's
-/// second column over all twenty-seven rows (t-9469). A seat this crate
-/// builds is asked here, from a fixture, in every shape it asks in, and no
-/// option, level or outcome of it may go without the words that say what it
-/// means; a seat zo builds from words this crate spells is read where they
-/// are spelled; a seat zo builds from words of its own is zo's tests' to
-/// hold. A row added to the table and placed nowhere is red here.
+/// second column over every row (t-9469). A seat this crate builds is asked
+/// here, from a fixture, in every shape it asks in, and no option, level or
+/// outcome of it may go without the words that say what it means; a seat zo
+/// builds from words this crate spells is read where they are spelled; a seat
+/// zo builds from words of its own is zo's tests' to hold. A row added to the
+/// table and placed nowhere is red here.
 #[test]
 fn every_seat_offers_no_option_without_the_words_that_say_what_it_means() {
     use crate::jev::questions::{self as words, Contrast};

@@ -678,9 +678,40 @@ impl PlainSession {
     /// that race frontend startup wait in the unbounded channel rather than
     /// falling through a channel-less host.
     pub(crate) fn start_agent_completion_pump(&mut self) -> Option<AgentCompletionPump> {
-        self.agent_completion_receiver
+        let mut pump = self
+            .agent_completion_receiver
             .take()
-            .map(|receiver| AgentCompletionPump::spawn(receiver, self.handle.id.clone()))
+            .map(|receiver| AgentCompletionPump::spawn(receiver, self.handle.id.clone()));
+        if let Some(pump) = pump.as_mut() {
+            // A background helper that falls silent is told to the main
+            // conversation once, the way its result would be (t-11354).
+            pump.watch_stalls(Arc::clone(&self.registry));
+        }
+        pump
+    }
+
+    /// How much of this session's background work is still out — its
+    /// running background agents and background shell tasks — for the
+    /// turn-end gate ([`runtime::BackgroundWorkProbe`]). `None` unless a pump
+    /// brings their results back as messages — an interactive session whose
+    /// front end took the completion receiver into one: without it, a turn
+    /// that ended on "when they land" would wait for something that never
+    /// lands.
+    fn background_work_probe(&self) -> Option<runtime::BackgroundWorkProbe> {
+        let completions_come_back = !self.headless && self.agent_completion_receiver.is_none();
+        if !completions_come_back {
+            return None;
+        }
+        let registry = Arc::clone(&self.registry);
+        let session_id = self.handle.id.clone();
+        let processes = self.tasks.live_background_process_count(Some(&session_id));
+        Some(Arc::new(move || {
+            let agents = super::subagent_progress::snapshot_for_session(&registry, &session_id)
+                .iter()
+                .filter(|agent| tools::is_background_agent(&agent.agent_id))
+                .count();
+            agents + processes.load()
+        }))
     }
 
     /// Current runtime's mid-turn completion inbox. Model/permission rebuilds
@@ -801,8 +832,8 @@ impl PlainSession {
         let model = self.model.clone();
         let result = match self.runtime.runtime.as_mut() {
             Some(rt) => {
-                let completed = {
-                    let turn = drive_render_stream(
+                let completed = until_aborted(
+                    Box::pin(drive_render_stream(
                         rt,
                         live_client,
                         input,
@@ -810,18 +841,10 @@ impl PlainSession {
                         &model,
                         block_tx,
                         prompter,
-                    );
-                    tokio::pin!(turn);
-                    tokio::select! {
-                        biased;
-                        result = &mut turn => Some(result),
-                        () = async {
-                            while !hook_abort_signal.is_aborted() {
-                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                            }
-                        } => None,
-                    }
-                };
+                    )),
+                    &hook_abort_signal,
+                )
+                .await;
                 if user_cancel_requested.load(Ordering::SeqCst) {
                     Err(rt
                         .cancel_streaming_turn_by_user("turn cancelled by user")
@@ -857,6 +880,7 @@ impl PlainSession {
     /// it. Its own method so the turn's body stays readable (clippy's line
     /// budget), not because any of it is reused.
     fn arm_turn_limits(&mut self) {
+    let background_work = self.background_work_probe();
     if let Some(inner) = self.runtime.try_runtime_mut() {
         // Who stops this turn if it does not stop itself. A person at the
         // keyboard has Esc — the one breaker Claude Code and Codex run
@@ -911,6 +935,12 @@ impl PlainSession {
         // 런타임은 모델·권한 전환에 다시 세워지고, 그때 심어둔 사본은
         // 함께 사라진다.
         inner.set_tool_cancel_signal(self.tool_cancel.clone());
+        // What of this session is still out in the background, read by the
+        // turn-end gate at a natural end: a person's turn whose remaining
+        // work is only those results may end, and the results come back as
+        // their own messages (t-11354). Re-armed every turn for the reason
+        // above; a host with no pump installs none, and the gate is as it was.
+        inner.set_background_work_probe(background_work);
     }    }
 
     /// Write the routing and recall seats' `agreed` marks for the turn that
@@ -1487,19 +1517,63 @@ impl PlainSession {
         Ok(())
     }
 
-    /// `/compact [focus]` — 라이브 런타임에 제자리 적용. `(removed, kept)`.
-    pub fn compact(
+    /// `/compact [focus]` — the one compaction both front-ends run (t-10956).
+    ///
+    /// The summary round-trip goes through the live async client a turn uses,
+    /// so it never holds the loop that paints and reads keys: its progress
+    /// rides `block_tx`, and `abort` (Esc, the IDE's Stop, an interrupt) stops
+    /// it. Nothing is swapped until the summary is in, so a stop leaves the
+    /// conversation — and the transcript on disk — exactly as it was. When
+    /// the summary round-trip fails, the deterministic local summary stands
+    /// in and the report says why.
+    pub(crate) async fn compact(
         &mut self,
         focus: Option<&str>,
-    ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
-        let result = self
-            .runtime
-            .compact(runtime::CompactionConfig::default(), focus);
-        let removed = result.removed_message_count;
-        let kept = result.compacted_session.messages.len();
-        self.runtime.apply_manual_compaction(result);
-        self.persist()?;
-        Ok((removed, kept))
+        block_tx: tokio::sync::mpsc::Sender<RenderBlock>,
+        abort: HookAbortSignal,
+    ) -> Result<CompactReport, String> {
+        // The client a turn would build now, on a fresh login if the stored
+        // one is about to lapse — the summary is a request like any other.
+        self.refresh_credentials_for_turn(&block_tx).await;
+        let live_client = TurnHarness::build_live_client(
+            &self.runtime,
+            self.allowed_tools.clone(),
+            thinking_config_for(self.effort),
+            self.effort.and_then(Effort::level),
+            self.effort.and_then(Effort::band_ceiling),
+        );
+        let report = {
+            let Some(rt) = self.runtime.runtime.as_mut() else {
+                return Err("runtime not available".to_string());
+            };
+            rt.set_async_api_client(live_client);
+            let ids = runtime::message_stream::BlockIdGen::default();
+            let tokens_before = rt.estimated_tokens();
+            let compaction = rt.compact_streaming(
+                runtime::CompactionConfig::default(),
+                &block_tx,
+                &ids,
+                focus,
+            );
+            let Some(done) = until_aborted(compaction, &abort).await else {
+                return Ok(CompactReport::Cancelled);
+            };
+            let removed = done.result.removed_message_count;
+            let kept = done.result.compacted_session.messages.len();
+            rt.apply_manual_compaction(done.result);
+            if removed == 0 {
+                return Ok(CompactReport::NothingToCompact { kept });
+            }
+            CompactReport::Compacted {
+                removed,
+                kept,
+                tokens_before,
+                tokens_after: rt.estimated_tokens(),
+                local_summary: done.local_summary_reason,
+            }
+        };
+        self.persist().map_err(|error| error.to_string())?;
+        Ok(report)
     }
 
     #[must_use]
@@ -1751,6 +1825,90 @@ impl PlainSession {
             drop(old_shell);
         }
         Ok(())
+    }
+}
+
+/// How often a stop is looked for while a turn or a `/compact` is in flight.
+/// The stop is a flag with no waker ([`HookAbortSignal`]), so it is polled.
+const ABORT_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Run `work` until it finishes or `abort` is raised — `None` when the stop
+/// came first, `work` dropped where it stood. A turn and a `/compact` stop
+/// the same way through here (t-10956).
+async fn until_aborted<F: std::future::Future>(work: F, abort: &HookAbortSignal) -> Option<F::Output> {
+    tokio::pin!(work);
+    tokio::select! {
+        biased;
+        done = &mut work => Some(done),
+        () = async {
+            while !abort.is_aborted() {
+                tokio::time::sleep(ABORT_POLL).await;
+            }
+        } => None,
+    }
+}
+
+/// What a `/compact` came to — the one sentence both front-ends show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CompactReport {
+    /// The conversation was folded: `removed` messages into a summary,
+    /// `kept` left, and the estimate before and after. `local_summary` says
+    /// why the model's summary did not come, when the local one stands in.
+    Compacted {
+        removed: usize,
+        kept: usize,
+        tokens_before: usize,
+        tokens_after: usize,
+        local_summary: Option<String>,
+    },
+    /// Too short to fold; `kept` messages stand.
+    NothingToCompact { kept: usize },
+    /// Stopped before the summary was in; nothing changed.
+    Cancelled,
+}
+
+impl CompactReport {
+    /// The line the person reads.
+    #[must_use]
+    pub(crate) fn note(&self) -> String {
+        match self {
+            Self::Compacted {
+                removed,
+                kept,
+                tokens_before,
+                tokens_after,
+                local_summary,
+            } => {
+                let folded = format!(
+                    "compact: {removed} removed · {kept} kept · {} → {} tokens",
+                    runtime::format_kilo_tokens(*tokens_before),
+                    runtime::format_kilo_tokens(*tokens_after),
+                );
+                match local_summary {
+                    Some(reason) => format!(
+                        "{folded} — the model's summary did not come ({reason}); the local \
+                         summary stands in"
+                    ),
+                    None => folded,
+                }
+            }
+            Self::NothingToCompact { kept } => {
+                format!("compact: nothing to compact ({kept} messages)")
+            }
+            Self::Cancelled => "compact cancelled — the conversation is unchanged".to_string(),
+        }
+    }
+
+    /// How loud the line is: a summary that did not come is worth a look.
+    #[must_use]
+    pub(crate) fn level(&self) -> runtime::message_stream::SystemLevel {
+        match self {
+            Self::Compacted {
+                local_summary: Some(_),
+                ..
+            } => runtime::message_stream::SystemLevel::Warn,
+            _ => runtime::message_stream::SystemLevel::Info,
+        }
     }
 }
 

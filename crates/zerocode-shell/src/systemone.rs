@@ -160,7 +160,8 @@ pub fn record_rows(seat: &JevUse, ledger: &Path, rows: &[Value], now_ms: i64) {
     if !seat.promotes {
         return;
     }
-    let held = read_rows(ledger);
+    let mut held = read_rows(ledger);
+    seat.marked_now(&mut held);
     let version = zerocode_core::jev::promote::on_the_newest_version(seat, &held);
     if !zerocode_core::jev::promote::judgment_due_on(seat, &version, &held) {
         return;
@@ -273,8 +274,9 @@ pub fn append_rows(ledger: &Path, rows: &[Value]) {
     }
 }
 
-/// The origin to ask, honouring the test override.
-fn base_url() -> String {
+/// The origin to ask, honouring the test override — also the pane guard's
+/// measurement's (`pane_guard::replay`).
+pub(crate) fn base_url() -> String {
     std::env::var(SYSTEMONE_BASE_URL_ENV)
         .ok()
         .map(|given| given.trim().to_string())

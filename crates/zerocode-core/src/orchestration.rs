@@ -1404,7 +1404,7 @@ impl Message {
     /// say so: a question wears whatever `--to` it was given, and a row in
     /// the ledger's voice, or of a kind only the ledger writes, is an
     /// observation about the receiver, not a word from it.
-    fn answers(&self, question: &Message) -> bool {
+    pub(crate) fn answers(&self, question: &Message) -> bool {
         self.thread.as_deref() == Some(question.id.as_str())
             && self.from == question.to
             && self.from != LEDGER_ITSELF
@@ -1440,7 +1440,7 @@ pub const MAX_THREAD_HOPS: usize = 16;
 /// rather than sixteen walks of the whole vector. The index holds only the
 /// messages that carry a thread, which in an ordinary run is a small part of
 /// the mail.
-fn thread_hops(run: &Run, from: &str) -> usize {
+pub(crate) fn thread_hops(run: &Run, from: &str) -> usize {
     let parents: std::collections::HashMap<&str, &str> = run
         .messages()
         .iter()
@@ -5488,6 +5488,19 @@ struct Served {
     expired: bool,
 }
 
+/// One receipt as [`Ledger::receipt_views`] hands it to the rest of this
+/// crate.
+#[derive(Clone, Copy)]
+pub(crate) struct ReceiptView<'a> {
+    pub(crate) caller: Option<&'a str>,
+    pub(crate) verb: Option<&'a str>,
+    pub(crate) filed_ms: Option<i64>,
+    /// What the verb printed, while the ledger keeps it; `None` for a `check`.
+    pub(crate) printed: Option<&'a str>,
+    /// What a `check` answered about.
+    pub(crate) check: Option<&'a CheckV1>,
+}
+
 impl Served {
     /// Give up the answer and keep the key.
     ///
@@ -7355,6 +7368,28 @@ impl Ledger {
         let oldest_kept = newest.saturating_sub(VERB_TALLY_DAYS.saturating_mul(DAY_MS));
         self.verb_tallies
             .retain(|row| row.day_start_ms > oldest_kept);
+    }
+
+    /// Every receipt, as the rest of this crate may read it (t-9471,
+    /// `crate::mail_triage::Filed::of_ledger`): who filed it, which verb,
+    /// when, and what it answered with — the printed answer while the ledger
+    /// keeps it, or the question a `check` answered. Never the retry name or
+    /// the fingerprint, and nothing outside this crate: a receipt's answer is
+    /// prose as often as ids.
+    pub(crate) fn receipt_views(&self) -> impl Iterator<Item = ReceiptView<'_>> {
+        self.served.iter().map(|held| {
+            let (printed, check) = match &held.answer {
+                ServedAnswer::Inline(text) => (Some(text.as_str()), None),
+                ServedAnswer::Check(about) => (None, Some(about)),
+            };
+            ReceiptView {
+                caller: held.caller.as_deref(),
+                verb: held.verb.as_deref(),
+                filed_ms: held.filed_ms,
+                printed,
+                check,
+            }
+        })
     }
 
     /// The verb tallies as they stand, in the order they were opened.
@@ -13523,13 +13558,23 @@ pub trait Launcher {
     }
 
     /// An acting difficulty request's receipt, or no request while recording.
-    /// This hook is called only when effort was omitted and a model exists.
+    /// Fresh summonses can fill either omitted dial; sealed handovers decline.
     fn choose_difficulty(
         &self,
         _look: &crate::summon_difficulty::Look,
         _origin: [&str; 3],
     ) -> Option<serde_json::Value> {
         None
+    }
+
+    /// The person's difficulty table, captured by the host for this launch.
+    fn difficulty_profile(
+        &self,
+        _agent: &str,
+        _difficulty: &str,
+        _origin: [&str; 3],
+    ) -> Result<Option<crate::summon_difficulty::Profile>, String> {
+        Ok(None)
     }
 
     /// What this machine actually has, one row per agent the catalog knows.
@@ -17644,6 +17689,19 @@ fn question_closed(run: &Run, question: &Message) -> bool {
         .is_some_and(|held| held.ended_ms.is_some())
 }
 
+/// The key a look that hands nothing over names its kind under, in the page
+/// it prints — a peek ([`PEEK_MODE`]) or a history ([`HISTORY_MODE`]). Named
+/// once because a reader leans on it: a receipt an older window filed with
+/// no verb says it was the inbox's only by this page (t-9471,
+/// `crate::mail_triage::Filed::reads_the_inbox`).
+pub const LOOK_MODE_KEY: &str = "mode";
+
+/// The page `check --peek` prints ([`LOOK_MODE_KEY`]).
+pub const PEEK_MODE: &str = "peek";
+
+/// The page `check --all` prints ([`LOOK_MODE_KEY`]).
+pub const HISTORY_MODE: &str = "all";
+
 /// The non-consuming look behind `check --peek`: what is pending, capped at
 /// a page, and left exactly where it is. Waking on it is fine — the same
 /// mail will be in the next delivery.
@@ -17663,7 +17721,7 @@ fn peek_look(
         .collect();
     Ok((
         said(serde_json::json!({
-            "mode": "peek",
+            LOOK_MODE_KEY: PEEK_MODE,
             "count": messages.len(),
             "messages": messages,
         })),
@@ -17693,7 +17751,7 @@ fn history_look(
         .map(message_json)
         .collect();
     Ok(said(serde_json::json!({
-        "mode": "all",
+        LOOK_MODE_KEY: HISTORY_MODE,
         "count": messages.len(),
         "messages": messages,
     })))
@@ -19237,9 +19295,6 @@ fn plan_inner(
             };
             let model = words.value("--model").map(str::to_string);
             let effort = words.value("--effort").map(str::to_string);
-            if effort.is_some() && model.is_none() {
-                return Err("--effort requires --model".to_string());
-            }
             // The readiness window: how long this summons may stay silent
             // before the sweep tells the coordinator. A minute unless the
             // caller says otherwise — and a window, never a settlement.
@@ -19319,6 +19374,7 @@ fn plan_inner(
                 (agent, false)
             };
             let teacher_effort = effort.clone();
+            let model_was_pinned = model.is_some();
             let requested = Pinned {
                 agent: agent.clone(),
                 model,
@@ -19352,34 +19408,50 @@ fn plan_inner(
                 failures: written.as_ref().map_or(0, |written| written.failures),
                 retry_of: words.value("--retry-of").is_some(),
             };
-            // A pin is a teacher, never a candidate for replacement. Remote
-            // summonses leave the decision to the server window.
-            let difficulty_receipt = if teacher_effort.is_none()
-                && effort.is_none()
-                && model.is_some()
+            let difficulty_team = team.id.clone();
+            let difficulty_origin = [
+                difficulty_team.as_str(),
+                pane,
+                words.value("--retry-request").unwrap_or_default(),
+            ];
+            // Explicit choices survive; omitted dials may use the table.
+            // The server window owns remote summonses.
+            let difficulty_receipt = if (effort.is_none() || model.is_none())
                 && words.value("--on").is_none()
                 && !difficulty_look.spec.is_empty()
                 && difficulty_effort(&agent, crate::summon_difficulty::LADDER[0].0).is_some()
             {
-                launcher.choose_difficulty(
-                    &difficulty_look,
-                    [
-                        &team.id,
-                        pane,
-                        words.value("--retry-request").unwrap_or_default(),
-                    ],
-                )
+                launcher.choose_difficulty(&difficulty_look, difficulty_origin)
             } else {
                 None
             };
-            let effort = effort.or_else(|| {
-                difficulty_receipt
-                    .as_ref()
-                    .filter(|row| row["applied"].as_bool() == Some(true))
-                    .and_then(|row| row["chosen"].as_str())
-                    .and_then(|chosen| difficulty_effort(&agent, chosen))
-                    .map(str::to_string)
-            });
+            let chosen = difficulty_receipt
+                .as_ref()
+                .filter(|row| row["applied"].as_bool() == Some(true))
+                .and_then(|row| row["chosen"].as_str());
+            let profile = if model.is_none()
+                && words.value("--on").is_none()
+                && !difficulty_look.spec.is_empty()
+            {
+                launcher.difficulty_profile(
+                    &agent,
+                    chosen.unwrap_or(crate::summon_difficulty::FALLBACK_DIFFICULTY),
+                    difficulty_origin,
+                )?
+            } else {
+                None
+            };
+            let model = model.or_else(|| profile.as_ref().map(|p| p.model.clone()));
+            let effort = effort
+                .or_else(|| profile.as_ref().map(|p| p.effort.clone()))
+                .or_else(|| {
+                    chosen
+                        .and_then(|d| difficulty_effort(&agent, d))
+                        .map(str::to_string)
+                });
+            if effort.is_some() && model.is_none() {
+                return Err("--effort requires --model or a configured summon profile".to_string());
+            }
             // A worker that carries a task is told how to report it, unless
             // somebody asked for a bare one — an operator starting an agent to
             // work with by hand does not want a protocol in its composer.
@@ -19632,10 +19704,23 @@ fn plan_inner(
             // work, and a judgment asked about nothing is a row that says
             // nothing: it gets no question at all.
             let said = Some(summon_brief(written.as_ref(), asked)).filter(|said| !said.is_empty());
+            let baseline_high = launcher
+                .difficulty_profile(
+                    &agent,
+                    crate::summon_difficulty::LADDER[2].0,
+                    difficulty_origin,
+                )
+                .ok()
+                .flatten()
+                .is_some_and(|profile| {
+                    model.as_deref() == Some(profile.model.as_str())
+                        && effort.as_deref() == Some(profile.effort.as_str())
+                });
             prepared_worker_start.difficulty_shadow =
                 said.map(|_| crate::summon_difficulty::Shadow {
                     look: difficulty_look,
                     teacher_effort,
+                    baseline_high,
                     receipt: difficulty_receipt,
                 });
             prepared_worker_start.summon_shadow = said.map(|words| {
@@ -19646,7 +19731,7 @@ fn plan_inner(
                         model: model.clone(),
                         effort: effort.clone(),
                     },
-                    model_was_pinned: model.is_some(),
+                    model_was_pinned,
                     auto: agent_by_seat,
                     brief,
                     brief_chars,

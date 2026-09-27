@@ -28,6 +28,7 @@
 pub(crate) mod coordinator_handover;
 pub(crate) mod cost_book;
 pub(crate) mod desk;
+mod mail_triage;
 pub(crate) mod restart_census;
 mod stall_cause;
 mod step_effort;
@@ -234,6 +235,10 @@ struct RuntimeSeat {
     /// The between-turn effort moves this window has judged, typed and not
     /// yet graded (t-5637) — shared with the question asked off the beat.
     moves: Arc<Mutex<step_effort::MoveBook>>,
+    /// The coordinators' letters this window put to Jev and the answers still
+    /// waiting for what the coordinator did next (t-9471) — shared with the
+    /// questions asked off the beat.
+    mail: Arc<Mutex<mail_triage::MailBook>>,
 }
 
 type LiveRuntime = Arc<RuntimeSeat>;
@@ -1464,11 +1469,31 @@ pub(crate) fn settled_checkouts() -> Vec<SettledCheckout> {
         return Vec::new();
     };
     drop(image);
+    let mut answered: Vec<SettledCheckout> = settled_workers(&ledger)
+        .into_iter()
+        .map(|(_, worker, at)| SettledCheckout {
+            path: at.to_string(),
+            worker: worker.id.clone(),
+            agent: worker.agent.clone(),
+        })
+        .collect();
+    // Sorted so a sweep that judges only a few per pass walks them in the
+    // same order every time rather than in a hash map's.
+    answered.sort_by(|left, right| left.path.cmp(&right.path));
+    answered
+}
+
+/// Every settled checkout ([`settled_checkouts`]) with the last worker to sit
+/// in it and that worker's run — the one walk behind the reclaim's listing and
+/// the board's rows for finished work ([`ledger_agents_for_seats`], t-10993).
+fn settled_workers(ledger: &Ledger) -> Vec<(&zerocode_core::orchestration::Run, &Worker, &str)> {
     let mut summoned: std::collections::HashSet<&str> = std::collections::HashSet::new();
     // Keyed by path, holding the newest settled worker seen for it — a
     // checkout handed from one worker to the next reports the last one.
-    let mut settled: std::collections::HashMap<&str, (i64, &Worker)> =
-        std::collections::HashMap::new();
+    let mut settled: std::collections::HashMap<
+        &str,
+        (&zerocode_core::orchestration::Run, &Worker),
+    > = std::collections::HashMap::new();
     for run in ledger.runs() {
         for worker in &run.workers {
             let Some(checkout) = worker.checkout.as_deref() else {
@@ -1482,25 +1507,17 @@ pub(crate) fn settled_checkouts() -> Vec<SettledCheckout> {
                 summoned.insert(at);
                 continue;
             }
-            let entry = settled.entry(at).or_insert((worker.started_ms, worker));
-            if worker.started_ms >= entry.0 {
-                *entry = (worker.started_ms, worker);
+            let entry = settled.entry(at).or_insert((run, worker));
+            if worker.started_ms >= entry.1.started_ms {
+                *entry = (run, worker);
             }
         }
     }
-    let mut answered: Vec<SettledCheckout> = settled
+    settled
         .into_iter()
         .filter(|(at, _)| !summoned.contains(at))
-        .map(|(at, (_, worker))| SettledCheckout {
-            path: at.to_string(),
-            worker: worker.id.clone(),
-            agent: worker.agent.clone(),
-        })
-        .collect();
-    // Sorted so a sweep that judges only a few per pass walks them in the
-    // same order every time rather than in a hash map's.
-    answered.sort_by(|left, right| left.path.cmp(&right.path));
-    answered
+        .map(|(at, (run, worker))| (run, worker, at))
+        .collect()
 }
 
 /// Ask the same question again about ONE checkout, right before acting on it.
@@ -1743,6 +1760,20 @@ pub(crate) struct LedgerAgent {
     /// reported, and the ledger wrote the ending down. This is the worker's
     /// own claim of being done; what a coordinator made of it is `review`.
     pub(crate) reported: bool,
+    /// Whether that closed dispatch ended WITHOUT a successful report — a
+    /// `worker_done` saying `ok:false`, or an attempt stopped or abandoned
+    /// (`Dispatch::succeeded` other than `Some(true)`). The row then says the
+    /// attempt failed rather than that it waits for review.
+    pub(crate) failed: bool,
+    /// A row for a worker the ledger RELEASED, kept because the work it
+    /// finished still stands in its checkout ([`settled_workers`]): no seat, no
+    /// summons — the board shows the work, and the roster of summoned workers
+    /// leaves it out (t-10993).
+    pub(crate) settled: bool,
+    /// The provider conversation the worker ran in (`Worker::session`), by id —
+    /// what lets a surface holding that conversation's own row name the row
+    /// after the task instead of after the prompt.
+    pub(crate) session: Option<String>,
     pub(crate) dispatch_id: String,
     pub(crate) dispatch_started_ms: i64,
     pub(crate) retry_of: Option<String>,
@@ -2035,11 +2066,19 @@ fn graph_overlay_snapshot_for_seats(
     }
 }
 
-/// Every worker the ledger still holds, seat or no seat.
+/// Every worker the ledger still holds, seat or no seat — and the work a
+/// released worker finished, while it still stands.
 ///
 /// Bounded by the ledger's OUTSTANDING rows, not its history: a released
 /// worker is a summons somebody answered and is not drawn. One run in this
-/// window holds sixty-five released rows beside two live ones.
+/// window holds sixty-five released rows beside two live ones. The one
+/// exception is the last worker of a checkout nobody holds any more
+/// ([`settled_workers`]) whose last attempt closed, in a run still in play,
+/// while that checkout stands on disk (t-10993): its pane went with the
+/// `worker_done`, but its work is still there waiting for a coordinator, and
+/// a board without it showed finished work by vanishing. That row is
+/// `settled`, seatless, and leaves when the checkout is reclaimed or the run
+/// goes quiet — five on this machine the day it was written.
 pub(crate) fn ledger_agents() -> Vec<LedgerAgent> {
     with_ledger_seats(ledger_agents_for_seats).unwrap_or_default()
 }
@@ -2071,7 +2110,7 @@ pub(crate) fn refresh_board_ledger() {
     let Some(held) = runtime() else {
         return;
     };
-    let Some(next) = with_ledger_seats(|ledger, seats| {
+    let Some((next, outcomes)) = with_ledger_seats(|ledger, seats| {
         // A finished task's cost is worked out once and remembered; the
         // beat only asks (t-9470, [`cost_book`]).
         let mut costs = cost_book::book();
@@ -2087,11 +2126,13 @@ pub(crate) fn refresh_board_ledger() {
                 |run, task| costs.cost(run, task),
             )),
         };
+        let outcomes = summon_difficulty::observations(ledger, &mut costs);
         costs.end();
-        next
+        (next, outcomes)
     }) else {
         return;
     };
+    summon_difficulty::record_observations(outcomes, crate::now_epoch_ms());
     // Build, allocate and drop old rows outside the publication lock. The
     // main-thread reader holds it only long enough to clone an Arc.
     let next = Arc::new(next);
@@ -2145,35 +2186,57 @@ fn latest_worker_dispatches(
 
 fn ledger_agents_for_seats(ledger: &Ledger, seats: &TeamSeatIndex) -> Vec<LedgerAgent> {
     let mut listed = Vec::new();
+    // The released workers whose work may still stand (t-10993), by run and
+    // worker; which of them does is asked below, once their run is in play.
+    let settled: std::collections::HashMap<(&str, &str), &str> = settled_workers(ledger)
+        .into_iter()
+        .map(|(run, worker, at)| ((run.id.as_str(), worker.id.as_str()), at))
+        .collect();
     for run in ledger.runs() {
         let latest_dispatches = latest_worker_dispatches(run);
+        let in_play = desk::in_play(run);
         for worker in &run.workers {
-            if !worker.state.still_summoned() {
+            let finished = !worker.state.still_summoned();
+            if finished
+                && !(in_play
+                    && settled
+                        .get(&(run.id.as_str(), worker.id.as_str()))
+                        .is_some_and(|at| std::path::Path::new(at).is_dir()))
+            {
                 continue;
             }
             /* Pane names are reusable, so a seat only belongs to the worker
              * occupying it NOW — the same filter `worker-list` applies for
              * the same reason. A historical row that kept the pane name must
-             * not borrow its replacement's terminal. */
+             * not borrow its replacement's terminal. A released worker has
+             * no seat: its pane went with it. */
             let term = seats
                 .get(worker.team.as_str())
                 .and_then(|team| team.get(worker.pane.as_str()))
                 .copied()
                 .filter(|_| {
-                    run.worker_in_pane(&worker.team, &worker.pane)
-                        .is_some_and(|current| current.id == worker.id)
+                    !finished
+                        && run
+                            .worker_in_pane(&worker.team, &worker.pane)
+                            .is_some_and(|current| current.id == worker.id)
                 });
             let dispatch = worker
                 .dispatch
                 .as_ref()
                 .and_then(|id| run.dispatch(id))
                 .or_else(|| latest_dispatches.get(worker.id.as_str()).copied());
+            // Finished work is an attempt that closed; a released worker whose
+            // last attempt never did has nothing here to show.
+            if finished && dispatch.is_none_or(|one| one.is_open()) {
+                continue;
+            }
             let carried = dispatch.and_then(|one| run.task(&one.task));
             let task = carried
                 .map(|held| held.display_name().to_string())
                 .unwrap_or_default();
             let task_id = carried.map(|held| held.id.clone()).unwrap_or_default();
             let reported = dispatch.is_some_and(|one| !one.is_open());
+            let failed = dispatch.is_some_and(|one| !one.is_open() && one.succeeded != Some(true));
             let dispatch_id = dispatch.map(|one| one.id.clone()).unwrap_or_default();
             let dispatch_started_ms = dispatch.map_or(0, |one| one.started_ms);
             let retry_of = dispatch.and_then(|one| one.retry_of.clone());
@@ -2207,12 +2270,23 @@ fn ledger_agents_for_seats(ledger: &Ledger, seats: &TeamSeatIndex) -> Vec<Ledger
                 task,
                 task_id,
                 reported,
+                failed,
+                settled: finished,
+                session: worker.session.as_ref().map(|session| session.id.clone()),
                 dispatch_id,
                 dispatch_started_ms,
                 retry_of,
                 review,
                 term,
-                at: worker.started_ms,
+                // Finished work is dated by when its attempt ended — the
+                // moment the board's card and the sidebar's clock count from.
+                at: if finished {
+                    dispatch
+                        .and_then(|one| one.ended_ms)
+                        .unwrap_or(worker.started_ms)
+                } else {
+                    worker.started_ms
+                },
                 model: worker.model.clone(),
                 effort: worker.effort.clone(),
                 pane: worker.pane.clone(),
@@ -2324,6 +2398,7 @@ fn install_runtime(actor: RuntimeActor, overrides: LiveOverrides, usage: UsageSo
         usage,
         stalls: Arc::default(),
         moves: Arc::default(),
+        mail: Arc::default(),
     }));
     // Boot seeds the first answer before any webview can restore worker seats.
     refresh_board_ledger();
@@ -2602,7 +2677,7 @@ fn composer_at_rest(
             }
         }
         Some(PaneTurn::Ended { interrupted: true }) => Err(THE_PERSON_HOLDS_IT),
-        Some(PaneTurn::Running) => Err(A_TURN_IS_RUNNING),
+        Some(PaneTurn::Running { .. }) => Err(A_TURN_IS_RUNNING),
         None => Err(NOTHING_WAS_EVER_HEARD),
     }
 }
@@ -2779,6 +2854,15 @@ enum HeadroomSource {
 }
 
 impl Launcher for LiveCatalog {
+    fn difficulty_profile(
+        &self,
+        agent: &str,
+        difficulty: &str,
+        origin: [&str; 3],
+    ) -> Result<Option<zerocode_core::summon_difficulty::Profile>, String> {
+        summon_difficulty::profile(agent, difficulty, origin)
+    }
+
     fn choose_difficulty(
         &self,
         look: &zerocode_core::summon_difficulty::Look,
@@ -3536,10 +3620,40 @@ fn wait_for_mail(seen: u64, deadline: std::time::Instant) -> u64 {
 #[derive(Clone, Copy)]
 enum PaneTurn {
     /// A turn is under way — the window heard this pane say something that
-    /// was not a turn ending.
-    Running,
+    /// was not a turn ending, the last time at `heard`.
+    Running { heard: std::time::Instant },
     /// The last turn ended, and how it ended.
     Ended { interrupted: bool },
+}
+
+impl PaneTurn {
+    /// The turn as a door that types reads it.
+    ///
+    /// A running turn nothing has spoken for in
+    /// [`zerocode_core::interrupt::STALE_AFTER_MS`] is not a turn — the decay
+    /// the board already applies to the same reports ([`pane_turn_is_alive`]),
+    /// for the same reason. A turn at work speaks at every tool it reaches
+    /// for; one that has said nothing for half an hour lost its ending on the
+    /// way — the hook script gives a turn end one and a half seconds to reach
+    /// a loaded window and says nothing when it does not (t-11233). Read as
+    /// running, that pane's mail waited on its shelf for a turn end that had
+    /// already happened; read at rest, the pointer's other doors still stand
+    /// (a person's words in the line, a shell in front).
+    ///
+    /// [`pane_turn_is_alive`]: crate::pane_runtime::pane_turn_is_alive
+    fn as_read(self) -> Self {
+        let stale = std::time::Duration::from_millis(
+            zerocode_core::interrupt::STALE_AFTER_MS.unsigned_abs(),
+        );
+        match self {
+            Self::Running { heard }
+                if crate::standing_clock::now().saturating_duration_since(heard) > stale =>
+            {
+                Self::Ended { interrupted: false }
+            }
+            turn => turn,
+        }
+    }
 }
 
 /// What each pane's turn was last measured doing, off the same hook event that
@@ -4667,13 +4781,42 @@ pub(crate) fn pane_turn_began(term: u32, began_ms: i64) {
     pane_turns()
         .lock()
         .unwrap_or_else(|held| held.into_inner())
-        .insert(term, PaneTurn::Running);
+        .insert(
+            term,
+            PaneTurn::Running {
+                heard: crate::standing_clock::now(),
+            },
+        );
     // A hold on the pane's own question stands: the wait is this window's
     // fact, and a report from inside the same turn does not end it.
     pointed()
         .lock()
         .unwrap_or_else(|held| held.into_inner())
         .retain(|_, held| held.term != Some(term) || held.standing == Standing::Asking);
+}
+
+/// A pane's LEAD ended its turn: the window's own half of a turn end, and
+/// the whole of it when work the lead left running holds its card at working
+/// (t-11233).
+///
+/// The hook loop holds such a `Stop` back — a background shell or helper is
+/// still going, so the card must not ring a completion, and the ledger must
+/// not hear that a worker went quiet (the parked all-clear tells it when that
+/// work ends). Both are about the WORK. The composer is a different fact: the
+/// lead is back at its prompt, a line typed there is read, and its next turn
+/// end comes only once somebody gives it a turn. Written down as running, a
+/// coordinator whose `until` shell waited on a gate chain had its workers'
+/// questions parked for that turn end for two hours (2026-09-27).
+///
+/// So this writes the window's facts and nothing else: the sound, and the
+/// rest. An interrupted end is remembered AS interrupted — the person typed,
+/// and the second condition says that pane is theirs, not ours.
+pub(crate) fn pane_lead_rested(term: u32, turn_ended_ms: i64, interrupted: bool) {
+    heard(term, turn_ended_ms);
+    pane_turns()
+        .lock()
+        .unwrap_or_else(|held| held.into_inner())
+        .insert(term, PaneTurn::Ended { interrupted });
 }
 
 /// A pane's turn ended. Tell the ledger, in case that pane is a worker's.
@@ -4695,7 +4838,7 @@ pub(crate) fn pane_turn_ended(term: u32, turn_ended_ms: i64, interrupted: bool, 
     // window, but it does not run in a degraded window — the beat's sweep
     // still must not report a pane the window plainly heard. Heard at the
     // moment the turn ended, the moment the actor road reads it at too.
-    heard(term, turn_ended_ms);
+    //
     // Nobody to refuse on this road — it is a hook event, not a verb — so it
     // simply does not run in a degraded window. See [`unavailable`]; the
     // window already said why, once, at boot. A silence the store refuses is
@@ -4704,12 +4847,8 @@ pub(crate) fn pane_turn_ended(term: u32, turn_ended_ms: i64, interrupted: bool, 
     // again rather than a half-written silence surviving.
     /* The idle fact is written down whatever the runtime's state: it is a
      * window fact, not a ledger one, and the pointer pass reads it on the
-     * next beat. An interrupted end is remembered AS interrupted — the person
-     * typed, and the second condition says that pane is theirs, not ours. */
-    pane_turns()
-        .lock()
-        .unwrap_or_else(|held| held.into_inner())
-        .insert(term, PaneTurn::Ended { interrupted });
+     * next beat. */
+    pane_lead_rested(term, turn_ended_ms, interrupted);
     if unavailable().is_some() {
         return;
     }
@@ -5898,7 +6037,8 @@ fn resume_stalled_workers(
             .lock()
             .unwrap_or_else(|held| held.into_inner())
             .get(&one.term)
-            .copied();
+            .copied()
+            .map(PaneTurn::as_read);
         if composer_at_rest(host, one.term, heard).is_err() {
             quiet.push((one.worker, one.since_ms));
             continue;
@@ -6071,6 +6211,10 @@ pub(crate) fn tick(host: &dyn Host, overrides: &[(String, LaunchOverride)], now_
     // A turn ending is only a row. The existing beat revisits it after the
     // grace interval and is the sole producer of quiet notifications.
     notify_stalled_workers(host, now_ms);
+    // The letters the coordinators this window seats can still be handed are
+    // put to the mail triage, and what they did next is written as its
+    // labels — recorded only, on a ledger that moved (t-9471).
+    mail_triage::sweep(host, now_ms);
     // A decline whose pause dialog stands behind a stale `working` hook, which
     // the sweep cannot see, is told on its own two witnesses (t-6747).
     note_paused_declines(host, now_ms);
@@ -6383,7 +6527,7 @@ fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
                  * finished turn, and a pane the window has never heard from
                  * may have no hook wired at all, in which case its silence
                  * outlasts the run. */
-                let heard = turns.get(&term).copied();
+                let heard = turns.get(&term).copied().map(PaneTurn::as_read);
                 /* The moment a WORKING pane can be reached without a
                  * keystroke, and the one this pass used to have nothing to
                  * say about.
@@ -6406,7 +6550,7 @@ fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
                  * the ordinary road below speaks about it the moment the turn
                  * is over. A parked pointer can only make the composer road
                  * unnecessary; it can never make it unavailable. */
-                if matches!(heard, Some(PaneTurn::Running)) {
+                if matches!(heard, Some(PaneTurn::Running { .. })) {
                     /* Unless the turn is held inside the pane's own question
                      * (t-8938): the wait this window runs for it is out, and
                      * a pointer handed over at that tool call's end would
@@ -7959,7 +8103,7 @@ fn run_seated(
                 .windows(2)
                 .find(|pair| pair[0] == "--retry-request")
                 .map_or("", |pair| pair[1].as_str());
-            summon_difficulty::origin([team_id, pane, request], checkout)
+            summon_difficulty::origin([team_id, pane, request], checkout, authority.is_none())
         });
     let decided = match actor.plan(command) {
         Ok((decided, _)) => *decided,

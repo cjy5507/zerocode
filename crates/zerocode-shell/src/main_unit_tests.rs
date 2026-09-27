@@ -150,6 +150,8 @@ const WINDOW_GLOBALS: &[&str] = &[
     "ResizeObserver",
     "Set",
     "String",
+    // 관계 탭 입체 보기의 렌더러 — `ui/vendor/three.js`가 창보다 먼저 거는 전역.
+    "THREE",
     // The address bar's parser (1-fy) — Orca classifies with `new URL`
     // and so does the port, because a hand-rolled URL parser is a CVE
     // generator.
@@ -7991,6 +7993,48 @@ fn a_helpers_line_counts_its_tool_uses_whoever_counted_them() {
     );
 }
 
+/// A `Stop` the done gate holds back is still the lead's rest (t-11233).
+///
+/// The gate keeps the CARD at working while a background shell or helper of
+/// the lead's runs, and keeps the ledger from hearing that the worker went
+/// quiet. It must not keep the mail pointer from the lead's composer: written
+/// down through `pane_turn_began`, a coordinator whose `until` shell waited
+/// on a gate chain had its workers' questions parked for a turn end that
+/// never came, for two hours. So the state door hands the window that very
+/// held event as the lead's rest — the parked event, matched by its word,
+/// never a later one that happens to find a park standing — and the ledger
+/// still hears the end only through the all-clear's replay.
+#[test]
+fn a_held_stop_is_the_leads_rest_to_the_window_and_not_to_the_ledger() {
+    let shipped = shipped_backend();
+    let noting = block_after(shipped, "fn note_pane_state(");
+    let resting = noting
+        .find("None if lead_rested =>")
+        .expect("the state door no longer hands a held stop to the window as rest");
+    let beginning = noting
+        .find("None => orchestration::pane_turn_began(report.term, began_ms),")
+        .expect("the state door stopped writing a running turn down");
+    assert!(
+        resting < beginning,
+        "a held stop falls through to the running arm first:\n{noting}"
+    );
+    assert!(
+        noting.contains(
+            "orchestration::pane_lead_rested(report.term, began_ms, report.interrupted);"
+        ) && noting.contains(".is_some_and(|(_, held)| held.event == report.event);"),
+        "the rest is written for some event other than the held one:\n{noting}"
+    );
+    let rested = block_after(
+        include_str!("orchestration.rs"),
+        "pub(crate) fn pane_lead_rested(",
+    );
+    assert!(
+        !rested.contains("actor"),
+        "the window's rest reached the ledger, which the done gate keeps \
+         from hearing a turn end while work still runs:\n{rested}"
+    );
+}
+
 /// An agent that leaves without saying so still leaves.
 ///
 /// The reported break: `codex` ran in a terminal, the person quit it back
@@ -11780,7 +11824,10 @@ fn an_account_switch_reaches_each_live_zo_pane_once_and_no_other_pane() {
     let params = auth_reload_params(
         zerocode_core::account::Provider::Anthropic,
         Some("joe@example.com · Acme"),
-        Some(Path::new("/data/runtime/claude")),
+        Some(ClaudeDirs {
+            config: Path::new("/data/runtime/claude"),
+            credentials: Path::new("/data/claude-accounts/a-1"),
+        }),
         None,
     );
     let mut sent: Vec<String> = Vec::new();
@@ -11798,36 +11845,54 @@ fn an_account_switch_reaches_each_live_zo_pane_once_and_no_other_pane() {
 /// already frozen. A lane back on the machine's own login carries an EMPTY
 /// path — "no managed account" — which is not the same as carrying nothing:
 /// silence would leave the pane on the account the person just left.
+///
+/// Claude's switch carries both folders: the credential folder is where the
+/// login lives and its CLI renews it, and a zo told only the runtime home read
+/// the window's copy of the login and spent its stale refresh token (t-11045).
 #[test]
 fn a_reload_carries_the_new_paths_and_says_so_when_there_are_none() {
     let switched = auth_reload_params(
         zerocode_core::account::Provider::Anthropic,
         Some("  joe@example.com  "),
-        Some(Path::new("/data/runtime/claude")),
+        Some(ClaudeDirs {
+            config: Path::new("/data/runtime/claude"),
+            credentials: Path::new("/data/claude-accounts/a-1"),
+        }),
         None,
     );
     assert_eq!(switched["provider"], "anthropic");
     assert_eq!(switched["label"], "joe@example.com");
     assert_eq!(switched["claude_config_dir"], "/data/runtime/claude");
+    assert_eq!(
+        switched["claude_secure_storage_dir"],
+        "/data/claude-accounts/a-1"
+    );
     assert!(switched.get("codex_home").is_none());
 
-    // Back on the machine's own login: an EMPTY directory and an EMPTY
-    // name. Both say "no managed account" — leaving either key out would
-    // leave the pane on, and showing, the account it just left.
+    // Back on the machine's own login: EMPTY directories and an EMPTY
+    // name. All say "no managed account" — leaving a key out would leave the
+    // pane on, and showing, the account it just left.
     let system_default = auth_reload_params(
         zerocode_core::account::Provider::Anthropic,
         Some(""),
-        Some(Path::new("")),
+        Some(ClaudeDirs {
+            config: Path::new(""),
+            credentials: Path::new(""),
+        }),
         None,
     );
     assert_eq!(system_default["claude_config_dir"], "");
+    assert_eq!(system_default["claude_secure_storage_dir"], "");
     assert_eq!(system_default["label"], "");
 
     // A caller that is not speaking about the name at all leaves it alone.
     let silent = auth_reload_params(
         zerocode_core::account::Provider::Anthropic,
         None,
-        Some(Path::new("/data/runtime/claude")),
+        Some(ClaudeDirs {
+            config: Path::new("/data/runtime/claude"),
+            credentials: Path::new("/data/claude-accounts/a-1"),
+        }),
         None,
     );
     assert!(
@@ -11844,6 +11909,7 @@ fn a_reload_carries_the_new_paths_and_says_so_when_there_are_none() {
     assert_eq!(codex["provider"], "openai");
     assert_eq!(codex["codex_home"], "/data/runtime/codex");
     assert!(codex.get("claude_config_dir").is_none());
+    assert!(codex.get("claude_secure_storage_dir").is_none());
 }
 
 /// A pane that died between the enumeration and the call is not a failed
@@ -15220,6 +15286,16 @@ fn a_retained_session_is_scanned_named_and_gated() {
         Some("orca 를 완벽하게 리버스")
     );
     assert_eq!(claude_session_title("{\"type\":\"summary\"}\n"), None);
+    // A pasted brief titles the session by what was pasted, never by the
+    // frame the CLI wrote around it (t-10993).
+    let pasted = concat!(
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":",
+        "\"<pasted_content id=\\\"8a76\\\">\\nYou are a worker\\n</pasted_content id=\\\"8a76\\\">\"}}\n",
+    );
+    assert_eq!(
+        claude_session_title(pasted).as_deref(),
+        Some("You are a worker")
+    );
 
     let launching = block_after(shipped_backend(), "fn launch_agent_tab(");
     assert!(

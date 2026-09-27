@@ -44,7 +44,7 @@ use compaction::{auto_compaction_threshold_from_env_or_policy, ContextPolicy};
 pub use compaction::{
     auto_compaction_tail_budget, auto_compaction_threshold_for_model, auto_compaction_threshold_from_env, MICROCOMPACT_MIN_OUTPUT_BYTES,
     count_progress_tool_results, final_assistant_text, AutoCompactionEvent, BudgetExhausted,
-    TurnSummary,
+    ManualCompaction, TurnSummary,
 };
 pub use config::{
     declare_attendance, declare_classifier_fallback, declared_attendance,
@@ -90,8 +90,8 @@ use streaming::{
     build_async_permission_request, tool_preview_from, tool_summary_line, CapturePrompter,
 };
 use tool::{
-    is_concurrency_safe, is_long_running, sleep_tool_execution_input, tool_execution_input,
-    unblock_tool_execute,
+    is_concurrency_safe, is_long_running, sleep_tool_cut_short, sleep_tool_execution_input,
+    tool_execution_input, unblock_tool_execute,
 };
 use repetition::{ReadFileRange, ToolBatchRepetitionHardStops};
 // Turn-stop policy (cost breaker vs behavior heuristic). Shared with the
@@ -336,8 +336,10 @@ fn format_auto_compaction_done_notice(
 }
 
 /// `254_100` → `"254.1k"`, sub-thousand values stay raw. Matches the HUD's
-/// ctx-figure style so the done notice reads on the same scale.
-fn format_kilo_tokens(tokens: usize) -> String {
+/// ctx-figure style so the done notice reads on the same scale — and the
+/// `/compact` report a front-end writes (t-10956), so both say it one way.
+#[must_use]
+pub fn format_kilo_tokens(tokens: usize) -> String {
     if tokens >= 1_000 {
         let tenths = tokens / 100;
         format!("{}.{}k", tenths / 10, tenths % 10)
@@ -399,12 +401,16 @@ fn empty_stream_exhausted_message() -> ConversationMessage {
 /// override the original request. Kept as one constant so the tool-result and
 /// the text-only-turn steering paths inject identical wording.
 ///
+/// The answer clause (t-11354): a steer that asks is answered in words before
+/// the next tool call. On 2026-09-27 a person's "현재 상황" reached a turn
+/// that said "I'll check quickly" and went on calling tools for six minutes.
+///
 /// The absorption clause is the orchestrator policy: a steer that adds a NEW,
 /// separable requirement must not stall the work already in flight — it is
 /// delegated to a background agent and the current lane keeps running, which
 /// is what makes typing mid-turn cheap for the user instead of a context
 /// switch that serializes everything behind it.
-const STEERING_PREAMBLE: &str = "[User steering — the user sent this mid-turn to correct course. Treat it as a higher-priority instruction that supersedes any conflicting earlier guidance, and adjust your plan and current work accordingly before continuing. If it introduces a NEW requirement that is separable from what you are doing right now, do not serialize it: launch a background `Agent` for it immediately and keep working on your current task — you will be notified when that agent completes. Fold it into your current work instead only when it modifies the very thing you are editing.]";
+const STEERING_PREAMBLE: &str = "[User steering — the user sent this mid-turn to correct course or to ask. If it asks you something — a question, or where the work stands — answer it in words at the start of your very next reply, before any further tool call, then carry on. Treat it as a higher-priority instruction that supersedes any conflicting earlier guidance, and adjust your plan and current work accordingly before continuing. If it introduces a NEW requirement that is separable from what you are doing right now, do not serialize it: launch a background `Agent` for it immediately and keep working on your current task — you will be notified when that agent completes. Fold it into your current work instead only when it modifies the very thing you are editing.]";
 
 /// Transcript echo prefix stamped when a mid-turn steering message is folded
 /// into the live turn. The TUI matches on this exact prefix to clear that
@@ -832,6 +838,10 @@ pub struct ConversationRuntime<C, T> {
     /// [`ConversationRuntime::agent_notification_inbox`] and re-queues
     /// whatever the turn never folded as follow-up turns.
     agent_notifications: AgentNotificationInbox,
+    /// How much of this session's background work is still out — see
+    /// [`BackgroundWorkProbe`]. `None` on every host that brings no result
+    /// back as a message.
+    background_work: Option<BackgroundWorkProbe>,
     /// True when nobody can answer a mid-run question on this surface
     /// (headless one-shots). Turns the turn-end gate's question lint on; the
     /// promise lint runs regardless. Set by the host via
@@ -1094,6 +1104,14 @@ pub struct ConversationRuntime<C, T> {
     /// Whether this public turn already asked about the declined request's
     /// images — asked once, whatever the answer.
     refusal_images_asked_for_turn: bool,
+    /// Whether this public turn already spent its one compacted retry (the
+    /// ladder's last rung, t-10956). Reset at every public turn begin, like
+    /// the same-model retry.
+    refusal_compaction_used: bool,
+    /// The compacted retry this turn made, for its turn record: what the
+    /// compaction cost and whether the retry cleared the decline. Cleared at
+    /// every public turn begin.
+    refusal_compaction: Option<crate::turn_trace::RefusalCompaction>,
     /// The category of the refusal that armed [`Self::refusal_dry_until`]:
     /// the pre-arm routes that category, and only a routed one arms it.
     refusal_dry_category: Option<String>,
@@ -1648,6 +1666,14 @@ pub struct AgentNotification {
 /// the two drain points never run concurrently.
 pub type AgentNotificationInbox = Arc<Mutex<Vec<AgentNotification>>>;
 
+/// How many of this session's background jobs — agents, background shell
+/// tasks — are still out and will come back as a message when they finish.
+/// Installed by the one host that brings them back (the interactive session
+/// that owns the completion pump), read at a turn's natural end: a turn whose
+/// remaining work is only those results may end on "when they land, I'll …",
+/// the way a Claude Code turn ends while its agents run (t-11354).
+pub type BackgroundWorkProbe = Arc<dyn Fn() -> usize + Send + Sync>;
+
 impl<C, T> ConversationRuntime<C, T>
 where
     C: ApiClient,
@@ -1776,6 +1802,7 @@ where
             steering_observer: None,
             switch_observer: None,
             agent_notifications: Arc::new(Mutex::new(Vec::new())),
+            background_work: None,
             autonomous_surface: false,
             deep_subturn_depth: 0,
             long_running_tool_names: BTreeSet::new(),
@@ -1825,6 +1852,8 @@ where
             refusal_switch_refused_for_turn: false,
             refusal_switch_unasked_to: None,
             refusal_images_asked_for_turn: false,
+            refusal_compaction_used: false,
+            refusal_compaction: None,
             refusal_dry_category: None,
             escalation_model_override: None,
             escalation_armed_fresh: false,
@@ -2208,6 +2237,7 @@ where
         // additional legs of the same user turn and must not double-count it.
         if !is_continuation {
             self.fold_finished_refusal_turn();
+            self.refusal_compaction = None;
         }
         // Clear the per-leg refusal override before deciding whether the
         // session cooldown should re-arm it below.
@@ -2218,6 +2248,7 @@ where
         self.refusal_switch_refused_for_turn = false;
         self.refusal_switch_unasked_to = None;
         self.refusal_images_asked_for_turn = false;
+        self.refusal_compaction_used = false;
         // Reset the per-turn quota fallback, pre-arming onto it when the session
         // is still inside a recorded quota-dry cooldown. See
         // [`Self::begin_turn_quota_fallback`].
@@ -2618,11 +2649,27 @@ where
                                 )
                             );
                         }
+                        // The last rung (t-10956), folded where it is decided;
+                        // a compaction that folded nothing leaves the ladder
+                        // to answer again with the rung spent.
+                        RefusalDecision::RetryCompacted(config) => {
+                            eprintln!(
+                                "[zo] {}",
+                                core_types::retry_signal::refusal_compaction_notice(&from_model)
+                            );
+                            if let Some(event) = self.apply_auto_compaction(config) {
+                                self.note_refusal_compaction(event);
+                                auto_compaction.get_or_insert(event);
+                                break RefusalDecision::RetryCompacted(config);
+                            }
+                        }
                         other => break other,
                     }
                 };
                 match decision {
-                    RefusalDecision::RetrySameModel => {
+                    // The compacted retry was folded where it was decided;
+                    // like the same-model retry, all that is left is to ask.
+                    RefusalDecision::RetrySameModel | RefusalDecision::RetryCompacted(_) => {
                         if let Some(usage) = refused_usage {
                             self.usage_tracker.record(usage);
                         }
@@ -2663,6 +2710,9 @@ where
                     RefusalDecision::Surface => {
                         if let Some(usage) = refused_usage {
                             self.usage_tracker.record(usage);
+                        }
+                        for line in self.settle_surfaced_refusal() {
+                            eprintln!("[zo] {line}");
                         }
                         // A route nobody could be asked about is said so (t-7153).
                         if let Some(to) = self.refusal_switch_unasked_to.take() {

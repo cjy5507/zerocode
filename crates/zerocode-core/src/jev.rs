@@ -7,8 +7,9 @@
 //! page or on the desktop — about a worker whose pane went quiet, about where
 //! a worker's window belongs, about which agent a summons should start,
 //! about which blocks of a page an agent's browser read should fold away
-//! about whether a ring is worth interrupting the person for, and about
-//! which of the screens a forked phone step led to is the one to keep.
+//! about whether a ring is worth interrupting the person for, about
+//! which of the screens a forked phone step led to is the one to keep, and
+//! about when a coordinator should deal with a letter in its inbox.
 //! Each keeps its own wire — the two Cargo workspaces carry different `reqwest` majors
 //! (docs/design/jev-browser-action-20260917.md §1.4) — so what must not fork
 //! lives here, in the one crate both already read:
@@ -41,6 +42,7 @@ pub mod reflex_decide;
 pub mod shard;
 pub mod summary;
 pub mod threshold;
+pub mod tool_guard;
 
 /// The object zo's settings keep every Jev switch under.
 pub const SMART_SETTINGS_KEY: &str = "smart";
@@ -502,6 +504,40 @@ pub struct JevUse {
     /// written it stands where it stood before the split, at the switch's
     /// recommendation ([`Self::mode_in`]). `None` for a use nobody split.
     pub follows: Option<&'static str>,
+    /// How a label row this use wrote under an older label rule is read
+    /// now ([`Regrade`], t-11010).
+    pub regrade: Regrade,
+}
+
+impl JevUse {
+    /// `rows` read as this use's label writer marks them today
+    /// ([`Self::regrade`]) — what every reader that judges or counts the
+    /// use's marks does to the rows first, so a rule fixed in the writer
+    /// reaches the record it already wrote without a line of the ledger
+    /// being rewritten.
+    pub fn marked_now(&self, rows: &mut [Value]) {
+        match self.regrade {
+            Regrade::AsWritten => {}
+            Regrade::NotifyFacts => rows.iter_mut().for_each(crate::notify_call::regrade),
+        }
+    }
+}
+
+/// How a use's label rows are read ([`JevUse::regrade`], t-11010).
+///
+/// A mark is written once, by the rule of the day it was written. Where the
+/// row keeps the facts the mark was read from, a rule fixed later can read
+/// them again; where it keeps only the mark, the mark is all there is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Regrade {
+    /// As written: the row keeps its mark and nothing it was read from.
+    AsWritten,
+    /// The notify seat's: every label row keeps the call, the attendance
+    /// and whether the person turned to the pane, and is marked on them by
+    /// today's rule ([`crate::notify_call::regrade`]) — the baseline's mark
+    /// the 37 rows of 2026-09-23 were written without, and no mark for the
+    /// 11 away rings a hand came back to.
+    NotifyFacts,
 }
 
 /// What a request's name picks out ([`JevUse::request_name`]), and so which
@@ -994,6 +1030,7 @@ pub const ROUTING: JevUse = JevUse {
     names: Naming::Turn,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// The wall zo's routing waits for a judgment when the seat acts: the batch
@@ -1172,6 +1209,7 @@ pub const RECALL: JevUse = JevUse {
     names: Naming::Words,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// What every screen question carries, whichever surface answered it
@@ -1282,6 +1320,7 @@ pub const BROWSER: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// The window's desktop walk: which numbered control of an app's
@@ -1330,6 +1369,7 @@ pub const DESKTOP: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// A mobile screen is a separate consent and evidence surface. Existing
@@ -1375,6 +1415,7 @@ pub const EMULATOR: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// The window's stall sweep: why a quiet worker stopped when the measured
@@ -1422,6 +1463,7 @@ pub const STALL: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// What the placement seat's answers must bound above before `auto` rises to
@@ -1533,6 +1575,7 @@ pub const PLACEMENT: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// The summons' agent choice: which of the agents this window could start
@@ -1653,10 +1696,10 @@ pub const SUMMON: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
-/// Difficulty of a new summons, compared with the coordinator's explicit
-/// effort pin. Outcomes of executed work do not grade this comparison seat.
+/// Difficulty of new work, graded by completed executions at the same difficulty.
 pub const SUMMON_DIFFICULTY: JevUse = JevUse {
     id: crate::summon_difficulty::QUESTION,
     setting: "summonDifficulty",
@@ -1680,10 +1723,10 @@ pub const SUMMON_DIFFICULTY: JevUse = JevUse {
     agreement_floor_permille: Some(ORCHESTRATION_AGREEMENT_FLOOR_PERMILLE),
     apply_deadline_ms: Some(crate::summon_difficulty::APPLY_DEADLINE_MS),
     window_forgives: Some(FORGIVES_A_BAD_MINUTE),
-    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
-    agreement_kind: AgreementKind::Comparison,
+    agreement_rows_wanted: Some(crate::summon_difficulty::outcomes::MIN_EXECUTIONS),
+    agreement_kind: AgreementKind::Hindsight,
     baseline: Baseline::AlwaysSame(crate::summon_difficulty::LADDER[2].0),
-    negatives_wanted: Some(NEGATIVES_WANTED),
+    negatives_wanted: Some(crate::summon_difficulty::outcomes::MIN_NEGATIVES),
     confidence_bands: Some(ConfidenceBands::ROUTED),
     reads_act_line: true,
     rubric_version: crate::summon_difficulty::RUBRIC_VERSION,
@@ -1691,6 +1734,7 @@ pub const SUMMON_DIFFICULTY: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// Characters of the repeated tool call one step-effort question carries —
@@ -1766,6 +1810,7 @@ pub const STEP_EFFORT: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// Characters of the task a skill ranking reads — what the turn is about, in
@@ -1995,6 +2040,7 @@ pub const SKILLS: JevUse = JevUse {
     names: Naming::Words,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// zo's turn-start skill suggestion (t-6347): the two-stage question asked
@@ -2044,6 +2090,7 @@ pub const SKILL_SUGGESTION: JevUse = JevUse {
     names: Naming::Words,
     label_part: &[],
     follows: Some(SKILLS.setting),
+    regrade: Regrade::AsWritten,
 };
 
 /// The wall zo's step effort governor holds a step judgment to, in
@@ -2127,6 +2174,7 @@ pub const ZO_STEP_EFFORT: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// Characters of the person's last request one compaction judgment reads
@@ -2310,6 +2358,7 @@ pub const COMPACTION: JevUse = JevUse {
     names: Naming::Request,
     label_part: &["block"],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// Characters of one text an agent's own question carries — the question,
@@ -2416,6 +2465,7 @@ pub const AGENT_TOOL: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// Characters of a page's title one browser-read question carries — the head
@@ -2602,6 +2652,7 @@ pub const BROWSER_READ: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// The closed answer every notify question offers, spelled once: ring now,
@@ -2720,18 +2771,23 @@ pub const NOTIFY_AGREEMENT_FLOOR_PERMILLE: u16 = 800;
 /// Under `off`, `shadow`, a timeout or a refusal the bell rings exactly as
 /// today; only a person's `on`, or an `auto` its own evidence raised, lets
 /// `batch` and `ignore` change what the OS shows and what the tab strip
-/// marks. A held ring is
+/// marks — and only on a ring the person is present for
+/// (`crate::notify_call::acts_under`, t-11010): a ring they are away from
+/// is one no label grades, and it rings as today. A held ring is
 /// folded with every other held ring into one notice at the person's next
 /// hand on the window (`crate::notify::batched`).
 ///
 /// The `agreed` rule: a Comparison label written by the person's own hand.
-/// A key or a paste into the ring's pane within [`NOTIFY_LABEL_WINDOW_MS`]
-/// says the ring was worth the interruption — `agreed` iff the call was
-/// [`NOTIFY_INTERRUPT`]. No hand inside the window while the person was
-/// present at it says it was not — `agreed` iff the call was not. No hand
-/// while they were away says nothing either way, and leaves no mark: a
-/// person who was not there could not have turned to it. One label row per
-/// answered row, keyed by the row's own `notify` key.
+/// While the person is present at the window, a key or a paste into the
+/// ring's pane within [`NOTIFY_LABEL_WINDOW_MS`] says the ring was worth the
+/// interruption — `agreed` iff the call was [`NOTIFY_INTERRUPT`] — and no
+/// hand inside the window says it was not — `agreed` iff the call was not.
+/// A ring they were away from leaves no mark either way (t-11010): no hand
+/// says nothing, since a person who was not there could not have turned to
+/// it, and a mark for the hand that came back alone would grade away rings
+/// one way only. One label row per answered row, keyed by the row's own
+/// `notify` key; the row keeps the facts its mark is read from, and a
+/// reader marks it again by today's rule ([`Regrade::NotifyFacts`]).
 pub const NOTIFY: JevUse = JevUse {
     id: "notify",
     setting: "jevNotify",
@@ -2775,6 +2831,7 @@ pub const NOTIFY: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::NotifyFacts,
 };
 
 /// Characters of the sentence a person is writing that one mention
@@ -2912,6 +2969,7 @@ pub const MENTION_RERANK: JevUse = JevUse {
     names: Naming::Words,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// How many of the emulator seat's candidates a forked phone step tries
@@ -3096,6 +3154,7 @@ pub const BRANCHING: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// The judgment cache: a memo in front of the wire that answers a screen
@@ -3158,6 +3217,98 @@ pub const JUDGMENT_CACHE: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
+};
+
+/// The wall one mail triage question waits for its answer, in milliseconds —
+/// the wire's own, since the seat never rises and names no apply wall.
+///
+/// A record-only question asked off the beat holds nothing but its own
+/// thread, so its wall is set by the answers it would lose. The window's
+/// three seats that ask about orchestration facts got every one of their 967
+/// answers on this machine inside 2,517 ms (2026-09-26: the notify seat's
+/// 558 at p99 895 ms, the summons' 247 at p99 1,464 ms, the stall seat's 162
+/// — with a screen's 8 KB in each — at p99 2,003 ms), and a letter's facts
+/// are fewer bytes than any of them. Five seconds is twice the slowest; an
+/// answer later than that is the row's `timeout`, which says the service was
+/// slow as plainly.
+pub const MAIL_TRIAGE_DEADLINE_MS: u64 = 5_000;
+
+/// The window's mail triage (t-9471, `crate::mail_triage`): for every letter
+/// a run's coordinator is handed while this window holds its seat, whether
+/// the coordinator should deal with it now, later, or not at all — and
+/// whether it should be the very next thing it does.
+///
+/// Record-only: `shadow` is the most it offers and it never rises. Its rows
+/// are the evidence the desk's order will be judged on before it may move a
+/// letter (the harness design's §H6, a later round). What it sends is a
+/// letter's structure — kinds, the ledger's own ids, counts, a priority word
+/// — and never a word of the letter; the table declares every text the
+/// state carries, each a word or an id the product wrote.
+///
+/// The label is what the coordinator did next, read off the ledger alone
+/// (`crate::mail_triage::Mailroom::label`): its acts after the hand-over, the
+/// inbox's own bookkeeping aside, and which of them first named what the
+/// letter was about. The kind rule — a question and a finished task now, a
+/// status later, a silence never (`crate::mail_triage::kind_rule`) — is
+/// marked beside it on every label row as `baselineAgreed`, as the notify
+/// seat marks today's rule; nothing binds it, since nothing rises.
+pub const MAIL_TRIAGE: JevUse = JevUse {
+    id: "mail_triage",
+    setting: "jevMailTriage",
+    modes: &[JevMode::Off, JevMode::Shadow],
+    recommended: JevMode::Shadow,
+    repeat: None,
+    // Every text the state carries: the letter's kind, its sender's address
+    // head, the ledger's ids of the worker and the task, the task's stage
+    // word and the priority word. The rest are numbers and flags.
+    sends: &[
+        Sent {
+            at: "/state/kind",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/state/from",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/state/worker",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/state/task",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/state/taskStatus",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/state/priority",
+            cap: Cap::Uncut,
+        },
+    ],
+    ledger: "mail-triage.jsonl",
+    promotes: false,
+    answer_floor_permille: None,
+    press_floor_permille: None,
+    agreement_floor_permille: None,
+    // A seat that never rises names no apply wall; its wire waits
+    // `MAIL_TRIAGE_DEADLINE_MS`.
+    apply_deadline_ms: None,
+    window_forgives: None,
+    agreement_rows_wanted: None,
+    agreement_kind: AgreementKind::Comparison,
+    baseline: Baseline::None,
+    negatives_wanted: None,
+    confidence_bands: None,
+    reads_act_line: false,
+    rubric_version: crate::mail_triage::MAIL_TRIAGE_RUBRIC_VERSION,
+    request_name: &["mail"],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// How many of a role's eligible attempts try the model nobody has evidence
@@ -3316,6 +3467,7 @@ pub const CHALLENGER: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// Characters of the person's words one patch review reads as the task the
@@ -3504,6 +3656,7 @@ pub const PATCH_REVIEW: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// One turn's completion claims put beside the tool output that can support
@@ -3571,6 +3724,7 @@ pub const CLAIM: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// The vault pair seat only suggests relations for a person's weekly review.
@@ -3646,6 +3800,7 @@ pub const VAULT_PAIRS: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// Re-rank likely files for a code task, with one Noul for each candidate.
@@ -3701,6 +3856,7 @@ pub const FILE_PICK: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// Characters of a shell command one command-guard question carries (t-6348).
@@ -3762,11 +3918,12 @@ pub const COMMAND_GUARD_REGRET_TURNS: u32 = PATCH_REVIEW_REGRET_TURNS;
 ///
 /// The `agreed` rule is hindsight, one label per answered command, written
 /// when its turn ends or its window of turns closes: the command was regretted
-/// when the person stopped it (Esc while it ran, or the turn it ran in),
-/// when a path it named outside the project changed under it, or when a later
-/// command restored a path it named and changed
-/// ([`COMMAND_GUARD_REGRET_TURNS`], t-9087); it stood otherwise. A failed
-/// command is recorded, not graded. `flagged` agreed when
+/// when the person stopped the call itself (Esc while it ran, or refused
+/// it when asked — a turn the person stopped is not by itself a regret of the
+/// commands that finished in it, t-10916), when a path it named outside the
+/// project changed under it, or when a later command restored a path it named
+/// and changed ([`COMMAND_GUARD_REGRET_TURNS`], t-9087); it stood otherwise.
+/// A failed command is recorded, not graded. `flagged` agreed when
 /// the command was regretted, `plain` when it stood. The baseline is today's
 /// rule: zo's destructive and path tables, its shared-tree table, and the
 /// Computer Use words a control that cannot be taken back carries
@@ -3818,6 +3975,7 @@ pub const COMMAND_GUARD: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// Characters of a tool block's head one tool-text question carries
@@ -3862,8 +4020,9 @@ pub const TOOL_TEXT_GUARD_AGREEMENT_FLOOR_PERMILLE: u16 = COMMAND_GUARD_AGREEMEN
 /// The `agreed` rule is hindsight, one label per answered block, written when
 /// the turn ends: the block was followed when a call in the agent's next step
 /// carried out a command or wrote a file the block spelled and the person's
-/// words did not; it was not when that step made no such call. `instructed`
-/// agreed when the block was followed, `plain` when it was not. The baseline
+/// words did not — which proves the block held an order, and `instructed`
+/// agreed there, `plain` did not. A block that step left alone proves
+/// nothing either way and carries no mark (t-10916). The baseline
 /// is today's rule — the block arrived already fenced — graded on what the
 /// host itself says of the fence, and marked on no row where the host cannot
 /// say (a shell answer carrying another host's marker; t-7058).
@@ -3908,6 +4067,7 @@ pub const TOOL_TEXT_GUARD: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// The wall one reflex decision waits for its answer, in milliseconds: one
@@ -3995,10 +4155,11 @@ pub const REFLEX_DECIDE: JevUse = JevUse {
     names: Naming::Request,
     label_part: &[],
     follows: None,
+    regrade: Regrade::AsWritten,
 };
 
 /// Every place this product asks Jev something.
-pub static JEV_USES: [JevUse; 28] = [
+pub static JEV_USES: [JevUse; 29] = [
     ROUTING,
     RECALL,
     SKILLS,
@@ -4019,6 +4180,7 @@ pub static JEV_USES: [JevUse; 28] = [
     MENTION_RERANK,
     BRANCHING,
     JUDGMENT_CACHE,
+    MAIL_TRIAGE,
     CHALLENGER,
     PATCH_REVIEW,
     CLAIM,
@@ -4310,6 +4472,29 @@ pub fn fingerprint_of(words: &str) -> String {
 /// The bytes of a SHA-256 a fingerprint keeps: sixteen hex digits, enough to
 /// tell apart everything one ledger names and short enough to read.
 const FINGERPRINT_BYTES: usize = 8;
+
+/// FNV-1a over both text fields with a length-prefixed separator, so
+/// (`"ab"`, `"c"`) and (`"a"`, `"bc"`) cannot collide by concatenation. The
+/// decision shadow's rows and the label evaluation join on this same key, and
+/// the tool guards name a call by it — its turn and its id — in zo and in the
+/// window alike (t-10916).
+#[must_use]
+pub fn task_fingerprint(description: &str, prompt: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for chunk in [
+        description.len().to_le_bytes().as_slice(),
+        description.as_bytes(),
+        prompt.as_bytes(),
+    ] {
+        for byte in chunk {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    hash
+}
 
 /// The whole SHA-256, in hex, of what one request was — the seat that asked,
 /// the version of its rubric, the model it asked for, and the body's bytes as

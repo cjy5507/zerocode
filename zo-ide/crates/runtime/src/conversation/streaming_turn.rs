@@ -23,7 +23,7 @@ use super::{
     parallel_waves, pre_hook_denial_outcome, ConcurrentDispatchFn,
     overload_demotion_warn, quota_fallback_swap_warn, quota_wait_hold_warn,
     refusal_surfaced_message,
-    sleep_tool_execution_input,
+    sleep_tool_cut_short, sleep_tool_execution_input,
     agent_notification_text, steering_message, tool_execution_input,
     take_truncation_continuation, tool_preview_from,
     tool_result_message, tool_summary_line, unblock_tool_execute, ApiClient, AssistantEvent,
@@ -232,6 +232,22 @@ const STEERING_INTERRUPT_POLL_INTERVAL: std::time::Duration =
 /// steering", exactly like the drain does.
 fn steering_pending(queue: &SteeringQueue) -> bool {
     queue.lock().map(|queue| !queue.is_empty()).unwrap_or(false)
+}
+
+/// A `Sleep` tool call's wait: `delay`, or until the person has typed
+/// steering, whichever comes first (t-11354). The wait holds the turn for the
+/// model's sake, never against the person's words — they are what the model
+/// reads next. Checked on the same tick as a silent generation. Returns the
+/// time actually slept.
+async fn sleep_unless_steered(delay: Duration, steering: &SteeringQueue) -> Duration {
+    let started = std::time::Instant::now();
+    loop {
+        let slept = started.elapsed();
+        if slept >= delay || steering_pending(steering) {
+            return slept.min(delay);
+        }
+        tokio::time::sleep(STEERING_INTERRUPT_POLL_INTERVAL.min(delay.saturating_sub(slept))).await;
+    }
 }
 
 /// How a streaming provider call stopped being consumed.
@@ -637,6 +653,7 @@ where
         // additional legs of the same user turn and must not double-count it.
         if !internal_subturn {
             self.fold_finished_refusal_turn();
+            self.refusal_compaction = None;
         }
         // Reset the per-leg refusal override before deciding whether the
         // session cooldown should re-arm it below.
@@ -649,6 +666,7 @@ where
         self.refusal_switch_consented_for_turn = false;
         self.refusal_switch_refused_for_turn = false;
         self.refusal_images_asked_for_turn = false;
+        self.refusal_compaction_used = false;
         // Reset the per-turn quota fallback, pre-arming onto it when the session
         // is still inside a recorded quota-dry cooldown (applies to internal
         // subturns too — a quota-dry session applies to every leg). See
@@ -1983,6 +2001,34 @@ where
                                 }
                             }
                         }
+                        // The last rung (t-10956): fold the conversation and ask
+                        // the same model once more, the person's last words as
+                        // they wrote them. Said on screen before it runs; the
+                        // compaction's own lines say what it folded.
+                        RefusalDecision::RetryCompacted(config) => {
+                            let _ = render_tx
+                                .send(RenderBlock::System {
+                                    id: id_gen.next(),
+                                    level: SystemLevel::Warn,
+                                    text: core_types::retry_signal::refusal_compaction_notice(
+                                        &from_model,
+                                    ),
+                                })
+                                .await;
+                            if let Some(event) = self
+                                .apply_auto_compaction_streaming(config, &render_tx, &id_gen)
+                                .await
+                            {
+                                if let Some(usage) = refused_usage {
+                                    self.usage_tracker.record(usage);
+                                }
+                                self.note_refusal_compaction(event);
+                                auto_compaction.get_or_insert(event);
+                                continue 'outer;
+                            }
+                            // Nothing was folded after all: the rung is spent,
+                            // and the ladder answers again.
+                        }
                         other => break other,
                     }
                 };
@@ -2014,7 +2060,8 @@ where
                     }
                     RefusalDecision::Surface
                     | RefusalDecision::Proceed
-                    | RefusalDecision::Ask { .. } => None,
+                    | RefusalDecision::Ask { .. }
+                    | RefusalDecision::RetryCompacted(_) => None,
                 };
                 if let Some((level, text)) = retry_notice {
                     if let Some(usage) = refused_usage {
@@ -2030,6 +2077,7 @@ where
                     | RefusalDecision::RetrySameModel
                     | RefusalDecision::CrossProvider
                     | RefusalDecision::RetryCleaned
+                    | RefusalDecision::RetryCompacted(_)
                     | RefusalDecision::Ask { .. } => unreachable!("handled above"),
                     RefusalDecision::Surface => {
                         if let Some(usage) = refused_usage {
@@ -2042,6 +2090,18 @@ where
                                 text: REFUSAL_SURFACED_NOTICE.to_string(),
                             })
                             .await;
+                        // What stands beside it (t-10956): a compacted retry
+                        // that was declined too, and the pictures from earlier
+                        // in the conversation that ride every request.
+                        for text in self.settle_surfaced_refusal() {
+                            let _ = render_tx
+                                .send(RenderBlock::System {
+                                    id: id_gen.next(),
+                                    level: SystemLevel::Info,
+                                    text,
+                                })
+                                .await;
+                        }
                         // A route nobody could be asked about is said so
                         // (t-7153): `ask` with nobody at the keyboard.
                         if let Some(to) = self.refusal_switch_unasked_to.take() {
@@ -2668,10 +2728,12 @@ where
                                 let execution_input = if let Some((delay, input)) =
                                     sleep_tool_execution_input(&p.tool_name, &p.effective_input)
                                 {
-                                    if !delay.is_zero() {
-                                        tokio::time::sleep(delay).await;
-                                    }
-                                    Cow::Owned(input)
+                                    let slept = sleep_unless_steered(delay, &self.steering).await;
+                                    Cow::Owned(if slept < delay {
+                                        sleep_tool_cut_short(&input, slept)
+                                    } else {
+                                        input
+                                    })
                                 } else if let Some(input) = tool_execution_input(
                                     &p.tool_name,
                                     &p.tool_use_id,

@@ -15,6 +15,15 @@ use super::activity::Activity;
 use super::shimmer::fmt_elapsed_compact;
 
 pub const WORKING: &str = "Working";
+/// The status row's word while `/compact` summarizes the conversation
+/// (t-10956) — a job that can take minutes on a large one.
+pub const COMPACTING: &str = "Compacting conversation";
+
+/// How far a `/compact` summary has come, beside its status row's clock.
+#[must_use]
+pub fn compaction_progress(streamed_chars: u64) -> String {
+    format!("{streamed_chars} chars of summary so far")
+}
 /// The title row of a committed thinking cell (t-5872) — codex's reasoning
 /// cells carry the model's own bold heading; Anthropic thinking has none, so
 /// the cell says what it is.
@@ -120,6 +129,14 @@ pub fn helper(
         parts.push(format!("\"{tail}\""));
     }
     parts.join(core_types::helper_run::FACT_SEPARATOR)
+}
+
+/// What a helper's row adds once it has been quiet past the bar outside any
+/// tool call (t-11354): a doubt, and the one place to stop or message just
+/// that helper.
+#[must_use]
+pub fn helper_may_be_stuck() -> String {
+    format!("may be stuck — {} to stop or message it", super::agents::OPEN_KEY_LABEL)
 }
 
 #[must_use]
