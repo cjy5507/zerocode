@@ -2461,6 +2461,7 @@ pub(super) async fn computer_loop(
                                     step,
                                     step,
                                     Asking::Person,
+                                    cwd.as_deref().map(Path::new),
                                 )
                             },
                             |step, refusal| {
@@ -2489,6 +2490,7 @@ pub(super) async fn computer_loop(
                                         step,
                                         logged,
                                         Asking::HandBack,
+                                        cwd.as_deref().map(Path::new),
                                     )
                                 }
                                 zerocode_core::computer_recipe::RecipeTool::Browser => {
@@ -2654,6 +2656,7 @@ pub(super) async fn computer_loop(
                         &desktop,
                         &desktop,
                         computer_use::confirm::Asking::Person,
+                        cwd.as_deref().map(Path::new),
                     )
                 })
                 .await
@@ -2669,6 +2672,8 @@ pub(super) async fn computer_loop(
 /// walk take, so each is stopped, counted, confirmed and logged the same way.
 /// `logged` is the line the log keeps — the command itself, or a recipe's
 /// own words, so a value the walk was given never reaches the log.
+/// `workspace` is the folder the command was asked from: the Jev door
+/// consents by folder, and a covered press asks the cover seat for it.
 pub(super) fn desktop_step(
     app: &AppHandle,
     local_data_root: &Path,
@@ -2676,12 +2681,13 @@ pub(super) fn desktop_step(
     argv: &[String],
     logged: &[String],
     asking: computer_use::confirm::Asking,
+    workspace: Option<&Path>,
 ) -> zerocode_hookd::TeamAnswer {
     let began = std::time::Instant::now();
     // A command that panicked is answered and left like any refusal: its
     // line, the operator's memory and the band still hear of it.
     let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        answer_computer_command(argv, Some(app), asking)
+        answer_computer_command(argv, Some(app), asking, workspace)
     }))
     .unwrap_or_else(|panic| {
         computer_refused(format!(
@@ -3217,8 +3223,11 @@ pub(super) fn run_recipe(
                 // Whether the seat presses: a person's `on`, or an `auto`
                 // its own ledger has promoted — read off the wire the
                 // questions go down, so the standing and the answers come
-                // from one settings file and one ledger root.
-                let acting = crate::systemone::applies(judge.wire(), seat);
+                // from one settings file and one ledger root. Only a rise
+                // the judge recorded: the goal walk starts pressing under
+                // `auto`, a press in the middle of a written-down walk does
+                // not (t-13091).
+                let acting = crate::systemone::applies_once_risen(judge.wire(), seat);
                 let options = computer_use::errand::Options {
                     overlap: false,
                     rescue: rescue.is_some(),
@@ -3431,6 +3440,8 @@ pub(super) fn run_goal(
             (words::ROWS): [],
         }));
     }
+    // A person's `on`, or an `auto` its own marks have not taken back: the
+    // screen seats start pressing (t-13091), and a person's `shadow` records.
     let acting = crate::systemone::applies(judge.wire(), seat);
     // The branching seat's standing (t-6044), read off the same wire and the
     // same settings file as the screen seat's: whether a phone step whose
@@ -4696,6 +4707,7 @@ pub(super) fn answer_computer_command(
     argv: &[String],
     permission_window: Option<&tauri::AppHandle>,
     asking: computer_use::confirm::Asking,
+    workspace: Option<&Path>,
 ) -> zerocode_hookd::TeamAnswer {
     use zerocode_core::computer_use::{ComputerMethod, parse_command, usage};
 
@@ -4916,7 +4928,7 @@ pub(super) fn answer_computer_command(
         std::thread::sleep(std::time::Duration::from_millis(waited));
         Ok(serde_json::json!({ "waitedMs": waited, "capped": capped }))
     } else if command.method == ComputerMethod::Click && command.params.get("mark").is_some() {
-        click_by_mark(&command, asking)
+        click_by_mark(&command, asking, workspace)
     } else if command.method == ComputerMethod::Find {
         // A desktop find reads the way a desktop read does.
         let reading = zerocode_core::computer_use::ComputerCommand {
@@ -4978,9 +4990,16 @@ pub(super) fn answer_computer_command(
 /// look's window, pinned by what the look saw, down the same road as every
 /// press — the person's last step, the stop, the evidence — and answered
 /// with what it pressed.
+///
+/// A press the helper refused because something stands over the mark's
+/// centre is uncovered first — the target's own window to the front or moved
+/// clear — and pressed again, or refused as `covered` for the person
+/// (t-12979, `computer_use::cover`); `workspace` is the folder the cover
+/// seat is asked for.
 fn click_by_mark(
     command: &zerocode_core::computer_use::ComputerCommand,
     asking: computer_use::confirm::Asking,
+    workspace: Option<&Path>,
 ) -> Result<serde_json::Value, computer_use::ComputerUseError> {
     let mark = computer_use::marks::pinned_click(&command.params)?;
     let resolved = zerocode_core::computer_use::ComputerCommand {
@@ -4988,7 +5007,8 @@ fn click_by_mark(
         params: serde_json::Value::Object(mark.params.clone()),
         json: command.json,
     };
-    call_with_the_persons_last_step(&resolved, asking, &mut computer_use::call)
+    let mut press = || call_with_the_persons_last_step(&resolved, asking, &mut computer_use::call);
+    computer_use::cover::press_mark_here(&mark, &mut press, asking, workspace)
         .map(|answer| computer_use::marks::click_answer(answer, &mark))
         .map_err(|error| computer_use::marks::click_refusal(error, &mark))
 }

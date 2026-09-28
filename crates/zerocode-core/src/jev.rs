@@ -32,6 +32,7 @@ pub mod challenger;
 pub mod choice;
 pub mod claim;
 pub mod count;
+pub mod cover;
 pub mod door;
 pub mod file_pick;
 pub mod hedge;
@@ -534,9 +535,15 @@ pub struct JevUse {
     /// ([`crate::summon_difficulty::outcomes::evidence`]) — earned nothing
     /// to rise on: every row of this machine's difficulty ledger said
     /// `applied: false` and its judge `too_few_compared` 0 of 30
-    /// (2026-09-28). Such a use is still judged, and falls on a line its
-    /// own marks break — answers carried out that did worse than the pins,
-    /// or that coordinators' own choices disagree with — though not on the
+    /// (2026-09-28). The three screen seats are such uses too (t-13091): a
+    /// goal walk is asked only when a caller handed over the goal and not
+    /// the presses (the placeholder is `needs_fallback`), and its marks come
+    /// only from presses the walk went on to confirm or not — seven days of
+    /// this machine's Computer Use, 26,124 steps, asked them nothing. Such a
+    /// use is still judged, and falls on a line its own marks break —
+    /// answers carried out that did worse than the pins, that coordinators'
+    /// own choices disagree with, or presses the walk was still stuck
+    /// after — though not on the
     /// wire's health, since for it a fall is for good and a late or missing
     /// answer already falls back request by request ([`promote::judge`]); a
     /// contract holds it to a row the judge reads, because a use that acts
@@ -1332,6 +1339,16 @@ const DESKTOP_SENDS: [Sent; 6] = [
 /// A person's `off`, `shadow` and `on` still outrank the judge in both
 /// directions; `auto` is the mode that says "decide on the evidence", and it
 /// now does.
+///
+/// It decides from pressing (t-13091, [`JevUse::auto_starts`]). Recording,
+/// a goal walk asked once, pressed nothing, and so was never marked, and a
+/// seat that is never marked never rises: in seven days of this machine's
+/// Computer Use the three screen seats were asked nothing. What still stands
+/// between a judgment and a press is every door that stood before — the
+/// press floor and its destructive rung, the money bar, the injected and
+/// walled screens, the pin checked again at the press. A recorded walk that
+/// stopped is cleared under `auto` only on a rise
+/// ([`promote::risen`]), as it was.
 pub const BROWSER: JevUse = JevUse {
     id: "browser",
     setting: "browserAction",
@@ -1359,7 +1376,9 @@ pub const BROWSER: JevUse = JevUse {
     label_part: &[],
     follows: None,
     regrade: Regrade::AsWritten,
-    auto_starts: promote::Stand::Recording,
+    // A goal walk fills what its caller left open and is marked only on
+    // its presses (t-13091).
+    auto_starts: promote::Stand::Applying,
 };
 
 /// The window's desktop walk: which numbered control of an app's
@@ -1379,9 +1398,9 @@ pub const BROWSER: JevUse = JevUse {
 ///    open question this seat exists to answer, and a ledger that mixes them
 ///    cannot answer it for either.
 ///
-/// `auto` rises here on this seat's own evidence, as [`BROWSER`]'s does, and
-/// on nothing the other surface earned — which is reason 3 above holding at
-/// the moment it matters.
+/// `auto` presses here from a goal walk's first step and falls on this
+/// seat's own marks, as [`BROWSER`]'s does, and on nothing the other surface
+/// earned — which is reason 3 above holding at the moment it matters.
 pub const DESKTOP: JevUse = JevUse {
     id: "desktop",
     setting: "desktopAction",
@@ -1409,13 +1428,15 @@ pub const DESKTOP: JevUse = JevUse {
     label_part: &[],
     follows: None,
     regrade: Regrade::AsWritten,
-    auto_starts: promote::Stand::Recording,
+    // A goal walk fills what its caller left open and is marked only on
+    // its presses (t-13091).
+    auto_starts: promote::Stand::Applying,
 };
 
 /// A mobile screen is a separate consent and evidence surface. Existing
-/// browser/desktop settings never enable it, and its `auto` rises — as
-/// [`BROWSER`]'s and [`DESKTOP`]'s do — only on the presses this surface's own
-/// walks confirmed.
+/// browser/desktop settings never enable it, and its `auto` — pressing from a
+/// goal walk's first step, as [`BROWSER`]'s and [`DESKTOP`]'s do — falls only
+/// on the presses this surface's own walks marked.
 pub const EMULATOR: JevUse = JevUse {
     id: "emulator",
     setting: "emulatorAction",
@@ -1456,7 +1477,90 @@ pub const EMULATOR: JevUse = JevUse {
     label_part: &[],
     follows: None,
     regrade: Regrade::AsWritten,
-    auto_starts: promote::Stand::Recording,
+    // A goal walk fills what its caller left open and is marked only on
+    // its presses (t-13091).
+    auto_starts: promote::Stand::Applying,
+};
+
+/// How many windows over one place a cover question describes, front first:
+/// the screen question's own cut, because it is the same kind of list — what
+/// one closed choice can be asked to weigh.
+pub const COVER_OVER_CAP: usize = SCREEN_CANDIDATE_CAP;
+
+/// What a move the cover answer ranked after its first must reach, per
+/// thousand, before a hand whose first move left the place covered makes it
+/// without asking again (t-12979, the runner-up of one answer): three in
+/// twenty — the margin outside judgment libraries try a runner-up within
+/// (the field survey's C3, Footwork's 0.15). A policy line, not a calibrated
+/// accuracy claim, like [`SCREEN_PRESS_FLOOR_PERMILLE`]: a move the answer
+/// gave less than this is one it did not mean.
+pub const COVER_RUNNER_UP_FLOOR_PERMILLE: u16 = 150;
+
+/// A press whose place another window hides (t-12979,
+/// `computer_use_protocol::cover`): would a press land on something else,
+/// what stands in front as a person would call it, which move comes first —
+/// the target's window to the front, moved clear, a second look, or the
+/// person — and can moves of the target's own window do it at all. Asked of
+/// the scene's facts alone: whose each window is beside the target, its app,
+/// its layer and its bounds; never a title, never what a window shows.
+///
+/// A seat of its own because a seat is one question: the desktop seat's is
+/// which numbered control to press, and its marks grade presses; these grade
+/// whether the move put first is the one that left the place clear
+/// ([`cover::marks`]), against today's rule ([`cover::todays_rule`]).
+///
+/// It decides from acting (t-13091's rule, [`JevUse::auto_starts`]): its
+/// moves change only the target's own window, can be undone, and never touch
+/// what stands in front, while the lines that matter are the code's — the
+/// system's, an app waiting on an answer or anything unknown holds the hand
+/// for the person, and an answer that does not come usable inside the wall
+/// leaves the hand to today's rule, whose moves are as safe without it. A
+/// seat that started recording would be marked only on the moves today's
+/// rule made, which leave most of its answers uncompared, and would not rise
+/// for the same reason the screen seats did not. `shadow` records, `off`
+/// asks nothing, and under either the hand makes today's rule's moves.
+pub const COVER: JevUse = JevUse {
+    id: "cover",
+    setting: "jevCover",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On, JevMode::Auto],
+    recommended: JevMode::Auto,
+    repeat: None,
+    sends: &[
+        Sent {
+            at: "/state/target/app",
+            cap: Cap::Uncut,
+        },
+        Sent {
+            at: "/state/over",
+            cap: Cap::Items(COVER_OVER_CAP),
+        },
+        Sent {
+            at: "/state/over/*/app",
+            cap: Cap::Uncut,
+        },
+    ],
+    ledger: "cover.jsonl",
+    promotes: true,
+    answer_floor_permille: Some(SCREEN_ANSWER_FLOOR_PERMILLE),
+    press_floor_permille: Some(SCREEN_PRESS_FLOOR_PERMILLE),
+    agreement_floor_permille: Some(SCREEN_AGREEMENT_FLOOR_PERMILLE),
+    apply_deadline_ms: Some(SCREEN_APPLY_DEADLINE_MS),
+    window_forgives: Some(FORGIVES_A_BAD_MINUTE),
+    agreement_rows_wanted: Some(A_WINDOW_OF_COMPARISONS),
+    agreement_kind: AgreementKind::Hindsight,
+    // Bring it to the front, then move it: what the hand does with no seat.
+    baseline: Baseline::TodaysRule,
+    negatives_wanted: Some(NEGATIVES_WANTED),
+    confidence_bands: Some(ConfidenceBands::pressing(SCREEN_PRESS_FLOOR_PERMILLE)),
+    reads_act_line: true,
+    rubric_version: questions::COVER_RUBRIC_VERSION,
+    // One question per covered press, named by an id the window made for it.
+    request_name: &["asked"],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
+    regrade: Regrade::AsWritten,
+    auto_starts: promote::Stand::Applying,
 };
 
 /// The window's stall sweep: why a quiet worker stopped when the measured
@@ -4230,7 +4334,7 @@ pub const REFLEX_DECIDE: JevUse = JevUse {
 };
 
 /// Every place this product asks Jev something.
-pub static JEV_USES: [JevUse; 29] = [
+pub static JEV_USES: [JevUse; 30] = [
     ROUTING,
     RECALL,
     SKILLS,
@@ -4238,6 +4342,7 @@ pub static JEV_USES: [JevUse; 29] = [
     BROWSER,
     DESKTOP,
     EMULATOR,
+    COVER,
     STALL,
     PLACEMENT,
     SUMMON,
