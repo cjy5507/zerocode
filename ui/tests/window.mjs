@@ -72,6 +72,7 @@ import { testComposerAttach } from "./attach.mjs";
 import { testComposerMenuPosition } from "./composer-menu-position.mjs";
 import { testImeBrokenCommit } from "./ime-broken-commit.mjs";
 import { testWorkers } from "./workers.mjs";
+import { testSidebarAgents } from "./sidebar-agents.mjs";
 import { testConversationAgents, testConversationFolds, testConversationFont, testConversationKeys, testConversationPaths, testConversationScroll, testConversationFoot, testConversationStatus, testConversationTodos, testConversationImages, testConversationCopies, testConversationShelf, testConversationRelease } from "./conversation-parity.mjs";
 import { measureConversation, standingPids } from "./conversation-perf.mjs";
 import { createRequire } from "node:module";
@@ -234,6 +235,7 @@ suite("vault", async ({ browser, origin }) => {
   }
 });
 suite("workers", testWorkers);
+suite("sidebar-agents", testSidebarAgents);
 /* The conversation view against the Claude Code extension's own webview
  * (t-6323, docs/design/agent-conversation-claude-code-grammar-20260915.md
  * §10): each suite one difference that was closed, read off the laid-out page. */
@@ -5646,7 +5648,8 @@ ok(
 // refocus the sink within a frame, and flushing on that blink split 계속
 // into "ㄱ ㅖ 속" (reported). A blur now waits BLUR_FLUSH_GRACE_MS: focus
 // back home in time keeps the half word; a real departure still flushes —
-// and a flush that lets bare jamo out writes the scrubbed ring to the husk.
+// and a flush that lets bare jamo out writes the ring's SHAPE to the husk:
+// what kind of letter, never which (t-11740).
 const blurBlink = await page.evaluate(async () => {
   const wait = (ms) => new Promise((done) => setTimeout(done, ms));
   const seen = {};
@@ -5694,15 +5697,17 @@ const blurBlink = await page.evaluate(async () => {
   seen.bodyJoins = order.at(-2) === "text:나" && order.at(-1) === "key:Enter";
 
   // 진짜 이탈: 유예가 지나면 방류하고, 자모가 섞였으니 링이 husk로 간다 —
-  // 한글만 살아남고 나머지는 점이 된 채로.
+  // 글자는 하나도 없이 모양만: 홑자음 c, 홑모음 v, 받침 없는 음절 s, 받침
+  // 있는 음절 S, 공백은 공백, 나머지는 점. 글자 수는 그대로다.
   strayJamoReportedAt = 0;
   strike("ㅋ");
   sink.blur();
   await wait(250);
   seen.departureFlushes = order.at(-1) === "text:ㅋ";
-  seen.huskHears = husk.length === 1 && husk[0].startsWith("ime: bare jamo left through rescue.flush") &&
-    husk[0].includes("ㅋ");
-  seen.huskScrubs = scrubImePayload("sink=hunter2! ㅗ") === "············· ㅗ";
+  seen.huskHears = husk.length === 1 &&
+    husk[0].startsWith("ime: bare jamo left through rescue.flush: c ");
+  seen.huskSpellsNothing = husk.length === 1 && !/[\u3130-\u318f\uac00-\ud7a3]/.test(husk[0]);
+  seen.huskShapes = imeShape("sink=hunter2! ㅗ각가") === "············· vSs";
 
   // 분당 한 번: 같은 분에 또 새어도 husk는 조용하다.
   sink.focus();
@@ -5721,10 +5726,10 @@ const blurBlink = await page.evaluate(async () => {
   return seen;
 });
 ok(
-  "a blink of blur keeps the half word, a stray jamo goes home from the body, and a real flush leaves scrubbed footprints",
+  "a blink of blur keeps the half word, a stray jamo goes home from the body, and a real flush leaves footprints shaped, not spelled",
   blurBlink.blinkHolds && blurBlink.blinkKeeps && blurBlink.bodyComesHome && blurBlink.bodyRescued &&
     blurBlink.bodyJoins && blurBlink.departureFlushes && blurBlink.huskHears &&
-    blurBlink.huskScrubs && blurBlink.huskRateLimited,
+    blurBlink.huskSpellsNothing && blurBlink.huskShapes && blurBlink.huskRateLimited,
   JSON.stringify(blurBlink),
 );
 
@@ -43490,6 +43495,14 @@ const agentDotClock = await page.evaluate(async () => {
   say(mate, "done");
   say(asks, "needs-attention");
   await window.__PAINTED__();
+  // A finished pane folds into the one line that counts the finished
+  // (t-11753): its mark and its clock are read once that line is opened.
+  const folded = rows().find((one) => one.dataset.history);
+  seen.doneFolds =
+    folded?.dataset.history === "1" && !rows().some((one) => one.dataset.term === String(mate));
+  folded?.click();
+  await window.__PAINTED__();
+  const standing = () => rows().filter((one) => !one.dataset.history);
   const dotOf = (at) =>
     rows().find((one) => one.dataset.term === String(at))?.querySelector(".wt-agent-dot") ?? null;
   const marked = (at, id) =>
@@ -43503,8 +43516,8 @@ const agentDotClock = await page.evaluate(async () => {
   seen.doneWearsCheck = marked(mate, "#i-circle-check");
   seen.waitingAsks = marked(asks, "#i-msg-ask");
 
-  const whens = rows().map((one) => one.querySelector(".wt-agent-when")?.textContent ?? "");
-  seen.rows = rows().length;
+  const whens = standing().map((one) => one.querySelector(".wt-agent-when")?.textContent ?? "");
+  seen.rows = standing().length;
   seen.everyRowHasWhen = whens.length === seen.rows && whens.every((word) => word.length > 0);
   // 태어난 시각은 손으로 넣어 준 것이 아니라 뷰가 처음 설 때 저절로 찍힌 것이어야
   // 한다 — 이 장부가 비면 시계는 상태 전이 시각으로 미끄러져 "방금"만 말한다.
@@ -43516,6 +43529,7 @@ const agentDotClock = await page.evaluate(async () => {
   paneBorn.set(term, Date.now() - 90_000);
   seen.signatureMoves = agentRowsSaid(worktreeAgentRows(path)) !== before;
 
+  agentHistoryShown.delete(term);
   for (const tab of [...tabs]) dropTab(tab.id);
   for (const at of [...termViews.keys()]) dropTermView(at);
   for (const at of [term, mate, asks]) dropTermView(at);
@@ -43523,7 +43537,8 @@ const agentDotClock = await page.evaluate(async () => {
 });
 ok(
   "a session row wears Orca's dot and its own clock",
-  agentDotClock.workingSpins && agentDotClock.doneWearsCheck && agentDotClock.waitingAsks &&
+  agentDotClock.doneFolds &&
+    agentDotClock.workingSpins && agentDotClock.doneWearsCheck && agentDotClock.waitingAsks &&
     agentDotClock.rows === 3 && agentDotClock.everyRowHasWhen && agentDotClock.bornStamped &&
     agentDotClock.clockRidesSignature && agentDotClock.signatureMoves,
   JSON.stringify(agentDotClock),

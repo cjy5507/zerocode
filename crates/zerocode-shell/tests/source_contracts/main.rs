@@ -13628,6 +13628,100 @@ mod tests {
         }
     }
 
+    /// What the Korean-input husk writes to disk is the typing's shape, never
+    /// its letters (t-11740).
+    ///
+    /// The husk used to keep every hangul syllable of its trace ring when a
+    /// bare jamo leaked, and `window-errors.log` read as the person's own
+    /// sentences — a file agents read, whose words go on to a model provider.
+    /// So the one function that builds the log's sentence takes nothing but
+    /// the road's name and what `imeShape` has already made of the text, the
+    /// trace reaches it only through the shaping copy of the ring, and it is
+    /// the one door in the input file that writes the log. What earlier
+    /// builds wrote is withdrawn at boot, before anything else writes the
+    /// log, by a pass that recognises the header the window sends.
+    #[test]
+    fn the_ime_husk_writes_shapes_and_never_letters() {
+        let window = window_source();
+        let dump = block_after(window, "function imeDump(road, text) {");
+        let spliced: Vec<&str> = dump
+            .split("${")
+            .skip(1)
+            .map(|rest| rest.split_once('}').map_or(rest, |(inside, _)| inside))
+            .collect();
+        assert!(
+            !spliced.is_empty()
+                && spliced.iter().all(|inside| {
+                    ["road", "imeShape(text)", "IME_SHAPE_LEGEND"].contains(inside)
+                        || inside.starts_with("shapedImeTrace()")
+                }),
+            "the husk's sentence takes something other than shapes:\n{dump}"
+        );
+        assert!(
+            !dump.contains("imeTrace.") && !dump.contains("imeTrace["),
+            "the husk's sentence reads the raw ring:\n{dump}"
+        );
+        let trail = block_after(window, "function shapedImeTrace() {");
+        assert!(
+            trail.contains("imeShape("),
+            "the ring reaches the husk without being shaped:\n{trail}"
+        );
+        let report = block_after(window, "function reportStrayJamo(road, text) {");
+        assert!(
+            report.contains("message: imeDump(road, text)"),
+            "the husk writes a sentence the shaping function did not build:\n{report}"
+        );
+        let input = include_str!("../../../../ui/shell-input.js");
+        assert_eq!(
+            input.matches("log_window_error").count(),
+            1,
+            "a second door from the input file into the window log"
+        );
+        // The boot pass knows the header by the words the window sends.
+        let withdrawal = include_str!("../../src/ime_trace_withdrawal.rs");
+        assert!(
+            dump.contains("`ime: bare jamo left through ${road}: ")
+                && withdrawal.contains("\"window: ime: bare jamo left through \""),
+            "the boot pass and the husk disagree on the dump's header"
+        );
+        let main = strip_rust_comments(include_str!("../../src/main.rs"));
+        let withdraws = main.find("ime_trace_withdrawal::withdraw_once(");
+        let first_note = main.find("codex_queue::reap_stale()");
+        assert!(
+            withdraws.is_some_and(|at| first_note.is_some_and(|note| at < note)),
+            "the old dumps are not withdrawn before the boot's first log line"
+        );
+    }
+
+    /// A failed request that carried the person's typing leaves the device's
+    /// words out of the window log (t-11740).
+    ///
+    /// Android hands typed text to the device's shell (`adb shell input
+    /// text`), and the shell's error quotes pieces of it back; the window
+    /// logged that error whole. The toast was always a fixed sentence, so
+    /// only the log changes: the two doors that send typing report the one
+    /// sentence that says it failed.
+    #[test]
+    fn a_typed_text_failure_leaves_the_devices_words_out_of_the_log() {
+        let window = window_source();
+        let sending = block_after(window, "function sendEmulatorInput(");
+        assert!(
+            sending.contains(r#"verb === "text" ? EMULATOR_TYPED_FAILURE : error"#),
+            "a failed typing request logs the device's words again:\n{sending}"
+        );
+        let routing = block_after(window, "function routeText(text) {");
+        let emulator = routing
+            .split("const target = keyboardTarget();")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            emulator.contains("reportEmulatorError(")
+                && emulator.contains("EMULATOR_TYPED_FAILURE")
+                && !emulator.contains("error,"),
+            "the terminal's typing into a device logs the device's words again:\n{emulator}"
+        );
+    }
+
     /// Typing in a diff is saved by the save that already exists.
     ///
     /// Orca's `readOnly: !editable` / `originalEditable: false` pair, and the
@@ -16135,8 +16229,9 @@ mod tests {
 
         let primary = block_after(window, "function agentRowPrimary(row, state) {");
         assert!(
-            primary.contains("agentConversationName(row)")
-                && primary.contains("panePrompts.get(row.term)?.trim()")
+            primary.contains("agentPaneName(row.tab, row.term, row.agent)")
+                && block_after(window, "function agentPaneName(tab, term, agent = \"\") {")
+                    .contains("panePrompts.get(term)?.trim()")
                 && primary
                     .contains(r#"bucketWord(state === "needs-attention" ? "attention" : state)"#),
             "the first-words ladder lost a rung:\n{primary}"
@@ -16151,7 +16246,7 @@ mod tests {
         let hooked = block_after(window, r#"listen("hook:agent", (event) => {"#);
         assert!(
             hooked
-                .contains("if (event.payload.prompt) panePrompts.set(term, event.payload.prompt);")
+                .contains("if (event.payload.prompt && !event.payload.prompt_names_nothing) panePrompts.set(term, event.payload.prompt);")
                 && hooked
                     .contains("if (event.payload.said) paneSaid.set(term, event.payload.said);"),
             "the ladder's raw feeds no longer ride the hook event:\n{hooked}"
@@ -29658,7 +29753,9 @@ mod tests {
 
         // The reader is bounded and read-only: these are the vendors' files.
         assert!(
-            reader.contains("take(MAX_TAIL_BYTES)"),
+            reader.contains("file.take(window)")
+                && reader.contains("Self::read_within(path, MAX_TAIL_BYTES)")
+                && reader.contains("Tail::read_within(path, NAMING_PROMPT_SEARCH_BYTES)"),
             "the tail read lost its bound, so a 2 GB transcript is read whole"
         );
         for forbidden in ["fs::write", "fs::rename", "OpenOptions", "fs::remove"] {
@@ -36965,4 +37062,132 @@ fn the_emulator_pane_opens_on_a_resumed_device() {
             "`{key}` is missing from one of the en/ja/zh/es catalogs"
         );
     }
+}
+
+/// t-11540: an agent is called one thing wherever the window names it. The
+/// sidebar's row and the board's card ask the one pane-name function, and
+/// every surface of the board — the relation map's label, its one-line story,
+/// the detail panel, the scope list, the peek — reads the card through
+/// `agentGraphIdentity`. A prompt that only says go on, or the window's own
+/// mail pointer, is judged by the core's one list (`names_the_turn`), carried
+/// on the report, and never becomes the name; a stored name that fails the
+/// same test is renamed where the window restores a tab.
+#[test]
+fn an_agent_is_called_one_thing_on_every_surface() {
+    let window = support::window_source();
+    let orbit = include_str!("../../../../ui/shell-board-orbit.js");
+    assert_eq!(
+        window.matches("function agentPaneName(").count(),
+        1,
+        "the pane's name is worked out in one place"
+    );
+    assert!(
+        !window.contains("function agentConversationName("),
+        "a second name ladder is back"
+    );
+    let cards = support::block_after(window, "function cardsFromPanes(panes) {");
+    assert!(
+        cards.contains(
+            "heading: tab ? agentPaneName(tab, pane.term, pane.agent) || where || tabLabel(tab) : pane.agent,"
+        ),
+        "the card's heading stopped asking the one name, then the workspace:\n{cards}"
+    );
+    assert!(
+        support::block_after(window, "function agentRowPrimary(row, state) {")
+            .contains("agentPaneName(row.tab, row.term, row.agent)"),
+        "the sidebar's row names its agent some other way"
+    );
+    assert!(
+        support::block_after(window, "function agentGraphIdentity(card) {").contains(
+            "agentGraphCleanText(card.task) || agentGraphCleanText(card.heading) || card.pane"
+        ),
+        "the board's surfaces stopped reading the card's name"
+    );
+    for (surface, said) in [
+        ("the detail panel", "identity: agentGraphIdentity(card),"),
+        (
+            "the relation map's entity",
+            "label: agentGraphIdentity(entry.card),",
+        ),
+        (
+            "the peek",
+            "el(\"peek-title\").textContent = agentGraphIdentity(card);",
+        ),
+        (
+            "the scope list",
+            "entity?.label ?? agentGraphIdentity(entry.card)",
+        ),
+    ] {
+        assert!(
+            window.contains(said),
+            "{surface} names an agent some other way"
+        );
+    }
+    assert!(
+        orbit.contains("name: agentGraphIdentity(entry.card),"),
+        "the 3D view's label names an agent some other way"
+    );
+    // The one-line story's subject is that same name, in the sentence it
+    // already had — the counts live there and nowhere else (coordinator,
+    // m-11649).
+    let glance = support::block_after(orbit, "function agentOrbitGlance(state) {");
+    assert!(
+        glance.contains("subject: subject(lead), count: lead.children.length")
+            && glance.contains("named = lead.name;"),
+        "the story's subject stopped being the lead's own name:\n{glance}"
+    );
+
+    let hooks = include_str!("../../src/hooks.rs");
+    assert!(
+        support::block_after(hooks, "pub fn report_of(")
+            .contains("zerocode_core::transcript::names_the_turn(said)"),
+        "the report no longer says which prompts name nothing"
+    );
+    assert!(
+        include_str!("../../src/system_runtime.rs").contains("layout.named_by_their_turns()"),
+        "a restored tab keeps a stored name that only says go on"
+    );
+}
+
+/// t-11540, second round: a prompt names its pane only once its own record
+/// says a person typed it. Claude Code fires `UserPromptSubmit` for a check
+/// the agent scheduled on itself too, and says so only in the transcript it
+/// writes after the hook — so the window's hook loop holds a numbered prompt
+/// and settles it on the pane's next event (the core reads the record), and
+/// the window takes the settled name from the report's `named`.
+#[test]
+fn a_prompt_names_its_pane_only_once_its_record_says_a_person_typed_it() {
+    let hooks = include_str!("../../src/hooks.rs");
+    let settling = support::block_after(hooks, "pub fn settle_prompt_name(");
+    assert!(
+        settling.contains("settle_prompt_name_in("),
+        "the loop's settling is not the tested one:\n{settling}"
+    );
+    assert!(
+        support::block_after(hooks, "fn settle_prompt_name_in(")
+            .contains("zerocode_core::transcript::prompt_typed_by_a_person("),
+        "a held prompt is settled by something other than its own record"
+    );
+    let runtime = include_str!("../../src/pane_runtime.rs");
+    let settled = runtime
+        .find("hooks::settle_prompt_name(&mut report);")
+        .expect("the hook loop settles each report's name");
+    let noted = runtime
+        .find("note_pane_state(&app, Some(&envelope.worktree_id), &report);")
+        .expect("the hook loop notes each report");
+    let gated = runtime
+        .find("if !report_speaks_for_its_pane(&app, &report) {")
+        .expect("the hook loop gates a nested run's report");
+    assert!(
+        gated < settled && settled < noted,
+        "the name is settled after the pane's own gate and before the window hears it"
+    );
+    let hooked = support::block_after(
+        support::window_source(),
+        r#"listen("hook:agent", (event) => {"#,
+    );
+    assert!(
+        hooked.contains("if (event.payload.named) panePrompts.set(term, event.payload.named);"),
+        "the window does not take a settled name:\n{hooked}"
+    );
 }
