@@ -4255,6 +4255,31 @@ function paintScmNotices(rows) {
 
 listen("scm:notices", (event) => paintScmNotices(event.payload));
 
+/* Today's model lineup moved (t-14437): one line per agent, said once — a
+ * model that arrived is chosen without anybody typing it, and one that
+ * folded is not chosen any more. */
+listen("summon-lineup:changed", (event) => {
+  // One line per set of models, whatever number of agents took them in: a
+  // release zo and its own CLI both run arrives once.
+  const byModels = new Map();
+  const folded = new Set();
+  for (const change of Array.isArray(event.payload) ? event.payload : []) {
+    if (change.entered?.length) {
+      const models = change.entered.join(", ");
+      byModels.set(models, [...(byModels.get(models) ?? []), change.agent]);
+    }
+    for (const model of change.folded ?? []) folded.add(model);
+  }
+  for (const [models, agents] of byModels) {
+    toast(t("summon.lineup.entered", "새 모델 {{models}}을(를) 이제 쓸 수 있습니다 — {{agent}}의 쉬운 일부터 써 봅니다.",
+      { models, agent: agents.join("·") }));
+  }
+  if (folded.size) {
+    toast(t("summon.lineup.folded", "{{models}}은(는) 이제 고르지 않습니다 — 새 버전이 나왔거나 목록에서 빠졌습니다.",
+      { models: [...folded].join(", ") }));
+  }
+});
+
 /* Codex's PTY route is the safety net, not a state to hide. The first event
  * is said immediately and this term-keyed mark remains reviewable until every
  * worker using the fallback has ended. */
@@ -4899,7 +4924,13 @@ function endTabDrag() {
   tabDrag = null;
   tabstrip.classList.remove("is-dragging");
   showDropZone(null);
-  if (!target) return;
+  // A drag that stayed in its own strip reordered it while it moved, and the
+  // order is part of what the stage looks like — terminals' seats included
+  // (t-14036).
+  if (!target) {
+    persistStageLayouts();
+    return;
+  }
   const tab = tabs.find((held) => held.id === id);
   if (!tab) return;
   const source = tab.pane;
@@ -4910,7 +4941,10 @@ function endTabDrag() {
   // Dropped in another group's middle: the tab joins that group — Orca's
   // `moveUnifiedTabToGroup` — and the group it left folds if it emptied.
   if (target.zone === "center") {
-    if (target.group === source) return;
+    if (target.group === source) {
+      persistStageLayouts();
+      return;
+    }
     tab.pane = target.group;
     collapseStageGroup(source);
     setActiveTab(tab.id);
@@ -5441,8 +5475,12 @@ function dropTab(id, { closed = false } = {}) {
     persistPaneLayouts(removed.worktree);
     scheduleAgentPaint(["cards"]);
   }
-  // A closed document the same — and a group that folded moved the tree.
+  // A closed document the same — and a group that folded moved the tree. A
+  // terminal the stage record seats is in that record too (t-14036).
   if (STAGE_STORED_KINDS.has(removed?.kind)) persistStageLayouts();
+  else if (removed?.kind === "term" && removed.storedId != null) {
+    persistStageLayouts({ worktree: removed.worktree });
+  }
 }
 
 /* ---- 도는 프로세스의 터미널은 닫기 전에 묻는다 (1-ft) ----

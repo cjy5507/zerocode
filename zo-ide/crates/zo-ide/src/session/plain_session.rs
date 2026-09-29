@@ -698,8 +698,7 @@ impl PlainSession {
     /// that ended on "when they land" would wait for something that never
     /// lands.
     fn background_work_probe(&self) -> Option<runtime::BackgroundWorkProbe> {
-        let completions_come_back = !self.headless && self.agent_completion_receiver.is_none();
-        if !completions_come_back {
+        if !self.completions_come_back() {
             return None;
         }
         let registry = Arc::clone(&self.registry);
@@ -712,6 +711,28 @@ impl PlainSession {
                 .count();
             agents + processes.load()
         }))
+    }
+
+    /// Whether a pump brings this session's background results back as
+    /// messages: an interactive session whose front end took the completion
+    /// receiver into one.
+    fn completions_come_back(&self) -> bool {
+        !self.headless && self.agent_completion_receiver.is_none()
+    }
+
+    /// Hand the turn about to run its stop, so a blocking `Agent` call lets
+    /// its helper go on in the background when the turn stops (t-11460) —
+    /// only where a pump brings that helper's result back; elsewhere the call
+    /// waits as it did. Every turn, because a model or permission switch
+    /// rebuilds the runtime with a fresh tool context.
+    fn install_turn_stop(&self, stop: &HookAbortSignal) {
+        if let Some(inner) = self.runtime.runtime.as_ref() {
+            inner
+                .tool_executor()
+                .tool_registry()
+                .context()
+                .set_turn_stop(self.completions_come_back().then(|| stop.clone()));
+        }
     }
 
     /// Current runtime's mid-turn completion inbox. Model/permission rebuilds
@@ -780,6 +801,7 @@ impl PlainSession {
     ) -> Result<runtime::TurnSummary, String> {
         self.runtime
             .set_hook_abort_signal(hook_abort_signal.clone());
+        self.install_turn_stop(&hook_abort_signal);
         if let Some(mcp_state) = self.runtime.mcp_state.as_ref() {
             discover_pending_mcp_tools_in_background(
                 mcp_state,
@@ -917,7 +939,10 @@ impl PlainSession {
         //
         // Here, beside the deadline it extends, and re-read every turn for
         // the same reason `set_deadline` is: an env change takes effect on
-        // the next turn rather than at next launch.
+        // the next turn rather than at next launch. With nothing named the
+        // deadline is a quiet window pushed on for as long as the turn keeps
+        // showing progress; a deadline the environment names is a wall
+        // (t-12076).
         //
         // Only this host. A spawned sub-agent keeps its deadline as a hard
         // straggler bound — nobody is watching it to notice a grind.
@@ -2537,13 +2562,16 @@ mod turn_arming_tests {
         );
     }
 
-    /// The policy the host arms is the documented one, and it is disableable.
+    /// The policy the host arms is the documented one: with nothing named, a
+    /// quiet window pushed on half an hour at a time for as long as the turn
+    /// keeps making progress — no count (t-12076). The runtime's own test walks
+    /// the rest of the table: a named deadline is a wall, a named count caps.
     #[test]
-    fn the_env_policy_is_two_half_hour_pushes_and_can_be_turned_off() {
+    fn the_env_policy_is_half_hour_pushes_with_no_count_unless_somebody_names_one() {
         // Defaults, with nothing in the environment.
-        let (count, step) = runtime::env_deadline_extension().expect("on by default");
-        assert_eq!(count, 2, "two pushes");
-        assert_eq!(step.as_secs(), 30 * 60, "half an hour each");
+        let extension = runtime::env_deadline_extension().expect("on by default");
+        assert_eq!(extension.max, None, "no cap on pushes nobody capped");
+        assert_eq!(extension.step.as_secs(), 30 * 60, "half an hour each");
     }
 }
 

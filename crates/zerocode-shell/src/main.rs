@@ -177,6 +177,7 @@ mod stage_layout;
 mod standing_clock;
 mod state_migration;
 mod stats_events_store;
+mod summon_lineup;
 mod supply_chain;
 mod system_fonts;
 mod system_locale;
@@ -339,21 +340,21 @@ use cmd::{
     skills_rescan, slash_commands, source_control_compare_context, ssh_hosts, ssh_import_config,
     ssh_link_connect, ssh_link_disconnect, ssh_link_states, ssh_open_remote_term, ssh_probe_target,
     ssh_remove_target, ssh_save_target, ssh_submit_credential, ssh_targets, stage_layouts,
-    stage_path, stage_paths, stats_summary, stop_workspace_port, subagent_log, submodule_status,
-    supply_chain_graph, supply_chain_report, suppress_external_worktree_inbox, term_focus,
-    term_fold, term_has_running_process, term_key, term_lines, term_mouse, term_paste, term_pull,
-    term_resize, term_scroll, term_search, term_snapshot, term_text, term_view_to_line,
-    terminal_command, terminal_command_argv, terminal_prefs, terminal_sessions,
-    terminal_windows_status, test_local_network_permission, test_remote_server,
-    test_remote_workspace, test_router_connection, test_ssh_host, text_input, tip_verdict,
-    tour_decision, type_value_keys, typesafe_settings, unstage_path, unstage_paths, update_check,
-    update_download, update_history, update_install, upstream_status, use_system_claude_login,
-    validate_branch_name, vault_sessions, verify_claude_accounts, verify_codex_accounts,
-    watch_files, wire_answer, wire_image, wire_interrupt, wire_log, wire_models, wire_send,
-    wire_set_mode, wire_set_model, wire_start, wire_stop, work_item_seed, worker_screen,
-    workspace_cleanup_scan, workspace_space_cancel, workspace_space_git, workspace_space_scan,
-    worktree_committed_diff, worktree_evidence, worktree_last_agent, worktree_loss, worktree_prefs,
-    worktree_stamp, write_primary_selection, write_text_file,
+    stage_path, stage_paths, standing_pane_worktrees, stats_summary, stop_workspace_port,
+    subagent_log, submodule_status, supply_chain_graph, supply_chain_report,
+    suppress_external_worktree_inbox, term_focus, term_fold, term_has_running_process, term_key,
+    term_lines, term_mouse, term_paste, term_pull, term_resize, term_scroll, term_search,
+    term_snapshot, term_text, term_view_to_line, terminal_command, terminal_command_argv,
+    terminal_prefs, terminal_sessions, terminal_windows_status, test_local_network_permission,
+    test_remote_server, test_remote_workspace, test_router_connection, test_ssh_host, text_input,
+    tip_verdict, tour_decision, type_value_keys, typesafe_settings, unstage_path, unstage_paths,
+    update_check, update_download, update_history, update_install, upstream_status,
+    use_system_claude_login, validate_branch_name, vault_sessions, verify_claude_accounts,
+    verify_codex_accounts, watch_files, wire_answer, wire_image, wire_interrupt, wire_log,
+    wire_models, wire_send, wire_set_mode, wire_set_model, wire_start, wire_stop, work_item_seed,
+    worker_screen, workspace_cleanup_scan, workspace_space_cancel, workspace_space_git,
+    workspace_space_scan, worktree_committed_diff, worktree_evidence, worktree_last_agent,
+    worktree_loss, worktree_prefs, worktree_stamp, write_primary_selection, write_text_file,
 };
 use cmd::{
     artifact_copy_path, artifact_counts, artifact_delete, artifact_export,
@@ -755,30 +756,23 @@ struct ForegroundAgentLook {
     process: Option<u32>,
 }
 
-/// Confirm that a submitting Enter was consumed, retrying that Enter once
-/// when a capable provider stays silent for one normal TUI quiet window.
-/// Providers without a prompt-submit hook pass `None` and keep the terminal
-/// delivery contract they can actually prove.
+/// Confirm that a launch briefing's submitting Enter was consumed: the
+/// provider's own prompt-submit report, heard by the deadline.
+///
+/// The Enter pressed again when that report is late is the delivery's own
+/// step now (t-14037, [`zerocode_pty::ready::PromptDelivery`]) — guarded at
+/// the write like every other, and the same for every door — so this only
+/// listens. Providers without a prompt-submit hook pass `None` and keep the
+/// terminal delivery contract they can actually prove.
 fn await_prompt_submission(
     submitted: Option<&std::sync::mpsc::Receiver<()>>,
     deadline: Instant,
-    acknowledgement_window: Duration,
-    retry_enter: impl FnOnce() -> bool,
 ) -> bool {
-    let Some(submitted) = submitted else {
-        return true;
-    };
-    let first_wait = acknowledgement_window.min(deadline.saturating_duration_since(Instant::now()));
-    match submitted.recv_timeout(first_wait) {
-        Ok(()) => true,
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => false,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            retry_enter()
-                && submitted
-                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .is_ok()
-        }
-    }
+    submitted.is_none_or(|submitted| {
+        submitted
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .is_ok()
+    })
 }
 
 /// The reason a worker launch gives when its briefing never went in, naming
@@ -3134,6 +3128,7 @@ fn main() -> ExitCode {
             set_panel_width,
             pane_layouts,
             save_pane_layouts,
+            standing_pane_worktrees,
             stage_layouts,
             save_stage_layouts,
             term_has_running_process,
@@ -3267,6 +3262,12 @@ fn main() -> ExitCode {
             // and no other; until it is named, every door answers unknown.
             readiness_runtime::configure_root(managed.config_root());
             readiness_runtime::configure(readiness_runtime::limits_of(&boot_settings.readiness));
+            // Today's model lineup for the summons's choices (t-14437): read
+            // once now on a thread of its own, then whenever a reader finds
+            // it older than zo's refresh rule.
+            if let Some(home) = dirs::home_dir() {
+                summon_lineup::configure(handle.clone(), home, managed.config_root().to_path_buf());
+            }
             crumbs::record("boot", format_args!("settings"));
             if let Err(error) = managed.native_tray().sync_for_boot(
                 &handle,

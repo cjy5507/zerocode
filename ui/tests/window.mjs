@@ -23,7 +23,7 @@ import { createRunner } from "./window-runner.mjs";
 
 import { testVaultSubagents } from "./vault-subagents.mjs";
 import { testKnowledgeLive } from "./knowledge-live.mjs";
-import { testArtifactBand, testArtifactBeside, testArtifactCatalog, testArtifactChrome, testArtifactFirstScreen, testArtifactNewMenu, testArtifactPages, testArtifactProvenance, testArtifactRecall, testArtifactStudio, testArtifactStudioLayout, testArtifactStudioOwnership } from "./artifact-gallery.mjs";
+import { testArtifactBand, testArtifactBeside, testArtifactFollowed, testArtifactCatalog, testArtifactChrome, testArtifactFirstScreen, testArtifactNewMenu, testArtifactPages, testArtifactProvenance, testArtifactRecall, testArtifactStudio, testArtifactStudioLayout, testArtifactStudioOwnership } from "./artifact-gallery.mjs";
 
 import { testLedgerPoll } from "./ledger-poll.mjs";
 import { testUsageRefresh, testUsageWords } from "./usage-refresh.mjs";
@@ -66,6 +66,7 @@ import { testNativeFolderPicker } from "./native-folder-picker.mjs";
 import { testSftpAndTeam } from "./sftp.mjs";
 import { testPaneFollowsCwd } from "./pane-follow.mjs";
 import { testZoRestore } from "./zo-restore.mjs";
+import { testRestartSamePanes } from "./restart-same-panes.mjs";
 import { testPermissionCard } from "./permission-card.mjs";
 import { testEditorSelection } from "./editor-selection.mjs";
 import { testEditorRecovery } from "./editor-recovery.mjs";
@@ -215,6 +216,7 @@ suite("browser-panes-survive", ({ browser, origin, ok }) => testBrowserPanesSurv
 suite("emulator-seat", ({ browser, origin, ok }) => testEmulatorSeat(browser, origin, ok));
 suite("artifact-beside", ({ browser, origin, ok }) => testArtifactBeside(browser, origin, ok, join(UI, "..", "output/playwright")));
 suite("artifact-band", ({ browser, origin, ok }) => testArtifactBand(browser, origin, ok, join(UI, "..", "output/playwright")));
+suite("artifact-followed", ({ browser, origin, ok }) => testArtifactFollowed(browser, origin, ok, join(UI, "..", "output/playwright")));
 suite("emulator-loans", ({ browser, origin, ok }) => testEmulatorLoans(browser, origin, ok));
 suite("coordinator-panel", ({ browser, origin, ok }) => testCoordinatorPanel(browser, origin, ok));
 suite("jev-dashboard", async ({ browser, origin, ok }) => {
@@ -228,6 +230,8 @@ suite("sftp", ({ browser, origin, ok }) => testSftpAndTeam(browser, origin, ok))
 suite("pane-follow", ({ browser, origin, ok }) => testPaneFollowsCwd(browser, origin, ok));
 // The zo panes a restart brings back, in their own workspaces (t-12063).
 suite("zo-restore", ({ browser, origin, ok }) => testZoRestore(browser, origin, ok));
+// The panes a restart opens again, where they stood, in every workspace (t-14036).
+suite("restart-same-panes", ({ browser, origin, ok }) => testRestartSamePanes(browser, origin, ok));
 suite("permission-card", ({ browser, origin, ok }) => testPermissionCard(browser, origin, ok));
 suite("editor-selection", ({ browser, origin, ok }) => testEditorSelection(browser, origin, ok));
 suite("editor-recovery", ({ browser, origin, ok }) => testEditorRecovery(browser, origin, ok));
@@ -56626,6 +56630,20 @@ suite("term-withheld", async ({ browser, origin, ok }) => {
       tell("term:prompt", draft);
       await settle();
       seen.afterDrop = toasts().length - standing;
+      // Sixty beats of a draft held at a third pane (t-14585): the pane's
+      // hook reports the same rest every beat, the pointer's words change
+      // once when new mail lands, and the person sees one notice.
+      const third = await openTermTab({ placement: "tab" });
+      const beforeBeats = toasts().length;
+      const copiedBeforeBeats = copied.length;
+      const held = { ...draft, term: third };
+      for (let beat = 0; beat < 60; beat += 1) {
+        tell("hook:agent", { term: third, state: "done", agent: "claude", session: "s-held-draft", resumable: false });
+        tell("term:prompt", beat < 30 ? held : { ...held, text: pointer.replace("2", "3") });
+      }
+      await settle();
+      seen.sixtyBeats = toasts().length - beforeBeats;
+      seen.sixtyBeatsCopied = copied.length - copiedBeforeBeats;
       // No toast ever wore a guard's English sentence.
       seen.guardWords = toasts().filter((note) =>
         /holding words|appended to them|did not accept the input|reached the line/.test(note.textContent)).length;
@@ -56646,6 +56664,11 @@ suite("term-withheld", async ({ browser, origin, ok }) => {
       "the notice comes back only when the situation is new: another pane, a prompt that landed, the pane's state moving, a shell that ended",
       seen.otherPane === 2 && seen.afterLanded === 3 && seen.afterMoved === 4 &&
         seen.stillSaid && seen.afterDrop === 1,
+      JSON.stringify(seen),
+    );
+    ok(
+      "sixty beats of a draft held on one pane are one notice, and the words reach the clipboard once per new watermark",
+      seen.sixtyBeats === 1 && seen.sixtyBeatsCopied === 2,
       JSON.stringify(seen),
     );
     ok(

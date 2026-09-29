@@ -3738,6 +3738,62 @@ impl Run {
             .and_then(|(_, inbox)| inbox.open.as_ref())
     }
 
+    /// Every message at this address nobody has acknowledged: the open
+    /// batch first, then the queue behind it, oldest first — the mail the
+    /// next plain `check` and the ones after it would hand over (t-15313).
+    ///
+    /// Acknowledged is the one proof the ledger has that the holder's MODEL
+    /// read a message: an `--ack` names a delivery id, and that id was only
+    /// ever printed beside the mail. Handed over is not that proof. `check`
+    /// acknowledges, then looks, so `check --ack <d> >/dev/null` leases the
+    /// next batch into /dev/null — which is how a worker's go-ahead sat
+    /// "delivered" for ten minutes on 2026-09-29 while its model waited for
+    /// it.
+    pub fn unread(&self, address: &str) -> Vec<&str> {
+        self.inboxes
+            .iter()
+            .find(|(held, _)| held == address)
+            .map(|(_, inbox)| {
+                inbox
+                    .open
+                    .iter()
+                    .flat_map(|open| open.messages.iter())
+                    .chain(inbox.pending.iter())
+                    .map(String::as_str)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// [`Self::pointer_wanted`] for a holder whose turn is OVER: the open
+    /// batch counts too (t-15313).
+    ///
+    /// `pointer_wanted` leaves the open batch out because a holder mid-turn
+    /// may be reading it right now, and a pointer on top would nag a
+    /// recovery in progress. A holder at rest is recovering nothing: the
+    /// batch in front of it was read and left unacknowledged, or never
+    /// reached its model at all, and its next `check` replays it either way.
+    /// So the pane at rest is pointed at it — once per watermark, like any
+    /// other mail.
+    pub fn unread_wanted(&self, address: &str, asking_seat: Option<&str>) -> Option<usize> {
+        let open = self
+            .open_delivery(address)
+            .map_or(0, |held| held.messages.len());
+        let queued = self.pointer_wanted(address, asking_seat).unwrap_or(0);
+        (open + queued > 0).then_some(open + queued)
+    }
+
+    /// The newest message [`Self::unread_wanted`] would point at — the
+    /// watermark of a pointer at rest: the queue's newest, or the open
+    /// batch's when nothing is queued behind it (t-15313).
+    pub fn newest_unread(&self, address: &str) -> Option<&str> {
+        self.newest_pending(address).or_else(|| {
+            self.open_delivery(address)
+                .and_then(|held| held.messages.last())
+                .map(String::as_str)
+        })
+    }
+
     /// Take back the mail of every worker in this run that can never read
     /// again, onto the run's own queue. Answers how many rows moved.
     ///
@@ -3865,10 +3921,11 @@ impl Run {
             .map(String::as_str)
     }
 
-    /// What is waiting for this address, left exactly where it is: the rows
-    /// behind `check --peek`. No lease is minted and nothing moves — the
-    /// same mail will be in the next delivery, which is the difference
-    /// between looking through the window and opening the door.
+    /// What is queued for this address, left exactly where it is: the rows
+    /// behind `check --peek`, after the open batch it shows first. No lease
+    /// is minted and nothing moves — the same mail will be in the next
+    /// delivery, which is the difference between looking through the window
+    /// and opening the door.
     pub fn pending_messages(&self, address: &str, kinds: &[MessageKind]) -> Vec<&Message> {
         self.inboxes
             .iter()
@@ -4076,15 +4133,28 @@ pub const QUIET_GRACE_MS: i64 = 180_000;
 /// under it would be a second death for one restart.
 pub const RESEAT_GRACE_MS: i64 = 600_000;
 
-/// A stalled episode's reminder cadence.
+/// How long a worker at rest may leave unread mail — or sit in its own
+/// `check --wait` — before its coordinator is told (t-15313).
+///
+/// Shorter than [`QUIET_GRACE_MS`] on purpose: the stall grace waits out a
+/// pane that is quiet for reasons of its own, and this silence has one
+/// reason already named — mail the worker has not read, or a wait on the
+/// coordinator. A minute and a half is long past the second the pointer
+/// takes to type into a composer at rest, so mail the window CAN put in
+/// front of the model is read before this passes, and it is inside the two
+/// minutes the person asked for. Measured from the later of the rest and the
+/// mail: mail that lands on a pane long at rest earns the pointer its
+/// minute and a half too.
+pub const IDLE_NOTICE_GRACE_MS: i64 = 90_000;
+
+/// The cadence an asker's thread hears the same word about its receiver
+/// again ([`notice_owed`]).
 ///
 /// Wall time, deliberately, rather than turn count: turn frequency is the
-/// quantity that produced the flood. A worker ending a turn every 2.4 seconds
-/// must not earn notices faster than one ending a turn every thirty seconds.
-/// Five minutes keeps a genuinely stuck pane visible without turning the
-/// window's one-second beat into coordinator mail. There is no timer behind
-/// this constant; the existing window beat merely asks whether the durable
-/// episode is due again.
+/// quantity that produced the flood. A receiver ending a turn every 2.4
+/// seconds must not earn lines faster than one ending a turn every thirty
+/// seconds. It once paced the coordinator's stall reminders too; those are
+/// told once per episode now (t-15313, [`Ledger::workers_stalled`]).
 const QUIET_REMINDER_MS: i64 = 300_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4122,9 +4192,14 @@ fn quiet_episode(run: &Run, worker_id: &str, dispatch_id: &str) -> Option<QuietE
         let stalled_since_ms = body
             .get("stalledSinceMs")
             .and_then(serde_json::Value::as_i64);
-        let Some(observed_ms) = turn_ms.or(stalled_since_ms) else {
+        // A rest the window saw — the lead back at its prompt, its Stop
+        // perhaps held back by work it left running (t-15313) — is a fact
+        // about the same silence, and the notice it earned is this
+        // episode's one notice.
+        let idle_since_ms = body.get("idleSinceMs").and_then(serde_json::Value::as_i64);
+        let Some(observed_ms) = turn_ms.or(stalled_since_ms).or(idle_since_ms) else {
             // Episode-closing summaries are observations too, but neither a
-            // turn nor a stall sample. Only those two facts define an episode.
+            // turn, a stall nor a rest. Only those facts define an episode.
             continue;
         };
         let notified = body
@@ -4148,6 +4223,51 @@ fn quiet_episode(run: &Run, worker_id: &str, dispatch_id: &str) -> Option<QuietE
         }
     }
     episode
+}
+
+/// Message ids named for a headline: the first few, and how many more.
+fn named_ids(ids: &[&str]) -> String {
+    const NAMED: usize = 5;
+    let shown = ids
+        .iter()
+        .take(NAMED)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    match ids.len().saturating_sub(NAMED) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
+    }
+}
+
+/// A worker's last `status`, as an idle notice carries it (t-15313): which
+/// message, when, and its first line — what the worker last said it was
+/// doing or waiting on, however long before its rest it said it. `null`
+/// for a worker that has sent none.
+fn last_status_json(run: &Run, worker_id: &str) -> serde_json::Value {
+    const LINE_CHARS: usize = 200;
+    let reporter = worker_address(worker_id);
+    let Some(said) = run
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.from == reporter && message.kind == MessageKind::Status)
+    else {
+        return serde_json::Value::Null;
+    };
+    let first = said.body.as_str().lines().next().unwrap_or_default();
+    let line = match first.chars().count() > LINE_CHARS {
+        true => format!(
+            "{}…",
+            first.chars().take(LINE_CHARS - 1).collect::<String>()
+        ),
+        false => first.to_string(),
+    };
+    serde_json::json!({
+        "messageId": said.id,
+        "createdMs": said.created_ms,
+        "line": line,
+    })
 }
 
 fn quiet_rollup(episode: QuietEpisode) -> serde_json::Value {
@@ -7939,6 +8059,7 @@ impl Ledger {
             // person already has on their screen.
             summon_shadow: None,
             difficulty_shadow: None,
+            model_shadow: None,
             placement_shadow: None,
             prior_binding,
             prior_binding_revision,
@@ -10245,6 +10366,29 @@ impl Ledger {
         now_ms: i64,
         notify: bool,
     ) -> Option<String> {
+        self.record_quiet_row(
+            run_id,
+            body,
+            Text::default(),
+            (task, dispatch),
+            now_ms,
+            notify,
+        )
+    }
+
+    /// The same row with a headline: the words a reader meets before the
+    /// body, which is where an idle notice says what the worker is waiting
+    /// on (t-15313). A body's key order is the serializer's to choose; a
+    /// subject is read first by every renderer, the banner included.
+    fn record_quiet_row(
+        &mut self,
+        run_id: &str,
+        body: serde_json::Value,
+        subject: Text,
+        (task, dispatch): (String, String),
+        now_ms: i64,
+        notify: bool,
+    ) -> Option<String> {
         let address = self.run(run_id)?.address();
         let id = self.mint("m-");
         let run = self.run_mut(run_id)?;
@@ -10254,7 +10398,7 @@ impl Ledger {
             to: address.clone(),
             kind: MessageKind::WentQuiet,
             body: body.to_string().into(),
-            subject: Text::default(),
+            subject,
             priority: Priority::Normal,
             payload: Text::default(),
             thread: None,
@@ -10491,16 +10635,18 @@ impl Ledger {
                 if !dispatch.is_open() || awaiting_reply(run, &worker.id) {
                     return None;
                 }
+                /* Once per episode (t-15313). This used to remind every five
+                 * minutes the silence lasted, and a silence the coordinator
+                 * ordered — "wait until the release" — then drew a notice every
+                 * five minutes for as long as it was obeyed: more than ten
+                 * about one worker between 14:10 and 14:50 on 2026-09-29,
+                 * with a real silence buried among them. The notice stands on
+                 * the desk while the silence goes on (`quiet_notice_stands`),
+                 * so a reminder repeats a fact the coordinator already holds;
+                 * the worker's own next word closes the episode, and the
+                 * silence after it is news again. */
                 let episode = quiet_episode(run, &worker.id, &dispatch.id);
-                let due = episode.as_ref().is_none_or(|held| {
-                    held.last_notified_ms.is_none_or(|last| {
-                        /* A backwards wall clock spends one notice and rebases
-                         * the durable cadence. Otherwise subtraction could
-                         * mute a stalled pane until the clock caught up. */
-                        now_ms < last || now_ms.saturating_sub(last) >= QUIET_REMINDER_MS
-                    })
-                });
-                if !due {
+                if episode.is_some_and(|held| held.last_notified_ms.is_some()) {
                     return None;
                 }
                 let started = episode.map_or(*stalled_since_ms, |held| held.first_turn_ms);
@@ -10539,6 +10685,167 @@ impl Ledger {
             }
         }
         notified
+    }
+
+    /// Tell each coordinator, once per quiet episode, about a worker at rest
+    /// that has unread mail or sits in its own `check --wait` (t-15313).
+    ///
+    /// The hole this closes, measured on 2026-09-29 (run-11955, w-15216): a
+    /// worker ended its turn at 14:36 to wait for 「빌드 가능」, which had been
+    /// in its inbox since 14:32 — leased by its own
+    /// `check --ack <d> >/dev/null`. Its own `check --wait` loop kept
+    /// running, so the window held its `Stop` back as work in progress
+    /// (t-11233): the pane stayed
+    /// `working`, no turn end reached this ledger, and the stall sweep skips
+    /// a working pane. For seven minutes its coordinator was told nothing,
+    /// and only the person noticed.
+    ///
+    /// So the window hands over every lead it has seen come to rest, parked
+    /// `Stop` or not, and the ledger decides with what it owns: a live
+    /// worker carrying an open attempt; mail at its address nobody
+    /// acknowledged ([`Run::unread`]) or — for a worker the person has not
+    /// taken over — a wait of its own on that address; and
+    /// [`IDLE_NOTICE_GRACE_MS`] past the later of the rest
+    /// and the oldest unread mail — the pointer's chance to put the mail in
+    /// front of the model. A worker whose unanswered question stands and who
+    /// has nothing unread is waiting on purpose, and its question is already
+    /// in the coordinator's inbox. A worker the person took over is never
+    /// typed into, so its unread mail is told and named as taken over — the
+    /// pointer's skip of a taken pane had left it with nobody told at all.
+    ///
+    /// Once per episode: the report-free interval `quiet_episode` reads,
+    /// shared with the stall sweep, so neither road tells a silence the
+    /// other already told. The worker's own next word closes it — a status
+    /// written before the rest began does not, because the rest came after
+    /// it (the 14:33 status in the case above).
+    ///
+    /// A notice and nothing else. Idle is not done: no attempt ends, no task
+    /// moves, no terminal is released or cleaned up because of this — the
+    /// t-11233 gate exists so a lead at rest beside a running build is never
+    /// read as a finished turn, and this road keeps that promise.
+    ///
+    /// Answers how many notices were written.
+    pub fn workers_idle(&mut self, idle: &[IdleWorker], now_ms: i64) -> usize {
+        if now_ms < 0 {
+            return 0;
+        }
+        let mut told = 0;
+        for one in idle {
+            if one.rested_ms < 0 {
+                continue;
+            }
+            let Some((run_id, body, subject, task, dispatch)) = self.runs.iter().find_map(|run| {
+                let worker = run.worker(&one.worker)?;
+                if !worker.state.is_live() || !worker.state.may_occupy_pane() {
+                    return None;
+                }
+                let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
+                if !dispatch.is_open() {
+                    return None;
+                }
+                let address = worker_address(&worker.id);
+                let unread: Vec<&Message> = run
+                    .unread(&address)
+                    .into_iter()
+                    .filter_map(|id| run.message(id))
+                    .collect();
+                /* A pane the person took is theirs to wait in: nothing is
+                 * typed there, and with nothing unread there is nothing to
+                 * tell. Its unread mail IS news — the pointer's skip of a
+                 * taken pane left run-4275's w-14439 with six letters nobody
+                 * was told about (t-15313). */
+                if unread.is_empty()
+                    && (worker.taken_over
+                        || !one.waiting_on_mail
+                        || awaiting_reply(run, &worker.id))
+                {
+                    return None;
+                }
+                let since = unread
+                    .iter()
+                    .map(|message| message.created_ms)
+                    .min()
+                    .map_or(one.rested_ms, |oldest| oldest.max(one.rested_ms));
+                /* A clock that stepped back behind the rest fails toward the
+                 * notice, not toward silence: the grace is the pointer's
+                 * chance, and a subtraction that never reaches it would mute
+                 * the one notice this silence has for as long as the clock
+                 * takes to climb back. Once per episode bounds it to one. */
+                if now_ms >= since && now_ms - since < IDLE_NOTICE_GRACE_MS {
+                    return None;
+                }
+                let episode = quiet_episode(run, &worker.id, &dispatch.id);
+                if episode.is_some_and(|held| held.last_notified_ms.is_some()) {
+                    return None;
+                }
+                let unread_ids: Vec<&str> = unread.iter().map(|message| message.id.as_str()).collect();
+                let reason = match unread.is_empty() {
+                    false => IDLE_UNREAD_REASON,
+                    true => IDLE_WAITING_REASON,
+                };
+                let rested_s = now_ms.saturating_sub(one.rested_ms) / 1000;
+                let taken = match worker.taken_over {
+                    true => ", taken over by the person,",
+                    false => ",",
+                };
+                let subject = match unread.is_empty() {
+                    false => format!(
+                        "unread mail waiting: {} for {} ({}){taken} at rest {rested_s} s",
+                        named_ids(&unread_ids),
+                        worker.id,
+                        dispatch.task
+                    ),
+                    true => format!(
+                        "waiting on mail: {} ({}) sleeps in its own check --wait with nothing \
+                         unread, at rest {rested_s} s",
+                        worker.id, dispatch.task
+                    ),
+                };
+                let turns = episode.map_or(0, |held| held.turns);
+                Some((
+                    run.id.clone(),
+                    serde_json::json!({
+                        "reason": reason,
+                        "unreadMail": unread_ids,
+                        "workerId": worker.id,
+                        "agent": worker.agent,
+                        "pane": worker.pane,
+                        "taskId": dispatch.task,
+                        "dispatchId": dispatch.id,
+                        "idleSinceMs": one.rested_ms,
+                        "observedAtMs": now_ms,
+                        "waitingOnMail": one.waiting_on_mail,
+                        "takenOver": worker.taken_over,
+                        "lastStatus": last_status_json(run, &worker.id),
+                        "episodeStartedMs": episode.map_or(one.rested_ms, |held| held.first_turn_ms),
+                        "lastTurnEndedMs": episode.map(|held| held.last_turn_ms),
+                        "quietTurns": turns,
+                        "suppressedTurns": episode
+                            .map_or(0, |held| held.turns.saturating_sub(held.notified_through)),
+                        "notification": true,
+                    }),
+                    subject,
+                    dispatch.task.clone(),
+                    dispatch.id.clone(),
+                ))
+            }) else {
+                continue;
+            };
+            if self
+                .record_quiet_row(
+                    &run_id,
+                    body,
+                    subject.into(),
+                    (task, dispatch),
+                    now_ms,
+                    true,
+                )
+                .is_some()
+            {
+                told += 1;
+            }
+        }
+        told
     }
 
     /// Two witnesses to a worker's quota wall become news — once per wall,
@@ -13572,14 +13879,40 @@ pub trait Launcher {
         None
     }
 
-    /// The person's difficulty table, captured by the host for this launch.
+    /// The launch row for `difficulty` — the person's, else today's lineup's,
+    /// else the shipped table's — captured by the host for this launch, with
+    /// what else the lineup offers there (t-14437).
     fn difficulty_profile(
         &self,
         _agent: &str,
         _difficulty: &str,
         _origin: [&str; 3],
-    ) -> Result<Option<crate::summon_difficulty::Profile>, String> {
+    ) -> Result<Option<crate::summon_difficulty::lineup::Row>, String> {
         Ok(None)
+    }
+
+    /// Every difficulty's launch row for `agent` as the window's lineup
+    /// snapshot reads today — peeked, never fetched: this runs inside the
+    /// actor. `None` when nobody looked (t-14437).
+    fn summon_rows(&self, _agent: &str) -> Option<Vec<crate::summon_difficulty::lineup::Row>> {
+        None
+    }
+
+    /// What the model question reads for `agent` under this summons's origin
+    /// — lineup, book and records — or `None` when the host holds no lineup
+    /// or the launch was sealed (t-14437).
+    fn model_facts(&self, _agent: &str, _origin: [&str; 3]) -> Option<crate::summon_model::Facts> {
+        None
+    }
+
+    /// Ask the model seat `asked`: the receipt row, `applied` true only when
+    /// its answer is to run. `None` while the seat is off.
+    fn choose_model(
+        &self,
+        _asked: &crate::summon_model::ModelAsk,
+        _origin: [&str; 3],
+    ) -> Option<serde_json::Value> {
+        None
     }
 
     /// What this machine actually has, one row per agent the catalog knows.
@@ -13974,6 +14307,35 @@ pub struct StallJudged {
     pub stalled_since_ms: i64,
     pub cause: String,
     pub confidence: f64,
+}
+
+/// The `reason` of an idle notice whose worker has mail it has not read
+/// (t-15313) — the first words a coordinator reads, because a go-ahead lost
+/// in an unread output and a worker waiting on its own build job must be
+/// told apart at a glance.
+pub const IDLE_UNREAD_REASON: &str = "unread_mail";
+
+/// The `reason` of an idle notice whose worker sleeps in its own
+/// `check --wait` with nothing unread: it is waiting on mail — a go-ahead,
+/// an answer, a build letter — and nothing has come (t-15313).
+pub const IDLE_WAITING_REASON: &str = "waiting_on_mail";
+
+/// One worker the window found with its lead at rest (t-15313): its turn
+/// over, whether or not work it left running held its `Stop` back
+/// (t-11233) — or, in a pane the person took over, ended by their hand —
+/// since `rested_ms` on the pane's own clock, and whether it sleeps in a
+/// `check --wait` on its own inbox, which only the window that runs the
+/// wait can see. Built only by the window's beat, read only by
+/// [`Ledger::workers_idle`].
+///
+/// Idle is not done. Nothing that ends, releases or cleans up a worker reads
+/// this: a lead at rest beside a running build is the t-11233 case exactly,
+/// and the only thing this fact may produce is one notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleWorker {
+    pub worker: String,
+    pub rested_ms: i64,
+    pub waiting_on_mail: bool,
 }
 
 /// Both witnesses to one worker's quota wall, and the worker they are about.
@@ -16139,6 +16501,60 @@ const TUNABLE: &[(&str, &str, Option<EffortRide>, &str)] = &[
     ("cursor", "--model", None, ""),
 ];
 
+/// One model turn's facts, as [`dials_why`] reads them.
+type ModelTurn = (
+    Option<crate::summon_model::ModelAsk>,
+    Option<serde_json::Value>,
+    Option<crate::summon_difficulty::lineup::Candidate>,
+    crate::summon_model::Facts,
+);
+
+/// `dials.why` (t-14437): the chosen model's band, what set its effort
+/// (`jev` when the seat's pair ran, else the row's rule), how many of its
+/// summonses here have ended, and the seat's confidence when its answer ran.
+fn dials_why(
+    turn: Option<&ModelTurn>,
+    pick: Option<&(String, String, &str)>,
+    row: Option<&crate::summon_difficulty::lineup::Row>,
+) -> serde_json::Value {
+    let model = pick
+        .map(|(model, _, _)| model.as_str())
+        .or_else(|| row.map(|row| row.model.as_str()));
+    let facts = turn.map(|(_, _, _, facts)| facts);
+    let band = model
+        .and_then(|model| facts?.lineup.find(model)?.band)
+        .or_else(|| row.and_then(|row| row.band));
+    let jev = pick.is_some_and(|(_, _, from)| *from == DIALS_FROM_JEV);
+    serde_json::json!({
+        "band": band,
+        "effortRule": if jev {
+            serde_json::json!(DIALS_FROM_JEV)
+        } else {
+            serde_json::json!(row.map(|row| row.effort_rule))
+        },
+        "samples": model
+            .and_then(|model| facts?.records.get(model))
+            .map_or(0, |record| record.ended),
+        "confidence": turn
+            .and_then(|(_, receipt, _, _)| receipt.as_ref())
+            .filter(|_| jev)
+            .map(|receipt| receipt["confidence"].clone()),
+    })
+}
+
+/// `dials.difficultyFrom`: the difficulty seat's applied answer chose it.
+const DIALS_FROM_JEV: &str = "jev";
+/// `dials.difficultyFrom`: nobody chose; the ladder's middle stood.
+const DIALS_FROM_FALLBACK: &str = "fallback";
+/// `dials.modelFrom`: the summons named its own `--model`.
+const DIALS_FROM_REQUEST: &str = "request";
+/// `dials.modelFrom`: a challenger's turn tried a model with too little
+/// record here (`summon_model::challenger`).
+const DIALS_FROM_CHALLENGE: &str = "challenge";
+/// `dials.modelFrom`: no row, no lineup and no answer named a model, so the
+/// agent's own CLI launched with its default.
+const DIALS_FROM_CLI_DEFAULT: &str = "cli-default";
+
 /// Translate the difficulty ladder through the measured launch table.
 /// Its last column is the highest effort this summons ladder may use.
 #[must_use]
@@ -16245,6 +16661,7 @@ fn agent_row(
     launched: &[serde_json::Value],
     headroom: Option<&Headroom>,
     readiness: Option<&crate::readiness::AgentReadinessSnapshot>,
+    summon: Option<&[crate::summon_difficulty::lineup::Row]>,
     now_ms: i64,
 ) -> serde_json::Value {
     let tuning = TUNABLE.iter().find(|(id, _, _, _)| *id == spec.id);
@@ -16284,8 +16701,32 @@ fn agent_row(
     // The binary and the login as the window's probe last saw them, with
     // the age on it; `unknown` where nobody has observed this agent.
     row["readiness"] = readiness_json(readiness, now_ms);
+    // What a summons that leaves the model open would launch with at each
+    // difficulty, where that came from (`person`, `lineup`, `table`), and
+    // what else today's lineup offers there, a newly arrived model marked
+    // `fresh` — so a coordinator can name one with `--model` (t-14437).
+    // `null` is "nobody read a lineup", never "no choices".
+    row["summon"] = summon.map_or(serde_json::Value::Null, |rows| serde_json::json!(rows));
+    // And when there are none, why — said, never left to a CLI's default.
+    row["summonUnavailable"] = match (tuning, summon) {
+        (None, _) => serde_json::json!(SUMMON_NO_MODEL_FLAG),
+        (Some((_, _, None, _)), _) => serde_json::json!(SUMMON_NO_EFFORT_FLAG),
+        (Some(_), Some(rows)) if !rows.is_empty() => serde_json::Value::Null,
+        (Some(_), _) => serde_json::json!(SUMMON_NO_LINEUP),
+    };
     row
 }
+
+/// `summonUnavailable`: the launch table has measured no `--model` for this
+/// agent's CLI, so a summons cannot name one.
+const SUMMON_NO_MODEL_FLAG: &str = "its CLI takes no measured --model at launch";
+/// `summonUnavailable`: a model can be named but no effort, so no difficulty
+/// row can be launched as a whole.
+const SUMMON_NO_EFFORT_FLAG: &str = "its CLI takes no measured effort at launch";
+/// `summonUnavailable`: the window read no lineup with models for it — its
+/// provider is not connected to zo, or zo's discovery for it failed.
+const SUMMON_NO_LINEUP: &str =
+    "no lineup today: its provider is not connected to zo, or zo could not list it";
 
 /// What this ledger has actually launched, per agent: every `(model, effort)`
 /// pair a summons here has carried, and how many times.
@@ -16844,6 +17285,8 @@ pub struct PreparedWorkerStart {
     pub placement_shadow: Option<PlacementShadow>,
     /// Difficulty evidence, recorded after this reservation really opens.
     pub difficulty_shadow: Option<crate::summon_difficulty::Shadow>,
+    /// The model question's receipt, recorded the same way (t-14437).
+    pub model_shadow: Option<crate::summon_model::Shadow>,
     prior_binding: Option<String>,
     prior_binding_revision: Option<u64>,
     binding_revision: u64,
@@ -17194,6 +17637,21 @@ bypass a safeguard or reach anything the person does not own.";
 
 const WORKER_GATE_CONTEXT: &str = "For code changes in a Rust workspace, the worker gate must include `cargo clippy --all-targets -- -D warnings` from the repository root, including test targets across the workspace. Report each gate exit code without hiding it behind a pipe.";
 
+/// The sentence that sends a worker to `zerocode-find` before it reads code
+/// it does not know (t-14869): the file pick seat, called by the agent
+/// itself, in place of the reads a worker spends finding its files — a
+/// note that only mentioned such a tool was used 0 times in 22 (t-14656).
+fn worker_find_context() -> String {
+    format!(
+        "Before your first read of code you do not know yet, run `{} <what you are about to change or debug>`: it lists the files most likely involved, each with its first comment line, so you start from them instead of searching.",
+        crate::file_find::SHIM
+    )
+}
+
+/// The words a worker's briefing ends on, before the task it carries — where
+/// a reader of the prompt finds the task's own words (t-14869).
+pub const BRIEFING_HANDS_OVER: &str = "Now do this:";
+
 /// What a summoned worker is told, ahead of its own instruction.
 ///
 /// Without this the loop does not close. A coordinator summons, the worker
@@ -17236,12 +17694,14 @@ with the same path named once in the summary. Say in the summary if that \
 file dies with your worktree, because the coordinator reads it before \
 anything is cleaned up. Every command that CHANGES anything needs --retry-request: repeat \
 the same name to retry one you never heard back from, and choose a new one for \
-a new request. `zerocode-orc help` lists the rest. {purpose}\n\n{contract}\n\n{worker_gate}\n\n{trust}\n\nNow do this:\n\n",
+a new request. `zerocode-orc help` lists the rest. {find} {purpose}\n\n{contract}\n\n{worker_gate}\n\n{trust}\n\n{hands_over}\n\n",
+        find = worker_find_context(),
         purpose = WORKER_PURPOSE_CONTEXT,
         worker_gate = WORKER_GATE_CONTEXT,
         contract = crate::delegation::AGENT_SELECTION_CONTEXT,
         trust = trust,
         head = HANDED_IN_HEAD,
+        hands_over = BRIEFING_HANDS_OVER,
     )
 }
 
@@ -17279,12 +17739,13 @@ nobody on either side can answer one. Keep the summary short and carry a \
 longer answer as a path — `--payload '{{\"reportPath\":\"/abs/path\",\"lifetime\":\"ephemeral\"}}'` — \
 naming it once in the summary too, and say whether that file outlives your \
 worktree, because the home window is not on this machine. Every command that CHANGES anything needs --retry-request. \
-`zerocode-orc help` lists the rest. {purpose}\n\n{contract}\n\n{worker_gate}\n\n{trust}\n\nNow do this:\n\n",
+`zerocode-orc help` lists the rest. {purpose}\n\n{contract}\n\n{worker_gate}\n\n{trust}\n\n{hands_over}\n\n",
         purpose = WORKER_PURPOSE_CONTEXT,
         worker_gate = WORKER_GATE_CONTEXT,
         contract = crate::delegation::AGENT_SELECTION_CONTEXT,
         trust = trust,
         head = HANDED_IN_HEAD,
+        hands_over = BRIEFING_HANDS_OVER,
     )
 }
 
@@ -17351,10 +17812,48 @@ pub const ASK_BUDGET_DEFAULT_MS: u32 = 600_000;
 /// (`zerocode_hookd::WAIT_BUDGET_CEILING_MS`) matches this exactly.
 pub const ASK_BUDGET_MAX_MS: u32 = 1_800_000;
 
-/// A caller's `--timeout-ms`, refused outside its range rather than clamped:
-/// a silently clamped budget reports a wait the caller never asked for.
-fn wait_budget(raw: &str) -> Result<u32, String> {
-    budget_under(raw, WAIT_BUDGET_MAX_MS)
+/// A `check --wait` budget: what the wait holds, and — when the caller asked
+/// for more than the ceiling — what it asked.
+///
+/// Above the ceiling the wait holds the ceiling and SAYS so, rather than
+/// refusing (t-15313). A refusal there arrives at once, and a caller that
+/// piped the answer (`… 2>&1 | head`) reads an exit code of zero and an empty
+/// page: on 2026-09-29 a worker asked for fifty minutes, got the refusal in
+/// the same second, took it for silence and sat idle for seven minutes on a
+/// go-ahead that was already in its inbox. Below the floor is still refused:
+/// a wait of a few milliseconds is a mistyped unit, not a patience, and
+/// holding a second instead would answer a question nobody asked.
+fn wait_budget(raw: &str) -> Result<(u32, Option<u64>), String> {
+    let asked: u64 = raw
+        .parse()
+        .map_err(|_| format!("--timeout-ms is milliseconds, and {raw:?} is not a number"))?;
+    match u32::try_from(asked) {
+        Ok(fits) if fits <= WAIT_BUDGET_MAX_MS => {
+            Ok((budget_under(raw, WAIT_BUDGET_MAX_MS)?, None))
+        }
+        _ => Ok((WAIT_BUDGET_MAX_MS, Some(asked))),
+    }
+}
+
+/// What a wait held to the ceiling says, on both of its roads (t-15313).
+///
+/// The sentence goes to stderr, which is where a note about the call belongs;
+/// the same fact rides in the answer's JSON too, because the bridge carries a
+/// successful answer's stdout alone and a note only stderr held would never
+/// reach the pane that asked. On the answer this call itself returns — mail
+/// already waiting, or the deadline's empty page — and not on a woken one:
+/// mail that arrived before the ceiling is the whole answer, and the ceiling
+/// cut nothing short.
+fn note_wait_ceiling(decided: &mut Decided, asked: u64) {
+    decided.reply.stderr.push_str(&format!(
+        "orchestration: --timeout-ms {asked} is above the {WAIT_BUDGET_MAX_MS} ceiling; this \
+         wait holds {WAIT_BUDGET_MAX_MS}\n"
+    ));
+    let Ok(mut answer) = serde_json::from_str::<serde_json::Value>(&decided.reply.stdout) else {
+        return;
+    };
+    answer["timeoutMs"] = serde_json::json!({ "asked": asked, "held": WAIT_BUDGET_MAX_MS });
+    decided.reply.stdout = format!("{answer}\n");
 }
 
 /// One clamp for every verb that takes `--timeout-ms`, told its own ceiling.
@@ -17724,9 +18223,21 @@ pub const PEEK_MODE: &str = "peek";
 /// The page `check --all` prints ([`LOOK_MODE_KEY`]).
 pub const HISTORY_MODE: &str = "all";
 
-/// The non-consuming look behind `check --peek`: what is pending, capped at
-/// a page, and left exactly where it is. Waking on it is fine — the same
-/// mail will be in the next delivery.
+/// The non-consuming look behind `check --peek`: everything at this address
+/// nobody has acknowledged, capped at a page, and left exactly where it is.
+/// Waking on it is fine — the same mail will be in the next delivery.
+///
+/// Acknowledged, not merely handed over (t-15313). A batch a `check` handed
+/// over stays open until its `--ack`, and it is the next plain `check`'s
+/// answer — so it is unread mail, and a look that shows only the queue
+/// behind it shows less than the next `check` would hand over. That gap lost
+/// a go-ahead on 2026-09-29: a worker ran `check --ack <d> >/dev/null`, the
+/// same call leased the next batch into /dev/null, and its
+/// `check --wait --peek` then slept ten minutes beside the one message it was
+/// waiting for.
+/// The open batch comes first, oldest mail first as `check` would hand it,
+/// and is named under `unacked` so the reader knows a plain `check` replays
+/// it and which id retires it. A batch acknowledged is never shown again.
 fn peek_look(
     ledger: &Ledger,
     run_id: &str,
@@ -17734,21 +18245,39 @@ fn peek_look(
     kinds: &[MessageKind],
 ) -> Result<(Decided, bool), String> {
     let run = ledger.run(run_id).ok_or_else(|| unknown_run(run_id))?;
+    let unacked = run
+        .open_delivery(address)
+        .map(|open| {
+            let held: Vec<&Message> = open
+                .messages
+                .iter()
+                .filter_map(|id| run.message(id))
+                .filter(|message| kinds.is_empty() || kinds.contains(&message.kind))
+                .collect();
+            (open.id.as_str(), held)
+        })
+        .filter(|(_, held)| !held.is_empty());
     let pending = run.pending_messages(address, kinds);
-    let empty = pending.is_empty();
-    let messages: Vec<serde_json::Value> = pending
-        .into_iter()
+    let empty = pending.is_empty() && unacked.is_none();
+    let messages: Vec<serde_json::Value> = unacked
+        .iter()
+        .flat_map(|(_, held)| held.iter().copied())
+        .chain(pending)
         .take(PAGE_LIMIT)
         .map(message_json)
         .collect();
-    Ok((
-        said(serde_json::json!({
-            LOOK_MODE_KEY: PEEK_MODE,
-            "count": messages.len(),
-            "messages": messages,
-        })),
-        empty,
-    ))
+    let mut page = serde_json::json!({
+        LOOK_MODE_KEY: PEEK_MODE,
+        "count": messages.len(),
+        "messages": messages,
+    });
+    if let Some((delivery, held)) = &unacked {
+        page["unacked"] = serde_json::json!({
+            "deliveryId": delivery,
+            "messages": held.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(),
+        });
+    }
+    Ok((said(page), empty))
 }
 
 /// The history look behind `check --all`: everything ever addressed to this
@@ -19250,12 +19779,14 @@ fn plan_inner(
                     // and a binary that arrived since the last look is a
                     // fact the snapshot's own `binary` carries.
                     let readiness = launcher.readiness(spec.id);
+                    let summon = launcher.summon_rows(spec.id);
                     agent_row(
                         spec,
                         seen,
                         history,
                         headroom.as_ref(),
                         readiness.as_ref(),
+                        summon.as_deref(),
                         now_ms,
                     )
                 })
@@ -19467,6 +19998,119 @@ fn plan_inner(
             } else {
                 None
             };
+            // The model dial nobody filled — no `--model`, no row the person
+            // wrote — is the model seat's (t-14437): asked over today's
+            // lineup whenever it can be; a challenger's turn tries a model
+            // with too little record first, and the seat's applied answer
+            // runs otherwise. The ladder's row is the road back.
+            let model_turn = if model.is_none()
+                && words.value("--on").is_none()
+                && !difficulty_look.spec.is_empty()
+                && profile
+                    .as_ref()
+                    .is_some_and(|row| row.from != crate::summon_difficulty::lineup::Source::Person)
+            {
+                launcher.model_facts(&agent, summons_origin).map(|facts| {
+                    let ladder = difficulty_effort(
+                        &agent,
+                        chosen.unwrap_or(crate::summon_difficulty::FALLBACK_DIFFICULTY),
+                    )
+                    .unwrap_or_default();
+                    let options = crate::summon_model::options(
+                        &agent,
+                        &facts.lineup,
+                        Some(&facts.seen),
+                        &facts.records,
+                        ladder,
+                        |offered| {
+                            launcher
+                                .provider_headroom(&agent, Some(offered))
+                                .map(|held| (held.used_percent, held.window.as_str()))
+                        },
+                        now_ms,
+                    );
+                    let asked = crate::summon_model::ask(&difficulty_look, &options);
+                    let summonses = ledger
+                        .runs()
+                        .iter()
+                        .flat_map(|run| run.workers.iter())
+                        .filter(|held| held.agent == agent)
+                        .count();
+                    let challenge = profile
+                        .as_ref()
+                        .and_then(|row| {
+                            crate::summon_model::challenger(row, &facts.records, summonses)
+                        })
+                        .cloned();
+                    // A challenger's turn runs whatever the seat would say,
+                    // so the launch does not wait for it to say it: the
+                    // question is kept, and asked once the pane is open.
+                    let receipt = asked
+                        .as_ref()
+                        .filter(|_| challenge.is_none())
+                        .and_then(|asked| launcher.choose_model(asked, summons_origin));
+                    (asked, receipt, challenge, facts)
+                })
+            } else {
+                None
+            };
+            let model_pick: Option<(String, String, &str)> = match &model_turn {
+                Some((_, _, Some(challenge), _)) => Some((
+                    challenge.model.clone(),
+                    challenge.effort.clone(),
+                    DIALS_FROM_CHALLENGE,
+                )),
+                Some((_, Some(receipt), None, _)) if receipt["applied"] == true => {
+                    receipt["chosen"]
+                        .as_str()
+                        .zip(receipt[crate::summon_model::EFFORT_KEY].as_str())
+                        .filter(|(chosen, _)| runs_model(&agent, chosen))
+                        .map(|(chosen, effort)| {
+                            (chosen.to_string(), effort.to_string(), DIALS_FROM_JEV)
+                        })
+                }
+                _ => None,
+            };
+            // What the reply says about the dials the coordinator left open:
+            // the difficulty and who chose it, where the model came from, and
+            // what else today's lineup offers at that difficulty (t-14437).
+            let dials = (model.is_none() || effort.is_none()).then(|| {
+                serde_json::json!({
+                    "difficulty": chosen.unwrap_or(crate::summon_difficulty::FALLBACK_DIFFICULTY),
+                    "difficultyFrom": if chosen.is_some() { DIALS_FROM_JEV } else { DIALS_FROM_FALLBACK },
+                    "modelFrom": match (&model, &model_pick, &profile) {
+                        (Some(_), _, _) => serde_json::json!(DIALS_FROM_REQUEST),
+                        (None, Some((_, _, from)), _) => serde_json::json!(from),
+                        (None, None, Some(row)) => serde_json::json!(row.from),
+                        // Nothing here chose: the agent's own CLI picks, and
+                        // the reply says so rather than leaving it unsaid.
+                        (None, None, None) => serde_json::json!(DIALS_FROM_CLI_DEFAULT),
+                    },
+                    "effortClamped": profile.as_ref().and_then(|row| row.effort_clamped.clone()),
+                    "candidates": profile.as_ref().map_or_else(Vec::new, |row| row.candidates.clone()),
+                    // Why this pair, in the facts a person asks for: where the
+                    // model stands, what set its effort, how much finished
+                    // work here stands behind it, and the seat's confidence
+                    // when its answer ran (t-14437).
+                    "why": dials_why(model_turn.as_ref(), model_pick.as_ref(), profile.as_ref()),
+                })
+            });
+            let model_shadow = model_turn
+                .as_ref()
+                .and_then(|(asked, receipt, challenge, _)| {
+                    Some(crate::summon_model::Shadow {
+                        ask: asked.clone()?,
+                        receipt: receipt.clone(),
+                        challenge: challenge.is_some(),
+                    })
+                });
+            let effort = effort.or_else(|| {
+                model_pick
+                    .as_ref()
+                    .filter(|_| model.is_none())
+                    .map(|(_, effort, _)| effort.clone())
+            });
+            let model = model.or_else(|| model_pick.as_ref().map(|(picked, _, _)| picked.clone()));
             let model = model.or_else(|| profile.as_ref().map(|p| p.model.clone()));
             let effort = effort
                 .or_else(|| profile.as_ref().map(|p| p.effort.clone()))
@@ -19742,6 +20386,7 @@ fn plan_inner(
                     model.as_deref() == Some(profile.model.as_str())
                         && effort.as_deref() == Some(profile.effort.as_str())
                 });
+            prepared_worker_start.model_shadow = said.and(model_shadow);
             prepared_worker_start.difficulty_shadow =
                 said.map(|_| crate::summon_difficulty::Shadow {
                     look: difficulty_look,
@@ -19844,6 +20489,7 @@ fn plan_inner(
                         // carries, `null` where nothing was asked.
                         "model": model,
                         "effort": effort,
+                        "dials": dials,
                         "launchNotice": launch_notice,
                         // The disk's word on a `--worktree` cut: `null` when
                         // it had nothing to say, the arithmetic when live
@@ -20804,9 +21450,12 @@ fn plan_inner(
                      --wait plain or with --peek"
                     .to_string());
             }
-            let deadline_ms = match words.value("--timeout-ms") {
-                Some(raw) => Some(wait_budget(raw)?),
-                None => None,
+            let (deadline_ms, over_ceiling) = match words.value("--timeout-ms") {
+                Some(raw) => {
+                    let (held, asked) = wait_budget(raw)?;
+                    (Some(held), asked)
+                }
+                None => (None, None),
             };
             if deadline_ms.is_some() && !wants_wait {
                 return Err("--timeout-ms is --wait's budget; without --wait there is \
@@ -20851,6 +21500,9 @@ fn plan_inner(
                     thread: None,
                     seat: seat.clone(),
                 });
+            }
+            if let Some(asked) = over_ceiling {
+                note_wait_ceiling(&mut decided, asked);
             }
             if words.has("--format") {
                 formatted_over(&mut decided);
@@ -21341,6 +21993,11 @@ fn worker_json(run: &Run, worker: &Worker, team: &Team) -> serde_json::Value {
         // Which coordinator generation took this worker over after its
         // leader left; `null` for a worker still under its summoner.
         "adoptedBy": worker.adopted_by,
+        // What waits at its address that nobody acknowledged, the open batch
+        // first (t-15313): a batch handed over into an output nobody read is
+        // still here. The window lays `idleSinceMs` beside it — whether the
+        // lead is at rest is the pane's fact, not this ledger's.
+        "unreadMail": run.unread(&worker_address(&worker.id)),
     })
 }
 
