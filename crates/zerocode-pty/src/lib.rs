@@ -34,8 +34,8 @@ pub use grid::{
     TerminalGrid, drawn,
 };
 pub use input::{
-    KeyPress, MouseEvent, MouseKind, encode_focus, encode_key, encode_mouse, encode_paste,
-    sanitize_paste,
+    KeyPress, MouseEvent, MouseKind, Words, encode_focus, encode_key, encode_mouse, encode_paste,
+    encode_typed, sanitize_paste,
 };
 pub use lane::{
     DECLARED_TERMINAL, INHERITED_SESSION_MARKERS, INHERITED_TERMINAL_IDENTITY,
@@ -45,7 +45,7 @@ pub use readers::{
     FrameReaders, Look, READER_SHARE_FRAMES, READER_SHARE_SCREENS, RENOTIFY_AFTER, ShareOf,
 };
 pub use ready::{
-    Observed, Outcome as DeliveryOutcome, PromptDelivery, Readiness, ReadySignal,
+    EnterAgain, Observed, Outcome as DeliveryOutcome, PromptDelivery, Readiness, ReadySignal,
     State as ReadyState, Step as DeliveryStep,
 };
 pub use serialize::{

@@ -37,7 +37,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::input::encode_paste;
+use crate::input::Words;
 
 /// How long a silent program must stay silent before it counts as ready.
 ///
@@ -710,6 +710,21 @@ impl Refusal {
     }
 }
 
+/// The Enter a paste's own delivery pressed and its pane never took, pressed
+/// once more on its own (t-17037) — no words, no clear keys, no envelope.
+///
+/// Words a resumed pane was handed can land in a composer that is mounted
+/// enough to take the paste and not yet the Enter: they sit there as a
+/// draft, and a person had to press Enter for them. What finishes them is an
+/// Enter at the next moment the composer says it is ready — never the words
+/// typed a second time. `hand` is the line's hand count read before those
+/// words were placed: a hand that has reached the line since means a person
+/// is on it, and the Enter is theirs to press or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnterAgain {
+    pub hand: Option<u64>,
+}
+
 /// One prompt on its way into one shell, driven by the pump.
 ///
 /// The shape is a hand-rolled future on purpose: the pump loop is the one
@@ -733,6 +748,11 @@ pub struct PromptDelivery {
     /// left to a person (t-14037) — [`SUBMIT_ACK_TIMEOUT`] and [`TIMEOUT`]
     /// everywhere but a test's short clock.
     receipt: ReceiptClock,
+    /// Set for a delivery that presses only the Enter its words are still
+    /// waiting on (t-17037); `None` for one that carries words.
+    enter_again: Option<EnterAgain>,
+    /// How the words go onto the composer: its agent's row says (t-17274).
+    words: Words,
 }
 
 /// The receipt's two clocks (t-14037).
@@ -782,6 +802,8 @@ impl PromptDelivery {
             wait: Readiness::new(signal, now),
             phase: Phase::Waiting,
             receipt: ReceiptClock::default(),
+            enter_again: None,
+            words: Words::Pasted,
         }
     }
 
@@ -823,6 +845,8 @@ impl PromptDelivery {
             wait: Readiness::with_deadlines(signal, now, quiet, timeout),
             phase: Phase::Waiting,
             receipt: ReceiptClock::default(),
+            enter_again: None,
+            words: Words::Pasted,
         }
     }
 
@@ -844,6 +868,37 @@ impl PromptDelivery {
     #[must_use]
     pub const fn receipt_clock(mut self, window: Duration, patience: Duration) -> Self {
         self.receipt = ReceiptClock { window, patience };
+        self
+    }
+
+    /// Make this delivery the Enter alone, for words already on the line
+    /// (t-17037) — or leave it carrying its words, for `None`. See
+    /// [`EnterAgain`]: once the composer is ready, the Enter goes only on a
+    /// line no hand has reached since `hand`, with no question parked there,
+    /// under the launch addressed; and it goes once — a pane that still
+    /// reports nothing is not pressed a third time.
+    #[must_use]
+    pub const fn pressing(mut self, enter_again: Option<EnterAgain>) -> Self {
+        if let Some(again) = enter_again {
+            self.hand_at_paste = again.hand;
+            self.submit = true;
+            self.clearing = false;
+        }
+        self.enter_again = enter_again;
+        self
+    }
+
+    /// Whether this delivery is the Enter alone, and for which hand count.
+    #[must_use]
+    pub const fn enter_again(&self) -> Option<EnterAgain> {
+        self.enter_again
+    }
+
+    /// Choose how this delivery's words go onto the composer (t-17274): its
+    /// agent's row decides — see [`Words`]. The default is the paste.
+    #[must_use]
+    pub const fn words(mut self, words: Words) -> Self {
+        self.words = words;
         self
     }
 
@@ -909,6 +964,7 @@ impl PromptDelivery {
                     self.phase = Phase::Done(Outcome::TimedOut);
                     Step::Done(Outcome::TimedOut)
                 }
+                State::Ready if self.enter_again.is_some() => self.enter_alone(line, now),
                 State::Ready => {
                     // The line, looked at as the words are about to land —
                     // not when they were registered, which may have been a
@@ -922,23 +978,36 @@ impl PromptDelivery {
                     // consumes these edit keys. Launch composers are new and
                     // empty; several TUIs insert Ctrl+U/Ctrl+K as literal
                     // text. When present, the clear rides OUTSIDE the envelope:
-                    // inside brackets a Ctrl+U is always paste data.
-                    let mut bytes = if self.clearing {
+                    // inside brackets a Ctrl+U is always paste data. And it is
+                    // only ever made room for words: a delivery with none
+                    // empties nobody's line (t-17274).
+                    let mut bytes = if self.clearing && !self.text.is_empty() {
                         clear_input_for_text("")
                     } else {
                         Vec::new()
                     };
-                    // Always bracketed: the handshake this wait is gated on IS
-                    // the program turning bracketed paste on, so by the time
-                    // anything is written the envelope is wanted. Sanitisation
-                    // lives inside `encode_paste`.
-                    bytes.extend(encode_paste(&self.text, true));
+                    // The words the way the agent's row says they go (t-17274):
+                    // framed in a paste — always bracketed, since the handshake
+                    // this wait is gated on IS the program turning bracketed
+                    // paste on — or typed as keys at a composer where a frame
+                    // that comes apart is a picture paste. Sanitisation lives
+                    // in the encoding.
+                    bytes.extend(self.words.encode(&self.text));
                     if self.submit {
                         self.phase = Phase::Submitting { pasted_at: now };
                     } else {
                         self.phase = Phase::Done(Outcome::Delivered);
                     }
-                    Step::Write(bytes)
+                    match (bytes.is_empty(), self.submit) {
+                        (false, _) => Step::Write(bytes),
+                        // No words and no clear keys: nothing is written — a
+                        // wait for the composer to stand, or an Enter with
+                        // nothing before it. An envelope around nothing is an
+                        // empty paste, which a composer that reads the
+                        // clipboard for a picture answers with the person's.
+                        (true, false) => Step::Done(Outcome::Delivered),
+                        (true, true) => Step::Waiting,
+                    }
                 }
             },
             Phase::Submitting { pasted_at } => {
@@ -972,6 +1041,31 @@ impl PromptDelivery {
             } => self.confirm(line, now, entered_at, taken, again),
             Phase::Done(outcome) => Step::Done(outcome),
         }
+    }
+
+    /// The Enter alone, at a composer that just said it is ready (t-17037).
+    ///
+    /// The same guard as any Enter over words already on the line, read
+    /// against the hand count from before they were placed: a person who
+    /// reached the line since, a question parked there, a relaunch — each
+    /// withholds it, and nothing was written. A pane that reports what it
+    /// takes is then waited on for its receipt with the one Enter already
+    /// spent, so silence leaves the words to a person rather than pressing
+    /// again.
+    fn enter_alone(&mut self, line: Line, now: Instant) -> Step {
+        if let Some(why) = self.guard.against_submit(line, self.hand_at_paste) {
+            self.phase = Phase::Done(Outcome::Refused(why));
+            return Step::Done(Outcome::Refused(why));
+        }
+        self.phase = match line.taken {
+            Some(taken) => Phase::Confirming {
+                entered_at: now,
+                taken,
+                again: true,
+            },
+            None => Phase::Done(Outcome::Delivered),
+        };
+        Step::Submit(b"\r".to_vec())
     }
 
     /// One round of waiting for the pane's receipt (t-14037).
@@ -2271,5 +2365,192 @@ mod tests {
         let distinct: std::collections::HashSet<&str> = tokens.into_iter().collect();
         assert_eq!(distinct.len(), tokens.len(), "two refusals share a token");
         assert_eq!(Refusal::HoldsADraft.token(), "holds_a_draft");
+    }
+
+    /* ---- the Enter alone, for words already on the line (t-17037) ------ */
+
+    /// An Enter-only delivery on somebody else's line, its hand count pinned
+    /// at `hand`, reporting its pane's receipts on the short clock.
+    fn enter_again(hand: Option<u64>, start: Instant) -> PromptDelivery {
+        PromptDelivery::new(String::new(), true, ReadySignal::CursorShown, start)
+            .guarded(Guard::for_somebody_elses_line(None))
+            .receipt_clock(WINDOW, SILENCE)
+            .pressing(Some(EnterAgain { hand }))
+    }
+
+    /// 07:08 on 2026-09-30: the words were pasted, both Enters went while
+    /// the resumed program was still booting, and they sat in the composer
+    /// until a person pressed Enter. What finishes them is one Enter at the
+    /// composer's next ready — no paste, no clear keys, and never a third
+    /// Enter: a pane that still reports nothing leaves them to a person.
+    #[test]
+    fn the_enter_alone_writes_one_carriage_return_and_no_words() {
+        let start = Instant::now();
+        let mut delivery = enter_again(Some(3), start);
+        let line = Line {
+            hand: Some(3),
+            ..reporting(4)
+        };
+        assert_eq!(
+            delivery.poll_line(seen(true, true, 0, false), line, start),
+            Step::Waiting
+        );
+        let entered = start + SUBMIT_GAP;
+        assert_eq!(
+            delivery.poll_line(seen(true, true, 1, false), line, entered),
+            Step::Submit(b"\r".to_vec()),
+            "the ready composer was not sent its Enter alone"
+        );
+        // Past the receipt window with no receipt: no Enter again.
+        assert_eq!(
+            delivery.poll_line(seen(false, true, 1, false), line, entered + WINDOW),
+            Step::Waiting,
+            "the Enter alone was pressed a second time"
+        );
+        assert_eq!(
+            delivery.poll_line(
+                seen(false, true, 1, false),
+                line,
+                entered + WINDOW + SILENCE
+            ),
+            Step::Done(Outcome::Unsubmitted(Refusal::NotTaken))
+        );
+        // A pane that takes it is done with it.
+        let mut taken = enter_again(None, start);
+        taken.poll_line(seen(true, true, 0, false), reporting(4), start);
+        taken.poll_line(seen(true, true, 1, false), reporting(4), entered);
+        assert_eq!(
+            taken.poll_line(
+                seen(false, true, 1, false),
+                reporting(5),
+                entered + SUBMIT_GAP
+            ),
+            Step::Done(Outcome::Delivered)
+        );
+        // A pane that reports nothing is done at the Enter.
+        let mut silent = enter_again(None, start);
+        silent.poll_line(seen(true, true, 0, false), Line::default(), start);
+        assert_eq!(
+            silent.poll_line(seen(true, true, 1, false), Line::default(), entered),
+            Step::Submit(b"\r".to_vec())
+        );
+        assert_eq!(
+            silent.poll_line(seen(false, true, 1, false), Line::default(), entered),
+            Step::Done(Outcome::Delivered)
+        );
+    }
+
+    /// A person's hand since the words were placed, a question parked on the
+    /// pane, a program relaunched under it: each withholds the Enter alone,
+    /// and nothing at all is written.
+    #[test]
+    fn the_enter_alone_is_withheld_from_a_line_a_person_reached() {
+        let start = Instant::now();
+        let placed = Line {
+            hand: Some(3),
+            ..Line::default()
+        };
+        for (name, line, why) in [
+            (
+                "a hand since",
+                Line {
+                    hand: Some(4),
+                    draft: true,
+                    ..placed
+                },
+                Refusal::HandReached,
+            ),
+            (
+                "a first hand",
+                Line {
+                    hand: Some(1),
+                    ..Line::default()
+                },
+                Refusal::HandReached,
+            ),
+            (
+                "a parked question",
+                Line {
+                    parked: true,
+                    ..placed
+                },
+                Refusal::Parked,
+            ),
+        ] {
+            let pinned = if name == "a first hand" {
+                None
+            } else {
+                Some(3)
+            };
+            let mut delivery = enter_again(pinned, start);
+            delivery.poll_line(seen(true, true, 0, false), line, start);
+            assert_eq!(
+                delivery.poll_line(seen(true, true, 1, false), line, start + SUBMIT_GAP),
+                Step::Done(Outcome::Refused(why)),
+                "{name}"
+            );
+            assert!(!delivery.pasted(), "{name}");
+        }
+        let mut relaunched =
+            PromptDelivery::new(String::new(), true, ReadySignal::CursorShown, start)
+                .guarded(Guard::for_somebody_elses_line(Some(7)))
+                .pressing(Some(EnterAgain { hand: Some(3) }));
+        let moved = Line {
+            launch: Some(8),
+            ..placed
+        };
+        relaunched.poll_line(seen(true, true, 0, false), moved, start);
+        assert_eq!(
+            relaunched.poll_line(seen(true, true, 1, false), moved, start + SUBMIT_GAP),
+            Step::Done(Outcome::Refused(Refusal::LaunchChanged))
+        );
+    }
+
+    /* ---- no words, no paste frame (t-17274) ------------------------------ */
+
+    /// Every byte a delivery writes, round by round, until it settles: a
+    /// composer that shook hands, then one showing its cursor, on a clock
+    /// that passes the gap before the Enter each round.
+    fn every_write(mut delivery: PromptDelivery, start: Instant) -> (Vec<u8>, Outcome) {
+        let mut wrote = Vec::new();
+        let mut now = start;
+        for round in 0..100 {
+            let shows = u64::from(round > 0);
+            match delivery.poll_line(seen(round == 0, true, shows, false), Line::default(), now) {
+                Step::Write(bytes) | Step::Submit(bytes) => wrote.extend(bytes),
+                Step::Done(outcome) => return (wrote, outcome),
+                Step::Waiting => {}
+            }
+            now += SUBMIT_GAP;
+        }
+        panic!("the delivery never settled");
+    }
+
+    /// A restored worker's pane is waited on by a delivery that carries no
+    /// words — its composer standing is all that is wanted of it (the worker
+    /// split's restoring road). That wait still wrote its envelope, and an
+    /// envelope around nothing is an EMPTY paste: what a terminal sends for
+    /// Cmd+V when the clipboard holds only a picture. Claude Code 2.1.285 on
+    /// macOS answers one by reading the system clipboard and attaching the
+    /// picture — the pty probe saw it reach for `com.apple.pasteboard.1` the
+    /// moment an empty frame arrived — and the person's screenshot went into
+    /// three restored workers' conversations that way on 2026-09-30 (08:44
+    /// and 09:46). No words, no frame: the wait writes nothing, and one that
+    /// asks for an Enter writes the Enter alone.
+    #[test]
+    fn a_delivery_with_no_words_writes_no_paste_frame() {
+        let start = Instant::now();
+        let waiting = PromptDelivery::new(String::new(), false, ReadySignal::CursorShown, start);
+        assert_eq!(
+            every_write(waiting, start),
+            (Vec::new(), Outcome::Delivered),
+            "a readiness wait wrote to the composer it waited for"
+        );
+        let entering = PromptDelivery::new(String::new(), true, ReadySignal::CursorShown, start);
+        assert_eq!(
+            every_write(entering, start),
+            (b"\r".to_vec(), Outcome::Delivered),
+            "an Enter with no words came wrapped in an empty paste"
+        );
     }
 }
