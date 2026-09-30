@@ -16,17 +16,22 @@ export async function testAgentConversation(browser, origin, ok) {
         data: btoa('<svg xmlns="http://www.w3.org/2000/svg" width="180" height="60"><rect width="180" height="60" fill="seagreen"/><text x="12" y="36" fill="white">Verified</text></svg>') });
       window.__ANSWER__.subagent_log = () => ({ found: true, next: 1, turns: [
         { role: "user", text: "실행 결과를 확인하고 보고서를 만들어줘." },
-        { role: "tool", text: "Bash · node first.js", tool: { call_id: "a", name: "Bash", input: "node first.js\nprintf done", is_error: false } },
-        { role: "tool", text: "Bash · node second.js", tool: { call_id: "b", name: "Bash", input: "node second.js", is_error: false } },
+        { role: "tool", text: "Bash · node first.js", tool: { call_id: "a", name: "Bash", kind: "bash", input: "node first.js\nprintf done", is_error: false } },
+        { role: "tool", text: "Bash · node second.js", tool: { call_id: "b", name: "Bash", kind: "bash", input: "node second.js", is_error: false } },
       ] });
       await openHelperPage({ term, tab: owner, worktree: owner.worktree, agent: "claude" }, { id: "conversation-test", name: "검증 도우미", state: "working" });
       window.__CHAT_TAB__ = activeHelperPage();
       window.__ANSWER__.subagent_log = () => ({ found: true, next: 1, turns: [] });
     });
     await page.waitForSelector(".helper-turn.is-tool");
-    const paired = await page.evaluate(() => {
+    const paired = await page.evaluate(async () => {
       const tab = window.__CHAT_TAB__;
       const original = document.querySelector(".helper-turn.is-tool");
+      // A step is one closed line; the press that opens its row builds the
+      // body, and a result that joins after comes into that same body.
+      const closed = original.open === false && original.querySelector(".helper-tool-body") === null;
+      original.open = true;
+      await new Promise((done) => setTimeout(done, 30));
       window.__CHAT_BODY__ = original.querySelector(".helper-tool-body");
       holdHelperTurns(tab.worker.helper, [
         { role: "tool_result", text: "SECOND OUTPUT", tool: { call_id: "b", is_error: false } },
@@ -34,23 +39,24 @@ export async function testAgentConversation(browser, origin, ok) {
       ]);
       paintWorkerView(tab);
       const rows = [...document.querySelectorAll(".helper-turn.is-tool")];
-      // The rest stands in the row's body with no fold to press (t-6323
-      // A1): the body that stood for the two-line command before the result
-      // came is the same node after it, now carrying the output too.
-      return { count: rows.length, same: rows[0] === original,
+      // The body the press built for the two-line command before the result
+      // came is the same node after it, now carrying the output too (t-6323
+      // A1).
+      return { count: rows.length, same: rows[0] === original, closed,
         open: rows[0].querySelector(".helper-tool-body") === window.__CHAT_BODY__ &&
           rows[0].querySelector(".helper-tool-output").checkVisibility(),
         command: rows[0].querySelector(".helper-tool-input").textContent,
-        results: rows.map((row) => row.querySelector(".helper-tool-result").textContent),
+        results: rows.map((row) => row.querySelector(".helper-step-res").textContent),
+        wantResults: [t("worker.stepFailed", "실패: {{why}}", { why: "FIRST OUTPUT" }), t("worker.stepPrinted", "{{n}}줄 출력", { n: 1 })],
         output: rows[0].querySelector(".helper-tool-output").textContent,
-        secondBare: rows[1].querySelector(".helper-tool-body") === null,
+        secondClosed: rows[1].open === false && rows[1].querySelector(".helper-step-body") === null,
         failed: rows.map((row) => row.classList.contains("is-failed")),
         done: rows.map((row) => row.classList.contains("is-done")) };
     });
-    ok("interleaved tool results join their call IDs: each dresses its own row — first line under the call, the rest in the row's same body, the failed one in the halt state",
-      paired.count === 2 && paired.same && paired.open && paired.command.includes("printf done") &&
-      paired.results.join("|") === "FIRST OUTPUT|SECOND OUTPUT" && paired.output === "FIRST OUTPUT\nexit 1" &&
-      paired.secondBare && paired.failed.join() === "true,false" && paired.done.join() === "false,true", JSON.stringify(paired));
+    ok("interleaved tool results join their call IDs: each dresses its own row — what came of it on its line, both raw sides in the row's same body once opened, the failed one in the halt state",
+      paired.count === 2 && paired.same && paired.closed && paired.open && paired.command.includes("printf done") &&
+      paired.results.join("|") === paired.wantResults.join("|") && paired.output === "FIRST OUTPUT\nexit 1" &&
+      paired.secondClosed && paired.failed.join() === "true,false" && paired.done.join() === "false,true", JSON.stringify(paired));
 
     const hidden = await page.evaluate(async () => {
       const tab = window.__CHAT_TAB__;
@@ -88,6 +94,21 @@ export async function testAgentConversation(browser, origin, ok) {
       await page.locator(".helper-said table").count() === 1 &&
       await page.evaluate(() => window.__CHAT_INJECTED__ !== true && !document.querySelector(".helper-said [onerror]")));
 
+    // The composer stands on a pane's own conversation page: a helper's page has a
+    // footer where it stood (t-15683). The sends below are the composer's, so they
+    // ride a pane's conversation (zo, no wire — the transcript view stays), the road a
+    // helper's page used to borrow. The helper's page keeps the fit checks at the end.
+    await page.evaluate(async () => {
+      const term = await openTermTab({ placement: "tab" });
+      paneAgents.set(term, "zo");
+      hookStates.set(term, "working");
+      window.__HELPER_TAB__ = window.__CHAT_TAB__;
+      window.__ANSWER__.pane_log = () => ({ found: true, next: 1, turns: [{ role: "assistant", text: "대기 중입니다." }],
+        skipped: false, more: false, folded: false, model: "claude-opus-5" });
+      await setPaneChat(term, true);
+      window.__CHAT_TAB__ = paneChatOf(term).tab;
+    });
+    await page.waitForSelector(".pane-chat .worker-composer-box");
     await page.fill(".worker-composer-box", "기존 초안");
     const draftBefore = await page.evaluate(() => window.__COUNTS__.term_paste ?? 0);
     // The window's own /artifact, reached through the `/` button's palette,
@@ -105,7 +126,7 @@ export async function testAgentConversation(browser, origin, ok) {
     await page.evaluate(() => {
       const term = window.__CHAT_TAB__.worker.term;
       for (const handler of window.__LISTENERS__["hook:agent"] ?? []) {
-        handler({ payload: { term, state: "idle", agent: "claude" } });
+        handler({ payload: { term, state: "idle", agent: paneAgents.get(term) } });
       }
     });
     const failure = await page.evaluate(async () => {
@@ -148,11 +169,11 @@ export async function testAgentConversation(browser, origin, ok) {
       let finish;
       window.__ANSWER__.term_paste = () => new Promise((done) => { finish = done; });
       const tab = window.__CHAT_TAB__;
-      const host = docHost(tab.pane, "worker");
+      const host = paneChatOf(tab.term).host;
       const previous = host.querySelector(".worker-composer-box");
       host.querySelector(".worker-composer").requestSubmit();
       host.__helperPage = null;
-      paintWorkerView(tab);
+      paintPaneChat(tab.term);
       const current = host.querySelector(".worker-composer-box");
       const state = { rebuilt: previous !== current, readOnly: current.readOnly,
         disabled: host.querySelector(".worker-composer-send").disabled };
@@ -167,6 +188,8 @@ export async function testAgentConversation(browser, origin, ok) {
     await mkdir("output/playwright/agent-conversation", { recursive: true });
     await page.evaluate(() => {
       delete window.__ANSWER__.term_paste;
+      window.__CHAT_TAB__ = window.__HELPER_TAB__;
+      setActiveTab(window.__CHAT_TAB__.id);
       const tab = window.__CHAT_TAB__;
       tab.worker.status = "done";
       tab.worker.endedAt = Date.now();

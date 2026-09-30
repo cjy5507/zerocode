@@ -331,18 +331,19 @@ function settleComposerQueuesFor(term) {
 
 /* `✻ Claude · Fable 5.1 ▾` — the catalog's mark and name, the pane's model
  * (the hook's word, shown as the model catalog names it when it can), and the
- * chevron that says it opens. */
+ * chevron that says it opens. A helper's page has no composer, so no chip here
+ * ever speaks for a helper: its model is in the page's head (`updateHelperPageModel`). */
 function composerAgentChip(run, spec) {
   const chip = document.createElement("button");
-  chip.type = "button";
   chip.className = "worker-composer-pill worker-composer-agent";
-  chip.setAttribute("aria-haspopup", "menu");
-  chip.setAttribute("aria-expanded", "false");
-  chip.dataset.keyboardOwner = "true";
   const mark = agentMarkNode("worker-composer-mark", agentVoice(spec.id).glyph);
   const words = pillWordsNode(spec.name);
   const model = document.createElement("span");
   model.className = "worker-composer-model-words";
+  chip.type = "button";
+  chip.setAttribute("aria-haspopup", "menu");
+  chip.setAttribute("aria-expanded", "false");
+  chip.dataset.keyboardOwner = "true";
   const chevron = document.createElement("span");
   chevron.className = "worker-composer-chevron";
   chevron.textContent = "▾";
@@ -356,12 +357,19 @@ function composerAgentChip(run, spec) {
   return chip;
 }
 
+/* The words for a model id: the catalog's display name when the model list
+ * knows the id, else the id as the vendor said it. One lookup for a pane's
+ * chip and a helper's (`helperModelWords`), so one id is never worded two
+ * ways. */
+function catalogModelWords(said, models = null) {
+  const known = models?.find((row) => row.id === said);
+  return known ? known.display_name : said;
+}
+
 /* The words the chip shows for the pane's model: the catalog's display name
  * when the model list knows the id, else the id as the hook said it. */
 function paintComposerAgentChip(chip, run, models = null) {
-  const said = composerRoad(run).model();
-  const known = models?.find((row) => row.id === said);
-  const words = known ? known.display_name : said;
+  const words = catalogModelWords(composerRoad(run).model(), models);
   writeTextContent(chip.querySelector(".worker-composer-model-words"), words ? ` · ${words}` : "");
 }
 
@@ -655,6 +663,54 @@ function composerSubagentsOf(run) {
   return paneSubagents.get(run.term) ?? [];
 }
 
+/* Whether this page is a HELPER's own — the one that reads the helper's
+ * transcript — and not a pane's conversation, a wire session or a command
+ * run. Those three have a model of their own to read from a pane or a wire;
+ * a helper has neither, and its page rides its parent's terminal, so
+ * anything read off `run.term` here is the PARENT's. */
+function isHelperPage(run) {
+  const id = run.helper?.id;
+  return id !== undefined && id !== PANE_LOG_ID && id !== WIRE_LOG_ID && !run.wire;
+}
+
+/* The roster row a helper's page stands on: the live one while its pane still
+ * lists the helper, else the last one the page saw (`run.sub`, kept by
+ * `openHelperPage` and `syncHelperPagesWith`). A helper outlives its row when
+ * the session turns, and its model does not change because the roster
+ * forgot it. */
+function composerHelperRow(run) {
+  return composerSubagentsOf(run).find((one) => one.id === run.helper.id) ?? run.sub ?? null;
+}
+
+/* The model a helper ITSELF runs on, in the words the model catalog gives
+ * it (the id as its vendor said it when the catalog does not know it), or
+ * `""` when the vendor named none.
+ *
+ * The one function the helper page's pill, the sidebar's helper row and the
+ * agents menu all ask (t-15625), so the three cannot word one model three
+ * ways — and none of them can borrow the pane's, because the pane's model is
+ * not on the row. `agent` is the vendor the helper runs under: the catalog it
+ * is worded from. */
+function helperModelWords(sub, agent) {
+  const said = sub?.model;
+  return said ? catalogModelWords(said, agentModelLists.get(agent)?.rows ?? null) : "";
+}
+
+/* The facts behind a helper's model words, for a tip: the model that ran
+ * (and how hard it thinks, when the vendor said), and — when that is not the
+ * model the helper was asked for (an alias the vendor resolved, a router that
+ * moved it, a fallback that took over) — both. `""` when there is no model
+ * to speak of. The ids are the vendor's own; nothing here knows a name. */
+function helperModelTip(sub) {
+  if (!sub?.model) return "";
+  const ran = sub.effort
+    ? t("board.desk.workerModel", "{{model}} · {{effort}}", { model: sub.model, effort: sub.effort })
+    : sub.model;
+  return sub.requestedModel && sub.requestedModel !== sub.model
+    ? t("helper.model.moved", "요청 {{asked}} → 실행 {{ran}}", { asked: sub.requestedModel, ran })
+    : ran;
+}
+
 /* The window's word for one helper's state. The board's own words, so a row
  * in this menu and the same row in the sidebar never disagree. */
 function subagentStateWords(state) {
@@ -689,7 +745,12 @@ function openComposerAgentsMenu(chip, run) {
   const owner = tabOfTerm(run.term);
   composerMenuSection(menu, t("composer.agentsTip", "하위 에이전트 보기"));
   for (const row of rows) {
-    composerMenuItem(menu, row.name, subagentStateWords(row.state), () =>
+    // The helper's own model beside its state, in the words its page and its
+    // sidebar row use — the same function, so the three cannot disagree.
+    const words = [helperModelWords(row, run.agent), subagentStateWords(row.state)]
+      .filter(Boolean)
+      .join(" · ");
+    composerMenuItem(menu, row.name, words, () =>
       void openHelperPage(
         { term: run.term, agent: run.agent, worktree: owner?.worktree, tab: owner },
         row,
@@ -1194,7 +1255,10 @@ function interruptOnEscape(host) {
     if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
     if (event.isComposing || event.keyCode === 229) return;
     const run = host.__helperPage?.run;
-    if (!run || !composerWorking(run)) return;
+    // A helper's page has no input, and its `composerWorking` is its PARENT's
+    // turn: Esc there would end the parent's whole turn from a page that never
+    // said it could (t-15683). The parent's own page is where Esc interrupts.
+    if (!run || isHelperPage(run) || !composerWorking(run)) return;
     const typing = event.target?.closest?.(".worker-composer-box") !== null && event.target?.closest?.(".worker-composer-box") !== undefined;
     if (host.querySelector(".pane-chat-ask") && !typing) return;
     event.preventDefault();

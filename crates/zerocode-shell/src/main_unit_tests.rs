@@ -6006,6 +6006,12 @@ fn no_label_reaches_the_window_hardcoded() {
         // UI language (docs/design/composer-attachments.md §3) — the attach
         // harness pins the literal while the window speaks `en`.
         "const ATTACH_HEADER = \"첨부:\";",
+        // A reader, not a label: `HELPER_CONDITION_MARKERS` finds a condition
+        // in the words the parent wrote to its helper, in the language they
+        // were written in, so the window's language never changes it — the
+        // Korean row of that table quotes the instruction, it never speaks to
+        // the person (t-15683).
+        r"/지\s?마(?:세요|십시오|라|요)?|지\s?말(?:고|라|것|아)|말\s?것|금지|읽기\s?전용|안\s?됩니다|하면\s?안|않도록/,",
     ];
 
     // The catalog-bearing part is exactly one file. The byte range used
@@ -7823,7 +7829,12 @@ fn what_an_agent_is_doing_reaches_the_window_bounded_and_coalesced() {
     // The verb is translated and the target is not: a path and a command
     // are the machine's own words.
     let wording = block_after(window, "function activityWord(verb) {");
-    for key in ["activity.read", "activity.bash", "activity.grep"] {
+    for key in [
+        "activity.read",
+        "activity.bash",
+        "activity.grep",
+        "activity.websearch",
+    ] {
         assert!(
             wording.contains(&format!("t(\"{key}\", ")),
             "`{key}` is not read where the verb is drawn:\n{wording}"
@@ -7839,6 +7850,7 @@ fn what_an_agent_is_doing_reaches_the_window_bounded_and_coalesced() {
             "activity.grep",
             "activity.task",
             "activity.web",
+            "activity.websearch",
             "activity.prompt",
             "activity.stop",
         ] {
@@ -7957,9 +7969,10 @@ fn a_helpers_line_counts_its_tool_uses_whoever_counted_them() {
     );
     assert_eq!(
         window.matches("toolUsesWords(").count(),
-        5,
+        6,
         "the count's word grew a second speller — the definition, the row \
-         builder, the re-dress's fit, the page head and the conversation's \
+         builder, the re-dress's fit, the page head, the helper page's own \
+         head (`updateHelperPageHead`, t-15683) and the conversation's \
          helpers at work (`helperSpent`, t-6323 A6) are its only mentions"
     );
     for language in ["en", "ja", "zh", "es"] {
@@ -14100,6 +14113,58 @@ fn a_vault_page_is_read_from_the_vault_and_anything_else_from_the_project() {
     assert!(resolve_in_project(&root, &stray.to_string_lossy()).is_err());
 }
 
+/// The gallery lists every project's documents. The window asks which door a
+/// document goes through: the project's own file door — an editable tab, as it
+/// always was — or the artifact store, as a tab nobody can write. The answer is
+/// the door's own, so it can never be wider than what `read_text_file` reads
+/// (t-16006).
+#[test]
+fn a_document_opens_through_the_project_door_only_where_that_door_would_read_it() {
+    let project = tempfile::tempdir().expect("project");
+    let another = tempfile::tempdir().expect("another project");
+    let vault = tempfile::tempdir().expect("vault");
+    std::fs::write(project.path().join("inside.md"), "in").expect("inside");
+    std::fs::write(another.path().join("outside.md"), "out").expect("outside");
+    std::fs::create_dir_all(vault.path().join("wiki")).expect("wiki");
+    let page = vault.path().join("wiki/page.md");
+    std::fs::write(&page, "# page").expect("page");
+    let vault_str = vault.path().to_string_lossy().into_owned();
+    let saved = Some(vault_str.as_str());
+    let opens = |vault: Option<&str>, path: &std::path::Path| {
+        crate::cmd::fs::opens_in_project(
+            project.path().to_path_buf(),
+            vault,
+            &path.to_string_lossy(),
+        )
+    };
+
+    assert!(opens(saved, &project.path().join("inside.md")));
+    assert!(
+        !opens(saved, &another.path().join("outside.md")),
+        "another project's document is read through the store, not this door"
+    );
+    assert!(
+        opens(saved, &page),
+        "the vault stays the door's one exception"
+    );
+    assert!(
+        !opens(None, &page),
+        "no vault saved: the page is outside the only root there is"
+    );
+    assert!(
+        !opens(None, &project.path().join("gone.md")),
+        "a file that is not there is not read by the door either"
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(another.path(), project.path().join("link")).expect("symlink");
+        assert!(
+            !opens(None, &project.path().join("link/outside.md")),
+            "a link inside the project that points out of it reads nothing"
+        );
+    }
+}
+
 #[test]
 fn a_session_is_shown_a_vault_page_once_and_another_session_is_shown_it_again() {
     let vault = tempfile::tempdir().expect("vault");
@@ -16720,6 +16785,311 @@ fn a_zo_subagent_snapshot_keeps_every_named_helper() {
     );
 }
 
+/// A frame's helpers, folded into `roster` the way `note_zo_session_frame`
+/// folds them, and put on the wire the way `hook:subagent` sends them — what
+/// the webview is actually given, which is all a helper's page and its
+/// sidebar row have to draw a model from.
+fn zo_helpers_on_the_wire(
+    roster: &mut Vec<hooks::SubagentRow>,
+    frame: &serde_json::Value,
+) -> serde_json::Value {
+    let helpers = zo_subagent_helpers(frame).expect("subagent frame");
+    hooks::fold_helper_roster(roster, helpers.into_iter().map(|one| one.row).collect());
+    serde_json::to_value(&*roster).expect("a roster is wire-shaped")
+}
+
+/// A helper's row says the model the helper ITSELF runs on (t-15625).
+///
+/// The row used to carry an id, a name, a state and a count, so a helper's
+/// page and its sidebar row had nothing of the helper's own to draw and wore
+/// the model of the PANE the helper runs inside — a helper asked for one
+/// model, running on it, drawn as its parent's. The frame names the model
+/// that ran; the record zo keeps beside the helper's transcript
+/// (`<id>.json` next to `<id>.session.jsonl`) names what it was asked for and
+/// how hard it thinks. The names here are synthetic: the words are the
+/// record's, never a table's.
+#[test]
+fn a_zo_helper_row_carries_the_model_it_ran_on_what_it_was_asked_and_its_effort() {
+    let store = tempfile::tempdir().expect("a helper store");
+    let transcript = store.path().join("a-reader.session.jsonl");
+    std::fs::write(&transcript, "the helper's own conversation\n").expect("a transcript");
+    std::fs::write(
+        store.path().join("a-reader.json"),
+        json!({
+            "agentId": "a-reader",
+            "requestedModel": "sonnet",
+            "resolvedModel": "model-s",
+            "model": "model-s",
+            "activity": { "effectiveEffort": "high" },
+            "outputTail": "what the helper said last",
+        })
+        .to_string(),
+    )
+    .expect("a record");
+
+    let wire = zo_helpers_on_the_wire(
+        &mut Vec::new(),
+        &json!({
+            "type": "subagents",
+            "running": [{ "id": "a-reader", "label": "reader", "model": "model-s",
+                          "transcript": transcript.to_str().expect("utf-8 path") }]
+        }),
+    );
+
+    assert_eq!(
+        wire[0]["model"],
+        json!("model-s"),
+        "the row does not say the model the helper ran on: {wire}"
+    );
+    assert_eq!(
+        wire[0]["requestedModel"],
+        json!("sonnet"),
+        "the row does not say what the helper was asked for: {wire}"
+    );
+    assert_eq!(
+        wire[0]["effort"],
+        json!("high"),
+        "the row does not say how hard the helper thinks: {wire}"
+    );
+    // Only the record's own fields are read: nothing the helper said, in the
+    // record or in the transcript beside it, travels with the row.
+    let sent = wire.to_string();
+    assert!(
+        !sent.contains("what the helper said last") && !sent.contains("own conversation"),
+        "a helper's words reached its row: {sent}"
+    );
+}
+
+/// The second word is only said when there is a second thing to say: a helper
+/// that ran on exactly the model it was asked for has one model, not two.
+#[test]
+fn a_zo_helper_that_ran_on_what_it_was_asked_carries_no_second_model() {
+    let store = tempfile::tempdir().expect("a helper store");
+    let transcript = store.path().join("a-same.session.jsonl");
+    std::fs::write(&transcript, "").expect("a transcript");
+    std::fs::write(
+        store.path().join("a-same.json"),
+        json!({ "requestedModel": "model-s", "resolvedModel": "model-s", "model": "model-s" })
+            .to_string(),
+    )
+    .expect("a record");
+
+    let wire = zo_helpers_on_the_wire(
+        &mut Vec::new(),
+        &json!({
+            "type": "subagents",
+            "running": [{ "id": "a-same", "model": "model-s",
+                          "transcript": transcript.to_str().expect("utf-8 path") }]
+        }),
+    );
+
+    assert_eq!(
+        wire[0]["model"],
+        json!("model-s"),
+        "no model on the row: {wire}"
+    );
+    assert!(
+        wire[0].get("requestedModel").is_none() && wire[0].get("effort").is_none(),
+        "a word the record did not have was invented: {wire}"
+    );
+}
+
+/// The record adds to the frame and never subtracts from it: a frame that
+/// names the model is enough for a row to say it, a frame that does not lets
+/// the record say it, and a vendor that says neither leaves the row without
+/// one — the page then names the agent alone rather than a guess.
+#[test]
+fn a_zo_helper_without_a_record_still_says_the_model_its_frame_named() {
+    let store = tempfile::tempdir().expect("a helper store");
+    // A helper whose record has not been written (or was removed): the file
+    // the frame names does not exist, and neither does the record beside it.
+    let bare = store.path().join("a-bare.session.jsonl");
+    // A helper whose frame names no model, with a record that does.
+    let quiet = store.path().join("a-quiet.session.jsonl");
+    std::fs::write(&quiet, "").expect("a transcript");
+    std::fs::write(
+        store.path().join("a-quiet.json"),
+        json!({ "resolvedModel": "model-r", "model": "model-x" }).to_string(),
+    )
+    .expect("a record");
+
+    let wire = zo_helpers_on_the_wire(
+        &mut Vec::new(),
+        &json!({
+            "type": "subagents",
+            "running": [
+                { "id": "a-bare", "model": "model-s",
+                  "transcript": bare.to_str().expect("utf-8 path") },
+                { "id": "a-none", "model": "model-t" },
+                { "id": "a-quiet", "model": null,
+                  "transcript": quiet.to_str().expect("utf-8 path") },
+                { "id": "a-silent", "model": null }
+            ]
+        }),
+    );
+
+    let said: Vec<serde_json::Value> = wire
+        .as_array()
+        .expect("a roster")
+        .iter()
+        .map(|row| row.get("model").cloned().unwrap_or(serde_json::Value::Null))
+        .collect();
+    assert_eq!(
+        said,
+        [
+            json!("model-s"),
+            json!("model-t"),
+            json!("model-r"),
+            json!(null)
+        ],
+        "a row does not say the model its own vendor named: {wire}"
+    );
+
+    // A vendor that fires hook events and lists no model at all: its rows
+    // carry none of the three words, so nothing on screen can be a guess.
+    let mut hooked = vec![];
+    let reading = zerocode_core::hook::background_agent_tasks(
+        r#"{"background_tasks":[{"id":"bg-1","type":"subagent","agent_type":"Explore","status":"running"}]}"#,
+    )
+    .expect("present");
+    hooks::fold_background_tasks(&mut hooked, &reading);
+    let hooked = serde_json::to_value(&hooked).expect("a roster is wire-shaped");
+    assert!(
+        ["model", "requestedModel", "effort"]
+            .iter()
+            .all(|word| hooked[0].get(*word).is_none()),
+        "a vendor that names no model got one: {hooked}"
+    );
+}
+
+/// The record is read only from beside the helper's OWN transcript, and only
+/// as the small regular file it is: a frame that names another helper's
+/// transcript names nothing, and a record too big to be one (or not a file at
+/// all) says nothing rather than stalling the frame that asked.
+#[test]
+fn a_zo_helpers_record_is_read_only_beside_its_own_transcript_and_only_when_small() {
+    let store = tempfile::tempdir().expect("a helper store");
+    std::fs::write(store.path().join("a-one.session.jsonl"), "").expect("a transcript");
+    std::fs::write(
+        store.path().join("a-one.json"),
+        json!({ "requestedModel": "someone-elses", "resolvedModel": "model-one" }).to_string(),
+    )
+    .expect("a record");
+    // A record no helper writes: three hundred thousand bytes of padding.
+    let big = store.path().join("a-big.session.jsonl");
+    std::fs::write(&big, "").expect("a transcript");
+    std::fs::write(
+        store.path().join("a-big.json"),
+        json!({ "requestedModel": "sonnet", "resolvedModel": "model-b",
+                "pad": "x".repeat(300 * 1024) })
+        .to_string(),
+    )
+    .expect("a record");
+    // And a directory where the record should be.
+    let odd = store.path().join("a-odd.session.jsonl");
+    std::fs::write(&odd, "").expect("a transcript");
+    std::fs::create_dir(store.path().join("a-odd.json")).expect("a directory");
+
+    let wire = zo_helpers_on_the_wire(
+        &mut Vec::new(),
+        &json!({
+            "type": "subagents",
+            "running": [
+                // Another helper's transcript: the id is not this one's.
+                { "id": "a-two", "model": "model-x",
+                  "transcript": store.path().join("a-one.session.jsonl").to_str().expect("utf-8 path") },
+                { "id": "a-big", "model": "model-b", "transcript": big.to_str().expect("utf-8 path") },
+                { "id": "a-odd", "model": "model-d", "transcript": odd.to_str().expect("utf-8 path") }
+            ]
+        }),
+    );
+
+    let asked: Vec<serde_json::Value> = wire
+        .as_array()
+        .expect("a roster")
+        .iter()
+        .map(|row| {
+            row.get("requestedModel")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        })
+        .collect();
+    let ran: Vec<serde_json::Value> = wire
+        .as_array()
+        .expect("a roster")
+        .iter()
+        .map(|row| row.get("model").cloned().unwrap_or(serde_json::Value::Null))
+        .collect();
+    assert_eq!(
+        ran,
+        [json!("model-x"), json!("model-b"), json!("model-d")],
+        "a row lost the model its frame named: {wire}"
+    );
+    assert_eq!(
+        asked,
+        [json!(null), json!(null), json!(null)],
+        "a record was read that is not the helper's own, or is not a small file: {wire}"
+    );
+}
+
+/// A roster keeps what it was told and takes what it is told next: a fallback
+/// that moves a running helper to another model is the frame's news and
+/// replaces the model, a frame that says nothing about it leaves it standing,
+/// and what the helper was asked for does not change because it was moved.
+#[test]
+fn a_fallback_moves_the_model_a_roster_holds_and_a_silent_frame_leaves_it() {
+    let store = tempfile::tempdir().expect("a helper store");
+    let transcript = store.path().join("a-moved.session.jsonl");
+    std::fs::write(&transcript, "").expect("a transcript");
+    let record = store.path().join("a-moved.json");
+    let path = transcript.to_str().expect("utf-8 path").to_string();
+    let frame = |model: serde_json::Value| {
+        json!({ "type": "subagents",
+                "running": [{ "id": "a-moved", "model": model, "transcript": path }] })
+    };
+    let mut roster = Vec::new();
+
+    std::fs::write(
+        &record,
+        json!({ "requestedModel": "sonnet", "resolvedModel": "model-s" }).to_string(),
+    )
+    .expect("a record");
+    let first = zo_helpers_on_the_wire(&mut roster, &frame(json!("model-s")));
+    assert_eq!(
+        first[0]["model"],
+        json!("model-s"),
+        "no model on the row: {first}"
+    );
+
+    // The provider ran out and zo moved the helper: the record and the frame
+    // both say so.
+    std::fs::write(
+        &record,
+        json!({ "requestedModel": "sonnet", "resolvedModel": "model-t", "model": "model-t" })
+            .to_string(),
+    )
+    .expect("a record");
+    let moved = zo_helpers_on_the_wire(&mut roster, &frame(json!("model-t")));
+    assert_eq!(
+        (
+            moved[0]["model"].clone(),
+            moved[0]["requestedModel"].clone()
+        ),
+        (json!("model-t"), json!("sonnet")),
+        "a fallback did not move the model, or forgot what was asked: {moved}"
+    );
+
+    // A frame that says nothing (the record cannot be read either) leaves the
+    // last word standing.
+    std::fs::remove_file(&record).expect("the record goes");
+    let silent = zo_helpers_on_the_wire(&mut roster, &frame(json!(null)));
+    assert_eq!(
+        silent[0]["model"],
+        json!("model-t"),
+        "a frame that said nothing erased what the roster knew: {silent}"
+    );
+}
+
 #[test]
 fn a_zo_turn_start_is_working_and_acknowledges_the_worker_prompt() {
     let report = zo_channel_report(&json!({
@@ -18113,6 +18483,14 @@ fn the_helper_page_speaks_from_its_catalogs_and_paints_from_its_tokens() {
         "status-mark-w",
         "status-mark-size",
         "status-in",
+        // A step is one line (t-15682): the row, its mark and its body's
+        // indent, and the foot line's ring.
+        "step-h",
+        "step-icon",
+        "step-icon-pad",
+        "step-body-indent",
+        "status-ring",
+        "status-ring-stroke",
         "actions-h",
         "actions-gap",
         "copy-size",
@@ -18160,9 +18538,18 @@ fn the_helper_page_speaks_from_its_catalogs_and_paints_from_its_tokens() {
         ".chat-dock {",
         ".helper-actions {",
         ".helper-status-mark {",
-        ".helper-turn.is-tool {",
+        // A step is one line (t-15682): the row, its line and its parts, the
+        // foot line's ring, and the report a finished helper opens on.
+        ".helper-turn:is(.is-tool, .is-thinking) {",
+        ".helper-step-line {",
+        ".helper-step-what {",
+        ".helper-step-body {",
+        ".helper-status.is-naming {",
+        ".helper-status-ring {",
+        ".helper-report {",
+        ".helper-report-label {",
+        ".helper-report-door {",
         ".helper-tool-call {",
-        ".helper-tool-result {",
         ".helper-tool-body {",
         ".helper-tool-diff-rows {",
         // What a row folds (t-6323): the cut, the fade, the door.
