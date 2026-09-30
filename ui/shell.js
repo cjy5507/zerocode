@@ -117,6 +117,14 @@ const panePermissionModes = new Map();
  * piece the voice finished (`done`) stands until the turn that says those
  * words arrives (`settlePaneLive`), so the close is one paint, never a blink. */
 const paneLive = new Map();
+/* What a pane's agent says it is doing, by pane: the `activity` of the newest
+ * `session_status` its own channel sent — zo says what its working row says, a
+ * tool's verb and target or waiting, reconnecting, thinking, and leaves the
+ * fact out while the pane is idle and in the first token's grace period. The
+ * foot line of the pane's conversation says it when no row of a step is out to
+ * (`nowActivityOf`, t-18702). A frame without it, the turn's end and the next
+ * turn's start take it away. */
+const paneNow = new Map();
 /* The question a pane's program is asking, when the hook DESCRIBED it — a
  * permission request (tool, summary, the edit as rows) or an AskUserQuestion
  * with its options — keyed by term, cleared by the next report that is not a
@@ -304,6 +312,38 @@ function ledgerReviewWord(facts) {
  * deployed in the ledger (`ReviewFacts`); a worker's claim never is. */
 function ledgerVouched(review) {
   return Boolean(review && (review.verified || review.merged || review.deployed));
+}
+
+/* Where the sidebar places one piece of work, in the two words it has for it.
+ *
+ * The verdict is the board's own — `ledgerReviewStage`, which reads the one
+ * hand (`ledgerReviewWord`) and names its answer as a stage — and this table
+ * only folds those stages onto what a sidebar row can say: `review` is work
+ * handed in that no coordinator has stood behind yet (a worker's own
+ * 「~됐다 함」 is still a claim, so it waits with the report), `vouched` is what
+ * a coordinator wrote as verified, merged or deployed. A stage with no entry —
+ * a failed attempt, work never reported — says neither: `worktreeReviewPhase`
+ * and `agentRowPhase` call that `unsettled` where the ledger holds a task, and
+ * leave it unsaid where it holds none. */
+const LEDGER_REVIEW_PHASE = Object.freeze({
+  reported: "review",
+  "claimed-verified": "review",
+  "claimed-merged": "review",
+  "claimed-deployed": "review",
+  verified: "vouched",
+  merged: "vouched",
+  deployed: "vouched",
+});
+
+function ledgerReviewPhaseOf(facts) {
+  return LEDGER_REVIEW_PHASE[ledgerReviewStage(null, facts)] ?? "";
+}
+
+/* Whether the ledger holds a task for this seat or checkout: a named one, or —
+ * where a sweep compacted the task away and left its title empty — the failed
+ * attempt that proves there was one (a closed dispatch always carried a task). */
+function ledgerHoldsTask(facts) {
+  return facts.failed === true || Boolean(facts.taskId || facts.task);
 }
 
 function seedPaneAgents() {
@@ -9157,6 +9197,13 @@ listen("hook:activity", (event) => {
   // 모아서 함께 싣는다. 이어 붙이고 스무 개에서 끊는다.
   const held = [...(paneActivities.get(pane) ?? []), ...activities];
   paneActivities.set(pane, held.slice(-ACTIVITY_RING));
+  // A helper's page says what its own card last did when no row is out to say
+  // it (`nowActivityOf`): the card's news is the foot line's, not the list's.
+  const page = activeHelperPage();
+  if (page && isHelperPage(page.worker) && helperCardOf(page.worker) === pane) {
+    const status = helperStatusOf(page);
+    if (status) updateHelperStatus(status, page.worker);
+  }
   // A tool call is a line in the transcript already; the conversation view on
   // this pane, if it is up, reads it now (`pollHelperPages` is the one reader).
   const term = Number(/^term:(\d+)$/.exec(pane)?.[1]);
@@ -9721,6 +9768,9 @@ function agentRowStatusWord(row, state) {
   if (row.history) return "";
   const ledgerWord = row.sub ? "" : paneLedgerWord(row.term);
   if (ledgerWord && !LIVE_HOOK_STATES.has(state)) return ledgerWord;
+  // A turn that ended before the ledger's task was handed in is at rest, not
+  // done — the same reading the workspace's dot takes of it (`agentRowPhase`).
+  if (agentRowPhase(row, state) === "unsettled") return bucketWord("idle");
   return bucketWord(state === "needs-attention" ? "attention" : state);
 }
 
@@ -9730,6 +9780,78 @@ function agentRowStatusWord(row, state) {
 function agentRowVerified(row) {
   if (row.sub || row.history) return false;
   return ledgerVouched(paneLedger.get(row.term)?.review);
+}
+
+/* And the other half of that distinction: where the ledger says the work of a
+ * turn that ENDED stands.
+ *
+ *   review     handed in, and nobody has stood behind it yet — 검증 대기, or a
+ *              worker's own 「~됐다 함」. The row's mark says so in SHAPE (an
+ *              hourglass, where a verified turn wears a check), not in grey
+ *              alone
+ *   failed     the attempt ended without a successful report — the worker said
+ *              ok:false, or it was stopped or abandoned
+ *   unsettled  the ledger gave this seat a task and the turn ended without
+ *              handing anything in
+ *   ""         nothing to say — a person's own agent, or a verified turn
+ *
+ * The last two are not done, and the row does not say so: it is at rest, in a
+ * plain dot. Only a turn that ended can be any of them — `done`, or `idle`, the
+ * process that left with no `Stop` (which the workspace dot folds as done) — a
+ * row at work is at work, whatever it filed before. The reading is the
+ * workspace dot's (`worktreeReviewPhase`), for one seat. */
+function agentRowPhase(row, state) {
+  if (row.sub || row.history || (state !== "done" && state !== "idle")) return "";
+  const facts = paneLedger.get(row.term);
+  if (!facts) return "";
+  const said = ledgerReviewPhaseOf(facts);
+  if (said !== "") return said === "review" ? "review" : "";
+  if (facts.failed === true) return "failed";
+  return ledgerHoldsTask(facts) ? "unsettled" : "";
+}
+
+/* The glyph an agent row's dot wears, out of the state and that reading: a
+ * check for a turn that ended, an hourglass while its work waits for a
+ * coordinator, a question for a person wanted. Working, and a turn that ended
+ * on work never handed in or failed, are drawn by CSS on a bare span, so they
+ * have no glyph. */
+function agentRowMark(state, phase) {
+  if (phase === "review") return "#i-hourglass";
+  if (state === "done") return phase === "unsettled" || phase === "failed" ? "" : "#i-circle-check";
+  return state === "needs-attention" ? "#i-msg-ask" : "";
+}
+
+/* One agent row's dot: the sprite's glyph when the state has one, else the bare
+ * span the stylesheet draws (the ring while at work, the floor's dot). */
+function agentDotNode(mark) {
+  let dot;
+  if (mark) {
+    dot = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    dot.setAttribute("class", "icon wt-agent-dot");
+    const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+    use.setAttribute("href", mark);
+    dot.appendChild(use);
+  } else {
+    dot = document.createElement("span");
+    dot.className = "wt-agent-dot";
+  }
+  dot.setAttribute("aria-hidden", "true");
+  return dot;
+}
+
+/* What a failed attempt's dot says when it is pointed at: as much as the
+ * ledger knows, which is one fact — the attempt ended without a successful
+ * report (the worker said ok:false, or the attempt was stopped or abandoned).
+ * The reason's own words never reach this window: a ledger row carries
+ * `failed`, not a summary. Keyed through `applyLocale` (`data-i18n-title`)
+ * because a finished-work row is not rebuilt for a change of language. */
+const AGENT_FAILED_TIP = { key: "worktree.attemptFailedTip", word: "실패 — 원장에 성공 보고 없이 끝난 시도로 적혀 있습니다(워커가 ok:false로 보고했거나, 시도가 멈추거나 폐기됨)" };
+
+function dressFailedDot(dot) {
+  if (!dot) return;
+  dot.dataset.tip = t(AGENT_FAILED_TIP.key, AGENT_FAILED_TIP.word);
+  dot.dataset.i18nTitle = AGENT_FAILED_TIP.key;
+  dot.dataset.i18nSourcedatatip = AGENT_FAILED_TIP.word;
 }
 
 /* The task a workspace is working on, when the ledger seated one in a pane
@@ -9744,6 +9866,43 @@ function worktreeTaskTitle(path) {
   // No pane here carries a task, but the work a released worker finished in
   // this checkout still does (t-10993).
   return checkoutLedger.get(checkoutKey(path))?.task?.trim() ?? "";
+}
+
+/* Where the ledger says the work standing in one checkout is:
+ *
+ *   review     handed in, and no coordinator has stood behind it yet
+ *   vouched    a coordinator wrote verified, merged or deployed
+ *   unsettled  the ledger holds a task here that nobody handed in — the turn
+ *              ended before `worker_done`, or the attempt failed
+ *   ""         the ledger has nothing to say about this checkout at all
+ *
+ * The last is the rule the sidebar always had (an agent whose turn ended is
+ * 완료, and a person's own agent has no ledger task to be measured against).
+ * The third exists so a row never SAYS 완료 about work the ledger knows is not
+ * done: see `worktreeMark`.
+ *
+ * The checkout is found by PATH, the link `worktreeTaskTitle` already draws
+ * its title by and the task board follows — never by the branch's name: the
+ * seats in this checkout's tabs first, then the work a released worker left
+ * in it. With several the one still waiting wins, and anything unresolved
+ * outranks what is settled, so a worker's verified report cannot hide
+ * another's that nobody has looked at. */
+const WORKTREE_PHASE_RANK = Object.freeze({ "": 0, vouched: 1, unsettled: 2, review: 3 });
+
+function worktreeReviewPhase(path) {
+  if (paneLedger.size === 0 && checkoutLedger.size === 0) return "";
+  let phase = "";
+  const read = (facts) => {
+    if (!facts) return;
+    const said = ledgerReviewPhaseOf(facts) || (ledgerHoldsTask(facts) ? "unsettled" : "");
+    if (WORKTREE_PHASE_RANK[said] > WORKTREE_PHASE_RANK[phase]) phase = said;
+  };
+  for (const tab of tabs) {
+    if (tab.kind !== "term" || tab.worktree !== path) continue;
+    for (const term of paneLeaves(tab.layout)) read(paneLedger.get(term));
+  }
+  read(checkoutLedger.get(checkoutKey(path)));
+  return phase;
 }
 
 /* Whether this row IS the pane on stage — Orca's `isFocusedPane`, which fills
@@ -9800,13 +9959,14 @@ function agentPaneName(tab, term, agent = "") {
  * back by `redressAgentRows` to tell a row whose words moved from a row whose
  * shape did. */
 function agentRowClasses(state, here, foldedSummary, row = null) {
+  const phase = row ? agentRowPhase(row, state) : "";
   return `wt-agent is-${state === "needs-attention" ? "waiting" : state}${
     here ? " is-here" : ""
   }${foldedSummary ? " is-folded-summary" : ""}${row?.history ? " is-history" : ""}${
     row?.ancestry ? " is-ancestry" : ""
   }${!row?.history && LIVE_HOOK_STATES.has(state) ? " is-live" : ""}${
     row && agentRowVerified(row) ? " is-verified" : ""
-  }`;
+  }${phase ? ` is-${phase}` : ""}`;
 }
 
 function agentHistoryLabel(row) {
@@ -9824,7 +9984,9 @@ function agentFoldLabel(row) {
 /* What a folded summary row says: identity, the state's word, and the
  * disclosure — the tip carries the first two, the label all three. */
 function foldedSummaryWords(row, state, fold) {
-  const stateWord = bucketWord(state === "needs-attention" ? "attention" : state);
+  // The row's own status word (`agentRowStatusWord`): 검증 대기 or the ledger's
+  // other word where a coordinator has been told, else the state's.
+  const stateWord = agentRowStatusWord(row, state);
   const identity = row.agent ? agentName(row.agent) : stateWord;
   const disclosure = fold?.getAttribute("aria-label") ?? "";
   return {
@@ -10056,20 +10218,9 @@ function makeAgentRow(row, gutter = false) {
     fold.className = "wt-agent-fold is-quiet";
     fold.setAttribute("aria-hidden", "true");
   }
-  const mark =
-    state === "done" ? "#i-circle-check" : state === "needs-attention" ? "#i-msg-ask" : "";
-  let dot;
-  if (mark) {
-    dot = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    dot.setAttribute("class", "icon wt-agent-dot");
-    const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
-    use.setAttribute("href", mark);
-    dot.appendChild(use);
-  } else {
-    dot = document.createElement("span");
-    dot.className = "wt-agent-dot";
-  }
-  dot.setAttribute("aria-hidden", "true");
+  const phase = agentRowPhase(row, state);
+  const dot = agentDotNode(agentRowMark(state, phase));
+  if (phase === "failed") dressFailedDot(dot);
   // The agent's REAL face beside its state ("어떤 에이전트가 도는지 아이콘
   // 실제") — the registry's favicon chain, with its letter tile standing in
   // until the mark lands. A row that predates the registry, or a helper with
@@ -10304,6 +10455,16 @@ function makeFinishedWorkRow(path, work) {
     session: work.conversation ?? null,
   });
   if (ledgerVouched(work.review)) node.classList.add("is-verified");
+  // The dot says where the work stands, in the glyph a live row's turn wears —
+  // an hourglass while it waits for a coordinator, a check once one vouched. An
+  // attempt that failed, or work the ledger has no phase for, keeps the plain
+  // dot the retained rows always had.
+  const phase = ledgerReviewPhaseOf(work);
+  if (phase === "review") node.classList.add("is-review");
+  if (phase !== "") {
+    node.querySelector(".wt-agent-dot")?.replaceWith(agentDotNode(agentRowMark("done", phase)));
+  }
+  if (phase === "" && work.failed === true) dressFailedDot(node.querySelector(".wt-agent-dot"));
   return node;
 }
 
@@ -11389,7 +11550,23 @@ function elapsedWords(ms) {
 }
 
 function workerElapsedWords(run) {
+  if (isHelperPage(run)) return helperSpanWords(run);
   return elapsedWords((run.endedAt ?? Date.now()) - run.startedAt);
+}
+
+/* How long a helper ran, by the times its file stamped: from its first stamped line to its last — to
+ * now while it runs. The window's own clock says nothing about it (it started when the page happened
+ * to open, so every finished helper read 「완료 0초」), and a file that stamped nothing, or whose
+ * stamps go backwards (`holdHelperTurns`), has no clock: the head says nothing rather than a time
+ * nobody knows (t-18702). A span that is not positive, or under half a second, is worded 0초 or less,
+ * which is the same nothing. */
+const HELPER_SPAN_MIN_MS = 500;
+
+function helperSpanWords(run) {
+  const held = run.helper;
+  if (held.firstStampMs === undefined || held.clockBroken === true) return "";
+  const span = (run.status === "running" ? Date.now() : held.lastStampMs) - held.firstStampMs;
+  return span >= HELPER_SPAN_MIN_MS ? elapsedWords(span) : "";
 }
 
 /* The clock alone, so a second's tick never rebuilds the page under a
@@ -11448,14 +11625,28 @@ function holdHelperTurns(held, turns) {
   const now = Date.now();
   for (const turn of turns) {
     // 벤더가 줄에 찍은 시각이 있으면 그것(`TranscriptTurn.at_ms`), 없으면
-    // 도착한 순간 — 「{{time}} 동안 작업」의 시간은 이 시각들의 차다.
+    // 도착한 순간 — 「{{time}} 동안 작업」의 시간은 이 시각들의 차다. 찍힌 시각이
+    // 없는 줄을 백엔드는 `null`로 보낸다(빠진 열쇠가 아니다): 둘 다 「없음」이다.
+    const stamp = Number.isFinite(turn.at_ms) && turn.at_ms > 0 ? turn.at_ms : null;
+    // 헬퍼 자신의 시계는 파일이 찍은 첫 줄에서 끝 줄까지다(`helperSpanWords`) —
+    // 페이지가 열린 순간이 아니라. 턴을 앞에서 지워도(상한) 이 둘은 남는다. 도장이
+    // 직전 도장보다 이르면(압축한 세션의 맨 앞 요약은 쓰인 순간이 찍혀서 뒤따르는
+    // 옛 줄들보다 늦다 — 설계이고 지어낸 시각이 아니다) 그 파일의 시계는 곧지
+    // 않다: 어디서든 뒤로 가면 폭을 말하지 않는다.
+    if (stamp !== null) {
+      if (held.firstStampMs === undefined) held.firstStampMs = stamp;
+      else if (stamp < held.lastStampMs) held.clockBroken = true;
+      held.lastStampMs = stamp;
+    }
     if (turn.role === "tool_result" && turn.tool?.call_id) {
       const call = held.turns.findLast((one) => one.role === "tool" &&
         one.tool?.call_id === turn.tool.call_id && one.output === undefined);
       if (call) {
         call.output = turn.text;
         call.outputError = turn.tool.is_error === true;
-        call.outputAt = turn.at_ms ?? now;
+        call.outputAt = stamp ?? now;
+        // A length is said only between two times the file itself gave (`stepTook`).
+        call.outputFromClock = stamp === null;
         // What the result handed back beside its words: pictures (A8).
         if (turn.images?.length > 0) call.outputImages = turn.images;
         // An edit the result describes and the call did not (ACP hands the
@@ -11473,13 +11664,13 @@ function holdHelperTurns(held, turns) {
     // A length of nothing is no length: turns held in one read share one
     // clock reading, and a file can stamp two lines alike.
     const last = held.turns.at(-1);
-    const fromClock = turn.at_ms === undefined;
+    const fromClock = stamp === null;
     if (last?.role === "thinking" && last.thoughtMs === undefined && last.fromClock === fromClock) {
-      const lasted = (turn.at_ms ?? now) - last.at;
+      const lasted = (stamp ?? now) - last.at;
       if (lasted > 0) last.thoughtMs = lasted;
     }
     held.turns.push({ role: turn.role, text: turn.text, tool: turn.tool ?? null,
-      seq: held.seq, at: turn.at_ms ?? now, fromClock, ...(turn.images?.length > 0 && { images: turn.images }) });
+      seq: held.seq, at: stamp ?? now, fromClock, ...(turn.images?.length > 0 && { images: turn.images }) });
     held.seq += 1;
   }
   if (held.turns.length > HELPER_TURN_CAP) {
@@ -11953,6 +12144,7 @@ function forgetPaneChat(term) {
   held.run.queue = null;
   paneChats.delete(term);
   paneLive.delete(term);
+  paneNow.delete(term);
   paneUsage.delete(term);
 }
 
@@ -12252,7 +12444,13 @@ async function pollHelperPages() {
     if (activeHelperPage() === tab) paintHelperSurface(tab);
   }
   const replaced = after !== null && more.next < after;
-  if (replaced) { held.turns.length = 0; held.skipped = false; }
+  if (replaced) {
+    held.turns.length = 0;
+    held.skipped = false;
+    held.firstStampMs = undefined;
+    held.lastStampMs = undefined;
+    held.clockBroken = false;
+  }
   // The first read of a pane's transcript began at its tail: the turns above
   // are not carried, and the page says so once (`paintPaneChat`).
   if (more.folded === true) held.folded = true;
@@ -12444,9 +12642,12 @@ function toolWords(turn) {
     } catch {}
   }
 
+  // `arg` is the target as a line has room for it; `whole` is what a shell step's title is read from —
+  // a `cd <long path> &&` cut at 80 letters would take the command's own words with it (t-18702).
+  const whole = target || input.split("\n", 1)[0];
   if (target && target.length > 80) target = `${target.slice(0, 77)}…`;
 
-  return { name, arg: target || input.split("\n", 1)[0], input };
+  return { name, arg: target || input.split("\n", 1)[0], whole, input };
 }
 
 function cleanseAssistantText(text) {
@@ -12585,7 +12786,7 @@ function dressToolTurn(row, turn, run, spoken) {
  * extension's 「Thought for 3s」), the bare word until then. */
 function thoughtLabel(turn) {
   if (turn.thoughtMs !== undefined) {
-    return t("worker.thoughtFor", "{{s}}초 동안 생각", { s: Math.max(1, Math.round(turn.thoughtMs / 1000)) });
+    return t("worker.thoughtFor", "생각 {{s}}초", { s: Math.max(1, Math.round(turn.thoughtMs / 1000)) });
   }
   return t("worker.thought", "생각");
 }
@@ -12643,10 +12844,11 @@ function updateHelperStatus(line, run) {
   wearReach(line, composerReachOf(run));
   const mark = line.querySelector(".helper-status-mark");
   // What is going on now, in the words its row wears (t-15682): the step that
-  // is out, else the thought that is going. With nothing to name the line
-  // keeps the CLI's own verb, which holds still for a person who asked for
-  // less motion.
-  const naming = shown ? nowWordsOf(line.parentElement) : "";
+  // is out, else the thought that is going, else what the card's activity says
+  // (t-18702). With nothing to name a voice that turns through verbs keeps the
+  // CLI's own, which holds still for a person who asked for less motion; a
+  // voice with one static word gives way to the window's own.
+  const naming = shown ? nowSaidOf(line.parentElement, run, voice) : "";
   writeClass(line, "is-naming", naming !== "");
   writeTextContent(line.querySelector(".helper-status-now"), naming === "" ? "" : `${t("worker.now", "지금")} · ${naming}`);
   writeTextContent(line.querySelector(".helper-status-said"), naming === "" ? voice.busy_word : naming);
@@ -14094,7 +14296,9 @@ function updateHelperPageHead(head, run, owner) {
     dot.remove();
   }
   const said = state.querySelector(".worker-state");
-  writeAttribute(said, "class", `worker-state is-${run.status}`);
+  // 「✓ 끝남」: the check stands only before the plain ending, not before 「직접 멈춤」.
+  const clean = run.status === "done" && !run.helper?.stopRecord;
+  writeAttribute(said, "class", `worker-state is-${run.status}${clean ? " is-clean" : ""}`);
   writeTextContent(said, workerStatusWords(run));
   writeTextContent(state.querySelector(".worker-elapsed"), workerElapsedWords(run));
   writeTextContent(head.querySelector(".worker-uses"), toolUsesWords(run.toolCalls ?? 0));
@@ -14213,6 +14417,51 @@ function paintHelperPageSibs(nav, run) {
   }
   nav.replaceChildren(...chips);
   if (kept) nav.querySelector(`[data-sib="${CSS.escape(kept)}"]`)?.focus();
+}
+
+/* The strip under the brief (t-18702): what the helper did, counted — the whole,
+ * each kind of step in the words the step rows wear, how many failed, and a bar
+ * of the kinds' shares (the mockup's 「도구 9 · 웹 2 · 셸 1 · 파일 읽기 6 · 실패
+ * 0」). Nothing done, nothing shown. Repainted only when the log moved (`seq`
+ * counts every turn and every answer), so a quiet poll costs no mutation. */
+function helperPageTallyNode() {
+  const strip = document.createElement("div");
+  strip.className = "helper-tally";
+  strip.hidden = true;
+  return strip;
+}
+
+function paintHelperPageTally(strip, run) {
+  const sig = `${run.helper.seq}|${locale}`;
+  if (strip.__sig === sig) return;
+  strip.__sig = sig;
+  const { total, failed, kinds } = helperTally(run);
+  writeHidden(strip, total === 0);
+  if (total === 0) {
+    strip.replaceChildren();
+    return;
+  }
+  const whole = document.createElement("b");
+  whole.className = "helper-tally-total";
+  whole.textContent = t("worker.tallyTotal", "도구 {{n}}", { n: total });
+  const parts = [...kinds].map(([kind, count]) => {
+    const one = document.createElement("span");
+    one.className = "helper-tally-kind";
+    one.textContent = `${stepLook(kind).word()} ${count}`;
+    return one;
+  });
+  const lost = document.createElement("span");
+  lost.className = `helper-tally-failed ${failed > 0 ? "is-failed" : "is-ok"}`;
+  lost.textContent = t("worker.tallyFailed", "실패 {{n}}", { n: failed });
+  const bar = document.createElement("span");
+  bar.className = "helper-tally-bar";
+  bar.setAttribute("aria-hidden", "true");
+  for (const count of kinds.values()) {
+    const share = document.createElement("i");
+    share.style.flexGrow = String(count);
+    bar.appendChild(share);
+  }
+  strip.replaceChildren(whole, ...parts, lost, bar);
 }
 
 /* The card: what the helper was asked, drawn once from the instruction and
@@ -14444,7 +14693,7 @@ async function stopHelperFromPage(stop, run) {
 /* A finished helper's word: the plain one, unless the person's stop is what
  * its record says ended it. */
 function helperStopRecordWords(record) {
-  const ended = t("worker.ended", "완료");
+  const ended = t("worker.ended", "끝남");
   return record ? helperStopWords(record, ended) : ended;
 }
 
@@ -14490,6 +14739,7 @@ function updateHelperPageChrome(page, run, owner) {
   updateHelperPageHead(page.head, run, owner);
   paintHelperPageSibs(page.sibs, run);
   paintHelperPageBrief(page.brief, run);
+  paintHelperPageTally(page.tally, run);
   updateHelperPageFoot(page.foot, run, owner);
 }
 
@@ -14534,12 +14784,13 @@ function paintHelperPageOwn(host, tab, run, owner) {
     head: helperPageHeadNode(run, owner),
     sibs: helperPageSibsNode(),
     brief: helperPageBriefNode(),
+    tally: helperPageTallyNode(),
     foot: helperPageFootNode(run, owner),
     turns,
     status,
     run,
   };
-  host.append(page.head, page.sibs, page.brief, body, page.foot);
+  host.append(page.head, page.sibs, page.brief, page.tally, body, page.foot);
   updateHelperPageChrome(page, run, owner);
   standChatPlace(turns);
   host.__helperPage = page;
@@ -15778,6 +16029,14 @@ function laneSignal(session, frame) {
       paneLive.delete(term);
       paintPaneLive(term);
     }
+    notePaneNow(session, null);
+  } else if (frame.type === "turn") {
+    // The turn ended, however it ended: what it was doing is over.
+    notePaneNow(session, null);
+  } else if (frame.type === "session_status") {
+    // zo's status card carries what its working row says (`activity`); the
+    // frame leaves it out while the pane is idle.
+    notePaneNow(session, frame.activity && typeof frame.activity === "object" ? frame.activity : null);
   } else if (frame.type === "usage") {
     /* 상태바와 보드는 같은 손으로 읽는다 (t-2374). 두 번째 파서를 지으면
      * 「상태바는 24,489인데 카드는 비었다」가 언제든 생긴다 — 그리고 그것은
@@ -15823,6 +16082,33 @@ function notePaneLive(session, frame) {
     paneLive.set(term, pieces);
     paintPaneLive(term);
   }
+}
+
+/* Keep what a pane's channel says the pane is doing (`null`: nothing), and
+ * repaint the foot line of its conversation when that moved. */
+function notePaneNow(session, activity) {
+  for (const term of paneTermsBySession(session)) {
+    const held = paneNow.get(term) ?? null;
+    const same = activity === null
+      ? held === null
+      : held?.verb === activity.verb && held.target === activity.target && held.phase === activity.phase;
+    if (same) continue;
+    if (activity === null) paneNow.delete(term);
+    else paneNow.set(term, activity);
+    paintPaneNow(term);
+  }
+}
+
+/* The foot line of the page a tab is, when it stands drawn on screen. */
+function helperStatusOf(tab) {
+  const host = tab.kind === "chat" ? paneChats.get(tab.term)?.host : groups.get(tab.pane)?.workerView;
+  return host && !host.hidden ? host.__helperPage?.status ?? null : null;
+}
+
+function paintPaneNow(term) {
+  const tab = paneChats.get(term)?.tab;
+  const status = tab ? helperStatusOf(tab) : null;
+  if (status) updateHelperStatus(status, tab.worker);
 }
 
 /* The streaming rows of a pane's conversation, when it is on screen, follow

@@ -77,6 +77,7 @@ import { testComposerMenuPosition } from "./composer-menu-position.mjs";
 import { testImeBrokenCommit } from "./ime-broken-commit.mjs";
 import { testWorkers } from "./workers.mjs";
 import { testSidebarAgents } from "./sidebar-agents.mjs";
+import { testSidebarReviewState } from "./sidebar-review-state.mjs";
 import { testConversationAgents, testConversationFolds, testConversationFont, testConversationKeys, testConversationPaths, testConversationScroll, testConversationFoot, testConversationStatus, testConversationTodos, testConversationImages, testConversationCopies, testConversationShelf, testConversationRelease, testConversationSteps } from "./conversation-parity.mjs";
 import { measureConversation, standingPids } from "./conversation-perf.mjs";
 import { createRequire } from "node:module";
@@ -255,6 +256,8 @@ suite("vault", async ({ browser, origin }) => {
 });
 suite("workers", testWorkers);
 suite("sidebar-agents", testSidebarAgents);
+// The sidebar tells 작업 중, 검증 대기 and 완료 apart, by the ledger (t-18902).
+suite("sidebar-review-state", testSidebarReviewState);
 /* The conversation view against the Claude Code extension's own webview
  * (t-6323, docs/design/agent-conversation-claude-code-grammar-20260915.md
  * §10): each suite one difference that was closed, read off the laid-out page. */
@@ -36613,7 +36616,7 @@ const toolStates = await page.evaluate(async () => {
   // The four the answer closed: their kinds' words, no accent.
   seen.fourNames = tools.slice(0, 4).map((row) => row.querySelector(".helper-step-kind").textContent).join(",");
   seen.wantFourNames = [t("worker.stepRead", "파일 읽기"), t("worker.stepSearch", "검색"),
-    t("worker.stepEdit", "파일 수정"), t("worker.stepShell", "셸 실행")].join(",");
+    t("worker.stepEdit", "파일 수정"), t("worker.stepShell", "셸")].join(",");
   seen.fourPlain = tools.slice(0, 4).every((row) => !row.classList.contains("is-live") &&
     markOf(row).color === probe("--ink-mist"));
   // The one still out: the mark on the accent, "in progress" where its result

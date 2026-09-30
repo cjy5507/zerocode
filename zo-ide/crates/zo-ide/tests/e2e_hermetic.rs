@@ -4071,6 +4071,46 @@ async fn e2e_a_tall_edit_cell_keeps_the_composer_on_the_floor() {
     }
 }
 
+/// A draft taller than the pane keeps the row of its caret on screen (t-17194).
+///
+/// Before: the view built every row of the composer and the painter drew the
+/// first rows the pane had, so with a 60-row draft in a 10-row pane the caret
+/// and every letter typed at the end of the draft were on rows nobody drew.
+/// The composer now scrolls the draft between its own lines: the end of the
+/// paste is on screen, and the next letter is drawn where the caret is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_a_draft_taller_than_the_pane_keeps_what_is_typed_at_its_end_on_screen() {
+    const ROWS: u16 = 10;
+    let layout = Layout::new();
+    let service = ScriptedAnthropicService::text("nothing is asked")
+        .await
+        .expect("start text script");
+    let args = interactive_args();
+    let mut run = PtyRun::spawn_sized(
+        ROWS,
+        80,
+        &layout.cwd,
+        &layout.home,
+        &layout.sessions,
+        &layout.state,
+        service.base_url(),
+        &args,
+        &[],
+    )
+    .expect("spawn zo in a short PTY");
+    run.wait_for("directory:", TEST_TIMEOUT);
+    let draft = (1..=60)
+        .map(|number| format!("row {number:02} of the draft"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    run.send(format!("\u{1b}[200~{draft}\u{1b}[201~").as_bytes())
+        .expect("paste a 60-row draft");
+    run.wait_for_screen("row 60 of the draft", usize::from(ROWS), TEST_TIMEOUT);
+    run.send(b"Z").expect("type a letter at the end of the draft");
+    run.wait_for_screen("row 60 of the draftZ", usize::from(ROWS), TEST_TIMEOUT);
+    let _ = run.finish();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_a_fresh_session_at_sixty_rows_keeps_the_composer_on_the_floor() {
     a_fresh_session_fills_the_pane_from_the_top(60, "sixty-rows").await;
@@ -6143,6 +6183,55 @@ async fn e2e_a_tool_that_takes_the_terminal_does_not_take_the_pane_input() {
     // Typing must still reach the composer.
     run.send(b"still typing here").expect("type after the tool");
     run.wait_for_screen("still typing here", 40, TEST_TIMEOUT);
+    let _ = run.finish();
+}
+
+/// [`TERMINAL_THIEF`], two seconds later and from the background: a command the
+/// tool has already returned from. Only a process that shares zo's controlling
+/// terminal can; the subshell's output is thrown away so the tool does not
+/// wait for it.
+const DELAYED_TERMINAL_THIEF: &str = "(sleep 2; perl -e '$SIG{TTOU} = \"IGNORE\"; use POSIX (); \
+open(my $tty, \"+<\", \"/dev/tty\") or exit 0; \
+POSIX::tcsetpgrp(fileno($tty), getpgrp()) or exit 3; exit 0') >/dev/null 2>&1 &";
+
+/// A terminal taken while zo idles is taken back, within the bound the idle
+/// look keeps (t-17057).
+///
+/// The one-second size poll that healed this woke an idle zo 3.2 times a
+/// second; the idle look is now at every wake and, when nothing wakes zo,
+/// `IDLE_TEND` (thirty seconds) after the last. A stray that takes the foreground
+/// group after the turn is over — no key ever arrives to tell zo — is the case
+/// only that look can heal, so the bound is pinned here: what is typed after
+/// the strike reaches the composer within it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_a_terminal_taken_while_zo_idles_is_taken_back_within_the_idle_bound() {
+    let layout = Layout::new();
+    let service = ScriptedAnthropicService::bash(DELAYED_TERMINAL_THIEF, "the thief is gone\n")
+        .await
+        .expect("start bash script");
+    let args = interactive_args();
+    let mut run = PtyRun::spawn_controlling(
+        &layout.cwd,
+        &layout.home,
+        &layout.sessions,
+        &layout.state,
+        service.base_url(),
+        &args,
+    )
+    .expect("spawn zo on its own terminal");
+
+    run.wait_for("directory:", TEST_TIMEOUT);
+    run.send(b"Start the thief in the background, then say it is gone\r")
+        .expect("send tool prompt");
+    run.wait_for("the thief is gone", TEST_TIMEOUT);
+
+    // The turn is over and zo idles. The thief strikes two seconds after its
+    // command returned; by four it has, and nothing wakes zo.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    run.send(b"typed after the strike").expect("type after the strike");
+    // The painter writes the cells that changed, so the words are read off the
+    // screen, as the neighbouring test reads its own (t-17056).
+    run.wait_for_screen("typed after the strike", 40, Duration::from_secs(45));
     let _ = run.finish();
 }
 

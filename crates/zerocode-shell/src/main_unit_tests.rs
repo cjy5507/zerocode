@@ -17852,6 +17852,37 @@ fn a_folder_panel_presumed_lost_yields_to_a_fresh_one_and_its_late_answer_is_ign
 }
 
 #[test]
+fn a_folder_panel_settles_once_per_generation_by_whichever_road_ends_it() {
+    let mut desk = FolderPanelDesk::new();
+    let opened = Instant::now();
+    assert_eq!(desk.ask(opened), FolderPanelAsk::Fresh { generation: 1 });
+    let settled = desk
+        .settle(1, FolderPanelHow::Cancelled, opened + Duration::from_secs(9))
+        .expect("the standing panel settles");
+    assert_eq!(settled.1, FolderPanelSettled { generation: 1, how: FolderPanelHow::Cancelled });
+    assert_eq!(settled.0.stood_for, Duration::from_secs(9));
+    // The same generation never settles twice.
+    assert_eq!(desk.settle(1, FolderPanelHow::Answered, opened + Duration::from_secs(10)), None);
+    assert_eq!(FolderPanelSettled::EVENT, "project:folder-panel-settled");
+}
+
+#[test]
+fn a_panel_presumed_lost_is_settled_lost_when_the_next_ask_replaces_it_and_not_again_when_it_answers() {
+    let mut desk = FolderPanelDesk::new();
+    let opened = Instant::now();
+    assert_eq!(desk.ask(opened), FolderPanelAsk::Fresh { generation: 1 });
+    assert_eq!(desk.take_replaced(), None);
+    let lost = opened + FOLDER_PANEL_PRESUMED_LOST;
+    assert_eq!(desk.ask(lost), FolderPanelAsk::Fresh { generation: 2 });
+    assert_eq!(
+        desk.take_replaced(),
+        Some(FolderPanelSettled { generation: 1, how: FolderPanelHow::Lost })
+    );
+    assert_eq!(desk.take_replaced(), None);
+    assert_eq!(desk.settle(1, FolderPanelHow::Answered, lost), None);
+}
+
+#[test]
 fn the_folder_panel_clock_is_ordered() {
     // The receipt behind the panel's task is judged before the panel is
     // overdue, and a panel is overdue long before it is presumed lost. A
@@ -18435,6 +18466,14 @@ fn the_helper_page_speaks_from_its_catalogs_and_paints_from_its_tokens() {
         // A read's lines beside its file's door (t-6323 A2).
         "worker.readLines",
         "worker.readFrom",
+        // The foot line's words for what an agent's status says with no row
+        // of a step out to name (t-18702): waiting, reconnecting, thinking.
+        "worker.nowWaiting",
+        "worker.nowReconnecting",
+        "worker.nowThinking",
+        // The strip under a helper's brief that counts what it did (t-18702).
+        "worker.tallyTotal",
+        "worker.tallyFailed",
     ];
     for language in ["en", "ja", "zh", "es"] {
         let catalog = block_after(window, &format!("  {language}: {{"));
@@ -18477,6 +18516,21 @@ fn the_helper_page_speaks_from_its_catalogs_and_paints_from_its_tokens() {
             vec!["worker.thinking"],
         ),
         ("function agentVoice(id) {", vec!["worker.busy"]),
+        // The strip's two words are read where the strip is painted (t-18702).
+        (
+            "function paintHelperPageTally(strip, run) {",
+            vec!["worker.tallyTotal", "worker.tallyFailed"],
+        ),
+        // What the foot line says while no row is out (t-18702): the three
+        // status words are read where zo's status verbs are tabled.
+        (
+            "const ZO_STATUS_WORDS = {",
+            vec![
+                "worker.nowWaiting",
+                "worker.nowReconnecting",
+                "worker.nowThinking",
+            ],
+        ),
         // The copy stands under every answer now (the extension's
         // `assistantActions`), not only the last one's tail.
         (
