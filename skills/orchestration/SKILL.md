@@ -873,6 +873,48 @@ that opens a prompt nobody is watching blocks its own pane until somebody
 happens to look at it. Send the blocker as `escalation` and stop; a stopped
 child with a written reason is recoverable, a hung one is not.
 
+## Closing work that is neither done nor failed
+
+Work folded into another task, handed to the other run, or overtaken by events
+is not a completion and not a failure — it is `closed`, with the reason and the
+target that make it a fact. The coordinator writes it with `task-update`, and
+nothing else writes it:
+
+```
+task-update --task <id> --status closed --closed-as folded --into <task>
+task-update --task <id> --status closed --closed-as handed-over --to <run-id>
+task-update --task <id> --status closed --closed-as outdated --why '<one line>'
+```
+
+Each form is refused without its own flag, a fold into a task the run does not
+hold, into itself or in a circle is refused, and so is closing a task a worker
+is carrying (stop the attempt first) or one with a decision standing. A closed
+task leaves `task-list --open`, counts as neither completed nor failed
+(`run-show` counts `closed` on its own), and the board reads 닫힘 with the
+reason (접힘 → t-…, 넘김 → run-…, 낡음). A task that depends on a folded one
+waits for the task it was folded into; one that depends on a handed-over or
+outdated task lists it under `blockedBy`, because nothing in this run can
+produce it. `--status ready` (or any other status) puts a closed task back to
+work and drops its reason.
+
+`task-settle [--days <n>]` lists, and only lists, two piles of old work: the
+open tasks (pending, ready, blocked) whose every attempt ended handing nothing
+in and that nobody has touched for a week (the default is `SETTLE_QUIET_DAYS`),
+and — apart, as `unreviewableCompleted` — the completed tasks that can never
+take a review record. `task-settle --apply --retry-request settle-<run>` closes
+the first pile `outdated`, from the coordinator seat only; a completed task is
+never changed by it. Run it without `--apply` first and read both counts.
+
+The board does not wait on those completed tasks either. A completed task whose
+every attempt ended handing nothing in has no source a review could name —
+`task-update` refuses any review of it — so `task-list` carries
+`review.unreviewable: true` on its row, and the board, the worker rows and the
+sidebar read 완료 — 검토 기록 없음 instead of 검증 대기 from the moment it is so,
+without the quiet week `task-settle` waits. It is the ledger's reading of the
+attempts each time it is asked and is never written down: a new attempt that
+hands something in takes it back, and a task with a review written, a decision
+standing or an attempt still open is never read this way.
+
 ## Decision gates
 
 When a slice reaches a decision that is a person's or the coordinator's to

@@ -232,6 +232,7 @@ async function refreshPaneLedger() {
         reported: row?.reported === true,
         failed: row?.failed === true,
         review: row?.review ?? null,
+        closed: row?.closed ?? null,
       };
       if (typeof row?.term === "number") next.set(row.term, facts);
       else if (row?.settled === true && row.checkout) {
@@ -265,7 +266,7 @@ function paneLedgerSaid(map) {
     .sort(([a], [b]) => a - b)
     .map(([term, f]) =>
       `${term}:${f.taskId}:${f.task}:${f.ledger}:${f.reported ? 1 : 0}:${f.failed ? 1 : 0}` +
-      `:${JSON.stringify(f.review)}`)
+      `:${JSON.stringify(f.review)}:${JSON.stringify(f.closed)}`)
     .join(",");
 }
 
@@ -285,7 +286,9 @@ listen("ledger:changed", () => {
  * facts the ledger holds: reported is the worker's claim; verified, merged
  * and deployed are the coordinator's. A turn that ended without a report is
  * not "awaiting review" — nothing was handed in, and an attempt that ended
- * without a successful report says it failed. */
+ * without a successful report says it failed. And work that is done with
+ * nothing handed in on it at all cannot be reviewed, so it does not wait for
+ * review either: it says so (`review.unreviewable`). */
 function paneLedgerWord(term) {
   const facts = paneLedger.get(term);
   return facts ? ledgerReviewWord(facts) : "";
@@ -295,6 +298,9 @@ function paneLedgerWord(term) {
  * task board's worker roster draws (t-6588). */
 function ledgerReviewWord(facts) {
   const review = facts.review ?? {};
+  // Closed is neither done nor failed: the coordinator folded, handed over or
+  // retired the task, so no report or claim on it still waits for anyone.
+  if (facts.closed) return t("board.closed", "닫힘");
   if (review.deployed) return t("board.deployed", "배포됨");
   if (review.merged) return t("board.merged", "병합됨");
   if (review.verified) return t("board.verified", "검증됨");
@@ -303,15 +309,54 @@ function ledgerReviewWord(facts) {
   if (review.claimed_deployed) return t("board.claimedDeployed", "배포됐다 함");
   if (review.claimed_merged) return t("board.claimedMerged", "병합됐다 함");
   if (review.claimed_verified) return t("board.claimedVerified", "검증됐다 함");
+  // Completed, and every attempt ended handing nothing in: a review names what an
+  // attempt handed in, so none can ever be written — it waits on nobody and
+  // nothing vouches for it. The ledger's own reading (`ReviewFacts::unreviewable`,
+  // t-19328); the window counts no attempt itself, and a row from an older ledger,
+  // which carries no such key, reads as it always did.
+  if (review.unreviewable) return t("board.noReviewRecord", "완료 — 검토 기록 없음");
   if (facts.failed) return t("board.desk.stageFailed", "실패");
   if (facts.reported) return t("board.awaitingReview", "검증 대기");
   return "";
+}
+
+/* 닫힘의 까닭을 낱말로 — 원장의 `Closure` 종류(`closed.kind`)마다 한 줄씩, 이 표가
+ * 그 낱말의 유일한 곳이다. `target`은 접힌 과업·넘긴 런의 이름이고, 낡음은 가리킬 곳이
+ * 없다(그 한 줄 이유는 `closed.why`로 데스크 행이 덧붙인다). */
+const CLOSED_REASONS = Object.freeze({
+  folded: { key: "board.closedFolded", word: "접힘 → {{target}}", target: "into" },
+  "handed-over": { key: "board.closedHandedOver", word: "넘김 → {{target}}", target: "to" },
+  outdated: { key: "board.closedOutdated", word: "낡음", target: null },
+});
+
+function ledgerClosedReason(closed) {
+  const held = closed && CLOSED_REASONS[closed.kind];
+  if (!held) return "";
+  return t(held.key, held.word, { target: held.target ? closed[held.target] ?? "" : "" });
 }
 
 /* Whether a coordinator has stood behind the work — verified, merged or
  * deployed in the ledger (`ReviewFacts`); a worker's claim never is. */
 function ledgerVouched(review) {
   return Boolean(review && (review.verified || review.merged || review.deployed));
+}
+
+/* The phases of the ledger's reading (`ledgerReviewPhaseOf`) that wait on nobody:
+ * work closed, or completed with nothing handed in on it (no review can ever be
+ * written). A turn that ended on such work is at rest — not done, which a
+ * coordinator vouches for, and not waiting, which it would still have to look at.
+ * One set, read by a checkout's mark (`worktreeMark`) and by the fold of a
+ * finished child pane (`ledgerAwaitsCoordinator`). */
+const LEDGER_AT_REST_PHASES = new Set(["closed", "unreviewable"]);
+
+/* Whether the ledger still holds something for a coordinator to do on this seat's
+ * work: a task nobody vouched for — a report to look at, a claim to check, an
+ * attempt that failed or never reported — unless the ledger says nothing can wait
+ * on it. What keeps a finished child pane standing in the sidebar instead of
+ * folding into 완료 N개. */
+function ledgerAwaitsCoordinator(facts) {
+  if (!facts?.task || ledgerVouched(facts.review)) return false;
+  return !LEDGER_AT_REST_PHASES.has(ledgerReviewPhaseOf(facts));
 }
 
 /* Where the sidebar places one piece of work, in the two words it has for it.
@@ -321,11 +366,15 @@ function ledgerVouched(review) {
  * only folds those stages onto what a sidebar row can say: `review` is work
  * handed in that no coordinator has stood behind yet (a worker's own
  * 「~됐다 함」 is still a claim, so it waits with the report), `vouched` is what
- * a coordinator wrote as verified, merged or deployed. A stage with no entry —
+ * a coordinator wrote as verified, merged or deployed, and `unreviewable` is
+ * work done with nothing handed in on it: no review can ever be written, so it
+ * waits on nobody and nothing vouches for it (t-19328). A stage with no entry —
  * a failed attempt, work never reported — says neither: `worktreeReviewPhase`
  * and `agentRowPhase` call that `unsettled` where the ledger holds a task, and
  * leave it unsaid where it holds none. */
 const LEDGER_REVIEW_PHASE = Object.freeze({
+  closed: "closed",
+  unreviewable: "unreviewable",
   reported: "review",
   "claimed-verified": "review",
   "claimed-merged": "review",
@@ -9408,7 +9457,7 @@ function worktreeAgentRows(path) {
       !LIVE_HOOK_STATES.has(agentRowState(child)) &&
       !liveBelow(child) &&
       !agentRowHere(child) &&
-      !(paneLedger.get(child.term)?.task && !ledgerVouched(paneLedger.get(child.term)?.review));
+      !ledgerAwaitsCoordinator(paneLedger.get(child.term));
     const standing = dressed.filter((child) => !settled(child));
     const finished = dressed.filter(settled);
     for (const child of standing) walk(child, depth + 1, hideBelow);
@@ -9874,6 +9923,8 @@ function worktreeTaskTitle(path) {
  *   vouched    a coordinator wrote verified, merged or deployed
  *   unsettled  the ledger holds a task here that nobody handed in — the turn
  *              ended before `worker_done`, or the attempt failed
+ *   unreviewable  the task was done with nothing handed in on it: no review can
+ *              ever be written, so nothing waits on anybody (t-19328)
  *   ""         the ledger has nothing to say about this checkout at all
  *
  * The last is the rule the sidebar always had (an agent whose turn ended is
@@ -9887,7 +9938,7 @@ function worktreeTaskTitle(path) {
  * in it. With several the one still waiting wins, and anything unresolved
  * outranks what is settled, so a worker's verified report cannot hide
  * another's that nobody has looked at. */
-const WORKTREE_PHASE_RANK = Object.freeze({ "": 0, vouched: 1, unsettled: 2, review: 3 });
+const WORKTREE_PHASE_RANK = Object.freeze({ "": 0, closed: 1, unreviewable: 2, vouched: 3, unsettled: 4, review: 5 });
 
 function worktreeReviewPhase(path) {
   if (paneLedger.size === 0 && checkoutLedger.size === 0) return "";
@@ -10449,7 +10500,7 @@ function makeFinishedWorkRow(path, work) {
   const node = makePastRow({
     agent: work.agent,
     name: work.task || work.taskId,
-    said: ledgerReviewWord(work),
+    said: [ledgerReviewWord(work), ledgerClosedReason(work.closed)].filter(Boolean).join(" · "),
     at: work.at,
     worktree: path,
     session: work.conversation ?? null,
@@ -10461,7 +10512,7 @@ function makeFinishedWorkRow(path, work) {
   // dot the retained rows always had.
   const phase = ledgerReviewPhaseOf(work);
   if (phase === "review") node.classList.add("is-review");
-  if (phase !== "") {
+  if (phase !== "" && phase !== "closed") {
     node.querySelector(".wt-agent-dot")?.replaceWith(agentDotNode(agentRowMark("done", phase)));
   }
   if (phase === "" && work.failed === true) dressFailedDot(node.querySelector(".wt-agent-dot"));

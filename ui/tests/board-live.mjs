@@ -791,7 +791,8 @@ async function testLiveMap(browser, origin, ok) {
       const fact = said("dp-verify");
       /* seam이 답할 수 있는 모든 낱말이 단계 하나로 되읽히는가. */
       const reviews = [{ deployed: true }, { merged: true }, { verified: true },
-        { claimed_deployed: true }, { claimed_merged: true }, { claimed_verified: true }, {}];
+        { claimed_deployed: true }, { claimed_merged: true }, { claimed_verified: true },
+        { unreviewable: true }, {}];
       const unread = reviews.filter((review) =>
         ledgerReviewStage({ reported: true }, { reported: true, review }) === "dispatched");
       /* 표의 `flag`가 그 seam이 그 낱말을 고를 때 읽는 칸인가 — 그 칸 하나만 선
@@ -799,9 +800,12 @@ async function testLiveMap(browser, origin, ok) {
        * 서 있는가」를 물을 때(`agentGraphLiveStageHolds`) 그 행에서 참이어야 한다. */
       const misnamed = AGENT_GRAPH_LIVE_STAGES.filter((one) => {
         // `reported`와 `failed`는 행의 칸이고(실패도 닫힌 보고다), 나머지는 검토의 칸이다.
-        const row = one.flag === "reported" || one.flag === "failed"
-          ? { reported: true, [one.flag]: true, review: null }
-          : { reported: false, review: { [one.flag]: true } };
+        // `closed`는 행의 칸이고 까닭을 든 닫힘이다(접힘·넘김·낡음 중 하나).
+        const row = one.flag === "closed"
+          ? { reported: false, closed: { kind: "outdated", why: "x" }, review: null }
+          : one.flag === "reported" || one.flag === "failed"
+            ? { reported: true, [one.flag]: true, review: null }
+            : { reported: false, review: { [one.flag]: true } };
         return ledgerReviewWord(row) !== t(one.key, one.word)
           || !agentGraphLiveStageHolds(one.stage, null, row);
       }).map((one) => one.stage);
@@ -823,6 +827,43 @@ async function testLiveMap(browser, origin, ok) {
       authority.unread.length === 0, JSON.stringify(authority.unread));
     ok("each_stage_names_the_ledger_field_the_review_seam_reads_for_its_word",
       authority.misnamed.length === 0, JSON.stringify(authority.misnamed));
+
+    /* 검토 기록을 받을 수 없는 일 (t-19328, t-15558 조각 2). 모든 시도가 아무것도 넘기지
+     * 않고 끝난 뒤 사람 손으로 끝낸 과업은 코디네이터가 볼 출처가 없어 검토 기록이 영영
+     * 적힐 수 없는데, 보드는 그것을 검증 대기로 세고 있었다. 사실은 원장의 것이다 —
+     * 행의 `review.unreviewable` — 그리고 창은 그 한 칸만 읽는다. */
+    const noRecord = await page.evaluate(() => {
+      const row = (over) => ({ reported: true, failed: false, review: null, ...over });
+      const word = (over) => ledgerReviewWord(row(over));
+      const stage = (over) => ledgerReviewStage({ reported: true }, row(over));
+      const awaiting = t("board.awaitingReview", "검증 대기");
+      const none = t("board.noReviewRecord", "완료 — 검토 기록 없음");
+      const old = { verified: false, merged: false, deployed: false, written: false };
+      return {
+        said: word({ review: { ...old, unreviewable: true } }),
+        // 시도는 실패했고 과업은 손으로 끝났다: 과업의 낱말이 이긴다(닫힘이 그랬듯).
+        afterFailure: word({ failed: true, review: { ...old, unreviewable: true } }),
+        // 옛 원장의 행에는 그 칸이 없고, 옛 그대로 읽힌다.
+        older: word({ review: old }),
+        olderFailed: word({ failed: true, review: old }),
+        // 코디네이터의 사실 위에 서지 않는다.
+        fact: word({ review: { ...old, verified: true, unreviewable: true } }),
+        stage: stage({ review: { ...old, unreviewable: true } }),
+        olderStage: stage({ review: old }),
+        awaiting, none, failed: t("board.desk.stageFailed", "실패"), verified: t("board.verified", "검증됨"),
+        distinct: new Set([awaiting, none, t("board.verified", "검증됨"), t("board.merged", "병합됨"),
+          t("board.deployed", "배포됨"), t("board.closed", "닫힘"), t("board.desk.stageFailed", "실패")]).size,
+      };
+    });
+    ok("a_completed_task_nothing_can_review_reads_no_review_record_not_awaiting_review",
+      noRecord.said === noRecord.none && noRecord.afterFailure === noRecord.none
+      && noRecord.said !== noRecord.awaiting && noRecord.distinct === 7
+      && noRecord.stage === "unreviewable",
+      JSON.stringify(noRecord));
+    ok("an_older_ledgers_row_without_the_fact_reads_as_it_did_and_a_coordinators_fact_outranks_it",
+      noRecord.older === noRecord.awaiting && noRecord.olderFailed === noRecord.failed
+      && noRecord.olderStage === "reported" && noRecord.fact === noRecord.verified,
+      JSON.stringify(noRecord));
 
     ok("a_recorded_dispatch_and_message_point_to_their_exact_evidence",
       await page.evaluate(() => {

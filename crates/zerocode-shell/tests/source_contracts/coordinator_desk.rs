@@ -317,3 +317,214 @@ fn the_desks_numbers_are_the_backends_and_the_window_counts_no_letter() {
         "a kind the table does not know is drawn as a silence:\n{letter}"
     );
 }
+
+/// A task the coordinator folded, handed over or retired reads 닫힘 and its
+/// reason in words — never 실패 (t-19159, t-15558 slice 1).
+///
+/// Reported as the whole problem of the old tasks: work folded into another
+/// task or handed to the other run could only be written `completed` or
+/// `failed`, and the board showed the second as 실패. What is pinned is that the
+/// desk has a stage of its own for it and draws it without the failed tone,
+/// that the three reasons live in one table (`CLOSED_REASONS`) and say
+/// 접힘 → t-…, 넘김 → run-…, 낡음, that the word is one key read by every
+/// surface, and that all five languages carry those words.
+#[test]
+fn a_closed_task_reads_closed_with_its_reason_and_is_never_called_failed() {
+    let window = window_source();
+    let stages = block_after(window, "const DESK_STAGES = Object.freeze([");
+    assert!(
+        stages.contains(
+            r#"{ id: "closed", flow: false, tone: "", key: "board.closed", word: "닫힘" }"#
+        ),
+        "the desk has no closed stage, or draws it in a signal tone:\n{stages}"
+    );
+    let reasons = block_after(window, "const CLOSED_REASONS = Object.freeze({");
+    for held in [
+        r#"key: "board.closedFolded", word: "접힘 → {{target}}""#,
+        r#"key: "board.closedHandedOver", word: "넘김 → {{target}}""#,
+        r#"key: "board.closedOutdated", word: "낡음""#,
+    ] {
+        assert!(
+            reasons.contains(held),
+            "the reasons lost `{held}`:\n{reasons}"
+        );
+    }
+    let word = block_after(window, "function ledgerReviewWord(facts) {");
+    assert!(
+        word.contains(r#"if (facts.closed) return t("board.closed", "닫힘");"#),
+        "a closed task's card does not say closed:\n{word}"
+    );
+    assert!(
+        word.find("facts.closed") < word.find("stageFailed"),
+        "a closed task is read as failed before it is read as closed:\n{word}"
+    );
+    let i18n = include_str!("../../../../ui/shell-i18n.js");
+    for key in [
+        "board.closed",
+        "board.closedFolded",
+        "board.closedHandedOver",
+        "board.closedOutdated",
+    ] {
+        assert_eq!(
+            i18n.matches(&format!("\"{key}\":")).count(),
+            4,
+            "{key} is not in every language but the source's own Korean"
+        );
+    }
+    // The backend's stage list is the order the desk draws; closed is last.
+    let desk = shell_source("orchestration/desk.rs");
+    let table = block_after(&desk, "pub(crate) const STAGES: [&str; 10] = [");
+    assert!(
+        table
+            .find("\"failed\"")
+            .is_some_and(|failed| table.find("\"closed\"") > Some(failed)),
+        "the backend's stages do not end with closed:\n{table}"
+    );
+}
+
+/// A completed task nothing can review reads 완료 — 검토 기록 없음 and is
+/// never called 검증 대기 (t-19328, t-15558 slice 2).
+///
+/// Reported as the pile of old completed work whose every attempt ended
+/// handing nothing in: `task-update` refuses any review of it for ever, and the
+/// board called it 검증 대기 all the same. What is pinned is that the LEDGER
+/// decides it — one definition in core (`Run::handed_nothing_in`, the settle
+/// pass's own reading) shipped as a flag on the review the rows already carry —
+/// that neither the desk's stage nor the window judges it a second time, that
+/// every surface reads the one word from the one seam and the one key, and
+/// that the desk draws the backend's stages in the backend's order.
+#[test]
+fn a_completed_task_nothing_can_review_reads_no_review_record_and_never_awaiting_review() {
+    // One definition, in core, reused — by the settle pass and by the review.
+    let core = include_str!("../../../zerocode-core/src/orchestration.rs");
+    assert_eq!(
+        core.matches("fn handed_nothing_in(").count(),
+        1,
+        "the predicate is defined more than once"
+    );
+    for (opens, what) in [
+        ("fn quiet_unhanded(", "the settle pass's listing"),
+        (
+            "pub fn review_of(&self, task: &Task) -> ReviewFacts {",
+            "the review the rows carry",
+        ),
+    ] {
+        assert!(
+            block_after(core, opens).contains(".handed_nothing_in("),
+            "{what} does not ask the one definition"
+        );
+    }
+
+    // The desk's stage reads the core's review; it does not count attempts.
+    let desk = shell_source("orchestration/desk.rs");
+    let stage = block_after(
+        &desk,
+        "fn stage_of(run: &Run, task: &Task) -> &'static str {",
+    );
+    assert!(
+        stage.contains("run.review_of(task)") && stage.contains(".unreviewable"),
+        "the desk's stage does not read the ledger's own fact:\n{stage}"
+    );
+    assert!(
+        !stage.contains(".dispatches") && !stage.contains(".source"),
+        "the desk's stage counts attempts itself:\n{stage}"
+    );
+
+    // The window reads the flag and nothing else, ahead of 실패 and 검증 대기.
+    let window = window_source();
+    let word = block_after(window, "function ledgerReviewWord(facts) {");
+    assert!(
+        word.contains(
+            r#"if (review.unreviewable) return t("board.noReviewRecord", "완료 — 검토 기록 없음");"#
+        ),
+        "a completed task nothing can review does not say so:\n{word}"
+    );
+    assert!(
+        word.find("review.unreviewable") < word.find("stageFailed")
+            && word.find("review.unreviewable") < word.find("board.awaitingReview"),
+        "the word is read as failed or as waiting before it is read as unreviewable:\n{word}"
+    );
+
+    // The desk's stage, the board's live map and the sidebar all place it.
+    let stages = block_after(window, "const DESK_STAGES = Object.freeze([");
+    assert!(
+        stages.contains(
+            r#"{ id: "unreviewable", flow: false, tone: "", key: "board.noReviewRecord", word: "완료 — 검토 기록 없음" }"#
+        ),
+        "the desk has no stage for it, or draws it in a signal tone:\n{stages}"
+    );
+    let live = block_after(window, "const AGENT_GRAPH_LIVE_STAGES = Object.freeze([");
+    assert!(
+        live.contains(
+            r#"{ stage: "unreviewable", flag: "unreviewable", key: "board.noReviewRecord", word: "완료 — 검토 기록 없음" }"#
+        ),
+        "the live map cannot read the word back as a stage:\n{live}"
+    );
+    let placed = block_after(window, "const LEDGER_REVIEW_PHASE = Object.freeze({");
+    assert!(
+        placed.contains("unreviewable: \"unreviewable\""),
+        "the sidebar does not place the stage:\n{placed}"
+    );
+    let rank = block_after(window, "const WORKTREE_PHASE_RANK = Object.freeze({");
+    assert!(
+        rank.contains("unreviewable: 2"),
+        "a checkout's phase ranking does not know the stage:\n{rank}"
+    );
+
+    // The phases that wait on nobody are one set, read by the checkout's mark and
+    // by the fold of a finished child pane — so a coordinator is not shown a row
+    // that has nothing left for it (t-19328).
+    let rest = block_after(window, "const LEDGER_AT_REST_PHASES = new Set(");
+    assert!(
+        rest.contains("\"closed\"") && rest.contains("\"unreviewable\""),
+        "the phases that wait on nobody lost one:\n{rest}"
+    );
+    assert!(
+        block_after(window, "function ledgerAwaitsCoordinator(facts) {")
+            .contains("LEDGER_AT_REST_PHASES.has(ledgerReviewPhaseOf(facts))")
+            && block_after(window, "function worktreeMark(path, state) {")
+                .contains("LEDGER_AT_REST_PHASES.has(phase)"),
+        "the mark or the helper keeps a set of its own"
+    );
+    let rows = block_after(window, "function worktreeAgentRows(path) {");
+    assert!(
+        rows.contains("ledgerAwaitsCoordinator(paneLedger.get(child.term))")
+            && !rows.contains("ledgerVouched("),
+        "the fold of a finished child pane reads the ledger in a hand of its own:\n{rows}"
+    );
+
+    // The window draws the backend's stages, in the backend's order.
+    let table = block_after(&desk, "pub(crate) const STAGES: [&str; 10] = [");
+    let backend: Vec<&str> = table
+        .split("];")
+        .next()
+        .unwrap_or_default()
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .collect();
+    let drawn: Vec<&str> = stages
+        .split("]);")
+        .next()
+        .unwrap_or_default()
+        .split("id: \"")
+        .skip(1)
+        .map(|rest| rest.split('"').next().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        drawn, backend,
+        "the desk draws its stages in an order the backend does not send"
+    );
+    assert!(
+        backend.contains(&"unreviewable"),
+        "the backend has no stage for it: {backend:?}"
+    );
+
+    // One key, read by every surface, in every language but the source's Korean.
+    let i18n = include_str!("../../../../ui/shell-i18n.js");
+    assert_eq!(
+        i18n.matches("\"board.noReviewRecord\":").count(),
+        4,
+        "board.noReviewRecord is not in every language but the source's own Korean"
+    );
+}
