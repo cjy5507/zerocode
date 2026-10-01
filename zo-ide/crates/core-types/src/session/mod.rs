@@ -38,7 +38,7 @@ pub use mask::{
 };
 pub use message::{
     is_reminder_lineage_text, ContentBlock, ConversationMessage, MessageRole,
-    CLEARED_REMINDER_PLACEHOLDER, REMINDER_TAG_OPEN,
+    CLEARED_REMINDER_PLACEHOLDER, MODEL_HANDOFF_PREFIX, PROCESS_EVENT_PREFIX, REMINDER_TAG_OPEN,
 };
 
 use json_field::{
@@ -1749,9 +1749,9 @@ impl Session {
 
     /// Remove the last `steps` assistant turns from the session.
     ///
-    /// A "turn" is one assistant message plus any immediately following
-    /// user-role tool-result messages that belong to it, **and** the user
-    /// message that preceded the assistant reply. Returns the number of
+    /// A "turn" is the user prompt plus every assistant message and
+    /// tool-result message (Tool or User role) that followed it, up to the
+    /// next prompt. Returns the number of
     /// messages actually removed.
     pub fn rewind_turns(&mut self, steps: usize) -> usize {
         if steps == 0 || self.messages.is_empty() {
@@ -1764,39 +1764,34 @@ impl Session {
         let mut removed = 0usize;
         let mut turns_removed = 0usize;
 
+        // Host notes about a seam (a model handoff, a process event) belong to
+        // no turn: lift them off the tail, rewind the turn beneath, and put
+        // them back in their order — so a `/model` after the last turn does
+        // not make the turn unreachable.
+        let mut seam_notes: Vec<ConversationMessage> = Vec::new();
+
         while turns_removed < steps && !self.messages.is_empty() {
-            // Walk backward: trailing tool-result messages — and the reminder
-            // annotations the runtime persists alongside each request — belong
-            // to the turn being removed, so they go first. Other System
-            // content (a compaction summary) is NOT part of a turn and stops
-            // the walk like any foreign message.
-            while self.messages.last().is_some_and(|m| {
-                m.is_reminder_annotation()
-                    || (m.role == MessageRole::User
-                        && m.blocks
-                            .iter()
-                            .any(|b| matches!(b, ContentBlock::ToolResult { .. })))
-            }) {
-                Arc::make_mut(&mut self.messages).pop();
-                removed += 1;
-            }
-            // Remove the assistant message.
-            if self
-                .messages
-                .last()
-                .is_some_and(|m| m.role == MessageRole::Assistant)
-            {
-                Arc::make_mut(&mut self.messages).pop();
-                removed += 1;
-            }
-            // A reminder persisted between the user prompt and the first
-            // assistant reply also belongs to this turn — pop it so the
-            // prompt below is reachable.
             while self
                 .messages
                 .last()
-                .is_some_and(ConversationMessage::is_reminder_annotation)
+                .is_some_and(ConversationMessage::is_host_seam_note)
             {
+                if let Some(note) = Arc::make_mut(&mut self.messages).pop() {
+                    seam_notes.push(note);
+                }
+            }
+            // Walk backward over everything the turn holds: the assistant
+            // replies of every tool round, the tool results (zo writes them
+            // in the Tool role, other writers in the User role) and the
+            // reminder annotations the runtime persists alongside each
+            // request. Other System content (a compaction summary) is NOT
+            // part of a turn and stops the walk like any foreign message.
+            while self.messages.last().is_some_and(|m| {
+                m.is_reminder_annotation()
+                    || m.role == MessageRole::Assistant
+                    || m.role == MessageRole::Tool
+                    || m.holds_tool_result()
+            }) {
                 Arc::make_mut(&mut self.messages).pop();
                 removed += 1;
             }
@@ -1804,12 +1799,16 @@ impl Session {
             if self
                 .messages
                 .last()
-                .is_some_and(|m| m.role == MessageRole::User)
+                .is_some_and(ConversationMessage::is_user_prompt)
             {
                 Arc::make_mut(&mut self.messages).pop();
                 removed += 1;
             }
             turns_removed += 1;
+        }
+        // Newest was lifted first; the oldest goes back first.
+        while let Some(note) = seam_notes.pop() {
+            Arc::make_mut(&mut self.messages).push(note);
         }
 
         if removed > 0 {

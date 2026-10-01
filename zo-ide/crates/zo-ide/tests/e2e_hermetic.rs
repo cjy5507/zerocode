@@ -1008,6 +1008,129 @@ async fn e2e_a_teammate_pane_runs_its_brief_once_and_writes_the_answer_back() {
     let _ = run.finish();
 }
 
+/// A pane that is cut after its parent gave up waiting for it starts no work
+/// (t-19898). The parent left a note in the child's directory, and the child
+/// looks for it before it reads its brief: no model request, no result file
+/// for a parent that is not waiting, the strings table's line on the pane, and
+/// a clean exit — the pane is not a failure of the child's. The note comes
+/// after the brief, because a brief written takes the note away again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_a_teammate_cut_after_its_parent_gave_up_leaves_without_working() {
+    use runtime::subagent_panes::{Brief, PROTOCOL_VERSION, SPLIT_GIVEN_UP_FILE};
+
+    let layout = Layout::new();
+    let service = ScriptedAnthropicService::text("nobody asked for this answer\n")
+        .await
+        .expect("start teammate script");
+    let directory = layout.root.path().join("agent-late-1");
+    fs::create_dir_all(&directory).expect("teammate directory");
+    Brief {
+        version: PROTOCOL_VERSION,
+        agent_id: "agent-late-1".to_string(),
+        prompt: "Count the edges of the map.".to_string(),
+        description: "recon".to_string(),
+        subagent_type: Some("Explore".to_string()),
+        name: Some("late".to_string()),
+        permission_mode: Some("read-only".to_string()),
+        parent_session: Some("session-parent-e2e".to_string()),
+        tool_call_id: Some("toolu_late".to_string()),
+        ..Brief::default()
+    }
+    .write(&directory)
+    .expect("write brief");
+    fs::write(directory.join(SPLIT_GIVEN_UP_FILE), "").expect("write the note");
+
+    let dir_arg = directory.to_string_lossy().into_owned();
+    let mut run = pty(&layout, service.base_url(), &["--teammate", &dir_arg]);
+    // It leaves by itself, and only then are its bytes read: a line written
+    // just before the exit is in the capture once the reader has ended.
+    let code = run.exit_code(Duration::from_secs(5));
+    let output = run.finish();
+    let shown = String::from_utf8_lossy(&output);
+    assert_eq!(code, Some(0), "a teammate whose split was given up did not leave by itself; output:\n{shown}");
+    assert!(
+        shown.contains(zo_ide::tui::strings::TEAMMATE_SPLIT_GIVEN_UP),
+        "the pane does not say why it left; output:\n{shown}"
+    );
+    assert!(
+        runtime::subagent_panes::TeammateResult::read(&directory).is_none(),
+        "a withdrawn teammate wrote a result for a parent that is not waiting"
+    );
+    assert!(
+        service.request_bodies().await.is_empty(),
+        "a withdrawn teammate asked a model for something"
+    );
+}
+
+/// The note is looked for once more right before the first model request
+/// (t-19898): a child that read its brief a moment before its parent gave up
+/// is the one the first look cannot catch. Its `SessionStart` hook runs between
+/// the two looks, in the child's own boot, and writes the note — the parent
+/// giving up at exactly that moment, which no test can time any other way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_a_teammate_whose_parent_gives_up_while_it_boots_leaves_before_its_first_request() {
+    use runtime::subagent_panes::{Brief, PROTOCOL_VERSION, SPLIT_GIVEN_UP_FILE};
+
+    let layout = Layout::new();
+    let service = ScriptedAnthropicService::text("nobody asked for this answer\n")
+        .await
+        .expect("start teammate script");
+    let directory = layout.root.path().join("agent-late-2");
+    fs::create_dir_all(&directory).expect("teammate directory");
+    Brief {
+        version: PROTOCOL_VERSION,
+        agent_id: "agent-late-2".to_string(),
+        prompt: "Count the edges of the map.".to_string(),
+        description: "recon".to_string(),
+        subagent_type: Some("Explore".to_string()),
+        name: Some("late".to_string()),
+        permission_mode: Some("read-only".to_string()),
+        parent_session: Some("session-parent-e2e".to_string()),
+        tool_call_id: Some("toolu_late".to_string()),
+        ..Brief::default()
+    }
+    .write(&directory)
+    .expect("write brief");
+    // There is no note yet: the first look finds nothing, and the child boots.
+    assert!(!runtime::subagent_panes::split_given_up(&directory));
+    let hooks = layout.root.path().join("hooks");
+    fs::create_dir_all(&hooks).expect("hook directory");
+    let hook = hooks.join("give-up.sh");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\n: > '{}'\n", directory.join(SPLIT_GIVEN_UP_FILE).display()),
+    )
+    .expect("write the hook");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod the hook");
+    }
+    layout.with_hooks(&serde_json::json!({ "SessionStart": [hook.to_string_lossy()] }));
+
+    let dir_arg = directory.to_string_lossy().into_owned();
+    let mut run = pty(&layout, service.base_url(), &["--teammate", &dir_arg]);
+    let code = run.exit_code(Duration::from_secs(10));
+    let output = run.finish();
+    let shown = String::from_utf8_lossy(&output);
+    assert!(
+        runtime::subagent_panes::split_given_up(&directory),
+        "the hook did not run, so this test says nothing; output:\n{shown}"
+    );
+    assert_eq!(code, Some(0), "a teammate whose parent gave up while it booted did not leave; output:\n{shown}");
+    assert!(
+        shown.contains(zo_ide::tui::strings::TEAMMATE_SPLIT_GIVEN_UP),
+        "the pane does not say why it left; output:\n{shown}"
+    );
+    assert!(
+        runtime::subagent_panes::TeammateResult::read(&directory).is_none(),
+        "a withdrawn teammate wrote a result for a parent that is not waiting"
+    );
+    assert!(
+        service.request_bodies().await.is_empty(),
+        "a withdrawn teammate asked a model for something"
+    );
+}
+
 /// Wait for a teammate's `result.json` the way its parent does.
 fn wait_for_teammate_result(
     directory: &std::path::Path,
@@ -1906,6 +2029,120 @@ async fn e2e_headerless_thinking_names_the_status_row_and_commits_a_titled_cell(
     let _ = run.finish();
 }
 
+/// `/rewind` is in the help the commands crate prints, and the shipped zo
+/// answered "/rewind is not in zo" (t-19459). Now a bare `/rewind` lists the
+/// workspace checkpoints, and `/rewind turn` takes the last finished turn out
+/// of the conversation AND out of the saved transcript.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_rewind_command_works_in_the_shipped_tui() {
+    let layout = Layout::new();
+    let service = ScriptedAnthropicService::text("rewind fixture answer")
+        .await
+        .expect("start text script");
+    let mut run = pty(&layout, service.base_url(), &interactive_args());
+    let timeout = Duration::from_secs(20);
+
+    run.wait_for("directory:", TEST_TIMEOUT);
+    run.send(b"remember the ZEBRA-REWIND prompt\r").expect("send prompt");
+    run.wait_for_history_row("rewind fixture answer", timeout);
+    wait_until_quiet(&run, Duration::from_millis(300), timeout);
+
+    run.send(b"/rewind\r").expect("send /rewind");
+    run.wait_for_history_row("Workspace checkpoints", timeout);
+    let mut screen = Screen::new(40);
+    screen.feed(&run.snapshot_output());
+    assert!(
+        !screen.transcript().iter().any(|row| row.contains("is not in zo")),
+        "/rewind must not fall through to the unknown-command note: {:#?}",
+        screen.transcript()
+    );
+
+    run.send(b"/rewind turn\r").expect("send /rewind turn");
+    run.wait_for_history_row("Rewound 1 turn", timeout);
+    let saved: String = transcripts(&layout.sessions)
+        .iter()
+        .map(|path| fs::read_to_string(path).unwrap_or_default())
+        .collect();
+    assert!(
+        !saved.contains("ZEBRA-REWIND"),
+        "the rewound prompt must be gone from the saved transcript"
+    );
+
+    run.send(b"/rewind turn\r").expect("send second /rewind turn");
+    run.wait_for_history_row("Nothing to rewind", timeout);
+    let _ = run.finish();
+}
+
+/// `/rewind N` puts a guarded write back (file content asserted), refuses
+/// without `force` when the file changed after the checkpoint, and says in
+/// words that the conversation was not rewound (t-19459).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_rewind_n_restores_the_guarded_write_and_refuses_a_changed_file_without_force() {
+    let layout = Layout::new();
+    let service = ScriptedAnthropicService::writes_then_bash(
+        vec![("rewound.txt".to_string(), "written by the turn\n".to_string())],
+        None,
+        Duration::ZERO,
+        "### Done\n\n- one file written\n",
+    )
+    .await
+    .expect("start write script");
+    let mut run = pty(&layout, service.base_url(), &interactive_args());
+    let timeout = Duration::from_secs(20);
+    let file = layout.cwd.join("rewound.txt");
+
+    run.wait_for("directory:", TEST_TIMEOUT);
+    run.send(b"write one file\r").expect("send prompt");
+    run.wait_for_history_row("one file written", timeout);
+    wait_until_quiet(&run, Duration::from_millis(300), timeout);
+    assert_eq!(fs::read_to_string(&file).expect("the turn wrote the file"), "written by the turn\n");
+
+    // The turn left a checkpoint: the list names it.
+    run.send(b"/rewind\r").expect("send /rewind");
+    run.wait_for_history_row("1 file(s)", timeout);
+
+    // The file changed after the checkpoint: refused, content untouched.
+    fs::write(&file, "changed by hand\n").expect("change the file");
+    run.send(b"/rewind 1\r").expect("send /rewind 1");
+    run.wait_for_history_row("Retry with /rewind 1 force", timeout);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "changed by hand\n");
+
+    // With force the write is undone — the file did not exist before the turn.
+    run.send(b"/rewind 1 force\r").expect("send /rewind 1 force");
+    run.wait_for_history_row("Conflicted       0", timeout);
+    assert!(!file.exists(), "the restore must delete the file the turn created");
+    let _ = run.finish();
+}
+
+/// A `/model` switch leaves a handoff note after the last turn; `/rewind turn`
+/// steps over it and still takes the turn out (t-19459).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_rewind_turn_after_a_model_switch_still_takes_the_last_turn() {
+    let layout = Layout::new();
+    let service = ScriptedAnthropicService::text("handoff fixture answer")
+        .await
+        .expect("start text script");
+    let mut run = pty(&layout, service.base_url(), &interactive_args());
+    let timeout = Duration::from_secs(20);
+
+    run.wait_for("directory:", TEST_TIMEOUT);
+    run.send(b"remember the OKAPI-REWIND prompt\r").expect("send prompt");
+    run.wait_for_history_row("handoff fixture answer", timeout);
+    wait_until_quiet(&run, Duration::from_millis(300), timeout);
+    run.send(b"/model haiku\r").expect("send /model");
+    wait_until_quiet(&run, Duration::from_millis(300), timeout);
+
+    run.send(b"/rewind turn\r").expect("send /rewind turn");
+    run.wait_for_history_row("Rewound 1 turn", timeout);
+    let saved: String = transcripts(&layout.sessions)
+        .iter()
+        .map(|path| fs::read_to_string(path).unwrap_or_default())
+        .collect();
+    assert!(!saved.contains("OKAPI-REWIND"), "the turn must be gone from the saved transcript");
+    assert!(saved.contains("Model handoff"), "the handoff note stays where it was");
+    let _ = run.finish();
+}
+
 /// One turn, one spawn, four ledgers — joined by equality on the attempt key.
 ///
 /// This is the case the attempt-key contract exists for
@@ -2177,7 +2414,14 @@ async fn e2e_workflow_first_tool_frame_shows_both_live_helpers() {
     )
     .await
     .expect("start workflow script");
-    let mut run = pty(&layout, service.base_url(), &interactive_args());
+    // Both helpers must be live together, which is the cap the child reads:
+    // cores minus two, one on a 3-core CI runner. Hand the child its own two.
+    let mut run = pty_with_env(
+        &layout,
+        service.base_url(),
+        &interactive_args(),
+        &[("ZO_WORKFLOW_MAX_CONCURRENCY", "2")],
+    );
     let timeout = Duration::from_secs(20);
 
     run.wait_for("directory:", TEST_TIMEOUT);

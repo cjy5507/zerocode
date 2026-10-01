@@ -1,7 +1,7 @@
 use super::{
     cleanup_rotated_logs, reconcile_tool_history, rotate_session_file_if_needed,
     seal_orphan_tool_uses, vault_path_for, AnchorSummary, ContentBlock, ConversationMessage,
-    MessageRole, Session, SessionError, SessionFork,
+    MessageRole, Session, SessionError, SessionFork, MODEL_HANDOFF_PREFIX, PROCESS_EVENT_PREFIX,
 };
 use crate::json::JsonValue;
 use crate::usage::TokenUsage;
@@ -3820,4 +3820,173 @@ fn the_legacy_json_form_of_a_session_carries_no_message_times() {
     let restored = Session::from_json(&json).expect("read the legacy form back");
     assert!(message_times_in_memory(&restored).iter().all(Option::is_none));
     cleanup_session_file(&path);
+}
+
+// t-19202: zo writes tool results in the Tool role (`ConversationMessage::tool_result`),
+// so a rewind must treat them as part of the turn like a User-role result.
+fn zo_text_reply(text: &str) -> ConversationMessage {
+    ConversationMessage::assistant(vec![ContentBlock::Text { text: text.into() }])
+}
+
+#[test]
+fn rewind_removes_a_turn_ending_in_a_tool_role_result() {
+    let mut session = Session::new();
+    session.push_user_text("q0").unwrap();
+    session.push_message(zo_text_reply("a0")).unwrap();
+    session.push_user_text("q1").unwrap();
+    session.push_message(assistant_tool_use("t1", "bash")).unwrap();
+    session
+        .push_message(ConversationMessage::tool_result("t1", "bash", "ok", false))
+        .unwrap();
+
+    let removed = session.rewind_turns(1);
+    assert_eq!(removed, 3); // tool result + assistant + user prompt
+    assert_eq!(session.messages.len(), 2);
+}
+
+#[test]
+fn rewind_removes_a_whole_turn_of_several_tool_rounds() {
+    let mut session = Session::new();
+    session.push_user_text("q0").unwrap();
+    session.push_message(zo_text_reply("a0")).unwrap();
+    session.push_user_text("q1").unwrap();
+    for id in ["t1", "t2"] {
+        session.push_message(assistant_tool_use(id, "bash")).unwrap();
+        session
+            .push_message(ConversationMessage::tool_result(id, "bash", "ok", false))
+            .unwrap();
+    }
+    session.push_message(zo_text_reply("done")).unwrap();
+
+    let removed = session.rewind_turns(1);
+    assert_eq!(removed, 6); // prompt + 2 × (use, result) + final reply
+    assert_eq!(session.messages.len(), 2);
+}
+
+#[test]
+fn rewind_removes_a_turn_cut_short_right_after_a_tool_ran() {
+    let mut session = Session::new();
+    session.push_user_text("q0").unwrap();
+    session.push_message(assistant_tool_use("t1", "bash")).unwrap();
+    session
+        .push_message(ConversationMessage::tool_result("t1", "bash", "ok", false))
+        .unwrap();
+
+    assert_eq!(session.rewind_turns(1), 3);
+    assert!(session.messages.is_empty());
+}
+
+#[test]
+fn rewind_with_user_role_results_removes_several_tool_rounds_too() {
+    let mut session = Session::new();
+    session.push_user_text("q0").unwrap();
+    session.push_message(zo_text_reply("a0")).unwrap();
+    session.push_user_text("q1").unwrap();
+    for id in ["t1", "t2"] {
+        session.push_message(assistant_tool_use(id, "bash")).unwrap();
+        session.push_message(make_tool_result_message(id)).unwrap();
+    }
+    session.push_message(zo_text_reply("done")).unwrap();
+
+    assert_eq!(session.rewind_turns(1), 6);
+    assert_eq!(session.messages.len(), 2);
+}
+
+#[test]
+fn a_user_prompt_is_a_user_message_without_a_tool_result() {
+    assert!(ConversationMessage::user_text("hi").is_user_prompt());
+    assert!(!make_tool_result_message("t1").is_user_prompt());
+    assert!(make_tool_result_message("t1").holds_tool_result());
+    let tool_role = ConversationMessage::tool_result("t1", "bash", "ok", false);
+    assert!(!tool_role.is_user_prompt());
+    assert!(tool_role.holds_tool_result());
+    assert!(!zo_text_reply("a").is_user_prompt());
+}
+
+#[test]
+fn rewind_stops_at_a_compaction_summary_after_tool_role_rounds() {
+    let mut session = Session::new();
+    let mut summary = ConversationMessage::user_text("summary of earlier work");
+    summary.role = MessageRole::System;
+    session.push_message(summary).unwrap();
+    session.push_user_text("q1").unwrap();
+    session.push_message(assistant_tool_use("t1", "bash")).unwrap();
+    session
+        .push_message(ConversationMessage::tool_result("t1", "bash", "ok", false))
+        .unwrap();
+
+    assert_eq!(session.rewind_turns(3), 3);
+    assert_eq!(session.messages.len(), 1);
+}
+
+fn system_text(text: &str) -> ConversationMessage {
+    let mut message = ConversationMessage::user_text(text);
+    message.role = MessageRole::System;
+    message
+}
+
+fn texts(session: &Session) -> Vec<String> {
+    session
+        .messages
+        .iter()
+        .map(|message| match message.blocks.first() {
+            Some(ContentBlock::Text { text }) => text.clone(),
+            _ => format!("{:?}", message.role),
+        })
+        .collect()
+}
+
+#[test]
+fn rewind_steps_over_a_trailing_model_handoff_note_and_keeps_it_last() {
+    let mut session = Session::new();
+    session.push_user_text("q1").unwrap();
+    session.push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+        text: "a1".to_string(),
+    }]))
+    .unwrap();
+    let handoff = format!("{MODEL_HANDOFF_PREFIX}old`. You are `new`.");
+    session.push_message(system_text(&handoff)).unwrap();
+
+    assert_eq!(session.rewind_turns(1), 2, "the turn goes, the note is not counted");
+    assert_eq!(texts(&session), vec![handoff]);
+}
+
+#[test]
+fn rewind_steps_over_a_trailing_process_event_and_keeps_it_last() {
+    let mut session = Session::new();
+    session.push_user_text("q1").unwrap();
+    session.push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+        text: "a1".to_string(),
+    }]))
+    .unwrap();
+    let event = format!("{PROCESS_EVENT_PREFIX}{{\"kind\":\"lifeline_panic\"}}");
+    session.push_message(system_text(&event)).unwrap();
+
+    assert_eq!(session.rewind_turns(1), 2);
+    assert_eq!(texts(&session), vec![event]);
+}
+
+#[test]
+fn rewind_keeps_seam_notes_in_order_across_two_turns() {
+    let mut session = Session::new();
+    let first = format!("{MODEL_HANDOFF_PREFIX}a`. You are `b`.");
+    let second = format!("{PROCESS_EVENT_PREFIX}{{}}");
+    session.push_user_text("q1").unwrap();
+    session.push_message(system_text(&first)).unwrap();
+    session.push_user_text("q2").unwrap();
+    session.push_message(system_text(&second)).unwrap();
+
+    assert_eq!(session.rewind_turns(2), 2);
+    assert_eq!(texts(&session), vec![first, second]);
+}
+
+#[test]
+fn rewind_still_stops_at_a_compaction_summary_behind_a_seam_note() {
+    let mut session = Session::new();
+    session.push_message(system_text("summary of earlier work")).unwrap();
+    let handoff = format!("{MODEL_HANDOFF_PREFIX}old`. You are `new`.");
+    session.push_message(system_text(&handoff)).unwrap();
+
+    assert_eq!(session.rewind_turns(1), 0);
+    assert_eq!(session.messages.len(), 2, "nothing moved");
 }
