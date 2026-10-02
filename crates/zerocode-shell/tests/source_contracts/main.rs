@@ -462,6 +462,10 @@ mod tests {
                             // the refusals, the option set it may not widen
                             // and the apply it cannot claim are all one file's.
                             | "cmd/worker_room.rs"
+                            // t-21017: a provider's done report reaches the
+                            // human-input line through the one door
+                            // `note_pane_state` calls, tested beside that door.
+                            | "pane_runtime.rs"
                     ),
                 "`{name}` acquired a test fence; only the shell and command crates \
                  may own source-contract fences"
@@ -9141,11 +9145,11 @@ mod tests {
     #[test]
     fn the_embedded_chromium_loads_the_address_typed_and_never_invents_https() {
         let chromium = include_str!("../../src/chromium_browser.rs");
+        let disabled = disabled_chromium_features(chromium);
         assert!(
             chromium.contains("const CEF_SWITCH_DISABLE_FEATURES: &str = \"disable-features\";")
-                && chromium.contains(
-                    "const CEF_DISABLED_FEATURES: &str = \"HttpsUpgrades,HttpsFirstBalancedMode\";"
-                ),
+                && disabled.contains(&"HttpsUpgrades")
+                && disabled.contains(&"HttpsFirstBalancedMode"),
             "the https-upgrade features lost their named constants"
         );
         let hook = block_after(chromium, "fn on_before_command_line_processing(");
@@ -9154,6 +9158,85 @@ mod tests {
                 && hook.contains("Some(&CefString::from(CEF_DISABLED_FEATURES)),"),
             "Chromium's command line no longer turns the https upgrade off:\n{hook}"
         );
+    }
+
+    /// The features the embedded Chromium is started with turned off, as the
+    /// one named constant spells them.
+    fn disabled_chromium_features(chromium: &str) -> Vec<&str> {
+        chromium
+            .split_once("const CEF_DISABLED_FEATURES: &str = \"")
+            .and_then(|(_, rest)| rest.split_once("\";"))
+            .map(|(list, _)| list.split(',').collect())
+            .expect("the disabled-features constant")
+    }
+
+    /// Chromium copies the whole signed app into the per-user `X` folder at
+    /// every start and deletes the copy only after an orderly shutdown — the
+    /// restart road (`exit(0)`), a crash and a force quit leave it (t-20243:
+    /// 0.4 GiB each, thirty-one on one machine, 12.3 GiB). macOS itself makes
+    /// none — a plain signed app, launched and updated every way the installers
+    /// do, leaves nothing there. The copy is not waste, though: its hard link is a
+    /// second name for the running executable, and without one macOS stops
+    /// recognising a window whose installed bundle an update has renamed away
+    /// and deleted (`codesign --verify +pid` answers "host has no guest with
+    /// the requested attributes"; keychain, notifications and permissions
+    /// vet a client that way). So the engine's feature stays ON, and the
+    /// window deletes what no process runs — once, after its first paint, on a
+    /// thread of its own, on macOS only (Windows and Linux have no such folder).
+    #[test]
+    fn the_embedded_chromium_keeps_the_signed_copy_that_identifies_a_long_lived_window_and_the_first_paint_sweeps_the_old_ones()
+     {
+        let chromium = include_str!("../../src/chromium_browser.rs");
+        assert!(
+            !disabled_chromium_features(chromium).contains(&"MacAppCodeSignClone"),
+            "the engine's signed copy was turned off: a window that outlives its installed \
+             bundle is no longer recognised by macOS until it restarts"
+        );
+        let timeline = strip_rust_comments(include_str!("../../src/boot_timeline.rs"));
+        let call = "code_sign_clone::sweep_after_first_paint(";
+        assert_eq!(
+            timeline.matches(call).count(),
+            1,
+            "the first paint sweeps the old signed copies once, on a thread of its own"
+        );
+        let sweep = timeline.find(call).expect("the first paint's sweep");
+        let gate = timeline[..sweep]
+            .rfind("#[cfg(target_os = \"macos\")]")
+            .expect("the sweep's macOS-only gate");
+        let paint = timeline[..sweep]
+            .rfind("known == Phase::FirstPaint")
+            .expect("the sweep waits for the first paint");
+        assert!(
+            sweep - gate < 250 && sweep - paint < 250,
+            "the sweep call lost its macOS-only gate or its first-paint gate:\n{}",
+            &timeline[gate.min(paint)..sweep]
+        );
+        let main = strip_rust_comments(include_str!("../../src/main.rs"));
+        let module = main
+            .find("mod code_sign_clone;")
+            .expect("the module is declared");
+        assert!(
+            main[..module]
+                .trim_end()
+                .ends_with("#[cfg(target_os = \"macos\")]"),
+            "the module is compiled outside macOS, where there is no such folder"
+        );
+        let sweeper = include_str!("../../src/code_sign_clone.rs");
+        let shipped = sweeper.split("#[cfg(test)]").next().unwrap();
+        for (needle, why) in [
+            ("std::thread::Builder", "a thread of its own"),
+            ("libc::PRIO_DARWIN_BG", "the lowest priority the system has"),
+            ("const BUDGET: Duration", "a time limit"),
+            (
+                "const MIN_AGE: Duration",
+                "nothing younger than five minutes",
+            ),
+        ] {
+            assert!(
+                shipped.contains(needle),
+                "the sweep lost {why} (`{needle}`)"
+            );
+        }
     }
 
     /// A device the emulator door booted for an agent's pane goes down when
@@ -19856,16 +19939,26 @@ mod tests {
         );
     }
 
-    /// A workspace the ledger seated a worker in comes back as THAT agent.
+    /// A workspace the ledger seated a worker in comes back as THAT seat: the
+    /// pane that stands is attached and the one that is coming back is waited
+    /// for — and the window never launches the agent the ledger names.
     ///
     /// A worker's tab is the ledger's to persist, never the pane layout's, so
     /// a checkout cut for a Codex worker restores with nothing stored — and the
     /// empty-workspace road opened the default agent: a Codex worktree wearing
     /// Claude after every restart ("원래는 codex가 작업중이였는데 재시작하면
     /// claude로 바껴있는"). The restore asks the ledger once, on the one road
-    /// that would otherwise guess; the backend answers from the newest seat.
+    /// that would otherwise guess, and the backend answers from the newest seat
+    /// somebody is coming back to. A seat the ledger LET GO of is nobody's
+    /// (t-19779): the window used to start its agent again, fresh, on every
+    /// visit, so five finished workers' checkouts each held an empty Claude a
+    /// few minutes after their last turn on 2026-10-01 — whatever the person
+    /// had chosen to open in a new workspace — and the reclaimer waited on it.
+    /// A restart puts a worker to sleep now, so the one road that needed a
+    /// launch is gone, and a checkout nobody is coming back to takes the
+    /// person's own road (`openTermTab`).
     #[test]
-    fn a_workspace_the_ledger_seated_comes_back_as_that_agent() {
+    fn a_workspace_the_ledger_seated_is_attached_or_waited_for_and_never_launched_again() {
         let window = window_source();
         let restoring = block_after(window, "async function restoreActiveWorktreeTab(");
         assert!(
@@ -19879,9 +19972,12 @@ mod tests {
             seating.contains("invoke(\"worktree_last_agent\", { worktree: activeWorktreePath })")
                 && seating.contains("if (!seated?.agent) return false;")
                 && seating.contains("if (seated.sleeping === true)")
-                && seating.contains("restoringWorkers.set(activeWorktreePath, seated.agent);")
-                && seating.contains("row.id === seated.agent"),
-            "the first terminal no longer asks who the ledger seated here, or lost its fallback:\n{seating}"
+                && seating.contains("restoringWorkers.set(activeWorktreePath, seated.agent);"),
+            "the first terminal no longer asks who the ledger seated here, or lost its answer for a reserved seat:\n{seating}"
+        );
+        assert!(
+            !seating.contains("launchAgentTab(") && !seating.contains("row.id === seated.agent"),
+            "the window launches the agent of a seat the ledger named, in a checkout nobody may be coming back to:\n{seating}"
         );
         let answering = block_after(
             include_str!("../../src/orchestration.rs"),
@@ -19893,6 +19989,10 @@ mod tests {
                 .count()
                 >= 2,
             "the ledger's answer no longer reserves a sleeping or orphaned seat before choosing the newest:\n{answering}"
+        );
+        assert!(
+            answering.contains(".filter(|(_, worker)| worker.state.still_summoned())"),
+            "the ledger's answer names a worker it let go of — the window opens its agent again on a visit:\n{answering}"
         );
     }
 
@@ -35314,6 +35414,21 @@ mod tests {
         assert!(
             reading.contains("transcript_log_at(&path, after)"),
             "the helper page reads its file down a road of its own:\n{reading}"
+        );
+        // What the vendor wrote beside that file about the helper is found from the
+        // same path, opened by the opener every file the window owns is opened by
+        // (a link, a pipe or a swapped file answers nothing, and the handle's own size
+        // is checked), and read only up to its bound.
+        let about = block_after(shipped, "fn helper_about(");
+        assert!(
+            reading.contains("log.about = helper_about(&path);")
+                && about.contains("crate::durable_file::open_plain_file(&beside)")
+                && about.contains("file.metadata().ok()?.len() > HELPER_ABOUT_BYTES")
+                && about.contains("std::io::Read::take(file, HELPER_ABOUT_BYTES)")
+                && !about.contains("File::open(")
+                && !about.contains("symlink_metadata"),
+            "the helper's sidecar is looked at by path and then opened by it, or read without its \
+             bound:\n{about}"
         );
         let pane = block_after(shipped, "fn pane_log(");
         assert!(

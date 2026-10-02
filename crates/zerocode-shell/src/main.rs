@@ -87,6 +87,8 @@ mod chromium_browser;
 mod claude_tokens;
 mod cli_login;
 mod cmd;
+#[cfg(target_os = "macos")]
+mod code_sign_clone;
 mod codex_accounts;
 mod codex_queue;
 mod codex_tokens;
@@ -3739,3 +3741,9 @@ impl exit_runtime::Terminating for ExitSteps<'_> {
 mod tests {
     include!("main_unit_tests.rs");
 }
+
+// Declared after the tests module, never above it: the source contracts read
+// this file's shipped half up to the tests module's fence, and that fence must
+// be the first test-only item here.
+#[cfg(test)]
+mod test_host;

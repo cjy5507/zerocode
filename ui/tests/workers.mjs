@@ -1285,7 +1285,15 @@ export async function testWorkers({ browser, origin, ok, faults }) {
     // worker's tab is the ledger's — so it came back after a restart as an empty
     // workspace, and an empty workspace opened the DEFAULT agent: a Codex
     // worktree wearing Claude. The ledger still knows who was seated there, and
-    // the restore asks it before guessing.
+    // the restore asks it before guessing — for a seat that stands or one that is
+    // coming back. A seat the ledger LET GO of is nobody's (t-19779): the visit
+    // used to launch the agent the ledger named, fresh, so five finished workers'
+    // checkouts each held an empty agent a few minutes after their last turn,
+    // whatever the person had chosen to open in a new workspace, and the
+    // reclaimer waited on it. The backend no longer answers for such a checkout;
+    // the stub gives the answer it used to — the agent that was there, no seat,
+    // nothing to wait for — and the window must not launch it: the person's own
+    // road opens a first terminal (here the harness's plain one).
     await page.evaluate(() => {
       window.__ANSWER__.set_active_worktree = () => "wt/t-3";
       window.__ASKED_SEAT__ = [];
@@ -1295,15 +1303,20 @@ export async function testWorkers({ browser, origin, ok, faults }) {
       );
       window.__LAUNCHED__ = null;
     });
-    const seatedBack = await page.evaluate(async () => {
+    const letGo = await page.evaluate(async () => {
+      const terminalTabs = () => tabs.filter((held) => held.kind === "term").length;
+      const before = terminalTabs();
       await activateWorktree("/tmp/zerocode-window-test/wt-t3");
-      return { launched: window.__LAUNCHED__?.agent ?? null, asked: window.__ASKED_SEAT__ };
+      return {
+        launched: window.__LAUNCHED__?.agent ?? null,
+        asked: window.__ASKED_SEAT__.length,
+        opened: terminalTabs() - before,
+      };
     });
     ok(
-      "a workspace the ledger seated a Codex worker in comes back as Codex, not the default agent",
-      seatedBack.launched === "codex" &&
-        seatedBack.asked.length === 1,
-      JSON.stringify(seatedBack),
+      "a seat the ledger names but nobody is coming back to is not launched again — the visit takes the person's own road to a first terminal",
+      letGo.launched === null && letGo.asked === 1 && letGo.opened >= 1,
+      JSON.stringify(letGo),
     );
 
     // A stronger answer than the last agent's TYPE is its live seat. The window
@@ -2289,12 +2302,13 @@ async function testHelperPage(page, ok) {
     return seen;
   }, { briefs: HELPER_BRIEFS, byLanguage: HELPER_BRIEFS_BY_LANGUAGE });
   const stated = HELPER_BRIEFS.stated;
-  const statedSummary = stated.slice(0, stated.indexOf(" Keep the report"));
+  // The sentences that are not conditions, as many whole ones as fit: the conditions are the tags, so the summary does not say them twice.
+  const statedSummary = stated.slice(0, stated.indexOf(" Do not modify"));
   ok(
-    "the card shows the first whole sentences up to a limit, names no cut where it cut at a sentence, and offers the whole instruction with its length in one press",
+    "the card shows the first whole sentences that are not conditions, up to a limit, names no cut where it cut at a sentence, and offers the whole instruction with its length in one press",
     card["stated"].present === true &&
       card["stated"].said === statedSummary &&
-      statedSummary.endsWith("src/sync.") && statedSummary.length <= 200 &&
+      statedSummary.endsWith("are counted.") && statedSummary.length <= 200 &&
       card["stated"].cut === null && card["stated"].cutSaid === "" &&
       card["stated"].more?.includes(String(stated.length)) === true &&
       card["stated"].expanded === "false" &&
@@ -2321,10 +2335,12 @@ async function testHelperPage(page, ok) {
       card["runOn"].more?.includes(String(HELPER_BRIEFS.runOn.length)) === true,
     JSON.stringify(card),
   );
+  const withItsStop = (sentence) => new RegExp(sentence.replace(/[.*+?^$()|[\]\\{}]/g, "\\$&") + "[。.！!？?]?\\s*");
   const tagChecks = Object.fromEntries(Object.entries(HELPER_BRIEFS_BY_LANGUAGE).map(([code, [text, tag, fact]]) => [code, {
     exactly: JSON.stringify(card[`lang-${code}`].tags) === JSON.stringify([tag]),
     noFact: !card[`lang-${code}`].tags.some((one) => one.includes(fact)),
-    whole: card[`lang-${code}`].said === text,
+    // The summary is the instruction without its condition's sentence — the fact stays in it, the gap the next sentence had too.
+    whole: card[`lang-${code}`].said === text.replace(withItsStop(tag), "").trim(),
   }]));
   const quoted = [...card["stated"].tags, ...card["lang-en"].tags].every((one) =>
     [stated, HELPER_BRIEFS_BY_LANGUAGE.en[0]].some((text) => text.includes(one.replace(/…$/, ""))));
