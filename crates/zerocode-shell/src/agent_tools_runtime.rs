@@ -839,6 +839,37 @@ impl agent_teams::Host for TeamWindow {
         shell_in_front_of(&self.app.state::<AppState>(), term)
     }
 
+    /// The pane's own terminal on whether its provider is at rest
+    /// (t-21565): the pty's silence, and whether the catalog row's ready
+    /// mark is the composer on screen. The screen is copied only for a row
+    /// whose mark is a glyph, and only for a pane whose hook facts still say
+    /// mid-turn — the one caller asks for no other.
+    fn provider_rest(&self, term: TermId) -> agent_teams::ProviderRest {
+        let state = self.app.state::<AppState>();
+        let Some(held) = state.terminals().handle(term) else {
+            return agent_teams::ProviderRest::default();
+        };
+        let mark = { state.agent_terms().get(&term).copied() }
+            .and_then(zerocode_core::agent_capabilities)
+            .map(|caps| caps.startup.mark);
+        let pty = lock_pty(&held);
+        let silent_ms = pty
+            .last_output_epoch_ms()
+            .map(|at| crate::now_epoch_ms().saturating_sub(at));
+        let grid = pty.terminal().grid();
+        let prompt_shown = mark.is_some_and(|mark| {
+            crate::orchestration::ready_prompt_shown(
+                mark,
+                &grid.visible_text(),
+                grid.cursor_visible(),
+            )
+        });
+        agent_teams::ProviderRest {
+            silent_ms,
+            prompt_shown,
+        }
+    }
+
     fn split(
         &self,
         team: &str,
@@ -1577,6 +1608,13 @@ impl agent_teams::Host for TeamWindow {
     /// a ledger road reads before pasting a briefing at it.
     fn delivery_refusal(&self, term: TermId) -> Option<String> {
         zo_integration_runtime::delivery_refusal(&self.app, term)
+    }
+
+    fn mail_waiting_not_typed(&self, term: TermId, why: &str) {
+        let _ = self.app.emit(
+            crate::orchestration::MAIL_WAITING_NOT_TYPED_EVENT,
+            serde_json::json!({ "term": term, "why": why }),
+        );
     }
 
     fn point(
@@ -4893,12 +4931,13 @@ pub(super) fn answer_computer_command(
     ) {
         // A live reflex run is the window's to admit and to watch, and
         // whether one is supported here and enabled is the window's to say
-        // beside the helper's handshake; the person's setting is read only
-        // when a start, a status or the capabilities ask.
+        // beside the helper's handshake; an autopilot keeps reading the
+        // person's setting as it runs.
+        let reflex_window = permission_window.cloned();
         computer_use::reflex::answer(
             &command,
-            || {
-                permission_window.is_some_and(|app| {
+            move || {
+                reflex_window.as_ref().is_some_and(|app| {
                     crate::settings_runtime::computer_live_reflex(
                         app.state::<AppState>().settings(),
                     )

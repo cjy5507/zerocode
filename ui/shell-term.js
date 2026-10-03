@@ -3471,6 +3471,12 @@ function makeTermView(host, pre, caret, owner = { address: () => null }) {
    * The bytes are still the backend's to write. This decides whether there is
    * anything worth sending, never what it says. */
   let holding = 3;
+  /* The position the program was last told about: the cell, the button and the
+   * modifiers of the last report that went out. Motion inside it is not told
+   * again (see `report`). Set where a report is SENT, not where it is made, so
+   * a report held back by a link gesture and then dropped never counts as
+   * told. */
+  let lastReported = null;
   let pressOwnedByProgram = false;
   // Shift reserves a gesture for the terminal even while a program is tracking
   // the mouse — the xterm convention this window already keeps for the wheel
@@ -3571,6 +3577,14 @@ function makeTermView(host, pre, caret, owner = { address: () => null }) {
     }
     const cell = cellUnder(event);
     if (cell === null) return false;
+    /* A program that asked for motion is told when the pointer enters another
+     * cell — as xterm tells it, and every terminal that copied xterm — not for
+     * every pixel the pointer travels inside one. `claude` asks for every move
+     * (`?1003h`), and this reporter sent one request, one pty write and one
+     * redraw of the program per `mousemove`: a sweep across a pane was hundreds
+     * (t-20972). A press and a release are not positions and always go. */
+    const position = `${address.key}|${held.tracking}|${button}|${cell.row}|${cell.col}|${event.shiftKey}|${event.altKey}|${event.ctrlKey}`;
+    if (kind === "move" && position === lastReported) return true;
     const payload = {
       row: cell.row,
       col: cell.col,
@@ -3581,6 +3595,7 @@ function makeTermView(host, pre, caret, owner = { address: () => null }) {
       ctrl: event.ctrlKey,
     };
     const send = () => {
+      lastReported = position;
       if (address.kind === "term") {
         invoke("term_mouse", { term: address.term, event: payload }).catch(() => {});
       } else {
@@ -5836,6 +5851,35 @@ function paintPreviewScreen(term) {
   host.textContent = said.join("\n");
   host.hidden = said.length === 0;
 }
+
+/* 우편이 왔는데 창이 그 판에 안내문을 치지 못했다 (t-21017). 사람이 그 판에서
+ * 이유를 읽는다 — 사유는 가드의 토큰(`why`)이고 문장은 창의 표다. */
+const MAIL_WAITING_WORDS = Object.freeze({
+  holds_a_draft: (term) =>
+    t(
+      "term.mailWaiting.holds_a_draft",
+      "터미널 {{term}}의 에이전트에게 온 우편을 입력하지 않았습니다: 입력줄에 직접 쓰고 보내지 않은 글이 있습니다. 우편함에 안전하게 있고, 보내거나 지우면 안내됩니다.",
+      { term },
+    ),
+  parked: (term) =>
+    t(
+      "term.mailWaiting.parked",
+      "터미널 {{term}}의 에이전트에게 온 우편을 입력하지 않았습니다: 그 판에서 당신을 기다리는 질문이나 승인이 있습니다.",
+      { term },
+    ),
+  other: (term) =>
+    t(
+      "term.mailWaiting.other",
+      "터미널 {{term}}의 에이전트에게 온 우편을 입력하지 않았습니다. 우편함에 안전하게 있고, 에이전트가 다음 확인에서 읽습니다.",
+      { term },
+    ),
+});
+listen("term:mail-waiting", (event) => {
+  const { term, why } = event.payload ?? {};
+  if (typeof term !== "number") return;
+  const known = Object.prototype.hasOwnProperty.call(MAIL_WAITING_WORDS, why);
+  toast(MAIL_WAITING_WORDS[known ? why : "other"](term));
+});
 
 /* 백엔드가 이 셸의 꼬리를 보냈다.
  *
