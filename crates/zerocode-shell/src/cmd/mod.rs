@@ -72,7 +72,8 @@ pub(crate) use fs::{
     fs_trash, fs_undo, image_diff, list_dir, open_computer_use_permission, open_download,
     orchestration_runtime_state, path_kinds, paths_exist, read_image_file, read_text_file,
     render_mermaid, reset_computer_use_permissions, resume_vault_session, reveal_vault_session,
-    set_clipboard_image, show_download, vault_sessions, watch_files, write_text_file,
+    set_clipboard_image, show_download, tree_selection, vault_sessions, watch_files,
+    write_text_file,
 };
 
 pub(crate) use usage::{
@@ -211,7 +212,8 @@ pub(crate) use worktree::{
     gitlab_todos, gitlab_update_mr, gitlab_work_items, list_branches, list_worktrees,
     merge_and_remove_worktree, remove_worktree, resolve_mr_base, resolve_pr_base,
     save_worktree_prefs, set_active_worktree, validate_branch_name, work_item_seed,
-    worktree_evidence, worktree_last_agent, worktree_loss, worktree_prefs, worktree_stamp,
+    worktree_evidence, worktree_landing_stamp, worktree_last_agent, worktree_loss, worktree_prefs,
+    worktree_stamp,
 };
 
 pub(crate) use settings::{

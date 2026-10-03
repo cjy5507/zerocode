@@ -1926,6 +1926,7 @@ class StatefulBackend {
       // 창이 보이는 동안 2초마다 묻는 도장 — 이 픽스처의 체크아웃은 움직이지
       // 않으므로 늘 같은 답이고, 목록은 다시 읽히지 않는다.
       case "worktree_stamp": return "";
+      case "worktree_landing_stamp": return "";
       // The release lane's two files, read once at boot and on the usage
       // gauge's period (t-3005). This fixture's machine has no lane: two
       // nulls and no notice, which is what a fresh install answers.
@@ -1943,6 +1944,9 @@ class StatefulBackend {
         };
       case "update_history": return { releases: [], fetched_at: null, source: "none", failure: null };
       case "scm_status": return { changed: [], ignored: [] };
+      // The file tree's head reads the branch's standing (t-24298); this fixture's
+      // workspace tracks no upstream, so the answer is the real backend's for that.
+      case "upstream_status": return { upstream: null, ahead: 0, behind: 0, behind_commits_are_patch_equivalent: null };
       case "list_dir": return [];
       case "stage_layouts": return null;
       case "pane_layouts": return [];

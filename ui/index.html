@@ -2774,12 +2774,54 @@
               <span data-i18n="file.content">내용</span>
             </button>
           </div>
-          <div class="file-tree" id="file-tree" tabindex="0"></div>
+          <!-- The tree's head (t-24298): where this checkout stands in git,
+               and whether the tree follows what the agents touch. -->
+          <div class="tree-head" id="tree-head">
+            <span class="tree-head-branch" id="tree-head-branch"></span>
+            <span class="tree-pin" id="tree-pin" hidden>
+              <svg class="icon" aria-hidden="true"><use href="#i-pin"></use></svg>
+              <span class="tree-pin-path" id="tree-pin-path"></span>
+              <button
+                class="tree-head-button"
+                id="tree-unpin"
+                type="button"
+                data-i18n-aria="tree.unpin" aria-label="고정 풀기"
+                data-i18n-title="tree.unpin" data-tip="고정 풀기"
+              >
+                <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+              </button>
+            </span>
+            <span class="tree-head-space" aria-hidden="true"></span>
+            <button
+              class="tree-head-button"
+              id="tree-follow"
+              type="button"
+              aria-pressed="true"
+              data-i18n-aria="tree.follow" aria-label="에이전트 따라가기"
+              data-i18n-title="tree.followTip" data-tip="에이전트가 읽고 쓰는 파일로 트리를 펼칩니다"
+            >
+              <svg class="icon" aria-hidden="true"><use href="#i-crosshair"></use></svg>
+            </button>
+          </div>
+          <!-- A tree to a screen reader, with one tab stop on its rows (the
+               cursor's); the box itself is focusable only for code that
+               hands it the keyboard, and it keeps its own keys (t-24298). -->
+          <div
+            class="file-tree"
+            id="file-tree"
+            tabindex="-1"
+            role="tree"
+            data-keyboard-owner="true"
+            data-i18n-aria="tree.label" aria-label="파일 트리"
+          ></div>
           <div class="file-tree" id="file-hits" hidden></div>
           <!-- Content hits are three facts wide — file, line, the line — so
                they get their own host rather than being squeezed into the
                name list's single column. -->
           <div class="text-hits" id="file-text-hits" hidden></div>
+          <!-- What an agent is doing in git right now (t-24298), one line
+               under the tree while it runs. -->
+          <div class="tree-ops" id="tree-ops" role="status" aria-live="polite" hidden></div>
         </section>
 
         <!-- What has moved since the last commit. Clicking one opens its diff
@@ -2927,6 +2969,10 @@
                 <span class="scm-compare-add" id="scm-compare-add"></span>
                 <span class="scm-compare-del" id="scm-compare-del"></span>
               </span>
+              <!-- Whether this checkout's work is in the compare ref, said by
+                   git (t-22104) — the sidebar row's own words, from the same
+                   function; hidden when git has said nothing. -->
+              <span class="wt-landing" id="scm-compare-landing" hidden></span>
             </div>
             <div class="scm-compare-flow">
               <span class="scm-compare-arrow" aria-hidden="true">→</span>
@@ -4344,7 +4390,7 @@
           <div data-jev-feature="reflex_decide">
             <span data-jev-name data-i18n="settings.typesafe.reflex_decide">실시간 반사 판단</span>
             <span data-jev-summary data-i18n="settings.typesafe.reflex_decideSummary">화면을 빠르게 누르는 반사 실행이 도는 동안, 계속할지·멈출지·계획을 다시 쓸지 판단합니다. 자동 실행(reflex-auto)에서는 그 판단대로 실행을 멈추거나 계획을 다시 씁니다.</span>
-            <p data-jev-hint data-i18n="settings.typesafe.reflex_decideHint">반사 실행이 도는 동안 감지기마다 최신 판독(값 또는 모르는 이유, 따라가는 표적 번호, 프레임이 찍힌 지 몇 밀리초인지)과 지금까지 동작이 끝난 방식별 개수만 보냅니다. 감지기 이름은 계획에 적힌 식별자(최대 64바이트, 최대 16개)이며, 화면 이미지·화면 글자·앱 이름은 보내지 않습니다. 「기록만」은 답을 기록하기만 하고, 「항상 적용」은 자동 실행(reflex-auto)을 답대로 바로 멈추거나 계획을 다시 쓰며, 「자동」은 답마다 그 뒤 3초 동안 손이 실제로 한 일로 매긴 채점이 충분히 쌓인 뒤에야 그렇게 합니다. 직접 쓴 계획(reflex-start)의 실행에서는 기록만 합니다. 1초 안에 오지 않은 답, 2초보다 오래된 판독에 대한 답, 이미 바뀐 계획이나 끝난 실행에 대한 답은 수행하지 않습니다.</p>
+            <p data-jev-hint data-i18n="settings.typesafe.reflex_decideHint">반사 실행이 도는 동안 감지기마다 최신 판독(값 또는 모르는 이유, 따라가는 표적 번호, 프레임이 찍힌 지 몇 밀리초인지)과 지금까지 동작이 끝난 방식별 개수, 직전 판독 뒤 손이 끝낸 동작의 결과 수(done·missed), 그리고 캡처가 찍힌 지 몇 밀리초인지를 손의 프레임 한도와 함께 보냅니다 — 그 밖에는 보내지 않습니다. 감지기 이름은 계획에 적힌 식별자(최대 64바이트, 최대 16개)이며, 화면 이미지·화면 글자·앱 이름은 보내지 않습니다. 「기록만」은 답을 기록하기만 하고, 「항상 적용」은 자동 실행(reflex-auto)을 답대로 바로 멈추거나 계획을 다시 쓰며, 「자동」은 답마다 그 뒤 3초 동안 손이 실제로 한 일로 매긴 채점이 충분히 쌓인 뒤에야 그렇게 합니다. 직접 쓴 계획(reflex-start)의 실행에서는 기록만 합니다. 1초 안에 오지 않은 답, 2초보다 오래된 판독에 대한 답, 이미 바뀐 계획이나 끝난 실행에 대한 답은 수행하지 않습니다.</p>
           </div>
         </template>
         </section>
