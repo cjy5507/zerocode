@@ -233,7 +233,14 @@ fn every_use_recommends_one_of_its_own_modes_and_off_only_where_stopped() {
 /// line the judge reads — the answer floor, the agreement floor, the apply
 /// wall, the sample it may speak on — and offers `auto`, the only mode the
 /// column speaks for. A seat that acted from the start with no judge behind it
-/// would be `on` under another name.
+/// would be `on` under another name. The reflex decision is the eighth
+/// (t-26708): it fills what the hand's plan left open — whether to go on,
+/// stop or have the plan rewritten — and its question v2 (t-22110), read on
+/// the hand's own activity and freshness, answered `continue` on every
+/// healthy reading of the bench's fixture rounds and ended none by a pause
+/// (§5.3 of the task's report names the runs); a seat that only records
+/// there would leave an autopilot run unprotected for the window it takes
+/// to rise.
 #[test]
 fn only_a_seat_that_fills_what_its_caller_left_open_starts_acting() {
     use crate::jev::promote::Stand;
@@ -245,6 +252,7 @@ fn only_a_seat_that_fills_what_its_caller_left_open_starts_acting() {
         DESKTOP.id,
         EMULATOR.id,
         COVER.id,
+        REFLEX_DECIDE.id,
     ];
     for row in &JEV_USES {
         let expected = if acting.contains(&row.id) {
@@ -1715,7 +1723,7 @@ fn the_agent_tool_seat_names_the_wires_bounds_and_never_rises() {
     );
     assert_eq!(AGENT_TOOL_DEADLINE_MS, SKILL_SEARCH_APPLY_DEADLINE_MS);
     assert_eq!(AGENT_TOOL_ASK_OPTIONS, ["yes", "no"]);
-    assert_eq!(JEV_USES.len(), 31);
+    assert_eq!(JEV_USES.len(), 32);
 }
 
 /// The branching seat (t-6044) forks one phone step — the emulator seat's
@@ -2017,7 +2025,7 @@ fn the_file_pick_seat_rises_only_by_the_judge_and_compares_with_recent_edits() {
     assert_eq!(FILE_PICK.sends[2].cap, Cap::Uncut);
     assert_eq!(FILE_PICK.sends[3].at, "/state/files/*/about");
     assert_eq!(FILE_PICK.sends[3].cap, Cap::Bytes(200));
-    assert_eq!(JEV_USES.len(), 31);
+    assert_eq!(JEV_USES.len(), 32);
     assert_eq!(JEV_USES.get(JEV_USES.len() - 4), Some(&FILE_PICK));
 }
 
@@ -3315,6 +3323,12 @@ fn every_seat_offers_no_option_without_the_words_that_say_what_it_means() {
                 {
                     Asked::InZo
                 }
+                id if id == PROJECT_RULES.id => Asked::Spelled(
+                    super::project_rules::CRITERIA
+                        .iter()
+                        .map(|(_, meaning)| *meaning)
+                        .collect(),
+                ),
                 id if id == JUDGMENT_CACHE.id => Asked::Nothing,
                 id => panic!("{id}: a seat the audit places nowhere"),
             },

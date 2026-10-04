@@ -20,6 +20,11 @@ function scmCleanText() {
  * lists ignored paths because it is answering "what is in this directory",
  * and this panel is answering "what might I commit". */
 let scmEntries = [];
+/* The whole-repository read now in flight, or the last one that was (t-31715).
+ * A scoped answer (`applyScmScoped`) waits behind it: a whole answer git took
+ * before a file's write ended must not land after the scoped one git took
+ * after, and turn that file's counts back. Always a promise that settles. */
+let scmStatusAsking = Promise.resolve();
 /* The checkout `scmEntries` is the status of — the one in front when the
  * answer landed, `null` before the first or after git failed. Its count is
  * said of that checkout only (the conversation's state, t-22100). */
@@ -973,6 +978,129 @@ function scmPanelShowing() {
   return el("activity-scm").hidden === false && !folded.aside;
 }
 
+let scmObserverHealthRows = [];
+let scmObserverHealthErrorRoot = null;
+let scmObserverRetryRoot = null;
+let scmObserverHealthRead = 0;
+
+function scmObserverFailureWords(kind) {
+  const words = {
+    missing_tool: t("scm.health.missingTool", "gh 명령을 찾지 못함 — 설치와 PATH를 확인하세요"),
+    authentication: t("scm.health.authentication", "GitHub 인증 실패 — GitHub 설정에서 다시 로그인하세요"),
+    forbidden: t("scm.health.forbidden", "접근 거절 — 계정의 저장소 권한을 확인하세요"),
+    not_found: t("scm.health.notFound", "대상을 찾지 못함 — 저장소와 접근 권한을 확인하세요"),
+    rate_limited: t("scm.health.rateLimited", "GitHub 요청 제한 — 안내된 재시도 시각까지 기다립니다"),
+    timeout: t("scm.health.timeout", "응답 시간 초과 — 네트워크를 확인하세요"),
+    unavailable: t("scm.health.unavailable", "GitHub 서버 응답 오류"),
+    invalid_response: t("scm.health.invalidResponse", "응답 형식을 읽지 못함"),
+    refused: t("scm.health.refused", "요청 거절 — 로그인·권한·네트워크를 확인하세요 (원인 미확정)"),
+  };
+  return words[kind] ?? words.refused;
+}
+
+function scmObserverOperationWords(operation) {
+  const words = {
+    discovery: t("scm.health.discovery", "PR 찾기"), checks: t("scm.health.checks", "CI 확인"),
+    details: t("scm.health.details", "CI 상세"), reviews: t("scm.health.reviews", "리뷰"), stack: t("scm.health.stack", "연관 PR"),
+  };
+  return words[operation] ?? words.discovery;
+}
+
+function paintScmObserverHealth() {
+  let panel = el("scm-observer-health");
+  const root = activeWorktreePath;
+  const rows = scmObserverHealthRows.filter((row) => row?.root === root);
+  const failed = rows.filter((row) => row.failure);
+  const unreadable = scmObserverHealthErrorRoot === root;
+  if (!scmPanelShowing() || (!rows.length && !unreadable)) {
+    panel?.remove();
+    return;
+  }
+  const signature = JSON.stringify([root, rows, unreadable, scmObserverRetryRoot === root]);
+  if (panel?.dataset.signature === signature) return;
+  if (!panel) {
+    panel = document.createElement("section");
+    panel.id = "scm-observer-health";
+    panel.className = "scm-observer-health";
+    panel.setAttribute("role", "status");
+    panel.setAttribute("aria-live", "polite");
+    el("scm-pr-note").after(panel);
+  }
+  panel.dataset.signature = signature;
+  panel.classList.toggle("is-degraded", unreadable || failed.length > 0);
+  panel.replaceChildren();
+  const heading = document.createElement("strong");
+  heading.textContent = unreadable
+    ? t("scm.health.unreadable", "SCM 연동 상태를 읽지 못했습니다")
+    : failed.length ? t("scm.health.degraded", "SCM 자동 확인 지연") : t("scm.health.healthy", "SCM 자동 확인 정상");
+  panel.append(heading);
+  const timestamp = (value) => Number.isFinite(value) ? new Date(value).toLocaleString() : t("scm.health.never", "기록 없음");
+  const details = failed.length ? failed : rows.slice(0, 1);
+  for (const row of details) {
+    const line = document.createElement("p");
+    const parts = [scmObserverOperationWords(row.operation)];
+    if (row.failure) parts.push(scmObserverFailureWords(row.failure));
+    parts.push(t("scm.health.lastSuccess", "마지막 성공 {{at}}", { at: timestamp(row.lastSuccessMs) }));
+    if (row.failure) {
+      parts.push(t("scm.health.failures", "연속 {{count}}회 실패", { count: row.consecutiveFailures }));
+      parts.push(t("scm.health.nextRetry", "다음 재시도 {{at}}", { at: timestamp(row.nextRetryMs) }));
+    }
+    line.textContent = parts.join(" · ");
+    panel.append(line);
+  }
+  if (failed.length || unreadable) {
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "btn";
+    retry.disabled = scmObserverRetryRoot === root;
+    retry.textContent = retry.disabled ? t("scm.health.retrying", "재시도 요청 중…") : t("scm.health.retry", "지금 재시도");
+    retry.addEventListener("click", () => void retryScmObserver(root));
+    panel.append(retry);
+  }
+}
+
+function acceptScmObserverSnapshot(snapshot, root) {
+  if (activeWorktreePath !== root || snapshot?.root !== root || !Array.isArray(snapshot.rows)) return;
+  scmObserverHealthRows = scmObserverHealthRows.filter((row) => row?.root !== root).concat(snapshot.rows);
+  scmObserverHealthErrorRoot = null;
+  paintScmObserverHealth();
+}
+
+async function refreshScmObserverHealth() {
+  const root = activeWorktreePath;
+  const read = ++scmObserverHealthRead;
+  try {
+    const snapshot = await invoke("scm_observer_health");
+    if (read === scmObserverHealthRead) acceptScmObserverSnapshot(snapshot, root);
+  } catch {
+    if (read !== scmObserverHealthRead || activeWorktreePath !== root) return;
+    scmObserverHealthErrorRoot = root;
+    paintScmObserverHealth();
+  }
+}
+
+async function retryScmObserver(root) {
+  if (activeWorktreePath !== root || scmObserverRetryRoot === root) return;
+  scmObserverRetryRoot = root;
+  paintScmObserverHealth();
+  try {
+    const snapshot = await invoke("scm_observer_retry", { root });
+    acceptScmObserverSnapshot(snapshot, root);
+  } catch {
+    if (activeWorktreePath === root) scmObserverHealthErrorRoot = root;
+  } finally {
+    if (scmObserverRetryRoot === root) scmObserverRetryRoot = null;
+    paintScmObserverHealth();
+  }
+}
+
+listen("scm:health", (event) => {
+  if (!Array.isArray(event.payload)) return;
+  scmObserverHealthRows = event.payload;
+  if (event.payload.some((row) => row?.root === activeWorktreePath)) scmObserverHealthErrorRoot = null;
+  paintScmObserverHealth();
+});
+
 async function refreshScm({ uncapped = false } = {}) {
   // 다른 체크아웃으로 건너온 참이면 메시지 칸부터 그 체크아웃의 드래프트로 —
   // 상태를 그리기 전에: 아래 결정표(hasMessage)가 남의 초안을 읽으면 안 된다.
@@ -1006,6 +1134,7 @@ async function refreshScm({ uncapped = false } = {}) {
     // Rust's 60-second cache) is only worth spawning for a panel somebody is
     // looking at. Its own promise — the file list never waits on the network.
     void refreshScmReview();
+    void refreshScmObserverHealth();
     scmPanelOwed = false;
   } else {
     scmPanelOwed = true;
@@ -1014,7 +1143,9 @@ async function refreshScm({ uncapped = false } = {}) {
     // `uncapped` is the banner's one-shot retry (Orca's
     // `resolveGitStatusLimit(0)` road); every ordinary refresh caps again.
     const asked = activeWorktreePath;
-    const tree = await invoke("scm_status", { uncapped });
+    const asking = invoke("scm_status", { uncapped });
+    scmStatusAsking = asking.catch(() => {});
+    const tree = await asking;
     scmEntries = tree?.changed ?? [];
     scmStatusOf = asked;
     // The operation this checkout is halfway through, whether or not anything
@@ -1074,6 +1205,24 @@ async function refreshScm({ uncapped = false } = {}) {
   // 아무도 보지 않는 패널의 것이다. 작업공간을 옮길 때마다 git 하나를 더
   // 쓰는 값은 그 낯이 치를 값이 아니다(보이면 갚는 빚은 scmPanelOwed).
   if (scmPanelShowing()) void refreshHostedReviewEligibility();
+}
+
+/* A scoped answer — "what changed in just these files" (`scm_numstat`, asked
+ * by the file tree when an agent's write ends, t-31715) — replaces what was
+ * known of exactly those files. The rest of the list stays as the last whole
+ * answer left it, and the next whole answer replaces everything again. A file
+ * asked about and not in the answer is clean now. The tree wears it in place;
+ * the source-control panel, which the periodic refresh keeps, is not repainted
+ * for it. */
+function applyScmScoped(paths, entries) {
+  const asked = new Set(paths);
+  const unasked = (path) => !asked.has(path.replace(/\/+$/, ""));
+  scmEntries = [...scmEntries.filter((entry) => unasked(entry.path)), ...entries];
+  vcsCodes = [
+    ...vcsCodes.filter(([path, code]) => code === "!!" || unasked(path)),
+    ...entries.map((entry) => [entry.path, entry.code.trim()]),
+  ];
+  paintTreeGitOf(paths);
 }
 
 /* ---- 이름으로 파일 거르기 (U03 재확인, Orca SourceControlHeaderToolbar +
@@ -1402,6 +1551,7 @@ paintScmFilter();
 paintScmPrimary();
 
 function paintScm() {
+  paintScmObserverHealth();
   const conflicted = scmEntries.filter((entry) => entry.conflict);
   const staged = scmEntries.filter((entry) => entry.staged && !entry.conflict);
   // The filter narrows what the ordinary GROUPS show and nothing else — Orca

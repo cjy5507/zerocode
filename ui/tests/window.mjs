@@ -30,6 +30,9 @@ import { testLedgerPoll } from "./ledger-poll.mjs";
 import { testUsageRefresh, testUsageWords } from "./usage-refresh.mjs";
 import { testAccountSwitch } from "./account-switch.mjs";
 import { testTaskBoard } from "./task-board.mjs";
+import { testScmHealth } from "./scm-health.mjs";
+import { testArtifactPreferences } from "./artifact-preferences.mjs";
+import { testAgentSupport } from "./agent-support.mjs";
 import { testCoordinatorDesk } from "./coordinator-desk.mjs";
 import { testCoordinatorDeskLayout } from "./coordinator-desk-layout.mjs";
 import { testAgentRelations, testAgentRelationsForm } from "./agent-relations.mjs";
@@ -67,7 +70,7 @@ import { installHarnessWaits } from "./harness-waits.mjs";
 import { installBoardWaits, testBoardWaits } from "./board-waits.mjs";
 
 import { testExplorer } from "./explorer.mjs";
-import { testExplorerAgentActivity, testExplorerAgentBurst, testExplorerGit, testExplorerKeys, testExplorerMentions, testExplorerRoot, testExplorerSelection, testExplorerVcs } from "./explorer-agent.mjs";
+import { testExplorerAgentActivity, testExplorerAgentBurst, testExplorerGit, testExplorerKeys, testExplorerMentions, testExplorerRoot, testExplorerSelection, testExplorerVcs, testExplorerWriting, testExplorerAgentMemory } from "./explorer-agent.mjs";
 import { testPathBrowser } from "./path-browser.mjs";
 import { testNativeFolderPicker } from "./native-folder-picker.mjs";
 import { testSftpAndTeam } from "./sftp.mjs";
@@ -75,6 +78,7 @@ import { testPaneFollowsCwd } from "./pane-follow.mjs";
 import { testZoRestore } from "./zo-restore.mjs";
 import { testRestartSamePanes } from "./restart-same-panes.mjs";
 import { testPermissionCard } from "./permission-card.mjs";
+import { testAnswerDoor } from "./answer-door.mjs";
 import { testAskPopup } from "./ask-popup.mjs";
 import { testEditorSelection } from "./editor-selection.mjs";
 import { testEditorRecovery } from "./editor-recovery.mjs";
@@ -215,6 +219,11 @@ suite("explorer", async ({ browser, origin, ok }) => {
  * (t-24298): one suite per slice, so each red and green is one name. */
 suite("explorer-agent-activity", ({ browser, origin, ok }) => testExplorerAgentActivity(browser, origin, ok));
 suite("explorer-agent-burst", ({ browser, origin, ok }) => testExplorerAgentBurst(browser, origin, ok));
+/* Live progress (t-31715): a write that has started and not ended shimmers its
+ * row, its end lands the file's +N -N from one scoped git question. */
+suite("explorer-agent-writing", ({ browser, origin, ok }) => testExplorerWriting(browser, origin, ok));
+/* A long run holds nothing without a cap: heap before and after (t-31715). */
+suite("explorer-agent-memory", ({ browser, origin, ok }) => testExplorerAgentMemory(browser, origin, ok));
 suite("explorer-git", ({ browser, origin, ok }) => testExplorerGit(browser, origin, ok));
 suite("explorer-mentions", ({ browser, origin, ok }) => testExplorerMentions(browser, origin, ok));
 suite("explorer-keys", ({ browser, origin, ok }) => testExplorerKeys(browser, origin, ok));
@@ -229,8 +238,12 @@ suite("usage-refresh", async ({ browser, origin, ok }) => {
 });
 suite("account-switch", ({ browser, origin, ok }) => testAccountSwitch(browser, origin, standBackend, ok));
 suite("board-waits", ({ browser, origin, ok }) => testBoardWaits(browser, origin, ok));
+suite("answer-door", ({ browser, origin, ok }) => testAnswerDoor(browser, origin, ok));
 // Vault state stays local to this fixture, just like the explorer fixture.
 suite("task-board", ({ browser, origin, ok }) => testTaskBoard(browser, origin, ok));
+suite("scm-health", ({ browser, origin, ok }) => testScmHealth(browser, origin, ok));
+suite("artifact-preferences", ({ browser, origin, ok }) => testArtifactPreferences(browser, origin, ok));
+suite("agent-support", ({ browser, origin, ok }) => testAgentSupport(browser, origin, ok));
 // The coordinator's desk above the task list (t-6588, docs/design/agent-board-round4.md).
 suite("coordinator-desk", ({ browser, origin, ok }) => testCoordinatorDesk(browser, origin, ok));
 suite("coordinator-desk-layout", ({ browser, origin, ok }) => testCoordinatorDeskLayout(browser, origin, ok));
@@ -56124,6 +56137,19 @@ suite("pane-conversation-view", async ({ browser, origin, ok }) => {
       await settle();
       const quietChat = document.querySelector(`.pane-slot[data-term="${quiet}"] .pane-chat`);
       seen.noticeSaid = Boolean(quietChat?.querySelector('.pane-chat-notice[data-says="worker.noPaneTranscript"]'));
+      // A notice is a line of the conversation above its body, as wide as the
+      // list — never a cell of the body's rail | list grid, where it fell into
+      // the rail's column and stood one word a line down the composer's left
+      // (1.1.50, the person's photo).
+      const noticeAboveBody = (chat, key) => {
+        const notice = chat?.querySelector(`.pane-chat-notice[data-says="${key}"]`);
+        const body = chat?.querySelector(":scope > .helper-body");
+        if (!notice || !body || body.contains(notice)) return false;
+        const line = notice.getBoundingClientRect();
+        const list = body.querySelector(":scope > .helper-turns")?.getBoundingClientRect();
+        return Boolean(list) && line.bottom <= body.getBoundingClientRect().top + 0.5 && line.width >= list.width / 2;
+      };
+      seen.noticeAbove = noticeAboveBody(quietChat, "worker.noPaneTranscript");
       // A long transcript is read to its end the moment the view opens — the
       // backend says the file goes on (`more`) and the page reads on at once,
       // not one chunk a beat — and the head counts THIS turn from the state
@@ -56157,6 +56183,19 @@ suite("pane-conversation-view", async ({ browser, origin, ok }) => {
       seen.openedAtTail = firstAfter === null &&
         longChat?.querySelector('.pane-chat-notice[data-says="worker.historyFolded"]')?.textContent ===
           t("worker.historyFolded", "긴 기록의 끝부분만 보입니다 — 이전 턴은 판의 화면과 세션 기록에 있습니다.");
+      seen.foldedAbove = noticeAboveBody(longChat, "worker.historyFolded");
+      // Two notices at once, as in the person's photo (a hand-over waiting
+      // beside the folded history): both stand above the body, one under the
+      // other, each as wide as the list.
+      noticeOnPaneChat(paneChats.get(long), "worker.handoverPending", true,
+        t("worker.handoverPending", "이 턴이 끝나면 대화가 실시간 세션(선)으로 이어집니다."));
+      const pairBox = (key) => longChat?.querySelector(`.pane-chat-notice[data-says="${key}"]`)?.getBoundingClientRect();
+      const folded = pairBox("worker.historyFolded");
+      const pending = pairBox("worker.handoverPending");
+      seen.pairAbove = noticeAboveBody(longChat, "worker.historyFolded") &&
+        noticeAboveBody(longChat, "worker.handoverPending") &&
+        Boolean(folded && pending) && (pending.top >= folded.bottom - 0.5 || folded.top >= pending.bottom - 0.5);
+      noticeOnPaneChat(paneChats.get(long), "worker.handoverPending", false);
       seen.turnClock = paneChats.get(long)?.run.startedAt === hookStamps.get(long) &&
         Date.now() - paneChats.get(long).run.startedAt < bornAgo / 2;
       // The permission mode's reach colours the send and the spinner's mark
@@ -56212,6 +56251,11 @@ suite("pane-conversation-view", async ({ browser, origin, ok }) => {
         seen.noticeSaid && seen.caughtUp && seen.openedAtTail && seen.turnClock && seen.hiddenOnPlain && seen.forgotten &&
         seen.toggleMs < 50,
       JSON.stringify(seen),
+    );
+    ok(
+      "a conversation's notice (no transcript named, history folded, two at once) is a line above the conversation's body as wide as its list, never a cell of the body's rail | list grid",
+      seen.noticeAbove && seen.foldedAbove && seen.pairAbove,
+      JSON.stringify({ noticeAbove: seen.noticeAbove, foldedAbove: seen.foldedAbove, pairAbove: seen.pairAbove }),
     );
   } finally {
     await page.close();

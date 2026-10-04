@@ -3,6 +3,27 @@
 use crate::*;
 
 #[tauri::command]
+pub(crate) async fn scm_observer_health(
+    app: AppHandle,
+) -> Result<scm_observer::HealthSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scm_observer::health_snapshot(&app.state::<AppState>())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn scm_observer_retry(
+    app: AppHandle,
+    root: String,
+) -> Result<scm_observer::HealthSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || scm_observer::retry(&app, Path::new(&root)))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 pub(crate) async fn scm_status(
     state: State<'_, AppState>,
     uncapped: Option<bool>,
@@ -32,30 +53,7 @@ pub(crate) async fn scm_status(
         .numstat(&here.root)
         .map(|text| line_counts_by_path(&text))
         .unwrap_or_default();
-    let mut changed: Vec<ScmEntry> = loss
-        .uncommitted
-        .into_iter()
-        .map(|entry| {
-            let (staged, changed) = scm_flags(&entry.code);
-            let (added, removed) = counts
-                .get(&entry.path)
-                .copied()
-                .map_or((None, None), |(added, removed)| {
-                    (Some(added), Some(removed))
-                });
-            ScmEntry {
-                conflict: ConflictKind::from_code(&entry.code).map(ConflictKind::label),
-                submodule: entry.submodule.map(|found| ScmSubmodule::of(found, staged)),
-                path: entry.path,
-                code: entry.code,
-                staged,
-                changed,
-                origin: entry.origin,
-                added,
-                removed,
-            }
-        })
-        .collect();
+    let mut changed = scm_entries(loss.uncommitted, &counts);
     // Asked on every answer, not only when a conflicted row already stands.
     // A merge or rebase BETWEEN steps — every file resolved, nothing yet
     // continued — has no conflicted row and is still the most important thing
@@ -97,6 +95,30 @@ pub(crate) async fn scm_status(
         total,
         limit: SCM_STATUS_LIMIT,
     })
+}
+
+/// What changed in just `paths` — the file tree's question when an agent's
+/// write ends (t-31715): the same entries `scm_status` answers, for exactly
+/// the files that were written, from git reads limited to them. A whole-
+/// repository status per write is what this exists to avoid; a file that is
+/// clean has no entry, so a path asked about and not answered is clean now.
+/// Paths are the workspace's own, relative to its root.
+#[tauri::command]
+pub(crate) async fn scm_numstat(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<Vec<ScmEntry>, String> {
+    if paths.len() > SCM_NUMSTAT_PATHS_MAX {
+        return Err(format!(
+            "{} paths is more than one question may name ({SCM_NUMSTAT_PATHS_MAX})",
+            paths.len()
+        ));
+    }
+    let here = state.active();
+    let Some(orchestrator) = here.orchestrator else {
+        return Ok(Vec::new());
+    };
+    scoped_scm_entries(&orchestrator, &here.root, &paths)
 }
 
 /// Put a whole section in the index at once — the section header's `모두
@@ -733,6 +755,10 @@ pub(crate) async fn create_pull_request(
             match error {
                 gh::GhError::Missing => "GitHub CLI(gh)를 찾지 못했습니다".to_string(),
                 gh::GhError::Refused(said) | gh::GhError::Unreadable(said) => said,
+                gh::GhError::Fetch(failure) => {
+                    format!("GitHub 요청 실패: {}", failure.kind.token())
+                }
+                gh::GhError::Budget => "SCM 확인 예산을 모두 사용했습니다".into(),
             }
         })
     })

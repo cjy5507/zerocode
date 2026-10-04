@@ -36,12 +36,16 @@ pub mod cover;
 pub mod door;
 pub mod file_pick;
 pub mod hedge;
+pub mod journal;
+pub mod learning;
 pub mod memo;
 pub mod noul;
+pub mod project_rules;
 pub mod promote;
 pub mod questions;
 pub mod recent;
 pub mod reflex_decide;
+pub mod score;
 pub mod shard;
 pub mod summary;
 pub mod threshold;
@@ -2735,6 +2739,71 @@ pub const AGENT_TOOL: JevUse = JevUse {
     ),
 };
 
+/// Checks compiled project instructions at turn completion. A semantic answer
+/// can supply a bounded advisory; it never grants permission to edit or execute.
+pub const PROJECT_RULES: JevUse = JevUse {
+    id: "project_rules",
+    setting: "projectRules",
+    modes: &[JevMode::Off, JevMode::Shadow, JevMode::On],
+    recommended: JevMode::On,
+    repeat: None,
+    sends: &[
+        Sent {
+            at: "/state/task",
+            cap: Cap::Chars(ROUTING_TASK_CHAR_CAP),
+        },
+        Sent {
+            at: "/state/evidence",
+            cap: Cap::Bytes(16 * 1024),
+        },
+        Sent {
+            at: "/state/final_text",
+            cap: Cap::Chars(4_000),
+        },
+        Sent {
+            at: "/state/rules",
+            cap: Cap::Items(project_rules::MAX_RULES),
+        },
+        Sent {
+            at: "/state/rules/*/text",
+            cap: Cap::Chars(project_rules::MAX_RULE_CHARS),
+        },
+        Sent {
+            at: "/state/rules/*/source/path",
+            cap: Cap::Chars(project_rules::MAX_PATH_CHARS),
+        },
+        Sent {
+            at: "/questions/*/instructions",
+            cap: Cap::Chars(2_000),
+        },
+        Sent {
+            at: "/questions/*/criteria/*",
+            cap: Cap::Chars(600),
+        },
+    ],
+    ledger: "project-rules.jsonl",
+    promotes: false,
+    answer_floor_permille: None,
+    press_floor_permille: None,
+    agreement_floor_permille: None,
+    apply_deadline_ms: None,
+    window_forgives: None,
+    agreement_rows_wanted: None,
+    agreement_kind: AgreementKind::Comparison,
+    baseline: Baseline::None,
+    negatives_wanted: None,
+    confidence_bands: None,
+    reads_act_line: false,
+    rubric_version: questions::PROJECT_RULES_RUBRIC_VERSION,
+    request_name: &["definition", "turn"],
+    names: Naming::Request,
+    label_part: &[],
+    follows: None,
+    regrade: Regrade::AsWritten,
+    auto_starts: promote::Stand::Recording,
+    abstain: Abstain::Offered,
+};
+
 /// Characters of a page's title one browser-read question carries — the head
 /// of what the tab says the page is, which is what bands a block's words:
 /// "Sign in" under a title that is a product page is a chrome block, and the
@@ -4396,6 +4465,8 @@ pub const REFLEX_DECIDE_DEADLINE_MS: u64 =
 /// in the window after each answer, one label row naming the request by its
 /// run, its decision and the time it was asked (`reflex_decide::label_row`).
 /// A run started from a person's own plan (`reflex-start`) only records.
+/// Under `auto` it acts from the start ([`JevUse::auto_starts`], t-26708):
+/// it fills what the plan left open, as the screen seats do for a goal walk.
 ///
 /// Its lines are the stall seat's, borrowed for the stall seat's own reason
 /// ([`ORCHESTRATION_ANSWER_FLOOR_PERMILLE`]): a decision that does not come
@@ -4471,14 +4542,19 @@ pub const REFLEX_DECIDE: JevUse = JevUse {
     label_part: &[],
     follows: None,
     regrade: Regrade::AsWritten,
-    auto_starts: promote::Stand::Recording,
+    // Acting from the start (t-26708 §5.3): the question v2 (t-22110) answered
+    // `continue` on every healthy reading of the bench's fixture rounds and
+    // ended none by a pause, so the autopilot run is guarded from its first
+    // decision; recording first left it unguarded for the window it takes to
+    // rise, and a late or failed answer still changes no input.
+    auto_starts: promote::Stand::Applying,
     abstain: Abstain::Lacks(
         "continue, pause and replan offer none — pause is the safe stop, not unknown; no reason was found in the code",
     ),
 };
 
 /// Every place this product asks Jev something.
-pub static JEV_USES: [JevUse; 31] = [
+pub static JEV_USES: [JevUse; 32] = [
     ROUTING,
     RECALL,
     SKILLS,
@@ -4496,6 +4572,7 @@ pub static JEV_USES: [JevUse; 31] = [
     ZO_STEP_EFFORT,
     COMPACTION,
     AGENT_TOOL,
+    PROJECT_RULES,
     BROWSER_READ,
     NOTIFY,
     MENTION_RERANK,

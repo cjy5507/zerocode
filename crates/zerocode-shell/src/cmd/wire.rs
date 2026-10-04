@@ -138,6 +138,7 @@ fn stand_wire(
         .ok_or_else(|| format!("{name} is not on the shell's PATH"))?;
     // Which account it runs as — the door every launch of this agent takes.
     let launch_env = account_env_for(state.config_root(), agent)?;
+    let page = app.clone();
     let app = app.clone();
     state.shell_runtime().wires.start(
         agent,
@@ -146,8 +147,15 @@ fn stand_wire(
         env!("CARGO_PKG_VERSION"),
         resume,
         &launch_env,
-        move |id| {
-            let _ = app.emit("wire:update", WireUpdate { id });
+        wire_runtime::WireNews {
+            changed: Box::new(move |id| {
+                let _ = page.emit("wire:update", WireUpdate { id });
+            }),
+            // The tool calls the session said, on the road every pane's
+            // travel — the file tree hears a wire session's writes (t-31715).
+            acted: Box::new(move |id, activities| {
+                pane_runtime::note_wire_activities(&app, id, activities);
+            }),
         },
     )
 }
@@ -245,7 +253,29 @@ fn hand_over_pane(
         pty.terminal_mut().grid_mut().view_to_bottom();
         Ok(())
     })?;
-    crate::cmd::terminal::walk_key_groups(state, term, &groups, step, || true)?;
+    // The exit command is a line the window types by itself, and a menu takes
+    // its Enter for the highlighted row — which may be a permission nobody
+    // gave. So its first key goes through the answer door, which refuses a
+    // pane that is standing on one; the rest is the walk every line takes.
+    let Some((first, rest)) = groups.split_first() else {
+        return Err(format!("{agent}'s exit command has nothing to type"));
+    };
+    let held = state
+        .terminals()
+        .handle(term)
+        .ok_or("터미널이 떠 있지 않습니다")?;
+    let typed = crate::answer_door::type_if_up(
+        &held,
+        &crate::answer_door::Expect::no_menu(),
+        &crate::cmd::terminal::key_group_bytes(first),
+    )
+    .map_err(|error| error.to_string())?;
+    state.cadence().wake();
+    if !typed {
+        return Err("the pane stands on a menu — nothing was typed; answer it first".to_string());
+    }
+    std::thread::sleep(step);
+    crate::cmd::terminal::walk_key_groups(state, term, rest, step)?;
     while state.terminals().contains_key(&term) {
         if started.elapsed() >= HAND_OVER_EXIT_WAIT {
             return Err(format!(
@@ -359,5 +389,9 @@ pub(crate) fn wire_stop(
     state: State<'_, AppState>,
     id: wire_runtime::WireId,
 ) -> Result<(), String> {
-    state.shell_runtime().wires.stop(id)
+    state.shell_runtime().wires.stop(id)?;
+    // The session's card has nothing more to say, and its ring goes with it
+    // (t-31715): a card nothing forgets is a leak wearing a feature's clothes.
+    state.activities().remove(&hooks::activity_wire(id));
+    Ok(())
 }

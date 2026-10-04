@@ -529,8 +529,11 @@ body:has(#workbench.is-sidebar-folded) .titlebar {
   }
 }
 
+/* A notice stands above the conversation's body, its words on the list's
+ * left edge: the rail's column and the list's gutter, as the rows below. */
 .pane-chat-notice {
-  margin: var(--space-3) var(--space-4) 0;
+  margin: var(--space-3) var(--helper-gutter, var(--chat-list-pad-x)) 0
+    calc(var(--chat-turn-rail-w) + var(--helper-gutter, var(--chat-list-pad-x)));
   color: var(--ink-mist);
   font-size: var(--text-xs);
 }
@@ -6600,6 +6603,64 @@ body.is-dragging-pane {
   background: var(--surface-deck);
 }
 
+.artifact-preferences-panel {
+  box-sizing: border-box;
+  width: min(460px, calc(100vw - 24px));
+  min-width: 0;
+  max-width: min(460px, calc(100vw - 24px));
+  max-height: calc(100vh - 72px);
+  overflow: auto;
+  padding: var(--space-3);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+.artifact-preferences-panel header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.artifact-preferences-panel form,
+.artifact-preferences-panel label,
+.artifact-preferences-list {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.artifact-preferences-panel input,
+.artifact-preferences-panel select {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: var(--space-2);
+  color: var(--ink-chalk);
+  background: var(--surface-deck);
+  border: var(--rule-width) solid var(--edge-rule);
+  border-radius: var(--radius-edge);
+  font: inherit;
+}
+
+.artifact-preferences-panel p {
+  margin-block: var(--space-2);
+}
+
+.artifact-preferences-list article {
+  padding-block: var(--space-2);
+  border-top: var(--rule-width) solid var(--edge-rule);
+}
+
+.artifact-preferences-list small {
+  display: block;
+  margin-bottom: var(--space-2);
+  color: var(--ink-mist);
+}
+
+.artifact-preferences-status {
+  color: var(--ink-mist);
+}
+
 .note-pop-label {
   padding: var(--space-1) var(--space-2);
   color: var(--ink-mist);
@@ -9687,6 +9748,24 @@ body.is-dragging-pane {
 
 .scm-pr-note[data-tone="halt"] {
   color: var(--signal-halt);
+}
+
+.scm-observer-health {
+  margin: var(--space-2) var(--space-3);
+  padding: var(--space-2);
+  border: var(--rule-width) solid color-mix(in srgb, var(--ink-mist) 25%, transparent);
+  border-radius: var(--radius-edge);
+  color: var(--ink-mist);
+  font-size: var(--text-2xs);
+  overflow-wrap: anywhere;
+}
+
+.scm-observer-health.is-degraded {
+  border-color: var(--signal-halt);
+}
+
+.scm-observer-health p {
+  margin-block: var(--space-1);
 }
 
 .scm-head {
@@ -21040,6 +21119,13 @@ button.helper-sib:hover {
   color: var(--ink-mist);
   font-family: var(--font-mono);
   font-size: var(--text-2xs);
+}
+.agent-support {
+  display: block;
+  font-size: var(--text-2xs);
+  color: var(--ink-mist);
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 /* What this agent does when it is ready for keys, for the two that say so.
@@ -32840,6 +32926,42 @@ details.task-board-section > summary {
   overflow-wrap: anywhere;
 }
 
+/* 계속 판정 (t-26583): 워커 줄 밑의 한 줄. 판정 낱말만 제 신호의 잉크를 입고(체크포인트는
+ * 준비의 초록, 멈춤은 기다림, 중지는 멈춤), 사유는 본문 잉크, 근거 숫자는 조용한 글씨다 —
+ * 「계속」은 아무 색도 입지 않는다. 줄에 움직임이 없으니 줄일 움직임도 없다. */
+.board-desk-worker-gate {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 var(--space-2);
+  min-width: 0;
+  font-size: var(--text-2xs);
+}
+
+.board-desk-worker-gate[hidden],
+.board-desk-worker-gate-why:empty {
+  display: none;
+}
+
+.board-desk-worker-gate-verdict {
+  color: var(--ink-label);
+  font-weight: 600;
+}
+
+.board-desk-worker-gate[data-verdict="checkpoint"] .board-desk-worker-gate-verdict { color: var(--signal-ready-ink); }
+.board-desk-worker-gate[data-verdict="pause"] .board-desk-worker-gate-verdict { color: var(--signal-wait-ink); }
+.board-desk-worker-gate[data-verdict="stop"] .board-desk-worker-gate-verdict { color: var(--signal-halt-ink); }
+
+.board-desk-worker-gate-why {
+  overflow-wrap: anywhere;
+}
+
+.board-desk-worker-gate-basis {
+  color: var(--ink-label);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
 /* 과업 흐름: 흐름의 다섯 단계는 작은 꺾쇠로 이어지고, 멈춰 선 셋은 한 칸 떨어져
  * 선다. 과업이 있는 멈춘 단계만 제 신호의 잉크를 입는다. 누른 단계는 필터 알약과
  * 같은 옷(보기의 색)이다. */
@@ -34345,6 +34467,15 @@ details.task-board-section > summary {
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* A question read off a pane's screen can run over several rows (the command,
+ * then the ask): the rows as they are, under the same ellipsis. */
+.board-ask-question.is-multiline {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  white-space: pre-line;
 }
 
 .board-ask-rows {
@@ -42202,6 +42333,47 @@ h4.knowledge-inspector-head::after {
   font-weight: var(--jev-weight-strong);
 }
 
+.jev-review-cases, .jev-review-case, .jev-review-case form, .jev-review-note {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-2);
+}
+
+.jev-review-cases {
+  gap: var(--space-4);
+}
+
+.jev-review-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.jev-review-case pre {
+  max-height: 24em;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: var(--jev-meta-size);
+}
+
+.jev-review-note textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 5em;
+  resize: vertical;
+  padding: var(--space-2);
+  color: var(--ink-chalk);
+  background: var(--surface-deck);
+  border: var(--jev-line) solid var(--edge-rule);
+  font: inherit;
+}
+
+.jev-review-case summary {
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
 .jev-drawer-facts {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -43692,6 +43864,52 @@ button.jev-token:hover {
 .tree-row[data-agent-touch="commit"] { box-shadow: inset 2px 0 0 var(--tree-touch-commit); }
 @media (prefers-reduced-motion: reduce) {
   .file-tree .tree-row { transition: none; }
+}
+
+/* The row an agent is writing right now (t-31715): the write colour, and its
+ * mark — a still line along the row's foot, which is all a row wears under
+ * reduced motion and all a row past the first few wears while many are
+ * written at once (`TREE_WRITING_MOVING_MAX`), and a sheen that sweeps across
+ * the rows that move. A folder shut over a file being written wears it too (it
+ * is pointing, as it does for a touch). The words for the state are on the row
+ * either way (`labelTreeRow`). `overflow: hidden` is the row's own;
+ * `position: relative` is what lets the mark stand inside it. */
+.tree-row[data-agent-writing],
+.tree-row[data-agent-writing-within] {
+  position: relative;
+  color: var(--tree-touch-write);
+}
+.tree-row[data-agent-writing]::after,
+.tree-row[data-agent-writing-within]::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 2px;
+  pointer-events: none;
+  background: var(--tree-touch-write);
+}
+/* The sheen is a pseudo-element moved by `transform` alone — the compositor's
+ * work: no layout, no paint, and no script per frame — and it exists only
+ * while a row that moves wears the state, so a tree nobody is writing in runs
+ * no animation at all. */
+@media (prefers-reduced-motion: no-preference) {
+  .tree-row[data-agent-writing="true"]::after,
+  .tree-row[data-agent-writing-within="true"]::after {
+    top: 0;
+    right: auto;
+    width: 40%;
+    height: auto;
+    background: linear-gradient(90deg, transparent 0, var(--tree-writing-sheen) 50%, transparent 100%);
+    transform: translateX(-100%);
+    will-change: transform;
+    animation: tree-writing-sweep var(--tree-writing-sweep) linear infinite;
+  }
+}
+@keyframes tree-writing-sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(250%); }
 }
 
 /* The keyboard's place in the tree, and the row a reveal pointed at — an

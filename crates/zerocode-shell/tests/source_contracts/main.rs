@@ -1,14 +1,17 @@
 mod act_lines;
 mod agent_capabilities;
+mod answer_door;
 mod artifact_export;
 mod ask_popup;
 mod bundle_resources;
 mod cli_login;
 mod computer_use_mirrors;
 mod computer_use_tcc;
+mod continue_gate;
 mod coordinator_desk;
 mod crash_report;
 mod fixture_cases;
+mod git_doors;
 mod jev_pane_seats;
 mod quiet_children;
 mod quota_wall;
@@ -434,6 +437,7 @@ mod tests {
                         "explorer_policy.rs"
                             | "crash.rs" | "crumbs.rs" | "hang_watchdog.rs" | "hang_sample.rs"
                             | "artifact_runtime.rs"
+                            | "preference_runtime.rs"
                             // t-2733: the checks numbers/memory/cache file
                             // tests its LRU and its change fence beside them.
                             | "checks_runtime.rs"
@@ -466,6 +470,10 @@ mod tests {
                             // human-input line through the one door
                             // `note_pane_state` calls, tested beside that door.
                             | "pane_runtime.rs"
+                            // t-24545: the cleanup evidence's index-write proof
+                            // runs the real door against a real repository,
+                            // beside the function it reads.
+                            | "worktree_runtime.rs"
                     ),
                 "`{name}` acquired a test fence; only the shell and command crates \
                  may own source-contract fences"
@@ -20111,9 +20119,7 @@ mod tests {
         let backend = shipped_backend();
         let (shipped, _) = backend.split_once("#[cfg(test)]").unwrap_or((backend, ""));
 
-        // The door names every map keyed by a shell. `ask_sends` is in the list
-        // because it was in no list at all — nothing removed from it anywhere,
-        // not even the deliberate close.
+        // The door names every map keyed by a shell.
         let forgetting = block_after(shipped, "fn forget_term_state(");
         for map in [
             "state.agent_terms().remove(&term);",
@@ -20126,7 +20132,6 @@ mod tests {
             // names, and a pane's helpers own keys no `&term` could reach.
             "state.forget_activities(term);",
             "state.team_envs().remove(&term);",
-            "state.ask_sends().remove(&term);",
             "agent_teams::forget_term(term);",
         ] {
             assert!(
@@ -27261,9 +27266,14 @@ mod tests {
         let drafting_road = block_after(shipped, "fn run_text_generation(");
         let account = block_after(shipped, "fn claude_reading_env(");
         let running = block_after(shipped, "fn run_once(");
+        let ledgers_door = block_after(
+            include_str!("../../src/launch_budget_door.rs"),
+            "pub(crate) fn run_budgeted(",
+        );
         assert!(
             drafting_road.contains("claude_reading_env(config_root)")
-                && drafting_road.contains("run_once(")
+                && drafting_road.contains("run_budgeted(")
+                && ledgers_door.contains("run_once(")
                 && account.contains("accounts::reading_env_for(config_root, \"claude\")")
                 && account.contains("accounts::prepare_selected_store(config_root)")
                 && running.contains("shell_path::hydrated()")
@@ -30400,20 +30410,31 @@ mod tests {
         }
         // The walk itself — the pacing between groups and the paste envelope
         // for text — is the one walker the card shares with a pane's
-        // hand-over (`walk_key_groups`), so the two cannot type differently.
+        // hand-over (`walk_key_groups`), so the two cannot type differently;
+        // what a group IS as bytes has one home (`key_group_bytes`), which
+        // the card's first key (typed through the answer door) shares too.
         let walking = block_after(shipped, "fn walk_key_groups(");
         assert!(
-            walking.contains("std::thread::sleep(step)") && walking.contains("encode_paste(text"),
-            "the walk no longer paces its groups or pastes its text:\n{walking}"
+            walking.contains("std::thread::sleep(step)")
+                && walking.contains("key_group_bytes(group)"),
+            "the walk no longer paces its groups or spells them through the one \
+             table of bytes:\n{walking}"
         );
-        // A second answer for the same pane stops the first mid-walk —
-        // otherwise both type into one TUI and the interleaving answers
-        // neither question. The card hands the walker that question.
         assert!(
-            answering.contains("ask_sends")
-                && answering.contains("== Some(&generation)")
-                && answering.contains("walk_key_groups(&state, term, &groups, step, same_send)"),
-            "a newer answer no longer cancels the walk in flight:\n{answering}"
+            block_after(shipped, "fn key_group_bytes(").contains("encode_paste(text"),
+            "a key group's text no longer travels as a paste"
+        );
+        // A second answer for the same pane is REFUSED while the first is on
+        // its way in — otherwise both type into one TUI and the interleaving
+        // answers neither question. The pane takes one answer at a time, on
+        // the lease a send already takes, and the first key is typed only if
+        // the screen still shows the question (`answer_door`).
+        assert!(
+            answering.contains("answer_door::answer_lease(term)")
+                && answering.contains("answer_door::type_if_up(")
+                && answering.contains("answer_door::Expect::question(question)")
+                && answering.contains("walk_key_groups(&state, term, &rest, step)"),
+            "the card's answer no longer goes through the answer door:\n{answering}"
         );
 
         // The full shape rides only the asking event, exactly like the
@@ -30455,9 +30476,14 @@ mod tests {
             "BoardCard dropped the prompt, so the columns strip the choices \
              off every card on the way to the screen"
         );
+        // What the agent described, and — for a pane that described nothing — the
+        // numbered menu on its screen (`answer_door`), in that order.
+        let listing = block_after(shipped, "fn pane_agents(");
         assert!(
-            shipped.contains("ask_prompt: held.and_then(|one| one.ask_prompt.clone())"),
-            "pane_agents stopped shipping the question's shape"
+            listing.contains(".and_then(|one| one.ask_prompt.clone())")
+                && listing.contains(".or_else(|| screen_cards.get(term).cloned())"),
+            "pane_agents stopped shipping the question's shape, or the screen's menu \
+             for a pane that described none:\n{listing}"
         );
 
         // The window: the amber box opens into the panel, the picks travel
@@ -30529,8 +30555,11 @@ mod tests {
         assert!(
             answering.contains("ask::APPROVAL_ALLOW")
                 && answering.contains("ask::APPROVAL_DENY")
-                && answering.contains("with_terminal"),
-            "answer_approval no longer spends the measured keys:\n{answering}"
+                && answering.contains("answer_door::type_if_up(")
+                && answering.contains("answer_door::Expect::any_menu()")
+                && answering.contains("row.approval.is_some()"),
+            "answer_approval no longer spends the measured keys through the \
+             answer door, for a permission the pane still holds:\n{answering}"
         );
 
         // The panel: both verbs through the command, dismissed on press.
@@ -36008,14 +36037,12 @@ mod tests {
         // Err로 돌아오고, 카드는 그 Err에서 돌아선다.
         let walker = block_after(shipped, "fn walk_key_groups(");
         assert!(
-            walker.contains("with_terminal(state, term, |pty| pty.write_input(&bytes))?;")
-                && walker.contains("if !keep_going() {"),
-            "the walk stopped giving up on a failed write or a superseded \
-             answer:\n{walker}"
+            walker.contains("with_terminal(state, term, |pty| pty.write_input(&bytes))?;"),
+            "the walk stopped giving up on a failed write:\n{walker}"
         );
         let walking = block_after(shipped, "fn answer_ask(");
         let failed = walking
-            .find("if walk_key_groups(&state, term, &groups, step, same_send).is_err() {")
+            .find("walk_key_groups(&state, term, &rest, step).is_ok()")
             .expect("the card's answer no longer turns back on a walk that did not land");
         let cleared = walking
             .find("clear_answered_wait(&app, term, &AnswerRoad::Card);")
