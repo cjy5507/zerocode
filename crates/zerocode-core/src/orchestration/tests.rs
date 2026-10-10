@@ -60,6 +60,7 @@ fn a_worker_summary_is_the_prose_its_own_report_carries_and_nothing_else() {
         attempt: None,
         source: None,
         completed_ms: None,
+        verified_ms: None,
     };
     let body = r#"{"ok":true,"summary":"시험이 통과했다.","head":"abc1234"}"#;
     assert_eq!(
@@ -197,6 +198,7 @@ fn review_facts_read_only_what_a_coordinator_wrote() {
             attempt: Some("dp-1".into()),
             source: None,
             completed_ms: None,
+            verified_ms: None,
         }),
         closed: None,
     };
@@ -22882,13 +22884,13 @@ fn a_pr_observation_receipt_survives_restart_and_lost_ack_without_duplicate_mail
         .unwrap();
     ledger.worker_seated(("team-scm", "%1"), "/wt/scm");
     assert_eq!(
-        ledger.post_observation_once("@worktree:/wt/scm", "ci failed", Some("scm:ci:1"), 3),
+        ledger.post_observation_once(None, "@worktree:/wt/scm", "ci failed", Some("scm:ci:1"), 3),
         1
     );
     let mut restored: Ledger =
         serde_json::from_str(&serde_json::to_string(&ledger).unwrap()).unwrap();
     assert_eq!(
-        restored.post_observation_once("@worktree:/wt/scm", "ci failed", Some("scm:ci:1"), 4),
+        restored.post_observation_once(None, "@worktree:/wt/scm", "ci failed", Some("scm:ci:1"), 4),
         1
     );
     assert_eq!(
@@ -22902,7 +22904,7 @@ fn a_pr_observation_receipt_survives_restart_and_lost_ack_without_duplicate_mail
         1
     );
     assert_eq!(
-        restored.post_observation_once("@worktree:/wt/scm", "ci failed", Some("scm:ci:2"), 5),
+        restored.post_observation_once(None, "@worktree:/wt/scm", "ci failed", Some("scm:ci:2"), 5),
         1
     );
     assert_eq!(
@@ -22914,6 +22916,262 @@ fn a_pr_observation_receipt_survives_restart_and_lost_ack_without_duplicate_mail
             .filter(|m| m.subject.as_str().starts_with("scm:"))
             .count(),
         2
+    );
+}
+
+/// A pane's own mail, as the window files it into the run the pane sits in.
+fn a_pane_mail(run: &str) -> Draft {
+    Draft {
+        from: "pane:%7".into(),
+        to: format!("run:{run}"),
+        kind: MessageKind::Status,
+        body: "the pane's words".into(),
+        subject: Text::default(),
+        priority: Priority::Normal,
+        payload: Text::default(),
+        thread: None,
+        task: None,
+        dispatch: None,
+    }
+}
+
+/// How many messages carry this subject, summed over the runs named.
+fn messages_with_subject(ledger: &Ledger, runs: &[String], subject: &str) -> usize {
+    runs.iter()
+        .map(|run| {
+            ledger
+                .run(run)
+                .expect("a run")
+                .messages()
+                .iter()
+                .filter(|one| one.subject.as_str() == subject)
+                .count()
+        })
+        .sum()
+}
+
+/// t-35823: when the window cannot type a pane's pointer, the sender of that
+/// mail is told by a letter filed in the run the mail is in, and in no other
+/// run. The letter is addressed to a pane, which every run accepts, so the
+/// call the window made without a run copied it into each run of the ledger.
+#[test]
+fn a_letter_about_a_pane_mail_that_was_not_pointed_is_filed_in_its_run_only() {
+    let mut ledger = Ledger::new();
+    let runs: Vec<String> = (0..45)
+        .map(|n| ledger.create_run(&format!("run {n}"), 1))
+        .collect();
+    let mail_run = runs[30].clone();
+    let mail = ledger
+        .post(&mail_run, a_pane_mail(&mail_run), 2)
+        .expect("the pane's mail is filed in its run");
+    let receipt = format!("pointer-held:{mail}");
+    let filed = ledger.post_observation_once(
+        Some(mail_run.as_str()),
+        "pane:%7",
+        "message was filed in its inbox but was NOT pointed",
+        Some(receipt.as_str()),
+        3,
+    );
+    let copies = messages_with_subject(&ledger, &runs, &receipt);
+    assert_eq!(
+        copies,
+        1,
+        "the letter was filed {copies} times over {} runs",
+        runs.len()
+    );
+    assert_eq!(filed, 1);
+}
+
+/// Measurement, not a rule (t-35823): the synthetic ledger of the test above,
+/// read through the two verbs a person looks at it with. Prints the rows that
+/// carry the letter and the median milliseconds of 200 reads of each verb.
+#[test]
+#[ignore = "measurement, not a rule"]
+fn measure_a_pointer_letter_about_a_pane_mail_across_forty_five_runs() {
+    let mut bench = Bench::new();
+    let mut runs = Vec::new();
+    for n in 0..45 {
+        let opened = bench.json(&format!("run-create --name measure-{n}"));
+        runs.push(opened["runId"].as_str().expect("a run id").to_string());
+    }
+    let mail_run = runs[30].clone();
+    let mail = bench
+        .ledger
+        .post(&mail_run, a_pane_mail(&mail_run), 2)
+        .expect("the pane's mail is filed in its run");
+    let receipt = format!("pointer-held:{mail}");
+    bench.ledger.post_observation_once(
+        Some(mail_run.as_str()),
+        "pane:%7",
+        "was NOT pointed",
+        Some(receipt.as_str()),
+        3,
+    );
+    let rows = messages_with_subject(&bench.ledger, &runs, &receipt);
+    let mut median_ms = |line: &str| {
+        let mut samples: Vec<f64> = (0..200)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                bench.json(line);
+                started.elapsed().as_secs_f64() * 1_000.0
+            })
+            .collect();
+        samples.sort_by(f64::total_cmp);
+        samples[samples.len() / 2]
+    };
+    let inbox = median_ms("inbox");
+    let check = median_ms("check --peek");
+    eprintln!(
+        "t-35823 measure: runs={} letter_rows={rows} inbox_median_ms={inbox:.3} check_peek_median_ms={check:.3}",
+        runs.len()
+    );
+}
+
+/// Measurement, not a rule (t-35823): a checks letter to a checkout group on
+/// the same 45-run ledger. Only one run seats a worker in the checkout, so the
+/// letter should land in that run and nowhere else.
+#[test]
+#[ignore = "measurement, not a rule"]
+fn measure_a_checks_letter_across_forty_five_runs() {
+    let mut ledger = Ledger::new();
+    let runs: Vec<String> = (0..45)
+        .map(|n| ledger.create_run(&format!("run {n}"), 1))
+        .collect();
+    ledger
+        .start_worker(&runs[30], "codex", ("team-checks", "%1"), None, 2)
+        .unwrap();
+    ledger.worker_seated(("team-checks", "%1"), "/wt/checks");
+    let filed = ledger.post_observation_once(
+        None,
+        "@worktree:/wt/checks",
+        "checks: 1 failed (ci/test)",
+        Some("checks:ci:1"),
+        3,
+    );
+    eprintln!(
+        "t-35823 measure checks: runs={} filed={filed} letter_rows={}",
+        runs.len(),
+        messages_with_subject(&ledger, &runs, "checks:ci:1")
+    );
+}
+
+/// t-35823: a checks letter goes to a checkout group, and a group is only the
+/// runs that seat a worker in that checkout. On a ledger of 45 runs with one
+/// such seat, the letter lands in that run and in no other.
+#[test]
+fn a_checks_letter_reaches_only_the_runs_that_seat_its_checkout() {
+    let mut ledger = Ledger::new();
+    let runs: Vec<String> = (0..45)
+        .map(|n| ledger.create_run(&format!("run {n}"), 1))
+        .collect();
+    ledger
+        .start_worker(&runs[30], "codex", ("team-checks", "%1"), None, 2)
+        .unwrap();
+    ledger.worker_seated(("team-checks", "%1"), "/wt/checks");
+    assert_eq!(
+        ledger.post_observation_once(
+            None,
+            "@worktree:/wt/checks",
+            "checks: 1 failed (ci/test)",
+            Some("checks:ci:1"),
+            3,
+        ),
+        1
+    );
+    assert_eq!(messages_with_subject(&ledger, &runs, "checks:ci:1"), 1);
+    assert_eq!(
+        messages_with_subject(&ledger, &runs[30..31], "checks:ci:1"),
+        1,
+        "the letter is in the run that seats the checkout"
+    );
+}
+
+/// t-35823: a letter named to a run that is not in the ledger is filed in no
+/// run, and the count says so.
+#[test]
+fn a_letter_named_to_a_run_that_is_not_there_is_filed_nowhere() {
+    let mut ledger = Ledger::new();
+    let runs: Vec<String> = (0..3)
+        .map(|n| ledger.create_run(&format!("run {n}"), 1))
+        .collect();
+    assert_eq!(
+        ledger.post_observation_once(
+            Some("run-that-is-not-there"),
+            "pane:%7",
+            "was NOT pointed",
+            Some("pointer-held:m-missing"),
+            2,
+        ),
+        0
+    );
+    assert_eq!(
+        messages_with_subject(&ledger, &runs, "pointer-held:m-missing"),
+        0
+    );
+}
+
+/// t-35823: a letter named to its run keeps the receipt rule of the road. Asked
+/// again under the same receipt, it is answered as filed and written once.
+#[test]
+fn a_letter_named_to_its_run_is_written_once_when_it_is_asked_again() {
+    let mut ledger = Ledger::new();
+    let runs: Vec<String> = (0..3)
+        .map(|n| ledger.create_run(&format!("run {n}"), 1))
+        .collect();
+    let mail = ledger
+        .post(&runs[1], a_pane_mail(&runs[1]), 2)
+        .expect("the pane's mail is filed in its run");
+    let receipt = format!("pointer-held:{mail}");
+    for now in [3, 4] {
+        assert_eq!(
+            ledger.post_observation_once(
+                Some(runs[1].as_str()),
+                "pane:%7",
+                "was NOT pointed",
+                Some(receipt.as_str()),
+                now,
+            ),
+            1
+        );
+    }
+    assert_eq!(messages_with_subject(&ledger, &runs, &receipt), 1);
+}
+
+/// t-35823: a letter lives in its run. When the retention sweep takes a
+/// finished run, the letter goes with it; a run still working keeps its own.
+#[test]
+fn a_letter_filed_in_a_run_goes_with_that_run_when_the_sweep_takes_it() {
+    let mut bench = Bench::new();
+    let (finished, _) = a_finished_run(&mut bench, "nightly", "drain-the-gate");
+    let live = bench.json("run-create --name still-going")["runId"]
+        .as_str()
+        .expect("a run id")
+        .to_string();
+    bench.json("task-create --spec keep-open --title still-open");
+    let homes = [finished.clone(), live.clone()];
+    let receipt = "pointer-held:m-retention";
+    for run in &homes {
+        let at = bench.clock;
+        assert_eq!(
+            bench.ledger.post_observation_once(
+                Some(run.as_str()),
+                "pane:%7",
+                "was NOT pointed",
+                Some(receipt),
+                at,
+            ),
+            1
+        );
+    }
+    assert_eq!(messages_with_subject(&bench.ledger, &homes, receipt), 2);
+    let now = long_after(&bench);
+    let swept = bench.ledger.sweep_retention(now);
+    assert_eq!(swept.runs, 1, "only the finished run was taken: {swept:?}");
+    assert_eq!(messages_with_subject(&bench.ledger, &homes, receipt), 1);
+    assert_eq!(
+        messages_with_subject(&bench.ledger, &homes[1..], receipt),
+        1,
+        "the run still working kept its letter"
     );
 }
 
@@ -23196,6 +23454,7 @@ fn a_former_coordinator_or_another_runs_worker_cannot_correct_the_record() {
             attempt: None,
             source: Some("abc1234".to_string()),
             completed_ms: None,
+            verified_ms: Some(bench.clock),
         })
     );
     assert!(run.review_of(held).verified);
@@ -23399,6 +23658,7 @@ fn a_workers_claimed_verification_is_shown_as_a_claim() {
                 attempt: Some(dispatch.clone()),
                 source: Some(source.clone()),
                 completed_ms: Some(bench.clock),
+                verified_ms: Some(bench.clock),
             })
         );
     }
@@ -24861,6 +25121,9 @@ mod assign;
 /// (`tests/closed.rs`).
 mod closed;
 mod completion;
+/// t-34501: late landings told to the coordinator, a branch that ran away told to its worker
+/// (`tests/landing_watch.rs`).
+mod landing_watch;
 /// t-7812: the window restart restore transitions (`tests/restore.rs`).
 mod restore;
 /// t-7812: the transitions those roads added (`tests/restore_seams.rs`).
@@ -26661,4 +26924,524 @@ fn a_gate_judgment_leaves_one_receipt_per_key_in_the_ledgers_own_voice() {
 
     let typed = bench.at(&pane, "send --type gate_judged --body {\"workerId\":\"x\"}");
     assert_eq!(typed.reply.exit_code, 1, "{}", typed.reply.stdout);
+}
+
+/* ---- delegate: the work, a worker and its first letter in one planned step (t-34501) --------- */
+
+/// One `delegate` from the leader's pane, with the retry name the test gives it. The work is a
+/// single word because `words` would cut a sentence at its spaces; the title is what a person
+/// reads on the board.
+fn delegating(bench: &mut Bench, name: &str, extra: &[&str]) -> Decided {
+    let mut argv: Vec<String> = [
+        "delegate",
+        "--spec",
+        "write-the-report",
+        "--title",
+        "Report",
+        "--agent",
+        "claude",
+        "--retry-request",
+        name,
+    ]
+    .iter()
+    .map(|word| (*word).to_string())
+    .collect();
+    argv.extend(extra.iter().map(|word| (*word).to_string()));
+    bench.at_argv(agent_teams::LEADER_PANE, argv)
+}
+
+/// What the window does once the pane the plan asked for has opened.
+fn seat_the_split(bench: &mut Bench, planned: &Decided) -> String {
+    let Effect::Split {
+        ref pane,
+        ref from,
+        direction,
+        ..
+    } = planned.effect
+    else {
+        panic!("delegate planned no split: {:?}", planned.effect);
+    };
+    let (pane, from) = (pane.clone(), from.clone());
+    bench.clock += 1;
+    let term = bench.clock as u32;
+    bench.team.record_split(&pane, term, &from, direction);
+    pane
+}
+
+fn delegation_answer(planned: &Decided) -> serde_json::Value {
+    serde_json::from_str(&planned.reply.stdout).unwrap_or_else(|_| {
+        panic!(
+            "not JSON: {} / {}",
+            planned.reply.stdout, planned.reply.stderr
+        )
+    })
+}
+
+/// The id letter is mail, and mail is read when the worker looks: a pane is pointed at its mail only
+/// once it rests. A worker that needs its ids in its first turn — to name a queue job — has to be
+/// told to look before anything else, whether the first words are the work itself or a prompt the
+/// coordinator wrote.
+#[test]
+fn delegate_tells_the_worker_in_its_first_words_to_read_its_letter_before_anything_else() {
+    for (extra, first) in [
+        (&[][..], "write-the-report"),
+        (&["--prompt", "do-this-first"][..], "do-this-first"),
+    ] {
+        let mut bench = Bench::new();
+        bench.json("run-create --name delegation");
+        let planned = delegating(&mut bench, "d-first", extra);
+        assert_eq!(planned.reply.exit_code, 0, "{}", planned.reply.stderr);
+        let prompt = &planned
+            .prepared_worker_start
+            .as_ref()
+            .expect("the reservation the window carries out")
+            .prompt;
+        let (work, look) = (prompt.find(first), prompt.find("zerocode-orc check"));
+        assert!(
+            matches!((work, look), (Some(work), Some(look)) if work < look),
+            "the first words name the work, then say to run `zerocode-orc check`: {prompt}"
+        );
+    }
+}
+
+/// The three things a coordinator used to do by hand are one plan: the task is written, the worker
+/// is reserved on it, and the worker's inbox already holds the letter that tells it its own ids.
+#[test]
+fn delegate_writes_the_work_starts_the_worker_and_leaves_its_first_letter_in_one_step() {
+    let mut bench = Bench::new();
+    bench.json("run-create --name delegation");
+    let planned = delegating(&mut bench, "d-1", &[]);
+    assert_eq!(planned.reply.exit_code, 0, "{}", planned.reply.stderr);
+    assert!(
+        matches!(planned.effect, Effect::Split { .. }),
+        "the worker's pane is the one effect: {:?}",
+        planned.effect
+    );
+    let answer = delegation_answer(&planned);
+    let (task, worker, dispatch) = (
+        answer["taskId"].as_str().expect("a task").to_string(),
+        answer["workerId"].as_str().expect("a worker").to_string(),
+        answer["dispatchId"]
+            .as_str()
+            .expect("a dispatch")
+            .to_string(),
+    );
+    assert_eq!(answer["delegated"], true);
+
+    let run = &bench.ledger.runs()[0];
+    assert_eq!(run.tasks.len(), 1, "one task, written by the delegation");
+    let written = run.task(&task).expect("the task");
+    assert_eq!(written.status, TaskStatus::Dispatched);
+    assert_eq!(written.title.as_str(), "Report");
+    assert_eq!(written.spec.as_str(), "write-the-report");
+    assert_eq!((run.workers.len(), run.dispatches.len()), (1, 1));
+    assert_eq!(run.dispatches[0].task, task);
+
+    // The worker's first words are the work itself, because a task id alone opens an empty composer.
+    let prepared = planned
+        .prepared_worker_start
+        .as_ref()
+        .expect("the reservation the window carries out");
+    assert!(
+        prepared.prompt.contains("write-the-report"),
+        "{}",
+        prepared.prompt
+    );
+
+    // And the letter says the ids the worker cannot know by itself.
+    let letters: Vec<&Message> = run
+        .messages()
+        .iter()
+        .filter(|held| held.to == worker_address(&worker))
+        .collect();
+    assert_eq!(letters.len(), 1, "one letter to the worker, no more");
+    let letter = letters[0];
+    assert_eq!(answer["letterId"], letter.id.as_str());
+    assert_eq!(letter.kind, MessageKind::Status);
+    assert_eq!(letter.task.as_deref(), Some(task.as_str()));
+    assert_eq!(letter.dispatch.as_deref(), Some(dispatch.as_str()));
+    for id in [&worker, &dispatch, &task] {
+        assert!(
+            letter.body.as_str().contains(id.as_str()),
+            "{}",
+            letter.body.as_str()
+        );
+    }
+}
+
+/// The same retry name is the same delegation: the first answer comes back, and no second task,
+/// worker, pane or letter exists afterwards.
+#[test]
+fn delegate_asked_again_under_the_same_name_makes_nothing_twice() {
+    let mut bench = Bench::new();
+    bench.json("run-create --name delegation");
+    let first = delegating(&mut bench, "d-1", &[]);
+    assert_eq!(first.reply.exit_code, 0, "{}", first.reply.stderr);
+    let again = delegating(&mut bench, "d-1", &[]);
+    assert_eq!(again.reply.exit_code, 0, "{}", again.reply.stderr);
+    assert_eq!(
+        again.reply.stdout, first.reply.stdout,
+        "the first answer, word for word"
+    );
+    assert!(
+        matches!(again.effect, Effect::None),
+        "a replay opens no pane"
+    );
+    let run = &bench.ledger.runs()[0];
+    assert_eq!(run.tasks.len(), 1);
+    assert_eq!((run.workers.len(), run.dispatches.len()), (1, 1));
+    assert_eq!(run.messages().len(), 1, "one letter, not two");
+
+    // A different delegation under the same name is refused, not run: the name is spent.
+    let other = bench.at_argv(
+        agent_teams::LEADER_PANE,
+        words("delegate --spec something-else --agent claude --retry-request d-1"),
+    );
+    assert_eq!(other.reply.exit_code, 1);
+    assert!(
+        other.reply.stderr.contains("already answered"),
+        "{}",
+        other.reply.stderr
+    );
+    assert_eq!(bench.ledger.runs()[0].tasks.len(), 1);
+}
+
+/// Waiting for the worker is not part of what was asked: the call that did not wait and the retry
+/// that does are one request.
+#[test]
+fn delegate_does_not_count_the_wait_as_part_of_the_request() {
+    let mut bench = Bench::new();
+    bench.json("run-create --name delegation");
+    let first = delegating(&mut bench, "d-1", &[]);
+    let waiting = delegating(&mut bench, "d-1", &["--wait", "--timeout-ms", "5000"]);
+    assert_eq!(waiting.reply.exit_code, 0, "{}", waiting.reply.stderr);
+    assert_eq!(waiting.reply.stdout, first.reply.stdout);
+    assert_eq!(bench.ledger.runs()[0].tasks.len(), 1);
+}
+
+/// A refusal anywhere in the plan leaves the ledger as it found it: no task, no worker, no attempt,
+/// no letter. The task is written first, so this is what the withdrawal is for.
+#[test]
+fn delegate_that_is_refused_leaves_no_task_no_worker_and_no_letter() {
+    let mut bench = Bench::new();
+    bench.json("run-create --name delegation");
+    for line in [
+        "delegate --spec x --agent nobody --retry-request r-agent",
+        "delegate --spec x --agent claude --on-quota-wall nobody --retry-request r-wall",
+        "delegate --spec x --agent claude --deps t-999 --retry-request r-deps",
+        "delegate --spec x --agent claude --task t-1 --retry-request r-task",
+        "delegate --spec x --agent claude --retry-of dp-1 --retry-request r-retry",
+        "delegate --spec x --agent claude --bare --retry-request r-bare",
+        "delegate --spec x --agent claude --on somewhere --retry-request r-on",
+        "delegate --agent claude --retry-request r-spec",
+        "delegate --spec x --retry-request r-agentless",
+    ] {
+        let refused = bench.at_argv(agent_teams::LEADER_PANE, words(line));
+        assert_eq!(
+            refused.reply.exit_code, 1,
+            "`{line}` was not refused: {}",
+            refused.reply.stdout
+        );
+        assert!(
+            matches!(refused.effect, Effect::None),
+            "`{line}` planned an effect"
+        );
+        let run = &bench.ledger.runs()[0];
+        assert!(
+            run.tasks.is_empty()
+                && run.workers.is_empty()
+                && run.dispatches.is_empty()
+                && run.messages().is_empty(),
+            "`{line}` left something behind: {} tasks, {} workers, {} dispatches, {} messages",
+            run.tasks.len(),
+            run.workers.len(),
+            run.dispatches.len(),
+            run.messages().len()
+        );
+    }
+}
+
+/// The quota wall and the seat's own limits are `worker-start`'s, unchanged: a delegation at the wall is
+/// refused with the sentence `worker-start` gives, and one that names its alternative lands there.
+#[test]
+fn delegate_follows_the_quota_wall_exactly_as_worker_start_does() {
+    const NOW: i64 = 5_000_000;
+    let walled = Gauged {
+        machine: Looked::at(&["codex", "claude", "kimi"]),
+        gauges: vec![
+            (
+                "codex",
+                gauge("codex", 98, NOW - 3 * 60_000, Some(NOW + 42 * 60_000)),
+            ),
+            ("claude", gauge("claude", 61, NOW - 60_000, None)),
+        ],
+    };
+    let mut ledger = Ledger::new();
+    let mut team = Team::new("team-1", "token", 7);
+    let opened = planned_on(
+        &mut ledger,
+        &mut team,
+        &walled,
+        "run-create --name walled",
+        NOW,
+    );
+    assert_eq!(opened.reply.exit_code, 0, "{}", opened.reply.stderr);
+
+    let refused = planned_on(
+        &mut ledger,
+        &mut team,
+        &walled,
+        "delegate --spec build-it --agent codex",
+        NOW + 1,
+    );
+    assert_eq!(refused.reply.exit_code, 1, "{}", refused.reply.stdout);
+    assert!(
+        refused.reply.stderr.contains("codex is at 98%")
+            && refused.reply.stderr.contains("nothing was written"),
+        "{}",
+        refused.reply.stderr
+    );
+    let run = &ledger.runs()[0];
+    assert!(
+        run.tasks.is_empty() && run.workers.is_empty() && run.messages().is_empty(),
+        "a refused delegation wrote something"
+    );
+
+    let redirected = planned_on(
+        &mut ledger,
+        &mut team,
+        &walled,
+        "delegate --spec build-it --agent codex --on-quota-wall claude:fable-5-1:high",
+        NOW + 2,
+    );
+    assert_eq!(redirected.reply.exit_code, 0, "{}", redirected.reply.stderr);
+    let answer = delegation_answer(&redirected);
+    assert_eq!(answer["agent"], "claude");
+    assert_eq!(answer["quotaNotice"]["level"], "redirect");
+    let run = &ledger.runs()[0];
+    assert_eq!(
+        (run.tasks.len(), run.workers.len(), run.messages().len()),
+        (1, 1, 1)
+    );
+}
+
+/// A `--worktree` the disk cannot hold is refused before any row, and the delegation takes its task back.
+#[test]
+fn delegate_into_a_full_disk_refuses_and_keeps_nothing() {
+    let squeezed = Squeezed {
+        free_bytes: Some(3 * GIB),
+    };
+    let mut ledger = Ledger::new();
+    let mut team = Team::new("team-1", "token", 7);
+    let opened = planned_on(
+        &mut ledger,
+        &mut team,
+        &squeezed,
+        "run-create --name tight",
+        1_000,
+    );
+    assert_eq!(opened.reply.exit_code, 0, "{}", opened.reply.stderr);
+    let refused = planned_on(
+        &mut ledger,
+        &mut team,
+        &squeezed,
+        "delegate --spec build-it --agent claude --worktree",
+        1_001,
+    );
+    assert_eq!(refused.reply.exit_code, 1, "{}", refused.reply.stdout);
+    let run = &ledger.runs()[0];
+    assert!(
+        run.tasks.is_empty() && run.workers.is_empty() && run.dispatches.is_empty(),
+        "a refused delegation wrote something"
+    );
+}
+
+/// What `delegate --wait` waits for: the worker's own report, its open question, or an attempt that
+/// ended without either — read off the ledger's rows, never off the coordinator's inbox.
+#[test]
+fn delegate_outcome_is_the_workers_report_its_open_question_or_a_silent_end() {
+    let mut bench = Bench::new();
+    bench.json("run-create --name delegation");
+    let planned = delegating(&mut bench, "d-1", &[]);
+    let pane = seat_the_split(&mut bench, &planned);
+    let answer = delegation_answer(&planned);
+    let (worker, dispatch) = (
+        answer["workerId"].as_str().expect("a worker").to_string(),
+        answer["dispatchId"]
+            .as_str()
+            .expect("a dispatch")
+            .to_string(),
+    );
+    let outcome_now = |bench: &Bench| {
+        let run = &bench.ledger.runs()[0];
+        super::delegate::outcome(run, &worker, &dispatch)
+    };
+    assert_eq!(
+        outcome_now(&bench),
+        None,
+        "nothing said and the attempt is open"
+    );
+
+    // A question stands until it is answered.
+    let asked = bench.at_argv(
+        &pane,
+        vec![
+            "send".to_string(),
+            "--type".to_string(),
+            "question".to_string(),
+            "--body".to_string(),
+            "which-branch".to_string(),
+            "--retry-request".to_string(),
+            "q-1".to_string(),
+        ],
+    );
+    assert_eq!(asked.reply.exit_code, 0, "{}", asked.reply.stderr);
+    let question = delegation_answer(&asked)["messageId"]
+        .as_str()
+        .expect("a question id")
+        .to_string();
+    match outcome_now(&bench) {
+        Some(super::delegate::Outcome::Asking { message, body }) => {
+            assert_eq!(
+                (message.as_str(), body.as_str()),
+                (question.as_str(), "which-branch")
+            );
+        }
+        other => panic!("an unanswered question is the outcome: {other:?}"),
+    }
+    let replied = bench.at_argv(
+        agent_teams::LEADER_PANE,
+        vec![
+            "reply".to_string(),
+            "--to-message".to_string(),
+            question,
+            "--body".to_string(),
+            "main".to_string(),
+            "--retry-request".to_string(),
+            "a-1".to_string(),
+        ],
+    );
+    assert_eq!(replied.reply.exit_code, 0, "{}", replied.reply.stderr);
+    assert_eq!(
+        outcome_now(&bench),
+        None,
+        "an answered question waits for nothing"
+    );
+
+    // The report ends it, in the worker's own words.
+    bench.json_at(&pane, "send --type worker_done --body {\"ok\":true}");
+    match outcome_now(&bench) {
+        Some(super::delegate::Outcome::Reported { body, .. }) => assert_eq!(body, "{\"ok\":true}"),
+        other => panic!("the report is the outcome: {other:?}"),
+    }
+}
+
+/// An attempt that ends with no report and no question is an outcome too: nobody is coming back.
+#[test]
+fn delegate_outcome_names_an_attempt_that_ended_without_a_word() {
+    let mut bench = Bench::new();
+    bench.json("run-create --name delegation");
+    let planned = delegating(&mut bench, "d-1", &[]);
+    seat_the_split(&mut bench, &planned);
+    let answer = delegation_answer(&planned);
+    let (worker, dispatch) = (
+        answer["workerId"].as_str().expect("a worker").to_string(),
+        answer["dispatchId"]
+            .as_str()
+            .expect("a dispatch")
+            .to_string(),
+    );
+    let stopped = bench.run(&format!("worker-stop --worker {worker} --reason enough"));
+    assert_eq!(stopped.reply.exit_code, 0, "{}", stopped.reply.stderr);
+    match super::delegate::outcome(&bench.ledger.runs()[0], &worker, &dispatch) {
+        Some(super::delegate::Outcome::Ended { task_status }) => {
+            assert!(!task_status.is_empty());
+        }
+        other => panic!("a stopped attempt is the outcome: {other:?}"),
+    }
+}
+
+/// `--wait` brings its own length, because the bridge and the shim hold their doors open for exactly
+/// that long. A delegation that does not say how long is refused before the work is written.
+#[test]
+fn delegate_wait_needs_a_budget_it_can_hold() {
+    let budget = |line: &str| delegate::wait_budget(&words(line));
+    assert_eq!(budget("delegate --spec x --agent claude"), Ok(None));
+    assert_eq!(
+        budget("delegate --spec x --wait --timeout-ms 5000"),
+        Ok(Some(5_000))
+    );
+    assert_eq!(budget("delegate --wait --timeout-ms=7000"), Ok(Some(7_000)));
+    for refused in [
+        "delegate --wait",
+        "delegate --wait --timeout-ms 0",
+        "delegate --wait --timeout-ms 600001",
+        "delegate --wait --timeout-ms soon",
+    ] {
+        assert!(budget(refused).is_err(), "`{refused}` was accepted");
+    }
+    // Without --wait the number is the readiness window, which is worker-start's business.
+    assert_eq!(budget("delegate --timeout-ms 999999999"), Ok(None));
+}
+
+/// What the wait saw is added to the first answer; nothing the first answer said is changed.
+#[test]
+fn delegate_adds_what_the_wait_saw_to_the_first_answer_and_changes_nothing_else() {
+    let first = r#"{"workerId":"w-1","dispatchId":"dp-2","taskId":"t-3","letterId":"m-4"}"#;
+    let read = |outcome: Option<&delegate::Outcome>| -> serde_json::Value {
+        serde_json::from_str(&delegate::with_waited(first, outcome, 1_200, 60_000))
+            .expect("still JSON")
+    };
+    let reported = delegate::Outcome::Reported {
+        message: "m-9".to_string(),
+        body: r#"{"ok":true,"summary":"done","head":"abc1234"}"#.to_string(),
+    };
+    let said = read(Some(&reported));
+    for key in ["workerId", "dispatchId", "taskId", "letterId"] {
+        assert_eq!(
+            said[key],
+            serde_json::from_str::<serde_json::Value>(first).unwrap()[key]
+        );
+    }
+    let waited = &said["waited"];
+    assert_eq!(waited["outcome"], "reported");
+    assert_eq!(waited["messageId"], "m-9");
+    assert_eq!(waited["summary"], "done");
+    assert_eq!(waited["ok"], true);
+    assert_eq!(waited["head"], "abc1234");
+    assert_eq!(
+        (waited["waitedMs"].as_u64(), waited["budgetMs"].as_u64()),
+        (Some(1_200), Some(60_000))
+    );
+
+    let asking = delegate::Outcome::Asking {
+        message: "m-10".to_string(),
+        body: "which-branch".to_string(),
+    };
+    let said = read(Some(&asking));
+    assert_eq!(said["waited"]["outcome"], "asking");
+    assert_eq!(said["waited"]["question"], "which-branch");
+    assert!(
+        said["waited"]["next"]
+            .as_str()
+            .unwrap()
+            .contains("reply --to-message")
+    );
+
+    let ended = delegate::Outcome::Ended {
+        task_status: "failed",
+    };
+    let said = read(Some(&ended));
+    assert_eq!(said["waited"]["outcome"], "ended");
+    assert_eq!(said["waited"]["taskStatus"], "failed");
+
+    // Nothing heard by the deadline is said as such, and is not an error.
+    let said = read(None);
+    assert_eq!(said["waited"]["outcome"], "timeout");
+    assert!(
+        said["waited"]["next"]
+            .as_str()
+            .unwrap()
+            .contains("check --wait")
+    );
 }

@@ -3,6 +3,7 @@ mod agent_capabilities;
 mod answer_door;
 mod artifact_export;
 mod ask_popup;
+mod beat_lock_order;
 mod bundle_resources;
 mod cli_login;
 mod computer_use_mirrors;
@@ -12,6 +13,8 @@ mod coordinator_desk;
 mod crash_report;
 mod fixture_cases;
 mod git_doors;
+mod hand_in_keep;
+mod handoff_code;
 mod jev_pane_seats;
 mod quiet_children;
 mod quota_wall;
@@ -814,7 +817,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("`{name}` is no helper method"));
             assert!(!method.acts(), "{name} would act outside the road");
         }
-        assert!(block_after(shell, "fn answer_computer_command(").contains("refused_at_the_door("));
+        assert!(
+            block_after(shell, "fn answer_computer_command_with(").contains("refused_at_the_door(")
+        );
         assert_eq!(
             shell.matches("guard::note_action(").count(),
             1,
@@ -8793,12 +8798,29 @@ mod tests {
         }
         // And `adb` alone carries a device that is already running: the
         // emulator package is asked for the AVD list, never for the frames,
-        // taps or tree of a device adb can already see.
-        let listing = block_after(android_emulator, "fn list_android_devices(");
+        // taps or tree of a device adb can already see. The rule is one
+        // function's (`emulators_listed`, t-36920), and both roads to the list
+        // — the panes' device list and the one `zerocode-emulator list`
+        // answers with the phones beside it — read adb first and hand what is
+        // running to it, so neither can hide a running device behind a missing
+        // package.
+        let listing = block_after(android_emulator, "fn emulators_listed(");
         assert!(
-            listing.contains("android_running(&sdk.adb)")
-                && listing.contains("if devices.is_empty()"),
+            listing.contains("if devices.is_empty()"),
             "a missing emulator package hides devices adb can already reach:\n{listing}"
+        );
+        let panes_list = block_after(android_emulator, "fn list_android_devices(");
+        assert!(
+            panes_list.contains("android_running(&sdk.adb)")
+                && panes_list.contains("emulators_listed(&sdk, &running)"),
+            "the panes' device list has its own rule for a missing emulator package:\n{panes_list}"
+        );
+        let answer_list = block_after(android_emulator, "fn android_listing_with(");
+        assert!(
+            answer_list.contains("adb_rows(&sdk.adb)")
+                && answer_list.contains("running_emulators(&sdk.adb, rows)")
+                && answer_list.contains("emulators_listed(sdk, &running)"),
+            "`zerocode-emulator list` has its own rule for a missing emulator package, or asks adb again:\n{answer_list}"
         );
         let videoing = block_after(android_emulator, "fn pump_android_video(");
         assert!(
@@ -9375,8 +9397,9 @@ mod tests {
         );
         let mobile = block_after(shell, "async fn answer_emulator_command(");
         for owned in [
-            "mobile_emulators_direct()",
-            "android_emulators_direct()",
+            // The list is one function of the emulator module (t-36920); the
+            // door only calls it.
+            "crate::emulator::list_answer_now()",
             r#"emit_to("main", "emulator:agent-open""#,
             // Seated in the asking pane's checkout (t-6379): the payload
             // names the terminal the door's pane key reads as.
@@ -9396,6 +9419,33 @@ mod tests {
             !mobile.contains("Command::new") && !mobile.contains("open_mobile_emulator_direct"),
             "the agent route opens or drives an external emulator instead of ZeroCode's pane"
         );
+        // `list` reads the simulators, Android (the emulators and the phones
+        // from ONE `adb devices -l`) and the real iPhones and iPads the window
+        // sees and cannot drive side by side, and puts them in the one answer
+        // the core writes — never a reader of its own.
+        let list = block_after(
+            include_str!("../../src/emulator/physical.rs"),
+            "pub(crate) async fn list_answer_now(",
+        );
+        for owned in [
+            "mobile_emulators_direct()",
+            "android_listing_now()",
+            "physical_ios()",
+            "list_answer(",
+        ] {
+            assert!(
+                list.contains(owned),
+                "the emulator list lost {owned}:\n{list}"
+            );
+        }
+        // A second reader of the same `adb devices -l` is a second process on
+        // the efficiency cores: +122 ms on 194 (t-36920, `taskpolicy -b`).
+        for second in ["android_emulators_direct()", "physical_android()"] {
+            assert!(
+                !list.contains(second),
+                "the emulator list asks adb again through {second}:\n{list}"
+            );
+        }
         // The frame comes from the backend that paints the pane, through the
         // one helper both the agent's `screenshot` and a run's evidence use.
         let frame = block_after(shell, "async fn emulator_screenshot_bytes(");
@@ -9465,13 +9515,23 @@ mod tests {
             4,
             "`emulator.agentOpenUnseated` is missing from one of the en/ja/zh/es catalogs"
         );
+        // The mobile road has a skill of its own (t-36920): computer-use
+        // routes to it by name, and it holds the commands.
+        let mobile_skill = zerocode_core::skill_install::bundled_skill(
+            zerocode_core::agent_emulator::MOBILE_SKILL_NAME,
+        )
+        .map_or("", |skill| skill.content);
         assert!(
             skill.contains("Website or web app: use `zerocode-browser")
-                && skill.contains("Never assume a specific phone")
-                && skill.contains("zerocode-emulator list --json")
                 && skill.contains("zerocode-browser screenshot <pane-label>")
-                && skill.contains("zerocode-emulator screenshot --platform ios|android"),
-            "the installed skill no longer teaches dynamic built-in routing"
+                && skill.contains(&format!(
+                    "`{}` skill",
+                    zerocode_core::agent_emulator::MOBILE_SKILL_NAME
+                ))
+                && mobile_skill.contains("Never assume a specific phone")
+                && mobile_skill.contains("zerocode-emulator list --json")
+                && mobile_skill.contains("zerocode-emulator screenshot --platform ios|android"),
+            "the installed skills no longer teach dynamic built-in routing"
         );
         // The remote route, whole: the router owns the word, the verbs reach
         // this window's own machinery, the pane is mounted by the window, and
@@ -9613,6 +9673,8 @@ mod tests {
             "automate_scroll(app, &state",
             "automate_find(app, &state",
             "automate_diagnose(app, &state",
+            "automate_fields(app, &state",
+            "automate_fill(app, &state",
             "browser_snapshot_png(app, &state",
             "write_agent_screenshot",
         ] {
@@ -21516,29 +21578,41 @@ mod tests {
              others"
         );
 
-        // The Done ring is armed and re-checked by stamp.
-        let arming = block_after(shipped, "fn ring_for_pane(");
+        // A stop's ring is armed when the stop is seen, and fires only when the
+        // same stop still stands at the end of its quiet (t-26595).
+        let routing = block_after(shipped, "fn ring_for_pane(");
         assert!(
-            arming.contains("notify::DONE_QUIET_MS"),
-            "the finished ring fires immediately, mid-conversation:\n{arming}"
+            routing.contains("arm_stop_ring("),
+            "the stop rings no longer go through the armed wait:\n{routing}"
         );
+        let arming = block_after(shipped, "fn arm_stop_ring(");
         // 두 사실을 따로 잰다 — 한 표현의 철자로 재면 모양을 바꾸는 순간
         // 깨지고, 깨진 핀은 고치는 사람이 의도까지 함께 지운다.
         assert!(
-            arming.contains("state == zerocode_core::hook::HookState::Done"),
-            "the quiet's re-check no longer asks whether the pane is still \
-             done:\n{arming}"
+            arming.contains("zerocode_core::notify::quiet_ms(ring)"),
+            "the armed ring no longer waits the quiet its kind earns:\n{arming}"
         );
         assert!(
-            arming.contains("armed_at == Some(at)"),
-            "the quiet's re-check no longer compares the stamp, so an armed \
-             ring fires for a turn that already moved on:\n{arming}"
+            arming.contains("stop_stands(held.state, ring)"),
+            "the quiet's re-check no longer asks whether the same stop still \
+             stands, so an armed ring fires for a stop that moved on:\n{arming}"
+        );
+        assert!(
+            arming.contains("quiet.settle(&term, epoch_ms_now(), standing)"),
+            "the wait no longer settles through the one book, so a stop can ring \
+             twice:\n{arming}"
+        );
+        // 한 번 울린 멈춤의 발사는 설정을 발사 시점에 다시 본다.
+        assert!(
+            arming.contains("finish_earns(&app, term)"),
+            "a finish fires without asking the finish setting at the moment it \
+             fires:\n{arming}"
         );
         // 그리고 인터럽트 깃발은 **발사 시점의 줄에서** 읽힌다. 무장 때
-        // 베껴 두면 조용한 1.5초 동안 사람이 누른 키가 낱말에 안 나타난다 —
+        // 베껴 두면 조용한 대기 동안 사람이 누른 키가 낱말에 안 나타난다 —
         // 원본도 보낼 때 스토어에서 읽는다(`use-notification-dispatch.ts:202`).
         assert!(
-            arming.contains("held.interrupted)"),
+            arming.contains("held.interrupted"),
             "the armed completion copies the interrupt flag instead of reading \
              the row when it fires:\n{arming}"
         );
@@ -21569,6 +21643,69 @@ mod tests {
             "the badge draws on macOS only — Windows and Linux have no \
              `set_badge_label`, and a count badge is their road:\n{drawing}"
         );
+    }
+
+    /// 나를 기다림 (t-26595): the sidebar's top list and the finish setting are
+    /// pinned — the list sits in the column above the shortcut rows, the window
+    /// asks Rust for its rows and releases a finish by its pane, the setting
+    /// writes its word through its own command, and every word the two show is
+    /// in the four languages that are not the source.
+    #[test]
+    fn the_waiting_list_sits_on_top_and_its_words_reach_every_language() {
+        let markup = include_str!("../../../../ui/index.html");
+        let column = markup_between(
+            markup,
+            "<aside class=\"threads\"",
+            "<nav class=\"nav-rows\"",
+        );
+        assert!(
+            column.contains("<section class=\"waiting-list\" id=\"waiting-list\""),
+            "the waiting list left the top of the column:\n{column}"
+        );
+        assert!(
+            markup.contains("id=\"notify-finish-mode\"")
+                && !markup.contains("id=\"notify-agent-completion\""),
+            "the finish setting is no longer the three-way select"
+        );
+
+        let shell = include_str!("../../../../ui/shell.js");
+        assert!(
+            shell.contains("invoke(\"waiting_on_me\")")
+                && shell.contains("invoke(\"clear_finish_mark\""),
+            "the list no longer asks Rust for its rows, or no longer releases a \
+             finish by its pane"
+        );
+
+        let settings = include_str!("../../../../ui/shell-settings.js");
+        assert!(
+            settings.contains("\"set_finish_notification_mode\""),
+            "the finish setting no longer writes its word"
+        );
+
+        let main = include_str!("../../src/main.rs");
+        assert!(
+            main.contains("waiting_on_me,") && main.contains("clear_finish_mark,"),
+            "the list commands are not registered with the window"
+        );
+
+        let i18n = include_str!("../../../../ui/shell-i18n.js");
+        for key in [
+            "waiting.label",
+            "waiting.title",
+            "waiting.blocked",
+            "waiting.question",
+            "waiting.finished",
+            "settings.notifications.finishOff",
+            "settings.notifications.finishLong",
+            "settings.notifications.finishAlways",
+            "settings.notifications.completionHint",
+        ] {
+            assert_eq!(
+                i18n.matches(&format!("\"{key}\"")).count(),
+                4,
+                "{key} must be in en/ja/zh/es"
+            );
+        }
     }
 
     /// A lane rings through the same bell as a pane.
@@ -36844,6 +36981,8 @@ mod tests {
             "pub(crate) fn artifact_preview(",
             "pub(crate) fn artifact_document(",
             "pub(crate) fn artifact_counts(",
+            "pub(crate) fn artifact_tasks(",
+            "pub(crate) fn artifact_bundle(",
             "pub(crate) fn artifact_open(",
             "pub(crate) fn artifact_reveal(",
             "pub(crate) fn artifact_copy_path(",
@@ -36906,6 +37045,33 @@ mod tests {
         );
     }
 
+    /// 작업별 탭의 창 조각(t-36910)은 다섯 목록에 다 들어 있다 — 하나라도 빠지면 그 조각의
+    /// 함수가 창에 없거나, 배포본에 실리지 않거나, 계약이 그 조각을 읽지 못한다.
+    #[test]
+    fn the_tab_by_task_is_a_window_part_in_every_registry() {
+        const PART: &str = "shell-artifact-tasks.js";
+        let quoted = format!("\"{PART}\",");
+        for (registry, text) in [
+            ("build.rs", include_str!("../../build.rs")),
+            (
+                "scripts/build-ui-dist.mjs",
+                include_str!("../../../../scripts/build-ui-dist.mjs"),
+            ),
+            ("src/ui_source.rs", include_str!("../../src/ui_source.rs")),
+            (
+                "tests/source_contracts/support.rs",
+                include_str!("support.rs"),
+            ),
+        ] {
+            assert!(text.contains(&quoted), "`{PART}` is not in {registry}");
+        }
+        let markup = include_str!("../../../../ui/index.html");
+        assert!(
+            markup.contains(&format!("<script defer src=\"./{PART}\"></script>")),
+            "`{PART}` is not loaded by the window"
+        );
+    }
+
     /// `worker_done`이 이름한 보고서는 스토어로 복사되고, `worker-show`는 그 id를 낸다.
     #[test]
     fn a_worker_done_report_is_copied_and_worker_show_names_it() {
@@ -36919,12 +37085,20 @@ mod tests {
             road.contains("ids_for_worker(") && road.contains("\"artifacts\""),
             "the garnish does not read the store by worker:\n{road}"
         );
+        // The road moved (t-32798): a send that names files is handed to the
+        // keeping, which reads them once through the one parser, masks them and
+        // copies them into the store under the origin the worker's row vouches for.
         assert!(
-            shipped.contains("report_path_in(") && shipped.contains("register_report("),
-            "a worker_done's report is not copied into the store"
+            shipped.contains("hand_in_keep::after_send("),
+            "a worker_done's report is not handed to the keeping"
+        );
+        let keeping = include_str!("../../src/orchestration/hand_in_keep.rs");
+        assert!(
+            keeping.contains("hand_in::named(") && keeping.contains("register_kept("),
+            "what a hand-in names is not copied into the store"
         );
         assert!(
-            shipped.contains("origin_of_worker("),
+            keeping.contains("origin_of_worker("),
             "the report's origin is not read from the ledger row"
         );
     }

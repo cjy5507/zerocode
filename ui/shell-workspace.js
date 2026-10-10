@@ -3811,7 +3811,47 @@ function worktreeLedgerMerged(path) {
 function landingShape(landing) {
   if (!landing) return "";
   return `${landing.state}.${landing.ahead}.${landing.dirty ? 1 : 0}.${landing.ignored ? 1 : 0}` +
-    `.${landing.detached ? 1 : 0}.${landing.compare_ref ?? ""}.${landing.landed_in?.sha ?? ""}`;
+    `.${landing.detached ? 1 : 0}.${landing.compare_ref ?? ""}.${landing.landed_in?.sha ?? ""}` +
+    // How far behind and what a merge would clash on move the chip and its tooltip, so they move the row.
+    `.${landing.behind ?? ""}.${landing.far_behind ? 1 : 0}.${landing.conflict ? landing.conflict.total : ""}` +
+    `.${(landing.conflict?.files ?? []).join(",")}`;
+}
+
+/* The compare ref without its remote: `origin/main` is 「main」 on a chip that has a few
+ * letters to spare. The tooltip keeps the whole name. */
+function landingRefName(ref) {
+  return ref.replace(/^[^/]+\//, "");
+}
+
+/* What the tooltip of an unlanded row says about drift (t-34501): how many commits the branch
+ * runs behind the compare ref, which files a merge would conflict on, and the next thing to do.
+ * A conflict nobody looked at (`conflict` absent) is said as not read — never as none; the
+ * backend sends a `total` of 0 only for a merge it tried and found clean. */
+function worktreeDriftLines(landing, ref) {
+  const lines = [];
+  const behind = Number.isFinite(landing.behind) ? landing.behind : null;
+  if (behind !== null) {
+    lines.push(behind > 0
+      ? t("worktree.landTipBehind", "{{ref}}보다 {{count}}커밋 뒤처져 있습니다", { ref, count: behind })
+      : t("worktree.landTipBehindNone", "{{ref}}의 최신 커밋을 모두 담고 있습니다 (뒤처지지 않음)", { ref }));
+  }
+  const clash = landing.conflict ?? null;
+  if (clash === null) {
+    lines.push(t("worktree.landTipConflictUnknown", "{{ref}}에 합치면 충돌하는지는 읽지 못했습니다", { ref }));
+  } else if (clash.total === 0) {
+    lines.push(t("worktree.landTipConflictNone", "{{ref}}에 합쳐 보아도 충돌하는 파일이 없습니다", { ref }));
+  } else if (clash.files.length === 0) {
+    lines.push(t("worktree.landTipConflictNoNames", "{{ref}}에 합치면 충돌합니다 (파일 이름은 읽지 못했습니다)", { ref }));
+  } else {
+    const left = clash.total - clash.files.length;
+    lines.push(t("worktree.landTipConflict", "{{ref}}에 합치면 {{count}}개 파일이 충돌합니다: {{files}}", {
+      ref, count: clash.total, files: clash.files.join(", "),
+    }) + (left > 0 ? t("worktree.landTipConflictMore", " 외 {{count}}개", { count: left }) : ""));
+  }
+  if ((behind !== null && behind > 0) || (clash !== null && clash.total > 0)) {
+    lines.push(t("worktree.landTipNext", "다음 할 일: git fetch 뒤 {{ref}}에 있는 것을 이 브랜치에 합치고, 이미 돈 게이트를 다시 돌리세요", { ref }));
+  }
+  return lines;
 }
 
 /* The words for "files git ignores are still here" — a build's output, a
@@ -3845,6 +3885,7 @@ function worktreeLandingSay(landing, { phase = "", merged = false, idle = false,
   if (state === "pending") {
     return {
       word: t("worktree.landPending", "확인 중"),
+      head: t("worktree.landPending", "확인 중"),
       tone: "pending",
       tip: t("worktree.landTipPending", "main에 들어갔는지 git으로 확인하는 중입니다"),
       cleanable: false,
@@ -3855,6 +3896,7 @@ function worktreeLandingSay(landing, { phase = "", merged = false, idle = false,
   if (state === "failed") {
     return {
       word: t("worktree.landFailed", "확인 실패"),
+      head: t("worktree.landFailed", "확인 실패"),
       tone: "check",
       tip: t("worktree.landTipFailed", "git으로 main 반영 여부를 읽지 못했습니다 — 다음 새로고침에 다시 시도합니다"),
       cleanable: false,
@@ -3877,6 +3919,9 @@ function worktreeLandingSay(landing, { phase = "", merged = false, idle = false,
   const cleanable = gitIn && !landing.dirty && !check && idle && !current;
   let word;
   let tone;
+  // The state's own word, before anything is added to it: what a place with room for one word says
+  // (an artifact card's chip, t-36910) — the rest is in the tooltip either way.
+  let head = null;
   if (check) {
     word = t("worktree.landCheck", "확인 필요");
     tone = "check";
@@ -3886,6 +3931,16 @@ function worktreeLandingSay(landing, { phase = "", merged = false, idle = false,
   } else if (state === "unlanded") {
     word = t("worktree.landAhead", "미반영 {{count}}", { count: landing.ahead });
     tone = "ahead";
+    head = word;
+    // The clash comes first — it is what stops a landing — and the distance after it, because the
+    // ellipsis cuts the end of a chip (t-34501). Only a clash changes the colour.
+    if (landing.conflict && landing.conflict.total > 0) {
+      word += ` · ${t("worktree.landConflict", "충돌 {{count}}", { count: landing.conflict.total })}`;
+      tone = "conflict";
+    }
+    if (landing.far_behind === true && Number.isFinite(landing.behind)) {
+      word += ` · ${t("worktree.landBehind", "{{ref}}보다 {{count}} 뒤", { ref: landingRefName(ref), count: landing.behind })}`;
+    }
   } else if (state === "no_commits") {
     word = t("worktree.landNoCommits", "커밋 없음");
     tone = "none";
@@ -3893,6 +3948,7 @@ function worktreeLandingSay(landing, { phase = "", merged = false, idle = false,
     word = t("worktree.landNoRef", "비교 기준 없음");
     tone = "none";
   }
+  head ??= word;
   if (landing.dirty && !check) word += t("worktree.landDirty", " · 저장 안 한 변경");
   // Said of work that is in the compare ref and of nothing else: the backend
   // asks only landed rows, and a row that is in doubt says nothing more.
@@ -3912,6 +3968,7 @@ function worktreeLandingSay(landing, { phase = "", merged = false, idle = false,
     lines.push(t("worktree.landTipLanded", "이 작업의 커밋이 모두 {{ref}}에 들어 있습니다 (git 기준)", { ref }));
   } else if (state === "unlanded") {
     lines.push(t("worktree.landTipAhead", "{{ref}}에 없는 커밋이 {{count}}개 있습니다 (내용 기준)", { ref, count: landing.ahead }));
+    lines.push(...worktreeDriftLines(landing, ref));
   } else if (state === "no_commits") {
     lines.push(t("worktree.landTipNone", "만든 뒤 자기 커밋이 없습니다 — 반영된 것이 아닙니다"));
   } else if (state === "no_ref") {
@@ -3947,7 +4004,7 @@ function worktreeLandingSay(landing, { phase = "", merged = false, idle = false,
     }));
   }
   if (cleanable) lines.push(t("worktree.landTipCleanable", "활성 세션이 없습니다 — 눌러서 비활성 워크스페이스 검토에서 정리하세요"));
-  return { word, tone, tip: lines.join("\n"), cleanable };
+  return { word, head, tone, tip: lines.join("\n"), cleanable };
 }
 
 /* The same words for a checkout looked up by path — what the git panel's head
@@ -4204,7 +4261,18 @@ function dressWorktreeDot(row, state) {
   // guard there has to be, because this runs once a frame per row for as long
   // as anything is working, and an attribute written to the value it already
   // holds still costs the accessibility tree a look.
-  const label = worktreeStateLabel(said, phase);
+  let label = worktreeStateLabel(said, phase);
+  // How long it has waited (t-22105): a report nobody verified is counted from the report, a
+  // verification nobody merged from the verification. Nothing at all where the ledger kept no time or
+  // it is under a minute — never a zero.
+  const waiting = indicator === "review" || phase === "vouched"
+    ? worktreeWaitingSince(row.dataset.worktreePath) : null;
+  const waited = waiting && Date.now() - waiting.since >= 60_000 ? agoWord(waiting.since, Date.now()) : "";
+  if (waited !== "") {
+    label += ` — ${waiting.kind === "review"
+      ? t("worktree.waitingReview", "{{time}}째 검증을 기다리는 중", { time: waited })
+      : t("worktree.unmergedFor", "검증은 됐지만 병합 기록 없이 {{time}}째", { time: waited })}`;
+  }
   // The two states a person has to tell apart at a glance — waiting for a
   // coordinator, and done — also wear their word on the row, beside the name:
   // a shape alone is a thing to learn, and a colour alone is not a label. The
@@ -4213,7 +4281,9 @@ function dressWorktreeDot(row, state) {
   // sentence, for a word the narrowest sidebar had to cut.
   const chip = row.querySelector(".wt-phase");
   if (chip) {
-    const word = WORKTREE_WORDED.has(indicator) ? workspaceStateWord(indicator) : "";
+    const lane = WORKTREE_WORDED.has(indicator) ? workspaceStateWord(indicator) : "";
+    const word = lane !== "" && waited !== "" && waiting.kind === "review"
+      ? t("worktree.waitingChip", "{{word}} {{time}}", { word: lane, time: waited }) : lane;
     writeTextContent(chip, word);
     if (word === "") {
       chip.removeAttribute("data-phase");
@@ -5015,6 +5085,8 @@ async function refreshWorktrees() {
       }
     }
     paintScmLanding();
+    // The Artifacts tab's landed chips read the same answers (t-36910).
+    noteArtifactLandings();
     if (!projectsRead) seedStartupProjectFolds(projects);
     projectsRead = true;
     worktreePoll.sync();
@@ -10996,23 +11068,29 @@ function spaceBytes(bytes) {
  *
  * `Intl.RelativeTimeFormat`이 하는 일이고, 언어는 지금 걸린 것이다. 0은 "모른다"
  * 이므로 대시로 남긴다 — 1970년을 상대 시각으로 말하면 "56년 전"이 된다. */
+/* 「3분 전」의 걸음 — 틈이 이 초보다 짧으면 이 단위로, 단위 하나의 초로 나눠 말한다. */
+const SPACE_AGO_STEPS = Object.freeze([
+  { under: 60, unit: "second", seconds: 1 },
+  { under: 3600, unit: "minute", seconds: 60 },
+  { under: 86400, unit: "hour", seconds: 3600 },
+  { under: Number.POSITIVE_INFINITY, unit: "day", seconds: 86400 },
+]);
+/* 그 말의 형식기 — 로케일마다 한 번 짓는다(t-40649): 짓는 값이 한 번 쓰는 값의 몇십 배라, 부를
+ * 때마다 지으면 시각을 말하는 줄 수만큼 그 값을 낸다. */
+let spaceAgoFormatCode = null;
+let spaceAgoFormat = null;
+
 function spaceAgo(ms) {
   if (!ms) return "—";
   const code = locale === "system" ? systemLocale : locale;
+  if (spaceAgoFormat === null || spaceAgoFormatCode !== code) {
+    spaceAgoFormatCode = code;
+    spaceAgoFormat = new Intl.RelativeTimeFormat(code, { numeric: "auto" });
+  }
   const gap = Math.round((ms - Date.now()) / 1000);
-  const steps = [
-    [60, "second"],
-    [3600, "minute"],
-    [86400, "hour"],
-    [Number.POSITIVE_INFINITY, "day"],
-  ];
-  const divisors = { second: 1, minute: 60, hour: 3600, day: 86400 };
-  const step = steps.find(([bound]) => Math.abs(gap) < bound) ?? steps[steps.length - 1];
-  const unit = step[1];
-  return new Intl.RelativeTimeFormat(code, { numeric: "auto" }).format(
-    Math.round(gap / divisors[unit]),
-    unit,
-  );
+  // 수가 아닌 시각은 어느 걸음에도 들지 않는다 — 마지막 걸음(날)이 받는다.
+  const step = SPACE_AGO_STEPS.find((one) => Math.abs(gap) < one.under) ?? SPACE_AGO_STEPS.at(-1);
+  return spaceAgoFormat.format(Math.round(gap / step.seconds), step.unit);
 }
 
 function spaceAllRows() {

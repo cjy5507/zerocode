@@ -427,9 +427,9 @@ pub const OBSERVE_FRAMES_MAX: usize = 8;
 pub const COMPUTER_HANDOFF_TIMEOUT_MS: u64 = 600_000;
 /// How long a hand whose place is covered waits before it lists the windows
 /// again, when what stands in front looks like it is passing — a
-/// notification sliding in or out, a window being dragged (t-12979): the
-/// eye's own longest settle, the most a repaint is given anywhere.
-pub const COVER_LOOK_AGAIN_MS: u64 = EYE_SETTLE_MAX_MS;
+/// notification sliding in or out, a window being dragged (t-12979): a
+/// sheet or a banner passes within a second.
+pub const COVER_LOOK_AGAIN_MS: u64 = 1_000;
 /// Stuck (§7.4): the same action this many times with nothing changing on
 /// the screen is a loop, not progress.
 pub const COMPUTER_STUCK_REPEATS: u32 = 2;
@@ -794,6 +794,8 @@ pub const COMPUTER_BATCH_ANSWER_MARGIN_MS: u64 = 2_000;
 pub const COMPUTER_WALK_MAX_GLIDE_STEPS: u64 = 60;
 /// The flag a batch carries its steps in: a JSON array of command lines.
 pub const BATCH_COMMANDS_FLAG: &str = "commands";
+/// The flag a `wait` ends on its act's settle by (`wait --settle`).
+pub const WAIT_SETTLE_FLAG: &str = "settle";
 /// The flag every walked step — a batch's or a recipe's — carries where its
 /// own table allows it: every step answers an envelope.
 pub const WALKED_STEP_FLAGS: &[&str] = &["json"];
@@ -879,10 +881,20 @@ pub const EYE_FRAMES_PER_SECOND: u32 = 30;
 /// The screen has settled once nothing the look cares about repainted for
 /// this long: three frame intervals, and a transition paints every frame.
 pub const EYE_QUIET_MS: u64 = 100;
-/// The longest the look after an act waits for the screen to settle: a sheet
-/// or a window animates for at most half a second, and motion past a second
-/// is content — a spinner, a video — shown as it is (`settled: false`).
-pub const EYE_SETTLE_MAX_MS: u64 = 1_000;
+/// The longest the look after an act waits for the screen to settle. A sheet
+/// on the Mac animates for half a second, but a mirrored or remote screen
+/// answers late and keeps repainting: the iPhone Mirroring session of
+/// t-37883 was still moving at a one-second cap 18 times in 110, each such
+/// picture distrusted and looked at again — a model round trip of about
+/// 17 s, against at most 2 s more of waiting here. Motion the act started
+/// that outlasts three seconds is content — a spinner, a video — shown as it
+/// is (`settled: false`); motion that was already there before the act never
+/// holds a look back at all (`EYE_BACKGROUND_MS`).
+pub const EYE_SETTLE_MAX_MS: u64 = 3_000;
+/// How long the screen must hold still before a `wait --settle` ends: three
+/// times a look's quiet, so the pause between a press's own paint (a row's
+/// highlight) and the screen it opens does not end the wait between the two.
+pub const EYE_WAIT_QUIET_MS: u64 = 300;
 /// What was repainting this long before an act (or a watch) began is the
 /// screen's own motion — a clock, a video, a spinner — not the act's doing.
 pub const EYE_BACKGROUND_MS: u64 = 500;
@@ -1046,11 +1058,15 @@ pub fn sound_event_matches(event: &Value, labels: &[String], min_confidence: f64
 /// The bridge's grace past a waiting command's own budget: the answer's trip
 /// back and the window's bookkeeping.
 pub const COMPUTER_BRIDGE_GRACE_MS: u64 = 5_000;
+/// What a person's turn that puts a code in a field is given past the turn
+/// itself: the window types the code, down the road any input takes, after the
+/// person has sent it — a tab's typing may hold for its own callback's time.
+pub const COMPUTER_ENTER_GRACE_MS: u64 = 20_000;
 /// The longest any one command may take — the person's whole turn — and so
 /// the shim's own clock, which must never cut a command the bridge still
 /// waits for.
 pub const COMPUTER_LONGEST_DEADLINE_MS: u64 =
-    COMPUTER_HANDOFF_TIMEOUT_MS + COMPUTER_BRIDGE_GRACE_MS;
+    COMPUTER_HANDOFF_TIMEOUT_MS + COMPUTER_BRIDGE_GRACE_MS + COMPUTER_ENTER_GRACE_MS;
 
 /// How long a `handoff` waits for the person: what it asked, never past the
 /// table's turn.
@@ -1077,6 +1093,11 @@ pub fn computer_deadline_ms(argv: &[String]) -> u64 {
         ComputerMethod::Handoff => {
             handoff_ms(command.params.get("timeoutMs").and_then(Value::as_u64))
                 + COMPUTER_BRIDGE_GRACE_MS
+                + if command.params.get("into").is_some() {
+                    COMPUTER_ENTER_GRACE_MS
+                } else {
+                    0
+                }
         }
         ComputerMethod::Batch => batch_deadline_ms(&batch_steps(&command)),
         // A repeat holds until the person stops it, its bound, or the
@@ -1162,7 +1183,7 @@ pub fn batch_commands(raw: &str) -> Result<Vec<Vec<String>>, String> {
             ));
         }
         // A batch is looked at once, after: no frame of its steps.
-        let step = walked_step(step, false);
+        let step = settled_wait(walked_step(step, false), normalised.last());
         let command =
             parse_command(&step).map_err(|error| format!("step {n} ({verb}): {error}"))?;
         if let Some(why) = walked_step_refusal(&step, &command) {
@@ -1180,6 +1201,27 @@ pub fn batch_commands(raw: &str) -> Result<Vec<Vec<String>>, String> {
         normalised.push(step);
     }
     Ok(normalised)
+}
+
+/// A batch's `wait` right after a step that acts ends once what that act
+/// painted has held still (`wait --settle`, t-37883): a plan waits for the
+/// screen it acted on, not for a guess at how long the screen takes — the
+/// mirrored phone's session asked 311 waits for 401 s. Any other step is as
+/// it was written.
+#[must_use]
+pub fn settled_wait(step: Vec<String>, before: Option<&Vec<String>>) -> Vec<String> {
+    let acted = before
+        .and_then(|before| before.first())
+        .and_then(|verb| verb_method(verb))
+        .is_some_and(ComputerMethod::acts);
+    let is_wait = step.first().and_then(|verb| verb_method(verb)) == Some(ComputerMethod::Wait);
+    let settle = format!("--{WAIT_SETTLE_FLAG}");
+    if acted && is_wait && !step.contains(&settle) {
+        let mut step = step;
+        step.push(settle);
+        return step;
+    }
+    step
 }
 
 /// Whether answering a command rebuilds the element tree the model's indexes
@@ -1783,6 +1825,9 @@ pub const WALK_STEPS_DEFAULT: usize = 30;
 /// goal, it is hunting, and hunting unattended is what the
 /// screen-did-not-move rule exists to end.
 pub const WALK_STEPS_MAX: usize = 40;
+
+pub const WALK_WAIT_MS: u64 = 500;
+pub const WALK_WAIT_LIMIT: usize = 4;
 
 /// How many presses this walk may spend: what the caller asked, clamped to
 /// [`WALK_STEPS_MAX`], or [`WALK_STEPS_DEFAULT`] when they asked for none.
@@ -3306,6 +3351,7 @@ pub fn parse_command(argv: &[String]) -> Result<ComputerCommand, String> {
         ("flow", "flow"),
         ("run", "run"),
         ("l1", "l1"),
+        ("after-text", "afterText"),
     ] {
         if let Some(value) = optional_string_allowing_empty(&flags, flag)? {
             params.insert(key.into(), Value::String(value));
@@ -3313,6 +3359,7 @@ pub fn parse_command(argv: &[String]) -> Result<ComputerCommand, String> {
     }
     for (flag, key) in [
         ("restore-window", "restoreWindow"),
+        ("background", "background"),
         ("no-screenshot", "noScreenshot"),
         ("full-res", "fullRes"),
         ("force", "force"),
@@ -3340,6 +3387,7 @@ pub fn parse_command(argv: &[String]) -> Result<ComputerCommand, String> {
         (WALK_RESCUE_FLAG, WALK_RESCUE_PARAM),
         (WALK_REPLAY_FLAG, WALK_REPLAY_PARAM),
         ("renew", "renew"),
+        ("ask-code", "askCode"),
     ] {
         if flags.contains_key(flag) {
             params.insert(key.into(), Value::Bool(true));
@@ -3377,6 +3425,15 @@ pub fn parse_command(argv: &[String]) -> Result<ComputerCommand, String> {
             Value::Object(crate::computer_recipe::recipe_params(&raw)?),
         );
     }
+    // The place a code goes is checked whole, before the card is shown.
+    if method == ComputerMethod::Handoff
+        && let Some(raw) = optional_string(&flags, "into")?
+    {
+        params.insert(
+            "into".into(),
+            json!(crate::handoff_code::EnterInto::parse(&raw)?.to_words()),
+        );
+    }
     // A batch's steps are checked whole, before the first one runs.
     if method == ComputerMethod::Batch
         && let Some(raw) = optional_string(&flags, BATCH_COMMANDS_FLAG)?
@@ -3409,6 +3466,7 @@ fn flags(argv: &[String]) -> Result<BTreeMap<String, Option<String>>, String> {
         let boolean = matches!(
             name,
             "json"
+                | "background"
                 | "restore-window"
                 | "no-screenshot"
                 | "local"
@@ -3430,6 +3488,7 @@ fn flags(argv: &[String]) -> Result<BTreeMap<String, Option<String>>, String> {
                 | "verify"
                 | "repeat"
                 | "renew"
+                | "ask-code"
                 | WALK_OVERLAP_FLAG
                 | WALK_RESCUE_FLAG
                 | WALK_REPLAY_FLAG
@@ -3461,6 +3520,7 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
     const BASIC: &[&str] = &["json"];
     const APP: &[&str] = &["json", "app"];
     const OBSERVE: &[&str] = &[
+        "background",
         "json",
         "app",
         "worktree",
@@ -3476,6 +3536,7 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
         ComputerMethod::ListWindows => APP,
         ComputerMethod::GetAppState => OBSERVE,
         ComputerMethod::Click => &[
+            "background",
             "json",
             "app",
             "worktree",
@@ -3497,6 +3558,10 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
             "text",
             "label",
             "role",
+            "ocr",
+            "after-text",
+            "dx",
+            "dy",
         ],
         ComputerMethod::PerformSecondaryAction => &[
             "json",
@@ -3512,6 +3577,7 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
             "confirming",
         ],
         ComputerMethod::Scroll => &[
+            "background",
             "json",
             "app",
             "worktree",
@@ -3566,6 +3632,7 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
             "confirming",
         ],
         ComputerMethod::SetValue => &[
+            "background",
             "json",
             "app",
             "worktree",
@@ -3576,6 +3643,8 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
             "no-screenshot",
             "element-index",
             "value",
+            "mark",
+            "look",
         ],
         ComputerMethod::Screenshot => &["json", "display", "region", "full-res", "viewer"],
         ComputerMethod::Zoom => &["json", "display", "region"],
@@ -3607,7 +3676,7 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
         ComputerMethod::Key => &["json", "key", "allow-self", "confirming"],
         ComputerMethod::HoldKey => &["json", "key", "ms", "allow-self", "confirming"],
         ComputerMethod::Type => &["json", "text", "allow-self"],
-        ComputerMethod::Wait => &["json", "ms"],
+        ComputerMethod::Wait => &["json", "ms", "settle"],
         ComputerMethod::Launch => &["json", "app", "args", "wait-ready"],
         ComputerMethod::Quit => &["json", "app", "force"],
         ComputerMethod::Activate => APP,
@@ -3623,6 +3692,7 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
         ComputerMethod::WindowResize => &["json", "id", "width", "height"],
         ComputerMethod::ClipboardWrite => &["json", "text"],
         ComputerMethod::Find => &[
+            "background",
             "json",
             "app",
             "text",
@@ -3635,6 +3705,7 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
             "region",
         ],
         ComputerMethod::WaitFor => &[
+            "background",
             "json",
             "app",
             "text",
@@ -3649,6 +3720,7 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
             "region",
         ],
         ComputerMethod::Read => &[
+            "background",
             "json",
             "app",
             "window-id",
@@ -3662,6 +3734,7 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
         ComputerMethod::Evidence => &["json", "last", "verify"],
         ComputerMethod::Verdict => &["json", "pass", "fail", "reason"],
         ComputerMethod::Observe => &[
+            "background",
             "json",
             "no-screenshot",
             "app",
@@ -3675,7 +3748,7 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
             "marks",
             "settle",
         ],
-        ComputerMethod::Handoff => &["json", "reason", "timeout-ms"],
+        ComputerMethod::Handoff => &["json", "reason", "timeout-ms", "ask-code", "into"],
         ComputerMethod::RecipeSave => &["json", "name", "from", "last", "note"],
         ComputerMethod::RecipeList => BASIC,
         ComputerMethod::RecipeShow => &["json", "name"],
@@ -3698,6 +3771,7 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
         ComputerMethod::Watch => &["json", "until", "timeout-ms", "display"],
         ComputerMethod::Batch => &["json", BATCH_COMMANDS_FLAG],
         ComputerMethod::Walk => &[
+            "background",
             "json",
             "goal",
             "app",
@@ -3752,6 +3826,14 @@ fn validate(
     flags: &BTreeMap<String, Option<String>>,
     params: &Map<String, Value>,
 ) -> Result<(), String> {
+    if flags.contains_key("background") {
+        if flags.contains_key("restore-window") {
+            return Err("--background cannot be combined with --restore-window".into());
+        }
+        if !params.contains_key("app") && !params.contains_key("mark") {
+            return Err("--background requires --app or a pinned --mark".into());
+        }
+    }
     if let Some(declared) = params.get("confirming").and_then(Value::as_str)
         && ConfirmKind::parse(declared).is_none()
     {
@@ -3764,7 +3846,7 @@ fn validate(
         return Err("use either --window-id or --window-index, not both".into());
     }
     // A mark names its own app and window: the look it was drawn on.
-    let by_mark = method == ComputerMethod::Click && has("mark");
+    let by_mark = matches!(method, ComputerMethod::Click | ComputerMethod::SetValue) && has("mark");
     // A control named by what it reads is found on a fresh tree at the press.
     let by_query = method == ComputerMethod::Click && QUERY_CLICK_KEYS.iter().any(|key| has(key));
     // A method that offers `--pane` names its place that way instead of by an
@@ -3796,7 +3878,17 @@ fn validate(
             }
         }
         ComputerMethod::Click | ComputerMethod::Scroll => {
-            if by_mark {
+            if method == ComputerMethod::Click
+                && !has("ocr")
+                && let Some((_, flag)) = WORDS_CLICK_ONLY.iter().find(|(key, _)| has(key))
+            {
+                return Err(format!(
+                    "{flag} belongs to a click by the words the screen shows: add --ocr --text"
+                ));
+            }
+            if method == ComputerMethod::Click && has("ocr") {
+                validate_words_click(params)?;
+            } else if by_mark {
                 validate_mark_click(params)?;
             } else if by_query {
                 validate_query_click(params)?;
@@ -3871,7 +3963,14 @@ fn validate(
                 .ok_or("missing required --key")?,
         )?,
         ComputerMethod::SetValue => {
-            require(params, "elementIndex", "--element-index")?;
+            if by_mark {
+                validate_mark_click(params)?;
+            } else {
+                require(params, "elementIndex", "--element-index")?;
+                if has("look") {
+                    return Err("--look requires --mark".into());
+                }
+            }
             require(params, "value", "--value")?;
         }
         ComputerMethod::MouseMove | ComputerMethod::MouseClick | ComputerMethod::MouseScroll => {
@@ -4201,6 +4300,18 @@ fn validate(
             if reason.trim().is_empty() {
                 return Err("--reason may not be empty".into());
             }
+            // A code is typed by the window where the agent says, and nowhere
+            // else: a card for one without a place, or a place without a card
+            // for one, is refused before anything is shown.
+            match (params.contains_key("askCode"), params.contains_key("into")) {
+                (true, false) => {
+                    return Err("--ask-code needs --into '<json words>': the window types the person's code into the field you name and never hands it to you, e.g. --into '[\"set-value\",\"--app\",\"Form\",\"--element-index\",\"3\"]'".into());
+                }
+                (false, true) => {
+                    return Err("--into goes with --ask-code: a place is named for a card that takes a code".into());
+                }
+                _ => {}
+            }
         }
         ComputerMethod::Compare => {
             require(params, "baseline", "--baseline")?;
@@ -4238,6 +4349,52 @@ const QUERY_CLICK_REFUSES: &[(&str, &str)] = &[
     ("y", "--y"),
     ("look", "--look"),
 ];
+
+/// What a click by the words the pixels show takes no part of: an element's
+/// index, a point, a mark, and the tree's own names for a control.
+const WORDS_CLICK_REFUSES: &[(&str, &str)] = &[
+    ("elementIndex", "--element-index"),
+    ("x", "--x"),
+    ("y", "--y"),
+    ("mark", "--mark"),
+    ("look", "--look"),
+    ("label", "--label"),
+    ("role", "--role"),
+];
+/// What only a click by the pixels' words takes: the line it follows and the
+/// nudge from the line's centre.
+const WORDS_CLICK_ONLY: &[(&str, &str)] = &[
+    ("afterText", "--after-text"),
+    ("dx", "--dx"),
+    ("dy", "--dy"),
+];
+
+/// `click --app A --ocr --text T [--after-text W] [--dx N --dy N]` (t-37883):
+/// the control a window with no tree shows as words — the line OCR reads
+/// there at the press (`computer_use_protocol::words`) — and nothing that
+/// names it another way. The words must read something.
+fn validate_words_click(params: &Map<String, Value>) -> Result<(), String> {
+    for (key, flag) in WORDS_CLICK_REFUSES {
+        if params.contains_key(*key) {
+            return Err(format!(
+                "a click by the words the screen shows takes no {flag}: drop it, or drop --ocr"
+            ));
+        }
+    }
+    let reads = |key: &str| {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|word| !word.trim().is_empty())
+    };
+    if !reads("text") {
+        return Err("--ocr --text must read something: the words the control shows".into());
+    }
+    if params.contains_key("afterText") && !reads("afterText") {
+        return Err("--after-text must read something: the line the control comes after".into());
+    }
+    Ok(())
+}
 
 /// `click --app A --text T | --label L | --role R [--label L]`: the control by
 /// what it reads, and nothing that names it another way. A word must read
@@ -4396,6 +4553,7 @@ fn validate_hotkey(key: &str) -> Result<(), String> {
 pub fn usage() -> String {
     let text = [
         "zerocode-computer — inspect and operate local desktop apps",
+        "  --background: macOS app-scoped semantic input only; no focus, synthetic input or foreground fallback",
         "",
         "  zerocode-computer capabilities [--json]",
         "  zerocode-computer permissions [--id accessibility|screenshots [--reset]] [--json]",
@@ -4405,6 +4563,9 @@ pub fn usage() -> String {
         "  zerocode-computer click --app <app> (--element-index N|--x X --y Y|--text <t>|--role <r> [--label <l>]) [--mouse-button left|right|middle] [--click-count N] [--modifiers chord] [--json]",
         "    --text/--label/--role name the control by what it reads (find's matcher), read off a fresh tree right before the press —",
         "    the target a batch step may name after earlier steps; one match presses, none or several answers which",
+        "  zerocode-computer click --app <app> --ocr --text <words> [--after-text <words>] [--dx N] [--dy N] [--mouse-button left|right|middle] [--click-count N] [--json]",
+        "    a window with no tree (a mirrored phone, a remote desktop): presses the line OCR reads as <words> at the press, nudged",
+        "    by --dx/--dy points; words that recur are told apart by the line they come after; one line presses, none or several answers which",
         "  zerocode-computer click --mark N --look <lookId> [--mouse-button left|right|middle] [--click-count N] [--modifiers chord] [--viewer <id>] [--json]",
         "    presses the control numbered N on the marked look <lookId> (observe --marks) through the element path; refused if it moved or changed since",
         "  zerocode-computer perform-secondary-action --app <app> --element-index N --action <name> [--json]",
@@ -4415,6 +4576,7 @@ pub fn usage() -> String {
         "  zerocode-computer hotkey --app <app> --key <modifier+key> [--json]",
         "  zerocode-computer paste-text --app <app> (--text text|--text-stdin) [--json]",
         "  zerocode-computer set-value --app <app> --element-index N (--value text|--value-stdin) [--json]",
+        "  zerocode-computer set-value --mark N --look L (--value text|--value-stdin) [--json]",
         "",
         "  the desktop, no app named — screen points, the mouse and the keys where a person has them:",
         "  zerocode-computer screenshot [--display N] [--region x,y,w,h] [--full-res] [--viewer <id>] [--json]",
@@ -4427,7 +4589,8 @@ pub fn usage() -> String {
         "  zerocode-computer key --key <key|modifier+key> [--json]",
         "  zerocode-computer hold-key --key <key> --ms N [--json]",
         "  zerocode-computer type (--text text|--text-stdin) [--json]",
-        "  zerocode-computer wait --ms N [--json]",
+        "  zerocode-computer wait --ms N [--settle] [--json]",
+        "    --settle ends it once what the act before it painted has held still (a batch adds it to a wait after an act)",
         "  zerocode-computer displays [--json]",
         "",
         "  apps, windows and the system — what a person does around an app:",
@@ -4464,8 +4627,12 @@ pub fn usage() -> String {
         "  zerocode-computer watch [--until change|quiet] [--timeout-ms N] [--display N] [--json]",
         "      (waits for the screen to change, or to go still, from the display's repaints — no pictures taken;",
         "       answers where it changed; ZeroCode's own windows and what was already moving do not count)",
-        "  zerocode-computer handoff --reason <what the person must do> [--timeout-ms N] [--json]",
-        "      (2FA, CAPTCHA, the last step you may not press: the window shows a card and waits for the person)",
+        "  zerocode-computer handoff --reason <what the person must do> [--ask-code --into '<json words>'] [--timeout-ms N] [--json]",
+        "      (2FA, CAPTCHA, the last step you may not press: the window shows a card and waits for the person;",
+        "       --ask-code adds a line for a one-time code and --into says where it goes, as the words of one input command in a JSON array:",
+        "       '[\"set-value\",\"--app\",\"Form\",\"--element-index\",\"3\"]', '[\"type-text\",\"--app\",\"Form\"]', '[\"browser\",\"type\",\"<tab>\",\"<selector>\"]'",
+        "       or '[\"emulator\",\"text\",\"--platform\",\"ios\",\"--device\",\"<id>\"]'; the window types the code there once and answers how many",
+        "       characters went in — you are never handed the code; never for a password or a card number — the person types those themselves)",
         "  zerocode-computer recipe-save --name <name> [--from <evidence dir>] [--last N] [--note <text>] [--json]",
         "      (this session's walked steps as a document a person can read and edit; next time, walk the recipe first)",
         "  zerocode-computer recipe-list [--json]",
@@ -4553,10 +4720,17 @@ fn computer_door<'a>(
 
 #[must_use]
 pub fn emulator_usage() -> String {
+    use crate::agent_emulator::physical::{PHYSICAL_KEY, UNCHECKED_KEY};
+    let list_note = format!(
+        "    Answers the simulators and emulators this window drives (ios, android), the real phones it\n\
+         \x20   sees and cannot drive ({PHYSICAL_KEY}, each with drivable: false and a reason), and a tool that\n\
+         \x20   gave no answer ({UNCHECKED_KEY}, with why). Start here when a phone is said to be connected."
+    );
     [
         "zerocode-emulator — control ZeroCode's built-in iOS and Android surfaces",
         "",
         "  zerocode-emulator list [--json]",
+        list_note.as_str(),
         "  zerocode-emulator open --platform ios|android [--device <id>] [--json]",
         "  zerocode-emulator tree --platform ios|android --device <id> [--json]",
         "  zerocode-emulator marks --platform ios|android --device <id> [--text <fragment>] [--json]",
@@ -5130,6 +5304,131 @@ pub struct ComputerErrorBody<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn background_input_is_explicit_and_never_accepts_a_restore_or_global_surface() {
+        let parse = |words: &[&str]| {
+            parse_command(
+                &words
+                    .iter()
+                    .map(|word| (*word).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for words in [
+            vec!["observe", "--app", "Fixture", "--marks", "--background"],
+            vec!["click", "--mark", "1", "--look", "look", "--background"],
+            vec![
+                "set-value",
+                "--mark",
+                "1",
+                "--look",
+                "look",
+                "--value",
+                "text",
+                "--background",
+            ],
+            vec![
+                "walk",
+                "--app",
+                "Fixture",
+                "--goal",
+                "Fill a form",
+                "--background",
+            ],
+        ] {
+            assert_eq!(parse(&words).unwrap().params["background"], true);
+        }
+        for words in [
+            vec![
+                "observe",
+                "--app",
+                "Fixture",
+                "--background",
+                "--restore-window",
+            ],
+            vec!["observe", "--background"],
+            vec![
+                "walk",
+                "--pane",
+                "browser",
+                "--goal",
+                "Fill a form",
+                "--background",
+            ],
+            vec![
+                "press-key",
+                "--app",
+                "Fixture",
+                "--key",
+                "tab",
+                "--background",
+            ],
+            vec!["mouse-click", "--x", "1", "--y", "1", "--background"],
+        ] {
+            assert!(parse(&words).is_err(), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn marked_values_require_a_look_and_cannot_override_its_target() {
+        let parse = |words: &[&str]| {
+            parse_command(
+                &words
+                    .iter()
+                    .map(|word| (*word).to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert!(
+            parse(&[
+                "set-value",
+                "--mark",
+                "1",
+                "--look",
+                "look",
+                "--value",
+                "text"
+            ])
+            .is_ok()
+        );
+        for words in [
+            vec!["set-value", "--mark", "1", "--value", "text"],
+            vec![
+                "set-value",
+                "--mark",
+                "0",
+                "--look",
+                "look",
+                "--value",
+                "text",
+            ],
+            vec![
+                "set-value",
+                "--mark",
+                "1",
+                "--look",
+                "look",
+                "--app",
+                "Editor",
+                "--value",
+                "text",
+            ],
+            vec![
+                "set-value",
+                "--mark",
+                "1",
+                "--look",
+                "look",
+                "--element-index",
+                "4",
+                "--value",
+                "text",
+            ],
+        ] {
+            assert!(parse(&words).is_err(), "{words:?}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -8429,5 +8728,87 @@ mod tests {
             );
         }
         assert!(parse_command(&words(&["key", "--key", "a", "--instant"])).is_err());
+    }
+
+    /// t-37883: a control on a window with no tree is named by the words its
+    /// pixels show — the line it follows tells recurring words apart, a nudge
+    /// moves the press off the words — and by nothing else at once.
+    #[test]
+    fn a_click_by_the_words_a_screen_shows_is_parsed_and_its_other_names_refused() {
+        let parsed = parse_command(&words(&[
+            "click",
+            "--app",
+            "iPhone Mirroring",
+            "--ocr",
+            "--text",
+            "No",
+            "--after-text",
+            "visited a farm",
+            "--dy",
+            "4",
+            "--json",
+        ]));
+        assert!(parsed.is_ok(), "{parsed:?}");
+        let command = parsed.unwrap_or_else(|_| unreachable!());
+        assert_eq!(command.method, ComputerMethod::Click);
+        assert_eq!(command.params["ocr"], true);
+        assert_eq!(command.params["text"], "No");
+        assert_eq!(command.params["afterText"], "visited a farm");
+        assert_eq!(command.params["dy"], 4.0);
+        let refused = |argv: &[&str]| parse_command(&words(argv)).err().unwrap_or_default();
+        assert!(
+            refused(&["click", "--app", "A", "--ocr", "--text", " "])
+                .contains("must read something")
+        );
+        assert!(refused(&["click", "--app", "A", "--ocr", "--label", "No"]).contains("--label"));
+        assert!(
+            refused(&[
+                "click", "--app", "A", "--ocr", "--text", "No", "--x", "1", "--y", "2"
+            ])
+            .contains("--x")
+        );
+        assert!(
+            refused(&[
+                "click",
+                "--app",
+                "A",
+                "--text",
+                "No",
+                "--after-text",
+                "farm"
+            ])
+            .contains("--ocr")
+        );
+        assert!(
+            refused(&["click", "--app", "A", "--x", "1", "--y", "2", "--dx", "3"])
+                .contains("--ocr")
+        );
+        assert!(usage().contains("--ocr --text <words>"));
+    }
+
+    /// t-37883: a batch's wait right after a step that acts ends once that
+    /// act's paint has held still (`--settle`); a wait after a wait, or one
+    /// at a batch's start, is as it was written.
+    #[test]
+    fn a_batch_wait_after_an_act_ends_on_that_acts_settle() {
+        let command = batch(&json!([
+            ["wait", "--ms", "50"],
+            ["mouse-click", "--x", "10", "--y", "20"],
+            ["wait", "--ms", "4000"],
+            ["wait", "--ms", "5"],
+        ]))
+        .expect("a batch");
+        let settles = |at: usize| {
+            command.params[BATCH_COMMANDS_FLAG][at]
+                .as_array()
+                .is_some_and(|step| {
+                    step.iter()
+                        .any(|word| word == &json!(format!("--{WAIT_SETTLE_FLAG}")))
+                })
+        };
+        assert_eq!((settles(0), settles(2), settles(3)), (false, true, false));
+        let alone = parse_command(&words(&["wait", "--ms", "10", "--settle"]));
+        assert!(alone.is_ok_and(|command| command.params[WAIT_SETTLE_FLAG] == true));
+        assert!(usage().contains("wait --ms N [--settle]"));
     }
 }

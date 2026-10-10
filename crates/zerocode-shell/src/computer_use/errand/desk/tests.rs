@@ -84,6 +84,237 @@ fn pane_answer() -> String {
 }
 
 #[test]
+fn desktop_words_come_from_the_same_observation_as_its_marks() {
+    let road = Road::new(|verb| match verb {
+        "observe" => {
+            let mut answer: Value = serde_json::from_str(&desktop_answer()).unwrap();
+            answer["result"]["tree"]["text"] = json!("Current state\n\nReady");
+            ok(&answer.to_string())
+        }
+        "read" => ok(r#"{"text":"A different observation"}"#),
+        _ => refused(),
+    });
+    let mut road_fn = road.road();
+    let mut world = GoalWorld::new(
+        &mut road_fn,
+        Aim::App {
+            name: "Editor".into(),
+        },
+        Seen::default(),
+        None,
+        60_000,
+        0,
+    );
+    let screen = world.look().unwrap();
+    assert_eq!(screen.shows, ["Current state", "Ready"]);
+    assert_eq!(road.said.borrow().len(), 1);
+}
+
+#[test]
+fn background_walk_keeps_its_mode_and_stops_after_foreground_changes() {
+    for receipt in [json!(true), json!(false), Value::Null] {
+        let returned = receipt.clone();
+        let road = Road::new(move |verb| match verb {
+            "observe" => {
+                let mut answer: Value = serde_json::from_str(&desktop_answer()).unwrap();
+                answer["result"]["tree"]["text"] = "Ready".into();
+                answer["result"]["tree"]["window"] = json!({"id": 7, "width": 400, "height": 300});
+                ok(&answer.to_string())
+            }
+            "click" | "scroll" => ok(
+                &json!({"action": {"background": {"foregroundUnchanged": returned}}}).to_string(),
+            ),
+            "wait-for" => refused(),
+            _ => panic!("unexpected {verb}"),
+        });
+        let mut send = road.road();
+        let mut world = GoalWorld::new(
+            &mut send,
+            Aim::App {
+                name: "Fixture".into(),
+            },
+            Seen::default(),
+            Some("Done".into()),
+            60_000,
+            0,
+        )
+        .background(true);
+        world.look().unwrap();
+        assert_eq!(world.navigation(), &Navigation::PAGE);
+        assert!(!world.navigate(Navigation::FocusNext));
+        assert!(world.press(1));
+        if receipt == true {
+            assert!(world.navigate(Navigation::ScrollDown));
+            assert!(world.look().is_some());
+            let _ = world.reached();
+        } else {
+            assert!(world.look().is_none());
+            assert_eq!(world.reached(), None);
+            assert!(world.background_interrupted());
+            assert!(!world.press(1));
+            assert!(!world.navigate(Navigation::ScrollDown));
+            assert_eq!(road.said.borrow().len(), 2);
+        }
+        for (_, argv) in road.said.borrow().iter() {
+            let parsed = zerocode_core::computer_use::parse_command(argv).unwrap();
+            assert_eq!(parsed.params["background"], true, "{argv:?}");
+        }
+    }
+}
+
+#[test]
+fn background_field_input_keeps_its_pin_and_has_no_focus_click() {
+    let road = Road::new(|verb| match verb {
+        "observe" => ok(&desktop_form_answer().to_string()),
+        "set-value" => ok(
+            r#"{"action":{"verification":{"state":"verified"},"background":{"foregroundUnchanged":true}}}"#,
+        ),
+        _ => panic!("unexpected {verb}"),
+    });
+    let mut send = road.road();
+    let (pen, _, _) = Pen::writing("query");
+    let mut world = GoalWorld::new(
+        &mut send,
+        Aim::App {
+            name: "Fixture".into(),
+        },
+        Seen::default(),
+        None,
+        60_000,
+        0,
+    )
+    .background(true)
+    .writing(Box::new(pen))
+    .remembering(memory());
+    world.look().unwrap();
+    assert!(matches!(
+        world.type_into(1, "Search"),
+        Typed::Entered { .. }
+    ));
+    let command = zerocode_core::computer_use::parse_command(&road.argv(1)).unwrap();
+    assert_eq!(command.params["background"], true);
+    assert_eq!(command.params["look"], "field-look");
+    assert_eq!(road.said.borrow().len(), 2);
+}
+
+#[test]
+fn an_empty_observed_text_does_not_trigger_another_tree_walk() {
+    let road = Road::new(|verb| match verb {
+        "observe" => {
+            let mut answer: Value = serde_json::from_str(&desktop_answer()).unwrap();
+            answer["result"]["tree"]["text"] = json!("");
+            ok(&answer.to_string())
+        }
+        "read" => ok(r#"{"text":"A different observation"}"#),
+        _ => refused(),
+    });
+    let mut road_fn = road.road();
+    let mut world = GoalWorld::new(
+        &mut road_fn,
+        Aim::App {
+            name: "Editor".into(),
+        },
+        Seen::default(),
+        None,
+        60_000,
+        0,
+    );
+    assert!(world.look().unwrap().shows.is_empty());
+    assert_eq!(road.said.borrow().len(), 1);
+}
+
+#[test]
+fn desktop_scroll_is_bound_to_the_window_and_geometry_that_were_observed() {
+    let road = Road::new(|verb| match verb {
+        "observe" => {
+            let mut answer: Value = serde_json::from_str(&desktop_answer()).unwrap();
+            answer["result"]["tree"] = json!({
+                "text": "List",
+                "window": { "id": 7, "title": "List", "width": 800, "height": 600 },
+            });
+            ok(&answer.to_string())
+        }
+        "scroll" | "wait" => ok("{}"),
+        _ => refused(),
+    });
+    let mut road_fn = road.road();
+    let mut world = GoalWorld::new(
+        &mut road_fn,
+        Aim::App {
+            name: "Editor".into(),
+        },
+        Seen::default(),
+        None,
+        60_000,
+        0,
+    );
+    assert!(world.navigation().is_empty());
+    world.look().unwrap();
+    assert!(world.navigate(Navigation::ScrollDown));
+    let argv = road.argv(1);
+    let command = zerocode_core::computer_use::parse_command(&argv).unwrap();
+    assert_eq!(command.params["windowId"], 7);
+    assert_eq!(command.params["app"], "Editor");
+    assert_eq!(command.params["x"], 400.0);
+    assert_eq!(command.params["y"], 300.0);
+    assert_eq!(command.params["direction"], "down");
+    assert!(world.navigate(Navigation::Wait));
+    assert_eq!(
+        road.argv(2),
+        ["wait", "--ms", &WALK_WAIT_MS.to_string(), "--json"]
+    );
+}
+
+#[test]
+fn a_page_walk_scrolls_by_viewport_without_requesting_another_model_turn() {
+    let road = Road::new(|verb| match verb {
+        "marks" => ok(&pane_answer()),
+        "scroll" => ok("{}"),
+        _ => refused(),
+    });
+    let mut road_fn = road.road();
+    let mut world = GoalWorld::new(
+        &mut road_fn,
+        Aim::Pane {
+            label: "browser-5".into(),
+        },
+        Seen::default(),
+        None,
+        60_000,
+        0,
+    );
+    world.look().unwrap();
+    assert!(world.navigate(Navigation::ScrollDown));
+    assert_eq!(road.argv(1), ["scroll", "browser-5", "page-down"]);
+    assert_eq!(road.tool(1), RecipeTool::Browser);
+}
+
+#[test]
+fn no_observed_window_geometry_means_no_desktop_scroll() {
+    let road = Road::new(|verb| match verb {
+        "observe" => ok(&desktop_answer()),
+        "read" => ok(r#"{"text":"Ready"}"#),
+        _ => refused(),
+    });
+    let mut road_fn = road.road();
+    let mut world = GoalWorld::new(
+        &mut road_fn,
+        Aim::App {
+            name: "Editor".into(),
+        },
+        Seen::default(),
+        None,
+        60_000,
+        0,
+    );
+    world.look().unwrap();
+    assert_eq!(world.navigation(), [Navigation::Wait]);
+    let before = road.said.borrow().len();
+    assert!(!world.navigate(Navigation::ScrollUp));
+    assert_eq!(road.said.borrow().len(), before);
+}
+
+#[test]
 fn a_desktop_walk_looks_presses_and_checks_through_the_apps_own_door() {
     let road = Road::new(|verb| match verb {
         "observe" => ok(&desktop_answer()),
@@ -655,6 +886,314 @@ fn a_page_with_a_field(epoch: &str, now: &str, selector: &str) -> String {
 /// One call a road was handed: the tool, the argv it ran, the argv it logged.
 type Call = (RecipeTool, Vec<String>, Vec<String>);
 
+fn desktop_form_answer() -> Value {
+    json!({
+        "tree": {"text": "Search", "window": {"id": 7, "title": "Editor", "width": 800, "height": 600}},
+        "marks": {
+            "lookId": "field-look", "app": "Editor", "documentEpoch": "[42,7]",
+            "items": [{"mark": 1, "role": "text field", "label": "Search", "centerX": 40, "centerY": 80}],
+            "fields": [{"mark": 1, "kind": "text", "secret": false, "label": "Search",
+                "value": "", "placeholder": "Words", "near": "Document", "identity": [3, "field", "Document"]}]
+        }
+    })
+}
+
+#[test]
+fn a_desktop_field_is_not_entered_twice_when_its_mark_number_changes() {
+    let mut answer = desktop_form_answer();
+    let aim = Aim::App {
+        name: "Editor".into(),
+    };
+    let (seen, _) = screen_of(&aim, &answer).unwrap();
+    let identity = super::super::field_identity_of(&seen, 1).unwrap();
+    answer["marks"]["items"][0]["mark"] = json!(5);
+    answer["marks"]["fields"][0]["mark"] = json!(5);
+    answer["marks"]["fields"][0]["value"] = json!("entered");
+    let (after, _) = screen_of(&aim, &answer).unwrap();
+    assert!(after.fields_left(&[identity]).is_empty());
+}
+
+#[test]
+fn desktop_typing_is_one_pinned_verified_write_without_global_keys() {
+    let calls = RefCell::new(Vec::<Call>::new());
+    let mut send = |tool, argv: &[String], logged: &[String]| {
+        calls
+            .borrow_mut()
+            .push((tool, argv.to_vec(), logged.to_vec()));
+        match argv[0].as_str() {
+            "observe" => ok(&desktop_form_answer().to_string()),
+            "set-value" => ok(r#"{"action":{"verification":{"state":"verified"}}}"#),
+            _ => refused(),
+        }
+    };
+    let (pen, writes, _) = Pen::writing("a new query");
+    let mut world = GoalWorld::new(
+        &mut send,
+        Aim::App {
+            name: "Editor".into(),
+        },
+        Seen::default(),
+        None,
+        60_000,
+        0,
+    )
+    .writing(Box::new(pen))
+    .remembering(memory());
+    world.look().unwrap();
+    assert!(world.types());
+    assert!(matches!(
+        world.type_into(1, "Search for a new query"),
+        Typed::Entered { chars: 11, .. }
+    ));
+    assert_eq!(writes.get(), 1);
+    let calls = calls.borrow();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].0, RecipeTool::Computer);
+    let command = zerocode_core::computer_use::parse_command(&calls[1].1).unwrap();
+    assert_eq!(command.params["mark"], 1);
+    assert_eq!(command.params["look"], "field-look");
+    assert!(!command.params.as_object().unwrap().contains_key("app"));
+    assert!(!calls[1].2.join(" ").contains("a new query"));
+}
+
+#[test]
+fn desktop_typing_never_reports_unverified_input_as_typed_or_retries_it() {
+    for state in [json!("unverified"), Value::Null] {
+        let writes = std::cell::Cell::new(0);
+        let mut send = |_, argv: &[String], _: &[String]| {
+            if argv[0] == "observe" {
+                return ok(&desktop_form_answer().to_string());
+            }
+            writes.set(writes.get() + 1);
+            ok(&json!({"action": {"verification": {"state": state}}}).to_string())
+        };
+        let (pen, _, _) = Pen::writing("query");
+        let mut world = GoalWorld::new(
+            &mut send,
+            Aim::App {
+                name: "Editor".into(),
+            },
+            Seen::default(),
+            None,
+            60_000,
+            0,
+        )
+        .writing(Box::new(pen))
+        .remembering(memory());
+        world.look().unwrap();
+        assert!(matches!(
+            world.type_into(1, "Search"),
+            Typed::Unverified { .. }
+        ));
+        assert_eq!(writes.get(), 1);
+    }
+}
+
+#[test]
+fn desktop_unclassified_or_secret_fields_never_reach_the_value_writer() {
+    for secret in [Value::Null, json!(true)] {
+        let mut answer = desktop_form_answer();
+        answer["marks"]["fields"][0]["secret"] = secret;
+        let road = Road::new(move |_| ok(&answer.to_string()));
+        let mut send = road.road();
+        let (pen, writes, _) = Pen::writing("never sent");
+        let mut world = GoalWorld::new(
+            &mut send,
+            Aim::App {
+                name: "Editor".into(),
+            },
+            Seen::default(),
+            None,
+            60_000,
+            0,
+        )
+        .writing(Box::new(pen))
+        .remembering(memory());
+        world.look().unwrap();
+        assert!(matches!(world.type_into(1, "Search"), Typed::Refused(_)));
+        assert_eq!(writes.get(), 0);
+        assert_eq!(road.said.borrow().len(), 1);
+    }
+}
+
+#[test]
+fn a_desktop_write_with_unverified_readback_counts_once_and_stops_the_walk() {
+    let road = Road::new(|verb| match verb {
+        "observe" => ok(&desktop_form_answer().to_string()),
+        "set-value" => ok(r#"{"action":{"verification":{"state":"unverified"}}}"#),
+        _ => refused(),
+    });
+    let mut send = road.road();
+    let (pen, writes, _) = Pen::writing("query");
+    let mut world = GoalWorld::new(
+        &mut send,
+        Aim::App {
+            name: "Editor".into(),
+        },
+        Seen::default(),
+        None,
+        60_000,
+        0,
+    )
+    .writing(Box::new(pen))
+    .remembering(memory());
+    let mut judge = FakeJudge::saying(vec![entry(1), entry(1)]);
+    let walked = run(Mode::On, true, &goal(4), &mut judge, &mut world);
+    assert_eq!(walked.pressed, 1);
+    assert_eq!(walked.typed, 1);
+    assert_eq!(walked.rows.len(), 1);
+    assert_eq!(walked.rows[0]["reason"], "type_unverified");
+    assert_eq!(writes.get(), 1);
+    assert_eq!(road.said.borrow().len(), 2);
+}
+
+#[test]
+fn desktop_shortcuts_keep_the_observed_window_and_never_accept_model_key_strings() {
+    let road = Road::new(|verb| {
+        if verb == "observe" {
+            ok(&desktop_form_answer().to_string())
+        } else {
+            ok("{}")
+        }
+    });
+    let mut send = road.road();
+    let mut world = GoalWorld::new(
+        &mut send,
+        Aim::App {
+            name: "Editor".into(),
+        },
+        Seen::default(),
+        None,
+        60_000,
+        0,
+    );
+    world.look().unwrap();
+    for action in [
+        Navigation::FocusNext,
+        Navigation::FocusPrevious,
+        Navigation::Escape,
+        Navigation::Find,
+        Navigation::SelectAll,
+    ] {
+        assert!(world.navigate(action));
+    }
+    for (_, argv) in road.said.borrow().iter().skip(1) {
+        let command = zerocode_core::computer_use::parse_command(argv).unwrap();
+        assert_eq!(command.params["app"], "Editor");
+        assert_eq!(command.params["windowId"], 7);
+        assert!(matches!(
+            command.method,
+            zerocode_core::computer_use::ComputerMethod::PressKey
+                | zerocode_core::computer_use::ComputerMethod::Hotkey
+        ));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_pixel_inspection_adds_ocr_to_the_next_look_and_to_independent_success_checks() {
+    let road = Road::new(|verb| {
+        if verb == "observe" {
+            ok(&desktop_form_answer().to_string())
+        } else {
+            ok("{}")
+        }
+    });
+    let mut send = road.road();
+    let mut world = GoalWorld::new(
+        &mut send,
+        Aim::App {
+            name: "Editor".into(),
+        },
+        Seen::default(),
+        Some("Finished".into()),
+        60_000,
+        0,
+    );
+    world.look().unwrap();
+    assert!(world.navigate(Navigation::ReadPixels));
+    assert_eq!(road.said.borrow().len(), 1);
+    assert!(!world.navigation().contains(&Navigation::ReadPixels));
+    world.look().unwrap();
+    assert!(road.argv(1).iter().any(|word| word == "--ocr"));
+    assert_eq!(world.until_before(Some(false)), Some(true));
+    assert!(road.argv(2).iter().any(|word| word == "--ocr"));
+    world.reached();
+    assert!(road.argv(3).iter().any(|word| word == "--ocr"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn switching_readers_does_not_count_an_existing_pixel_result_as_a_new_success() {
+    let mut send = |_, argv: &[String], _: &[String]| {
+        if argv[0] == "observe" {
+            ok(&desktop_form_answer().to_string())
+        } else if argv.iter().any(|word| word == "--ocr") {
+            ok("{}")
+        } else {
+            refused()
+        }
+    };
+    let mut world = GoalWorld::new(
+        &mut send,
+        Aim::App {
+            name: "Editor".into(),
+        },
+        Seen::default(),
+        Some("Finished".into()),
+        60_000,
+        0,
+    );
+    world.look().unwrap();
+    let mut walked = super::super::Walked::default();
+    let mut earlier = json!({});
+    assert!(!super::super::check_goal(
+        &mut world,
+        &mut walked,
+        &mut earlier
+    ));
+    walked.rows.push(earlier);
+    assert!(world.navigate(Navigation::ReadPixels));
+    world.look().unwrap();
+    let mut current = json!({});
+    assert!(super::super::check_goal(
+        &mut world,
+        &mut walked,
+        &mut current
+    ));
+    assert_eq!(world.until_before(Some(false)), Some(true));
+    assert!(walked.rows[0].get("recheck").is_none());
+    assert_eq!(walked.rows[0]["priorOracleCheck"]["recheck"], false);
+    assert_eq!(current["checkSource"], "ocr");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unreadable_pixel_oracle_is_unknown_not_proof_that_the_goal_was_absent() {
+    let mut send = |_, argv: &[String], _: &[String]| {
+        if argv[0] == "observe" {
+            ok(&desktop_form_answer().to_string())
+        } else {
+            refused()
+        }
+    };
+    let mut world = GoalWorld::new(
+        &mut send,
+        Aim::App {
+            name: "Editor".into(),
+        },
+        Seen::default(),
+        Some("Finished".into()),
+        60_000,
+        0,
+    );
+    world.look().unwrap();
+    assert!(world.navigate(Navigation::ReadPixels));
+    world.look().unwrap();
+    assert_eq!(world.until_before(Some(false)), None);
+    assert_eq!(world.reached(), None);
+}
+
 /// A road that keeps what it was handed to run AND what it was handed to
 /// log, and answers from what the test's page says now.
 struct Kept {
@@ -802,7 +1341,7 @@ fn identical_value_input_reuses_but_changed_document_or_value_does_not() {
     assert!(
         matches!(
             &first,
-            Typed::Typed {
+            Typed::Entered {
                 source: ValueSource::Written { .. },
                 chars: 6
             }
@@ -818,7 +1357,7 @@ fn identical_value_input_reuses_but_changed_document_or_value_does_not() {
     );
     assert_eq!(
         retried,
-        Typed::Typed {
+        Typed::Entered {
             source: ValueSource::Reused,
             chars: 6
         }
@@ -853,7 +1392,7 @@ fn identical_value_input_reuses_but_changed_document_or_value_does_not() {
         assert!(
             matches!(
                 typed,
-                Typed::Typed {
+                Typed::Entered {
                     source: ValueSource::Written { .. },
                     ..
                 }
@@ -872,7 +1411,7 @@ fn identical_value_input_reuses_but_changed_document_or_value_does_not() {
         );
         assert!(matches!(
             typed,
-            Typed::Typed {
+            Typed::Entered {
                 source: ValueSource::Written { .. },
                 ..
             }
@@ -901,7 +1440,7 @@ fn identical_value_input_reuses_but_changed_document_or_value_does_not() {
     replay.look().expect("a look");
     assert_eq!(
         replay.type_into(1, goal),
-        Typed::Typed {
+        Typed::Entered {
             source: ValueSource::Reused,
             chars: 6
         }
@@ -1656,7 +2195,7 @@ fn an_entrys_own_press_settles_before_the_typing_even_when_the_walk_asks_ahead()
     world.look().expect("a look with a field");
     assert!(matches!(
         world.type_into(1, "Search for London"),
-        Typed::Typed { .. }
+        Typed::Entered { .. }
     ));
     assert!(world.settle().is_none(), "no settle was left for later");
     drop(world);

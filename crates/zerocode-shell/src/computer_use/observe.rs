@@ -154,10 +154,37 @@ fn frame_key(params: &Map<String, Value>) -> String {
         let region = text("region").unwrap_or_else(|| "full".to_string());
         format!("desktop:{display}/region:{region}")
     };
-    match text("viewer") {
+    viewers(params, place)
+}
+
+/// A place as one viewer keeps it: each model's looks are its own.
+fn viewers(params: &Map<String, Value>, place: String) -> String {
+    match params.get("viewer").and_then(Value::as_str) {
         Some(viewer) => format!("viewer:{viewer}/{place}"),
         None => place,
     }
+}
+
+/// An app look's place by what the helper resolved — the app's bundle id
+/// (its pid when it has none) and the window's id — so one window looked at
+/// under its English name, its own-language name or its bundle id keeps one
+/// last frame (t-37883: a mirrored phone's session named one window three
+/// ways). `None` when the helper's answer names neither.
+fn resolved_key(params: &Map<String, Value>, frame: &Value) -> Option<String> {
+    let app = frame.pointer("/snapshot/app")?;
+    let who = app
+        .get("bundleId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            app.get("pid")
+                .and_then(Value::as_i64)
+                .map(|pid| format!("pid:{pid}"))
+        })?;
+    let window = frame
+        .pointer("/snapshot/window/id")
+        .and_then(Value::as_i64)?;
+    Some(viewers(params, format!("app:{who}/window:id:{window}")))
 }
 
 fn take_last(key: &str) -> Option<LastFrame> {
@@ -445,6 +472,69 @@ fn after_the_act(seen: &Value, standing: &Changes) -> bool {
             .is_some_and(|seq| seq > act.seq)
 }
 
+fn tree_answer(frame: &Value) -> Value {
+    frame.get("snapshot").map_or(Value::Null, |snapshot| {
+        serde_json::json!({
+            "id": snapshot.get("id"),
+            "window": snapshot.get("window"),
+            "text": snapshot.get("treeText"),
+            "elementCount": snapshot.get("elementCount"),
+        })
+    })
+}
+
+fn structured_look(
+    params: &Map<String, Value>,
+    mut ask: Map<String, Value>,
+    call: &mut dyn FnMut(&str, Value) -> Result<Value, ComputerUseError>,
+) -> Result<Option<Value>, ComputerUseError> {
+    let began = std::time::Instant::now();
+    ask.insert("noScreenshot".into(), true.into());
+    if params.get("marks") == Some(&Value::Bool(true)) {
+        ask.insert(ELEMENT_FRAMES_KEY.into(), true.into());
+    }
+    let frame = call("getAppState", Value::Object(ask))?;
+    let key = resolved_key(params, &frame).unwrap_or_else(|| frame_key(params));
+    let marked = if params.get("marks") == Some(&Value::Bool(true)) {
+        let Some(marked) = super::marks::structured_marks(&frame, &key)? else {
+            return Ok(None);
+        };
+        Some(marked.answer)
+    } else {
+        if frame.get("snapshot").is_none() {
+            return Err(ComputerUseError::new(
+                error_code::PROVIDER_INCOMPATIBLE,
+                "an app look without its snapshot",
+            ));
+        }
+        None
+    };
+    take_last(&key);
+    note_line(&serde_json::json!({
+        "n": LOOKS.fetch_add(1, Ordering::Relaxed) + 1,
+        "atEpochMs": crate::now_epoch_ms(),
+        "ms": u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "road": "app-structured",
+        "diff": false,
+        "imageBytes": 0,
+    }));
+    Ok(Some(serde_json::json!({
+        "app": frame.pointer("/snapshot/app"),
+        "screenshot": null,
+        "origin": {
+            "x": frame.pointer("/snapshot/window/x"),
+            "y": frame.pointer("/snapshot/window/y"),
+        },
+        "scale": 1.0,
+        "tree": tree_answer(&frame),
+        "text": null,
+        "changed": null,
+        "changedShare": null,
+        "marks": marked,
+        "perception": "accessibility",
+    })))
+}
+
 /// One look: the app's window through its tree, or the desktop — the eye's
 /// newest frame when the eye is open, a capture otherwise: always for a
 /// region, which is looked at closer than the eye sees, for a marked look,
@@ -465,10 +555,26 @@ fn look(
     let diffing = params.get("diff").and_then(Value::as_bool) == Some(true);
     let key = frame_key(params);
     let mut ask = Map::new();
-    for key in ["app", "windowId", "windowIndex", "display", "region"] {
+    for key in [
+        "app",
+        "windowId",
+        "windowIndex",
+        "display",
+        "region",
+        "background",
+    ] {
         if let Some(value) = params.get(key) {
             ask.insert(key.to_string(), value.clone());
         }
+    }
+    if app
+        && params.get("noScreenshot") == Some(&Value::Bool(true))
+        && !diffing
+        && params.get("ocr") != Some(&Value::Bool(true))
+        && params.get("settle") != Some(&Value::Bool(true))
+        && let Some(answer) = structured_look(params, ask.clone(), call)?
+    {
+        return Ok(answer);
     }
     let display = ask.get("display").and_then(Value::as_u64);
     let whole_display = !app && !ask.contains_key("region") && !marks;
@@ -539,10 +645,26 @@ fn look(
     let text = if params.get("ocr").and_then(Value::as_bool) == Some(true) {
         let mut read = ask.clone();
         read.insert("ocr".into(), Value::Bool(true));
+        if app {
+            read.insert(
+                "capturedFrame".into(),
+                serde_json::json!({
+                    "screenshot": frame.get("screenshot"),
+                    "window": frame.pointer("/snapshot/window"),
+                }),
+            );
+        }
         let read = super::eye::reading_with(memory, &Value::Object(read), call);
         Some(call("readText", read)?)
     } else {
         None
+    };
+    // An app's window is kept under who the helper says it is, whatever
+    // name it was asked by.
+    let key = if app {
+        resolved_key(params, &frame).unwrap_or(key)
+    } else {
+        key
     };
     // Taken out once the picture and its text are had: a look the helper
     // refused leaves the place's last look where it was.
@@ -622,16 +744,16 @@ fn look(
         "screenshot": frame.get("screenshot").cloned().unwrap_or(Value::Null),
         "origin": { "x": placed.origin().0, "y": placed.origin().1 },
         "scale": placed.scale(),
-        "tree": frame.get("snapshot").map(|snapshot| serde_json::json!({
-            "id": snapshot.get("id").cloned().unwrap_or(Value::Null),
-            "window": snapshot.get("window").cloned().unwrap_or(Value::Null),
-            "text": snapshot.get("treeText").cloned().unwrap_or(Value::Null),
-            "elementCount": snapshot.get("elementCount").cloned().unwrap_or(Value::Null),
-        })).unwrap_or(Value::Null),
+        "tree": tree_answer(&frame),
         "text": text.as_ref().and_then(|read| read.get("lines").cloned()).unwrap_or(Value::Null),
         "changed": changed,
         "changedShare": share,
     });
+    // Who an app look saw, as the helper resolved it — one name to keep
+    // asking by.
+    if let Some(resolved) = frame.pointer("/snapshot/app").filter(|_| app) {
+        answer["app"] = resolved.clone();
+    }
     if let Some(share) = share {
         let stuck = super::state::note_look(
             share > 0.0,
@@ -667,6 +789,7 @@ fn look(
                     fingerprint,
                     placed,
                     place: &key,
+                    text: text.as_ref(),
                 };
                 let marked = super::marks::mark_look(params, &frame, &picture, before, call);
                 if let Some(png) = &marked.png {
@@ -678,6 +801,9 @@ fn look(
                 serde_json::json!({ "unavailable": "screenshot_failed: the frame could not be read" })
             }
         };
+    }
+    if params.get("noScreenshot") == Some(&Value::Bool(true)) {
+        answer["screenshot"] = Value::Null;
     }
     Ok(answer)
 }
@@ -700,6 +826,9 @@ fn note_line(line: &Value) {
         LOOK_LINES.with(|lines| lines.borrow_mut().push(line));
     }
 }
+
+#[cfg(test)]
+mod structured_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1293,6 +1422,52 @@ mod tests {
             answer.get("stuck").is_none(),
             "an unknown look is not counted as one that saw nothing change"
         );
+    }
+
+    /// t-37883: one window asked for by its English name, its own-language
+    /// name and its bundle id is one place — the next look compares with the
+    /// first — and the look says who it saw.
+    #[test]
+    fn an_apps_window_named_three_ways_keeps_one_last_frame() {
+        let picture = png(8, 8, |_, _| [9, 9, 9, 255]);
+        let mut call = |method: &str, _: Value| -> Result<Value, ComputerUseError> {
+            match method {
+                "getAppState" => {
+                    let mut frame = answered(&picture, (8, 8), (742.0, 61.0), 1.0);
+                    frame["snapshot"] = serde_json::json!({
+                        "app": { "name": "iPhone Mirroring", "bundleId": "com.apple.ScreenContinuity", "pid": 4243 },
+                        "window": { "id": 77, "title": "iPhone Mirroring" },
+                        "treeText": "",
+                        "elementCount": 1,
+                    });
+                    Ok(frame)
+                }
+                other => Err(ComputerUseError::new(
+                    error_code::UNSUPPORTED_CAPABILITY,
+                    format!("not asked here: {other}"),
+                )),
+            }
+        };
+        let memory = super::super::eye::Memory::new();
+        let look = |name: &str| {
+            let mut params = diff_look("t-37883-names");
+            params.insert("app".into(), name.into());
+            params
+        };
+        let first =
+            observe_with(&look("iPhone Mirroring"), &memory, &mut call, &mut |_| {}).unwrap();
+        assert_eq!(
+            first["app"]["bundleId"], "com.apple.ScreenContinuity",
+            "the look says who it saw"
+        );
+        for name in ["iPhone 미러링", "com.apple.ScreenContinuity"] {
+            let again = observe_with(&look(name), &memory, &mut call, &mut |_| {}).unwrap();
+            assert_eq!(
+                again["changed"],
+                serde_json::json!([]),
+                "{name}: the same window, and nothing changed"
+            );
+        }
     }
 
     /// The measurement: every look leaves one line of numbers — how many

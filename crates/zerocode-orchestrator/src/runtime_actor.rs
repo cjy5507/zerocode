@@ -34,6 +34,9 @@ use zerocode_core::orchestration::{
 
 use crate::ledger_store;
 
+/// How many checkouts one landing look may carry: every worker's checkout of a busy day, with room.
+const MAX_LANDING_WITNESSES: usize = 1024;
+
 /// At most this many commands may wait for the owner thread. Replies use
 /// rendezvous channels and cannot accumulate elsewhere.
 pub const MAX_RUNTIME_MAILBOX: usize = 4;
@@ -387,6 +390,13 @@ pub enum RuntimeRequest {
         walled: Vec<zerocode_core::orchestration::QuotaWallWitness>,
         now_ms: i64,
     },
+    /// What the window saw of git for the checkouts the ledger's workers sit in (t-34501, t-22105).
+    /// The ledger holds its own record against them and writes the late-landing notices and the
+    /// worker wake-ups; a pass that finds nothing writes nothing.
+    LandingWatch {
+        witnesses: Vec<zerocode_core::orchestration::landing_watch::LandingWitness>,
+        now_ms: i64,
+    },
     /// Walls the wait rung held that lifted while their workers stayed
     /// stopped at them (t-6427) — both witnesses already in hand
     /// (`read_lift` builds nothing with one). The ledger revalidates and
@@ -483,8 +493,11 @@ pub enum RuntimeRequest {
     /// A fact the window observed about a checkout — CI moved on the review
     /// a worktree is on — for the ledger to mail to whoever sits there. The
     /// eighth host fact: `to` is a ledger address the window composed, never
-    /// argv a person typed, and the body is the window's own sentence.
+    /// argv a person typed, and the body is the window's own sentence. `run`
+    /// names the one run the letter is filed in; `None` files it in every run
+    /// where `to` resolves (t-35823).
     Observation {
+        run: Option<String>,
         to: String,
         body: String,
         receipt: Option<String>,
@@ -780,6 +793,12 @@ impl std::fmt::Debug for RuntimeRequest {
                 .field("workers", &walled.len())
                 .field("now_ms", now_ms)
                 .finish(),
+            // A count: a witness names a checkout and a head, which are the person's.
+            Self::LandingWatch { witnesses, now_ms } => formatter
+                .debug_struct("RuntimeRequest::LandingWatch")
+                .field("witnesses", &witnesses.len())
+                .field("now_ms", now_ms)
+                .finish(),
             // A count, for the same reason: a lift carries the agent's words.
             Self::QuotaLifts { lifted, now_ms } => formatter
                 .debug_struct("RuntimeRequest::QuotaLifts")
@@ -888,9 +907,14 @@ impl std::fmt::Debug for RuntimeRequest {
                 .field("now_ms", now_ms)
                 .finish(),
             Self::Observation {
-                to, body, now_ms, ..
+                run,
+                to,
+                body,
+                now_ms,
+                ..
             } => formatter
                 .debug_struct("RuntimeRequest::Observation")
+                .field("run", run)
                 .field("to", to)
                 .field("body_bytes", &body.len())
                 .field("now_ms", now_ms)
@@ -1899,6 +1923,20 @@ impl RuntimeActor {
         }
     }
 
+    /// The beat's look at late landings and runaway branches (t-34501). Answers whether a notice
+    /// was written, and the revision that answer speaks for; the same state on the next look is the
+    /// same fact and moves nothing.
+    pub fn landing_watch(
+        &self,
+        witnesses: Vec<zerocode_core::orchestration::landing_watch::LandingWitness>,
+        now_ms: i64,
+    ) -> Result<(bool, u64), RuntimeError> {
+        match self.request(RuntimeRequest::LandingWatch { witnesses, now_ms })? {
+            RuntimeReply::Settled { moved, revision } => Ok((moved, revision)),
+            _ => Err(RuntimeError::AuthorityRejected),
+        }
+    }
+
     /// The beat's lifted walls (t-6427). Answers whether a notice was
     /// written, and the revision that answer speaks for; a wall already told
     /// moves nothing.
@@ -2118,17 +2156,21 @@ impl RuntimeActor {
         body: String,
         now_ms: i64,
     ) -> Result<(bool, u64), RuntimeError> {
-        self.observation_once(to, body, None, now_ms)
+        self.observation_once(None, to, body, None, now_ms)
     }
 
+    /// `run` is the one run the letter is filed in, or `None` for every run
+    /// where `to` resolves (t-35823).
     pub fn observation_once(
         &self,
+        run: Option<String>,
         to: String,
         body: String,
         receipt: Option<String>,
         now_ms: i64,
     ) -> Result<(bool, u64), RuntimeError> {
         match self.request(RuntimeRequest::Observation {
+            run,
             to,
             body,
             receipt,
@@ -3200,6 +3242,9 @@ impl RuntimeState {
             RuntimeRequest::QuietSweep { stalled, now_ms } => self.quiet_swept(&stalled, now_ms),
             RuntimeRequest::IdleSweep { idle, now_ms } => self.idle_swept(&idle, now_ms),
             RuntimeRequest::QuotaWalls { walled, now_ms } => self.quota_walled(&walled, now_ms),
+            RuntimeRequest::LandingWatch { witnesses, now_ms } => {
+                self.landing_watched(&witnesses, now_ms)
+            }
             RuntimeRequest::QuotaLifts { lifted, now_ms } => self.quota_lifted(&lifted, now_ms),
             RuntimeRequest::ClassifierDeclines { declined, now_ms } => {
                 self.classifier_declined(&declined, now_ms)
@@ -3245,11 +3290,12 @@ impl RuntimeState {
                 now_ms,
             } => self.checkout_examined(&worker, &examined, now_ms),
             RuntimeRequest::Observation {
+                run,
                 to,
                 body,
                 receipt,
                 now_ms,
-            } => self.observed(&to, &body, receipt.as_deref(), now_ms),
+            } => self.observed(run.as_deref(), &to, &body, receipt.as_deref(), now_ms),
             RuntimeRequest::RetentionSweep { now_ms } => self.retention_swept(now_ms),
             RuntimeRequest::PaneTakenOver { term, now_ms } => self.pane_taken(term, now_ms),
             RuntimeRequest::PaneAttention {
@@ -4614,6 +4660,37 @@ impl RuntimeState {
         })
     }
 
+    /// Hold the ledger's record against the window's git facts, and write what is late.
+    fn landing_watched(
+        &mut self,
+        witnesses: &[zerocode_core::orchestration::landing_watch::LandingWitness],
+        now_ms: i64,
+    ) -> Result<RuntimeReply, RuntimeError> {
+        if now_ms < 0
+            || witnesses.len() > MAX_LANDING_WITNESSES
+            || witnesses
+                .iter()
+                .any(|one| one.checkout.is_empty() || one.checkout.len() > MAX_PROSE)
+        {
+            return Err(RuntimeError::InvalidInput);
+        }
+        if !self.recovery_permits.is_empty() {
+            return Err(RuntimeError::RecoveryRequired);
+        }
+        let told = self.ledger.landing_watch(witnesses, now_ms);
+        if told == 0 {
+            return Ok(RuntimeReply::Settled {
+                moved: false,
+                revision: self.revision,
+            });
+        }
+        let revision = self.write_through(now_ms)?;
+        Ok(RuntimeReply::Settled {
+            moved: true,
+            revision,
+        })
+    }
+
     fn quota_lifted(
         &mut self,
         lifted: &[zerocode_core::orchestration::QuotaLift],
@@ -4964,12 +5041,14 @@ impl RuntimeState {
 
     fn observed(
         &mut self,
+        run: Option<&str>,
         to: &str,
         body: &str,
         receipt: Option<&str>,
         now_ms: i64,
     ) -> Result<RuntimeReply, RuntimeError> {
         if now_ms < 0
+            || run.is_some_and(|value| value.is_empty() || value.len() > MAX_NAME)
             || to.is_empty()
             || to.len() > MAX_PROSE
             || body.is_empty()
@@ -4981,7 +5060,9 @@ impl RuntimeState {
         if !self.recovery_permits.is_empty() {
             return Err(RuntimeError::RecoveryRequired);
         }
-        let filed = self.ledger.post_observation_once(to, body, receipt, now_ms);
+        let filed = self
+            .ledger
+            .post_observation_once(run, to, body, receipt, now_ms);
         if filed == 0 {
             return Ok(RuntimeReply::Settled {
                 moved: false,
@@ -10692,6 +10773,7 @@ mod tests {
         connection.execute_batch("CREATE TRIGGER fail_scm AFTER UPDATE OF revision ON orchestration_ledger_heads BEGIN SELECT RAISE(ABORT, 'scm write failure'); END;").unwrap();
         let send = |actor: &RuntimeActor, now| {
             actor.observation_once(
+                None,
                 "@worktree:/wt/scm".into(),
                 "ci failed".into(),
                 Some("scm:receipt".into()),
@@ -10730,5 +10812,70 @@ mod tests {
             1
         );
         again.shutdown().unwrap();
+    }
+
+    /// t-35823: a letter named to one run is filed there and nowhere else,
+    /// and an empty run name is refused before anything is written.
+    #[test]
+    fn a_letter_named_to_one_run_is_filed_there_and_an_empty_name_is_refused() {
+        let fixture = Fixture::new();
+        let actor = start_with(
+            &fixture,
+            cutover(None, 10),
+            TableFixture::holding(a_team()),
+            Box::new(NoLauncher),
+        );
+        let mut runs = Vec::new();
+        for (name, at) in [("first", 20), ("second", 21)] {
+            let retry = format!("r-{name}");
+            let (opened, _) = actor
+                .plan(a_command(
+                    &[
+                        "run-create",
+                        "--name",
+                        name,
+                        "--retry-request",
+                        retry.as_str(),
+                    ],
+                    at,
+                ))
+                .expect("a run");
+            let answer: serde_json::Value =
+                serde_json::from_str(&opened.reply.stdout).expect("the run's answer is JSON");
+            runs.push(answer["runId"].as_str().expect("a run id").to_string());
+        }
+        let (filed, _) = actor
+            .observation_once(
+                Some(runs[1].clone()),
+                "pane:%9".into(),
+                "was NOT pointed".into(),
+                Some("pointer-held:m-scope".into()),
+                30,
+            )
+            .expect("the letter is filed");
+        assert!(filed);
+        let homes: Vec<String> = actor
+            .view()
+            .expect("the rows")
+            .projection()
+            .messages
+            .iter()
+            .filter(|row| row.subject.as_str() == "pointer-held:m-scope")
+            .map(|row| row.run.clone())
+            .collect();
+        assert_eq!(homes, vec![runs[1].clone()], "the letter left its run");
+        assert_eq!(
+            actor
+                .observation_once(
+                    Some(String::new()),
+                    "pane:%9".into(),
+                    "was NOT pointed".into(),
+                    Some("pointer-held:m-scope".into()),
+                    31,
+                )
+                .unwrap_err(),
+            RuntimeError::InvalidInput
+        );
+        actor.shutdown().expect("join the actor");
     }
 }

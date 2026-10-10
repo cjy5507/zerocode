@@ -352,10 +352,11 @@ const RUST_DEFAULT_DOCUMENT_JSON = String.raw`{
   "claude_autoswitch_mode": "ask",
   "harness": {
     "gate": { "mode": "notify", "task_usd": null, "day_usd": null },
-    "launches": { "concurrent": 4, "per_hour": 300, "per_day": 2000 }
+    "launches": { "concurrent": 4, "per_hour": 300, "per_day": 2000 },
+    "alerts": { "landing": true }
   },
   "worktree_prefs": { "branch_prefix": "git-username" },
-  "notifications": { "enabled": true, "agent_attention": true, "agent_completion": true },
+  "notifications": { "enabled": true, "agent_attention": true, "agent_completion": "long" },
   "computer_awake_mode": "off",
   "computer_confirm_payment": true,
   "computer_confirm_transfer": true,
@@ -760,7 +761,7 @@ function scmTreeRows(area, paths, folded) {
 const SETTINGS_MUTATION_COMMANDS = new Set([
   "set_crash_watchdog", "set_theme", "set_locale", "set_ui_zoom", "set_app_font_family", "set_show_titlebar_app_name", "set_show_menu_bar_icon", "set_minimize_to_tray_on_close", "set_compact_worktree_cards", "set_show_git_ignored_files", "set_source_control_group_order", "set_source_control_compare_base", "set_refresh_local_base_ref_on_worktree_create", "patch_left_sidebar_appearance", "set_status_bar_item", "set_usage_percentage_display", "set_status_bar_usage_mode", "set_usage_analytics_enabled", "set_source_control_view_mode", "set_terminal_command", "set_setup_script_launch_mode", "set_terminal_shortcut_policy", "set_terminal_prefs",
   "patch_terminal_prefs", "patch_editing_prefs", "patch_update_prefs", "apply_ghostty_import", "set_panel_width",
-  "set_notification_preference", "set_browser_home_page", "set_browser_search_engine",
+  "set_notification_preference", "set_finish_notification_mode", "set_browser_home_page", "set_browser_search_engine",
   "patch_browser_link_routing", "patch_browser_user_agents", "set_browser_restore_tabs", "set_browser_default_zoom", "set_browser_open_tabs",
   "set_terminal_opacity",
   "set_window_blur", "set_agent_teams_mode", "set_claude_autoswitch_mode", "set_harness_settings", "set_default_agent",
@@ -1551,6 +1552,13 @@ class StatefulBackend {
         };
         keys = ["notifications"];
         break;
+      case "set_finish_notification_mode":
+        this.settings.notifications = {
+          ...this.settings.notifications,
+          agent_completion: args.mode,
+        };
+        keys = ["notifications"];
+        break;
       case "set_browser_home_page":
         this.settings.browser = { ...this.settings.browser, home_page: args.homePage };
         keys = ["browser"];
@@ -1649,6 +1657,8 @@ class StatefulBackend {
             day_usd: budget(asked.gate?.day_usd),
           },
           launches,
+          // The Rust contract: only a plain `false` turns the ledger's alerts off.
+          alerts: { landing: asked.alerts?.landing !== false },
         };
         keys = ["harness"];
         break;
@@ -2107,6 +2117,9 @@ class StatefulBackend {
       // 없는 창에 답하는 그대로(`zerocode_core::board::snapshot`).
       case "board_snapshot": return { columns: [], attention_count: 0, total_count: 0 };
       case "pane_subagents": return [];
+      // 나를 기다림 — 기다리는 판이 없는 창이 실제 백엔드에서 받는 답(t-26595).
+      case "waiting_on_me": return [];
+      case "clear_finish_mark": return false;
       case "pane_activities": return [];
       case "process_memory": return 0;
       case "listening_ports": return { rows: [], unavailable: false };
@@ -5280,6 +5293,9 @@ await test("라우터 저장 중 이름이나 모델을 바꾸면 옛 저장 응
   for (const change of ["name", "model"]) {
     const held = backend.holdBeforeNext("save_api_router");
     const saving = pageA.evaluate(() => saveApiRouterEntry());
+    // Awaited below. A failed wait before that must not leave this rejection
+    // unhandled: Node would end the whole suite before its summary.
+    saving.catch(() => {});
     await held.reached;
     try {
       if (change === "name") await pageA.fill("#router-name-input", "unsaved-draft");
@@ -8529,6 +8545,8 @@ await test("the harness card shows what a person set and what the window counted
       concurrent: field("harness-concurrent")?.value ?? null,
       perHour: field("harness-per-hour")?.value ?? null,
       perDay: field("harness-per-day")?.value ?? null,
+      alerts: field("harness-alerts-landing")?.value ?? null,
+      alertsHint: field("harness-alerts-landing-hint")?.textContent ?? null,
       status: field("harness-status")?.textContent ?? null,
     };
   });
@@ -8542,12 +8560,19 @@ await test("the harness card shows what a person set and what the window counted
   const shown = await card();
   assert(
     shown.mode === "notify" && shown.task === "" && shown.day === "" &&
-      shown.concurrent === "4" && shown.perHour === "300" && shown.perDay === "2000",
+      shown.concurrent === "4" && shown.perHour === "300" && shown.perDay === "2000" &&
+      shown.alerts === "on",
     "the card does not show the document's gate and ceilings", shown,
   );
   assert(
     /^지금 1개 실행 중 · 최근 한 시간 3번 · 오늘 12번 · 쉬는 중: [Cc]laude 1[01]분 · 오늘 워커 비용 약 \$4\.20$/.test(shown.status ?? ""),
     "the card does not say what the launch ledger and the day's spend hold", shown.status,
+  );
+  // What is sent, to whom, and that nothing is merged or deleted, is said beside the switch (t-34501).
+  assert(
+    /코디네이터/.test(shown.alertsHint ?? "") && /워커/.test(shown.alertsHint ?? "") &&
+      /병합|삭제/.test(shown.alertsHint ?? ""),
+    "the switch does not say what it sends and to whom", shown.alertsHint,
   );
   assert(await pageB.$("#harness-task-usd"), "the card has no task budget field");
   const budget = await gestureAndWait(pageB, "B", "set_harness_settings", () =>
@@ -8558,6 +8583,7 @@ await test("the harness card shows what a person set and what the window counted
       harness: {
         gate: { mode: "notify", task_usd: 12.5, day_usd: null },
         launches: { concurrent: 4, per_hour: 300, per_day: 2000 },
+        alerts: { landing: true },
       },
     },
     "a budget was sent as something other than the whole record with the number typed",
@@ -8570,6 +8596,7 @@ await test("the harness card shows what a person set and what the window counted
     {
       gate: { mode: "notify", task_usd: 12.5, day_usd: null },
       launches: { concurrent: 4, per_hour: 300, per_day: null },
+      alerts: { landing: true },
     },
     "a blank ceiling is no ceiling, and the budget saved before it stays",
   );
@@ -8587,6 +8614,16 @@ await test("the harness card shows what a person set and what the window counted
     { concurrent: 4, per_hour: 300, per_day: null },
     "a refused ceiling reached the stored document",
   );
+  // The ledger's alerts are on until a person says otherwise, and turning them off is one saved word.
+  const silenced = await gestureAndWait(pageB, "B", "set_harness_settings", () =>
+    pageB.selectOption("#harness-alerts-landing", "off"));
+  assertEqual(
+    silenced.args.harness.alerts,
+    { landing: false },
+    "the switch did not send the alerts as off",
+  );
+  await waitForSettingsIdle(pageB);
+  assertEqual(backend.settings.harness.alerts, { landing: false }, "the stored document does not hold the alerts off");
   await backend.externalPatch({ locale: previousLocale }, ["locale"]);
   await renderSettled(pageB);
 });
@@ -10056,12 +10093,12 @@ await test("notification and browser controls remain item patches across stale w
   const attention = await backend.waitForCall("A", "set_notification_preference", from);
   assertEqual(attention.args, { kind: "agent_attention", on: false }, "notification sent sibling state");
   from = backend.calls.length;
-  await pageB.uncheck("#notify-agent-completion");
-  const completion = await backend.waitForCall("B", "set_notification_preference", from);
-  assertEqual(completion.args, { kind: "agent_completion", on: false }, "notification sent sibling state");
+  await pageB.selectOption("#notify-finish-mode", "off");
+  const completion = await backend.waitForCall("B", "set_finish_notification_mode", from);
+  assertEqual(completion.args, { mode: "off" }, "finish mode sent the wrong word");
   assertEqual(
     backend.settings.notifications,
-    { enabled: true, agent_attention: false, agent_completion: false },
+    { enabled: true, agent_attention: false, agent_completion: "off" },
     "stale notification patches lost one field",
   );
   // 마스터가 꺼지면 벨 전체가 침묵하고, 종류별 스위치는 만질 수 없게
@@ -10072,7 +10109,7 @@ await test("notification and browser controls remain item patches across stale w
   assertEqual(master.args, { kind: "enabled", on: false }, "master sent sibling state");
   assert(
     (await pageA.isDisabled("#notify-agent-attention"))
-      && (await pageA.isDisabled("#notify-agent-completion")),
+      && (await pageA.isDisabled("#notify-finish-mode")),
     "kind switches stayed live under a dead master",
   );
   from = backend.calls.length;
@@ -10144,6 +10181,9 @@ await test("an older same-key rejection cannot report over a newer browser value
       },
     }).then((answer) => ({ answer, message }));
   }, { homePage: oldHome, message: staleError });
+  // Awaited below. A failed wait before that must not leave this rejection
+  // unhandled: Node would end the whole suite before its summary.
+  oldRequest.catch(() => {});
   await backend.waitForCall("A", "set_browser_home_page", oldFrom);
 
   const newerFrom = backend.calls.length;

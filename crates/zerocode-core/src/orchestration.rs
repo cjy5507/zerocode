@@ -37,6 +37,8 @@
 
 mod completion;
 pub mod coordinator_handover;
+pub mod delegate;
+pub mod landing_watch;
 mod session_history;
 pub mod task_cost;
 
@@ -510,6 +512,22 @@ pub enum MessageKind {
     /// their numbers, and what the window did; never a word a worker said.
     /// The road that writes it is [`Ledger::gate_judged`].
     GateJudged,
+    /// Nobody said this either: the LEDGER held a task's own record against git's and
+    /// found it late (t-34501, t-22105) — a report nobody verified, a verification
+    /// nobody merged, work git has in main that the ledger never recorded, a checkout
+    /// left standing after its work landed, or a ledger that says merged where git has
+    /// no such commit. Told to the run's coordinator once when the state begins and
+    /// again every six hours while it stands; the body names the task, worker,
+    /// checkout, head, since when, and the next thing to do. Alerts and displays
+    /// only — nothing here merges or deletes. The road that writes it is
+    /// [`Ledger::landing_watch`].
+    LandingStalled,
+    /// Nobody said this either: the LEDGER's word to a LIVE worker that its branch
+    /// runs far behind the compare ref or would conflict with it (t-34501), once per
+    /// state of (head, compare ref) and at most ten times per attempt. Addressed to
+    /// the worker, not the coordinator. The road that writes it is
+    /// [`Ledger::landing_watch`].
+    BranchDrifted,
 }
 
 impl MessageKind {
@@ -534,6 +552,8 @@ impl MessageKind {
             Self::ModelDeviated => "model_deviated",
             Self::AccountSwitched => "account_switched",
             Self::GateJudged => "gate_judged",
+            Self::LandingStalled => "landing_stalled",
+            Self::BranchDrifted => "branch_drifted",
         }
     }
 
@@ -560,6 +580,8 @@ impl MessageKind {
                 | Self::ModelDeviated
                 | Self::AccountSwitched
                 | Self::GateJudged
+                | Self::LandingStalled
+                | Self::BranchDrifted
         )
     }
 }
@@ -588,6 +610,8 @@ impl std::str::FromStr for MessageKind {
             "model_deviated" => Self::ModelDeviated,
             "account_switched" => Self::AccountSwitched,
             "gate_judged" => Self::GateJudged,
+            "landing_stalled" => Self::LandingStalled,
+            "branch_drifted" => Self::BranchDrifted,
             _ => return Err(format!("unknown message type: {word}")),
         })
     }
@@ -764,6 +788,10 @@ pub enum ResultAuthor {
         source: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         completed_ms: Option<i64>,
+        /// When this review first said `verified` for the attempt and source it names
+        /// ([`ReviewFacts::verified_ms`]), stamped by the same pass as `completed_ms`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verified_ms: Option<i64>,
     },
     /// The ledger's own note — a stop, an abandon, a death it witnessed.
     Ledger,
@@ -836,6 +864,20 @@ pub struct ReviewFacts {
     pub claimed_merged: bool,
     #[serde(default)]
     pub claimed_deployed: bool,
+    /// The coordinator marked this verified task as having no code to land — research,
+    /// a review, a design (the key `nothingToLand`, or `noCodeChange`). The board says
+    /// 완료 — 착지할 것 없음, which is not 병합, and the late-landing alerts skip it
+    /// (t-34501). Believed only where the coordinator seat wrote it, like `verified`.
+    #[serde(default)]
+    pub nothing_to_land: bool,
+    /// The same key as a worker wrote it, or as somebody nobody knows wrote it: a claim.
+    #[serde(default)]
+    pub claimed_nothing_to_land: bool,
+    /// When the coordinator's review first said `verified` for this attempt and source,
+    /// epoch milliseconds. Absent on a review written before this was stamped, and then
+    /// the alert that counts from it stays silent rather than guess (t-34501).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_ms: Option<i64>,
     /// Who wrote the result these were read from.
     #[serde(default)]
     pub author: ReviewAuthor,
@@ -888,17 +930,22 @@ impl ReviewFacts {
         let read = Self::from_result(result);
         match author {
             Some(ResultAuthor::Coordinator {
-                attempt, source, ..
+                attempt,
+                source,
+                verified_ms,
+                ..
             }) => Self {
                 author: ReviewAuthor::Coordinator,
                 attempt: attempt.clone(),
                 source: source.clone(),
+                verified_ms: verified_ms.filter(|_| read.verified),
                 ..read
             },
             other => Self {
                 claimed_verified: read.verified,
                 claimed_merged: read.merged,
                 claimed_deployed: read.deployed,
+                claimed_nothing_to_land: read.nothing_to_land,
                 author: other.map_or(ReviewAuthor::Unknown, ResultAuthor::kind),
                 ..Self::default()
             },
@@ -922,6 +969,8 @@ impl ReviewFacts {
         let sha = |value: &serde_json::Value| value.as_str().and_then(commit_named);
         let verified_keys = ["verified", "reviewedBy", "coordinatorTests", "testedHead"];
         let merged_keys = ["merged", "mergeHead", "mergedInto"];
+        // A coordinator's mark that there is no code to land (research, a review, a design).
+        let nothing_keys = ["nothingToLand", "noCodeChange"];
         // Explicit decisions override older metadata left on the result.
         let verified = map.get("verified").map_or_else(
             || map.get("reviewedBy").is_some_and(named),
@@ -936,9 +985,13 @@ impl ReviewFacts {
         );
         let merge_head = candidate_head.filter(|_| merged);
         let deployed = map.get("deployed").and_then(serde_json::Value::as_bool) == Some(true);
+        let nothing_to_land = nothing_keys
+            .iter()
+            .any(|key| map.get(*key).and_then(serde_json::Value::as_bool) == Some(true));
         let written = verified_keys
             .iter()
             .chain(merged_keys.iter())
+            .chain(nothing_keys.iter())
             .chain(["deployed"].iter())
             .any(|key| map.contains_key(*key));
         Self {
@@ -946,6 +999,7 @@ impl ReviewFacts {
             merged,
             merge_head,
             deployed,
+            nothing_to_land,
             written,
             ..Self::default()
         }
@@ -1020,7 +1074,7 @@ pub const NO_ATTEMPT: &str = "none";
 
 /// A commit, as a person or an agent writes one: seven hex digits or more.
 /// Anything else is not a commit — a report id, a branch name, a sentence.
-fn commit_named(text: &str) -> Option<String> {
+pub(crate) fn commit_named(text: &str) -> Option<String> {
     let text = text.trim();
     (text.len() >= 7 && text.chars().all(|c| c.is_ascii_hexdigit())).then(|| text.to_string())
 }
@@ -3508,6 +3562,8 @@ impl Run {
             merged: false,
             merge_head: None,
             deployed: false,
+            nothing_to_land: false,
+            verified_ms: None,
             written: false,
             superseded_by: attempt_moved
                 .then(|| newest_id.map(str::to_string))
@@ -8850,20 +8906,31 @@ impl Ledger {
     /// Answers how many runs a letter was filed in, so the caller knows
     /// whether anything was written down and the actor whether to persist.
     pub fn post_observation(&mut self, to: &str, body: &str, now_ms: i64) -> usize {
-        self.post_observation_once(to, body, None, now_ms)
+        self.post_observation_once(None, to, body, None, now_ms)
     }
 
     /// An observer receipt is filed with the mail, so losing its local ACK
     /// (even across restart) cannot create a second letter for the same fact.
     /// The count includes accepted replays; an empty audience is not an ACK.
+    ///
+    /// `run` names where the letter is filed. `None` is every run where `to`
+    /// resolves, the checkout group's reading above. `Some` is that one run and
+    /// no other, for a letter about one mail: the run the mail is in. A pane
+    /// address resolves in every run (the ledger's own letters skip the
+    /// has-spoken check), so a caller holding a pane address names its run, or
+    /// the letter is copied into each of them (t-35823).
     pub fn post_observation_once(
         &mut self,
+        run: Option<&str>,
         to: &str,
         body: &str,
         receipt: Option<&str>,
         now_ms: i64,
     ) -> usize {
-        let runs: Vec<String> = self.runs.iter().map(|run| run.id.clone()).collect();
+        let runs: Vec<String> = match run {
+            Some(one) => vec![one.to_string()],
+            None => self.runs.iter().map(|held| held.id.clone()).collect(),
+        };
         runs.iter()
             .filter(|run_id| {
                 if let Some(receipt) = receipt
@@ -17640,6 +17707,16 @@ pub const VERBS: &[(&str, &str, Doing)] = &[
         Doing::Mutation,
     ),
     (
+        delegate::VERB,
+        "--spec <text> --agent <a> [--title <t>] [--deps a,b] [--parent <id>] [--prompt <p>] \
+         [--model <id> [--effort <level>]] [--on-quota-wall wait|<agent[:model[:effort]]>] \
+         [--worktree] [--horizontal] [--timeout-ms <ms>] [--wait] · write the work down, summon a \
+         worker on it and leave the worker a letter with its own ids, in one step; --wait holds \
+         the answer until the worker reports or asks (--timeout-ms is then how long, up to ten \
+         minutes); without --wait, --timeout-ms is the readiness window, as for worker-start",
+        Doing::Mutation,
+    ),
+    (
         "worker-list",
         "[--all] [--terminal-state <s>] · every worker in this run, with terminal counts",
         Doing::FreshRead,
@@ -18348,9 +18425,24 @@ is left — and when the real answer is longer than that, write it to a file \
 and carry the path instead: `--payload '{{\"reportPath\":\"/abs/path\",\"lifetime\":\"ephemeral\"}}'`, \
 with the same path named once in the summary. Say in the summary if that \
 file dies with your worktree, because the coordinator reads it before \
-anything is cleaned up. Every command that CHANGES anything needs --retry-request: repeat \
+anything is cleaned up. Screenshots, logs or a folder of them go in the same \
+payload as `\"{evidence}\":[\"/abs/file\",\"/abs/folder\"]`: the window keeps a copy of \
+what you name before your checkout is cleaned (text and pictures only, private \
+values masked, {cap_mb} MB at most). An intended failure is evidence too — name it \
+`{{\"path\":\"/abs/red.log\",\"{expect}\":\"fail\"}}` so nobody guesses it from the file \
+name — and a report that is not a plain report says what it is: `\"{report_kind}\":\"review\"` \
+(one of {kinds}). Every command that CHANGES anything needs --retry-request: repeat \
 the same name to retry one you never heard back from, and choose a new one for \
 a new request. `zerocode-orc help` lists the rest. {find} {plain} {purpose}\n\n{contract}\n\n{worker_gate}\n\n{trust}\n\n{hands_over}\n\n",
+        evidence = crate::hand_in::EVIDENCE_KEY,
+        expect = crate::hand_in::EXPECT_KEY,
+        report_kind = crate::hand_in::REPORT_KIND_KEY,
+        kinds = crate::hand_in::ReportKind::ALL
+            .iter()
+            .map(|kind| kind.word())
+            .collect::<Vec<_>>()
+            .join(", "),
+        cap_mb = crate::hand_in::HAND_IN_BYTES_MAX / (1024 * 1024),
         find = worker_find_context(),
         plain = WORKER_PLAIN_REPORT_CONTEXT,
         purpose = WORKER_PURPOSE_CONTEXT,
@@ -19464,7 +19556,13 @@ fn plan_inner(
     let (verb, rest) = argv
         .split_first()
         .ok_or_else(|| "a verb is required — try `help`".to_string())?;
-    let words = split_words(rest, BOOL_FLAGS);
+    let words = {
+        let mut words = split_words(rest, BOOL_FLAGS);
+        if verb == delegate::VERB {
+            delegate::strip_wait(&mut words);
+        }
+        words
+    };
     within_bounds(&words)?;
 
     // A retry is answered with the first answer, not by doing the thing again.
@@ -20557,6 +20655,10 @@ fn plan_inner(
                 "detected": measured.is_some(),
             }))
         }
+
+        delegate::VERB => delegate::plan(
+            ledger, team, launcher, &words, pane, now_ms, actor, &caller, &seat,
+        )?,
 
         "worker-start" => {
             let run_id = bound(ledger, &words, &caller, &seat)?;
@@ -22844,6 +22946,7 @@ fn correction_author(
         attempt: newest_id.map(str::to_string),
         source: observed.source.map(|named| named.trim().to_string()),
         completed_ms: None,
+        verified_ms: None,
     })
 }
 

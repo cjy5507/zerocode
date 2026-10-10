@@ -130,6 +130,7 @@ mod jev_scope;
 mod jira_attachments;
 mod jira_store;
 mod keyboard_input_source;
+mod landing_watch_sweep;
 mod last_status;
 mod launch_budget_door;
 mod native_tray;
@@ -253,33 +254,34 @@ use cmd::{
     browser_wait, browser_zoom, build_stamp, busy_census, cancel_folder_panel, cancel_google_login,
     check_typesafe_key, choose_paths, choose_project, claude_account_usage, claude_accounts,
     claude_autoswitch_apply, claude_autoswitch_mode, claude_token_usage, claude_usage,
-    claude_usage_stats, clear_delivered_diff_notes, clear_diff_notes, cli_login_list,
-    cli_login_logout, cli_login_start, cli_login_wait, cli_login_witness, cli_login_witness_drop,
-    clipboard_has_image, clone_repository, clone_target_name, close_browser_pane, close_lane,
-    close_onboarding, close_term, codex_account_list, codex_token_usage, codex_usage,
-    codex_usage_stats, commit_failure_card, commit_file_diff, commit_files, commit_staged,
-    computer_awake_status, computer_confirm_answer, computer_guard_status,
-    computer_live_reflex_check, computer_resume, computer_stop, computer_use_capabilities,
-    computer_use_permission_status, computer_use_skill_report, computer_use_tcc_row_action,
-    conflict_card, continuation_source, cookie_sources, crash_bundle, crash_open_log,
-    create_browser_profile, create_project, create_pull_request, create_untitled_markdown,
-    create_worktree, default_project_parent, default_tabs, delete_automation,
-    delete_browser_profile, delete_diff_note, delete_quick_command, delete_untitled_markdown,
-    delete_untracked, desk_ack, desk_checkouts, desk_reply, developer_permission_statuses,
-    discard_paths, dismiss_external_worktree_prompt, enable_automation, end_all_terminal_sessions,
-    end_terminal_session, file_diff, file_version, floating_workspace_seat, flow_list, flow_set,
-    focus_lane, focus_main, fs_create, fs_duplicate, fs_move, fs_open_default, fs_redo, fs_rename,
-    fs_reveal, fs_trash, fs_undo, gate_lane, generate_branch_name, generate_commit_message,
-    generate_pull_request, get_second_brain_scenes, git_history, github_assignable_users,
-    github_comment_work_item, github_disconnect, github_login_intent, github_merge_pr,
-    github_pr_file_diff, github_preset_query, github_review_states, github_select_account,
-    github_set_reviewers, github_set_work_item_open, github_status, github_test_connection,
-    github_web_urls, github_work_item_detail, github_work_items, gitlab_comment_item,
-    gitlab_inline_comment, gitlab_item_detail, gitlab_job_trace, gitlab_merge_mr, gitlab_mr_review,
-    gitlab_pipeline_jobs, gitlab_project_members, gitlab_retry_job, gitlab_set_item_open,
-    gitlab_set_mr_reviewers, gitlab_status, gitlab_todos, gitlab_update_mr, gitlab_work_items,
-    google_account, google_login_finish, google_login_start, google_logout, grok_usage,
-    harness_status, hooks_report, hosted_review_eligibility, image_diff, import_browser_cookies,
+    claude_usage_stats, clear_delivered_diff_notes, clear_diff_notes, clear_finish_mark,
+    cli_login_list, cli_login_logout, cli_login_start, cli_login_wait, cli_login_witness,
+    cli_login_witness_drop, clipboard_has_image, clone_repository, clone_target_name,
+    close_browser_pane, close_lane, close_onboarding, close_term, codex_account_list,
+    codex_token_usage, codex_usage, codex_usage_stats, commit_failure_card, commit_file_diff,
+    commit_files, commit_landings, commit_staged, computer_awake_status, computer_confirm_answer,
+    computer_guard_status, computer_handoff_code, computer_live_reflex_check, computer_resume,
+    computer_stop, computer_use_capabilities, computer_use_permission_status,
+    computer_use_skill_report, computer_use_tcc_row_action, conflict_card, continuation_source,
+    cookie_sources, crash_bundle, crash_open_log, create_browser_profile, create_project,
+    create_pull_request, create_untitled_markdown, create_worktree, default_project_parent,
+    default_tabs, delete_automation, delete_browser_profile, delete_diff_note,
+    delete_quick_command, delete_untitled_markdown, delete_untracked, desk_ack, desk_checkouts,
+    desk_reply, developer_permission_statuses, discard_paths, dismiss_external_worktree_prompt,
+    enable_automation, end_all_terminal_sessions, end_terminal_session, file_diff, file_version,
+    floating_workspace_seat, flow_list, flow_set, focus_lane, focus_main, fs_create, fs_duplicate,
+    fs_move, fs_open_default, fs_redo, fs_rename, fs_reveal, fs_trash, fs_undo, gate_lane,
+    generate_branch_name, generate_commit_message, generate_pull_request, get_second_brain_scenes,
+    git_history, github_assignable_users, github_comment_work_item, github_disconnect,
+    github_login_intent, github_merge_pr, github_pr_file_diff, github_preset_query,
+    github_review_states, github_select_account, github_set_reviewers, github_set_work_item_open,
+    github_status, github_test_connection, github_web_urls, github_work_item_detail,
+    github_work_items, gitlab_comment_item, gitlab_inline_comment, gitlab_item_detail,
+    gitlab_job_trace, gitlab_merge_mr, gitlab_mr_review, gitlab_pipeline_jobs,
+    gitlab_project_members, gitlab_retry_job, gitlab_set_item_open, gitlab_set_mr_reviewers,
+    gitlab_status, gitlab_todos, gitlab_update_mr, gitlab_work_items, google_account,
+    google_login_finish, google_login_start, google_logout, grok_usage, harness_status,
+    hooks_report, hosted_review_eligibility, image_diff, import_browser_cookies,
     import_cookie_file, import_external_worktrees, install_bundled_skill, install_hooks, jev_day,
     jev_review, jev_review_outcome, jev_summary, judge_worker_room, key_input, kimi_usage,
     lane_fold, lane_lines, lane_scroll, launch_agent_tab, launch_plan_for_action, launch_recipes,
@@ -330,14 +332,15 @@ use cmd::{
     set_computer_generator_road, set_computer_live_reflex, set_confirm_close_pinned,
     set_conversation_focus_view, set_crash_watchdog, set_ctrl_tab_order_mode, set_default_agent,
     set_default_task_source, set_diff_side_by_side, set_dock_badge,
-    set_external_worktree_visibility, set_guide_dismissed, set_harness_settings,
-    set_hidden_shortcuts, set_hidden_task_sources, set_hide_agent_scratch_workspaces,
-    set_hide_automation_workspaces, set_hide_default_branch_workspaces,
-    set_hide_detached_head_workspaces, set_hide_sleeping_workspaces, set_hooks_enabled,
-    set_jev_enabled, set_jev_model, set_jev_review_enabled, set_keep_default_branch_awake,
-    set_keybinding, set_locale, set_minimize_to_tray_on_close, set_notification_preference,
-    set_opencode_cookie, set_opencode_workspace, set_panel_width, set_panel_widths,
-    set_previewed_terms, set_project_script_policy, set_project_script_setting,
+    set_external_worktree_visibility, set_finish_notification_mode, set_guide_dismissed,
+    set_harness_settings, set_hidden_shortcuts, set_hidden_task_sources,
+    set_hide_agent_scratch_workspaces, set_hide_automation_workspaces,
+    set_hide_default_branch_workspaces, set_hide_detached_head_workspaces,
+    set_hide_sleeping_workspaces, set_hooks_enabled, set_jev_enabled, set_jev_model,
+    set_jev_review_enabled, set_keep_default_branch_awake, set_keybinding, set_locale,
+    set_minimize_to_tray_on_close, set_notification_preference, set_opencode_cookie,
+    set_opencode_workspace, set_panel_width, set_panel_widths, set_previewed_terms,
+    set_project_script_policy, set_project_script_setting,
     set_refresh_local_base_ref_on_worktree_create, set_repo_mark, set_route_classifier,
     set_second_brain_explore, set_second_brain_scenes, set_second_brain_weekly_review,
     set_setup_script_launch_mode, set_shortcut_visibility, set_show_git_ignored_files,
@@ -366,20 +369,21 @@ use cmd::{
     tip_verdict, tour_decision, tree_selection, type_value_keys, typesafe_settings, unstage_path,
     unstage_paths, update_check, update_download, update_history, update_install, upstream_status,
     use_system_claude_login, validate_branch_name, vault_sessions, verify_claude_accounts,
-    verify_codex_accounts, watch_files, wire_answer, wire_image, wire_interrupt, wire_log,
-    wire_models, wire_send, wire_set_mode, wire_set_model, wire_start, wire_stop, work_item_seed,
-    worker_screen, workspace_cleanup_scan, workspace_space_cancel, workspace_space_git,
-    workspace_space_scan, worktree_committed_diff, worktree_evidence, worktree_landing_stamp,
-    worktree_last_agent, worktree_loss, worktree_prefs, worktree_stamp, write_primary_selection,
-    write_text_file,
+    verify_codex_accounts, waiting_on_me, watch_files, wire_answer, wire_image, wire_interrupt,
+    wire_log, wire_models, wire_send, wire_set_mode, wire_set_model, wire_start, wire_stop,
+    work_item_seed, worker_screen, workspace_cleanup_scan, workspace_space_cancel,
+    workspace_space_git, workspace_space_scan, worktree_committed_diff, worktree_evidence,
+    worktree_landing_stamp, worktree_last_agent, worktree_loss, worktree_prefs, worktree_stamp,
+    write_primary_selection, write_text_file,
 };
 use cmd::{
-    artifact_copy_path, artifact_counts, artifact_delete, artifact_document, artifact_export,
-    artifact_feedback_record, artifact_import_transcripts, artifact_open, artifact_page_at,
-    artifact_preference_revoke, artifact_preference_save, artifact_preferences, artifact_preview,
-    artifact_register, artifact_reveal, artifact_search, artifact_thumbnail, artifact_versions,
-    artifacts_list, explain_cancel, explain_preview, explain_roads, explain_start,
-    set_artifacts_auto_open_beside, set_artifacts_retention_days, set_vault_session_limit,
+    artifact_bundle, artifact_copy_path, artifact_counts, artifact_delete, artifact_document,
+    artifact_export, artifact_feedback_record, artifact_import_transcripts, artifact_open,
+    artifact_page_at, artifact_preference_revoke, artifact_preference_save, artifact_preferences,
+    artifact_preview, artifact_register, artifact_reveal, artifact_search, artifact_tasks,
+    artifact_thumbnail, artifact_versions, artifacts_list, explain_cancel, explain_preview,
+    explain_roads, explain_start, set_artifacts_auto_open_beside, set_artifacts_retention_days,
+    set_vault_session_limit,
 };
 use cmd::{artifact_export_formats, artifact_export_reveal};
 use cmd::{
@@ -396,10 +400,9 @@ use emulator::{
     ios_button_direct, ios_install_app, ios_launch_app, ios_logs, ios_multi_touch, ios_rotate,
     ios_rotate_direct, ios_screenshot_direct, ios_set_permission, ios_swipe, ios_swipe_direct,
     ios_tap, ios_tap_direct, ios_text, ios_text_direct, ios_touch, mobile_emulators,
-    mobile_emulators_direct, open_mobile_emulator, set_emulator_stream_engaged,
-    set_emulator_stream_paused, set_emulator_stream_viewport, shutdown_android_emulator,
-    shutdown_mobile_emulator, start_android_stream, start_emulator_stream, start_emulator_video,
-    stop_emulator_stream,
+    open_mobile_emulator, set_emulator_stream_engaged, set_emulator_stream_paused,
+    set_emulator_stream_viewport, shutdown_android_emulator, shutdown_mobile_emulator,
+    start_android_stream, start_emulator_stream, start_emulator_video, stop_emulator_stream,
 };
 use pane_runtime::*;
 use pick_runtime::*;
@@ -420,7 +423,8 @@ use terminal_theme_import::{
 use usage_runtime::*;
 use window_runtime::*;
 use worktree_landing::{
-    LandingJob, WorktreeLanding, attach_landings, landing_stamp_of, spawn_landing_jobs,
+    LandingJob, WorktreeLanding, attach_commit_landings, attach_landings, known_repos,
+    landing_stamp_of, spawn_commit_landing_job, spawn_landing_jobs,
 };
 use worktree_runtime::*;
 #[allow(unused_imports)]
@@ -1193,6 +1197,9 @@ struct ShellRuntime {
     inference_sends: Mutex<HashMap<TermId, u64>>,
     /// When each worktree last rang a notification — the cooldown's memory.
     rings: Mutex<zerocode_core::notify::RingLedger>,
+    /// The stops waiting out their quiet before they may ring: a block's ten
+    /// seconds, a finish's minute (`notify::Quiet`). Armed when a stop is seen.
+    quiet_rings: Mutex<zerocode_core::notify::Quiet<TermId>>,
     /// What the notify seat remembers about the rings it asked about: the
     /// person's last hand on the window, each pane's last rings, the rows
     /// waiting for their label and the rings held for the next hand
@@ -1402,6 +1409,12 @@ impl ShellRuntime {
 
     fn rings(&self) -> MutexGuard<'_, zerocode_core::notify::RingLedger> {
         self.rings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn quiet_rings(&self) -> MutexGuard<'_, zerocode_core::notify::Quiet<TermId>> {
+        self.quiet_rings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -1776,6 +1789,7 @@ trait ShellStateExt {
     fn previewed_terms(&self) -> MutexGuard<'_, HashMap<String, HashSet<TermId>>>;
     fn hold_terminal(&self, term: TermId, pty: impl Into<PtyHandle>);
     fn rings(&self) -> MutexGuard<'_, zerocode_core::notify::RingLedger>;
+    fn quiet_rings(&self) -> MutexGuard<'_, zerocode_core::notify::Quiet<TermId>>;
     fn notify_book(&self) -> MutexGuard<'_, notify_call::NotifyBook>;
     fn lane_bell(&self) -> MutexGuard<'_, zerocode_core::notify::LaneBell>;
     fn commit_failure(&self) -> MutexGuard<'_, Option<CommitFailure>>;
@@ -1914,6 +1928,10 @@ impl ShellStateExt for AppState {
 
     fn rings(&self) -> MutexGuard<'_, zerocode_core::notify::RingLedger> {
         self.shell_runtime().rings()
+    }
+
+    fn quiet_rings(&self) -> MutexGuard<'_, zerocode_core::notify::Quiet<TermId>> {
+        self.shell_runtime().quiet_rings()
     }
 
     fn notify_book(&self) -> MutexGuard<'_, notify_call::NotifyBook> {
@@ -2382,6 +2400,7 @@ fn build_app_state(paths: app_paths::AppPaths, root: PathBuf) -> AppState {
         }),
         project_root: root,
         rings: Mutex::new(zerocode_core::notify::RingLedger::default()),
+        quiet_rings: Mutex::new(zerocode_core::notify::Quiet::default()),
         notify_book: Mutex::new(notify_call::NotifyBook::default()),
         lane_bell: Mutex::new(zerocode_core::notify::LaneBell::default()),
         native_tray: native_tray::NativeTray::default(),
@@ -2910,6 +2929,9 @@ fn main() -> ExitCode {
             gitlab_inline_comment,
             notification_probe,
             set_notification_preference,
+            set_finish_notification_mode,
+            waiting_on_me,
+            clear_finish_mark,
             set_browser_home_page,
             set_browser_search_engine,
             patch_browser_link_routing,
@@ -3018,6 +3040,9 @@ fn main() -> ExitCode {
             artifact_preview,
             artifact_document,
             artifact_counts,
+            artifact_tasks,
+            artifact_bundle,
+            commit_landings,
             artifact_open,
             artifact_reveal,
             artifact_copy_path,
@@ -3063,6 +3088,7 @@ fn main() -> ExitCode {
             set_computer_generator_road,
             set_computer_live_reflex,
             computer_confirm_answer,
+            computer_handoff_code,
             computer_stop,
             computer_resume,
             computer_guard_status,
@@ -3295,6 +3321,7 @@ fn main() -> ExitCode {
             // for them and the day the window had already counted (t-26583).
             launch_budget_door::open(managed.config_root(), boot_settings.harness.launches);
             orchestration::gate_book::open(managed.config_root(), boot_settings.harness.gate);
+            landing_watch_sweep::set_enabled(boot_settings.harness.alerts.landing);
             // The readiness probe reads the account stores under this root
             // and no other; until it is named, every door answers unknown.
             readiness_runtime::configure_root(managed.config_root());

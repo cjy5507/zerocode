@@ -5253,11 +5253,12 @@ fn ring_reads_are_capped_again_and_answered_as_rows() {
 fn every_browser_verb_has_its_evidence_row() {
     for verb in zerocode_core::agent_browser::VERBS {
         let expected = match verb {
-            "list" | "read" | "console" | "network" | "tabs" | "diagnose" => None,
+            // `fields` reads a page's forms like `read` reads its text.
+            "list" | "read" | "console" | "network" | "tabs" | "diagnose" | "fields" => None,
             // `marks` numbers the controls; the frame is `screenshot --marks`.
             "open" | "close" | "marks" => Some(false),
-            "goto" | "eval" | "click" | "type" | "wait" | "screenshot" | "viewport" | "scroll"
-            | "find" => Some(true),
+            "goto" | "eval" | "click" | "type" | "fill" | "wait" | "screenshot" | "viewport"
+            | "scroll" | "find" => Some(true),
             other => panic!("`{other}` joined VERBS without an evidence row in this table"),
         };
         assert_eq!(
@@ -8376,9 +8377,9 @@ fn an_agent_that_left_its_shell_behind_stops_being_drawn_as_running() {
     }
     assert_eq!(
         FOREGROUND_LOOK_EVERY * u32::from(zerocode_core::LOOKS_BEFORE_GONE),
-        Duration::from_millis(zerocode_core::notify::DONE_QUIET_MS as u64),
-        "a departure now settles in a different time than a finished turn, \
-         which are the same question asked of two roads"
+        Duration::from_millis(1_500),
+        "a departure settles in its own 1.5 seconds; a finished turn waits its \
+         own minute (notify::FINISHED_QUIET_MS), so the two no longer share a wait"
     );
     // Ridden on the pump, on a gate of its own — not per round, and not on
     // a thread of its own.
@@ -15362,7 +15363,7 @@ fn non_default_settings_are_the_next_boot_snapshot() {
         document.notifications = NotificationPrefs {
             enabled: true,
             agent_attention: false,
-            agent_completion: true,
+            agent_completion: zerocode_core::notify::FinishRing::Always,
         };
         document.browser = BrowserPrefs {
             home_page: "https://example.com".to_string(),
@@ -15546,7 +15547,11 @@ fn non_default_settings_are_the_next_boot_snapshot() {
         }]
     );
     assert!(!boot.document.notifications.agent_attention);
-    assert!(boot.document.notifications.agent_completion);
+    assert_eq!(
+        boot.document.notifications.agent_completion,
+        zerocode_core::notify::FinishRing::Always,
+        "the finish setting survives the boot round trip"
+    );
     assert_eq!(boot.document.browser.home_page, "https://example.com/");
     assert_eq!(
         boot.document.browser.search_engine,
@@ -20308,6 +20313,72 @@ pub(crate) mod computer_desktop_wait {
         );
     }
 
+    /// t-37883: a click by the words a mirrored phone shows reads the app's
+    /// window once, presses the chosen line's centre (nudged) as a click at a
+    /// point, and declares a payment its words name — handed back unpressed
+    /// to a walk with nobody to ask.
+    #[test]
+    fn a_click_by_the_words_a_screen_shows_presses_the_lines_centre() {
+        use crate::agent_tools_runtime::click_by_words;
+        use crate::computer_use::confirm::{self, Asking};
+        use zerocode_core::computer_use_protocol::error_code;
+        let background = zerocode_core::computer_use::parse_command(
+            &["click", "--app", "Fixture", "--ocr", "--text", "Continue", "--background"]
+                .map(str::to_owned),
+        ).unwrap();
+        let refusal = click_by_words(&background, Asking::HandBack, &mut |_, _| {
+            panic!("background OCR must not escape into a desktop coordinate click")
+        }).unwrap_err();
+        assert_eq!(refusal.code, "requires_foreground");
+        let _hand = ONE_HAND
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        confirm::set_policy(confirm::Policy::default());
+        let words = |argv: &[&str]| {
+            argv.iter()
+                .map(|word| (*word).to_string())
+                .collect::<Vec<_>>()
+        };
+        let screen = serde_json::json!({ "source": "ocr", "lines": [
+            { "text": "No", "x": 1060.0, "y": 300.0, "width": 20.0, "height": 17.0 },
+            { "text": "Have you visited a farm?", "x": 760.0, "y": 380.0, "width": 300.0, "height": 17.0 },
+            { "text": "No", "x": 1060.0, "y": 420.0, "width": 20.0, "height": 17.0 },
+            { "text": "Pay 30 USD", "x": 880.0, "y": 900.0, "width": 100.0, "height": 20.0 },
+        ] });
+        let command = zerocode_core::computer_use::parse_command(&words(&[
+            "click", "--app", "iPhone Mirroring", "--ocr", "--text", "No", "--after-text", "farm", "--dy", "2",
+        ]))
+        .expect("a click by words");
+        let mut asked = Vec::new();
+        let answer = click_by_words(&command, Asking::Person, &mut |method, params| {
+            asked.push((method.to_string(), params));
+            Ok(if method == "readText" { screen.clone() } else { serde_json::json!({ "path": "synthetic" }) })
+        })
+        .expect("pressed");
+        let methods: Vec<&str> = asked.iter().map(|(method, _)| method.as_str()).collect();
+        assert_eq!(methods, ["readText", "mouseClick"], "one reading, one press");
+        assert_eq!((&asked[0].1["app"], &asked[0].1["ocr"]), (&serde_json::json!("iPhone Mirroring"), &serde_json::json!(true)));
+        assert_eq!(
+            (asked[1].1["x"].as_f64(), asked[1].1["y"].as_f64()),
+            (Some(1070.0), Some(430.5)),
+            "the No after the farm question, two points lower"
+        );
+        assert_eq!(answer["pressed"]["words"], "No");
+        let pay = zerocode_core::computer_use::parse_command(&words(&[
+            "click", "--app", "iPhone Mirroring", "--ocr", "--text", "Pay",
+        ]))
+        .expect("a click by words");
+        let mut presses = 0;
+        let handed = click_by_words(&pay, Asking::HandBack, &mut |method, _| {
+            if method != "readText" {
+                presses += 1;
+            }
+            Ok(screen.clone())
+        });
+        assert_eq!(handed.expect_err("held for the person").code, error_code::CONFIRMATION_REQUIRED);
+        assert_eq!(presses, 0, "a payment the words name never reaches the helper unasked");
+    }
+
     /// Every request that types text as keys carries the keyboard's table —
     /// the helper keeps no numbers of its own and, without it, types no text
     /// that moves the focus; nothing else carries it.
@@ -22896,13 +22967,23 @@ mod browser_look_settle_pin {
             ("marks", BROWSER_MARKS_BODY),
             ("remeasure", BROWSER_REMEASURE_BODY),
             ("settle", BROWSER_SETTLE_BODY),
+            // A form read is a look too (t-37883): `fill` writes in its own body.
+            ("form helpers", cmd::browser::form::BROWSER_FORM_HELPERS),
+            ("fields", cmd::browser::form::BROWSER_FIELDS_BODY),
         ] {
             for act in [
                 "focus(",
                 "blur(",
                 "scrollIntoView",
-                "scrollTo",
-                "scrollBy",
+                // The calls and the writes, not the properties a read may look at
+                // (`scrollTop`, `scrollLeft`, read).
+                "scrollTo(",
+                "scrollBy(",
+                ".scroll(",
+                "scrollTop =",
+                "scrollTop=",
+                "scrollLeft =",
+                "scrollLeft=",
                 ".select(",
                 "setSelectionRange",
                 "dispatchEvent",
@@ -22913,6 +22994,24 @@ mod browser_look_settle_pin {
                 "requestAnimationFrame",
             ] {
                 assert!(!script.contains(act), "the {name} script does `{act}`");
+            }
+            // However it is spelled: a `scrollTo` that is not the `scrollTop` a read looks
+            // at (a call, `scrollTo.call(`, `scrollTo (`), and a scroll position that is
+            // assigned (`=`, `+=`, `-=`, but not the comparison `==`).
+            assert!(
+                script
+                    .match_indices("scrollTo")
+                    .all(|(at, word)| script[at + word.len()..].starts_with('p')),
+                "the {name} script scrolls"
+            );
+            for property in ["scrollTop", "scrollLeft"] {
+                for (at, word) in script.match_indices(property) {
+                    let after = script[at + word.len()..].trim_start();
+                    let assigned = (after.starts_with('=') && !after.starts_with("=="))
+                        || after.starts_with("+=")
+                        || after.starts_with("-=");
+                    assert!(!assigned, "the {name} script assigns `{property}`");
+                }
             }
         }
         let source = include_str!("cmd/browser.rs");
@@ -23452,5 +23551,1728 @@ fn a_helpers_sidecar_is_read_from_beside_its_transcript_only() {
         // SAFETY: `name` is a NUL-terminated path that outlives the call.
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
         assert_eq!(helper_about(&transcript), None, "a pipe was read");
+    }
+}
+
+/// The person's turn with a line for a one-time code (t-40807), through the
+/// door every agent's `zerocode-computer` comes in by: the window types the
+/// code the person typed into the field the agent named, and the agent is told
+/// how many characters went in — never the code, not as the answer and not as
+/// the echo of the field it was written to. The windowless parts — the pending
+/// table, the rule for a code, the words of the place — are pinned where they
+/// live (`computer_use::confirm`, core's `handoff_code`); this is the road
+/// between, and the places the road's output may be kept.
+mod handoff_code_road {
+    use std::cell::RefCell;
+    use std::sync::{Mutex, Once};
+
+    use serde_json::{Value, json};
+    use zerocode_core::computer_use::{ComputerCommand, parse_command};
+    use zerocode_core::computer_use_protocol::error_code;
+    use zerocode_core::handoff_code::{CodeLimits, OneTimeCode};
+
+    use crate::agent_tools_runtime::{
+        answer_computer_command_with, call_with_the_persons_last_step, door_refusal_with,
+        said_envelope,
+    };
+    use crate::computer_use::ComputerUseError;
+    use crate::computer_use::confirm::{self, Asking, Decision, Handed, Handoff};
+    use crate::computer_use::enter::Typer;
+    use crate::tests::computer_desktop_wait::ONE_HAND;
+
+    const A_CODE_REASON: &str = "카카오톡 인증번호";
+    /// What the person types — in groups, as a text message shows it — and the
+    /// code it comes to: no part of either may reach anything the agent reads.
+    const TYPED: &str = "ZC7 TEST9";
+    const A_CODE: &str = "ZC7TEST9";
+    const SET_VALUE: &str = r#"["set-value","--app","Form","--element-index","3"]"#;
+    const IN_A_TAB: &str = r##"["browser","type","browser-1","#otp"]"##;
+    const ON_A_PHONE: &str = r#"["emulator","text","--platform","ios","--device","SIM-1"]"#;
+
+    fn words(argv: &[&str]) -> Vec<String> {
+        argv.iter().map(|word| (*word).to_string()).collect()
+    }
+
+    fn one_hand() -> std::sync::MutexGuard<'static, ()> {
+        ONE_HAND
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A card that closes when its test ends, passed or failed, so one that
+    /// fails never leaves the person "being asked" for the tests after it.
+    struct Standing(String);
+
+    impl Drop for Standing {
+        fn drop(&mut self) {
+            confirm::close(&self.0);
+        }
+    }
+
+    /// What the person at the window is going to say to the next card, and the
+    /// cards they were shown: whether each had a line, and its reason.
+    #[derive(Default)]
+    struct Person {
+        will_say: Option<Handed>,
+        shown: Vec<(bool, String)>,
+    }
+
+    static PERSON: Mutex<Person> = Mutex::new(Person {
+        will_say: None,
+        shown: Vec::new(),
+    });
+
+    /// Seats the person once for the whole binary: the window's asker is set
+    /// once and answers from what the test last had the person say.
+    fn seat_a_person() {
+        static SEATED: Once = Once::new();
+        SEATED.call_once(|| {
+            confirm::install_handoff_asker(Box::new(|card| {
+                let mut person = PERSON
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                person
+                    .shown
+                    .push((card.code_ask.is_some(), card.reason.clone()));
+                person
+                    .will_say
+                    .take()
+                    .unwrap_or_else(|| Handed::said(Decision::TimedOut))
+            }));
+        });
+        let mut person = PERSON
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        person.will_say = None;
+        person.shown.clear();
+    }
+
+    fn person_types(typed: &str) {
+        let code = OneTimeCode::parse(typed);
+        assert!(code.is_ok(), "the person typed a code: {typed:?}");
+        PERSON
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .will_say = Some(Handed {
+            decision: Decision::Allowed,
+            code: code.ok(),
+        });
+    }
+
+    fn person_says(decision: Decision) {
+        PERSON
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .will_say = Some(Handed::said(decision));
+    }
+
+    fn shown_cards() -> Vec<(bool, String)> {
+        PERSON
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shown
+            .clone()
+    }
+
+    /// 합성 양식 (a page that is no real site): one field and a button that
+    /// pays. What the typer behind it is given it writes into the field, and
+    /// it answers the way the helper answers — the text it wrote and read back,
+    /// the tree's new value and a picture's path — so a window that let an
+    /// answer through would hand the code to the agent.
+    #[derive(Default)]
+    struct Form {
+        code_requested: bool,
+        field: Option<String>,
+        paid: u32,
+        /// Which doors were typed through, in order.
+        doors: Vec<&'static str>,
+        computer: Vec<ComputerCommand>,
+        browser: Vec<Vec<String>>,
+        emulator: Vec<Vec<String>>,
+        /// What the form refuses with instead of taking the text.
+        refuses_with: Option<ComputerUseError>,
+    }
+
+    struct FormTyper<'a>(&'a RefCell<Form>);
+
+    impl Typer for FormTyper<'_> {
+        fn computer(&mut self, command: &ComputerCommand) -> Result<Value, ComputerUseError> {
+            let mut form = self.0.borrow_mut();
+            form.doors.push("computer");
+            form.computer.push(command.clone());
+            if let Some(error) = form.refuses_with.clone() {
+                return Err(error);
+            }
+            let text = command
+                .params
+                .get("value")
+                .or_else(|| command.params.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            form.field = Some(text.clone());
+            Ok(json!({
+                "action": { "verification": {
+                    "state": "verified",
+                    "property": "value",
+                    "expected": text,
+                    "actualPreview": text,
+                } },
+                "snapshot": {
+                    "treeText": format!("3 text field, Code, Value: {text}"),
+                    "screenshot": { "path": "/tmp/after-the-code.png" },
+                },
+            }))
+        }
+
+        fn browser(&mut self, words: &[String]) -> Result<(), ComputerUseError> {
+            let mut form = self.0.borrow_mut();
+            form.doors.push("browser");
+            form.browser.push(words.to_vec());
+            if let Some(error) = form.refuses_with.clone() {
+                return Err(error);
+            }
+            form.field = words.last().cloned();
+            Ok(())
+        }
+
+        fn emulator(&mut self, words: &[String]) -> Result<(), ComputerUseError> {
+            let mut form = self.0.borrow_mut();
+            form.doors.push("emulator");
+            form.emulator.push(words.to_vec());
+            if let Some(error) = form.refuses_with.clone() {
+                return Err(error);
+            }
+            form.field = words
+                .windows(2)
+                .find(|pair| pair[0] == "--text")
+                .map(|pair| pair[1].clone());
+            Ok(())
+        }
+    }
+
+    fn at_the_door_with(argv: &[String], typer: &mut dyn Typer) -> zerocode_hookd::TeamAnswer {
+        answer_computer_command_with(argv, None, Asking::Person, None, typer)
+    }
+
+    fn at_the_door(argv: &[&str], form: &RefCell<Form>) -> zerocode_hookd::TeamAnswer {
+        at_the_door_with(&words(argv), &mut FormTyper(form))
+    }
+
+    fn envelope_of(answer: &zerocode_hookd::TeamAnswer) -> Value {
+        let line = [answer.stdout.as_str(), answer.stderr.as_str()]
+            .into_iter()
+            .flat_map(str::lines)
+            .find(|line| line.trim_start().starts_with('{'))
+            .unwrap_or("{}");
+        serde_json::from_str(line.trim()).unwrap_or(Value::Null)
+    }
+
+    /// Everything the agent is told by one answer.
+    fn told(answer: &zerocode_hookd::TeamAnswer) -> String {
+        format!("{}{}", answer.stdout, answer.stderr)
+    }
+
+    /// What of a code a reader of `text` could use: the code, a group of it,
+    /// or the person's own spelling.
+    fn holds_the_code(text: &str) -> bool {
+        [A_CODE, "TEST9", TYPED].iter().any(|part| text.contains(part))
+    }
+
+    /// A code is asked for and nothing says where it goes: the window shows no
+    /// card and tells the agent so. This is the old request — the one that was
+    /// answered with the code itself, in text and in the envelope — and it is
+    /// refused rather than answered, so what the agent is told holds no code
+    /// whichever way it asked.
+    #[test]
+    fn a_code_asked_for_is_never_in_what_the_agent_is_told() {
+        let _hand = one_hand();
+        for extra in [&["--timeout-ms", "180000"][..], &["--json"][..]] {
+            seat_a_person();
+            person_types(TYPED);
+            let form = RefCell::new(Form::default());
+            let mut argv = vec!["handoff", "--ask-code", "--reason", A_CODE_REASON];
+            argv.extend_from_slice(extra);
+            let said = at_the_door(&argv, &form);
+            assert_ne!(
+                said.exit_code, 0,
+                "a code with nowhere to go is refused: {argv:?}\n{}",
+                said.stdout
+            );
+            assert!(
+                said.stderr.contains("--into"),
+                "the refusal says what to add: {}",
+                said.stderr
+            );
+            assert!(
+                !holds_the_code(&told(&said)),
+                "the agent was told the code: {argv:?}\n{}",
+                told(&said)
+            );
+            assert!(
+                shown_cards().is_empty(),
+                "no card is shown for a code that has nowhere to go: {:?}",
+                shown_cards()
+            );
+            assert!(form.borrow().doors.is_empty(), "nothing was typed");
+        }
+    }
+
+    /// The agent says where the code goes; the person types it on the card; the
+    /// window types it into that field. What the agent is told is that it went
+    /// in, and how long it was — not one character of it, though the helper's
+    /// own answer to that typing carried all of it three ways.
+    #[test]
+    fn a_form_takes_the_code_through_into_and_the_answer_holds_no_digit() {
+        let _hand = one_hand();
+        seat_a_person();
+        confirm::set_policy(confirm::Policy::default());
+        let form = RefCell::new(Form::default());
+
+        // 1. 인증요청: the form sends its code to the person's phone.
+        let click = parse_command(&words(&["click", "--app", "Form", "--text", "인증요청"]));
+        assert!(click.is_ok(), "the press parses: {click:?}");
+        let click = click.unwrap_or_else(|_| unreachable!("asserted above"));
+        let mut helper = |method: &str, params: Value| -> Result<Value, ComputerUseError> {
+            let mut form = form.borrow_mut();
+            match (method, params.get("text").and_then(Value::as_str)) {
+                ("click", Some("인증요청")) => {
+                    form.code_requested = true;
+                    Ok(json!({ "clicked": true }))
+                }
+                ("click", Some("결제하기")) => {
+                    form.paid += 1;
+                    Ok(json!({ "clicked": true }))
+                }
+                _ => Err(ComputerUseError::new(
+                    error_code::INVALID_ARGUMENT,
+                    "the form has no such control",
+                )),
+            }
+        };
+        assert!(call_with_the_persons_last_step(&click, Asking::Person, &mut helper).is_ok());
+
+        // 2. The card: the person types what arrived; the window types it where
+        // the agent said, in the same request.
+        person_types(TYPED);
+        let argv = [
+            "handoff",
+            "--ask-code",
+            "--reason",
+            A_CODE_REASON,
+            "--timeout-ms",
+            "180000",
+            "--into",
+            SET_VALUE,
+            "--json",
+        ];
+        let said = at_the_door(&argv, &form);
+        assert_eq!(said.exit_code, 0, "{}{}", said.stdout, said.stderr);
+        let envelope = envelope_of(&said);
+        assert_eq!(envelope["ok"], true, "{}", said.stdout);
+        assert_eq!(
+            envelope["result"],
+            json!({
+                "resumed": true,
+                "reason": A_CODE_REASON,
+                "codeLength": 8,
+                "entered": true,
+                "into": { "tool": "computer", "verb": "set-value" },
+                "verification": "verified",
+            })
+        );
+        assert!(
+            !holds_the_code(&told(&said)),
+            "the agent was told the code: {}",
+            told(&said)
+        );
+        assert_eq!(shown_cards(), [(true, A_CODE_REASON.to_string())]);
+
+        // 3. What the window typed, and how: the code is the field's value, the
+        // command is the set-value the agent named, and the helper was asked for
+        // no picture of the field after it.
+        {
+            let form = form.borrow();
+            assert_eq!(form.field.as_deref(), Some(A_CODE), "the code is in the field");
+            assert_eq!(form.doors, ["computer"], "one input, through the desktop door");
+            let typed = &form.computer[0];
+            assert_eq!(typed.method, zerocode_core::computer_use::ComputerMethod::SetValue);
+            assert_eq!(typed.params["app"], "Form");
+            assert_eq!(typed.params["elementIndex"], 3);
+            assert_eq!(typed.params["value"], A_CODE);
+            assert_eq!(
+                typed.params["noScreenshot"], true,
+                "no picture of a field that shows the code"
+            );
+        }
+
+        // 4. The evidence line of the request names the place and holds no code.
+        let logged = crate::run_evidence::redacted("computer", &words(&argv));
+        assert!(
+            !holds_the_code(&logged.join(" ")),
+            "the evidence line holds the code: {logged:?}"
+        );
+        assert!(logged.join(" ").contains("set-value"), "{logged:?}");
+
+        // 5. The last step is the person's: the press that pays is held for
+        // them, and nobody says yes.
+        let pay = parse_command(&words(&[
+            "click",
+            "--app",
+            "Form",
+            "--text",
+            "결제하기",
+            "--confirming",
+            "payment",
+        ]));
+        assert!(pay.is_ok(), "the press parses: {pay:?}");
+        let pay = pay.unwrap_or_else(|_| unreachable!("asserted above"));
+        let paid = call_with_the_persons_last_step(&pay, Asking::Person, &mut helper);
+        assert_eq!(
+            paid.err().map(|error| error.code),
+            Some(error_code::CONFIRMATION_REFUSED.to_string())
+        );
+        let form = form.borrow();
+        assert!(form.code_requested);
+        assert_eq!(form.paid, 0, "the form was stopped before it was submitted");
+    }
+
+    /// The word on one line, as a script's `&&` reads it: what went in, where,
+    /// and whether the field read back what was written.
+    #[test]
+    fn text_mode_says_what_was_entered_in_one_line() {
+        let _hand = one_hand();
+        seat_a_person();
+        person_types(TYPED);
+        let form = RefCell::new(Form::default());
+        let said = at_the_door(
+            &[
+                "handoff",
+                "--ask-code",
+                "--reason",
+                A_CODE_REASON,
+                "--into",
+                SET_VALUE,
+            ],
+            &form,
+        );
+        assert_eq!(said.exit_code, 0, "{}{}", said.stdout, said.stderr);
+        assert_eq!(
+            said.stdout, "entered 8 characters into set-value (verified)\n",
+            "one line: how many went in, where, and what the field said"
+        );
+        assert!(said.stderr.is_empty(), "{}", said.stderr);
+
+        // A plain turn keeps the pretty JSON every other verb prints.
+        person_says(Decision::Allowed);
+        let plain = at_the_door(&["handoff", "--reason", A_CODE_REASON], &form);
+        assert!(
+            plain.stdout.contains("\"resumed\": true"),
+            "an answer with no code is the pretty JSON: {}",
+            plain.stdout
+        );
+    }
+
+    /// The input fails after the person has typed: the code is dropped, never
+    /// kept for a second try, and the agent hears the reason — in the words of
+    /// the refusal, with the code taken out of them if the helper quoted it.
+    #[test]
+    fn an_error_that_quotes_the_code_does_not_carry_it() {
+        let _hand = one_hand();
+        seat_a_person();
+        person_types(TYPED);
+        let form = RefCell::new(Form {
+            refuses_with: Some(ComputerUseError::new(
+                "value_not_settable",
+                format!("the field refused '{A_CODE}'"),
+            )),
+            ..Form::default()
+        });
+        let said = at_the_door(
+            &[
+                "handoff",
+                "--ask-code",
+                "--reason",
+                A_CODE_REASON,
+                "--into",
+                SET_VALUE,
+                "--json",
+            ],
+            &form,
+        );
+        assert_ne!(said.exit_code, 0, "a code that was not entered is an error");
+        let envelope = envelope_of(&said);
+        assert_eq!(envelope["ok"], false, "{}{}", said.stdout, said.stderr);
+        assert_eq!(
+            envelope["error"]["code"], "value_not_settable",
+            "the helper's own code stands: {}{}",
+            said.stdout, said.stderr
+        );
+        assert!(
+            told(&said).contains("the person's code was dropped, not kept"),
+            "the agent is told the code is gone and a new card is the way on: {}",
+            told(&said)
+        );
+        assert!(
+            !holds_the_code(&told(&said)),
+            "the helper's quotation reached the agent: {}",
+            told(&said)
+        );
+        assert_eq!(form.borrow().doors, ["computer"], "one try, not two");
+    }
+
+    /// The same road for every door the agent may name: the desktop's app, a
+    /// browser tab, a phone — one call each, the code the last word where the
+    /// door takes its value, and an answer that names the door and nothing of
+    /// the code.
+    #[test]
+    fn the_three_targets_are_typed_by_the_same_road() {
+        let _hand = one_hand();
+        for (into, door, verb, verification) in [
+            (SET_VALUE, "computer", "set-value", "verified"),
+            (IN_A_TAB, "browser", "type", "none"),
+            (ON_A_PHONE, "emulator", "text", "none"),
+        ] {
+            seat_a_person();
+            person_types(TYPED);
+            let form = RefCell::new(Form::default());
+            let said = at_the_door(
+                &[
+                    "handoff",
+                    "--ask-code",
+                    "--reason",
+                    A_CODE_REASON,
+                    "--into",
+                    into,
+                    "--json",
+                ],
+                &form,
+            );
+            assert_eq!(said.exit_code, 0, "{into}: {}{}", said.stdout, said.stderr);
+            assert_eq!(
+                envelope_of(&said)["result"]["into"],
+                json!({ "tool": door, "verb": verb }),
+                "{into}"
+            );
+            assert_eq!(envelope_of(&said)["result"]["verification"], verification);
+            assert_eq!(envelope_of(&said)["result"]["entered"], true);
+            assert!(!holds_the_code(&told(&said)), "{into}: {}", told(&said));
+            let form = form.borrow();
+            assert_eq!(form.doors, [door], "{into}: one input, through its own door");
+            assert_eq!(form.field.as_deref(), Some(A_CODE), "{into}");
+            match door {
+                "browser" => assert_eq!(
+                    form.browser,
+                    [words(&["type", "browser-1", "#otp", A_CODE])]
+                ),
+                "emulator" => assert_eq!(
+                    form.emulator,
+                    [words(&[
+                        "text",
+                        "--platform",
+                        "ios",
+                        "--device",
+                        "SIM-1",
+                        "--text",
+                        A_CODE,
+                    ])]
+                ),
+                _ => assert_eq!(form.computer.len(), 1),
+            }
+        }
+    }
+
+    /// A reason that names a secret got the plain card, and what the person
+    /// typed on their own device is theirs: nothing is typed anywhere. In text
+    /// mode that is an error, so a `&&` in front of whatever comes next stops;
+    /// the envelope says it to a reader who looks.
+    #[test]
+    fn a_secret_reason_gets_the_plain_card_and_no_code_is_taken() {
+        let _hand = one_hand();
+        seat_a_person();
+        let form = RefCell::new(Form::default());
+        person_says(Decision::Allowed);
+        let secret = at_the_door(
+            &[
+                "handoff",
+                "--ask-code",
+                "--reason",
+                "카드 비밀번호",
+                "--into",
+                SET_VALUE,
+                "--json",
+            ],
+            &form,
+        );
+        assert_eq!(
+            envelope_of(&secret)["result"],
+            json!({
+                "resumed": true,
+                "reason": "카드 비밀번호",
+                "entered": false,
+                "codeRefused": "secret_reason",
+            })
+        );
+        assert_eq!(
+            shown_cards().last(),
+            Some(&(false, "카드 비밀번호".to_string())),
+            "the card for a secret has no line"
+        );
+
+        person_says(Decision::Allowed);
+        let said = at_the_door(
+            &[
+                "handoff",
+                "--ask-code",
+                "--reason",
+                "카드 비밀번호",
+                "--into",
+                SET_VALUE,
+            ],
+            &form,
+        );
+        assert_ne!(
+            said.exit_code, 0,
+            "an answer with no code in it must not read as one to go on from"
+        );
+        assert!(said.stdout.is_empty(), "{:?}", said.stdout);
+        assert!(
+            said.stderr.contains("no code was taken"),
+            "the error says why: {}",
+            said.stderr
+        );
+        assert!(form.borrow().doors.is_empty(), "nothing was typed");
+    }
+
+    /// A plain turn answers as it always did, with or without anything else
+    /// said about codes.
+    #[test]
+    fn a_plain_turn_is_the_plain_answer() {
+        let _hand = one_hand();
+        seat_a_person();
+        let form = RefCell::new(Form::default());
+        person_says(Decision::Allowed);
+        let plain = at_the_door(&["handoff", "--reason", A_CODE_REASON, "--json"], &form);
+        assert_eq!(
+            envelope_of(&plain)["result"],
+            json!({ "resumed": true, "reason": A_CODE_REASON })
+        );
+        assert_eq!(shown_cards(), [(false, A_CODE_REASON.to_string())]);
+    }
+
+    /// A cancel and a silence are the answers of the plain turn, byte for
+    /// byte, whether or not the card had a line.
+    #[test]
+    fn a_cancel_and_a_silence_read_the_same_with_or_without_a_line() {
+        let _hand = one_hand();
+        seat_a_person();
+        for decision in [Decision::Refused, Decision::TimedOut] {
+            let form = RefCell::new(Form::default());
+            let say = |coded: bool| {
+                person_says(decision);
+                let mut argv = vec![
+                    "handoff",
+                    "--reason",
+                    A_CODE_REASON,
+                    "--timeout-ms",
+                    "180000",
+                ];
+                if coded {
+                    argv.extend(["--ask-code", "--into", SET_VALUE]);
+                }
+                at_the_door(&argv, &form)
+            };
+            let plain = say(false);
+            let coded = say(true);
+            assert_ne!(plain.exit_code, 0, "{decision:?} is a refusal");
+            assert_eq!(
+                (coded.exit_code, coded.stdout, coded.stderr),
+                (plain.exit_code, plain.stdout, plain.stderr),
+                "{decision:?}"
+            );
+            assert!(form.borrow().doors.is_empty(), "{decision:?}: nothing typed");
+        }
+    }
+
+    /// Nothing of the window answers for the person while a card with a line
+    /// stands: every action is refused `person_asked`, as for any question.
+    #[test]
+    fn nothing_acts_while_a_card_with_a_line_stands() {
+        let _hand = one_hand();
+        let id = confirm::next_id();
+        let card = Handoff {
+            id: id.clone(),
+            reason: A_CODE_REASON.to_string(),
+            reason_key: None,
+            reason_args: Value::Null,
+            timeout_ms: 1_000,
+            code_ask: Some(CodeLimits::TABLE),
+        };
+        let _receiver = confirm::open_handoff(&card);
+        let standing = Standing(id.clone());
+        let form = RefCell::new(Form::default());
+        for argv in [
+            &["key", "--key", "return", "--json"][..],
+            &["type-text", "--app", "Form", "--text", A_CODE, "--json"][..],
+            &["set-value", "--app", "Form", "--element-index", "3", "--value", A_CODE, "--json"][..],
+            &["click", "--app", "Form", "--text", "보내기", "--json"][..],
+        ] {
+            let refused = at_the_door(argv, &form);
+            assert_eq!(
+                envelope_of(&refused)["error"]["code"],
+                error_code::PERSON_ASKED,
+                "{argv:?}"
+            );
+        }
+        drop(standing);
+        assert!(!confirm::asking(), "the card goes when its guard does");
+    }
+
+    /// The card with a line shows what the person types, in clear. While it
+    /// stands, a picture of the whole display waits (`person_asked`) — it would
+    /// carry the code into a file — and every look that is not one still
+    /// answers. A card without a line, and no card at all, refuse no picture.
+    #[test]
+    fn a_picture_of_the_display_waits_while_a_card_with_a_line_stands() {
+        let _hand = one_hand();
+        // The helper's lists, handed in: a look that names an app asks for
+        // them while a card stands, and a unit test has no helper to ask.
+        let apps = Some(json!({ "apps": [
+            { "name": "Notes", "bundleId": "com.apple.Notes", "pid": 1 },
+        ] }));
+        let windows = Some(json!({ "windows": [] }));
+        let refusal = |argv: &[&str]| {
+            let parsed = parse_command(&words(argv));
+            assert!(parsed.is_ok(), "{argv:?} parses: {parsed:?}");
+            door_refusal_with(
+                &parsed.unwrap_or_else(|_| unreachable!("asserted above")),
+                &mut || apps.clone(),
+                &mut || windows.clone(),
+            )
+            .map(|why| why.code)
+        };
+        let card = |id: &str, line: bool| Handoff {
+            id: id.to_string(),
+            reason: A_CODE_REASON.to_string(),
+            reason_key: None,
+            reason_args: Value::Null,
+            timeout_ms: 1_000,
+            code_ask: line.then_some(CodeLimits::TABLE),
+        };
+        let pictures: [&[&str]; 4] = [
+            &["screenshot"],
+            &["zoom", "--region", "0,0,40,40"],
+            &["observe"],
+            &["compare", "--baseline", "/baseline.png"],
+        ];
+        let other_looks: [&[&str]; 5] = [
+            &["wait", "--ms", "1"],
+            &["status"],
+            &["watch"],
+            &["observe", "--app", "Notes"],
+            &["observe", "--no-screenshot"],
+        ];
+
+        let id = confirm::next_id();
+        let standing = Standing(id.clone());
+        let _receiver = confirm::open_handoff(&card(&id, true));
+        for argv in pictures {
+            assert_eq!(
+                refusal(argv),
+                Some(error_code::PERSON_ASKED.to_string()),
+                "{argv:?} while the card stands"
+            );
+        }
+        for argv in other_looks {
+            assert_eq!(
+                refusal(argv),
+                None,
+                "{argv:?} carries no picture of the display"
+            );
+        }
+        drop(standing);
+        for argv in pictures {
+            assert_eq!(refusal(argv), None, "{argv:?} once the card has gone");
+        }
+
+        let plain = confirm::next_id();
+        let _plain_standing = Standing(plain.clone());
+        let _plain_receiver = confirm::open_handoff(&card(&plain, false));
+        for argv in pictures {
+            assert_eq!(
+                refusal(argv),
+                None,
+                "{argv:?} while a card with no line stands: nothing typed to photograph"
+            );
+        }
+    }
+
+    /// The signed helper refuses ZeroCode as the target of an action only, so
+    /// a look that names ZeroCode's own app or one of its windows — the tree of
+    /// the app the card is drawn in, a picture of its window — would hand the
+    /// helper what the person is typing. While a card with a line stands the
+    /// window refuses those looks itself, finding itself in the helper's list
+    /// by its own process; a look at another app answers, and a list that does
+    /// not come refuses closed.
+    #[test]
+    fn a_look_that_names_zerocode_waits_while_a_card_with_a_line_stands() {
+        let _hand = one_hand();
+        let own = i64::from(std::process::id());
+        let apps = Some(json!({ "apps": [
+            { "name": "ZeroCode", "bundleId": "dev.zerocode.app", "pid": own },
+            { "name": "Notes", "bundleId": "com.apple.Notes", "pid": own + 1 },
+        ] }));
+        let windows = Some(json!({ "windows": [
+            { "id": 77, "own": true },
+            { "id": 78, "own": false },
+        ] }));
+        let refusal = |argv: &[&str], apps: &Option<Value>| {
+            let parsed = parse_command(&words(argv));
+            assert!(parsed.is_ok(), "{argv:?} parses: {parsed:?}");
+            door_refusal_with(
+                &parsed.unwrap_or_else(|_| unreachable!("asserted above")),
+                &mut || apps.clone(),
+                &mut || windows.clone(),
+            )
+            .map(|why| why.code)
+        };
+        let naming_zerocode: [&[&str]; 7] = [
+            &["observe", "--app", "ZeroCode"],
+            &["get-app-state", "--app", "dev.zerocode.app"],
+            &["get-app-state", "--app", "zerocode", "--no-screenshot"],
+            &["read", "--app", "ZeroCode"],
+            &["find", "--app", "ZeroCode", "--text", "Code"],
+            &["list-windows", "--app", "ZeroCode"],
+            &["get-app-state", "--app", "Notes", "--window-id", "77"],
+        ];
+        let naming_another: [&[&str]; 4] = [
+            &["observe", "--app", "Notes"],
+            &["get-app-state", "--app", "com.apple.Notes"],
+            &["get-app-state", "--app", "Notes", "--window-id", "78"],
+            &["read", "--app", "Notes"],
+        ];
+
+        let card = |id: &str, line: bool| Handoff {
+            id: id.to_string(),
+            reason: A_CODE_REASON.to_string(),
+            reason_key: None,
+            reason_args: Value::Null,
+            timeout_ms: 1_000,
+            code_ask: line.then_some(CodeLimits::TABLE),
+        };
+        let id = confirm::next_id();
+        let standing = Standing(id.clone());
+        let _receiver = confirm::open_handoff(&card(&id, true));
+        for argv in naming_zerocode {
+            assert_eq!(
+                refusal(argv, &apps),
+                Some(error_code::PERSON_ASKED.to_string()),
+                "{argv:?} names ZeroCode while the card stands"
+            );
+        }
+        for argv in naming_another {
+            assert_eq!(
+                refusal(argv, &apps),
+                None,
+                "{argv:?} names another app and answers"
+            );
+        }
+        assert_eq!(
+            refusal(&["get-app-state", "--app", "Notes"], &None),
+            Some(error_code::PERSON_ASKED.to_string()),
+            "a list that does not come refuses closed"
+        );
+        drop(standing);
+        for argv in naming_zerocode {
+            assert_eq!(refusal(argv, &apps), None, "{argv:?} once the card has gone");
+        }
+        let plain = confirm::next_id();
+        let _plain_standing = Standing(plain.clone());
+        let _plain_receiver = confirm::open_handoff(&card(&plain, false));
+        for argv in naming_zerocode {
+            assert_eq!(
+                refusal(argv, &apps),
+                None,
+                "{argv:?} while a card with no line stands: nothing typed to read"
+            );
+        }
+    }
+
+    /// What the agent is told on each road a code can be asked for, with the
+    /// command it ran: the old request (no place named — a code's answer before,
+    /// a refusal now) and the new one, through the form. The same body runs at
+    /// the head that answered the old request with the code and at the head
+    /// that does not.
+    fn roads() -> Vec<(&'static str, Vec<String>, zerocode_hookd::TeamAnswer)> {
+        seat_a_person();
+        let mut seen = Vec::new();
+        for (road, extra) in [
+            ("no place named", Vec::new()),
+            ("into a field", vec!["--into", SET_VALUE]),
+        ] {
+            person_types(TYPED);
+            let mut argv = vec![
+                "handoff",
+                "--ask-code",
+                "--reason",
+                A_CODE_REASON,
+                "--timeout-ms",
+                "180000",
+            ];
+            argv.extend(extra);
+            let argv = words(&argv);
+            let form = RefCell::new(Form::default());
+            let answer = at_the_door_with(&argv, &mut FormTyper(&form));
+            seen.push((road, argv, answer));
+        }
+        seen
+    }
+
+    /// A finished shell call as an agent's hook reports it to the window: its
+    /// command, and what came back — as one string, and as the two streams.
+    fn finished_call(command: &[String], answer: &zerocode_hookd::TeamAnswer, streams: bool) -> String {
+        let response = if streams {
+            json!({ "stdout": answer.stdout, "stderr": answer.stderr })
+        } else {
+            json!(told(answer))
+        };
+        json!({
+            "session_id": "session-1",
+            "cwd": "/Users/dev/app",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command.join(" ") },
+            "tool_use_id": "call-1",
+            "tool_response": response,
+        })
+        .to_string()
+    }
+
+    fn planted() -> zerocode_hookd::TeamAnswer {
+        zerocode_hookd::TeamAnswer {
+            stdout: format!("{A_CODE}\n"),
+            stderr: String::new(),
+            exit_code: 0,
+        }
+    }
+
+    /// The board's card line for a pane — "the last answer" — takes the text a
+    /// tool handed back, and the file the board is restored from keeps that
+    /// line for a week. Whatever the agent was told by a request for a code must
+    /// not be in either: the line is made from the answer, so the answer is
+    /// where the code must not be.
+    #[test]
+    fn the_board_card_and_the_file_it_is_restored_from_hold_no_code() {
+        let _hand = one_hand();
+        let dir = tempfile::tempdir().expect("a temporary folder");
+        let line_of = |payload: &str| {
+            let envelope = zerocode_core::HookEnvelope {
+                agent: zerocode_core::agent::AgentKind::Claude,
+                pane_key: crate::hooks::pane_key_of(9_411),
+                tab_id: String::new(),
+                launch_token: String::new(),
+                worktree_id: String::new(),
+                env: String::new(),
+                version: "1".into(),
+                hook_event_name: String::new(),
+                payload: payload.into(),
+            };
+            crate::hooks::report_of(&envelope, None).and_then(|report| report.said)
+        };
+        let file_of = |said: Option<String>| {
+            let at = dir.path().join("last-status.json");
+            let held = crate::last_status::LastStatus {
+                worktree: "/Users/dev/app".into(),
+                agent: "claude".into(),
+                state: zerocode_core::hook::HookState::Working,
+                at: 1_000,
+                state_started_at: 1_000,
+                you: None,
+                said,
+                session: None,
+                resumable: false,
+                received_at: 1_000,
+                session_boundary: false,
+                interrupted: false,
+            };
+            let mut entries = std::collections::HashMap::new();
+            entries.insert(crate::last_status::key("/Users/dev/app", 9_411), held);
+            let saved = crate::last_status::save(&at, &entries, None);
+            assert!(saved.is_ok(), "{saved:?}");
+            std::fs::read_to_string(at).unwrap_or_default()
+        };
+
+        // The check sees a code where one is: the same line, made from an answer
+        // that holds it, holds it in the card and in the file.
+        let with = line_of(&finished_call(&words(&["handoff"]), &planted(), false));
+        assert!(
+            with.as_deref().is_some_and(holds_the_code),
+            "the card line is made of the tool's text: {with:?}"
+        );
+        assert!(holds_the_code(&file_of(with)), "the file keeps the line");
+
+        for (road, argv, answer) in roads() {
+            let said = line_of(&finished_call(&argv, &answer, false));
+            assert!(
+                !said.as_deref().is_some_and(holds_the_code),
+                "{road}: the card says {said:?}"
+            );
+            assert!(
+                !holds_the_code(&file_of(said)),
+                "{road}: the file the board is restored from holds the code"
+            );
+        }
+    }
+
+    /// The seats that read what a finished call handed back — the claim seat's
+    /// evidence, which goes to a model outside the window when an answer
+    /// claims the work is done, and the digest a coordinator reads of a worker's
+    /// turns — keep no more of a request for a code than the answer held.
+    #[test]
+    fn what_a_seat_or_a_coordinator_reads_of_a_finished_call_holds_no_code() {
+        let _hand = one_hand();
+        let seen = |payload: &str| {
+            format!(
+                "{:?}",
+                zerocode_core::hook_guard::moments(
+                    zerocode_core::agent::AgentKind::Claude,
+                    "PostToolUse",
+                    payload,
+                )
+            )
+        };
+        let digest = |argv: &[String], answer: &zerocode_hookd::TeamAnswer| {
+            let tool = zerocode_core::transcript::TranscriptTool {
+                call_id: "toolu_1".into(),
+                name: "Bash".into(),
+                kind: "bash".into(),
+                input: argv.join(" "),
+                is_error: false,
+                edits: Vec::new(),
+                file: None,
+                facts: None,
+            };
+            let records = [
+                zerocode_core::transcript::TranscriptTurn {
+                    role: "tool".into(),
+                    text: String::new(),
+                    at_ms: Some(1),
+                    tool: Some(tool.clone()),
+                    images: Vec::new(),
+                },
+                zerocode_core::transcript::TranscriptTurn {
+                    role: "tool_result".into(),
+                    text: told(answer),
+                    at_ms: Some(2),
+                    tool: Some(tool),
+                    images: Vec::new(),
+                },
+            ];
+            let ask = zerocode_core::worker_transcript::TranscriptAsk::of(None, None, true);
+            assert!(ask.is_ok(), "{ask:?}");
+            let shaped = zerocode_core::worker_transcript::shape(
+                "w-1",
+                "claude",
+                &records,
+                zerocode_core::worker_transcript::Scan::default(),
+                &ask.unwrap_or_else(|_| unreachable!("asserted above")),
+            );
+            serde_json::to_string(&shaped).unwrap_or_default()
+        };
+
+        // The checks see a code where one is.
+        assert!(
+            holds_the_code(&seen(&finished_call(&words(&["handoff"]), &planted(), true))),
+            "the claim seat's evidence is made of the call's streams"
+        );
+        assert!(
+            holds_the_code(&digest(&words(&["handoff"]), &planted())),
+            "the coordinator's digest is made of the call's result"
+        );
+
+        for (road, argv, answer) in roads() {
+            assert!(
+                !holds_the_code(&seen(&finished_call(&argv, &answer, true))),
+                "{road}: a seat's evidence holds the code"
+            );
+            assert!(
+                !holds_the_code(&digest(&argv, &answer)),
+                "{road}: the coordinator's digest holds the code"
+            );
+        }
+    }
+
+    /// What a terminal shows of a call — its command and what it printed — is
+    /// kept when the terminal is closed or its worker released, and the window
+    /// writes to its log and to the evidence folder what it did. None of them
+    /// holds what the person typed, whichever way the code was asked for.
+    #[test]
+    fn the_terminal_the_log_and_the_evidence_folder_hold_no_code() {
+        let _hand = one_hand();
+        for (road, argv, answer) in roads() {
+            let screen = format!("$ zerocode-computer {}\n{}{}", argv.join(" "), answer.stdout, answer.stderr);
+            assert!(!holds_the_code(&screen), "{road}: the terminal shows the code\n{screen}");
+            let logged = crate::run_evidence::redacted("computer", &argv).join(" ");
+            assert!(!holds_the_code(&logged), "{road}: the evidence line holds the code: {logged}");
+        }
+        let planted = format!("$ zerocode-computer handoff\n{}", planted().stdout);
+        assert!(holds_the_code(&planted), "the check sees a code where one is");
+    }
+
+    /// The text mode's one line is what the pretty printer says: a handoff that
+    /// took a code says what went in, a plain one keeps the pretty JSON.
+    #[test]
+    fn the_pretty_answer_of_a_handoff_names_the_input_and_never_the_code() {
+        let ask = parse_command(&words(&[
+            "handoff",
+            "--ask-code",
+            "--reason",
+            "x",
+            "--into",
+            SET_VALUE,
+        ]));
+        assert!(ask.is_ok(), "handoff --ask-code --into parses: {ask:?}");
+        let ask = ask.unwrap_or_else(|_| unreachable!("asserted above"));
+        let entered = said_envelope(
+            &ask,
+            json!({
+                "resumed": true,
+                "reason": "x",
+                "codeLength": 8,
+                "entered": true,
+                "into": { "tool": "computer", "verb": "set-value" },
+                "verification": "unverified",
+            }),
+        );
+        assert_eq!(
+            entered.stdout,
+            "entered 8 characters into set-value (unverified)\n"
+        );
+        let refused = said_envelope(
+            &ask,
+            json!({ "resumed": true, "reason": "x", "entered": false, "codeRefused": "secret_reason" }),
+        );
+        assert!(
+            refused.stdout.contains("\"codeRefused\": \"secret_reason\""),
+            "an answer that took no code is the pretty JSON: {}",
+            refused.stdout
+        );
+    }
+}
+
+/// The browser door's form pair, window half (t-37883): a fill's passes on
+/// the window's clock, and what the page scripts are handed. The page
+/// halves run for real in Chromium (`ui/tests/browser-door.mjs`).
+mod browser_form_fill {
+
+    use super::*;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use zerocode_core::browser_form::{
+        BROWSER_FILL_PASSES, BROWSER_FILL_PENDING_MS, BROWSER_FORM_CONTROLS,
+        BROWSER_FORM_FRAME_SEPARATOR, FillEntry, FillPass, FillResult, FillStatus, FormValue,
+    };
+
+    const POLL: Duration = Duration::from_millis(100);
+
+    fn entry(handle: &str) -> FillEntry {
+        FillEntry {
+            handle: handle.to_string(),
+            value: FormValue::Text("x".into()),
+        }
+    }
+
+    fn answer(asked: &[FillEntry], status: impl Fn(&str) -> FillStatus) -> FillPass {
+        FillPass {
+            results: asked
+                .iter()
+                .map(|entry| FillResult {
+                    handle: entry.handle.clone(),
+                    status: status(&entry.handle),
+                    ..FillResult::default()
+                })
+                .collect(),
+            ..FillPass::default()
+        }
+    }
+
+    /// A time list a chosen date loads 300 ms later: the date is written once,
+    /// the time is tried every poll and written the pass its choices are
+    /// there — one fill, no look in between.
+    #[tokio::test(start_paused = true)]
+    async fn a_field_an_earlier_value_brings_is_written_once_it_is_there() {
+        let began = tokio::time::Instant::now();
+        let asked_log: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let log = asked_log.clone();
+        let report = cmd::browser::form::fill_passes(
+            vec![entry("#date"), entry("#time")],
+            None,
+            Duration::from_millis(BROWSER_FILL_PENDING_MS),
+            POLL,
+            move |asked, _| {
+                log.lock().unwrap().push(asked.iter().map(|e| e.handle.clone()).collect());
+                let loaded = began.elapsed() >= Duration::from_millis(300);
+                async move {
+                    Ok(answer(&asked, |handle| {
+                        if handle == "#time" && !loaded {
+                            FillStatus::NoOption
+                        } else {
+                            FillStatus::Set
+                        }
+                    }))
+                }
+            },
+        )
+        .await
+        .expect("filled");
+        assert!(report.all_took(), "{report:?}");
+        assert_eq!(report.passes, 4, "0, 100, 200 and 300 ms");
+        let asked = asked_log.lock().unwrap().clone();
+        assert_eq!(asked[0], ["#date", "#time"]);
+        assert!(asked[1..].iter().all(|pass| pass == &["#time"]), "{asked:?}");
+        assert!(began.elapsed() < Duration::from_millis(BROWSER_FILL_PENDING_MS));
+    }
+
+    /// A field that never comes is said, not waited for past the fill's
+    /// passes or its wait — whichever runs out first.
+    #[tokio::test(start_paused = true)]
+    async fn a_field_that_never_comes_is_said_once_the_wait_is_spent() {
+        let never = |asked: Vec<FillEntry>, _: Option<String>| async move {
+            Ok(answer(&asked, |_| FillStatus::NotFound))
+        };
+        let pending = Duration::from_millis(BROWSER_FILL_PENDING_MS);
+        let began = tokio::time::Instant::now();
+        let quick = cmd::browser::form::fill_passes(vec![entry("#ghost")], None, pending, POLL, never)
+            .await
+            .expect("answered");
+        assert_eq!(quick.passes, BROWSER_FILL_PASSES, "the passes ran out first");
+        assert_eq!(quick.results[0].status, FillStatus::NotFound);
+        assert!(began.elapsed() < pending);
+        let began = tokio::time::Instant::now();
+        let slow =
+            cmd::browser::form::fill_passes(vec![entry("#ghost")], None, pending, pending / 2, never)
+            .await
+            .expect("answered");
+        assert_eq!(slow.passes, 3, "the wait ran out first: 0, 1 and 2 s");
+        assert!(began.elapsed() <= pending);
+        assert!(!slow.all_took());
+    }
+
+    /// A pass the page could not answer ends the fill with the page's word.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_the_page_refuses_ends_the_fill_with_its_word() {
+        let refused = cmd::browser::form::fill_passes(
+            vec![entry("#a")],
+            None,
+            Duration::from_millis(BROWSER_FILL_PENDING_MS),
+            POLL,
+            |_, _| async { Err(cmd::browser::PAGE_TIMED_OUT.to_string()) },
+        )
+        .await;
+        assert_eq!(refused, Err(cmd::browser::PAGE_TIMED_OUT.to_string()));
+    }
+
+    /// The scripts are handed the core's tables — no list or cap of their
+    /// own — and a bundle travels as data, never as script text.
+    #[test]
+    fn the_form_scripts_are_handed_the_cores_tables_and_the_bundle_as_data() {
+        let mut request = cmd::browser::form::form_request();
+        assert_eq!(request["controls"], json!(BROWSER_FORM_CONTROLS));
+        assert_eq!(request["frameSeparator"], json!(BROWSER_FORM_FRAME_SEPARATOR));
+        // The words of a press that cannot be taken back are the one table the
+        // window asks a person with (`guarded`), whole and in its rows' order: a
+        // page script never presses, on a guess, a control that says one of them.
+        let held: Vec<&str> = [
+            zerocode_core::guarded::PAYMENT_WORDS,
+            zerocode_core::guarded::TRANSFER_WORDS,
+            zerocode_core::guarded::DELETE_WORDS,
+            zerocode_core::guarded::COMMIT_WORDS,
+        ]
+        .concat();
+        assert_eq!(request["holds"], json!(held));
+        for key in [
+            "notFields", "actions", "scopes", "options", "days", "dayWords", "on", "off", "lists",
+            "listItems", "pressables", "holds", "live",
+        ] {
+            assert!(
+                request[key].as_array().is_some_and(|list| !list.is_empty()),
+                "{key}"
+            );
+        }
+        for cap in [
+            "fieldCap", "actionCap", "optionCap", "wordCap", "valueCap", "answerCap",
+            "frameDepth", "captionDepth", "monthDays", "monthPages", "scanCap", "freshCap",
+            "pieceCap", "outsideCap",
+        ] {
+            assert!(request[cap].as_u64().is_some_and(|n| n > 0), "{cap}");
+        }
+        let hostile = "\"); alert(1); (\"";
+        request["entries"] = json!([{ "handle": "#a", "value": hostile }]);
+        let script = cmd::browser::form::fill_script(&request, cmd::browser::form::BROWSER_FILL_BODY);
+        assert!(!script.contains(hostile), "the value is JSON data in the request");
+        for piece in ["const zcNameOf", "const zcFormFields", "const zcWrite", "request.entries"] {
+            assert!(script.contains(piece), "the fill script lacks {piece}");
+        }
+    }
+
+    /// Nothing a form script does waits for a frame or reads where a field
+    /// sits, so a tab nobody is looking at reads and fills as a shown one;
+    /// and only the fill writes.
+    #[test]
+    fn a_form_script_reads_no_place_and_waits_for_no_frame() {
+        let fill = cmd::browser::form::BROWSER_FILL_HELPERS;
+        for script in [
+            cmd::browser::form::BROWSER_FORM_HELPERS,
+            cmd::browser::form::BROWSER_FIELDS_BODY,
+            fill,
+            cmd::browser::form::BROWSER_FILL_BODY,
+            cmd::browser::form::BROWSER_EVAL_FORM,
+            cmd::browser::form::BROWSER_PRESS_BEFORE_BODY,
+            cmd::browser::form::BROWSER_PRESS_AFTER_BODY,
+        ] {
+            for place in [
+                "getBoundingClientRect",
+                "elementFromPoint",
+                "requestAnimationFrame",
+                "setTimeout",
+                "scrollIntoView",
+                "innerWidth",
+            ] {
+                assert!(!script.contains(place), "a form script reads `{place}`");
+            }
+        }
+        for write in ["dispatchEvent", ".click(", "focus(", "selected = true"] {
+            assert!(fill.contains(write), "the fill lost `{write}`");
+        }
+        assert!(
+            fill.contains("\"secret\"") && fill.contains("\"file\""),
+            "a secret and a file are refused by name"
+        );
+    }
+
+    /// The form a fill is held to (m-40824): the first pass carries the
+    /// fingerprint its agent read and no later pass does — a field the
+    /// fill's own values bring is no stale form — and a page that says the
+    /// form changed ends the fill there, with nothing written.
+    #[tokio::test(start_paused = true)]
+    async fn a_fill_is_held_to_the_form_read_on_its_first_pass_only() {
+        let carried: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let seen = carried.clone();
+        let report = cmd::browser::form::fill_passes(
+            vec![entry("#date"), entry("#time")],
+            Some("9:read".into()),
+            Duration::from_millis(BROWSER_FILL_PENDING_MS),
+            POLL,
+            move |asked, expect| {
+                let first = seen.lock().unwrap().is_empty();
+                seen.lock().unwrap().push(expect);
+                async move {
+                    Ok(answer(&asked, |handle| {
+                        if handle == "#time" && first {
+                            FillStatus::NoOption
+                        } else {
+                            FillStatus::Set
+                        }
+                    }))
+                }
+            },
+        )
+        .await
+        .expect("filled");
+        assert!(report.all_took() && !report.stale, "{report:?}");
+        assert_eq!(
+            carried.lock().unwrap().clone(),
+            [Some("9:read".to_string()), None]
+        );
+        let stale = cmd::browser::form::fill_passes(
+            vec![entry("#date")],
+            Some("9:read".into()),
+            Duration::from_millis(BROWSER_FILL_PENDING_MS),
+            POLL,
+            |_, _| async {
+                Ok(FillPass {
+                    stale: true,
+                    fingerprint: "12:other".into(),
+                    ..FillPass::default()
+                })
+            },
+        )
+        .await
+        .expect("answered");
+        assert!(stale.stale && !stale.all_took() && stale.passes == 1, "{stale:?}");
+        assert!(
+            zerocode_core::browser_form::fill_lines(&stale).starts_with(
+                zerocode_core::computer_use_protocol::error_code::FORM_STALE
+            )
+        );
+    }
+
+    fn settled(state: zerocode_core::agent_browser::Settle) -> cmd::browser::SettleReport {
+        cmd::browser::SettleReport {
+            state,
+            why: zerocode_core::agent_browser::SettleWhy::Quiet,
+            ms: 52,
+            polls: 2,
+            hidden: Some(false),
+        }
+    }
+
+    fn written(wrote: bool) -> cmd::browser::form::FillWritten {
+        cmd::browser::form::FillWritten {
+            wrote,
+            epoch: "1760000000000".into(),
+            at: Some(812.5),
+            held: json!([{ "handle": "#a" }]),
+            ..cmd::browser::form::FillWritten::default()
+        }
+    }
+
+    /// One pass through `settled_pass` with the three halves faked: what it
+    /// asked of each, in order, and the pass it answered.
+    async fn pass_through(
+        first: cmd::browser::form::FillWritten,
+        ending: zerocode_core::agent_browser::Settle,
+    ) -> (Result<FillPass, String>, Vec<String>) {
+        let log: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (on_write, on_settle, on_read) = (log.clone(), log.clone(), log.clone());
+        let pass = cmd::browser::form::settled_pass(
+            move || {
+                on_write.lock().unwrap().push("write".into());
+                async move { Ok(first) }
+            },
+            move |epoch, at| {
+                on_settle.lock().unwrap().push(format!("settle {epoch} {at:?}"));
+                async move { settled(ending) }
+            },
+            move |held, epoch| {
+                on_read.lock().unwrap().push(format!("read {epoch} {held}"));
+                async move { Ok(FillPass::default()) }
+            },
+        )
+        .await;
+        let log = log.lock().unwrap().clone();
+        (pass, log)
+    }
+
+    /// A pass that wrote lets the page settle — in the document it wrote in,
+    /// counting from the page's clock at the last write — before it reads back.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_that_wrote_is_read_only_after_the_page_has_settled() {
+        use zerocode_core::agent_browser::Settle;
+        let (pass, log) = pass_through(written(true), Settle::Ready).await;
+        assert_eq!(
+            log,
+            [
+                "write",
+                "settle 1760000000000 Some(812.5)",
+                r##"read 1760000000000 [{"handle":"#a"}]"##
+            ],
+            "{log:?}"
+        );
+        assert_eq!(pass.expect("a pass").moving, Some(false));
+    }
+
+    /// A pass that wrote nothing has nothing to wait for.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_that_wrote_nothing_does_not_wait_for_the_page() {
+        use zerocode_core::agent_browser::Settle;
+        let (pass, log) = pass_through(written(false), Settle::Ready).await;
+        assert_eq!(
+            log,
+            ["write", r##"read 1760000000000 [{"handle":"#a"}]"##],
+            "{log:?}"
+        );
+        assert_eq!(pass.expect("a pass").moving, None, "no settle was heard");
+    }
+
+    /// A form that is not the one read is answered at once: nothing was
+    /// written, so nothing is settled or read.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_form_is_answered_before_anything_is_settled_or_read() {
+        use zerocode_core::agent_browser::Settle;
+        let mut first = written(true);
+        first.stale = true;
+        first.fingerprint = "12:other".into();
+        let (pass, log) = pass_through(first, Settle::Ready).await;
+        assert_eq!(log, ["write"], "{log:?}");
+        let pass = pass.expect("a pass");
+        assert!(pass.stale && pass.fingerprint == "12:other", "{pass:?}");
+    }
+
+    /// A page that did not stand still in the settle's time — or went to
+    /// another document — is said to be still changing, never settled.
+    #[tokio::test(start_paused = true)]
+    async fn a_page_that_does_not_settle_is_said_to_be_still_changing() {
+        use zerocode_core::agent_browser::Settle;
+        for ending in [Settle::NotReady, Settle::Invalidated] {
+            let (pass, _) = pass_through(written(true), ending).await;
+            assert_eq!(pass.expect("a pass").moving, Some(true), "{ending:?}");
+        }
+    }
+
+    /// What a pane's agent last read is what its next fill is held to; a
+    /// page that answered no fingerprint holds it to nothing.
+    #[test]
+    fn a_panes_last_form_is_remembered_and_forgotten() {
+        let label = "browser-form-memory-test";
+        assert_eq!(cmd::browser::form::known_form(label), None);
+        cmd::browser::form::remember_form(label, "9:read");
+        assert_eq!(cmd::browser::form::known_form(label).as_deref(), Some("9:read"));
+        cmd::browser::form::remember_form(label, "");
+        assert_eq!(cmd::browser::form::known_form(label), None);
+    }
+
+    /// The buttons of the form a pane's agent last read are kept beside its
+    /// fingerprint, so a fill's answer can say which one the page took away.
+    #[test]
+    fn a_panes_last_buttons_are_remembered_beside_its_form() {
+        use zerocode_core::browser_form::FormAction;
+        let label = "browser-form-buttons-test";
+        assert!(cmd::browser::form::known_buttons(label).is_empty());
+        let buttons = vec![FormAction {
+            handle: "#go".into(),
+            label: "Continue".into(),
+            disabled: true,
+            ..FormAction::default()
+        }];
+        cmd::browser::form::remember_buttons(label, &buttons);
+        assert_eq!(cmd::browser::form::known_buttons(label), buttons);
+    }
+
+    /// A fill pass on a page: the write, the settle a press by number waits with
+    /// (the one road — the pass has no wait of its own), then the read.
+    #[test]
+    fn a_fill_pass_waits_for_the_page_by_the_one_settle_road_between_its_write_and_its_read() {
+        let pass = include_str!("cmd/browser/form.rs")
+            .split("async fn fill_pass_on(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("the pass on a page");
+        let write = pass.find("\"write\"").expect("the write half");
+        let settle = pass
+            .find("settle_after_press(pane, &epoch, at)")
+            .expect("the settle");
+        let read = pass.find("\"read\"").expect("the read half");
+        assert!(
+            write < settle && settle < read,
+            "write, settle, read — in that order:\n{pass}"
+        );
+        assert!(
+            !pass.contains("sleep(") && !pass.contains("Duration::from_millis"),
+            "the pass has no wait of its own:\n{pass}"
+        );
+    }
+
+    /// The fill road sets its answer against the form its agent read before it
+    /// and keeps what it leaves — the form's print and its buttons — except
+    /// when the form was stale and nothing was written.
+    #[test]
+    fn a_fill_is_set_against_the_form_that_was_read_before_it() {
+        let road = include_str!("cmd/browser/form.rs")
+            .split("pub(crate) async fn automate_fill(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("the fill road");
+        for piece in [
+            "known_buttons(label)",
+            "report.against(known.as_deref(), &buttons)",
+            "remember_form(label, &report.fingerprint)",
+            "remember_buttons(label, &report.actions)",
+        ] {
+            assert!(road.contains(piece), "the fill road lacks `{piece}`:\n{road}");
+        }
+        let stale = road.find("if report.stale").expect("a stale fill ends first");
+        assert!(
+            stale < road.find("report.against(").expect("set against"),
+            "a stale fill is not set against anything:\n{road}"
+        );
+    }
+
+    /// What the read half of a pass is handed: the entries the write held and — when
+    /// the write took what the form's boxes showed before it — that, in one piece.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_hands_its_read_what_stood_before_the_write() {
+        use zerocode_core::agent_browser::Settle;
+        let mut first = written(true);
+        first.before = json!({ "groups": { "#a": ["3:1c"] }, "live": [] });
+        let (_, log) = pass_through(first, Settle::Ready).await;
+        let handed = log[2].trim_start_matches("read 1760000000000 ");
+        let handed: serde_json::Value = serde_json::from_str(handed).expect("one piece of JSON");
+        assert_eq!(
+            handed,
+            json!({ "held": [{ "handle": "#a" }], "before": { "groups": { "#a": ["3:1c"] }, "live": [] } }),
+            "{log:?}"
+        );
+    }
+
+    /// A press report as the click script answers one, made at the page's
+    /// clock 812.5.
+    fn a_press_at_812() -> cmd::browser::BrowserInputReport {
+        cmd::browser::input_report(
+            json!({ "method": "dom-activation", "pressedAt": 812.5 }),
+            &["dom-activation"],
+        )
+        .expect("a press report")
+    }
+
+    /// One press through `pressed_after` with its four halves faked: what it asked
+    /// of each, in order, and what it answered.
+    async fn press_through(
+        press: Result<cmd::browser::BrowserInputReport, String>,
+        ending: zerocode_core::agent_browser::Settle,
+    ) -> (Result<cmd::browser::form::PressedAfter, String>, Vec<String>) {
+        let log: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (on_before, on_press, on_settle, on_read) =
+            (log.clone(), log.clone(), log.clone(), log.clone());
+        let done = cmd::browser::form::pressed_after(
+            move || {
+                on_before.lock().unwrap().push("before".into());
+                async move {
+                    Ok(cmd::browser::form::PressBefore {
+                        epoch: "1760000000000".into(),
+                        before: json!({ "groups": {} }),
+                    })
+                }
+            },
+            move || {
+                on_press.lock().unwrap().push("press".into());
+                async move { press }
+            },
+            move |epoch, at| {
+                on_settle.lock().unwrap().push(format!("settle {epoch} {at:?}"));
+                async move { settled(ending) }
+            },
+            move |before| {
+                on_read.lock().unwrap().push(format!("read {before}"));
+                async move { Ok(zerocode_core::browser_form::PressRead::default()) }
+            },
+        )
+        .await;
+        let log = log.lock().unwrap().clone();
+        (done, log)
+    }
+
+    /// A press in a form the agent read: the page's text and watch are taken
+    /// before it, the page settles — in the document the press was made in,
+    /// counting from the page's clock at the press — and only then is the form
+    /// read, against what stood before.
+    #[tokio::test(start_paused = true)]
+    async fn a_press_in_a_known_form_is_read_only_after_the_page_has_settled() {
+        use zerocode_core::agent_browser::Settle;
+        let (done, log) = press_through(Ok(a_press_at_812()), Settle::Ready).await;
+        assert_eq!(
+            log,
+            [
+                "before",
+                "press",
+                "settle 1760000000000 Some(812.5)",
+                r##"read {"groups":{}}"##
+            ],
+            "{log:?}"
+        );
+        assert_eq!(done.expect("a press").settle.state, Settle::Ready);
+    }
+
+    /// A press the page refuses ends there: nothing is settled and nothing read.
+    #[tokio::test(start_paused = true)]
+    async fn a_press_the_page_refuses_is_neither_settled_nor_read() {
+        use zerocode_core::agent_browser::Settle;
+        let (done, log) = press_through(
+            Err(cmd::browser::PAGE_TIMED_OUT.to_string()),
+            Settle::Ready,
+        )
+        .await;
+        assert_eq!(log, ["before", "press"], "{log:?}");
+        assert_eq!(done.err(), Some(cmd::browser::PAGE_TIMED_OUT.to_string()));
+    }
+
+    /// A page that did not stand still in the settle's time is read all the same
+    /// — the caller says it is still changing.
+    #[tokio::test(start_paused = true)]
+    async fn a_press_in_a_page_that_does_not_settle_is_read_and_the_settle_says_so() {
+        use zerocode_core::agent_browser::Settle;
+        let (done, log) = press_through(Ok(a_press_at_812()), Settle::NotReady).await;
+        assert_eq!(log.len(), 4, "{log:?}");
+        assert_eq!(done.expect("a press").settle.state, Settle::NotReady);
+    }
+
+    /// A press by selector takes the form road when its pane's agent has read a
+    /// form, and no other: one that has read none is answered as it was, with no
+    /// read of its own.
+    #[test]
+    fn a_click_by_selector_takes_the_form_road_when_its_pane_has_a_known_form() {
+        let road = include_str!("cmd/browser.rs")
+            .split("pub(crate) async fn automate_click(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("the click road");
+        for piece in ["known_form(label)", "form::press_in_form(", "press(&pane, selector, None)"] {
+            assert!(road.contains(piece), "the click road lacks `{piece}`:\n{road}");
+        }
+        assert!(
+            road.find("known_form(label)") < road.find("press(&pane, selector, None)"),
+            "the form is asked about before the plain press:\n{road}"
+        );
+    }
+
+    /// The press road in a known form waits for the page by the one settle road
+    /// — no wait of its own — and sets its answer against the form the agent read
+    /// before it, keeping what it leaves unless the form changed.
+    #[test]
+    fn a_press_in_a_known_form_is_set_against_the_form_that_was_read_before_it() {
+        let road = include_str!("cmd/browser/form.rs")
+            .split("pub(crate) async fn press_in_form(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("the press road");
+        for piece in [
+            "pressed_after(",
+            "settle_after_press(pane, &epoch, at)",
+            "known_buttons(label)",
+            "PressAfter::against(",
+            "remember_buttons(label, ",
+            "remember_form(label, ",
+        ] {
+            assert!(road.contains(piece), "the press road lacks `{piece}`:\n{road}");
+        }
+        assert!(
+            !road.contains("sleep(") && !road.contains("Duration::from_millis"),
+            "the press road has no wait of its own:\n{road}"
+        );
+    }
+
+    /// An eval that names the form pair's object gets `fields()` and
+    /// `fill()` before its expression — the expression still inlined, never
+    /// the page's own eval — and any other eval carries none of it.
+    #[test]
+    fn an_eval_that_names_the_form_pair_gets_it_and_no_other_does() {
+        use zerocode_core::agent_browser::BROWSER_EVAL_FORM_OBJECT;
+        assert!(
+            cmd::browser::form::BROWSER_EVAL_FORM
+                .trim_start()
+                .starts_with(&format!("const {BROWSER_EVAL_FORM_OBJECT} = ")),
+            "the object the page script makes is the name the core gives"
+        );
+        let expression = format!("{BROWSER_EVAL_FORM_OBJECT}.fields().fields.length");
+        let body = cmd::browser::inlined_eval_body(&expression);
+        let script = cmd::browser::form::eval_script(&expression, &body);
+        for piece in [
+            "const zcFormFields",
+            "const zcFill",
+            cmd::browser::form::BROWSER_EVAL_FORM.trim(),
+            body.as_str(),
+            "\"frameSeparator\"",
+        ] {
+            assert!(script.contains(piece), "the form eval lacks {piece:?}");
+        }
+        let plain = cmd::browser::form::eval_script(
+            "document.title",
+            &cmd::browser::inlined_eval_body("document.title"),
+        );
+        assert!(
+            !plain.contains("const zcFormFields") && !plain.contains("const zcFill"),
+            "an eval that reads no form carries none of it"
+        );
     }
 }

@@ -1344,6 +1344,11 @@ const stubBackend = ({ boot, pollers }) => {
         : `# 문서\n\n/data/artifacts/versions/${args.id}/${args.version}/${path.split("/").at(-1)}`;
       return { text, bytes: text.length, truncated: false, in_project: path.startsWith(`${boot.active_root}/`) };
     },
+    /* 작업별 탭(t-36910): 이 픽스처의 카탈로그에는 작업의 줄이 없다 — 그래서 탭은 행이 있는 첫
+       종류 탭으로 서고, 줄과 묶음과 커밋의 반영은 그 탭의 스위트가 제 답을 갖다 놓는다. */
+    artifact_tasks: () => ({ tasks: [], total: 0, truncated: false, unlinked: null }),
+    artifact_bundle: () => null,
+    commit_landings: () => ({}),
     artifact_counts: () => {
       const rows = window.__buildArtifacts__(window.__ARTIFACTS__ ?? { count: 0 });
       const counts = {
@@ -1392,6 +1397,10 @@ const stubBackend = ({ boot, pollers }) => {
     // stub answers nothing by default, which is the state every other test
     // here runs in.
     pane_subagents: () => window.__SUBAGENTS__ ?? [],
+    // 나를 기다림 — a fresh window has no pane waiting on the person, and a finish
+    // mark nobody holds is released by nothing (t-26595).
+    waiting_on_me: () => [],
+    clear_finish_mark: () => false,
     // And what those agents have been DOING — the ring the backend keeps per
     // card, for a window that opened after the work started. Empty by default,
     // which is the state every other test here runs in.

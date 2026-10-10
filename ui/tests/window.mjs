@@ -28,10 +28,13 @@ import { testArtifactBand, testArtifactBeside, testArtifactFollowed, testArtifac
 
 import { testLedgerPoll } from "./ledger-poll.mjs";
 import { testUsageRefresh, testUsageWords } from "./usage-refresh.mjs";
+import { testWaitingList } from "./waiting-list.mjs";
 import { testAccountSwitch } from "./account-switch.mjs";
 import { testTaskBoard } from "./task-board.mjs";
 import { testScmHealth } from "./scm-health.mjs";
 import { testArtifactPreferences } from "./artifact-preferences.mjs";
+import { testArtifactCards } from "./artifact-cards.mjs";
+import { testArtifactTasks } from "./artifact-tasks.mjs";
 import { testAgentSupport } from "./agent-support.mjs";
 import { testCoordinatorDesk } from "./coordinator-desk.mjs";
 import { testCoordinatorDeskLayout } from "./coordinator-desk-layout.mjs";
@@ -86,10 +89,12 @@ import { testEditorRecovery } from "./editor-recovery.mjs";
 import { testComposerAttach } from "./attach.mjs";
 import { testComposerMenuPosition } from "./composer-menu-position.mjs";
 import { testImeBrokenCommit } from "./ime-broken-commit.mjs";
+import { testImeKoreanRegression } from "./ime-korean-regression.mjs";
 import { testWorkers } from "./workers.mjs";
 import { testSidebarAgents } from "./sidebar-agents.mjs";
 import { testSidebarReviewState } from "./sidebar-review-state.mjs";
 import { testSidebarLandingState } from "./sidebar-landing-state.mjs";
+import { testLandingAlerts } from "./landing-alerts.mjs";
 import { testConversationAgents, testConversationFolds, testConversationFont, testConversationKeys, testConversationPaths, testConversationScroll, testConversationFoot, testConversationStatus, testConversationTodos, testConversationImages, testConversationCopies, testConversationShelf, testConversationRelease, testConversationSteps, testConversationCodeColours, testConversationStreamWork, testConversationTypingWork } from "./conversation-parity.mjs";
 import { measureConversation, standingPids } from "./conversation-perf.mjs";
 import { testConversationRedesign } from "./conversation-redesign.mjs";
@@ -238,6 +243,7 @@ suite("usage-refresh", async ({ browser, origin, ok }) => {
   await testUsageWords(browser, origin, standBackend, ok);
 });
 suite("account-switch", ({ browser, origin, ok }) => testAccountSwitch(browser, origin, standBackend, ok));
+suite("waiting-list", ({ browser, origin, ok }) => testWaitingList(browser, origin, standBackend, ok));
 suite("board-waits", ({ browser, origin, ok }) => testBoardWaits(browser, origin, ok));
 suite("answer-door", ({ browser, origin, ok }) => testAnswerDoor(browser, origin, ok));
 suite("explain", ({ browser, origin, ok }) => testExplain(browser, origin, ok));
@@ -245,6 +251,8 @@ suite("explain", ({ browser, origin, ok }) => testExplain(browser, origin, ok));
 suite("task-board", ({ browser, origin, ok }) => testTaskBoard(browser, origin, ok));
 suite("scm-health", ({ browser, origin, ok }) => testScmHealth(browser, origin, ok));
 suite("artifact-preferences", ({ browser, origin, ok }) => testArtifactPreferences(browser, origin, ok));
+suite("artifact-cards", ({ browser, origin, ok }) => testArtifactCards(browser, origin, ok));
+suite("artifact-tasks", ({ browser, origin, ok }) => testArtifactTasks(browser, origin, ok));
 suite("agent-support", ({ browser, origin, ok }) => testAgentSupport(browser, origin, ok));
 // The coordinator's desk above the task list (t-6588, docs/design/agent-board-round4.md).
 suite("coordinator-desk", ({ browser, origin, ok }) => testCoordinatorDesk(browser, origin, ok));
@@ -301,6 +309,7 @@ suite("ask-popup", ({ browser, origin, ok }) => testAskPopup(browser, origin, ok
 suite("editor-selection", ({ browser, origin, ok }) => testEditorSelection(browser, origin, ok));
 suite("editor-recovery", ({ browser, origin, ok }) => testEditorRecovery(browser, origin, ok));
 suite("ime-broken-commit", ({ browser, origin, ok }) => testImeBrokenCommit(browser, origin, ok));
+suite("ime-korean-regression", ({ browser, origin, ok }) => testImeKoreanRegression(browser, origin, ok));
 suite("vault", async ({ browser, origin }) => {
   const { page } = await openWindowTestPage(browser, origin, {
     before: (surface) => surface.addInitScript(() => { window.__GEMINI_VENDOR_FIXTURE__ = true; }),
@@ -316,6 +325,7 @@ suite("sidebar-agents", testSidebarAgents);
 // The sidebar tells 작업 중, 검증 대기 and 완료 apart, by the ledger (t-18902).
 suite("sidebar-review-state", testSidebarReviewState);
 suite("sidebar-landing-state", testSidebarLandingState);
+suite("landing-alerts", testLandingAlerts);
 /* The conversation view against the Claude Code extension's own webview
  * (t-6323, docs/design/agent-conversation-claude-code-grammar-20260915.md
  * §10): each suite one difference that was closed, read off the laid-out page. */

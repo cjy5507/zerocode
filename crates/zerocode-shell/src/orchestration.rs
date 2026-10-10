@@ -32,6 +32,7 @@ pub(crate) mod desk;
 pub(crate) mod gate_book;
 mod gate_meter;
 mod gate_snapshot;
+pub(crate) mod hand_in_keep;
 mod mail_triage;
 pub(crate) mod restart_census;
 mod stall_cause;
@@ -574,6 +575,8 @@ fn reseat_sleeping_in_line(
         if answered.exit_code == 0 {
             restored += 1;
             forget_switch_mark(&worker);
+        } else {
+            tell_reseat_refused_once(&worker, &answered.stderr);
         }
     }
     restored
@@ -1594,14 +1597,23 @@ pub(crate) fn checkout_examined(
 
 /// Mail a window observation to a ledger address (t-2733): CI moved on the
 /// review a checkout is on, told to `@worktree:<path>` as one `status` line
-/// from the ledger itself. Rings the window when a letter was filed; silent
-/// when the runtime is down or nobody is seated there — the panel already
-/// shows the change, and an agent that is not there has nobody to tell.
-pub(crate) fn post_observation_once(to: &str, body: &str, receipt: &str, now_ms: i64) -> bool {
+/// from the ledger itself. `run` names the one run the letter is filed in
+/// (t-35823); `None` files it in every run where the address resolves. Rings
+/// the window when a letter was filed; silent when the runtime is down or
+/// nobody is seated there — the panel already shows the change, and an agent
+/// that is not there has nobody to tell.
+pub(crate) fn post_observation_once(
+    run: Option<&str>,
+    to: &str,
+    body: &str,
+    receipt: &str,
+    now_ms: i64,
+) -> bool {
     let Some(held) = runtime() else {
         return false;
     };
     match held.actor.observation_once(
+        run.map(str::to_string),
         to.to_string(),
         body.to_string(),
         Some(receipt.to_string()),
@@ -1612,9 +1624,45 @@ pub(crate) fn post_observation_once(to: &str, body: &str, receipt: &str, now_ms:
             moved
         }
         Err(_) => {
-            note_ledger_unwritten("a checks observation");
+            note_ledger_unwritten("a window observation");
             false
         }
+    }
+}
+
+/// Every checkout a worker of this ledger sat in, once each: the folders the beat looks up in the
+/// landing cache to hold the ledger's record against git's (t-34501 stage 2).
+pub(crate) fn watched_checkouts() -> Vec<String> {
+    let Some(held) = runtime() else {
+        return Vec::new();
+    };
+    let Ok(image) = held.actor.view() else {
+        return Vec::new();
+    };
+    let Ok(ledger) = cached_ledger(&held, &image) else {
+        return Vec::new();
+    };
+    drop(image);
+    let paths: std::collections::BTreeSet<&str> = ledger
+        .runs()
+        .iter()
+        .flat_map(|run| run.workers.iter())
+        .filter_map(|worker| worker.checkout.as_deref())
+        .collect();
+    paths.into_iter().map(str::to_string).collect()
+}
+
+/// Hand the ledger what the window saw of git, so it can write what is late. A pass that finds
+/// nothing writes nothing; one that wrote rings the bell for whoever sleeps on the mail.
+pub(crate) fn watch_landings(
+    witnesses: Vec<zerocode_core::orchestration::landing_watch::LandingWitness>,
+    now_ms: i64,
+) {
+    let Some(held) = runtime() else {
+        return;
+    };
+    if let Ok((told, _)) = held.actor.landing_watch(witnesses, now_ms) {
+        rang(told);
     }
 }
 
@@ -1941,6 +1989,11 @@ pub(crate) struct LedgerAgent {
     /// claim: verified, merged, deployed — or nothing yet. Never inferred
     /// from a provider's turn ending or from `reported` above.
     pub(crate) review: zerocode_core::orchestration::ReviewFacts,
+    /// Since when the work waits where the sidebar's word says it waits (t-22105, t-34501): a
+    /// report nobody has verified is counted from the report, a verification nobody merged from the
+    /// verification. `None` where the ledger holds no time to count from — a verification an older
+    /// window wrote has none — and the sidebar then says no time at all, never zero.
+    pub(crate) review_since_ms: Option<i64>,
     /// Why the task is closed — folded into a task, handed to a run, or
     /// outdated — when it is. A closed task is neither reported nor failed:
     /// the board says 닫힘 and its reason, and the card leaves the open lanes.
@@ -1985,6 +2038,11 @@ pub(crate) struct LedgerAgent {
     /// beside the cost. `None` for a task still moving, for a worker who wrote
     /// no summary, and on every row read another way.
     pub(crate) writing: Option<zerocode_core::plain_text::TextLint>,
+    /// What was kept of what this worker handed in (t-32798) — laid on by the
+    /// board's beat from the artifact store ([`hand_in_keep::dress`]); `None` for
+    /// a worker that handed nothing in by name, and on every row read another way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) kept: Option<zerocode_core::hand_in::Facts>,
 }
 
 /// Volatile relations layered over the board's two permanent graph edges.
@@ -2324,6 +2382,10 @@ pub(crate) fn refresh_board_ledger() {
     summon_difficulty::record_observations(outcomes, crate::now_epoch_ms());
     summon_model::record_observations(model_outcomes, crate::now_epoch_ms());
     summon_choice::record_observations(agent_outcomes, crate::now_epoch_ms());
+    // What was kept of what workers handed in is laid over the rows here, from the
+    // store's book in memory, outside the ledger's view (t-32798).
+    let mut next = next;
+    hand_in_keep::dress(&mut next);
     // Build, allocate and drop old rows outside the publication lock. The
     // main-thread reader holds it only long enough to clone an Arc.
     let next = Arc::new(next);
@@ -2432,6 +2494,20 @@ fn ledger_agents_for_seats(ledger: &Ledger, seats: &TeamSeatIndex) -> Vec<Ledger
             let dispatch_started_ms = dispatch.map_or(0, |one| one.started_ms);
             let retry_of = dispatch.and_then(|one| one.retry_of.clone());
             let review = carried.map(|held| run.review_of(held)).unwrap_or_default();
+            let review_since_ms = match (reported && !failed, dispatch) {
+                (true, Some(attempt)) if !review.verified => run
+                    .messages()
+                    .iter()
+                    .filter(|one| {
+                        one.kind == zerocode_core::orchestration::MessageKind::WorkerDone
+                            && one.dispatch.as_deref() == Some(attempt.id.as_str())
+                    })
+                    .map(|one| one.created_ms)
+                    .max()
+                    .or(attempt.ended_ms),
+                (true, Some(_)) if !review.merged && !review.nothing_to_land => review.verified_ms,
+                _ => None,
+            };
             listed.push(LedgerAgent {
                 run: run.id.clone(),
                 worker: worker.id.clone(),
@@ -2468,6 +2544,7 @@ fn ledger_agents_for_seats(ledger: &Ledger, seats: &TeamSeatIndex) -> Vec<Ledger
                 dispatch_started_ms,
                 retry_of,
                 review,
+                review_since_ms,
                 closed: carried.and_then(|held| held.closed.clone()),
                 term,
                 // Finished work is dated by when its attempt ended — the
@@ -2490,6 +2567,7 @@ fn ledger_agents_for_seats(ledger: &Ledger, seats: &TeamSeatIndex) -> Vec<Ledger
                 cost: None,
                 gate: None,
                 writing: None,
+                kept: None,
             });
         }
     }
@@ -2853,6 +2931,79 @@ fn note_seatless_mail(run: &str, address: &str) {
              this window — nothing can be pointed at it until a pane binds to \
              the run; open that agent's conversation in a pane here again"
         ),
+    );
+}
+
+/// A conversation bound to `run` came back into the pane at `term`, and the
+/// run's empty chair is sat from there (t-21908). Its sleeping workers are asked
+/// for their seats next, the way a restored coordinator tab asks at mount.
+fn note_chair_sat(run: &str, term: u32) {
+    let Some(root) = BLACKBOX.get() else { return };
+    crate::note_window_event(
+        root,
+        &format!(
+            "orchestration: run {run}'s empty coordinator chair was sat again from \
+             terminal {term}; its sleeping workers are asked for their seats"
+        ),
+    );
+}
+
+/// The facts this window has already said once, in this process, keyed by the
+/// facts themselves. A beat is a second long, so a repeat is the same line
+/// over again (t-21908).
+fn said_once() -> &'static Mutex<std::collections::HashSet<String>> {
+    static TOLD: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    TOLD.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// A conversation bound to `run` stands in terminal `term`, and another live
+/// pane holds the run's chair. The chair is not taken from its holder, and the
+/// person is told once which pane holds it (t-21908): a beat is a second long,
+/// so a repeat of the same fact is the same line over again.
+fn tell_chair_held_once(run: &str, holder: &str, term: u32) {
+    let key = format!("{run}\u{1f}{holder}\u{1f}{term}");
+    let first = said_once()
+        .lock()
+        .unwrap_or_else(|held| held.into_inner())
+        .insert(key);
+    if !first {
+        return;
+    }
+    let Some(root) = BLACKBOX.get() else { return };
+    crate::note_window_event(
+        root,
+        &format!(
+            "orchestration: run {run}'s coordinator chair is held by live pane {holder}; \
+             the conversation in terminal {term} did not take it. To move it, close that \
+             pane or run-takeover --run {run} --from {holder} --reason <why>"
+        ),
+    );
+}
+
+/// A sleeper the window could not seat again in its pane, and the refusal that
+/// said why (t-21908). A refusal used to pass in silence, so its mail waited
+/// with nobody told why; now the reason is written down once per worker and
+/// reason, and the mail stays where it is.
+fn tell_reseat_refused_once(worker: &str, why: &str) {
+    let reason: String = why
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(200)
+        .collect();
+    let key = format!("reseat\u{1f}{worker}\u{1f}{reason}");
+    let first = said_once()
+        .lock()
+        .unwrap_or_else(|held| held.into_inner())
+        .insert(key);
+    if !first {
+        return;
+    }
+    let Some(root) = BLACKBOX.get() else { return };
+    crate::note_window_event(
+        root,
+        &format!("orchestration: sleeping worker {worker} was not put back in its pane: {reason}"),
     );
 }
 
@@ -4455,8 +4606,9 @@ fn unpointed_letter(newest: &str, address: &str, term: Option<u32>, why: Unpoint
 
 /// A pointer was not typed: say so where each side can see it, once per
 /// waiting message. The person gets the pane's own notice (when there is a
-/// pane); the sender gets a letter from the ledger, so a coordinator knows the
-/// reply sits unpointed rather than waiting for an answer that cannot come.
+/// pane); the sender gets a letter from the ledger, filed in the run the mail is
+/// in (t-35823), so a coordinator knows the reply sits unpointed rather than
+/// waiting for an answer that cannot come.
 fn tell_unpointed(
     host: &dyn Host,
     run: &str,
@@ -4477,6 +4629,7 @@ fn tell_unpointed(
         return;
     }
     post_observation_once(
+        Some(run),
         &sender,
         &unpointed_letter(newest, address, term, why),
         &unpointed_receipt(newest),
@@ -7130,6 +7283,19 @@ fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
         why: Unpointed,
     }
     let mut unsaid: Vec<Unsaid> = Vec::new();
+    /// A conversation bound to a run came back into the run's empty chair from
+    /// this pane (t-21908). Sat once the marks are let go, like every ledger
+    /// write in this pass.
+    struct Sitting {
+        run: String,
+        team: String,
+        pane: String,
+        actor: Option<String>,
+        leader_term: u32,
+    }
+    let mut sitting: Vec<Sitting> = Vec::new();
+    // Conversations bound to a run that stand behind another live pane's chair.
+    let mut held_chairs: Vec<(String, String, u32)> = Vec::new();
     {
         let tables = crate::agent_teams::teams();
         let mut marks = pointed().lock().unwrap_or_else(|held| held.into_inner());
@@ -7172,7 +7338,19 @@ fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
                 if team.pane(&team.leader_pane).is_none() {
                     continue;
                 }
-                if run.seat_is_coordinator(&format!("{id}/{}", team.leader_pane)) == Some(false) {
+                let chair = format!("{id}/{}", team.leader_pane);
+                let conversation = host.actor_for(team.leader_term);
+                let bound_here = conversation
+                    .as_deref()
+                    .is_some_and(|actor| rows.bound_run(actor) == Some(run.id.as_str()));
+                if run.seat_is_coordinator(&chair) == Some(false) {
+                    /* A live chair its holder keeps is never taken here
+                     * (t-21908). A conversation bound to this run that stands in
+                     * this pane beside it is told once, in the window's own log,
+                     * which pane holds the chair. */
+                    if bound_here {
+                        held_chairs.push((run.id.clone(), chair.clone(), team.leader_term));
+                    }
                     continue;
                 }
                 /* Two spellings, and the run has to be recognised under
@@ -7188,17 +7366,25 @@ fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
                  * A beat where the actor is momentarily unknown and the run
                  * has cut no panes yet skips the seat, and the next beat
                  * recovers it. */
-                let leader_bound = host
-                    .actor_for(team.leader_term)
-                    .is_some_and(|actor| rows.bound_run(&actor) == Some(run.id.as_str()))
-                    || cut_panes_in.contains(id.as_str());
+                let leader_bound = bound_here || cut_panes_in.contains(id.as_str());
                 if leader_bound {
                     leader_seated = true;
-                    seats.push((
-                        run.address(),
-                        team.leader_term,
-                        format!("{id}/{}", team.leader_pane),
-                    ));
+                    seats.push((run.address(), team.leader_term, chair.clone()));
+                }
+                /* A conversation bound to this run is back in its pane and the
+                 * run's chair is empty. A restart vacated every chair, and only a
+                 * restored tab's mount sat one again, so a conversation that came
+                 * back any other way left its run's sleepers asleep (t-21908).
+                 * The chair is sat after the marks are let go, by the door the
+                 * mount uses. */
+                if bound_here && run.coordinator_live().is_none() {
+                    sitting.push(Sitting {
+                        run: run.id.clone(),
+                        team: id.clone(),
+                        pane: team.leader_pane.clone(),
+                        actor: conversation.clone(),
+                        leader_term: team.leader_term,
+                    });
                 }
             }
             /* Addresses whose mail has a READER but no seat in this window.
@@ -7251,6 +7437,9 @@ fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
                         term,
                         format!("{}/{}", worker.team, worker.pane),
                     )),
+                    // The plan wrote this worker and its first letter before the window opened its pane
+                    // (t-34501): not seatless, only not seated yet.
+                    None if delegate_is_seating(&worker.id) => {}
                     None => seatless.push(zerocode_core::orchestration::worker_address(&worker.id)),
                 }
             }
@@ -7720,6 +7909,25 @@ fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
             &told.newest,
             told.why,
         );
+    }
+    for chair in sitting {
+        let Ok((moved, _)) = held.actor.coordinator_returned(
+            &chair.run,
+            &chair.team,
+            &chair.pane,
+            chair.actor,
+            now_ms,
+        ) else {
+            continue;
+        };
+        rang(moved);
+        if moved {
+            note_chair_sat(&chair.run, chair.leader_term);
+            host.coordinator_sat(chair.leader_term);
+        }
+    }
+    for (run, holder, term) in held_chairs {
+        tell_chair_held_once(&run, &holder, term);
     }
     for one in pointing {
         let key = (one.run, one.address);
@@ -9048,24 +9256,66 @@ fn run_seated(
     // The consent origin is the window's own checkout observation, not an
     // argv path or the application's process cwd. Carry it across the actor
     // call under this command's identity; its guard drops even on refusal.
-    let _difficulty_origin =
-        (argv.first().map(String::as_str) == Some("worker-start")).then(|| {
-            let term = crate::agent_teams::teams()
-                .get(team_id)
-                .and_then(|team| team.term_of(pane));
-            let checkout = term.and_then(|term| host.worktree_of(term));
+    let _difficulty_origin = matches!(
+        argv.first().map(String::as_str),
+        Some("worker-start" | "delegate")
+    )
+    .then(|| {
+        let term = crate::agent_teams::teams()
+            .get(team_id)
+            .and_then(|team| team.term_of(pane));
+        let checkout = term.and_then(|term| host.worktree_of(term));
+        let request = argv
+            .windows(2)
+            .find(|pair| pair[0] == "--retry-request")
+            .map_or("", |pair| pair[1].as_str());
+        summon_difficulty::origin([team_id, pane, request], checkout, authority.is_none())
+    });
+    /* `delegate` writes the work, reserves the worker and posts the letter in ONE plan, so a second
+     * plan under the same name while the first is still opening its pane would write all three a
+     * second time: the first one's receipt is filed only after its pane is open. The same name waits
+     * its turn here and then finds the first answer; a wait that asks for no length is refused
+     * before anything is written. */
+    let delegating =
+        argv.first().map(String::as_str) == Some(zerocode_core::orchestration::delegate::VERB);
+    let waiting = match delegating {
+        true => match zerocode_core::orchestration::delegate::wait_budget(argv) {
+            Ok(budget) => budget,
+            Err(why) => return refused(why),
+        },
+        false => None,
+    };
+    let flight = match delegating {
+        true => {
             let request = argv
                 .windows(2)
                 .find(|pair| pair[0] == "--retry-request")
                 .map_or("", |pair| pair[1].as_str());
-            summon_difficulty::origin([team_id, pane, request], checkout, authority.is_none())
-        });
+            match DelegateFlight::enter(format!("{team_id}\u{1f}{pane}\u{1f}{request}")) {
+                Some(flight) => Some(flight),
+                None => {
+                    return refused(
+                        "a delegate under this --retry-request is still being carried out — ask \
+                         again in a moment and you will be given its answer",
+                    );
+                }
+            }
+        }
+        false => None,
+    };
     let decided = match actor.plan(command) {
         Ok((decided, _)) => *decided,
         Err(why) => return refused_by_runtime(why),
     };
+    if let Some(flight) = &flight
+        && let Ok(said) = serde_json::from_str::<serde_json::Value>(decided.reply.stdout.trim())
+        && let Some(worker) = said["workerId"].as_str()
+    {
+        flight.seating(worker);
+    }
     rang(decided.requires_durability);
     let mut answered = carried(host, actor, decided, team_id, pane, pane_token, now_ms);
+    drop(flight);
     // The window's own half of a worker observation, laid over the answer on
     // the way out. `seat` first — it resolves a foreign row's terminal, which
     // `agentWait` then reads — and `agentWait` is a hook fact no ledger row
@@ -9075,8 +9325,161 @@ fn run_seated(
     garnish_idle_since(argv.first().map(String::as_str), &mut answered);
     garnish_federation_help(argv.first().map(String::as_str), &mut answered);
     garnish_artifacts(argv.first().map(String::as_str), &mut answered);
-    note_worker_report(argv, team_id, pane, &answered, now_ms);
+    hand_in_keep::after_send(argv, &answered);
+    match waiting {
+        Some(budget_ms) => delegate_waited(&held, answered, budget_ms),
+        None => answered,
+    }
+}
+
+/// How long a second `delegate` under a name already being carried out waits for the first before it
+/// gives up: opening a pane and handing the worker its briefing is seconds, never minutes.
+const DELEGATE_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A `delegate` that is being carried out, held under its `team, pane, --retry-request`.
+///
+/// In memory only, because what it guards is the window between the plan (durable, rows written) and
+/// the receipt (filed once the pane is open); a restart ends that window by itself (the sweep takes
+/// the reservation back).
+struct DelegateFlight(String, Mutex<Vec<String>>);
+
+fn delegate_flights() -> &'static (Mutex<std::collections::HashSet<String>>, std::sync::Condvar) {
+    static FLIGHTS: OnceLock<(Mutex<std::collections::HashSet<String>>, std::sync::Condvar)> =
+        OnceLock::new();
+    FLIGHTS.get_or_init(|| {
+        (
+            Mutex::new(std::collections::HashSet::new()),
+            std::sync::Condvar::new(),
+        )
+    })
+}
+
+impl DelegateFlight {
+    /// Take the name, waiting for an earlier carrying of it. `None` when that one has not finished
+    /// within [`DELEGATE_FLIGHT_WAIT`].
+    fn enter(key: String) -> Option<Self> {
+        let (held, bell) = delegate_flights();
+        let deadline = std::time::Instant::now() + DELEGATE_FLIGHT_WAIT;
+        let mut flights = held.lock().unwrap_or_else(|held| held.into_inner());
+        while flights.contains(&key) {
+            let left = deadline.checked_duration_since(std::time::Instant::now())?;
+            flights = bell
+                .wait_timeout(flights, left)
+                .unwrap_or_else(|held| held.into_inner())
+                .0;
+        }
+        flights.insert(key.clone());
+        Some(Self(key, Mutex::new(Vec::new())))
+    }
+}
+
+/// The workers a `delegate` is still opening a pane for: the plan wrote the worker and its letter,
+/// the window has no seat for it yet. The beat leaves them out of its seatless reckoning.
+fn delegate_seating() -> &'static Mutex<std::collections::HashSet<String>> {
+    static SEATING: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    SEATING.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+impl DelegateFlight {
+    /// Say which worker this carrying is still seating. It is let go with the flight, whether the
+    /// pane opened or the carrying failed.
+    fn seating(&self, worker: &str) {
+        delegate_seating()
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .insert(worker.to_string());
+        self.1
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .push(worker.to_string());
+    }
+}
+
+/// Whether a delegate is still opening this worker's pane.
+fn delegate_is_seating(worker: &str) -> bool {
+    delegate_seating()
+        .lock()
+        .unwrap_or_else(|held| held.into_inner())
+        .contains(worker)
+}
+
+impl Drop for DelegateFlight {
+    fn drop(&mut self) {
+        let mut seating = delegate_seating()
+            .lock()
+            .unwrap_or_else(|held| held.into_inner());
+        for worker in self
+            .1
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .iter()
+        {
+            seating.remove(worker);
+        }
+        drop(seating);
+        let (held, bell) = delegate_flights();
+        held.lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .remove(&self.0);
+        bell.notify_all();
+    }
+}
+
+/// `delegate --wait`: hold the answer until the worker reports, asks or its attempt ends silently,
+/// or until the budget runs out, and say which in the answer's `waited`.
+///
+/// Reads the ledger's rows and sleeps on the same bell `check --wait` does; it takes nothing from the
+/// coordinator's inbox and acknowledges nothing, so other workers' mail is still the coordinator's.
+fn delegate_waited(
+    held: &LiveRuntime,
+    mut answered: zerocode_hookd::TeamAnswer,
+    budget_ms: u32,
+) -> zerocode_hookd::TeamAnswer {
+    if answered.exit_code != 0 {
+        return answered;
+    }
+    let Ok(said) = serde_json::from_str::<serde_json::Value>(answered.stdout.trim()) else {
+        return answered;
+    };
+    let (Some(worker), Some(dispatch)) = (said["workerId"].as_str(), said["dispatchId"].as_str())
+    else {
+        return answered;
+    };
+    let began = std::time::Instant::now();
+    let deadline = began + std::time::Duration::from_millis(u64::from(budget_ms));
+    let outcome = loop {
+        // The bell is read BEFORE the look, so a write that lands between the two is a wake-up and
+        // not a sleep through it.
+        let seen = mail_seen();
+        if let Some(found) = delegate_outcome_now(held, worker, dispatch) {
+            break Some(found);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        wait_for_mail(seen, deadline);
+    };
+    let waited_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
+    answered.stdout = zerocode_core::orchestration::delegate::with_waited(
+        &answered.stdout,
+        outcome.as_ref(),
+        waited_ms,
+        budget_ms,
+    );
     answered
+}
+
+fn delegate_outcome_now(
+    held: &LiveRuntime,
+    worker: &str,
+    dispatch: &str,
+) -> Option<zerocode_core::orchestration::delegate::Outcome> {
+    let image = held.actor.view().ok()?;
+    let rows = cached_ledger(held, &image).ok()?;
+    rows.runs()
+        .iter()
+        .find(|run| run.dispatch(dispatch).is_some())
+        .and_then(|run| zerocode_core::orchestration::delegate::outcome(run, worker, dispatch))
 }
 
 /// Lay the artifact store's rows over a worker-observation answer (t-2720
@@ -9110,46 +9513,6 @@ fn garnish_artifacts(verb: Option<&str>, reply: &mut zerocode_hookd::TeamAnswer)
         None => garnish(&mut answer),
     }
     reply.stdout = format!("{answer}\n");
-}
-
-/// A report a `send` names — `--payload {"reportPath":…}` first, an absolute
-/// `.md` path in the body second — copied into the artifact store under the
-/// origin the seat's ledger row vouches for (t-2720 §4: reports leave
-/// `/tmp`). Read only after the send succeeded, so a refused message registers
-/// nothing; best-effort, so a copy that failed leaves the answer as it was.
-fn note_worker_report(
-    argv: &[String],
-    team_id: &str,
-    pane: &str,
-    reply: &zerocode_hookd::TeamAnswer,
-    now_ms: i64,
-) {
-    if reply.exit_code != 0 || argv.first().map(String::as_str) != Some("send") {
-        return;
-    }
-    let value = |flag: &str| {
-        argv.iter()
-            .position(|word| word == flag)
-            .and_then(|at| argv.get(at + 1))
-            .map(String::as_str)
-    };
-    let Some(path) =
-        crate::artifact_runtime::report_path_in(value("--payload"), value("--body").unwrap_or(""))
-    else {
-        return;
-    };
-    let Some(store) = crate::artifact_runtime::store() else {
-        return;
-    };
-    let origin = with_ledger_seats(|ledger, _| {
-        ledger.runs().iter().find_map(|run| {
-            run.worker_in_pane(team_id, pane)
-                .map(|worker| crate::artifact_runtime::origin_of_worker(run, worker))
-        })
-    })
-    .flatten()
-    .unwrap_or_default();
-    let _ = store.register_report(&path, origin, now_ms);
 }
 
 /// Carry out the EFFECT of one decision, and say what the shim should print.
@@ -10004,6 +10367,9 @@ fn carried(
                 target.remove_pane(&seat.pane);
                 drop(tables);
                 host.close(term);
+                // What the worker handed in is kept before anything else can take
+                // its checkout (t-32798): asynchronous, and idempotent.
+                hand_in_keep::note_release(&seat.worker);
             }
             let reply = zerocode_core::agent_teams::Reply::ok(format!(
                 "{}\n",

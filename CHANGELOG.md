@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.1.54] — 2026-10-10
+
+### Computer Use
+- Skip capture, PNG decoding, and image retention for app observations that accessibility can describe without pixels.
+- Fall back to captured-frame OCR when accessibility exposes no readable controls or input fields.
+- Avoid the discarded post-action tree read for pinned macOS actions while retaining fresh target validation and independent success checks.
+- Add opt-in macOS semantic background input: no explicit window activation, synthetic input, clipboard writes, or silent foreground fallback.
+- Preserve background mode through goal walks and stop when foreground continuity cannot be verified. Unsupported controls, older helpers, and Windows refuse this mode; it is not a separate desktop.
+
+### Reliability
+- Reattach returning conversations to their coordinator after a window restart and restore their sleeping workers.
+- End timed-out child process groups before reaping their leaders.
+
+## [1.1.53] — 2026-10-10
+
+### Computer Use
+- Keep desktop text entry, window-scoped shortcuts, scrolling, waiting, and additional control inspection inside one goal walk.
+- Add on-demand macOS OCR marks from the captured frame, with live text and geometry verification before a click.
+- Pin ordinary text writes to the observed field and its previous value; stop without retrying an unverified write.
+- Keep success evidence separate when switching readers, prevent duplicate field entry, and bound retained input data and mark copies.
+- Unlabelled icons and ambiguous pixel targets still require the screenshot-analysis fallback.
+
+### Workspace
+- Include task-artifact navigation, private one-time-code handoff, and mainline orchestration and window reliability improvements.
+
 ## [1.1.52] — 2026-10-04
 
 ### feat

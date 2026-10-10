@@ -3721,7 +3721,7 @@ impl Ui {
                     status.note_tool_started(
                         &tool_call_id.0,
                         &activity.tool,
-                        activity.target.as_deref(),
+                        activity.full_target.as_deref(),
                     );
                 }
                 // 도구가 시작하면 스트림을 먼저 접는다 — codex 도 exec 이
@@ -6745,7 +6745,7 @@ mod tests {
         // The seconds live on the channel fact, which kept counting.
         let card = published_card(&ui).expect("channel fact");
         assert_eq!(card.verb, "bash");
-        assert_eq!(card.target.as_deref(), Some("sleep"));
+        assert_eq!(card.target.as_deref(), Some("sleep 5 && printf done"));
         assert_eq!(card.elapsed_secs, 5);
         assert!(ui.parked_dialog().is_some(), "the approval is still parked");
     }

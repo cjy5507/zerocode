@@ -41,6 +41,7 @@ pub(crate) mod system;
 pub(crate) mod terminal;
 pub(crate) mod update;
 pub(crate) mod usage;
+pub(crate) mod waiting;
 pub(crate) mod workspace;
 pub(crate) mod worktree;
 
@@ -167,8 +168,10 @@ pub(crate) use integration_prefs::{
     github_test_connection, gitlab_status, notification_probe, patch_browser_link_routing,
     patch_browser_user_agents, set_browser_default_zoom, set_browser_home_page,
     set_browser_open_tabs, set_browser_restore_tabs, set_browser_search_engine, set_browser_visits,
-    set_notification_preference,
+    set_finish_notification_mode, set_notification_preference,
 };
+
+pub(crate) use waiting::{clear_finish_mark, waiting_on_me};
 
 pub(crate) use workspace::{
     workspace_cleanup_scan, workspace_space_cancel, workspace_space_git, workspace_space_scan,
@@ -205,10 +208,10 @@ pub(crate) use update::{
 };
 
 pub(crate) use worktree::{
-    create_worktree, github_assignable_users, github_comment_work_item, github_merge_pr,
-    github_preset_query, github_set_work_item_open, github_web_urls, github_work_item_detail,
-    github_work_items, gitlab_comment_item, gitlab_inline_comment, gitlab_item_detail,
-    gitlab_job_trace, gitlab_merge_mr, gitlab_mr_review, gitlab_pipeline_jobs,
+    commit_landings, create_worktree, github_assignable_users, github_comment_work_item,
+    github_merge_pr, github_preset_query, github_set_work_item_open, github_web_urls,
+    github_work_item_detail, github_work_items, gitlab_comment_item, gitlab_inline_comment,
+    gitlab_item_detail, gitlab_job_trace, gitlab_merge_mr, gitlab_mr_review, gitlab_pipeline_jobs,
     gitlab_project_members, gitlab_retry_job, gitlab_set_item_open, gitlab_set_mr_reviewers,
     gitlab_todos, gitlab_update_mr, gitlab_work_items, list_branches, list_worktrees,
     merge_and_remove_worktree, remove_worktree, resolve_mr_base, resolve_pr_base,
@@ -219,18 +222,19 @@ pub(crate) use worktree::{
 
 pub(crate) use settings::{
     agent_teams_mode, claude_autoswitch_mode, computer_confirm_answer, computer_guard_status,
-    computer_resume, computer_stop, floating_workspace_seat, harness_status, list_system_fonts,
-    pane_layouts, patch_editing_prefs, patch_floating_workspace, patch_open_in_applications,
-    patch_workspace_board_items, patch_workspace_board_status, patch_workspace_creation_prefs,
-    read_primary_selection, save_pane_layouts, save_stage_layouts, scm_tree_rows,
-    set_agent_teams_mode, set_artifacts_auto_open_beside, set_artifacts_retention_days,
-    set_claude_autoswitch_mode, set_computer_confirm, set_computer_generator_road,
-    set_computer_live_reflex, set_confirm_close_pinned, set_conversation_focus_view,
-    set_ctrl_tab_order_mode, set_default_task_source, set_diff_side_by_side, set_harness_settings,
-    set_hidden_shortcuts, set_hidden_task_sources, set_hide_agent_scratch_workspaces,
-    set_hide_automation_workspaces, set_hide_default_branch_workspaces,
-    set_hide_detached_head_workspaces, set_hide_sleeping_workspaces, set_keep_default_branch_awake,
-    set_keybinding, set_panel_width, set_panel_widths, set_shortcut_visibility, set_sidebar_view,
+    computer_handoff_code, computer_resume, computer_stop, floating_workspace_seat, harness_status,
+    list_system_fonts, pane_layouts, patch_editing_prefs, patch_floating_workspace,
+    patch_open_in_applications, patch_workspace_board_items, patch_workspace_board_status,
+    patch_workspace_creation_prefs, read_primary_selection, save_pane_layouts, save_stage_layouts,
+    scm_tree_rows, set_agent_teams_mode, set_artifacts_auto_open_beside,
+    set_artifacts_retention_days, set_claude_autoswitch_mode, set_computer_confirm,
+    set_computer_generator_road, set_computer_live_reflex, set_confirm_close_pinned,
+    set_conversation_focus_view, set_ctrl_tab_order_mode, set_default_task_source,
+    set_diff_side_by_side, set_harness_settings, set_hidden_shortcuts, set_hidden_task_sources,
+    set_hide_agent_scratch_workspaces, set_hide_automation_workspaces,
+    set_hide_default_branch_workspaces, set_hide_detached_head_workspaces,
+    set_hide_sleeping_workspaces, set_keep_default_branch_awake, set_keybinding, set_panel_width,
+    set_panel_widths, set_shortcut_visibility, set_sidebar_view,
     set_skip_close_terminal_with_running_process_confirm, set_skip_delete_automation_confirm,
     set_skip_delete_worktree_confirm, set_source_control_view_mode, set_status_bar_usage_mode,
     set_task_source_visibility, set_terminal_command, set_usage_analytics_enabled,
@@ -254,12 +258,12 @@ pub(crate) use second_brain::{
 pub(crate) use supply_chain::{supply_chain_graph, supply_chain_report};
 
 pub(crate) use artifacts::{
-    artifact_copy_path, artifact_counts, artifact_delete, artifact_document, artifact_export,
-    artifact_export_formats, artifact_export_reveal, artifact_feedback_record,
+    artifact_bundle, artifact_copy_path, artifact_counts, artifact_delete, artifact_document,
+    artifact_export, artifact_export_formats, artifact_export_reveal, artifact_feedback_record,
     artifact_import_transcripts, artifact_open, artifact_page_at, artifact_preference_revoke,
     artifact_preference_save, artifact_preferences, artifact_preview, artifact_register,
-    artifact_reveal, artifact_search, artifact_thumbnail, artifact_versions, artifacts_list,
-    explain_cancel, explain_preview, explain_roads, explain_start,
+    artifact_reveal, artifact_search, artifact_tasks, artifact_thumbnail, artifact_versions,
+    artifacts_list, explain_cancel, explain_preview, explain_roads, explain_start,
 };
 pub(crate) use skills::{
     computer_use_skill_report, install_bundled_skill, list_skills, orchestration_report,

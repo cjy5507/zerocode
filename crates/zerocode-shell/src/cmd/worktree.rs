@@ -135,6 +135,26 @@ pub(crate) fn worktree_landing_stamp(roots: Vec<String>) -> String {
     landing_stamp_of(roots)
 }
 
+/// The landed state of commits whose checkouts are gone (t-36910): a task in
+/// the artifact gallery outlives its worktree, and what it handed in is still
+/// in the compare ref or it is not. Answered at once with what is known —
+/// `pending` for a commit never asked about — and what is left is read behind
+/// the answer; the window is told when an answer moved
+/// (`worktree:commit-landing`) and asks again.
+#[tauri::command(async)]
+pub(crate) fn commit_landings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    commits: Vec<String>,
+) -> BTreeMap<String, WorktreeLanding> {
+    let repos = known_repos(state.config_root(), state.settings());
+    let (said, job) = attach_commit_landings(&commits, &repos);
+    if let Some(job) = job {
+        spawn_commit_landing_job(&app, job);
+    }
+    said
+}
+
 /// Create a worktree for a task, named from its spec.
 ///
 /// Async because `git worktree add` writes a whole checkout: on a large
@@ -1438,6 +1458,28 @@ pub(crate) async fn remove_worktree(
             note_window_event(&history_root, &reason);
             return Err(reason);
         };
+        // What the workers that sat in this checkout handed in is kept before the
+        // directory it was written in goes (t-32798). The person is waiting for
+        // this answer, so whatever is owed is kept on the spot; a keeping that
+        // cannot be written refuses the removal with its reason, on every road to
+        // this door — the discard confirmation answers for unsaved work, not for a
+        // report nobody has copied out yet. Before the archive script, which works
+        // inside the directory as well.
+        match crate::orchestration::hand_in_keep::before_cleanup(
+            &chosen.path,
+            crate::orchestration::hand_in_keep::Mode::Now,
+        ) {
+            crate::orchestration::hand_in_keep::Clearance::Clear => {}
+            crate::orchestration::hand_in_keep::Clearance::Keeping(because)
+            | crate::orchestration::hand_in_keep::Clearance::Held(because) => {
+                let reason = format!(
+                    "worktree removal refused for {}: {because}",
+                    chosen.path.display()
+                );
+                note_window_event(&history_root, &reason);
+                return Err(reason);
+            }
+        }
         // BEFORE the removal, not after: the archive script exists to take
         // down what this checkout brought up — a compose stack, a tunnel, a
         // database — and it needs the directory it is talking about to still

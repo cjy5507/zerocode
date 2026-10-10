@@ -42,6 +42,7 @@
     <script defer src="./shell-term.js"></script>
     <script defer src="./shell-status.js"></script>
     <script defer src="./shell-doc.js"></script>
+    <script defer src="./shell-artifact-tasks.js"></script>
     <script defer src="./shell-knowledge-3d.js"></script>
     <script defer src="./shell-knowledge.js"></script>
     <script defer src="./shell-knowledge-supply.js"></script>
@@ -1068,6 +1069,14 @@
              row painted first and hidden a tick later is the flash this
              attribute exists to skip. Whichever rows the report names stay
              hidden; `paintShortcuts` only ever turns this back off. -->
+        <!-- 나를 기다림 (t-26595): the panes that wait on the person, at the very
+             top of the column — a block, a question, or a finish nobody has
+             looked at. Hidden while nothing waits. Rust decides the rows; a
+             row opens its pane. -->
+        <section class="waiting-list" id="waiting-list" data-i18n-aria="waiting.label" aria-label="나를 기다림" hidden>
+          <h2 class="waiting-list-title" data-i18n="waiting.title">나를 기다림</h2>
+          <ul class="waiting-list-items" id="waiting-list-items"></ul>
+        </section>
         <nav class="nav-rows" data-i18n-aria="view.navLabel" aria-label="바로 가기">
           <!-- 시작 체크리스트로 가는 한 줄, 나브의 첫 행으로 — Orca의
                SetupGuideSidebarEntry가 SidebarNav의 첫 자식이다
@@ -4010,6 +4019,16 @@
             <input class="settings-input" id="harness-day-usd" type="number" inputmode="decimal"
                    min="0" step="any" aria-describedby="harness-day-usd-hint" />
           </label>
+          <label class="settings-field" data-field="md" for="harness-alerts-landing">
+            <span class="settings-label" data-i18n="settings.harness.alerts">원장 알림: 늦은 착지와 뒤처진 브랜치</span>
+            <span class="settings-hint" id="harness-alerts-landing-hint" data-i18n="settings.harness.alertsHint">
+              켜면 원장이 1분에 한 번 작업의 기록을 git과 맞대어 봅니다. 보고했는데 검증이 2시간 넘게 없거나, 검증했는데 병합 기록이 없거나, 병합됐는데 폴더가 남아 있으면 그 런의 코디네이터에게 알리고, main보다 많이 뒤처졌거나 합치면 충돌하는 브랜치는 그 일을 하는 워커에게 알립니다. 알리기만 합니다 — 병합도 삭제도 push도 하지 않습니다.
+            </span>
+            <select class="settings-input" id="harness-alerts-landing" aria-describedby="harness-alerts-landing-hint">
+              <option value="on" data-i18n="settings.harness.alertsOn">켬</option>
+              <option value="off" data-i18n="settings.harness.alertsOff">끔</option>
+            </select>
+          </label>
           <div class="settings-subhead">
             <h3 class="settings-subhead-title" data-i18n="settings.harness.launchesTitle">에이전트 호출 한도</h3>
             <p class="settings-subhead-desc" data-i18n="settings.harness.launchesAbout">
@@ -4420,7 +4439,7 @@
           <div data-jev-feature="mail_triage">
             <span data-jev-name data-i18n="settings.typesafe.mail_triage">코디네이터 우편 분류</span>
             <span data-jev-summary data-i18n="settings.typesafe.mail_triageSummary">코디네이터에게 온 편지마다 지금 답할지·기다려도 될지·볼 필요 없는지와 급한지를 판단해 기록합니다. 지금은 기록만 하고 우편 목록 순서는 바꾸지 않습니다.</span>
-            <p data-jev-hint data-i18n="settings.typesafe.mail_triageHint">코디네이터가 맡은 실행에 편지(질문·작업 완료 보고·상태·작업자가 멈췄다는 알림 등)가 오면, 이 앱이 그 코디네이터의 터미널을 띄우고 있을 때만 편지 한 통마다 한 번 판단을 요청합니다. 보내는 것은 편지의 종류, 보낸 쪽의 종류(작업자·앱이 쓴 알림 등), 작업자와 작업의 번호와 작업의 진행 상태, 우선순위, 답을 기다리는지, 대화 깊이, 기다린 시간, 코디네이터에게 이미 넘어갔는지, 같은 내용이 그날 몇 번째인지, 코디네이터가 작업 중인지, 답을 기다리는 질문 수뿐이며 편지의 글은 한 글자도 보내지 않습니다. 판단은 기록만 하고 목록 순서는 바꾸지 않습니다. 정확도는 코디네이터가 그 뒤 실제로 한 일의 순서로 잽니다 — 세 번째 행동 안에 그 편지를 가리키는 일(답장, 그 작업·작업자를 가리키는 명령)을 했으면 「지금 답함」, 그 뒤에 했으면 「기다려도 됨」, 서른 번의 행동 동안 하지 않았으면 「볼 필요 없음」이고, 받은편지함 확인은 행동으로 세지 않습니다.</p>
+            <p data-jev-hint data-i18n="settings.typesafe.mail_triageHint">코디네이터가 맡은 실행에 편지(질문·작업 완료 보고·상태·작업자가 멈췄다는 알림 등)가 오면, 이 앱이 그 코디네이터의 터미널을 띄우고 있을 때만 판단을 요청합니다. 한꺼번에 온 편지는 한 번에 묶어 요청하고, 답은 편지마다 따로 받습니다. 보내는 것은 편지의 종류, 보낸 쪽의 종류(작업자·앱이 쓴 알림 등), 작업자와 작업의 번호와 작업의 진행 상태, 우선순위, 답을 기다리는지, 대화 깊이, 기다린 시간, 코디네이터에게 이미 넘어갔는지, 같은 내용이 그날 몇 번째인지, 코디네이터가 작업 중인지, 답을 기다리는 질문 수뿐이며 편지의 글은 한 글자도 보내지 않습니다. 판단은 기록만 하고 목록 순서는 바꾸지 않습니다. 정확도는 코디네이터가 그 뒤 실제로 한 일의 순서로 잽니다 — 세 번째 행동 안에 그 편지를 가리키는 일(답장, 그 작업·작업자를 가리키는 명령)을 했으면 「지금 답함」, 그 뒤에 했으면 「기다려도 됨」, 서른 번의 행동 동안 하지 않았으면 「볼 필요 없음」이고, 받은편지함 확인은 행동으로 세지 않습니다.</p>
           </div>
           <div data-jev-feature="challenger">
             <span data-jev-name data-i18n="settings.typesafe.challenger">새 모델 시험</span>
@@ -6886,15 +6905,19 @@
             </label>
           </div>
           <div class="settings-option-row settings-option-row--copy">
-            <label class="settings-check" for="notify-agent-completion">
-              <input type="checkbox" id="notify-agent-completion" />
+            <label class="settings-check" for="notify-finish-mode">
               <span>
                 <span class="settings-label" data-i18n="settings.notifications.completion">작업을 마쳤을 때</span>
                 <span class="settings-row-desc" data-i18n="settings.notifications.completionHint">
-                  잠깐의 안정 시간을 지난 완료 상태만 알립니다.
+                  막힘은 10초, 끝남은 1분 동안 그대로 남아 있어야 알립니다. 긴 작업만은 1분 이상 걸린 턴만 알립니다.
                 </span>
               </span>
             </label>
+            <select class="settings-input" id="notify-finish-mode" data-i18n-aria="settings.notifications.completion" aria-label="작업을 마쳤을 때">
+              <option value="off" data-i18n="settings.notifications.finishOff">끔</option>
+              <option value="long" data-i18n="settings.notifications.finishLong">1분 이상 걸린 작업만</option>
+              <option value="always" data-i18n="settings.notifications.finishAlways">항상</option>
+            </select>
           </div>
           <div class="settings-action-row">
             <p class="settings-inline-status" id="notify-test-status" role="status" aria-live="polite"></p>
@@ -9883,6 +9906,15 @@
         <p class="perm-why" id="ask-why" hidden></p>
         <!-- 시계가 있는 물음(Computer Use)의 남은 시간. 시계가 없는 물음에는 없다. -->
         <p class="ask-clock" id="ask-clock" hidden></p>
+        <!-- 인증번호를 받는 사람 차례 카드(t-40807)의 한 줄. 창이 줄이 있다고 한 카드에만
+             보이고, 그 값은 보낼 때 입력칸에서 지워진다. 비밀번호 칸이 아니다 — 사람이
+             치는 번호를 사람이 다시 읽어 확인한다. -->
+        <div class="ask-code" id="ask-code" hidden>
+          <label class="ask-code-label" id="ask-code-label" for="ask-code-input"></label>
+          <input class="ask-code-input" id="ask-code-input" type="text" autocomplete="one-time-code" autocapitalize="none" autocorrect="off" spellcheck="false" aria-describedby="ask-code-hint ask-code-error" aria-invalid="false" />
+          <p class="ask-code-hint" id="ask-code-hint"></p>
+          <p class="ask-code-error" id="ask-code-error" role="alert" hidden></p>
+        </div>
         <!-- 다른 물음이 동시에 기다리면 여기 그 수가 선다. 팝업은 가장 오래된
              물음 하나만 보여주고, 답하면 다음 것이 올라온다. -->
         <p class="perm-more" id="ask-more" hidden></p>

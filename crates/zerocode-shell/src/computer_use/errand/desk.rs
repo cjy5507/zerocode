@@ -9,14 +9,15 @@
 //!
 //! What a goal walk may NOT do is as load-bearing as what it may:
 //!
-//! - It presses, and — on a page, when its look read a field it may type
+//! - It presses, scrolls the observed surface, waits for a pending change,
+//!   and — on a page or desktop, when its look read a field it may type
 //!   into (t-6720) — it types. It does not navigate, run a script or set a
-//!   value of its own choosing: the answer space is a number and nothing
-//!   else, so there is no road from a judgment to a value, a selector or an
-//!   address. A typed value is the value seat's
+//!   value of its own choosing: the answer space is observed numbers and
+//!   supported navigation actions, so there is no road from a judgment to a
+//!   value, a selector or an address. A typed value is the value seat's
 //!   ([`super::value::ValueWriter`]), entered into the field the look itself
-//!   numbered: pressed first by its pinned number, then typed through the
-//!   look's own selector for it down the door's value road
+//!   numbered: desktop writes retain the mark's pin and prior value; page
+//!   fields are pressed first, then typed through the look's selector
 //!   (`type <pane> <selector> --value`, the shape the stdin road sends), with
 //!   the log keeping `[n chars]` in its place.
 //! - It stays where it was aimed. A desktop walk names one app and looks only
@@ -38,10 +39,10 @@ use zerocode_core::agent_browser::{
 };
 use zerocode_core::computer_recipe::{RecipeTool, recipe_line_holds_ms};
 use zerocode_core::computer_use::{
-    EMULATOR_PREVIEW_FLAG, EmulatorPlatform, FLOW_BASELINE_PROBE_MS,
+    EMULATOR_PREVIEW_FLAG, EmulatorPlatform, FLOW_BASELINE_PROBE_MS, WALK_WAIT_MS,
 };
 use zerocode_core::computer_use_protocol::marks::{ITEMS_KEY, LOOK_ID_KEY};
-use zerocode_core::screen_action::snapshot;
+use zerocode_core::screen_action::{Navigation, snapshot};
 use zerocode_core::type_value::{FieldLook, ValueInput};
 use zerocode_hookd::TeamAnswer;
 
@@ -117,9 +118,8 @@ fn phone_argv(verb: &str, platform: EmulatorPlatform, device: &str) -> Vec<Strin
 /// The lines of a surface's text answer, as the screen carries them —
 /// trimmed, blanks dropped; the question does the cutting.
 fn shows_of(text: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
+    zerocode_core::screen_action::shows_from(text.lines())
+        .into_iter()
         .map(str::to_string)
         .collect()
 }
@@ -317,8 +317,24 @@ pub fn screen_of(aim: &Aim, said: &Value) -> Option<(Screen, String)> {
                             .to_string(),
                     },
                     items: marks.get(ITEMS_KEY)?.as_array()?.clone(),
-                    shows: Vec::new(),
-                    snapshot: Snapshot::default(),
+                    shows: zerocode_core::screen_action::shows_from(
+                        said.pointer("/tree/text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .lines()
+                            .chain(
+                                marks
+                                    .get("text")
+                                    .and_then(Value::as_array)
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|line| line.get("text").and_then(Value::as_str)),
+                            ),
+                    )
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                    snapshot: Snapshot::of(marks),
                 },
                 marks
                     .get(LOOK_ID_KEY)
@@ -351,6 +367,9 @@ impl Entry {
     /// numbered control with a selector of its own and the page's facts
     /// about it.
     fn read(seen: &Screen, mark: usize) -> Option<Self> {
+        if !zerocode_core::screen_action::typeable(&seen.snapshot.fields, mark) {
+            return None;
+        }
         let numbered =
             |value: &Value| value.get("mark").and_then(Value::as_u64) == u64::try_from(mark).ok();
         let item = seen.items.iter().find(|item| numbered(item))?;
@@ -363,16 +382,20 @@ impl Entry {
                 .to_string()
         };
         let selector = said(item, snapshot::SELECTOR_KEY);
-        if selector.trim().is_empty() {
+        if selector.trim().is_empty() && !matches!(seen.at, Seen::Desk { .. }) {
             return None;
         }
         Some(Self {
-            target: json!([
-                selector,
-                said(item, snapshot::TAG_KEY),
-                said(item, snapshot::ROLE_KEY)
-            ])
-            .to_string(),
+            target: if matches!(seen.at, Seen::Desk { .. }) {
+                field.get("identity")?.to_string()
+            } else {
+                json!([
+                    selector,
+                    said(item, snapshot::TAG_KEY),
+                    said(item, snapshot::ROLE_KEY)
+                ])
+                .to_string()
+            },
             selector,
             label: said(field, snapshot::LABEL_KEY),
             placeholder: said(field, snapshot::FIELD_PLACEHOLDER_KEY),
@@ -433,9 +456,49 @@ pub struct GoalWorld<'a, Road> {
     values: Arc<Mutex<Values>>,
     /// Whether the writer's road was opened ahead of this walk's first entry.
     warmed: bool,
+    scroll_window: Option<(u64, f64, f64)>,
+    pixels: bool,
+    pixel_baseline: Option<Option<bool>>,
+    background: bool,
+    background_interrupted: bool,
 }
 
 impl<'a, Road> GoalWorld<'a, Road> {
+    pub fn until_before(&self, original: Option<bool>) -> Option<bool> {
+        if self.pixels {
+            self.pixel_baseline.flatten()
+        } else {
+            original
+        }
+    }
+    fn remember_fields(&self, screen: &Screen) -> Option<Screen> {
+        match self.aim {
+            Aim::Pane { .. } => Some(screen.clone()),
+            Aim::App { .. } if !screen.snapshot.fields.is_empty() => Some(Screen {
+                at: screen.at.clone(),
+                items: screen
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        item.get("mark")
+                            .and_then(Value::as_u64)
+                            .and_then(|mark| usize::try_from(mark).ok())
+                            .is_some_and(|mark| {
+                                zerocode_core::screen_action::typeable(
+                                    &screen.snapshot.fields,
+                                    mark,
+                                )
+                            })
+                    })
+                    .cloned()
+                    .collect(),
+                shows: Vec::new(),
+                snapshot: screen.snapshot.clone(),
+            }),
+            Aim::App { .. } | Aim::Phone { .. } => None,
+        }
+    }
+
     pub fn new(
         road: &'a mut Road,
         aim: Aim,
@@ -464,12 +527,40 @@ impl<'a, Road> GoalWorld<'a, Road> {
             writer: None,
             values: window_values(),
             warmed: false,
+            scroll_window: None,
+            pixels: false,
+            pixel_baseline: None,
+            background: false,
+            background_interrupted: false,
         }
     }
 
-    /// The same world, able to type into a page's fields the value `writer`
-    /// writes (t-6720). Only a pane types; a desktop or a phone keeps the
-    /// writer and never offers an entry.
+    #[must_use]
+    pub fn background(mut self, requested: bool) -> Self {
+        self.background = requested && matches!(self.aim, Aim::App { .. });
+        self
+    }
+
+    pub const fn background_interrupted(&self) -> bool {
+        self.background_interrupted
+    }
+
+    fn background_argv(&self, argv: &mut Vec<String>) {
+        if self.background {
+            argv.push("--background".into());
+        }
+    }
+
+    fn note_background(&mut self, answer: Option<&Value>) {
+        if self.background {
+            self.background_interrupted |= answer
+                .and_then(|answer| answer.pointer("/action/background/foregroundUnchanged"))
+                != Some(&Value::Bool(true));
+        }
+    }
+
+    /// Enable ordinary observed page or desktop fields through the configured
+    /// value writer. Phones keep their existing input capabilities.
     #[must_use]
     pub fn writing(mut self, writer: Box<dyn ValueWriter>) -> Self {
         self.writer = Some(writer);
@@ -523,6 +614,10 @@ impl<'a, Road> GoalWorld<'a, Road> {
         // longer holds. A phone's press is asked to count the caller's words
         // in the screen it settles on, so a walk that got there looks no more.
         let mut argv = self.aim.press_argv(mark, &self.look);
+        if self.background_interrupted {
+            return false;
+        }
+        self.background_argv(&mut argv);
         if let (Aim::Phone { .. }, Some(until)) = (&self.aim, &self.until) {
             argv.extend(["--text".to_string(), until.clone()]);
         }
@@ -542,6 +637,7 @@ impl<'a, Road> GoalWorld<'a, Road> {
         self.unsettled = None;
         let answer = (self.road)(self.aim.tool(), &argv, &argv);
         let said = answer_value(&answer);
+        self.note_background(said.as_ref());
         self.settled = said.as_ref().and_then(|said| {
             Some(Settled {
                 note: said
@@ -607,29 +703,53 @@ where
     Road: FnMut(RecipeTool, &[String], &[String]) -> TeamAnswer,
 {
     fn look(&mut self) -> Option<Screen> {
+        if self.background_interrupted {
+            return None;
+        }
         if let Some((screen, look)) = self.kept.take() {
             self.look = look;
-            self.seen = Some(screen.clone());
+            self.seen = self.remember_fields(&screen);
             return Some(screen);
         }
-        let argv = self.aim.look_argv();
+        let mut argv = self.aim.look_argv();
+        self.background_argv(&mut argv);
+        if self.pixels {
+            argv.push("--ocr".into());
+        }
         let answer = read_unjudged(self.road, self.aim.tool(), &argv);
         let said = answer_value(&answer)?;
+        self.pixels |=
+            said.pointer("/marks/perception").and_then(Value::as_str) == Some("accessibility+ocr");
         // A CLI answer is `{ ok, result }` when it went through the door's
         // envelope and the bare answer when it did not; both are read here so
         // the walk is not one envelope's prisoner.
         let (mut screen, look) = screen_of(&self.aim, &said)?;
+        self.scroll_window = (|| {
+            let window = said.pointer("/tree/window")?;
+            let identifier = window.get("id")?.as_u64()?;
+            let width = window.get("width")?.as_f64()?;
+            let height = window.get("height")?.as_f64()?;
+            (identifier > 0
+                && width.is_finite()
+                && height.is_finite()
+                && width > 0.0
+                && height > 0.0)
+                .then_some((identifier, width, height))
+        })();
         if matches!(self.aim, Aim::Pane { .. }) {
             screen.at = self.page.clone();
         }
-        if let Some(argv) = self.aim.shows_argv() {
+        if said.pointer("/tree/text").and_then(Value::as_str).is_none()
+            && let Some(mut argv) = self.aim.shows_argv()
+        {
+            self.background_argv(&mut argv);
             let answer = read_unjudged(self.road, self.aim.tool(), &argv);
             screen.shows = answer_value(&answer)
                 .and_then(|read| Some(shows_of(read.get("text")?.as_str()?)))
                 .unwrap_or_default();
         }
         self.look = look;
-        self.seen = Some(screen.clone());
+        self.seen = self.remember_fields(&screen);
         // The first look that read a field opens the value seat's road, so a
         // first entry is written over a connection the judgment's own wait
         // has already paid for.
@@ -640,6 +760,9 @@ where
             writer.warm();
             self.warmed = true;
         }
+        if self.pixels && self.pixel_baseline.is_none() {
+            self.pixel_baseline = Some(self.reached());
+        }
         Some(screen)
     }
 
@@ -648,6 +771,142 @@ where
         // (t-9712); an entry's own press settles as ever ([`Self::type_into`]).
         let later = self.previewing && matches!(self.aim, Aim::Pane { .. });
         self.press_by(mark, later)
+    }
+
+    fn navigation(&self) -> &'static [Navigation] {
+        if self.seen.is_none() && self.look.is_empty() {
+            return &[];
+        }
+        match self.aim {
+            Aim::Pane { .. } => &Navigation::PAGE,
+            Aim::App { .. } if self.background && self.scroll_window.is_some() => &Navigation::PAGE,
+            Aim::App { .. } if self.scroll_window.is_some() => {
+                if cfg!(target_os = "macos") && !self.pixels {
+                    &Navigation::ALL
+                } else {
+                    &Navigation::DESKTOP
+                }
+            }
+            Aim::App { .. } => &[Navigation::Wait],
+            Aim::Phone { .. } => &[],
+        }
+    }
+
+    fn check_source(&self) -> Option<&'static str> {
+        matches!(self.aim, Aim::App { .. }).then_some(if self.pixels {
+            "ocr"
+        } else {
+            "accessibility"
+        })
+    }
+
+    fn navigate(&mut self, action: Navigation) -> bool {
+        if self.background_interrupted || !self.navigation().contains(&action) {
+            return false;
+        }
+        if action == Navigation::ReadPixels {
+            self.pixels = true;
+            self.kept = None;
+            return true;
+        }
+        let (tool, mut argv) = if action == Navigation::Wait {
+            (
+                RecipeTool::Computer,
+                vec![
+                    "wait".into(),
+                    "--ms".into(),
+                    WALK_WAIT_MS.to_string(),
+                    JSON_FLAG.into(),
+                ],
+            )
+        } else if !Navigation::PAGE.contains(&action) {
+            let Aim::App { name } = &self.aim else {
+                return false;
+            };
+            let Some((window, _, _)) = self.scroll_window else {
+                return false;
+            };
+            let key = match action {
+                Navigation::FocusNext => "tab".to_string(),
+                Navigation::FocusPrevious => "shift+tab".to_string(),
+                Navigation::Escape => "escape".to_string(),
+                Navigation::Find => "cmdorctrl+f".to_string(),
+                Navigation::SelectAll => "cmdorctrl+a".to_string(),
+                _ => return false,
+            };
+            (
+                RecipeTool::Computer,
+                vec![
+                    if key.contains('+') {
+                        "hotkey"
+                    } else {
+                        "press-key"
+                    }
+                    .into(),
+                    "--app".into(),
+                    name.clone(),
+                    "--window-id".into(),
+                    window.to_string(),
+                    "--key".into(),
+                    key,
+                    "--no-screenshot".into(),
+                    JSON_FLAG.into(),
+                ],
+            )
+        } else {
+            let direction = if action == Navigation::ScrollDown {
+                "down"
+            } else {
+                "up"
+            };
+            match &self.aim {
+                Aim::Pane { label } => (
+                    RecipeTool::Browser,
+                    vec!["scroll".into(), label.clone(), format!("page-{direction}")],
+                ),
+                Aim::App { name } => {
+                    let Some((window, width, height)) = self.scroll_window else {
+                        return false;
+                    };
+                    (
+                        RecipeTool::Computer,
+                        vec![
+                            "scroll".into(),
+                            "--app".into(),
+                            name.clone(),
+                            "--window-id".into(),
+                            window.to_string(),
+                            "--x".into(),
+                            (width / 2.0).to_string(),
+                            "--y".into(),
+                            (height / 2.0).to_string(),
+                            "--direction".into(),
+                            direction.into(),
+                            "--no-screenshot".into(),
+                            JSON_FLAG.into(),
+                        ],
+                    )
+                }
+                Aim::Phone { .. } => return false,
+            }
+        };
+        if action != Navigation::Wait {
+            self.background_argv(&mut argv);
+        }
+        let left = self.left_ms();
+        if left == 0 || left < recipe_line_holds_ms(tool, &argv) {
+            return false;
+        }
+        self.kept = None;
+        self.settled = None;
+        self.unsettled = None;
+        self.settling = false;
+        self.counted = None;
+        let answer = (self.road)(tool, &argv, &argv);
+        if action != Navigation::Wait {
+            self.note_background(answer_value(&answer).as_ref());
+        }
+        answer.exit_code == 0
     }
 
     fn settled(&mut self) -> Option<Settled> {
@@ -689,22 +948,27 @@ where
         Some(Settled { note, screen })
     }
 
-    /// A page whose last look read a field, with a writer a person set up —
-    /// in that order, so a page with no field never touches the key store.
+    /// A surface whose last look read an ordinary field, with a configured
+    /// writer. A surface with no eligible field never touches the key store.
     fn types(&self) -> bool {
-        matches!(self.aim, Aim::Pane { .. })
-            && self
-                .seen
-                .as_ref()
-                .is_some_and(|seen| !seen.snapshot.fields.is_empty())
+        !matches!(self.aim, Aim::Phone { .. })
+            && self.seen.as_ref().is_some_and(|seen| {
+                seen.items
+                    .iter()
+                    .filter_map(|item| item.get("mark").and_then(Value::as_u64))
+                    .filter_map(|mark| usize::try_from(mark).ok())
+                    .any(|mark| zerocode_core::screen_action::typeable(&seen.snapshot.fields, mark))
+            })
             && self.writer.as_ref().is_some_and(|writer| writer.ready())
     }
 
     fn type_into(&mut self, mark: usize, goal: &str) -> Typed {
-        let Aim::Pane { label } = &self.aim else {
+        if self.background_interrupted {
+            return Typed::Refused(TYPE_REFUSED.to_string());
+        }
+        if matches!(self.aim, Aim::Phone { .. }) {
             return Typed::Refused(NO_TYPING.to_string());
-        };
-        let pane = label.clone();
+        }
         let Some(entry) = self.seen.as_ref().and_then(|seen| Entry::read(seen, mark)) else {
             return Typed::Refused(NO_FIELD.to_string());
         };
@@ -759,27 +1023,62 @@ where
         // look's age stand in front of an entry as they stand in front of a
         // press — and typed at once, by the look's own selector for it: a
         // press that settles before it answers, since the typing follows it.
-        if !self.press_by(mark, false) {
-            return Typed::Refused(PRESS_REFUSED.to_string());
-        }
-        let argv = vec![
-            "type".to_string(),
-            pane,
-            entry.selector,
-            TYPE_VALUE_FLAG.to_string(),
-            value,
-        ];
-        let logged = crate::run_evidence::redacted(RecipeTool::Browser.as_str(), &argv);
-        let holds = recipe_line_holds_ms(RecipeTool::Browser, &argv);
+        let chars = value.chars().count();
+        let (tool, mut argv) = match &self.aim {
+            Aim::Pane { label } => {
+                let pane = label.clone();
+                if !self.press_by(mark, false) {
+                    return Typed::Refused(PRESS_REFUSED.to_string());
+                }
+                (
+                    RecipeTool::Browser,
+                    vec![
+                        "type".into(),
+                        pane,
+                        entry.selector,
+                        TYPE_VALUE_FLAG.into(),
+                        value,
+                    ],
+                )
+            }
+            Aim::App { .. } => (
+                RecipeTool::Computer,
+                vec![
+                    "set-value".into(),
+                    "--mark".into(),
+                    mark.to_string(),
+                    "--look".into(),
+                    self.look.clone(),
+                    "--value".into(),
+                    value,
+                    JSON_FLAG.into(),
+                ],
+            ),
+            Aim::Phone { .. } => return Typed::Refused(NO_TYPING.to_string()),
+        };
+        self.background_argv(&mut argv);
+        let logged = crate::run_evidence::redacted(tool.as_str(), &argv);
+        let holds = recipe_line_holds_ms(tool, &argv);
         let left = self.left_ms();
         if left == 0 || left < holds {
             return Typed::Refused(TYPE_REFUSED.to_string());
         }
-        let chars = argv[4].chars().count();
-        if (self.road)(RecipeTool::Browser, &argv, &logged).exit_code != 0 {
+        let answer = (self.road)(tool, &argv, &logged);
+        self.note_background(answer_value(&answer).as_ref());
+        if answer.exit_code != 0 {
             return Typed::Refused(TYPE_REFUSED.to_string());
         }
-        Typed::Typed { source, chars }
+        if self.background_interrupted
+            || (tool == RecipeTool::Computer
+                && answer_value(&answer)
+                    .and_then(|said| said.pointer("/action/verification/state").cloned())
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    != Some("verified"))
+        {
+            return Typed::Unverified { source, chars };
+        }
+        Typed::Entered { source, chars }
     }
 
     fn asks_ahead_of_the_press(&self) -> bool {
@@ -795,6 +1094,9 @@ where
     }
 
     fn reached(&mut self) -> Option<bool> {
+        if self.background_interrupted {
+            return None;
+        }
         let until = self.until.clone()?;
         // A page's press that settled before it answered (t-9876) counted no
         // words: a page asks `find`, as ever.
@@ -820,10 +1122,25 @@ where
             self.kept = said.as_ref().and_then(|said| screen_of(&self.aim, said));
             return Some(count.is_some_and(|count| count > 0));
         }
-        let argv = self.aim.reached_argv(&until);
+        let mut argv = self.aim.reached_argv(&until);
+        self.background_argv(&mut argv);
+        if self.pixels && matches!(self.aim, Aim::App { .. }) {
+            argv.extend(["--ocr".into(), JSON_FLAG.into()]);
+        }
         let answer = read_unjudged(self.road, self.aim.tool(), &argv);
         if matches!(self.aim, Aim::App { .. }) {
-            Some(answer.exit_code == 0)
+            if answer.exit_code == 0 {
+                Some(true)
+            } else if self.pixels {
+                let error = serde_json::from_str::<Value>(answer.stderr.trim())
+                    .or_else(|_| serde_json::from_str::<Value>(answer.stdout.trim()))
+                    .ok()?;
+                (error.pointer("/error/code").and_then(Value::as_str)
+                    == Some(zerocode_core::computer_use_protocol::error_code::TIMEOUT))
+                .then_some(false)
+            } else {
+                Some(false)
+            }
         } else {
             Some(
                 answer_value(&answer)
