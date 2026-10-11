@@ -9,6 +9,7 @@
  */
 
 import { endRun } from "./end-run.mjs";
+import { PLATFORM_OVERRIDE, reportedPlatformScript, TEST_PLATFORM } from "./test-platform.mjs";
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
@@ -2112,6 +2113,9 @@ class StatefulBackend {
       // 원장이 아는 좌석 — 이 창이 판을 쥐지 않은 워커까지 보드가 그리려면
       // 세 번째 출처가 필요하다(1-t1103). 카드 없는 창에서는 빈 목록이다.
       case "ledger_agents": return [];
+      // 런마다 코디 자리(t-45938: 역할 칩) — 런이 없는 창은 실제 백엔드가 빈
+      // 목록으로 답한다(`cmd::board::coordinator_seats`).
+      case "coordinator_seats": return [];
       case "board_columns": return [];
       // 그래프 보드가 묻는 스냅샷 — 열 없음·주의 0·전체 0은 실제 백엔드가 카드
       // 없는 창에 답하는 그대로(`zerocode_core::board::snapshot`).
@@ -3152,15 +3156,15 @@ const installTauri = async (page, windowId) => {
   }, windowId);
 };
 
-const addReportedPlatform = (page, platform) => page.addInitScript((reported) => {
-  Object.defineProperty(navigator, "userAgentData", {
-    configurable: true,
-    get: () => ({ platform: reported }),
-  });
-}, platform);
+const addReportedPlatform = (page, platform) => page.addInitScript(reportedPlatformScript, platform);
 
 const pageA = await context.newPage();
 const pageB = await context.newPage();
+// `ZO_TEST_PLATFORM` names another platform: both windows report it before shell.js reads it (test-platform.mjs).
+if (PLATFORM_OVERRIDE) {
+  await addReportedPlatform(pageA, PLATFORM_OVERRIDE);
+  await addReportedPlatform(pageB, PLATFORM_OVERRIDE);
+}
 await installTauri(pageA, "A");
 await installTauri(pageB, "B");
 
@@ -8027,8 +8031,12 @@ await test("non-default writes become canonical state before the second window b
   });
   await gestureAndWait(pageA, "A", "patch_editing_prefs", () =>
     pageA.check("#editing-editor-minimap"));
-  await gestureAndWait(pageA, "A", "patch_editing_prefs", () =>
-    pageA.uncheck("#editing-primary-selection-middle-click-paste"));
+  // The middle-click paste follows the platform until someone writes it (shell-term.js), and its default is off on
+  // Windows: flip the box from where it stands, so the write changes the canonical state on every platform.
+  await gestureAndWait(pageA, "A", "patch_editing_prefs", async () => {
+    const middle = "#editing-primary-selection-middle-click-paste";
+    await pageA.setChecked(middle, !(await pageA.isChecked(middle)));
+  });
   await gestureAndWait(pageA, "A", "patch_editing_prefs", () =>
     pageA.selectOption("#editing-diff-file-tree", "shown"));
   await gestureAndWait(pageA, "A", "set_diff_side_by_side", () =>
@@ -8192,6 +8200,7 @@ await test("the second boot paints every non-default before opening settings", a
     optionAsAlt: document.getElementById("term-option-as-alt")?.value,
     optionAsAltOptions: [...(document.getElementById("term-option-as-alt")?.options ?? [])]
       .map((option) => option.value),
+    optionAsAltHidden: document.getElementById("term-option-as-alt-field")?.hidden,
     jisYenToBackslash: document.getElementById("term-jis-yen-to-backslash")?.checked,
     jisYenHidden: document.getElementById("term-jis-yen-to-backslash-field")?.hidden,
     themeDark: document.getElementById("term-theme-dark")?.value,
@@ -8315,10 +8324,11 @@ await test("the second boot paints every non-default before opening settings", a
     fontFamily: "JetBrains Mono",
     ligatures: "on",
     ligaturesEffective: "on",
-    optionAsAlt: "left",
-    optionAsAltOptions: ["auto", "true", "left", "right", "false"],
+    optionAsAlt: TEST_PLATFORM === "darwin" ? "left" : "",
+    optionAsAltOptions: TEST_PLATFORM === "darwin" ? ["auto", "true", "left", "right", "false"] : [],
+    optionAsAltHidden: TEST_PLATFORM !== "darwin",
     jisYenToBackslash: true,
-    jisYenHidden: process.platform !== "darwin",
+    jisYenHidden: TEST_PLATFORM !== "darwin",
     themeDark: "Dracula",
     themeLight: "Solarized Light",
     separateLightTheme: false,

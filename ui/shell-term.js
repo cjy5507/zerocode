@@ -5478,6 +5478,18 @@ const termViews = new Map();
  * the snapshot — three roads into one map. */
 const termTitles = new Map();
 
+/* A title a program printed that is a tool tag or an XML piece, not a word. Codex printed its
+ * tool-call tag into its title (`<send_user_message_question_re…`) and the strip wore it (t-44016).
+ * An opening `<` before a name, or a closing `</`, is output, never a title. */
+const TITLE_FRAGMENT = /<\/?[A-Za-z_]/;
+
+/* The program's own word for itself, or nothing: the trimmed title, unless it is a fragment. The strip
+ * and the agent rows read it through this one door, so a fragment is refused in both places. */
+function spokenTitleOf(term) {
+  const said = (termTitles.get(term) ?? "").trim();
+  return TITLE_FRAGMENT.test(said) ? "" : said;
+}
+
 function noteTermTitle(term, title) {
   const said = String(title ?? "").trim();
   if (!said || termTitles.get(term) === said) return;
@@ -8955,6 +8967,26 @@ const TAB_GLYPH = {
   emulator: "phone",
 };
 
+/* What the strip writes on a tab (t-45938): its name, after the role its pane
+ * plays — 「코디 · …」, 「워커 · …」, 「사람 · …」 — the word its sidebar row
+ * wears, so the strip tells the coordinator's tab from a worker's without the
+ * board. A tab holding the coordinator's pane is the coordinator's, whatever
+ * else is split into it; any other tab speaks for its one pane. Only the strip
+ * leads with the role: everything else that names a tab (a crumb, a sentence)
+ * names the work. */
+function tabStripWords(tab) {
+  const label = tabLabel(tab);
+  const role = tabRole(tab);
+  return role ? t("agent.role.tab", "{{role}} · {{label}}", { role: paneRoleWord(role), label }) : label;
+}
+
+function tabRole(tab) {
+  if (tab.kind !== "term" || tab.asleep) return null;
+  const leaves = paneLeaves(tab.layout);
+  const roles = leaves.map(paneRole).filter(Boolean);
+  return roles.find((role) => role.kind === "coordinator") ?? (leaves.length === 1 ? roles[0] ?? null : null);
+}
+
 function tabLabel(tab) {
   // 표와 노트북은 그 파일 자체이지 파생된 판이 아니다 — 이름만 단다(1-g39·1-g40).
   if (
@@ -9032,15 +9064,23 @@ function tabLabel(tab) {
     if (leaves.length === 1) {
       const named = paneTitleOf(tab, leaves[0]);
       if (named) return named;
+      // The task the ledger seated in this pane names it first (t-44016): what the person handed it.
+      const task = paneLedger.get(leaves[0])?.task?.trim();
+      if (task) return task;
       // The program's own word (OSC 0/2) — what Orca's strip shows for a
       // terminal that is doing something. A person's name for the pane still
       // wins above; the number below is only for a shell that says nothing.
-      const spoken = termTitles.get(leaves[0]);
+      const spoken = spokenTitleOf(leaves[0]);
       if (spoken) return spoken;
       const prompt = panePrompts.get(leaves[0])?.trim();
       if (prompt) return prompt;
     }
-    return tab.title ?? tab.agent ?? t("terminal.numbered", "터미널 {{n}}", { n: tab.term });
+    // A pane that runs an agent, with nothing above to say, is named for its folder: the folder is the
+    // work's own name, where "터미널 N" says only where the tab sits (t-44016). A tab that carries its
+    // agent's name keeps it, and a plain shell keeps its number.
+    const launched = leaves.length === 1 && paneAgents.has(leaves[0]);
+    const folder = launched && tab.worktree ? basename(tab.worktree) : "";
+    return tab.title ?? tab.agent ?? (folder || t("terminal.numbered", "터미널 {{n}}", { n: tab.term }));
   }
   const entry = lanes.get(focusedId);
   return entry ? laneTitle(entry.lane) : t("terminal.label", "터미널");

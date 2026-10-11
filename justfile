@@ -54,6 +54,7 @@ tools-test:
     python3 tools/signing/tests/test_sign_app_bundle.py
     python3 tools/scoreboard/tests/test_scoreboard_launchd.py
     python3 tools/computer-bench/test_batch_rtt.py
+    python3 tools/computer-bench/test_background_input.py
     python3 tools/computer-bench/test_tally.py
     python3 tools/computer-bench/test_onboarding.py
     python3 tools/computer-bench/test_scenarios.py
@@ -120,9 +121,10 @@ settings-browser-test:
 # browser — it says in 100 ms whether the harness can still report at all.
 # Beside it the IPC census's arithmetic (t-20972): what a body weighs on the
 # wire, how repeats and bursts are counted. And the script a hidden pane's page
-# is told before its first script — no bridge (t-20972).
+# is told before its first script — no bridge (t-20972). And the frame budget's
+# rule on a platform that cannot read the load: recorded, never judged (t-43414).
 window-runner-test:
-    node --test ui/tests/window-runner.test.mjs ui/tests/ipc-census.test.mjs ui/tests/hidden-pane-bridge.test.mjs
+    node --test ui/tests/window-runner.test.mjs ui/tests/ipc-census.test.mjs ui/tests/hidden-pane-bridge.test.mjs ui/tests/machine-load.test.mjs
 
 # 설정뿐 아니라 전체 renderer interaction을 실제 layout engine에서 확인한다.
 # 이 gate가 있어야 설정 변경이 탭/보드/온보딩 같은 인접 UI를 깨뜨리지 않았다는

@@ -1652,6 +1652,25 @@ pub(crate) fn watched_checkouts() -> Vec<String> {
     paths.into_iter().map(str::to_string).collect()
 }
 
+/// The orchestration's own data root: where a landing check keeps its folders, rows and logs.
+fn land_check_root() -> Option<std::path::PathBuf> {
+    BLACKBOX.get().cloned()
+}
+
+/// One landing check's evidence, written as the ledger's own letter (t-34501 stage 3). Rings the
+/// bell when the letter is new; a repeat of a check id writes nothing.
+pub(crate) fn record_land_check(
+    receipt: zerocode_core::orchestration::land_check::LandCheckReceipt,
+    now_ms: i64,
+) {
+    let Some(held) = runtime() else {
+        return;
+    };
+    if let Ok((moved, _)) = held.actor.land_checked(receipt, now_ms) {
+        rang(moved);
+    }
+}
+
 /// Hand the ledger what the window saw of git, so it can write what is late. A pass that finds
 /// nothing writes nothing; one that wrote rings the bell for whoever sleeps on the mail.
 pub(crate) fn watch_landings(
@@ -1985,6 +2004,10 @@ pub(crate) struct LedgerAgent {
     pub(crate) dispatch_id: String,
     pub(crate) dispatch_started_ms: i64,
     pub(crate) retry_of: Option<String>,
+    /// What the attempt handed in for review (`Dispatch::source`): the commit the worker named, or the
+    /// report's own id where it named none. A card reads a commit id off it and never a report's id
+    /// (t-44016). `None` while nothing was handed in.
+    pub(crate) handed_in: Option<String>,
     /// What a coordinator wrote about the task's outcome, beyond the worker's
     /// claim: verified, merged, deployed — or nothing yet. Never inferred
     /// from a provider's turn ending or from `reported` above.
@@ -2011,6 +2034,10 @@ pub(crate) struct LedgerAgent {
     /// The pane id inside its team (`%3`) — the half of the seat a person
     /// types `worker-read` with when this window holds no terminal for it.
     pub(crate) pane: String,
+    /// Whether the person took its pane over (`Worker::taken_over`, the
+    /// `takenOver` `worker-list` prints): the pane is then the person's, and
+    /// the sidebar and the desk name it 사람 rather than 워커 (t-45938).
+    pub(crate) taken_over: bool,
     /// Whether it asked a question nobody has answered yet
     /// (`Run::awaiting_reply`, the silence the stall sweep keeps quiet).
     pub(crate) asking: bool,
@@ -2364,7 +2391,7 @@ pub(crate) fn refresh_board_ledger() {
                 ledger,
                 desk::desk_snapshot(
                     ledger,
-                    |seat| seat_is_held(seats, seat),
+                    |seat| seat_term(seats, seat),
                     |run, task| costs.cost(run, task),
                 ),
             )),
@@ -2543,6 +2570,7 @@ fn ledger_agents_for_seats(ledger: &Ledger, seats: &TeamSeatIndex) -> Vec<Ledger
                 dispatch_id,
                 dispatch_started_ms,
                 retry_of,
+                handed_in: dispatch.and_then(|one| one.source.clone()),
                 review,
                 review_since_ms,
                 closed: carried.and_then(|held| held.closed.clone()),
@@ -2559,6 +2587,7 @@ fn ledger_agents_for_seats(ledger: &Ledger, seats: &TeamSeatIndex) -> Vec<Ledger
                 model: worker.model.clone(),
                 effort: worker.effort.clone(),
                 pane: worker.pane.clone(),
+                taken_over: worker.taken_over,
                 asking: run.awaiting_reply(&worker.id),
                 wall: dispatch
                     .and_then(|one| zerocode_core::orchestration::newest_wall(run, &one.id)),
@@ -2586,13 +2615,12 @@ pub(crate) fn ledger_revision() -> Option<u64> {
 
 type TeamSeatIndex = std::collections::HashMap<String, std::collections::HashMap<String, u32>>;
 
-/// Whether this window holds the pane a seat names (`team/pane`).
-fn seat_is_held(seats: &TeamSeatIndex, seat: &str) -> bool {
-    seat.split_once('/').is_some_and(|(team, pane)| {
-        seats
-            .get(team)
-            .is_some_and(|panes| panes.contains_key(pane))
-    })
+/// The terminal of this window that the pane a seat names (`team/pane`) is,
+/// or `None` where this window does not hold that pane — whether this window
+/// holds the seat, and which of its panes sits in it (t-45938).
+fn seat_term(seats: &TeamSeatIndex, seat: &str) -> Option<u32> {
+    let (team, pane) = seat.split_once('/')?;
+    seats.get(team)?.get(pane).copied()
 }
 
 fn index_team_seats(
@@ -5144,6 +5172,8 @@ pub(crate) fn window_exiting(
     road: crate::exit_runtime::ExitRoad,
     census: &dyn Fn() -> restart_census::RestartCensus,
 ) {
+    // A landing check the window still runs goes with it; its row waits for the next sweep.
+    crate::land_check::stop_running();
     let taken = census();
     // Once per exit for the road, and whenever there are workers to name:
     // the first call is the one that finds them, before they sleep.
@@ -9159,6 +9189,41 @@ fn run_from_seat(
     }
 }
 
+/// The receipt files a `worker_done` names, read here so the ledger judges what
+/// was read and not what the worker says it holds (t-26587). A receipt that is
+/// not a plain file (missing, a link, a folder) or does not read as text is left
+/// out, and the ledger refuses a report that names it.
+fn read_receipts(argv: &[String]) -> zerocode_core::orchestration::evidence::ReceiptFiles {
+    let mut files = zerocode_core::orchestration::evidence::ReceiptFiles::default();
+    if !crate::agent_tools_runtime::is_worker_done(argv) {
+        return files;
+    }
+    let payload =
+        crate::agent_tools_runtime::orchestration_arg(argv, "--payload").unwrap_or_default();
+    for path in zerocode_core::orchestration::evidence::receipts_named(payload) {
+        if let Some(text) = read_receipt_text(&path) {
+            files.insert(path, text);
+        }
+    }
+    files
+}
+
+/// The first bytes of one receipt, when it is a plain file that reads as text.
+/// A link is not followed: `symlink_metadata` describes the link itself.
+fn read_receipt_text(path: &str) -> Option<String> {
+    use std::io::Read;
+    if !std::fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(zerocode_core::orchestration::evidence::RECEIPT_BYTES_MAX)
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
+}
+
 fn run_seated(
     host: &dyn Host,
     overrides: Vec<(String, LaunchOverride)>,
@@ -9234,7 +9299,7 @@ fn run_seated(
         .and_then(|term| host.actor_for(term));
     let command =
         match PlanCommand::checked(argv.to_vec(), team_id, pane, pane_token, caller, now_ms) {
-            Ok(command) => command,
+            Ok(command) => command.with_receipts(read_receipts(argv)),
             Err(why) => return refused_by_runtime(why),
         };
     /* What comes back has already been carried out against the rows AND made
@@ -10413,6 +10478,28 @@ fn carried(
                     answer(reply)
                 }
                 None => refused("worker is gone"),
+            }
+        }
+        /* A landing check (t-34501 stage 3). The window merges the head in a throwaway checkout
+         * of the compare ref and runs the project's check there. The verb answers the first
+         * word the check has — the merge's evidence, or `started` when the check runs on — and
+         * the evidence follows as the ledger's letter. The answer is filed as the receipt, so
+         * a retry with the same name is told the same thing and nothing runs twice. */
+        Effect::LandCheck(ask) => {
+            let Some(root) = land_check_root() else {
+                return refused("the orchestration data root is not open");
+            };
+            match crate::land_check::carry(&root, &ask, now_ms) {
+                Ok(said) => {
+                    let text = format!("{said}\n");
+                    if let Some(key) = decided.receipt.clone()
+                        && let Err(why) = actor.remember_served(key, text.clone(), now_ms)
+                    {
+                        return refused_by_runtime(why);
+                    }
+                    answer(zerocode_core::agent_teams::Reply::ok(text))
+                }
+                Err(why) => refused(why),
             }
         }
         /* One checkout's evidence, assembled where the sources live.
@@ -11970,3 +12057,6 @@ fn refused(why: impl std::fmt::Display) -> zerocode_hookd::TeamAnswer {
 
 #[cfg(test)]
 pub(crate) mod tests;
+// t-26587: the receipts a worker_done names, and the board's condition rows.
+#[cfg(test)]
+mod evidence_tests;

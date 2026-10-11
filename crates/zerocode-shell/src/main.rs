@@ -130,6 +130,7 @@ mod jev_scope;
 mod jira_attachments;
 mod jira_store;
 mod keyboard_input_source;
+mod land_check;
 mod landing_watch_sweep;
 mod last_status;
 mod launch_budget_door;
@@ -390,7 +391,7 @@ use cmd::{
 };
 use cmd::{artifact_export_formats, artifact_export_reveal};
 use cmd::{
-    claim_coordinator_seat, coordinator_handover_status, coordinator_seat_runs,
+    claim_coordinator_seat, coordinator_handover_status, coordinator_seat_runs, coordinator_seats,
     set_coordinator_handover,
 };
 use emulator::{
@@ -2282,6 +2283,7 @@ fn build_app_state(paths: app_paths::AppPaths, root: PathBuf) -> AppState {
     let ssh_hosts = ssh_hosts::SshHostService::new();
     let remote_servers = remote_servers::RemoteServerService::new();
     let settings = Arc::new(settings::SettingsRepository::new(settings_root.clone()));
+    land_check::hold_settings(Arc::clone(&settings));
     if let Err(error) = migrate_legacy_project_settings(&settings) {
         eprintln!("zerocode-shell: could not migrate project settings: {error}");
     }
@@ -2999,6 +3001,7 @@ fn main() -> ExitCode {
             machine_load,
             coordinator_handover_status,
             coordinator_seat_runs,
+            coordinator_seats,
             claim_coordinator_seat,
             set_coordinator_handover,
             pane_subagents,

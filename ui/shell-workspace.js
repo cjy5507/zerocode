@@ -4485,6 +4485,8 @@ function dressWorktreeTitle(row) {
   const label = row.dataset.label ?? "";
   const words = task || label;
   writeTextContent(row.querySelector(".wt-title"), words);
+  // Before the branch line below decides what it shows: the stage and the worker are words of that line (t-44016).
+  dressWorktreeWork(row, path);
   const branch = row.querySelector(".wt-branch");
   const name = branch?.querySelector(".wt-branch-name");
   if (!branch || !name) return;
@@ -4511,6 +4513,31 @@ function dressWorktreeTitle(row) {
   if (branch.hidden !== shut) branch.hidden = shut;
   const tip = task ? `${label} · ${path}` : path;
   if (row.dataset.tip !== tip) row.dataset.tip = tip;
+}
+
+/* The task id beside the title, and beside the name the stage the work stands at and the agent that did it
+ * (t-44016). Each word is written only when it changed, like the rest of the row. */
+function dressWorktreeWork(row, path) {
+  const set = (node, words) => {
+    if (!node) return;
+    if (node.textContent !== words) node.textContent = words;
+    if (node.hidden !== (words === "")) node.hidden = words === "";
+  };
+  set(row.querySelector(".wt-task-id"), worktreeWorkFacts(path)?.taskId ?? "");
+  set(row.querySelector(".wt-stage"), landingStageWord(worktreeStageOf(path)));
+  set(row.querySelector(".wt-worker"), worktreeWorkerWords(path));
+  // A run whose coordinator seat nobody holds, said once, on this line when it is that run's (t-45938).
+  const vacant = coordinatorVacancyAt(path);
+  const empty = row.querySelector(".wt-coordinator-vacant");
+  set(empty, vacant.length > 0 ? t("agent.role.coordinatorVacant", "코디 (비어 있음)") : "");
+  if (empty) {
+    const tip = vacant.length > 0
+      ? t("agent.role.coordinatorVacantTip", "{{runs}} 런의 코디 자리가 비어 있습니다 — 코디가 다시 앉으면 사라집니다", {
+        runs: vacant.map((seat) => seat.name || seat.run).join(", "),
+      })
+      : "";
+    if ((empty.dataset.tip ?? "") !== tip) empty.dataset.tip = tip;
+  }
 }
 
 function makeWorktreeNode(worktree, held) {
@@ -4743,6 +4770,23 @@ function makeWorktreeNode(worktree, held) {
   unseated.dataset.i18nSourcedatatip = unseatedTip.word;
   unseated.dataset.tip = t(unseatedTip.key, unseatedTip.word);
   unseated.hidden = true;
+  // The task id, the stage and the worker of the work in this checkout (t-44016), set on the branch line where the
+  // title keeps its whole width; `dressWorktreeWork` fills them.
+  const taskId = document.createElement("span");
+  taskId.className = "wt-task-id";
+  taskId.hidden = true;
+  const stage = document.createElement("span");
+  stage.className = "wt-stage";
+  stage.hidden = true;
+  const worker = document.createElement("span");
+  worker.className = "wt-worker";
+  worker.hidden = true;
+  // And the empty coordinator seat of a run whose work is here (t-45938) — said on one line of that run's work.
+  const vacant = document.createElement("span");
+  vacant.className = "wt-coordinator-vacant";
+  vacant.hidden = true;
+  branch.prepend(taskId);
+  branch.append(stage, worker, vacant);
   branch.appendChild(unseated);
   // A workspace can be carried straight from the rail into a board lane. If
   // the board was closed, the drag opens a preview sheet; a successful drop
@@ -7565,13 +7609,19 @@ async function activateWorktree(
         const owned = tabs.filter(
           (held) => held.worktree === path && held.kind !== "board",
         );
+        // The living agent of this checkout comes first (t-44057): the ledger may
+        // have seated a worker here whose tab is not on the stage yet, and a
+        // blank shell beside it is not what the click asked for. Only when there
+        // is neither a living agent nor a terminal to return to does the ledger's
+        // own seat get asked, and then a fresh shell.
         const back =
+          livingAgentTabOf(path) ??
           owned.find((held) => held.id === activeTabByWorktree.get(path)) ??
           owned[owned.length - 1];
         // `restoreActiveWorktreeTab` would find the board tab in `owned` and
         // hand it right back; a fresh terminal is what the click asked for.
         if (back) setActiveTab(back.id);
-        else await openTermTab();
+        else if (!(await openLedgerSeatedAgent())) await openTermTab();
       }
       recordNavVisit(path);
     }
