@@ -18649,12 +18649,15 @@ mod tests {
             "function plannedPlacement(placement, worktree) {",
             "  const host = placement === \"tab\" ? null : activeTabIn(focusedPane);",
             "  const shape = activePaneShape(host);",
-            "  const where = tilePlacement({",
-            "    sameWorktree: host !== null && host.worktree === worktree,",
-            "    activeIsTermTab: host?.kind === \"term\",",
-            "    ...shape,",
-            "  });",
-            "  return { host, shape, where };",
+            "  const where = placement?.tab === true",
+            "    ? { split: null }",
+            "    : tilePlacement({",
+            "        sameWorktree: host !== null && host.worktree === worktree,",
+            "        activeIsTermTab: host?.kind === \"term\",",
+            "        ...shape,",
+            "      });",
+            "  const beside = host?.kind === \"browser\" && host.worktree === worktree;",
+            "  return { host, shape, where, beside };",
             "}",
         ]
         .join("\n");
@@ -18664,7 +18667,7 @@ mod tests {
              group's tab and the measured shape"
         );
         let gateway = [
-            "  const { host, where } = plannedPlacement(placement, worktree);",
+            "  const { host, where, beside: besideBrowser } = plannedPlacement(placement, worktree);",
             "  if (where.split) return tileTermPane(host, term, extra, where.split, focus);",
         ]
         .join("\n");
@@ -18675,7 +18678,7 @@ mod tests {
         );
         assert!(
             block_after(window, "function spawnGrid(")
-                .contains("({ shape, where } = plannedPlacement(placement, worktree));"),
+                .contains("({ shape, where, beside } = plannedPlacement(placement, worktree));"),
             "a shell is no longer sized by the placement it will be seated by"
         );
         for (needle, count) in [
@@ -21700,7 +21703,7 @@ mod tests {
         // the notify seat between the two; a watched screen is not asked).
         let ringing = block_after(shipped, "fn ring_now(");
         let suppressing = ringing
-            .find("notify::suppressed(worktree, &active, focused)")
+            .find("notify::suppressed(worktree, &active, focused, stage.shows(term))")
             .expect("the ring no longer asks whether the person is watching");
         let returning = ringing
             .find("if watched {\n        return;\n    }")
@@ -22829,7 +22832,8 @@ mod tests {
         let runner = strip_rust_comments(include_str!("../../src/vendor_cli.rs"));
         let shipped = runner.split("mod tests {").next().expect("a module body");
         assert!(
-            shipped.matches("proc::quiet_command(").count() == 1
+            shipped.matches("proc::quiet_command_on_path(").count() == 1
+                && !shipped.contains("proc::quiet_command(")
                 && shipped.contains("shell_path::hydrated()")
                 && shipped.contains("trait CliRunner"),
             "vendor CLI execution forked outside the injectable, shell-PATH-aware runner"
@@ -24704,12 +24708,13 @@ mod tests {
         );
 
         // The account login spawns `claude` by name too, and `Command` resolves
-        // a bare name against the CHILD's PATH — so it gets the hydrated one.
+        // a bare name against the CHILD's PATH — so it gets the hydrated one,
+        // through the door that resolves the name on it first (t-47141).
         let accounts = include_str!("../../src/accounts.rs");
         let logging_in = block_after(accounts, "fn run_login(");
         assert!(
-            logging_in.contains("shell_path::hydrated()")
-                && logging_in.contains("command.env(\"PATH\", path)"),
+            logging_in
+                .contains("proc::quiet_command_on_path(program, crate::shell_path::hydrated())"),
             "the account login no longer carries the shell's PATH:\n{logging_in}"
         );
         // And it runs the SUBCOMMAND, not the REPL. `/login` starts the

@@ -3184,7 +3184,7 @@ struct HandoverCandidate<'a> {
 
 /// Who a stopped worker's task goes to for the `news` it stopped on, and
 /// whether step ① may commit its tree: a wall's standing order
-/// ([`standing_order`]), or the run's `--on-classifier-decline` with the
+/// (`standing_order`), or the run's `--on-classifier-decline` with the
 /// parts it left out filled from the declined worker's own ([`inherited`]).
 fn effective_handover_order(
     run: &Run,
@@ -3260,15 +3260,20 @@ fn ladder_holds(
         })
 }
 
-/// Whether this run can hand `dispatch_id` over right now, with the reason
-/// it cannot: one reading for the plan and for the reservation, so the beat
-/// and the actor cannot disagree about who is eligible.
-fn handover_candidate<'a>(
-    run: &'a Run,
-    dispatch_id: &str,
-    news: MessageKind,
-    now_ms: i64,
-) -> Result<HandoverCandidate<'a>, String> {
+/// What any handover of an attempt needs before the question of WHO it goes
+/// to is asked (t-39771): the same six rules whether the beat walks it under a
+/// standing order or a person's press hands it over by hand, in one place so
+/// the two cannot come to disagree about what is eligible.
+struct HandoverEligible<'a> {
+    worker: &'a Worker,
+    dispatch: &'a Dispatch,
+    checkout: String,
+}
+
+/// An open attempt, its worker live and not the person's, a checkout to
+/// inherit, not walked already, and its task under the table's ceiling — or
+/// the reason it is not.
+fn handover_eligible<'a>(run: &'a Run, dispatch_id: &str) -> Result<HandoverEligible<'a>, String> {
     let dispatch = run
         .dispatch(dispatch_id)
         .ok_or_else(|| format!("unknown dispatch: {dispatch_id}"))?;
@@ -3315,6 +3320,27 @@ fn handover_candidate<'a>(
             dispatch.task
         ));
     }
+    Ok(HandoverEligible {
+        worker,
+        dispatch,
+        checkout,
+    })
+}
+
+/// Whether this run can hand `dispatch_id` over right now, with the reason
+/// it cannot: one reading for the plan and for the reservation, so the beat
+/// and the actor cannot disagree about who is eligible.
+fn handover_candidate<'a>(
+    run: &'a Run,
+    dispatch_id: &str,
+    news: MessageKind,
+    now_ms: i64,
+) -> Result<HandoverCandidate<'a>, String> {
+    let HandoverEligible {
+        worker,
+        dispatch,
+        checkout,
+    } = handover_eligible(run, dispatch_id)?;
     // The wait rung is a wall's own; a decline has nothing to wait out.
     if news == MessageKind::QuotaWalled
         && let Some(why) = ladder_holds(run, worker, dispatch_id, QuotaWallRung::Handover, now_ms)
@@ -12000,7 +12026,7 @@ impl Ledger {
             let run = self.run(&plan.run).ok_or_else(|| unknown_run(&plan.run))?;
             let current =
                 resume_plan(run, &plan.worker, &plan.marker, now_ms).map_err(|not| match not {
-                    NotResumed::InFlight => "a continuation is already being typed".to_string(),
+                    NotResumed::InFlight => RESUME_IN_FLIGHT.to_string(),
                     NotResumed::Refused(why) => why,
                 })?;
             if current != *plan {
@@ -12020,7 +12046,7 @@ impl Ledger {
                 },
                 "attempt": plan.attempt,
                 "attemptsMax": RESUME_POLICY.attempts_max,
-                "line": RESUME_LINE,
+                "line": resume_line(&plan.marker),
                 "typedMs": now_ms,
             })
         };
@@ -14449,6 +14475,12 @@ pub trait Launcher {
         None
     }
 
+    /// The difficulty seat's mode and how its last recorded question ended
+    /// (t-45961). `None` when the host cannot say.
+    fn summon_judgment(&self) -> Option<SummonJudgment> {
+        None
+    }
+
     /// What the model question reads for `agent` under this summons's origin
     /// — lineup, book and records — or `None` when the host holds no lineup
     /// or the launch was sealed (t-14437).
@@ -15372,6 +15404,163 @@ fn lift_told(run: &Run, dispatch_id: &str, wall_id: &str) -> bool {
     })
 }
 
+/* ---- the chip a walled worker wears (t-39771) ------------------------- */
+
+/// The two facts about a walled worker only the window can see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WallChipSeat {
+    /// The window holds the worker's pane.
+    pub worker_here: bool,
+    /// The window holds the seat of the run's live coordinator — the hand the
+    /// handover's two verbs are presented from.
+    pub coordinator_here: bool,
+}
+
+/// What a worker standing at its quota wall is shown as, in the sidebar row
+/// and on the task board, and what the two buttons beside it may do right now
+/// (t-39771).
+///
+/// **Nothing here is a new fact.** It is the newest `quota_walled` row of the
+/// worker's open attempt ([`newest_wall`]), the run's standing order
+/// (`standing_order`) and the two rules the buttons' roads already keep —
+/// [`resume_plan`] and `handover_eligible` — read once, in one place, so the
+/// chip and the road behind its button cannot disagree about whether a press
+/// would be taken. The window reads the same function again when a button is
+/// pressed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct QuotaWallChip {
+    /// The `quota_walled` row: one wall episode of one attempt.
+    pub wall: String,
+    pub observed_at_ms: i64,
+    /// The reset the provider named, when it named one ahead of the witness.
+    /// `None` is "the wall does not say" — the chip says so in words and never
+    /// fills a time in.
+    pub resets_at_ms: Option<i64>,
+    /// Until when the wall explains the silence: past it the chip is gone.
+    pub stands_until_ms: i64,
+    /// Who a standing order hands this task to, when one names an alternative.
+    pub declared_alt: Option<Pinned>,
+    /// Why 「지금 다시 시도」 would not be taken now — the continuation's own
+    /// rules ([`resume_plan`]) in the ledger's words. `None`: it would.
+    pub retry_refusal: Option<String>,
+    /// Why 「다른 에이전트로 넘기기」 would not be taken now. `None`: it would.
+    pub hand_over_refusal: Option<String>,
+}
+
+/// Whether the ledger wrote a PANE move of `worker_id` (an account switch that
+/// seated it again) at or after `since_ms`. A wall the ledger witnessed before
+/// that move was met on the account the worker has left.
+fn account_moved_since(run: &Run, worker_id: &str, since_ms: i64) -> bool {
+    run.messages.iter().rev().any(|held| {
+        held.kind == MessageKind::AccountSwitched
+            && serde_json::from_str::<serde_json::Value>(held.body.as_str()).is_ok_and(|body| {
+                body["moved"] == "pane"
+                    && body["workerId"] == worker_id
+                    && body["switchedAtMs"].as_i64().unwrap_or(held.created_ms) >= since_ms
+            })
+    })
+}
+
+/// The chip `worker` wears for the newest wall of its open attempt, or why it
+/// wears none — the reason, in the ledger's words, that a press made from a
+/// screen drawn earlier is refused with.
+///
+/// None for a worker asleep for an account move ([`WorkerState::Sleeping`] is
+/// not a pane) or no longer live, for a pane the person took, for an attempt
+/// that closed, for an attempt with no wall the ledger witnessed, for a wall
+/// that no longer stands (it lifted), for a wall an account switch has since
+/// moved the worker off — the wall belongs to the account it left — and for a
+/// worker whose pane this window does not hold.
+pub fn wall_chip_for(
+    run: &Run,
+    worker: &Worker,
+    seat: WallChipSeat,
+    now_ms: i64,
+) -> Result<QuotaWallChip, String> {
+    if !worker.state.is_live() || !worker.state.may_occupy_pane() {
+        return Err(format!("worker {} is {}", worker.id, worker.state.as_str()));
+    }
+    if worker.taken_over {
+        return Err(format!(
+            "worker {}'s pane was taken over by the person — the terminal is theirs",
+            worker.id
+        ));
+    }
+    let Some(dispatch) = worker
+        .dispatch
+        .as_deref()
+        .and_then(|id| run.dispatch(id))
+        .filter(|held| held.is_open())
+    else {
+        return Err(format!("worker {} carries no open attempt", worker.id));
+    };
+    let Some(wall) = newest_wall(run, &dispatch.id) else {
+        return Err(format!(
+            "worker {} stands at no quota wall the ledger has witnessed",
+            worker.id
+        ));
+    };
+    if !wall.stands(now_ms) {
+        return Err(format!(
+            "worker {}'s quota wall no longer stands — it lifted",
+            worker.id
+        ));
+    }
+    if account_moved_since(run, &worker.id, wall.observed_at_ms) {
+        return Err(format!(
+            "worker {} was seated again on another account after this wall",
+            worker.id
+        ));
+    }
+    if !seat.worker_here {
+        return Err(format!("this window holds no pane of worker {}", worker.id));
+    }
+    let retry_refusal = match resume_plan(
+        run,
+        &worker.id,
+        &person_marker_at(&dispatch.id, &wall),
+        now_ms,
+    ) {
+        Ok(_) => None,
+        Err(NotResumed::InFlight) => Some(RESUME_IN_FLIGHT.to_string()),
+        Err(NotResumed::Refused(why)) => Some(why),
+    };
+    let hand_over_refusal = if !seat.coordinator_here {
+        Some(format!(
+            "this window does not hold run {}'s coordinator seat",
+            run.id
+        ))
+    } else if resume_rows(run, &dispatch.id).any(|body| body["status"] == RESUME_TYPING) {
+        Some(format!(
+            "a continuation is being typed at dispatch {} — a handover waits until it settles",
+            dispatch.id
+        ))
+    } else {
+        handover_eligible(run, &dispatch.id).err()
+    };
+    Ok(QuotaWallChip {
+        wall: wall.wall.clone(),
+        observed_at_ms: wall.observed_at_ms,
+        resets_at_ms: wall.resets_at_ms.filter(|at| *at > wall.observed_at_ms),
+        stands_until_ms: wall.stands_until_ms,
+        declared_alt: standing_order(run, worker).1.cloned(),
+        retry_refusal,
+        hand_over_refusal,
+    })
+}
+
+/// The briefing paragraph's cause for a wall the ledger wrote: the provider,
+/// the percentage and the reset as the `quota_walled` row said them
+/// (`handover_cause`), for a handover a person asked for. `None` when the
+/// row is gone.
+#[must_use]
+pub fn wall_cause(run: &Run, wall: &WallAt) -> Option<HandoverCause> {
+    run.messages
+        .iter()
+        .find(|held| held.id == wall.wall)
+        .and_then(handover_cause)
+}
+
 /// Read one wall's lift off the agent's own words and the provider's number
 /// (t-6427) — two witnesses, the wall's own rule turned round. Words that
 /// moved past the wall are another silence; a number taken before the reset,
@@ -15455,6 +15644,9 @@ pub const RESUME_LINE: &str =
 
 /// Where one continuation receipt stands.
 pub const RESUME_TYPING: &str = "typing";
+/// What a second continuation for an attempt whose first is still being typed
+/// is told ([`NotResumed::InFlight`]) — by the reservation and by a press.
+pub const RESUME_IN_FLIGHT: &str = "a continuation is already being typed";
 pub const RESUME_SUBMITTED: &str = "submitted";
 pub const RESUME_NOT_SUBMITTED: &str = "not_submitted";
 // A row the window restarted under is [`HANDOVER_INTERRUPTED`], the handover
@@ -15484,6 +15676,69 @@ pub struct TransientErrorMarker {
 /// for the continuation it asks for, so [`resume_plan`] does not also ask for
 /// `--on-transient-error resume`; every other line of the plan still holds.
 pub const JEV_MARKER_SOURCE: &str = "jev";
+
+/// The marker source that names a PERSON's press (t-39771): 「지금 다시 시도」
+/// on a worker standing at its quota wall, after the window's confirm.
+///
+/// A press is the standing order for the continuation it asks for, the way a
+/// seat that acts is ([`JEV_MARKER_SOURCE`]) — and it is asked AT a wall,
+/// which the beat's own continuation never is ("the handover road answers
+/// it"). So [`resume_plan`] waives exactly those two refusals for it and no
+/// other: an open attempt, the worker in its own seat and not the person's,
+/// no unanswered question, nothing being typed, the table's ceiling and
+/// spacing, and a key that was not typed at already all stand.
+///
+/// Built by [`person_wall_marker`] and by nothing else. No verb, no request
+/// body and no beat names a marker's source: the CLI cannot ask for this one
+/// (a source contract pins who may mention it).
+pub const PERSON_MARKER_SOURCE: &str = "person";
+
+/// What a person's press types at a wall (t-39771). The beat's
+/// [`RESUME_LINE`] says the last turn died on a transient API error, which is
+/// not what a wall is, so the press has a sentence of its own — one English
+/// sentence, like the other, because the agent reads it.
+pub const WALL_RETRY_LINE: &str =
+    "The usage limit may have lifted; try again and continue from where you left off.";
+
+/// The sentence one continuation types: the wall's own for a person's press,
+/// the transient error's for every other marker.
+#[must_use]
+pub fn resume_line(marker: &TransientErrorMarker) -> &'static str {
+    if marker.source == PERSON_MARKER_SOURCE {
+        WALL_RETRY_LINE
+    } else {
+        RESUME_LINE
+    }
+}
+
+/// The marker a person's press stands on, read off the worker's own wall.
+///
+/// Its key names the attempt and the wall the press is about, so one wall
+/// episode of one attempt is typed at once — [`resume_plan`]'s rule for a key
+/// whose words may be on the line — and the next wall, which the ledger
+/// writes as a row of its own, is a new key. `None` for a worker with no
+/// attempt or no wall to press at.
+#[must_use]
+pub fn person_wall_marker(run: &Run, worker_id: &str) -> Option<TransientErrorMarker> {
+    let dispatch = run.worker(worker_id)?.dispatch.as_deref()?;
+    let wall = newest_wall(run, dispatch)?;
+    Some(person_marker_at(dispatch, &wall))
+}
+
+fn person_marker_at(dispatch_id: &str, wall: &WallAt) -> TransientErrorMarker {
+    TransientErrorMarker {
+        source: PERSON_MARKER_SOURCE.to_string(),
+        line: "a person asked this worker to try again at its quota wall"
+            .to_string()
+            .into(),
+        key: person_wall_key(dispatch_id, &wall.wall),
+    }
+}
+
+/// The key one wall episode of one attempt gives a person's press.
+fn person_wall_key(dispatch_id: &str, wall_id: &str) -> String {
+    format!("person:{dispatch_id}:{wall_id}")
+}
 
 /// One continuation the beat may type now — what [`resume_plan`] makes of a
 /// quiet worker, its marker and the run's declared order.
@@ -15557,6 +15812,10 @@ fn resume_may_have_typed(body: &serde_json::Value) -> bool {
 /// typed is [`NotResumed::InFlight`]; [`RESUME_POLICY`]`.attempts_max` of them
 /// is the ceiling; a marker whose words may already be on the line is never
 /// typed at again; and two continuations stand `retry_after_ms` apart.
+///
+/// A person's press at a wall ([`PERSON_MARKER_SOURCE`], t-39771) is its own
+/// order and is asked at the wall, so the first and the wall's refusal are
+/// waived for it — and only those two.
 pub fn resume_plan(
     run: &Run,
     worker_id: &str,
@@ -15564,7 +15823,11 @@ pub fn resume_plan(
     now_ms: i64,
 ) -> Result<ResumePlan, NotResumed> {
     let refused = |why: String| Err(NotResumed::Refused(why));
+    // A person's press stands in for the declared order AND is asked at a wall
+    // (t-39771): the two refusals it waives, and nothing else of the plan.
+    let by_person = marker.source == PERSON_MARKER_SOURCE;
     if marker.source != JEV_MARKER_SOURCE
+        && !by_person
         && run
             .handover
             .as_ref()
@@ -15605,9 +15868,21 @@ pub fn resume_plan(
             worker.id
         ));
     }
-    if newest_wall(run, &dispatch.id).is_some_and(|wall| wall.stands(now_ms)) {
+    if !by_person && newest_wall(run, &dispatch.id).is_some_and(|wall| wall.stands(now_ms)) {
         return refused(format!(
             "dispatch {} is at its quota wall — the handover road answers it",
+            dispatch.id
+        ));
+    }
+    // A press is about ONE wall: the one the attempt stands at now. A press
+    // made on an older wall, or on one that lifted, is not this one's.
+    if by_person
+        && newest_wall(run, &dispatch.id)
+            .filter(|wall| wall.stands(now_ms))
+            .is_none_or(|wall| person_wall_key(&dispatch.id, &wall.wall) != marker.key)
+    {
+        return refused(format!(
+            "the press names a wall dispatch {} does not stand at now",
             dispatch.id
         ));
     }
@@ -17263,12 +17538,24 @@ fn dials_why(
         .map(|(model, _, _)| model.as_str())
         .or_else(|| row.map(|row| row.model.as_str()));
     let facts = turn.map(|(_, _, _, facts)| facts);
-    let band = model
-        .and_then(|model| facts?.lineup.find(model)?.band)
+    let held = model.and_then(|model| facts?.lineup.find(model));
+    let band = held
+        .and_then(|held| held.band)
         .or_else(|| row.and_then(|row| row.band));
+    // Who put the model in that band, and how sure that judgment was
+    // (t-45961): the Jev seat, the fact rule, or the facts for a model that
+    // arrived after the judgment.
+    let tier_from = held
+        .and_then(|held| held.tier_from)
+        .or_else(|| row.and_then(|row| row.tier_from));
+    let tier_confidence = held
+        .and_then(|held| held.tier_confidence_permille)
+        .or_else(|| row.and_then(|row| row.tier_confidence_permille));
     let jev = pick.is_some_and(|(_, _, from)| *from == DIALS_FROM_JEV);
     serde_json::json!({
         "band": band,
+        "tierFrom": tier_from,
+        "tierConfidencePermille": tier_confidence,
         "effortRule": if jev {
             serde_json::json!(DIALS_FROM_JEV)
         } else {
@@ -17286,8 +17573,92 @@ fn dials_why(
 
 /// `dials.difficultyFrom`: the difficulty seat's applied answer chose it.
 const DIALS_FROM_JEV: &str = "jev";
-/// `dials.difficultyFrom`: nobody chose; the ladder's middle stood.
-const DIALS_FROM_FALLBACK: &str = "fallback";
+/// `dials.difficultyFrom`: no answer, and the person's own row for unjudged
+/// work ([`crate::summon_difficulty::UNJUDGED_DIFFICULTY`]) stood (t-45961).
+const DIALS_FROM_PERSON: &str = "person";
+/// `dials.difficultyFrom`: no answer and no row of the person's: the
+/// lineup's hard rung — the provider's top implementation model as the
+/// classifier ordered it — ran (t-45961).
+const DIALS_FROM_FACTS: &str = "facts";
+/// `dials.difficultyFrom`: no answer, and no difficulty ran — the summons
+/// named its model, and its CLI's own effort stands. `dials.difficulty` then
+/// names the rung an unjudged summons stands at
+/// ([`crate::summon_difficulty::UNJUDGED_DIFFICULTY`]), so it is a word every
+/// time.
+const DIALS_FROM_NONE: &str = "none";
+/// `dials.unjudged.why`: the difficulty question was never asked (its
+/// switch off, or every dial named).
+const UNJUDGED_NOT_ASKED: &str = "not_asked";
+/// `dials.unjudged.why`: the question was answered, and the answer was only
+/// recorded.
+const UNJUDGED_NOT_APPLIED: &str = "not_applied";
+/// The status codes HTTP has: a refused request's outcome word carries one
+/// (`http_402`), which the plain sentence names.
+const HTTP_STATUS_CODES: std::ops::Range<u16> = 100..600;
+/// The window wire's word for a question whose answer missed its wall
+/// (`systemone::TIMEOUT` in the shell, which this crate cannot read).
+const UNJUDGED_TIMEOUT: &str = "timeout";
+
+/// Why a summons ran without the difficulty seat's answer (t-45961), as a
+/// word and as a sentence a person reads: the seat's own outcome word — a
+/// request the service refused carries its HTTP status (`http_402`), the
+/// door's refusal its own word (`off`, `no_key`, …), a wall passed
+/// `timeout` — or [`UNJUDGED_NOT_ASKED`], or [`UNJUDGED_NOT_APPLIED`] for an
+/// answer only recorded. Response codes and refusal words only: nothing here
+/// reads a key or a credential.
+fn unjudged_reason(outcome: Option<&str>) -> serde_json::Value {
+    use crate::jev::door::{ANSWERED_OUTCOME, Refused};
+    let why = match outcome {
+        None => UNJUDGED_NOT_ASKED,
+        Some(ANSWERED_OUTCOME) => UNJUDGED_NOT_APPLIED,
+        Some(word) => word,
+    };
+    let status = why
+        .rsplit_once('_')
+        .and_then(|(_, code)| code.parse::<u16>().ok())
+        .filter(|code| HTTP_STATUS_CODES.contains(code));
+    let says = match (why, status, Refused::from_token(why)) {
+        (UNJUDGED_NOT_ASKED, _, _) => {
+            "No difficulty judgment: it was not asked (its switch is off, or the summons named every dial).".to_string()
+        }
+        (UNJUDGED_NOT_APPLIED, _, _) => {
+            "The difficulty judgment answered, but its answer was only recorded, not applied.".to_string()
+        }
+        (_, Some(code), _) => {
+            format!("No difficulty judgment: the judgment service refused the request (HTTP {code}).")
+        }
+        (UNJUDGED_TIMEOUT, _, _) => {
+            "No difficulty judgment: no answer came within its time limit.".to_string()
+        }
+        (_, _, Some(Refused::Off)) => "No difficulty judgment: Jev is switched off.".to_string(),
+        (_, _, Some(Refused::NoKey)) => "No difficulty judgment: no Jev key is set.".to_string(),
+        (_, _, Some(Refused::NotConsented)) => {
+            "No difficulty judgment: this folder is not one Jev may read.".to_string()
+        }
+        (_, _, Some(Refused::Budget)) => {
+            "No difficulty judgment: today's Jev request budget is spent.".to_string()
+        }
+        (_, _, Some(Refused::SettingsChanged)) => {
+            "No difficulty judgment: the Jev settings changed while it was asked.".to_string()
+        }
+        (word, None, None) => format!("No difficulty judgment: the request ended `{word}`."),
+    };
+    serde_json::json!({ "why": why, "says": says })
+}
+
+/// The difficulty seat as agent-list shows it (t-45961): its mode, and how
+/// its last recorded question ended — what a coordinator reads to know
+/// whether summonses are being judged, and why not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummonJudgment {
+    /// The seat's mode word (`off`, `shadow`, `on`, `auto`).
+    pub mode: String,
+    /// The last recorded question's outcome word; `None` when none is
+    /// recorded.
+    pub last_outcome: Option<String>,
+    /// When that question was recorded.
+    pub last_at_ms: Option<i64>,
+}
 /// `dials.modelFrom`: the summons named its own `--model`.
 const DIALS_FROM_REQUEST: &str = "request";
 /// `dials.modelFrom`: a challenger's turn tried a model with too little
@@ -20757,6 +21128,18 @@ fn plan_inner(
                     )
                 })
                 .collect();
+            // Whether summonses are being judged now, and why not (t-45961):
+            // the difficulty seat's mode and its last recorded outcome, and
+            // what a summons nobody judged runs instead.
+            let judgment = launcher.summon_judgment().map(|seat| {
+                serde_json::json!({
+                    "mode": seat.mode,
+                    "lastOutcome": seat.last_outcome,
+                    "lastAtMs": seat.last_at_ms,
+                    "unjudged": unjudged_reason(seat.last_outcome.as_deref()),
+                    "unjudgedRuns": crate::summon_difficulty::UNJUDGED_DIFFICULTY,
+                })
+            });
             said(serde_json::json!({
                 "agents": agents,
                 // Said out loud rather than left to be inferred from the rows:
@@ -20764,6 +21147,7 @@ fn plan_inner(
                 // tell "this window cannot look" from "this window looked and
                 // found nothing", and thirty-six identical rows cannot.
                 "detected": measured.is_some(),
+                "summonJudgment": judgment,
             }))
         }
 
@@ -21058,7 +21442,7 @@ fn plan_inner(
             let profile = if model.is_none() && open {
                 launcher.difficulty_profile(
                     &agent,
-                    chosen.unwrap_or(crate::summon_difficulty::FALLBACK_DIFFICULTY),
+                    chosen.unwrap_or(crate::summon_difficulty::UNJUDGED_DIFFICULTY),
                     summons_origin,
                 )?
             } else {
@@ -21110,8 +21494,22 @@ fn plan_inner(
             // what else today's lineup offers at that difficulty (t-14437).
             let dials = (model.is_none() || effort.is_none()).then(|| {
                 serde_json::json!({
-                    "difficulty": chosen.unwrap_or(crate::summon_difficulty::FALLBACK_DIFFICULTY),
-                    "difficultyFrom": if chosen.is_some() { DIALS_FROM_JEV } else { DIALS_FROM_FALLBACK },
+                    // Always a word: the rung the answer chose, else the one
+                    // an unjudged summons stands at — `difficultyFrom` says
+                    // whether any dial ran at it (t-45961).
+                    "difficulty": chosen.unwrap_or(crate::summon_difficulty::UNJUDGED_DIFFICULTY),
+                    "difficultyFrom": match (chosen, &profile) {
+                        (Some(_), _) => DIALS_FROM_JEV,
+                        (None, Some(row)) if row.from == crate::summon_difficulty::lineup::Source::Person => {
+                            DIALS_FROM_PERSON
+                        }
+                        (None, Some(_)) => DIALS_FROM_FACTS,
+                        (None, None) => DIALS_FROM_NONE,
+                    },
+                    // Why no judgment chose, when none did (t-45961).
+                    "unjudged": chosen.is_none().then(|| unjudged_reason(
+                        difficulty_receipt.as_ref().and_then(|row| row["outcome"].as_str()),
+                    )),
                     "modelFrom": match (&model, &model_pick, &profile) {
                         (Some(_), _, _) => serde_json::json!(DIALS_FROM_REQUEST),
                         (None, Some((_, _, from)), _) => serde_json::json!(from),

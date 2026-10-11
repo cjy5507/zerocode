@@ -47,6 +47,7 @@ mod shape;
 mod shape_words;
 mod tool_guard;
 mod step_effort;
+mod tier_seat;
 mod turn;
 mod turn_reads;
 
@@ -86,11 +87,14 @@ pub use decision_report::{
     AxisEvaluation, DecisionShadowSummary, LabelEvaluation, BASIS_POINTS,
 };
 pub use decision_shadow::{
-    check_system_one, decision_shadow_path, note_route_followed, route_unseated_by, CheckFailure,
+    check_system_one, check_system_one_for, decision_shadow_path, note_route_followed, route_unseated_by, CheckFailure,
     DecisionShadowRow, JudgedAxis, ProbeCell, RouteLabelRow, SystemOneCheck, DECISION_SHADOW_FILE,
     KEY_CHECK_TASK, OUTCOME_ANSWERED, ROUTE_STOOD,
 };
 pub use probe_exec::task_fingerprint;
+pub use tier_seat::{
+    judgment_for as tier_judgment_for, tier_judgment_path, tier_seat_mode, TierRow, TIER_JUDGMENT_FILE,
+};
 pub use rerank_shadow::{
     note_recall_read, rerank_shadow_path, Judged, RerankLabelRow, RerankShadow, RerankShadowRow, ShownNote,
     RERANK_OUTCOME_ANSWERED, RERANK_OUTCOME_UNORDERABLE, RERANK_SHADOW_FILE,
