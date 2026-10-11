@@ -9200,6 +9200,36 @@ mod tests {
         );
     }
 
+    /// The Bluetooth usage descriptions (t-45873). The embedded Chromium reads
+    /// the devices paired with this Mac through IOBluetooth, and macOS ends a
+    /// process that does so without `NSBluetoothAlwaysUsageDescription` (a TCC
+    /// abort seen on 2026-10-11). Both keys sit in the main bundle's Info.plist,
+    /// the file tauri-bundler merges. build.rs writes another bundle's plist (the
+    /// Computer Use helper's), so the keys must not appear there.
+    #[test]
+    fn the_main_bundle_declares_the_bluetooth_usage_descriptions() {
+        let plist = include_str!("../../Info.plist");
+        let helper_plist = include_str!("../../build.rs");
+        for key in [
+            "NSBluetoothAlwaysUsageDescription",
+            "NSBluetoothPeripheralUsageDescription",
+        ] {
+            let text = plist
+                .split_once(&format!("<key>{key}</key>"))
+                .and_then(|(_, rest)| rest.split_once("<string>"))
+                .and_then(|(_, rest)| rest.split_once("</string>"))
+                .map_or("", |(body, _)| body.trim());
+            assert!(
+                text.split_whitespace().count() >= 8 && text.ends_with('.'),
+                "`{key}` is missing from Info.plist or is not a sentence a person can read: `{text}`"
+            );
+            assert!(
+                !helper_plist.contains(key),
+                "`{key}` belongs to one plist only: build.rs writes the Computer Use helper's"
+            );
+        }
+    }
+
     /// The features the embedded Chromium is started with turned off, as the
     /// one named constant spells them.
     fn disabled_chromium_features(chromium: &str) -> Vec<&str> {
@@ -18561,8 +18591,10 @@ mod tests {
     /// :687000) — mechanics this window already carried. What was missing was
     /// a decision: every road ended in a tab, so a second terminal always hid
     /// the first. The product owner's call goes one step past Orca — a
-    /// terminal opened in the checkout being looked at divides the stage
-    /// ("터미널이 여러 개 열리면 화면에 맞게 분할됨") — and this gate holds
+    /// terminal a launch seats in the checkout being looked at divides the
+    /// stage ("터미널이 여러 개 열리면 화면에 맞게 분할됨"), while the
+    /// new-terminal doors open a tab, as the person asking for one by hand
+    /// expects — and this gate holds
     /// that rule's edges:
     ///
     /// - the RULE is one table: same workspace, a terminal tab on stage,
@@ -20059,6 +20091,108 @@ mod tests {
         assert!(
             launching.contains("resume: Option<String>,"),
             "launch_agent_tab's resume is no longer a plain session id — re-read the handoff"
+        );
+    }
+
+    /// t-46106: every Claude pane says which account it runs as, where the
+    /// pane is said, and a switch says what became of the panes. A sidebar
+    /// row and the status bar each read the plan's census through ONE
+    /// function — a row cannot name one account while the bar names another
+    /// for the same reading — a row's account is part of what the row says
+    /// (or the row freezes on the account it was first drawn with), the
+    /// bar names the account its own reading is of, and both switch roads —
+    /// the beat's apply and the person's pick — say the same four counts.
+    #[test]
+    fn every_pane_says_its_account_and_a_switch_says_what_became_of_the_panes() {
+        let window = window_source();
+        let row = block_after(window, "function agentRowAccount(row) {");
+        assert!(
+            row.contains("paneAccountWords(row.term)"),
+            "a sidebar row reads its account off something else than the census:\n{row}"
+        );
+        let said = block_after(window, "function agentRowsSaid(rows) {");
+        assert!(
+            said.contains("agentRowAccount(row)"),
+            "a row's account is not part of what the row says, so it freezes:\n{said}"
+        );
+        let bar = block_after(window, "function paintClaudeBarAccount() {");
+        assert!(
+            bar.contains("claudeUsage?.account") && bar.contains("accountShortId("),
+            "the bar names an account other than its reading's own:\n{bar}"
+        );
+        for road in [
+            "async function applyAccountSwitch(by, token) {",
+            "async function pickClaudeAccount(id) {",
+        ] {
+            let body = block_after(window, road);
+            assert!(
+                body.contains("saySwitchCensus("),
+                "`{road}` no longer says what became of the panes:\n{body}"
+            );
+        }
+        let picked = block_after(shipped_backend(), "async fn person_switched(");
+        assert!(
+            picked.contains("report.switched = Some(applied.census);"),
+            "the person's pick no longer carries its census to the window:\n{picked}"
+        );
+    }
+
+    /// t-46106 (ZO's read, m-46917): the window never calls a pane between
+    /// turns while words it typed there on its own are on their way. It reads
+    /// the typing door's own record — the delivery the pump carries and the
+    /// queue behind it — at the switch's every look and FIRST at the rest's
+    /// fence (outside the hook state's lock, so the two locks never nest), and
+    /// it waits for the output to settle as the pointer does. A switch asks
+    /// both questions through one function.
+    #[test]
+    fn a_pane_with_words_on_their_way_is_never_between_turns_for_a_switch() {
+        let backend = shipped_backend();
+        let typing = block_after(
+            backend,
+            "    fn typing_in_flight(&self, term: TermId) -> bool {",
+        );
+        assert!(
+            typing.contains("state.deliveries().contains_key(&term)")
+                && typing.contains(".prompt_queue()"),
+            "the window no longer reads its typing door for words on their way:\n{typing}"
+        );
+        let between = block_after(
+            backend,
+            "    fn between_turns(&self, term: TermId) -> bool {",
+        );
+        assert!(
+            between.contains("output_settled(&state, term)"),
+            "a pane is called between turns before its output settles:\n{between}"
+        );
+        let fence = block_after(
+            backend,
+            "    fn with_between_turns_observation(&self, term: TermId, commit: &mut dyn FnMut()) {",
+        );
+        let asked = fence
+            .find("self.typing_in_flight(term)")
+            .expect("the fence no longer asks for words on their way");
+        let locked = fence
+            .find("state.pane_states()")
+            .expect("the fence no longer holds the hook state");
+        assert!(
+            asked < locked && fence.contains("output_settled(&state, term)"),
+            "the fence asks for words on their way under the hook state's lock, or \
+             skips the settle:\n{fence}"
+        );
+        let switch = include_str!("../../src/account_switch.rs");
+        let rests = block_after(
+            switch,
+            "fn rests_for_a_move(host: &dyn Host, term: u32) -> bool {",
+        );
+        assert!(
+            rests.contains("host.between_turns(term) && !host.typing_in_flight(term)"),
+            "a switch decides \"now\" without asking for words on their way:\n{rests}"
+        );
+        assert_eq!(
+            switch.matches("host.between_turns(").count(),
+            1,
+            "a switch asks \"between turns\" around the one function that also asks for \
+             words on their way"
         );
     }
 
@@ -34598,6 +34732,35 @@ mod tests {
         assert!(
             markup.contains("id=\"sb-codex-route\"") && window.contains("paintCodexPtyFallbacks()"),
             "the fallback has no persistent, reviewable status surface"
+        );
+        assert!(
+            markup.contains("id=\"sb-scm-notices\"") && window.contains("paintScmMark()"),
+            "a PR condition that stands has no status bar mark"
+        );
+        let registered = include_str!("../../src/main.rs");
+        assert!(
+            registered.contains("scm_observer_shown,")
+                && registered.contains("scm_observer_dismiss,"),
+            "the PR notice marks are not registered as window commands"
+        );
+    }
+
+    #[test]
+    fn a_waiting_mail_the_window_could_not_type_is_said_once_per_condition() {
+        let orchestration = include_str!("../../src/orchestration.rs");
+        let delivered = block_after(
+            orchestration,
+            "zerocode_pty::DeliveryOutcome::Delivered => {",
+        );
+        assert!(
+            delivered.contains("host.mail_waiting_cleared(term)"),
+            "a pointer that landed no longer ends the waiting condition the window was told about:\n{delivered}"
+        );
+        let terminal = include_str!("../../../../ui/shell-term.js");
+        assert!(
+            terminal.contains("mailWaitingSaid.get(term) === reason")
+                && terminal.contains("listen(\"term:mail-waiting-cleared\""),
+            "the same reason on the same pane is said once per condition, and the condition's end is heard"
         );
     }
 

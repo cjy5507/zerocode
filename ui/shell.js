@@ -9890,6 +9890,8 @@ function agentRowsSaid(rows) {
         // A helper's own model — its words and the facts behind them — is
         // what its row says about it; the pane's (above) is not.
         `:${row.sub ? `${agentRowModelWords(row)}|${agentRowModelTip(row)}` : ""}` +
+        // The account the pane runs as, and its share (t-46106).
+        `:${JSON.stringify(agentRowAccount(row))}` +
         `:${row.sub && row.subHost === undefined ? "" : JSON.stringify(paneAutonomyValue(row.term))}` +
         `:${agentRowHere(row) ? 1 : 0}` +
         // What the row waits for is what it says too: the answer, the wall and the review come from the ledger.
@@ -9929,6 +9931,16 @@ function agentRowModelTip(row) {
   return row.sub ? (helperModelTip(row.sub) || agentRowModelWords(row)) : (paneModels.get(row.term) ?? "");
 }
 
+/* The account a pane's row wears beside its model (t-46106): the account
+ * its login is, by its short id, and that account's share — and, off the
+ * default, where the pane stands (`paneAccountWords`, the switch plan's
+ * census). A helper rides its parent's pane and says nothing of it; a pane
+ * the plan does not count — not Claude's — wears none. */
+function agentRowAccount(row) {
+  if (row.sub || typeof paneAccountWords !== "function") return null;
+  return paneAccountWords(row.term);
+}
+
 /* 행이 툴팁으로 하는 말 — 원본의 title(`${primary}${secondary ? ` - ${secondary}` : ''}`)에
  * 헬퍼의 도구 수를 이어 붙인 것.
  *
@@ -9953,13 +9965,13 @@ function agentRowSpoken(tip, status, ago, role = null) {
  * ledger holds it — the word its agent row, its workspace line, its tab and the
  * desk lead with, out of this one table: the pane sitting in a run's live
  * coordinator seat is 코디 (two runs' coordinators in one window are two), a
- * pane the ledger summoned a worker into is 워커, and 사람 once the person took
- * that pane over. A pane the ledger never seated plays none — a person's own
- * agent is not 사람, which names a takeover. */
+ * pane the ledger summoned a worker into is 워커 — still 워커 once the person
+ * took that pane over: a takeover is a state the chip's tip names, not a role
+ * (10-11 「사람이 소환한 게 아닌데 사람이라 표시됨」). A pane the ledger never
+ * seated wears none. */
 const PANE_ROLES = Object.freeze({
   coordinator: { key: "agent.role.coordinator", word: "코디" },
   worker: { key: "agent.role.worker", word: "워커" },
-  person: { key: "agent.role.person", word: "사람" },
 });
 
 function paneRole(term) {
@@ -9972,7 +9984,7 @@ function paneRole(term) {
 /* A ledger worker's role, from its row alone — the desk's rows name workers
  * this window may hold no terminal for. */
 function ledgerWorkerRole(facts) {
-  return { kind: facts.takenOver ? "person" : "worker", facts };
+  return { kind: "worker", facts, takenOver: facts.takenOver === true };
 }
 
 function paneRoleWord(role) {
@@ -9981,16 +9993,16 @@ function paneRoleWord(role) {
 }
 
 /* What a role says when pointed at: the run and the seat's generation for a
- * coordinator (one line a run), the worker and its task for a worker or for
- * the person who took one over. */
+ * coordinator (one line a run), the worker and its task for a worker — and
+ * that the person took it over, when they did. */
 function paneRoleTip(role) {
   if (role.kind === "coordinator") {
     return role.seats.map((seat) => t("agent.role.coordinatorTip", "코디네이터 · 런 {{run}} · {{generation}}세대", {
       run: seat.name || seat.run, generation: seat.generation,
     })).join(" / ");
   }
-  const who = role.kind === "person"
-    ? t("agent.role.personTip", "사람이 넘겨받은 판 · 워커 {{worker}}", { worker: role.facts.worker })
+  const who = role.takenOver
+    ? t("agent.role.workerTakenTip", "사람이 넘겨받은 판 · 워커 {{worker}}", { worker: role.facts.worker })
     : t("agent.role.workerTip", "워커 {{worker}}", { worker: role.facts.worker });
   const task = role.facts.task?.trim() || role.facts.taskId || "";
   return task ? `${who} · ${task}` : who;
@@ -10020,7 +10032,7 @@ function agentRowRoleSaid(row) {
  * the one button, and the chip is words, not a second press. */
 function agentRoleChip(role) {
   const chip = document.createElement("span");
-  chip.className = `wt-agent-role is-${role.kind}`;
+  chip.className = `wt-agent-role is-${role.kind}${role.takenOver ? " is-taken" : ""}`;
   chip.textContent = paneRoleWord(role);
   chip.dataset.tip = paneRoleTip(role);
   return chip;
@@ -10478,7 +10490,7 @@ function worktreeRoleWords(path) {
   for (const term of worktreeTerms(path)) {
     const role = paneRole(term);
     if (role?.kind === "coordinator") return paneRoleWord(role);
-    if (worker === null && role && !role.facts.reported) worker = role;
+    if (worker === null && role?.kind === "worker" && !role.facts.reported) worker = role;
   }
   return worker ? workerRoleWords(worker) : "";
 }
@@ -10714,6 +10726,10 @@ function fittedAgentRowWords(node, row) {
     fit.model = agentRowModelWords(row);
     fit.wears = node.querySelector(".wt-agent-model");
     if (Boolean(fit.model) !== (fit.wears !== null)) return null;
+    // The account chip comes and goes as a shape too (t-46106).
+    fit.account = agentRowAccount(row);
+    fit.accountNode = node.querySelector(".wt-agent-account");
+    if (Boolean(fit.account) !== (fit.accountNode !== null)) return null;
     // 도구 수가 처음 서거나 사라지는 것은 낱말이 아니라 모양이다 — 첫 도구를
     // 집는 순간에만 한 번 다시 세우고, 그 뒤로는 숫자만 갈아입힌다.
     fit.uses = toolUsesWords(row.sub?.tool_calls ?? 0);
@@ -10763,6 +10779,10 @@ function redressAgentRows(host, rows) {
       writeTextContent(fit.wears, fit.model);
       const modelTip = agentRowModelTip(row);
       if (fit.wears.dataset.tip !== modelTip) fit.wears.dataset.tip = modelTip;
+    }
+    if (fit.accountNode !== null) {
+      writeTextContent(fit.accountNode, fit.account.words);
+      if (fit.accountNode.dataset.tip !== fit.account.tip) fit.accountNode.dataset.tip = fit.account.tip;
     }
     if (fit.usesNode !== null) writeTextContent(fit.usesNode, fit.uses);
     if (fit.chip !== null) {
@@ -10999,6 +11019,16 @@ function makeAgentRow(row, gutter = false) {
     wears.textContent = model;
     wears.dataset.tip = agentRowModelTip(row);
   }
+  // The account the pane's login is, and its share, beside the model
+  // (t-46106).
+  const account = agentRowAccount(row);
+  let runsAs = null;
+  if (account) {
+    runsAs = document.createElement("span");
+    runsAs.className = "wt-agent-account";
+    runsAs.textContent = account.words;
+    runsAs.dataset.tip = account.tip;
+  }
   // 헬퍼 행에는 그 모델 칩 곁에 이 수가 선다 — 도는 헬퍼가 무엇을 얼마나
   // 했는지, Claude Code가 도는 Task 줄에 다는 그 낱말로. 아직 아무것도
   // 집지 않았으면 아무것도 서지 않는다.
@@ -11047,6 +11077,7 @@ function makeAgentRow(row, gutter = false) {
       meta.appendChild(who);
     }
     if (wears) meta.appendChild(wears);
+    if (runsAs) meta.appendChild(runsAs);
     if (said) meta.appendChild(said);
     if (meta.childElementCount > 0) body.appendChild(meta);
   } else if (said) {
@@ -11057,7 +11088,7 @@ function makeAgentRow(row, gutter = false) {
   const chip = role ? agentRoleChip(role) : null;
   const parts = (live
     ? [fold, dot, chip, face, body, uses, status, when, peek]
-    : [fold, dot, chip, face, body, wears, uses, status, when, peek]
+    : [fold, dot, chip, face, body, wears, runsAs, uses, status, when, peek]
   ).filter(Boolean);
   node.append(...parts, activityBorder);
   node.dataset.tip = agentRowTip(primary, secondary, usesWords);
@@ -16259,6 +16290,7 @@ listen("term:exited", (event) => {
   const { term } = event.payload;
   forgetManagedTerminalSession(term);
   forgetCodexPtyFallback(term);
+  forgetMailWaiting(term);
   paneUsage.delete(term);
   orphanWorkersOf(term);
   if (term === FLOAT_TERM) {

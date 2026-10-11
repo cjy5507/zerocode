@@ -903,11 +903,15 @@ pub trait Host {
     }
     /// Tell the person at this pane that mail is waiting for its agent and
     /// was not typed (t-21017), naming why by the guard's token
-    /// ([`zerocode_pty::ready::Refusal::token`]). Said once per waiting
-    /// message by the pointer's beat. The window words it in the person's
-    /// language from its own table; hosts without a screen — tmux-only,
-    /// tests — say nothing.
+    /// ([`zerocode_pty::ready::Refusal::token`]). The pointer's beat offers it
+    /// once per waiting message; the window says it once per condition at a
+    /// pane (t-45801). The window words it in the person's language from its
+    /// own table; hosts without a screen — tmux-only, tests — say nothing.
     fn mail_waiting_not_typed(&self, _term: u32, _why: &str) {}
+    /// The condition [`Host::mail_waiting_not_typed`] named at this pane is
+    /// over: its pointer landed there, or no mail waits for it any longer, so
+    /// the next one the pane raises is said afresh (t-45801).
+    fn mail_waiting_cleared(&self, _term: u32) {}
     /// Whether this window still holds the pane behind `term`.
     ///
     /// The default keeps small and test-only hosts source-compatible. The
@@ -1095,6 +1099,49 @@ pub trait Host {
     fn pane_account(&self, term: u32) -> Option<String> {
         self.pane_login(term).map(|held| held.account)
     }
+
+    /// Every Claude pane this window launched as a managed login, with that
+    /// login (t-46106) — what an account switch counts besides the workers
+    /// the ledger names: the person's own panes, which no worker holds.
+    /// Hosts that record no login hold none.
+    fn claude_pane_logins(&self) -> Vec<(u32, PaneLogin)> {
+        Vec::new()
+    }
+
+    /// Whether this pane is between turns now (t-46106): its last turn ended
+    /// at rest — not cut short by a person's hand, no work it left running,
+    /// no question parked in it — its agent is still in front, and no
+    /// person's words wait on its line. An account switch moves a pane like
+    /// that at once, and a pane at work at its turn's end. Hosts without
+    /// hook facts never claim it, so they move no pane that way.
+    fn between_turns(&self, _term: u32) -> bool {
+        false
+    }
+
+    /// Whether words this window typed at the pane on its own are still on
+    /// their way (t-46106): a guarded delivery the pump is carrying, or one
+    /// queued behind it — a mail pointer's line, a continuation, an effort
+    /// step. Until the program reports taking them, the hooks have not heard
+    /// of the turn they start, and the pane still looks between turns; an
+    /// account switch that closed it then would throw the words away. Hosts
+    /// with no typing door of their own type nothing.
+    fn typing_in_flight(&self, _term: u32) -> bool {
+        false
+    }
+
+    /// [`Self::between_turns`], observed under the locks that can change the
+    /// answer — the fence an account switch rests a following worker in
+    /// (t-46106). Call `commit` at most once, only while the pane is between
+    /// turns, and keep the locks until it returns; implementations must not
+    /// call the actor or the team table. Hosts without such a fence never
+    /// commit.
+    fn with_between_turns_observation(&self, _term: u32, _commit: &mut dyn FnMut()) {}
+
+    /// Move one worker an account switch still owes a move to, now that its
+    /// turn has ended (t-46106) — on the beat, before the mail pointer can
+    /// start its next turn. The window's own host walks its switch journal;
+    /// other hosts owe nothing.
+    fn follow_account_switch(&self, _now_ms: i64) {}
 
     /// Publish a restored worker only after its durable seat has moved. Fake
     /// hosts need no renderer surface and therefore default to doing nothing.
