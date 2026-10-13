@@ -8642,19 +8642,13 @@ mod tests {
             stills.contains("CAPTURE_TIMEOUT") && stills.contains("wait_for_child"),
             "the iOS still capture lost its wedged-device deadline:\n{stills}"
         );
-        // A pane opening never puts a second application on the person's
-        // desktop. The Simulator is launched hidden and put back out of sight
-        // after the boot that makes it draw, because the road that reads the
-        // device does not need a window: with the Simulator hidden and the
-        // device's screen deliberately made to move, the helper answered 10
-        // distinct pictures in 11 polls and its seed walked 489 -> 644.
-        // (Byte-identical frames across the hide would have proved nothing —
-        // that is exactly what a cached dead surface looks like.)
+        // A stream can read its device without hiding the Simulator application.
+        // Other devices may be visible there because the person opened them.
         let starting = block_after(ios_emulator, "fn start_emulator_stream(");
         assert!(
-            starting.contains("simulator_window::hide_simulator();")
+            !starting.contains("simulator_window::hide_simulator();")
                 && !starting.contains("show_simulator"),
-            "an emulator pane put the Simulator on the person's desktop:\n{starting}"
+            "an emulator stream changed the Simulator application's visibility:\n{starting}"
         );
         // And both roads are still wired, in the order that matters: the
         // window when this machine offers it, the still picture whenever it
@@ -9074,7 +9068,8 @@ mod tests {
         // And the close hides first, closes second, burns the mint LAST — a
         // failure must leave a pane that can still be addressed (finding 6).
         let hid = closing
-            .find("pane.hide()")
+            .find("hide_browser_pane(&pane, &webview)")
+            .or_else(|| closing.find("pane.hide()"))
             .expect("the close no longer hides first");
         let shut = closing
             .find("pane.close()")
@@ -9533,14 +9528,16 @@ mod tests {
                 && listener.contains("openEmulatorTab(platform, device, { from, agent: true })"),
             "the window stopped validating and opening the built-in emulator request:\n{listener}"
         );
-        // Seated in the asking pane's checkout (t-6379): an agent's mirror
-        // never turns the person's head from another checkout, and one whose
+        // Seated in the asking pane's checkout: an agent's mirror never
+        // changes the active tab or split layout, and one whose
         // pane is unknown says where it went, in every catalog.
         let opening = block_after(window, "async function openEmulatorTab(");
         for owned in [
             "tabOfTerm(from)",
             "standBeside(caller.pane)",
-            "{ focus: !away }",
+            "const focus = !agent && !away;",
+            "const stood = !focus ? null",
+            "{ focus }",
             "\"emulator.agentOpenUnseated\"",
         ] {
             assert!(
@@ -11753,6 +11750,7 @@ mod tests {
         let claimed = [
             ("type=\"checkbox\"", ".settings-check input"),
             ("<select", ".qo--settings .settings-input"),
+            ("<progress", "progress {"),
             // t-3191: the update policy's three radios, drawn as a ring and a dot.
             ("type=\"radio\"", ".update-policy-option > input"),
         ];
@@ -11769,9 +11767,23 @@ mod tests {
 
         // A kind nobody has claimed is worse than one drawn badly, because
         // nothing points at it.
-        for unclaimed in ["type=\"range\"", "<progress", "<meter"] {
+        for unclaimed in ["type=\"range\"", "<meter"] {
             if markup.contains(unclaimed) {
                 bare.push(format!("{unclaimed} has no rule in this gate's list"));
+            }
+        }
+
+        if markup.contains("<progress") {
+            for selector in [
+                "progress::-webkit-progress-bar {",
+                "progress::-webkit-progress-value {",
+                "progress::-moz-progress-bar {",
+                "progress:indeterminate,",
+            ] {
+                assert!(
+                    block_after_css(&css, selector).contains("background:"),
+                    "progress leaves its track, fill, or indeterminate state unstyled: {selector}"
+                );
             }
         }
 
@@ -20042,16 +20054,21 @@ mod tests {
         );
 
         // And nothing waits for a shell that cannot answer: both ends of a
-        // shell's life sweep its queue.
+        // shell's life sweep its queue. A death sweeps it in
+        // `prompt_transaction::departed`, the seam that also tells a pasted
+        // delivery from one that wrote nothing (t-47834).
         let retiring = block_after(shipped, "fn retire_terminal(");
         assert!(
             retiring.contains("state.prompt_queue().remove(&term);"),
             "closing a shell leaves prompts parked for it:\n{retiring}"
         );
         let reaping = block_after(shipped, "for (id, _, _) in &gone {");
+        let departing = block_after(transaction, "pub(super) fn departed(");
         assert!(
-            reaping.contains("state.prompt_queue().remove(id);"),
-            "a dead shell keeps its parked prompts:\n{reaping}"
+            reaping.contains("prompt_transaction::departed(")
+                && reaping.contains("&mut state.prompt_queue(),")
+                && departing.contains("queue.remove(&term);"),
+            "a dead shell keeps its parked prompts:\n{reaping}\n{departing}"
         );
     }
 
@@ -22354,9 +22371,17 @@ mod tests {
         );
         let looping = block_after(backend, "fn pump_loop(app: &AppHandle) {");
         // The vector carries the exit code beside the id since 1-de — what it
-        // is destructured into changed, what it must still do did not.
+        // is destructured into changed, what it must still do did not. The
+        // removal itself lives in `prompt_transaction::departed` (t-47834),
+        // handed the pump's own `deliveries` guard.
+        let departing = block_after(
+            include_str!("../../src/prompt_transaction.rs"),
+            "pub(super) fn departed(",
+        );
         assert!(
-            looping.contains("for (id, _, _) in &gone {\n                deliveries.remove(id);"),
+            looping.contains(
+                "for (id, _, _) in &gone {\n                prompt_transaction::departed(\n                    *id,\n                    &mut deliveries,"
+            ) && departing.contains("deliveries.remove(&term);"),
             "a shell that exited on its own leaves its delivery behind:\n{looping}"
         );
     }
@@ -25384,12 +25409,17 @@ mod tests {
             "the switch road changes the Claude account without telling the running panes:\n{door}"
         );
 
-        // And the fan-out is the one the pane's own wire names.
+        // And the fan-out is the one the pane's own wire names — sent by the
+        // one transport both announcements share, on each channel with that
+        // channel's own bearer (t-49081).
         let backend = shipped_backend();
         let sending = block_after(backend, "fn announce_account_switch(");
+        let transport = block_after(backend, "fn reload_on(");
         assert!(
-            sending.contains("method::AUTH_RELOAD") && sending.contains("account_env_for("),
-            "the announcement does not read the launch table it must agree with:\n{sending}"
+            sending.contains("reload_on")
+                && transport.contains("method::AUTH_RELOAD")
+                && sending.contains("account_env_for("),
+            "the announcement does not read the launch table it must agree with:\n{sending}\n{transport}"
         );
     }
 

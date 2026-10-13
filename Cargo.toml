@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/local-judgment",
     "crates/judgment-provider",
     "crates/jev-socket",
     "crates/model-prices",
@@ -21,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.1.60"
+version = "1.1.61"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -44,6 +45,7 @@ lto = "fat"
 codegen-units = 1
 
 [workspace.dependencies]
+local-judgment = { path = "crates/local-judgment" }
 judgment-provider = { path = "crates/judgment-provider" }
 jev-socket = { path = "crates/jev-socket" }
 model-prices = { path = "crates/model-prices" }

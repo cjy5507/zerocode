@@ -228,7 +228,7 @@ struct PaneReconciler {
 /// Named fields rather than a tuple, so a road reads `held.actor` and not a
 /// position it has to look up.
 struct RuntimeSeat {
-    actor: RuntimeActor,
+    actor: Arc<RuntimeActor>,
     overrides: LiveOverrides,
     cache: LiveLedgerCache,
     board: std::sync::RwLock<Arc<BoardLedgerSnapshot>>,
@@ -737,19 +737,74 @@ pub(crate) fn reseat_nudge(worker: &str, checkout: Option<&str>) -> String {
 /// and one the goodbye saw at rest is written down at rest again
 /// ([`resumed_at_rest`]), so its mail is pointed at like any pane's.
 ///
-/// The goodbye's note these words came from is spent here, whatever the
-/// paste answered (t-7812 R2): handed to a seated pane, the words may have
-/// landed, and words that may have landed are never said a second time.
-pub(crate) fn deliver_continuation(host: &dyn Host, term: u32, words: &str, worker: &str) -> bool {
+/// The goodbye's note is spent when the words reached the pane or their
+/// delivery is unknown. A delivery known to have typed nothing keeps it.
+pub(crate) fn deliver_continuation(
+    host: &dyn Host,
+    term: u32,
+    words: &str,
+    worker: &str,
+) -> Option<zerocode_pty::DeliveryOutcome> {
     let idle = words.trim().is_empty();
-    let delivered = idle || host.paste_continuation(term, words);
+    let delivered = if idle {
+        Some(zerocode_pty::DeliveryOutcome::Delivered)
+    } else {
+        host.paste_continuation(term, words, worker)
+    };
     if let Some(root) = BLACKBOX.get() {
         if idle {
             resumed_at_rest(root, term, worker);
         }
-        crate::restart_nudge_runtime::nudge_spent(root, worker);
+        if idle || delivered.is_none_or(zerocode_pty::DeliveryOutcome::pasted) {
+            crate::restart_nudge_runtime::nudge_spent(root, worker);
+        }
     }
     delivered
+}
+
+fn continuation_status(
+    outcome: Option<zerocode_pty::DeliveryOutcome>,
+    idle: bool,
+) -> (&'static str, Option<&'static str>) {
+    use zerocode_pty::{DeliveryOutcome, ready::Refusal};
+    match (idle, outcome) {
+        (true, _) => ("idle", None),
+        (false, Some(DeliveryOutcome::Delivered)) => ("submitted", None),
+        (false, Some(DeliveryOutcome::TimedOut)) => ("not_typed", Some("not_ready")),
+        (false, Some(DeliveryOutcome::Refused(why))) => ("not_typed", Some(why.token())),
+        (
+            false,
+            Some(DeliveryOutcome::Unsubmitted(why @ (Refusal::NotTaken | Refusal::LaunchChanged))),
+        ) => ("unknown", Some(why.token())),
+        (false, Some(DeliveryOutcome::Unsubmitted(why))) => ("pasted", Some(why.token())),
+        (false, None) => ("unknown", Some("delivery_unknown")),
+    }
+}
+
+fn continuation_answer(
+    mut reply: zerocode_core::agent_teams::Reply,
+    outcome: Option<zerocode_pty::DeliveryOutcome>,
+    idle: bool,
+) -> zerocode_hookd::TeamAnswer {
+    use zerocode_pty::DeliveryOutcome;
+    let (status, reason) = continuation_status(outcome, idle);
+    if let Ok(mut body) = serde_json::from_str::<serde_json::Value>(&reply.stdout)
+        && let Some(object) = body.as_object_mut()
+    {
+        object.insert(
+            "continuation".to_string(),
+            serde_json::json!({
+                "status": status,
+                "pasted": if idle { Some(false) } else { outcome.map(DeliveryOutcome::pasted) },
+                "reason": reason,
+            }),
+        );
+        reply.stdout = format!("{body}\n");
+    }
+    if status == "unknown" {
+        reply.stderr = "the continuation's delivery is unknown; observe the restored worker or confirm with a person before sending more input\n".to_string();
+    }
+    answer(reply)
 }
 
 /// A resumed pane the last goodbye saw at rest is at rest again (t-11548).
@@ -2808,7 +2863,7 @@ fn install_runtime(actor: RuntimeActor, overrides: LiveOverrides, usage: UsageSo
     *runtime_cell()
         .lock()
         .unwrap_or_else(|held| held.into_inner()) = Some(Arc::new(RuntimeSeat {
-        actor,
+        actor: Arc::new(actor),
         overrides,
         cache: Arc::new(Mutex::new(LedgerCache::default())),
         board: std::sync::RwLock::default(),
@@ -5386,6 +5441,68 @@ pub(crate) fn window_exiting(
     }
 }
 
+/// Whether a goodbye on this way out went unanswered for its whole
+/// patience (t-49062): every later call on the same way out goes without
+/// waiting again.
+static GOODBYE_UNANSWERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [`window_exiting`] on a road out of the window (t-49062): said on a thread
+/// of its own, and waited for at most [`crate::exit_runtime::LEDGER_PATIENCE`].
+/// Every road calls this on the main thread — the close's exit, ⌘Q, a restart
+/// button, the menu-bar Quit — and the goodbye asks the ledger's actor, which
+/// twice on 2026-10-12 never answered. A goodbye that does not answer in time
+/// is left to finish if it can; the window goes on and says so in one line,
+/// and the next boot's sweep puts every seat the ledger still holds live to
+/// sleep, as it does after a crash ([`RuntimeActor::window_restarted`]). What
+/// is lost is the census's note of what each turn was cut in.
+pub(crate) fn goodbye_within(
+    now_ms: i64,
+    road: crate::exit_runtime::ExitRoad,
+    census: impl Fn() -> restart_census::RestartCensus + Send + 'static,
+) {
+    goodbye_on(now_ms, road, census, &GOODBYE_UNANSWERED);
+}
+
+/// [`goodbye_within`], with `unanswered` marking a goodbye that went
+/// unanswered on this way out.
+fn goodbye_on(
+    now_ms: i64,
+    road: crate::exit_runtime::ExitRoad,
+    census: impl Fn() -> restart_census::RestartCensus + Send + 'static,
+    unanswered: &std::sync::atomic::AtomicBool,
+) {
+    if unanswered.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let (said, answered) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name("zerocode-goodbye".to_string())
+        .spawn(move || {
+            window_exiting(now_ms, road, &census);
+            let _ = said.send(());
+        });
+    if spawned.is_ok()
+        && answered
+            .recv_timeout(crate::exit_runtime::LEDGER_PATIENCE)
+            .is_ok()
+    {
+        return;
+    }
+    unanswered.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(root) = BLACKBOX.get() {
+        crate::note_window_event(
+            root,
+            &format!(
+                "exit by {road} · census unread · the goodbye did not answer within {} ms: the \
+                 window goes without it, and the next boot puts the seats the ledger still \
+                 holds to sleep",
+                crate::exit_runtime::LEDGER_PATIENCE.as_millis()
+            ),
+        );
+    }
+}
+
 /// Every worker the ledger holds asleep right now — what a goodbye may still
 /// owe a continuation to (t-7812 R2). Empty when the ledger cannot be read:
 /// nothing is carried on a guess.
@@ -7041,11 +7158,37 @@ fn record_scanned_switches(
 struct Resuming {
     run: String,
     term: u32,
-    delivery: std::sync::mpsc::Receiver<zerocode_pty::DeliveryOutcome>,
+    delivery: Option<std::sync::mpsc::Receiver<zerocode_pty::DeliveryOutcome>>,
     /// The delivery's answer, and when this beat first read it.
     answered: Option<(Option<zerocode_pty::DeliveryOutcome>, i64)>,
     /// A prompt event arrived at the pane after the words went to the door.
     prompt_seen: bool,
+    outcome: Option<zerocode_core::orchestration::ResumeOutcome>,
+}
+
+impl Resuming {
+    fn new(
+        run: String,
+        term: u32,
+        delivery: Option<std::sync::mpsc::Receiver<zerocode_pty::DeliveryOutcome>>,
+        not_addressed: &str,
+    ) -> Self {
+        let outcome = delivery
+            .is_none()
+            .then(|| zerocode_core::orchestration::ResumeOutcome {
+                submitted: false,
+                typed: false,
+                detail: not_addressed.to_string().into(),
+            });
+        Self {
+            run,
+            term,
+            delivery,
+            answered: None,
+            prompt_seen: false,
+            outcome,
+        }
+    }
 }
 
 /// The continuations being typed, by receipt row id. In memory on purpose:
@@ -7089,7 +7232,7 @@ fn resume_stalled_workers(
     quiet: &mut Vec<(String, i64)>,
     now_ms: i64,
 ) -> bool {
-    use zerocode_core::orchestration::{NotResumed, RESUME_LINE, ResumeOutcome, resume_plan};
+    use zerocode_core::orchestration::{NotResumed, RESUME_LINE, resume_plan};
     if stopped.is_empty() {
         return false;
     }
@@ -7135,30 +7278,23 @@ fn resume_stalled_workers(
             continue;
         };
         moved = true;
-        let Some(delivery) = host.point(one.term, RESUME_LINE, true) else {
-            let outcome = ResumeOutcome {
-                submitted: false,
-                typed: false,
-                detail: "the pane could not be addressed; nothing was typed"
-                    .to_string()
-                    .into(),
-            };
-            let _ = actor.resume_settle(run, receipt, outcome, now_ms);
-            continue;
-        };
+        let delivery = host.point(one.term, RESUME_LINE, true);
+        let not_addressed = delivery.is_none();
         resumes_in_flight()
             .lock()
             .unwrap_or_else(|held| held.into_inner())
             .insert(
                 receipt,
-                Resuming {
+                Resuming::new(
                     run,
-                    term: one.term,
+                    one.term,
                     delivery,
-                    answered: None,
-                    prompt_seen: false,
-                },
+                    "the pane could not be addressed; nothing was typed",
+                ),
             );
+        if not_addressed {
+            settle_resumes(now_ms);
+        }
     }
     moved
 }
@@ -7235,29 +7371,86 @@ fn settle_resumes(now_ms: i64) {
             .lock()
             .unwrap_or_else(|held| held.into_inner());
         let mut settled = Vec::new();
-        flying.retain(|receipt, one| {
-            if one.answered.is_none() {
-                one.answered = match one.delivery.try_recv() {
-                    Ok(answer) => Some((Some(answer), now_ms)),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some((None, now_ms)),
-                };
-            }
-            match resume_outcome(one, now_ms) {
-                Some(outcome) => {
-                    settled.push((one.run.clone(), receipt.clone(), outcome));
-                    false
+        for (receipt, one) in flying.iter_mut() {
+            if one.outcome.is_none() {
+                if one.answered.is_none() {
+                    one.answered =
+                        one.delivery
+                            .as_ref()
+                            .and_then(|delivery| match delivery.try_recv() {
+                                Ok(answer) => Some((Some(answer), now_ms)),
+                                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    Some((None, now_ms))
+                                }
+                            });
                 }
-                None => true,
+                one.outcome = resume_outcome(one, now_ms);
             }
-        });
+            if let Some(outcome) = &one.outcome {
+                settled.push((one.run.clone(), receipt.clone(), outcome.clone()));
+            }
+        }
         settled
     };
     for (run, receipt, outcome) in settled {
-        if let Ok((moved, _)) = held.actor.resume_settle(run, receipt, outcome, now_ms) {
-            rang(moved);
+        let accepted =
+            match held
+                .actor
+                .resume_settle(run.clone(), receipt.clone(), outcome.clone(), now_ms)
+            {
+                Ok((moved, _)) => {
+                    rang(moved);
+                    moved || resume_settlement_recorded(&held, &run, &receipt, &outcome)
+                }
+                Err(_) => false,
+            };
+        if accepted {
+            let mut flying = resumes_in_flight()
+                .lock()
+                .unwrap_or_else(|held| held.into_inner());
+            if flying
+                .get(&receipt)
+                .is_some_and(|one| one.run == run && one.outcome.as_ref() == Some(&outcome))
+            {
+                flying.remove(&receipt);
+            }
         }
     }
+}
+
+fn resume_settlement_recorded(
+    held: &LiveRuntime,
+    run: &str,
+    receipt: &str,
+    outcome: &zerocode_core::orchestration::ResumeOutcome,
+) -> bool {
+    let Ok(image) = held.actor.view() else {
+        return false;
+    };
+    image
+        .projection()
+        .messages
+        .iter()
+        .filter(|message| {
+            message.run == run
+                && message.id == receipt
+                && message.kind == zerocode_core::orchestration::MessageKind::Resumed
+        })
+        .any(|message| {
+            let Ok(body) = serde_json::from_str::<serde_json::Value>(message.body.as_str()) else {
+                return false;
+            };
+            let status = if outcome.submitted {
+                "submitted"
+            } else {
+                "not_submitted"
+            };
+            body["status"] == status
+                && body["typed"] == outcome.typed
+                && body["detail"] == outcome.detail.as_str()
+                && body["settledMs"].as_i64().is_some()
+        })
 }
 
 pub(crate) fn tick(host: &dyn Host, overrides: &[(String, LaunchOverride)], now_ms: i64) -> usize {
@@ -9428,6 +9621,41 @@ fn read_receipt_text(path: &str) -> Option<String> {
     Some(text)
 }
 
+pub(super) fn open_gate_session(
+    host: &dyn Host,
+    team: &str,
+    pane: &str,
+    capability: &str,
+    body: &str,
+) -> zerocode_hookd::TeamAnswer {
+    let result = runtime().ok_or("authority_unavailable").and_then(|held| {
+        let caller = crate::agent_teams::teams()
+            .get(team)
+            .and_then(|team| team.term_of(pane))
+            .and_then(|term| host.actor_for(term));
+        zerocode_orchestrator::runtime_actor::gate_session::open_native(
+            &held.actor,
+            team,
+            pane,
+            capability,
+            caller,
+            body,
+        )
+    });
+    match result {
+        Ok(value) => zerocode_hookd::TeamAnswer {
+            stdout: value.to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+        },
+        Err(code) => zerocode_hookd::TeamAnswer {
+            stdout: String::new(),
+            stderr: format!("{code}: native gate session refused"),
+            exit_code: 1,
+        },
+    }
+}
+
 fn run_seated(
     host: &dyn Host,
     overrides: Vec<(String, LaunchOverride)>,
@@ -10477,10 +10705,18 @@ fn carried(
                          * may it see the interrupted work. A tiny task can run
                          * `worker_done` synchronously from this callback; that
                          * is the adversarial ordering this fence exists for. */
-                        if !deliver_continuation(host, term, &prepared.prompt, &prepared.worker) {
-                            host.close(term);
-                            return refused(
-                                "the restored worker became unreachable before its continuation was delivered",
+                        let continuation =
+                            deliver_continuation(host, term, &prepared.prompt, &prepared.worker);
+                        let idle = prepared.prompt.trim().is_empty();
+                        if let Some(root) = BLACKBOX.get() {
+                            let (status, reason) = continuation_status(continuation, idle);
+                            crate::note_window_event(
+                                root,
+                                &format!(
+                                    "orchestration: worker {} terminal {term} continuation {status} ({})",
+                                    prepared.worker,
+                                    reason.unwrap_or("none"),
+                                ),
                             );
                         }
                         host.announce_reseated_worker(
@@ -10489,7 +10725,7 @@ fn carried(
                             &prepared.agent,
                             prepared.resumed,
                         );
-                        return answer(decided.reply);
+                        return continuation_answer(decided.reply, continuation, idle);
                     }
                     /* The judgment's row, beside what was actually summoned
                      * (t-4711). Here rather than at the plan, because a

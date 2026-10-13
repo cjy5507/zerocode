@@ -94,6 +94,10 @@ const BACKEND_PARTS: &[(&str, &str)] = &[
     ("cmd/second_brain.rs", include_str!("cmd/second_brain.rs")),
     ("cmd/worktree.rs", include_str!("cmd/worktree.rs")),
     ("cmd/settings.rs", include_str!("cmd/settings.rs")),
+    (
+        "cmd/managed_judgment.rs",
+        include_str!("cmd/managed_judgment.rs"),
+    ),
     ("cmd/session.rs", include_str!("cmd/session.rs")),
 ];
 
@@ -763,6 +767,70 @@ fn declared_names(code: &str) -> HashSet<String> {
     names
 }
 
+fn plain_block_arrow_scope(chars: &[char], opening: usize) -> Option<(usize, Vec<String>)> {
+    let mut cursor = opening + 1;
+    let mut parameters = Vec::new();
+    loop {
+        while chars.get(cursor).is_some_and(|value| value.is_whitespace()) {
+            cursor += 1;
+        }
+        if chars.get(cursor) == Some(&')') {
+            cursor += 1;
+            break;
+        }
+        if !chars
+            .get(cursor)
+            .is_some_and(|value| is_ident_start(*value))
+        {
+            return None;
+        }
+        let start = cursor;
+        while chars.get(cursor).is_some_and(|value| is_ident_char(*value)) {
+            cursor += 1;
+        }
+        parameters.push(chars[start..cursor].iter().collect());
+        while chars.get(cursor).is_some_and(|value| value.is_whitespace()) {
+            cursor += 1;
+        }
+        match chars.get(cursor) {
+            Some(',') => cursor += 1,
+            Some(')') => {}
+            _ => return None,
+        }
+    }
+    while chars.get(cursor).is_some_and(|value| value.is_whitespace()) {
+        cursor += 1;
+    }
+    if parameters.is_empty()
+        || chars.get(cursor) != Some(&'=')
+        || chars.get(cursor + 1) != Some(&'>')
+    {
+        return None;
+    }
+    cursor += 2;
+    while chars.get(cursor).is_some_and(|value| value.is_whitespace()) {
+        cursor += 1;
+    }
+    if chars.get(cursor) != Some(&'{') {
+        return None;
+    }
+    let mut depth = 0_usize;
+    while let Some(glyph) = chars.get(cursor) {
+        match glyph {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some((cursor + 1, parameters));
+                }
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    None
+}
+
 /// Bare `name(` call sites. A method call (`a.b()`) belongs to whatever
 /// object it is on, an object/class method declaration (`write(value) {`)
 /// introduces a member rather than calling a global, and a keyword's
@@ -792,9 +860,16 @@ fn called_names(code: &str) -> std::collections::BTreeSet<String> {
 
     let chars: Vec<char> = code.chars().collect();
     let mut called = std::collections::BTreeSet::new();
+    let mut parameter_scopes: Vec<(usize, Vec<String>)> = Vec::new();
     let mut i = 0;
 
     while i < chars.len() {
+        parameter_scopes.retain(|(end, _)| *end > i);
+        if chars[i] == '('
+            && let Some(scope) = plain_block_arrow_scope(&chars, i)
+        {
+            parameter_scopes.push(scope);
+        }
         let after_name_char = i > 0 && (is_ident_char(chars[i - 1]) || chars[i - 1] == '.');
         if !is_ident_start(chars[i]) || after_name_char {
             i += 1;
@@ -835,7 +910,11 @@ fn called_names(code: &str) -> std::collections::BTreeSet<String> {
             continue;
         }
         let word: String = chars[start..i].iter().collect();
-        if !KEYWORDS.contains(&word.as_str()) {
+        if !KEYWORDS.contains(&word.as_str())
+            && !parameter_scopes
+                .iter()
+                .any(|(_, parameters)| parameters.contains(&word))
+        {
             called.insert(word);
         }
     }
@@ -12132,10 +12211,15 @@ fn an_account_switch_reaches_each_live_zo_pane_once_and_no_other_pane() {
         id: id.to_string(),
         transcript_path: None,
     };
+    let kept =
+        |addr: &str, bearer: &str| zo_channel_entry(addr.to_string(), Some(bearer.to_string()));
     let channels = HashMap::from([
-        ("zo-one".to_string(), "127.0.0.1:41001".to_string()),
-        ("zo-two".to_string(), "127.0.0.1:41002".to_string()),
-        ("a-claude-pane".to_string(), "127.0.0.1:41003".to_string()),
+        ("zo-one".to_string(), kept("127.0.0.1:41001", "bearer-one")),
+        ("zo-two".to_string(), kept("127.0.0.1:41002", "bearer-two")),
+        (
+            "a-claude-pane".to_string(),
+            kept("127.0.0.1:41003", "bearer-three"),
+        ),
     ]);
     let pane_sessions: HashMap<TermId, zerocode_core::ProviderSession> = HashMap::from([
         (1, session("zo-one")),
@@ -12155,15 +12239,15 @@ fn an_account_switch_reaches_each_live_zo_pane_once_and_no_other_pane() {
         (5, AgentKind::Zo.slug()),
     ]);
 
-    let targets = zo_channel_targets(&channels, &pane_sessions, &agent_terms);
+    let targets = zo_channel_targets(&channels, &pane_sessions, &agent_terms, None);
 
     assert_eq!(
         targets,
         vec![
-            ("zo-one".to_string(), "127.0.0.1:41001".to_string()),
-            ("zo-two".to_string(), "127.0.0.1:41002".to_string()),
+            ("zo-one".to_string(), kept("127.0.0.1:41001", "bearer-one")),
+            ("zo-two".to_string(), kept("127.0.0.1:41002", "bearer-two")),
         ],
-        "the switch went to the wrong panes"
+        "the switch went to the wrong panes, or without their own bearers"
     );
 
     let params = auth_reload_params(
@@ -12176,9 +12260,9 @@ fn an_account_switch_reaches_each_live_zo_pane_once_and_no_other_pane() {
         None,
     );
     let mut sent: Vec<String> = Vec::new();
-    let taken = broadcast_auth_reload(&targets, &params, |addr, carried| {
+    let taken = broadcast_auth_reload(&targets, &params, |channel, carried| {
         assert_eq!(carried, &params);
-        sent.push(addr.to_string());
+        sent.push(channel.addr.clone());
         Ok(())
     });
 
@@ -12262,8 +12346,14 @@ fn a_reload_carries_the_new_paths_and_says_so_when_there_are_none() {
 #[test]
 fn a_pane_that_refuses_the_reload_does_not_fail_the_switch() {
     let targets = vec![
-        ("zo-gone".to_string(), "127.0.0.1:41001".to_string()),
-        ("zo-live".to_string(), "127.0.0.1:41002".to_string()),
+        (
+            "zo-gone".to_string(),
+            zo_channel_entry("127.0.0.1:41001".to_string(), None),
+        ),
+        (
+            "zo-live".to_string(),
+            zo_channel_entry("127.0.0.1:41002".to_string(), None),
+        ),
     ];
     let params = auth_reload_params(
         zerocode_core::account::Provider::OpenAi,
@@ -12272,8 +12362,8 @@ fn a_pane_that_refuses_the_reload_does_not_fail_the_switch() {
         Some(Path::new("/data/runtime/codex")),
     );
 
-    let taken = broadcast_auth_reload(&targets, &params, |addr, _| {
-        if addr.ends_with("41001") {
+    let taken = broadcast_auth_reload(&targets, &params, |channel, _| {
+        if channel.addr.ends_with("41001") {
             Err("connection refused".to_string())
         } else {
             Ok(())
@@ -12281,6 +12371,280 @@ fn a_pane_that_refuses_the_reload_does_not_fail_the_switch() {
     });
 
     assert_eq!(taken, 1);
+}
+
+/// A card's answer goes back on the session's own channel, with the bearer
+/// that channel takes (t-49081).
+///
+/// The person's report, 10-12 17:1x: `zo` typed into a shell pane, a model
+/// switch question on the window's card, and every button said 「응답이
+/// 서버에 닿지 못했습니다 — 다시 시도하세요. (permission.respond failed
+/// (-32002): missing or wrong token for this events channel)」 while the same
+/// question stood in the terminal as a numbered menu. That zo was not started
+/// by this window: it found no token in its environment, made its own, and
+/// wrote it beside its address in `zo-events-<pid>.addr`. The window adopted
+/// the channel from that file and subscribed with that bearer — the card came
+/// — and answered with its own.
+mod zo_channel_bearer {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    /// What a zo typed into a shell made for itself and wrote on the second
+    /// line of its address file. Synthetic.
+    const OWN: &str = "bearer-a-zo-typed-into-a-shell-made-for-itself";
+    /// What this window hands every zo it starts. Synthetic.
+    const WINDOW: &str = "bearer-this-window-hands-every-zo-it-starts";
+    const HEARD_WITHIN: Duration = Duration::from_secs(5);
+
+    /// A pane's events channel as zo serves it: one JSON-RPC line per request
+    /// on loopback, the bearer judged before anything else, and any other
+    /// bearer refused with zo's own code and words (zo-ide
+    /// `ide/channel/server.rs`). It serves `exchanges` connections and says of
+    /// each the method asked and whether the bearer was the one it takes —
+    /// never the bearer itself.
+    fn channel_taking(
+        bearer: &'static str,
+        exchanges: usize,
+    ) -> (String, mpsc::Receiver<(String, bool)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback channel");
+        let addr = listener.local_addr().expect("its address").to_string();
+        let (heard, hearing) = mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(exchanges) {
+                let Ok(mut stream) = stream else { return };
+                let mut line = String::new();
+                let reader = stream.try_clone().expect("a second handle on the socket");
+                if BufReader::new(reader).read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let request: serde_json::Value =
+                    serde_json::from_str(&line).expect("one JSON-RPC line");
+                let taken = request["token"].as_str() == Some(bearer);
+                let answer = if taken {
+                    json!({ "jsonrpc": "2.0", "id": request["id"], "result": {} })
+                } else {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "error": {
+                            "code": -32002,
+                            "message": "missing or wrong token for this events channel",
+                        },
+                    })
+                };
+                let _ = writeln!(stream, "{answer}");
+                let _ = stream.flush();
+                let method = request["method"].as_str().unwrap_or_default().to_string();
+                let _ = heard.send((method, taken));
+            }
+        });
+        (addr, hearing)
+    }
+
+    /// This window, holding its one token.
+    fn window() -> LaneSupervisor {
+        LaneSupervisor::new(
+            ZoBinary {
+                path: PathBuf::from("/nonexistent/zo"),
+            },
+            "127.0.0.1:8788",
+            Some(WINDOW.to_string()),
+        )
+        .expect("a loopback supervisor")
+    }
+
+    /// The person's case: the window learned the channel and its bearer from
+    /// the address file, and a card's button answers on that channel with
+    /// that bearer.
+    #[test]
+    fn a_cards_answer_reaches_a_zo_typed_into_a_shell_with_the_bearer_it_published() {
+        let (addr, heard) = channel_taking(OWN, 1);
+        let mut channels = HashMap::new();
+        channels.insert(
+            "session-typed-into-a-shell".to_string(),
+            zo_channel_entry(addr, Some(OWN.to_string())),
+        );
+        let window = window();
+
+        let answered = zo_channel_in(&channels, Some(&window), "session-typed-into-a-shell")
+            .and_then(|channel| answer_prompt(channel, 7, "allow_once".to_string()));
+
+        assert_eq!(
+            answered,
+            Ok(()),
+            "the card's answer did not reach the zo typed into a shell"
+        );
+        assert_eq!(
+            heard
+                .recv_timeout(HEARD_WITHIN)
+                .expect("the channel heard the answer"),
+            ("permission.respond".to_string(), true),
+        );
+    }
+
+    /// A zo this window started was handed the window's bearer, and its card
+    /// is answered with it as before — and so is a pane that published only
+    /// its address, the supervised one-line publisher, which only this window
+    /// starts.
+    #[test]
+    fn a_zo_this_window_started_is_still_answered_with_the_windows_bearer() {
+        let (addr, heard) = channel_taking(WINDOW, 2);
+        let mut channels = HashMap::new();
+        channels.insert(
+            "session-this-window-started".to_string(),
+            zo_channel_entry(addr.clone(), Some(WINDOW.to_string())),
+        );
+        channels.insert(
+            "session-that-published-an-address".to_string(),
+            zo_channel_entry(addr, None),
+        );
+        let window = window();
+
+        for session in [
+            "session-this-window-started",
+            "session-that-published-an-address",
+        ] {
+            let answered = zo_channel_in(&channels, Some(&window), session)
+                .and_then(|channel| answer_prompt(channel, 3, "deny".to_string()));
+            assert_eq!(answered, Ok(()), "{session}");
+            assert_eq!(
+                heard
+                    .recv_timeout(HEARD_WITHIN)
+                    .expect("the channel heard the answer"),
+                ("permission.respond".to_string(), true),
+                "{session}"
+            );
+        }
+    }
+
+    /// An account switch reaches a zo typed into a shell the same way: on its
+    /// channel, with the bearer it published. With the window's token it was
+    /// refused, and that zo stayed on the account the person had just left.
+    #[test]
+    fn an_account_switch_reaches_a_zo_typed_into_a_shell_with_the_bearer_it_published() {
+        let (addr, heard) = channel_taking(OWN, 1);
+        let channels = HashMap::from([(
+            "session-typed-into-a-shell".to_string(),
+            zo_channel_entry(addr, Some(OWN.to_string())),
+        )]);
+        let pane_sessions: HashMap<TermId, zerocode_core::ProviderSession> = HashMap::from([(
+            7,
+            zerocode_core::ProviderSession {
+                key: zerocode_core::SessionKey::SessionId,
+                id: "session-typed-into-a-shell".to_string(),
+                transcript_path: None,
+            },
+        )]);
+        let agent_terms: HashMap<TermId, &'static str> = HashMap::from([(7, AgentKind::Zo.slug())]);
+        let window = window();
+        let params = auth_reload_params(
+            zerocode_core::account::Provider::OpenAi,
+            Some("personal"),
+            None,
+            Some(Path::new("/data/runtime/codex")),
+        );
+
+        let targets = zo_channel_targets(&channels, &pane_sessions, &agent_terms, Some(&window));
+        let taken = broadcast_auth_reload(&targets, &params, reload_on);
+
+        assert_eq!(taken, 1, "the zo typed into a shell refused the switch");
+        assert_eq!(
+            heard
+                .recv_timeout(HEARD_WITHIN)
+                .expect("the channel heard the switch"),
+            ("auth.reload".to_string(), true),
+        );
+    }
+
+    /// A bearer the channel did not publish is refused in the very words the
+    /// person read on the card, and the refusal is all the window gets back.
+    #[test]
+    fn another_bearer_is_refused_in_the_words_the_card_showed() {
+        let (addr, heard) = channel_taking(OWN, 1);
+
+        let answered = answer_prompt(
+            ZoChannel {
+                addr,
+                token: Some(WINDOW.to_string()),
+            },
+            7,
+            "allow_once".to_string(),
+        );
+
+        assert_eq!(
+            answered,
+            Err(
+                "permission.respond failed (-32002): missing or wrong token for this events channel"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            heard
+                .recv_timeout(HEARD_WITHIN)
+                .expect("the channel heard the answer"),
+            ("permission.respond".to_string(), false),
+        );
+    }
+
+    /// What the window keeps of a channel never prints its bearer.
+    #[test]
+    fn a_channel_never_prints_its_bearer() {
+        let channel = ZoChannel {
+            addr: "127.0.0.1:49152".to_string(),
+            token: Some(OWN.to_string()),
+        };
+
+        let shown = format!("{channel:?}");
+
+        assert!(
+            shown.contains("127.0.0.1:49152")
+                && shown.contains("<redacted>")
+                && !shown.contains(OWN),
+            "{shown}"
+        );
+    }
+}
+
+/// A session's channel is asked with that channel's own bearer (t-49081).
+///
+/// The window's one token opens only the zo the window started: a zo typed
+/// into a shell made its own and refuses the window's with -32002 — the card
+/// whose buttons did nothing (10-12). So the supervisor's token is read once,
+/// by the opener that hands it to the zo it starts, and every door that talks
+/// to a session's channel goes by the road that knows each channel's bearer.
+#[test]
+fn a_session_channel_is_asked_with_its_own_bearer_never_the_supervisors() {
+    let backend = shipped_backend();
+    let opener = block_after(backend, "pub(crate) fn open_zo_pane_process(");
+    assert!(
+        opener.contains("supervisor.token()"),
+        "the opener no longer hands the window's token to the zo it starts:\n{opener}"
+    );
+    assert_eq!(
+        backend.matches("supervisor.token()").count(),
+        1,
+        "a door reads the supervisor's token besides the opener"
+    );
+    for door in [
+        "pub(crate) async fn respond_permission(",
+        "pub(crate) async fn session_info(",
+        "pub(crate) async fn stop_pane_helper(",
+    ] {
+        let body = block_after(backend, door);
+        assert!(
+            body.contains("zo_channel(") && !body.contains(".token()"),
+            "{door} does not reach the session's channel by its own bearer:\n{body}"
+        );
+    }
+    for door in ["fn announce_account_switch(", "fn announce_google_login("] {
+        let body = block_after(backend, door);
+        assert!(
+            body.contains("reload_on") && !body.contains(".token()"),
+            "{door} tells the running panes with the supervisor's token:\n{body}"
+        );
+    }
 }
 
 /// The helper page's stop (t-16943): the webview names an agent, never a
@@ -13625,12 +13989,14 @@ fn terminate_says_goodbye_before_the_browser_can_stall() {
         "the Exit arm keeps an order of its own:\n{arm}"
     );
     assert!(
-        !arm.contains("chromium_browser::shutdown()") && !arm.contains("window_exiting("),
+        !arm.contains("chromium_browser::shutdown()")
+            && !arm.contains("window_exiting(")
+            && !arm.contains("goodbye_within("),
         "the Exit arm shuts the browser or says goodbye outside the one order:\n{arm}"
     );
     let steps = block_after(main, "impl exit_runtime::Terminating for ExitSteps<'_> {");
     for (step, does) in [
-        ("fn goodbye(", "orchestration::window_exiting("),
+        ("fn goodbye(", "orchestration::goodbye_within("),
         ("fn keep_screens(", "capture_scrollback_at_exit("),
         ("fn keep_statuses(", "write_last_statuses_now("),
         ("fn shut_browser(", "chromium_browser::shutdown()"),
@@ -17884,6 +18250,36 @@ fn a_call_to_a_name_nobody_wrote_is_caught() {
 }
 
 #[test]
+fn block_arrow_parameters_are_local_calls_not_window_globals() {
+    let code =
+        strip_literals("new Promise((complete, fail) => { complete(); fail(); stillMissing(); });");
+    let calls = called_names(&code);
+    assert!(!calls.contains("complete") && !calls.contains("fail"));
+    assert!(calls.contains("stillMissing"));
+    assert!(!declared_names(&code).contains("fail"));
+}
+
+#[test]
+fn a_callback_parameter_does_not_hide_a_missing_call_outside_its_body() {
+    let inside = "new Promise((complete, fail) => { setTimeout(() => { fail(); }, 0); });";
+    assert!(!called_names(&strip_literals(inside)).contains("fail"));
+    let outside = format!("{inside} fail();");
+    assert!(called_names(&strip_literals(&outside)).contains("fail"));
+}
+
+#[test]
+fn call_arguments_and_default_value_calls_are_not_parameter_declarations() {
+    for source in [
+        "perform(complete, missing); missing();",
+        "const callback = (complete = missing(), failure) => failure();",
+    ] {
+        let code = strip_literals(source);
+        assert!(!declared_names(&code).contains("missing"));
+        assert!(called_names(&code).contains("missing"));
+    }
+}
+
+#[test]
 fn an_object_method_is_not_a_global_call_but_a_bare_call_still_is() {
     let method = called_names(&strip_literals(
         "const clipboardText = { async write(value) { return value; } };\n",
@@ -19866,6 +20262,126 @@ pub(crate) mod computer_desktop_wait {
     /// never refuses another's run.
     pub(crate) static ONE_HAND: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[cfg(unix)]
+    #[test]
+    fn an_omitted_background_flag_does_not_allow_a_shared_desktop_process() {
+        let _hand = ONE_HAND.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(crate::computer_use::guard::stopped_reason(), None);
+        let answer = answer_computer_command(&words(&[
+            "run", "--program", "/bin/echo", "--args", "background-policy-probe", "--json",
+        ]));
+        assert_ne!(answer.exit_code, 0, "an unscoped program was started by default");
+        assert_eq!(envelope(&answer)["error"]["code"], "requires_foreground");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_shared_desktop_policy_preserves_the_existing_process_road() {
+        let _hand = ONE_HAND.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _policy = crate::computer_use::input_policy::enter(
+            zerocode_core::computer_use_protocol::execution::InputPolicy::SharedDesktop,
+        );
+        let answer = answer_computer_command(&words(&[
+            "run", "--program", "/bin/echo", "--args", "background-policy-probe", "--json",
+        ]));
+        assert_eq!(answer.exit_code, 0, "{}", answer.stderr);
+        assert_eq!(envelope(&answer)["ok"], true);
+    }
+
+    #[test]
+    fn a_default_settings_document_does_not_allow_shared_desktop_input() {
+        assert_eq!(
+            crate::settings_runtime::SettingsDocument::default().computer_input_policy,
+            zerocode_core::computer_use_protocol::execution::InputPolicy::Background,
+        );
+    }
+
+    fn assert_revoked_confirmation_is_not_sent(declared: bool) {
+        let _hand = ONE_HAND.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _policy = crate::computer_use::input_policy::enter(
+            crate::computer_use::input_policy::InputPolicy::SharedDesktop,
+        );
+        crate::computer_use::confirm::set_policy(crate::computer_use::confirm::Policy::default());
+        let mut argv = words(&["mouse-click", "--x", "1", "--y", "1"]);
+        if declared {
+            argv.extend(words(&["--confirming", "payment"]));
+        }
+        let command = zerocode_core::computer_use::parse_command(&argv).unwrap();
+        let mut calls = 0;
+        let answer = crate::agent_tools_runtime::call_with_confirmation_asker(
+            &command,
+            crate::computer_use::confirm::Asking::Person,
+            &mut |_, _| {
+                calls += 1;
+                Err(crate::computer_use::ComputerUseError::new(
+                    "confirmation_required",
+                    "payment: fixture",
+                ))
+            },
+            &mut |_, _, _| {
+                crate::computer_use::guard::stop(zerocode_core::computer_use::STOP_REASON_WINDOW);
+                crate::computer_use::guard::lift();
+                crate::computer_use::confirm::Decision::Allowed
+            },
+        );
+        assert_eq!(answer.unwrap_err().code, "stopped");
+        assert_eq!(calls, usize::from(!declared));
+    }
+
+    #[test]
+    fn a_declared_confirmation_cannot_revive_a_revoked_shared_request() {
+        assert_revoked_confirmation_is_not_sent(true);
+    }
+
+    #[test]
+    fn a_provider_confirmation_cannot_retry_a_revoked_shared_request() {
+        assert_revoked_confirmation_is_not_sent(false);
+    }
+
+    #[test]
+    fn program_output_is_bounded_while_the_pipe_is_fully_drained() {
+        let limit = zerocode_core::computer_use::COMPUTER_RUN_MAX_BYTES;
+        let mut input = std::io::Cursor::new(vec![b'x'; limit * 2]);
+        let kept = crate::agent_tools_runtime::bounded_computer_run_output(&mut input);
+        assert_eq!(kept.len(), limit + 1);
+        assert_eq!(input.position(), u64::try_from(limit * 2).unwrap());
+        assert!(zerocode_core::computer_use::desktop_run_output(&kept).1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_program_obeys_a_stop_while_it_is_in_flight() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _hand = ONE_HAND.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let folder = tempfile::tempdir().unwrap();
+        let program = folder.path().join("wait-for-stop");
+        let ready = folder.path().join("ready");
+        std::fs::write(&program, b"#!/bin/sh\nprintf ready > ready\nexec /bin/sleep 5\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let args = words(&[
+            "run", "--program", program.to_str().unwrap(), "--cwd", folder.path().to_str().unwrap(), "--json",
+        ]);
+        let running = std::thread::spawn(move || {
+            let _policy = crate::computer_use::input_policy::enter(
+                crate::computer_use::input_policy::InputPolicy::SharedDesktop,
+            );
+            answer_computer_command(&args)
+        });
+        let started = std::time::Instant::now();
+        while !ready.exists() && started.elapsed() < std::time::Duration::from_secs(3) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let was_running = ready.exists();
+        crate::computer_use::guard::stop(zerocode_core::computer_use::STOP_REASON_WINDOW);
+        let stopped_at = std::time::Instant::now();
+        let answer = running.join().unwrap();
+        crate::computer_use::guard::lift();
+        assert!(was_running, "the child must have started before the stop");
+        assert_eq!(answer.exit_code, 1, "the in-flight program ignored the stop");
+        assert_eq!(envelope(&answer)["error"]["code"], "stopped");
+        assert!(stopped_at.elapsed() < std::time::Duration::from_secs(2));
+    }
+
     fn envelope(answer: &zerocode_hookd::TeamAnswer) -> serde_json::Value {
         let line = [answer.stdout.as_str(), answer.stderr.as_str()]
             .into_iter()
@@ -19898,6 +20414,9 @@ pub(crate) mod computer_desktop_wait {
         let _hand = ONE_HAND
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _policy = crate::computer_use::input_policy::enter(
+            crate::computer_use::input_policy::InputPolicy::SharedDesktop,
+        );
         crate::computer_use::confirm::set_policy(crate::computer_use::confirm::Policy::default());
         let command = batch_of(&serde_json::json!([
             ["wait", "--ms", "1"],
@@ -20211,6 +20730,9 @@ pub(crate) mod computer_desktop_wait {
         let _hand = ONE_HAND
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _policy = crate::computer_use::input_policy::enter(
+            crate::computer_use::input_policy::InputPolicy::SharedDesktop,
+        );
         let words = |argv: &[&str]| {
             argv.iter()
                 .map(|word| (*word).to_string())
@@ -20250,7 +20772,7 @@ pub(crate) mod computer_desktop_wait {
             transfer: true,
             delete: true,
         });
-        let unguarded = answer_computer_command(&words(&[
+        let unguarded = zerocode_core::computer_use::parse_command(&words(&[
             "mouse-click",
             "--x",
             "1",
@@ -20259,12 +20781,18 @@ pub(crate) mod computer_desktop_wait {
             "--confirming",
             "payment",
             "--json",
-        ]));
-        assert_ne!(
-            envelope(&unguarded)["error"]["code"],
-            "confirmation_refused",
-            "a kind turned off is not asked about; the helper (absent here) answers"
+        ])).unwrap();
+        let mut calls = 0;
+        let result = crate::agent_tools_runtime::call_with_the_persons_last_step(
+            &unguarded,
+            crate::computer_use::confirm::Asking::Person,
+            &mut |_, _| {
+                calls += 1;
+                Ok(serde_json::json!({ "fixture": true }))
+            },
         );
+        assert!(result.is_ok(), "a disabled confirmation reaches the provider");
+        assert_eq!(calls, 1);
         crate::computer_use::confirm::set_policy(crate::computer_use::confirm::Policy::default());
     }
 
@@ -20914,9 +21442,12 @@ pub(crate) mod computer_desktop_wait {
         let _hand = ONE_HAND
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _policy = crate::computer_use::input_policy::enter(
+            crate::computer_use::input_policy::InputPolicy::SharedDesktop,
+        );
         let bin = tempfile::tempdir().expect("a folder for the stand-in programs");
         let echo = crate::test_host::echo_program(bin.path());
-        let echoed = desktop_run(&serde_json::json!({ "program": echo, "args": "hello there" }));
+        let echoed = desktop_run(&serde_json::json!({ "program": echo, "args": "hello there" })).unwrap();
         assert_eq!(echoed["spawned"], true, "{echoed}");
         assert_eq!(echoed["exitCode"], 0);
         assert_eq!(echoed["stdout"], "hello there\n");
@@ -20926,7 +21457,7 @@ pub(crate) mod computer_desktop_wait {
         let failed = desktop_run(&serde_json::json!({
             "program": crate::test_host::shell_program(),
             "args": "-c exit_7_please",
-        }));
+        })).unwrap();
         assert_eq!(failed["spawned"], true);
         assert_ne!(failed["exitCode"], 0);
         assert!(
@@ -20942,7 +21473,7 @@ pub(crate) mod computer_desktop_wait {
             let started = std::time::Instant::now();
             let slow = desktop_run(
                 &serde_json::json!({ "program": "/bin/sleep", "args": "5", "timeoutMs": 120 }),
-            );
+            ).unwrap();
             assert_eq!(slow["timedOut"], true, "{slow}");
             assert!(
                 started.elapsed() < std::time::Duration::from_secs(3),
@@ -20950,7 +21481,7 @@ pub(crate) mod computer_desktop_wait {
             );
         }
 
-        let missing = desktop_run(&serde_json::json!({ "program": "/nonexistent/program" }));
+        let missing = desktop_run(&serde_json::json!({ "program": "/nonexistent/program" })).unwrap();
         assert_eq!(missing["spawned"], false);
 
         let answer = answer_computer_command(&[

@@ -46,6 +46,7 @@ shell-lint:
 # 2026-09-11 (the signer's until 09-12) — the same silence the knowledge graph
 # tests had.
 tools-test:
+    python3 -I -S -B tools/release/tests/test_gate_receipt.py --receipt-mode routine -v
     python3 tools/release/tests/test_lane.py
     python3 tools/release/tests/test_win_check.py
     python3 tools/release/tests/test_bump.py
@@ -124,7 +125,7 @@ settings-browser-test:
 # is told before its first script — no bridge (t-20972). And the frame budget's
 # rule on a platform that cannot read the load: recorded, never judged (t-43414).
 window-runner-test:
-    node --test ui/tests/window-runner.test.mjs ui/tests/ipc-census.test.mjs ui/tests/hidden-pane-bridge.test.mjs ui/tests/machine-load.test.mjs
+    node --test ui/tests/window-runner.test.mjs ui/tests/ipc-census.test.mjs ui/tests/hidden-pane-bridge.test.mjs ui/tests/machine-load.test.mjs ui/tests/background-surface-focus.test.mjs
 
 # 설정뿐 아니라 전체 renderer interaction을 실제 layout engine에서 확인한다.
 # 이 gate가 있어야 설정 변경이 탭/보드/온보딩 같은 인접 UI를 깨뜨리지 않았다는

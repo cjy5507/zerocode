@@ -293,6 +293,9 @@ use cmd::{
     list_automation_runs, list_automations, list_branches, list_claude_sessions, list_diff_notes,
     list_dir, list_quick_commands, list_run_evidence, list_skills, list_system_fonts,
     list_worktrees, listening_ports, log_window_error, logout_codex_login, machine_load,
+    managed_judgment_apply, managed_judgment_cancel, managed_judgment_check,
+    managed_judgment_install, managed_judgment_prepare_runtime, managed_judgment_remove,
+    managed_judgment_start, managed_judgment_status, managed_judgment_stop,
     mark_default_tabs_applied, mark_first_run_seen, mark_onboarding, merge_and_remove_worktree,
     mirror_ready, mouse_input, note_webview_error, note_worker_room_change, note_worker_room_seen,
     notification_probe, open_board_popout, open_browser_pane, open_commit_remote,
@@ -334,11 +337,12 @@ use cmd::{
     set_browser_restore_tabs, set_browser_search_engine, set_browser_visits,
     set_claude_autoswitch_mode, set_clipboard_image, set_compact_worktree_cards,
     set_computer_awake_mode, set_computer_confirm, set_computer_generator_road,
-    set_computer_live_reflex, set_confirm_close_pinned, set_conversation_focus_view,
-    set_crash_watchdog, set_ctrl_tab_order_mode, set_default_agent, set_default_task_source,
-    set_diff_side_by_side, set_dock_badge, set_external_worktree_visibility,
-    set_finish_notification_mode, set_guide_dismissed, set_harness_settings, set_hidden_shortcuts,
-    set_hidden_task_sources, set_hide_agent_scratch_workspaces, set_hide_automation_workspaces,
+    set_computer_input_policy, set_computer_live_reflex, set_confirm_close_pinned,
+    set_conversation_focus_view, set_crash_watchdog, set_ctrl_tab_order_mode, set_default_agent,
+    set_default_task_source, set_diff_side_by_side, set_dock_badge,
+    set_external_worktree_visibility, set_finish_notification_mode, set_guide_dismissed,
+    set_harness_settings, set_hidden_shortcuts, set_hidden_task_sources,
+    set_hide_agent_scratch_workspaces, set_hide_automation_workspaces,
     set_hide_default_branch_workspaces, set_hide_detached_head_workspaces,
     set_hide_sleeping_workspaces, set_hooks_enabled, set_jev_enabled, set_jev_model,
     set_jev_review_enabled, set_judgment_provider, set_keep_default_branch_awake, set_keybinding,
@@ -781,6 +785,33 @@ enum ZoChannelOwner {
     Term(TermId),
 }
 
+/// A pane-owned Zo session's private events channel as an exchange reaches
+/// it: the loopback address its process published and the bearer presented
+/// there.
+///
+/// The two travel together because each channel takes its own bearer. A zo
+/// this window starts is handed the window's token, so its channel takes that;
+/// a zo somebody typed into a shell found none in its environment, made its
+/// own and wrote it beside its address (`zo-events-<pid>.addr`), and refuses
+/// any other with -32002 (t-49081).
+#[derive(Clone, PartialEq, Eq)]
+struct ZoChannel {
+    addr: String,
+    token: Option<String>,
+}
+
+/// Never the bearer itself — a channel is printed wherever a lookup or an
+/// exchange is debugged, and its bearer opens every tool approval it asks.
+impl std::fmt::Debug for ZoChannel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ZoChannel")
+            .field("addr", &self.addr)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 struct ForegroundAgentLook {
     term: TermId,
     child_in_front: Option<bool>,
@@ -921,12 +952,14 @@ struct ShellRuntime {
     /// stop — the loop checks membership before forwarding a frame, so a lane
     /// the person closed cannot raise a modal afterwards.
     subscriptions: Arc<Mutex<HashSet<String>>>,
-    /// Each pane-owned Zo session's private events-channel address.
+    /// Each pane-owned Zo session's private events channel: its address and the
+    /// bearer that channel was opened with.
     ///
     /// Unlike the retained `zo serve` supervisor used by remote lanes, a local
     /// IDE pane opens one socket per process. Permission replies, status reads,
-    /// and subscriptions must all return to that exact address.
-    channels: Arc<Mutex<HashMap<String, String>>>,
+    /// and subscriptions must all return to that exact address, with that
+    /// channel's own bearer — the window's token opens only the zo it started.
+    channels: Arc<Mutex<HashMap<String, ZoChannel>>>,
     /// Which lane or terminal won each session-id subscription claim.
     channel_owners: Mutex<HashMap<String, ZoChannelOwner>>,
     /// The project this window is open on — the repository root when there is
@@ -1338,7 +1371,7 @@ impl ShellRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn channels(&self) -> MutexGuard<'_, HashMap<String, String>> {
+    fn channels(&self) -> MutexGuard<'_, HashMap<String, ZoChannel>> {
         self.channels
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1867,7 +1900,7 @@ trait ShellStateExt {
     fn project_root(&self) -> &Path;
     fn watched(&self) -> &Arc<file_watch::WatchSet>;
     fn subscriptions(&self) -> &Arc<Mutex<HashSet<String>>>;
-    fn channels(&self) -> MutexGuard<'_, HashMap<String, String>>;
+    fn channels(&self) -> MutexGuard<'_, HashMap<String, ZoChannel>>;
     fn channel_owners(&self) -> MutexGuard<'_, HashMap<String, ZoChannelOwner>>;
     fn cadence(&self) -> &Cadence;
     fn ssh_credentials(&self) -> &ssh_prompt::CredentialBroker;
@@ -2188,7 +2221,7 @@ impl ShellStateExt for AppState {
         &self.shell_runtime().subscriptions
     }
 
-    fn channels(&self) -> MutexGuard<'_, HashMap<String, String>> {
+    fn channels(&self) -> MutexGuard<'_, HashMap<String, ZoChannel>> {
         self.shell_runtime().channels()
     }
 
@@ -2561,6 +2594,15 @@ fn main() -> ExitCode {
             set_route_classifier,
             set_jev_model,
             set_judgment_provider,
+            managed_judgment_apply,
+            managed_judgment_cancel,
+            managed_judgment_check,
+            managed_judgment_install,
+            managed_judgment_prepare_runtime,
+            managed_judgment_remove,
+            managed_judgment_start,
+            managed_judgment_status,
+            managed_judgment_stop,
             judgment_models,
             set_summon_profiles,
             check_typesafe_key,
@@ -3116,6 +3158,7 @@ fn main() -> ExitCode {
             set_computer_confirm,
             set_computer_generator_road,
             set_computer_live_reflex,
+            set_computer_input_policy,
             computer_confirm_answer,
             computer_handoff_code,
             computer_stop,
@@ -3678,13 +3721,16 @@ fn main() -> ExitCode {
                 let _ = api;
                 // The ledger hears the goodbye before any pane goes (t-3058):
                 // seated workers sleep instead of being settled by their own
-                // panes' exits on the way out.
-                orchestration::window_exiting(now_epoch_ms(), road, &|| {
-                    cmd::appearance::take_census(handle)
+                // panes' exits on the way out — waited for no longer than the
+                // ledger's patience (t-49062).
+                let census = handle.clone();
+                orchestration::goodbye_within(now_epoch_ms(), road, move || {
+                    cmd::appearance::take_census(&census)
                 });
                 handle.state::<AppState>().native_tray().begin_exit();
                 emulator::shutdown_all(handle);
                 codex_queue::shutdown_all();
+                cmd::managed_judgment::shutdown();
                 capture_scrollback_at_exit(handle);
                 // 원장의 마지막 플러시 — 디바운스가 아직 자고 있어도 여기서
                 // 적힌다(Orca quit의 flushStatusPersistSync와 같은 자리).
@@ -3773,8 +3819,9 @@ struct ExitSteps<'a>(&'a AppHandle);
 
 impl exit_runtime::Terminating for ExitSteps<'_> {
     fn goodbye(&self, road: exit_runtime::ExitRoad) {
-        orchestration::window_exiting(now_epoch_ms(), road, &|| {
-            cmd::appearance::take_census(self.0)
+        let census = self.0.clone();
+        orchestration::goodbye_within(now_epoch_ms(), road, move || {
+            cmd::appearance::take_census(&census)
         });
     }
 
@@ -3787,6 +3834,7 @@ impl exit_runtime::Terminating for ExitSteps<'_> {
     }
 
     fn end_panes(&self) {
+        cmd::managed_judgment::shutdown();
         // Out of the pool, one by one: the last hold on each lets go and
         // the lane ends its child (`PtyLane`'s own drop). Their seats are
         // asleep by now, so the ledger settles nothing as they go.
