@@ -306,6 +306,19 @@ fn held_landing(path: &Path) -> Option<HeldLanding> {
     unpoisoned(landing_cache()).get(path).cloned()
 }
 
+/// The compare ref a checkout's work is in, when the sidebar's last answer for
+/// it was `landed` (t-45336): what the cleanup review offers landed work for,
+/// and what a landed task's branches are measured against before they go. Read
+/// from the cache only, like the ledger's witness — a checkout the sidebar
+/// never classified is not called landed.
+pub(crate) fn landed_compare_ref(path: &Path) -> Option<String> {
+    let held = held_landing(path)?;
+    (held.landing.state == "landed")
+        .then_some(held.landing.compare_ref)
+        .flatten()
+        .filter(|compare| !compare.is_empty())
+}
+
 /// A TTL in the epoch milliseconds the readings are stamped in.
 fn millis(ttl: Duration) -> i64 {
     i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX)
@@ -349,6 +362,9 @@ pub(crate) fn witness_for(
         compare_oid: compare_oid.to_string(),
         git,
         occupied,
+        // What a hand-in left beside this checkout is the reclaim's to say, not
+        // the landing cache's; the sweep that hands this to the ledger adds it.
+        beside: Vec::new(),
     })
 }
 
@@ -1006,7 +1022,7 @@ fn overlap_of(
 
 /// 병합 시험(`merge-tree --write-tree --name-only`)의 답.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum MergeProbe {
+pub(crate) enum MergeProbe {
     /// 충돌 없이 합쳐진다 — 합친 나무의 oid.
     Clean(String),
     /// 충돌한다 — 충돌한 파일(중복 없이, git이 적은 순서).
@@ -1020,7 +1036,7 @@ enum MergeProbe {
 /// `--name-only`의 표준 출력은 첫 줄이 합친 나무, 충돌이면 이어서 파일 이름이고,
 /// 빈 줄 뒤는 사람이 읽는 메시지다. 종료값 1만 충돌이다 — 128 같은 값은 git이
 /// 답하지 못한 것이라 충돌 없음으로 읽지 않는다.
-fn parse_merge_probe(code: i32, said: &str) -> MergeProbe {
+pub(crate) fn parse_merge_probe(code: i32, said: &str) -> MergeProbe {
     let mut lines = said.lines().map(str::trim_end);
     let Some(tree) = lines.next().map(str::trim).filter(|tree| !tree.is_empty()) else {
         return MergeProbe::Failed;

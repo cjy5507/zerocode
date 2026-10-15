@@ -51,6 +51,28 @@ fn worker_briefings_ask_for_a_plain_report_by_the_skills_name() {
     }
 }
 
+/// A worker is told once, at launch, to keep one checkout per task and to take
+/// a checkout it cut beside its own away before it hands in (t-45336) — in the
+/// shared briefing and the federated one, before the task.
+#[test]
+fn worker_briefings_keep_one_checkout_per_task() {
+    for briefing in [
+        worker_briefing("t-1", "lint", ""),
+        federated_briefing("d-1"),
+    ] {
+        let (before, _) = briefing
+            .split_once(BRIEFING_HANDS_OVER)
+            .expect("the briefing hands over");
+        assert_eq!(
+            before.matches("one checkout per task").count(),
+            1,
+            "{before}"
+        );
+        assert!(before.contains("goes before you hand in"), "{before}");
+        assert!(before.contains("never with force"), "{before}");
+    }
+}
+
 /// What the board lints is what the worker itself wrote for a person: the
 /// `summary` of its own `worker_done` body. A coordinator's correction, a body
 /// without prose and a result nobody is known to have written are not read.
@@ -273,6 +295,12 @@ impl Launcher for Catalog {
         words.push("--resume".to_string());
         words.push(session.id.clone());
         Ok(words.join(" "))
+    }
+
+    /// The bench stands in for a machine the integration queue runs on, whatever machine runs
+    /// the tests; the platform's own answer is a test of its own.
+    fn integration_queue_supported(&self) -> bool {
+        true
     }
 }
 
@@ -25168,6 +25196,9 @@ mod completion;
 /// its task wrote (`tests/evidence.rs`).
 mod evidence;
 mod gate_reuse;
+/// t-45315 (T3 stage 6): `land-batch` chooses verified work for the window to stack, and every
+/// record of a batch comes back as a receipt the ledger judges (`tests/land_batch.rs`).
+mod land_batch;
 /// t-34501 stage 3 (t-42447): `land-check` names the task, head and repository for the window, and
 /// the window's evidence comes back as the ledger's own letter (`tests/land_check.rs`).
 mod land_check;

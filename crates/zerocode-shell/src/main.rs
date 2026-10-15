@@ -130,6 +130,7 @@ mod jev_scope;
 mod jira_attachments;
 mod jira_store;
 mod keyboard_input_source;
+mod land_batch;
 mod land_check;
 mod landing_watch_sweep;
 mod last_status;
@@ -244,6 +245,7 @@ use browser_diagnose::*;
 use browser_guest_runtime::*;
 use browser_nav_state::*;
 use browser_runtime::*;
+use cmd::judgment_latest_request;
 use cmd::{
     abort_conflict_operation, ack_board_agent, add_claude_account, add_codex_account, agent_icon,
     agent_launch_plans, agent_models, agent_teams_mode, agent_terms, answer_approval, answer_ask,
@@ -371,21 +373,21 @@ use cmd::{
     ssh_link_disconnect, ssh_link_states, ssh_open_remote_term, ssh_probe_target,
     ssh_remove_target, ssh_save_target, ssh_submit_credential, ssh_targets, stage_layouts,
     stage_path, stage_paths, standing_pane_worktrees, stats_summary, stop_pane_helper,
-    stop_workspace_port, subagent_log, submodule_status, supply_chain_graph, supply_chain_report,
-    suppress_external_worktree_inbox, term_focus, term_fold, term_has_running_process, term_key,
-    term_lines, term_mouse, term_paste, term_pull, term_resize, term_scroll, term_search,
-    term_snapshot, term_text, term_view_to_line, terminal_command, terminal_command_argv,
-    terminal_prefs, terminal_sessions, terminal_windows_status, test_local_network_permission,
-    test_remote_server, test_remote_workspace, test_router_connection, test_ssh_host, text_input,
-    tip_verdict, tour_decision, tree_selection, type_value_keys, typesafe_settings, unstage_path,
-    unstage_paths, update_check, update_download, update_history, update_install, upstream_status,
-    use_system_claude_login, validate_branch_name, vault_sessions, verify_claude_accounts,
-    verify_codex_accounts, waiting_on_me, watch_files, wire_answer, wire_image, wire_interrupt,
-    wire_log, wire_models, wire_send, wire_set_mode, wire_set_model, wire_start, wire_stop,
-    work_item_seed, worker_screen, workspace_cleanup_scan, workspace_space_cancel,
-    workspace_space_git, workspace_space_scan, worktree_committed_diff, worktree_evidence,
-    worktree_landing_stamp, worktree_last_agent, worktree_loss, worktree_prefs, worktree_stamp,
-    write_primary_selection, write_text_file,
+    stop_workspace_port, subagent_log, submodule_status, superseded_models, supply_chain_graph,
+    supply_chain_report, suppress_external_worktree_inbox, term_focus, term_fold,
+    term_has_running_process, term_key, term_lines, term_mouse, term_paste, term_pull, term_resize,
+    term_scroll, term_search, term_snapshot, term_text, term_view_to_line, terminal_command,
+    terminal_command_argv, terminal_prefs, terminal_sessions, terminal_windows_status,
+    test_local_network_permission, test_remote_server, test_remote_workspace,
+    test_router_connection, test_ssh_host, text_input, tip_verdict, tour_decision, tree_selection,
+    type_value_keys, typesafe_settings, unstage_path, unstage_paths, update_check, update_download,
+    update_history, update_install, upstream_status, use_system_claude_login, validate_branch_name,
+    vault_sessions, verify_claude_accounts, verify_codex_accounts, waiting_on_me, watch_files,
+    wire_answer, wire_image, wire_interrupt, wire_log, wire_models, wire_send, wire_set_mode,
+    wire_set_model, wire_start, wire_stop, work_item_seed, worker_screen, workspace_cleanup_scan,
+    workspace_space_cancel, workspace_space_git, workspace_space_scan, worktree_committed_diff,
+    worktree_evidence, worktree_landing_stamp, worktree_last_agent, worktree_loss, worktree_prefs,
+    worktree_stamp, write_primary_selection, write_text_file,
 };
 use cmd::{
     artifact_bundle, artifact_copy_path, artifact_counts, artifact_delete, artifact_document,
@@ -400,6 +402,10 @@ use cmd::{artifact_export_formats, artifact_export_reveal};
 use cmd::{
     claim_coordinator_seat, coordinator_handover_status, coordinator_seat_runs, coordinator_seats,
     set_coordinator_handover,
+};
+use cmd::{
+    integration_queue_setting, land_batch_bisect, land_batch_cancel, land_batch_promote,
+    land_batch_restack, set_integration_queue_enabled,
 };
 use emulator::{
     acknowledge_emulator_payload, android_accessibility_tree, android_accessibility_tree_direct,
@@ -2320,6 +2326,7 @@ fn build_app_state(paths: app_paths::AppPaths, root: PathBuf) -> AppState {
     let remote_servers = remote_servers::RemoteServerService::new();
     let settings = Arc::new(settings::SettingsRepository::new(settings_root.clone()));
     land_check::hold_settings(Arc::clone(&settings));
+    land_batch::hold_settings(Arc::clone(&settings));
     if let Err(error) = migrate_legacy_project_settings(&settings) {
         eprintln!("zerocode-shell: could not migrate project settings: {error}");
     }
@@ -2611,6 +2618,7 @@ fn main() -> ExitCode {
             managed_judgment_stop,
             managed_judgment_switch_model,
             judgment_models,
+            judgment_latest_request,
             preflight_judgment_provider,
             set_summon_profiles,
             check_typesafe_key,
@@ -2970,6 +2978,8 @@ fn main() -> ExitCode {
             mark_default_tabs_applied,
             set_project_script_policy,
             set_project_script_setting,
+            integration_queue_setting,
+            set_integration_queue_enabled,
             repo_trust_standing,
             record_repo_trust,
             archive_trust_standing,
@@ -3055,6 +3065,10 @@ fn main() -> ExitCode {
             desk_ack,
             quota_wall_retry,
             quota_wall_handover,
+            land_batch_promote,
+            land_batch_bisect,
+            land_batch_restack,
+            land_batch_cancel,
             desk_checkouts,
             machine_load,
             coordinator_handover_status,
@@ -3069,6 +3083,7 @@ fn main() -> ExitCode {
             orchestration_accuracy,
             agent_models,
             slash_commands,
+            superseded_models,
             wire_answer,
             wire_interrupt,
             wire_image,
@@ -3473,6 +3488,9 @@ fn main() -> ExitCode {
                     ),
                 );
             }
+            // The integration queue's next run (t-45315): batches a crash left half way are
+            // settled from what git holds, on a thread of their own.
+            orchestration::settle_land_batches_at_start(now_epoch_ms());
             boot_timeline::mark(boot_timeline::Phase::LedgerReady);
             crumbs::record("boot", format_args!("hooks"));
             if let Some((events, teams, browser, computer, federation)) =

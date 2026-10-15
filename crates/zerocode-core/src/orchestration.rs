@@ -41,6 +41,7 @@ pub mod coordinator_handover;
 pub mod delegate;
 pub mod evidence;
 pub mod gate_reuse;
+pub mod land_batch;
 pub mod land_check;
 pub mod landing_watch;
 mod progress;
@@ -1091,7 +1092,10 @@ pub const NO_ATTEMPT: &str = "none";
 
 /// A commit, as a person or an agent writes one: seven hex digits or more.
 /// Anything else is not a commit — a report id, a branch name, a sentence.
-pub(crate) fn commit_named(text: &str) -> Option<String> {
+/// Public because the window measures a task's other checkouts against the
+/// commit an attempt handed in (t-45336) and must read [`Dispatch::source`] the
+/// way the ledger wrote it.
+pub fn commit_named(text: &str) -> Option<String> {
     let text = text.trim();
     (text.len() >= 7 && text.chars().all(|c| c.is_ascii_hexdigit())).then(|| text.to_string())
 }
@@ -6452,6 +6456,9 @@ fn changes_the_ledger(verb: &str, words: &Words) -> bool {
         "retention" => words.value("--days").is_some() || words.has("--sweep"),
         // Listing what would be settled changes nothing; applying it does.
         "task-settle" => words.has("--apply"),
+        // Reading the batches changes nothing; every press hands the window work whose
+        // records come back as receipts.
+        land_batch::LAND_BATCH_VERB => land_batch::presses(words),
         _ => true,
     };
     doing(verb).is_some_and(|what| what.changes(spending))
@@ -12521,15 +12528,36 @@ impl Ledger {
     /// The launch words the sleeper `worker_id` comes back with (t-7812):
     /// `kept_worker_tuning`'s, asked by the window's resume road so the pane
     /// it opens for a sleeper's conversation is the launch the ledger's own
-    /// reseat would have cut. A read; nothing moves.
-    pub fn sleeper_resume_tuning(&self, worker_id: &str) -> Result<Vec<String>, String> {
+    /// reseat would have cut — `current` answering, as the launcher's
+    /// [`Launcher::current_release`] does there, which release stands for a
+    /// superseded one today (t-46882). A read; nothing moves.
+    pub fn sleeper_resume_tuning(
+        &self,
+        worker_id: &str,
+        current: &dyn Fn(&str, &str) -> Option<String>,
+    ) -> Result<Vec<String>, String> {
         self.runs
             .iter()
             .find_map(|run| {
                 run.worker(worker_id)
-                    .map(|worker| kept_worker_tuning(&run.id, worker))
+                    .map(|worker| kept_worker_tuning(&run.id, worker, current))
             })
             .unwrap_or_else(|| Err(format!("unknown worker: {worker_id}")))
+    }
+
+    /// The model the sleeper `worker_id` comes back on — the release
+    /// [`Self::sleeper_resume_tuning`] names, alone, for the window to show
+    /// on its pane before the agent says (t-46882). A read; `None` for a row
+    /// that names none.
+    pub fn sleeper_resume_model(
+        &self,
+        worker_id: &str,
+        current: &dyn Fn(&str, &str) -> Option<String>,
+    ) -> Option<String> {
+        self.runs
+            .iter()
+            .find_map(|run| run.worker(worker_id))
+            .and_then(|worker| kept_worker_model(worker, current))
     }
 
     /// The window resumed a conversation into a checkout, and a sleeper is
@@ -12795,7 +12823,8 @@ impl Ledger {
             .checkout
             .clone()
             .ok_or_else(|| format!("{kept} worker {worker_id} has no checkout"))?;
-        let tuning = kept_worker_tuning(run_id, worker)?;
+        let current = |agent: &str, model: &str| launcher.current_release(agent, model);
+        let tuning = kept_worker_tuning(run_id, worker, &current)?;
         /* Resume the conversation without starting the interrupted work yet.
          *
          * The host has to spawn the process before `worker_reseated` can prove
@@ -12846,6 +12875,7 @@ impl Ledger {
             prompt,
             prompt_timeout_ms: READY_TIMEOUT_DEFAULT_MS,
             resumed,
+            model: kept_worker_model(worker, &current),
         };
         Ok(Decided {
             answered_from: None,
@@ -14408,6 +14438,11 @@ const BOOL_FLAGS: &[&str] = &[
     "--wip-commit",
     "--inherit-checkout",
     "--prepare",
+    "--promote",
+    "--bisect",
+    "--restack",
+    "--abort",
+    "--record-merged",
 ];
 
 /* ---- what the ledger cannot know ------------------------------------- */
@@ -14501,6 +14536,16 @@ pub trait Launcher {
         None
     }
 
+    /// The release that stands today for `model`, a release of `agent`'s
+    /// lineup the classifier superseded
+    /// ([`crate::summon_difficulty::lineup::Lineup::current_release`]) —
+    /// what a kept worker comes back on instead (t-46882). Peeked, never
+    /// fetched: this runs inside the actor. `None` when the host holds no
+    /// lineup for the agent or the model is current.
+    fn current_release(&self, _agent: &str, _model: &str) -> Option<String> {
+        None
+    }
+
     /// What this machine actually has, one row per agent the catalog knows.
     ///
     /// The ledger cannot look for itself — it reads no `PATH` and stats no
@@ -14576,6 +14621,13 @@ pub trait Launcher {
     /// with the reservation's exact rollback.
     fn checkout_present(&self, _path: &str) -> Option<bool> {
         None
+    }
+
+    /// Whether the integration queue (`land-batch`) may run on this machine at all — the one
+    /// platform judgment, [`land_batch::integration_queue_supported`]. A lookup like the rest:
+    /// a test launcher answers for the platform it stands in for.
+    fn integration_queue_supported(&self) -> bool {
+        land_batch::integration_queue_supported()
     }
 }
 
@@ -17650,10 +17702,17 @@ fn continue_past_classifier_declines(agent: &str, pinned: bool, words: &mut Vec<
 /// The row's values win: an effort changed inside the pane reaches no hook,
 /// so the row's effort stands, and a value the row never held is not filled
 /// in — an agent summoned without tuning comes back without it.
-fn kept_worker_tuning(run_id: &str, worker: &Worker) -> Result<Vec<String>, String> {
+///
+/// `current` answers which release stands today for a superseded one
+/// ([`Launcher::current_release`], t-46882).
+fn kept_worker_tuning(
+    run_id: &str,
+    worker: &Worker,
+    current: &dyn Fn(&str, &str) -> Option<String>,
+) -> Result<Vec<String>, String> {
     let mut tuning = launch_tuning(
         &worker.agent,
-        worker.model.as_deref(),
+        kept_worker_model(worker, current).as_deref(),
         worker.effort.as_deref(),
     )?;
     if let Some(peer) = provider_peer(&worker.agent, run_id, &worker.id) {
@@ -17667,6 +17726,25 @@ fn kept_worker_tuning(run_id: &str, worker: &Worker) -> Result<Vec<String>, Stri
         &mut tuning,
     );
     Ok(tuning)
+}
+
+/// The model a kept worker comes back on (t-46882): the one its row names —
+/// or, for a worker no person took, the release that stands for it today
+/// when the classifier has since superseded the row's (`claude-fable-5` →
+/// `claude-fable-5-1`, the person's 10-11 「페이블 5.1이 있는데 5를 왜」). A
+/// pane the person took is theirs, and so is the model its row names; a row
+/// that names none comes back naming none.
+fn kept_worker_model(
+    worker: &Worker,
+    current: &dyn Fn(&str, &str) -> Option<String>,
+) -> Option<String> {
+    let named = worker.model.as_deref()?;
+    Some(
+        (!worker.taken_over)
+            .then(|| current(&worker.agent, named))
+            .flatten()
+            .unwrap_or_else(|| named.to_string()),
+    )
 }
 
 /// Assemble a reserved worker's command or put the reservation back exactly.
@@ -17981,6 +18059,18 @@ fn launch_tuning(
         }
     }
     Ok(words)
+}
+
+/// The launch words that name `model` for `agent`'s CLI — the measured
+/// launch table's own spelling (`TUNABLE`), for a road that names a model
+/// the ledger did not summon with: the release that stands for the one a
+/// resumed conversation last ran (t-46882).
+///
+/// # Errors
+/// An agent the table measured no model flag for, or an empty id — the
+/// refusals a summons' own `--model` meets.
+pub fn model_words(agent: &str, model: &str) -> Result<Vec<String>, String> {
+    launch_tuning(agent, Some(model), None)
 }
 
 /// Say which launch choices this summons left to the agent CLI.
@@ -18465,6 +18555,20 @@ pub const VERBS: &[(&str, &str, Doing)] = &[
         Doing::Mutation,
     ),
     (
+        land_batch::LAND_BATCH_VERB,
+        "[--batch <id>] · read this run's integration batches | --members <t-1,t-2,…> \
+         --message-dir <dir> · stack ready, verified tasks on the base branch, one merge each, \
+         on an app-only ref (refs/zerocode/stack/) — no checkout, index or branch is touched | \
+         --batch <id> --prepare | --record <check> --rc <n> --log <path> [--took-ms <ms>] | \
+         --promote | --bisect | --restack [--drop <t-1,…>] | --abort | --record-merged · \
+         --prepare readies the tip (or the culprit search's next step) for the gate; the gate is \
+         a set of build-line jobs, so --record takes the whole set's result — --rc 0 only when \
+         every job passed — and --log names the per-job RC summary; --promote fast-forwards the \
+         base branch to a green tip; --record-merged writes the merged records after the \
+         person's promote. macOS only, and off until the repository turns it on",
+        Doing::Policy,
+    ),
+    (
         gate_reuse::PIN,
         "--gate <gate-root|gate-zo> --body <policy-json> · pin exact policy and producer identities for the current authenticated coordinator",
         Doing::Mutation,
@@ -18767,6 +18871,9 @@ pub struct PreparedWorkerReseat {
     pub prompt: String,
     pub prompt_timeout_ms: u32,
     pub resumed: WorkerResume,
+    /// The model the pane is launched on, when its launch names one — what
+    /// the window shows for it before its agent first says (t-46882).
+    pub model: Option<String>,
 }
 
 impl std::fmt::Debug for PreparedWorkerReseat {
@@ -18782,6 +18889,7 @@ impl std::fmt::Debug for PreparedWorkerReseat {
             .field("prompt", &format_args!("<{} bytes>", self.prompt.len()))
             .field("prompt_timeout_ms", &self.prompt_timeout_ms)
             .field("resumed", &self.resumed)
+            .field("model", &self.model)
             .finish()
     }
 }
@@ -18986,6 +19094,7 @@ impl std::fmt::Debug for Decided {
             Effect::WorktreeEvidence { .. } => "worktree-evidence",
             Effect::WorkerTranscript { .. } => "worker-transcript",
             Effect::LandCheck(..) => "land-check",
+            Effect::LandBatch(..) => "land-batch",
             Effect::WorkerTerminal { .. } => "worker-terminal",
             Effect::Focus { .. } => "focus",
             Effect::Close { .. } => "close",
@@ -19066,6 +19175,15 @@ const WORKER_GATE_CONTEXT: &str = "For code changes in a Rust workspace, the wor
 /// the same for every agent that takes a task, so every agent is told the same.
 /// The sentence says the rule's gist itself, so a CLI that has not installed the
 /// skill yet is still told what to do.
+/// What a worker is told, once and at launch, about the checkouts it cuts
+/// (t-45336): one per task, and a checkout cut beside it for a red, a verify
+/// or evidence goes before the hand-in. The person saw one task stand in the
+/// sidebar four times — a worker's before, evidence, green and verify
+/// checkouts — and finished work pile up. The window takes back what the
+/// handed-in head holds, and the ledger tells the coordinator when a hand-in
+/// leaves one standing; this is the rule both of those enforce.
+const WORKER_ONE_CHECKOUT_CONTEXT: &str = "Keep one checkout per task: a checkout you cut beside your own — for a red, a verify or evidence — goes before you hand in (`git worktree remove`, never with force), and evidence you name lives outside every checkout. The ledger tells the coordinator when a hand-in leaves one standing, and the window takes back what your handed-in head holds.";
+
 const WORKER_PLAIN_REPORT_CONTEXT: &str = "What you write for a person to read — the summary, a report, a notice — follows the `plain-report` skill. Put the result first, write one fact in a sentence, give every number a unit, and use no codebase metaphors.";
 
 /// The sentence that sends a worker to `zerocode-find` before it reads code
@@ -19137,8 +19255,9 @@ values masked, {cap_mb} MB at most). An intended failure is evidence too — nam
 name — and a report that is not a plain report says what it is: `\"{report_kind}\":\"review\"` \
 (one of {kinds}). Every command that CHANGES anything needs --retry-request: repeat \
 the same name to retry one you never heard back from, and choose a new one for \
-a new request. `zerocode-orc help` lists the rest. {find} {plain} {purpose}\n\n{conditions}{contract}\n\n{worker_gate}\n\n{trust}\n\n{hands_over}\n\n",
+a new request. `zerocode-orc help` lists the rest. {find} {plain} {one_checkout} {purpose}\n\n{conditions}{contract}\n\n{worker_gate}\n\n{trust}\n\n{hands_over}\n\n",
         conditions = conditions,
+        one_checkout = WORKER_ONE_CHECKOUT_CONTEXT,
         evidence = crate::hand_in::EVIDENCE_KEY,
         expect = crate::hand_in::EXPECT_KEY,
         report_kind = crate::hand_in::REPORT_KIND_KEY,
@@ -19194,8 +19313,9 @@ nobody on either side can answer one. Keep the summary short and carry a \
 longer answer as a path — `--payload '{{\"reportPath\":\"/abs/path\",\"lifetime\":\"ephemeral\"}}'` — \
 naming it once in the summary too, and say whether that file outlives your \
 worktree, because the home window is not on this machine. Every command that CHANGES anything needs --retry-request. \
-`zerocode-orc help` lists the rest. {plain} {purpose}\n\n{contract}\n\n{worker_gate}\n\n{trust}\n\n{hands_over}\n\n",
+`zerocode-orc help` lists the rest. {plain} {one_checkout} {purpose}\n\n{contract}\n\n{worker_gate}\n\n{trust}\n\n{hands_over}\n\n",
         plain = WORKER_PLAIN_REPORT_CONTEXT,
+        one_checkout = WORKER_ONE_CHECKOUT_CONTEXT,
         purpose = WORKER_PURPOSE_CONTEXT,
         worker_gate = WORKER_GATE_CONTEXT,
         contract = crate::delegation::AGENT_SELECTION_CONTEXT,
@@ -20210,8 +20330,11 @@ const BOUNDED_INPUT: &[(&str, Destination)] = &[
     ("--to-message", Destination::Name),
     ("--ack", Destination::Name),
     ("--gate", Destination::Name),
+    ("--batch", Destination::Name),
     // A list of names.
     ("--deps", Destination::Names),
+    ("--members", Destination::Names),
+    ("--drop", Destination::Names),
     ("--types", Destination::Names),
     ("--cursor", Destination::Name),
     ("--address", Destination::Name),
@@ -20237,6 +20360,8 @@ const BOUNDED_INPUT: &[(&str, Destination)] = &[
     ("--rc", Destination::Name),
     ("--took-ms", Destination::Name),
     ("--log", Destination::Prose),
+    // The integration queue's folder of landing messages (t-45315), a path like the log's.
+    ("--message-dir", Destination::Prose),
 ];
 
 /// Refuse an oversized field before anything happens, not while saving.
@@ -22857,6 +22982,23 @@ fn plan_inner(
             let mut planned = said(serde_json::Value::Null);
             planned.effect = Effect::LandCheck(ask);
             planned
+        }
+
+        /* The integration queue (t-45315). A read is answered here; a press is judged here and
+         * carried by the window, which reads the repository's switch before anything is written
+         * and hands every record back as a receipt the ledger judges again
+         * (`Ledger::land_batched`). */
+        land_batch::LAND_BATCH_VERB => {
+            let run_id = bound(ledger, &words, &caller, &seat)?;
+            let supported = launcher.integration_queue_supported();
+            match land_batch::plan(ledger, &run_id, team, pane, &words, supported, now_ms)? {
+                land_batch::Planned::Said(value) => said(value),
+                land_batch::Planned::Carry(ask) => {
+                    let mut planned = said(serde_json::Value::Null);
+                    planned.effect = Effect::LandBatch(ask);
+                    planned
+                }
+            }
         }
 
         "send" => {

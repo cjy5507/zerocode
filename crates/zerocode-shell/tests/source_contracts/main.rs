@@ -16,11 +16,13 @@ mod git_doors;
 mod hand_in_keep;
 mod handoff_code;
 mod jev_pane_seats;
+mod land_batch;
 mod quiet_children;
 mod quota_wall;
 mod raw_feed;
 mod readiness;
 mod release_versions;
+mod scm_observer_lock;
 mod secret_prompt;
 mod skills_view;
 mod support;
@@ -19610,12 +19612,15 @@ mod tests {
                  naming itself:\n{body}"
             );
         }
-        // Two roads come through the reclaim's one judgment — the beat's
-        // sweep and a worker's `ok:true` report (t-12773) — and the judgment
-        // writes the line under the name of the road that brought it.
+        // Three roads come through the reclaim's one judgment — the beat's
+        // sweep, a worker's `ok:true` report (t-12773), and the checkouts a
+        // worker cut beside its own for a task it handed in (t-45336) — and the
+        // judgment writes the line under the name of the road that brought it.
         let naming = block_after(sweep, "fn source(");
         assert!(
-            naming.contains("=> \"reclaim\"") && naming.contains("=> \"completed-worker\""),
+            naming.contains("=> \"reclaim\"")
+                && naming.contains("=> \"completed-worker\"")
+                && naming.contains("=> \"handed-in\""),
             "a road through the reclaim's judgment lost its name:\n{naming}"
         );
         let reclaiming = block_after(sweep, "fn settle(");
@@ -19626,7 +19631,7 @@ mod tests {
              directory:\n{reclaiming}"
         );
 
-        // Five roads, five different names — a duplicate would put two doors
+        // Six roads, six different names — a duplicate would put two doors
         // behind one word and give back the ambiguity this closes.
         let mut named: Vec<&str> = backend
             .match_indices("note_worktree_removal(")
@@ -19639,7 +19644,7 @@ mod tests {
                 Some(&backend[opened..closed])
             })
             .collect();
-        named.extend(["reclaim", "completed-worker"]);
+        named.extend(["reclaim", "completed-worker", "handed-in"]);
         named.sort_unstable();
         assert_eq!(
             named,
@@ -19647,10 +19652,11 @@ mod tests {
                 "completed-worker",
                 "failed-automation",
                 "failed-worker-launch",
+                "handed-in",
                 "reclaim",
                 "window-remove"
             ],
-            "the five removal roads and their five names have drifted apart — \
+            "the six removal roads and their six names have drifted apart — \
              a name shared by two doors gives back the ambiguity this closes, \
              and a road with none is a deletion nothing accounts for"
         );
@@ -20718,12 +20724,15 @@ mod tests {
         // and wrong the moment a second arrived (the per-project external-
         // worktree switch, 1-ec). Axes behind separate `if`s mean "why is this
         // row not showing" has answers in several places, each of which looks
-        // complete alone. Pinned as one predicate naming all four: the three
+        // complete alone. Pinned as one predicate naming all of them: the
         // 표시-menu hides, then the catalog's own external judgment — which
         // carries its one exception INSIDE the same clause: a worktree this
         // window did not make stays listed while an agent runs in one of its
         // panes (2026-09-13, "네비바에 안 보여서": the person could not reach
-        // the zo that held their session because its place was hidden).
+        // the zo that held their session because its place was hidden) — and
+        // last a task's other checkouts folded under its row (t-45336, "네비바에
+        // … 너무 많아"), with the same exception, and the row the window stands
+        // in, inside its clause too.
         let filtering = block_after(window, "function shownWorktrees(project) {");
         let chained = [
             "  return project.worktrees.filter((worktree) =>",
@@ -20733,7 +20742,8 @@ mod tests {
             "    && !(hideAgentScratchWorkspaces && worktree.ownership === \"agent-scratch\")",
             "    && !(sleepingPaths.has(worktree.path) && !worktree.active",
             "      && !(keepDefaultBranchAwake && worktree.is_main))",
-            "    && !(worktree.external_hidden && worktreeAgentRows(worktree.path).length === 0));",
+            "    && !(worktree.external_hidden && worktreeAgentRows(worktree.path).length === 0)",
+            "    && !(taskFoldedPaths.has(worktree.path) && !worktree.active && worktreeAgentRows(worktree.path).length === 0));",
         ]
         .join("\n");
         assert!(
@@ -28602,9 +28612,11 @@ mod tests {
     /// A closed window's screens reopen showing what they showed.
     ///
     /// Orca's scrollback round trip, measured at both ends: the shutdown
-    /// capture serialises every live pane under the 512 KiB cap, binary-
-    /// searching the largest TAIL of rows that fits
-    /// (`captureTerminalShutdownLayout`, index-ftls8Hg_.js:100871); the
+    /// capture serialises every live pane under the 512 KiB cap, keeping the
+    /// largest TAIL of rows that fits — Orca binary-searches it
+    /// (`captureTerminalShutdownLayout`, index-ftls8Hg_.js:100871), ours
+    /// walks back from the newest row, which finds the same tail without
+    /// unpacking the history the cap leaves out (t-54317); the
     /// restore strips a trailing alt-screen segment and follows the buffer
     /// with the measured mode reset (`restoreScrollbackBuffers` +
     /// `POST_REPLAY_MODE_RESET`, I18nProvider:46152/:46043). The rules live
@@ -28623,7 +28635,10 @@ mod tests {
         // output and loses the part the person was looking at.
         assert!(
             writing.contains("SCROLLBACK_BUFFER_BYTE_LIMIT: usize = 512 * 1024")
-                && writing.contains("usize::midpoint(lo, hi)"),
+                && block_after(writing, "pub fn serialize_tail(").contains(
+                    "let mut fits = visible.iter().rev().all(|cells| tail.take(grid, cells));"
+                )
+                && block_after(writing, "pub fn serialize_tail(").contains("index -= 1;"),
             "the capture lost its measured cap or its tail search"
         );
         // The replay strip: a buffer ending inside the alternate screen is
@@ -32562,6 +32577,26 @@ mod tests {
         assert!(
             ticked < swept,
             "the reclaim sweep runs ahead of the settlement it reads:\n{beat}"
+        );
+        // And the checkouts a worker cut beside its own for a task it handed
+        // in (t-45336), on the same beat, after the settlement too.
+        let beside = beat
+            .find("worktree_reclaim::sweep_handed_in(")
+            .expect("nothing beside a hand-in is ever taken back");
+        assert!(
+            ticked < beside,
+            "the road beside hand-ins runs ahead of the settlement it reads:\n{beat}"
+        );
+        // Its removal is the automatic gate's, held, and never forced: a
+        // detached checkout goes only while the branch that holds the handed-in
+        // head holds its commit too.
+        let held_by = block_after(backend, "fn remove_automatic_held_by(");
+        assert!(
+            held_by.contains("held: &CheckoutHeld")
+                && held_by.contains("automatic_cleanup_allowed(orchestrator, path)?")
+                && held_by.contains(".remove_held_by(path, holder)")
+                && !held_by.contains("ConfirmedDiscardingChanges"),
+            "the removal beside a hand-in skips the automatic gate or can force:\n{held_by}"
         );
 
         // Nothing here forces, and nothing here removes except through the
@@ -37905,6 +37940,8 @@ fn a_pane_conversations_notices_are_keyed_by_what_they_say_and_speak_four_locale
     for key in [
         "worker.noPaneTranscript",
         "worker.handoverPending",
+        "worker.handingOver",
+        "worker.readingTranscript",
         "worker.wireRefused",
         "worker.historyFolded",
     ] {

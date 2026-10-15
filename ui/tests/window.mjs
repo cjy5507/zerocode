@@ -28,7 +28,7 @@ import { frameBudgetHolds, loadNote } from "./machine-load.mjs";
 
 import { testVaultSubagents } from "./vault-subagents.mjs";
 import { testKnowledgeLive } from "./knowledge-live.mjs";
-import { testArtifactBand, testArtifactBeside, testArtifactFollowed, testArtifactOtherProject, testArtifactCatalog, testArtifactChrome, testArtifactFirstScreen, testArtifactNewMenu, testArtifactPages, testArtifactProvenance, testArtifactRecall, testArtifactStudio, testArtifactStudioLayout, testArtifactStudioOwnership } from "./artifact-gallery.mjs";
+import { testArtifactBand, testArtifactBeside, testArtifactFollowed, testArtifactOtherProject, testArtifactCatalog, testArtifactChrome, testArtifactFirstScreen, testArtifactNewMenu, testArtifactPages, testArtifactProvenance, testArtifactRecall, testArtifactStudio, testArtifactStudioLayout, testArtifactStudioOwnership, testArtifactWordFacedCards } from "./artifact-gallery.mjs";
 
 import { testLedgerPoll } from "./ledger-poll.mjs";
 import { testUsageRefresh, testUsageWords } from "./usage-refresh.mjs";
@@ -100,16 +100,20 @@ import { testComposerMenuPosition } from "./composer-menu-position.mjs";
 import { testImeBrokenCommit } from "./ime-broken-commit.mjs";
 import { testImeKoreanRegression } from "./ime-korean-regression.mjs";
 import { testWorkers } from "./workers.mjs";
+import { testSupersededModel } from "./superseded-model.mjs";
 import { testSidebarAgents } from "./sidebar-agents.mjs";
 import { testSidebarReviewState } from "./sidebar-review-state.mjs";
 import { testSidebarLandingState } from "./sidebar-landing-state.mjs";
 import { testSidebarActivity } from "./sidebar-activity.mjs";
 import { testSidebarRoles } from "./sidebar-roles.mjs";
+import { testSidebarTaskFold } from "./sidebar-task-fold.mjs";
 import { testLandingAlerts } from "./landing-alerts.mjs";
 import { testLandCheckLetter } from "./land-check-letter.mjs";
+import { testLandBatch } from "./land-batch.mjs";
 import { testConversationAgents, testConversationFolds, testConversationFont, testConversationKeys, testConversationPaths, testConversationScroll, testConversationFoot, testConversationStatus, testConversationTodos, testConversationImages, testConversationCopies, testConversationShelf, testConversationRelease, testConversationSteps, testConversationCodeColours, testConversationStreamWork, testConversationTypingWork } from "./conversation-parity.mjs";
 import { measureConversation, standingPids } from "./conversation-perf.mjs";
 import { testConversationRedesign } from "./conversation-redesign.mjs";
+import { testConversationSwitch } from "./conversation-switch.mjs";
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
@@ -184,6 +188,7 @@ const artifactGallery = async (page, ok) => {
   await testArtifactChrome(page, ok);
   await testArtifactPages(page, ok);
   await testArtifactFirstScreen(page, ok);
+  await testArtifactWordFacedCards(page, ok);
   await testArtifactRecall(page, ok);
   await testArtifactProvenance(page, ok);
   await testArtifactStudio(page, ok);
@@ -329,6 +334,8 @@ suite("vault", async ({ browser, origin }) => {
   }
 });
 suite("workers", testWorkers);
+// A pane on a release the catalog superseded says so, in one word (t-46882).
+suite("superseded-model", testSupersededModel);
 suite("sidebar-agents", testSidebarAgents);
 // The sidebar tells 작업 중, 검증 대기 and 완료 apart, by the ledger (t-18902).
 suite("sidebar-review-state", testSidebarReviewState);
@@ -337,8 +344,12 @@ suite("sidebar-landing-state", testSidebarLandingState);
 suite("sidebar-activity", testSidebarActivity);
 // Who is the coordinator, a worker or the person, read off the sidebar, the tabs and the desk (t-45938).
 suite("sidebar-roles", testSidebarRoles);
+// One task, one sidebar row: the checkouts a worker cut beside its own fold under it (t-45336).
+suite("sidebar-task-fold", testSidebarTaskFold);
 suite("landing-alerts", testLandingAlerts);
 suite("land-check-letter", testLandCheckLetter);
+// The integration queue's batch card on the desk and its switch in the project settings (t-45315).
+suite("land-batch", testLandBatch);
 /* The conversation view against the Claude Code extension's own webview
  * (t-6323, docs/design/agent-conversation-claude-code-grammar-20260915.md
  * §10): each suite one difference that was closed, read off the laid-out page. */
@@ -372,6 +383,9 @@ suite("conversation-typing-work", ({ browser, origin, ok }) => testConversationT
 /* 사람이 승인한 대화창 (2026-10-02 23:4x, t-22100) — 머리줄·사람의 말·생각·걸음·셸의 첫 줄·울타리·지금
  * 줄·턴 레일·입력창 위 상태 묶음·입력창, 평평하게, 두 테마와 줄인 움직임에서. */
 suite("conversation-redesign", ({ browser, origin, ok }) => testConversationRedesign(browser, origin, ok));
+/* 대화를 바꿨다가 돌아오면 그 화면 그대로, 판의 「대화」는 전사부터(인계 중 보낸 글은 한 번만),
+ * 늦은 첫 읽기는 늦게 한 줄 (t-54304 — Claude·Codex·Dots 역분석에서 가져온 1단계). */
+suite("conversation-switch", ({ browser, origin, ok }) => testConversationSwitch(browser, origin, ok));
 /* 대화 뷰의 무게(t-6323 B0) — 400턴 픽스처 하나의 다섯 수. 이름으로만 돈다
  * (`WINDOW_SUITES=conversation-perf`): 숫자는 그 순간 기계의 부하를 타는
  * 자이지 게이트가 아니다. 전/후 중앙값은 `node ui/tests/conversation-perf.mjs

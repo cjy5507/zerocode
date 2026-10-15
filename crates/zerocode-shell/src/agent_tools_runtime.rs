@@ -369,6 +369,12 @@ pub(super) struct TermWorker {
     /// surface asks the door and seats the pane where the answer says when
     /// the seat acts (`judge_worker_room`); `None` seats it as a tab.
     pub(super) seat: Option<agent_teams::WorkerSeatWords>,
+    /// The model a restoration's launch names, when it names one — what the
+    /// window shows on the pane until its agent says, so a conversation that
+    /// last ran a superseded release does not wear that release's name off
+    /// its transcript while the CLI runs the one the launch named (t-46882).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) model: Option<String>,
 }
 
 /// The window carrying out what a team asked for.
@@ -476,6 +482,22 @@ pub(super) fn remove_automatic_worktree(
     automatic_cleanup_allowed(orchestrator, path)?;
     orchestrator
         .remove(path, Removal::ConfirmedIfClean)
+        .map_err(|error| error.to_string())
+}
+
+/// The same gate for a checkout a worker cut beside its own (t-45336): clean,
+/// owned, unlocked and held — and a detached `HEAD` only while `holder`, the
+/// branch that holds the head the worker handed in, holds its commit too
+/// ([`Orchestrator::remove_held_by`]). Never a forced removal.
+pub(super) fn remove_automatic_held_by(
+    orchestrator: &Orchestrator,
+    held: &CheckoutHeld,
+    holder: &str,
+) -> Result<(), String> {
+    let path = held.path();
+    automatic_cleanup_allowed(orchestrator, path)?;
+    orchestrator
+        .remove_held_by(path, holder)
         .map_err(|error| error.to_string())
 }
 
@@ -1493,6 +1515,7 @@ impl agent_teams::Host for TeamWindow {
                     resumed: restored.map(|one| one.as_str()),
                     helper,
                     seat: seat_words,
+                    model: None,
                 },
             );
         } else {
@@ -1568,6 +1591,7 @@ impl agent_teams::Host for TeamWindow {
         worktree: &str,
         agent: &str,
         resumed: zerocode_core::orchestration::WorkerResume,
+        model: Option<&str>,
     ) {
         let state = self.app.state::<AppState>();
         let Some(parent) = state.pane_parents().get(&term).copied() else {
@@ -1586,6 +1610,7 @@ impl agent_teams::Host for TeamWindow {
                 resumed: Some(resumed.as_str()),
                 helper,
                 seat: None,
+                model: model.map(str::to_string),
             },
         );
     }
@@ -2218,6 +2243,11 @@ pub(super) fn beat_standing_orders(app: &AppHandle) {
         // See [`worktree_reclaim`] for what the pass costs when it finds
         // nothing, which is the reason it can ride a one-second beat at all.
         worktree_reclaim::sweep(&beating, now_ms);
+        // And the checkouts a worker cut beside its own for a task it has handed
+        // in (t-45336) — a red, a verify, an evidence checkout the ledger never
+        // named — judged against the head it handed in. Its own pace: one hand-in
+        // a pass, each looked at once until something it kept is due again.
+        worktree_reclaim::sweep_handed_in(&beating, now_ms);
         // And the ledger's record held against git's, once a minute, from the landing cache the
         // sidebar already keeps (t-34501): what is late is told, nothing is merged or deleted.
         crate::landing_watch_sweep::sweep(&beating, now_ms);

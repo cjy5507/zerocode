@@ -1217,14 +1217,16 @@ pub trait Host {
     /// other hosts owe nothing.
     fn follow_account_switch(&self, _now_ms: i64) {}
 
-    /// Publish a restored worker only after its durable seat has moved. Fake
-    /// hosts need no renderer surface and therefore default to doing nothing.
+    /// Publish a restored worker only after its durable seat has moved, with
+    /// the model its launch named when it named one (t-46882). Fake hosts
+    /// need no renderer surface and therefore default to doing nothing.
     fn announce_reseated_worker(
         &self,
         _term: u32,
         _worktree: &str,
         _agent: &str,
         _resumed: zerocode_core::orchestration::WorkerResume,
+        _model: Option<&str>,
     ) {
     }
 
@@ -1626,7 +1628,8 @@ pub fn run(
         | Effect::WorkerTerminal { .. }
         | Effect::WorktreeEvidence { .. }
         | Effect::WorkerTranscript { .. }
-        | Effect::LandCheck(..) => answer(zerocode_core::agent_teams::Reply::refused(
+        | Effect::LandCheck(..)
+        | Effect::LandBatch(..) => answer(zerocode_core::agent_teams::Reply::refused(
             "the tmux road reads its own panes only",
         )),
         Effect::Focus { term } => {
