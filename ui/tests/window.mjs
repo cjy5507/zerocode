@@ -99,6 +99,7 @@ import { testAnswerDoor } from "./answer-door.mjs";
 import { testExplain } from "./explain.mjs";
 import { testAskPopup } from "./ask-popup.mjs";
 import { testSecretPrompt } from "./secret-prompt.mjs";
+import { testComputerProgress } from "./computer-progress.mjs";
 import { testEditorSelection } from "./editor-selection.mjs";
 import { testEditorRecovery } from "./editor-recovery.mjs";
 import { testComposerAttach } from "./attach.mjs";
@@ -114,6 +115,7 @@ import { testSidebarActivity } from "./sidebar-activity.mjs";
 import { testSidebarRoles } from "./sidebar-roles.mjs";
 import { testSidebarTaskFold } from "./sidebar-task-fold.mjs";
 import { testSidebarTeam } from "./sidebar-team.mjs";
+import { testSidebarScroll } from "./sidebar-scroll.mjs";
 import { testLandingAlerts } from "./landing-alerts.mjs";
 import { testLandCheckLetter } from "./land-check-letter.mjs";
 import { testLandBatch } from "./land-batch.mjs";
@@ -333,6 +335,7 @@ suite("permission-card", ({ browser, origin, ok }) => testPermissionCard(browser
 suite("ask-popup", ({ browser, origin, ok }) => testAskPopup(browser, origin, ok));
 // The secret card: a pane that waits for a password gets a field, typed once (herdr 3, t-26596).
 suite("secret-prompt", ({ browser, origin, ok }) => testSecretPrompt(browser, origin, ok));
+suite("computer-progress", ({ browser, origin, ok }) => testComputerProgress(browser, origin, ok));
 suite("editor-selection", ({ browser, origin, ok }) => testEditorSelection(browser, origin, ok));
 suite("editor-recovery", ({ browser, origin, ok }) => testEditorRecovery(browser, origin, ok));
 suite("ime-broken-commit", ({ browser, origin, ok }) => testImeBrokenCommit(browser, origin, ok));
@@ -362,6 +365,8 @@ suite("sidebar-roles", testSidebarRoles);
 suite("sidebar-task-fold", testSidebarTaskFold);
 // The team view: coordinators, the workers under each, a row a worker's pane (t-56141).
 suite("sidebar-team", testSidebarTeam);
+// The sidebar holds its rows while the person scrolls it, and reaches row 0 in one go (t-63568).
+suite("sidebar-scroll", testSidebarScroll);
 suite("landing-alerts", testLandingAlerts);
 suite("land-check-letter", testLandCheckLetter);
 // The integration queue's batch card on the desk and its switch in the project settings (t-45315).
@@ -49092,12 +49097,14 @@ const sidebarVirtual = await page.evaluate(async () => {
   seen.padCount = pads.length === 2;
   seen.topPadZero = pads[0].getBoundingClientRect().height === 0;
   // 세우지 않은 행의 몫 — 스페이서가 셈하는 그대로: 창을 지나갔다 떠난 행은
-  // 제 실측을 지니고(캐시는 비워지지 않는다), 한 번도 서지 않은 행은 추정치다.
+  // 제 실측을 지니고(캐시는 비워지지 않는다), 한 번도 서지 않은 행은 쉴 때 정한
+  // 셈(sidebarRowGuesses: 같은 꼴로 잰 행들의 평균), 그것도 없으면 추정치다.
   // 실측: 사이드바의 문이 하나 늘자(t-2720 「아티팩트」) 첫 창이 한 행 더
   // 세웠다 되물렸고, 그 한 행의 실측(47.4)과 추정(44)의 차가 이 3px를 넘겼다.
   const unbuilt = flock("va").slice(rowsIn("/tmp/va"));
   const expectedPad = unbuilt.reduce(
-    (sum, worktree) => sum + (sidebarRowHeights.get(worktree.path) ?? SIDEBAR_ROW_ESTIMATE),
+    (sum, worktree) =>
+      sum + (sidebarRowHeights.get(worktree.path) ?? sidebarRowGuesses.get(worktree.path) ?? SIDEBAR_ROW_ESTIMATE),
     0,
   );
   seen.bottomPadStands = Math.abs(pads[1].getBoundingClientRect().height - expectedPad) < 3;
@@ -55288,11 +55295,11 @@ const computerHand = await page.evaluate(async () => {
   const seen = {};
   window.__ANSWER__.computer_stop = () => {
     window.__COMPUTER_STOPPED__ = true;
-    return { stopped: true };
+    return { stopped: true, reason: "window", revision: 2, helperSignalled: false };
   };
   window.__ANSWER__.computer_resume = (args) => {
     window.__COMPUTER_RESUMED__ = args;
-    return { resumed: true };
+    return { resumed: true, revision: 3, stopped: null, helper: "idle" };
   };
   window.__ANSWER__.computer_confirm_answer = (args) => {
     window.__COMPUTER_ANSWER__ = args;
@@ -55306,14 +55313,14 @@ const computerHand = await page.evaluate(async () => {
   const fire = (name, payload) => {
     for (const handler of window.__LISTENERS__[name] ?? []) handler({ payload });
   };
-  fire("computer:activity", { active: true, verb: "mouse-click", actions: 3, stopped: null, hotkey: "control+option+escape" });
+  fire("computer:activity", { revision: 1, active: true, verb: "mouse-click", actions: 3, stopped: null, hotkey: "control+option+escape" });
   await settle();
   seen.bandShown = !el("computer-band").hidden;
   seen.count = el("computer-band-count").textContent;
   el("computer-band-stop").click();
   await settle();
   seen.stopAsked = window.__COMPUTER_STOPPED__ === true;
-  fire("computer:activity", { active: false, verb: "mouse-click", actions: 3, stopped: "window", hotkey: "control+option+escape" });
+  fire("computer:activity", { revision: 2, active: false, verb: "mouse-click", actions: 3, stopped: "window", hotkey: "control+option+escape" });
   await settle();
   seen.resumeShown = !el("computer-band-resume").hidden && el("computer-band-stop").hidden;
   const savedLocale = locale;
