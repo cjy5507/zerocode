@@ -100,16 +100,45 @@ fn visibility_decision_and_bounds_run_together_on_the_native_ui_thread() {
     );
     let wry = block_after(BROWSER, "fn place_native_browser(");
     assert!(wry.contains("pane.with_webview(move |platform|"));
-    assert!(wry.contains(".with_placement(&label, revision, |allowed|"));
+    assert!(wry.contains(".with_placement(&label, revision, watching, |placement|"));
     assert!(wry.find("setHidden: true").unwrap() < wry.find(".with_placement(").unwrap());
     assert!(wry.find("SetIsVisible(false)").unwrap() < wry.find(".with_placement(").unwrap());
     assert!(wry.contains("SetBounds("));
     assert!(wry.contains("setFrame: frame"));
+    // No shield stands over a WebKit or WebView2 pane (t-66513): it is shown
+    // for the person's hand alone, and a watch is refused to the snapshots.
+    assert!(
+        wry.contains("let allowed = placement == crate::browser_workspace::Placement::Control;")
+    );
+    assert!(wry.contains("return Err(WATCH_UNSUPPORTED.to_string());"));
     let cef = block_after(CEF, "fn place(");
     assert!(cef.contains("on_ui(&self.app, &self.label"));
-    assert!(cef.contains(".with_placement(&label, revision, |allowed|"));
+    assert!(cef.contains(".with_placement(&label, revision, watching, |placement|"));
     assert!(cef.find("pane.set_hidden(true)").unwrap() < cef.find(".with_placement(").unwrap());
-    assert!(cef.contains("pane.set_bounds("));
+    // The decision and the pane's frame, shield and showing are one native
+    // operation (t-66513): the moves are staged inside the decision.
+    assert!(
+        cef.find(".with_placement(").unwrap()
+            < cef
+                .find("crate::browser_workspace::stage_pane(&mut stage, placement, bounds, shown)")
+                .unwrap()
+    );
+    let staged = block_after(
+        CEF,
+        "impl crate::browser_workspace::PaneStage for Staged<'_> {",
+    );
+    assert!(staged.contains(".set_bounds(bounds[0], bounds[1], bounds[2], bounds[3])"));
+    assert!(staged.contains("self.pane.shield.raise(view, dress)"));
+    assert!(staged.contains("self.pane.shield.lower();"));
+    assert!(staged.contains("self.pane.set_hidden(false)"));
+    let source = include_str!("../../src/browser_workspace.rs");
+    let stage = block_after(source, "pub(crate) fn stage_pane(");
+    let bounds = stage.find("stage.bounds(bounds)?").unwrap();
+    let shield = stage
+        .find("stage.shield(shown && placement == Placement::Watch)?")
+        .unwrap();
+    let shown = stage.find("stage.show()?").unwrap();
+    assert!(bounds < shield && shield < shown);
 }
 
 #[test]
@@ -189,9 +218,7 @@ fn capture_limits_survive_caller_cancellation_until_the_native_callback_complete
     );
     let capture = block_after(SNAPSHOT, "async fn browser_snapshot_png_for(");
     assert!(
-        capture
-            .find(".begin_snapshot_for(label, spectator)")
-            .unwrap()
+        capture.find(".lease_frame(label, spectator)").unwrap()
             < capture
                 .find("snapshot_leased(pane, frame, Default::default())")
                 .unwrap()
@@ -263,7 +290,14 @@ fn original_revision_admission_and_observation_completion_share_backend_state() 
         source.contains("fn finish_observation("),
         "a read needs a checked completion"
     );
-    let completion = block_after(source, "fn finish_observation(");
+    // A look that lifts a pause completes under the person's stop's own lock
+    // (t-66200); every look completes through the one checked body.
+    let finishing = block_after(source, "fn finish_observation(");
+    assert!(
+        finishing.contains("unless_persons_stop(|| self.observed())")
+            && finishing.contains("self.observed()")
+    );
+    let completion = block_after(source, "fn observed(");
     for guard in [
         "state.closed",
         "state.revision",
@@ -440,7 +474,9 @@ fn only_a_refusal_before_dispatch_is_known_to_have_no_effect() {
     }
     let fill = arm(dispatch, "(\"fill\", _) =>", "(\"screenshot\", _) =>");
     assert!(fill.contains("page_refused(&label, words)"));
-    assert!(fill.contains("return browser_refused(format!(\"zerocode-browser: {words}\"));"));
+    // A form other than the one read is the executor's own refusal, unsent
+    // (t-66200): the arm infers nothing from the report.
+    assert!(!fill.contains("report.stale"));
     let usage = &dispatch[dispatch.rfind("_ => ").unwrap()..];
     assert!(usage.starts_with("_ => refused_unsent("));
     assert!(usage.contains("zerocode_core::agent_browser::usage()"));
@@ -692,9 +728,13 @@ fn an_executors_refusal_before_its_first_send_keeps_control_and_one_after_it_doe
         .find("pane().map_err(BrowserRefusal::Unsent)?")
         .unwrap();
     let sent = sending
-        .find("send(checked, pane).await.map_err(BrowserRefusal::Sent)")
+        .find("send(checked, pane).await.map_err(Into::into)")
         .unwrap();
     assert!(checked < minted && minted < sent);
+    // A send's failure said only in words is `Sent`: only a refusal that
+    // names itself `Unsent` keeps the tab in its agent's hands (t-66200).
+    let words = block_after(BROWSER, "impl From<String> for BrowserRefusal {");
+    assert!(words.contains("Self::Sent(why)") && !words.contains("Unsent"));
     let form = include_str!("../../src/cmd/browser/form.rs");
     for (source, executor) in [
         (BROWSER, "async fn automate_click("),
@@ -777,4 +817,194 @@ fn an_executors_refusal_before_its_first_send_keeps_control_and_one_after_it_doe
     let missing = found.find("Ok(None) => browser_refused(").unwrap();
     assert!(whole < missing);
     assert!(!found.contains("\"count\": 0") && !found.contains("unwrap_or"));
+}
+
+/// An input script's body, from its opener to the raw string's end.
+fn raw_body<'a>(source: &'a str, opens: &str) -> &'a str {
+    let start = source
+        .find(opens)
+        .unwrap_or_else(|| panic!("`{opens}` is gone"));
+    let rest = &source[start..];
+    &rest[..rest
+        .find("\"#;")
+        .unwrap_or_else(|| panic!("`{opens}` never closes"))]
+}
+
+/// A page refusal is `Unsent` only by a code its script answers before its
+/// first event (t-66200): in each input body every refusal before the first
+/// statement that sends the page anything — a code, or the selector's own —
+/// is in the table, and no refusal after it names one. Bringing a control
+/// into view is not sending it an event; a scroll's own move is its first.
+#[test]
+fn a_pages_unsent_refusals_come_before_its_first_event() {
+    let table = block_after(BROWSER, "pub(crate) const UNSENT_PAGE_CODES:");
+    let unsent: Vec<&str> = table
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.trim().strip_prefix('"')?.strip_suffix("\","))
+        .collect();
+    assert!(
+        unsent.contains(&"element_obscured") && unsent.len() == 12,
+        "{unsent:?}"
+    );
+    for (opens, sends) in [
+        (
+            "pub(crate) const CLICK_BODY: &str",
+            &["dispatchEvent(", ".focus(", ".click()"][..],
+        ),
+        (
+            "pub(crate) const TYPE_BODY: &str",
+            &[
+                "dispatchEvent(",
+                ".focus(",
+                "execCommand(",
+                ".select()",
+                ".selected = true",
+                ".set.call(",
+                "textContent =",
+            ][..],
+        ),
+        (
+            "const BROWSER_SCROLL_BODY: &str",
+            &["scrollIntoView(", "scrollTo(", "scrollBy("][..],
+        ),
+    ] {
+        let script = raw_body(BROWSER, opens);
+        let first = sends
+            .iter()
+            .filter_map(|send| script.find(send))
+            .min()
+            .unwrap_or_else(|| panic!("{opens} sends nothing"));
+        let (before, after) = script.split_at(first);
+        let refusals = before
+            .split("zcFail(")
+            .skip(1)
+            .map(|rest| rest.split(')').next().unwrap_or_default().trim_matches('"'));
+        for refusal in refusals {
+            assert!(
+                refusal == "selected.code" || unsent.contains(&refusal),
+                "{opens}: `{refusal}` before the first event is not in the table"
+            );
+        }
+        for code in &unsent {
+            assert!(
+                !after.contains(&format!("zcFail(\"{code}\")")),
+                "{opens}: `{code}` is answered after the first event"
+            );
+        }
+    }
+}
+
+/// What an executor refused before it sent anything it says `Unsent` itself
+/// (t-66200) — a mark whose pin broke on the read-only re-measure, a form a
+/// fill wrote nothing to, the keys held at a password field — and every input
+/// road judges the page's answer by the one table.
+#[test]
+fn an_executor_says_unsent_for_what_it_refused_before_sending() {
+    let form = include_str!("../../src/cmd/browser/form.rs");
+    let marked = block_after(BROWSER, "async fn press_mark(");
+    let pinned = &marked[marked.find("look_still_holds(&mark").unwrap()
+        ..marked.find("press(&pane, &mark.selector").unwrap()];
+    assert!(pinned.contains(".map_err(|error| BrowserRefusal::Unsent(error.message))?"));
+    let fill = block_after(form, "pub(crate) async fn automate_fill(");
+    let stale = &fill[fill.find("if report.stale").unwrap()..fill.find("report.against(").unwrap()];
+    assert!(
+        stale.contains("return Err(BrowserRefusal::Unsent("),
+        "{stale}"
+    );
+    let typed = block_after(BROWSER, "pub(crate) fn typed_report(");
+    let held = typed.find("SecretEntryVerdict::PersonsEntry {").unwrap();
+    assert!(typed[held..].starts_with("SecretEntryVerdict::PersonsEntry {\n            return Err(BrowserRefusal::Unsent(page_failure("));
+    for executor in [
+        "async fn press(",
+        "pub(crate) async fn automate_type(",
+        "pub(crate) async fn automate_scroll(",
+    ] {
+        let body = block_after(BROWSER, executor);
+        assert!(
+            body.contains("input_value(reply)?") && !body.contains("page_value(reply)"),
+            "{executor}"
+        );
+    }
+}
+
+/// Who lifts a paused work browser rides every refusal an agent hears
+/// (t-66200): the backend says `workspace_paused` only through its one
+/// formatter, which carries `[resume=…]`, and the door answers a work
+/// browser's refusals — a look's completion's too — through `door_refused`,
+/// which moves the word into `error.resume` for a `--json` call.
+#[test]
+fn every_paused_refusal_names_who_lifts_it() {
+    let source = include_str!("../../src/browser_workspace.rs");
+    let production = &source[source.find("const WORKSPACE_CAP").unwrap()
+        ..source.find("mod review_regressions").unwrap()];
+    assert!(
+        !production.contains("\"workspace_paused"),
+        "a paused refusal written by hand carries no resume word"
+    );
+    let formatter = block_after(production, "fn paused(");
+    assert!(formatter.contains("{WORKSPACE_PAUSED}[resume={}]: "));
+    let answer = block_after(RUNTIME, "async fn answer_browser_command(");
+    assert_eq!(
+        answer.matches("door_refused(argv, &error)").count(),
+        4,
+        "the door's three refusals and a look's completion: {answer}"
+    );
+    let door = block_after(RUNTIME, "pub(super) fn door_refused(");
+    for piece in [
+        "paused_resume(error)",
+        "if answers_json(argv)",
+        "\"resume\": resume",
+    ] {
+        assert!(door.contains(piece), "{piece}");
+    }
+    assert!(
+        block_after(RUNTIME, "pub(super) fn stamp_browser_observation(")
+            .contains("answers_json(argv)")
+    );
+}
+
+/// The session's regrant is the bar's (t-66200): only the bar's own
+/// 「다시 맡기기」 asks for it — the band's resume hands back without it — the
+/// chip shows what the backend says, its off switch is one command of its
+/// own, and the backend keeps it with the tab alone.
+#[test]
+fn the_sessions_regrant_is_turned_on_by_the_bars_hand_back_alone() {
+    let browser = include_str!("../../../../ui/shell-browser.js");
+    let asking = block_after(browser, "async function setBrowserWorkspaceMode(");
+    assert!(asking.contains("...(regrant && mode === \"agent\" ? { regrant: true } : {}),"));
+    assert!(browser.contains(
+        "else void setBrowserWorkspaceMode(tab, name === \"pause\" ? \"paused\" : name, { regrant: name === \"agent\" });"
+    ));
+    let resume = block_after(browser, "function resumeAgentBrowserWorkspaces(");
+    assert!(
+        !resume.contains("regrant"),
+        "the band's resume hands back without the regrant"
+    );
+    let chip = block_after(browser, "function paintBrowserWorkspaceRegrant(");
+    assert!(chip.contains("row.hidden = tab.workspace?.regrant !== true;"));
+    assert_eq!(
+        browser
+            .matches("invoke(\"end_browser_workspace_regrant\"")
+            .count(),
+        1
+    );
+    let command = block_after(CONTROL, "async fn set_browser_workspace_mode(");
+    assert!(command.contains(".regranting(regrant == Some(true))"));
+    let ending = block_after(CONTROL, "pub(crate) fn end_browser_workspace_regrant(");
+    assert!(
+        ending.contains("from_the_main_webview(&webview)?")
+            && ending.contains(".end_regrant(&label)?")
+    );
+    let main = include_str!("../../src/main.rs");
+    assert!(main.contains("cmd::browser_workspace::end_browser_workspace_regrant,"));
+    let source = include_str!("../../src/browser_workspace.rs");
+    let finishing = block_after(
+        source,
+        "pub(crate) fn finish(mut self) -> Result<Snapshot, String> {",
+    );
+    assert!(
+        finishing.contains("Mode::Agent => state.regrant |= self.regrant,")
+            && finishing.contains("Mode::Human => state.regrant = false,")
+    );
 }

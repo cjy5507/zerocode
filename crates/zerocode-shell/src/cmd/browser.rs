@@ -339,18 +339,28 @@ impl From<BrowserRefusal> for String {
     }
 }
 
-pub(crate) async fn send_after_checks<C, P, T, F, Fut>(
+/// A send's failure said only in words may have come after the page was sent
+/// something: it is `Sent`. Only a refusal that names itself `Unsent` keeps
+/// the tab in its agent's hands (t-66200).
+impl From<String> for BrowserRefusal {
+    fn from(why: String) -> Self {
+        Self::Sent(why)
+    }
+}
+
+pub(crate) async fn send_after_checks<C, P, T, E, F, Fut>(
     checked: Result<C, String>,
     pane: impl FnOnce() -> Result<P, String>,
     send: F,
 ) -> Result<T, BrowserRefusal>
 where
     F: FnOnce(C, P) -> Fut,
-    Fut: std::future::Future<Output = Result<T, String>>,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: Into<BrowserRefusal>,
 {
     let checked = checked.map_err(BrowserRefusal::Unsent)?;
     let pane = pane().map_err(BrowserRefusal::Unsent)?;
-    send(checked, pane).await.map_err(BrowserRefusal::Sent)
+    send(checked, pane).await.map_err(Into::into)
 }
 
 pub(crate) const NAVIGATION_SUPERSEDED: &str =
@@ -892,6 +902,46 @@ pub(crate) fn page_value(reply: serde_json::Value) -> Result<serde_json::Value, 
         .unwrap_or(serde_json::Value::Null))
 }
 
+/// The codes an input script answers before it sends the page any event
+/// (t-66200): a selector or a frame it cannot use, a control hidden,
+/// covered, disabled or not one to write in, a text too long for it, a look
+/// the page has moved on from. Every body that answers one returns it before
+/// its first event — a source contract holds `CLICK_BODY`, `TYPE_BODY` and
+/// `BROWSER_SCROLL_BODY` to that; any other failure (the script's own throw,
+/// an option missing after the focus, an input the page cancelled) may come
+/// after an event the page already heard.
+pub(crate) const UNSENT_PAGE_CODES: [&str; 12] = [
+    "invalid_selector",
+    "selector_not_found",
+    "element_not_visible",
+    "element_obscured",
+    "element_disabled",
+    "element_read_only",
+    "element_not_editable",
+    "text_too_long",
+    "frame_sealed",
+    "form_stale",
+    "document_replaced",
+    "value_changed",
+];
+
+/// An input script's answer: its value, or its refusal — `Unsent` for a
+/// code it answers before its first event ([`UNSENT_PAGE_CODES`]), `Sent`
+/// for any other (t-66200).
+pub(crate) fn input_value(reply: serde_json::Value) -> Result<serde_json::Value, BrowserRefusal> {
+    let unsent = reply
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|code| UNSENT_PAGE_CODES.contains(&code));
+    page_value(reply).map_err(|why| {
+        if unsent {
+            BrowserRefusal::Unsent(why)
+        } else {
+            BrowserRefusal::Sent(why)
+        }
+    })
+}
+
 pub(crate) fn input_report(
     value: serde_json::Value,
     expected: &[&str],
@@ -963,7 +1013,7 @@ pub(crate) fn input_report(
 pub(crate) fn typed_report(
     value: serde_json::Value,
     road: TypeRoad,
-) -> Result<BrowserInputReport, String> {
+) -> Result<BrowserInputReport, BrowserRefusal> {
     use zerocode_core::computer_use_protocol::validate::{
         SecretEntryFacts, SecretEntryVerdict, secret_entry,
     };
@@ -980,13 +1030,15 @@ pub(crate) fn typed_report(
             secure_input_by_receiver: false,
             focus_read: true,
         });
+        // The keys road held its keys at a password field and said so before
+        // its first event: the page was sent nothing (t-66200).
         if verdict == SecretEntryVerdict::PersonsEntry {
-            return Err(page_failure(
+            return Err(BrowserRefusal::Unsent(page_failure(
                 &serde_json::json!({ "code": verdict.as_str() }),
-            ));
+            )));
         }
     }
-    input_report(value, road.methods())
+    input_report(value, road.methods()).map_err(BrowserRefusal::Sent)
 }
 
 pub(crate) fn checked_selector(selector: &str) -> Result<(), String> {
@@ -1838,6 +1890,7 @@ fn open_webkit_browser_pane(
             &label,
             [x, y, width.max(1.0), height.max(1.0)],
             false,
+            None,
             Some(workspace.revision),
         ) {
             let _ = pane.close();
@@ -2338,10 +2391,25 @@ pub(crate) fn browser_stop(
     super::browser_workspace::finish_person_control(operation, result)
 }
 
+/// What a watch placement dresses the shield in (t-66513): the shield's own
+/// dress where it stands — a Chromium pane on macOS — and elsewhere anything
+/// at all, since a pane without a shield only hears that the person watches,
+/// and refuses it: watching there is the snapshots'.
+#[cfg(all(target_os = "macos", feature = "chromium-browser"))]
+type WatchDress = crate::chromium_browser::shield::Dress;
+#[cfg(not(all(target_os = "macos", feature = "chromium-browser")))]
+type WatchDress = serde::de::IgnoredAny;
+
+/// A watch placement on a pane no shield can stand over (t-66513).
+pub(crate) const WATCH_UNSUPPORTED: &str =
+    "workspace_watch_unsupported: 이 브라우저 판은 실시간 관전을 지원하지 않습니다";
+
 /// Where the pane sits and whether it may be seen — ONE command, because the
 /// two answers race as two: a hide that lost the queue to an older show put
 /// the page back on top of a dialog (gpt-sol review of 1-fy, finding 8). A
 /// native view does not follow CSS, so this command IS its layout engine.
+/// `watch` asks to show the pane for the person's eyes only, under the shield
+/// it dresses (t-66513).
 #[tauri::command(async)]
 #[allow(clippy::too_many_arguments)] // Tauri command arguments are the public IPC wire.
 pub(crate) fn browser_place(
@@ -2354,6 +2422,7 @@ pub(crate) fn browser_place(
     width: f64,
     height: f64,
     shown: bool,
+    watch: Option<WatchDress>,
 ) -> Result<(), String> {
     from_the_main_webview(&webview)?;
     let pane = browser_pane_of(&app, &state, &label)?;
@@ -2367,6 +2436,14 @@ pub(crate) fn browser_place(
     if !shown {
         return hide_browser_pane(&pane, &webview);
     }
+    #[cfg(all(target_os = "macos", feature = "chromium-browser"))]
+    let watch = match watch.map(WatchDress::checked).transpose() {
+        Ok(watch) => watch,
+        Err(error) => {
+            hide_browser_pane(&pane, &webview)?;
+            return Err(error);
+        }
+    };
     place_native_browser(
         &app,
         &pane,
@@ -2374,10 +2451,12 @@ pub(crate) fn browser_place(
         &label,
         [x, y, width, height],
         shown,
+        watch,
         revision,
     )
 }
 
+#[allow(clippy::too_many_arguments)] // The placement's whole question, in one native operation.
 fn place_native_browser(
     app: &AppHandle,
     pane: &BrowserPane,
@@ -2385,6 +2464,7 @@ fn place_native_browser(
     label: &str,
     bounds: [f64; 4],
     shown: bool,
+    watch: Option<WatchDress>,
     revision: Option<u64>,
 ) -> Result<(), String> {
     let size_limit = f64::from(zerocode_core::agent_browser::VIEWPORT_MAX);
@@ -2405,14 +2485,19 @@ fn place_native_browser(
     #[cfg(all(target_os = "macos", feature = "chromium-browser"))]
     {
         let _ = (app, label);
-        pane.place(bounds, shown, revision, main_webview.clone())
+        pane.place(bounds, shown, watch, revision, main_webview.clone())
     }
     #[cfg(not(all(target_os = "macos", feature = "chromium-browser")))]
     {
+        let watching = watch.is_some();
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let state = app.state::<AppState>();
             let _ = (main_webview, revision);
+            if watching {
+                let _ = pane.hide();
+                return Err(WATCH_UNSUPPORTED.to_string());
+            }
             if state
                 .shell_runtime()
                 .browser_workspaces
@@ -2486,7 +2571,10 @@ fn place_native_browser(
                         .state::<AppState>()
                         .shell_runtime()
                         .browser_workspaces
-                        .with_placement(&label, revision, |allowed| {
+                        .with_placement(&label, revision, watching, |placement| {
+                            // No shield stands over this engine's pane: it is
+                            // shown for the person's hand alone.
+                            let allowed = placement == crate::browser_workspace::Placement::Control;
                             let visible = shown && allowed;
                             #[cfg(target_os = "macos")]
                             unsafe {
@@ -2540,6 +2628,9 @@ fn place_native_browser(
                                         .SetIsVisible(true)
                                         .map_err(|error| error.to_string())?;
                                 }
+                            }
+                            if shown && placement == crate::browser_workspace::Placement::Watch {
+                                return Err(WATCH_UNSUPPORTED.to_string());
                             }
                             if shown && !allowed {
                                 return Err(
@@ -2845,14 +2936,14 @@ pub(crate) async fn automate_scroll(
         |request, pane| async move {
             let script = automation_script(&request, BROWSER_SCROLL_BODY);
             let reply = page_json(&pane, script, BROWSER_CALLBACK_DEADLINE).await?;
-            let value = page_value(reply)?;
+            let value = input_value(reply)?;
             let axis = |name: &str| {
                 value
                     .get(name)
                     .and_then(serde_json::Value::as_i64)
                     .ok_or_else(|| "스크롤 좌표를 읽을 수 없습니다".to_string())
             };
-            Ok::<_, String>((axis("x")?, axis("y")?))
+            Ok::<_, BrowserRefusal>((axis("x")?, axis("y")?))
         },
     )
     .await
@@ -3673,13 +3764,15 @@ pub(crate) async fn automate_click(
 /// The one press: the click's page script by a selector, answered as the
 /// door's report. A press by number hands it what its look read (`expect`:
 /// the document, the value's digest, the settle's watch), for the page to
-/// prove at the moment of the press.
+/// prove at the moment of the press. A refusal the page made before the
+/// press's first event is `Unsent` (t-66200). A press the page measured moves
+/// the shield's mark there, for the person watching the pane (t-66513).
 async fn press(
     pane: &BrowserPane,
     selector: &str,
     expect: Option<serde_json::Value>,
-) -> Result<BrowserInputReport, String> {
-    checked_selector(selector)?;
+) -> Result<BrowserInputReport, BrowserRefusal> {
+    checked_selector(selector).map_err(BrowserRefusal::Unsent)?;
     let mut request = serde_json::json!({ "selector": selector, "blockRoots": block_roots() });
     let body = match expect {
         Some(expect) => {
@@ -3694,7 +3787,13 @@ async fn press(
         BROWSER_CALLBACK_DEADLINE,
     )
     .await?;
-    input_report(page_value(reply)?, &["dom-activation"])
+    let report =
+        input_report(input_value(reply)?, &["dom-activation"]).map_err(BrowserRefusal::Sent)?;
+    #[cfg(all(target_os = "macos", feature = "chromium-browser"))]
+    if let (Some(rect), Some(dpr)) = (report.rect, report.dpr) {
+        pane.mark_press(rect, dpr);
+    }
+    Ok(report)
 }
 
 /// The click's page script: the first element the selector names that a
@@ -4640,14 +4739,17 @@ async fn press_mark(
                 .map_err(|_| "재측정 결과를 읽을 수 없습니다".to_string())?;
             let context: BrowserRemeasureContext = serde_json::from_value(value)
                 .map_err(|_| "재측정 결과를 읽을 수 없습니다".to_string())?;
-            look_still_holds(&mark, &pin, &now, &context).map_err(|error| error.message)?;
+            // The pin refused on a read-only re-measure: nothing was pressed
+            // (t-66200).
+            look_still_holds(&mark, &pin, &now, &context)
+                .map_err(|error| BrowserRefusal::Unsent(error.message))?;
             let expect = serde_json::json!({
                 "epoch": pin.document_epoch,
                 "value": pin.value_digest,
                 "watch": settle_watch(),
             });
             let report = press(&pane, &mark.selector, Some(expect)).await?;
-            Ok::<_, String>(PressedMark {
+            Ok::<_, BrowserRefusal>(PressedMark {
                 pane,
                 pin,
                 marks,
@@ -4922,7 +5024,7 @@ pub(crate) async fn automate_type(
             }
             let script = form::form_script(&held, TYPE_BODY);
             let reply = page_json(&pane, script, BROWSER_CALLBACK_DEADLINE).await?;
-            typed_report(page_value(reply)?, road)
+            typed_report(input_value(reply)?, road)
         },
     )
     .await
