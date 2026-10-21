@@ -16,8 +16,8 @@ use serde::Serialize;
 use zerocode_core::orchestration::evidence::{TaskHandIn, hand_in_of};
 use zerocode_core::orchestration::task_cost::TaskCost;
 use zerocode_core::orchestration::{
-    Closure, Delivery, Ledger, Message, MessageKind, Run, Task, TaskStatus, WorkProgress,
-    WorkStage, WorktreeRoom, worktree_room,
+    Closure, Delivery, Gate, GateStatus, LEDGER_ITSELF, Ledger, Message, MessageKind, Run, Task,
+    TaskStatus, WorkProgress, WorkStage, WorktreeRoom, worktree_room,
 };
 use zerocode_core::plain_text::TextLint;
 
@@ -475,6 +475,11 @@ pub(crate) struct DeskTask {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) stage: &'static str,
+    /// The task this one was written under (`task-create --parent`) and that
+    /// task's name: the goal the board's 「지금 도는 일」 folds its rows under
+    /// (t-67607). `None` for a task written at the top.
+    pub(crate) parent: Option<String>,
+    pub(crate) parent_title: Option<String>,
     /// The decision standing in front of it, oldest first
     /// (`Run::pending_gate_on`).
     pub(crate) gate: Option<DeskGate>,
@@ -508,12 +513,148 @@ pub(crate) struct DeskTask {
     /// sends, and read once for a completed task, whose stage it decides.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) progress: Option<WorkProgress>,
+    /// When its work moved (t-67482): the task board's schedule draws the row
+    /// on the time axis from these. Asked of the rows the desk sends; `None`
+    /// for a task nobody has carried yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) times: Option<TaskTimes>,
+}
+
+/// When a task's work moved, as the ledger keeps it: its first attempt's
+/// start, the newest attempt that ended handing its work in (`worker_done`),
+/// the coordinator's first `verified` of the review that stands, and its
+/// landing — the completion the coordinator wrote over a verified, merged
+/// review ([`Run::completion_ms`]). Each is `None` until it happened.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct TaskTimes {
+    pub(crate) started_ms: Option<i64>,
+    pub(crate) handed_ms: Option<i64>,
+    pub(crate) verified_ms: Option<i64>,
+    pub(crate) landed_ms: Option<i64>,
+}
+
+/// A task's times, read off its attempts and its review — the readings the
+/// cost (`task_cost::attempts`) and the stage (`Run::review_of`) already use.
+fn task_times(run: &Run, task: &Task) -> Option<TaskTimes> {
+    let attempts = zerocode_core::orchestration::task_cost::attempts(run, &task.id);
+    let started_ms = attempts.iter().map(|attempt| attempt.started_ms).min()?;
+    let review = run.review_of(task);
+    Some(TaskTimes {
+        started_ms: Some(started_ms),
+        handed_ms: attempts
+            .iter()
+            .filter(|attempt| attempt.succeeded == Some(true))
+            .filter_map(|attempt| attempt.ended_ms)
+            .max(),
+        verified_ms: review.verified_ms.filter(|_| review.verified),
+        landed_ms: run.completion_ms(task),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct DeskGate {
     pub(crate) id: String,
+    /// The decision in the asker's words — for a hold, the ledger's own
+    /// English sentence, which the board keeps behind 「원문 보기」.
     pub(crate) question: String,
+    /// What kind of decision this is, so the board can say it in the
+    /// person's language (t-67607) rather than print the ledger's sentence:
+    /// `asked` — somebody put it in front of the task, in their own words;
+    /// `unexamined` — the ledger holds the task for a worker that exited
+    /// before reporting, and nobody has looked at its checkout yet; or what
+    /// the window found once it looked (`unlanded`, `uncommitted`,
+    /// `unknown` — `zerocode_core::orchestration::Examined`).
+    pub(crate) kind: &'static str,
+    /// The answers its asker offered (`gate-create --options`), as advice:
+    /// the board draws each as a button beside a free answer.
+    pub(crate) options: Vec<String>,
+    /// The worker the ledger holds the task for, and that worker's checkout.
+    pub(crate) worker: Option<String>,
+    pub(crate) checkout: Option<String>,
+    /// The window's reading of that checkout as the ledger mailed it
+    /// (`checkoutExamined`): the branch, base and commits left unlanded, the
+    /// changes left uncommitted, or why it could not tell.
+    pub(crate) examined: Option<serde_json::Value>,
+}
+
+/// The two answers a hold takes from the board (t-67607), in the ledger's own
+/// words: 거두기 lands what the worker left and frees the task, 다시 띄우기
+/// hands the task out afresh. The words are the core's, never a copy.
+pub(crate) const HOLD_ACTS: [(&str, &str); 2] = [
+    ("harvest", zerocode_core::orchestration::HARVEST),
+    ("dispatch", zerocode_core::orchestration::DISPATCH_AGAIN),
+];
+
+/// The window's last reading of each held checkout, by the gate that holds
+/// it (t-67607). The ledger mails that reading to the run's home in its own
+/// voice — a status carrying `checkoutExamined` beside `gateId`
+/// (`Ledger::checkout_examined`) — and rewrites the gate's question as prose,
+/// so the letter is the one structured copy. Read only for a run with a hold
+/// standing; letters are oldest first, so the newest reading wins.
+fn examined_holds(run: &Run) -> HashMap<String, serde_json::Value> {
+    let mut held = HashMap::new();
+    let holding = run
+        .gates
+        .iter()
+        .any(|gate| gate.status == GateStatus::Pending && gate.held_for.is_some());
+    if !holding {
+        return held;
+    }
+    for message in run.messages() {
+        if message.kind != MessageKind::Status || message.from != LEDGER_ITSELF {
+            continue;
+        }
+        let body = message.body.as_str();
+        if !body.contains("\"checkoutExamined\"") {
+            continue;
+        }
+        let Ok(said) = serde_json::from_str::<serde_json::Value>(body) else {
+            continue;
+        };
+        if let (Some(gate), Some(examined)) =
+            (said["gateId"].as_str(), said.get("checkoutExamined"))
+        {
+            held.insert(gate.to_string(), examined.clone());
+        }
+    }
+    held
+}
+
+/// One standing decision as the board draws it: its kind, and for a hold the
+/// worker, its checkout and what the window found there.
+fn desk_gate(run: &Run, gate: &Gate, examined: &HashMap<String, serde_json::Value>) -> DeskGate {
+    let reading = gate
+        .held_for
+        .as_ref()
+        .and_then(|_| examined.get(&gate.id))
+        .cloned();
+    let kind = match (
+        gate.held_for.as_ref(),
+        reading.as_ref().and_then(|said| said["kind"].as_str()),
+    ) {
+        (None, _) => "asked",
+        (Some(_), None) => "unexamined",
+        (Some(_), Some("unlanded")) => "unlanded",
+        (Some(_), Some("uncommitted")) => "uncommitted",
+        (Some(_), Some(_)) => "unknown",
+    };
+    DeskGate {
+        id: gate.id.clone(),
+        question: gate.question.as_str().to_string(),
+        kind,
+        options: gate
+            .options
+            .iter()
+            .map(|option| option.as_str().to_string())
+            .collect(),
+        checkout: gate
+            .held_for
+            .as_deref()
+            .and_then(|worker| run.worker(worker))
+            .and_then(|seat| seat.checkout.clone()),
+        worker: gate.held_for.clone(),
+        examined: reading,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -620,7 +761,9 @@ const fn completed_stage(work: WorkStage) -> &'static str {
     }
 }
 
-fn stage_of(run: &Run, task: &Task) -> &'static str {
+/// A task's one stage word ([`STAGES`]) — the reading the desk, the board and
+/// the artifact tab's flow (t-68458) all draw, so no surface keeps a second one.
+pub(crate) fn stage_of(run: &Run, task: &Task) -> &'static str {
     staged(run, task).0
 }
 
@@ -688,6 +831,7 @@ pub(crate) fn desk_snapshot(
         let live = run.coordinator_live();
         let term = live.and_then(|held| seat_term(&held.seat));
         let tasks_before = staged_tasks.len();
+        let examined = examined_holds(run);
         for task in &run.tasks {
             let (stage, progress) = staged(run, task);
             staged_tasks.push((
@@ -698,11 +842,16 @@ pub(crate) fn desk_snapshot(
                     id: task.id.clone(),
                     title: task.display_name().to_string(),
                     stage,
+                    parent: task.parent.clone(),
+                    parent_title: task
+                        .parent
+                        .as_deref()
+                        .and_then(|parent| run.task(parent))
+                        .map(|parent| parent.display_name().to_string()),
                     progress,
-                    gate: run.pending_gate_on(&task.id).map(|gate| DeskGate {
-                        id: gate.id.clone(),
-                        question: gate.question.as_str().to_string(),
-                    }),
+                    gate: run
+                        .pending_gate_on(&task.id)
+                        .map(|gate| desk_gate(run, gate, &examined)),
                     blocked_by: run.blocked_by(task),
                     closed: task.closed.clone(),
                     created_ms: task.created_ms,
@@ -710,6 +859,7 @@ pub(crate) fn desk_snapshot(
                     writing: None,
                     kept: None,
                     hand_in: TaskHandIn::default(),
+                    times: None,
                 },
             ));
         }
@@ -756,6 +906,7 @@ pub(crate) fn desk_snapshot(
             cost: finished.then(|| cost(run, task)),
             hand_in: hand_in_of(run, task),
             progress: row.progress.clone().or_else(|| Some(run.progress_of(task))),
+            times: task_times(run, task),
             ..row.clone()
         }));
     }
@@ -872,6 +1023,97 @@ pub(crate) fn acknowledge(
         now_ms,
     )?;
     Ok(serde_json::json!({ "acknowledged": delivery }))
+}
+
+/// Answer a decision from the board (t-67607), as `run_id`'s coordinator seat
+/// — the ledger's `gate-resolve`. A hold the ledger opened takes one of the
+/// two answers the ledger itself offers ([`HOLD_ACTS`]); a decision somebody
+/// put in front of a task takes the person's own words (`answer`), since its
+/// resolution is free text by design. Any other act is refused here rather
+/// than sent. Only on the person's press; the answer the ledger gives back is
+/// what the row shows.
+pub(crate) fn resolve_hold(
+    run_id: &str,
+    gate: &str,
+    act: &str,
+    answer: Option<&str>,
+    retry_request: &str,
+    now_ms: i64,
+) -> Result<serde_json::Value, String> {
+    if retry_request.trim().is_empty() {
+        return Err("retryRequest is required".into());
+    }
+    let resolution = if act == "answer" {
+        answer
+            .map(str::trim)
+            .filter(|words| !words.is_empty())
+            .ok_or("an answer needs words")?
+    } else {
+        HOLD_ACTS
+            .iter()
+            .find(|(name, _)| *name == act)
+            .map(|(_, words)| *words)
+            .ok_or_else(|| format!("a hold takes harvest or dispatch, not {act:?}"))?
+    };
+    as_the_coordinator(
+        run_id,
+        [
+            "gate-resolve",
+            "--run",
+            run_id,
+            "--gate",
+            gate,
+            "--resolution",
+            resolution,
+            "--retry-request",
+            retry_request,
+        ]
+        .map(str::to_string)
+        .to_vec(),
+        now_ms,
+    )
+}
+
+/// Pass a reported task from the board (t-67607, 「통과」 on a 검토 row), as
+/// `run_id`'s coordinator seat — the ledger's `task-update` with a verified
+/// review that names the attempt and the source the board drew. The ledger
+/// refuses the pass when either has moved since, which is what keeps a press
+/// from passing work that changed after the person read it.
+pub(crate) fn pass_review(
+    run_id: &str,
+    task: &str,
+    attempt: &str,
+    source: &str,
+    retry_request: &str,
+    now_ms: i64,
+) -> Result<serde_json::Value, String> {
+    if retry_request.trim().is_empty() {
+        return Err("retryRequest is required".into());
+    }
+    if attempt.trim().is_empty() || source.trim().is_empty() {
+        return Err("a pass names the attempt and the source it read".into());
+    }
+    as_the_coordinator(
+        run_id,
+        [
+            "task-update",
+            "--run",
+            run_id,
+            "--task",
+            task,
+            "--result",
+            r#"{"verified":true}"#,
+            "--attempt",
+            attempt,
+            "--source",
+            source,
+            "--retry-request",
+            retry_request,
+        ]
+        .map(str::to_string)
+        .to_vec(),
+        now_ms,
+    )
 }
 
 /// The machine strip's one answer: what `df -g`, `uptime` and `simctl` told a
@@ -2228,6 +2470,108 @@ mod tests {
         );
     }
 
+    /// A hold the ledger opened for a worker that exited before reporting
+    /// reaches the board as its kind and its facts, not only as the ledger's
+    /// English sentence (t-67607): `unexamined` with the worker and its
+    /// checkout first, then what the window found there, read off the
+    /// ledger's own `checkoutExamined` letter. A gate somebody opened is
+    /// `asked`, and its words are the asker's.
+    #[test]
+    fn a_hold_reaches_the_board_as_its_kind_and_its_facts() {
+        use zerocode_core::orchestration::Examined;
+
+        let mut ledger = Ledger::new();
+        let run = ledger.create_run("holds", 1);
+        let held = ledger
+            .create_task(&run, "do held".to_string(), "held".into(), vec![], None, 10)
+            .expect("a task");
+        let asked = ledger
+            .create_task(
+                &run,
+                "do asked".to_string(),
+                "asked".into(),
+                vec![],
+                None,
+                11,
+            )
+            .expect("a task");
+        ledger
+            .seat_coordinator(&run, "team-desk/%1", None, 12)
+            .expect("a coordinator");
+        let started = ledger
+            .start_worker(&run, "codex", ("team-desk", "%2"), Some(&held), 20)
+            .expect("a worker carries it");
+        assert!(ledger.worker_seated(("team-desk", "%2"), "/wt/left-behind"));
+        ledger
+            .terminal_gone_with_archive("team-desk", "%2", None, 30)
+            .expect("a death before reporting");
+        ledger
+            .create_gate(&run, &asked, "rpc or rest?".into(), vec![], 31)
+            .expect("a gate somebody opened");
+        let gate_of = |ledger: &Ledger, id: &str| -> serde_json::Value {
+            desk_json(ledger)["tasks"]
+                .as_array()
+                .expect("the desk's rows")
+                .iter()
+                .find(|row| row["id"] == id)
+                .map(|row| row["gate"].clone())
+                .unwrap_or_else(|| panic!("{id} is missing from the desk"))
+        };
+
+        let before = gate_of(&ledger, &held);
+        assert_eq!(before["kind"], "unexamined", "{before}");
+        assert_eq!(before["worker"], started.worker.as_str(), "{before}");
+        assert_eq!(before["checkout"], "/wt/left-behind", "{before}");
+        assert!(
+            before["question"]
+                .as_str()
+                .is_some_and(|question| question.contains("nobody has looked")),
+            "the ledger's own sentence rides along for 「원문 보기」: {before}"
+        );
+        let other = gate_of(&ledger, &asked);
+        assert_eq!(
+            (other["kind"].as_str(), other["question"].as_str()),
+            (Some("asked"), Some("rpc or rest?")),
+            "{other}"
+        );
+
+        let found = Examined::Unlanded {
+            branch: "wt/left-behind".to_string(),
+            base: "main".to_string(),
+            commits: 2,
+        };
+        assert_eq!(ledger.checkout_examined(&started.worker, &found, 40), 1);
+        let after = gate_of(&ledger, &held);
+        assert_eq!(after["kind"], "unlanded", "{after}");
+        assert_eq!(after["examined"]["commits"], 2, "{after}");
+        assert_eq!(after["examined"]["branch"], "wt/left-behind", "{after}");
+        assert_eq!(after["examined"]["base"], "main", "{after}");
+    }
+
+    /// The two answers a hold takes from the board are the core's own words,
+    /// an answer to somebody's decision has words, and an act the board does
+    /// not name is refused before any seat is asked.
+    #[test]
+    fn a_hold_takes_the_ledgers_two_answers_and_nothing_else() {
+        assert_eq!(
+            HOLD_ACTS,
+            [("harvest", "harvest"), ("dispatch", "dispatch again")]
+        );
+        let refused = resolve_hold("run-x", "gate-1", "close it", None, "ui-hold-1", 1)
+            .expect_err("an act the board does not name");
+        assert!(refused.contains("harvest or dispatch"), "{refused}");
+        let unnamed = resolve_hold("run-x", "gate-1", "harvest", None, " ", 1)
+            .expect_err("a press without a request name");
+        assert!(unnamed.contains("retryRequest"), "{unnamed}");
+        let silent = resolve_hold("run-x", "gate-1", "answer", Some("  "), "ui-hold-2", 1)
+            .expect_err("an answer without words");
+        assert!(silent.contains("needs words"), "{silent}");
+        // And a pass that cannot name what it read is not sent at all.
+        let blind = pass_review("run-x", "t-1", "", "1234567", "ui-pass-1", 1)
+            .expect_err("a pass without its attempt");
+        assert!(blind.contains("attempt and the source"), "{blind}");
+    }
+
     /// A run in play with one task in every stage, and a finished run nobody
     /// is at: the desk carries the first and not the second, counts every
     /// task by the one stage word the ledger's own facts give it, and says
@@ -3203,6 +3547,89 @@ mod tests {
                 "deskBytes": desk_bytes,
                 "rowBytes": row_bytes,
             })
+        );
+    }
+
+    /// The task board's schedule draws a task on the time axis from when its
+    /// work moved (t-67482): its first attempt's start, the report that ended
+    /// it, the coordinator's first `verified` and the landing it wrote — read
+    /// off the ledger the desk already holds. A task nobody carried has none.
+    #[test]
+    fn a_desk_row_carries_when_its_work_moved() {
+        let mut ledger = Ledger::new();
+        let run = ledger.create_run("timed", 1);
+        let landed = ledger
+            .create_task(&run, "land it".into(), "landed".into(), vec![], None, 10)
+            .expect("a task");
+        let waiting = ledger
+            .create_task(&run, "wait".into(), "waiting".into(), vec![], None, 11)
+            .expect("a task");
+        let started = ledger
+            .start_worker(&run, "claude", ("team-timed", "%2"), Some(&landed), 12)
+            .expect("a worker carries it");
+        ledger
+            .post(
+                &run,
+                Draft {
+                    from: worker_address(&started.worker),
+                    to: ledger.run(&run).expect("the run").address(),
+                    kind: MessageKind::WorkerDone,
+                    body: Text::from(r#"{"ok":true,"head":"89abcde"}"#.to_string()),
+                    subject: Text::default(),
+                    priority: Priority::Normal,
+                    payload: Text::default(),
+                    thread: None,
+                    task: Some(landed.clone()),
+                    dispatch: started.dispatch.clone(),
+                },
+                20,
+            )
+            .expect("the report");
+        ledger
+            .update_task(
+                &run,
+                &landed,
+                Some(TaskStatus::Completed),
+                Some(r#"{"verified":true,"merged":true,"mergeHead":"89abcde"}"#.to_string()),
+                ResultAuthor::Coordinator {
+                    seat: "team-timed/%1".to_string(),
+                    generation: Some(1),
+                    attempt: started.dispatch.clone(),
+                    source: Some("89abcde".to_string()),
+                    completed_ms: None,
+                    verified_ms: None,
+                },
+                30,
+            )
+            .expect("a review");
+        let desk = desk_snapshot(&ledger, |_| None, no_cost);
+        let times = |id: &str| {
+            desk.tasks
+                .iter()
+                .find(|row| row.id == id)
+                .map(|row| row.times)
+                .unwrap_or_else(|| panic!("{id} missing"))
+        };
+        assert_eq!(
+            times(&landed),
+            Some(TaskTimes {
+                started_ms: Some(12),
+                handed_ms: Some(20),
+                verified_ms: Some(30),
+                landed_ms: Some(30),
+            })
+        );
+        assert_eq!(times(&waiting), None, "nobody carried it");
+        let wire = serde_json::to_value(&desk).expect("the desk serializes");
+        let row = wire["tasks"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["id"] == landed.as_str()))
+            .cloned()
+            .expect("the landed row");
+        assert_eq!(
+            row["times"],
+            serde_json::json!({"started_ms": 12, "handed_ms": 20, "verified_ms": 30, "landed_ms": 30}),
+            "the window reads these keys"
         );
     }
 }

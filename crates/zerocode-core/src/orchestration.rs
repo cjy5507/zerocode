@@ -1047,7 +1047,11 @@ pub fn is_workers_own(author: Option<&ResultAuthor>) -> bool {
 }
 
 /// The [`HANDED_IN_SUMMARY`] string of a `worker_done` body, when it carries one.
-fn summary_of_body(body: &str) -> Option<String> {
+/// Public for the readers that hold one attempt's own report — the artifact
+/// tab's flow says what each attempt reported (t-68458) — and read the key
+/// the briefing spells from this one place.
+#[must_use]
+pub fn summary_of_body(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()?
         .get(HANDED_IN_SUMMARY)?
@@ -14713,8 +14717,10 @@ pub enum Examined {
 }
 
 /// The two answers a hold offers, as advice — the resolution is free text.
-const HARVEST: &str = "harvest";
-const DISPATCH_AGAIN: &str = "dispatch again";
+/// Public so the window's board answers a hold in these words and no copy of
+/// them (t-67607).
+pub const HARVEST: &str = "harvest";
+pub const DISPATCH_AGAIN: &str = "dispatch again";
 /// The resolutions the ledger writes when it resolves a hold by itself.
 const NOTHING_TO_HARVEST: &str =
     "nothing to harvest: the checkout was clean and every commit on its branch had landed";

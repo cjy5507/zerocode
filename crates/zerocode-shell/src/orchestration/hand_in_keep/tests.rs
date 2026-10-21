@@ -107,6 +107,8 @@ fn desk_row(message: &str) -> DeskTask {
         id: task_of(message),
         title: "keep it".into(),
         stage: "reported",
+        parent: None,
+        parent_title: None,
         gate: None,
         blocked_by: Vec::new(),
         closed: None,
@@ -116,6 +118,7 @@ fn desk_row(message: &str) -> DeskTask {
         kept: None,
         hand_in: Default::default(),
         progress: None,
+        times: None,
     }
 }
 
