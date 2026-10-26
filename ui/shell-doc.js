@@ -9365,6 +9365,9 @@ async function jumpFromArtifact(jump, id) {
 const artifactOpening = new Set();
 
 async function artifactAction(view, action, id) {
+  // The press's hand, carried past the delete question (shell-boot.js
+  // `flowHand`, t-75209): a delete is the person's (t-74975).
+  const started = handNow();
   const row = artifactRows.get(id);
   if (!row) return;
   try {
@@ -9395,7 +9398,7 @@ async function artifactAction(view, action, id) {
         cancel: false,
       });
       if (answer !== true) return;
-      const gone = await invoke("artifact_delete", { id, confirmed: true });
+      const gone = await invoke("artifact_delete", { id, confirmed: true }, { hand: flowHand(started) });
       if (gone) {
         artifactRows.delete(id);
         indexArtifactTasks();
@@ -9428,6 +9431,8 @@ async function artifactAction(view, action, id) {
  * 있으면 그 판이 새 주소로 옮겨 간다(Codex의 미리보기 탭, Claude의 패널 하나). */
 async function openArtifactPage(row, { version = null, seat = null, hint = null, glance = false } = {}) {
   if (!artifactOpensInWindow(row)) return false;
+  // A page the person opened is a place ⌘J can go back to.
+  if (row.kind === "page" && row.path) rememberRecentPlace({ kind: "artifact", id: row.id, label: row.title ?? basename(row.path), path: row.path });
   // 여는 시계의 시작(t-59665 ⑧): 누른 때. 판이 서기까지의 기다림도 사람의 것이다.
   const pressedAt = performance.now();
   const standing = artifactTabFor(row, version);

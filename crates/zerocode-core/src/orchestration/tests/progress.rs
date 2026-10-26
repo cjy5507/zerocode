@@ -521,3 +521,105 @@ fn every_stage_has_its_own_wire_name() {
         );
     }
 }
+
+/// t-73910: an attempt the coordinator stopped or abandoned, or whose terminal
+/// went away, ended with no result anybody saw — `succeeded: None` — and reads
+/// [`WorkStage::Stopped`], never [`WorkStage::Failed`], which is the worker's own
+/// word. On 2026-10-25 two released workers stood painted 「실패」 in the sidebar
+/// while the ledger held neither as failed. An older attempt reads the same way
+/// once a newer one carries the task, and a stopped attempt points at the
+/// worker's conversation as a failed one does.
+#[test]
+fn an_attempt_nobody_saw_a_result_of_is_stopped_and_a_reported_failure_is_failed() {
+    let mut bench = Bench::new();
+    bench.json("run-create --name stopped");
+    let run_id = bench.ledger.runs()[0].id.clone();
+
+    let stopped = task_of(&mut bench, "stopped");
+    let (worker, _, dispatch) = attempt_on(&mut bench, &stopped);
+    bench.json(&format!(
+        "worker-stop --worker {worker} --reason superseded"
+    ));
+    assert_eq!(
+        bench.ledger.runs()[0]
+            .dispatch(&dispatch)
+            .and_then(|one| one.succeeded),
+        None,
+        "a stop wrote a result nobody saw"
+    );
+    let (row, whole) = read(&bench, &stopped, &dispatch);
+    assert_eq!(
+        (row.stage, whole.stage),
+        (WorkStage::Stopped, WorkStage::Stopped)
+    );
+    assert_eq!(
+        row.next.as_deref(),
+        Some(format!("zerocode-orc worker-transcript --run {run_id} --worker {worker}").as_str())
+    );
+
+    let abandoned = task_of(&mut bench, "abandoned");
+    let (worker, _, dispatch) = attempt_on(&mut bench, &abandoned);
+    bench.json(&format!(
+        "worker-abandon --worker {worker} --reason unknown"
+    ));
+    assert_eq!(
+        read(&bench, &abandoned, &dispatch).0.stage,
+        WorkStage::Stopped
+    );
+
+    let failed = task_of(&mut bench, "failed");
+    let (_, pane, dispatch) = attempt_on(&mut bench, &failed);
+    bench.json_at(&pane, "send --type worker_done --body {\"ok\":false}");
+    assert_eq!(read(&bench, &failed, &dispatch).0.stage, WorkStage::Failed);
+
+    // The stopped attempt, once a newer one carries the task, still reads
+    // by its own end.
+    let (_, _, newer) = attempt_on(&mut bench, &stopped);
+    let run = &bench.ledger.runs()[0];
+    let held = run.task(&stopped).expect("the task");
+    let first = run
+        .dispatches
+        .iter()
+        .find(|one| one.task == stopped && one.id != newer)
+        .expect("the stopped attempt");
+    assert_eq!(
+        run.progress_from(Some(held), &run.review_of(held), Some(first))
+            .stage,
+        WorkStage::Stopped
+    );
+    assert_eq!(run.progress_of(held).stage, WorkStage::Working);
+    assert_eq!(WorkStage::Stopped.word(), "stopped");
+}
+
+/// t-73910 W4-1: every stage says its next step in one place, and the steps a
+/// person acts on are the ones the plan names — a review for a report, a land
+/// for verified work, a ship for landed work, a fresh review for a stale one,
+/// another hand-out for a failure and a restart for a stop, never one for the
+/// other. Work that is over asks for nothing, and what the ledger cannot read
+/// asks for nothing it would have to guess.
+#[test]
+fn every_stage_names_one_next_step_and_no_two_stages_share_a_wrong_one() {
+    let expected = [
+        (WorkStage::Working, NextStep::Wait),
+        (WorkStage::ReportOnly, NextStep::Review),
+        (WorkStage::Failed, NextStep::RetryOrClose),
+        (WorkStage::Stopped, NextStep::RestartOrClose),
+        (WorkStage::Stale, NextStep::ReviewNewHead),
+        (WorkStage::Verified, NextStep::Land),
+        (WorkStage::Merged, NextStep::Ship),
+        (WorkStage::Unknown, NextStep::Unknown),
+    ];
+    for (stage, step) in expected {
+        assert_eq!(stage.next_step(), step, "{stage:?}");
+    }
+    for stage in WorkStage::ALL {
+        if !expected.iter().any(|(named, _)| *named == stage) {
+            assert_eq!(stage.next_step(), NextStep::Over, "{stage:?} is not over");
+        }
+    }
+    let words: std::collections::BTreeSet<String> = NextStep::ALL
+        .iter()
+        .map(|step| serde_json::to_value(step).expect("serializes").to_string())
+        .collect();
+    assert_eq!(words.len(), NextStep::ALL.len(), "two steps share a word");
+}

@@ -348,7 +348,15 @@ zerocode-browser find <pane-label> <text> --workspace-revision <revision>
 zerocode-browser diagnose <pane-label> [--json]
 zerocode-browser fields <pane-label> [--json]           # every field of the page's forms at once: handle, kind, words, value, choices, required; and the buttons
 zerocode-browser fill <pane-label> --workspace-revision <revision> --value-stdin # stdin: {"<handle>": value, …}
+zerocode-browser upload <pane-label> <css> [--drop] <absolute-path>... --workspace-revision <revision> # local files into a file input or, with --drop, a drop area
 ```
+
+`upload` hands 1 to 16 local files (16 MiB in all, absolute paths, no folders)
+to a page's file input — or its label when the input is hidden — or, with
+`--drop`, to a drop area; use it when a form asks for a file, since `fill`
+refuses file fields. Its answer says the files reached the page's list, not
+that the site took them: confirm the site's own acceptance with `wait` or
+`read`.
 
 Words a page wrote — `read`, `eval`, `fields`, `fill`, `console`,
 `network`, `tabs`, `list` and the `diagnose` paragraph — arrive between
@@ -1096,6 +1104,12 @@ Recording permission the screenshots use — no new prompt.
     with spaces); delete a line to drop a step. `--start` counts lines from
     1, not the numbers written in front of them. A `{{name}}` fills a
     flag's value, never a flag; a saved line never carries `--allow-self`.
+  - A saved `zerocode-browser upload` names its files `$file_N` (`$file_N_2`
+    for a step's second file), never their folder: give each with
+    `--params '{"file_3":"/abs/path"}'`, and a walk that reaches one with no
+    value stops as `persons_turn` — never guess a path. A recipe saved before
+    this keeps its path and still runs; saving again turns it into `$file_N`.
+    The evidence log keeps an upload's file names, sizes and count only.
 - **Memory across a cut context**: `status --json` carries `state` — the
   last verb, whether it worked, failures in a row, recent actions — and the
   session's evidence folder holds `state.json` and `steps.jsonl`. Read them
@@ -1129,11 +1143,34 @@ a failed step in the log and is filed as a task for a person; write
   someone else's computer, and destructive or outward-facing commands need the
   same explicit authorization there as anywhere else.
 - Password managers and other blocked apps stay blocked. Do not work around an
-  `app_blocked` response. ZeroCode's own window is never a target: a desktop
-  point on it, keys while it is frontmost, or any action naming ZeroCode as
-  its `--app` or one of its windows answer `app_blocked` — activate the app
-  you mean first. `--allow-self` exists for the test harness only (desktop
-  points and keys).
+  `app_blocked` response. ZeroCode's own window takes no OS input: a desktop
+  point on it, keys while it is frontmost, or an action naming one of its
+  windows answer `app_blocked`. `--allow-self` exists for the test harness
+  only (desktop points and keys).
+- ZeroCode's own controls are pressed through `--app ZeroCode`: the window
+  presses its own tabs, pane buttons and fields in its page, so the person's
+  pointer, focus and keys stay theirs while you work beside them. Look with
+  `get-app-state --app ZeroCode`, then `click`, `set-value` or `scroll` with
+  `--element-index` from that look. Keys, typed text, pastes and drags are
+  `unsupported_capability` there — use `set-value` for a field. A line tagged
+  `[self_sensitive]` is the person's (a question to them, a secret field or
+  its pane, a terminal, a setting, a control kept for them): do not press it,
+  ask the person. A line tagged `[person_typing]` is the field they are in.
+- One window is shared with you at a time. The first time you act in an app
+  the person is asked once whether to hand that window over; wait for the
+  answer your command returns. While a window is shared, an act or a look at
+  another app, an act naming no app, or a whole-screen picture answers
+  `share_scope` — work in the shared app, or act in the other app to ask for
+  it. The person can take control at any time; then every act answers
+  `person_took_control` until they hand it back. Do not retry around either.
+- When the person enables required sharing, `share_required` refuses acts in
+  an unshared app and acts naming no app. If the person does not answer the
+  card, that app waits for them: until the time the refusal names, its acts
+  answer `share_required` at once with no new card; the person can hand it
+  over from the window's band at any time; and your first act in it after
+  that time asks again. Do not retry inside that wait; tell the person you are waiting for
+  them to hand the app over. Never change this person-only setting. Looks
+  keep the existing share rules.
 - The person has one hand on you at all times: the desktop chord
   control+option+escape, `zerocode-computer stop`, and the window's stop
   button all stop the operator at its next event. A `stopped` answer means
@@ -1215,6 +1252,16 @@ a failed step in the log and is filed as a task for a person; write
   emulator route where applicable.
 - `secure_input`: a password field — hand it to the person (`handoff`), then
   look; do not retry, paste or copy it (see the rule above).
+- `self_sensitive`: that control of ZeroCode's own window is the person's;
+  nothing was pressed. Do not look for another way to press it — ask them.
+- `person_typing`: the person is in that field of ZeroCode's own window, or
+  typed in it a moment ago; nothing was pressed. Look again later.
+- `share_scope`: the request reaches outside the window the person shared, or
+  the person declined that app; nothing was done. Stay in the shared app.
+- `share_required`: sharing is required and the person has not handed that
+  app over; nothing was done. The message says when the window asks again.
+- `person_took_control`: the person took the shared window back; nothing was
+  done. Report where you were and wait for them to hand it back.
 
 ### Concurrent requests
 

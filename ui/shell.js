@@ -249,6 +249,7 @@ async function refreshPaneLedger() {
         ledger: row?.ledger ?? "",
         reported: row?.reported === true,
         failed: row?.failed === true,
+        stopped: row?.stopped === true,
         review: row?.review ?? null,
         progress: row?.progress ?? null,
         closed: row?.closed ?? null,
@@ -340,7 +341,7 @@ function paneLedgerSaid(map) {
   return [...map.entries()]
     .sort(([a], [b]) => a - b)
     .map(([term, f]) =>
-      `${term}:${f.taskId}:${f.task}:${f.ledger}:${f.reported ? 1 : 0}:${f.failed ? 1 : 0}` +
+      `${term}:${f.taskId}:${f.task}:${f.ledger}:${f.reported ? 1 : 0}:${f.failed ? 1 : 0}:${f.stopped ? 1 : 0}` +
       `:${JSON.stringify(f.review)}:${JSON.stringify(f.progress)}:${JSON.stringify(f.closed)}:${f.review_since_ms ?? ""}` +
       `:${f.asking ? 1 : 0}:${f.wall?.stands_until_ms ?? ""}:${f.handed_in ?? ""}:${f.model ?? ""}` +
       `:${f.worker}:${f.takenOver ? 1 : 0}:${JSON.stringify(f.quotaWall)}:${(f.stalled ?? []).join("+")}` +
@@ -365,6 +366,8 @@ const WORK_STAGES = Object.freeze({
   stale: { key: "board.staleReview", word: "다시 검토 대기", phase: "review", landing: "handedIn", live: "stale" },
   superseded: { key: "board.superseded", word: "다음 시도로 넘어감", phase: "superseded", landing: null, live: "superseded" },
   failed: { key: "board.desk.stageFailed", word: "실패", phase: "", landing: "failed", live: "failed" },
+  // 결과를 아무도 보지 못하고 끝난 시도(t-73910): 코디가 멈췄거나 놓았거나, 판이 사라졌다. 실패가 아니다.
+  stopped: { key: "board.stageStopped", word: "중단", phase: "", landing: "stopped", live: "stopped" },
   unreviewable: { key: "board.noReviewRecord", word: "종료 — 검토 자료 없음", phase: "unreviewable", landing: "failed", live: "unreviewable" },
   // 사람이 검토를 생략한 일(t-71220): 아무도 기다리지 않는 것은 검토 기록 없음과 같고, 말만 다르다.
   waived: { key: "board.reviewWaived", word: "종료 — 검토 생략(사람)", phase: "unreviewable", landing: "failed", live: "waived" },
@@ -450,7 +453,7 @@ function ledgerReviewPhaseOf(facts) {
  * where a sweep compacted the task away and left its title empty — the failed
  * attempt that proves there was one (a closed dispatch always carried a task). */
 function ledgerHoldsTask(facts) {
-  return facts.failed === true || Boolean(facts.taskId || facts.task);
+  return facts.failed === true || facts.stopped === true || Boolean(facts.taskId || facts.task);
 }
 
 function seedPaneAgents() {
@@ -875,7 +878,7 @@ function submitAsk(card, draft) {
   const term = Number(card.pane.slice(card.pane.indexOf(":") + 1));
   const road = draft.answer
     ? draft.answer(selections)
-    : invoke("answer_ask", { term, agent: card.agent, prompt: card.ask_prompt, selections });
+    : invoke("answer_ask", { term, agent: card.agent, prompt: card.ask_prompt, selections }, { hand: handNow() });
   road.catch((error) => {
     draft.sending = false;
     showError(answerRefusalWords(error));
@@ -893,6 +896,8 @@ function askPanelNode(card, draft) {
   const question = prompt.questions[draft.index];
   const panel = document.createElement("span");
   panel.className = "board-ask";
+  // Its answers are the person's: an agent pressing in the window never makes them (t-73906).
+  panel.dataset.personOnly = "";
 
   if (total > 1) {
     const steps = document.createElement("span");
@@ -1037,6 +1042,8 @@ function askSendWord(card, draft) {
 function approvalPanelNode(card, draft) {
   const panel = document.createElement("span");
   panel.className = "board-approve";
+  // Its answers are the person's: an agent pressing in the window never makes them (t-73906).
+  panel.dataset.personOnly = "";
   // The plan this permission asks approval FOR, when the CLI's plan tool is
   // what asked (`ApprovalPrompt.plan`, filled off the catalog in Rust): the
   // extension's plan review card — the plan itself instead of a summary
@@ -1086,7 +1093,7 @@ function approvalPanelNode(card, draft) {
   const term = Number(card.pane.slice(card.pane.indexOf(":") + 1));
   // The board's card answers the TUI by keystroke; a wire's card answers the
   // request itself (`draft.answer`, the option's id).
-  const decide = draft.answer ?? ((allow) => invoke("answer_approval", { term, allow }));
+  const decide = draft.answer ?? ((allow) => invoke("answer_approval", { term, allow }, { hand: handNow() }));
   const act = (label, choice, kind, { then = null, says = null } = {}) => {
     const button = document.createElement("button");
     button.type = "button";
@@ -1749,12 +1756,7 @@ function updateActionHub(answer) {
   attentionCards = attCol?.cards ?? [];
   const stuck = answer.attention_count ?? attentionCards.length;
 
-  const navAttention = el("nav-attention");
-  const attBadge = el("attention-badge");
   const hubBadge = el("action-hub-badge");
-
-  if (navAttention) navAttention.hidden = (stuck === 0);
-  if (attBadge) attBadge.textContent = String(stuck);
   if (hubBadge) hubBadge.textContent = String(stuck);
 
   const scrim = el("action-hub-scrim");
@@ -1838,103 +1840,14 @@ function paintActionHubModal() {
 window.openActionHub = openActionHub;
 window.closeActionHub = closeActionHub;
 
-/* 나를 기다림 (t-26595) — the column's top list: which pane waits on the person,
- * and for what. Rust decides the rows (`waiting_on_me`, the notify rules); this
- * only paints them. A row opens its pane the way a board card does, and looking
- * releases the pane's finish mark (`clear_finish_mark`). */
-let waitingRows = [];
-
-/* How long the list waits to be read after the last report. A busy turn reports
- * many times a second; the list is read once per settled beat, not per report. */
-const WAITING_REFRESH_MS = 150;
-
-let waitingRefreshTimer = 0;
-
-function scheduleWaitingList() {
-  if (waitingRefreshTimer) return;
-  waitingRefreshTimer = setTimeout(() => {
-    waitingRefreshTimer = 0;
-    void refreshWaitingList();
-  }, WAITING_REFRESH_MS);
-}
-
-async function refreshWaitingList() {
-  if (isPopout) return;
-  let rows = [];
-  try {
-    const answer = await invoke("waiting_on_me");
-    // Only a list of rows counts: anything else reads as nobody waiting.
-    rows = Array.isArray(answer) ? answer : [];
-  } catch {
-    // The list reads the rows as they are now. A failed read shows none, never
-    // the rows of the last good read.
-  }
-  waitingRows = rows;
-  paintWaitingList();
-}
-
-/* Whether the list shows this pane as a finish nobody has looked at. Releasing a
- * mark costs a round trip, so it is asked only when there is a finish to release. */
-function waitingFinishStands(term) {
-  return waitingRows.some((row) => row.pane === `term:${term}` && row.waiting === "finished");
-}
-
-function waitingKindWord(waiting) {
-  if (waiting === "blocked") return t("waiting.blocked", "막힘");
-  if (waiting === "question") return t("waiting.question", "질문");
-  return t("waiting.finished", "끝남");
-}
-
-function paintWaitingList() {
-  const box = el("waiting-list");
-  const list = el("waiting-list-items");
-  if (!box || !list) return;
-  box.hidden = waitingRows.length === 0;
-  list.replaceChildren(
-    ...waitingRows.map((row) => {
-      const item = document.createElement("li");
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "waiting-row";
-      button.dataset.waiting = row.waiting;
-
-      const agent = document.createElement("span");
-      agent.className = "waiting-row-agent";
-      agent.textContent = row.agent || "Agent";
-
-      const kind = document.createElement("span");
-      kind.className = "waiting-row-kind";
-      kind.textContent = waitingKindWord(row.waiting);
-
-      const place = document.createElement("span");
-      place.className = "waiting-row-place";
-      place.textContent = row.worktree.split("/").filter(Boolean).pop() || row.pane;
-      place.dataset.tip = row.worktree;
-
-      button.append(agent, kind, place);
-      button.addEventListener("click", () => openWaitingRow(row));
-      item.appendChild(button);
-      return item;
-    }),
-  );
-}
-
-function openWaitingRow(row) {
-  const bucket = row.waiting === "finished" ? "done" : "attention";
-  openBoardCard({ pane: row.pane, agent: row.agent, worktree: row.worktree }, bucket);
-  void invoke("clear_finish_mark", { pane: row.pane })
-    .catch(() => false)
-    .then(() => refreshWaitingList());
-}
-
-el("nav-attention")?.addEventListener("click", openActionHub);
 el("action-hub-close")?.addEventListener("click", closeActionHub);
 el("action-hub-dismiss")?.addEventListener("click", closeActionHub);
 
 window.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.shiftKey && (event.key === "a" || event.key === "A")) {
     event.preventDefault();
-    openActionHub();
+    // 「주의 필요」 is absorbed by the inbox (t-67483, draft Q2): the chord opens its 막힘 tab.
+    openInboxView({ tab: "blocked" });
   }
 });
 
@@ -1987,14 +1900,19 @@ function openBoard() {
  * 손은 첫 그림 **뒤에** 온다. 판이 카드를 들고 있지 않으면(끝난 워커) 보드만
  * 선다 — 답은 골랐는가다. 카드의 열쇠는 `agent:term:<n>`(`cardsFromPanes`). */
 async function revealTaskBoardPane(term) {
+  return revealTaskBoardMember(`agent:term:${term}`);
+}
+
+/* The same, for any card's key — what ⌘J's 「최근」 uses to open a task again. */
+async function revealTaskBoardMember(key) {
   leavePagesForStage();
   openBoard();
   const tab = boardTab();
   if (!tab) return false;
   await paintBoardView(tab, { force: true });
   const view = docHost(tab.pane, "board");
-  const key = `agent:term:${term}`;
   selectAgentGraphEntity(view, key, { focus: true });
+  noteTaskBoardPlace(view, key);
   return agentGraphSelectedKey === key;
 }
 
@@ -2510,7 +2428,7 @@ function openBoardCard(card, bucket) {
   const { kind, id, term, valid } = boardCardDestination(card);
   if (!valid) return;
   // Opening a pane is looking at it: a finish the list shows is released (t-26595).
-  if ((kind === "term" || kind === "sub") && term !== null && waitingFinishStands(term)) {
+  if ((kind === "term" || kind === "sub") && term !== null && inboxFinishStands(term)) {
     void invoke("clear_finish_mark", { pane: `term:${term}` }).catch(() => false);
   }
   if (kind === "term") {
@@ -7175,8 +7093,8 @@ async function changeCoordinator(action) {
   el("coordinator-result").textContent = "";
   paintCoordinatorPanel();
   try {
-    if (action === "claim") await invoke("claim_coordinator_seat", { runId, targetTerm, expectedGeneration, retryRequest });
-    else await invoke("set_coordinator_handover", { runId, targetTerm, expectedGeneration, retryRequest });
+    if (action === "claim") await invoke("claim_coordinator_seat", { runId, targetTerm, expectedGeneration, retryRequest }, { hand: handNow() });
+    else await invoke("set_coordinator_handover", { runId, targetTerm, expectedGeneration, retryRequest }, { hand: handNow() });
     if (coordinatorPanel !== panel) return;
     panel.retry = null;
     el("coordinator-result").textContent = action === "claim"
@@ -7398,7 +7316,17 @@ function taskBoardElement(tag, className, text = "") {
   return node;
 }
 
+/* A task the person opened is a place ⌘J can go back to. The row that holds
+ * the card names it; a card no row holds (a pane with no task) is not one. */
+function noteTaskBoardPlace(view, key) {
+  const group = [...view.querySelectorAll(".task-board-row")]
+    .map((row) => row.__group)
+    .find((one) => one?.members.some((entry) => entry.key === key));
+  if (group) rememberRecentPlace({ kind: "task", id: group.lead.key, label: group.title });
+}
+
 function selectTaskBoardMember(view, key) {
+  noteTaskBoardPlace(view, key);
   agentGraphSelectedKey = key;
   setAgentGraphInspectorOpen(view, true);
   const model = agentGraphModels.get(view);
@@ -9531,10 +9459,10 @@ listen("hook:activity", (event) => {
  * 같은 사실의 두 번째 사본이 생긴다. */
 listen("agents:changed", () => {
   void refreshPaneLedger();
-  scheduleWaitingList();
+  scheduleInbox();
   scheduleAgentPaint(["tabs", "cards", "badge", "board"]);
 });
-void refreshWaitingList();
+void refreshInbox();
 
 listen("hook:subagent", (event) => {
   const { term, rows } = event.payload ?? {};
@@ -10367,6 +10295,7 @@ function agentRowPhase(row, state) {
   const said = ledgerReviewPhaseOf(facts);
   if (said !== "") return said === "review" ? "review" : "";
   if (facts.failed === true) return "failed";
+  if (facts.stopped === true) return "stopped";
   return ledgerHoldsTask(facts) ? "unsettled" : "";
 }
 
@@ -10377,7 +10306,7 @@ function agentRowPhase(row, state) {
  * have no glyph. */
 function agentRowMark(state, phase) {
   if (phase === "review") return "#i-hourglass";
-  if (state === "done") return phase === "unsettled" || phase === "failed" ? "" : "#i-circle-check";
+  if (state === "done") return phase === "unsettled" || phase === "failed" || phase === "stopped" ? "" : "#i-circle-check";
   return state === "needs-attention" ? "#i-msg-ask" : "";
 }
 
@@ -10400,19 +10329,24 @@ function agentDotNode(mark) {
 }
 
 /* What a failed attempt's dot says when it is pointed at: as much as the
- * ledger knows, which is one fact — the attempt ended without a successful
- * report (the worker said ok:false, or the attempt was stopped or abandoned).
+ * ledger knows, which is one fact — the worker reported it failed (ok:false).
+ * An attempt that was stopped or abandoned is 중단 (`AGENT_STOPPED_TIP`).
  * The reason's own words never reach this window: a ledger row carries
  * `failed`, not a summary. Keyed through `applyLocale` (`data-i18n-title`)
  * because a finished-work row is not rebuilt for a change of language. */
-const AGENT_FAILED_TIP = { key: "worktree.attemptFailedTip", word: "실패 — 원장에 성공 보고 없이 끝난 시도로 적혀 있습니다(워커가 ok:false로 보고했거나, 시도가 멈추거나 폐기됨)" };
+const AGENT_FAILED_TIP = { key: "worktree.attemptFailedTip", word: "실패 — 워커가 이 시도를 실패로 보고했습니다(ok:false)" };
 
-function dressFailedDot(dot) {
+/* An attempt nobody saw a result of (t-73910) says so, in words of its own: the ledger holds it as stopped, and
+ * calling it a failure was the sidebar inventing one — 2026-10-25, two released workers painted 「실패」. */
+const AGENT_STOPPED_TIP = { key: "worktree.attemptStoppedTip", word: "중단 — 결과 보고 없이 끝난 시도입니다(코디가 멈췄거나 놓았거나, 판이 사라짐). 실패로 적힌 것이 아닙니다" };
+
+function dressFailedDot(dot, tip = AGENT_FAILED_TIP) {
   if (!dot) return;
-  dot.dataset.tip = t(AGENT_FAILED_TIP.key, AGENT_FAILED_TIP.word);
-  dot.dataset.i18nTitle = AGENT_FAILED_TIP.key;
-  dot.dataset.i18nSourcedatatip = AGENT_FAILED_TIP.word;
+  dot.dataset.tip = t(tip.key, tip.word);
+  dot.dataset.i18nTitle = tip.key;
+  dot.dataset.i18nSourcedatatip = tip.word;
 }
+
 
 /* The task a workspace is working on, when the ledger seated one in a pane
  * here — the card's first words then, ahead of a branch named after a task id
@@ -10452,7 +10386,7 @@ function worktreeSeatFacts(path) {
  * (`reviewing`), verified and not yet merged (`landWait`), merged or deployed (`landed`). A failed attempt,
  * a closed task and a task with nothing to land say so. The gate the coordinator runs before landing is not
  * in the ledger, so no stage names it. */
-const WORKTREE_STAGE_RANK = Object.freeze({ closed: 0, landed: 1, nothing: 1, landWait: 2, reviewing: 3, handedIn: 4, failed: 5 });
+const WORKTREE_STAGE_RANK = Object.freeze({ closed: 0, landed: 1, nothing: 1, landWait: 2, reviewing: 3, handedIn: 4, stopped: 5, failed: 5 });
 
 function ledgerLandingStage(facts) {
   return ledgerWork(facts)?.landing ?? null;
@@ -10466,6 +10400,7 @@ function landingStageWord(stage) {
     case "landed": return t("worktree.stage.landed", "착지됨");
     case "nothing": return t("worktree.stage.nothing", "착지할 것 없음");
     case "failed": return t("board.desk.stageFailed", "실패");
+    case "stopped": return t("board.stageStopped", "중단");
     case "closed": return t("board.closed", "닫힘");
     default: return "";
   }
@@ -11012,6 +10947,7 @@ function makeAgentRow(row, gutter = false) {
   const phase = agentRowPhase(row, state);
   const dot = agentDotNode(agentRowMark(state, phase));
   if (phase === "failed") dressFailedDot(dot);
+  else if (phase === "stopped") dressFailedDot(dot, AGENT_STOPPED_TIP);
   // The agent's REAL face beside its state ("어떤 에이전트가 도는지 아이콘
   // 실제") — the registry's favicon chain, with its letter tile standing in
   // until the mark lands. A row that predates the registry, or a helper with
@@ -11311,6 +11247,7 @@ function makeFinishedWorkRow(path, work) {
     node.querySelector(".wt-agent-dot")?.replaceWith(agentDotNode(agentRowMark("done", phase)));
   }
   if (phase === "" && work.failed === true) dressFailedDot(node.querySelector(".wt-agent-dot"));
+  else if (phase === "" && work.stopped === true) dressFailedDot(node.querySelector(".wt-agent-dot"), AGENT_STOPPED_TIP);
   return node;
 }
 
@@ -11971,7 +11908,7 @@ const agentClock = idlePoller({
 });
 
 listen("hook:agent", (event) => {
-  scheduleWaitingList();
+  scheduleInbox();
   const { term, state, agent, session } = event.payload;
   agentGraphHotKey = agentGraphAgentKey(`term:${term}`);
   // A run NESTED in this pane reports through the pane's own terminal — it
@@ -12993,7 +12930,7 @@ function paintWireAsk(host, run, force = false) {
           // The words only ride a refusal that has some; a plain answer is
           // the same request it always was.
           : { option: choice, ...(message ? { message } : {}) }),
-      }),
+      }, { hand: handNow() }),
     });
     force = true;
   }
@@ -16959,7 +16896,7 @@ listen("worktree:landing", () => {
  * that carries the deletions. Those go to the window log with their reason,
  * beside the refusals the existing automatic cleanup already writes there. */
 listen("worktree:reclaimed", (event) => {
-  const { name, branch, base, beside } = event.payload ?? {};
+  const { name, branch, base, beside, elsewhere } = event.payload ?? {};
   // The list refresh is not repeated here: the backend emits
   // `worktree:removed` for the same reclaim, and that listener already owns
   // it. This one carries the sentence and nothing else.
@@ -16967,6 +16904,18 @@ listen("worktree:reclaimed", (event) => {
   // A checkout a worker cut beside its own goes because its task was handed in
   // (t-45336): its sentence names the task, and the head that holds its commits.
   const handedIn = typeof beside === "string" && beside !== "";
+  // A worker that made no commit of its own (t-73910): its branch's commits are on another branch, which is named.
+  if (!handedIn && elsewhere === true) {
+    toast(
+      t(
+        "worktree.reclaimedElsewhere",
+        "워커가 끝나 워크스페이스 {{name}}을(를) 정리했습니다 — 워커가 만든 커밋은 0개이고, {{branch}}의 커밋은 모두 {{base}}에 있으며 저장되지 않은 변경은 없었습니다. 브랜치는 그대로 남아 있습니다.",
+        { name, branch: branch ?? "", base: base ?? "" },
+      ),
+      "done",
+    );
+    return;
+  }
   toast(
     handedIn
       ? t(
@@ -19344,6 +19293,7 @@ const DOC_VIEWS = {
   skills: { build: buildSkillsView, paint: paintSkillsStage },
   artifacts: { build: buildArtifactsView, paint: paintArtifactsStage },
   jev: { build: buildJevView, paint: paintJevStage, wire: wireJevView },
+  inbox: { build: buildInboxView, paint: paintInboxStage, wire: wireInboxView },
   tokens: { build: buildTokensView, paint: paintTokensView, wire: wireTokensView },
 };
 

@@ -33,6 +33,7 @@ const PANE_OF = {
   "type-value-key-input": "computer-use",
   "computer-live-reflex": "computer-use",
   "computer-shared-desktop": "computer-use",
+  "computer-share-required": "computer-use",
   "show-automations": "appearance",
   "show-tasks": "appearance",
   "worktree-prefix": "git",
@@ -418,6 +419,7 @@ function applyWorkflowSettingsSnapshot(snapshot, first) {
     // The field shows a placeholder for "one is on file" and empties when the
     // person takes it back, so the box never claims to hold what it cannot.
     el("opencode-cookie").value = "";
+    opencodeCookieHand = "none";
     el("opencode-cookie").placeholder = opencodeCookieConfigured
       ? t("settings.opencode.cookieHeld", "저장됨 — 새 값을 붙여넣으면 바뀝니다")
       : "auth=Fe26.2**…";
@@ -548,6 +550,11 @@ function applyWorkflowSettingsSnapshot(snapshot, first) {
     computerLiveReflex = snapshot.computer_live_reflex === true;
     paintComputerLiveReflex();
   }
+  if (first || hasSetting(snapshot, "computer_share_required")) {
+    const control = el("computer-share-required");
+    control.checked = snapshot.computer_share_required === true;
+    control.disabled = typeof snapshot.computer_share_required !== "boolean";
+  }
   if (first || hasSetting(snapshot, "computer_input_policy")) {
     computerInputPolicyKnown = ["background", "shared-desktop"].includes(snapshot.computer_input_policy);
     computerInputPolicy = snapshot.computer_input_policy === "shared-desktop" ? "shared-desktop" : "background";
@@ -560,25 +567,12 @@ function applyWorkflowSettingsSnapshot(snapshot, first) {
   if (hasSetting(snapshot, "skip_close_terminal_with_running_process_confirm")) {
     const skip = snapshot.skip_close_terminal_with_running_process_confirm === true;
     setConfirmCloseRunning(!skip);
-    if (skip) {
-      closeRunningLegacyMigrationStarted = true;
-      forgetLegacyCloseRunningPreference();
-    } else if (first && legacySkipCloseRunningConfirm && !closeRunningLegacyMigrationStarted) {
-      // Pre-canonical builds stored the inverse in this webview only. Carry it
-      // once into the repository; a failed write leaves the old key for the
-      // next boot and the canonical recovery snapshot turns prompting back on.
-      closeRunningLegacyMigrationStarted = true;
-      setConfirmCloseRunning(false);
-      void commitSetting(
-        "skip_close_terminal_with_running_process_confirm",
-        "set_skip_close_terminal_with_running_process_confirm",
-        { skip: true },
-      ).then((saved) => {
-        if (saved?.skip_close_terminal_with_running_process_confirm === true) {
-          forgetLegacyCloseRunningPreference();
-        }
-      });
-    }
+    // Pre-canonical builds kept the person's "don't ask again" in this
+    // webview only. Writing it to the repository is the person's to do
+    // (t-74975), and a boot has no hand: the old key carries nothing until
+    // the person answers the question again, and goes once the setting says
+    // skip (t-75153).
+    if (skip) forgetLegacyCloseRunningPreference();
   }
   if (hasSetting(snapshot, "workspace_creation_prefs")) {
     workspaceCreationPrefs = {
@@ -793,14 +787,15 @@ async function refreshSettingsSnapshot(options = {}) {
 
 /* All setting writes share the same recovery rule. A rejection and a lost
  * acknowledgement are indistinguishable to the webview, so both re-read the
- * authoritative document before reporting the failure. */
-async function commitSetting(key, command, args, { onError = null } = {}) {
+ * authoritative document before reporting the failure. `hand` is the hand a
+ * person-only write carries (shell-boot.js `handNow`, t-75209). */
+async function commitSetting(key, command, args, { onError = null, hand } = {}) {
   const generation = (settingsMutationGenerations.get(key) ?? 0) + 1;
   settingsMutationGenerations.set(key, generation);
   const mutationEpoch = ++settingsMutationEpoch;
   settingsMutationsInFlight += 1;
   try {
-    const snapshot = await invoke(command, args);
+    const snapshot = await invoke(command, args, { hand });
     applySettingsMutationSnapshot(key, generation, mutationEpoch, snapshot);
     return snapshot;
   } catch (error) {
@@ -877,7 +872,7 @@ function answerSshCredential(value) {
   sshCredCurrent = null;
   sshCredValue.value = "";
   hideModal(sshCredScrim);
-  void invoke("ssh_submit_credential", { requestId, value });
+  void invoke("ssh_submit_credential", { requestId, value }, { hand: handNow() });
   showNextSshCredential();
 }
 
@@ -966,12 +961,20 @@ function paneMatches(pane, query) {
 }
 
 function settingsPaneAvailable(pane) {
+  // 숨은 페이지는 버전 줄을 5번 누른 창에만 있다 (shell-design.js).
+  if (pane === "design-system") return designPageAvailable();
   return pane !== "macos-permissions" || usesCommandModifier;
 }
 
 function showSettingsPane(pane) {
   const arriving = settingsView.hidden || pane !== settingsPane;
   settingsPane = pane;
+  // 디자인 페이지는 테마 스위치로 창의 테마 속성을 잠시 바꾼다: 떠나면 사람이 고른 테마로 돌아간다.
+  if (pane === "design-system") {
+    if (arriving && designPageAvailable()) enterDesignPage();
+  } else {
+    leaveDesignPage();
+  }
   // Twelve directory walks; asked for when the page is opened rather than at
   // boot, and only the first time — the row carries a 다시 읽기 for the rest.
   if (pane === "skills" || pane === "onboarding") void refreshSkills();
@@ -1009,8 +1012,9 @@ function showSettingsPane(pane) {
     void refreshCliLogins();
   }
   if (pane === "judgment-models" && arriving) void modelConnectionsController.refresh();
-  if (pane === "api-routers" && arriving) {
-    void refreshApiRouters();
+  if (pane === "api-routers") {
+    modelConnectionsController.paintView("catalog");
+    if (arriving) void refreshApiRouters();
   }
   if (pane === "onboarding" && arriving) {
     paintSettingsOnboarding();
@@ -2811,10 +2815,10 @@ function launchLineEl(row, badge) {
  * identical from this webview, so the plans are re-read either way — if the
  * backend committed, its value wins; if it refused, the field rolls back to
  * the last durable value. */
-async function commitAgentLaunch(command, args) {
+async function commitAgentLaunch(command, args, hand) {
   let failure = null;
   try {
-    await invoke(command, args);
+    await invoke(command, args, { hand });
   } catch (error) {
     failure = error;
   }
@@ -2836,7 +2840,7 @@ async function saveAgentLaunchEnv(agent, env) {
 }
 
 async function resetAgentLaunch(agent) {
-  await commitAgentLaunch("reset_agent_launch", { agent });
+  await commitAgentLaunch("reset_agent_launch", { agent }, handNow());
 }
 
 function paintAgents() {
@@ -3157,10 +3161,16 @@ function paintComputerInputPolicy() {
     : t("computerUse.inputPolicyUnknown", "현재 입력 정책을 확인하지 못했습니다."));
 }
 
+el("computer-share-required").addEventListener("change", () => {
+  void commitSetting("computer_share_required", "set_computer_share_required", {
+    on: el("computer-share-required").checked,
+  }, { hand: handNow() });
+});
+
 el("computer-shared-desktop").addEventListener("change", () => {
   if (!computerInputPolicyKnown) return;
   computerInputPolicy = el("computer-shared-desktop").checked ? "shared-desktop" : "background";
-  void commitSetting("computer_input_policy", "set_computer_input_policy", { policy: computerInputPolicy });
+  void commitSetting("computer_input_policy", "set_computer_input_policy", { policy: computerInputPolicy }, { hand: handNow() });
 });
 
 function paintComputerConfirm() {
@@ -3187,7 +3197,7 @@ for (const kind of COMPUTER_CONFIRM_KINDS) {
   el(`computer-confirm-${kind}`).addEventListener("change", () => {
     const on = el(`computer-confirm-${kind}`).checked;
     computerConfirmPolicy[kind] = on;
-    void commitSetting(`computer_confirm_${kind}`, "set_computer_confirm", { kind, on });
+    void commitSetting(`computer_confirm_${kind}`, "set_computer_confirm", { kind, on }, { hand: handNow() });
   });
 }
 
@@ -3302,7 +3312,7 @@ function paintComputerLiveReflex() {
 function setComputerLiveReflex(on) {
   computerLiveReflex = on;
   paintComputerLiveReflex();
-  void commitSetting("computer_live_reflex", "set_computer_live_reflex", { on });
+  void commitSetting("computer_live_reflex", "set_computer_live_reflex", { on }, { hand: handNow() });
 }
 
 // An unpressable switch takes focus and the pointer, so its line is read, and
@@ -3506,7 +3516,7 @@ for (const id of COMPUTER_PERMISSION_IDS) {
   document.querySelector(`[data-permission-check="${id}"]`).addEventListener("click", () => void refreshComputerUse());
 }
 el("computer-use-reset").addEventListener("click", () => void computerUseCall(
-  () => invoke("reset_computer_use_permissions"),
+  () => invoke("reset_computer_use_permissions", undefined, { hand: handNow() }),
   (report) => report,
 ));
 async function computerUseInstall() {
@@ -3723,7 +3733,7 @@ function typeValueSlotNode(name) {
   slot.querySelector("[data-type-value-remove]").addEventListener("click", () => {
     void runKeyCardStep(
       typeValueCard(name),
-      () => invoke("remove_type_value_key", { credentialKey: name }),
+      () => invoke("remove_type_value_key", { credentialKey: name }, { hand: handNow() }),
       () => t("computerUse.typeKeyRemoved", "지웠습니다 — {{name}}. 빈 칸은 입력하지 않고 사람에게 맡깁니다.", { name }),
     );
   });
@@ -3758,7 +3768,7 @@ async function saveTypeValueKey(name, input) {
   const key = input.value.trim();
   if (!key) return;
   await runKeyCardStep(typeValueCard(name), async () => {
-    const state = await invoke("save_type_value_key", { credentialKey: name, key });
+    const state = await invoke("save_type_value_key", { credentialKey: name, key }, { hand: handNow() });
     input.value = "";
     return state;
   }, () => t("computerUse.typeKeySaved", "키체인에 저장했습니다 — {{name}}. 다음 작업부터 빈 칸에 글자를 입력합니다.", { name }));
@@ -4336,7 +4346,7 @@ function claudeLoginMoved() {
 async function pickSystemClaudeLogin() {
   if (!accountReport.active) return;
   try {
-    accountReport = await invoke("use_system_claude_login");
+    accountReport = await invoke("use_system_claude_login", undefined, { hand: handNow() });
   } catch (error) {
     showError(String(error));
     await refreshClaudeAccounts();
@@ -4590,7 +4600,7 @@ async function resolveClaudeIdentity(row, choice) {
   addingAccount = true;
   paintClaudeAccounts();
   try {
-    accountReport = await invoke("resolve_claude_account_identity", { id: row.id, choice });
+    accountReport = await invoke("resolve_claude_account_identity", { id: row.id, choice }, { hand: handNow() });
   } catch (error) {
     showError(String(error));
     await refreshClaudeAccounts();
@@ -4629,7 +4639,7 @@ async function reloginClaudeAccount(row, button) {
   button.disabled = true;
   paintAccountAdd();
   try {
-    accountReport = await invoke("relogin_claude_account", { id: row.id });
+    accountReport = await invoke("relogin_claude_account", { id: row.id }, { hand: handNow() });
   } catch (error) {
     showError(String(error));
     await refreshClaudeAccounts();
@@ -4653,7 +4663,7 @@ async function pickClaudeAccount(id) {
   switchingAccount = id;
   paintClaudeAccounts();
   try {
-    accountReport = await invoke("select_claude_account", { id });
+    accountReport = await invoke("select_claude_account", { id }, { hand: handNow() });
   } catch (error) {
     showError(String(error));
     switchingAccount = null;
@@ -5253,6 +5263,7 @@ for (const id of [
  * Anything but a plain yes leaves the account alone — the dialog's third answer
  * and its dismissal both mean "not this". */
 async function dropClaudeAccount(row) {
+  const started = handNow();
   const said = await askConfirm({
     title: t("settings.accounts.removeAsk", "이 계정을 지울까요?"),
     body: t("settings.accounts.removeBody", "{{who}}의 로그인이 이 기계에서 지워집니다.", {
@@ -5263,8 +5274,10 @@ async function dropClaudeAccount(row) {
     danger: true,
   });
   if (said !== true) return;
+  // The press's hand, joined by the answer's (shell-boot.js `flowHand`).
+  const hand = flowHand(started);
   try {
-    accountReport = await invoke("remove_claude_account", { id: row.id });
+    accountReport = await invoke("remove_claude_account", { id: row.id }, { hand });
   } catch (error) {
     showError(String(error));
     await refreshClaudeAccounts();
@@ -5286,7 +5299,7 @@ el("account-add").addEventListener("click", async () => {
   addingAccount = true;
   paintAccountAdd();
   try {
-    accountReport = await invoke("add_claude_account");
+    accountReport = await invoke("add_claude_account", undefined, { hand: handNow() });
   } catch (error) {
     showError(String(error));
   } finally {
@@ -5436,7 +5449,7 @@ async function reloginCodexLogin(button) {
   button.disabled = true;
   paintCodexAccounts();
   try {
-    codexAccountReport = await invoke("relogin_codex_login");
+    codexAccountReport = await invoke("relogin_codex_login", undefined, { hand: handNow() });
   } catch (error) {
     showError(String(error));
     await refreshCodexAccounts();
@@ -5451,6 +5464,7 @@ async function reloginCodexLogin(button) {
  * credential this removes is the one every terminal without a chosen account
  * runs on, and the managed homes stay exactly as they are. */
 async function logoutCodexLogin() {
+  const started = handNow();
   const said = await askConfirm({
     title: t("settings.accounts.logoutAsk", "이 기계의 로그인을 로그아웃할까요?"),
     body: t(
@@ -5462,8 +5476,10 @@ async function logoutCodexLogin() {
     danger: true,
   });
   if (said !== true) return;
+  // The press's hand, joined by the answer's (shell-boot.js `flowHand`).
+  const hand = flowHand(started);
   try {
-    codexAccountReport = await invoke("logout_codex_login");
+    codexAccountReport = await invoke("logout_codex_login", undefined, { hand });
   } catch (error) {
     showError(String(error));
     await refreshCodexAccounts();
@@ -5554,7 +5570,7 @@ async function reloginCodexAccount(row, button) {
   button.disabled = true;
   paintCodexAccounts();
   try {
-    codexAccountReport = await invoke("relogin_codex_account", { id: row.id });
+    codexAccountReport = await invoke("relogin_codex_account", { id: row.id }, { hand: handNow() });
   } catch (error) {
     showError(String(error));
     await refreshCodexAccounts();
@@ -5568,7 +5584,7 @@ async function reloginCodexAccount(row, button) {
 async function pickCodexAccount(id) {
   if ((id ?? null) === (codexAccountReport.active ?? null)) return;
   try {
-    codexAccountReport = await invoke("select_codex_account", { id });
+    codexAccountReport = await invoke("select_codex_account", { id }, { hand: handNow() });
   } catch (error) {
     showError(String(error));
     await refreshCodexAccounts();
@@ -5578,6 +5594,7 @@ async function pickCodexAccount(id) {
 }
 
 async function dropCodexAccount(row) {
+  const started = handNow();
   const said = await askConfirm({
     title: t("settings.accounts.removeAsk", "이 계정을 지울까요?"),
     body: t("settings.accounts.removeBody", "{{who}}의 로그인이 이 기계에서 지워집니다.", {
@@ -5588,8 +5605,10 @@ async function dropCodexAccount(row) {
     danger: true,
   });
   if (said !== true) return;
+  // The press's hand, joined by the answer's (shell-boot.js `flowHand`).
+  const hand = flowHand(started);
   try {
-    codexAccountReport = await invoke("remove_codex_account", { id: row.id });
+    codexAccountReport = await invoke("remove_codex_account", { id: row.id }, { hand });
   } catch (error) {
     showError(String(error));
     await refreshCodexAccounts();
@@ -5604,7 +5623,7 @@ el("codex-account-add").addEventListener("click", async () => {
   addingCodexAccount = true;
   paintCodexAccountAdd();
   try {
-    codexAccountReport = await invoke("add_codex_account");
+    codexAccountReport = await invoke("add_codex_account", undefined, { hand: handNow() });
   } catch (error) {
     showError(String(error));
   } finally {
@@ -5804,10 +5823,11 @@ function googleAccountNote() {
  * still hand over a refresh token. */
 async function startGoogleLogin(button) {
   if (googleConsentUrl !== null) return;
+  const started = handNow();
   button.disabled = true;
   let url;
   try {
-    url = await invoke("google_login_start");
+    url = await invoke("google_login_start", undefined, { hand: flowHand(started) });
   } catch (error) {
     showError(String(error));
     paintGoogleAccount();
@@ -5822,7 +5842,7 @@ async function startGoogleLogin(button) {
   void openGoogleConsentInSystemBrowser();
   let report;
   try {
-    report = await invoke("google_login_finish");
+    report = await invoke("google_login_finish", undefined, { hand: flowHand(started) });
   } catch (error) {
     googleConsentUrl = null;
     showError(String(error));
@@ -5853,7 +5873,7 @@ async function openGoogleConsentInSystemBrowser() {
 async function cancelGoogleLogin() {
   googleLoginCancelled = true;
   try {
-    await invoke("cancel_google_login");
+    await invoke("cancel_google_login", undefined, { hand: handNow() });
   } catch (error) {
     showError(String(error));
   }
@@ -6201,7 +6221,7 @@ function startCliLogin(row, button) {
     command: row.tui_login ?? row.pane_command ?? null,
     walk: async () => {
       if (row.road === "verb") {
-        await invoke("cli_login_start", { agent: row.agent });
+        await invoke("cli_login_start", { agent: row.agent }, { hand: handNow() });
         return;
       }
       // `pane-verb` types the row's shell line into a plain shell; `tui`
@@ -6311,6 +6331,7 @@ async function typeCliLoginShellLine(row, line) {
  * removes is the one every terminal running that CLI signs in with. */
 async function logoutCliLogin(row) {
   if (cliLoginBusy.has(row.agent)) return;
+  const started = handNow();
   const said = await askConfirm({
     title: t("settings.cliLogins.logoutAsk", "{{name}} 로그인을 로그아웃할까요?", { name: row.name }),
     body: t(
@@ -6323,6 +6344,8 @@ async function logoutCliLogin(row) {
     danger: true,
   });
   if (said !== true) return;
+  // The press's hand, joined by the answer's (shell-boot.js `flowHand`).
+  const hand = flowHand(started);
   cliLoginBusy.set(row.agent, {
     road: row.logout_road,
     command: row.tui_logout ?? row.logout_command ?? null,
@@ -6332,7 +6355,7 @@ async function logoutCliLogin(row) {
   // road is over, as every road in does (`walkCliLoginRoad`).
   try {
     if (row.logout_road === "verb") {
-      await invoke("cli_login_logout", { agent: row.agent });
+      await invoke("cli_login_logout", { agent: row.agent }, { hand });
     } else {
       // The way out has the same three shapes the way in has: a verb that
       // needs a screen (it asks which provider, or asks twice), and a slash
@@ -6755,7 +6778,7 @@ function initTypeSafeEvents() {
   el("typesafe-remove-btn")?.addEventListener("click", () => {
     void runTypeSafe(() => {
       typesafeChecked = null;
-      return invoke("remove_typesafe_key", { providerIdentity: typesafeState?.providerIdentity });
+      return invoke("remove_typesafe_key", { providerIdentity: typesafeState?.providerIdentity }, { hand: handNow() });
     }, () => t("settings.typesafe.removed", "저장된 키를 지웠습니다."));
   });
   el("typesafe-check-btn")?.addEventListener("click", () => {
@@ -6874,9 +6897,7 @@ function summonRowNote(row) {
   const auto = t("settings.typesafe.rowAuto", "자동 — 지금은 {{model}} · {{effort}}로 뜹니다.", { model: row.model, effort: row.effort });
   const said = row.from === "person"
     ? t("settings.typesafe.rowWritten", "직접 적은 모델입니다. 비우면 자동으로 돌아갑니다.")
-    : row.effortRule === "highest"
-      ? `${auto} ${t("settings.typesafe.rowHighest", "쉬운 일과 보통 일은 한 등급 아래 모델을 그 모델의 가장 높은 사고 깊이로 씁니다.")}`
-      : auto;
+    : auto;
   const fresh = (row.candidates ?? []).filter((candidate) => candidate.fresh).map((candidate) => candidate.model);
   const placed = summonRowTier(row);
   const told = placed ? `${said} ${placed}` : said;
@@ -7021,7 +7042,8 @@ async function refreshTypeSafe() {
       if (managedJudgmentController.visible()) managedJudgmentController.render();
     });
   }
-  if (managedJudgmentController.visible() && !request.managed) {
+  const connectionsVisible = !settingsView.hidden && settingsPane === "api-routers" && !document.hidden;
+  if ((managedJudgmentController.visible() || connectionsVisible) && !request.managed) {
     managedJudgmentController.init();
     managedJudgmentController.loading = true;
     request.managed = settled(invoke("managed_judgment_status"));
@@ -7101,7 +7123,7 @@ async function saveTypeSafeKey() {
     // A different key is a different question: what the last check answered
     // was about the key that is being replaced.
     typesafeChecked = null;
-    const state = await invoke("save_typesafe_key", { key, provider, providerIdentity: typesafeState?.providerIdentity });
+    const state = await invoke("save_typesafe_key", { key, provider, providerIdentity: typesafeState?.providerIdentity }, { hand: handNow() });
     if (input) input.value = "";
     return state;
   }, () => t("settings.typesafe.saved", "키를 키체인에 저장했습니다. zo가 다음에 필요할 때 읽습니다."));
@@ -7115,7 +7137,7 @@ async function checkTypeSafeKey() {
   if (typesafeState) paintTypeSafe(typesafeState);
   paintTypeSafeStatus(t("settings.judgment.checking", "선택한 판단 모델에 묻는 중…"));
   try {
-    const check = await invoke("check_typesafe_key", { providerIdentity: identity });
+    const check = await invoke("check_typesafe_key", { providerIdentity: identity }, { hand: handNow() });
     if (identity !== typesafeState?.providerIdentity) {
       paintTypeSafeStatus(judgmentProviderController.failure("settings_changed"));
       return;
@@ -7212,6 +7234,7 @@ function onRouterPresetChange(chosenId) {
     if (urlInput) urlInput.value = "";
     if (keyInput) keyInput.value = "";
   }
+  modelConnectionsController.preset(found);
 }
 
 function routerAccountRow(row) {
@@ -7272,7 +7295,7 @@ function paintConfiguredRouters() {
  * left the real key behind. */
 async function dropConfiguredRouter(row) {
   try {
-    configuredRouters = (await invoke("remove_api_router", { name: row.name })) ?? [];
+    configuredRouters = (await invoke("remove_api_router", { name: row.name }, { hand: handNow() })) ?? [];
   } catch (error) {
     showError(error);
   }
@@ -7459,7 +7482,7 @@ async function saveApiRouterEntry() {
       models,
       clientFingerprint: modelConnectionsController.editing?.provider.client_fingerprint ?? preset?.client_fingerprint ?? null,
       headers: modelConnectionsController.editing?.provider.headers ?? preset?.headers ?? null,
-    })) ?? [];
+    }, { hand: handNow() })) ?? [];
 
     if (generation === routerDraftGeneration) {
       if (keyInput) keyInput.value = "";
@@ -7756,6 +7779,7 @@ function repaintDocumentsForLocale() {
 function setLocale(code) {
   const { refresh = true, persist = true } = arguments[1] ?? {};
   locale = code;
+  syncComputerSharePanelWords();
   document.documentElement.lang = code === "system" ? systemLocale : code;
   applyLocale();
   paintLocalePicker();
@@ -7973,14 +7997,16 @@ async function refreshTerminalSessions() {
   }
 }
 
-async function runTerminalSessionMutation(command, args) {
+// `hand` is the hand of the flow that asks (shell-boot.js `flowHand`):
+// ending a session is the person's (t-75153, R7b).
+async function runTerminalSessionMutation(command, args, { hand } = {}) {
   if (terminalSessionsLoading) return;
   ++terminalSessionsGeneration;
   terminalSessionsLoading = true;
   terminalSessionsProblem = "";
   paintTerminalSessions();
   try {
-    await invoke(command, args);
+    await invoke(command, args, { hand });
     terminalSessionsLoading = false;
     await refreshTerminalSessions();
   } catch (error) {
@@ -7995,6 +8021,7 @@ async function runTerminalSessionMutation(command, args) {
 }
 
 async function requestEndTerminalSession(session) {
+  const started = handNow();
   const label = managedTerminalSessionLabel(session);
   const accepted = await askConfirm({
     title: t("settings.terminal.sessionsEndOneTitle", "터미널 세션을 종료할까요?"),
@@ -8008,11 +8035,12 @@ async function requestEndTerminalSession(session) {
     danger: true,
   });
   if (accepted === true) {
-    await runTerminalSessionMutation("end_terminal_session", { term: session.term });
+    await runTerminalSessionMutation("end_terminal_session", { term: session.term }, { hand: flowHand(started) });
   }
 }
 
 async function requestEndAllTerminalSessions() {
+  const started = handNow();
   const count = managedTerminalSessions.length;
   if (count === 0) return;
   const accepted = await askConfirm({
@@ -8027,7 +8055,7 @@ async function requestEndAllTerminalSessions() {
     danger: true,
   });
   if (accepted === true) {
-    await runTerminalSessionMutation("end_all_terminal_sessions", {});
+    await runTerminalSessionMutation("end_all_terminal_sessions", {}, { hand: flowHand(started) });
   }
 }
 
@@ -8383,6 +8411,16 @@ function applyTerminalPalette() {
   if (signature !== terminalPaletteSignature) {
     terminalPaletteSignature = signature;
     forgetPalette();
+    // The shell's grid answers a program's `OSC 10/11/12 ; ?` with what the
+    // window paints, and only this function knows what that is (t-73869).
+    invoke("report_terminal_colors", {
+      report: {
+        foreground: colors.foreground,
+        background: colors.background,
+        cursor: colors.cursor,
+        ansi: terminalAnsiColorKeys().map((key) => colors[key]),
+      },
+    }).catch((error) => tellWindowLog(`terminal colours were not reported: ${error}`));
   }
   return true;
 }
@@ -9624,6 +9662,7 @@ function setSettingsOpen(on, focus = null) {
   }
   settingsSection = on ? focus : null;
   settingsView.hidden = !on;
+  if (!on) leaveDesignPage();
   if (on && !wasOpen && settingsPane === "judgment-models") void refreshTypeSafe();
   if (on && focus) {
     const at = el(focus);
@@ -11017,6 +11056,7 @@ function paintAutomationRuns() {
       mergeBtn.textContent = t("auto.mergeAndClean", "병합 및 정리");
       mergeBtn.dataset.tip = t("auto.mergeAndCleanTip", "메인 브랜치에 스쿼시 병합하고 워크트리를 정리합니다");
       mergeBtn.addEventListener("click", async () => {
+        const started = handNow();
         const confirmed = await askConfirm({
           title: t("auto.mergeConfirmTitle", "워크트리 병합 및 정리"),
           body: t(
@@ -11029,10 +11069,12 @@ function paintAutomationRuns() {
           danger: false,
         });
         if (!confirmed) return;
+        // The press's hand, joined by the answer's (shell-boot.js `flowHand`).
+        const hand = flowHand(started);
         mergeBtn.disabled = true;
         mergeBtn.textContent = t("auto.merging", "병합 중…");
         try {
-          const res = await invoke("merge_and_remove_worktree", { path: run.root });
+          const res = await invoke("merge_and_remove_worktree", { path: run.root }, { hand });
           toast(String(res));
           refreshWorktrees();
           void refreshAutomationRuns();
@@ -11662,8 +11704,8 @@ for (const button of document.querySelectorAll("[data-auto-sort]")) {
   });
 }
 
-async function deleteAutomationAndHistory(automation) {
-  automations = await invoke("delete_automation", { id: automation.id });
+async function deleteAutomationAndHistory(automation, hand) {
+  automations = await invoke("delete_automation", { id: automation.id }, { hand });
   if (autoSelectedId === automation.id) autoSelectedId = null;
   closeAutoForm();
   autoRuns = [];
@@ -11672,6 +11714,9 @@ async function deleteAutomationAndHistory(automation) {
 }
 
 async function requestAutomationDeletion(automation) {
+  // The press's hand, carried past the question (shell-boot.js `flowHand`,
+  // t-75209): the delete and "don't ask again" are the person's (t-74975).
+  const started = handNow();
   if (!skipDeleteAutomationConfirm) {
     const confirmed = await askConfirm({
       title: t("auto.deleteTitle", "자동화 삭제"),
@@ -11687,9 +11732,9 @@ async function requestAutomationDeletion(automation) {
       cancel: false,
     });
     if (confirmed !== true) return;
-    if (askRemembered()) setAskBeforeDeletingAutomations(false);
+    if (askRemembered()) setAskBeforeDeletingAutomations(false, flowHand(started));
   }
-  await deleteAutomationAndHistory(automation);
+  await deleteAutomationAndHistory(automation, flowHand(started));
 }
 
 el("auto-delete").addEventListener("click", () => {
@@ -12027,6 +12072,7 @@ async function toggleDefaultBrowserProfile(id) {
 /* 프로필 하나를 잊는다 — 확인을 묻고(되돌릴 수 없다), 목록·쿠키 단지·기본
  * 표시를 시스템 손이 함께 거둔다(delete_browser_profile). */
 async function deleteBrowserProfile(profile) {
+  const started = handNow();
   const yes = await askConfirm({
     title: t("settings.browser.profileDelete", "프로필 삭제"),
     body: t(
@@ -12041,7 +12087,7 @@ async function deleteBrowserProfile(profile) {
   });
   if (yes !== true) return;
   try {
-    await invoke("delete_browser_profile", { id: profile.id });
+    await invoke("delete_browser_profile", { id: profile.id }, { hand: flowHand(started) });
   } catch (error) {
     showError(String(error));
     return;
@@ -13422,7 +13468,7 @@ async function mergeGhItem(method) {
       project: ghItem.project,
       number: ghItem.number,
       method,
-    });
+    }, { hand: handNow() });
     ghItemBusy = false;
     await readGithubItem();
   } catch (error) {
@@ -15231,7 +15277,7 @@ async function mergeGlItem(method) {
       project: glItem.project,
       number: glItem.number,
       method,
-    });
+    }, { hand: handNow() });
     // 병합된 카드는 `merged`를 입고 이 문을 접는다 — 목록의 그 행도 같이.
     await readGitlabItem();
     void loadTaskGitlab();

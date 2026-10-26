@@ -19,9 +19,9 @@ use zerocode_core::orchestration::settle::{
 };
 use zerocode_core::orchestration::task_cost::TaskCost;
 use zerocode_core::orchestration::{
-    Closure, Delivery, Gate, GateStatus, LEDGER_ITSELF, Ledger, Message, MessageKind, Run,
-    SETTLE_QUIET_DAYS, Task, TaskStatus, WorkProgress, WorkStage, WorktreeRoom, last_touched_ms,
-    worktree_room,
+    Closure, Delivery, Gate, GateStatus, LEDGER_ITSELF, Ledger, Message, MessageKind, NextStep,
+    Run, SETTLE_QUIET_DAYS, Task, TaskStatus, WorkProgress, WorkStage, WorktreeRoom,
+    last_touched_ms, worktree_room,
 };
 use zerocode_core::plain_text::TextLint;
 
@@ -183,7 +183,7 @@ struct NewsTable {
     /// them, and the one night that filled the desk with 46 letters was a
     /// seven-hour gap. What is older is history, and `inbox` reads history.
     stands_ms: i64,
-    kinds: [(MessageKind, NewsLine); 8],
+    kinds: [(MessageKind, NewsLine); 9],
     /// Where a folded notice can still be acknowledged from the desk: in the
     /// batch its coordinator holds open, handed over and not acknowledged
     /// (t-9548) — the folded count then offers that whole batch, as a line
@@ -219,6 +219,7 @@ const DESK_NEWS: NewsTable = NewsTable {
         (MessageKind::ModelDeviated, NewsLine::PerNotice),
         (MessageKind::LandingStalled, NewsLine::PerNotice),
         (MessageKind::LandCheck, NewsLine::PerNotice),
+        (MessageKind::TurnFailed, NewsLine::PerNotice),
     ],
     folded_ack: "delivered",
 };
@@ -498,6 +499,9 @@ pub(crate) struct DeskTask {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) stage: &'static str,
+    /// What is to be done next ([`next_step`], t-73910 W4-1): the window
+    /// translates the word, and keeps no table of steps of its own.
+    pub(crate) next_step: NextStep,
     /// The task this one was written under (`task-create --parent`) and that
     /// task's name: the goal the board's 「지금 도는 일」 folds its rows under
     /// (t-67607). `None` for a task written at the top.
@@ -536,6 +540,11 @@ pub(crate) struct DeskTask {
     /// sends, and read once for a completed task, whose stage it decides.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) progress: Option<WorkProgress>,
+    /// Whether the commit its work landed as (`progress.merge_head`) is on
+    /// the remote's default branch, as the beat last asked git (t-73910 W4-2,
+    /// [`crate::remote_landing`]); `None` until it was asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) on_remote: Option<crate::remote_landing::OnRemote>,
     /// When its work moved (t-67482): the task board's schedule draws the row
     /// on the time axis from these. Asked of the rows the desk sends; `None`
     /// for a task nobody has carried yet.
@@ -805,9 +814,11 @@ const fn completed_stage(work: WorkStage) -> &'static str {
         WorkStage::Waived => "waived",
         WorkStage::NothingToLand => "nothing_to_land",
         WorkStage::Closed => "closed",
-        WorkStage::Working | WorkStage::Failed | WorkStage::Superseded | WorkStage::Unknown => {
-            "unknown"
-        }
+        WorkStage::Working
+        | WorkStage::Failed
+        | WorkStage::Stopped
+        | WorkStage::Superseded
+        | WorkStage::Unknown => "unknown",
     }
 }
 
@@ -819,6 +830,26 @@ pub(crate) fn word_awaits_review(word: &str) -> bool {
     WorkStage::ALL
         .into_iter()
         .any(|stage| awaits_review(stage) && completed_stage(stage) == word)
+}
+
+/// What comes next for a task at a desk stage: the work's own step
+/// ([`WorkStage::next_step`]) where its stage is where completed work stands,
+/// and for the task's own status otherwise. A completed task the ledger
+/// cannot read (`unknown`) asks for nothing it would have to guess.
+pub(crate) fn next_step(stage: &str, progress: Option<&WorkProgress>) -> NextStep {
+    match stage {
+        "pending" => NextStep::AwaitDependencies,
+        "ready" => NextStep::Summon,
+        "dispatched" => NextStep::Wait,
+        "gate" => NextStep::Decide,
+        "blocked" => NextStep::MendDependency,
+        "failed" => WorkStage::Failed.next_step(),
+        "closed" => WorkStage::Closed.next_step(),
+        word => progress
+            .map(|progress| progress.stage)
+            .filter(|work| completed_stage(*work) == word && word != "unknown")
+            .map_or(NextStep::Unknown, WorkStage::next_step),
+    }
 }
 
 /// A task's one stage word ([`STAGES`]) — the reading the desk, the board and
@@ -910,6 +941,7 @@ pub(crate) fn desk_snapshot(
             .collect();
         let left = left_behind_by(run, now_ms, |task| awaiting.contains(task.id.as_str()));
         for (task, (stage, progress)) in read {
+            let next_step = next_step(stage, progress.as_ref());
             staged_tasks.push((
                 run,
                 task,
@@ -918,6 +950,7 @@ pub(crate) fn desk_snapshot(
                     id: task.id.clone(),
                     title: task.display_name().to_string(),
                     stage,
+                    next_step,
                     parent: task.parent.clone(),
                     parent_title: task
                         .parent
@@ -925,6 +958,7 @@ pub(crate) fn desk_snapshot(
                         .and_then(|parent| run.task(parent))
                         .map(|parent| parent.display_name().to_string()),
                     progress,
+                    on_remote: None,
                     gate: run
                         .pending_gate_on(&task.id)
                         .map(|gate| desk_gate(run, gate, &examined)),
@@ -3140,6 +3174,57 @@ mod tests {
         assert!(finished(held, held.task(&by_hand[0]).expect("a task")));
     }
 
+    /// t-73910 W4-1: every desk stage says what comes next. A task's own
+    /// status decides it before completion; after, the work's own step does,
+    /// and only where the row's word is that work's word — a word and a
+    /// reading that disagree, or a completed task the ledger cannot read, ask
+    /// for nothing.
+    #[test]
+    fn every_desk_stage_says_what_comes_next_and_completed_work_reads_its_own() {
+        let progress = |stage: WorkStage| WorkProgress {
+            stage,
+            claimed: None,
+            attempt: None,
+            source: None,
+            merge_head: None,
+            reviewed: None,
+            next: None,
+        };
+        for stage in STAGES {
+            if !FINISHED_STAGES.contains(&stage) {
+                let step = next_step(stage, None);
+                assert_eq!(
+                    step == NextStep::Unknown,
+                    stage == "unknown",
+                    "{stage}: {step:?}"
+                );
+            }
+        }
+        for (word, work, step) in [
+            ("reported", WorkStage::ReportOnly, NextStep::Review),
+            ("verified", WorkStage::Verified, NextStep::Land),
+            ("merged", WorkStage::Merged, NextStep::Ship),
+            ("stale", WorkStage::Stale, NextStep::ReviewNewHead),
+            ("deployed", WorkStage::Deployed, NextStep::Over),
+            ("nothing_to_land", WorkStage::NothingToLand, NextStep::Over),
+            ("unknown", WorkStage::Working, NextStep::Unknown),
+            ("verified", WorkStage::ReportOnly, NextStep::Unknown),
+        ] {
+            assert_eq!(
+                next_step(word, Some(&progress(work))),
+                step,
+                "{word} over {work:?}"
+            );
+        }
+        assert_eq!(next_step("ready", None), NextStep::Summon);
+        assert_eq!(next_step("gate", None), NextStep::Decide);
+        assert_eq!(next_step("failed", None), NextStep::RetryOrClose);
+        assert_eq!(
+            serde_json::to_value(NextStep::ReviewNewHead).expect("json"),
+            "review_new_head"
+        );
+    }
+
     /// Work nobody is coming back to stands apart on the desk (t-71220): each
     /// row says the pile it is in, each stage counts how many of its tasks are
     /// left, and the piles carry every task a press names — so the board's
@@ -4125,5 +4210,165 @@ mod tests {
             (Some(25), Some("v1.2.3")),
             "{shipped_times:?}"
         );
+    }
+    /// The inbox page (t-67483) is a view over this snapshot and the panes:
+    /// the number it says for 질문 is the coordinator cards' sum and the desk's
+    /// 「답할 우편」, its 넘김 is the desk's `reported` stage, and its 막힘 and
+    /// 알림 together are the desk's 「소식」 plus the panes and the landing
+    /// line — one count, made in one place. Three questions over two runs
+    /// (2 + 1), a hand-in, a quota wall and a worker's death in the news, and
+    /// three panes (a stop, its own question, a finish).
+    #[test]
+    fn inbox_counts_equal_card_and_desk_counts() {
+        use crate::cmd::waiting::WaitingRow;
+        let start = crate::now_epoch_ms() - HOUR_MS;
+        let mut ledger = Ledger::new();
+        let (first, _) = a_worker_carrying_a_task(&mut ledger, start);
+        // A hand-in somebody is coming back to has a live seat to come back to.
+        ledger
+            .seat_coordinator(&first, "team-news/%1", None, start + 49)
+            .expect("a seat");
+        let second = ledger.create_run("desk-second", start + 50);
+        ledger
+            .start_worker(&second, "codex", ("team-second", "%3"), None, start + 51)
+            .expect("somebody is at the second run");
+        let ask = |ledger: &mut Ledger, run: &str, team: &str, at: i64| {
+            ledger
+                .post(
+                    run,
+                    Draft {
+                        from: format!("pane:{team}/%7"),
+                        to: format!("run:{run}"),
+                        kind: MessageKind::Question,
+                        body: Text::from("main에 올릴까요?"),
+                        subject: Text::default(),
+                        priority: Priority::Normal,
+                        payload: Text::default(),
+                        thread: None,
+                        task: None,
+                        dispatch: None,
+                    },
+                    start + at,
+                )
+                .expect("a question");
+        };
+        ask(&mut ledger, &first, "team-news", 60);
+        ask(&mut ledger, &first, "team-news", 61);
+        ask(&mut ledger, &second, "team-second", 62);
+        for (at, kind) in [
+            (63, MessageKind::QuotaWalled),
+            (64, MessageKind::WorkerDied),
+        ] {
+            ledger
+                .post(
+                    &first,
+                    a_notice(&first, kind, r#"{"workerId":"w-elsewhere"}"#),
+                    start + at,
+                )
+                .expect("a notice");
+        }
+        let task = ledger
+            .create_task(
+                &first,
+                "hand".into(),
+                "hand".into(),
+                vec![],
+                None,
+                start + 65,
+            )
+            .expect("a task");
+        let carrier = ledger
+            .start_worker(
+                &first,
+                "claude",
+                ("team-news", "%4"),
+                Some(&task),
+                start + 66,
+            )
+            .expect("a worker carries it");
+        ledger
+            .post(
+                &first,
+                Draft {
+                    from: worker_address(&carrier.worker),
+                    to: ledger.run(&first).expect("the run").address(),
+                    kind: MessageKind::WorkerDone,
+                    body: Text::from(r#"{"ok":true,"head":"1234567"}"#.to_string()),
+                    subject: Text::default(),
+                    priority: Priority::Normal,
+                    payload: Text::default(),
+                    thread: None,
+                    task: Some(task.clone()),
+                    dispatch: carrier.dispatch.clone(),
+                },
+                start + 67,
+            )
+            .expect("the report");
+        let panes: Vec<WaitingRow> = [("blocked", 3), ("question", 4), ("finished", 5)]
+            .into_iter()
+            .map(|(waiting, at)| WaitingRow {
+                pane: format!("term:{at}"),
+                agent: "claude",
+                worktree: format!("/Users/dev/acme/wt-{at}"),
+                waiting,
+                since_ms: start + at,
+            })
+            .collect();
+
+        let desk = desk_snapshot(
+            &ledger,
+            |seat| (seat == "team-news/%1").then_some(7),
+            no_cost,
+        );
+        let inbox = crate::orchestration::inbox::inbox_of(&desk, &panes);
+        let cards: usize = desk.runs.iter().map(|run| run.mail).sum();
+        assert_eq!(desk.counts.mail, 3, "{:?}", desk.counts);
+        assert_eq!(
+            (inbox.counts.question, cards),
+            (3, 3),
+            "the page's 질문 is the cards' sum (2 + 1) and the desk's 「답할 우편」"
+        );
+        let reported = desk
+            .stages
+            .iter()
+            .find(|stage| stage.stage == "reported")
+            .map(|stage| stage.count);
+        assert_eq!(
+            (inbox.counts.handoff, reported),
+            (1, Some(1)),
+            "the page's 넘김 is the desk's reported stage"
+        );
+        let letters = |tab: &str| {
+            inbox
+                .items
+                .iter()
+                .filter(|item| item.tab == tab && item.letter.is_some())
+                .count()
+        };
+        assert_eq!(
+            letters("blocked") + letters("notice"),
+            desk.counts.news,
+            "the news is split between 막힘 and 알림, never counted twice or dropped"
+        );
+        assert_eq!(
+            (inbox.counts.blocked, inbox.counts.notice),
+            (1 + 2, 1 + 1),
+            "막힘 = the wall + the stopped pane + the pane's own question; \
+             알림 = the death + the finish"
+        );
+        assert_eq!(
+            inbox.counts.waiting,
+            inbox.counts.question + inbox.counts.handoff + inbox.counts.blocked,
+            "the sidebar's number is everything but the notices"
+        );
+        assert_eq!(inbox.counts.all, inbox.items.len(), "{:?}", inbox.counts);
+        let order: Vec<&str> = inbox.items.iter().map(|item| item.tab).collect();
+        let mut sorted = order.clone();
+        sorted.sort_by_key(|tab| {
+            crate::orchestration::inbox::TABS
+                .iter()
+                .position(|one| one == tab)
+        });
+        assert_eq!(order, sorted, "the tabs stand in the page's order");
     }
 }

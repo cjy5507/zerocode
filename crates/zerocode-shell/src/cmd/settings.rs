@@ -1474,6 +1474,26 @@ pub(crate) fn set_computer_confirm(
     Ok(snapshot)
 }
 
+/// Only the person may require or relax app sharing (t-74582).
+#[tauri::command(async)]
+pub(crate) fn set_computer_share_required(
+    app: AppHandle,
+    webview: tauri::Webview,
+    state: State<'_, AppState>,
+    on: bool,
+) -> Result<SettingsSnapshot, String> {
+    commit_setting(
+        &app,
+        &webview,
+        &state,
+        &[setting_key::COMPUTER_SHARE_REQUIRED],
+        |settings| {
+            settings.computer_share_required = on;
+            Ok(())
+        },
+    )
+}
+
 #[tauri::command(async)]
 pub(crate) fn set_computer_input_policy(
     app: AppHandle,
@@ -1557,6 +1577,47 @@ pub(crate) fn set_computer_generator_road(
 pub(crate) fn computer_confirm_answer(id: String, allow: bool) -> bool {
     let _crumb = crate::crumbs::Command::enter("computer_confirm_answer");
     computer_use::confirm::answer(&id, allow)
+}
+
+/// The person takes control of the window shared with an agent (t-73906):
+/// the request in flight stops at its next step and every act after it is
+/// refused until they hand it back.
+#[tauri::command(async)]
+pub(crate) fn computer_take_control() {
+    let _crumb = crate::crumbs::Command::enter("computer_take_control");
+    computer_use::share::take_control();
+}
+
+/// The person hands the shared window back to the agent (t-73906).
+#[tauri::command(async)]
+pub(crate) fn computer_give_back() {
+    let _crumb = crate::crumbs::Command::enter("computer_give_back");
+    computer_use::share::give_back();
+}
+
+/// The person hands over, from the band, the app an agent waits for under
+/// required sharing (t-74826): that app only, and only while it waits.
+#[tauri::command]
+pub(crate) fn computer_share_hand_over(app: String) -> bool {
+    let _crumb = crate::crumbs::Command::enter("computer_share_hand_over");
+    computer_use::share::hand_over(&app)
+}
+
+/// What is shared with an agent now, for the band's first paint (t-73906).
+#[tauri::command(async)]
+pub(crate) fn computer_share_state(panel_label: Option<String>) -> serde_json::Value {
+    let _crumb = crate::crumbs::Command::enter("computer_share_state");
+    computer_use::share::panel_label(panel_label);
+    computer_use::share::state()
+}
+
+/// The page's answer to the window's request about its own controls
+/// (t-73906): a look, one control's facts, or a press it made. Called from
+/// the window's page and from nowhere else.
+#[tauri::command]
+pub(crate) fn computer_self_answer(id: u64, answer: serde_json::Value) -> bool {
+    let _crumb = crate::crumbs::Command::enter("computer_self_answer");
+    computer_use::self_surface::answered(id, answer)
 }
 
 /// The person's code for a person's-turn card that has a line for one

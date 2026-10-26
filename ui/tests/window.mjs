@@ -33,8 +33,12 @@ import { testArtifactBand, testArtifactBeside, testArtifactFollowed, testArtifac
 import { testLedgerPoll } from "./ledger-poll.mjs";
 import { testUsageGoogleLogin, testUsageRefresh, testUsageWords } from "./usage-refresh.mjs";
 import { testTerminalDoor } from "./terminal-door.mjs";
-import { testWaitingList } from "./waiting-list.mjs";
+import { testInbox } from "./inbox.mjs";
+import { testPaletteRecent } from "./palette-recent.mjs";
+import { testDesignSystem } from "./design-system.mjs";
 import { testAccountSwitch } from "./account-switch.mjs";
+import { testToastClearOfDrawer } from "./toast-clear-of-drawer.mjs";
+import { testSkillsPickers } from "./skills-pickers.mjs";
 import { testTaskBoard } from "./task-board.mjs";
 import { testScmHealth } from "./scm-health.mjs";
 import { testScmNoticeWindow } from "./scm-notice-window.mjs";
@@ -106,6 +110,8 @@ import { testKeybindingText } from "./keybinding-text.mjs";
 import { testTerminalCloseResult } from "./terminal-close-result.mjs";
 import { testPermissionCard } from "./permission-card.mjs";
 import { testAnswerDoor } from "./answer-door.mjs";
+import { testSelfAct } from "./self-act.mjs";
+import { testComputerShare } from "./computer-share.mjs";
 import { testExplain } from "./explain.mjs";
 import { testAskPopup } from "./ask-popup.mjs";
 import { testSecretPrompt } from "./secret-prompt.mjs";
@@ -126,7 +132,7 @@ import { testSidebarRoles } from "./sidebar-roles.mjs";
 import { testCloseGuard, testRestartNotice } from "./close-guard.mjs";
 import { testSidebarTaskFold } from "./sidebar-task-fold.mjs";
 import { testSidebarFinishedFold } from "./sidebar-finished-fold.mjs";
-import { testSidebarTeam } from "./sidebar-team.mjs";
+import { testSidebarTeam, testSidebarTeamFamilies } from "./sidebar-team.mjs";
 import { testSidebarTeamSettled } from "./sidebar-team-settled.mjs";
 import { testSidebarScroll } from "./sidebar-scroll.mjs";
 import { testLandingAlerts } from "./landing-alerts.mjs";
@@ -277,9 +283,17 @@ suite("usage-refresh", async ({ browser, origin, ok }) => {
 suite("usage-google-login", ({ browser, origin, ok }) => testUsageGoogleLogin(browser, origin, standBackend, ok));
 suite("terminal-door", ({ browser, origin, ok }) => testTerminalDoor(browser, origin, standBackend, ok));
 suite("account-switch", ({ browser, origin, ok }) => testAccountSwitch(browser, origin, standBackend, ok));
-suite("waiting-list", ({ browser, origin, ok }) => testWaitingList(browser, origin, standBackend, ok));
+suite("inbox", ({ browser, origin, ok }) => testInbox(browser, origin, standBackend, ok));
+suite("palette-recent", ({ browser, origin, ok }) => testPaletteRecent(browser, origin, standBackend, ok));
+suite("design-system", ({ browser, origin, ok }) => testDesignSystem(browser, origin, standBackend, ok));
+suite("toast-clear-of-drawer", ({ browser, origin, ok }) => testToastClearOfDrawer(browser, origin, ok));
+suite("skills-pickers", ({ browser, origin, ok }) => testSkillsPickers(browser, origin, ok));
 suite("board-waits", ({ browser, origin, ok }) => testBoardWaits(browser, origin, ok));
 suite("answer-door", ({ browser, origin, ok }) => testAnswerDoor(browser, origin, ok));
+/* ZeroCode's own window as a Computer Use target: the page's half (t-73906). */
+suite("self-act", ({ browser, origin, ok }) => testSelfAct(browser, origin, ok));
+/* One window shared with an agent: the card and the band (t-73906). */
+suite("computer-share", ({ browser, origin, ok }) => testComputerShare(browser, origin, ok));
 suite("explain", ({ browser, origin, ok }) => testExplain(browser, origin, ok));
 // Vault state stays local to this fixture, just like the explorer fixture.
 suite("task-board", ({ browser, origin, ok }) => testTaskBoard(browser, origin, ok));
@@ -411,6 +425,7 @@ suite("sidebar-task-fold", testSidebarTaskFold);
 suite("sidebar-finished-fold", testSidebarFinishedFold);
 // The team view: coordinators, the workers under each, a row a worker's pane (t-56141).
 suite("sidebar-team", testSidebarTeam);
+suite("sidebar-team-families", testSidebarTeamFamilies);
 // A coordinator's finished sub-agents stand under it in the branch list, whatever the run or the agent (t-66539).
 suite("sidebar-team-settled", testSidebarTeamSettled);
 // The sidebar holds its rows while the person scrolls it, and reaches row 0 in one go (t-63568).
@@ -927,7 +942,7 @@ ok(
 // remap contract is held by the finder's chord instead — whose label is not
 // a tooltip at all but the search button's keycap, the one composed surface
 // a [data-chord] sweep cannot reach.
-row = await rowFor("워크트리로 이동");
+row = await rowFor("어디로 갈까요");
 await page.evaluate((node) => node.querySelector(".keys-edit").click(), row);
 await page.keyboard.press(primaryPress("Alt", "J"));
 await page.waitForTimeout(200);
@@ -2560,7 +2575,7 @@ await page.evaluate(() => setLocale("en"));
 await page.waitForTimeout(250);
 const finderTitle = await page.evaluate(() => ({
   shown: document.getElementById("qo-title").textContent.trim(),
-  wanted: t("worktree.jump", "워크트리로 이동"),
+  wanted: t("worktree.jump", "어디로 갈까요"),
   file: t("file.goto", "파일로 이동"),
 }));
 ok(
@@ -10050,6 +10065,8 @@ const mirrored = await page.evaluate(async () => {
   };
   const closed = [];
   window.__ANSWER__.close_term = (args) => (closed.push(args.term), null);
+  // A mirror pane closes by its own door (t-75153, R7b).
+  window.__ANSWER__.close_mirror_term = (args) => (closed.push(args.term), null);
   // A running page for the same run stands first — the mirror must replace it.
   tell("worker:opened", { id: "m1", term, agent: "codex", name: "Codex", command: "codex exec" });
   await pageStands("m1");
@@ -10104,6 +10121,7 @@ const mirrored = await page.evaluate(async () => {
   seen.fallbackQuiet = window.__MIRROR_ASKED__ === null;
   delete window.__ANSWER__.open_mirror_term;
   delete window.__ANSWER__.close_term;
+  delete window.__ANSWER__.close_mirror_term;
   // Tidy: drop the mirror pane and the term tab.
   tab.layout = prunePanes(tab.layout, new Set([term]));
   tab.activePane = term;

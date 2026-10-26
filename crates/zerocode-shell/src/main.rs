@@ -27,6 +27,8 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 use zerocode_core::conflict::{self, ConflictKind, ConflictOperation};
 use zeroize::Zeroizing;
+
+use crate::computer_use::self_surface::person_only_gate;
 // 호스트 경계. 워크스페이스의 파일과 git이 어느 기계에 있는지는 `Host` 하나가
 // 답하고, 이 파일은 그 답을 들고 다닐 뿐 어느 변종인지 묻지 않는다.
 use zerocode_core::agent_teams::TeamsMode;
@@ -153,6 +155,7 @@ mod pane_layout;
 mod pane_runtime;
 mod pane_transcript;
 mod pick_runtime;
+mod plain_read;
 mod preference_runtime;
 mod primary_selection;
 mod proc;
@@ -162,6 +165,7 @@ mod prompt_transaction;
 mod qa_triage;
 mod quota_wall;
 mod readiness_runtime;
+mod remote_landing;
 mod remote_repo;
 mod remote_servers;
 mod remote_workspaces;
@@ -259,80 +263,82 @@ use cmd::{
     agent_launch_plans, agent_models, agent_teams_mode, agent_terms, answer_approval, answer_ask,
     answer_secret, antigravity_usage, api_router_keys_kept, api_router_presets,
     api_router_providers, apply_ghostty_import, apply_ui_zoom, archive_trust_standing,
-    automation_born_worktrees, board_columns, board_desk, board_settle, board_snapshot,
-    boot_after_restart, boot_report, browse_dir, browse_places, browser_click, browser_console,
-    browser_devtools, browser_diagnose, browser_eval, browser_find, browser_find_clear,
-    browser_grab_arm, browser_grab_disarm, browser_grab_take, browser_history, browser_menu_take,
-    browser_navigate, browser_network, browser_place, browser_profiles, browser_read,
-    browser_reload, browser_scroll, browser_snapshot, browser_stop, browser_type, browser_wait,
-    browser_zoom, build_stamp, builtin_decision_definition, busy_census, cancel_folder_panel,
-    cancel_google_login, check_model_connection, check_typesafe_key, choose_paths, choose_project,
-    claude_account_usage, claude_accounts, claude_autoswitch_apply, claude_autoswitch_mode,
-    claude_token_usage, claude_usage, claude_usage_stats, clear_delivered_diff_notes,
-    clear_diff_notes, clear_finish_mark, clear_model_connection, cli_login_list, cli_login_logout,
-    cli_login_start, cli_login_wait, cli_login_witness, cli_login_witness_drop,
-    clipboard_has_image, clone_repository, clone_target_name, close_browser_pane, close_lane,
-    close_onboarding, close_term, codex_account_list, codex_token_usage, codex_usage,
-    codex_usage_stats, commit_failure_card, commit_file_diff, commit_files, commit_landings,
-    commit_staged, computer_awake_status, computer_confirm_answer, computer_guard_status,
-    computer_handoff_code, computer_live_reflex_check, computer_resume, computer_stop,
-    computer_use_capabilities, computer_use_permission_status, computer_use_skill_report,
-    computer_use_tcc_row_action, conflict_card, continuation_source, cookie_sources, crash_bundle,
-    crash_open_log, create_browser_profile, create_project, create_pull_request,
-    create_untitled_markdown, create_worktree, default_project_parent, default_tabs,
-    delete_automation, delete_browser_profile, delete_diff_note, delete_quick_command,
-    delete_untitled_markdown, delete_untracked, desk_ack, desk_checkouts, desk_hold_resolve,
-    desk_reply, desk_review_pass, developer_permission_statuses, discard_paths,
-    dismiss_external_worktree_prompt, enable_automation, end_all_terminal_sessions,
-    end_terminal_session, file_diff, file_version, floating_workspace_seat, flow_list, flow_set,
-    focus_lane, focus_main, fs_create, fs_duplicate, fs_move, fs_open_default, fs_redo, fs_rename,
-    fs_reveal, fs_trash, fs_undo, gate_lane, generate_branch_name, generate_commit_message,
-    generate_pull_request, get_browser_workspaces, get_second_brain_scenes, git_history,
-    github_assignable_users, github_comment_work_item, github_disconnect, github_login_intent,
-    github_merge_pr, github_pr_file_diff, github_preset_query, github_review_states,
-    github_select_account, github_set_reviewers, github_set_work_item_open, github_status,
-    github_test_connection, github_web_urls, github_work_item_detail, github_work_items,
-    gitlab_comment_item, gitlab_inline_comment, gitlab_item_detail, gitlab_job_trace,
-    gitlab_merge_mr, gitlab_mr_review, gitlab_pipeline_jobs, gitlab_project_members,
-    gitlab_retry_job, gitlab_set_item_open, gitlab_set_mr_reviewers, gitlab_status, gitlab_todos,
-    gitlab_update_mr, gitlab_work_items, google_account, google_login_finish, google_login_start,
-    google_logout, grok_usage, harness_status, hooks_report, hosted_review_eligibility, image_diff,
-    import_browser_cookies, import_cookie_file, import_external_worktrees, install_bundled_skill,
-    install_hooks, jev_day, jev_review, jev_review_outcome, jev_summary, judge_worker_room,
-    judgment_models, key_input, kimi_usage, lane_fold, lane_lines, lane_scroll, launch_agent_tab,
-    launch_plan_for_action, launch_recipes, leave_cancel, leave_hold, leave_now, leave_when_idle,
-    ledger_agents, list_agents, list_automation_runs, list_automations, list_branches,
-    list_claude_sessions, list_diff_notes, list_dir, list_quick_commands, list_run_evidence,
-    list_skills, list_system_fonts, list_worktrees, listening_ports, log_window_error,
-    logout_codex_login, machine_load, managed_judgment_apply, managed_judgment_cancel,
-    managed_judgment_check, managed_judgment_inspect_source, managed_judgment_install,
-    managed_judgment_install_source, managed_judgment_prepare_model_runtime,
-    managed_judgment_prepare_runtime, managed_judgment_register_catalog, managed_judgment_remove,
-    managed_judgment_start, managed_judgment_status, managed_judgment_stop,
-    managed_judgment_switch_model, mark_default_tabs_applied, mark_first_run_seen, mark_onboarding,
-    merge_and_remove_worktree, mirror_ready, model_connections, mouse_input, note_webview_error,
-    note_worker_room_change, note_worker_room_seen, notification_probe, open_board_popout,
-    open_browser_pane, open_commit_remote, open_computer_use_permission,
-    open_developer_permission_settings, open_download, open_lane, open_mirror_term,
-    open_path_in_application, open_project, open_remote_server_session,
-    open_remote_workspace_terminal, open_ssh_terminal, open_term_tab, open_term_tab_in,
-    open_terminal, open_url, open_workspace_in_application, opencode_usage, opencode_usage_stats,
-    orchestration_accuracy, orchestration_report, orchestration_runtime_state, pane_activities,
-    pane_agents, pane_image, pane_layouts, pane_log, pane_sessions, pane_subagents, paste_input,
-    patch_browser_link_routing, patch_browser_user_agents, patch_editing_prefs,
-    patch_floating_workspace, patch_left_sidebar_appearance, patch_open_in_applications,
-    patch_terminal_prefs, patch_update_prefs, patch_workspace_board_items,
-    patch_workspace_board_status, patch_workspace_creation_prefs, path_kinds, paths_exist,
-    pr_check_details, pr_checks, preflight_judgment_provider, preview_ghostty_import,
-    preview_warp_terminal_themes, probe_remote_workspace, probe_ssh_host, process_memory,
-    project_catalog, project_kind, project_scripts, pull_request_seed, quota_wall_handover,
-    quota_wall_retry, read_image_file, read_primary_selection, read_text_file, recall_folder_panel,
-    record_archive_trust, record_repo_trust, release_status, release_untitled_markdown,
-    relogin_claude_account, relogin_codex_account, relogin_codex_login, remote_servers,
-    remote_workspaces, remove_api_router, remove_claude_account, remove_codex_account,
-    remove_project, remove_remote_server, remove_remote_workspace, remove_ssh_host,
-    remove_type_value_key, remove_typesafe_key, remove_worktree, render_mermaid, reopen_onboarding,
-    reorder_projects, repo_trust_standing, request_developer_permission, reset_agent_launch,
+    automation_born_worktrees, board_columns, board_desk, board_inbox, board_settle,
+    board_snapshot, boot_after_restart, boot_report, browse_dir, browse_places, browser_click,
+    browser_console, browser_devtools, browser_diagnose, browser_eval, browser_find,
+    browser_find_clear, browser_grab_arm, browser_grab_disarm, browser_grab_take, browser_history,
+    browser_menu_take, browser_navigate, browser_network, browser_place, browser_profiles,
+    browser_read, browser_reload, browser_scroll, browser_snapshot, browser_stop, browser_type,
+    browser_wait, browser_zoom, build_stamp, builtin_decision_definition, busy_census,
+    cancel_folder_panel, cancel_google_login, check_model_connection, check_typesafe_key,
+    choose_paths, choose_project, claude_account_usage, claude_accounts, claude_autoswitch_apply,
+    claude_autoswitch_mode, claude_token_usage, claude_usage, claude_usage_stats,
+    clear_delivered_diff_notes, clear_diff_notes, clear_finish_mark, clear_model_connection,
+    cli_login_list, cli_login_logout, cli_login_start, cli_login_wait, cli_login_witness,
+    cli_login_witness_drop, clipboard_has_image, clone_repository, clone_target_name,
+    close_browser_pane, close_lane, close_mirror_term, close_onboarding, close_term,
+    codex_account_list, codex_token_usage, codex_usage, codex_usage_stats, commit_failure_card,
+    commit_file_diff, commit_files, commit_landings, commit_staged, computer_awake_status,
+    computer_confirm_answer, computer_give_back, computer_guard_status, computer_handoff_code,
+    computer_live_reflex_check, computer_resume, computer_self_answer, computer_share_hand_over,
+    computer_share_state, computer_stop, computer_take_control, computer_use_capabilities,
+    computer_use_permission_status, computer_use_skill_report, computer_use_tcc_row_action,
+    conflict_card, continuation_source, cookie_sources, crash_bundle, crash_open_log,
+    create_browser_profile, create_project, create_pull_request, create_untitled_markdown,
+    create_worktree, default_project_parent, default_tabs, delete_automation,
+    delete_browser_profile, delete_diff_note, delete_quick_command, delete_untitled_markdown,
+    delete_untracked, desk_ack, desk_checkouts, desk_hold_resolve, desk_reply, desk_review_pass,
+    developer_permission_statuses, discard_paths, dismiss_external_worktree_prompt,
+    enable_automation, end_all_terminal_sessions, end_terminal_session, file_diff, file_version,
+    floating_workspace_seat, flow_list, flow_set, focus_lane, focus_main, fs_create, fs_duplicate,
+    fs_move, fs_open_default, fs_redo, fs_rename, fs_reveal, fs_trash, fs_undo, gate_lane,
+    generate_branch_name, generate_commit_message, generate_pull_request, get_browser_workspaces,
+    get_second_brain_scenes, git_history, github_assignable_users, github_comment_work_item,
+    github_disconnect, github_login_intent, github_merge_pr, github_pr_file_diff,
+    github_preset_query, github_review_states, github_select_account, github_set_reviewers,
+    github_set_work_item_open, github_status, github_test_connection, github_web_urls,
+    github_work_item_detail, github_work_items, gitlab_comment_item, gitlab_inline_comment,
+    gitlab_item_detail, gitlab_job_trace, gitlab_merge_mr, gitlab_mr_review, gitlab_pipeline_jobs,
+    gitlab_project_members, gitlab_retry_job, gitlab_set_item_open, gitlab_set_mr_reviewers,
+    gitlab_status, gitlab_todos, gitlab_update_mr, gitlab_work_items, google_account,
+    google_login_finish, google_login_start, google_logout, grok_usage, harness_status,
+    hooks_report, hosted_review_eligibility, image_diff, import_browser_cookies,
+    import_cookie_file, import_external_worktrees, install_bundled_skill, install_hooks, jev_day,
+    jev_review, jev_review_outcome, jev_summary, judge_worker_room, judgment_models, key_input,
+    kimi_usage, lane_fold, lane_lines, lane_scroll, launch_agent_tab, launch_plan_for_action,
+    launch_recipes, leave_cancel, leave_hold, leave_now, leave_when_idle, ledger_agents,
+    list_agents, list_automation_runs, list_automations, list_branches, list_claude_sessions,
+    list_diff_notes, list_dir, list_quick_commands, list_run_evidence, list_skills,
+    list_system_fonts, list_worktrees, listening_ports, log_window_error, logout_codex_login,
+    machine_load, managed_judgment_apply, managed_judgment_cancel, managed_judgment_check,
+    managed_judgment_inspect_source, managed_judgment_install, managed_judgment_install_source,
+    managed_judgment_prepare_model_runtime, managed_judgment_prepare_runtime,
+    managed_judgment_register_catalog, managed_judgment_remove, managed_judgment_start,
+    managed_judgment_status, managed_judgment_stop, managed_judgment_switch_model,
+    mark_default_tabs_applied, mark_first_run_seen, mark_onboarding, merge_and_remove_worktree,
+    mirror_ready, model_connections, mouse_input, note_webview_error, note_worker_room_change,
+    note_worker_room_seen, notification_probe, open_board_popout, open_browser_pane,
+    open_commit_remote, open_computer_use_permission, open_developer_permission_settings,
+    open_download, open_lane, open_mirror_term, open_path_in_application, open_project,
+    open_remote_server_session, open_remote_workspace_terminal, open_ssh_terminal, open_term_tab,
+    open_term_tab_in, open_terminal, open_url, open_workspace_in_application, opencode_usage,
+    opencode_usage_stats, orchestration_accuracy, orchestration_report,
+    orchestration_runtime_state, pane_activities, pane_agents, pane_image, pane_layouts, pane_log,
+    pane_sessions, pane_subagents, paste_input, patch_browser_link_routing,
+    patch_browser_user_agents, patch_editing_prefs, patch_floating_workspace,
+    patch_left_sidebar_appearance, patch_open_in_applications, patch_terminal_prefs,
+    patch_update_prefs, patch_workspace_board_items, patch_workspace_board_status,
+    patch_workspace_creation_prefs, path_kinds, paths_exist, pr_check_details, pr_checks,
+    preflight_judgment_provider, preview_ghostty_import, preview_warp_terminal_themes,
+    probe_remote_workspace, probe_ssh_host, process_memory, project_catalog, project_kind,
+    project_scripts, pull_request_seed, quota_wall_handover, quota_wall_retry, read_image_file,
+    read_primary_selection, read_text_file, recall_folder_panel, record_archive_trust,
+    record_repo_trust, release_status, release_untitled_markdown, relogin_claude_account,
+    relogin_codex_account, relogin_codex_login, remote_servers, remote_workspaces,
+    remove_api_router, remove_claude_account, remove_codex_account, remove_project,
+    remove_remote_server, remove_remote_workspace, remove_ssh_host, remove_type_value_key,
+    remove_typesafe_key, remove_worktree, render_mermaid, reopen_onboarding, reorder_projects,
+    repo_trust_standing, report_terminal_colors, request_developer_permission, reset_agent_launch,
     reset_computer_use_permissions, resize_lane, resolve_claude_account_identity, resolve_mr_base,
     resolve_pr_base, resource_snapshot, respond_permission, resume_line, resume_session,
     resume_vault_session, reveal_board_agent, reveal_run_evidence, reveal_skill,
@@ -353,11 +359,11 @@ use cmd::{
     set_browser_workspace_mode, set_claude_autoswitch_mode, set_clipboard_image,
     set_compact_worktree_cards, set_computer_awake_mode, set_computer_confirm,
     set_computer_generator_road, set_computer_input_policy, set_computer_live_reflex,
-    set_confirm_close_pinned, set_conversation_focus_view, set_crash_watchdog,
-    set_ctrl_tab_order_mode, set_default_agent, set_default_task_source, set_diff_side_by_side,
-    set_dock_badge, set_external_worktree_visibility, set_finish_notification_mode,
-    set_guide_dismissed, set_harness_settings, set_hidden_shortcuts, set_hidden_task_sources,
-    set_hide_agent_scratch_workspaces, set_hide_automation_workspaces,
+    set_computer_share_required, set_confirm_close_pinned, set_conversation_focus_view,
+    set_crash_watchdog, set_ctrl_tab_order_mode, set_default_agent, set_default_task_source,
+    set_diff_side_by_side, set_dock_badge, set_external_worktree_visibility,
+    set_finish_notification_mode, set_guide_dismissed, set_harness_settings, set_hidden_shortcuts,
+    set_hidden_task_sources, set_hide_agent_scratch_workspaces, set_hide_automation_workspaces,
     set_hide_default_branch_workspaces, set_hide_detached_head_workspaces,
     set_hide_sleeping_workspaces, set_hooks_enabled, set_jev_enabled, set_jev_model,
     set_jev_review_enabled, set_judgment_provider, set_keep_default_branch_awake, set_keybinding,
@@ -391,10 +397,10 @@ use cmd::{
     terminal_command, terminal_command_argv, terminal_prefs, terminal_sessions,
     terminal_windows_status, test_local_network_permission, test_remote_server,
     test_remote_workspace, test_router_connection, test_ssh_host, text_input, tip_verdict,
-    tour_decision, tree_selection, type_value_keys, typesafe_settings, unstage_path, unstage_paths,
-    update_builtin_decision, update_check, update_download, update_history, update_install,
-    upstream_status, use_system_claude_login, validate_branch_name, vault_sessions,
-    verify_claude_accounts, verify_codex_accounts, waiting_on_me, watch_files, wire_answer,
+    tour_decision, tree_selection, turn_failed_retry, type_value_keys, typesafe_settings,
+    unstage_path, unstage_paths, update_builtin_decision, update_check, update_download,
+    update_history, update_install, upstream_status, use_system_claude_login, validate_branch_name,
+    vault_sessions, verify_claude_accounts, verify_codex_accounts, watch_files, wire_answer,
     wire_image, wire_interrupt, wire_log, wire_models, wire_send, wire_set_mode, wire_set_model,
     wire_start, wire_stop, work_item_seed, worker_screen, workspace_cleanup_scan,
     workspace_space_cancel, workspace_space_git, workspace_space_scan, worktree_committed_diff,
@@ -447,7 +453,7 @@ use shell_runtime::*;
 use system_locale::{LOCALES, system_locale};
 use system_runtime::*;
 use terminal_prefs_runtime::*;
-use terminal_registry::{TerminalRegistry, lock_pty};
+use terminal_registry::{TerminalPalette, TerminalRegistry, lock_pty};
 use terminal_theme_import::{
     CUSTOM_THEME_SELECTION_PREFIX, CustomTerminalTheme, MAX_CUSTOM_TERMINAL_THEMES,
     WarpThemeImportSource, WarpThemePreview, has_custom_theme_selection, merge_custom_themes,
@@ -766,6 +772,13 @@ struct PendingWorkerReadiness {
     /// wait carries no briefing — see `await_worker_ready`, which will not
     /// tear down a restored worker that is alive and at work.
     restoring: bool,
+    /// The briefing the delivery was given to type, and the composer glyph
+    /// the agent's row names (`None` for a row that names none): what
+    /// `await_worker_ready` looks for on the screen once the delivery says it
+    /// is done (t-74381). A delivery is done when its words were written; a
+    /// booting program may have thrown them away.
+    briefing: String,
+    composer: Option<char>,
 }
 
 struct WorkerReadinessSlot {
@@ -952,6 +965,11 @@ struct ShellRuntime {
     /// by the path the sidebar row carries. A workspace click resolves its
     /// path here first and asks git only for a path this answer does not name.
     catalog_owners: Mutex<HashMap<String, (Orchestrator, Worktree)>>,
+    /// The colours the renderer last said it paints terminals with (t-73869).
+    /// Every new shell is dressed with it in `hold_terminal`; every open shell
+    /// when the renderer reports — each under the palette's own lock, so a
+    /// shell born during a report is never left on the old colours (t-74931).
+    terminal_palette: TerminalPalette,
     /// The shells a window is PREVIEWING — the board's cards, which show every
     /// running agent at once.
     ///
@@ -1020,6 +1038,12 @@ struct ShellRuntime {
     /// looks at every terminal at the display rate. A thread per pending
     /// prompt would be a second cadence to keep honest.
     deliveries: Mutex<HashMap<TermId, PromptDelivery>>,
+    /// Panes whose between-turns account move is being written to the
+    /// ledger (t-74974). Marked and cleared only under [`Self::deliveries`]
+    /// (`prompt_transaction::with_no_prompt_in_flight`): a prompt addressed
+    /// to one of them waits in [`AppState::prompt_queue`] until the move is
+    /// written, while the pump keeps turning every pane.
+    moving_terms: Mutex<std::collections::HashSet<TermId>>,
     /// Restart continuations awaiting the resumed agent's first working hook.
     pending_nudges: Mutex<restart_nudge_runtime::PendingNudges>,
     /// Fresh Zo worker briefings held until their pane event subscriber has
@@ -1450,6 +1474,10 @@ impl ShellRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn terminal_palette(&self) -> &TerminalPalette {
+        &self.terminal_palette
+    }
+
     /// Take a freshly spawned shell into the window's keeping.
     ///
     /// The one door, because there are SEVEN spawn sites — the float, a tab, an
@@ -1471,7 +1499,12 @@ impl ShellRuntime {
         pty.terminal_mut()
             .grid_mut()
             .set_scrollback_cap(prefs.scrollback);
-        self.terminals().insert(term, pty);
+        // The colours the window paints, when it has said (t-73869): a shell
+        // born after the renderer reported must answer `OSC 10/11/12 ; ?`
+        // from its first line. Before the first report there is nothing to
+        // tell, and the report itself dresses the shells already open. The
+        // palette reads its colours and lists the shell as one stretch.
+        self.terminal_palette.hold(&self.terminals, term, pty);
     }
 
     fn rings(&self) -> MutexGuard<'_, zerocode_core::notify::RingLedger> {
@@ -1858,6 +1891,7 @@ trait ShellStateExt {
     fn watched_terms(&self) -> MutexGuard<'_, HashMap<String, HashSet<TermId>>>;
     fn catalog_owners(&self) -> MutexGuard<'_, HashMap<String, (Orchestrator, Worktree)>>;
     fn previewed_terms(&self) -> MutexGuard<'_, HashMap<String, HashSet<TermId>>>;
+    fn terminal_palette(&self) -> &TerminalPalette;
     fn hold_terminal(&self, term: TermId, pty: impl Into<PtyHandle>);
     fn rings(&self) -> MutexGuard<'_, zerocode_core::notify::RingLedger>;
     fn quiet_rings(&self) -> MutexGuard<'_, zerocode_core::notify::Quiet<TermId>>;
@@ -1991,6 +2025,10 @@ impl ShellStateExt for AppState {
 
     fn previewed_terms(&self) -> MutexGuard<'_, HashMap<String, HashSet<TermId>>> {
         self.shell_runtime().previewed_terms()
+    }
+
+    fn terminal_palette(&self) -> &TerminalPalette {
+        self.shell_runtime().terminal_palette()
     }
 
     fn hold_terminal(&self, term: TermId, pty: impl Into<PtyHandle>) {
@@ -2342,6 +2380,8 @@ fn build_app_state(paths: app_paths::AppPaths, root: PathBuf) -> AppState {
     let ssh_hosts = ssh_hosts::SshHostService::new();
     let remote_servers = remote_servers::RemoteServerService::new();
     let settings = Arc::new(settings::SettingsRepository::new(settings_root.clone()));
+    // Before the first read below waits on the lock with no end (t-73907).
+    settle_settings_lock_for_boot(&settings, &local_data_root);
     land_check::hold_settings(Arc::clone(&settings));
     land_batch::hold_settings(Arc::clone(&settings));
     if let Err(error) = migrate_legacy_project_settings(&settings) {
@@ -2421,6 +2461,7 @@ fn build_app_state(paths: app_paths::AppPaths, root: PathBuf) -> AppState {
         tree_hooks: Mutex::new(file_tree_hooks::Pending::default()),
         resource_usage: Mutex::new(resource_usage::ResourceUsageState::default()),
         deliveries: Mutex::new(HashMap::new()),
+        moving_terms: Mutex::default(),
         pending_nudges: Mutex::new(restart_nudge_runtime::PendingNudges::default()),
         zo_worker_deliveries: Mutex::new(HashMap::new()),
         delivery_waiters: Mutex::new(HashMap::new()),
@@ -2469,6 +2510,7 @@ fn build_app_state(paths: app_paths::AppPaths, root: PathBuf) -> AppState {
         next_term: Mutex::new(FLOAT_TERM + 1),
         watched_terms: Mutex::new(HashMap::new()),
         catalog_owners: Mutex::new(HashMap::new()),
+        terminal_palette: TerminalPalette::default(),
         previewed_terms: Mutex::new(HashMap::new()),
         subscriptions: Arc::new(Mutex::new(HashSet::new())),
         channels: Arc::new(Mutex::new(HashMap::new())),
@@ -2616,7 +2658,8 @@ fn main() -> ExitCode {
         // t-67936).
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .invoke_handler(tauri::generate_handler![
+        // Every command asks the second wall first (t-73906).
+        .invoke_handler(person_only_gate(tauri::generate_handler![
             api_router_keys_kept,
             api_router_presets,
             api_router_providers,
@@ -3060,7 +3103,7 @@ fn main() -> ExitCode {
             notification_probe,
             set_notification_preference,
             set_finish_notification_mode,
-            waiting_on_me,
+            board_inbox,
             clear_finish_mark,
             set_browser_home_page,
             set_browser_search_engine,
@@ -3112,6 +3155,7 @@ fn main() -> ExitCode {
             desk_review_pass,
             quota_wall_retry,
             quota_wall_handover,
+            turn_failed_retry,
             land_batch_promote,
             land_batch_bisect,
             land_batch_restack,
@@ -3232,8 +3276,14 @@ fn main() -> ExitCode {
             set_computer_generator_road,
             set_computer_live_reflex,
             set_computer_input_policy,
+            set_computer_share_required,
             computer_confirm_answer,
             computer_handoff_code,
+            computer_self_answer,
+            computer_share_state,
+            computer_take_control,
+            computer_give_back,
+            computer_share_hand_over,
             computer_stop,
             computer_resume,
             computer_guard_status,
@@ -3340,6 +3390,7 @@ fn main() -> ExitCode {
             end_terminal_session,
             end_all_terminal_sessions,
             close_term,
+            close_mirror_term,
             term_text,
             term_key,
             term_mouse,
@@ -3356,6 +3407,7 @@ fn main() -> ExitCode {
             terminal_prefs,
             terminal_windows_status,
             preview_warp_terminal_themes,
+            report_terminal_colors,
             preview_ghostty_import,
             apply_ghostty_import,
             set_terminal_prefs,
@@ -3367,7 +3419,7 @@ fn main() -> ExitCode {
             last_statuses,
             term_resize,
 
-        ])
+        ]))
         .setup(move |app| {
             computer_use::initialize(app.path().resource_dir().ok());
             run_evidence::install_window(app.handle().clone());
@@ -3804,8 +3856,13 @@ fn main() -> ExitCode {
                     api.prevent_exit();
                     return;
                 }
-                #[cfg(not(all(target_os = "macos", feature = "chromium-browser")))]
-                let _ = api;
+                // The devices go down before the goodbye, as the browser's
+                // tabs do, and off the main thread (t-62468): an AVD's saved
+                // exit is up to thirty seconds.
+                if emulator::defer_exit(handle, code) {
+                    api.prevent_exit();
+                    return;
+                }
                 // The ledger hears the goodbye before any pane goes (t-3058):
                 // seated workers sleep instead of being settled by their own
                 // panes' exits on the way out — waited for no longer than the

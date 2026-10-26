@@ -246,13 +246,21 @@ fn enter_is_the_safe_answer_of_its_kind_and_a_held_key_answers_once() {
         "Escape on a tool prompt can record a refusal for good:\n{tool}"
     );
 
-    // One key, one answer.
+    // One key, one answer — the ask's and, since t-75153 (R7b), every
+    // control's the keyboard presses, through the one rule.
+    let stop = block_after(window, "function stopRepeatedPress(event) {");
     assert!(
-        window.contains("askScrim.addEventListener(\n  \"keydown\",")
-            && window.contains(
-                "if (!event.repeat || (event.key !== \"Enter\" && event.key !== \" \")) return;"
-            ),
+        window.contains("askScrim.addEventListener(\"keydown\", stopRepeatedPress, true);")
+            && stop.contains(
+                "if (!event.repeat || (event.key !== \"Enter\" && event.key !== \" \")) return false;"
+            )
+            && stop.contains("event.preventDefault();")
+            && stop.contains("event.stopPropagation();"),
         "a repeating Enter or Space can answer the next ask"
+    );
+    assert!(
+        window.contains("window.addEventListener(\"keydown\", stopRepeatedControlPress, true);"),
+        "a repeating Enter or Space presses a focused control again"
     );
     let input = ui_file("shell-input.js");
     assert!(
@@ -301,9 +309,12 @@ fn the_popup_names_no_agent_of_its_own() {
     );
     // The Computer Use kinds name the feature through the catalog's own key,
     // not a literal.
+    // One per kind: the confirm, the hand-over and the share card (t-73906).
     let computer = ui_file("shell-computer.js");
+    let kinds = computer.matches("registerAskKind(\"computer-").count();
+    assert!(kinds >= 3, "the Computer Use kinds are registered here");
     assert!(
-        computer.matches("t(\"computerUse.title\"").count() == 2,
+        computer.matches("t(\"computerUse.title\"").count() == kinds,
         "a Computer Use ask names its source without the catalog"
     );
 }

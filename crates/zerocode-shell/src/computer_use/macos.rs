@@ -34,6 +34,7 @@ use super::ComputerUseError;
 use super::permissions::missing_permissions;
 use super::session::{ProviderSession, SessionFailure};
 
+mod panel;
 mod tcc;
 
 #[cfg(test)]
@@ -189,10 +190,57 @@ impl Wire {
     }
 }
 
+/// A separate authenticated connection carries panel updates. It never takes
+/// the provider/session lock, so taking control can cancel an in-flight act.
+#[derive(Clone, PartialEq, Eq)]
+struct PanelEndpoint {
+    socket: PathBuf,
+    token: String,
+}
+
+static PANEL_ENDPOINT: std::sync::Mutex<Option<PanelEndpoint>> = std::sync::Mutex::new(None);
+
+fn remember_panel(socket: &Path, token: &str) {
+    *PANEL_ENDPOINT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PanelEndpoint {
+        socket: socket.to_path_buf(),
+        token: token.to_string(),
+    });
+}
+
+fn forget_panel(socket: &Path) {
+    let mut held = PANEL_ENDPOINT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held
+        .as_ref()
+        .is_some_and(|endpoint| endpoint.socket == socket)
+    {
+        *held = None;
+        drop(held);
+        sync_share_panel(&super::share::state());
+    }
+}
+
+pub(super) fn sync_share_panel(state: &Value) {
+    let endpoint = PANEL_ENDPOINT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    panel::publish(state, endpoint);
+}
+
 /// The connection the window's waiting request rides, and its thread.
 struct StopWatch {
     stream: std::os::unix::net::UnixStream,
     thread: std::thread::JoinHandle<()>,
+    /// Set before the connection is shut on purpose: the request that ends
+    /// because of it is no loss, and says nothing.
+    leaving: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the watch thread as it ends, for whatever reason: the panel
+    /// worker reads it to know its helper connection is gone (t-75398).
+    ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl StopWatch {
@@ -201,43 +249,97 @@ impl StopWatch {
     /// flight and none waits behind it (t-62469 B2). Each answer goes to the
     /// guard, which takes in the person's chord at once; then it asks again
     /// after the stop it heard. A helper that cannot answer one — or a
-    /// connection that broke — ends it; the session goes on without it.
+    /// connection that broke — ends it, and the end is said to the guard
+    /// (t-68324 ①): the session goes on without it, the person's chord
+    /// reaching the window only at its next command. One that never began is
+    /// said the same way.
     fn start(socket: &Path, token: &str) -> Option<Self> {
-        let stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
-        let kept = stream.try_clone().ok()?;
-        let mut wire = Wire::new(stream, token.to_string()).ok()?;
+        match Self::begin(socket, token) {
+            Ok(watch) => Some(watch),
+            Err(why) => {
+                super::guard::watch_lost(&format!("the waiting request could not start: {why}"));
+                // No watch thread exists to withdraw this endpoint. Wake the
+                // panel worker after the guard has recorded the lost watch.
+                forget_panel(socket);
+                None
+            }
+        }
+    }
+
+    fn begin(socket: &Path, token: &str) -> Result<Self, String> {
+        let stream = std::os::unix::net::UnixStream::connect(socket)
+            .map_err(|error| format!("connect: {error}"))?;
+        let kept = stream
+            .try_clone()
+            .map_err(|error| format!("clone: {error}"))?;
+        let mut wire = Wire::new(stream, token.to_string()).map_err(|error| error.message)?;
         let wait = u64::try_from(STOP_WATCH_WAIT.as_millis()).unwrap_or(u64::MAX);
+        let leaving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let leaving_seen = std::sync::Arc::clone(&leaving);
+        let lost = move |reason: String| {
+            if !leaving_seen.load(std::sync::atomic::Ordering::Acquire) {
+                super::guard::watch_lost(&reason);
+            }
+        };
+        // Begun before the thread can end, so an end is never overwritten.
+        super::guard::watch_began();
+        let socket = socket.to_path_buf();
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_ended = std::sync::Arc::clone(&ended);
         let thread = std::thread::Builder::new()
             .name("computer-use-stop-watch".into())
             .spawn(move || {
                 let mut after: Option<u64> = None;
+                let mut after_share: Option<i64> = None;
                 loop {
                     let mut asked = serde_json::Map::new();
                     asked.insert("ms".into(), wait.into());
                     if let Some(after) = after {
                         asked.insert("after".into(), after.into());
                     }
-                    let Ok(heard) = wire.request(STOP_WATCH_METHOD, Value::Object(asked)) else {
-                        return;
+                    if let Some(event) = after_share {
+                        asked.insert("afterShare".into(), event.into());
+                    }
+                    let heard = match wire.request(STOP_WATCH_METHOD, Value::Object(asked)) {
+                        Ok(heard) => heard,
+                        Err(failure) => {
+                            let error = failure.into_error_pub();
+                            lost(format!(
+                                "the waiting request failed: {} ({})",
+                                error.message, error.code
+                            ));
+                            break;
+                        }
                     };
                     super::guard::hear_watched(&heard);
+                    super::share::hear_panel(&heard);
+                    after_share = heard.pointer("/shareControl/event").and_then(Value::as_i64);
                     // An answer with no count to ask after is not this road's.
                     let Some(revision) = heard.get("stopRevision").and_then(Value::as_u64) else {
-                        return;
+                        lost("the helper's answer carried no stop count to ask after".to_string());
+                        break;
                     };
                     after = Some(revision);
                 }
+                // Publish liveness before forgetting the endpoint: that
+                // presentation can wake the panel worker before we return.
+                worker_ended.store(true, std::sync::atomic::Ordering::Release);
+                forget_panel(&socket);
             })
-            .ok()?;
-        Some(Self {
+            .map_err(|error| format!("thread: {error}"))?;
+        Ok(Self {
             stream: kept,
             thread,
+            leaving,
+            ended,
         })
     }
 
     /// Shut its connection, which ends the request waiting on it, and wait
     /// for its thread to end: nothing it heard is taken in after the session.
     fn end(self) {
+        self.leaving
+            .store(true, std::sync::atomic::Ordering::Release);
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         let _ = self.thread.join();
     }
@@ -338,6 +440,12 @@ fn launch() -> Result<Launched, ComputerUseError> {
 }
 
 impl Session {
+    pub(super) fn panel_watch_ended(&self) -> bool {
+        self.watching
+            .as_ref()
+            .is_none_or(|watch| watch.ended.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     /// Connect to a launched helper and shake hands — the second half of
     /// [`Session::start`]: the pid read off the socket, the token on every
     /// request, the protocol and the guard table held to this window's.
@@ -395,6 +503,10 @@ impl Session {
         validate_guard_budget(&handshake)?;
         client.supports_background =
             handshake.pointer("/supports/actions/background") == Some(&Value::Bool(true));
+        if handshake.pointer("/supports/windows/shareControlPanel") == Some(&Value::Bool(true)) {
+            remember_panel(&socket, &client.wire.token);
+            sync_share_panel(&super::share::state());
+        }
         // The person's chord reaches the window as the helper hears it
         // (t-66753 B), not at the window's next command.
         client.watching = StopWatch::start(&socket, &client.wire.token);
@@ -412,9 +524,12 @@ impl SessionFailure {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        forget_panel(&self.directory.join("provider.sock"));
         if let Some(watching) = self.watching.take() {
             watching.end();
         }
+        // The session is over, and its watch with it: nothing is lost.
+        super::guard::watch_left();
         let id = self.wire.next_id;
         if let Ok(line) = serde_json::to_vec(&json!({
             "id": id,

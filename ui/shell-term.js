@@ -4320,7 +4320,7 @@ function noteTermFocus() {
   // The pane that now holds the keyboard is one the person is looking at, so a
   // finish the list shows for it is released (t-26595). A switch between panes
   // with nothing to release costs no round trip.
-  if (focusedTerm !== null && focusedTerm !== undefined && waitingFinishStands(focusedTerm)) {
+  if (focusedTerm !== null && focusedTerm !== undefined && inboxFinishStands(focusedTerm)) {
     void invoke("clear_finish_mark", { pane: `term:${focusedTerm}` }).catch(() => false);
   }
 }
@@ -4404,8 +4404,10 @@ const floatView = makeTermView(el("terminal"), el("term"), el("caret"), {
  *                element of the kind's own where the keyboard starts instead
  *                (a field the person types in); `safe` is Escape's
  *   clock(ask)   the words for a deadline the ask carries (Computer Use)
- *   deliver(ask, choice)  a promise that settles once the answer has reached
- *                whoever asked; a rejection keeps the ask on screen
+ *   deliver(ask, choice, hand)  a promise that settles once the answer has
+ *                reached whoever asked; a rejection keeps the ask on screen;
+ *                `hand` is the hand that answered (shell-boot.js `handNow`),
+ *                which a person-only answer carries (t-75209)
  *   refused(ask) the line under the reason when an answer did not arrive:
  *                where else the same question can be answered, for a kind
  *                that has such a place
@@ -4442,15 +4444,7 @@ const askFrame = askScrim.querySelector(".permission");
  * answering a question its person has not read. So a repeating Enter or Space
  * answers nothing here; a repeating Escape is left out by the modal manager
  * (`ignoresRepeat`, shell-input.js). */
-askScrim.addEventListener(
-  "keydown",
-  (event) => {
-    if (!event.repeat || (event.key !== "Enter" && event.key !== " ")) return;
-    event.preventDefault();
-    event.stopPropagation();
-  },
-  true,
-);
+askScrim.addEventListener("keydown", stopRepeatedPress, true);
 
 function registerAskKind(name, kind) {
   askKinds.set(name, kind);
@@ -4626,11 +4620,12 @@ async function answerAsk(choice) {
   // ask that was pressed.
   const answered = activeAsk;
   if (!answered || answered.sending === true) return;
+  const hand = handNow();
   answered.sending = true;
   for (const button of el("ask-choices").querySelectorAll("button")) button.disabled = true;
   const kind = askKindOf(answered);
   try {
-    await kind.deliver(answered, choice);
+    await kind.deliver(answered, choice, hand);
   } catch (error) {
     answered.sending = false;
     if (activeAsk !== answered) return;
@@ -4816,12 +4811,12 @@ const ASK_SESSION_UNREACHABLE = "zerocode:session-unreachable";
  * questions leave the way a session end takes them, and the person is told
  * the answer went nowhere (t-51007). */
 const askFromChannel = {
-  deliver: (ask, choice) =>
+  deliver: (ask, choice, hand) =>
     invoke("respond_permission", {
       session: ask.session,
       promptId: ask.frame.prompt_id,
       decision: choice.decision,
-    }).catch((error) => {
+    }, { hand }).catch((error) => {
       if (error === ASK_SESSION_UNREACHABLE) {
         withdrawPermissions(ask.session);
         toast(
@@ -7190,7 +7185,7 @@ function persistPaneLayouts(worktree) {
  * (`isTransientEditorContentType`, :50810); not sending them keeps the
  * file's churn down to what can actually return. */
 const STAGE_STORED_KINDS = new Set(
-  ["file", "image", "mdview", "csv", "ipynb", "board", "changes", "vault", "knowledge", "skills", "artifacts", "jev"],
+  ["file", "image", "mdview", "csv", "ipynb", "board", "changes", "vault", "knowledge", "skills", "artifacts", "jev", "inbox"],
 );
 
 /* A tab the record may hold: its kind is worth writing down, and it is not a
@@ -7510,6 +7505,7 @@ async function reopenStageTab(tab) {
   if (tab.kind === "skills") return openSkillsView();
   if (tab.kind === "artifacts") return openArtifacts({ fresh: true });
   if (tab.kind === "jev") return openJevView();
+  if (tab.kind === "inbox") return openInboxView();
 }
 
 /* The documents this worktree had when it was last looked at, back in their
@@ -9116,11 +9112,19 @@ function terminalCloseFailure(error) {
 // Keeping the view while this waits leaves both the screen and a retry door.
 const terminalCloseRequests = new Map();
 
-function closeTermAndView(term, road) {
+// `hand` is the hand of the flow that asked (shell-boot.js `flowHand`,
+// t-75209): ending a terminal is the person's (t-74975), and the close goes
+// out a microtask later, where the event that asked is already over.
+function closeTermAndView(term, road, hand = handNow()) {
   const waiting = terminalCloseRequests.get(term);
   if (waiting) return waiting.promise;
   const receipt = { promise: null, exited: false };
-  const request = Promise.resolve().then(() => invoke("close_term", { term })).then(() => {
+  // A mirror pane — a `tail -F` the window opened over a run's log — closes
+  // on no person's hand, by its own door (t-75153, R7b).
+  const closing = road.startsWith("mirror-")
+    ? () => invoke("close_mirror_term", { term })
+    : () => invoke("close_term", { term }, { hand });
+  const request = Promise.resolve().then(closing).then(() => {
     dropClosedTermLeaf(term, road);
     return true;
   }, (error) => {
@@ -9158,7 +9162,7 @@ function dropClosedTermLeaf(term, road) {
   return true;
 }
 
-async function closeTerminalTab(tab, road) {
+async function closeTerminalTab(tab, road, hand = handNow()) {
   const wake = waking.get(tab.id);
   if (wake) await wake;
   const terms = paneLeaves(tab.layout);
@@ -9166,12 +9170,12 @@ async function closeTerminalTab(tab, road) {
     dropTab(tab.id);
     return true;
   }
-  for (const term of terms) await closeTermAndView(term, road);
+  for (const term of terms) await closeTermAndView(term, road, hand);
   // A newly opened leaf is not part of this close's snapshot either.
   return !tabs.includes(tab);
 }
 
-async function closePaneLeaf(tab, going) {
+async function closePaneLeaf(tab, going, hand = handNow()) {
   const staying = paneLeaves(tab.layout).filter((term) => term !== going);
   if (staying.length === 0) return;
   if (termHoldsAgent(going)) {
@@ -9185,7 +9189,7 @@ async function closePaneLeaf(tab, going) {
     noteWorkerRoomChange(going, "background");
     noteLeafLeft(going, tab, "close-pane", `detached ${tab.worktree}`);
   } else {
-    if (!(await closeTermAndView(going, "close-pane"))) return;
+    if (!(await closeTermAndView(going, "close-pane", hand))) return;
     if (document.activeElement === document.body) keySink.focus();
     return;
   }
@@ -9196,6 +9200,7 @@ async function closePaneLeaf(tab, going) {
 }
 
 function closeActivePane() {
+  const started = handNow();
   const tab = currentTab();
   if (tab?.kind !== "term") return false;
   const leaves = paneLeaves(tab.layout);
@@ -9210,8 +9215,8 @@ function closeActivePane() {
     void terminalCloseNeedsConfirmation([going]).then(async (needsConfirmation) => {
       closeChecks.delete(key);
       if (!paneLeaves(tab.layout).includes(going)) return;
-      if (needsConfirmation && !(await askAboutRunning(tab, [going]))) return;
-      if (paneLeaves(tab.layout).includes(going)) closePaneLeaf(tab, going);
+      if (needsConfirmation && !(await askAboutRunning(tab, [going], started))) return;
+      if (paneLeaves(tab.layout).includes(going)) closePaneLeaf(tab, going, flowHand(started));
     });
     return true;
   }
@@ -9474,6 +9479,7 @@ function tabLabel(tab) {
   if (tab.kind === "skills") return skillText("title");
   if (tab.kind === "artifacts") return t("artifacts.tab", "아티팩트");
   if (tab.kind === "jev") return t("jev.tab", "의사결정 모델");
+  if (tab.kind === "inbox") return t("inbox.title", "받은 편지함");
   if (tab.kind === "tokens") return t("tokens.tab", "토큰 사용량");
   if (tab.kind === "emulator") {
     return tab.deviceName || t("emulator.tab", "모바일 에뮬레이터");

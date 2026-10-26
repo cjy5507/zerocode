@@ -391,6 +391,91 @@ export async function testQuotaWallChip({ browser, origin, ok, faults: shared })
     ok("a wall's chip goes when its window passes, on the clock and with no beat", down.standing && !down.afterClock, JSON.stringify(down));
     ok("a chip the ledger takes down — the worker moved to another account — leaves the desk", down.again && !down.moved, JSON.stringify(down));
 
+    /* ---- t-69010: 턴이 실패한 워커의 띠 — 「다시 띄우기」는 확인 뒤에 한 번 ---------------------- */
+    const turn = await page.evaluate(async () => {
+      const failed = { error: "api failed after 3 attempts: stream_startup_no_progress", at_ms: Date.now() - 60_000, dispatch: "d-2", letter: "m-fail-1" };
+      window.__ANSWER__.turn_failed_retry = (args) => {
+        window.__SENT__.push({ command: "turn_failed_retry", ...args });
+        return { receipt: "m-resumed-9", line: "Your last turn stopped on a transient API error; continue from where you left off." };
+      };
+      const setTurn = async (value) => {
+        window.__LEDGER__ = window.__LEDGER__.map((row) => (row.worker === "w-2" ? { ...row, turn_failed: value } : row));
+        refreshDeskLedger();
+        const want = JSON.stringify(value ?? null);
+        for (let frame = 0; frame < 300; frame += 1) {
+          const held = JSON.stringify(deskAgents.find((row) => row.worker === "w-2")?.turn_failed ?? null);
+          if (held === want && !deskLedgerAsking && deskPaintFrame === null) break;
+          await new Promise((done) => requestAnimationFrame(done));
+        }
+        await new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)));
+      };
+      window.__SET_TURN__ = setTurn;
+      const read = () => {
+        const node = document.querySelector('#board-view [data-worker="run-desk/w-2"] .board-desk-worker-turn');
+        const part = (name) => node?.querySelector(`.board-desk-worker-turn-${name}`) ?? null;
+        const shown = (one) => one !== null && !one.hidden && getComputedStyle(one).display !== "none";
+        return {
+          shown: shown(node),
+          chip: part("chip")?.textContent ?? "",
+          retry: { text: part("retry")?.textContent ?? "", disabled: part("retry")?.disabled ?? null },
+          said: shown(part("said")) ? part("said").textContent : "",
+          inMain: Boolean(node?.closest(".board-desk-worker-main")),
+        };
+      };
+      const before = read();
+      await setTurn(failed);
+      const standing = read();
+      window.__SENT__.length = 0;
+      return { before, standing };
+    });
+    ok("a worker whose turn failed wears a strip under its row — 턴 실패 and the error's words, and 다시 띄우기 — and one with no failure wears none",
+      !turn.before.shown && turn.standing.shown && turn.standing.chip.startsWith("턴 실패 — api failed after 3 attempts")
+        && turn.standing.retry.text === "다시 띄우기" && turn.standing.retry.disabled === false && !turn.standing.inMain,
+      JSON.stringify(turn));
+    const pressTurn = async (answer) => {
+      await page.click('#board-view [data-worker="run-desk/w-2"] .board-desk-worker-turn-retry');
+      await page.waitForSelector("#ask-yes", { state: "visible" });
+      const asked = await page.evaluate(() => document.querySelector("#ask-body")?.textContent ?? "");
+      await page.click(answer === true ? "#ask-yes" : "#ask-no");
+      await page.evaluate(async () => {
+        for (let frame = 0; frame < 60; frame += 1) await new Promise((done) => requestAnimationFrame(done));
+      });
+      return asked;
+    };
+    await pressTurn(false);
+    const turnDenied = await page.evaluate(() => window.__SENT__.length);
+    const turnAsked = await pressTurn(true);
+    const turnPressed = await page.evaluate(() => {
+      const node = document.querySelector('#board-view [data-worker="run-desk/w-2"] .board-desk-worker-turn');
+      return {
+        sent: [...window.__SENT__],
+        said: node?.querySelector(".board-desk-worker-turn-said")?.textContent ?? "",
+        disabled: node?.querySelector(".board-desk-worker-turn-retry")?.disabled ?? null,
+      };
+    });
+    ok("다시 띄우기 asks first: 아니요 calls nothing, 예 calls turn_failed_retry once for the run and the worker, says what came of it and stands down for this failure",
+      turnDenied === 0 && turnAsked.includes("w-2") && turnPressed.sent.length === 1
+        && turnPressed.sent[0].command === "turn_failed_retry" && turnPressed.sent[0].run === "run-desk"
+        && turnPressed.sent[0].worker === "w-2" && turnPressed.said === "이어서 하라는 한 줄을 넣었습니다"
+        && turnPressed.disabled === true && turnPressed.sent[0].dispatch === "d-2" && turnPressed.sent[0].letter === "m-fail-1",
+      JSON.stringify({ turnDenied, turnAsked, turnPressed }));
+
+    /* The review R2, P2-10: the confirm stands open while the attempt fails again. The press names the failure
+     * the person was shown — the ledger then refuses it as one that no longer stands — never the newer one. */
+    const shownA = { error: "api failed after 3 attempts: overloaded", at_ms: Date.now() - 30_000, dispatch: "d-2", letter: "m-fail-a" };
+    await page.evaluate(async (one) => { await window.__SET_TURN__(one); window.__SENT__.length = 0; }, shownA);
+    await page.click('#board-view [data-worker="run-desk/w-2"] .board-desk-worker-turn-retry');
+    await page.waitForSelector("#ask-yes", { state: "visible" });
+    await page.evaluate((one) => window.__SET_TURN__(one), { ...shownA, at_ms: Date.now(), letter: "m-fail-b" });
+    await page.click("#ask-yes");
+    const staleSent = await page.evaluate(async () => {
+      for (let frame = 0; frame < 60; frame += 1) await new Promise((done) => requestAnimationFrame(done));
+      return [...window.__SENT__];
+    });
+    ok("a confirm left open while the attempt failed again presses the failure it showed, never the one that came after",
+      staleSent.length === 1 && staleSent[0].dispatch === "d-2" && staleSent[0].letter === "m-fail-a",
+      JSON.stringify(staleSent));
+
     measured.at = new Date().toISOString();
     await writeFile(`${OUT}/measure.json`, `${JSON.stringify(measured, null, 2)}\n`);
     ok("the quota-wall chip raises no browser errors", faults.length === 0, faults.join("\n"));

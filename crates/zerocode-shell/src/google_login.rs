@@ -241,13 +241,14 @@ fn update_root(
 ///
 /// The lock file stays in place permanently and the OS lock rides the open
 /// descriptor: an unlink-and-recreate cycle would race, and a crash would
-/// leave an existence lock nobody can clear.
-fn hold_lock(path: &Path) -> Result<std::fs::File, String> {
+/// leave an existence lock nobody can clear. The guard ends the lock when it
+/// drops, so a copy of the descriptor in a forked launch cannot keep it.
+fn hold_lock(path: &Path) -> Result<zerocode_core::held_file_lock::HeldFileLock, String> {
     let lock_path = path.with_extension("json.lock");
     let file = durable_file::private_lock_file(&lock_path).map_err(|error| error.to_string())?;
     for attempt in 0..LOCK_TRIES {
         match file.try_lock() {
-            Ok(()) => return Ok(file),
+            Ok(()) => return Ok(zerocode_core::held_file_lock::HeldFileLock::locked(file)),
             Err(error) => {
                 let error = std::io::Error::from(error);
                 if error.kind() != std::io::ErrorKind::WouldBlock {
@@ -942,6 +943,28 @@ mod tests {
         save(&path, &credentials()).expect("save once the lock is free");
     }
 
+    /// A launch on another thread that forks before it execs holds a copy of
+    /// every descriptor until the exec, and a flock belongs to the open file
+    /// description, so a lock its holder only closed stays held by that copy
+    /// (t-73907, t-74976). The duplicate here is that copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_of_the_credential_lock_left_in_a_launch_does_not_hold_the_next_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("credentials.json");
+        let held = hold_lock(&path).expect("first hold");
+        let inherited = held.try_clone().expect("a copy of the descriptor");
+        drop(held);
+        let next = crate::durable_file::private_lock_file(&path.with_extension("json.lock"))
+            .expect("the lock file");
+        let taken = next.try_lock();
+        drop(inherited);
+        assert!(
+            taken.is_ok(),
+            "a lock its holder let go is still held by a copy"
+        );
+    }
+
     /// The store's word turned into the two judgements a person acts on.
     #[test]
     fn a_standing_names_what_is_wrong_with_the_login() {
@@ -1210,37 +1233,26 @@ mod tests {
     /// port is fixed by the OAuth client's registration, so a refused bind has
     /// nowhere else to go. Measured on macOS 26 — without the option, a rebind
     /// two hundred milliseconds after the connection closed answers
-    /// `EADDRINUSE`. On an ephemeral port, so no test ever contends for the
-    /// real callback seat or for a zo sign-in in flight.
+    /// `EADDRINUSE`. On a port of its own, so no test ever contends for the
+    /// real callback seat or for a zo sign-in in flight — and not one the
+    /// kernel hands out on its own (t-74682): the port is released before it is
+    /// bound again, and another test's `bind(0)` can take it in that gap. The
+    /// port is a quiet one, under the dynamic range, and its lease is kept to
+    /// the end of the test so no other test is given it meanwhile (t-74864).
     #[test]
     fn the_callback_seat_can_be_retaken_while_the_last_one_lingers() {
-        // The port is released before it is bound again, so in a parallel run
-        // another test can take it in between. Such a refusal is told from the
-        // one under test by asking who answers on the port: a thief listens,
-        // a lingering connection does not. A stolen port starts over on a new
-        // one; a refusal with nobody listening is the claim failing.
-        for _ in 0..20 {
-            let first = bind_seat(0).expect("a seat");
-            let port = first.local_addr().expect("its address").port();
-            let client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("a browser");
-            let (accepted, _) = first.accept().expect("the redirect");
-            // Closed from THIS side first, so it is our end of that connection
-            // that lingers on the port a second sign-in needs.
-            drop(accepted);
-            drop(first);
-            drop(client);
-            match bind_seat(port) {
-                Ok(_) => return,
-                Err(error) => {
-                    let stolen = std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
-                    assert!(
-                        stolen,
-                        "the seat could not be retaken while the last one lingered: {error}"
-                    );
-                }
-            }
+        let (lease, first) = crate::test_host::quiet_ports::QuietPort::claim(bind_seat);
+        let port = lease.port();
+        let client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("a browser");
+        let (accepted, _) = first.accept().expect("the redirect");
+        // Closed from THIS side first, so it is our end of that connection
+        // that lingers on the port a second sign-in needs.
+        drop(accepted);
+        drop(first);
+        drop(client);
+        if let Err(error) = bind_seat(port) {
+            panic!("the seat could not be retaken while the last one lingered: {error}");
         }
-        panic!("twenty ports in a row were taken by other tests");
     }
 
     /// A redirect is accepted only when it is THIS attempt's answer.

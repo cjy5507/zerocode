@@ -183,7 +183,7 @@ function paintSettingsQuickCommands() {
     drop.addEventListener("click", async () => {
       drop.disabled = true;
       try {
-        await invoke("delete_quick_command", { id: command.id });
+        await invoke("delete_quick_command", { id: command.id }, { hand: handNow() });
         await refreshSettingsQuickCommands();
       } catch (error) {
         drop.disabled = false;
@@ -609,6 +609,9 @@ function removableProject(path) {
 const removingProjectPaths = new Set();
 
 async function removeProjectFromList(path) {
+  // The press's hand, carried past the awaits below (shell-boot.js `flowHand`,
+  // t-75209): the removal and the ends it brings are the person's (t-74975).
+  const started = handNow();
   if (!removableProject(path) || removingProjectPaths.has(path)) return;
   // Orca asks before it removes (`confirm-remove-folder` →
   // RemoveFolderDialog.tsx: title "Remove Project", "This only removes
@@ -645,7 +648,7 @@ async function removeProjectFromList(path) {
     // Keep the project and its retry doors until every selected shell has
     // confirmed exit. Removing the catalog first would strand a refusal.
     for (const held of tabs.filter((one) => one.kind === "term" && gone.has(one.worktree))) {
-      if (!(await closeTerminalTab(held, "project-removed"))) return;
+      if (!(await closeTerminalTab(held, "project-removed", flowHand(started)))) return;
     }
     if (tabs.some((one) => one.kind === "term" && gone.has(one.worktree))) return;
     if (path === activeProjectPath) {
@@ -664,7 +667,7 @@ async function removeProjectFromList(path) {
       await switchingProject;
     }
     if (tabs.some((one) => one.kind === "term" && gone.has(one.worktree))) return;
-    await invoke("remove_project", { path });
+    await invoke("remove_project", { path }, { hand: flowHand(started) });
     // Shells have already confirmed exit. Other surfaces can now leave the
     // list, and the start fence stays up until the refreshed catalog arrives.
     for (const held of tabs.filter((held) => gone.has(held.worktree))) {
@@ -1045,6 +1048,9 @@ function worktreeMenuAt(worktree, x, y) {
  * that one tab and carrying on: "no" answered about a file is also an answer
  * about the sweep it was asked inside. */
 async function closeTabRun(list) {
+  // The press's hand, carried past each document's let-go (an await): the
+  // terminals in the run end as the person's (t-75153, R7b).
+  const started = handNow();
   for (const tab of list) {
     // Every bulk close walks around the pins — Orca's own filters
     // (`closeOtherTabs`/`closeTabsToRight`, I18nProvider:58085): "close the
@@ -1052,7 +1058,7 @@ async function closeTabRun(list) {
     if (tab.pinned) continue;
 
     if (!isDocument(tab)) {
-      closeTab(tab.id);
+      closeTab(tab.id, flowHand(started));
       continue;
     }
     // The same two steps `closeTab` takes for a document, in the order it
@@ -1251,7 +1257,7 @@ el("ctrl-tab-order-mode").addEventListener("change", (event) => {
 function setConfirmClosePinned(on) {
   confirmClosePinnedTab = on;
   paintPinnedConfirm();
-  void commitSetting("confirm_close_pinned", "set_confirm_close_pinned", { on });
+  void commitSetting("confirm_close_pinned", "set_confirm_close_pinned", { on }, { hand: handNow() });
 }
 
 function paintPinnedConfirm() {
@@ -1540,13 +1546,14 @@ el("open-in-add-custom").addEventListener("click", () => {
   )?.focus();
 });
 
-function setAskBeforeDeletingWorktrees(on) {
+function setAskBeforeDeletingWorktrees(on, hand = handNow()) {
   skipDeleteWorktreeConfirm = !on;
   paintDeleteWorktreeConfirm();
   void commitSetting(
     "skip_delete_worktree_confirm",
     "set_skip_delete_worktree_confirm",
     { skip: skipDeleteWorktreeConfirm },
+    { hand },
   );
 }
 
@@ -1558,13 +1565,14 @@ el("ask-before-delete-worktree").addEventListener("change", (event) => {
   setAskBeforeDeletingWorktrees(event.target.checked);
 });
 
-function setAskBeforeDeletingAutomations(on) {
+function setAskBeforeDeletingAutomations(on, hand = handNow()) {
   skipDeleteAutomationConfirm = !on;
   paintDeleteAutomationConfirm();
   void commitSetting(
     "skip_delete_automation_confirm",
     "set_skip_delete_automation_confirm",
     { skip: skipDeleteAutomationConfirm },
+    { hand },
   );
 }
 
@@ -2422,6 +2430,9 @@ const automationBornPaths = new Set();
  * every road that reads the list. */
 let taskFoldedPaths = new Set();
 let taskFoldsUnder = new Map();
+/* The rows of an OPENED task fold, by path, to the row they fold under: where the list stands them (right under it,
+ * one step in — `placeFoldedUnder`). */
+let foldedOpenUnder = new Map();
 const openedTaskFolds = new Set();
 let landingFolds = new Map();
 let landingFoldedPaths = new Set();
@@ -3012,14 +3023,19 @@ function leavePagesForStage() {
 el("nav-board").addEventListener("click", () => {
   setWorkspaceBoardOpen(!workspaceBoardOpen);
 });
+/* The board's tab, brought forward from wherever the person is. The door
+ * toggles it; ⌘J's 「이동」 only goes there. */
+function showAgentBoard() {
+  leavePagesForStage();
+  openBoard();
+}
 el("nav-agents").addEventListener("click", () => {
   setWorkspaceBoardOpen(false);
   if (activeTabId === "board") {
     dropTab("board");
     return;
   }
-  leavePagesForStage();
-  openBoard();
+  showAgentBoard();
 });
 /* The Jev door: the seats' numbers, decisions and trend on one tab
  * (docs/design/jev-dashboard-and-perfection-20260921.md §2). A neighbour of
@@ -3924,6 +3940,14 @@ function worktreeIgnoredWord() {
   return t("worktree.landIgnored", "무시된 파일 남음");
 }
 
+/* The work an unlanded checkout waits on, as the reclaimer read it (`waits`): its own commits and their base. */
+function reclaimWaiting(reason) {
+  const waits = reason?.waits;
+  return waits && Number.isFinite(waits.own) && typeof waits.base === "string" && waits.base !== ""
+    ? { own: waits.own, base: waits.base }
+    : null;
+}
+
 function worktreeReclaimWord(reason) {
   switch (reason.kind) {
     case "active": return t("worktree.reclaimActive", "현재 열어 둔 폴더");
@@ -3931,6 +3955,10 @@ function worktreeReclaimWord(reason) {
     case "locked": return t("worktree.reclaimLocked", "워크트리 잠김");
     case "ignored_file": return t("worktree.reclaimFile", "보존할 파일 있음");
     case "not_managed": return t("worktree.reclaimNotManaged", "자동 정리 대상 아님");
+    // What a checkout with the worker's own unlanded commits waits for (t-73910): how many are its own, and the base.
+    case "unlanded": return reclaimWaiting(reason)
+      ? t("worktree.reclaimUnlanded", "워커 커밋 {{own}}개 {{base}} 대기", reclaimWaiting(reason))
+      : t("worktree.reclaimKept", "정리 보류");
     default: return t("worktree.reclaimKept", "정리 보류");
   }
 }
@@ -4048,6 +4076,9 @@ function worktreeLandingSay(landing, { phase = "", merged = false, idle = false,
   if (reclaim) lines.push(t("worktree.reclaimTip", "자동 정리 보류: {{reason}}", {
     reason: `${worktreeReclaimWord(reclaim)}${reclaim.detail ? `\n${reclaim.detail}` : ""}`,
   }));
+  if (reclaim?.kind === "unlanded" && reclaimWaiting(reclaim)) {
+    lines.push(t("worktree.reclaimWaits", "워커가 여기서 만든 커밋 {{own}}개가 아직 {{base}}에 없습니다 — 들어가면 자동으로 정리합니다", reclaimWaiting(reclaim)));
+  }
   if (reclaim?.checked_ms) lines.push(t("worktree.reclaimChecked", "자동 정리 확인: {{time}}", {
     time: new Date(reclaim.checked_ms).toLocaleTimeString(),
   }));
@@ -5043,6 +5074,17 @@ const sidebarRowResize = new ResizeObserver((entries) => {
 
 /* 한 절의 행 목록 — 창이 실체화 범위를 정하고, 나머지는 스페이서가 선다.
  * 접힌 절은 members를 비워 등록한다: 스페이서 0, 행 0, 같은 코드 길. */
+/* The members of an opened task fold that stand right under the row they fold under — those draw one step in. */
+function worktreesFoldedUnder(members) {
+  const under = new Set();
+  members.forEach((worktree, at) => {
+    const lead = foldedOpenUnder.get(worktree.path);
+    const above = members[at - 1]?.path;
+    if (lead && above && (above === lead || foldedOpenUnder.get(above) === lead)) under.add(worktree.path);
+  });
+  return under;
+}
+
 function windowedWorktreeList(members, held) {
   const list = document.createElement("div");
   list.className = "worktree-list";
@@ -5063,11 +5105,28 @@ function windowedWorktreeList(members, held) {
     members,
     held,
     index: new Map(members.map((worktree, at) => [worktree.path, at])),
+    under: worktreesFoldedUnder(members),
     live: new Map(),
     start: 0,
     end: 0,
+    // 그리기마다 placeSidebarWindows가 읽는 뷰포트 속의 자리.
+    view: null,
   });
   return list;
+}
+
+/* 절마다 뷰포트의 어디에 섰는지를 어느 절도 고치기 전에 한 번에 읽는다. 한 절의
+ * 행을 옮긴 뒤에 다음 절의 자리를 읽으면, 그 읽기가 엔진에게 목록의 스타일과
+ * 레이아웃을 다시 셈하게 한다 — 그리기마다 절 하나에 한 번이다(t-73874). 앞 절의
+ * 새 행이 셈과 다른 높이로 서면 뒤 절은 그 차만큼 옮겨 서지만, 그 차는 창의
+ * overscan이 덮고 다음 그리기가 새 자리에서 다시 읽는다. */
+function placeSidebarWindows() {
+  const bounds = sidebarScroller.getBoundingClientRect();
+  for (const record of sidebarWindows) {
+    // 스페이서 위 가장자리가 곧 0번 행의 자리다 — 스크롤 좌표를 셈할 것 없이
+    // 뷰포트 좌표끼리 뺀다.
+    record.view = { start: bounds.top - record.top.getBoundingClientRect().top, height: bounds.height };
+  }
 }
 
 function renderSidebarWindow(record) {
@@ -5079,19 +5138,16 @@ function renderSidebarWindow(record) {
   for (let i = 0; i < members.length; i += 1) {
     offsets[i + 1] = offsets[i] + sidebarRowHeight(members[i].path);
   }
-  const bounds = sidebarScroller.getBoundingClientRect();
-  // 스페이서 위 가장자리가 곧 0번 행의 자리다 — 스크롤 좌표를 셈할 것 없이
-  // 뷰포트 좌표끼리 뺀다.
-  const viewStart = bounds.top - record.top.getBoundingClientRect().top;
-  const viewEnd = viewStart + bounds.height;
+  const { start: viewStart, height: viewHeight } = record.view;
+  const viewEnd = viewStart + viewHeight;
   let start = 0;
   let end = 0;
-  if (bounds.height <= 0) {
+  if (viewHeight <= 0) {
     // 높이를 모르는 창은 창이 아니다 — 재지 못하면 전부 세운다(가상화 이전과
     // 같은 값이고, 시험대처럼 판이 아직 눕혀지지 않은 곳에서 행이 사라지는
     // 것보다 낫다).
     end = members.length;
-  } else if (members.length && viewEnd > -bounds.height && viewStart < offsets[members.length] + bounds.height) {
+  } else if (members.length && viewEnd > -viewHeight && viewStart < offsets[members.length] + viewHeight) {
     // 한 화면 안의 이웃 절도 뷰포트 쪽 가장자리에 overscan만큼 선다 — WebKit은 스크롤의 새 자리를 스크롤
     // 이벤트보다 먼저 그리므로, 비어 있는 이웃 절은 그 한 프레임 동안 빈 스페이서로 비친다.
     while (start < members.length && offsets[start + 1] <= viewStart) start += 1;
@@ -5114,6 +5170,7 @@ function renderSidebarWindow(record) {
     let node = record.live.get(worktree.path);
     if (!node) {
       node = makeWorktreeNode(worktree, record.held);
+      node.classList.toggle("is-folded-under", record.under.has(worktree.path));
       // Retained sessions belong to a row a person can actually reach. The
       // old pre-virtualization road warmed every logical member up front,
       // turning 22 live rows in a 360-worktree catalog into 360 backend asks.
@@ -5157,6 +5214,7 @@ function renderSidebarWindows() {
   const anchor = atTop ? null : carried ? carried.anchor : readSidebarAnchor();
   if (atTop) setSidebarDebt(0);
   if (resting) settleSidebarWindows(anchor);
+  placeSidebarWindows();
   let built = false;
   for (const record of sidebarWindows) built = renderSidebarWindow(record) || built;
   // 스크롤이 새로 세운 행은 지은 자리에서 다 입는다(makeWorktreeNode) —
@@ -5440,7 +5498,6 @@ function shownWorktrees(project, { includeLandingFold = false } = {}) {
     && !(worktree.external_hidden && worktreeAgentRows(worktree.path).length === 0)
     && !(taskFoldedPaths.has(worktree.path) && !worktree.active && worktreeAgentRows(worktree.path).length === 0)
     && !(sidebarGroupBy === "repo" && !includeLandingFold && landingFoldedPaths.has(worktree.path)));
-
 }
 
 /* A verified checkout keeps its unlanded commits under the project's
@@ -5505,26 +5562,92 @@ function finishedCheckoutFold(project) {
 function foldTaskCheckouts(catalog) {
   const folded = new Set();
   const under = new Map();
+  const openUnder = new Map();
   for (const project of catalog) {
+    const rows = project.worktrees ?? [];
+    const names = checkoutNames(rows);
     const byTask = new Map();
-    for (const worktree of project.worktrees ?? []) {
-      if (!worktree.task_id) continue;
-      byTask.set(worktree.task_id, [...(byTask.get(worktree.task_id) ?? []), worktree]);
+    for (const worktree of rows) {
+      const family = checkoutFamily(worktree, names);
+      if (family === "") continue;
+      byTask.set(family, [...(byTask.get(family) ?? []), worktree]);
     }
     for (const [task, group] of byTask) {
       if (group.length < 2) continue;
-      const lead = taskLeadRow(task, group);
+      const lead = task.startsWith(CHECKOUT_COPY_FAMILY)
+        ? group.find((worktree) => checkoutCopyBase(worktree, names) === null)
+        : taskLeadRow(task, group);
       const tucked = group.filter((worktree) => worktree !== lead && !worktree.active
         && worktreeAgentRows(worktree.path).length === 0);
       if (tucked.length === 0) continue;
       const key = `${project.path}|${task}`;
-      under.set(lead.path, { key, rows: tucked });
-      if (openedTaskFolds.has(key)) continue;
+      // Only copies, by name: the row says so in its own words (`dressWorktreeFold`).
+      under.set(lead.path, { key, rows: tucked, copies: tucked.every((worktree) => checkoutCopyBase(worktree, names) !== null) });
+      if (openedTaskFolds.has(key)) {
+        for (const worktree of tucked) openUnder.set(worktree.path, lead.path);
+        continue;
+      }
       for (const worktree of tucked) folded.add(worktree.path);
     }
   }
   taskFoldedPaths = folded;
   taskFoldsUnder = under;
+  foldedOpenUnder = openUnder;
+  // The rows of an opened fold stand right under their lead in the project's own order, which every list built from
+  // it (the section, ⌘1–9, the arrows) reads.
+  for (const project of catalog) project.worktrees = placeFoldedUnder(project.worktrees ?? []);
+}
+
+/* A task's verify, Windows and red copies are named for the folder they copy: `<folder>-verify`, `-windows`,
+ * `-red` (t-60498). A checkout named so, whose original stands in the same project, is that original's copy —
+ * whether or not the catalog names a task for either — and folds under it with the rest of the task's checkouts. */
+const CHECKOUT_COPY = /-(?:verify|windows|red)$/;
+const CHECKOUT_COPY_FAMILY = "copy:";
+
+/* A project's checkouts by folder name, and the folders that have a copy: what the name rule reads. */
+function checkoutNames(rows) {
+  const byFolder = new Map(rows.map((worktree) => [basename(worktree.path), worktree]));
+  const copied = new Set();
+  for (const worktree of rows) {
+    const base = checkoutCopyBase(worktree, { byFolder });
+    if (base !== null) copied.add(base);
+  }
+  return { byFolder, copied };
+}
+
+/* The folder a checkout is a copy of, when its name says so and that folder stands; `null` otherwise. */
+function checkoutCopyBase(worktree, { byFolder }) {
+  const folder = basename(worktree.path);
+  const base = folder.replace(CHECKOUT_COPY, "");
+  return base !== folder && byFolder.has(base) ? base : null;
+}
+
+/* What a checkout is one of: the task the catalog names, else the folder a name rule ties it to, else nothing. A copy
+ * answers as its original does, so the two meet in one family. */
+function checkoutFamily(worktree, names) {
+  const base = checkoutCopyBase(worktree, names);
+  if (base !== null) return checkoutFamily(names.byFolder.get(base), names) || `${CHECKOUT_COPY_FAMILY}${base}`;
+  if (worktree.task_id) return worktree.task_id;
+  const folder = basename(worktree.path);
+  return names.copied.has(folder) ? `${CHECKOUT_COPY_FAMILY}${folder}` : "";
+}
+
+/* The rows of opened task folds stand right under the row they fold under, in the order the list had them; a row
+ * whose lead is not in this list stands where it was. Idempotent, so every list the window builds from the shown
+ * rows (the branch list's sections, ⌘1–9, the arrows) can ask it. */
+function placeFoldedUnder(rows) {
+  if (foldedOpenUnder.size === 0) return rows;
+  const paths = new Set(rows.map((worktree) => worktree.path));
+  const beneath = new Map();
+  const placed = new Set();
+  for (const worktree of rows) {
+    const lead = foldedOpenUnder.get(worktree.path);
+    if (!lead || !paths.has(lead)) continue;
+    beneath.set(lead, [...(beneath.get(lead) ?? []), worktree]);
+    placed.add(worktree.path);
+  }
+  if (placed.size === 0) return rows;
+  return rows.flatMap((worktree) => (placed.has(worktree.path) ? [] : [worktree, ...(beneath.get(worktree.path) ?? [])]));
 }
 
 /* The row that stands for a task: the checkout the ledger seated its work in —
@@ -5554,11 +5677,14 @@ function dressWorktreeFold(chip, path) {
     words = t("worktree.taskFoldOpen", "접기");
     tip = t("worktree.taskFoldOpenTip", "이 과업의 다른 체크아웃 {{count}}개를 다시 이 행 밑에 접습니다", { count });
   } else if (held) {
-    words = t("worktree.taskFold", "+{{count}} 접힘", { count });
-    tip = t("worktree.taskFoldTip", "이 과업의 다른 체크아웃 {{count}}개({{names}})를 이 행 밑에 접었습니다 — 누르면 펼칩니다. 넘긴 머리에 담긴 것은 창이 거둡니다.", {
-      count,
-      names: held.rows.map((one) => basename(one.path)).join(", "),
-    });
+    const names = held.rows.map((one) => basename(one.path)).join(", ");
+    if (held.copies) {
+      words = t("worktree.copyFold", "검증 사본 {{count}}", { count });
+      tip = t("worktree.copyFoldTip", "이 과업의 검증·윈도·빨강 사본 {{count}}개({{names}})를 이 행 밑에 접었습니다 — 누르면 펼칩니다", { count, names });
+    } else {
+      words = t("worktree.taskFold", "+{{count}} 접힘", { count });
+      tip = t("worktree.taskFoldTip", "이 과업의 다른 체크아웃 {{count}}개({{names}})를 이 행 밑에 접었습니다 — 누르면 펼칩니다. 넘긴 머리에 담긴 것은 창이 거둡니다.", { count, names });
+    }
   }
   if (chip.textContent !== words) chip.textContent = words;
   if (chip.hidden !== (words === "")) chip.hidden = words === "";
@@ -5786,7 +5912,7 @@ async function refreshWorktrees() {
   // 없으므로 끝에서 끝까지 하나의 순서다 — 원본도 프로젝트로 묶을 때에만
   // 본체 우선 규칙을 적용한다. 이걸 안 하면 평평한 목록은 저장소별 정렬을
   // 이어 붙인 것이 되어, 이름순인데 이름순이 아니다.
-  if (sidebarGroupBy === "none") visibleWorktrees.sort(compareWorktrees);
+  if (sidebarGroupBy === "none") visibleWorktrees = placeFoldedUnder(visibleWorktrees.sort(compareWorktrees));
   worktreeOrder = visibleWorktrees.map((worktree) => worktree.path);
   const visiblePaths = new Set(worktreeOrder);
   for (const path of selectedWorktreePaths) {
@@ -5941,9 +6067,12 @@ const TEAM_PEEK_LINES = 3;
 const TEAM_PEEK_CHARS = 80;
 const TEAM_PEEK_FRESH_MS = 3_000;
 const TEAM_CLOCK_MS = 30_000;
+/* How long a sentence that just changed stays lit on its line. */
+const TEAM_FRESH_MS = 1_600;
 
-/* A worker's state, in the order a coordinator's rows stand: a question or a blocker first, then work going,
- * then work waiting on the coordinator, then rest. */
+/* A worker's state, ranked by how much the person is wanted: a question or a blocker, then work going, then work
+ * waiting on the coordinator, then rest. The rank orders a family's tally and names its head's dot; it does not
+ * order rows — those keep the ledger's order (`teamRunEntries`). */
 const TEAM_STATES = Object.freeze({
   asking: { rank: 0, key: "sidebar.team.stateAsking", word: "질문" },
   blocked: { rank: 1, key: "sidebar.team.stateBlocked", word: "막힘" },
@@ -5973,7 +6102,7 @@ const TEAM_CHECK_GOING = new Set(["started", "prepared"]);
  * `released` settles a worker in the ledger's eyes, and one whose release got no answer stood on landed work under
  * a running coordinator with every step green at 착지 (t-60850; the person, 10-16: 「코덱스가 돌고 있는데 착지라 표시되는
  * 버그」). A worker still at work keeps its row on such work (`teamWorkerAtWork`). */
-const TEAM_SETTLED_STAGES = new Set(["handedIn", "reviewing", "landWait", "failed"]);
+const TEAM_SETTLED_STAGES = new Set(["handedIn", "reviewing", "landWait", "failed", "stopped"]);
 const TEAM_LEFT_STAGES = new Set(["landed", "nothing", "closed"]);
 
 /* What a step's cell says in the strip's tip: done, where the work is, where it is held, no record — and a step
@@ -6107,6 +6236,11 @@ function teamAgo(at, now) {
   return now - at < 60_000 ? word : t("sidebar.team.ago", "{{time}} 전", { time: word });
 }
 
+/* What the line under a worker says when pointed at: the whole sentence and how long ago it was said. */
+function teamNowTip(line, at, now) {
+  return `${line}\n${teamAgo(at, now)}`;
+}
+
 /* The first sentence of a status line, cut to what a row holds. */
 function teamSentence(line) {
   const text = String(line).trim();
@@ -6128,12 +6262,14 @@ function teamSteps(row, held) {
   const committed = commits > 0 || landing?.state === "landed";
   const landed = phase === "landed" || phase === "nothing";
   const verified = landed || phase === "landWait" || row.review?.verified === true;
-  const handed = Boolean(row.handed_in) && !row.failed;
+  // An attempt that ended handing nothing in — failed on its own word, or stopped with no result seen (t-73910).
+  const ended = row.failed === true || row.stopped === true;
+  const handed = Boolean(row.handed_in) && !ended;
   let current = null;
   if (!landed) {
     if (verified) current = "land";
     else if (handed) current = "verify";
-    else if (row.failed) current = "handIn";
+    else if (ended) current = "handIn";
     else if (committed) current = "commit";
     else current = "read";
   }
@@ -6142,7 +6278,7 @@ function teamSteps(row, held) {
     read: current === "read" ? "cur" : "on",
     commit: committed ? (current === "commit" ? "cur" : "on") : "",
     check: check === null ? "" : TEAM_CHECK_PASSED.has(check) ? "on" : TEAM_CHECK_GOING.has(check) ? "cur" : "stuck",
-    handIn: row.failed ? "stuck" : handed || verified ? "on" : "",
+    handIn: ended ? "stuck" : handed || verified ? "on" : "",
     verify: verified ? "on" : current === "verify" ? "cur" : "",
     land: landed ? "on" : current === "land" ? "cur" : "",
   };
@@ -6198,11 +6334,22 @@ function teamWorkerAtWork(row, hook = teamWorkerHook(row)) {
   return hook === "working" || (hook === null && row.state === "working");
 }
 
+/* A failed turn in one line: 「턴 실패 — <the error's own words>」, or the word alone when the CLI gave none. */
+function teamTurnFailedLine(failed) {
+  const error = String(failed.error ?? "").trim();
+  return error === ""
+    ? t("sidebar.team.turnFailed", "턴 실패")
+    : t("sidebar.team.turnFailedLine", "턴 실패 — {{error}}", { error });
+}
+
 /* One worker's row, as words: its state and the one word of what holds it, its title, its pane, what it last
  * said it was doing, and its steps. */
 function teamWorkerEntry(row, at, now) {
   const stage = ledgerLandingStage(row);
-  const blocker = seatHealthBlockerWord(row, now) || seatStallWord(row, stage);
+  // A turn that failed on an error its CLI named (t-69010) holds the worker until somebody acts on it.
+  const failedTurn = row.turn_failed && typeof row.turn_failed === "object" ? row.turn_failed : null;
+  const blocker = (failedTurn ? t("sidebar.team.turnFailed", "턴 실패") : "") ||
+    seatHealthBlockerWord(row, now) || seatStallWord(row, stage);
   const hook = teamWorkerHook(row);
   let state = "resting";
   if (row.asking === true || hook === "needs-attention") state = "asking";
@@ -6212,6 +6359,8 @@ function teamWorkerEntry(row, at, now) {
   const chip = blocker || (hook === "needs-attention" ? bucketWord("attention") : "");
   const steps = teamSteps(row, state === "blocked" || state === "asking");
   const said = row.last_status;
+  const told = failedTurn ? teamTurnFailedLine(failedTurn) : said?.line ?? "";
+  const toldAt = Number((failedTurn ? failedTurn.at_ms : said?.created_ms) ?? 0) || 0;
   const role = { kind: "worker", facts: { worker: row.worker, task: row.task, taskId: row.task_id }, takenOver: row.taken_over === true };
   return {
     key: `w:${row.run}/${row.worker}`,
@@ -6226,8 +6375,15 @@ function teamWorkerEntry(row, at, now) {
     paneTip: row.pane && row.settled !== true
       ? t("sidebar.team.paneTip", "워커 {{worker}}의 판 — 계정이 바뀌어 판 번호가 옮겨도 이 행은 그 워커를 따라갑니다", { worker: row.worker })
       : "",
-    now: said?.line ? `${teamSentence(said.line)} · ${teamAgo(said.created_ms, now)}` : "",
-    nowTip: said?.line ?? "",
+    // The line under the title is always there, so a worker speaking for the first time grows no row, and it holds
+    // the sentence only: how long ago is the tip's, worked out when it is pointed at (`teamNowTip`) — a minute
+    // passing writes nothing. A failed turn (t-69010) stands where the worker's last status would.
+    now: told ? teamSentence(told) : t("sidebar.team.nowNone", "아직 보낸 말 없음"),
+    nowIdle: !told,
+    nowLine: told,
+    nowAt: told ? toldAt : 0,
+    nowTip: told && toldAt > 0 ? teamNowTip(told, toldAt, now) : told,
+    root: row.root_id ? { id: row.root_id, title: row.root_title || row.root_id } : null,
     steps,
     step: steps.current === null ? teamStepWord("land", 0) : teamStepWord(steps.current, steps.commits),
     stepsTip: teamStepsTip(row, steps),
@@ -6317,6 +6473,62 @@ function teamPersonPanes(rows) {
   return { own, taken };
 }
 
+/* The workers of one coordinator, as rows: those whose tasks share a root (the topmost task of the task's parent
+ * chain, `root_id` on the ledger's row) stand under one head row; a worker alone on its root, or with none, stays a
+ * plain row. A family is closed until pressed (`teamGroupOpen`).
+ *
+ * The order: a unit is a family or a lone worker, and the ledger's order — the order the workers were summoned
+ * in — keeps them where they are. Only a unit the person is wanted at (a question, a blocker in any member) stands
+ * above the rest, in the ledger's order among themselves. Inside an opened family the rows keep the ledger's order
+ * too: a question shows on the head and on its own row and moves neither, and a worker going to work or to rest
+ * moves nothing — the rows' states used to re-sort them, and a row under the pointer ran away. */
+const teamGroupOpen = new Set();
+
+const teamNeedsPerson = (entry) => entry.state === "asking" || entry.state === "blocked";
+
+function teamRunEntries(run, workers) {
+  const byRoot = new Map();
+  for (const entry of workers) {
+    const id = entry.root?.id ?? entry.key;
+    if (!byRoot.has(id)) byRoot.set(id, []);
+    byRoot.get(id).push(entry);
+  }
+  const units = [...byRoot].map(([id, members]) => ({
+    id,
+    members: [...members].sort((one, other) => one.at - other.at),
+    needs: members.some(teamNeedsPerson),
+  }));
+  units.sort((one, other) => Number(other.needs) - Number(one.needs) || one.members[0].at - other.members[0].at);
+  const out = [];
+  for (const unit of units) {
+    if (unit.members.length < 2) {
+      out.push(...unit.members);
+      continue;
+    }
+    const key = `g:${run}/${unit.id}`;
+    const open = teamGroupOpen.has(key);
+    const counts = Object.entries(TEAM_STATES)
+      .sort((one, other) => one[1].rank - other[1].rank)
+      .map(([state]) => [state, unit.members.filter((member) => member.state === state).length])
+      .filter(([, count]) => count > 0);
+    const asking = unit.members.filter((member) => member.state === "asking").length;
+    out.push({
+      key,
+      kind: "group",
+      run,
+      open,
+      state: counts[0][0],
+      title: unit.members[0].root.title,
+      count: t("sidebar.team.groupCount", "워커 {{count}}", { count: unit.members.length }),
+      asking: asking > 0 ? t("sidebar.team.questions", "질문 {{count}}", { count: asking }) : "",
+      tally: counts.map(([state, count]) => `${t(TEAM_STATES[state].key, TEAM_STATES[state].word)} ${count}`).join(" · "),
+      tip: t("sidebar.team.groupTip", "같은 일에서 갈라진 과업 {{count}}개 — 누르면 펼치거나 접습니다", { count: unit.members.length }),
+    });
+    if (open) out.push(...unit.members.map((member) => ({ ...member, child: true })));
+  }
+  return out;
+}
+
 /* Everything the view says, in the order it stands. */
 function sidebarTeamEntries(now) {
   const byRun = new Map();
@@ -6341,9 +6553,7 @@ function sidebarTeamEntries(now) {
     landing += Number(seat.landing) || 0;
     batched += Number(seat.batched) || 0;
     entries.push(teamCoordinatorEntry(seat));
-    const workers = byRun.get(seat.run) ?? [];
-    workers.sort((one, other) => TEAM_STATES[one.state].rank - TEAM_STATES[other.state].rank || one.at - other.at);
-    entries.push(...workers);
+    entries.push(...teamRunEntries(seat.run, byRun.get(seat.run) ?? []));
   }
   entries.push({
     key: "landing",
@@ -6368,8 +6578,13 @@ function sidebarTeamEntries(now) {
 /* What one entry says, as one string: a row is written again only when this moved. */
 function teamEntrySaid(entry) {
   switch (entry.kind) {
+    case "group":
+      return [entry.title, entry.count, entry.tally, entry.state, entry.asking, entry.tip, entry.open ? 1 : 0].join("|");
     case "worker":
-      return [entry.state, entry.chip, entry.title, entry.pane, entry.paneTip, entry.now, entry.nowTip,
+      // The line's tip carries a clock that moves every minute; what the row is written again for is the sentence
+      // and the time it was said (`nowAt`), not the minute count.
+      return [entry.child ? "c" : "", entry.nowIdle ? "i" : "", entry.nowLine, entry.nowAt,
+        entry.state, entry.chip, entry.title, entry.pane, entry.paneTip, entry.now,
         TEAM_STEPS.map((step) => entry.steps.cells[step.id]).join(","), entry.step, entry.stepsTip, entry.tip,
         entry.taken ? 1 : 0, entry.term ?? "", t(TEAM_STATES[entry.state].key, TEAM_STATES[entry.state].word)].join("|");
     case "coordinator":
@@ -6438,6 +6653,17 @@ function buildTeamNode(entry) {
     node.__parts = { face, name, project, run, questions, letters, now };
     return node;
   }
+  if (entry.kind === "group") {
+    const chevron = teamPart(line, "span", "team-chevron");
+    chevron.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#i-chevron"></use></svg>';
+    const dot = teamPart(line, "span", "team-dot");
+    const title = teamPart(line, "span", "team-title");
+    const chip = teamPart(line, "span", "team-chip is-question");
+    const pane = teamPart(line, "span", "team-pane");
+    const now = teamPart(node, "span", "team-now");
+    node.__parts = { dot, title, chip, pane, now };
+    return node;
+  }
   const dot = teamPart(line, "span", "team-dot");
   const title = teamPart(line, "span", "team-title");
   const chip = teamPart(line, "span", "team-chip");
@@ -6466,6 +6692,22 @@ function writeTeamTip(node) {
   const lines = Number.isInteger(term) ? sidebarTeamPeeks.get(term)?.lines ?? [] : [];
   const tip = [node.__tip ?? "", ...(lines.length ? ["", ...lines] : [])].join("\n").trim();
   if ((node.dataset.tip ?? "") !== tip) node.dataset.tip = tip;
+}
+
+/* The line under a worker: always there, so it holds its height whether or not the worker has spoken. A sentence
+ * that replaces another stays lit for `TEAM_FRESH_MS`; the row's first writing lights nothing. */
+function dressTeamNow(part, entry) {
+  const was = part.textContent;
+  writeTextContent(part, entry.now);
+  writeHidden(part, false);
+  part.classList.toggle("is-idle", entry.nowIdle);
+  part.__line = entry.nowLine;
+  part.dataset.saidMs = entry.nowAt > 0 ? String(entry.nowAt) : "";
+  if ((part.dataset.tip ?? "") !== entry.nowTip) part.dataset.tip = entry.nowTip;
+  if (was === "" || was === entry.now || entry.nowIdle) return;
+  part.classList.add("is-fresh");
+  clearTimeout(part.__fresh);
+  part.__fresh = setTimeout(() => part.classList.remove("is-fresh"), TEAM_FRESH_MS);
 }
 
 function dressTeamNode(node, entry) {
@@ -6511,6 +6753,19 @@ function dressTeamNode(node, entry) {
     return;
   }
   const state = TEAM_STATES[entry.state];
+  if (entry.kind === "group") {
+    parts.dot.className = `team-dot is-${entry.state}`;
+    node.classList.toggle("is-open", entry.open);
+    node.setAttribute("aria-expanded", entry.open ? "true" : "false");
+    writeTextContent(parts.title, entry.title);
+    writeTeamText(parts.chip, entry.asking);
+    writeTextContent(parts.pane, entry.count);
+    writeTextContent(parts.now, entry.tally);
+    if ((node.dataset.tip ?? "") !== entry.tip) node.dataset.tip = entry.tip;
+    node.setAttribute("aria-label", [entry.title, entry.count, entry.asking, entry.tally].filter(Boolean).join(" · "));
+    return;
+  }
+  node.classList.toggle("is-child", entry.child === true);
   parts.dot.className = `team-dot is-${entry.state}`;
   // A working row moves: the dot's ring turns (`spinWorktreeDots`) and the row wears the flowing border.
   node.classList.toggle("is-working", entry.state === "working");
@@ -6520,7 +6775,7 @@ function dressTeamNode(node, entry) {
   writeTeamText(parts.chip, entry.chip);
   parts.chip.classList.toggle("is-question", entry.state === "asking");
   writeTeamText(parts.pane, entry.pane, entry.paneTip);
-  writeTeamText(parts.now, entry.now, entry.nowTip);
+  dressTeamNow(parts.now, entry);
   TEAM_STEPS.forEach((step, at) => {
     const cell = parts.cells[at];
     const said = entry.steps.cells[step.id];
@@ -6631,7 +6886,10 @@ sidebarTeam.addEventListener("click", (event) => {
   if (!node || !sidebarTeam.contains(node) || !node.__entry) return;
   sidebarTeamFocus = node.dataset.teamKey;
   const entry = node.__entry;
-  if (entry.kind === "coordinator") pressTeamSeat(entry.seat);
+  if (entry.kind === "group") {
+    if (!teamGroupOpen.delete(entry.key)) teamGroupOpen.add(entry.key);
+    paintSidebarTeam();
+  } else if (entry.kind === "coordinator") pressTeamSeat(entry.seat);
   else if (entry.kind === "worker") pressTeamWorker(entry.row);
   else if (entry.kind === "landing") pressTeamLanding();
 });
@@ -6687,6 +6945,12 @@ async function peekTeamRow(node) {
 }
 
 sidebarTeam.addEventListener("pointerover", (event) => {
+  // How long ago the line was said is worked out now, when it is asked for — the window's tip reads it a beat later.
+  const said = event.target.closest?.(".team-now[data-said-ms]");
+  if (said && said.dataset.saidMs !== "" && sidebarTeam.contains(said)) {
+    const tip = teamNowTip(said.__line ?? "", Number(said.dataset.saidMs), Date.now());
+    if ((said.dataset.tip ?? "") !== tip) said.dataset.tip = tip;
+  }
   const node = event.target.closest?.(".team-row[data-team-term]");
   if (node && sidebarTeam.contains(node)) void peekTeamRow(node);
 });
@@ -11662,6 +11926,9 @@ function describeLoss(loss) {
  * checkout its explicit Force Delete fallback without ever turning a stored
  * preference into `discardChanges: true`. */
 async function requestWorktreeRemoval(worktree) {
+  // The press's hand, carried past the awaits below (shell-boot.js `flowHand`,
+  // t-75209): the removal and the ends it brings are the person's (t-74975).
+  const started = handNow();
   if (!skipDeleteWorktreeConfirm) {
     await askToRemoveWorktree(worktree);
     return;
@@ -11681,14 +11948,14 @@ async function requestWorktreeRemoval(worktree) {
   }
   setWorktreeDeleting(worktree.path, true);
   try {
-    await invoke("remove_worktree", { path: worktree.path, discardChanges: false });
+    await invoke("remove_worktree", { path: worktree.path, discardChanges: false }, { hand: flowHand(started) });
   } catch {
     await askToRemoveWorktree(worktree);
     return;
   } finally {
     setWorktreeDeleting(worktree.path, false);
   }
-  await finishWorktreeRemoval(worktree);
+  await finishWorktreeRemoval(worktree, flowHand(started));
 }
 
 async function askToRemoveWorktree(worktree) {
@@ -11758,10 +12025,10 @@ async function askToRemoveWorktree(worktree) {
  * and a window that creates and deletes workspaces all day accumulated a split
  * tree per checkout it had ever stood in — each holding group numbers that can
  * never be drawn again. */
-async function dropWorktreeSurfaces(path) {
+async function dropWorktreeSurfaces(path, hand) {
   for (const held of tabs.filter((one) => one.worktree === path)) {
     if (held.kind === "term") {
-      await closeTerminalTab(held, "worktree-removed");
+      await closeTerminalTab(held, "worktree-removed", hand);
       continue;
     }
     dropTab(held.id);
@@ -11773,7 +12040,9 @@ async function dropWorktreeSurfaces(path) {
   return true;
 }
 
-async function finishWorktreeRemoval(worktree) {
+/* `hand` is the removal's (`flowHand`): the shells standing in the checkout
+ * end with it. */
+async function finishWorktreeRemoval(worktree, hand) {
   const { path, active } = worktree;
   // Which project the removed checkout belonged to, asked while the list
   // still remembers it — after the refresh below the row is gone and the
@@ -11783,7 +12052,7 @@ async function finishWorktreeRemoval(worktree) {
   // below, because a ghost left as the active tab is exactly what the
   // same-workspace early return mistakes for "already fine" — the blank-stage
   // bug this sweep exists to end.
-  if (!(await dropWorktreeSurfaces(path))) return;
+  if (!(await dropWorktreeSurfaces(path, hand))) return;
   const worktrees = await refreshWorktrees();
   // The backend has already moved off a removed worktree; this catches the
   // titlebar and the tree up with it.
@@ -11800,6 +12069,9 @@ async function finishWorktreeRemoval(worktree) {
 }
 
 async function removeWorktree(discardChanges) {
+  // The press's hand, carried past the awaits below (shell-boot.js `flowHand`,
+  // t-75209): the removal and the ends it brings are the person's (t-74975).
+  const started = handNow();
   const asked = removal;
   if (!asked) return;
   // Nothing has been shown yet, so there is nothing anyone could have agreed
@@ -11834,7 +12106,7 @@ async function removeWorktree(discardChanges) {
   closeRemovalPrompt();
   setWorktreeDeleting(path, true);
   try {
-    await invoke("remove_worktree", { path, discardChanges });
+    await invoke("remove_worktree", { path, discardChanges }, { hand: flowHand(started) });
   } catch (error) {
     // The dialog is gone, so the refusal lands where errors already land.
     showError(error);
@@ -11842,7 +12114,7 @@ async function removeWorktree(discardChanges) {
   } finally {
     setWorktreeDeleting(path, false);
   }
-  await finishWorktreeRemoval(worktree);
+  await finishWorktreeRemoval(worktree, flowHand(started));
 }
 
 /* Re-reads the loss and compares it with the one the dialog is showing. On a
@@ -12329,6 +12601,9 @@ function closeCleanupConfirm(said) {
  * 수 있다. 상태가 나빠진 행은 거부한다 — 좋아진 것은 거부하지 않는다: 사람이
  * 승인한 것보다 안전해진 것을 막을 이유가 없다. */
 async function removeCleanupRows(rows) {
+  // The press's hand, carried past the awaits below (shell-boot.js `flowHand`,
+  // t-75209): the removal and the ends it brings are the person's (t-74975).
+  const started = handNow();
   if (wsclean.busy || rows.length === 0) return;
   if (!(await askCleanupConfirm(rows.length))) return;
   wsclean.busy = true;
@@ -12353,7 +12628,7 @@ async function removeCleanupRows(rows) {
         path: row.path,
         discardChanges: now.force,
         landedBranches: (now.reasons ?? []).includes("landed"),
-      });
+      }, { hand: flowHand(started) });
       removed.push(row.name);
       wsclean.picked.delete(row.id);
     } catch (error) {
@@ -12367,7 +12642,7 @@ async function removeCleanupRows(rows) {
   // 사라진 체크아웃의 표면은 함께 간다 — `removeWorktree`가 한 행에 대해 하는
   // 일과 같은 문이고, 그것을 건너뛰면 없는 디렉터리를 가리키는 탭이 남는다.
   for (const row of ordered) {
-    if (removed.includes(row.name)) await dropWorktreeSurfaces(row.path);
+    if (removed.includes(row.name)) await dropWorktreeSurfaces(row.path, flowHand(started));
   }
   await refreshWorktrees();
 }
@@ -13133,6 +13408,9 @@ async function prefetchSpaceGit() {
  * 들고 있는 `force`를 쓴다 — Rust가 증거를 보고 답한 값이지 이 화면이 정한
  * 값이 아니다. */
 async function removeSpaceRows(rows, forced = false) {
+  // The press's hand, carried past the awaits below (shell-boot.js `flowHand`,
+  // t-75209): the removal and the ends it brings are the person's (t-74975).
+  const started = handNow();
   if (space.busy || space.scanning || rows.length === 0) return;
   if (!(await askCleanupConfirm(rows.length))) return;
   space.busy = true;
@@ -13146,7 +13424,7 @@ async function removeSpaceRows(rows, forced = false) {
       await invoke("remove_worktree", {
         path: row.path,
         discardChanges: forced || row.force,
-      });
+      }, { hand: flowHand(started) });
       removed.push(row.name);
       space.picked.delete(row.id);
       delete space.errors[row.id];
@@ -13159,7 +13437,7 @@ async function removeSpaceRows(rows, forced = false) {
   space.summary = { removed, kept };
   // 사라진 체크아웃의 표면은 함께 간다 — `removeCleanupRows`와 같은 문이다.
   for (const row of ordered) {
-    if (removed.includes(row.name)) await dropWorktreeSurfaces(row.path);
+    if (removed.includes(row.name)) await dropWorktreeSurfaces(row.path, flowHand(started));
   }
   await refreshWorktrees();
   await scanSpace();
@@ -13590,6 +13868,7 @@ async function openStrandedSession(term, worktreeKey) {
 }
 
 async function killResourceSession(session) {
+  const started = handNow();
   const accepted = await askConfirm({
     title: t("resource.killTitle", "{{name}}을(를) 종료할까요?", { name: session.label }),
     body: t(
@@ -13606,8 +13885,8 @@ async function killResourceSession(session) {
   resourceManager.killing.add(session.key);
   paintResourcePop();
   try {
-    if (session.kind === "lane") await invoke("close_lane", { id: session.lane });
-    else await invoke("end_terminal_session", { term: session.term });
+    if (session.kind === "lane") await invoke("close_lane", { id: session.lane }, { hand: flowHand(started) });
+    else await invoke("end_terminal_session", { term: session.term }, { hand: flowHand(started) });
   } catch (error) {
     resourceManager.operationError = t("resource.endFailed", "세션을 종료하지 못했습니다.");
     resourceManager.error = resourceManager.operationError;
@@ -13650,6 +13929,7 @@ async function killResourceNativeProcess(process) {
 }
 
 async function killAllResourceSessions() {
+  const started = handNow();
   const { projects } = resourceTree();
   const sessions = projects.flatMap((project) =>
     project.worktrees.flatMap((worktree) => worktree.sessions));
@@ -13674,8 +13954,8 @@ async function killAllResourceSessions() {
     sessions.filter((session) => session.kind === "lane").map((session) => session.lane),
   )];
   const results = await Promise.allSettled([
-    invoke("end_all_terminal_sessions"),
-    ...laneIds.map((id) => invoke("close_lane", { id })),
+    invoke("end_all_terminal_sessions", undefined, { hand: flowHand(started) }),
+    ...laneIds.map((id) => invoke("close_lane", { id }, { hand: flowHand(started) })),
   ]);
   resourceManager.killing.clear();
   if (results.some((result) => result.status === "rejected")) {

@@ -776,9 +776,59 @@ pub(crate) fn open_mirror_term(
         state.local_data_root(),
         &format!("term {id} spawned tail (mirror)"),
     );
+    // A mirror before it is a terminal: the exit watch may see it end the
+    // moment it is held (R8).
+    note_mirror_term(id);
     state.hold_terminal(id, pty);
     state.cadence().wake();
     Ok(id)
+}
+
+/// The terms [`open_mirror_term`] started: a `tail -F` over a run's mirror
+/// file, nothing typed into them and nothing lost when one closes. The window
+/// replaces a run's mirror and takes down one whose parent left on no
+/// person's hand — a backend notice, a timer — so they close through
+/// [`close_mirror_term`], which ends these and nothing else; `close_term`
+/// stays the person's (t-75153, R7b).
+static MIRROR_TERMS: std::sync::Mutex<std::collections::BTreeSet<TermId>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn mirror_terms() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<TermId>> {
+    MIRROR_TERMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+pub(crate) fn note_mirror_term(term: TermId) {
+    mirror_terms().insert(term);
+}
+
+pub(crate) fn forget_mirror_term(term: TermId) {
+    mirror_terms().remove(&term);
+}
+
+/// Whether `term` is a mirror pane [`close_mirror_term`] may end.
+pub(crate) fn mirror_close_allowed(term: TermId) -> Result<(), TerminalCloseError> {
+    if mirror_terms().contains(&term) {
+        Ok(())
+    } else {
+        Err(TerminalCloseError::NotMirror)
+    }
+}
+
+/// Close one mirror pane the window opened — the same retirement as
+/// [`close_term`], refused for any other term.
+#[tauri::command(async)]
+pub(crate) fn close_mirror_term(
+    state: State<'_, AppState>,
+    term: TermId,
+) -> Result<(), TerminalCloseError> {
+    mirror_close_allowed(term)?;
+    let retired = retire_terminal(&state, term);
+    if retired.is_ok() {
+        forget_mirror_term(term);
+    }
+    retired.map(|_| ())
 }
 
 #[tauri::command(async)]
@@ -1154,7 +1204,13 @@ pub(crate) fn type_prompt_at_term(
         return Err(format!("터미널 {term}이(가) 없습니다"));
     }
     let (notify, waiting) = std::sync::mpsc::sync_channel(1);
-    if deliveries.contains_key(&term) {
+    // A pane whose account move is being written queues its prompts too
+    // (t-74974): the move marks it under this same lock.
+    if crate::prompt_transaction::line_is_taken(
+        &deliveries,
+        &state.shell_runtime().moving_terms,
+        term,
+    ) {
         state
             .prompt_queue()
             .entry(term)

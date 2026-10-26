@@ -123,14 +123,14 @@ pub fn fenced_dir(local_data_root: &Path, presented: Option<&str>) -> Option<Pat
 #[must_use]
 pub fn captures(tool: &str, verb: &str) -> Option<bool> {
     match (tool, verb) {
+        ("browser", verb) if zerocode_core::agent_browser::acts(verb) => Some(true),
         ("emulator", verb) if zerocode_core::agent_emulator::acts(verb) => Some(true),
         // Deterministic AX checks leave a line; their verdict needs no picture.
         ("emulator", verb) if zerocode_core::agent_emulator::is_check(verb) => Some(false),
         ("emulator", "screenshot")
         | (
             "browser",
-            "goto" | "click" | "type" | "press" | "fill" | "eval" | "wait" | "screenshot"
-            | "viewport" | "scroll" | "find",
+            "wait" | "screenshot" | "viewport" | "find",
         )
         | (
             "computer",
@@ -185,6 +185,30 @@ pub fn captures(tool: &str, verb: &str) -> Option<bool> {
     }
 }
 
+/// Keep only the backend's completed `open` label, so a saved recipe binds a
+/// new tab instead of replaying a label from another day. No page text enters.
+pub(crate) fn browser_open_observation(
+    argv: &[String],
+    answer: &zerocode_hookd::TeamAnswer,
+    observation: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if argv.first().map(String::as_str) != Some("open") || answer.exit_code != 0 {
+        return observation;
+    }
+    let Some(label) = zerocode_core::agent_browser::opened_browser_label(&answer.stdout) else {
+        return observation;
+    };
+    let mut observation = observation.unwrap_or_else(|| serde_json::json!({}));
+    if !observation.is_object() {
+        observation = serde_json::json!({ "context": observation });
+    }
+    observation.as_object_mut()?.insert(
+        zerocode_core::agent_browser::BROWSER_OPENED_TAB_KEY.into(),
+        serde_json::json!(label),
+    );
+    Some(observation)
+}
+
 /// The argv as the log keeps it: what was typed is replaced by its length.
 /// A QA run types passwords and one-time codes, and a step log that kept
 /// them would be the leak the evidence folder was never meant to be. What a
@@ -193,28 +217,33 @@ pub fn captures(tool: &str, verb: &str) -> Option<bool> {
 /// frames already hold, and a recipe replays it.
 #[must_use]
 pub fn redacted(tool: &str, argv: &[String]) -> Vec<String> {
-    // A browser `type` and a `fill` carry what was typed last, as one word
-    // or after `--value`.
-    let typing = tool == "browser"
-        && argv
-            .first()
-            .is_some_and(|verb| verb == "type" || verb == "fill");
-    let needle = tool == "computer"
-        && argv
-            .first()
-            .and_then(|verb| zerocode_core::computer_use::verb_method(verb))
-            .is_some_and(|method| COMPUTER_NEEDLE_VERBS.contains(&method));
-    let mut hide_next = false;
+    let Ok(plain) = zerocode_core::computer_recipe::privacy::normalized(tool, argv) else {
+        return argv
+            .iter()
+            .enumerate()
+            .map(|(index, word)| {
+                if index < 2 {
+                    word.clone()
+                } else {
+                    redaction(word.chars().count())
+                }
+            })
+            .collect();
+    };
+    let argv = &plain;
+    let positions = zerocode_core::computer_recipe::privacy::value_positions(tool, argv);
+    let files = zerocode_core::computer_recipe::privacy::file_positions(tool, argv);
+    let policy = observed_input_policy(tool, argv);
     argv.iter()
         .enumerate()
         .map(|(index, word)| {
-            // A recipe's own words — a word holding its placeholder — are the
-            // document's, not what was typed. A browser `type` carries its text
-            // last, as one word or after `--value` (the stdin road's shape).
-            let hidden =
-                (hide_next || (typing && index + 1 == argv.len())) && !names_a_placeholder(word);
-            hide_next = !needle && matches!(word.as_str(), "--text" | "--value");
-            if hidden {
+            if files.contains(&index) && !names_a_placeholder(word) {
+                // Where a file sat names a person (a home folder): the log
+                // keeps the file's name.
+                zerocode_core::computer_recipe::privacy::file_name(word).to_string()
+            } else if positions.contains(&index)
+                && (policy.secret || policy.credential || !names_a_placeholder(word))
+            {
                 redaction(word.chars().count())
             } else {
                 word.clone()
@@ -226,17 +255,9 @@ pub fn redacted(tool: &str, argv: &[String]) -> Vec<String> {
 /// Whether a word holds a recipe's placeholder (`{{name}}`): a line a recipe
 /// walk logs in its own words — the document's text, with its names.
 fn names_a_placeholder(word: &str) -> bool {
-    !zerocode_core::computer_recipe::recipe_placeholders(word).is_empty()
+    zerocode_core::computer_recipe::privacy::is_parameter_word(word)
 }
 
-/// The verbs whose `--text` is what the screen should show, not what the
-/// hand types: a check's needle, and a click's target — the control named
-/// by what it reads, kept so a saved walk replays the press (t-4227).
-const COMPUTER_NEEDLE_VERBS: &[zerocode_core::computer_use::ComputerMethod] = &[
-    zerocode_core::computer_use::ComputerMethod::Click,
-    zerocode_core::computer_use::ComputerMethod::Find,
-    zerocode_core::computer_use::ComputerMethod::WaitFor,
-];
 /// How a redacted word reads in the log — written and read back here only.
 const REDACTED_OPEN: &str = "[";
 const REDACTED_CLOSE: &str = " chars]";
@@ -387,6 +408,84 @@ pub fn observing<T>(value: serde_json::Value, run: impl FnOnce() -> T) -> T {
     run()
 }
 
+fn observed_input_policy(
+    tool: &str,
+    argv: &[String],
+) -> zerocode_core::computer_recipe::privacy::InputPolicy {
+    let plain = zerocode_core::computer_recipe::privacy::normalized(tool, argv).unwrap_or_default();
+    let masked = if tool == "browser" {
+        plain
+            .get(1)
+            .map(|label| crate::cmd::browser::form::known_masked(label))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    zerocode_core::computer_recipe::privacy::input_policy(tool, argv, &masked)
+}
+
+fn with_input_policy(
+    mut observation: Option<serde_json::Value>,
+    tool: &str,
+    argv: &[String],
+) -> Option<serde_json::Value> {
+    use zerocode_core::computer_recipe::privacy::{INPUT_KEY, InputPolicy};
+    let mut policy = observed_input_policy(tool, argv);
+    if observation.is_none() && !policy.secret && !policy.credential {
+        return None;
+    }
+    let value = observation.get_or_insert_with(|| serde_json::json!({}));
+    if !value.is_object() {
+        *value = serde_json::json!({ "context": value.clone() });
+    }
+    if let Some(prior) = value
+        .get(INPUT_KEY)
+        .and_then(|value| serde_json::from_value::<InputPolicy>(value.clone()).ok())
+    {
+        policy.secret |= prior.secret;
+        policy.credential |= prior.credential;
+    }
+    value[INPUT_KEY] = serde_json::json!(policy);
+    observation
+}
+
+/// What an upload step leaves of its files: how many, and each one's name and
+/// size in bytes (a file gone or unreadable has its name only). The folders
+/// above them are never kept.
+fn with_file_facts(
+    mut observation: Option<serde_json::Value>,
+    tool: &str,
+    argv: &[String],
+) -> Option<serde_json::Value> {
+    use zerocode_core::computer_recipe::privacy::{file_name, file_positions};
+    let Ok(plain) = zerocode_core::computer_recipe::privacy::normalized(tool, argv) else {
+        return observation;
+    };
+    let files: Vec<serde_json::Value> = file_positions(tool, &plain)
+        .into_iter()
+        .map(|index| {
+            let word = &plain[index];
+            let mut fact = serde_json::json!({ "name": file_name(word) });
+            if !names_a_placeholder(word)
+                && let Ok(meta) = std::fs::metadata(word)
+                && meta.is_file()
+            {
+                fact["bytes"] = serde_json::json!(meta.len());
+            }
+            fact
+        })
+        .collect();
+    if files.is_empty() {
+        return observation;
+    }
+    let value = observation.get_or_insert_with(|| serde_json::json!({}));
+    if !value.is_object() {
+        *value = serde_json::json!({ "context": value.clone() });
+    }
+    value["upload"] = serde_json::json!({ "count": files.len(), "files": files });
+    observation
+}
+
 /// Add the time measured around the actual door call. Verb classification
 /// stays with the existing core tables; a read is never labelled a press.
 pub fn measured(
@@ -395,6 +494,7 @@ pub fn measured(
     argv: &[String],
     elapsed: std::time::Duration,
 ) -> Option<serde_json::Value> {
+    observed = with_input_policy(observed, tool, argv);
     let verb = argv.first().map_or("", String::as_str);
     let acts = match tool {
         "browser" => zerocode_core::agent_browser::acts(verb),
@@ -447,6 +547,11 @@ fn record_with(
     emitted: impl FnOnce(&Path, &Step),
 ) -> Option<String> {
     let verb = argv.first().map_or("?", String::as_str);
+    let observation = with_file_facts(with_input_policy(observation, tool, argv), tool, argv);
+    let typed = zerocode_core::computer_recipe::privacy::normalized(tool, argv)
+        .map_or(true, |plain| {
+            !zerocode_core::computer_recipe::privacy::value_positions(tool, &plain).is_empty()
+        });
     let _writing = WRITING.lock().unwrap_or_else(PoisonError::into_inner);
     let steps = dir.join(STEPS_FILE);
     let (n, separated) = match std::fs::read(&steps) {
@@ -494,9 +599,13 @@ fn record_with(
         argv: redacted(tool, argv),
         ok: outcome.is_ok(),
         observation,
-        error: outcome
-            .err()
-            .map(|error| error.trim().chars().take(ERROR_CHARS).collect()),
+        error: outcome.err().map(|error| {
+            if typed {
+                "input failed; values omitted".into()
+            } else {
+                error.trim().chars().take(ERROR_CHARS).collect()
+            }
+        }),
         code: outcome
             .err()
             .and_then(zerocode_core::computer_use_protocol::refusal_code),
@@ -633,6 +742,47 @@ fn walk_files(dir: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn secret_input_facts_and_credential_rejections_survive_value_redaction() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = "SYNTHETIC_INPUT_ONLY";
+        let argv = [
+            "type",
+            "browser-91009",
+            "#opaque",
+            "--value",
+            marker,
+            "--workspace-revision",
+            "7",
+        ]
+        .map(str::to_string);
+        let _ = record(root.path(), 1, "browser", &argv, Err(marker), Framing::None);
+        let text = std::fs::read_to_string(root.path().join(STEPS_FILE)).unwrap();
+        assert!(
+            !text.contains(marker),
+            "neither argv nor the error may keep the value"
+        );
+        let steps = steps_in(root.path());
+        assert_eq!(
+            steps[0].observation.as_ref().unwrap()
+                [zerocode_core::computer_recipe::privacy::INPUT_KEY]["secret"],
+            true
+        );
+        let payload = serde_json::json!({"#reference":"4242".repeat(4)}).to_string();
+        let argv = ["fill", "browser-91009", &payload].map(str::to_string);
+        let _ = record(root.path(), 2, "browser", &argv, Ok(()), Framing::None);
+        let steps = steps_in(root.path());
+        assert_eq!(
+            steps[1].observation.as_ref().unwrap()
+                [zerocode_core::computer_recipe::privacy::INPUT_KEY]["credential"],
+            true
+        );
+        assert!(
+            !std::fs::read_to_string(root.path().join(STEPS_FILE))
+                .unwrap()
+                .contains(&"4242".repeat(4))
+        );
+    }
     use super::*;
 
     #[test]
@@ -709,7 +859,7 @@ mod tests {
                             ),
                         ),
                         "computer",
-                        &words(&["type", "--text", "secret"]),
+                        &words(&["type", "--text", "SYNTHETIC_INPUT_ONLY"]),
                         Ok(()),
                         Framing::None,
                         |folder, step| {
@@ -736,7 +886,11 @@ mod tests {
                 .unwrap()
                 .clone()
         );
-        assert!(!serde_json::to_string(&emitted).unwrap().contains("secret"));
+        assert!(
+            !serde_json::to_string(&emitted)
+                .unwrap()
+                .contains("SYNTHETIC_INPUT_ONLY")
+        );
         assert_eq!(emitted[0]["observation"]["act_ms"], 7);
         crate::computer_use::report::write(dir.path()).unwrap();
         assert!(crate::computer_use::report::verify(dir.path()).reproduced);
@@ -1070,8 +1224,8 @@ mod tests {
         );
         assert_eq!(
             redacted("computer", &words(&["type", "--text", "Dear {{name}}"]))[2],
-            "Dear {{name}}",
-            "a recipe's own words keep the names a re-save needs"
+            "[13 chars]",
+            "a partial reference does not exempt adjacent literal input"
         );
         assert_eq!(
             redacted("computer", &words(&["type", "--text", "Dear Kim"]))[2],
@@ -1191,7 +1345,10 @@ mod tests {
             vec![1, 2, 3]
         );
         assert_eq!(steps[1].argv, words(&["text", "--text", "[6 chars]"]));
-        assert_eq!(steps[1].error.as_deref(), Some("no focused field"));
+        assert_eq!(
+            steps[1].error.as_deref(),
+            Some("input failed; values omitted")
+        );
         assert!(!steps[1].ok && steps[1].shot.is_none());
         assert_eq!(
             steps[1].frame_skipped,
@@ -1266,6 +1423,83 @@ mod tests {
         );
     }
 
+    /// An upload names local files; the log keeps each one's name, size and
+    /// the count — never the folders above it, where a person's name sits.
+    #[test]
+    fn an_upload_is_logged_by_file_name_never_by_folder() {
+        assert_eq!(
+            redacted(
+                "browser",
+                &words(&[
+                    "upload",
+                    "b1",
+                    "#receipt",
+                    "/Users/dev/Documents/receipt 1.pdf",
+                    "C:\\Users\\dev\\scan.png"
+                ])
+            ),
+            words(&["upload", "b1", "#receipt", "receipt 1.pdf", "scan.png"])
+        );
+        assert_eq!(
+            redacted(
+                "browser",
+                &words(&["upload", "b1", "#drop", "--drop", "/Users/dev/a.pdf"])
+            ),
+            words(&["upload", "b1", "#drop", "--drop", "a.pdf"])
+        );
+        // A parameter stands for its file: the document's own word.
+        assert_eq!(
+            redacted("browser", &words(&["upload", "b1", "#f", "$file_3"])),
+            words(&["upload", "b1", "#f", "$file_3"])
+        );
+        assert_eq!(
+            redacted("browser", &words(&["upload", "b1", "#f", "{{receipt}}"])),
+            words(&["upload", "b1", "#f", "{{receipt}}"])
+        );
+    }
+
+    #[test]
+    fn an_upload_step_records_file_names_sizes_and_count_and_no_folder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home");
+        let kept = home.path().join("receipt.txt");
+        std::fs::write(&kept, b"12345").expect("file");
+        let kept = kept.display().to_string();
+        record(
+            dir.path(),
+            1,
+            "browser",
+            &words(&["upload", "b1", "#r", &kept, "/Users/dev/Documents/gone.pdf"]),
+            Err("upload_file_unreadable: 파일을 열 수 없습니다"),
+            Framing::None,
+        );
+        let raw = std::fs::read_to_string(dir.path().join(STEPS_FILE)).expect("log");
+        assert!(
+            !raw.contains("/Users/dev"),
+            "a folder reached the log: {raw}"
+        );
+        assert!(
+            !raw.contains(&home.path().display().to_string()),
+            "a folder reached the log: {raw}"
+        );
+        let step = &steps_in(dir.path())[0];
+        assert_eq!(step.argv[3], "receipt.txt");
+        assert_eq!(step.argv[4], "gone.pdf");
+        let files = &step.observation.as_ref().expect("facts")["upload"];
+        assert_eq!(files["count"], 2);
+        assert_eq!(files["files"][0]["name"], "receipt.txt");
+        assert_eq!(files["files"][0]["bytes"], 5);
+        assert_eq!(files["files"][1]["name"], "gone.pdf");
+        assert!(files["files"][1].get("bytes").is_none());
+        assert!(
+            step.error
+                .as_deref()
+                .is_some_and(|error| !error.contains('/')),
+            "{:?}",
+            step.error
+        );
+    }
+
     /// Only a folder inside this window's automations tree is believed.
     #[test]
     fn a_presented_folder_is_fenced_to_the_automations_tree() {
@@ -1303,6 +1537,7 @@ mod tests {
         assert_eq!(captures("browser", "close"), Some(false));
         assert_eq!(captures("browser", "marks"), Some(false));
         assert_eq!(captures("browser", "find"), Some(true));
+        assert_eq!(captures("browser", "upload"), Some(true));
         assert_eq!(captures("browser", "read"), None);
         assert_eq!(captures("browser", "tabs"), None);
         assert_eq!(captures("computer", "get-app-state"), None);

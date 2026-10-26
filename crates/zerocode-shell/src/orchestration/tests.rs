@@ -1651,6 +1651,121 @@ fn a_workers_board_row_carries_its_last_status_and_its_tasks_newest_check() {
     );
 }
 
+/// The team view stands the workers of one piece of work under one row (t-60498), so a worker's
+/// board row names the root of its task's `parent` chain — the topmost task, however many steps up
+/// — and that root's name. Two workers on sibling tasks of one parent carry the same root.
+#[test]
+fn ledger_agents_row_carries_the_root_of_its_tasks_parent_chain() {
+    use zerocode_core::orchestration::Ledger;
+    let mut ledger = Ledger::new();
+    let run = ledger.create_run("families", 1);
+    let root = ledger
+        .create_task(
+            &run,
+            "improve the chat screen".into(),
+            "chat screen".into(),
+            vec![],
+            None,
+            2,
+        )
+        .unwrap();
+    let child = ledger
+        .create_task(
+            &run,
+            "a".into(),
+            "chat input".into(),
+            vec![],
+            Some(root.clone()),
+            3,
+        )
+        .unwrap();
+    let grandchild = ledger
+        .create_task(
+            &run,
+            "b".into(),
+            "chat input retry".into(),
+            vec![],
+            Some(child.clone()),
+            4,
+        )
+        .unwrap();
+    let other = ledger
+        .create_task(&run, "c".into(), "alert sound".into(), vec![], None, 5)
+        .unwrap();
+    let start = |ledger: &mut Ledger, pane: &str, task: &str| {
+        ledger
+            .start_worker(&run, "claude", ("team-fam", pane), Some(task), 6)
+            .unwrap()
+            .worker
+    };
+    let on_child = start(&mut ledger, "%2", &child);
+    let on_grandchild = start(&mut ledger, "%3", &grandchild);
+    let on_other = start(&mut ledger, "%4", &other);
+    let rows = super::ledger_agents_for_seats(&ledger, &super::TeamSeatIndex::new());
+    let root_of = |worker: &str| {
+        let row = rows
+            .iter()
+            .find(|one| one.worker == worker)
+            .expect("the worker's row");
+        (row.root_id.clone(), row.root_title.clone())
+    };
+    assert_eq!(
+        root_of(&on_child),
+        (root.clone(), "chat screen".to_string()),
+        "a child's root is its parent"
+    );
+    assert_eq!(
+        root_of(&on_grandchild),
+        (root, "chat screen".to_string()),
+        "a grandchild's root is two steps up"
+    );
+    assert_eq!(
+        root_of(&on_other),
+        (other, "alert sound".to_string()),
+        "an unrelated task has its own root"
+    );
+}
+
+/// A task with no parent is the root of its own family, and a worker with no task has none — an
+/// empty id the window reads as "not part of a family".
+#[test]
+fn a_task_without_a_parent_is_its_own_root() {
+    use zerocode_core::orchestration::Ledger;
+    let mut ledger = Ledger::new();
+    let run = ledger.create_run("alone", 1);
+    let task = ledger
+        .create_task(&run, "do it".into(), "alone task".into(), vec![], None, 2)
+        .unwrap();
+    let with_task = ledger
+        .start_worker(&run, "claude", ("team-alone", "%2"), Some(&task), 3)
+        .unwrap()
+        .worker;
+    let without = ledger
+        .start_worker(&run, "claude", ("team-alone", "%3"), None, 3)
+        .unwrap()
+        .worker;
+    let rows = super::ledger_agents_for_seats(&ledger, &super::TeamSeatIndex::new());
+    let row = |id: &str| {
+        rows.iter()
+            .find(|one| one.worker == id)
+            .expect("the worker's row")
+    };
+    assert_eq!(
+        (
+            row(&with_task).root_id.as_str(),
+            row(&with_task).root_title.as_str()
+        ),
+        (task.as_str(), "alone task")
+    );
+    assert_eq!(
+        (
+            row(&without).root_id.as_str(),
+            row(&without).root_title.as_str()
+        ),
+        ("", "")
+    );
+}
+
 /// The desk calls a run's coordinator seat this window's only where the pane
 /// the seat names (`team/pane`) is in this window's pane table (t-6588) —
 /// the seat a reply from the board is written as — and names the terminal
@@ -5158,6 +5273,56 @@ fn a_worker_stopped_by_a_transient_api_error_is_typed_at_once_under_a_declared_o
         stood.news("went_quiet", stood.began + 12_001),
         Vec::<serde_json::Value>::new(),
         "a stop the beat answered was also a silence"
+    );
+}
+
+/// t-69010: a zo worker's turn died on a provider stream that never sent a
+/// byte (t-68710, 240 s), and its coordinator heard `went_quiet` and nothing
+/// else. zo's channel says the turn FAILED and why; the failure is told once,
+/// as `turn_failed` with the error's words, the turn is not also a silence,
+/// and under a declared `--on-transient-error resume` the beat types the
+/// continuation once — the same road a Claude transcript's transient stop
+/// takes. zo writes no such error into a file the window reads: the ledger's
+/// letter is the marker.
+#[test]
+fn a_zo_turn_that_failed_on_a_stalled_stream_is_told_failed_and_typed_at_once_under_a_declared_order()
+ {
+    let stood = StoppedWorker::stand_with(
+        96_500,
+        "--agent zo",
+        "--on-transient-error resume",
+        Vec::new(),
+    );
+    let error = "api failed after 3 attempts: stream_startup_no_progress";
+    let at = stood.began + 9_000;
+    *stood
+        .host
+        .busy
+        .lock()
+        .unwrap_or_else(|held| held.into_inner()) = false;
+    super::with_turn_failure(stood.host.worker_term, Some(error.to_string()), || {
+        super::pane_turn_ended(stood.host.worker_term, at - 1, false, at);
+    });
+    let failed = stood.news("turn_failed", at + 1);
+    assert_eq!(failed.len(), 1, "one failed turn, one notice: {failed:?}");
+    assert_eq!(failed[0]["error"], error);
+    for beat in [10_000, 11_000, 12_000] {
+        tick(&stood.host, &[], stood.began + beat);
+    }
+    let typed = stood.host.typed_at(96_501);
+    assert_eq!(
+        typed.len(),
+        2,
+        "not one continuation and its Enter: {typed:?}"
+    );
+    assert!(
+        typed[0].contains("continue from where you left off"),
+        "{typed:?}"
+    );
+    assert_eq!(
+        stood.news("went_quiet", stood.began + 12_001),
+        Vec::<serde_json::Value>::new(),
+        "the failed turn was also told as a silence"
     );
 }
 
@@ -11965,7 +12130,14 @@ fn unsubmitted_pointer_never_acquires_a_durable_delivery_watermark() {
         zerocode_pty::ready::Refusal::HandReached,
     ))
     .unwrap();
-    let _ = super::advice_standing(&Nowhere, run, address, 11_009, newest, false);
+    let _ = super::advice_standing(
+        &Nowhere,
+        run,
+        address,
+        11_009,
+        newest,
+        super::AdviceHistory::default(),
+    );
     assert!(
         !super::delivered_before(run, address, newest),
         "an Enter that was withheld permanently silenced unread mail"
@@ -22288,8 +22460,9 @@ fn a_finished_workers_row_says_whether_its_task_can_take_a_review() {
     assert_eq!(said(&by_hand), true, "{:?}", row(&by_hand));
     assert_eq!(said(&reported), false, "{:?}", row(&reported));
     // The attempt's own ending is still said apart from the task's: the stopped
-    // worker's attempt did not succeed, and the task is done all the same.
-    assert!(row(&by_hand).reported && row(&by_hand).failed);
+    // worker's attempt ended with no result anybody saw — stopped, never
+    // failed (t-73910) — and the task is done all the same.
+    assert!(row(&by_hand).reported && row(&by_hand).stopped && !row(&by_hand).failed);
 }
 
 /* ---- worktree-evidence, through the door an agent uses ----------------- */
@@ -28520,4 +28693,115 @@ fn a_handover_whose_replacement_cannot_start_says_so_by_code_and_leaves_the_task
         .find(|one| one.id == stood.task)
         .expect("the task");
     assert_eq!(task.status, zerocode_core::orchestration::TaskStatus::Ready);
+}
+
+/// A line no road carried is written down and nobody is told; a refusal on
+/// a later beat for the same mail must raise the pane's notice then, because
+/// its standing says the person was told (t-74974). The beats are driven in
+/// order, each one's history read off the standing the last one left, as
+/// the pointer's own pass reads it.
+#[test]
+fn followup_a_refusal_after_an_unreached_line_raises_the_notice_its_standing_claims() {
+    use zerocode_pty::{DeliveryOutcome, ready::Refusal};
+    let _window = the_window();
+    let _turn = one_beat_at_a_time();
+    let host = BesideADraft {
+        term: 74974,
+        offered: Mutex::new(Vec::new()),
+        told: Mutex::new(Vec::new()),
+        cleared: Mutex::new(Vec::new()),
+    };
+    let key = ("fixture-run".to_string(), "fixture-address".to_string());
+    let mut standing: Option<super::Standing> = None;
+    let mut notices = Vec::new();
+    for outcome in [
+        DeliveryOutcome::TimedOut,
+        DeliveryOutcome::Refused(Refusal::Parked),
+        DeliveryOutcome::Refused(Refusal::Parked),
+        DeliveryOutcome::Delivered,
+    ] {
+        let history = super::AdviceHistory {
+            noted: matches!(
+                standing,
+                Some(
+                    super::Standing::Unreachable
+                        | super::Standing::Withheld
+                        | super::Standing::HeldByADraft
+                )
+            ),
+            notified: standing.is_some_and(super::Standing::told_not_typed),
+        };
+        let (send, receipt) = std::sync::mpsc::sync_channel(1);
+        send.send(outcome).unwrap();
+        super::pointer_receipts()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), receipt);
+        standing =
+            super::advice_standing(&host, &key.0, &key.1, host.term, "fixture-mail", history)
+                .flatten();
+        let told = host.told.lock().unwrap().len();
+        notices.push((told, host.cleared().len()));
+        assert!(
+            !standing.is_some_and(super::Standing::told_not_typed) || told > 0,
+            "after {outcome:?} the standing says the pane was told, and it never was"
+        );
+    }
+    assert_eq!(
+        notices,
+        [(0, 0), (1, 0), (1, 0), (1, 1)],
+        "(notices raised, notices cleared) after each beat"
+    );
+}
+
+/// Successful advice does not clear a notice that was never raised.
+#[test]
+fn followup_successful_advice_clears_only_a_previously_notified_condition() {
+    use zerocode_pty::{DeliveryOutcome, ready::Refusal};
+    let _window = the_window();
+    let _turn = one_beat_at_a_time();
+    let host = BesideADraft {
+        term: 47223,
+        offered: Mutex::new(Vec::new()),
+        told: Mutex::new(Vec::new()),
+        cleared: Mutex::new(Vec::new()),
+    };
+    for outcome in [
+        DeliveryOutcome::Delivered,
+        DeliveryOutcome::Unsubmitted(Refusal::NotTaken),
+    ] {
+        for history in [
+            super::AdviceHistory::default(),
+            super::AdviceHistory {
+                noted: true,
+                notified: false,
+            },
+            super::AdviceHistory {
+                noted: true,
+                notified: true,
+            },
+        ] {
+            let notified = history.notified;
+            assert_eq!(
+                super::Standing::Advised { history }.told_not_typed(),
+                notified
+            );
+            let key = ("fixture-run".to_string(), "fixture-address".to_string());
+            let (send, receipt) = std::sync::mpsc::sync_channel(1);
+            send.send(outcome).unwrap();
+            super::pointer_receipts()
+                .lock()
+                .unwrap()
+                .insert(key.clone(), receipt);
+            host.cleared.lock().unwrap().clear();
+            let result =
+                super::advice_standing(&host, &key.0, &key.1, host.term, "fixture-mail", history);
+            assert!(result.is_some());
+            assert_eq!(
+                host.cleared().len(),
+                usize::from(notified),
+                "{outcome:?}, notified={notified}"
+            );
+        }
+    }
 }

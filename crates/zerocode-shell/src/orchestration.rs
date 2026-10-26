@@ -33,6 +33,7 @@ pub(crate) mod gate_book;
 mod gate_meter;
 mod gate_snapshot;
 pub(crate) mod hand_in_keep;
+pub(crate) mod inbox;
 mod mail_triage;
 mod project_scope;
 pub(crate) mod restart_census;
@@ -1831,6 +1832,9 @@ pub(crate) struct SettledCheckout {
     /// up whose it was.
     pub(crate) worker: String,
     pub(crate) agent: String,
+    /// That worker's run — where a removal the window did on its own is told
+    /// (t-73910).
+    pub(crate) run: String,
 }
 
 /// Every checkout the ledger named and has now let go of.
@@ -2152,10 +2156,11 @@ pub(crate) fn settled_checkouts() -> Vec<SettledCheckout> {
     drop(image);
     let mut answered: Vec<SettledCheckout> = settled_workers(&ledger)
         .into_iter()
-        .map(|(_, worker, at)| SettledCheckout {
+        .map(|(run, worker, at)| SettledCheckout {
             path: at.to_string(),
             worker: worker.id.clone(),
             agent: worker.agent.clone(),
+            run: run.id.clone(),
         })
         .collect();
     // Sorted so a sweep that judges only a few per pass walks them in the
@@ -2220,6 +2225,7 @@ pub(crate) struct HandedIn {
     pub(crate) task: String,
     pub(crate) worker: String,
     pub(crate) agent: String,
+    pub(crate) run: String,
     /// The worker's own checkout, as the ledger holds it, trailing separator
     /// shed.
     pub(crate) checkout: String,
@@ -2264,6 +2270,7 @@ pub(crate) fn handed_in_heads() -> Vec<HandedIn> {
                     task: task.id.clone(),
                     worker: worker.id.clone(),
                     agent: worker.agent.clone(),
+                    run: run.id.clone(),
                     checkout: checkout.to_string(),
                     head,
                 })
@@ -2497,6 +2504,40 @@ fn with_ledger_seats<T>(read: impl FnOnce(&Ledger, &TeamSeatIndex) -> T) -> Opti
 
 /// One worker the ledger still holds, as the board draws it.
 ///
+/// The marker a declared `--on-transient-error resume` types a continuation
+/// on, out of an attempt whose newest letter is a turn that failed on a
+/// transient fault (t-69010) — keyed by that letter, so one failure is typed
+/// at once however many beats see it.
+fn transient_failed_turn(
+    run: &zerocode_core::orchestration::Run,
+    agent: &str,
+    dispatch: &str,
+) -> Option<zerocode_core::orchestration::TransientErrorMarker> {
+    // Read past the continuation's own receipt, so the marker stands with its
+    // key and the failure is typed at once and is no silence after.
+    let newest = zerocode_core::orchestration::standing_turn_failure(run, dispatch)?;
+    let said: serde_json::Value = serde_json::from_str(newest.body.as_str()).ok()?;
+    let error = said["error"].as_str()?;
+    crate::quota_wall::transient_turn_failure(agent, error).then(|| {
+        zerocode_core::orchestration::TransientErrorMarker {
+            source: "turn_failed".to_string(),
+            line: error.into(),
+            key: format!("turn_failed:{}", newest.id),
+        }
+    })
+}
+
+/// A failed turn as a ledger row carries it (t-69010), with the attempt and
+/// the failure's letter: a press names the failure the person was shown (the
+/// review R2, P2-10).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub(crate) struct TurnFailed {
+    pub(crate) error: String,
+    pub(crate) at_ms: i64,
+    pub(crate) dispatch: String,
+    pub(crate) letter: String,
+}
+
 /// The board's THIRD source. Its first two — the panes this window opened and
 /// the lanes it supervises — are both answers to "what is this window
 /// holding", so a worker whose seat this window does not have (a run whose
@@ -2536,15 +2577,28 @@ pub(crate) struct LedgerAgent {
     /// The task's id, so a row can say which piece of work it is beside the
     /// title. Empty where there is no dispatch.
     pub(crate) task_id: String,
+    /// The topmost task of that task's `parent` chain (`Run::root_task`): the piece of
+    /// work this one was broken out of, so the sidebar's team view can stand the workers
+    /// of one piece of work under one row (t-60498). A task with no parent is its own
+    /// root. Worked out on every read and never stored; empty where there is no task.
+    pub(crate) root_id: String,
+    /// That root task's name, as `task` is this task's.
+    pub(crate) root_title: String,
     /// Whether the dispatch carrying that task has CLOSED — the worker
     /// reported, and the ledger wrote the ending down. This is the worker's
     /// own claim of being done; what a coordinator made of it is `review`.
     pub(crate) reported: bool,
-    /// Whether that closed dispatch ended WITHOUT a successful report — a
-    /// `worker_done` saying `ok:false`, or an attempt stopped or abandoned
-    /// (`Dispatch::succeeded` other than `Some(true)`). The row then says the
-    /// attempt failed rather than that it waits for review.
+    /// Whether that closed dispatch ended on the worker's own word that it
+    /// failed — a `worker_done` saying `ok:false` (`Dispatch::succeeded` is
+    /// `Some(false)`). The row then says the attempt failed rather than that
+    /// it waits for review.
     pub(crate) failed: bool,
+    /// Whether that closed dispatch ended with no result anybody saw — stopped,
+    /// abandoned, its terminal gone (`Dispatch::succeeded` is `None`, t-73910).
+    /// The row says the attempt was stopped, never that it failed: on
+    /// 2026-10-25 two released workers stood painted 「실패」 in the sidebar
+    /// while the ledger held neither as failed.
+    pub(crate) stopped: bool,
     /// A row for a worker the ledger RELEASED, kept because the work it
     /// finished still stands in its checkout ([`settled_workers`]): no seat, no
     /// summons — the board shows the work, and the roster of summoned workers
@@ -2581,6 +2635,12 @@ pub(crate) struct LedgerAgent {
     /// takes a told reason back.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) stalled: Vec<String>,
+    /// The newest turn of this open attempt that FAILED (t-69010), while
+    /// nothing the worker or the ledger said of the attempt since stands after
+    /// it: the error's words and when the turn ended. The team view says it
+    /// where the worker's last status would stand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) turn_failed: Option<TurnFailed>,
     /// Why the task is closed — folded into a task, handed to a run, or
     /// outdated — when it is. A closed task is neither reported nor failed:
     /// the board says 닫힘 and its reason, and the card leaves the open lanes.
@@ -2998,6 +3058,9 @@ pub(crate) fn refresh_board_ledger() {
     // Whether each batch's repository has the integration queue on is the project's setting,
     // laid over the desk the same way, outside the ledger's view (t-45315).
     crate::land_batch::dress_desk(Arc::make_mut(&mut next.desk));
+    // Whether each landed task's commit is on the remote, from the answers the beat's
+    // look kept (t-73910 W4-2) — no git here.
+    crate::remote_landing::dress_desk(Arc::make_mut(&mut next.desk));
     // Build, allocate and drop old rows outside the publication lock. The
     // main-thread reader holds it only long enough to clone an Arc.
     let next = Arc::new(next);
@@ -3125,15 +3188,21 @@ fn ledger_agents_for_seats(ledger: &Ledger, seats: &TeamSeatIndex) -> Vec<Ledger
                 .map(|held| held.display_name().to_string())
                 .unwrap_or_default();
             let task_id = carried.map(|held| held.id.clone()).unwrap_or_default();
+            let root = carried.and_then(|held| run.root_task(&held.id));
+            let root_id = root.map(|held| held.id.clone()).unwrap_or_default();
+            let root_title = root
+                .map(|held| held.display_name().to_string())
+                .unwrap_or_default();
             let reported = dispatch.is_some_and(|one| !one.is_open());
-            let failed = dispatch.is_some_and(|one| !one.is_open() && one.succeeded != Some(true));
+            let failed = dispatch.is_some_and(|one| !one.is_open() && one.succeeded == Some(false));
+            let stopped = dispatch.is_some_and(|one| !one.is_open() && one.succeeded.is_none());
             let dispatch_id = dispatch.map(|one| one.id.clone()).unwrap_or_default();
             let dispatch_started_ms = dispatch.map_or(0, |one| one.started_ms);
             let retry_of = dispatch.and_then(|one| one.retry_of.clone());
             let review = carried.map(|held| run.review_of(held)).unwrap_or_default();
             let progress = (carried.is_some() || dispatch.is_some())
                 .then(|| run.progress_from(carried, &review, dispatch));
-            let review_since_ms = match (reported && !failed, dispatch) {
+            let review_since_ms = match (reported && !failed && !stopped, dispatch) {
                 (true, Some(attempt)) if !review.verified => run
                     .messages()
                     .iter()
@@ -3173,6 +3242,18 @@ fn ledger_agents_for_seats(ledger: &Ledger, seats: &TeamSeatIndex) -> Vec<Ledger
                 }
                 _ => Vec::new(),
             };
+            // The attempt's failed turn while it stands (t-69010).
+            let turn_failed = dispatch.filter(|one| one.is_open()).and_then(|attempt| {
+                let newest = zerocode_core::orchestration::standing_turn_failure(run, &attempt.id)?;
+                let said: serde_json::Value =
+                    serde_json::from_str(newest.body.as_str()).unwrap_or_default();
+                Some(TurnFailed {
+                    error: said["error"].as_str().unwrap_or_default().to_string(),
+                    at_ms: said["turnEndedMs"].as_i64().unwrap_or(newest.created_ms),
+                    dispatch: attempt.id.clone(),
+                    letter: newest.id.clone(),
+                })
+            });
             let wall =
                 dispatch.and_then(|one| zerocode_core::orchestration::newest_wall(run, &one.id));
             // Asked only of a row with a wall: the chip is that wall's.
@@ -3213,8 +3294,11 @@ fn ledger_agents_for_seats(ledger: &Ledger, seats: &TeamSeatIndex) -> Vec<Ledger
                 checkout: worker.checkout.clone().unwrap_or_default(),
                 task,
                 task_id,
+                root_id,
+                root_title,
                 reported,
                 failed,
+                stopped,
                 settled: finished,
                 session: worker.session.as_ref().map(|session| session.id.clone()),
                 dispatch_id,
@@ -3225,6 +3309,7 @@ fn ledger_agents_for_seats(ledger: &Ledger, seats: &TeamSeatIndex) -> Vec<Ledger
                 review_since_ms,
                 progress,
                 stalled,
+                turn_failed,
                 closed: carried.and_then(|held| held.closed.clone()),
                 term,
                 // Finished work is dated by when its attempt ended — the
@@ -5225,10 +5310,9 @@ enum Standing {
     /// The advice is registered with the pump as one guarded delivery — the
     /// paste and its Enter — and its receipt is in [`pointer_receipts`]. The
     /// next beats read the receipt; nothing is retyped while it stands.
-    /// `noted` carries whether an earlier beat already wrote down that this
-    /// mail could not be delivered, so a pane that stays shut costs one line
-    /// and not one line per second.
-    Advised { noted: bool },
+    /// The history keeps the prior log and notice separately while the pump
+    /// carries the line. A successful line ends only a notice actually shown.
+    Advised { history: AdviceHistory },
     /// Advice and Enter both landed — nothing more is owed for this mail.
     Delivered,
     /// Advice was pasted but its Enter was withheld. Keep this transient
@@ -5310,10 +5394,13 @@ impl Standing {
     /// that line still stands: the window said it once for the whole condition
     /// (t-45801), so the condition ends when this mark goes.
     fn told_not_typed(self) -> bool {
-        matches!(
-            self,
-            Standing::Withheld | Standing::HeldByADraft | Standing::PaneTaken
-        )
+        match self {
+            Standing::Advised { history } => history.notified,
+            _ => matches!(
+                self,
+                Standing::Withheld | Standing::HeldByADraft | Standing::PaneTaken
+            ),
+        }
     }
 }
 
@@ -5370,6 +5457,13 @@ fn read_pointer_receipt(key: &(String, String)) -> Receipt {
     }
 }
 
+/// The log and the person's waiting notice are independent facts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AdviceHistory {
+    noted: bool,
+    notified: bool,
+}
+
 /// What the pump's answer about an advice line makes of its standing.
 ///
 /// `None` while the pump has not answered; the caller leaves the mark as it
@@ -5386,7 +5480,7 @@ fn advice_standing(
     address: &str,
     term: u32,
     newest: &str,
-    noted: bool,
+    history: AdviceHistory,
 ) -> Option<Option<Standing>> {
     let stood = match read_pointer_receipt(&(run.to_string(), address.to_string())) {
         Receipt::Pending => return None,
@@ -5396,17 +5490,26 @@ fn advice_standing(
     Some(Some(match stood {
         zerocode_pty::DeliveryOutcome::Delivered => {
             note_delivered(run, address, newest);
-            host.mail_waiting_cleared(term);
+            if history.notified {
+                host.mail_waiting_cleared(term);
+            }
             Standing::Delivered
         }
         zerocode_pty::DeliveryOutcome::Unsubmitted(_) => {
             note_pointer_withheld(run, address, term, stood);
-            host.mail_waiting_cleared(term);
+            if history.notified {
+                host.mail_waiting_cleared(term);
+            }
             Standing::Unsubmitted
         }
         zerocode_pty::DeliveryOutcome::Refused(why) => {
-            if !noted {
+            if !history.noted {
                 note_pointer_withheld(run, address, term, stood);
+            }
+            // The standing below says the pane was told, so a refusal after a
+            // line no road carried — written down, nobody told — tells it
+            // now (t-74974).
+            if !history.notified {
                 tell_unpointed(
                     host,
                     run,
@@ -5423,7 +5526,7 @@ fn advice_standing(
             }
         }
         zerocode_pty::DeliveryOutcome::TimedOut => {
-            if !noted {
+            if !history.noted {
                 note_pointer_silent(run, address, term, NO_ROAD_CARRIED_IT);
             }
             Standing::Unreachable
@@ -6744,8 +6847,45 @@ pub(crate) fn pane_turn_ended(term: u32, turn_ended_ms: i64, interrupted: bool, 
         return;
     };
     let actor = &held.actor;
-    if let Ok((moved, _)) = actor.pane_turn_ended(term, turn_ended_ms, interrupted, now_ms) {
+    let failure = failed_turns()
+        .lock()
+        .unwrap_or_else(|held| held.into_inner())
+        .remove(&term);
+    let told = match failure {
+        Some(error) => actor.pane_turn_failed(term, turn_ended_ms, error, now_ms),
+        None => actor.pane_turn_ended(term, turn_ended_ms, interrupted, now_ms),
+    };
+    if let Ok((moved, _)) = told {
         rang(moved);
+    }
+}
+
+/// The error a pane's turn failed on, as its CLI's own channel said it at
+/// the turn's end (t-69010), held only while that end is reported:
+/// [`pane_turn_ended`] takes it for the same pane and tells the ledger the
+/// turn FAILED, and why, instead of that it went quiet.
+fn failed_turns() -> &'static Mutex<std::collections::HashMap<u32, String>> {
+    static FAILED: OnceLock<Mutex<std::collections::HashMap<u32, String>>> = OnceLock::new();
+    FAILED.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Hold `error` for `term`'s turn end for the length of `report` — the call
+/// that carries that end to [`pane_turn_ended`]. Whatever it did not take
+/// goes with it, so a failure never waits for a later turn's end.
+pub(crate) fn with_turn_failure(term: u32, error: Option<String>, report: impl FnOnce()) {
+    let held = error.is_some();
+    if let Some(error) = error {
+        failed_turns()
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .insert(term, error);
+    }
+    report();
+    if held {
+        failed_turns()
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .remove(&term);
     }
 }
 
@@ -7120,6 +7260,11 @@ struct Stalled {
     /// Whether the run declared `--on-transient-error resume` — asked before
     /// a transcript is read, so an undeclared run costs nothing more.
     resume_declared: bool,
+    /// The attempt's newest letter, when it is a turn that failed on a fault
+    /// the next request may well not meet (t-69010): zo writes no provider
+    /// error into a transcript the window could read, and its channel's
+    /// failure reaches the ledger instead — so the marker is read there.
+    failed_turn: Option<zerocode_core::orchestration::TransientErrorMarker>,
     /// The record keys of this attempt's declines told already (t-6747):
     /// the same decline's silence is ordinary quiet news after that,
     /// reminded as any other — and a decline on another record of the same
@@ -7282,6 +7427,7 @@ fn notify_stalled_workers(host: &dyn Host, now_ms: i64) {
                         .handover
                         .as_ref()
                         .is_some_and(|policy| policy.on_transient_error.is_some()),
+                    failed_turn: transient_failed_turn(run, &worker.agent, &dispatch.id),
                     declines_told: zerocode_core::orchestration::declines_told(run, &dispatch.id),
                     dispatch: dispatch.id.clone(),
                     task: dispatch.task.clone(),
@@ -7459,6 +7605,13 @@ fn notify_stalled_workers(host: &dyn Host, now_ms: i64) {
                     ),
                 })
             });
+        // zo's failed turn, as the ledger holds it (t-69010): the table's
+        // transcript rows read no zo file.
+        let transient = transient.or_else(|| {
+            one.resume_declared
+                .then(|| one.failed_turn.clone())
+                .flatten()
+        });
         match transient {
             Some(marker) => stopped.push((one, marker)),
             None => {
@@ -7604,10 +7757,7 @@ fn note_paused_declines(host: &dyn Host, now_ms: i64) {
     let mut declined = Vec::new();
     for one in seated {
         if one.taken_over
-            || !crate::quota_wall::has_rule(
-                &one.agent,
-                crate::quota_wall::StallCause::ClassifierDecline,
-            )
+            || !crate::quota_wall::witnesses_declines(&one.agent)
             || host.quiet_since(one.term, one.started_ms, now_ms).is_some()
         {
             continue;
@@ -8541,7 +8691,7 @@ fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
         /// Whether an earlier beat already wrote down that this pane cannot
         /// be reached, so a pane that stays shut costs one line and not one
         /// line per second.
-        unreachable_noted: bool,
+        history: AdviceHistory,
     }
     let mut pointing: Vec<Pointing> = Vec::new();
     /// A pointer this pass could not type and has not told anyone about:
@@ -9231,8 +9381,8 @@ fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
                      * person's screen, which is as far as advice goes — the
                      * Enter is theirs now, and retyping the line would only
                      * stack a second copy under it. */
-                    Some(Standing::Advised { noted }) => {
-                        match advice_standing(host, &run.id, &address, term, &newest, noted) {
+                    Some(Standing::Advised { history }) => {
+                        match advice_standing(host, &run.id, &address, term, &newest, history) {
                             None => continue,
                             Some(None) => {
                                 marks.remove(&key);
@@ -9356,14 +9506,20 @@ fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
                             newest,
                             text,
                             notice,
-                            unreachable_noted: matches!(
-                                standing,
-                                Some(
-                                    Standing::Unreachable
-                                        | Standing::Withheld
-                                        | Standing::HeldByADraft
-                                )
-                            ),
+                            history: AdviceHistory {
+                                notified: marks
+                                    .get(&key)
+                                    .filter(|stood| stood.term == Some(term))
+                                    .is_some_and(|stood| stood.standing.told_not_typed()),
+                                noted: matches!(
+                                    standing,
+                                    Some(
+                                        Standing::Unreachable
+                                            | Standing::Withheld
+                                            | Standing::HeldByADraft
+                                    )
+                                ),
+                            },
                         });
                     }
                 }
@@ -9435,7 +9591,7 @@ fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
              * pane has mail nothing told it about. Remembered as unreachable
              * — the next beat tries the same line again, and the black box
              * hears about it once. */
-            if !one.unreachable_noted {
+            if !one.history.noted {
                 note_pointer_silent(&key.0, &key.1, one.term, NO_ROAD_CARRIED_IT);
             }
             pointed()
@@ -9460,20 +9616,14 @@ fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
          * but a host that answers on the spot (a `send-keys` dialect, a
          * test's fake) is settled on this very beat, exactly as the raw
          * road used to be. */
-        let standing = match advice_standing(
-            host,
-            &key.0,
-            &key.1,
-            one.term,
-            &one.newest,
-            one.unreachable_noted,
-        ) {
-            None => Standing::Advised {
-                noted: one.unreachable_noted,
-            },
-            Some(None) => continue,
-            Some(Some(standing)) => standing,
-        };
+        let standing =
+            match advice_standing(host, &key.0, &key.1, one.term, &one.newest, one.history) {
+                None => Standing::Advised {
+                    history: one.history,
+                },
+                Some(None) => continue,
+                Some(Some(standing)) => standing,
+            };
         pointed()
             .lock()
             .unwrap_or_else(|held| held.into_inner())

@@ -54,7 +54,9 @@ pub mod recipes;
 pub mod reflex;
 pub mod report;
 pub(crate) mod screenshot_png;
+pub(crate) mod self_surface;
 pub mod sequence;
+pub(crate) mod share;
 pub mod state;
 pub(crate) mod surface_execution;
 #[cfg(any(target_os = "windows", test))]
@@ -123,10 +125,69 @@ fn held_client() -> &'static Mutex<Option<platform::Session>> {
     CLIENT.get_or_init(|| Mutex::new(None))
 }
 
+/// Only a request in flight defers panel startup. Poison still grants the
+/// lock, as it does for the other session callers; it must not keep retrying.
+#[cfg(any(target_os = "macos", test))]
+fn panel_lock_unless_busy<T>(result: std::sync::TryLockResult<T>) -> Option<T> {
+    match result {
+        Ok(held) => Some(held),
+        Err(std::sync::TryLockError::Poisoned(held)) => Some(held.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+#[test]
+fn panel_lock_recovers_poison_and_only_defers_a_busy_request() {
+    use std::sync::{PoisonError, TryLockError};
+
+    assert_eq!(panel_lock_unless_busy(Ok(1)), Some(1));
+    assert_eq!(
+        panel_lock_unless_busy::<u8>(Err(TryLockError::WouldBlock)),
+        None
+    );
+    assert_eq!(
+        panel_lock_unless_busy(Err(TryLockError::Poisoned(PoisonError::new(2)))),
+        Some(2)
+    );
+}
+
+/// A shared page needs its native person-only panel even when the page route
+/// handles all actions. Starting the helper posts no input and takes no focus.
+#[cfg(all(target_os = "macos", not(test)))]
+fn ensure_share_panel() -> bool {
+    let Some(mut held) = panel_lock_unless_busy(held_client().try_lock()) else {
+        // A provider may already be starting; this is not a failed launch.
+        return false;
+    };
+    if held
+        .as_ref()
+        .is_some_and(platform::Session::panel_watch_ended)
+    {
+        discard_session(&mut held);
+    }
+    if held.is_none()
+        && let Ok(session) = platform::Session::start()
+    {
+        guard::remember_helper(session.helper_pid());
+        SESSION_EPOCH.fetch_add(1, Ordering::AcqRel);
+        *held = Some(session);
+    }
+    // The panel worker remembers an attempted launch, including a failure.
+    true
+}
+
 /// Call the persistent provider. Transport failures discard the session so a
 /// later request gets one clean restart; provider refusals keep its snapshots.
 pub fn call(method: &str, params: Value) -> Result<Value, ComputerUseError> {
     input_policy::ensure_current()?;
+    // A request admitted to a window the person since took back goes no
+    // further (t-73906).
+    share::ensure_current()?;
+    // ZeroCode's own app is the page's to answer, before any helper road
+    // (t-73906): no OS event is made in the window the person works in.
+    if let Some(answer) = self_surface::route(method, &params) {
+        return answer;
+    }
     browser_route::provider(method, &params)?;
     let params = input_policy::current().prepare_provider(method, params)?;
     if let Some(params) = params.as_object() {
@@ -198,11 +259,15 @@ pub fn call(method: &str, params: Value) -> Result<Value, ComputerUseError> {
 /// A broken road's end: the session is discarded so the next call starts a
 /// clean one, and the break is the answer.
 fn discard(held: &mut Option<platform::Session>, error: ComputerUseError) -> ComputerUseError {
+    discard_session(held);
+    error
+}
+
+fn discard_session(held: &mut Option<platform::Session>) {
     *held = None;
     SESSION_EPOCH.fetch_add(1, Ordering::AcqRel);
     guard::remember_helper(None);
     evidence::end_session();
-    error
 }
 
 /// Whether a provider session stands right now — without starting one.
@@ -225,6 +290,17 @@ pub fn session_stands_now() -> bool {
         Err(std::sync::TryLockError::Poisoned(held)) => held.into_inner().is_some(),
         Err(std::sync::TryLockError::WouldBlock) => true,
     }
+}
+
+/// Whether a request holds the session's lock right now — not whether a
+/// session stands: one left standing by an earlier test, as a Windows
+/// process keeps its in-process provider, is idle and holds nothing.
+#[cfg(test)]
+pub(crate) fn session_lock_held_now() -> bool {
+    matches!(
+        held_client().try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    )
 }
 
 /// Hold the session's lock for as long as `hold` runs, as [`call`] holds it

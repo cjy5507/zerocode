@@ -3,6 +3,7 @@ use std::io::Read;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use zerocode_core::held_file_lock::HeldFileLock;
 use zerocode_core::orchestration::task_cost::{GenerationCost, UsdReason};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -35,12 +36,9 @@ pub(super) fn preserve(
     if crate::durable_file::ensure_private_directory(root).is_err() {
         return;
     }
-    let Ok(lock) = crate::durable_file::private_lock_file(&root.join(".receipts.lock")) else {
+    let Some(_held) = take_lock(root) else {
         return;
     };
-    if lock.try_lock().is_err() {
-        return;
-    }
     let previous = read(&file).filter(|receipt| {
         receipt.version == 1
             && receipt.run == run
@@ -98,6 +96,17 @@ pub(super) fn preserve(
     } else {
         let _ = crate::durable_file::remove_file(&file);
     }
+}
+
+/// The receipts lock while one preserve holds it, ended by its guard
+/// ([`HeldFileLock`]), not by its last descriptor: a child another thread
+/// starts while this is held can keep a copy of the descriptor, and a close
+/// alone would shut the next preserve out (the lesson of t-73907 and
+/// t-73946).
+fn take_lock(root: &Path) -> Option<HeldFileLock> {
+    let lock = crate::durable_file::private_lock_file(&root.join(".receipts.lock")).ok()?;
+    lock.try_lock().ok()?;
+    Some(HeldFileLock::locked(lock))
 }
 
 fn read(file: &Path) -> Option<Receipt> {
@@ -163,6 +172,22 @@ mod tests {
         };
         preserve(directory.path(), "run", "task", Some(1), &mut missing);
         assert_eq!(missing.usd, None);
+    }
+
+    /// A copy of the lock's descriptor that outlives its guard — what a child
+    /// started on another thread keeps until its exec — does not hold the
+    /// next preserve's lock.
+    #[test]
+    fn a_copy_of_the_lock_left_behind_does_not_hold_the_next_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let held = take_lock(directory.path()).expect("a free lock");
+        let copy = held.try_clone().unwrap();
+        drop(held);
+        assert!(
+            take_lock(directory.path()).is_some(),
+            "the copy of an ended guard's descriptor still holds the receipts lock"
+        );
+        drop(copy);
     }
 
     #[test]

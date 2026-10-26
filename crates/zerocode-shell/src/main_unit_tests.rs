@@ -356,7 +356,7 @@ fn assert_canonical_setting_round_trip(
     );
     let transport = block_after(window, "async function commitSetting(");
     assert!(
-        transport.contains("const snapshot = await invoke(command, args);")
+        transport.contains("const snapshot = await invoke(command, args, { hand });")
             && transport.contains("const snapshot = await fetchSettingsSnapshot();")
             && transport.contains("const mutationEpoch = ++settingsMutationEpoch;")
             && transport.contains("settingsMutationsInFlight += 1;")
@@ -4723,7 +4723,7 @@ fn a_running_terminal_is_measured_and_its_answer_survives_restart() {
     );
     let retiring = block_after(window, "async function runTerminalSessionMutation(");
     assert!(
-        retiring.contains("await invoke(command, args);")
+        retiring.contains("await invoke(command, args, { hand });")
             && window.contains(r#"runTerminalSessionMutation("end_terminal_session""#)
             && window.contains(r#"runTerminalSessionMutation("end_all_terminal_sessions""#),
         "Manage Sessions has no single native mutation door:\n{retiring}"
@@ -4754,21 +4754,21 @@ fn a_running_terminal_is_measured_and_its_answer_survives_restart() {
             && measuring.contains(r#"hookStates.get(term) === "working""#),
         "terminal close no longer measures every PTY and fails back to the known agent state:\n{measuring}"
     );
-    let tab = block_after(window, "function closeTab(id) {");
+    let tab = block_after(window, "function closeTab(id, started = handNow()) {");
     assert!(
         tab.contains("const terms = paneLeaves(tab.layout);")
             && tab.contains("terminalCloseNeedsConfirmation(terms)")
-            && tab.contains("askAboutRunning(tab, terms)"),
+            && tab.contains("askAboutRunning(tab, terms, started)"),
         "the tab close no longer measures all of its terminal panes:\n{tab}"
     );
     let pane = block_after(window, "function closeActivePane() {");
     assert!(
         pane.contains("const going = activePaneOf(tab);")
             && pane.contains("terminalCloseNeedsConfirmation([going])")
-            && pane.contains("askAboutRunning(tab, [going])"),
+            && pane.contains("askAboutRunning(tab, [going], started)"),
         "the pane close no longer measures the pane selected at click time:\n{pane}"
     );
-    let asking = block_after(window, "async function askAboutRunning(tab, terms) {");
+    let asking = block_after(window, "async function askAboutRunning(tab, terms, started) {");
     assert!(
         asking.contains("terminal.stopProcessTitle")
             && asking.contains("terminal.stopAgentTitle")
@@ -4788,7 +4788,7 @@ fn a_running_terminal_is_measured_and_its_answer_survives_restart() {
         "set_skip_close_terminal_with_running_process_confirm",
         "setting_key::SKIP_CLOSE_TERMINAL_WITH_RUNNING_PROCESS_CONFIRM",
         "settings.skip_close_terminal_with_running_process_confirm = skip;",
-        "async function askAboutRunning(tab, terms) {",
+        "async function askAboutRunning(tab, terms, started) {",
         "skip_close_terminal_with_running_process_confirm",
         "setConfirmCloseRunning(!skip);",
     );
@@ -6359,6 +6359,10 @@ fn every_browser_verb_has_its_evidence_row() {
             "open" | "close" | "marks" => Some(false),
             "goto" | "eval" | "click" | "type" | "press" | "fill" | "wait" | "screenshot"
             | "viewport" | "scroll" | "find" => Some(true),
+            // `upload` is a form write like `fill`: a step with its frame. Its
+            // reply carries the file count and whether the page's file list
+            // matches by name and size; the bytes never enter a reply or log.
+            "upload" => Some(true),
             other => panic!("`{other}` joined VERBS without an evidence row in this table"),
         };
         assert_eq!(
@@ -9806,7 +9810,8 @@ fn an_agent_that_left_its_shell_behind_stops_being_drawn_as_running() {
     );
 
     // The syscall itself compares against the CHILD, so nothing has to be
-    // recorded at spawn — `portable_pty` spawns through `setsid`, which
+    // recorded at spawn — the child starts as a new session (`setsid`, by
+    // `portable_pty` or by `posix_spawn` on macOS), which
     // makes the child's pid its own process group.
     let asking = block_after(
         include_str!("../../../crates/zerocode-pty/src/lane.rs"),
@@ -10207,9 +10212,9 @@ fn team_work_has_sixteen_total_credits_and_only_eight_wait_credits() {
         receivers.push(receiver);
         permits.push(budget.try_admit(&request).expect("wait credit"));
     }
-    assert_eq!(budget.waiting.available_permits(), 0);
+    assert_eq!(budget.waiting.available(), 0);
     assert_eq!(
-        budget.active.available_permits(),
+        budget.active.available(),
         zerocode_hookd::TEAM_ACTIVE_LIMIT - zerocode_hookd::TEAM_WAIT_LIMIT
     );
 
@@ -10221,7 +10226,23 @@ fn team_work_has_sixteen_total_credits_and_only_eight_wait_credits() {
     let busy = ninth_answer
         .try_recv()
         .expect("the rejected wait gets an immediate answer");
-    assert_eq!(busy.stderr, zerocode_hookd::TEAM_BUSY_MESSAGE);
+    // The refusal keeps the busy kind's two ends and names the credit that
+    // was full: the wait credit, not the total, with its eight holders
+    // (t-47458).
+    assert!(
+        busy.stderr
+            .starts_with(zerocode_hookd::busy::TEAM_BUSY_LEAD)
+    );
+    assert!(busy.stderr.ends_with(zerocode_hookd::busy::TEAM_BUSY_TAIL));
+    assert!(
+        busy.stderr.contains(&format!(
+            "refused at the window wait credit: {limit} of {limit} held, oldest held ",
+            limit = zerocode_hookd::TEAM_WAIT_LIMIT
+        )),
+        "{:?}",
+        busy.stderr
+    );
+    assert_eq!(busy.exit_code, 1);
 
     // A send still has one of the eight reserved non-wait roads and answers
     // while every wait seat remains occupied.
@@ -10245,18 +10266,22 @@ fn team_work_has_sixteen_total_credits_and_only_eight_wait_credits() {
         receivers.push(receiver);
         permits.push(budget.try_admit(&request).expect("active credit"));
     }
-    assert_eq!(budget.active.available_permits(), 0);
+    assert_eq!(budget.active.available(), 0);
     let (overflow, _receiver) = team_request(&["split-window"]);
-    assert!(budget.try_admit(&overflow).is_none());
+    let refused = budget
+        .try_admit(&overflow)
+        .err()
+        .expect("the total is full, so one more request is refused");
+    // The total is full and the wait credit is not even asked: the name is the
+    // total's, so a reader does not go looking in the wait quota (t-47458).
+    assert_eq!(
+        refused.entry(),
+        zerocode_hookd::busy::BusyEntry::WindowCredit
+    );
+    assert_eq!(refused.held(), zerocode_hookd::TEAM_ACTIVE_LIMIT);
     drop(permits);
-    assert_eq!(
-        budget.active.available_permits(),
-        zerocode_hookd::TEAM_ACTIVE_LIMIT
-    );
-    assert_eq!(
-        budget.waiting.available_permits(),
-        zerocode_hookd::TEAM_WAIT_LIMIT
-    );
+    assert_eq!(budget.active.available(), zerocode_hookd::TEAM_ACTIVE_LIMIT);
+    assert_eq!(budget.waiting.available(), zerocode_hookd::TEAM_WAIT_LIMIT);
     drop(receivers);
 }
 
@@ -10276,14 +10301,8 @@ fn team_work_credits_return_after_refusal_and_panic() {
         });
     }));
     assert!(unwound.is_err());
-    assert_eq!(
-        budget.active.available_permits(),
-        zerocode_hookd::TEAM_ACTIVE_LIMIT
-    );
-    assert_eq!(
-        budget.waiting.available_permits(),
-        zerocode_hookd::TEAM_WAIT_LIMIT
-    );
+    assert_eq!(budget.active.available(), zerocode_hookd::TEAM_ACTIVE_LIMIT);
+    assert_eq!(budget.waiting.available(), zerocode_hookd::TEAM_WAIT_LIMIT);
 
     let (refused, mut answer) = team_request(&["check", "--wait"]);
     schedule_team_request(&budget, refused, |permit, request| {
@@ -10295,14 +10314,8 @@ fn team_work_credits_return_after_refusal_and_panic() {
         });
     });
     assert_eq!(answer.try_recv().expect("refusal answer").exit_code, 1);
-    assert_eq!(
-        budget.active.available_permits(),
-        zerocode_hookd::TEAM_ACTIVE_LIMIT
-    );
-    assert_eq!(
-        budget.waiting.available_permits(),
-        zerocode_hookd::TEAM_WAIT_LIMIT
-    );
+    assert_eq!(budget.active.available(), zerocode_hookd::TEAM_ACTIVE_LIMIT);
+    assert_eq!(budget.waiting.available(), zerocode_hookd::TEAM_WAIT_LIMIT);
 }
 
 /// A leader's tree is read off the leader's own environment.
@@ -11920,7 +11933,13 @@ fn launches_do_not_clear_and_sends_follow_the_agent_catalog() {
             && !pumping.contains("pty.write_input(&bytes)"),
         "the pump writes a delivery past the transaction seam:\n{pumping}"
     );
-    let promotion = block_after(backend, "fn settle(");
+    // The promotion lives in `take_next` since t-74974; settle hands it over.
+    let settling = block_after(backend, "fn settle(");
+    assert!(
+        settling.contains("take_next(term, deliveries, waiters, queue, now);"),
+        "a settled send no longer promotes the next queued one:\n{settling}"
+    );
+    let promotion = block_after(backend, "fn take_next(");
     assert!(
         promotion.contains(".clearing(next.clearing)")
             && promotion.contains(".guarded(next.guard)"),
@@ -12045,28 +12064,30 @@ fn a_launch_deadline_is_the_agents_own_on_every_launch_road() {
 
     let backend = shipped_backend();
     let (shipped, _) = backend.split_once("#[cfg(test)]").unwrap_or((backend, ""));
-    // Four mounting constructions: the two ordinary launch roads pay the
+    // Five mounting constructions: the two ordinary launch roads pay the
     // registry's deadline, while orchestration pays its caller-provided
-    // `--timeout-ms`, and a resumed composer pays its agent catalog through
-    // the same PromptDelivery machine;
+    // `--timeout-ms`, a resumed composer pays its agent catalog through
+    // the same PromptDelivery machine, and a worker's briefing typed again
+    // after its booting composer dropped it (t-74381) pays the agent's own
+    // quiet window and deadline;
     // the two `new` that remain are the send road and the queue
     // promotion, which are sends by definition. A reused automation run
     // was counted a launch until t-4530 — it sends to a composer that is
     // already up, and takes the send road's door and timing.
     assert_eq!(
         shipped.matches("PromptDelivery::with_deadlines(").count(),
-        4,
+        5,
         "a launch road stopped paying the agent's own quiet window and deadline"
     );
     assert_eq!(
         shipped.matches("ready_quiet_for(").count(),
-        5,
-        "the quiet resolver or one of its four mounting sites drifted"
+        6,
+        "the quiet resolver or one of its five mounting sites drifted"
     );
     assert_eq!(
         shipped.matches("ready_timeout_for(").count(),
-        4,
-        "the deadline resolver or one of its three catalog-timed launch sites drifted"
+        5,
+        "the deadline resolver or one of its four catalog-timed launch sites drifted"
     );
     assert_eq!(
         shipped.matches("PromptDelivery::new(").count(),
@@ -12456,11 +12477,14 @@ fn a_strangers_archive_script_waits_for_its_own_approval() {
     std::fs::create_dir_all(&repo_root).expect("repo root");
     let repository = settings::SettingsRepository::new(temp.path().join("settings"));
     let cloned = temp.path().join("cloned-marker");
+    // A block scalar, because the project file's reader strips only the quotes
+    // that wrap a one-line value and unescapes nothing: the backslashes and
+    // quotes of a Windows path would reach the shell as written in the file.
     std::fs::write(
         repo_root.join(zerocode_core::PROJECT_FILE),
         format!(
-            "scripts:\n  archive: {}\n",
-            serde_json::to_string(&crate::test_host::script_that_creates(&cloned)).expect("a line"),
+            "scripts:\n  archive: |\n    {}\n",
+            crate::test_host::script_that_creates(&cloned),
         ),
     )
     .expect("the repository's file");
@@ -12504,7 +12528,7 @@ fn a_strangers_archive_script_waits_for_its_own_approval() {
         .expect("the gate answers");
     assert!(
         matches!(outcome, script::ScriptOutcome::Ok { .. }) && cloned.exists(),
-        "the approved archive script did not run"
+        "the approved archive script did not run: {outcome:?} for {half:?}"
     );
 
     // Under RunBoth, the person's own half runs while the repo's
@@ -12516,19 +12540,22 @@ fn a_strangers_archive_script_waits_for_its_own_approval() {
     std::fs::create_dir_all(&other_root).expect("other repo");
     std::fs::write(
         other_root.join(zerocode_core::PROJECT_FILE),
-        format!("scripts:\n  archive: touch {}\n", strangers.display()),
+        format!(
+            "scripts:\n  archive: |\n    {}\n",
+            crate::test_host::script_that_creates(&strangers),
+        ),
     )
     .expect("the other repository's file");
     update_project_settings(&repository, &project_settings_key(&other_root), |entry| {
         entry.source = zerocode_core::ScriptSource::RunBoth;
-        entry.local_archive = Some(format!("touch {}", mine.display()));
+        entry.local_archive = Some(crate::test_host::script_that_creates(&mine));
     })
     .expect("their own settings");
     let outcome = archive_worktree(&repository, &config_root, &other_root, &other_root)
         .expect("the gate answers");
     assert!(
         matches!(outcome, script::ScriptOutcome::Ok { .. }) && mine.exists() && !strangers.exists(),
-        "the local half and the unapproved repo half parted wrong"
+        "the local half and the unapproved repo half parted wrong: {outcome:?}"
     );
 
     // And under SharedOnly a refusal runs nothing at all: the person said
@@ -19544,6 +19571,39 @@ fn a_cancelled_zo_turn_end_is_an_interrupted_done() {
     );
 }
 
+/// t-69010: zo ends a turn that errored `failed` with the error beside it,
+/// and that error rides the report to the ledger — a turn that failed is
+/// still a turn that ended, and only `cancelled` is a person's interrupt.
+#[test]
+fn a_failed_zo_turn_end_carries_its_error_and_a_completed_or_cancelled_one_none() {
+    let ended = |outcome: &str, error: Option<&str>| {
+        let mut frame = json!({ "type": "turn", "phase": "end", "turn_id": 9, "outcome": outcome });
+        if let Some(error) = error {
+            frame["error"] = json!(error);
+        }
+        zo_channel_report(&frame).expect("a turn-end report")
+    };
+    let failed = ended(
+        "failed",
+        Some("  api failed after 3 attempts: stream_startup_no_progress  "),
+    );
+    assert_eq!(
+        (failed.state, failed.event, failed.interrupted),
+        (zerocode_core::hook::HookState::Done, "zo-turn-end", false)
+    );
+    assert_eq!(
+        failed.failure.as_deref(),
+        Some("api failed after 3 attempts: stream_startup_no_progress")
+    );
+    assert_eq!(
+        ended("failed", None).failure.as_deref(),
+        Some(""),
+        "a failure zo gave no words for is still a failure"
+    );
+    assert_eq!(ended("completed", Some("stale words")).failure, None);
+    assert_eq!(ended("cancelled", None).failure, None);
+}
+
 #[test]
 fn a_zo_channel_question_maps_to_the_workers_wait_state() {
     let report = zo_channel_report(&json!({
@@ -22019,6 +22079,9 @@ pub(crate) mod computer_desktop_wait {
         let _policy = crate::computer_use::input_policy::enter(
             crate::computer_use::input_policy::InputPolicy::SharedDesktop,
         );
+        // The press is at a bare point: whatever app the person has in front
+        // would decide the browser route before the confirmation is asked.
+        let _not_a_browser = crate::computer_use::browser_route::tests::hold_not_a_browser();
         crate::computer_use::confirm::set_policy(crate::computer_use::confirm::Policy::default());
         let command = batch_of(&serde_json::json!([
             ["wait", "--ms", "1"],
@@ -22335,6 +22398,9 @@ pub(crate) mod computer_desktop_wait {
         let _policy = crate::computer_use::input_policy::enter(
             crate::computer_use::input_policy::InputPolicy::SharedDesktop,
         );
+        // The press is at a bare point: whatever app the person has in front
+        // would decide the browser route before the confirmation is asked.
+        let _not_a_browser = crate::computer_use::browser_route::tests::hold_not_a_browser();
         let words = |argv: &[&str]| {
             argv.iter()
                 .map(|word| (*word).to_string())
@@ -23051,6 +23117,110 @@ pub(crate) mod computer_desktop_wait {
                 "a work browser refuses the agent ({over}): {door:?}"
             );
         }
+    }
+
+    /// The window's waiting request to the helper (t-68324 ①) ends three
+    /// ways while its session stands — the helper shuts the connection,
+    /// refuses the request, or answers with no stop count — and each was
+    /// silent: the person's chord then reached the window only at its next
+    /// command, and nothing said so. Now `status` says that it ended and why.
+    /// An end that comes with the session (a clean close) says nothing. The
+    /// helper is the stand-in: nothing is launched and no key is pressed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stop_watch_that_ends_while_its_session_stands_says_why_and_one_that_ends_with_it_says_nothing()
+    {
+        use crate::computer_use::guard;
+        use crate::computer_use::stand_in::{Shape, StandIn, WatchFault};
+        use std::time::{Duration, Instant};
+        const SAID_WITHIN: Duration = Duration::from_secs(2);
+        let _hand = ONE_HAND
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let went_wrong = |fault: WatchFault| {
+            let helper = StandIn::start("watch-token", Shape::matching());
+            let session = helper
+                .connect_window("watch-token")
+                .expect("the window connects to the stand-in");
+            let standing = guard::watch_report();
+            helper.break_watch(fault);
+            let began = Instant::now();
+            let said = loop {
+                let report = guard::watch_report();
+                if report["state"] == "ended" {
+                    break Some(report);
+                }
+                if began.elapsed() >= SAID_WITHIN {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            drop(session);
+            (standing, said, guard::watch_report())
+        };
+        for (fault, reason) in [
+            (WatchFault::HangUp, "closed the connection"),
+            (WatchFault::Refuse, "cannot wait for a stop"),
+            (WatchFault::NoCount, "no stop count"),
+        ] {
+            let (standing, said, after) = went_wrong(fault);
+            assert_eq!(
+                standing["state"], "watching",
+                "{fault:?}: a session waits for the stop: {standing}"
+            );
+            let said = said.unwrap_or_else(|| {
+                panic!("{fault:?}: the watch ended and status said nothing within {SAID_WITHIN:?}")
+            });
+            assert!(
+                said["reason"].as_str().is_some_and(|words| words.contains(reason)),
+                "{fault:?}: the reason names what went wrong ({reason}): {said}"
+            );
+            assert_eq!(
+                after["state"], "away",
+                "{fault:?}: the session's end ends the record: {after}"
+            );
+        }
+        let helper = StandIn::start("clean-token", Shape::matching());
+        let session = helper
+            .connect_window("clean-token")
+            .expect("the window connects to the stand-in");
+        drop(session);
+        assert_eq!(
+            guard::watch_report()["state"],
+            "away",
+            "a watch that ends with its session is no loss"
+        );
+    }
+
+    /// `status` carries the watch's state whether or not a helper session
+    /// stands (t-68324 ①): the window's own record, not the helper's.
+    #[test]
+    fn status_says_how_the_stop_watch_stands() {
+        use crate::computer_use::guard;
+        let _hand = ONE_HAND
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let words = |argv: &[&str]| {
+            argv.iter()
+                .map(|word| (*word).to_string())
+                .collect::<Vec<_>>()
+        };
+        guard::watch_lost("the helper closed the connection");
+        let ended = envelope(&answer_computer_command(&words(&["status", "--json"])));
+        guard::watch_left();
+        let away = envelope(&answer_computer_command(&words(&["status", "--json"])));
+        assert_eq!(ended["result"]["stopWatch"]["state"], "ended", "{ended}");
+        assert_eq!(
+            ended["result"]["stopWatch"]["reason"], "the helper closed the connection",
+            "{ended}"
+        );
+        assert!(
+            ended["result"]["stopWatch"]["effect"]
+                .as_str()
+                .is_some_and(|words| words.contains("next command")),
+            "status says what the lost watch costs: {ended}"
+        );
+        assert_eq!(away["result"]["stopWatch"]["state"], "away", "{away}");
     }
 
     /// The person's chord the helper heard (t-66753 B): the window hears it
@@ -23998,7 +24168,7 @@ pub(crate) mod computer_desktop_wait {
             let mut status_took = Duration::ZERO;
             while !done.load(Ordering::SeqCst) {
                 samples += 1;
-                if crate::computer_use::session_stands_now() {
+                if crate::computer_use::session_lock_held_now() {
                     held += 1;
                 }
                 if samples == 300 {
@@ -24504,9 +24674,8 @@ mod update_command_edges {
 
     #[test]
     fn a_dead_port_is_a_network_word_and_a_non_json_body_is_malformed() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
+        let silent = crate::test_host::quiet_ports::QuietPort::silent();
+        let dead = format!("http://{}", silent.addr());
         assert_eq!(
             tauri::async_runtime::block_on(fetch_releases(&dead)).unwrap_err(),
             FailureWord::Network
@@ -29461,4 +29630,148 @@ fn managed_judgment_boot_restore_has_one_setup_call() {
 
 mod keybinding_input_tests {
     include!("keybinding_input_tests.rs");
+}
+
+/// What the renderer reports for one built-in theme: the same strings it
+/// paints with, so a test drives the pane with the real catalog.
+fn reported_theme(name: &str) -> TerminalColorsReport {
+    let theme = terminal_theme_catalog()
+        .get(name)
+        .expect("a built-in terminal theme");
+    TerminalColorsReport {
+        foreground: theme.foreground.clone(),
+        background: theme.background.clone(),
+        cursor: theme.cursor.clone(),
+        ansi: [
+            &theme.black,
+            &theme.red,
+            &theme.green,
+            &theme.yellow,
+            &theme.blue,
+            &theme.magenta,
+            &theme.cyan,
+            &theme.white,
+            &theme.bright_black,
+            &theme.bright_red,
+            &theme.bright_green,
+            &theme.bright_yellow,
+            &theme.bright_blue,
+            &theme.bright_magenta,
+            &theme.bright_cyan,
+            &theme.bright_white,
+        ]
+        .into_iter()
+        .cloned()
+        .collect(),
+    }
+}
+
+/// What a program in the pane gets back for `ask`, once the pane was told
+/// `report` the way `hold_terminal` and `report_terminal_colors` tell it.
+fn answer_after_telling(report: &TerminalColorsReport, ask: &[u8]) -> Vec<u8> {
+    let colors = report.to_colors().expect("the window's own colours parse");
+    let mut terminal = zerocode_pty::Terminal::new(4, 20);
+    terminal.grid_mut().set_colors(Arc::new(colors));
+    terminal.feed(ask);
+    terminal.grid_mut().take_replies()
+}
+
+#[test]
+fn a_pane_answers_the_colours_the_window_paints_it_with() {
+    let dracula = reported_theme("Dracula");
+    // #282a36 / #f8f8f2 / #f8f8f2, and bright blue #d6acff, sixteen bits a
+    // channel and ST-terminated — the form `report_color` writes.
+    assert_eq!(
+        answer_after_telling(&dracula, b"\x1b]11;?\x1b\\"),
+        b"\x1b]11;rgb:2828/2a2a/3636\x1b\\"
+    );
+    assert_eq!(
+        answer_after_telling(&dracula, b"\x1b]10;?\x1b\\\x1b]12;?\x1b\\"),
+        b"\x1b]10;rgb:f8f8/f8f8/f2f2\x1b\\\x1b]12;rgb:f8f8/f8f8/f2f2\x1b\\"
+    );
+    assert_eq!(
+        answer_after_telling(&dracula, b"\x1b]4;12;?\x1b\\"),
+        b"\x1b]4;12;rgb:d6d6/acac/ffff\x1b\\"
+    );
+}
+
+#[test]
+fn a_theme_switch_changes_the_background_a_pane_answers() {
+    let mut terminal = zerocode_pty::Terminal::new(4, 20);
+    for (theme, expected) in [
+        ("Dracula", &b"\x1b]11;rgb:2828/2a2a/3636\x1b\\"[..]),
+        (TERM_THEME_LIGHT, &b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\"[..]),
+    ] {
+        let colors = reported_theme(theme)
+            .to_colors()
+            .expect("the window's own colours parse");
+        terminal.grid_mut().set_colors(Arc::new(colors));
+        terminal.feed(b"\x1b]11;?\x1b\\");
+        assert_eq!(terminal.grid_mut().take_replies(), expected, "{theme}");
+    }
+}
+
+#[test]
+fn a_report_that_is_not_a_whole_palette_dresses_no_pane() {
+    let mut short = reported_theme("Dracula");
+    short.ansi.pop();
+    assert!(short.to_colors().is_err(), "fifteen colours were taken");
+    let mut named = reported_theme("Dracula");
+    named.background = "navy".to_string();
+    assert!(named.to_colors().is_err(), "a colour name was taken");
+}
+
+#[test]
+fn required_computer_sharing_defaults_off_and_survives_the_settings_repository() {
+    let legacy: SettingsDocument = serde_json::from_str("{}").expect("old settings");
+    assert!(!legacy.computer_share_required);
+    assert!(!SettingsDocument::default().computer_share_required);
+    let directory = tempfile::tempdir().expect("settings sandbox");
+    let repository = settings::SettingsRepository::new(directory.path());
+    let enabled = mutate_settings(&repository, |settings| {
+        settings.computer_share_required = true;
+        Ok(())
+    }).expect("enable");
+    assert_eq!(serde_json::to_value(enabled).unwrap()["computer_share_required"], true);
+    drop(repository);
+    let restarted = settings::SettingsRepository::new(directory.path());
+    assert!(load_settings(&restarted).expect("restart").document.computer_share_required);
+    mutate_settings(&restarted, |settings| {
+        settings.computer_share_required = false;
+        Ok(())
+    }).expect("disable");
+    assert!(!load_settings(&restarted).expect("disabled").document.computer_share_required);
+}
+
+/// A mirror pane closes with no person's hand, and only a mirror does
+/// (t-75153, R7b): `close_mirror_term` refuses a term `open_mirror_term` did
+/// not start, and one it closed already.
+#[test]
+fn only_a_mirror_the_window_opened_closes_without_a_hand() {
+    // Every road that ends a terminal forgets it as a mirror, and a mirror
+    // is one before the exit watch can see it (R8).
+    let backend = shipped_backend();
+    let closing = block_after(backend, "fn forget_term_state(");
+    assert!(
+        closing.contains("crate::cmd::terminal::forget_mirror_term(term);"),
+        "a mirror ended by another road stays among the mirrors:\n{closing}"
+    );
+    let opening = block_after(backend, "fn open_mirror_term(");
+    let noted = opening.find("note_mirror_term(id);").expect("a mirror is noted");
+    let held = opening.find("state.hold_terminal(id, pty);").expect("a mirror is held");
+    assert!(noted < held, "a mirror is held before it is noted:\n{opening}");
+    use crate::cmd::terminal::{forget_mirror_term, mirror_close_allowed, note_mirror_term};
+    let mirror: TermId = 4_100_001;
+    let shell: TermId = 4_100_002;
+    note_mirror_term(mirror);
+    assert!(matches!(
+        mirror_close_allowed(shell),
+        Err(TerminalCloseError::NotMirror)
+    ));
+    assert!(mirror_close_allowed(mirror).is_ok());
+    forget_mirror_term(mirror);
+    assert!(matches!(
+        mirror_close_allowed(mirror),
+        Err(TerminalCloseError::NotMirror)
+    ));
 }

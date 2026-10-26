@@ -33,10 +33,12 @@ mod release_versions;
 mod scm_observer_lock;
 mod seat_follows;
 mod secret_prompt;
+mod self_surface;
 mod skills_view;
 mod support;
 mod type_value_keys;
 mod update;
+mod window_forks;
 pub(crate) use support as ui_source;
 
 mod tests {
@@ -129,7 +131,7 @@ mod tests {
             asking.contains("invoke(\"busy_census\", { road: \"restart\", door })")
                 && asking.contains("if (census && !census.busy?.busy) {")
                 && asking.contains(
-                    "invoke(\"leave_now\", { road: \"restart\", door, by, unasked: true })"
+                    "invoke(\"leave_now\", { road: \"restart\", door, by, unasked: true }, { hand: flowHand(started) })"
                 ),
             "the restart question lost its census or its notice:\n{asking}"
         );
@@ -1825,6 +1827,221 @@ mod tests {
         assert!(
             body.contains("refreshWorktrees"),
             "nothing re-counts the worktrees when a lane ends:\n{body}"
+        );
+    }
+
+    /// ⌘J asks where to go, and the window asks only two questions (t-67485).
+    ///
+    /// 「한 화면, 두 질문」: ⌘P asks which file and ⌘J asks where to go — not a
+    /// command bar that grew a third mode. What ⌘J added is three groups in one
+    /// answer (the five places the person opened last, the doors the sidebar
+    /// already has, the worktrees), a digit that opens a recent place only while
+    /// the field is empty, and a list that holds five and no more.
+    #[test]
+    fn the_palette_asks_two_questions_and_remembers_five_places() {
+        let window = strip_comments(window_source());
+        let finders = block_after(&window, "const FINDERS = {");
+        let asks: Vec<&str> = finders
+            .lines()
+            .filter(|line| line.starts_with("  ") && !line.starts_with("   "))
+            .filter_map(|line| line.trim().strip_suffix(": {"))
+            .collect();
+        assert_eq!(
+            asks,
+            ["file", "worktree"],
+            "the finder grew a question beyond \"which file\" and \"where to\":\n{finders}"
+        );
+        assert!(
+            finders
+                .split("\n  worktree: {")
+                .next()
+                .is_some_and(|file| file.contains("listsEmpty: false")),
+            "the file finder lists before a word is typed"
+        );
+        assert!(
+            window.contains("const RECENT_PLACES_LIMIT = 5;"),
+            "the recent list is no longer five places"
+        );
+        // Each road the person opens a place by leaves a mark on it.
+        for kind in ["task", "pane", "artifact"] {
+            assert!(
+                window.contains(&format!("rememberRecentPlace({{ kind: \"{kind}\",")),
+                "opening a {kind} no longer lands in the recent list"
+            );
+        }
+        // The digit is a key only while the field is empty, or it eats the
+        // first letters of a word being typed.
+        let keys = block_after(&window, "qoInput.addEventListener(\"keydown\"");
+        assert!(
+            keys.contains("/^[1-5]$/.test(event.key)") && keys.contains("qoInput.value === \"\""),
+            "a digit opens a recent place while a word is being typed:\n{keys}"
+        );
+    }
+
+    /// The design page draws every token `ui/tokens.css` declares (t-67484).
+    ///
+    /// The page keeps no list of names. It reads the file and takes the names
+    /// by one rule — a declaration at the start of a line — and this gate takes
+    /// them by the same rule, so a token added tomorrow is on the page without
+    /// anyone editing the page. The window test counts what is drawn against
+    /// the file; a token whose value does not resolve here is listed by name in
+    /// its failure message.
+    #[test]
+    fn every_token_in_tokens_css_is_drawn_by_the_design_page() {
+        let tokens = include_str!("../../../../ui/tokens.css");
+        let page = strip_comments(include_str!("../../../../ui/shell-design.js"));
+        let mut declared: Vec<&str> = tokens
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("--"))
+            .filter_map(|rest| rest.split_once(':').map(|(name, _)| name.trim_end()))
+            .filter(|name| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            })
+            .collect();
+        declared.sort_unstable();
+        declared.dedup();
+        assert!(
+            declared.len() > 1000,
+            "tokens.css stopped declaring tokens the way the page reads them: {} found",
+            declared.len()
+        );
+        assert!(
+            page.contains("fetch(\"./tokens.css\")") && page.contains("/^\\s*(--[\\w-]+)\\s*:/gm"),
+            "the design page no longer reads its names from tokens.css by the line-start rule"
+        );
+        // The page names no token of its own: a name written here is a name
+        // that can go stale. The two prefixes are how a family is told which
+        // property its sample sets.
+        let named: Vec<&str> = page
+            .split("\"--")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap_or(""))
+            .collect();
+        assert!(
+            named.iter().all(|name| matches!(*name, "type-" | "text-")),
+            "the design page writes token names of its own: {named:?}"
+        );
+    }
+
+    /// The design page restates no value (t-67484).
+    ///
+    /// Swatches, bars and specimens read `var(--token)`; the components are the
+    /// window's own classes. A colour, a length of time or a size written on the
+    /// page would be a second copy of a value the tokens already own, waiting to
+    /// disagree. Only the page's own script and its own block of the stylesheet
+    /// are read.
+    #[test]
+    fn the_design_page_restates_no_value() {
+        let page = strip_comments(include_str!("../../../../ui/shell-design.js"));
+        let styles = strip_comments(include_str!("../../../../ui/shell.css"));
+        let own = styles
+            .split_once(".settings-version {")
+            .map(|(_, rest)| rest)
+            .expect("the design page's block left ui/shell.css");
+        let literal = |line: &str| -> Option<&'static str> {
+            let bytes = line.as_bytes();
+            if line.contains("cubic-bezier(") {
+                return Some("an easing curve");
+            }
+            if line.contains("rgb(") || line.contains("hsl(") || line.contains("oklch(") {
+                return Some("a colour function");
+            }
+            for (at, byte) in bytes.iter().enumerate() {
+                if *byte == b'#'
+                    && bytes
+                        .get(at + 1..at + 4)
+                        .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+                {
+                    return Some("a hex colour");
+                }
+                if bytes[at..].starts_with(b"ms") && at > 0 && bytes[at - 1].is_ascii_digit() {
+                    return Some("a duration in ms");
+                }
+            }
+            None
+        };
+        for (name, text) in [
+            ("shell-design.js", page.as_str()),
+            ("its block of shell.css", own),
+        ] {
+            for line in text.lines() {
+                if let Some(found) = literal(line) {
+                    panic!("{name} restates {found}:\n{line}");
+                }
+            }
+        }
+        // Lengths: the stylesheet block takes its sizes from the tokens. The
+        // one pixel value it writes is the focus ring's, which every surface
+        // spells the same way (design skill, "Keyboard focus"), and the widths
+        // at which the page folds, which measure the page and are not design.
+        for line in own.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("@container") || trimmed.starts_with("outline") {
+                continue;
+            }
+            let bytes = trimmed.as_bytes();
+            let pixels = (0..bytes.len().saturating_sub(1))
+                .any(|at| &bytes[at..at + 2] == b"px" && at > 0 && bytes[at - 1].is_ascii_digit());
+            assert!(
+                !pixels,
+                "the design page's stylesheet block writes a length of its own:\n{trimmed}"
+            );
+        }
+        // Inline styles may set a property only to a token or to nothing.
+        for line in page.lines().filter(|line| line.contains(".style.")) {
+            assert!(
+                line.contains("var(${name})") || line.contains("cssText"),
+                "the design page sets an inline style to something other than a token:\n{line}"
+            );
+        }
+    }
+
+    /// The design page is a hidden page and loading is one definition (t-67484).
+    ///
+    /// The entry ships hidden in the markup and the settings list asks the page
+    /// whether it is available; five presses of the version line unlock it. A
+    /// control that is busy says so with `aria-busy="true"` and the stylesheet
+    /// gives all seven kinds the same look for it.
+    #[test]
+    fn the_design_page_is_hidden_until_the_version_line_is_pressed_five_times() {
+        let markup = include_str!("../../../../ui/index.html");
+        let page = strip_comments(include_str!("../../../../ui/shell-design.js"));
+        let styles = strip_comments(include_str!("../../../../ui/shell.css"));
+        assert!(
+            markup.contains("data-pane=\"design-system\" hidden>"),
+            "the design page's rail item no longer ships hidden"
+        );
+        assert!(
+            page.contains("const DESIGN_UNLOCK_PRESSES = 5;"),
+            "the version line no longer unlocks the page at five presses"
+        );
+        let settings = strip_comments(include_str!("../../../../ui/shell-settings.js"));
+        assert!(
+            block_after(&settings, "function settingsPaneAvailable(pane) {")
+                .contains("designPageAvailable()"),
+            "the settings list does not ask whether the design page is available"
+        );
+        let busy = block_after(&styles, ":is(.btn, .task-board-filter");
+        for kind in [
+            ".btn",
+            ".task-board-filter",
+            ".nav-row",
+            ".nav-badge",
+            ".settings-input",
+            ".auto-row-toggle",
+            ".board-mode button",
+        ] {
+            assert!(
+                busy.contains(kind),
+                "loading has no definition for `{kind}`:\n{busy}"
+            );
+        }
+        assert!(
+            busy.contains("[aria-busy=\"true\"]"),
+            "loading is not defined on aria-busy:\n{busy}"
         );
     }
 
@@ -6402,7 +6619,7 @@ mod tests {
             asking.contains("await askConfirm({")
                 && asking.contains("danger: true,")
                 && asking.contains(
-                    "invoke(\"clear_diff_notes\", { workspace: activeWorktreePath, filePath })"
+                    "invoke(\"clear_diff_notes\", { workspace: activeWorktreePath, filePath }, { hand: flowHand(started) })"
                 ),
             "clearing notes stopped asking first, or reaches past this \
              checkout:\n{asking}"
@@ -6656,7 +6873,7 @@ mod tests {
     #[test]
     fn an_unsaved_file_is_not_closed_without_asking() {
         let window = window_source();
-        let closing = block_after(window, "function closeTab(id) {");
+        let closing = block_after(window, "function closeTab(id, started = handNow()) {");
         assert!(
             closing.contains("letGoOf(tab)"),
             "closing a document does not go through the door that asks about \
@@ -9298,7 +9515,7 @@ mod tests {
             dropping.contains("if (closed) rememberBrowserOpenTabs();"),
             "the browser's restore record is written by bookkeeping again:\n{dropping}"
         );
-        let closing = block_after(window, "function closeTab(id) {");
+        let closing = block_after(window, "function closeTab(id, started = handNow()) {");
         assert!(
             closing.contains("dropTab(id, { closed: true });"),
             "the person's own close stopped saying so, so the restore record \
@@ -9315,7 +9532,19 @@ mod tests {
 
         let window = window_source();
         let request = block_after(window, "function closeTermAndView(");
-        assert!(request.contains("invoke(\"close_term\", { term })).then(() => {"));
+        assert!(request.contains("Promise.resolve().then(closing).then(() => {"));
+        // A mirror pane closes by its own door, which ends mirrors only
+        // (t-75153, R7b); every other close is `close_term` on the hand.
+        assert!(request.contains(concat!(
+            "  const closing = road.startsWith(\"mirror-\")\n",
+            "    ? () => invoke(\"close_mirror_term\", { term })\n",
+            "    : () => invoke(\"close_term\", { term }, { hand });\n",
+        )));
+        assert_eq!(
+            window.matches("invoke(\"close_mirror_term\"").count(),
+            1,
+            "another door closes a mirror pane"
+        );
         assert!(
             request.contains("dropClosedTermLeaf(term, road);")
                 && request.contains("showError(terminalCloseFailure(error))")
@@ -9330,12 +9559,14 @@ mod tests {
             "another close door bypasses the receipt"
         );
 
-        let closing = block_after(window, "function closeTab(id) {");
+        let closing = block_after(window, "function closeTab(id, started = handNow()) {");
         let terminals = block_after(closing, "if (tab.kind === \"term\") {");
-        assert!(terminals.contains("closeTerminalTab(tab, \"close-tab\")"));
+        assert!(terminals.contains("closeTerminalTab(tab, \"close-tab\", flowHand(started))"));
         assert!(!terminals.contains("dropTermView(") && !terminals.contains("dropTab("));
         let pane = block_after(window, "async function closePaneLeaf(");
-        assert!(pane.contains("if (!(await closeTermAndView(going, \"close-pane\"))) return;"));
+        assert!(
+            pane.contains("if (!(await closeTermAndView(going, \"close-pane\", hand))) return;")
+        );
         let project = block_after(window, "async function removeProjectFromList(");
         let fence = project
             .find("removingProjectPaths.add(path)")
@@ -9408,34 +9639,27 @@ mod tests {
         );
     }
 
-    /// The Bluetooth usage descriptions (t-45873). The embedded Chromium reads
-    /// the devices paired with this Mac through IOBluetooth, and macOS ends a
-    /// process that does so without `NSBluetoothAlwaysUsageDescription` (a TCC
-    /// abort seen on 2026-10-11). Both keys sit in the main bundle's Info.plist,
-    /// the file tauri-bundler merges. build.rs writes another bundle's plist (the
-    /// Computer Use helper's), so the keys must not appear there.
+    /// macOS needs the Always key; Peripheral is for iOS before version 13.
     #[test]
     fn the_main_bundle_declares_the_bluetooth_usage_descriptions() {
+        // A readability floor for this contract, not an Apple requirement.
+        const MIN_USAGE_DESCRIPTION_WORDS: usize = 8;
         let plist = include_str!("../../Info.plist");
         let helper_plist = include_str!("../../build.rs");
-        for key in [
-            "NSBluetoothAlwaysUsageDescription",
-            "NSBluetoothPeripheralUsageDescription",
-        ] {
-            let text = plist
-                .split_once(&format!("<key>{key}</key>"))
-                .and_then(|(_, rest)| rest.split_once("<string>"))
-                .and_then(|(_, rest)| rest.split_once("</string>"))
-                .map_or("", |(body, _)| body.trim());
-            assert!(
-                text.split_whitespace().count() >= 8 && text.ends_with('.'),
-                "`{key}` is missing from Info.plist or is not a sentence a person can read: `{text}`"
-            );
-            assert!(
-                !helper_plist.contains(key),
-                "`{key}` belongs to one plist only: build.rs writes the Computer Use helper's"
-            );
-        }
+        let key = "NSBluetoothAlwaysUsageDescription";
+        let text = plist
+            .split_once(&format!("<key>{key}</key>"))
+            .and_then(|(_, rest)| rest.split_once("<string>"))
+            .and_then(|(_, rest)| rest.split_once("</string>"))
+            .map_or("", |(body, _)| body.trim());
+        assert!(
+            text.split_whitespace().count() >= MIN_USAGE_DESCRIPTION_WORDS && text.ends_with('.'),
+            "`{key}` is missing from Info.plist or is not a sentence a person can read: `{text}`"
+        );
+        assert!(
+            !helper_plist.contains(key),
+            "`{key}` belongs to one plist only: build.rs writes the Computer Use helper's"
+        );
     }
 
     /// The features the embedded Chromium is started with turned off, as the
@@ -14443,20 +14667,23 @@ mod tests {
         // deleted with nothing on screen addressing it is a leak.
         let removing = block_after(window, "async function removeWorktree(");
         assert!(
-            removing.contains("await finishWorktreeRemoval(worktree);"),
+            removing.contains("await finishWorktreeRemoval(worktree, flowHand(started));"),
             "the confirmed removal bypasses the one cleanup owner:\n{removing}"
         );
-        let finishing = block_after(window, "async function finishWorktreeRemoval(worktree) {");
+        let finishing = block_after(
+            window,
+            "async function finishWorktreeRemoval(worktree, hand) {",
+        );
         assert!(
-            finishing.contains("if (!(await dropWorktreeSurfaces(path))) return;"),
+            finishing.contains("if (!(await dropWorktreeSurfaces(path, hand))) return;"),
             "a removed worktree leaves its tabs behind again:\n{finishing}"
         );
-        let sweeping = block_after(window, "async function dropWorktreeSurfaces(path) {");
+        let sweeping = block_after(window, "async function dropWorktreeSurfaces(path, hand) {");
         assert!(
             sweeping.contains(concat!(
                 "  for (const held of tabs.filter((one) => one.worktree === path)) {\n",
                 "    if (held.kind === \"term\") {\n",
-                "      await closeTerminalTab(held, \"worktree-removed\");\n",
+                "      await closeTerminalTab(held, \"worktree-removed\", hand);\n",
                 "      continue;\n",
                 "    }\n",
                 "    dropTab(held.id);\n",
@@ -14834,7 +15061,7 @@ mod tests {
             )),
             "the standing no longer resolves to one action:\n{deciding}"
         );
-        let acting = block_after(window, "async function runScmAction(action) {");
+        let acting = block_after(window, "async function runScmAction(action, started) {");
         assert!(
             acting.contains(concat!(
                 "  await invoke(\"scm_pull\");\n",
@@ -15113,7 +15340,10 @@ mod tests {
         // `runScmRemote` is the one road every network verb takes — the
         // primary button and the menu alike — so the loop cannot be bypassed
         // by whichever surface asked.
-        let clicking = block_after(window, "async function runScmRemote(action) {");
+        let clicking = block_after(
+            window,
+            "async function runScmRemote(action, started = handNow()) {",
+        );
         assert!(
             clicking.contains(concat!(
                 "    if (kind === \"rejected\" || kind === \"stale-lease\") {\n",
@@ -16061,6 +16291,50 @@ mod tests {
             !titlebar.contains("backdrop-filter:"),
             "the titlebar stands a backdrop layer over the streaming stage at all \
              times:\n{titlebar}"
+        );
+    }
+
+    /// A program in a window pane that asks for the terminal's colours
+    /// (`OSC 10/11/12 ; ?`) is answered with the colours the window paints
+    /// (t-73869). The renderer alone knows them, so it reports them whenever
+    /// its palette changes; every new shell is dressed at `hold_terminal`, the
+    /// one door, and every live shell is dressed when the report arrives.
+    #[test]
+    fn a_window_pane_is_told_the_colours_it_is_painted_with() {
+        let backend = shipped_backend();
+        let (shipped, _) = backend.split_once("#[cfg(test)]").unwrap_or((backend, ""));
+        let window = window_source();
+        assert!(
+            shipped.contains("\n            report_terminal_colors,\n"),
+            "report_terminal_colors is not registered with the window"
+        );
+        let holding = block_after(
+            shipped,
+            "    fn hold_terminal(\n        &self,\n        settings: &settings::SettingsRepository,",
+        );
+        assert!(
+            holding.contains("self.terminal_palette") && holding.contains(".hold("),
+            "a newly spawned shell is not told the colours the window paints:\n{holding}"
+        );
+        assert!(
+            !holding.contains("terminals().insert("),
+            "hold_terminal lists a shell outside the palette's lock (t-74931):\n{holding}"
+        );
+        let reporting = block_after(shipped, "fn report_terminal_colors(");
+        assert!(
+            reporting.contains("to_colors()")
+                && reporting.contains("state.terminal_palette().tell(state.terminals()"),
+            "a reported palette does not reach the shells already open:\n{reporting}"
+        );
+        assert!(
+            !reporting.contains("handles()") && !reporting.contains("set_colors("),
+            "a report dresses the pool outside the palette's lock (t-74931):\n{reporting}"
+        );
+        let painting = block_after(window, "function applyTerminalPalette() {");
+        assert!(
+            painting.contains("invoke(\"report_terminal_colors\"")
+                && painting.contains("terminalAnsiColorKeys()"),
+            "the renderer paints a palette without reporting it:\n{painting}"
         );
     }
 
@@ -19743,6 +20017,64 @@ mod tests {
         );
     }
 
+    /// A worker whose briefing the booting program threw away is not a
+    /// started worker (t-74381).
+    ///
+    /// The delivery is done when the words were written; the waiter then looks
+    /// for them on the screen, types them once more when they are not there,
+    /// and fails the launch with the briefing named undelivered when they
+    /// still are not — before the success return, so no ledger line says the
+    /// worker started over an empty composer. The pure half (what counts as
+    /// shown, the one retype, its outcome before the screen) is
+    /// `zerocode_pty::briefing::confirm`, held by
+    /// `crates/zerocode-pty/tests/briefing_taken.rs` against fake Claude and
+    /// Codex shaped programs; this pins that the launch road asks it.
+    #[test]
+    fn a_worker_whose_briefing_never_stood_on_its_screen_fails_its_launch() {
+        let backend = shipped_backend();
+        let waiting = backend
+            .split_once("fn await_worker_ready(&self, term: TermId)")
+            .map_or("", |(_, rest)| rest);
+        let waiting = &waiting[..waiting.find("\n    fn send(").unwrap_or(waiting.len())];
+        let asked = waiting.find("self.confirm_briefing(term, &pending)");
+        let seated = waiting.find("if accepted && undelivered.is_none()");
+        let torn = waiting.find("let removed = state.terminals().remove(&term);");
+        assert!(
+            matches!((asked, seated, torn), (Some(ask), Some(seat), Some(tear)) if ask < seat && seat < tear),
+            "the waiter no longer asks the screen before it calls the launch a success:\n{waiting}"
+        );
+        assert!(
+            waiting.contains("if let Some(why) = undelivered {"),
+            "an undelivered briefing is not the launch's failure reason:\n{waiting}"
+        );
+        let confirming = block_after(backend, "fn confirm_briefing(");
+        assert!(
+            confirming.contains("confirm(")
+                && confirming.contains("Verdict::Taken => return None")
+                && confirming.contains("Unheard::RetypeEnded(outcome)")
+                && confirming.contains("briefing not delivered"),
+            "the screen check lost a step:\n{confirming}"
+        );
+        // The retype is waited for on the agent's own deadline, which its
+        // delivery pays, and the receipt's patience — never the watch's
+        // window (t-74919) — and its outcome goes back to the watch.
+        assert!(
+            confirming.contains("let deadline = ready_timeout_for(agent);")
+                && confirming.contains("deadline + zerocode_pty::ready::SUBMIT_RECEIPT_PATIENCE"),
+            "the retype's outcome is no longer waited for on the agent's own deadline:\n{confirming}"
+        );
+        let retyping = block_after(backend, "fn retype(&mut self)");
+        assert!(
+            retyping.contains("self.deadline,") && retyping.trim_end().ends_with("waiting"),
+            "the retype drops its delivery's outcome or its agent's deadline:\n{retyping}"
+        );
+        let slot = block_after(backend, "struct PendingWorkerReadiness {");
+        assert!(
+            slot.contains("briefing: String,") && slot.contains("composer: Option<char>,"),
+            "the readiness slot no longer carries the briefing it must find on the screen:\n{slot}"
+        );
+    }
+
     /// Every door that deletes a worktree asks this window's own terminals
     /// first, through ONE function.
     ///
@@ -20444,7 +20776,13 @@ mod tests {
         let (transaction, _) = transaction
             .split_once("#[cfg(test)]")
             .unwrap_or((transaction, ""));
-        let swapping = block_after(transaction, "pub(super) fn settle(");
+        // A between-turns move's hold ends through the same swap (t-74974).
+        assert!(
+            block_after(transaction, "pub(super) fn settle(")
+                .contains("take_next(term, deliveries, waiters, queue, now);"),
+            "a settled delivery no longer hands its line to the next in queue"
+        );
+        let swapping = block_after(transaction, "fn take_next(");
         assert!(
             swapping.contains("row.pop_front()")
                 && swapping
@@ -20584,9 +20922,11 @@ mod tests {
     /// turns while words it typed there on its own are on their way. It reads
     /// the typing door's own record — the delivery the pump carries and the
     /// queue behind it — at the switch's every look and FIRST at the rest's
-    /// fence (outside the hook state's lock, so the two locks never nest), and
-    /// it waits for the output to settle as the pointer does. A switch asks
-    /// both questions through one function.
+    /// fence under the prompt registration lock, before the hook state —
+    /// where it marks the pane so later prompts queue, and lets the lock go
+    /// for the ledger's write (t-74974) — and it waits for the output to
+    /// settle as the pointer does. A switch asks both questions through one
+    /// function.
     #[test]
     fn a_pane_with_words_on_their_way_is_never_between_turns_for_a_switch() {
         let backend = shipped_backend();
@@ -20611,16 +20951,15 @@ mod tests {
             backend,
             "    fn with_between_turns_observation(&self, term: TermId, commit: &mut dyn FnMut()) {",
         );
-        let asked = fence
-            .find("self.typing_in_flight(term)")
-            .expect("the fence no longer asks for words on their way");
-        let locked = fence
-            .find("state.pane_states()")
-            .expect("the fence no longer holds the hook state");
         assert!(
-            asked < locked && fence.contains("output_settled(&state, term)"),
-            "the fence asks for words on their way under the hook state's lock, or \
-             skips the settle:\n{fence}"
+            fence.contains("crate::prompt_transaction::with_no_prompt_in_flight(&lines, term,")
+                && fence.contains("deliveries: &runtime.deliveries,")
+                && fence.contains("queue: &runtime.prompt_queue,")
+                && fence.contains("moving: &runtime.moving_terms,")
+                && fence.contains("output_settled(&state, term)")
+                && fence.contains("state.cadence().wake()"),
+            "the switch must observe and hold the pane's prompts under the prompt \
+             registration lock, and wake the pump for one it held:\n{fence}"
         );
         let switch = include_str!("../../src/account_switch.rs");
         let rests = block_after(
@@ -20700,8 +21039,8 @@ mod tests {
             "the Claude system row grew an action this window may not take:\n{claude}"
         );
         for road in [
-            "invoke(\"relogin_codex_login\")",
-            "invoke(\"logout_codex_login\")",
+            "invoke(\"relogin_codex_login\", undefined, { hand: handNow() })",
+            "invoke(\"logout_codex_login\", undefined, { hand })",
         ] {
             assert!(window.contains(road), "the window no longer walks {road}");
         }
@@ -21049,9 +21388,9 @@ mod tests {
         // as well. Three roads used to sweep the tabs themselves in the same
         // shape — the removal dialog, the cleanup table, the space page — and
         // none of them forgot the stage layout keyed by the path.
-        let sweeping = block_after(window, "async function dropWorktreeSurfaces(path) {");
+        let sweeping = block_after(window, "async function dropWorktreeSurfaces(path, hand) {");
         assert!(
-            sweeping.contains("await closeTerminalTab(held, \"worktree-removed\");")
+            sweeping.contains("await closeTerminalTab(held, \"worktree-removed\", hand);")
                 && sweeping.contains("dropTab(held.id);")
                 && sweeping
                     .contains("if (tabs.some((one) => one.worktree === path)) return false;")
@@ -22248,13 +22587,13 @@ mod tests {
         );
     }
 
-    /// 나를 기다림 (t-26595): the sidebar's top list and the finish setting are
-    /// pinned — the list sits in the column above the shortcut rows, the window
-    /// asks Rust for its rows and releases a finish by its pane, the setting
-    /// writes its word through its own command, and every word the two show is
-    /// in the four languages that are not the source.
+    /// 받은 편지함 (t-67483, absorbing 나를 기다림 of t-26595 and the 주의 필요
+    /// row): the sidebar keeps one row for it in the shortcut rows, the two lists
+    /// it absorbed are gone, the finish setting still writes its word through its
+    /// own command, and every word the page and the setting show is in the four
+    /// languages that are not the source.
     #[test]
-    fn the_waiting_list_sits_on_top_and_its_words_reach_every_language() {
+    fn the_inbox_replaces_the_waiting_list_and_its_words_reach_every_language() {
         let markup = include_str!("../../../../ui/index.html");
         let column = markup_between(
             markup,
@@ -22262,8 +22601,13 @@ mod tests {
             "<nav class=\"nav-rows\"",
         );
         assert!(
-            column.contains("<section class=\"waiting-list\" id=\"waiting-list\""),
-            "the waiting list left the top of the column:\n{column}"
+            !column.contains("id=\"waiting-list\"") && !markup.contains("id=\"nav-attention\""),
+            "the lists the inbox absorbed are back in the sidebar"
+        );
+        let nav = markup_between(markup, "<nav class=\"nav-rows\"", "</nav>");
+        assert!(
+            nav.contains("id=\"nav-inbox\"") && nav.contains("id=\"inbox-badge\""),
+            "the shortcut rows lost the inbox's row and its number"
         );
         assert!(
             markup.contains("id=\"notify-finish-mode\"")
@@ -22272,11 +22616,15 @@ mod tests {
         );
 
         let shell = include_str!("../../../../ui/shell.js");
+        let inbox = include_str!("../../../../ui/shell-inbox.js");
         assert!(
-            shell.contains("invoke(\"waiting_on_me\")")
-                && shell.contains("invoke(\"clear_finish_mark\""),
-            "the list no longer asks Rust for its rows, or no longer releases a \
-             finish by its pane"
+            inbox.contains("invoke(\"board_inbox\")")
+                && inbox.contains("invoke(\"clear_finish_mark\""),
+            "the page no longer asks Rust for its letters, or no longer releases a finish by its pane"
+        );
+        assert!(
+            !shell.contains("waiting_on_me") && !shell.contains("refreshWaitingList"),
+            "the sidebar's waiting list is still asked for"
         );
 
         let settings = include_str!("../../../../ui/shell-settings.js");
@@ -22287,17 +22635,26 @@ mod tests {
 
         let main = include_str!("../../src/main.rs");
         assert!(
-            main.contains("waiting_on_me,") && main.contains("clear_finish_mark,"),
-            "the list commands are not registered with the window"
+            main.contains("board_inbox,")
+                && main.contains("clear_finish_mark,")
+                && !main.contains("waiting_on_me"),
+            "the inbox commands are not registered with the window"
         );
 
         let i18n = include_str!("../../../../ui/shell-i18n.js");
+        for key in INBOX_KEYS {
+            assert_eq!(
+                i18n.matches(&format!("\"{key}\"")).count(),
+                4,
+                "{key} must be in en/ja/zh/es"
+            );
+        }
+        assert_eq!(
+            i18n.matches("\"waiting.").count(),
+            0,
+            "a word of the absorbed list is still in the catalogs"
+        );
         for key in [
-            "waiting.label",
-            "waiting.title",
-            "waiting.blocked",
-            "waiting.question",
-            "waiting.finished",
             "settings.notifications.finishOff",
             "settings.notifications.finishLong",
             "settings.notifications.finishAlways",
@@ -22309,6 +22666,112 @@ mod tests {
                 "{key} must be in en/ja/zh/es"
             );
         }
+    }
+
+    /// The words the inbox page asks the catalog for.
+    const INBOX_KEYS: [&str; 30] = [
+        "inbox.title",
+        "inbox.tabs.label",
+        "inbox.tab.all",
+        "inbox.tab.question",
+        "inbox.tab.handoff",
+        "inbox.tab.blocked",
+        "inbox.tab.notice",
+        "inbox.unreadOnly",
+        "inbox.list.label",
+        "inbox.fact.project",
+        "inbox.fact.task",
+        "inbox.fact.from",
+        "inbox.reply.label",
+        "inbox.reply.placeholder",
+        "inbox.pick",
+        "inbox.sum",
+        "inbox.landing",
+        "inbox.pane.blocked",
+        "inbox.pane.question",
+        "inbox.pane.finished",
+        "inbox.unread",
+        "inbox.read",
+        "inbox.empty",
+        "inbox.emptyUnread",
+        "inbox.confirm",
+        "inbox.openPane",
+        "inbox.openBoard",
+        "inbox.note.question",
+        "inbox.note.handoff",
+        "inbox.note.blocked",
+    ];
+
+    /// The inbox reads one snapshot (t-67483): its letters and its numbers are
+    /// Rust's single reading (`board_inbox` → `orchestration::inbox::inbox_of`),
+    /// and the page draws the numbers it is given. It does not ask the desk or
+    /// the panes a second time, and it does not count its own rows into a tab,
+    /// the sidebar or the summary line. Answers, passes and acks leave by the
+    /// ledger's own doors, and a stopped pane is only ever opened — the page
+    /// holds no door to allow or deny.
+    #[test]
+    fn the_inbox_reads_one_snapshot() {
+        let inbox = include_str!("../../../../ui/shell-inbox.js");
+        let code = strip_comments(inbox);
+        for second_source in [
+            "board_desk",
+            "waiting_on_me",
+            "coordinator_seats",
+            "pane_agents",
+            "ledger_agents",
+            "deskLedger",
+        ] {
+            assert!(
+                !code.contains(second_source),
+                "the inbox page reads `{second_source}` beside its one snapshot"
+            );
+        }
+        for door in [
+            "invoke(\"desk_reply\"",
+            "invoke(\"desk_ack\"",
+            "invoke(\"desk_review_pass\"",
+        ] {
+            assert!(code.contains(door), "the page lost its door {door}");
+        }
+        for forbidden in ["answer_approval", "answer_ask", "approve", "deny"] {
+            assert!(
+                !code.contains(forbidden),
+                "the page presses `{forbidden}` — permissions are answered in the pane (draft Q3)"
+            );
+        }
+
+        let badge = block_after(&code, "function paintInboxBadge(");
+        assert!(
+            badge.contains("inboxSnapshot.counts?.waiting") && !badge.contains(".items"),
+            "the sidebar's number is no longer Rust's `counts.waiting`:\n{badge}"
+        );
+        let view = block_after(&code, "function paintInboxView(");
+        assert!(
+            view.contains("counts[tab]")
+                && view.contains("counts.waiting")
+                && view.contains("counts.notice"),
+            "the tabs and the summary are no longer drawn from `counts`:\n{view}"
+        );
+        assert!(
+            !view.contains("items.length") && !view.contains(".items.filter("),
+            "the page counts its own rows for a number it draws:\n{view}"
+        );
+
+        let backend = include_str!("../../src/cmd/waiting.rs");
+        let (shipped, _) = backend.split_once("#[cfg(test)]").unwrap_or((backend, ""));
+        let command = block_after(shipped, "pub(crate) fn board_inbox(");
+        assert!(
+            command.contains("pane_waits(&state)")
+                && command.contains("inbox_of(")
+                && command.contains("board_ledger_snapshot().desk"),
+            "`board_inbox` is no longer the desk snapshot and the panes, made once:\n{command}"
+        );
+        let reading = include_str!("../../src/orchestration/inbox.rs");
+        assert_eq!(
+            reading.matches("InboxCounts {").count(),
+            2,
+            "the counts are made in more than one place (the type, `inbox_of`)"
+        );
     }
 
     /// A lane rings through the same bell as a pane.
@@ -22766,7 +23229,8 @@ mod tests {
         let backend = shipped_backend();
         let sending = block_after(backend, "fn type_prompt_at_term(");
         assert!(
-            sending.contains("deliveries.contains_key(&term)")
+            sending.contains("crate::prompt_transaction::line_is_taken(")
+                && sending.contains("&state.shell_runtime().moving_terms,")
                 && sending.contains("prompt_queue()")
                 && sending.contains("push_back(QueuedPrompt"),
             "a second prompt can interleave with the delivery already on the line:\n{sending}"
@@ -24811,13 +25275,23 @@ mod tests {
         // The empty-means-remove half of the contract, in the crate that keeps
         // it. Named as the two calls rather than counted, because what matters
         // is which branch each value takes.
+        // The value becomes an edit, and each start applies a `None` edit as
+        // a removal: portable_pty's builder, and the fork-free start on macOS
+        // (t-73907).
         let spawning = block_after(pty, "for (key, value) in env {");
+        let applying = block_after(pty, "for (key, value) in edits {");
+        let posix = include_str!("../../../zerocode-pty/src/posix_launch.rs");
+        let editing = block_after(posix, "for (key, value) in edits {");
         assert!(
             spawning.contains("if value.is_empty()")
-                && spawning.contains("command.env_remove(key)")
-                && spawning.contains("command.env(key, value)"),
+                && spawning.contains("edits.push((key, None))")
+                && spawning.contains("edits.push((key, Some(value)))")
+                && applying.contains("None => command.env_remove(key)")
+                && applying.contains("Some(value) => command.env(key, value)")
+                && editing.contains("env.retain(|(named, _)| named != key)")
+                && editing.contains("if let Some(value) = value"),
             "an empty environment value no longer REMOVES the variable, so a \
-             cleared credential would reach the child as an empty one:\n{spawning}"
+             cleared credential would reach the child as an empty one:\n{spawning}\n{applying}\n{editing}"
         );
 
         // And the half that relies on it, at both the places a config directory
@@ -27455,10 +27929,13 @@ mod tests {
         // completion; the card's note says so while it waits.
         let signing = block_after(window, "async function startGoogleLogin(");
         assert!(
-            signing.contains(r#"invoke("google_login_start")"#)
-                && signing.contains("openGoogleConsentInSystemBrowser()")
+            signing.contains(
+                r#"invoke("google_login_start", undefined, { hand: flowHand(started) })"#
+            ) && signing.contains("openGoogleConsentInSystemBrowser()")
                 && !signing.contains("openBrowserTab(")
-                && signing.contains(r#"invoke("google_login_finish")"#)
+                && signing.contains(
+                    r#"invoke("google_login_finish", undefined, { hand: flowHand(started) })"#
+                )
                 && signing.contains("googleLoginMoved()"),
             "the sign-in no longer hands consent to the system browser and \
              waits for the loopback:\n{signing}"
@@ -28575,12 +29052,12 @@ mod tests {
         // comes off on the way through in both, so what actually closes the tab
         // is the ordinary close underneath (a document still asks about its
         // unsaved typing).
-        let closing = block_after(window, "function closeTab(id) {");
+        let closing = block_after(window, "function closeTab(id, started = handNow()) {");
         let gated = [
             format!("  if (tab.{}) {{", "pinned"),
             format!("    if (!{}) {{", "confirmClosePinnedTab"),
             format!("      tab.{} = false;", "pinned"),
-            format!("      {}(id);", "closeTab"),
+            format!("      {}(id, started);", "closeTab"),
             "      return;".to_string(),
             "    }".to_string(),
             format!("    void {}(tab).then((proceed) => {{", "askAboutPinned"),
@@ -28731,7 +29208,7 @@ mod tests {
             "set_skip_delete_worktree_confirm",
             "setting_key::SKIP_DELETE_WORKTREE_CONFIRM",
             "settings.skip_delete_worktree_confirm = skip;",
-            "function setAskBeforeDeletingWorktrees(on) {",
+            "function setAskBeforeDeletingWorktrees(on, hand = handNow()) {",
             "skip_delete_worktree_confirm",
             "skipDeleteWorktreeConfirm = snapshot.skip_delete_worktree_confirm === true;",
         );
@@ -28746,9 +29223,9 @@ mod tests {
             request.contains("if (!skipDeleteWorktreeConfirm)")
                 && request.contains("await askToRemoveWorktree(worktree)")
                 && request.contains(
-                    "await invoke(\"remove_worktree\", { path: worktree.path, discardChanges: false })",
+                    "await invoke(\"remove_worktree\", { path: worktree.path, discardChanges: false }, { hand: flowHand(started) })",
                 )
-                && request.contains("await finishWorktreeRemoval(worktree)")
+                && request.contains("await finishWorktreeRemoval(worktree, flowHand(started))")
                 && !request.contains("discardChanges: true"),
             "skipping the question no longer means safe-first with a review fallback:\n{request}"
         );
@@ -28952,7 +29429,7 @@ mod tests {
             "set_skip_delete_automation_confirm",
             "setting_key::SKIP_DELETE_AUTOMATION_CONFIRM",
             "settings.skip_delete_automation_confirm = skip;",
-            "function setAskBeforeDeletingAutomations(on) {",
+            "function setAskBeforeDeletingAutomations(on, hand = handNow()) {",
             "skip_delete_automation_confirm",
             "skipDeleteAutomationConfirm = snapshot.skip_delete_automation_confirm === true;",
         );
@@ -28970,8 +29447,9 @@ mod tests {
             request.contains("if (!skipDeleteAutomationConfirm)")
                 && request.contains("await askConfirm({")
                 && request.contains("askRemembered()")
-                && request.contains("setAskBeforeDeletingAutomations(false)")
-                && request.contains("await deleteAutomationAndHistory(automation)"),
+                && request.contains("setAskBeforeDeletingAutomations(false, flowHand(started))")
+                && request
+                    .contains("await deleteAutomationAndHistory(automation, flowHand(started))"),
             "automation deletion bypasses the stored question or its single delete owner:\n{request}"
         );
         let deleting = block_after(shipped, "fn delete_automation_and_run_history(");
@@ -32849,7 +33327,10 @@ mod tests {
             2,
             "a drop no longer reports the placed worker's move:\n{dragged}"
         );
-        let closed = block_after(window, "async function closePaneLeaf(tab, going) {");
+        let closed = block_after(
+            window,
+            "async function closePaneLeaf(tab, going, hand = handNow()) {",
+        );
         assert!(
             closed.contains("noteWorkerRoomChange(going, \"background\")"),
             "closing a tiled worker no longer reports the move:\n{closed}"
@@ -33776,8 +34257,9 @@ mod tests {
         // 5. The trash deletes the saved command, not the terminal's peace.
         let submenu = block_after(source, "async function openQuickCommands(anchor, term) {");
         assert!(
-            submenu.contains(r#"invoke("delete_quick_command", { id: command.id })"#)
-                && submenu.contains("event.stopPropagation();"),
+            submenu.contains(
+                r#"invoke("delete_quick_command", { id: command.id }, { hand: handNow() })"#
+            ) && submenu.contains("event.stopPropagation();"),
             "the quick-command trash is unwired or runs the row on the way \
              out:\n{submenu}"
         );
@@ -33967,8 +34449,7 @@ mod tests {
             .split_once("#[cfg(test)]")
             .unwrap_or((transaction, ""));
         assert!(
-            block_after(transaction, "pub(super) fn settle(")
-                .contains(".handing_back(next.hands_back)"),
+            block_after(transaction, "fn take_next(").contains(".handing_back(next.hands_back)"),
             "an activated queued prompt forgot whose words it carries"
         );
         let pumping = block_after(backend, "fn pump_loop(app: &AppHandle) {");
@@ -36941,7 +37422,10 @@ mod tests {
     fn closing_a_split_lets_the_agent_in_it_keep_running() {
         let window = window_source();
 
-        let closing = block_after(window, "async function closePaneLeaf(tab, going) {");
+        let closing = block_after(
+            window,
+            "async function closePaneLeaf(tab, going, hand = handNow()) {",
+        );
         assert!(
             closing.contains("if (termHoldsAgent(going)) {")
                 && closing.contains("detachedAgents.set(going, tab.worktree);")

@@ -10,8 +10,127 @@
  * states, the permission modal, status-bar numbers. Unknown frame types flow
  * past silently (제품 원칙 5). */
 
-const { invoke, Channel: TauriChannel } = window.__TAURI__.core;
+const { invoke: invokeBackend, Channel: TauriChannel } = window.__TAURI__.core;
 const { listen: listenToBackend } = window.__TAURI__.event;
+
+/* Whose hand made a command (t-74927, t-75209). The window runs a person-only
+ * command (`PERSON_ONLY_COMMANDS`, self_surface.rs) only when the page says
+ * the person made it, so every call says so in `zerocode-hand`. The hand is
+ * the flow's, never the page's last input: the person moving elsewhere while
+ * an agent's flow awaits gives that flow nothing.
+ *
+ *  - `person` inside the person's own event — a pointer, a touch, a key or
+ *    the text they type, which the browser marks `isTrusted`, what the page
+ *    answers it with, and the microtasks it settles (a question's answer) —
+ *    made outside a press. A focus, a blur, a change or a submit is trusted
+ *    too when the page's own focus() or click() sets it off, so it is the
+ *    person's only inside their event, or as a checkbox's change the hand of
+ *    the click that flipped it (t-75431); a handler that saves on blur
+ *    carries the hand that wrote what it saves;
+ *  - `agent` inside an agent's press in this window (shell-self-act.js), and
+ *    for the rest of the flow it started, when the flow carries its hand;
+ *  - `none` anywhere else: after an await that left the event behind, a
+ *    timer, a backend event. A flow that awaits before its person-only
+ *    command carries the hand it started with (`flowHand`);
+ *  - `program`, asked for by name, for the one road no hand starts and the
+ *    window still runs a person-only command on: the update clock's quiet
+ *    download.
+ *
+ * No clock decides, and no input a flow did not start with moves its hand. */
+const HAND_HEADER = "zerocode-hand";
+const PERSON_MOVES = [
+  "pointerdown", "pointerup", "mousedown", "mouseup", "click", "auxclick", "dblclick", "contextmenu",
+  "touchstart", "touchend", "keydown", "keyup",
+];
+let agentPressing = false;
+// The person's own event the browser is dispatching, if one is: a page's
+// `click()` inside it (Enter pressing a button) is still the person's.
+let personEvent = null;
+// The last click the page saw, whoever made it, with its hand: a checkbox's
+// change is fired after that click's dispatch, and answers it.
+let lastClick = null;
+
+for (const kind of PERSON_MOVES) {
+  window.addEventListener(kind, (event) => {
+    if (event.isTrusted && !agentPressing) personEvent = event;
+  }, true);
+}
+window.addEventListener("click", (event) => {
+  lastClick = { target: event.target, hand: handNow() };
+}, true);
+
+/* Whether a trusted event is the person's own move: a pointer, a touch, a
+ * key, or text typed, pasted or dropped (an InputEvent — the input a
+ * checkbox's click() fires is a plain Event). */
+function personMove(event) {
+  return PERSON_MOVES.includes(event.type) || event instanceof InputEvent;
+}
+
+/* One key, one press (t-75153, R7b). A held Enter or Space repeats, and each
+ * repeat on a focused button, link or box presses it again — as the person's
+ * own key. The ask popup has said so since it stood (shell-term.js); every
+ * control the keyboard can press says it here. Typing keeps its repeats: a
+ * field, an editor and the terminal are not pressed. */
+function stopRepeatedPress(event) {
+  if (!event.repeat || (event.key !== "Enter" && event.key !== " ")) return false;
+  event.preventDefault();
+  event.stopPropagation();
+  return true;
+}
+
+const PRESSED_BY_KEY = 'button, a[href], summary, [role="button"], [role="menuitem"], [role="link"], '
+  + 'input[type="button"], input[type="submit"], input[type="reset"], input[type="checkbox"], input[type="radio"]';
+
+function stopRepeatedControlPress(event) {
+  if (event.target instanceof Element && event.target.matches(PRESSED_BY_KEY)) stopRepeatedPress(event);
+}
+
+window.addEventListener("keydown", stopRepeatedControlPress, true);
+
+/* The hand of the event the page is answering right now. */
+function handNow() {
+  if (agentPressing) return "agent";
+  const event = window.event;
+  if (!event) return "none";
+  if (event.isTrusted && personMove(event)) return "person";
+  const flipped = event.target;
+  if (event.isTrusted && (event.type === "change" || event.type === "input")
+    && flipped instanceof HTMLInputElement && (flipped.type === "checkbox" || flipped.type === "radio")
+    && lastClick?.target === flipped) {
+    return lastClick.hand;
+  }
+  return personEvent !== null && personEvent.eventPhase !== Event.NONE ? "person" : "none";
+}
+
+/* The hand of a flow that started with `started` (`handNow()` before its
+ * first await), said at one of its later steps: the agent's flow stays the
+ * agent's whatever the person pressed meanwhile — a question it opened too;
+ * a flow no hand started is the person's when the person's own answer is the
+ * event this step answers (the window's close, asked by the backend). */
+function flowHand(started) {
+  const now = handNow();
+  if (started === "agent" || now === "agent") return "agent";
+  return now === "person" ? "person" : started;
+}
+
+/* An agent's press: `press` runs as the agent's, and the flow it starts
+ * carries that hand. */
+function asAgentPress(press) {
+  agentPressing = true;
+  try {
+    return press();
+  } finally {
+    agentPressing = false;
+  }
+}
+
+/* Tauri's `invoke`, saying whose hand made the call: `options.hand` when the
+ * caller carries a flow's hand or names the `program` road, the event the
+ * page is answering otherwise. */
+const invoke = (command, args, options) => {
+  const { hand = handNow(), ...rest } = options ?? {};
+  return invokeBackend(command, args, { ...rest, headers: { ...rest.headers, [HAND_HEADER]: hand } });
+};
 
 /* The backend event this window is answering right now, by name — what the
  * black box says moved the stage when a program did (t-69526: a worker's pane

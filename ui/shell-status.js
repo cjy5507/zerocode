@@ -344,6 +344,15 @@ function flashPane(term) {
  * Both commit on blur and on Enter rather than per keystroke — a keychain
  * write per typed character is a keychain prompt per typed character. */
 let opencodeCookieConfigured = false;
+// Whose hand wrote the cookie box's text (t-75431): a blur is no one's move —
+// the page's own focus() sets it off as well as the person leaving the box —
+// so the save carries the hand that wrote what it saves. An agent's fill keeps
+// the text the agent's until the box is emptied.
+let opencodeCookieHand = "none";
+
+el("opencode-cookie").addEventListener("input", (event) => {
+  opencodeCookieHand = event.currentTarget.value === "" ? "none" : flowHand(opencodeCookieHand);
+});
 
 function commitOpencodeCookie() {
   const field = el("opencode-cookie");
@@ -351,14 +360,17 @@ function commitOpencodeCookie() {
   // An empty box is not "clear it": the box is empty whenever a cookie is
   // already held, because a stored secret is never read back into the window.
   if (pasted === "") return;
+  const hand = flowHand(opencodeCookieHand);
   field.value = "";
-  void commitSetting("opencode_cookie_configured", "set_opencode_cookie", { cookie: pasted })
+  opencodeCookieHand = "none";
+  void commitSetting("opencode_cookie_configured", "set_opencode_cookie", { cookie: pasted }, { hand })
     .then(() => refreshProviderUsage(usageProvider("opencode-go"), true));
 }
 
 function clearOpencodeCookie() {
   el("opencode-cookie").value = "";
-  void commitSetting("opencode_cookie_configured", "set_opencode_cookie", { cookie: "" });
+  opencodeCookieHand = "none";
+  void commitSetting("opencode_cookie_configured", "set_opencode_cookie", { cookie: "" }, { hand: handNow() });
 }
 
 for (const [id, run] of [
@@ -4380,11 +4392,21 @@ function paintScmMark() {
 
 listen("scm:notices", (event) => paintScmNotices(event.payload));
 
-el("sb-scm-notices").addEventListener("click", () => {
-  const row = scmStanding[0];
-  if (!row) return;
-  if (row.root !== activeWorktreePath) selectWorktree(row.root);
-  setActivityItem("checks");
+el("sb-scm-notices").addEventListener("click", (event) => {
+  const open = (row) => {
+    if (row.root !== activeWorktreePath) selectWorktree(row.root);
+    setActivityItem("checks");
+  };
+  if (scmStanding.length === 1) {
+    open(scmStanding[0]);
+  } else if (scmStanding.length > 1) {
+    const mark = event.currentTarget;
+    const box = mark.getBoundingClientRect();
+    openSidebarMenu(box.left, box.top, scmStanding.map((row) => ({
+      label: scmWords(row),
+      run: () => open(row),
+    })), mark);
+  }
 });
 
 /* Today's model lineup moved (t-14437): one line per agent, said once — a
@@ -4556,6 +4578,13 @@ function renderTabs() {
   const jevDoor = el("nav-jev");
   const jevPressed = String(activeTabId === JEV_TAB.id);
   if (jevDoor.getAttribute("aria-pressed") !== jevPressed) jevDoor.setAttribute("aria-pressed", jevPressed);
+  // The inbox's row in the sidebar says the same of its page: it is the screen on stage.
+  const inboxDoor = el("nav-inbox");
+  const onInbox = activeTabId === INBOX_TAB.id;
+  if (inboxDoor.hasAttribute("aria-current") !== onInbox) {
+    if (onInbox) inboxDoor.setAttribute("aria-current", "page");
+    else inboxDoor.removeAttribute("aria-current");
+  }
   // The machine figures ride along, bounded — a render is a fine moment to
   // notice they are stale, and a terrible one to spawn `lsof`.
   paintMachineFigures();
@@ -4602,6 +4631,10 @@ function buildTabNode(tab, group) {
       ? '<span class="tab-pin" aria-hidden="true"></span>'
       : '<button class="tab-close">×</button>');
   if (tab.pinned) node.querySelector(".tab-pin").innerHTML = icon("pin");
+  // A terminal tab's close ends whatever runs in it — another agent's work
+  // or the person's — so an agent pressing in the window never makes it (t-73906).
+  const close = node.querySelector(".tab-close");
+  if (tab.kind === "term" && close) close.dataset.personOnly = "";
   // What kind of thing this tab holds. Orca's tabs carry one (measured on
   // 1.4.164: its `Terminal 1` tab wears a terminal glyph), and a strip of
   // bare words is the thing that reads as a wireframe — the same finding
@@ -5292,6 +5325,8 @@ function setActiveTab(id) {
     // And looking at it moves it up the group's recency order — the order
     // that decides where the eye lands when a tab closes.
     if (owner.pane !== undefined) pushRecentTab(owner.pane, owner.id);
+    // A terminal the person brought forward is a place ⌘J can go back to.
+    if (owner.kind === "term") rememberRecentPlace({ kind: "pane", id: owner.id, label: tabLabel(owner) });
   }
   // The document surfaces are painted by `updateStage`, per leaf, rather than
   // here for the one tab that was clicked \u2014 see the note there.
@@ -5704,16 +5739,10 @@ function dropTab(id, { closed = false, nativeClosed = false } = {}) {
  * whether a foreground job owns it. The hook state is a fallback only when a
  * platform/transport cannot answer that process-group question. The person's
  * "don't ask again" answer is a canonical setting shared by every window and
- * the next boot; this old localStorage key is read only for one-way migration. */
+ * the next boot; the old localStorage key of pre-canonical builds is never
+ * read, only removed once that setting says skip (t-75153). */
 const CLOSE_RUNNING_KEY = "zerocode.confirm-close-running.v1";
 let confirmCloseRunning = true;
-let closeRunningLegacyMigrationStarted = false;
-let legacySkipCloseRunningConfirm = false;
-try {
-  legacySkipCloseRunningConfirm = localStorage.getItem(CLOSE_RUNNING_KEY) === "off";
-} catch {
-  // Refusing legacy browser storage cannot weaken the canonical default.
-}
 
 function setConfirmCloseRunning(on) {
   confirmCloseRunning = on;
@@ -5751,7 +5780,9 @@ async function terminalCloseNeedsConfirmation(terms) {
   return ids.some((term) => hookStates.get(term) === "working");
 }
 
-async function askAboutRunning(tab, terms) {
+/* `started` is the hand of the close that asks (shell-boot.js `flowHand`,
+ * t-75209): "don't ask again" is the person's to say (t-74975). */
+async function askAboutRunning(tab, terms, started) {
   const agent = terms.some((term) => hookStates.get(term) === "working") || !!tab.agent;
   const name = tab.agent || t("board.agent", "에이전트");
   const answer = await askConfirm({
@@ -5778,6 +5809,7 @@ async function askAboutRunning(tab, terms) {
       "skip_close_terminal_with_running_process_confirm",
       "set_skip_close_terminal_with_running_process_confirm",
       { skip: true },
+      { hand: flowHand(started) },
     ).then((snapshot) => {
       if (snapshot?.skip_close_terminal_with_running_process_confirm === true) {
         forgetLegacyCloseRunningPreference();
@@ -5925,14 +5957,14 @@ function refuseSyntheticClose(tab, road, held) {
 /* A close's question answered (or nothing to ask, after a look): said in the
  * black box, and the close goes on through the same door with its one
  * consumed pass — or stops here. */
-function passCloseCheck(tab, road, held, asked, proceed) {
+function passCloseCheck(tab, road, held, asked, proceed, started) {
   closeChecks.delete(tab.id);
   const standing = tabs.some((one) => one.id === tab.id);
   const outcome = !standing ? "gone meanwhile" : !proceed ? "kept" : asked ? "close requested after asking" : "close requested";
   noteCloseRoad(tab, road, held, outcome);
   if (!standing || !proceed) return;
   closeConfirmed.add(tab.id);
-  closeTab(tab.id);
+  closeTab(tab.id, started);
 }
 
 /* One-shot passes for a close the person already confirmed — consumed by the
@@ -5940,7 +5972,10 @@ function passCloseCheck(tab, road, held, asked, proceed) {
 const closeConfirmed = new Set();
 const closeChecks = new Set();
 
-function closeTab(id) {
+/* `started` is the hand the close began with, carried through its own
+ * re-entries after a dialog (shell-boot.js `flowHand`, t-75209): ending a
+ * lane or a terminal is the person's (t-74975). */
+function closeTab(id, started = handNow()) {
   const tab = tabs.find((held) => held.id === id);
   if (!tab) return;
   // A pinned tab closes only on purpose. Whether that purpose has to be
@@ -5954,13 +5989,13 @@ function closeTab(id) {
   if (tab.pinned) {
     if (!confirmClosePinnedTab) {
       tab.pinned = false;
-      closeTab(id);
+      closeTab(id, started);
       return;
     }
     void askAboutPinned(tab).then((proceed) => {
       if (!proceed) return;
       tab.pinned = false;
-      closeTab(id);
+      closeTab(id, flowHand(started));
     });
     return;
   }
@@ -5968,7 +6003,7 @@ function closeTab(id) {
   // — the same thing closing a terminal tab means anywhere else. The
   // `lane:closed` event takes the tab off the strip.
   if (tab.kind === "lane") {
-    if (focusedId) closeLane(focusedId);
+    if (focusedId) closeLane(focusedId, flowHand(started));
     return;
   }
   // A terminal tab IS its shell, so closing the tab ends the process — the
@@ -5989,7 +6024,7 @@ function closeTab(id) {
           return;
         }
         closeChecks.add(id);
-        void askAboutSeats(held).then((proceed) => passCloseCheck(tab, road, held, true, proceed));
+        void askAboutSeats(held).then((proceed) => passCloseCheck(tab, road, held, true, proceed, flowHand(started)));
         return;
       }
       if (confirmCloseRunning) {
@@ -5997,8 +6032,8 @@ function closeTab(id) {
         closeChecks.add(id);
         void terminalCloseNeedsConfirmation(terms).then(async (needsConfirmation) => {
           const asking = needsConfirmation && tabs.some((one) => one.id === id);
-          const proceed = !asking || (await askAboutRunning(tab, terms));
-          passCloseCheck(tab, road, held, asking, proceed);
+          const proceed = !asking || (await askAboutRunning(tab, terms, started));
+          passCloseCheck(tab, road, held, asking, proceed, flowHand(started));
         });
         return;
       }
@@ -6009,7 +6044,7 @@ function closeTab(id) {
     closeChecks.add(id);
     // Confirm each pane separately. A partial refusal keeps the tab and
     // only the panes whose programs did not confirm their exit.
-    void closeTerminalTab(tab, "close-tab").finally(() => {
+    void closeTerminalTab(tab, "close-tab", flowHand(started)).finally(() => {
       closeChecks.delete(id);
       if (termFloat.hidden && document.activeElement === document.body) keySink.focus();
     });

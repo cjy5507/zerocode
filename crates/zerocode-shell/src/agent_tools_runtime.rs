@@ -865,6 +865,127 @@ fn split_launch_agent(command: &str) -> Option<&'static str> {
     spoken.as_deref().and_then(agent_for_program)
 }
 
+impl TeamWindow {
+    /// Whether the briefing a worker was launched with stands on its screen
+    /// (t-74381); `None` when it does, else the sentence the launch fails with.
+    ///
+    /// The delivery that wrote it reports the words written and the Enter
+    /// pressed, never that the program kept them: Claude Code takes its first
+    /// input handler down while it boots and drops what the handler held,
+    /// which left a pane at an empty composer under a ledger line that said
+    /// the worker started. So the screen is read — the head of the briefing,
+    /// or the placeholder a long paste folds to — for [`BRIEFING_WINDOW`];
+    /// when it never shows, the briefing is typed once more to the composer
+    /// that stands by then, and when it still does not, the launch says so.
+    /// That retype is a success only once its own delivery says it was
+    /// submitted, and the screen is read after that (t-74919): its words
+    /// stand in the composer before their Enter, and stay there under an
+    /// Enter the delivery withholds. Its outcome is waited for on the
+    /// agent's own deadline and the submission receipt's patience, never the
+    /// watch's window. Only an agent whose row names a composer glyph is
+    /// checked: the others have no measured screen to read it off.
+    fn confirm_briefing(&self, term: TermId, pending: &PendingWorkerReadiness) -> Option<String> {
+        use zerocode_pty::briefing::{BRIEFING_WINDOW, Unheard, Verdict, confirm};
+        let glyph = pending.composer?;
+        if pending.briefing.trim().is_empty() {
+            return None;
+        }
+        let state = self.app.state::<AppState>();
+        let agent = state.agent_terms().get(&term).copied();
+        let deadline = ready_timeout_for(agent);
+        let mut pane = LaunchPane {
+            state: &state,
+            term,
+            briefing: &pending.briefing,
+            glyph,
+            agent,
+            deadline,
+        };
+        let why = match confirm(
+            &mut pane,
+            &pending.briefing,
+            BRIEFING_WINDOW,
+            deadline + zerocode_pty::ready::SUBMIT_RECEIPT_PATIENCE,
+        ) {
+            Verdict::Taken => return None,
+            Verdict::Gone => {
+                return Some("the worker exited before its briefing was seen on its screen".into());
+            }
+            Verdict::Undelivered(Unheard::NeverShown) => {
+                "typed twice, and the worker's screen never showed it".to_string()
+            }
+            Verdict::Undelivered(Unheard::RetypeEnded(outcome)) => {
+                format!("typed again, and that delivery ended {outcome:?}, not submitted")
+            }
+            Verdict::Undelivered(Unheard::RetypeUnanswered) => {
+                "typed again, and that delivery never answered".to_string()
+            }
+        };
+        note_window_event(
+            state.local_data_root(),
+            &format!("term {term} briefing not delivered: {why}"),
+        );
+        Some(format!("briefing not delivered (브리핑 미전달): {why}"))
+    }
+}
+
+/// A worker's pane as the briefing watch reads and types at it (t-74381,
+/// t-74919).
+struct LaunchPane<'a> {
+    state: &'a AppState,
+    term: TermId,
+    briefing: &'a str,
+    glyph: char,
+    agent: Option<&'static str>,
+    /// The agent's own readiness deadline, which the retype pays.
+    deadline: Duration,
+}
+
+impl zerocode_pty::briefing::BriefingPane for LaunchPane<'_> {
+    fn screen(&mut self) -> Option<String> {
+        let held = self.state.terminals().handle(self.term)?;
+        let pty = lock_pty(&held);
+        let grid = pty.terminal().grid();
+        let mut text = String::new();
+        for index in 0..grid.scrollback_len() {
+            text.push_str(&grid.scrollback_line(index));
+            text.push('\n');
+        }
+        text.push_str(&grid.visible_text());
+        Some(text)
+    }
+
+    /// The briefing typed once more, to the composer that stands by now:
+    /// any sign of rest says go, on the agent's own quiet window and
+    /// deadline.
+    fn retype(&mut self) -> std::sync::mpsc::Receiver<DeliveryOutcome> {
+        let (notify, waiting) = std::sync::mpsc::sync_channel(1);
+        self.state.delivery_waiters().insert(self.term, notify);
+        self.state.deliveries().insert(
+            self.term,
+            PromptDelivery::with_deadlines(
+                self.briefing.to_string(),
+                true,
+                zerocode_pty::ReadySignal::Rest(Some(self.glyph)),
+                Instant::now(),
+                ready_quiet_for(self.agent),
+                self.deadline,
+            )
+            .clearing(false)
+            .guarded(zerocode_pty::ready::Guard::for_its_own_line(
+                crate::cmd::terminal::launch_of(self.state, self.term),
+            ))
+            .words(composer_words_for(self.agent)),
+        );
+        waiting
+    }
+
+    fn withdraw(&mut self) {
+        self.state.deliveries().remove(&self.term);
+        self.state.delivery_waiters().remove(&self.term);
+    }
+}
+
 impl agent_teams::Host for TeamWindow {
     /// The Codex lease a split of `command` will need, taken now — before its
     /// caller takes the team table (t-51380).
@@ -989,24 +1110,36 @@ impl agent_teams::Host for TeamWindow {
                 .is_some_and(|queued| !queued.is_empty())
     }
 
-    /// The hook's word held still while it is read and while `commit` runs:
-    /// a report that the pane took a prompt or a tool waits on the same lock
-    /// the hook road writes `pane_states` under (t-46106). Words on their way
-    /// are asked first, under the typing door's locks and outside this one,
-    /// so the two never nest.
+    /// Hold this pane's prompts in its queue from the empty observation
+    /// through commit, under the registration door's own lock, so a pointer
+    /// either registers first and defers the move or queues behind it. The
+    /// ledger's write runs with that lock let go (t-74974): the pump turns
+    /// every pane under it, and one move must not stop the others' output.
+    /// The hook's word is held still while it is read and while `commit`
+    /// runs: a report that the pane took a tool waits on the same lock the
+    /// hook road writes `pane_states` under (t-46106).
     fn with_between_turns_observation(&self, term: TermId, commit: &mut dyn FnMut()) {
-        if self.typing_in_flight(term) {
-            return;
-        }
         let state = self.app.state::<AppState>();
-        let states = state.pane_states();
-        let done = states
-            .get(&term)
-            .is_some_and(|pane| pane.state == zerocode_core::hook::HookState::Done);
-        if done && turn_rests_on_an_empty_line(self, term) && output_settled(&state, term) {
-            commit();
+        let runtime = state.shell_runtime();
+        let lines = crate::prompt_transaction::PromptLines {
+            deliveries: &runtime.deliveries,
+            waiters: &runtime.delivery_waiters,
+            queue: &runtime.prompt_queue,
+            moving: &runtime.moving_terms,
+        };
+        let took = crate::prompt_transaction::with_no_prompt_in_flight(&lines, term, &mut || {
+            let states = state.pane_states();
+            let done = states
+                .get(&term)
+                .is_some_and(|pane| pane.state == zerocode_core::hook::HookState::Done);
+            if done && turn_rests_on_an_empty_line(self, term) && output_settled(&state, term) {
+                commit();
+            }
+            drop(states);
+        });
+        if took {
+            state.cadence().wake();
         }
-        drop(states);
     }
 
     fn follow_account_switch(&self, now_ms: i64) {
@@ -1453,6 +1586,12 @@ impl agent_teams::Host for TeamWindow {
                  * can report completion while its row is still Sleeping. */
                 let restoring = prompt.resumed.is_some();
                 let submitted_prompt = (!restoring).then(|| prompt.prompt.clone());
+                let briefing = submitted_prompt.clone().unwrap_or_default();
+                let composer = match ready_signal_for(named) {
+                    zerocode_pty::ReadySignal::Prompt(glyph)
+                    | zerocode_pty::ReadySignal::AltScreenPrompt(glyph) => Some(glyph),
+                    _ => None,
+                };
                 let timeout = Duration::from_millis(u64::from(prompt.timeout_ms));
                 let started = Instant::now();
                 let (notify, waiting) = std::sync::mpsc::sync_channel(1);
@@ -1499,6 +1638,8 @@ impl agent_teams::Host for TeamWindow {
                     submitted,
                     started + timeout + zerocode_pty::ready::SUBMIT_RECEIPT_PATIENCE,
                     restoring,
+                    briefing,
+                    composer,
                 )
             });
         // Who started it — the same edge the board's subagent tree is drawn
@@ -1555,7 +1696,7 @@ impl agent_teams::Host for TeamWindow {
             );
         }
         state.cadence().wake();
-        if let Some((waiting, submitted, deadline, restoring)) = readiness {
+        if let Some((waiting, submitted, deadline, restoring, briefing, composer)) = readiness {
             state.worker_readiness().insert(
                 term,
                 WorkerReadinessSlot {
@@ -1568,6 +1709,8 @@ impl agent_teams::Host for TeamWindow {
                         previous_pane_token,
                         isolated,
                         restoring,
+                        briefing,
+                        composer,
                     }),
                     exited_screen: None,
                 },
@@ -1665,7 +1808,15 @@ impl agent_teams::Host for TeamWindow {
         let accepted = entered
             && terminal_is_live
             && await_prompt_submission(pending.submitted.as_ref(), pending.deadline);
-        if accepted && state.terminals().contains_key(&term) {
+        // Done is the words having been written, and a program still booting
+        // throws away what it is written (t-74381): the screen says whether
+        // the briefing stayed, and a pane that holds none is no success.
+        let undelivered = if accepted && !pending.restoring {
+            self.confirm_briefing(term, &pending)
+        } else {
+            None
+        };
+        if accepted && undelivered.is_none() && state.terminals().contains_key(&term) {
             state.worker_readiness().remove(&term);
             return Ok(());
         }
@@ -1699,7 +1850,9 @@ impl agent_teams::Host for TeamWindow {
             }
         }
 
-        let reason = if entered && terminal_is_live {
+        let reason = if let Some(why) = undelivered {
+            why
+        } else if entered && terminal_is_live {
             "the worker TUI never acknowledged the submitted briefing".to_string()
         } else if entered {
             "the worker exited while accepting its briefing".to_string()
@@ -1976,7 +2129,7 @@ impl agent_teams::Host for TeamWindow {
     ) -> Option<crate::quota_wall::DeclineReading> {
         // The table is asked before the grid is copied: an agent nobody
         // measured costs nothing per beat.
-        if !crate::quota_wall::has_rule(agent, crate::quota_wall::StallCause::ClassifierDecline) {
+        if !crate::quota_wall::witnesses_declines(agent) {
             return None;
         }
         let transcript = self
@@ -1994,7 +2147,7 @@ impl agent_teams::Host for TeamWindow {
         agent: &str,
         commit: &mut dyn FnMut(crate::quota_wall::DeclineReading, i64),
     ) {
-        if !crate::quota_wall::has_rule(agent, crate::quota_wall::StallCause::ClassifierDecline) {
+        if !crate::quota_wall::witnesses_declines(agent) {
             return;
         }
         let transcript = self
@@ -2318,6 +2471,10 @@ pub(super) fn beat_standing_orders(app: &AppHandle) {
         // And the ledger's record held against git's, once a minute, from the landing cache the
         // sidebar already keeps (t-34501): what is late is told, nothing is merged or deleted.
         crate::landing_watch_sweep::sweep(&beating, now_ms);
+        // And whether each landed task's commit is on the remote (t-73910 W4-2),
+        // once a minute: the reclaimer's git question, put to the remote's
+        // default branch; the desk is dressed from the answers on the next beat.
+        crate::remote_landing::sweep(&beating, now_ms);
     });
 }
 
@@ -2329,34 +2486,40 @@ pub(super) fn beat_standing_orders(app: &AppHandle) {
 /// a reserved road forward.
 #[derive(Clone)]
 pub(super) struct TeamWorkBudget {
-    pub(super) active: Arc<tokio::sync::Semaphore>,
-    pub(super) waiting: Arc<tokio::sync::Semaphore>,
+    pub(super) active: zerocode_hookd::busy::Seats,
+    pub(super) waiting: zerocode_hookd::busy::Seats,
 }
 
 impl TeamWorkBudget {
     pub(super) fn new() -> Self {
         Self {
-            active: Arc::new(tokio::sync::Semaphore::new(
+            active: zerocode_hookd::busy::Seats::new(
+                zerocode_hookd::busy::BusyEntry::WindowCredit,
                 zerocode_hookd::TEAM_ACTIVE_LIMIT,
-            )),
-            waiting: Arc::new(tokio::sync::Semaphore::new(zerocode_hookd::TEAM_WAIT_LIMIT)),
+            ),
+            waiting: zerocode_hookd::busy::Seats::new(
+                zerocode_hookd::busy::BusyEntry::WindowWaitCredit,
+                zerocode_hookd::TEAM_WAIT_LIMIT,
+            ),
         }
     }
 
     pub(super) fn try_admit(
         &self,
         request: &zerocode_hookd::TeamRequest,
-    ) -> Option<TeamWorkPermit> {
+    ) -> Result<TeamWorkPermit, zerocode_hookd::busy::Busy> {
         // The narrower credit first. If the total is then full, returning drops
         // this one immediately; a rejected wait never withholds a future wait
-        // seat while occupying no active seat.
+        // seat while occupying no active seat. The refusal names the credit
+        // that was full, so a "busy" that stands for hours says which one
+        // (t-47458).
         let waiting = if request.reserves_wait_slot() {
-            Some(Arc::clone(&self.waiting).try_acquire_owned().ok()?)
+            Some(self.waiting.try_acquire()?)
         } else {
             None
         };
-        let active = Arc::clone(&self.active).try_acquire_owned().ok()?;
-        Some(TeamWorkPermit {
+        let active = self.active.try_acquire()?;
+        Ok(TeamWorkPermit {
             _active: active,
             _waiting: waiting,
         })
@@ -2366,8 +2529,8 @@ impl TeamWorkBudget {
 /// Credits travel into the blocking closure and are returned by `Drop`,
 /// including unwinding and every early-return/refusal path.
 pub(super) struct TeamWorkPermit {
-    pub(super) _active: tokio::sync::OwnedSemaphorePermit,
-    pub(super) _waiting: Option<tokio::sync::OwnedSemaphorePermit>,
+    pub(super) _active: zerocode_hookd::busy::Seat,
+    pub(super) _waiting: Option<zerocode_hookd::busy::Seat>,
 }
 
 /// Admit or refuse one dequeued request without parking another task behind a
@@ -2382,9 +2545,9 @@ pub(super) fn schedule_team_request(
         return;
     }
     match budget.try_admit(&request) {
-        Some(permit) => spawn(permit, request),
-        None => {
-            let _ = request.answer.send(zerocode_hookd::TeamAnswer::busy());
+        Ok(permit) => spawn(permit, request),
+        Err(busy) => {
+            let _ = request.answer.send(zerocode_hookd::TeamAnswer::busy(&busy));
         }
     }
 }
@@ -2757,8 +2920,11 @@ pub(super) async fn computer_loop(
     mut requests: tokio::sync::mpsc::UnboundedReceiver<zerocode_hookd::ComputerRequest>,
 ) {
     install_confirm_asker(app.clone());
+    install_self_surface(app.clone());
+    install_share(app.clone());
     install_frame_notice(app.clone());
     install_band_notice(app.clone());
+    install_watch_notice(app.clone());
     let sequences = computer_use::sequence::SequenceGate::default();
     while let Some(request) = requests.recv().await {
         let steering = app.clone();
@@ -5866,6 +6032,12 @@ pub(super) fn answer_computer_command_with(
     if let Err(error) = input_policy.prepare(&mut command) {
         return computer_cli_error(command.json, &error.code, &error.message);
     }
+    // One window shared with an agent (t-73906): the first act in an app asks
+    // the person once, and nothing outside the shared window is reached.
+    let _share = match computer_use::share::admit(command.method, &command.params) {
+        Ok(scope) => scope,
+        Err(error) => return computer_cli_error(command.json, &error.code, &error.message),
+    };
     let surface_context = computer_use::surface_execution::begin(command.method);
     let waiting = Waiting::new(&SessionHelper, permission_window);
     let result = if command.method == ComputerMethod::Stop {
@@ -5897,6 +6069,7 @@ pub(super) fn answer_computer_command_with(
                 zerocode_core::computer_use::COMPUTER_PACE
             ),
             "helper": helper,
+            "stopWatch": computer_use::guard::watch_report(),
             "state": computer_use::state::snapshot(),
             "confirming": computer_use::confirm::open_questions(),
         }))
@@ -6507,6 +6680,77 @@ pub(super) fn install_confirm_asker(app: AppHandle) {
     }));
 }
 
+/// ZeroCode's own window as a target (t-73906): an act that names this app
+/// is answered by the window's page, which presses its own controls without
+/// an OS event. Only the main page is asked; it answers by id through
+/// [`crate::cmd::settings::computer_self_answer`].
+fn install_self_surface(app: AppHandle) {
+    use zerocode_core::computer_use_protocol::self_surface::{OwnApp, PAGE_ANSWER_MS};
+
+    let stem = std::env::current_exe().ok().and_then(|path| {
+        path.file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+    });
+    let own = OwnApp {
+        pid: std::process::id(),
+        bundle_id: app.config().identifier.clone(),
+        names: std::iter::once(app.package_info().name.clone())
+            .chain(stem)
+            .collect(),
+    };
+    computer_use::self_surface::install(
+        own,
+        std::sync::Arc::new(move |request| {
+            computer_use::self_surface::ask_through(
+                &|id, request| {
+                    let _ = app.emit_to(
+                        MAIN_WINDOW_LABEL,
+                        "computer:self-act",
+                        serde_json::json!({ "id": id, "request": request }),
+                    );
+                },
+                request,
+                std::time::Duration::from_millis(PAGE_ANSWER_MS),
+            )
+        }),
+    );
+}
+
+/// One window shared with an agent (t-73906): the card the first act in an
+/// app raises in the question popup, answered by id like a confirm, and the
+/// band told what is shared whenever it moves.
+fn install_share(app: AppHandle) {
+    use computer_use::{confirm, share};
+
+    let policy = app.clone();
+    share::install_required(Box::new(move || {
+        // Asked at every provider step, so from memory (t-74826): never the
+        // disk, never the lock a commit holds through its fsync (t-67102).
+        // The person's toggle commits, and every commit is remembered; a
+        // root nothing read yet is read once, healed rather than failed.
+        let snapshot = remembered_settings(policy.state::<AppState>().settings());
+        snapshot.document.computer_share_required
+    }));
+    let asking = app.clone();
+    share::install(
+        Box::new(move |card| {
+            let receiver = confirm::open(&card.id);
+            let _ = asking.emit("computer:share", card);
+            let decision =
+                confirm::wait(&receiver, std::time::Duration::from_millis(card.timeout_ms));
+            confirm::close(&card.id);
+            let _ = asking.emit(
+                "computer:share-closed",
+                serde_json::json!({ "id": card.id, "decision": decision }),
+            );
+            decision
+        }),
+        Box::new(move |state| {
+            let _ = app.emit("computer:share-state", state);
+        }),
+    );
+}
+
 /// The band hears a stop the helper's waiting answer moved (t-66753 B): the
 /// report it paints, as every road that moves the stop sends it — so the
 /// person's chord stops the work browsers too, with no command between.
@@ -6516,6 +6760,14 @@ fn install_band_notice(app: AppHandle) {
             "computer:activity",
             computer_use::guard::activity_report(None),
         );
+    }));
+}
+
+/// A stop watch that ended while its session stood is written in the
+/// window's black box (t-68324 ①): `eprintln!` reaches nobody there.
+fn install_watch_notice(app: AppHandle) {
+    computer_use::guard::install_watch_notice(Box::new(move |line| {
+        crate::note_window_event(app.state::<AppState>().local_data_root(), line);
     }));
 }
 
@@ -8337,6 +8589,19 @@ async fn dispatch_browser_command(
                     zerocode_core::browser_form::fields_lines(&read),
                 ),
                 Err(why) => browser_refused(format!("zerocode-browser: {why}\n")),
+            }
+        }
+        ("upload", _) => {
+            let command = match zerocode_core::agent_browser::parse_upload(argv) {
+                Ok(command) => command,
+                Err(why) => {
+                    return refused_unsent(dispatched, format!("zerocode-browser: {why}\n"));
+                }
+            };
+            let label = command.label.clone();
+            match cmd::browser::upload::automate_upload(app, &state, command).await {
+                Ok(report) => page_said(&label, report.to_string()),
+                Err(refusal) => executor_refused(dispatched, refusal),
             }
         }
         ("fill", _) => {

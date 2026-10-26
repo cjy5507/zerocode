@@ -33,8 +33,14 @@ pub enum WorkStage {
     /// Handed in, and no coordinator has written a review of it. A worker's
     /// own 「verified」 or 「merged」 rides beside it as [`WorkProgress::claimed`].
     ReportOnly,
-    /// The attempt ended without a successful report.
+    /// The attempt ended on the worker's own word that it failed: a
+    /// `worker_done` saying `ok:false`.
     Failed,
+    /// The attempt ended and nobody saw a result (t-73910): the coordinator
+    /// stopped or abandoned it, or its terminal went away — the ledger writes
+    /// `succeeded: None` for each, "a failure nobody observed" being the one
+    /// thing it will not record. Not a failure, and not a report to review.
+    Stopped,
     /// Completed, and every attempt ended handing nothing in: no review can
     /// ever be written ([`ReviewFacts::unreviewable`]). Over, not verified.
     Unreviewable,
@@ -66,10 +72,11 @@ pub enum WorkStage {
 
 impl WorkStage {
     /// Every stage, each once.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Working,
         Self::ReportOnly,
         Self::Failed,
+        Self::Stopped,
         Self::Unreviewable,
         Self::Waived,
         Self::Stale,
@@ -89,6 +96,7 @@ impl WorkStage {
             Self::Working => "working",
             Self::ReportOnly => "report_only",
             Self::Failed => "failed",
+            Self::Stopped => "stopped",
             Self::Unreviewable => "unreviewable",
             Self::Waived => "waived",
             Self::Stale => "stale",
@@ -110,6 +118,83 @@ impl WorkStage {
             Self::Verified | Self::NothingToLand | Self::Merged | Self::Deployed
         )
     }
+
+    /// What comes next for work at this stage (t-73910 W4-1), decided here
+    /// once: every surface translates the step's word and keeps no table of
+    /// its own. A stage added later must say its step to compile.
+    #[must_use]
+    pub const fn next_step(self) -> NextStep {
+        match self {
+            Self::Working => NextStep::Wait,
+            Self::ReportOnly => NextStep::Review,
+            Self::Failed => NextStep::RetryOrClose,
+            Self::Stopped => NextStep::RestartOrClose,
+            Self::Stale => NextStep::ReviewNewHead,
+            Self::Verified => NextStep::Land,
+            Self::Merged => NextStep::Ship,
+            // The newer attempt carries the work; this one is behind it.
+            Self::Superseded
+            | Self::Unreviewable
+            | Self::Waived
+            | Self::NothingToLand
+            | Self::Deployed
+            | Self::Closed => NextStep::Over,
+            Self::Unknown => NextStep::Unknown,
+        }
+    }
+}
+
+/// The step that comes next for a task's work, as a word every window table
+/// is read by: what is to be done, never a command (that is
+/// [`WorkProgress::next`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NextStep {
+    /// Its dependencies are not done yet.
+    AwaitDependencies,
+    /// Nobody carries it: summon a worker, or do it.
+    Summon,
+    /// A worker is on it.
+    Wait,
+    /// A decision stands in front of it: answer it.
+    Decide,
+    /// A dependency failed: mend it, or close this.
+    MendDependency,
+    /// Review what was handed in.
+    Review,
+    /// The worker said it failed: hand it out again, or close it.
+    RetryOrClose,
+    /// Nobody saw it end: start it again from where it stopped, or close it.
+    RestartOrClose,
+    /// The review stands for older work: review the newer source.
+    ReviewNewHead,
+    /// Verified: land it.
+    Land,
+    /// Landed: ship it.
+    Ship,
+    /// Nothing is left to do.
+    Over,
+    /// The ledger cannot say.
+    Unknown,
+}
+
+impl NextStep {
+    /// Every step, each once.
+    pub const ALL: [Self; 13] = [
+        Self::AwaitDependencies,
+        Self::Summon,
+        Self::Wait,
+        Self::Decide,
+        Self::MendDependency,
+        Self::Review,
+        Self::RetryOrClose,
+        Self::RestartOrClose,
+        Self::ReviewNewHead,
+        Self::Land,
+        Self::Ship,
+        Self::Over,
+        Self::Unknown,
+    ];
 }
 
 /// A [`WorkStage`] with the ids it stands on.
@@ -206,7 +291,7 @@ impl Run {
                 WORKTREE_EVIDENCE_VERB,
                 vec!["--worker".into(), current?.worker.clone()],
             ),
-            WorkStage::Failed => (
+            WorkStage::Failed | WorkStage::Stopped => (
                 WORKER_TRANSCRIPT_VERB,
                 vec!["--worker".into(), current?.worker.clone()],
             ),
@@ -278,8 +363,10 @@ fn stage_of(
             WorkStage::Unreviewable
         } else if older.is_open() {
             WorkStage::Working
-        } else if older.succeeded != Some(true) {
+        } else if older.succeeded == Some(false) {
             WorkStage::Failed
+        } else if older.succeeded.is_none() {
+            WorkStage::Stopped
         } else {
             WorkStage::Superseded
         };
@@ -312,8 +399,12 @@ fn stage_of(
     if attempt.is_open() {
         return (WorkStage::Working, None);
     }
-    if attempt.succeeded != Some(true) {
+    // Its worker said it failed, or nobody saw a result (t-73910).
+    if attempt.succeeded == Some(false) {
         return (WorkStage::Failed, None);
+    }
+    if attempt.succeeded.is_none() {
+        return (WorkStage::Stopped, None);
     }
     if review.author == ReviewAuthor::Coordinator
         && (review.superseded_by.is_some() || review.source_now.is_some())

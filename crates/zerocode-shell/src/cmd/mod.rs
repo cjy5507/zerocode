@@ -110,14 +110,15 @@ pub(crate) use appearance::{
     apply_ghostty_import, apply_ui_zoom, boot_after_restart, busy_census, computer_awake_status,
     leave_cancel, leave_hold, leave_now, leave_when_idle, listening_ports, log_window_error,
     patch_left_sidebar_appearance, patch_terminal_prefs, preview_ghostty_import,
-    preview_warp_terminal_themes, process_memory, resource_snapshot, set_agent_activity_display,
-    set_app_font_family, set_compact_worktree_cards, set_computer_awake_mode, set_locale,
-    set_minimize_to_tray_on_close, set_refresh_local_base_ref_on_worktree_create,
-    set_setup_script_launch_mode, set_show_git_ignored_files, set_show_menu_bar_icon,
-    set_show_titlebar_app_name, set_source_control_compare_base, set_source_control_group_order,
-    set_status_bar_item, set_terminal_opacity, set_terminal_prefs, set_terminal_shortcut_policy,
-    set_theme, set_ui_zoom, set_window_blur, stop_workspace_port, terminal_command_argv,
-    terminal_prefs, terminal_windows_status,
+    preview_warp_terminal_themes, process_memory, report_terminal_colors, resource_snapshot,
+    set_agent_activity_display, set_app_font_family, set_compact_worktree_cards,
+    set_computer_awake_mode, set_locale, set_minimize_to_tray_on_close,
+    set_refresh_local_base_ref_on_worktree_create, set_setup_script_launch_mode,
+    set_show_git_ignored_files, set_show_menu_bar_icon, set_show_titlebar_app_name,
+    set_source_control_compare_base, set_source_control_group_order, set_status_bar_item,
+    set_terminal_opacity, set_terminal_prefs, set_terminal_shortcut_policy, set_theme, set_ui_zoom,
+    set_window_blur, stop_workspace_port, terminal_command_argv, terminal_prefs,
+    terminal_windows_status,
 };
 
 pub(crate) use onboarding::{
@@ -142,7 +143,7 @@ pub(crate) use board::{
     quota_wall_retry, release_untitled_markdown, resume_line, resume_session, reveal_board_agent,
     save_clipboard_image, schedule_timeline, set_coordinator_handover, set_dock_badge,
     set_hooks_enabled, set_previewed_terms, set_watched_terms, term_pull, term_snapshot,
-    worker_screen,
+    turn_failed_retry, worker_screen,
 };
 pub(crate) use board::{
     land_batch_bisect, land_batch_cancel, land_batch_promote, land_batch_restack,
@@ -204,7 +205,7 @@ pub(crate) use integration_prefs::{
     set_finish_notification_mode, set_notification_preference,
 };
 
-pub(crate) use waiting::{clear_finish_mark, waiting_on_me};
+pub(crate) use waiting::{board_inbox, clear_finish_mark};
 
 pub(crate) use workspace::{
     workspace_cleanup_scan, workspace_space_cancel, workspace_space_git, workspace_space_scan,
@@ -216,12 +217,12 @@ pub(crate) use project::{
 };
 
 pub(crate) use terminal::{
-    agent_terms, answer_approval, answer_ask, answer_secret, close_lane, close_term,
-    end_all_terminal_sessions, end_terminal_session, focus_lane, key_input, lane_fold, lane_lines,
-    lane_scroll, launch_agent_tab, mirror_ready, mouse_input, open_mirror_term, open_term_tab,
-    open_term_tab_in, open_terminal, pane_image, pane_log, paste_input, resize_lane, send_prompt,
-    ssh_agent_seated, subagent_log, term_focus, term_fold, term_has_running_process, term_key,
-    term_lines, term_mouse, term_paste, term_resize, term_scroll, term_search, term_text,
+    agent_terms, answer_approval, answer_ask, answer_secret, close_lane, close_mirror_term,
+    close_term, end_all_terminal_sessions, end_terminal_session, focus_lane, key_input, lane_fold,
+    lane_lines, lane_scroll, launch_agent_tab, mirror_ready, mouse_input, open_mirror_term,
+    open_term_tab, open_term_tab_in, open_terminal, pane_image, pane_log, paste_input, resize_lane,
+    send_prompt, ssh_agent_seated, subagent_log, term_focus, term_fold, term_has_running_process,
+    term_key, term_lines, term_mouse, term_paste, term_resize, term_scroll, term_search, term_text,
     term_view_to_line, terminal_sessions, text_input,
 };
 
@@ -256,17 +257,19 @@ pub(crate) use worktree::{
 };
 
 pub(crate) use settings::{
-    agent_teams_mode, claude_autoswitch_mode, computer_confirm_answer, computer_guard_status,
-    computer_handoff_code, computer_resume, computer_stop, floating_workspace_seat, harness_status,
-    list_system_fonts, pane_layouts, patch_editing_prefs, patch_floating_workspace,
-    patch_open_in_applications, patch_workspace_board_items, patch_workspace_board_status,
-    patch_workspace_creation_prefs, read_primary_selection, save_pane_layouts, save_stage_layouts,
-    scm_tree_rows, set_agent_teams_mode, set_artifacts_auto_open_beside,
-    set_artifacts_retention_days, set_claude_autoswitch_mode, set_computer_confirm,
-    set_computer_generator_road, set_computer_input_policy, set_computer_live_reflex,
-    set_confirm_close_pinned, set_conversation_focus_view, set_ctrl_tab_order_mode,
-    set_default_task_source, set_diff_side_by_side, set_harness_settings, set_hidden_shortcuts,
-    set_hidden_task_sources, set_hide_agent_scratch_workspaces, set_hide_automation_workspaces,
+    agent_teams_mode, claude_autoswitch_mode, computer_confirm_answer, computer_give_back,
+    computer_guard_status, computer_handoff_code, computer_resume, computer_self_answer,
+    computer_share_hand_over, computer_share_state, computer_stop, computer_take_control,
+    floating_workspace_seat, harness_status, list_system_fonts, pane_layouts, patch_editing_prefs,
+    patch_floating_workspace, patch_open_in_applications, patch_workspace_board_items,
+    patch_workspace_board_status, patch_workspace_creation_prefs, read_primary_selection,
+    save_pane_layouts, save_stage_layouts, scm_tree_rows, set_agent_teams_mode,
+    set_artifacts_auto_open_beside, set_artifacts_retention_days, set_claude_autoswitch_mode,
+    set_computer_confirm, set_computer_generator_road, set_computer_input_policy,
+    set_computer_live_reflex, set_computer_share_required, set_confirm_close_pinned,
+    set_conversation_focus_view, set_ctrl_tab_order_mode, set_default_task_source,
+    set_diff_side_by_side, set_harness_settings, set_hidden_shortcuts, set_hidden_task_sources,
+    set_hide_agent_scratch_workspaces, set_hide_automation_workspaces,
     set_hide_default_branch_workspaces, set_hide_detached_head_workspaces,
     set_hide_sleeping_workspaces, set_keep_default_branch_awake, set_keybinding, set_panel_width,
     set_panel_widths, set_shortcut_visibility, set_sidebar_view,

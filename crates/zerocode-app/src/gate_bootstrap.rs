@@ -10,6 +10,10 @@ use zerocode_core::orchestration::gate_reuse::{
 };
 use zerocode_core::user_preferences::content_key;
 
+// The private descriptor road; its one caller is unix-only, as the
+// descriptor is.
+#[cfg(unix)]
+mod gate_channel;
 mod runtime_libraries;
 mod startup_layout;
 
@@ -276,7 +280,7 @@ fn execute(args: &[String]) -> Result<ExitCode, ()> {
                 .arg("--bound-policy-sha256")
                 .arg(arguments.policy_sha)
                 .args(forwarded);
-            zerocode_pty::gate_channel::spawn(command, channel).map_err(|_| ())?
+            gate_channel::spawn(command, channel).map_err(|_| ())?
         }
         #[cfg(not(unix))]
         {
@@ -517,6 +521,19 @@ fn open_authority(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn an_unsupported_runtime_is_refused_before_any_image_is_loaded() {
+        assert_eq!(
+            runtime_libraries::verify_closure(
+                Path::new("absent-python"),
+                Path::new("absent-runtime"),
+                &[]
+            ),
+            Err("unsupported_runtime")
+        );
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

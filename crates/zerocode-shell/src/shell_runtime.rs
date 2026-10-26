@@ -926,6 +926,9 @@ pub(super) struct ZoChannelReport {
     pub(super) interrupted: bool,
     pub(super) acknowledges_prompt: bool,
     pub(super) ask: Option<String>,
+    /// The error a turn that ended `failed` names (t-69010) — empty when the
+    /// frame said it failed and gave no words. `None` for any other frame.
+    pub(super) failure: Option<String>,
 }
 
 /// A zo pane's `PushNotification` as the channel delivers it (t-2943): the
@@ -977,6 +980,7 @@ pub(super) fn zo_channel_report(frame: &serde_json::Value) -> Option<ZoChannelRe
             interrupted: false,
             acknowledges_prompt: true,
             ask: None,
+            failure: None,
         }),
         (Some("turn"), Some("end")) => Some(ZoChannelReport {
             state: zerocode_core::hook::HookState::Done,
@@ -984,6 +988,10 @@ pub(super) fn zo_channel_report(frame: &serde_json::Value) -> Option<ZoChannelRe
             interrupted: outcome == Some("cancelled"),
             acknowledges_prompt: false,
             ask: None,
+            // zo ends a turn that errored `failed` with the error beside it
+            // (`turn_scaffold.rs` `finish`); the window used to read the
+            // outcome only for `cancelled` and drop the rest (t-69010).
+            failure: (outcome == Some("failed")).then(|| text("error").unwrap_or_default()),
         }),
         (Some("permission_prompt"), _) => Some(ZoChannelReport {
             state: zerocode_core::hook::HookState::NeedsAttention,
@@ -991,6 +999,7 @@ pub(super) fn zo_channel_report(frame: &serde_json::Value) -> Option<ZoChannelRe
             interrupted: false,
             acknowledges_prompt: false,
             ask: text("reasoning").or_else(|| text("tool_name")),
+            failure: None,
         }),
         (Some("user_question_prompt"), _) => Some(ZoChannelReport {
             state: zerocode_core::hook::HookState::NeedsAttention,
@@ -998,6 +1007,7 @@ pub(super) fn zo_channel_report(frame: &serde_json::Value) -> Option<ZoChannelRe
             interrupted: false,
             acknowledges_prompt: false,
             ask: text("question"),
+            failure: None,
         }),
         (Some("prompt_resolved"), _) => Some(ZoChannelReport {
             state: zerocode_core::hook::HookState::Working,
@@ -1005,6 +1015,7 @@ pub(super) fn zo_channel_report(frame: &serde_json::Value) -> Option<ZoChannelRe
             interrupted: false,
             acknowledges_prompt: false,
             ask: None,
+            failure: None,
         }),
         _ => None,
     }
@@ -1372,15 +1383,19 @@ pub(super) fn note_zo_session_frame(app: &AppHandle, session: &str, frame: &serd
                 crate::human_input::took(term);
                 acknowledge_zo_worker_prompt(app, term);
             }
-            note_zo_pane_state(
-                app,
-                term,
-                report.state,
-                report.event,
-                report.interrupted,
-                None,
-                report.ask.clone(),
-            );
+            // A failed turn's error rides this one report to the ledger,
+            // which tells the turn as failed rather than gone quiet.
+            crate::orchestration::with_turn_failure(term, report.failure.clone(), || {
+                note_zo_pane_state(
+                    app,
+                    term,
+                    report.state,
+                    report.event,
+                    report.interrupted,
+                    None,
+                    report.ask.clone(),
+                );
+            });
         }
         return;
     }
@@ -2974,6 +2989,9 @@ pub(super) fn forget_term_state(state: &AppState, term: TermId, settlement: Term
     // The calls its agent left waiting on the tool guards' hindsight never
     // get it (t-10916); the next occupant of the id starts a book of its own.
     crate::pane_guard::forget_term(term);
+    // A mirror pane leaves the mirrors close_mirror_term may end, whichever
+    // road ended it — close_term, the session manager, its own exit (R8).
+    crate::cmd::terminal::forget_mirror_term(term);
     state.zo_worker_deliveries().remove(&term);
     state.agent_terms().remove(&term);
     state.pane_accounts().remove(&term);
@@ -3180,6 +3198,9 @@ pub(super) enum TerminalCloseError {
     SignalFailed,
     Unconfirmed,
     Replaced,
+    /// `close_mirror_term` was asked to close a term no mirror pane holds:
+    /// only `close_term`, on the person's hand, ends that (t-75153, R7b).
+    NotMirror,
 }
 
 /// Retire one observed shell after its exit is confirmed.

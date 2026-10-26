@@ -390,7 +390,7 @@ pub(crate) fn assert_canonical_setting_round_trip(
     );
     let transport = block_after(window, "async function commitSetting(");
     assert!(
-        transport.contains("const snapshot = await invoke(command, args);")
+        transport.contains("const snapshot = await invoke(command, args, { hand });")
             && transport.contains("const snapshot = await fetchSettingsSnapshot();")
             && transport.contains("const mutationEpoch = ++settingsMutationEpoch;")
             && transport.contains("settingsMutationsInFlight += 1;")
@@ -701,8 +701,16 @@ pub(crate) const WINDOW_PARTS: &[(&str, &str)] = &[
         include_str!("../../../../ui/shell-computer.js"),
     ),
     (
+        "shell-self-act.js",
+        include_str!("../../../../ui/shell-self-act.js"),
+    ),
+    (
         "shell-settings.js",
         include_str!("../../../../ui/shell-settings.js"),
+    ),
+    (
+        "shell-design.js",
+        include_str!("../../../../ui/shell-design.js"),
     ),
     (
         "shell-managed-judgment.js",
@@ -721,6 +729,10 @@ pub(crate) const WINDOW_PARTS: &[(&str, &str)] = &[
         include_str!("../../../../ui/shell-connections.js"),
     ),
     ("shell-jev.js", include_str!("../../../../ui/shell-jev.js")),
+    (
+        "shell-inbox.js",
+        include_str!("../../../../ui/shell-inbox.js"),
+    ),
     (
         "shell-flow.js",
         include_str!("../../../../ui/shell-flow.js"),

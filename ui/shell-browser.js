@@ -5838,7 +5838,7 @@ async function runCookieImport(family, profile, target, box) {
   paintBrowserProfiles();
   let summary;
   try {
-    summary = await invoke("import_browser_cookies", { family, profile, target });
+    summary = await invoke("import_browser_cookies", { family, profile, target }, { hand: handNow() });
   } catch (error) {
     browserImportingId = null;
     paintBrowserProfiles();
@@ -5861,7 +5861,7 @@ async function runCookieFileImport(target, box) {
   paintBrowserProfiles();
   let summary;
   try {
-    summary = await invoke("import_cookie_file", { target });
+    summary = await invoke("import_cookie_file", { target }, { hand: handNow() });
   } catch (error) {
     browserImportingId = null;
     paintBrowserProfiles();
@@ -7183,7 +7183,7 @@ async function openQuickCommands(anchor, term) {
       // The row runs the command; the trash must not run it on the way out.
       event.stopPropagation();
       try {
-        await invoke("delete_quick_command", { id: command.id });
+        await invoke("delete_quick_command", { id: command.id }, { hand: handNow() });
       } catch (error) {
         showError(error);
         return;

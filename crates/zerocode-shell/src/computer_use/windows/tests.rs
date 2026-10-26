@@ -102,6 +102,42 @@ fn foreground_or_skip(fixture: &Fixture, test: &str) -> bool {
     false
 }
 
+/// The number of context menus the fixture has shown once it reaches `want`,
+/// or when `within` is up.
+fn wait_for_menus(want: u32, within: Duration) -> u32 {
+    let limit = Instant::now() + within;
+    while Fixture::menus() < want && Instant::now() < limit {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Fixture::menus()
+}
+
+/// What a failing desktop test needs to tell the CI session apart from the
+/// code: who is in front, who holds the keyboard focus, and whether a popup
+/// menu stands.
+fn desktop_probe(fixture: &Fixture) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetClassNameW, GetForegroundWindow, GetWindowTextW,
+    };
+    use windows::core::w;
+    // SAFETY: plain queries; the buffers outlive the calls that fill them.
+    let (class, title, popup) = unsafe {
+        let front = GetForegroundWindow();
+        let (mut class, mut title) = ([0u16; 128], [0u16; 128]);
+        let class_len = GetClassNameW(front, &mut class).max(0) as usize;
+        let title_len = GetWindowTextW(front, &mut title).max(0) as usize;
+        (
+            String::from_utf16_lossy(&class[..class_len]),
+            String::from_utf16_lossy(&title[..title_len]),
+            FindWindowW(w!("#32768"), None).is_ok(),
+        )
+    };
+    format!(
+        "foreground {class:?} {title:?}, fixture focused control {}, popup menu window {popup}",
+        fixture.focused_control_id()
+    )
+}
+
 #[test]
 fn the_fixture_is_listed_and_its_window_resolves() {
     with_fixture(|provider, fixture| {
@@ -386,10 +422,9 @@ fn keys_never_write_into_a_password_edit_and_set_value_is_not_read_back() {
     });
 }
 
-/// H3: a right-click on an element asks the element for its own menu
-/// (`ShowContextMenu`) and, when the proxy has none, right-clicks it with the
-/// pointer — and the menu that opens under the pointer is the target's own,
-/// not a change of recipient. Either road ends in a menu and an `Ok`.
+/// H3: a right-click on an element sends one guarded pointer click. A UIA
+/// acknowledgement without a menu must not short-circuit that delivery.
+/// The menu under the pointer belongs to the target, not a new recipient.
 #[test]
 fn a_right_click_on_an_element_opens_its_context_menu_without_a_false_failure() {
     with_fixture(|provider, fixture| {
@@ -405,27 +440,46 @@ fn a_right_click_on_an_element_opens_its_context_menu_without_a_false_failure() 
                 json!({ "app": fixture.app_query(), "elementIndex": button, "mouseButton": "right" }),
             )
             .expect("right-click");
-        std::thread::sleep(Duration::from_millis(600));
+        // The menu of a context-menu request can open after the call has
+        // returned; wait for it, and say what the desktop looked like when
+        // none did.
+        let opened = wait_for_menus(before + 1, Duration::from_secs(3));
         assert_eq!(
-            Fixture::menus(),
+            opened,
             before + 1,
-            "no context menu was shown ({answer})"
+            "no context menu was shown ({}; {})",
+            desktop_probe(fixture),
+            answer["action"]
         );
-        match answer["action"]["path"].as_str() {
-            Some("accessibility") => {
-                assert_eq!(
-                    answer["action"]["actionName"], "ShowContextMenu",
-                    "{answer}"
-                );
-            }
-            Some("synthetic") => {
-                assert_eq!(
-                    answer["action"]["fallbackReason"], "actionUnsupported",
-                    "{answer}"
-                );
-            }
-            other => panic!("unexpected path {other:?}: {answer}"),
-        }
+        assert_eq!(answer["action"]["path"], "synthetic", "{answer}");
+        assert_eq!(
+            answer["action"]["fallbackReason"], "actionUnsupported",
+            "{answer}"
+        );
+    });
+}
+
+#[test]
+fn a_background_right_click_is_refused_without_synthetic_input() {
+    with_fixture(|provider, fixture| {
+        let observed = observe(provider, fixture, false);
+        let button = index_of(&observed, " OK");
+        let before = input::attempted_events();
+        let menus = Fixture::menus();
+        let answer = provider
+            .handle(
+                "click",
+                json!({ "app": fixture.app_query(), "elementIndex": button,
+                    "mouseButton": "right", "background": true }),
+            )
+            .expect_err("Windows has no advertised background input support");
+        assert_eq!(answer.code, "unsupported_capability");
+        assert_eq!(
+            input::attempted_events(),
+            before,
+            "background attempted synthetic input"
+        );
+        assert_eq!(Fixture::menus(), menus, "background opened a menu");
     });
 }
 
