@@ -83,6 +83,7 @@ pub(crate) const PERSON_ONLY_COMMANDS: &[&str] = &[
     // The person's hand on a window shared with an agent.
     "computer_take_control",
     "computer_give_back",
+    "computer_share_end",
     "computer_share_hand_over",
     // The two ways out the page offers; both reach `relaunch_window`.
     "leave_now",
@@ -90,6 +91,7 @@ pub(crate) const PERSON_ONLY_COMMANDS: &[&str] = &[
     // A credential written, checked or dropped.
     "save_api_router",
     "remove_api_router",
+    "adopt_legacy_judgment_key",
     "save_typesafe_key",
     "remove_typesafe_key",
     "check_typesafe_key",

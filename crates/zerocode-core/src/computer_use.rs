@@ -4560,6 +4560,53 @@ fn validate_words_click(params: &Map<String, Value>) -> Result<(), String> {
     Ok(())
 }
 
+/// The key a click's answer says its faster road under (t-76055).
+pub const CLICK_NEXT_KEY: &str = "next";
+/// How long the batch [`treeless_click_next`] spells waits for its result.
+const TREELESS_CHECK_MS: u64 = 5_000;
+
+/// What a click at a point says next, when the window it pressed shows no
+/// tree but itself (`snapshot.elementCount` of 1, t-76055): press by the words
+/// the screen shows, and send one screen as one batch whose last step is the
+/// check — the road that took a mirrored phone's form from 138 model round
+/// trips to 12 (t-37883). `None` for a click by any other name, a click that
+/// named no app, a background click (a click by words needs the foreground,
+/// so naming it would send the agent to a refusal), or a window with a tree.
+#[must_use]
+pub fn treeless_click_next(params: &Value, answer: &Value) -> Option<String> {
+    let app = params.get("app")?.as_str()?.trim();
+    let at_a_point = ["x", "y"].iter().all(|key| params.get(*key).is_some());
+    let background = params.get("background") == Some(&Value::Bool(true));
+    if app.is_empty() || !at_a_point || background {
+        return None;
+    }
+    if answer.pointer("/snapshot/elementCount")?.as_u64()? > 1 {
+        return None;
+    }
+    let check_ms = TREELESS_CHECK_MS.to_string();
+    let commands = json!([
+        ["click", "--app", app, "--ocr", "--text", "<words it shows>"],
+        ["type-text", "--app", app, "--text", "<text>"],
+        ["press-key", "--app", app, "--key", "Return"],
+        [
+            "wait-for",
+            "--app",
+            app,
+            "--ocr",
+            "--text",
+            "<words of the result>",
+            "--timeout-ms",
+            check_ms
+        ],
+    ]);
+    // One shell word: a quote in the app's name closes, escapes and reopens.
+    let quoted = commands.to_string().replace('\'', r"'\''");
+    Some(format!(
+        "this window shows no accessibility tree, so a point goes stale with its layout: press by the words it shows, click --app {} --ocr --text <words>, and send one screen as one batch whose last step is the check: batch --commands '{quoted}'",
+        Value::String(app.to_string())
+    ))
+}
+
 /// `click --app A --text T | --label L | --role R [--label L]`: the control by
 /// what it reads, and nothing that names it another way. A word must read
 /// something — an empty `--text` would match every control.
@@ -4675,11 +4722,16 @@ fn optional_non_negative_integer(
         .transpose()
 }
 
+const HOTKEY_EXAMPLE: &str = "use hotkey --key Cmd+V or press-key --key cmd+v";
+
 fn validate_press_key(key: &str) -> Result<(), String> {
-    if key.trim().is_empty() || key.contains('+') {
-        return Err(
-            "press-key accepts one key without modifiers; use hotkey for combinations".into(),
-        );
+    if key.contains('+') {
+        return validate_hotkey(key);
+    }
+    if key.trim().is_empty() {
+        return Err(format!(
+            "press-key needs one key; {HOTKEY_EXAMPLE} for combinations"
+        ));
     }
     Ok(())
 }
@@ -4687,7 +4739,9 @@ fn validate_press_key(key: &str) -> Result<(), String> {
 fn validate_hotkey(key: &str) -> Result<(), String> {
     let parts = key.split('+').map(str::trim).collect::<Vec<_>>();
     if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
-        return Err("hotkey requires modifiers plus one key, such as CmdOrCtrl+A".into());
+        return Err(format!(
+            "hotkey requires modifiers plus one key; {HOTKEY_EXAMPLE}"
+        ));
     }
     let modifiers = &parts[..parts.len() - 1];
     if modifiers.iter().any(|part| {
@@ -4706,7 +4760,16 @@ fn validate_hotkey(key: &str) -> Result<(), String> {
                 | "super"
         )
     }) {
-        return Err("hotkey contains an unsupported modifier".into());
+        return Err(format!(
+            "hotkey contains an unsupported modifier; {HOTKEY_EXAMPLE}"
+        ));
+    }
+    if !crate::computer_use_protocol::keys::KEY_NAMES
+        .contains(&parts[parts.len() - 1].to_ascii_lowercase().as_str())
+    {
+        return Err(format!(
+            "hotkey contains an unsupported key; {HOTKEY_EXAMPLE}"
+        ));
     }
     Ok(())
 }
@@ -4736,7 +4799,7 @@ pub fn usage() -> String {
         "  zerocode-computer scroll --app <app> (--element-index N|--x X --y Y) --direction <up|down|left|right> [--json]",
         "  zerocode-computer drag --app <app> (--from-element-index N --to-element-index N|--from-x X --from-y Y --to-x X --to-y Y) [--json]",
         "  zerocode-computer type-text --app <app> (--text text|--text-stdin) [--json]",
-        "  zerocode-computer press-key --app <app> --key <key> [--json]",
+        "  zerocode-computer press-key --app <app> --key <key|modifier+key> [--json] (combinations run as hotkey)",
         "  zerocode-computer hotkey --app <app> --key <modifier+key> [--json]",
         "  zerocode-computer paste-text --app <app> (--text text|--text-stdin) [--json]",
         "  zerocode-computer set-value --app <app> --element-index N (--value text|--value-stdin) [--json]",
@@ -7256,6 +7319,25 @@ mod tests {
     }
 
     #[test]
+    fn press_key_combinations_share_hotkey_validation() {
+        for key in ["cmd+v", "command+v", "Ctrl+Shift+T"] {
+            let press = parse_command(&words(&["press-key", "--app", "Fixture", "--key", key]))
+                .expect("press-key accepts a hotkey combination");
+            let hotkey =
+                parse_command(&words(&["hotkey", "--app", "Fixture", "--key", key])).unwrap();
+            assert_eq!(press.params, hotkey.params);
+        }
+        for key in ["cmd+", "+v", "foo+v", "cmd+unknown-key", "cmd+shift"] {
+            for verb in ["press-key", "hotkey"] {
+                let error = parse_command(&words(&[verb, "--app", "Fixture", "--key", key]))
+                    .expect_err("invalid key combination");
+                assert!(error.contains("hotkey --key Cmd+V"), "{error}");
+                assert!(error.contains("press-key --key cmd+v"), "{error}");
+            }
+        }
+    }
+
+    #[test]
     fn unsafe_or_ambiguous_targets_are_refused_before_the_provider() {
         for argv in [
             words(&["click", "--app", "Finder"]),
@@ -7280,7 +7362,6 @@ mod tests {
                 "--window-index",
                 "2",
             ]),
-            words(&["press-key", "--app", "Finder", "--key", "CmdOrCtrl+V"]),
             words(&["hotkey", "--app", "Finder", "--key", "Return"]),
         ] {
             assert!(parse_command(&argv).is_err(), "accepted {argv:?}");
@@ -9334,6 +9415,99 @@ mod tests {
                 .contains("--ocr")
         );
         assert!(usage().contains("--ocr --text <words>"));
+    }
+
+    /// t-76055: a click at a point on a window whose tree is the window alone
+    /// (a mirrored phone) says what to do instead, and what it says is a
+    /// command the grammar takes for that same window — a batch whose click
+    /// is by the words the screen shows and whose last step is the check.
+    /// A click by any other name, a click with no app, and a window with a
+    /// tree are told nothing.
+    #[test]
+    fn a_point_click_on_a_window_with_no_tree_names_the_batch_by_words() {
+        let app = "iPhone Mirroring";
+        let point = json!({ "app": app, "x": 220.0, "y": 120.0, "windowId": 33265 });
+        let treeless = json!({ "snapshot": { "elementCount": 1, "treeText": "" } });
+        let next = treeless_click_next(&point, &treeless).expect("a treeless window is told");
+        let opens = next.find("'[").expect("the batch's commands, quoted once");
+        let closes = next.rfind("]'").expect("the batch's commands end");
+        let commands: Value =
+            serde_json::from_str(&next[opens + 1..=closes]).expect("the commands are JSON");
+        let batch_argv = words(&["batch", "--commands", &commands.to_string(), "--json"]);
+        let parsed = parse_command(&batch_argv);
+        assert!(
+            parsed.is_ok(),
+            "the batch it names parses: {parsed:?} from {next}"
+        );
+        let steps = commands.as_array().cloned().unwrap_or_default();
+        let step = |at: usize| -> Vec<String> {
+            steps[at]
+                .as_array()
+                .map(|words| {
+                    words
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let first = parse_command(&step(0)).expect("its first step parses alone");
+        assert_eq!(first.method, ComputerMethod::Click);
+        assert_eq!(first.params["ocr"], true, "pressed by the words it shows");
+        assert_eq!(first.params["app"], app, "the same window it was asked of");
+        let last = parse_command(&step(steps.len() - 1)).expect("its last step parses alone");
+        assert_eq!(
+            last.method,
+            ComputerMethod::WaitFor,
+            "the last step is the check"
+        );
+        assert_eq!(last.params["ocr"], true);
+        assert_eq!(last.params["app"], app);
+        assert!(
+            next.contains(&format!(
+                "click --app {} --ocr --text",
+                serde_json::to_string(app).unwrap_or_default()
+            )),
+            "the one-press form is spelled too: {next}"
+        );
+        let quiet = |params: Value, answer: &Value| treeless_click_next(&params, answer).is_none();
+        assert!(
+            quiet(point.clone(), &json!({ "snapshot": { "elementCount": 9 } })),
+            "a tree"
+        );
+        assert!(
+            quiet(point.clone(), &json!({ "action": {} })),
+            "no snapshot said"
+        );
+        assert!(quiet(json!({ "x": 1.0, "y": 2.0 }), &treeless), "no app");
+        assert!(
+            quiet(json!({ "app": app, "elementIndex": 3 }), &treeless),
+            "an element"
+        );
+        assert!(
+            quiet(
+                json!({ "app": app, "x": 1.0, "y": 2.0, "background": true }),
+                &treeless
+            ),
+            "a background click: a click by words needs the foreground"
+        );
+        assert!(
+            quiet(
+                json!({ "app": app, "ocr": true, "text": "검색" }),
+                &treeless
+            ),
+            "words"
+        );
+    }
+
+    /// An app name with a quote stays one shell word in the batch spelled.
+    #[test]
+    fn a_treeless_click_next_quotes_an_app_name_with_a_quote_once() {
+        let point = json!({ "app": "Bob's Phone", "x": 1.0, "y": 2.0 });
+        let next = treeless_click_next(&point, &json!({ "snapshot": { "elementCount": 0 } }))
+            .expect("told");
+        assert!(next.contains(r"Bob'\''s Phone"), "{next}");
     }
 
     /// t-37883: a batch's wait right after a step that acts ends once that

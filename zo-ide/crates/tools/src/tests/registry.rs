@@ -105,6 +105,7 @@ fn a_searched_session_recall_runs_through_capability_invoke() {
         model: None,
         updated_at_ms: None,
         decline: None,
+        origin: None,
     }]);
     session
         .save_to_path(session_dir.join("session-r49.jsonl"))
@@ -1066,10 +1067,7 @@ fn jev_schema_is_measured_and_deferred() {
 /// nothing is added to the system prompt or a schema.
 #[test]
 fn tool_search_leads_a_computer_answer_with_the_work_browser_when_its_shim_is_installed() {
-    let directory = tempfile::tempdir().expect("a PATH folder");
-    crate::browser_execution::tests::install_browser_shim(directory.path());
-    let _path = super::EnvGuard::set("PATH", directory.path().to_str().unwrap());
-    let found = GlobalToolRegistry::builtin().search("select:Computer", 3, None, None);
+    let found = GlobalToolRegistry::builtin().search_with_work_browser("select:Computer", 3, None, None, || true);
     assert_eq!(found.matches, ["Computer"]);
     let text = serde_json::to_string_pretty(&found).expect("serializable");
     let first = text.lines().nth(1).expect("a first field");
@@ -1081,9 +1079,7 @@ fn tool_search_leads_a_computer_answer_with_the_work_browser_when_its_shim_is_in
 /// Without the installed shim the answer is today's, byte for byte.
 #[test]
 fn tool_search_answer_is_unchanged_without_the_work_browser() {
-    let directory = tempfile::tempdir().expect("an empty PATH folder");
-    let _path = super::EnvGuard::set("PATH", directory.path().to_str().unwrap());
-    let found = GlobalToolRegistry::builtin().search("select:Computer", 3, None, None);
+    let found = GlobalToolRegistry::builtin().search_with_work_browser("select:Computer", 3, None, None, || false);
     assert_eq!(found.matches, ["Computer"]);
     assert_eq!(serde_json::to_string_pretty(&found).expect("serializable"), todays_tool_search_answer(&found));
 }
@@ -1092,10 +1088,7 @@ fn tool_search_answer_is_unchanged_without_the_work_browser() {
 /// no line.
 #[test]
 fn tool_search_answer_without_computer_carries_no_work_browser_line() {
-    let directory = tempfile::tempdir().expect("a PATH folder");
-    crate::browser_execution::tests::install_browser_shim(directory.path());
-    let _path = super::EnvGuard::set("PATH", directory.path().to_str().unwrap());
-    let found = GlobalToolRegistry::builtin().search("select:Jev", 3, None, None);
+    let found = GlobalToolRegistry::builtin().search_with_work_browser("select:Jev", 3, None, None, || true);
     assert_eq!(found.matches, ["Jev"]);
     assert_eq!(serde_json::to_string_pretty(&found).expect("serializable"), todays_tool_search_answer(&found));
 }

@@ -195,6 +195,7 @@ fn event_message(session_id: &str, kind: &str, reason: &str) -> ConversationMess
         model: None,
         updated_at_ms: None,
         decline: None,
+        origin: None,
     }
 }
 
@@ -285,7 +286,7 @@ fn epoch_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::{self, File, FileTimes};
+    use std::fs::{self, FileTimes};
     use std::time::{Duration, UNIX_EPOCH};
 
     use core_types::session::{ContentBlock, ConversationMessage, MessageRole};
@@ -362,7 +363,10 @@ mod tests {
         drop(session);
 
         let historical = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
-        File::open(&path)
+        // Setting a time needs write access on Windows (FILE_WRITE_ATTRIBUTES).
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
             .expect("open transcript")
             .set_times(FileTimes::new().set_modified(historical))
             .expect("pin old mtime");

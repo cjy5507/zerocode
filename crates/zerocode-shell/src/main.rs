@@ -98,6 +98,7 @@ mod code_sign_clone;
 mod codex_accounts;
 mod codex_queue;
 mod codex_tokens;
+mod composer_empty;
 mod computer_use;
 mod conversation_wake;
 mod crash;
@@ -246,6 +247,7 @@ mod worktree_runtime;
 mod worktree_shared;
 mod zo_companion;
 mod zo_integration_runtime;
+mod zo_notice;
 mod zsh_wrapper;
 
 use agent_tools_runtime::*;
@@ -407,6 +409,7 @@ use cmd::{
     worktree_evidence, worktree_landing_stamp, worktree_last_agent, worktree_loss, worktree_prefs,
     worktree_stamp, write_primary_selection, write_text_file,
 };
+use cmd::{adopt_legacy_judgment_key, select_coding_model, zo_model_list};
 use cmd::{
     artifact_bundle, artifact_copy_path, artifact_counts, artifact_delete, artifact_document,
     artifact_export, artifact_feedback_record, artifact_flow, artifact_import_transcripts,
@@ -2664,6 +2667,7 @@ fn main() -> ExitCode {
             api_router_presets,
             api_router_providers,
             model_connections, sync_model_connections, check_model_connection, select_model_connection, clear_model_connection,
+            zo_model_list, select_coding_model, adopt_legacy_judgment_key,
             test_router_connection,
             save_api_router,
             remove_api_router,
@@ -3283,6 +3287,7 @@ fn main() -> ExitCode {
             computer_share_state,
             computer_take_control,
             computer_give_back,
+            cmd::settings::computer_share_end,
             computer_share_hand_over,
             computer_stop,
             computer_resume,

@@ -866,24 +866,13 @@ fn split_launch_agent(command: &str) -> Option<&'static str> {
 }
 
 impl TeamWindow {
-    /// Whether the briefing a worker was launched with stands on its screen
-    /// (t-74381); `None` when it does, else the sentence the launch fails with.
-    ///
-    /// The delivery that wrote it reports the words written and the Enter
-    /// pressed, never that the program kept them: Claude Code takes its first
-    /// input handler down while it boots and drops what the handler held,
-    /// which left a pane at an empty composer under a ledger line that said
-    /// the worker started. So the screen is read — the head of the briefing,
-    /// or the placeholder a long paste folds to — for [`BRIEFING_WINDOW`];
-    /// when it never shows, the briefing is typed once more to the composer
-    /// that stands by then, and when it still does not, the launch says so.
-    /// That retype is a success only once its own delivery says it was
-    /// submitted, and the screen is read after that (t-74919): its words
-    /// stand in the composer before their Enter, and stay there under an
-    /// Enter the delivery withholds. Its outcome is waited for on the
-    /// agent's own deadline and the submission receipt's patience, never the
-    /// watch's window. Only an agent whose row names a composer glyph is
-    /// checked: the others have no measured screen to read it off.
+    /// Confirm an entered briefing after its submission wait succeeded.
+    /// A provider receipt proves it was taken without reading a screen that
+    /// a TUI redraw may already have cleared (t-75907). Otherwise the watch
+    /// accepts a turn start, the briefing's head or tail, or a folded paste.
+    /// Only agents with a measured composer glyph need the screen fallback.
+    /// A retype still waits for its own delivery outcome before its echoed
+    /// words can count (t-74919).
     fn confirm_briefing(&self, term: TermId, pending: &PendingWorkerReadiness) -> Option<String> {
         use zerocode_pty::briefing::{BRIEFING_WINDOW, Unheard, Verdict, confirm};
         let glyph = pending.composer?;
@@ -900,6 +889,7 @@ impl TeamWindow {
             glyph,
             agent,
             deadline,
+            submitted: pending.submitted.is_some(),
         };
         let why = match confirm(
             &mut pane,
@@ -939,9 +929,34 @@ struct LaunchPane<'a> {
     agent: Option<&'static str>,
     /// The agent's own readiness deadline, which the retype pays.
     deadline: Duration,
+    /// `await_prompt_submission` already accepted this launch's receipt.
+    submitted: bool,
+}
+
+/// SessionStart also initializes the turn clock, so that clock alone proves
+/// no input was taken. A real finish can arrive before the watch starts;
+/// unlike a session boundary it does prove that the agent ran a turn.
+fn briefing_work_reported(state: zerocode_core::hook::HookState, session_boundary: bool) -> bool {
+    use zerocode_core::hook::HookState;
+    match state {
+        HookState::Working | HookState::NeedsAttention => true,
+        HookState::Done => !session_boundary,
+        HookState::Idle => false,
+    }
 }
 
 impl zerocode_pty::briefing::BriefingPane for LaunchPane<'_> {
+    fn submitted(&mut self) -> bool {
+        self.submitted || crate::human_input::taken(self.term) > 0
+    }
+
+    fn working(&mut self) -> bool {
+        self.state
+            .pane_states()
+            .get(&self.term)
+            .is_some_and(|pane| briefing_work_reported(pane.state, pane.session_boundary))
+    }
+
     fn screen(&mut self) -> Option<String> {
         let held = self.state.terminals().handle(self.term)?;
         let pty = lock_pty(&held);
@@ -1808,9 +1823,10 @@ impl agent_teams::Host for TeamWindow {
         let accepted = entered
             && terminal_is_live
             && await_prompt_submission(pending.submitted.as_ref(), pending.deadline);
-        // Done is the words having been written, and a program still booting
-        // throws away what it is written (t-74381): the screen says whether
-        // the briefing stayed, and a pane that holds none is no success.
+        // A terminal write can be lost during boot (t-74381), but the
+        // provider's own receipt proves it was taken. The watch uses that
+        // first and only falls back to a screen when it has no receipt:
+        // a working TUI may have redrawn the briefing away (t-75907).
         let undelivered = if accepted && !pending.restoring {
             self.confirm_briefing(term, &pending)
         } else {
@@ -1980,6 +1996,22 @@ impl agent_teams::Host for TeamWindow {
             crate::orchestration::MAIL_WAITING_CLEARED_EVENT,
             serde_json::json!({ "term": term }),
         );
+    }
+
+    fn line_holds_a_draft(&self, term: TermId) -> bool {
+        let state = self.app.state::<AppState>();
+        let agent = state.agent_terms().get(&term).copied();
+        if let (Some(agent), Some(held)) = (agent, state.terminals().handle(term)) {
+            let pty = lock_pty(&held);
+            crate::human_input::recheck_grid(
+                term,
+                agent,
+                pty.terminal().grid(),
+                pty.last_output_at(),
+                Instant::now(),
+            );
+        }
+        crate::human_input::line_of(term).0
     }
 
     fn point(
@@ -6293,6 +6325,18 @@ pub(super) fn answer_computer_command_with(
                     }),
                 );
             }
+            // A point pressed on a window with no tree (a mirrored phone)
+            // says the road by words, in the same answer (t-76055).
+            if command.method == ComputerMethod::Click
+                && let Some(next) =
+                    zerocode_core::computer_use::treeless_click_next(&command.params, &result)
+                && let Some(answered) = result.as_object_mut()
+            {
+                answered.insert(
+                    zerocode_core::computer_use::CLICK_NEXT_KEY.into(),
+                    next.into(),
+                );
+            }
             let png = computer_use::export_screenshot(&mut result);
             if command.method == ComputerMethod::Screenshot
                 && let Some(png) = png
@@ -6480,7 +6524,19 @@ pub(super) fn call_with_confirmation_asker(
     use zerocode_core::computer_use::{ConfirmKind, parse_confirmation_required};
     use zerocode_core::computer_use_protocol::error_code;
 
-    let method = command.method.provider_name().expect("provider method");
+    // Models often send a chord to press-key. Use the hotkey provider path,
+    // including its accessibility shortcuts and keyboard safety checks.
+    let ran_as_hotkey = command.method == zerocode_core::computer_use::ComputerMethod::PressKey
+        && command
+            .params
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|key| key.contains('+'));
+    let method = if ran_as_hotkey {
+        "hotkey"
+    } else {
+        command.method.provider_name().expect("provider method")
+    };
     let verb = command.method;
     let mut params = command.params.clone();
     let policy = confirm::policy();
@@ -6552,6 +6608,12 @@ pub(super) fn call_with_confirmation_asker(
         }
         other => other,
     }
+    .map(|mut answer| {
+        if ran_as_hotkey && let Some(object) = answer.as_object_mut() {
+            object.insert("ranAs".into(), serde_json::json!("hotkey"));
+        }
+        answer
+    })
 }
 
 /// Recipes (§7.2): saved from this session's steps (or a folder named), kept
@@ -8753,3 +8815,28 @@ pub(super) fn write_agent_screenshot(
         .to_string_lossy()
         .into_owned())
 }
+
+// The source contracts read everything above the first test-only marker as
+// the shipped code, and that marker must open `mod tests` (shipped_backend).
+#[cfg(test)]
+mod tests {
+    use super::briefing_work_reported;
+    use zerocode_core::hook::HookState;
+
+    #[test]
+    fn a_worker_briefing_accepts_a_real_turn_but_not_a_session_boundary() {
+        assert!(!briefing_work_reported(HookState::Done, true));
+        assert!(!briefing_work_reported(HookState::Idle, false));
+        for state in [
+            HookState::Working,
+            HookState::NeedsAttention,
+            HookState::Done,
+        ] {
+            assert!(briefing_work_reported(state, false), "{state:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "computer_use/key_combinations_tests.rs"]
+mod key_combinations_tests;
