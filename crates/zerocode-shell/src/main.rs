@@ -36,11 +36,11 @@ use zerocode_core::computer_use::RUN_EVIDENCE_DIR_ENV;
 use zerocode_core::host::{self, Fs, Host, Within};
 use zerocode_core::{
     AgentKind, Automation, AutomationFailureRecord, AutomationFailureStage, AutomationRun,
-    CheckDetails, CheckRun, ComposerClear, Cron, DiffNote, Lane, LaneId, LocalMinute, PaneKey,
-    RUNS_KEPT_PER_AUTOMATION, ReadyMark, RunTrigger, WorktreeTask, agent_may_be_saved,
-    agent_presence, agent_spec, born_worktrees, close_unwitnessed, commit_failure, leaves_evidence,
-    mark_completed, mark_ended, occurrence_recorded, prune_final_runs, record_run,
-    reuse_normalized, should_run_precheck,
+    CheckDetails, CheckRun, ComposerClear, Cron, DiffNote, Lane, LaneId, LocalMinute, MissedRecord,
+    MissedRuns, PaneKey, RUNS_KEPT_PER_AUTOMATION, ReadyMark, RunTrigger, WorktreeTask,
+    agent_may_be_saved, agent_presence, agent_spec, born_worktrees, close_unwitnessed,
+    commit_failure, leaves_evidence, mark_completed, mark_ended, newest_recorded_occurrence,
+    occurrence_recorded, prune_final_runs, record_run, reuse_normalized, should_run_precheck,
 };
 use zerocode_harness::{Client, method};
 use zerocode_lane::{
@@ -3583,16 +3583,19 @@ fn main() -> ExitCode {
             // Where the second brain is, before anything can open a pane. Every
             // later settings write republishes it (`mutate_settings`); this one
             // read is what carries the last run's answer across a restart.
-            let saved_vault = load_settings_resilient(app.state::<AppState>().settings())
-                .document
-                .second_brain_vault;
+            let settings = load_settings_resilient(app.state::<AppState>().settings()).document;
+            let weekly_review = settings.second_brain_weekly_review;
+            let saved_vault = settings.second_brain_vault;
             hooks::publish_second_brain_vault(&saved_vault);
             // And the agents' global instructions say the same: the block
             // setup wrote, written again for a vault saved before this road
             // existed or an agent installed since — idempotent, off the boot
-            // path.
+            // path. A weekly review an older build switched on becomes the
+            // window's job on the same road (t-77377).
             cmd::second_brain::relink_saved_vault_at_boot(
                 saved_vault,
+                weekly_review,
+                app.state::<AppState>().settings().clone(),
                 app.state::<AppState>().config_root().to_path_buf(),
                 local_data_root.clone(),
             );

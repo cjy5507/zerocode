@@ -899,7 +899,7 @@ class StatefulBackend {
         { agent: "codex", label: "Codex", path: "/Users/fixture/.codex/AGENTS.md",
           state: "missing", detail: "" },
       ],
-      // 주간 리뷰 cron — 스위치는 설정, 영수증은 볼트의 zo 등록부의 답.
+      // 주간 리뷰 — 스위치는 설정, 영수증은 창 자동화 목록이 그 일을 든 모습.
       weekly_review_enabled: false,
       weekly_review: null,
     };
@@ -1574,24 +1574,16 @@ class StatefulBackend {
         keys = ["skip_delete_automation_confirm"];
         break;
       case "set_second_brain_weekly_review": {
-        // The backend registers with `zo cron` first and writes the setting
-        // only then; the fixture answers what the vault's registry would.
+        // The backend writes the window's job first (t-77377) and the
+        // setting only then; the fixture answers what the store would hold:
+        // a job that has not run yet, due the coming Sunday at 06:00.
         const enabled = args.enabled === true;
         this.settings.second_brain_weekly_review = enabled;
         this.secondBrain = {
           ...this.secondBrain,
           weekly_review_enabled: enabled,
           weekly_review: enabled
-            ? {
-                registered: true,
-                cron_id: "cron_fixture_1",
-                schedule: "0 21 * * 6",
-                next_due_at: 1_800_000_000,
-                scheduler: "session_idle",
-                registry: "/Users/fixture/Knowledge/.zo/registries/crons.json",
-                outcome: "created",
-                error: null,
-              }
+            ? { registered: true, enabled: true, next_run_at: 29_891_880, last_run_at: null }
             : null,
         };
         keys = ["second_brain_weekly_review"];
@@ -2727,6 +2719,35 @@ class StatefulBackend {
         };
         return this.computerUseCapabilities();
       case "list_automations": return clone(this.automations);
+      // 세컨드 브레인 카드의 「켜기」(t-77381)가 여는 두 길. 실제 백엔드처럼 목록을 답하고,
+      // 카드가 다시 물을 볼트의 매일 취합도 그 자동화를 따라 고친다.
+      case "enable_automation": {
+        const row = this.automations.find((held) => held.id === args.id);
+        if (row) row.enabled = args.enabled;
+        const ingest = this.secondBrain.daily_ingest;
+        if (ingest?.automation_id === args.id) {
+          this.secondBrain.daily_ingest = { ...ingest, enabled: args.enabled, overdue_since: null };
+        }
+        return clone(this.automations);
+      }
+      case "save_automation": {
+        const automation = args.automation;
+        this.automations = [
+          ...this.automations.filter((held) => held.id !== automation.id),
+          automation,
+        ];
+        if (automation.workspace === this.secondBrain.saved_path
+          && String(automation.prompt).includes("raw/")) {
+          this.secondBrain.daily_ingest = {
+            automation_id: automation.id,
+            name: automation.name,
+            enabled: automation.enabled,
+            last_run_at: null,
+            overdue_since: null,
+          };
+        }
+        return clone(this.automations);
+      }
       case "list_automation_runs":
         // Newest first, as the backend answers: it stores oldest-first and
         // reverses on the way out.
@@ -13385,10 +13406,10 @@ await test("Second Brain detects, sets up, registers, and seeds its recurring wo
   );
   backend.secondBrainLinkFailure = null;
 
-  // 주간 리뷰를 zo cron 턴으로 — 스위치는 저장된 볼트가 있어야 살고, 켜면
-  // 백엔드가 `zo cron ensure`로 볼트의 등록부에 기록을 앉힌 뒤 설정을 쓰며,
-  // 카드는 상태를 다시 물어 영수증 줄에 스케줄러의 이름과 스케줄을 적는다.
-  // 끄면 기록이 걷히고 줄이 사라진다.
+  // 주간 리뷰를 창 자동화로(t-77377) — 스위치는 저장된 볼트가 있어야 살고, 켜면
+  // 백엔드가 볼트에서 zo로 도는 창의 일을 자동화 목록에 쓴 뒤 설정을 쓰며, 카드는
+  // 상태를 다시 물어 영수증 줄에 그 일의 다음·마지막 실행을 적는다. 끄면 일이
+  // 걷히고 줄이 사라진다.
   const switchOn = backend.calls.length;
   assert(
     await pageB.evaluate(() => document.getElementById("second-brain-weekly-review")?.disabled === false),
@@ -13396,36 +13417,59 @@ await test("Second Brain detects, sets up, registers, and seeds its recurring wo
   );
   await pageB.click("#second-brain-weekly-review");
   const turnedOn = await backend.waitForCall("B", "set_second_brain_weekly_review", switchOn);
-  assertEqual(turnedOn.args, { enabled: true }, "the switch did not ask to register the cron");
+  assertEqual(turnedOn.args, { enabled: true }, "the switch did not ask to write the review's job");
   await backend.waitForCall("B", "second_brain_status", switchOn);
-  await pageB.waitForFunction(() =>
+  const nextRun = await pageB.evaluate(() => localMinuteText(29_891_880));
+  await pageB.waitForFunction((next) =>
     document.getElementById("second-brain-weekly-review-receipt")?.hidden === false
-      && document.getElementById("second-brain-weekly-review-receipt").textContent.includes("session_idle"));
+      && document.getElementById("second-brain-weekly-review-receipt").textContent.includes(next),
+  nextRun, { timeout: 5_000 }).catch(() => {});
   const receipt = await pageB.evaluate(() => ({
     line: document.getElementById("second-brain-weekly-review-receipt").textContent,
     expected: t(
       "settings.secondBrain.reviewRegistered",
-      "{{scheduler}} 스케줄러에 등록됨 · {{schedule}} (UTC) · 다음 실행 {{when}}",
-      { scheduler: "session_idle", schedule: "0 21 * * 6", when: new Date(1_800_000_000 * 1000).toLocaleString() },
+      "창 자동화로 등록됨 · 다음 실행 {{next}} · 마지막 실행 {{last}}",
+      { next: localMinuteText(29_891_880), last: t("settings.secondBrain.reviewNever", "아직 없음") },
     ),
     checked: document.getElementById("second-brain-weekly-review").checked,
   }));
   assertEqual(
     [receipt.line, receipt.checked, backend.settings.second_brain_weekly_review],
     [receipt.expected, true, true],
-    "the receipt line does not name the scheduler and the schedule the registry answered",
+    "the receipt line does not say when the review's job runs next and last ran",
+  );
+  // 자동화 목록에서 꺼 둔 일은 그렇다고 말한다 — 켜진 스위치가 열리지 않을 턴을
+  // 약속하지 않는다.
+  backend.secondBrain = {
+    ...backend.secondBrain,
+    weekly_review: { registered: true, enabled: false, next_run_at: null, last_run_at: 29_891_880 },
+  };
+  const pausedAt = backend.calls.length;
+  await pageB.click("#second-brain-refresh");
+  await backend.waitForCall("B", "second_brain_status", pausedAt);
+  const pausedText = await pageB.evaluate(() => t(
+    "settings.secondBrain.reviewPaused",
+    "자동화 목록에서 꺼져 있습니다 · 거기서 켜거나 스위치를 껐다 다시 켜 주세요",
+  ));
+  await pageB.waitForFunction((text) =>
+    document.getElementById("second-brain-weekly-review-receipt")?.textContent === text,
+  pausedText, { timeout: 5_000 }).catch(() => {});
+  assertEqual(
+    await pageB.evaluate(() => document.getElementById("second-brain-weekly-review-receipt").textContent),
+    pausedText,
+    "a review switched off on the automation screen still reads as scheduled",
   );
   const switchOff = backend.calls.length;
   await pageB.click("#second-brain-weekly-review");
   const turnedOff = await backend.waitForCall("B", "set_second_brain_weekly_review", switchOff);
-  assertEqual(turnedOff.args, { enabled: false }, "the switch did not ask to remove the cron");
+  assertEqual(turnedOff.args, { enabled: false }, "the switch did not ask to take the review's job away");
   await pageB.waitForFunction(() =>
     document.getElementById("second-brain-weekly-review-receipt")?.hidden === true
       && document.getElementById("second-brain-weekly-review").checked === false);
   assertEqual(backend.settings.second_brain_weekly_review, false, "switching off did not clear the setting");
-  // A refusal (no zo, a zo too old for `cron`, a refused schedule) rolls the
+  // A refusal (no saved vault, a store that cannot be written) rolls the
   // switch back to what the document says: a switch reading "on" while no
-  // record stands would be the card promising a turn zo never opens.
+  // job stands would be the card promising a turn nobody opens.
   backend.rejectOnce("set_second_brain_weekly_review");
   const refusedAt = backend.calls.length;
   await pageB.click("#second-brain-weekly-review");
@@ -13494,6 +13538,119 @@ await test("Second Brain detects, sets up, registers, and seeds its recurring wo
     closeAutoForm();
     setAutoOpen(false);
   });
+});
+
+// t-77381: 볼트의 매일 취합이 10-19에 꺼지고 여드레 동안 아무도 몰랐다. 카드는 그 자동화가
+// 꺼졌거나 없으면 그렇다고 말하고 「켜기」를 세우며, 켜져 있어도 하루 넘게 밀렸으면
+// 경고한다. 「켜기」는 있는 자동화를 켜고, 없으면 「raw 자동 취합」 템플릿으로 만든다.
+await test("세컨드 브레인 카드의 매일 취합 줄은 꺼지거나 하루 넘게 밀린 취합을 말하고, 켜기는 그 자동화를 켜거나 템플릿으로 만든다 (t-77381)", async () => {
+  const vault = "/Users/fixture/Knowledge";
+  const lastRun = 29_871_060;
+  const heldAutomations = backend.automations;
+  backend.settings.second_brain_vault = vault;
+  backend.secondBrain = {
+    ...backend.secondBrain,
+    saved_path: vault,
+    daily_ingest: {
+      automation_id: "ingest-1",
+      name: "raw 자동 취합",
+      enabled: false,
+      last_run_at: lastRun,
+      overdue_since: null,
+    },
+  };
+  backend.automations = [{
+    id: "ingest-1",
+    name: "raw 자동 취합",
+    enabled: false,
+    workspace: vault,
+    prompt: "raw/에 있지만 wiki/에 아직 반영되지 않은 항목을 모두 취합하고 wiki/log.md에 기록해 줘.",
+    schedule: { cadence: "daily", time: "19:00", day_of_week: 1, custom: "" },
+    last_run_at: lastRun,
+  }];
+  const ingestLine = () => pageB.evaluate(() => {
+    const warning = document.getElementById("second-brain-ingest-warning");
+    return {
+      shown: document.getElementById("second-brain-ingest-field")?.hidden === false,
+      line: document.getElementById("second-brain-ingest")?.textContent ?? "",
+      state: document.getElementById("second-brain-ingest")?.dataset.state ?? "",
+      warning: warning && !warning.hidden
+        ? document.getElementById("second-brain-ingest-warning-text").textContent
+        : null,
+      turnOn: document.getElementById("second-brain-ingest-on")?.hidden === false,
+      off: t("auto.off", "꺼짐"),
+    };
+  });
+  const warningIs = (shown) => pageB.waitForFunction((want) => {
+    const warning = document.getElementById("second-brain-ingest-warning");
+    return Boolean(warning) && warning.hidden === !want;
+  }, shown);
+
+  // 꺼진 취합: 줄이 「꺼짐」을 경고색으로 말하고, 경고가 raw/가 wiki/에 닿지 않는다고
+  // 말하며, 「켜기」가 선다.
+  const openedAt = backend.calls.length;
+  await openSettings(pageB, "integrations");
+  await backend.waitForCall("B", "second_brain_status", openedAt);
+  await warningIs(true);
+  const off = await ingestLine();
+  assert(off.shown && off.line === off.off && off.state === "warn"
+    && off.warning?.includes("raw/") && off.turnOn,
+  "a daily ingest that is off was not said to be off with a switch to turn it on", off);
+
+  // 「켜기」는 그 자동화를 켜고 상태를 다시 묻는다. 경고는 사라지고 줄은 마지막 실행을 말한다.
+  const turnedAt = backend.calls.length;
+  await pageB.click("#second-brain-ingest-on");
+  const enabled = await backend.waitForCall("B", "enable_automation", turnedAt);
+  assertEqual(enabled.args, { id: "ingest-1", enabled: true },
+    "the switch turned on something other than the vault's ingest");
+  await backend.waitForCall("B", "second_brain_status", turnedAt);
+  await warningIs(false);
+  const on = await ingestLine();
+  assert(on.shown && on.line !== on.off && on.line !== "" && on.state !== "warn" && !on.turnOn,
+    "a daily ingest that is on still read as off, or kept its switch", on);
+
+  // 켜져 있어도 하루 넘게 밀리면 경고한다 — 켤 것이 없으니 스위치는 없다.
+  backend.secondBrain.daily_ingest = {
+    ...backend.secondBrain.daily_ingest,
+    enabled: true,
+    overdue_since: lastRun + 24 * 60,
+  };
+  const lateAt = backend.calls.length;
+  await pageB.click("#second-brain-refresh");
+  await backend.waitForCall("B", "second_brain_status", lateAt);
+  await warningIs(true);
+  const late = await ingestLine();
+  assert(late.state === "warn" && late.line !== late.off && late.warning && !late.turnOn,
+    "a daily ingest a day behind its schedule was not warned about", late);
+
+  // 볼트를 취합하는 자동화가 없으면 「켜기」는 템플릿으로 하나를 만든다.
+  backend.automations = [];
+  backend.secondBrain.daily_ingest = {
+    automation_id: null,
+    name: null,
+    enabled: false,
+    last_run_at: null,
+    overdue_since: null,
+  };
+  const noneAt = backend.calls.length;
+  await pageB.click("#second-brain-refresh");
+  await backend.waitForCall("B", "second_brain_status", noneAt);
+  await warningIs(true);
+  const none = await ingestLine();
+  assert(none.line === none.off && none.turnOn,
+    "a vault with no ingest job was not said to have its daily ingest off", none);
+  const madeAt = backend.calls.length;
+  await pageB.click("#second-brain-ingest-on");
+  const made = await backend.waitForCall("B", "save_automation", madeAt);
+  const job = made.args.automation;
+  assert(job.workspace === vault && job.prompt.includes("raw/") && job.enabled === true
+    && job.schedule.cadence === "daily" && job.schedule.time === "19:00",
+  "the switch did not make the raw ingestion job from its template", job);
+  await backend.waitForCall("B", "second_brain_status", madeAt);
+  await warningIs(false);
+
+  delete backend.secondBrain.daily_ingest;
+  backend.automations = heldAutomations;
 });
 
 // t-55424: the card's 「스킬」 line reads the second-brain skill's copies the

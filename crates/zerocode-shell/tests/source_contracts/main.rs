@@ -18397,7 +18397,7 @@ mod tests {
             "automation launch precedence drifted:\n{starting}"
         );
 
-        let saving = block_after(backend, "fn save_automation(");
+        let saving = block_after(backend, "fn save_automation_in(");
         assert!(
             saving.contains("automation.validate_for_save()?;"),
             "blank workspace/prompt or invalid custom quoting can be stored"
@@ -18473,7 +18473,9 @@ mod tests {
     /// Three more with the evidence folder: the agent's completion and its
     /// last words (unknown at birth), and the folder itself — whose name is
     /// the start instant, taken before the spawn now, because the folder has
-    /// to exist before the shell that is told about it does.
+    /// to exist before the shell that is told about it does. And one for the
+    /// gap rows of t-77376: a night the window was not running is a row in
+    /// this ledger too, so a run that did start says it is not one.
     #[test]
     fn a_run_is_written_down_and_the_ledger_is_the_only_provenance() {
         let backend = shipped_backend();
@@ -18497,6 +18499,7 @@ mod tests {
             "            made_worktree: made.as_ref().map(|path| path.display().to_string()),",
             "            skipped: None,",
             "            failure: None,",
+            "            missed: None,",
             "            ended_at_epoch_ms: None,",
             "            exit_code: None,",
             "            completed_at_epoch_ms: None,",
@@ -18537,11 +18540,11 @@ mod tests {
         assert!(
             listing.contains("    let history = stored_automation_runs(state.local_data_root());")
                 && listing.contains(
-                    "            let runs = history\n                .iter()\n                .filter(|run| run.automation_id == automation.id)\n                .count();"
+                    "            let runs = history\n                .iter()\n                .filter(|run| run.automation_id == automation.id && run.missed.is_none())\n                .count();"
                 ),
-            "a row no longer says how many times its job has run, so a schedule \
-             that has never worked reads the same as one that runs \
-             nightly:\n{listing}"
+            "a row no longer says how many times its job has run, or counts the \
+             nights it did not run as runs, so a schedule that has never worked \
+             reads the same as one that runs nightly:\n{listing}"
         );
 
         // The history one job can show, newest first — the question it answers
@@ -19015,11 +19018,14 @@ mod tests {
         );
 
         // The window tells the two apart, and asks about the skip FIRST — a
-        // stopped firing's term is a placeholder, not a shell to jump to.
+        // stopped firing's term is a placeholder, not a shell to jump to, and
+        // so is a missed night's (t-77376).
         let painting = block_after(window, "function paintAutomationRuns() {");
         assert!(
-            painting.contains("    const tab = run.skipped ? null : tabOfTerm(run.term);"),
-            "the list offers a way into a shell a stopped firing never \
+            painting.contains(
+                "    const tab = run.skipped || run.missed ? null : tabOfTerm(run.term);"
+            ),
+            "the list offers a way into a shell a stopped firing or a missed night never \
              opened:\n{painting}"
         );
         assert!(
@@ -19097,7 +19103,7 @@ mod tests {
 
         // Normalised on the way in as well as at the firing, so the switch the
         // form shows and the behaviour the job gets cannot disagree.
-        let saving = block_after(shipped, "fn save_automation(");
+        let saving = block_after(shipped, "fn save_automation_in(");
         assert!(
             saving.contains(
                 &[
@@ -19214,10 +19220,11 @@ mod tests {
 
         let listing = block_after(window, "function paintAutomationRuns() {");
         assert!(
-            listing.contains("    const tab = run.skipped ? null : tabOfTerm(run.term);")
-                && listing.contains("    const openableTab = run.failure ? null : tab;")
+            listing.contains(
+                "    const tab = run.skipped || run.missed ? null : tabOfTerm(run.term);"
+            ) && listing.contains("    const openableTab = run.failure ? null : tab;")
                 && listing.contains("    if (openableTab) {"),
-            "the way back is offered for skipped/failed runs or without a live \
+            "the way back is offered for skipped/missed/failed runs or without a live \
              shell, which mounts a fresh tab around a dead pty:\n{listing}"
         );
         assert!(
@@ -23042,7 +23049,7 @@ mod tests {
     #[test]
     fn a_schedule_that_will_not_parse_is_refused_at_the_door() {
         let backend = shipped_backend();
-        let saving = block_after(backend, "fn save_automation(");
+        let saving = block_after(backend, "fn save_automation_in(");
         assert!(
             saving.contains("Cron::parse(&cron).is_none()") && saving.contains("return Err("),
             "an unparseable schedule is stored:\n{saving}"
@@ -23074,7 +23081,13 @@ mod tests {
     #[test]
     fn an_agent_this_build_cannot_resolve_is_refused_at_the_door() {
         let backend = shipped_backend();
-        let saving = block_after(backend, "fn save_automation(");
+        let saving = block_after(backend, "fn save_automation_in(");
+
+        assert!(
+            block_after(backend, "fn save_automation(")
+                .contains("    save_automation_in(state.config_root(), automation)?;"),
+            "the editor's save no longer goes through the door these lines pin"
+        );
 
         // The guard is pinned WHOLE — its lines, their order, and their exact
         // indentation at the function's own depth — because substring pins
@@ -23095,7 +23108,7 @@ mod tests {
              dead:\n{saving}"
         );
         let writes = saving
-            .find("write_automations(state.config_root(), &rows)?")
+            .find("write_automations(config_root, &rows)?")
             .expect("the save no longer writes");
         assert!(
             judged < writes,

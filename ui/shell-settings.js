@@ -10133,24 +10133,32 @@ function normalizeSecondBrainReport(answer) {
     weeklyReview: answer?.weekly_review && typeof answer.weekly_review === "object"
       ? {
           registered: answer.weekly_review.registered === true,
-          cronId: answer.weekly_review.cron_id == null ? null : String(answer.weekly_review.cron_id),
-          schedule: answer.weekly_review.schedule == null ? null : String(answer.weekly_review.schedule),
-          nextDueAt: Number.isFinite(Number(answer.weekly_review.next_due_at))
-            && answer.weekly_review.next_due_at != null
-            ? Number(answer.weekly_review.next_due_at)
-            : null,
-          scheduler: answer.weekly_review.scheduler == null ? null : String(answer.weekly_review.scheduler),
-          registry: answer.weekly_review.registry == null ? null : String(answer.weekly_review.registry),
-          outcome: answer.weekly_review.outcome == null ? null : String(answer.weekly_review.outcome),
-          error: answer.weekly_review.error == null ? null : String(answer.weekly_review.error),
+          enabled: answer.weekly_review.enabled === true,
+          nextRunAt: localMinuteOrNull(answer.weekly_review.next_run_at),
+          lastRunAt: localMinuteOrNull(answer.weekly_review.last_run_at),
+        }
+      : null,
+    dailyIngest: answer?.daily_ingest && typeof answer.daily_ingest === "object"
+      ? {
+          automationId: answer.daily_ingest.automation_id == null
+            ? null
+            : String(answer.daily_ingest.automation_id),
+          enabled: answer.daily_ingest.enabled === true,
+          lastRunAt: localMinuteOrNull(answer.daily_ingest.last_run_at),
+          overdueSince: localMinuteOrNull(answer.daily_ingest.overdue_since),
         }
       : null,
   };
 }
 
+function localMinuteOrNull(value) {
+  return value != null && Number.isFinite(Number(value)) ? Number(value) : null;
+}
+
 /* 주간 리뷰 스위치와 그 영수증 줄. 스위치는 설정(`second_brain_weekly_review`)을
- * 비추고, 줄은 볼트의 zo 등록부가 답한 것을 — 어느 스케줄러가 언제 여는지 — 그대로
- * 말한다. 켜져 있는데 기록이 없으면 그렇다고 말한다; 켜진 스위치가 열리지 않을
+ * 비추고, 줄은 창의 자동화 목록이 그 일을 어떻게 들고 있는지를 — 다음에 언제
+ * 돌고 마지막에 언제 돌았는지를 — 그대로 말한다(t-77377). 켜져 있는데 일이
+ * 없거나 자동화 목록에서 꺼져 있으면 그렇다고 말한다; 켜진 스위치가 열리지 않을
  * 턴을 약속하는 것이 이 카드가 하지 않을 일이다. */
 function paintSecondBrainWeeklyReview() {
   const box = el("second-brain-weekly-review");
@@ -10164,22 +10172,27 @@ function paintSecondBrainWeeklyReview() {
     return;
   }
   line.hidden = false;
-  if (receipt?.error) {
-    say(line, () => t("settings.secondBrain.reviewFailed", "주간 리뷰 cron을 확인하지 못했습니다: {{detail}}", {
-      detail: receipt.error,
-    }));
-  } else if (receipt?.registered) {
+  if (receipt?.registered && receipt.enabled) {
     say(line, () => t(
       "settings.secondBrain.reviewRegistered",
-      "{{scheduler}} 스케줄러에 등록됨 · {{schedule}} (UTC) · 다음 실행 {{when}}",
+      "창 자동화로 등록됨 · 다음 실행 {{next}} · 마지막 실행 {{last}}",
       {
-        scheduler: receipt.scheduler ?? "?",
-        schedule: receipt.schedule ?? "?",
-        when: receipt.nextDueAt === null ? "?" : new Date(receipt.nextDueAt * 1000).toLocaleString(),
+        next: receipt.nextRunAt === null ? "?" : localMinuteText(receipt.nextRunAt),
+        last: receipt.lastRunAt === null
+          ? t("settings.secondBrain.reviewNever", "아직 없음")
+          : localMinuteText(receipt.lastRunAt),
       },
     ));
+  } else if (receipt?.registered) {
+    say(line, () => t(
+      "settings.secondBrain.reviewPaused",
+      "자동화 목록에서 꺼져 있습니다 · 거기서 켜거나 스위치를 껐다 다시 켜 주세요",
+    ));
   } else {
-    say(line, () => t("settings.secondBrain.reviewMissing", "볼트의 zo cron 등록부에 기록이 없습니다 · 스위치를 껐다 다시 켜 주세요"));
+    say(line, () => t(
+      "settings.secondBrain.reviewMissing",
+      "자동화 목록에 주간 리뷰가 없습니다 · 스위치를 껐다 다시 켜 주세요",
+    ));
   }
 }
 
@@ -10314,6 +10327,91 @@ function paintSecondBrain() {
   el("second-brain-link").disabled = secondBrainLoading || !secondBrainReport?.savedPath;
   paintSecondBrainWeeklyReview();
   paintSecondBrainRawCapture();
+  paintSecondBrainIngest();
+}
+
+/* 저장된 볼트의 매일 취합(t-77381): 꺼졌거나, 켜져 있어도 하루 넘게 밀렸으면
+ * 경고색 줄과 경고가 그렇다고 말한다. 「켜기」는 꺼진 것을 켤 때만 선다. */
+function paintSecondBrainIngest() {
+  const ingest = secondBrainReport?.dailyIngest ?? null;
+  const off = ingest !== null && !ingest.enabled;
+  const late = ingest !== null && ingest.enabled && ingest.overdueSince !== null;
+  el("second-brain-ingest-field").hidden = ingest === null;
+  const line = el("second-brain-ingest");
+  line.dataset.state = off || late ? "warn" : "ok";
+  say(line, () => {
+    if (ingest === null || off) return t("auto.off", "꺼짐");
+    if (late) {
+      return t("settings.secondBrain.ingestLate", "{{since}}부터 밀림", {
+        since: localMinuteText(ingest.overdueSince),
+      });
+    }
+    return ingest.lastRunAt === null
+      ? t("settings.secondBrain.ingestOn", "켜짐")
+      : t("settings.secondBrain.ingestLast", "켜짐 · 마지막 {{at}}", {
+        at: localMinuteText(ingest.lastRunAt),
+      });
+  });
+  el("second-brain-ingest-warning").hidden = !(off || late);
+  say(el("second-brain-ingest-warning-text"), () => {
+    if (late) {
+      return t(
+        "settings.secondBrain.ingestLateWarning",
+        "매일 취합이 하루 넘게 돌지 않았습니다. 그사이 raw/에 들어온 항목은 아직 wiki/에 없습니다.",
+      );
+    }
+    return ingest?.automationId
+      ? t(
+        "settings.secondBrain.ingestOffWarning",
+        "매일 취합이 꺼져 있어 raw/에 들어온 항목이 wiki/에 반영되지 않습니다.",
+      )
+      : t(
+        "settings.secondBrain.ingestMissingWarning",
+        "이 볼트를 매일 취합하는 자동화가 없어 raw/에 들어온 항목이 wiki/에 반영되지 않습니다.",
+      );
+  });
+  const turnOn = el("second-brain-ingest-on");
+  turnOn.hidden = !off;
+  turnOn.disabled = secondBrainLoading;
+}
+
+/* Local minutes since the epoch, read as the wall clock they encode (see
+ * `whenNext`). */
+function localMinuteText(minutes) {
+  return new Date(minutes * 60000).toLocaleString(undefined, {
+    timeZone: "UTC",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+/* 「켜기」: 볼트의 취합 자동화를 켜고, 없으면 「raw 자동 취합」 템플릿으로 저장된
+ * 볼트에 하나를 만든다. 자동화 목록도 같은 답으로 고쳐 그린다. */
+async function turnOnSecondBrainIngest() {
+  const ingest = secondBrainReport?.dailyIngest ?? null;
+  const vault = secondBrainReport?.savedPath ?? "";
+  if (ingest === null || !vault) return;
+  const button = el("second-brain-ingest-on");
+  button.disabled = true;
+  try {
+    if (ingest.automationId) {
+      automations = await invoke("enable_automation", { id: ingest.automationId, enabled: true });
+    } else {
+      if (agentRows.length === 0) await refreshAgents();
+      const automation = newAutomationDraft({ ...AUTO_TEMPLATES["raw-ingest"](), workspace: vault });
+      automations = await invoke("save_automation", { automation });
+    }
+    paintAutomations();
+  } catch (error) {
+    secondBrainError = String(error);
+    paintSecondBrain();
+    return;
+  } finally {
+    button.disabled = false;
+  }
+  await refreshSecondBrain(el("second-brain-path").value || null);
 }
 
 /* 이 카드가 백엔드에 묻는 모든 길은 같은 모양이다: 세대를 올리고, 기다리는
@@ -10358,6 +10456,7 @@ el("second-brain-new").addEventListener("click", () => void chooseSecondBrainFol
 el("second-brain-refresh").addEventListener("click", () => {
   void refreshSecondBrain(el("second-brain-path").value || null);
 });
+el("second-brain-ingest-on").addEventListener("click", () => void turnOnSecondBrainIngest());
 el("second-brain-detected").addEventListener("change", (event) => {
   if (event.target.value) void refreshSecondBrain(event.target.value);
 });
@@ -10367,8 +10466,8 @@ el("second-brain-link").addEventListener("click", () => {
 });
 el("second-brain-install").addEventListener("click", () => openExternal(OBSIDIAN_URL));
 el("second-brain-weekly-review").addEventListener("change", (event) => {
-  // 그림이 먼저, 쓰기는 그 뒤 — 다른 스위치와 같다. 백엔드는 zo가 볼트의
-  // 등록부에 기록을 앉힌 뒤에야 설정을 쓰고, 거절되면 스냅샷이 스위치를
+  // 그림이 먼저, 쓰기는 그 뒤 — 다른 스위치와 같다. 백엔드는 창의 일을 자동화
+  // 목록에 쓰거나 걷은 뒤에야 설정을 쓰고, 거절되면 스냅샷이 스위치를
   // 되돌린다. 성공하면 상태를 다시 물어 영수증 줄을 채운다.
   const enabled = event.target.checked;
   secondBrainWeeklyReview = enabled;
@@ -10865,8 +10964,9 @@ function paintAutomationCalendar() {
     if (historyRunsOnDate.length > 0) {
       const dots = document.createElement("div");
       dots.className = "auto-cal-dots";
-      const hasSuccess = historyRunsOnDate.some((r) => !r.failure);
+      const hasSuccess = historyRunsOnDate.some((r) => !r.failure && !r.missed);
       const hasFail = historyRunsOnDate.some((r) => r.failure);
+      const hasMissed = historyRunsOnDate.some((r) => r.missed);
       if (hasSuccess) {
         const dot = document.createElement("span");
         dot.className = "auto-cal-dot is-success";
@@ -10877,6 +10977,12 @@ function paintAutomationCalendar() {
         const dot = document.createElement("span");
         dot.className = "auto-cal-dot is-fail";
         dot.dataset.tip = t("auto.hasFail", "실패한 실행 있음");
+        dots.appendChild(dot);
+      }
+      if (hasMissed) {
+        const dot = document.createElement("span");
+        dot.className = "auto-cal-dot is-missed";
+        dot.dataset.tip = t("auto.hasMissed", "놓친 실행 있음");
         dots.appendChild(dot);
       }
       head.appendChild(dots);
@@ -11072,6 +11178,7 @@ function paintCalendarSelectedPanel(rows) {
     for (const run of historyRunsOnSelected) {
       const parentAuto = automations.find((a) => a.id === run.automation_id);
       const isFail = Boolean(run.failure);
+      const isMissed = Boolean(run.missed);
       const hItem = document.createElement("div");
       hItem.className = "auto-cal-selected-item";
 
@@ -11079,7 +11186,7 @@ function paintCalendarSelectedPanel(rows) {
       left.className = "auto-cal-selected-left";
 
       const dot = document.createElement("span");
-      dot.className = `auto-cal-dot ${isFail ? "is-fail" : "is-success"}`;
+      dot.className = `auto-cal-dot ${isFail ? "is-fail" : isMissed ? "is-missed" : "is-success"}`;
       dot.style.width = "8px";
       dot.style.height = "8px";
       dot.style.flex = "none";
@@ -11093,7 +11200,12 @@ function paintCalendarSelectedPanel(rows) {
 
       const subSpan = document.createElement("span");
       subSpan.className = "auto-cal-selected-sub";
-      subSpan.textContent = `${isFail ? t("auto.runError", "실행 실패") : t("auto.runSuccess", "실행 완료")} · ${basename(run.root || "")}`;
+      const verdict = isFail
+        ? t("auto.runError", "실행 실패")
+        : isMissed
+          ? t("auto.runMissed", "놓침 — 그 시각에 창이 돌지 않음")
+          : t("auto.runSuccess", "실행 완료");
+      subSpan.textContent = `${verdict} · ${basename(run.root || "")}`;
 
       info.append(nameSpan, subSpan);
       left.append(dot, info);
@@ -11233,6 +11345,20 @@ function paintAutomationRuns() {
           : `exit ${run.skipped.exit_code ?? "?"}`,
         run.skipped.output,
       ].filter(Boolean).join("\n");
+    } else if (run.missed) {
+      // Nights the window was not running for (t-77376). The row is dated at
+      // the last of them; the first is in the tip.
+      state.className = "auto-run-missed";
+      if (run.missed.count > 1) {
+        state.textContent = t("auto.runMissedMany", "놓침 {{n}}회 — 그 시각에 창이 돌지 않음", {
+          n: run.missed.count,
+        });
+        const first = run.at_epoch_ms
+          - (run.scheduled_for_epoch_minutes - run.missed.first_epoch_minutes) * 60000;
+        state.dataset.tip = t("auto.runMissedFirst", "처음 놓친 회차 {{at}}", { at: runClock(first) });
+      } else {
+        state.textContent = t("auto.runMissed", "놓침 — 그 시각에 창이 돌지 않음");
+      }
     } else if (run.ended_at_epoch_ms) {
       state.className = "auto-run-ended";
       if (run.exit_code === 0) {
@@ -11278,7 +11404,7 @@ function paintAutomationRuns() {
     }
     const actions = document.createElement("span");
     actions.className = "auto-run-actions";
-    const tab = run.skipped ? null : tabOfTerm(run.term);
+    const tab = run.skipped || run.missed ? null : tabOfTerm(run.term);
     const openableTab = run.failure ? null : tab;
     if (openableTab) {
       const open = document.createElement("button");
