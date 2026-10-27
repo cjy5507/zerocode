@@ -708,6 +708,45 @@ fn mirror_bin() -> Option<PathBuf> {
     )
 }
 
+/// Start every pane's program through the mirror (t-77414), which makes the
+/// pane's terminal its controlling terminal and then becomes the program:
+/// a spawn alone leaves `zsh` and `zo` with none, so the window going sent
+/// them no hangup — five zo processes went on spinning after a restart,
+/// each holding its conversation — a resize signalled nothing they ran, and
+/// ^C reached no group. Asked once at boot, before any pane opens, and
+/// this returns at once: the mirror answers `launch_through`'s question on
+/// a thread of its own within its limit, so a mirror that does not answer
+/// no longer holds the boot short of its first paint (t-77530, Codex
+/// t-77525). A window with no mirror beside it — a development build of the
+/// window's binary alone — starts its panes straight, as every start did
+/// before, and its log says so. So does one whose mirror does not answer
+/// in time, or was built before this road and cannot answer at all: named,
+/// it would leave its marker in every pane's program, and a nested agent
+/// launch under it would start past the mirror's guard (t-77495).
+#[cfg(target_os = "macos")]
+pub(crate) fn launch_panes_through_the_mirror(local_data_root: &Path) {
+    match mirror_bin().filter(|bin| bin.is_file()) {
+        Some(bin) => {
+            let root = local_data_root.to_path_buf();
+            zerocode_pty::launch_through(
+                bin,
+                Some(local_data_root.join(crate::system_runtime::WINDOW_LOG)),
+                move |why| {
+                    crate::note_window_event(
+                        &root,
+                        &format!("pane launch: {why} — panes start without a controlling terminal"),
+                    );
+                },
+            );
+        }
+        None => crate::note_window_event(
+            local_data_root,
+            "pane launch: no zerocode-mirror beside the window — panes start without a \
+             controlling terminal",
+        ),
+    }
+}
+
 /// Whether a nested run can be mirrored RIGHT NOW.
 ///
 /// [`mirror_shims`] answers once for the window's lifetime, because the shims

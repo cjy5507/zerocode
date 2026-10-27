@@ -12,7 +12,7 @@ use crate::types::{
     ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use serde_json::json;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 #[test]
 fn request_translation_uses_openai_compatible_shape() {
@@ -1089,11 +1089,10 @@ fn endpoint_builder_accepts_base_urls_and_full_endpoints() {
     );
 }
 
+// `ZO_STREAM_IDLE_TIMEOUT_MS` is process-wide and other modules' tests set it
+// too, so these tests serialise on the crate's one env lock.
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    crate::test_env_lock()
 }
 
 #[test]
@@ -1892,7 +1891,13 @@ async fn openai_compat_restart_budget_exhausted_surfaces_error() {
         .await
         .expect("open stream");
 
-    let error = stream.next_event().await.expect_err("budget exhausted");
+    // The server never ends a stream on its own, so each wait is bounded: a
+    // broken idle timer or restart must fail this test, not hang it.
+    let bound = std::time::Duration::from_secs(10);
+    let error = tokio::time::timeout(bound, stream.next_event())
+        .await
+        .expect("the idle timeout must end the held streams")
+        .expect_err("budget exhausted");
     assert!(
         matches!(
             error,
@@ -1902,7 +1907,10 @@ async fn openai_compat_restart_budget_exhausted_surfaces_error() {
         "expected idle-timeout after restart budget exhausted"
     );
     let _ = done.send(());
-    server.await.unwrap();
+    tokio::time::timeout(bound, server)
+        .await
+        .expect("the server must have seen both streams")
+        .unwrap();
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
@@ -2007,6 +2015,8 @@ async fn openai_compat_committed_stream_propagates_instead_of_restarting() {
     let addr = listener.local_addr().unwrap();
     let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let server_hits = hits.clone();
+    let (done, finished) = tokio::sync::oneshot::channel::<()>();
+    let bound = std::time::Duration::from_secs(10);
 
     let server = tokio::spawn(async move {
         let (mut conn, _) = listener.accept().await.unwrap();
@@ -2020,12 +2030,13 @@ async fn openai_compat_committed_stream_propagates_instead_of_restarting() {
             .await
             .unwrap();
         conn.flush().await.unwrap();
-        // Hold the connection open far past the idle window: the test asserts
-        // that the IDLE TIMEOUT ends the stream, and a 600 ms hold raced it —
+        // Hold the connection open until the test is done: the test asserts
+        // that the IDLE TIMEOUT ends the stream, and a fixed hold raced it —
         // under load the client read "partial" late, the server had already
-        // hung up, and EOF arrived where the timeout was expected. The task is
-        // aborted at the end of the test.
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        // hung up, and EOF arrived where the timeout was expected (600 ms,
+        // then 30 s; t-77341).
+        let _ = finished.await;
+        drop(conn);
     });
 
     let _idle = EnvVarGuard::set(crate::providers::STREAM_IDLE_TIMEOUT_ENV, Some("300"));
@@ -2052,7 +2063,10 @@ async fn openai_compat_committed_stream_propagates_instead_of_restarting() {
         }
     }
     assert!(saw_partial, "stream must surface the committing text delta");
-    let error = stream.next_event().await.expect_err("post-commit error");
+    let error = tokio::time::timeout(bound, stream.next_event())
+        .await
+        .expect("the idle timeout must end the held stream")
+        .expect_err("post-commit error");
     assert!(
         matches!(
             error,
@@ -2062,7 +2076,11 @@ async fn openai_compat_committed_stream_propagates_instead_of_restarting() {
         "post-commit idle must propagate"
     );
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
-    server.abort();
+    let _ = done.send(());
+    tokio::time::timeout(bound, server)
+        .await
+        .expect("the server must be released")
+        .unwrap();
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -2074,13 +2092,11 @@ async fn openai_compat_restart_reopen_is_bounded_by_the_wallclock_budget() {
     let _guard = env_lock();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let server_hits = hits.clone();
+    let bound = std::time::Duration::from_secs(10);
 
     let server = tokio::spawn(async move {
         // First stream opens and goes silent pre-commit.
         let (mut first, _) = listener.accept().await.unwrap();
-        server_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut scratch = [0u8; 1024];
         let _ = first.read(&mut scratch).await;
         first
@@ -2088,15 +2104,16 @@ async fn openai_compat_restart_reopen_is_bounded_by_the_wallclock_budget() {
             .await
             .unwrap();
         first.flush().await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(450)).await;
 
         // Reopen: accept the connection but never answer it. Without the
         // remaining-window timeout around the reopen this would park the
         // stream indefinitely (the shared client has no blanket timeout).
+        // Both sockets stay open until the test ends this task, so no EOF
+        // from this side can beat the restart window on a loaded machine
+        // (t-77341).
         let (mut second, _) = listener.accept().await.unwrap();
-        server_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _ = second.read(&mut scratch).await;
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        std::future::pending::<()>().await;
     });
 
     let _idle = EnvVarGuard::set(crate::providers::STREAM_IDLE_TIMEOUT_ENV, Some("300"));
@@ -2113,10 +2130,15 @@ async fn openai_compat_restart_reopen_is_bounded_by_the_wallclock_budget() {
         .expect("open stream");
     // Shrink the restart window so the never-answered reopen fails out in
     // test time instead of the production 120s ceiling.
-    stream.max_restart_wallclock = std::time::Duration::from_millis(500);
+    let window = std::time::Duration::from_millis(500);
+    stream.max_restart_wallclock = window;
 
     let started = std::time::Instant::now();
-    let error = stream.next_event().await.expect_err("reopen must time out");
+    let error = tokio::time::timeout(bound, stream.next_event())
+        .await
+        .expect("the restart window must end the reopen wait")
+        .expect_err("reopen must time out");
+    let waited = started.elapsed();
     assert!(
         matches!(
             &error,
@@ -2126,11 +2148,22 @@ async fn openai_compat_restart_reopen_is_bounded_by_the_wallclock_budget() {
         "expected stream_restart_timeout, got: {error:?}"
     );
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "reopen wait must be bounded by the restart window, took {:?}",
-        started.elapsed()
+        waited < std::time::Duration::from_secs(5),
+        "reopen wait must be bounded by the restart window, took {waited:?}"
     );
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // The window is wall clock and opens at the first restart, so the
+    // client must have waited all of it out since then. A stall inside it
+    // (a paused or starved test process) spends what is left wherever it
+    // lands, even before the reopen has connected, so whether the server got
+    // to accept the reopen is no part of the bound (t-77484 F1).
+    let spent = stream
+        .restart_window_start
+        .expect("the restart opens the window")
+        .elapsed();
+    assert!(
+        spent >= window,
+        "the client gave up on the reopen before its window had passed, {spent:?} after it opened"
+    );
     server.abort();
 }
 

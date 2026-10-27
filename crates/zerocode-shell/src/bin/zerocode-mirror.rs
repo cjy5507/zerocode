@@ -22,6 +22,14 @@
 //!   produce a real worker terminal; the mirror is not a degraded substitute
 //!   when durable authority is temporarily unavailable.
 //!
+//! - **A pane's start, when the window asks.** On macOS every pane's program
+//!   starts through this binary (`zerocode_pty::launch_through`, t-77414):
+//!   started by a lane, with `ZEROCODE_CTTY_EXEC` in its environment, it
+//!   makes the pane's terminal its controlling terminal and `exec`s the
+//!   program, before any of the above is looked at. The same marker merely
+//!   inherited — an older helper left it — is taken out, and the run goes
+//!   through the tee and the guard as any other (t-77495).
+//!
 //! The window learns about the run through the same loopback bridge the hook
 //! scripts use — a form POST with the pane's own coordinates from the
 //! environment. Every bridge failure is swallowed: the mirror is a witness,
@@ -31,6 +39,8 @@ use std::io::{IsTerminal, Read, Write};
 use std::sync::{Arc, Mutex};
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    zerocode_pty::serve_ctty_exec();
     let mut args = std::env::args_os().skip(1);
     let Some(real) = args.next() else {
         eprintln!("zerocode-mirror: real binary path missing");
