@@ -15,17 +15,21 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
 use crate::effect_journal::{
     AuthorityLease, BeginEffect, EffectJournal, EffectJournalError, EffectPermit, EffectRequest,
-    EffectSettlement, HostEffectKind, HostEffectState, OpenOperation,
+    EffectSettlement, HostEffectFailure, HostEffectKind, HostEffectState, OpenOperation,
+    Withdrawal,
 };
 use crate::workflow_store::{StoreHold, WorkflowStore};
 use zerocode_core::ProviderSession;
 
 pub mod gate_session;
+mod serving;
+pub use serving::{Served, Serving};
 use zerocode_core::agent_teams::{Effect, Team};
 use zerocode_core::orchestration::{
     Decided, Launcher, Ledger, LedgerProjectionV1, MAX_LIST, MAX_NAME, MAX_PROSE,
@@ -817,6 +821,17 @@ pub enum RuntimeRequest {
         worker: String,
         now_ms: i64,
     },
+    /// A pane the plan cut and settled never got its worker ready, and was
+    /// closed: the worker row goes back like [`Self::SeatNeverOpened`], and
+    /// the split the pane came from stops counting as carried out, so the
+    /// request that asked for it may cut again (t-76890). One request, so
+    /// the rows and the journal move at one revision.
+    SeatNeverReady {
+        worker: String,
+        operation_id: String,
+        tombstone_digest: String,
+        now_ms: i64,
+    },
     /// One federation call, home or worker-server side — a single statement
     /// because the ten calls share one shape: ledger law in, durable iff it
     /// moved, and the transport stays outside the actor entirely.
@@ -1386,6 +1401,18 @@ impl std::fmt::Debug for RuntimeRequest {
                 .field("worker_bytes", &worker.len())
                 .field("now_ms", now_ms)
                 .finish(),
+            Self::SeatNeverReady {
+                worker,
+                operation_id,
+                tombstone_digest,
+                now_ms,
+            } => formatter
+                .debug_struct("RuntimeRequest::SeatNeverReady")
+                .field("worker_bytes", &worker.len())
+                .field("operation_bytes", &operation_id.len())
+                .field("tombstone_bytes", &tombstone_digest.len())
+                .field("now_ms", now_ms)
+                .finish(),
             Self::PrepareEffect { request, now_ms } => formatter
                 .debug_struct("RuntimeRequest::PrepareEffect")
                 .field("request", request)
@@ -1943,6 +1970,7 @@ pub struct RuntimeActor {
     sender: Option<SyncSender<ActorCommand>>,
     join: Option<JoinHandle<Result<RuntimeImage, RuntimeError>>>,
     terminal: Arc<Terminal>,
+    serving: Arc<Serving>,
 }
 
 impl std::fmt::Debug for RuntimeActor {
@@ -1977,6 +2005,8 @@ impl RuntimeActor {
         let (boot_sender, boot_receiver) = mpsc::sync_channel(0);
         let terminal = Arc::new(Terminal::new());
         let thread_terminal = Arc::clone(&terminal);
+        let serving = Arc::new(Serving::default());
+        let thread_serving = Arc::clone(&serving);
         let join = thread::Builder::new()
             .name("zerocode-runtime-actor".to_string())
             .spawn(move || {
@@ -1987,7 +2017,10 @@ impl RuntimeActor {
                         boot,
                         panes,
                         launcher,
-                        receiver,
+                        Mail {
+                            receiver,
+                            serving: &thread_serving,
+                        },
                         boot_sender,
                     )
                 }));
@@ -2011,6 +2044,7 @@ impl RuntimeActor {
             sender: Some(sender),
             join: Some(join),
             terminal,
+            serving,
         };
         match boot_receiver.recv() {
             Ok(Ok(_)) => Ok(actor),
@@ -2026,6 +2060,12 @@ impl RuntimeActor {
                 Err(error)
             }
         }
+    }
+
+    /// What the actor is serving now, for a watcher that must never ask it.
+    #[must_use]
+    pub fn serving(&self) -> &Serving {
+        &self.serving
     }
 
     pub fn request(&self, request: RuntimeRequest) -> Result<RuntimeReply, RuntimeError> {
@@ -3113,6 +3153,27 @@ impl RuntimeActor {
         }
     }
 
+    /// A pane the plan cut never got its worker ready and was closed: the
+    /// worker row goes back and the split `operation_id` names may be asked
+    /// for again.
+    pub fn seat_never_ready(
+        &self,
+        worker: impl Into<String>,
+        operation_id: impl Into<String>,
+        tombstone_digest: impl Into<String>,
+        now_ms: i64,
+    ) -> Result<(bool, u64), RuntimeError> {
+        match self.request(RuntimeRequest::SeatNeverReady {
+            worker: worker.into(),
+            operation_id: operation_id.into(),
+            tombstone_digest: tombstone_digest.into(),
+            now_ms,
+        })? {
+            RuntimeReply::Settled { moved, revision } => Ok((moved, revision)),
+            _ => Err(RuntimeError::AuthorityRejected),
+        }
+    }
+
     /// Reserve one host effect. What comes back is the journal's word on it.
     pub fn prepare_effect(
         &self,
@@ -4019,6 +4080,12 @@ impl RuntimeState {
             RuntimeRequest::SeatNeverOpened { worker, now_ms } => {
                 self.seat_never_opened(&worker, now_ms)
             }
+            RuntimeRequest::SeatNeverReady {
+                worker,
+                operation_id,
+                tombstone_digest,
+                now_ms,
+            } => self.seat_never_ready(&worker, &operation_id, &tombstone_digest, now_ms),
             RuntimeRequest::PrepareEffect { request, now_ms } => {
                 self.prepare_effect(&request, now_ms)
             }
@@ -6034,7 +6101,39 @@ impl RuntimeState {
         worker: &str,
         now_ms: i64,
     ) -> Result<RuntimeReply, RuntimeError> {
-        if worker.is_empty() || worker.len() > MAX_NAME || now_ms < 0 {
+        self.seat_returned(worker, None, now_ms)
+    }
+
+    /// [`Self::seat_never_opened`] for a pane that WAS cut and settled and
+    /// then never got its worker ready: the same row goes back, and in the
+    /// same write the split's journal row stops saying "carried out".
+    fn seat_never_ready(
+        &mut self,
+        worker: &str,
+        operation_id: &str,
+        tombstone_digest: &str,
+        now_ms: i64,
+    ) -> Result<RuntimeReply, RuntimeError> {
+        self.seat_returned(worker, Some((operation_id, tombstone_digest)), now_ms)
+    }
+
+    /// The worker row goes back; with a `withdrawn` split, so does the
+    /// journal's word that the split was carried out.
+    fn seat_returned(
+        &mut self,
+        worker: &str,
+        withdrawn: Option<(&str, &str)>,
+        now_ms: i64,
+    ) -> Result<RuntimeReply, RuntimeError> {
+        /* A split that minted no worker row (a plain pane) has no seat to
+         * give back, but its cut may still be withdrawn: an empty `worker`
+         * is valid for a withdrawal alone. */
+        if (worker.is_empty() && withdrawn.is_none())
+            || worker.len() > MAX_NAME
+            || now_ms < 0
+            || withdrawn
+                .is_some_and(|(operation, tombstone)| operation.is_empty() || tombstone.is_empty())
+        {
             return Err(RuntimeError::InvalidInput);
         }
         if !self.recovery_permits.is_empty() {
@@ -6046,39 +6145,76 @@ impl RuntimeState {
                 .find(|one| one.id == worker)
                 .map(|one| (one.team.clone(), one.pane.clone()))
         });
-        let Some((team, pane)) = seat else {
+        if let Some((team, pane)) = seat {
+            /* The door checks its own name: the actor holds the table, so "the
+             * pane never opened" is a question it can ask rather than a promise
+             * the caller makes. A recorded seat means the split LANDED — erasing
+             * that worker would orphan a live agent — so a lying caller is
+             * refused here, not obeyed. The same shape as `recover`: make the
+             * false sentence impossible to spell.
+             *
+             * Strictly, the question this asks is "the seat is not open NOW",
+             * not "it never opened": a seat that opened and then lost its
+             * terminal answers None here too. The caller calls this door only
+             * for the split that just failed — read that sentence before
+             * calling it from anywhere else. */
+            let mut seat_open = false;
+            self.panes.with_team(&team, &mut |held| {
+                if let Some(held) = held {
+                    seat_open = held.term_of(&pane).is_some();
+                }
+            });
+            if seat_open {
+                return Err(RuntimeError::SeatStillOpen);
+            }
+            self.ledger.forget_worker(worker);
+        } else if withdrawn.is_none() {
             return Ok(RuntimeReply::Settled {
                 moved: false,
                 revision: self.revision,
             });
-        };
-        /* The door checks its own name: the actor holds the table, so "the
-         * pane never opened" is a question it can ask rather than a promise
-         * the caller makes. A recorded seat means the split LANDED — erasing
-         * that worker would orphan a live agent — so a lying caller is
-         * refused here, not obeyed. The same shape as `recover`: make the
-         * false sentence impossible to spell.
-         *
-         * Strictly, the question this asks is "the seat is not open NOW",
-         * not "it never opened": a seat that opened and then lost its
-         * terminal answers None here too. The caller calls this door only
-         * for the split that just failed — read that sentence before
-         * calling it from anywhere else. */
-        let mut seat_open = false;
-        self.panes.with_team(&team, &mut |held| {
-            if let Some(held) = held {
-                seat_open = held.term_of(&pane).is_some();
-            }
-        });
-        if seat_open {
-            return Err(RuntimeError::SeatStillOpen);
         }
-        self.ledger.forget_worker(worker);
-        let revision = self.write_through(now_ms)?;
-        Ok(RuntimeReply::Settled {
-            moved: true,
-            revision,
-        })
+        let Some((operation_id, tombstone_digest)) = withdrawn else {
+            let revision = self.write_through(now_ms)?;
+            return Ok(RuntimeReply::Settled {
+                moved: true,
+                revision,
+            });
+        };
+        /* The same single write `write_through` makes, with the journal row
+         * moving in its transaction. A refusal poisons exactly as that door
+         * does: the rows in memory are ahead of the disk, and the next
+         * request reads the disk's word. */
+        let next = self
+            .revision
+            .checked_add(1)
+            .ok_or(RuntimeError::RevisionMismatch)?;
+        let at_ms = self.stamped(now_ms);
+        let written_rows = Arc::new(self.ledger.export());
+        let withdrawal = Withdrawal {
+            operation_id: operation_id.to_string(),
+            failure: HostEffectFailure::Unavailable,
+            tombstone_digest: tombstone_digest.to_string(),
+            retry_not_before_ms: at_ms.saturating_add(1),
+            at_ms,
+        };
+        match self
+            .journal
+            .withdraw_applied(&self.lease, self.revision, &written_rows, &withdrawal)
+        {
+            Ok(()) => {
+                self.revision = next;
+                self.projection = Some((next, written_rows));
+                Ok(RuntimeReply::Settled {
+                    moved: true,
+                    revision: next,
+                })
+            }
+            Err(why) => {
+                self.poison = Some(runtime_error(why));
+                Err(RuntimeError::NotDurable)
+            }
+        }
     }
 
     /// Reserve one host effect against the current rows, in one transaction.
@@ -6762,15 +6898,23 @@ fn taken_over_letter(
     )
 }
 
+/// The actor's mailbox, and where it says which request it is serving
+/// (t-75646) for a watcher that must never send it one.
+struct Mail<'a> {
+    receiver: Receiver<ActorCommand>,
+    serving: &'a Serving,
+}
+
 fn actor_main(
     store: WorkflowStore,
     ledger_id: String,
     boot: RuntimeBoot,
     panes: Box<dyn PaneTable>,
     launcher: Box<dyn Launcher + Send>,
-    receiver: Receiver<ActorCommand>,
+    mail: Mail<'_>,
     boot_reply: SyncSender<Result<RuntimeImage, RuntimeError>>,
 ) -> Result<RuntimeImage, RuntimeError> {
+    let Mail { receiver, serving } = mail;
     let mut state = match RuntimeState::boot(store, ledger_id, boot, panes, launcher) {
         Ok(state) => state,
         Err(error) => {
@@ -6792,19 +6936,25 @@ fn actor_main(
             Err(_) => return Ok(state.image()),
         };
         match command {
-            ActorCommand::Request { request, reply } => match state.request(*request) {
-                Ok(answer) => {
-                    let _ = reply.send(Ok(answer));
+            ActorCommand::Request { request, reply } => {
+                let begun = serving.begin(request.verb(), Instant::now());
+                let answered = state.request(*request);
+                drop(begun);
+                match answered {
+                    Ok(answer) => {
+                        let _ = reply.send(Ok(answer));
+                    }
+                    Err(error) if error.fatal() => {
+                        let _ = reply.send(Err(error.clone()));
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
                 }
-                Err(error) if error.fatal() => {
-                    let _ = reply.send(Err(error.clone()));
-                    return Err(error);
-                }
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                }
-            },
+            }
             ActorCommand::Shutdown { reply } => {
+                let _begun = serving.begin("shutdown", Instant::now());
                 if let Err(error) = state.verify_authority() {
                     let _ = reply.send(Err(error.clone()));
                     return Err(error);
@@ -8391,6 +8541,12 @@ mod tests {
             worker: secret.to_string(),
             now_ms: 20,
         };
+        let never_ready = RuntimeRequest::SeatNeverReady {
+            worker: secret.to_string(),
+            operation_id: secret.to_string(),
+            tombstone_digest: secret.to_string(),
+            now_ms: 20,
+        };
         let gone = RuntimeRequest::TerminalGone {
             term: 7,
             screen: Some(secret.to_string()),
@@ -8402,7 +8558,7 @@ mod tests {
         };
         let rendered = format!(
             "{boot_rendered} {cutover_boot:?} {actor:?} {image:?} {reply:?} {request:?} \
-             {planned:?} {never_opened:?} {gone:?} {settled:?} {look_again_request:?} \
+             {planned:?} {never_opened:?} {never_ready:?} {gone:?} {settled:?} {look_again_request:?} \
              {serve_request:?} {release_request:?} {remember_request:?} \
              {dissolved_request:?} {missing_request:?} {seen_request:?} {:?}",
             initial.next_id

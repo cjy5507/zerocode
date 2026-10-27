@@ -46,7 +46,8 @@ pub use prompt_cache::{
 };
 pub use providers::anthropic::keychain::{
     ClaudeLoginRenewal, ClaudeLoginRenewer, KeychainSession, ManagedCredentialsStamp, RenewalRun,
-    claude_code_login_configured, claude_code_oauth_config, install_claude_login_renewer,
+    claude_code_login_configured, claude_code_oauth_config, claude_code_store_label,
+    install_claude_login_renewer,
     invalidate_claude_code_keychain_cache, managed_claude_credentials_stamp,
     peek_claude_code_login, read_claude_code_keychain_session,
     read_claude_code_keychain_session_explained,
@@ -66,8 +67,8 @@ pub use providers::chatgpt_backend::{
 };
 pub use providers::cli_sessions;
 pub use providers::cli_sessions::{
-    CliSession, XaiCredential, XaiCredentialSource, grok_session, kimi_code_login_configured,
-    kimi_code_models_url, kimi_code_session, resolve_xai_credential, xai_credential_configured,
+    CliSession, XaiCredential, XaiCredentialSource, grok_session, grok_store_label,
+    kimi_code_login_configured, kimi_code_models_url, kimi_code_session, kimi_code_store_label, resolve_xai_credential, xai_credential_configured,
 };
 pub use providers::cloud_gateway::cloud_gateway_active;
 pub use providers::gemini_code_assist::{
@@ -128,7 +129,8 @@ pub use providers::{
     orchestration_reserved_models, provider_catalog, provider_enabled,
     provider_usable_for_smart_inventory, refresh_custom_providers_from_env,
     refresh_custom_providers_from_json, refresh_model_registry_from_json, install_model_catalog_loader, adopt_launch_keys, find_router_keys_in_keychain,
-    find_service_keys_in_keychain,
+    find_service_keys_in_keychain, find_reference_keys_in_keychain, reference_key_in_window_keychain,
+    ReferenceKey,
     preserved_thinking_generation, rejects_forced_tool_choice, resolve_catalog_alias,
     resolve_effort_band,
     exact_model_reference, resolve_model_alias,

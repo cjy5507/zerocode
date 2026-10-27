@@ -142,6 +142,7 @@ mod land_check;
 mod landing_watch_sweep;
 mod last_status;
 mod launch_budget_door;
+mod model_connection_checks;
 #[path = "model_connections.rs"]
 mod model_connection_store;
 mod native_tray;
@@ -153,6 +154,7 @@ mod orchestration_pointer_mailbox;
 mod pane_cwd_runtime;
 mod pane_guard;
 mod pane_layout;
+mod pane_leftovers;
 mod pane_runtime;
 mod pane_transcript;
 mod pick_runtime;
@@ -187,6 +189,7 @@ mod seat_triage;
 mod secret_watch;
 mod settings;
 mod settings_runtime;
+mod settings_secrets;
 mod sftp_runtime;
 mod sftp_sources;
 mod shell_path;
@@ -336,11 +339,13 @@ use cmd::{
     project_scripts, pull_request_seed, quota_wall_handover, quota_wall_retry, read_image_file,
     read_primary_selection, read_text_file, recall_folder_panel, record_archive_trust,
     record_repo_trust, release_status, release_untitled_markdown, relogin_claude_account,
-    relogin_codex_account, relogin_codex_login, remote_servers, remote_workspaces,
-    remove_api_router, remove_claude_account, remove_codex_account, remove_project,
-    remove_remote_server, remove_remote_workspace, remove_ssh_host, remove_type_value_key,
-    remove_typesafe_key, remove_worktree, render_mermaid, reopen_onboarding, reorder_projects,
-    repo_trust_standing, report_terminal_colors, request_developer_permission, reset_agent_launch,
+    relogin_codex_account, relogin_codex_login, remember_judgment_applied,
+    remember_model_connection_check, remember_model_judgment_check,
+    remembered_model_connection_checks, remote_servers, remote_workspaces, remove_api_router,
+    remove_claude_account, remove_codex_account, remove_project, remove_remote_server,
+    remove_remote_workspace, remove_ssh_host, remove_type_value_key, remove_typesafe_key,
+    remove_worktree, render_mermaid, reopen_onboarding, reorder_projects, repo_trust_standing,
+    report_terminal_colors, request_developer_permission, reset_agent_launch,
     reset_computer_use_permissions, resize_lane, resolve_claude_account_identity, resolve_mr_base,
     resolve_pr_base, resource_snapshot, respond_permission, resume_line, resume_session,
     resume_vault_session, reveal_board_agent, reveal_run_evidence, reveal_skill,
@@ -432,6 +437,7 @@ use cmd::{
     integration_queue_setting, land_batch_bisect, land_batch_cancel, land_batch_promote,
     land_batch_restack, set_integration_queue_enabled,
 };
+use cmd::{move_settings_secrets, settings_secret_literals};
 use emulator::{
     acknowledge_emulator_payload, android_accessibility_tree, android_accessibility_tree_direct,
     android_button, android_button_direct, android_emulators, android_emulators_direct,
@@ -2668,12 +2674,16 @@ fn main() -> ExitCode {
             api_router_providers,
             model_connections, sync_model_connections, check_model_connection, select_model_connection, clear_model_connection,
             zo_model_list, select_coding_model, adopt_legacy_judgment_key,
+            remembered_model_connection_checks, remember_model_connection_check, remember_model_judgment_check,
+            remember_judgment_applied,
             test_router_connection,
             save_api_router,
             remove_api_router,
             typesafe_settings,
             save_typesafe_key,
             remove_typesafe_key,
+            settings_secret_literals,
+            move_settings_secrets,
             type_value_keys,
             save_type_value_key,
             remove_type_value_key,
@@ -3482,6 +3492,10 @@ fn main() -> ExitCode {
             if let Err(error) = crash::begin(crash_root) {
                 note_window_event(crash_root, &format!("crash boot: {error}"));
             }
+            // What the last window's panes left running without a terminal
+            // (t-76434): ended before the panes it would hold out of their
+            // conversations come back, on a thread of its own.
+            pane_leftovers::sweep_at_boot(crash_root.to_path_buf(), note_window_event);
             boot_timeline::set_root(paths.active_root(app_paths::PathClass::LocalData));
             let state = build_app_state(paths, root.clone());
             state.set_legacy_authority(legacy_authority);
@@ -3533,6 +3547,9 @@ fn main() -> ExitCode {
             // Today's model lineup for the summons's choices (t-14437): read
             // once now on a thread of its own, then whenever a reader finds
             // it older than zo's refresh rule.
+            // zo's model list is read with a zo pane's account variables
+            // (t-76598), named before the lineup's first read asks for it.
+            slash_catalog::configure_accounts(managed.config_root().to_path_buf());
             if let Some(home) = dirs::home_dir() {
                 summon_lineup::configure(handle.clone(), home, managed.config_root().to_path_buf());
             }
@@ -3986,6 +4003,18 @@ impl exit_runtime::Terminating for ExitSteps<'_> {
 
     fn keep_statuses(&self) {
         write_last_statuses_now(self.0);
+    }
+
+    fn hang_up_panes(&self) {
+        // The panes' agents are read on the way out's own thread (t-76504):
+        // the window's pane maps can be held by a stuck thread, and this one
+        // waits on none of them past `pane_leftovers::WRITE_PATIENCE`.
+        let app = self.0.clone();
+        pane_leftovers::leave(
+            self.0.state::<AppState>().local_data_root().to_path_buf(),
+            move || pane_leftovers::pane_groups(app.state::<AppState>().inner()),
+            note_window_event,
+        );
     }
 
     fn end_panes(&self) {

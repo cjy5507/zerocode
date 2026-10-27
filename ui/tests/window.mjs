@@ -116,6 +116,7 @@ import { testComputerShare } from "./computer-share.mjs";
 import { testExplain } from "./explain.mjs";
 import { testAskPopup } from "./ask-popup.mjs";
 import { testSecretPrompt } from "./secret-prompt.mjs";
+import { testSettingsSecrets } from "./settings-secrets.mjs";
 import { testComputerProgress } from "./computer-progress.mjs";
 import { testEditorSelection } from "./editor-selection.mjs";
 import { testEditorRecovery } from "./editor-recovery.mjs";
@@ -392,6 +393,7 @@ suite("permission-card", ({ browser, origin, ok }) => testPermissionCard(browser
 suite("ask-popup", ({ browser, origin, ok }) => testAskPopup(browser, origin, ok));
 // The secret card: a pane that waits for a password gets a field, typed once (herdr 3, t-26596).
 suite("secret-prompt", ({ browser, origin, ok }) => testSecretPrompt(browser, origin, ok));
+suite("settings-secrets", ({ browser, origin, ok }) => testSettingsSecrets(browser, origin, ok));
 suite("computer-progress", ({ browser, origin, ok }) => testComputerProgress(browser, origin, ok));
 suite("editor-selection", ({ browser, origin, ok }) => testEditorSelection(browser, origin, ok));
 suite("editor-recovery", ({ browser, origin, ok }) => testEditorRecovery(browser, origin, ok));
@@ -54543,7 +54545,7 @@ const restartAsked = await page.evaluate(async () => {
     seen.bodyCensus = body.includes(busyWords(busy));
     seen.bodyPatience = body.includes(t(
       "exit.restartNote",
-      "「끝나면 다시 시작」은 워커 판 아래 도는 명령이 없는 첫 틈에 다시 시작합니다 · 최대 {{minutes}}분 기다립니다",
+      "「끝나면 다시 시작」은 워커 판 아래 도는 명령이 없고 턴 중인 대화도 없는 첫 틈에 다시 시작합니다 · 최대 {{minutes}}분 기다립니다",
       { minutes: 30 },
     ));
     seen.yes = document.getElementById("ask-yes").textContent === t("exit.whenIdleRestart", "끝나면 다시 시작");
@@ -54701,7 +54703,7 @@ const closeAsked = await page.evaluate(async () => {
     seen.census = body.includes(busyWords(busy));
     seen.patience = body.includes(t(
       "exit.closeNote",
-      "「끝나면 종료」는 워커 판 아래 도는 명령이 없는 첫 틈에 종료합니다 · 최대 {{minutes}}분 · {{seconds}}초 안에 답이 없으면 지금 종료합니다",
+      "「끝나면 종료」는 워커 판 아래 도는 명령이 없고 턴 중인 대화도 없는 첫 틈에 종료합니다 · 최대 {{minutes}}분 · {{seconds}}초 안에 답이 없으면 지금 종료합니다",
       { minutes: 10, seconds: 60 },
     ));
     seen.yes = document.getElementById("ask-yes").textContent === t("exit.whenIdleClose", "끝나면 종료");

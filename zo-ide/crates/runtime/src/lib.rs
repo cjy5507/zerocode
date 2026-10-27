@@ -31,6 +31,7 @@ pub mod lsp_client;
 pub mod live_output;
 mod mcp;
 mod mcp_client;
+pub mod mcp_references;
 pub mod mcp_http;
 pub mod mcp_http_common;
 pub mod mcp_lifecycle_hardened;
@@ -144,7 +145,9 @@ pub use config::{
     RuntimeSecondBrainConfig, RuntimeShipConfig, ScopedMcpServerConfig, UntrustedMcpServer,
     TRUSTED_MCP_SERVERS_FILE, ZO_SETTINGS_SCHEMA_NAME,
     persist_allow_always_rules, remove_mcp_server, trust_mcp_server, untrust_mcp_server,
-    write_mcp_server,
+    write_mcp_server, mcp_literal_secrets, move_mcp_literal_to_reference,
+    slot_holds_literal_secret, persons_own_literal_secrets, can_tell_persons_own_settings_file,
+    McpLiteralSecret,
 };
 pub use conversation::{is_fan_out_tool, ModelSwitch, SteeringObserver, SteeringQueue, SwitchObserver};
 pub use conversation::{
@@ -232,6 +235,10 @@ pub use mcp_client::{
     McpRemoteTransport, McpSdkTransport, McpStdioTransport,
 };
 pub use mcp_http::{connect_mcp_http, McpHttpProcess};
+pub use mcp_references::{
+    is_reference_name, resolve_reference_name, LaunchReferenceKeys, ReferenceKeys, ReferenceMiss,
+    ReferenceSource,
+};
 pub use mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase, McpLifecycleState,
     McpLifecycleValidator, McpPhaseResult,
@@ -415,5 +422,11 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     // nowhere in the test. Cleared on every acquisition rather than once at
     // init, because the second-brain tests set it themselves under this lock.
     std::env::remove_var(crate::second_brain::VAULT_ENV);
+    // The window exports the project's team inbox the same way
+    // (`ZO_TEAM_INBOX_STORE`), so a turn in a test run from inside a pane would
+    // read, and write, the person's own inbox instead of the one the test made
+    // under its cwd. Cleared on every acquisition for the same reason as the
+    // vault: a test sets it under this lock to check exactly that.
+    std::env::remove_var(crate::team_inbox_digest::STORE_ENV);
     guard
 }

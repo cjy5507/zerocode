@@ -638,7 +638,7 @@ fn receipt_word(receipt: Option<Duration>) -> String {
 }
 
 /// The first characters of a session id, as every wake's line carries it.
-fn session_prefix(session_id: &str) -> String {
+pub(crate) fn session_prefix(session_id: &str) -> String {
     session_id
         .chars()
         .take(RESUME_LOG_SESSION_PREFIX_CHARS)
@@ -1859,6 +1859,21 @@ mod tests {
                 Instant::now() < deadline,
                 "fake Codex never received its nudge"
             );
+            thread::sleep(Duration::from_millis(TEST_POLL_MS));
+        }
+        // Delivered means the pty took the Enter, not that the fake's `cat`
+        // has read that line and written it out: stopping it here lost the
+        // nudge once under load (l79k2, "stdin transcript: \"\""). End its
+        // input — the fake's cooked line discipline reads ^D at a line start
+        // as end of file — and let it finish before it is stopped.
+        pty.write_input(b"\x04").expect("end fake codex input");
+        let drained = Instant::now() + Duration::from_secs(TEST_DEADLINE_SECS);
+        while pty.try_wait().expect("fake codex status").is_none() {
+            assert!(
+                Instant::now() < drained,
+                "fake Codex never finished reading its input"
+            );
+            pty.pump();
             thread::sleep(Duration::from_millis(TEST_POLL_MS));
         }
         pty.kill().expect("stop fake codex");

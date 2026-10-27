@@ -34,7 +34,9 @@ pub(crate) use managed_judgment::{
 pub(crate) mod model_connection_commands;
 pub(crate) use model_connection_commands::{
     adopt_legacy_judgment_key, check_model_connection, clear_model_connection, model_connections,
-    select_coding_model, select_model_connection, sync_model_connections, zo_model_list,
+    remember_judgment_applied, remember_model_connection_check, remember_model_judgment_check,
+    remembered_model_connection_checks, select_coding_model, select_model_connection,
+    sync_model_connections, zo_model_list,
 };
 pub(crate) mod onboarding;
 pub(crate) mod project;
@@ -51,6 +53,8 @@ pub(crate) mod scm;
 pub(crate) mod second_brain;
 pub(crate) mod session;
 pub(crate) mod settings;
+pub(crate) mod settings_secrets;
+pub(crate) use settings_secrets::{move_settings_secrets, settings_secret_literals};
 pub(crate) mod skills;
 pub(crate) mod supply_chain;
 pub(crate) mod system;

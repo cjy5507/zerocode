@@ -358,6 +358,79 @@ async fn a_status_read_that_waits_for_an_ended_runtimes_stderr_leaves_the_async_
     );
 }
 
+/// A status read made while another thread notes a runtime's end tells that
+/// end only once it is kept: the failed state it reads finds the end on disk
+/// and names it as the last end. The read here comes after the end is
+/// published and before it is kept, and the end is kept only once that read
+/// has answered or its thread is seen waiting for its turn, so the read comes
+/// first however late its thread runs. A read that does neither within
+/// [`SETTLE`] fails the test instead of letting the end be kept before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_status_read_while_an_end_is_noted_tells_it_only_once_it_is_kept() {
+    let fixture = supervised().await;
+    let manager = Arc::downgrade(&fixture.manager);
+    let exits = fixture.data.join("managed-judgment/server-exits.jsonl");
+    let answered = Arc::new(Mutex::new(None));
+    let answer = answered.clone();
+    let came = Arc::new(Mutex::new(None));
+    let seen = came.clone();
+    test_support::before_exit_kept(&fixture.manager, move || {
+        let watched = manager.clone();
+        let reader = std::thread::spawn(move || {
+            let Some(manager) = manager.upgrade() else {
+                return;
+            };
+            let read = manager.snapshot();
+            let kept = fs::read_to_string(&exits).unwrap_or_default();
+            *answer.lock().unwrap() = Some((read, kept));
+        });
+        let thread = reader.thread().id();
+        let began = Instant::now();
+        let read_came = loop {
+            if reader.is_finished()
+                || watched
+                    .upgrade()
+                    .is_some_and(|manager| test_support::waited_for_its_turn(&manager, thread))
+            {
+                break true;
+            }
+            if began.elapsed() >= SETTLE {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        *seen.lock().unwrap() = Some(read_came);
+    });
+    fixture.end("code 3", "");
+
+    let began = Instant::now();
+    let (read, kept) = loop {
+        if let Some(answer) = answered.lock().unwrap().take() {
+            break answer;
+        }
+        assert!(
+            began.elapsed() < SETTLE * 2,
+            "no status read was made while the end was noted"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!(
+        *came.lock().unwrap(),
+        Some(true),
+        "the status read neither answered nor waited for its turn within {SETTLE:?}"
+    );
+    assert_eq!(read.server.state, "failed");
+    assert!(
+        kept.contains("\"runtime_exited\""),
+        "a status read told the end before it was kept: {kept:?}"
+    );
+    assert_eq!(
+        read.supervision.last_end.and_then(|end| end.code),
+        Some(3),
+        "a status read told the end with an earlier last end"
+    );
+}
+
 /// Records kept at the same instant by writers on different threads (a
 /// reap, a restart's attempt, a stop) each keep their line, and no staging
 /// file is left behind.
