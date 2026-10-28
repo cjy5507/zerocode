@@ -7828,6 +7828,39 @@ fn a_refused_gauge_waits_until_somebody_asks() {
     );
 }
 
+/// A refusal on file was the answer to the build that asked. A new process
+/// starts without it and asks once, so an update that changes how the gauge
+/// asks is not held back by the old build's refusal; any other reading on
+/// file is what the gauge starts with.
+#[test]
+fn a_refusal_on_file_is_not_held_by_a_new_process() {
+    let on_file = |status: &str| {
+        serde_json::json!({
+            "provider": "antigravity",
+            "session": null,
+            "weekly": null,
+            "fable_weekly": null,
+            "updated_at": 1_793_083_884_908_i64,
+            "error": "Antigravity 사용량을 확인할 수 없습니다 — Google이 요청을 거절했습니다",
+            "status": status
+        })
+        .to_string()
+    };
+    assert_eq!(
+        seeded_antigravity_usage(&on_file("refused")),
+        None,
+        "the old build's refusal held the new process's gauge"
+    );
+    for status in ["ok", "no_project", "signed_out", "error"] {
+        assert_eq!(
+            seeded_antigravity_usage(&on_file(status)).map(|held| held.status),
+            Some(status.to_string()),
+            "a `{status}` reading on file was dropped at start"
+        );
+    }
+    assert_eq!(seeded_antigravity_usage("not json"), None);
+}
+
 /// The usage screen cuts what it already has, and says what it left out.
 ///
 /// Two claims hold this slice up and neither is visible in a screenshot.
@@ -12077,7 +12110,10 @@ fn a_launch_deadline_is_the_agents_own_on_every_launch_road() {
     // the two `new` that remain are the send road and the queue
     // promotion, which are sends by definition. A reused automation run
     // was counted a launch until t-4530 — it sends to a composer that is
-    // already up, and takes the send road's door and timing.
+    // already up, and takes the send road's door and timing. A fresh
+    // launch whose submit receipt never came (t-78356) asks its provider
+    // through the same briefing pane the retype uses, so it names the
+    // agent's own deadline too — it types nothing, and builds no delivery.
     assert_eq!(
         shipped.matches("PromptDelivery::with_deadlines(").count(),
         5,
@@ -12090,8 +12126,8 @@ fn a_launch_deadline_is_the_agents_own_on_every_launch_road() {
     );
     assert_eq!(
         shipped.matches("ready_timeout_for(").count(),
-        5,
-        "the deadline resolver or one of its four catalog-timed launch sites drifted"
+        6,
+        "the deadline resolver, its four catalog-timed launch sites or the receipt-less ask drifted"
     );
     assert_eq!(
         shipped.matches("PromptDelivery::new(").count(),
@@ -22709,6 +22745,39 @@ pub(crate) mod computer_desktop_wait {
         ]));
         assert_eq!(answer.exit_code, 0, "{}", answer.stderr);
         assert_eq!(envelope(&answer)["ok"], true);
+    }
+
+    /// A screen-point verb given `--app` (t-73872: codex sent a point read
+    /// off the phone's picture as `mouse-click --app 'iPhone Mirroring'`) is
+    /// refused at the door before any hand moves, under the refusal's own
+    /// code, and the answer names the app's verb whose points are that
+    /// window's (t-78095).
+    #[test]
+    fn a_screen_point_verb_with_an_app_is_refused_as_the_wrong_verb() {
+        let _hand = ONE_HAND.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (line, in_the_app) in [
+            (&["mouse-click", "--app", "iPhone Mirroring", "--x", "180", "--y", "165", "--json"][..], "click"),
+            (&["type", "--app", "iPhone Mirroring", "--text", "blue", "--json"], "type-text"),
+            (&["key", "--app", "iPhone Mirroring", "--key", "Return", "--json"], "press-key"),
+        ] {
+            let answer = answer_computer_command(&words(line));
+            assert_ne!(answer.exit_code, 0, "{line:?}");
+            let refused = envelope(&answer);
+            assert_eq!(refused["ok"], false, "{line:?}");
+            assert_eq!(
+                refused["error"]["code"],
+                zerocode_core::computer_use_protocol::error_code::WRONG_VERB,
+                "{line:?}"
+            );
+            let message = refused["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(&format!(
+                    "`{} {in_the_app} --app <app>",
+                    zerocode_core::computer_use::COMPUTER_CLI
+                )),
+                "{line:?}: {message}"
+            );
+        }
     }
 
     #[test]
