@@ -148,10 +148,11 @@ import { testSidebarScroll } from "./sidebar-scroll.mjs";
 import { testLandingAlerts } from "./landing-alerts.mjs";
 import { testLandCheckLetter } from "./land-check-letter.mjs";
 import { testLandBatch } from "./land-batch.mjs";
-import { testConversationAgents, testConversationFolds, testConversationFont, testConversationKeys, testConversationPaths, testConversationScroll, testConversationFoot, testConversationStatus, testConversationTodos, testConversationImages, testConversationCopies, testConversationShelf, testConversationRelease, testConversationSteps, testConversationCodeColours, testConversationStreamWork, testConversationTypingWork } from "./conversation-parity.mjs";
+import { testConversationAgents, testConversationFolds, testConversationFont, testConversationKeys, testConversationLinkLookup, testConversationOutsideLinks, testConversationPaths, testConversationScroll, testConversationFoot, testConversationStatus, testConversationTodos, testConversationImages, testConversationCopies, testConversationShelf, testConversationRelease, testConversationSteps, testConversationCodeColours, testConversationStreamWork, testConversationTypingWork } from "./conversation-parity.mjs";
 import { measureConversation, standingPids } from "./conversation-perf.mjs";
 import { testConversationRedesign } from "./conversation-redesign.mjs";
 import { testConversationB } from "./conversation-b.mjs";
+import { testConversationEarlier } from "./conversation-earlier.mjs";
 import { testConversationSwitch } from "./conversation-switch.mjs";
 import { testConversationDiagrams } from "./conversation-diagrams.mjs";
 import { createRequire } from "node:module";
@@ -464,6 +465,12 @@ suite("land-batch", testLandBatch);
 suite("conversation-font", ({ browser, origin, ok }) => testConversationFont(browser, origin, ok));
 suite("conversation-folds", ({ browser, origin, ok }) => testConversationFolds(browser, origin, ok));
 suite("conversation-paths", ({ browser, origin, ok }) => testConversationPaths(browser, origin, ok));
+/* 답이 이름만 댄 파일 — 누를 때 체크아웃에서 끝이 맞는 파일을 찾아 연다: 하나면 그 파일, 둘이면 파일 찾기,
+ * 없으면 한 문장 한 번 (t-83039). */
+suite("conversation-link-lookup", ({ browser, origin, ok }) => testConversationLinkLookup(browser, origin, ok));
+/* 답이 온전한 경로로 댄 프로젝트 밖 파일 — 에이전트 세션 제 폴더의 글은 아무도 쓰지 못하는 탭으로, 그 밖은
+ * 열지 않고 한 문장 한 번 (t-83039 ⑥). 다른 체크아웃의 답이 댄 이름도 프로젝트 밖이라 같은 한 문장. */
+suite("conversation-outside-links", ({ browser, origin, ok }) => testConversationOutsideLinks(browser, origin, ok));
 suite("conversation-keys", ({ browser, origin, ok }) => testConversationKeys(browser, origin, ok));
 suite("conversation-status", ({ browser, origin, ok }) => testConversationStatus(browser, origin, ok));
 suite("conversation-scroll", ({ browser, origin, ok }) => testConversationScroll(browser, origin, ok));
@@ -494,6 +501,7 @@ suite("conversation-redesign", ({ browser, origin, ok }) => testConversationRede
 /* 사람이 고른 대화 시안 B (2026-10-29, t-81525) — 접힌 페이지를 네 폭과 두 테마에서: 옆으로
  * 밀림 0, 폭을 따르는 읽기, 알약·말풍선·코드 띠, 대비 4.5:1. */
 suite("conversation-b", ({ browser, origin, ok }) => testConversationB(browser, origin, ok));
+suite("conversation-earlier", ({ browser, origin, ok }) => testConversationEarlier(browser, origin, ok));
 /* 대화를 바꿨다가 돌아오면 그 화면 그대로, 판의 「대화」는 전사부터(인계 중 보낸 글은 한 번만),
  * 늦은 첫 읽기는 늦게 한 줄 (t-54304 — Claude·Codex·Dots 역분석에서 가져온 1단계). */
 suite("conversation-switch", ({ browser, origin, ok }) => testConversationSwitch(browser, origin, ok));
@@ -56354,7 +56362,7 @@ suite("pane-conversation-view", async ({ browser, origin, ok }) => {
       // not one chunk a beat — and the head counts THIS turn from the state
       // change's stamp, not the pane's age.
       const chunks = [
-        { found: true, next: 1, more: true, folded: true, skipped: false, turns: [{ role: "user", text: "first" }] },
+        { found: true, next: 1, more: true, folded: true, start: 1, skipped: false, turns: [{ role: "user", text: "first", line: 1 }] },
         { found: true, next: 2, more: true, skipped: false, turns: [{ role: "assistant", text: "second" }] },
         { found: true, next: 3, more: false, skipped: false, turns: [{ role: "assistant", text: "third" }] },
       ];
@@ -56381,25 +56389,38 @@ suite("pane-conversation-view", async ({ browser, origin, ok }) => {
       await settle(150);
       const longChat = document.querySelector(`.pane-slot[data-term="${long}"] .pane-chat`);
       seen.caughtUp = longChat?.querySelectorAll(".helper-turn").length === 3 && reads >= 3;
-      // The first read asked for the tail (no cursor), and a folded answer
-      // says so on the page in the catalog's words.
-      const foldedNotice = longChat?.querySelector('.pane-chat-notice[data-says="worker.historyFolded"]');
-      seen.openedAtTail = firstAfter === null &&
-        foldedNotice?.textContent === t("worker.historyFolded", "↑ 이전 기록 · 끝부분만 보는 중") &&
-        foldedNotice?.dataset.tip === t("worker.historyFoldedTip", "긴 기록의 끝부분만 보입니다 — 이전 턴은 판의 화면과 세션 기록에 있습니다.");
-      seen.foldedAbove = noticeAboveBody(longChat, "worker.historyFolded");
+      // The first read asked for the tail (no cursor), and an answer with
+      // turns above it wears the way up at the list's head — a button in the
+      // catalog's words, centred on the list, above every row (t-82901) —
+      // where the line saying the rest was elsewhere stood.
+      const earlierDoor = longChat?.querySelector(".helper-turns > .chat-earlier-door");
+      const firstRow = longChat?.querySelector(".helper-turns > [data-turn]");
+      seen.openedAtTail = firstAfter === null && earlierDoor?.tagName === "BUTTON" && earlierDoor.hidden === false &&
+        earlierDoor.textContent === t("worker.earlierMore", "이전 기록 더 보기") &&
+        earlierDoor.dataset.tip === t("worker.earlierMoreTip", "누르거나 맨 위에서 더 올리면 그 앞의 턴을 이어서 읽습니다") &&
+        longChat.querySelector('.pane-chat-notice[data-says="worker.historyFolded"]') === null;
+      seen.foldedAbove = (() => {
+        const list = longChat?.querySelector(".helper-turns")?.getBoundingClientRect();
+        const door = earlierDoor?.getBoundingClientRect();
+        const row = firstRow?.getBoundingClientRect();
+        return Boolean(list && door && row) && Math.abs((door.left + door.right) / 2 - (list.left + list.right) / 2) <= 1 &&
+          door.bottom <= row.top + 0.5 && earlierDoor.nextElementSibling === firstRow;
+      })();
       // Two notices at once, as in the person's photo (a hand-over waiting
-      // beside the folded history): both stand above the body, one under the
+      // beside another line): both stand above the body, one under the
       // other, each as wide as the list.
       noticeOnPaneChat(paneChats.get(long), "worker.handoverPending", true,
         t("worker.handoverPending", "이 턴이 끝나면 대화가 실시간으로 이어집니다 — 그때부터 답이 낱말 단위로 흐릅니다."));
+      noticeOnPaneChat(paneChats.get(long), "worker.wireRefused", true,
+        t("worker.wireRefused", "실시간 대화로 넘기지 못했습니다: {{reason}} — 전사 뷰로 봅니다(답은 턴이 닫힐 때 한 번에). 「대화」를 다시 누르면 다시 시도합니다.", { reason: "시험" }));
       const pairBox = (key) => longChat?.querySelector(`.pane-chat-notice[data-says="${key}"]`)?.getBoundingClientRect();
-      const folded = pairBox("worker.historyFolded");
+      const refused = pairBox("worker.wireRefused");
       const pending = pairBox("worker.handoverPending");
-      seen.pairAbove = noticeAboveBody(longChat, "worker.historyFolded") &&
+      seen.pairAbove = noticeAboveBody(longChat, "worker.wireRefused") &&
         noticeAboveBody(longChat, "worker.handoverPending") &&
-        Boolean(folded && pending) && (pending.top >= folded.bottom - 0.5 || folded.top >= pending.bottom - 0.5);
+        Boolean(refused && pending) && (pending.top >= refused.bottom - 0.5 || refused.top >= pending.bottom - 0.5);
       noticeOnPaneChat(paneChats.get(long), "worker.handoverPending", false);
+      noticeOnPaneChat(paneChats.get(long), "worker.wireRefused", false);
       seen.turnClock = paneChats.get(long)?.run.startedAt === hookStamps.get(long) &&
         Date.now() - paneChats.get(long).run.startedAt < bornAgo / 2;
       // The permission mode's reach colours the send and the spinner's mark
@@ -56457,7 +56478,7 @@ suite("pane-conversation-view", async ({ browser, origin, ok }) => {
       JSON.stringify(seen),
     );
     ok(
-      "a conversation's notice (no transcript named, history folded, two at once) is a line above the conversation's body as wide as its list, never a cell of the body's rail | list grid",
+      "a conversation's notice (no transcript named, two at once) is a line above the conversation's body as wide as its list, never a cell of the body's rail | list grid — and the way up past a long transcript's newest turns is a button at the list's head, centred on it, above every row",
       seen.noticeAbove && seen.foldedAbove && seen.pairAbove,
       JSON.stringify({ noticeAbove: seen.noticeAbove, foldedAbove: seen.foldedAbove, pairAbove: seen.pairAbove }),
     );
@@ -57173,6 +57194,7 @@ suite("question-passed-wire", async ({ browser, origin, ok }) => {
       const face = document.querySelector("#worker-view");
       const card = face.querySelector(".pane-chat-ask");
       const box = face.querySelector(".worker-composer-box");
+      const send = face.querySelector(".worker-composer-send");
       return {
         card: card !== null,
         panel: Boolean(card?.querySelector(".board-ask")),
@@ -57181,10 +57203,16 @@ suite("question-passed-wire", async ({ browser, origin, ok }) => {
         value: box.value,
         focused: document.activeElement === box,
         answers: window.__CALLS__.filter(([name]) => name === "answer").length,
+        send: {
+          stop: send.classList.contains("is-stop"),
+          name: send.getAttribute("aria-label"),
+          mark: send.querySelector("use")?.getAttribute("href") ?? "",
+        },
       };
     });
     const words = await page.evaluate(() => ({
       working: t("board.ask.passedWorking", "이 질문은 이미 지나갔습니다 — 판은 이어서 일하는 중"),
+      queue: t("composer.queue.add", "대기열에 추가 — 멈추려면 Esc"),
     }));
 
     /* Words typed on the card's own field; the wire takes the question back. */
@@ -57202,6 +57230,15 @@ suite("question-passed-wire", async ({ browser, origin, ok }) => {
         !ended.card && ended.value === "멈추고 코디와 상의",
       JSON.stringify({ asked, passed, ended, words }),
     );
+    // The poll paints the box's button before the card hands its words back
+    // (t-84182 P2): the button follows the words, so a press queues them
+    // rather than stopping the turn the wire went on with.
+    ok(
+      "the words a question the wire took back gives to the box turn its button into 「대기열에 추가」 while the wire works, not the stop that would end the turn (t-84182 P2)",
+      asked.send.stop && passed.value !== "" &&
+        !passed.send.stop && passed.send.name === words.queue && passed.send.mark === "#i-arrow-up",
+      JSON.stringify({ asked: asked.send, passed: passed.send, value: passed.value, words }),
+    );
 
     /* A question answered through its card leaves the log: no line, nothing given back. */
     await page.evaluate(async () => {
@@ -57218,6 +57255,130 @@ suite("question-passed-wire", async ({ browser, origin, ok }) => {
       "a question answered through its card that leaves the wire's log takes its card with no 「지나갔습니다」 line and gives nothing back to the box (t-82287 r2 P2-1)",
       answered.answers === 1 && !answered.card && answered.value === "",
       JSON.stringify({ answered }),
+    );
+  } finally {
+    await page.close();
+  }
+});
+
+/* 워커의 질문은 코디에게(t-82296, 사람 10-29 10:5x 「버그」·15:0x 「질문이 자동으로 처리가 안돼」):
+ * 원장이 소환한 워커 판의 AskUserQuestion은 그 런의 코디 편지함으로 가고, 창의 백엔드는 그 판을
+ * 「일하는 중」으로 보여 준다 — 카드도 「당신 차례」 행도 없다. 사람에게 오는 것은 코디 자리가 비었거나
+ * 코디가 10분 안에 답하지 않았을 때뿐이고, 그때 백엔드가 `ask:raised`로 까닭을 먼저 말한 뒤 묻는
+ * 보고를 다시 보낸다. 카드(대화 보기와 「당신 차례」 목록)는 그 까닭을 첫 줄로 말하고, 판이 질문을
+ * 지나가면 까닭도 카드와 함께 간다. 보통 질문에는 그런 줄이 없다. */
+suite("worker-question-raised", async ({ browser, origin, ok }) => {
+  const { page } = await openWindowTestPage(browser, origin);
+  // `WORKER_QUESTION_SHOTS=<folder>` keeps the screens the report shows.
+  const shots = process.env.WORKER_QUESTION_SHOTS;
+  const shoot = async (name) => {
+    if (shots) await page.screenshot({ path: `${shots}/${name}.png` });
+  };
+  try {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.evaluate(async () => {
+      window.__TELL__ = (name, payload) => {
+        for (const handler of window.__LISTENERS__[name] ?? []) handler({ payload });
+      };
+      window.__ASK__ = (question) => ({ questions: [{ question, header: "단계", multi_select: false,
+        options: [{ label: "진행", description: "다음 단계로" }, { label: "멈춤", description: "여기서 멈춤" }] }] });
+      window.__LIST__ = async (...questions) => {
+        window.__COLUMNS__ = [{ bucket: "attention", cards: questions.map((question) => ({
+          pane: `term:${window.__TERM__}`, agent: "claude", state: "needs-attention", heading: "가독성 묶음",
+          worktree: "main", project: "/p", task: "", ask: question, ask_prompt: window.__ASK__(question),
+          unseen: true, changed_at: Date.now(), at: Date.now() })) }];
+        await refreshBoardBadge();
+      };
+      window.__BEATS__ = async (count = 3) => {
+        for (let beat = 0; beat < count; beat += 1) await window.__PAINTED__();
+      };
+      const term = await openTermTab({ placement: "tab" });
+      window.__TERM__ = term;
+      const turns = [{ role: "user", text: "가독성 묶음을 고쳐 줘." }, { role: "assistant", text: "cargo 시험을 돌립니다." }];
+      window.__ANSWER__.pane_log = () => ({ found: true, next: turns.length, turns, skipped: false, more: false, folded: false });
+      window.__TELL__("hook:agent", { term, state: "working", agent: "claude", session: "s-raised" });
+      await setPaneChat(term, true);
+      await pollHelperPages();
+    });
+    const read = () => page.evaluate(() => {
+      const card = document.querySelector(".pane-chat .pane-chat-ask");
+      return {
+        card: card !== null,
+        why: card?.querySelector(".board-ask-raised")?.textContent ?? "",
+        whyFirst: card?.querySelector(".board-ask")?.firstElementChild?.className ?? "",
+        turns: document.getElementById("your-turn-count").textContent,
+        listed: [...document.querySelectorAll("#your-turn-list .board-ask-raised")].map((line) => line.textContent),
+      };
+    });
+    const words = await page.evaluate(() => ({
+      silent: t("board.ask.raisedSilent", "코디가 답하지 않아 올림"),
+      gone: t("board.ask.raisedGone", "코디 자리가 비어 올림"),
+    }));
+
+    /* The coordinator held the question: the backend showed the pane at work. */
+    await page.evaluate(async () => {
+      window.__COLUMNS__ = [];
+      await refreshBoardBadge();
+      window.__TELL__("hook:agent", { term: window.__TERM__, state: "working", agent: "claude", session: "s-raised" });
+      await window.__BEATS__();
+    });
+    const held = await read();
+    await shoot("after-1-coordinator-holds-it");
+
+    /* Ten minutes without an answer: why first, then the asking report. */
+    await page.evaluate(async () => {
+      window.__TELL__("ask:raised", { term: window.__TERM__, why: "coordinator-silent" });
+      window.__TELL__("hook:agent", { term: window.__TERM__, state: "waiting", agent: "claude", session: "s-raised",
+        ask_prompt: window.__ASK__("cargo 시험 다음 단계로 넘어갈까요?") });
+      await window.__LIST__("cargo 시험 다음 단계로 넘어갈까요?");
+      await window.__BEATS__();
+      openYourTurnList();
+      await window.__BEATS__(1);
+    });
+    const raised = await read();
+    await shoot("after-2-raised-after-ten-minutes");
+    await page.evaluate(async () => {
+      closeYourTurnList({ restoreFocus: false });
+      window.__TELL__("hook:agent", { term: window.__TERM__, state: "working", agent: "claude", session: "s-raised" });
+      window.__COLUMNS__ = [];
+      await refreshBoardBadge();
+      await window.__BEATS__();
+    });
+    const moved = await read();
+    ok(
+      "a worker's question its coordinator holds draws no card and no 「당신 차례」; given to the person after ten minutes, the card and the list say 「코디가 답하지 않아 올림」 first, and the line goes with the question (t-82296 ③)",
+      !held.card && held.turns === "0" &&
+        raised.card && raised.why === words.silent && raised.whyFirst === "board-ask-raised" && raised.turns === "1" &&
+        JSON.stringify(raised.listed) === JSON.stringify([words.silent]) &&
+        !moved.card && moved.why === "" && moved.turns === "0",
+      JSON.stringify({ held, raised, moved, words }),
+    );
+
+    /* The seat emptied while it waited; and a person's own question says nothing of a coordinator. */
+    await page.evaluate(async () => {
+      window.__TELL__("ask:raised", { term: window.__TERM__, why: "coordinator-gone" });
+      window.__TELL__("hook:agent", { term: window.__TERM__, state: "waiting", agent: "claude", session: "s-raised",
+        ask_prompt: window.__ASK__("보고서는 어디에 둘까요?") });
+      await window.__BEATS__();
+    });
+    const gone = await read();
+    await page.evaluate(async () => {
+      window.__TELL__("hook:agent", { term: window.__TERM__, state: "working", agent: "claude", session: "s-raised" });
+      await window.__BEATS__();
+      window.__TELL__("hook:agent", { term: window.__TERM__, state: "waiting", agent: "claude", session: "s-raised",
+        ask_prompt: window.__ASK__("어느 이름으로 할까요?") });
+      await window.__BEATS__();
+    });
+    const plain = await read();
+    await page.evaluate(async () => {
+      await window.__LIST__("어느 이름으로 할까요?");
+      await window.__BEATS__();
+    });
+    await shoot("before-1-every-question-was-the-persons");
+    ok(
+      "a question raised because the coordinator's seat emptied says so, and a question that was never a coordinator's carries no such line (t-82296 ③)",
+      gone.card && gone.why === words.gone && plain.card && plain.why === "",
+      JSON.stringify({ gone, plain, words }),
     );
   } finally {
     await page.close();

@@ -278,11 +278,76 @@ export async function testConversationFolds(browser, origin, ok) {
       await window.__PAINTED__();
       seen.quiet = watch.takeRecords().length;
       watch.disconnect();
+      // The +/- column (t-83633): read on the short diff's lines in each
+      // theme — the sign each line draws, its ink and the line's words against
+      // the line's own ground (its see-through wash over the well), the
+      // wash's strength, and the words a copy takes.
+      const channels = (value) => {
+        const srgb = /color\(srgb (-?[\d.]+) (-?[\d.]+) (-?[\d.]+)(?: \/ ([\d.]+))?/.exec(value);
+        if (srgb) return [...srgb.slice(1, 4).map((one) => Math.min(1, Math.max(0, Number(one))) * 255), srgb[4] === undefined ? 1 : Number(srgb[4])];
+        const rgb = /rgba?\(([\d.]+),? ([\d.]+),? ([\d.]+)(?:,? ([\d.]+))?/.exec(value);
+        return [...rgb.slice(1, 4).map(Number), rgb[4] === undefined ? 1 : Number(rgb[4])];
+      };
+      const ground = (node) => {
+        const layers = [];
+        for (let at = node; at; at = at.parentElement) {
+          const layer = channels(getComputedStyle(at).backgroundColor);
+          if (layer[3] > 0) layers.push(layer);
+          if (layer[3] === 1) break;
+        }
+        return layers.reduceRight((under, top) => [0, 1, 2].map((at) => top[at] * top[3] + under[at] * (1 - top[3])), [255, 255, 255]);
+      };
+      const luminance = (colour) => colour.slice(0, 3).map((value) => {
+        const unit = value / 255;
+        return unit <= 0.04045 ? unit / 12.92 : ((unit + 0.055) / 1.055) ** 2.4;
+      }).reduce((sum, unit, at) => sum + unit * [0.2126, 0.7152, 0.0722][at], 0);
+      const ratio = (ink, under) => {
+        const [high, low] = [luminance(ink), luminance(under)].sort((one, other) => other - one);
+        return Math.round(((high + 0.05) / (low + 0.05)) * 100) / 100;
+      };
+      const root = document.documentElement;
+      const theme = root.getAttribute("data-theme");
+      seen.signs = {};
+      for (const one of ["dark", "light"]) {
+        root.setAttribute("data-theme", one);
+        await window.__PAINTED__();
+        seen.signs[one] = [...smallRows.querySelectorAll(".diff-line")].map((row) => {
+          const text = row.querySelector(".diff-text");
+          const sign = getComputedStyle(text, "::before");
+          const under = ground(row);
+          return {
+            kind: row.classList.contains("diff-line--add") ? "add" : row.classList.contains("diff-line--del") ? "del" : "other",
+            sign: sign.content,
+            signRatio: ratio(channels(sign.color), under),
+            wordsRatio: ratio(channels(getComputedStyle(text).color), under),
+            wash: Math.round(channels(getComputedStyle(row).backgroundColor)[3] * 100) / 100,
+            words: text.textContent,
+          };
+        });
+      }
+      if (theme === null) root.removeAttribute("data-theme");
+      else root.setAttribute("data-theme", theme);
+      await window.__PAINTED__();
       seen.more = more;
       seen.less = less;
       return seen;
     });
     const near = (value, want) => Math.abs(value - want) <= 1;
+    // The short diff's five lines as the fixture wrote them (`diff(5)`).
+    const smallWords = Array.from({ length: 5 }, (_, at) => [at % 3 === 0 ? "del" : "add", `const value_${at} = compute(${at});`]);
+    const signed = (theme) => {
+      const lines = seen.signs?.[theme] ?? [];
+      return lines.length === smallWords.length && lines.every((line, at) =>
+        line.kind === smallWords[at][0] && line.words === smallWords[at][1] &&
+        line.sign === (line.kind === "add" ? "\"+\"" : "\"-\"") && line.signRatio >= 4.5 && line.wordsRatio >= 4.5);
+    };
+    const washOf = (theme, kind) => seen.signs?.[theme]?.find((line) => line.kind === kind)?.wash;
+    ok(
+      "t-83633: every changed line of a conversation's diff draws its sign — + for an added line, - for a removed one, a shape beside the colour — in an ink that reads 4.5:1 or more on the line's own wash, as do the line's words, in the dark theme and the light one; the sign is drawn, so the words a copy takes are the code alone; and the dark wash is as strong as the light one (Monaco's measured 20%)",
+      signed("dark") && signed("light") &&
+        ["add", "del"].every((kind) => washOf("dark", kind) !== undefined && washOf("dark", kind) === washOf("light", kind)),
+      JSON.stringify(seen.signs),
+    );
     ok(
       "A1: what the person said stops at the extension's 60px (a token) with 「더 보기」, opens whole and closes back with 「접기」, and a short message stands whole with no door",
       seen.tokens.user === 60 && seen.userClipped && near(seen.userHeight, seen.tokens.user) &&
@@ -413,6 +478,431 @@ export async function testConversationPaths(browser, origin, ok) {
   }
 }
 
+/* A file the answer names by its name alone (t-83039): 「terminal.rs」 for a
+ * file three folders down. Pressed, the link opens the checkout's one file
+ * whose path ends that way, at the line it named; two such files stand in the
+ * file finder with the name typed in; none is one sentence, said once however
+ * often it is pressed, with what the disk said on its hover. The look is asked
+ * on the press, never while the answer is drawn, a path that stands where it
+ * points looks for nothing, and the document viewer's links take the same
+ * road. The checkout is a list of files the stubs answer from the way the
+ * backend does: a read of a path not on it fails with the disk's words, and
+ * the finder's look is a file name holding the word. */
+export async function testConversationLinkLookup(browser, origin, ok) {
+  const { page, faults } = await openWindowTestPage(browser, origin);
+  try {
+    const root = "/tmp/zerocode-window-test";
+    const deep = "crates/zerocode-shell/src/cmd/terminal.rs";
+    await page.evaluate(({ root, deep }) => {
+      const files = [deep, "crates/one/src/mod.rs", "crates/two/src/mod.rs", "crates/three/src/pmod.rs"];
+      const text = Array.from({ length: 40 }, (_, at) => `line ${at + 1}`).join("\n");
+      window.__READS__ = [];
+      window.__LOOKS__ = [];
+      window.__ANSWER__.read_text_file = (args) => {
+        window.__READS__.push(args.path);
+        const relative = args.path.startsWith(`${root}/`) ? args.path.slice(root.length + 1) : args.path;
+        if (!files.includes(relative)) throw "No such file or directory (os error 2)";
+        return { text, version: 1, missing: false };
+      };
+      window.__ANSWER__.search_files = (args) => {
+        window.__LOOKS__.push(args.query);
+        const word = args.query.toLowerCase();
+        return files.filter((path) => path.split("/").at(-1).toLowerCase().includes(word)).sort();
+      };
+    }, { root, deep });
+    await openConversation(page, [
+      { role: "user", text: "어디를 고쳤나요?" },
+      { role: "assistant", text: "terminal.rs:12 를 고쳤고 crates/one/src/mod.rs:3 과 mod.rs 도 봤습니다. gone.rs 는 지웠습니다." },
+    ]);
+    const seen = await page.evaluate(async ({ root, deep }) => {
+      const seen = {};
+      const until = async (done) => {
+        for (let beat = 0; beat < 30 && !done(); beat += 1) await window.__PAINTED__();
+      };
+      const lineNow = () => {
+        const editor = window.__EDITOR__();
+        return editor ? editor.state.doc.lineAt(editor.state.selection.main.head).number : null;
+      };
+      const toasts = () => [...document.querySelectorAll(".toasts .toast")];
+      const counts = () => [window.__READS__.length, window.__LOOKS__.length];
+      const face = document.querySelector("#worker-view");
+      const links = [...face.querySelectorAll(".helper-turn.is-assistant .helper-link")];
+      const byLabel = (label) => links.find((one) => one.textContent.trim() === label);
+      const pageTab = activeTabId;
+      const back = async () => {
+        setActiveTab(pageTab);
+        await until(() => activeTabId === pageTab);
+      };
+      // Drawing the answer asked the disk nothing.
+      seen.drawn = counts();
+      // One file ends that way: it opens at the line the link named, and nothing is said.
+      byLabel("terminal.rs:12")?.click();
+      await until(() => activeTabId === `file:${deep}` && lineNow() === 12);
+      seen.one = { tab: activeTabId, line: lineNow(), reads: [...window.__READS__], looks: [...window.__LOOKS__], toasts: toasts().length };
+      await back();
+      // A path that stands where it points opens there and looks for nothing.
+      const before = counts();
+      byLabel("crates/one/src/mod.rs:3")?.click();
+      await until(() => activeTabId === `file:${root}/crates/one/src/mod.rs` && lineNow() === 3);
+      seen.direct = { tab: activeTabId, line: lineNow(), looks: counts()[1] - before[1] };
+      await back();
+      // Two files end that way: the file finder stands with the name typed in and those two in it.
+      byLabel("mod.rs")?.click();
+      await until(() => !qoScrim.hidden && qoResults.querySelector(".qo-row") !== null);
+      seen.two = {
+        finder: !qoScrim.hidden && paletteMode === "file",
+        query: qoInput.value,
+        rows: [...qoResults.querySelectorAll(".qo-row .qo-label")].map((node) => node.textContent),
+        tab: activeTabId === pageTab,
+        toasts: toasts().length,
+      };
+      closePalette();
+      await until(() => qoScrim.hidden);
+      return seen;
+    }, { root, deep });
+    // No file ends that way: one sentence, however often it is pressed, the disk's words on its
+    // hover. Pressed with the real pointer, as the person pressed it — a press is one read and one
+    // look, so five toasts were five presses, each saying the same failure again.
+    const goneAt = await page.evaluate(() => {
+      const gone = [...document.querySelectorAll("#worker-view .helper-turn.is-assistant .helper-link")]
+        .find((one) => one.textContent.trim() === "gone.rs");
+      gone?.scrollIntoView({ block: "center" });
+      const box = gone?.getBoundingClientRect();
+      window.__UNPRESSED__ = [window.__READS__.length, window.__LOOKS__.length];
+      return box ? { x: box.left + box.width / 2, y: box.top + box.height / 2 } : null;
+    });
+    const settleToasts = (presses) => page.evaluate(async (presses) => {
+      for (let beat = 0; beat < 30 && window.__LOOKS__.length < window.__UNPRESSED__[1] + presses; beat += 1) {
+        await window.__PAINTED__();
+      }
+      for (let beat = 0; beat < 3; beat += 1) await window.__PAINTED__();
+      return [window.__READS__.length - window.__UNPRESSED__[0], window.__LOOKS__.length - window.__UNPRESSED__[1]];
+    }, presses);
+    let pressOnce = null;
+    let pressFive = null;
+    if (goneAt) {
+      await page.mouse.click(goneAt.x, goneAt.y);
+      pressOnce = await settleToasts(1);
+      for (let press = 2; press <= 5; press += 1) {
+        await page.mouse.click(goneAt.x, goneAt.y);
+        pressFive = await settleToasts(press);
+      }
+    }
+    seen.none = await page.evaluate(({ pressOnce, pressFive }) => {
+      const said = [...document.querySelectorAll(".toasts .toast")];
+      // The toast on its way out stands no more: the next press is told again.
+      said[0]?.classList.add("is-closing");
+      return {
+        pressOnce,
+        pressFive,
+        count: said.length,
+        words: said.map((node) => node.textContent),
+        want: t("file.linkUnfound", "이 파일을 체크아웃에서 찾지 못했어요: {{name}}", { name: "gone.rs" }),
+        tip: said[0]?.dataset.tip ?? "",
+        tab: activeTabId.startsWith("wire:"),
+      };
+    }, { pressOnce, pressFive });
+    if (goneAt) {
+      await page.mouse.click(goneAt.x, goneAt.y);
+      await settleToasts(6);
+    }
+    seen.none.afterFade = await page.evaluate(() => {
+      const said = [...document.querySelectorAll(".toasts .toast")];
+      const standing = said.filter((node) => !node.classList.contains("is-closing")).length;
+      for (const node of said) node.remove();
+      return standing;
+    });
+    seen.doc = await page.evaluate(async ({ deep }) => {
+      const until = async (done) => {
+        for (let beat = 0; beat < 30 && !done(); beat += 1) await window.__PAINTED__();
+      };
+      const lineNow = () => {
+        const editor = window.__EDITOR__();
+        return editor ? editor.state.doc.lineAt(editor.state.selection.main.head).number : null;
+      };
+      // The document viewer's links are the same door: a page under docs/ naming the file by its name.
+      const doc = document.createElement("div");
+      doc.className = "md-page";
+      document.body.appendChild(doc);
+      const readsBefore = window.__READS__.length;
+      renderMarkdownPage(doc, "[터미널](terminal.rs#L7)", "docs");
+      doc.querySelector(".md-link")?.click();
+      await until(() => activeTabId === `file:${deep}` && lineNow() === 7);
+      const seenDoc = {
+        tab: activeTabId,
+        line: lineNow(),
+        firstRead: window.__READS__[readsBefore] ?? null,
+        toasts: document.querySelectorAll(".toasts .toast").length,
+      };
+      doc.remove();
+      return seenDoc;
+    }, { deep });
+    // A link to a spot that holds nothing, where no look belongs: an absolute path in the checkout
+    // is where it says it is, and a vault page's link is the vault's — this checkout's finder would
+    // find a namesake. Each is the same one sentence, never the disk's own words.
+    seen.unlooked = await page.evaluate(async ({ root }) => {
+      const until = async (done) => {
+        for (let beat = 0; beat < 30 && !done(); beat += 1) await window.__PAINTED__();
+      };
+      const toasts = () => [...document.querySelectorAll(".toasts .toast")];
+      window.__SCRATCH__ = [];
+      window.__ANSWER__.session_scratch_document = (args) => {
+        window.__SCRATCH__.push(args.path);
+        return null;
+      };
+      secondBrainVault = "/vault";
+      const pressed = async (markdown, base) => {
+        const doc = document.createElement("div");
+        doc.className = "md-page";
+        document.body.appendChild(doc);
+        const before = [window.__READS__.length, window.__LOOKS__.length];
+        renderMarkdownPage(doc, markdown, base);
+        doc.querySelector(".md-link")?.click();
+        await until(() => toasts().length > 0);
+        for (let beat = 0; beat < 3; beat += 1) await window.__PAINTED__();
+        const said = toasts();
+        const seenOne = {
+          reads: window.__READS__.slice(before[0]),
+          looks: window.__LOOKS__.length - before[1],
+          words: said.map((node) => node.textContent),
+          tip: said[0]?.dataset.tip ?? "",
+        };
+        for (const node of said) node.remove();
+        doc.remove();
+        return seenOne;
+      };
+      const absolute = await pressed(`[잃은 파일](${root}/crates/lost.rs)`, "docs");
+      const vault = await pressed("[없는 글](missing.md)", "/vault/wiki");
+      secondBrainVault = "";
+      return {
+        absolute,
+        vault,
+        wantAbsolute: t("file.linkUnfound", "이 파일을 체크아웃에서 찾지 못했어요: {{name}}", { name: "lost.rs" }),
+        wantVault: t("file.linkUnfound", "이 파일을 체크아웃에서 찾지 못했어요: {{name}}", { name: "missing.md" }),
+        scratch: [...window.__SCRATCH__],
+      };
+    }, { root });
+    ok(
+      "t-83039: a file the answer names by its name alone opens the checkout's one file whose path ends that way, at the line it named, with nothing said — the look is asked on the press, never while the answer is drawn",
+      JSON.stringify(seen.drawn) === "[0,0]" &&
+        seen.one.tab === `file:${deep}` && seen.one.line === 12 &&
+        // One read at the link's own spot, which fails; every read after it is the file found (a file
+        // tab reads its file again when the stub's version answer differs — every open here does).
+        seen.one.reads[0] === `${root}/terminal.rs` && seen.one.reads.length >= 2 &&
+        seen.one.reads.slice(1).every((path) => path === deep) &&
+        JSON.stringify(seen.one.looks) === JSON.stringify(["terminal.rs"]) && seen.one.toasts === 0,
+      JSON.stringify(seen),
+    );
+    ok(
+      "t-83039: a path that stands where it points opens there, at its line, and looks for nothing",
+      seen.direct.tab === `file:${root}/crates/one/src/mod.rs` && seen.direct.line === 3 && seen.direct.looks === 0,
+      JSON.stringify(seen),
+    );
+    ok(
+      "t-83039: two files ending with the name stand in the file finder with the name typed in — a file whose name only holds the word is not one of them — and nothing opens or is said",
+      seen.two.finder && seen.two.query === "mod.rs" &&
+        JSON.stringify(seen.two.rows) === JSON.stringify(["crates/one/src/mod.rs", "crates/two/src/mod.rs"]) &&
+        seen.two.tab && seen.two.toasts === 0,
+      JSON.stringify(seen),
+    );
+    ok(
+      "t-83039: a name no file ends with is one sentence, once however often it is pressed, with the disk's words on its hover — each press is one read and one look, and a press as that toast fades is told again",
+      JSON.stringify(seen.none.pressOnce) === "[1,1]" && JSON.stringify(seen.none.pressFive) === "[5,5]" &&
+        seen.none.count === 1 && seen.none.words[0] === seen.none.want &&
+        seen.none.tip.includes("No such file or directory (os error 2)") && seen.none.tab &&
+        seen.none.afterFade === 1,
+      JSON.stringify(seen),
+    );
+    ok(
+      "t-83039: the document viewer's relative link takes the same road — measured from its page, then looked for by its name",
+      seen.doc.tab === `file:${deep}` && seen.doc.line === 7 && seen.doc.firstRead === "docs/terminal.rs" && seen.doc.toasts === 0,
+      JSON.stringify(seen),
+    );
+    ok(
+      "t-83039: an absolute path in the checkout that holds nothing, and a vault page's link that holds nothing, are each one sentence with the disk's words on its hover — nothing is looked for, and neither is taken for a file outside the project",
+      JSON.stringify(seen.unlooked.absolute.reads) === JSON.stringify([`${root}/crates/lost.rs`]) &&
+        seen.unlooked.absolute.looks === 0 &&
+        JSON.stringify(seen.unlooked.absolute.words) === JSON.stringify([seen.unlooked.wantAbsolute]) &&
+        seen.unlooked.absolute.tip.includes("No such file or directory (os error 2)") &&
+        JSON.stringify(seen.unlooked.vault.reads) === JSON.stringify(["/vault/wiki/missing.md"]) &&
+        seen.unlooked.vault.looks === 0 &&
+        JSON.stringify(seen.unlooked.vault.words) === JSON.stringify([seen.unlooked.wantVault]) &&
+        seen.unlooked.vault.tip.includes("No such file or directory (os error 2)") &&
+        seen.unlooked.scratch.length === 0,
+      JSON.stringify(seen.unlooked),
+    );
+    ok("t-83039: the link lookup raised no page errors", faults.length === 0, faults.join("\n"));
+  } finally {
+    await page.close();
+  }
+}
+
+/* A file outside the project the answer names by its whole path (t-83039 ⑥):
+ * an agent's note in its own session folder, and a file somewhere else. The
+ * stubs answer as the backend does — the project's door refuses both as
+ * outside the project; the session door reads the note (the session table is
+ * the backend's, pinned by `session_scratch`'s own tests) and answers nothing
+ * for the other. Pressed, the note opens in a tab nobody can write with its
+ * relative links inert; the other opens nothing and says so once, however
+ * often it is pressed, with the refusal on its hover. A name an answer from
+ * another checkout gives lands outside the project the same way. */
+export async function testConversationOutsideLinks(browser, origin, ok) {
+  const { page, faults } = await openWindowTestPage(browser, origin);
+  try {
+    const root = "/tmp/zerocode-window-test";
+    const note = "/private/tmp/claude-501/-Users-dev-zerocode/s-1/scratchpad/tokens-render.md";
+    const elsewhere = "/Users/dev/notes/plan.md";
+    await page.evaluate(({ root, note }) => {
+      window.__READS__ = [];
+      window.__SCRATCH__ = [];
+      window.__ANSWER__.read_text_file = (args) => {
+        window.__READS__.push(args.path);
+        if (!args.path.startsWith(`${root}/`)) throw "path escapes the project";
+        return { text: "inside", version: 1, missing: false };
+      };
+      window.__ANSWER__.session_scratch_document = (args) => {
+        window.__SCRATCH__.push(args.path);
+        return args.path === note ? { text: "# 토큰\n\n[옆 파일](other.md)", bytes: 32, truncated: false } : null;
+      };
+    }, { root, note });
+    await openConversation(page, [
+      { role: "user", text: "결과는 어디에 있나요?" },
+      { role: "assistant", text: `정리한 글: ${note} 그리고 계획: ${elsewhere} 입니다.` },
+    ]);
+    const seen = await page.evaluate(async ({ note, elsewhere }) => {
+      const seen = {};
+      const until = async (done) => {
+        for (let beat = 0; beat < 30 && !done(); beat += 1) await window.__PAINTED__();
+      };
+      const toasts = () => [...document.querySelectorAll(".toasts .toast")];
+      const links = [...document.querySelectorAll("#worker-view .helper-turn.is-assistant .helper-link")];
+      const byLabel = (label) => links.find((one) => one.textContent.trim() === label);
+      const pageTab = activeTabId;
+      seen.drawn = [window.__READS__.length, window.__SCRATCH__.length];
+      // The agent's own note: a tab nobody can write, its relative link inert.
+      byLabel(note)?.click();
+      await until(() => activeTabId === `scratch-doc:${note}`);
+      const tab = tabs.find((one) => one.id === activeTabId);
+      const view = document.querySelector(`.file-view[data-tab="${CSS.escape(activeTabId)}"]`);
+      const inner = view?.querySelector(".file-body .md-link");
+      seen.note = {
+        tab: activeTabId,
+        readOnly: tab?.readOnly === true,
+        heading: view?.querySelector(".file-body h1, .file-body .md-head")?.textContent ?? null,
+        innerInert: Boolean(inner) && inner.getAttribute("role") !== "button" && inner.classList.contains("md-link--external"),
+        said: view?.querySelector(".file-view-note")?.textContent ?? "",
+        wantSaid: t("artifacts.readOnlyNote", "읽기 전용 — 열린 프로젝트 밖의 문서입니다."),
+        asked: [...window.__SCRATCH__],
+        toasts: toasts().length,
+      };
+      setActiveTab(pageTab);
+      await until(() => activeTabId === pageTab);
+      // Anywhere else: nothing opens, one sentence however often it is pressed.
+      const tabsBefore = tabs.length;
+      for (let press = 0; press < 3; press += 1) {
+        byLabel(elsewhere)?.click();
+        await until(() => window.__SCRATCH__.filter((path) => path === elsewhere).length === press + 1);
+      }
+      for (let beat = 0; beat < 3; beat += 1) await window.__PAINTED__();
+      const said = toasts();
+      seen.elsewhere = {
+        count: said.length,
+        words: said.map((node) => node.textContent),
+        want: t("file.outsideProject", "프로젝트 밖 파일이라 여기서 열지 않아요"),
+        tip: said[0]?.dataset.tip ?? "",
+        tabs: tabs.length - tabsBefore,
+        front: activeTabId === pageTab,
+      };
+      return seen;
+    }, { note, elsewhere });
+    ok(
+      "t-83039 ⑥: a note the agent wrote in its own session folder opens, on the press, in a tab nobody can write that says so — its relative links inert — and nothing is said",
+      JSON.stringify(seen.drawn) === "[0,0]" &&
+        seen.note.tab === `scratch-doc:${note}` && seen.note.readOnly && seen.note.heading === "토큰" &&
+        seen.note.innerInert && seen.note.said.startsWith(seen.note.wantSaid) &&
+        JSON.stringify(seen.note.asked) === JSON.stringify([note]) && seen.note.toasts === 0,
+      JSON.stringify(seen),
+    );
+    ok(
+      "t-83039 ⑥: a file outside the project and outside every session folder opens nothing and is one sentence, once however often it is pressed, with the refusal on its hover",
+      seen.elsewhere.count === 1 && seen.elsewhere.words[0] === seen.elsewhere.want &&
+        seen.elsewhere.tip.includes("path escapes the project") && seen.elsewhere.tabs === 0 && seen.elsewhere.front,
+      JSON.stringify(seen),
+    );
+    ok("t-83039 ⑥: the outside links raised no page errors", faults.length === 0, faults.join("\n"));
+  } finally {
+    await page.close();
+  }
+  // A conversation in another checkout names 「gone.rs」, measured from that checkout. This
+  // checkout's finder would find a namesake, so nothing is looked for: the path lands outside the
+  // project, and the press says that in one sentence, however often it comes, the disk's words on
+  // its hover — the disk's own refusal was what stood there before.
+  const other = await openWindowTestPage(browser, origin);
+  try {
+    const root = "/tmp/zerocode-window-test";
+    const there = "/tmp/zerocode-window-other";
+    await other.page.evaluate(({ root }) => {
+      window.__READS__ = [];
+      window.__LOOKS__ = [];
+      window.__SCRATCH__ = [];
+      window.__ANSWER__.read_text_file = (args) => {
+        window.__READS__.push(args.path);
+        if (!args.path.startsWith(`${root}/`)) throw "No such file or directory (os error 2)";
+        return { text: "inside", version: 1, missing: false };
+      };
+      window.__ANSWER__.search_files = (args) => {
+        window.__LOOKS__.push(args.query);
+        return ["crates/zerocode-shell/src/gone.rs"];
+      };
+      window.__ANSWER__.session_scratch_document = (args) => {
+        window.__SCRATCH__.push(args.path);
+        return null;
+      };
+    }, { root });
+    await openConversation(other.page, [
+      { role: "user", text: "무엇을 지웠나요?" },
+      { role: "assistant", text: "gone.rs 를 지웠습니다." },
+    ], { cwd: there });
+    const seen = await other.page.evaluate(async ({ at }) => {
+      const until = async (done) => {
+        for (let beat = 0; beat < 30 && !done(); beat += 1) await window.__PAINTED__();
+      };
+      const gone = [...document.querySelectorAll("#worker-view .helper-turn.is-assistant .helper-link")]
+        .find((one) => one.textContent.trim() === "gone.rs");
+      const pageTab = activeTabId;
+      const tabsBefore = tabs.length;
+      for (let press = 0; press < 3; press += 1) {
+        gone?.click();
+        await until(() => window.__SCRATCH__.filter((path) => path === at).length === press + 1);
+      }
+      for (let beat = 0; beat < 3; beat += 1) await window.__PAINTED__();
+      const said = [...document.querySelectorAll(".toasts .toast")];
+      return {
+        pressed: Boolean(gone),
+        reads: [...window.__READS__],
+        looks: window.__LOOKS__.length,
+        scratch: [...window.__SCRATCH__],
+        words: said.map((node) => node.textContent),
+        want: t("file.outsideProject", "프로젝트 밖 파일이라 여기서 열지 않아요"),
+        tip: said[0]?.dataset.tip ?? "",
+        tabs: tabs.length - tabsBefore,
+        front: activeTabId === pageTab,
+      };
+    }, { at: `${there}/gone.rs` });
+    ok(
+      "t-83039: a name an answer from another checkout gives, holding nothing there, is one sentence once however often it is pressed — the path outside the project on its hover with the disk's words — and this checkout's namesake is neither looked for nor opened",
+      seen.pressed && JSON.stringify(seen.reads) === JSON.stringify([`${there}/gone.rs`, `${there}/gone.rs`, `${there}/gone.rs`]) &&
+        seen.looks === 0 && JSON.stringify(seen.scratch) === JSON.stringify([`${there}/gone.rs`, `${there}/gone.rs`, `${there}/gone.rs`]) &&
+        JSON.stringify(seen.words) === JSON.stringify([seen.want]) &&
+        seen.tip.includes(`${there}/gone.rs: No such file or directory (os error 2)`) && seen.tabs === 0 && seen.front,
+      JSON.stringify(seen),
+    );
+    ok("t-83039: the link from another checkout raised no page errors", other.faults.length === 0, other.faults.join("\n"));
+  } finally {
+    await other.page.close();
+  }
+}
+
 /* A3 — the keyboard. The extension's prompt keys (2.1.280 webview): a plain
  * Esc interrupts the turn from anywhere on the panel (`zU0` on body; a popup
  * takes it first, a permission card too); Shift+Tab steps the permission
@@ -538,6 +1028,62 @@ export async function testConversationKeys(browser, origin, ok) {
       await settle();
       seen.sent = JSON.stringify(calls("wire_send").map((args) => args.text));
 
+      // While the turn runs the send follows the box (t-83633, the extension's
+      // `busy && !canSendMessage` stops): words in the box make it the queue's
+      // door — a press queues them and stops nothing — an empty box makes it
+      // the stop again, a chip alone counts as words, and Esc still stops the
+      // turn from a box that holds words. A key that keeps the face writes
+      // nothing on the button.
+      log.status = "working";
+      await settle();
+      const form = face.querySelector(".worker-composer");
+      const run = form.__workerRun;
+      const send = form.querySelector(".worker-composer-send");
+      const faceOf = () => ({
+        stop: send.classList.contains("is-stop"),
+        name: send.getAttribute("aria-label"),
+        tip: send.dataset.tip ?? null,
+        mark: send.querySelector("use")?.getAttribute("href") ?? "",
+      });
+      const type = (text) => {
+        box.value = text;
+        box.dispatchEvent(new Event("input", { bubbles: true }));
+      };
+      type("");
+      seen.queueEmpty = faceOf();
+      type("ㅇ");
+      seen.queueTyped = faceOf();
+      const keys = new MutationObserver(() => {});
+      keys.observe(send, { attributes: true, childList: true, subtree: true, characterData: true });
+      type("ㅇㅇ");
+      type("ㅇㅇ 다음");
+      seen.queueQuiet = keys.takeRecords().length;
+      keys.disconnect();
+      const pressedAt = { interrupts: calls("wire_interrupt").length, sends: calls("wire_send").length };
+      send.click();
+      await settle();
+      seen.queuePress = {
+        interrupts: calls("wire_interrupt").length - pressedAt.interrupts,
+        sends: calls("wire_send").length - pressedAt.sends,
+        queue: run.queue ?? [],
+        box: box.value,
+      };
+      seen.queueAfter = faceOf();
+      type("멈출 글");
+      const escAt = calls("wire_interrupt").length;
+      press(box, "Escape");
+      await settle();
+      seen.queueEsc = calls("wire_interrupt").length - escAt;
+      type("");
+      await composerAttachmentsOf(form).add(["/Users/dev/zerocode/README.md"]);
+      seen.queueChip = faceOf();
+      form.querySelector(".composer-attach-drop")?.click();
+      seen.queueChipGone = faceOf();
+      seen.queueNames = {
+        stop: t("worker.stop", "중지"),
+        queue: t("composer.queue.add", "대기열에 추가 — 멈추려면 Esc"),
+      };
+
       // A pane's conversation: Esc and the stop button press the key its CLI
       // names (Claude Code: "esc to interrupt"), not the terminal's ^C.
       const term = await openTermTab({ placement: "tab" });
@@ -592,6 +1138,20 @@ export async function testConversationKeys(browser, origin, ok) {
         seen.upPastOldest === "첫째 부탁" && seen.down1 === "둘째 부탁" && seen.downToDraft === "쓰던 글" &&
         seen.ctrlJ === JSON.stringify("한\n 줄") && seen.sent === JSON.stringify(["한\n 줄"]),
       JSON.stringify(seen),
+    );
+    const { stop, queue } = seen.queueNames ?? {};
+    const stopFace = (one) => one?.stop === true && one.name === stop && one.tip === stop && one.mark === "#i-square";
+    const queueFace = (one) => one?.stop === false && one.name === queue && one.tip === queue && one.mark === "#i-arrow-up";
+    ok(
+      "t-83633: while the turn runs, words in the box turn the stop into 「대기열에 추가」 (an up arrow, its name said twice — tooltip and label — with Esc in it) and a press queues them: one held, nothing sent, nothing stopped, the box emptied and the stop back; a chip alone queues too; Esc from a box holding words stops the turn; and a key that keeps the face writes nothing on the button",
+      stopFace(seen.queueEmpty) && queueFace(seen.queueTyped) && seen.queueQuiet === 0 &&
+        seen.queuePress?.interrupts === 0 && seen.queuePress.sends === 0 &&
+        JSON.stringify(seen.queuePress.queue) === JSON.stringify(["ㅇㅇ 다음"]) && seen.queuePress.box === "" &&
+        stopFace(seen.queueAfter) && seen.queueEsc === 1 && queueFace(seen.queueChip) && stopFace(seen.queueChipGone),
+      JSON.stringify({
+        queueEmpty: seen.queueEmpty, queueTyped: seen.queueTyped, queueQuiet: seen.queueQuiet, queuePress: seen.queuePress,
+        queueAfter: seen.queueAfter, queueEsc: seen.queueEsc, queueChip: seen.queueChip, queueChipGone: seen.queueChipGone, names: seen.queueNames,
+      }),
     );
     ok("A3: the keys raised no page errors", faults.length === 0, faults.join("\n"));
   } finally {
@@ -5121,7 +5681,7 @@ async function inkShare(page, png, ink, plain) {
  * when it passes too — the numbers a receipt quotes. */
 if (import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const all = {
-    testConversationFont, testConversationFolds, testConversationPaths, testConversationKeys, testConversationStatus,
+    testConversationFont, testConversationFolds, testConversationPaths, testConversationLinkLookup, testConversationOutsideLinks, testConversationKeys, testConversationStatus,
     testConversationScroll, testConversationFoot, testConversationAgents, testConversationTodos, testConversationImages,
     testConversationCopies, testConversationShelf, testConversationRelease, testConversationSteps,
     testConversationCodeColours, testConversationStreamWork, testConversationTypingWork,

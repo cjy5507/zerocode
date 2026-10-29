@@ -13,8 +13,8 @@ pub(crate) use console::{agent_models, slash_commands, superseded_models};
 pub(crate) mod wire;
 pub(crate) use wire::{
     HAND_OVER_EXIT_POLL, HAND_OVER_EXIT_WAIT, program_left, wait_process_group_gone, wire_answer,
-    wire_image, wire_interrupt, wire_log, wire_models, wire_send, wire_set_mode, wire_set_model,
-    wire_start, wire_stop,
+    wire_history, wire_image, wire_interrupt, wire_log, wire_models, wire_send, wire_set_mode,
+    wire_set_model, wire_start, wire_stop,
 };
 pub(crate) mod browser;
 pub(crate) mod browser_workspace;
@@ -77,11 +77,12 @@ pub(crate) use remote::{
 };
 
 pub(crate) use browser::{
-    browser_click, browser_console, browser_devtools, browser_diagnose, browser_eval, browser_find,
-    browser_find_clear, browser_grab_arm, browser_grab_disarm, browser_grab_take, browser_history,
-    browser_menu_take, browser_navigate, browser_network, browser_place, browser_profiles,
-    browser_read, browser_reload, browser_scroll, browser_stop, browser_type, browser_wait,
-    browser_zoom, close_browser_pane, cookie_sources, create_browser_profile,
+    browser_address_candidates, browser_address_fill, browser_bookmarks, browser_click,
+    browser_console, browser_devtools, browser_diagnose, browser_entry_fill, browser_eval,
+    browser_find, browser_find_clear, browser_grab_arm, browser_grab_disarm, browser_grab_take,
+    browser_history, browser_menu_take, browser_navigate, browser_network, browser_place,
+    browser_profiles, browser_read, browser_reload, browser_scroll, browser_stop, browser_type,
+    browser_wait, browser_zoom, close_browser_pane, cookie_sources, create_browser_profile,
     delete_browser_profile, focus_main, import_browser_cookies, import_cookie_file,
     note_webview_error, open_browser_pane, set_browser_default_profile,
 };
@@ -93,8 +94,8 @@ pub(crate) use fs::{
     fs_trash, fs_undo, image_diff, list_dir, open_computer_use_permission, open_download,
     orchestration_runtime_state, path_kinds, paths_exist, read_image_file, read_text_file,
     render_mermaid, reset_computer_use_permissions, resume_vault_session, reveal_vault_session,
-    set_clipboard_image, show_download, tree_selection, vault_sessions, watch_files,
-    write_text_file,
+    session_scratch_document, set_clipboard_image, show_download, tree_selection, vault_sessions,
+    watch_files, write_text_file,
 };
 
 pub(crate) use usage::{
@@ -141,13 +142,13 @@ pub(crate) use board::{
     ack_board_agent, agent_icon, board_columns, board_desk, board_settle, board_snapshot,
     claim_coordinator_seat, clipboard_has_image, continuation_source, coordinator_handover_status,
     coordinator_seat_runs, coordinator_seats, create_untitled_markdown, delete_untitled_markdown,
-    desk_ack, desk_checkouts, desk_hold_resolve, desk_reply, desk_review_pass, hooks_report,
-    install_hooks, ledger_agents, machine_load, open_board_popout, orchestration_accuracy,
-    pane_activities, pane_agents, pane_sessions, pane_subagents, quota_wall_handover,
-    quota_wall_retry, release_untitled_markdown, resume_line, resume_session, reveal_board_agent,
-    save_clipboard_image, schedule_timeline, set_coordinator_handover, set_dock_badge,
-    set_hooks_enabled, set_previewed_terms, set_watched_terms, term_pull, term_snapshot,
-    turn_failed_retry, worker_screen,
+    desk_ack, desk_checkouts, desk_hold_resolve, desk_question_close, desk_reply, desk_review_pass,
+    hooks_report, install_hooks, ledger_agents, machine_load, open_board_popout,
+    orchestration_accuracy, pane_activities, pane_agents, pane_sessions, pane_subagents,
+    quota_wall_handover, quota_wall_retry, release_untitled_markdown, resume_line, resume_session,
+    reveal_board_agent, save_clipboard_image, schedule_timeline, set_coordinator_handover,
+    set_dock_badge, set_hooks_enabled, set_previewed_terms, set_watched_terms, term_pull,
+    term_snapshot, turn_failed_retry, worker_screen,
 };
 pub(crate) use board::{
     land_batch_bisect, land_batch_cancel, land_batch_promote, land_batch_restack,

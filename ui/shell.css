@@ -10564,6 +10564,128 @@ body.is-dragging-pane {
   color: var(--ink-chalk);
 }
 
+/* The form-fill strip: one line under the toolbar, a pane-pushing sibling
+ * like the downloads strip above it. The words wrap by word and the acts fold
+ * under them at a narrow pane; a primary act is a saved entry the person can
+ * press to fill the page's form (t-79331 — the sign-in strip of t-79326 is
+ * the same strip with its own entries). */
+.browser-fillbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 6px var(--space-3);
+  border-bottom: var(--rule-width) solid var(--edge-rule);
+  background: var(--surface-deck);
+  font-size: var(--text-xs);
+  color: var(--ink-chalk);
+}
+
+.browser-fillbar-words {
+  flex: 1 1 16em;
+  min-width: 0;
+}
+
+.browser-fillbar-acts {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.browser-fillbar-act {
+  max-width: 24em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: var(--rule-width) solid var(--edge-mark);
+  border-radius: var(--radius-sm);
+  background: none;
+  padding: 2px var(--space-2);
+  font: inherit;
+  font-size: var(--text-xs);
+  color: var(--ink-mist);
+  cursor: pointer;
+}
+
+.browser-fillbar-act.is-primary {
+  color: var(--ink-chalk);
+}
+
+.browser-fillbar-act:hover {
+  background: var(--row-hover);
+  color: var(--ink-chalk);
+}
+
+.browser-fillbar-act:focus-visible {
+  outline: 2px solid var(--ink-chalk);
+  outline-offset: 1px;
+}
+
+/* The bookmarks strip — Chrome's bookmarks bar under the toolbar, one row of
+ * the bar's own order: a bookmark is its words, a first-level folder wears
+ * the folder glyph and opens its bookmarks as a menu, and the trailing
+ * 「모든 북마크」 reaches what the row had no room for. Pane-pushing like the
+ * strips above it. */
+.browser-bookmarks {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px var(--space-2);
+  border-bottom: var(--rule-width) solid var(--edge-rule);
+  background: var(--surface-deck);
+}
+
+.browser-bookmarks-row {
+  display: flex;
+  flex: 1;
+  gap: var(--space-1);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.browser-bookmark {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-1);
+  /* Chrome cuts a long title on the bar too; at 12em a dozen bookmarks
+   * stand on one row of an ordinary pane. */
+  max-width: 12em;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  padding: 2px var(--space-2);
+  font: inherit;
+  font-size: var(--text-xs);
+  color: var(--ink-chalk);
+  cursor: pointer;
+}
+
+.browser-bookmark .icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--ink-mist);
+}
+
+.browser-bookmark-words {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-bookmark:hover {
+  background: var(--row-hover);
+}
+
+.browser-bookmark:focus-visible {
+  outline: 2px solid var(--ink-chalk);
+  outline-offset: -2px;
+}
+
 /* Orca's DiffLineCounts (SourceControl-xYgEJ0Pk.js:512811): `shrink-0
  * tabular-nums text-[10px]`, +N in the added ink and -N in the deleted —
  * the same two tokens the diff views already speak. */
@@ -10590,7 +10712,8 @@ body.is-dragging-pane {
 
 /* Where inside the changed line the change is — the char-level emphasis the
  * original's Monaco draws over its line tints: the span's own stronger wash
- * of the same diff ink, over the 14% the whole line already wears. */
+ * of the same diff ink, over the wash the whole line already wears
+ * (`--diff-add-surface`). */
 .diff-line--add .diff-word {
   background: color-mix(in srgb, var(--diff-add) 32%, transparent);
   border-radius: 2px;
@@ -14997,6 +15120,56 @@ details.worker-command {
   height: var(--chat-list-pad-top);
 }
 
+/* The way up (`chatEarlierDoorNode`, t-82901): the list's head, centred on
+ * its column, above every row — the quiet ink on the tool well that the
+ * old 「이전 기록」 line wore, a press now: the agent's accent on its edge under
+ * the pointer or the keyboard, as the foot's button wears it. It stands only
+ * while something stands above the page's first turn. */
+.chat-earlier-door {
+  flex: none;
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: min(var(--reading-column), 100%);
+  height: var(--control-height-sm);
+  margin: 0 0 var(--space-3);
+  padding: 0 var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  background: var(--chat-tool-bg);
+  color: var(--ink-mist);
+  font: inherit;
+  font-family: var(--font-ui);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition:
+    color var(--motion-fast) var(--ease-standard),
+    border-color var(--motion-fast) var(--ease-standard);
+}
+
+.chat-earlier-door:hover,
+.chat-earlier-door:focus-visible {
+  border-color: var(--chat-accent);
+  color: var(--ink-chalk);
+}
+
+.chat-earlier-door:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 var(--chat-focus-ring) color-mix(in srgb, var(--chat-accent) 12%, transparent);
+}
+
+/* Its read is out: the words say so, and the pointer says it is under way. */
+.chat-earlier-door[aria-busy="true"] {
+  cursor: progress;
+}
+
+.chat-earlier-door > .icon {
+  flex: none;
+  width: 1.1em;
+  height: 1.1em;
+}
+
 .helper-turn {
   margin: 0;
   border: 0;
@@ -15771,6 +15944,29 @@ pre.md-block > .chat-code-deleted { color: var(--syntax-deleted); }
 
 .helper-tool-diff .diff-num {
   width: 4ch;
+}
+
+/* The +/- column (t-83633). A conversation's diff is most often a snippet
+ * whose place in its file the call never said, so both gutters stand blank
+ * and the line's wash was the only mark of what the line is — a colour
+ * alone. The sign says it in a shape as well, in the diff's own ink
+ * (`--diff-add-ink`, which clears AA on its line in both themes). It is
+ * drawn, not written: a copy of the code carries no sign. A line that did
+ * not change keeps the column's width, so the code stays in one column. */
+.helper-tool-diff .diff-text::before {
+  display: inline-block;
+  width: 2ch;
+  content: "";
+}
+
+.helper-tool-diff .diff-line--add .diff-text::before {
+  content: "+";
+  color: var(--diff-add-ink);
+}
+
+.helper-tool-diff .diff-line--del .diff-text::before {
+  content: "-";
+  color: var(--diff-del-ink);
 }
 
 /* A thought is one line (t-22100): how long it lasted leads — the
@@ -18940,7 +19136,9 @@ button.helper-sib:hover {
   padding: 0 var(--space-2) var(--space-1);
 }
 
-.qo-empty {
+/* The finder's quiet lines: nothing matched, and what it left out (t-82875). */
+.qo-empty,
+.qo-note {
   margin: 0;
   padding: var(--space-5) var(--space-4);
   text-align: center;
@@ -25436,6 +25634,24 @@ progress:indeterminate::-webkit-progress-bar {
   gap: var(--space-2);
 }
 
+/* 답 없이 닫기 (t-83281): the one line of why and its button share a row; at any width the field
+   narrows and the button keeps its words. */
+.inbox-close {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.inbox-close-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.inbox-close-field {
+  flex: 1;
+  min-width: 0;
+}
+
 .inbox-note {
   margin: 0;
   color: var(--ink-mist);
@@ -27695,6 +27911,8 @@ select {
 .prc-field,
 .browser-suggest-row,
 .browser-dl-act,
+.browser-bookmark,
+.browser-fillbar-act,
 .browser-markup-tool,
 .browser-markup-width,
 .browser-markup-size,
@@ -34645,6 +34863,7 @@ details.task-board-section > summary {
 .task-board-desk[hidden],
 .board-desk-block[hidden],
 .board-desk-release-reason[hidden],
+.board-desk-release-stalled[hidden],
 .board-desk-release-skips[hidden] {
   display: none;
 }
@@ -35356,6 +35575,7 @@ details.task-board-section > summary {
 }
 
 .board-desk-release-reason,
+.board-desk-release-stalled,
 .board-desk-release-skips {
   margin: var(--space-2) 0 0;
   color: var(--ink-label);
@@ -35366,6 +35586,11 @@ details.task-board-section > summary {
 
 .board-desk-release-reason {
   color: var(--signal-halt-ink);
+}
+
+/* 「멈춘 듯」(t-83513): 아직 빨강이 아닌 주의 — 말이 상태를 말하고, 색은 기다림의 잉크다. */
+.board-desk-release-stalled {
+  color: var(--signal-wait-ink);
 }
 
 .board-desk-release-skips {
@@ -38954,6 +39179,13 @@ details.task-board-section > summary {
 
 .board-ask-step.is-answered::after {
   content: " ✓";
+}
+
+/* Why a worker's question is the person's after all (t-82296): one quiet
+ * line over the question, on tokens only. */
+.board-ask-raised {
+  color: var(--ink-mist);
+  font-size: var(--text-xs);
 }
 
 .board-ask-question {

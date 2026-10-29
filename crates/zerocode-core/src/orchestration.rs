@@ -1133,15 +1133,49 @@ fn says_something(value: &serde_json::Value) -> bool {
 }
 
 /// Whether a result verifies on nothing new: it says `verified` and names no new review it rests on
-/// ([`new_review_keys`]) — the board's 「통과」, a bare `{"verified":true}`, or the same with landing
-/// keys beside it. What a standing withdrawal refuses (t-81913, [`ReviewFacts::withdrawn`]).
+/// ([`new_review_keys`]) — a bare `{"verified":true}`, or the same with landing keys beside it — or
+/// it is the board's 「통과」 ([`BOARD_PASS_KEY`]), whatever it carried over from the result it was
+/// written over: the board adds `verified` and its mark and takes the review keys away, so a
+/// report beside them is the old result's, not a new review (t-82501). A result that still bears
+/// the board's mark when a coordinator writes it again with a review key of its own — who
+/// reviewed, what it ran, the head it tested — names a new review all the same: the press never
+/// leaves those keys, so only a later hand wrote them. What a standing withdrawal refuses
+/// (t-81913, [`ReviewFacts::withdrawn`]).
 fn verifies_on_nothing_new(result: &str) -> bool {
     let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(result)
     else {
         return false;
     };
+    let pressed = map.contains_key(BOARD_PASS_KEY);
     ReviewFacts::from_result(result).verified
-        && !new_review_keys().any(|key| map.get(key).is_some_and(says_something))
+        && !new_review_keys()
+            .filter(|key| !pressed || *key != REVIEW_REPORT_KEY)
+            .any(|key| map.get(key).is_some_and(says_something))
+}
+
+/// The key the board's 「통과」 marks its verification with (t-82501): when the person pressed it, in
+/// epoch milliseconds ([`board_pass_result`]).
+pub const BOARD_PASS_KEY: &str = "passedOnBoard";
+
+/// The result the board's 「통과」 writes (t-82501): the task's result as it stands, with `verified`
+/// and [`BOARD_PASS_KEY`] added — `task-update` replaces a result whole, so this is that whole, and
+/// a worker's summary, tests and report outlive the pass. The keys a review is read from
+/// (`review_keys`) and a withdrawal's (`VERIFICATION_WITHDRAWN_KEY`) are not carried over: the
+/// press vouches for its own verification and for nothing the result said before, so a worker's
+/// `merged` or `testedHead` stays the worker's claim instead of becoming the coordinator's fact. A
+/// result that is not a JSON object carries nothing over.
+#[must_use]
+pub fn board_pass_result(stored: &str, now_ms: i64) -> String {
+    let mut result = match serde_json::from_str::<serde_json::Value>(stored) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    for key in review_keys().chain(std::iter::once(VERIFICATION_WITHDRAWN_KEY)) {
+        result.remove(key);
+    }
+    result.insert(VERIFIED_KEY.into(), true.into());
+    result.insert(BOARD_PASS_KEY.into(), now_ms.into());
+    serde_json::Value::Object(result).to_string()
 }
 
 /// The key a coordinator marks work with no code to land under — the first of
@@ -2340,6 +2374,29 @@ pub struct RunSummary {
     pub sweeps: u32,
 }
 
+/// What is left of the letters a sweep folded out of a run still working
+/// (t-81273).
+///
+/// Retention compacts a FINISHED run; one a coordinator keeps open for months
+/// kept every letter it ever carried, and the window read all of them at
+/// every start (17,545 in the person's longest run, 2026-10-29). A sweep now
+/// folds the few no judgment of the ledger reads back, and this is what
+/// stands in their place: counts and stamps, nothing anybody wrote, the same
+/// size however many letters it replaced.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FoldedMail {
+    /// How many letters were folded, over every fold of this run.
+    pub letters: u32,
+    /// The bytes their words carried — body, subject and payload.
+    pub bytes: u64,
+    /// The oldest and the newest letter folded.
+    pub oldest_ms: i64,
+    pub newest_ms: i64,
+    /// When the last fold that took something ran.
+    pub folded_ms: i64,
+}
+
 /// What one sweep did, counted out.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Sweep {
@@ -2357,6 +2414,10 @@ pub struct Sweep {
     /// Runs the sweep looked at and left alone because something in them was
     /// still live, depended on, open, gated or unacknowledged.
     pub runs_spared: usize,
+    /// Letters folded out of runs still working, and the bytes their words
+    /// carried ([`FoldedMail`], t-81273).
+    pub letters_folded: usize,
+    pub letter_bytes_folded: u64,
 }
 
 impl Sweep {
@@ -2364,7 +2425,10 @@ impl Sweep {
     /// to spend a write.
     #[must_use]
     pub const fn moved(&self) -> bool {
-        self.runs > 0 || self.receipts_expired > 0 || self.tombstones_dropped > 0
+        self.runs > 0
+            || self.receipts_expired > 0
+            || self.tombstones_dropped > 0
+            || self.letters_folded > 0
     }
 
     /// This sweep as the answer a verb prints.
@@ -2380,6 +2444,8 @@ impl Sweep {
             "receiptsExpired": self.receipts_expired,
             "tombstonesDropped": self.tombstones_dropped,
             "runsSpared": self.runs_spared,
+            "lettersFolded": self.letters_folded,
+            "letterBytesFolded": self.letter_bytes_folded,
         })
     }
 }
@@ -2590,6 +2656,208 @@ fn compact(run: &mut Run, now_ms: i64) {
     run.summary = Some(summary);
 }
 
+/// Every question this ledger holds, by id: a letter that names one by its
+/// id may be the letter that answers it ([`answered_by_letters`]), in its own
+/// run or across runs, so a fold keeps it.
+fn question_ids(runs: &[Run]) -> std::collections::HashSet<String> {
+    runs.iter()
+        .flat_map(|run| &run.messages)
+        .filter(|held| held.kind == MessageKind::Question && held.thread.is_none())
+        .map(|held| held.id.clone())
+        .collect()
+}
+
+/// Whether `text` names one of `questions` as a word of its own, the way
+/// [`names_message`] reads it — found by the ids the text holds rather than
+/// by asking after every question in turn.
+fn names_a_question(text: &str, questions: &std::collections::HashSet<String>) -> bool {
+    text.match_indices("m-").any(|(at, _)| {
+        let digits = text[at + 2..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
+        let id = &text[at..at + 2 + digits];
+        digits > 0 && questions.contains(id) && names_message(text, id)
+    })
+}
+
+/// What a receipt that can still be replayed reads back, and so what a fold
+/// must leave where it is: the batches the receipts name, and the letters in
+/// them. A `check` is replayed by rendering those very rows again, and
+/// [`Ledger::validate_loaded`] refuses a receipt whose batch record no longer
+/// agrees with it.
+struct ReplayedMail<'a> {
+    batches: std::collections::HashSet<(&'a str, &'a str, &'a str)>,
+    letters: std::collections::HashSet<(&'a str, &'a str)>,
+}
+
+impl<'a> ReplayedMail<'a> {
+    fn of(served: &'a [Served]) -> Self {
+        let mut held = Self {
+            batches: std::collections::HashSet::new(),
+            letters: std::collections::HashSet::new(),
+        };
+        for receipt in served.iter().filter(|receipt| !receipt.is_tombstone()) {
+            let ServedAnswer::Check(about) = &receipt.answer else {
+                continue;
+            };
+            if let Some(delivery) = about.delivery.as_deref() {
+                held.batches
+                    .insert((about.run.as_str(), about.address.as_str(), delivery));
+            }
+            for id in &about.messages {
+                held.letters.insert((about.run.as_str(), id.as_str()));
+            }
+        }
+        held
+    }
+}
+
+/// Fold out of a run still working the old letters nothing in the ledger
+/// reads back (t-81273), and answer how many went and the bytes their words
+/// carried.
+///
+/// Most of what this ledger judges is judged OUT of old mail — whether a
+/// question was answered, how often a handover walked, whether a notice was
+/// already sent, how a batch landed, where a pane can still be written to —
+/// so a letter folds only when every one of these holds:
+///
+/// · it is an agent's own `status` letter. The ledger's observations never
+///   fold (`went_quiet` is one of them), and neither does any other kind;
+/// · it is older than the retention policy;
+/// · it was handed over and acknowledged, and waits in no queue and no open
+///   batch;
+/// · it stands in no thread — neither inside one nor at its root, as a
+///   letter somebody answered, which a reply finds by id — and names no
+///   question;
+/// · the work it was about is over: its attempt ended and its task is final;
+/// · it is not the last thing its writer said in this run from that seat —
+///   routing reads a pane's last word, and a chair's past seats are read off
+///   the letters signed from them ([`chair_seats`]);
+/// · no receipt that can still be replayed names it, or the batch it went in.
+///
+/// An acknowledged batch then loses exactly the letters folded, and is left
+/// claiming nothing — the shape a legacy acknowledgement already has — only
+/// when every letter in it folded; its id stays spent either way. What went
+/// is counted on the run ([`FoldedMail`]).
+fn fold_old_letters(
+    run: &mut Run,
+    cutoff_ms: i64,
+    questions: &std::collections::HashSet<String>,
+    replayed: &ReplayedMail<'_>,
+    now_ms: i64,
+) -> (usize, u64) {
+    use std::collections::{HashMap, HashSet};
+
+    let folded: HashSet<String> = {
+        let mut stays: HashSet<&str> = HashSet::new();
+        let mut acknowledged: HashSet<&str> = HashSet::new();
+        for (address, inbox) in &run.inboxes {
+            stays.extend(inbox.pending.iter().map(String::as_str));
+            if let Some(open) = &inbox.open {
+                stays.extend(open.messages.iter().map(String::as_str));
+            }
+            for spent in inbox.acked.iter().chain(&inbox.acked_history) {
+                let Some(went) = spent.messages.as_deref() else {
+                    continue;
+                };
+                // A batch a receipt can replay keeps every letter in it.
+                if replayed.batches.contains(&(
+                    run.id.as_str(),
+                    address.as_str(),
+                    spent.delivery.as_str(),
+                )) {
+                    stays.extend(went.iter().map(String::as_str));
+                } else {
+                    acknowledged.extend(went.iter().map(String::as_str));
+                }
+            }
+        }
+        // The letters somebody answered: the roots of the threads.
+        let answered: HashSet<&str> = run
+            .messages
+            .iter()
+            .filter_map(|held| held.thread.as_deref())
+            .collect();
+        // Each writer's last word from each seat it wrote from.
+        let mut last_word: HashMap<(&str, Option<&str>), &str> = HashMap::new();
+        for held in &run.messages {
+            last_word.insert(
+                (held.from.as_str(), held.author_seat.as_deref()),
+                held.id.as_str(),
+            );
+        }
+        let task_final = |id: &str| run.task(id).is_some_and(|task| task.status.is_final());
+        let over = |held: &Message| {
+            held.dispatch.as_deref().is_none_or(|id| {
+                run.dispatch(id).is_some_and(|attempt| {
+                    attempt.ended_ms.is_some() && task_final(attempt.task.as_str())
+                })
+            }) && held.task.as_deref().is_none_or(&task_final)
+        };
+        run.messages
+            .iter()
+            .filter(|&held| {
+                held.kind == MessageKind::Status
+                    && held.from != LEDGER_ITSELF
+                    && held.created_ms <= cutoff_ms
+                    && held.thread.is_none()
+                    && !answered.contains(held.id.as_str())
+                    && acknowledged.contains(held.id.as_str())
+                    && !stays.contains(held.id.as_str())
+                    && last_word.get(&(held.from.as_str(), held.author_seat.as_deref()))
+                        != Some(&held.id.as_str())
+                    && !replayed
+                        .letters
+                        .contains(&(run.id.as_str(), held.id.as_str()))
+                    && over(held)
+                    && !names_a_question(held.body.as_str(), questions)
+            })
+            .map(|held| held.id.clone())
+            .collect()
+    };
+    if folded.is_empty() {
+        return (0, 0);
+    }
+
+    let mut bytes = 0_u64;
+    let (mut oldest_ms, mut newest_ms) = (i64::MAX, i64::MIN);
+    run.messages.retain(|held| {
+        if !folded.contains(&held.id) {
+            return true;
+        }
+        bytes += (held.body.len() + held.subject.len() + held.payload.len()) as u64;
+        oldest_ms = oldest_ms.min(held.created_ms);
+        newest_ms = newest_ms.max(held.created_ms);
+        false
+    });
+    for (_, inbox) in &mut run.inboxes {
+        for spent in inbox.acked.iter_mut().chain(&mut inbox.acked_history) {
+            let Some(went) = spent.messages.as_mut() else {
+                continue;
+            };
+            went.retain(|id| !folded.contains(id));
+            if went.is_empty() {
+                spent.messages = None;
+            }
+        }
+    }
+    let letters = u32::try_from(folded.len()).unwrap_or(u32::MAX);
+    let record = run.folded.get_or_insert(FoldedMail {
+        letters: 0,
+        bytes: 0,
+        oldest_ms,
+        newest_ms,
+        folded_ms: now_ms,
+    });
+    record.letters = record.letters.saturating_add(letters);
+    record.bytes = record.bytes.saturating_add(bytes);
+    record.oldest_ms = record.oldest_ms.min(oldest_ms);
+    record.newest_ms = record.newest_ms.max(newest_ms);
+    record.folded_ms = now_ms;
+    (folded.len(), bytes)
+}
+
 /// A namespace and a home inbox. It never schedules and never places.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2664,6 +2932,12 @@ pub struct Run {
     /// back with none, and the window infers one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<RunProject>,
+    /// The letters a sweep folded out of this run while it was still working
+    /// (t-81273, [`FoldedMail`]). `default`, so every run written before
+    /// folding existed reads back as one that never folded any — which is
+    /// what it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folded: Option<FoldedMail>,
 }
 
 /// Who coordinates a run, and since when.
@@ -3990,6 +4264,17 @@ impl Run {
     /// Whether the asker still waits by the clock is the ledger's to say
     /// ([`Ledger::still_owed`]), since that reads other runs' chairs.
     pub fn question_is_answerable(&self, question: &Message) -> Result<(), String> {
+        if let Some(closed) = hand_closed(self, question) {
+            let said: serde_json::Value =
+                serde_json::from_str(closed.body.as_str()).unwrap_or_default();
+            return Err(format!(
+                "question {} is closed — {} closed it without an answer ({}): {}",
+                question.id,
+                said["closedBy"].as_str().unwrap_or("its coordinator"),
+                closed.id,
+                said["note"].as_str().unwrap_or_default()
+            ));
+        }
         if question_closed(self, question) {
             return Err(format!(
                 "question {} is closed — its dispatch ended \
@@ -4582,6 +4867,16 @@ const TERMINAL_EXITED: &str = "the terminal holding this worker exited";
 pub const NOT_RESUMED: &str =
     "the window restarted and nothing resumed this worker's conversation within the grace";
 
+/// What the receipt a coordinator taken over is handed says it is
+/// ([`Ledger::take_over_coordinator`]) — and how [`chair_witnessed`] knows
+/// the seat it names sat in the chair.
+const SEAT_TAKEN_OVER: &str = "coordinator seat taken over";
+
+/// The verb that closes a question without an answer (t-83289), named once
+/// for the plan, the table of verbs and the run a verb answers in
+/// ([`project_scope::acting_run`]).
+pub const QUESTION_CLOSE: &str = "question-close";
+
 /// The final word an ending is to the askers of the worker it ended: a
 /// terminal that died or a sleeper the restart lost EXITED, and everything
 /// else — a stop, an abandon — is its coordinator CANCELLING it. Read off
@@ -4704,11 +4999,16 @@ fn awaiting_reply(run: &Run, worker_id: &str) -> bool {
 }
 
 /// A thread's ROOT of the question kind with no [`Message::answers`] in its
-/// thread — both words as [`awaiting_reply`] explains them.
+/// thread — both words as [`awaiting_reply`] explains them — and not closed
+/// by a coordinator without one ([`closes_question`], t-83289): nobody waits
+/// on a question its own side closed.
 fn awaits_answer(run: &Run, message: &Message) -> bool {
     message.kind == MessageKind::Question
         && message.thread.is_none()
-        && !run.messages.iter().any(|one| one.answers(message))
+        && !run
+            .messages
+            .iter()
+            .any(|one| one.answers(message) || closes_question(one, message))
 }
 
 /// How long a quiet pane must remain still before the window calls it stalled.
@@ -4856,7 +5156,10 @@ pub const LAST_STATUS_LINE_CHARS: usize = 200;
 /// it was posted, so the walk back stops at the first letter older than
 /// that: a caller passing the moment the worker was summoned reads only the
 /// letters since, nothing it could not have written (the board's beat asks
-/// this of every live worker, t-56141). `i64::MIN` reads the whole run.
+/// this of every live worker, t-56141). `i64::MIN` reads the whole run —
+/// what the run still holds: a fold keeps a writer's last letter, not its
+/// last status, so the last status of an attempt long over may have gone
+/// (t-81273). A live worker's letters are never folded.
 pub fn last_status(run: &Run, worker_id: &str, since_ms: i64) -> Option<LastStatus> {
     let reporter = worker_address(worker_id);
     let said = run
@@ -5187,6 +5490,34 @@ fn receivers_at(run: &Run, team: &str, pane: &str, fact_ms: i64) -> Vec<(String,
 /// The same for a worker named by id — the stall sweep and the endings
 /// know the worker, not the pane — under the same rule: a fact that began
 /// before the worker was summoned is not about it.
+/// A live worker whose readiness window has passed with no sound
+/// ([`Ledger::workers_overdue`]).
+fn past_its_readiness(worker: &Worker, now_ms: i64) -> bool {
+    worker.state.is_live() && worker.ready_by_ms.is_some_and(|by| by <= now_ms)
+}
+
+/// A worker with a window a sound retires ([`Ledger::worker_spoke`]).
+fn awaits_a_sound(worker: &Worker) -> bool {
+    worker.ready_by_ms.is_some() || worker.hook_unreachable_since_ms.is_some()
+}
+
+/// The worker in `seat` whose hook failure is not written down yet
+/// ([`Ledger::worker_hook_delivery_failed`]).
+fn hook_failure_is_news(worker: &Worker, (team, pane): (&str, &str)) -> bool {
+    worker.team == team
+        && worker.pane == pane
+        && worker.state.may_occupy_pane()
+        && worker.hook_unreachable_since_ms.is_none()
+}
+
+/// A live worker whose pane's absence is not reported yet
+/// ([`Ledger::panes_missing`]).
+fn pane_absence_is_news(worker: &Worker) -> bool {
+    worker.state.is_live()
+        && worker.state.may_occupy_pane()
+        && worker.pane_missing_since_ms.is_none()
+}
+
 fn receiver_of_worker(run: &Run, worker_id: &str, fact_ms: i64) -> Option<(String, ReceiverSeat)> {
     let worker = run
         .worker(worker_id)
@@ -5498,22 +5829,114 @@ fn answered_by_letters<'a>(
 }
 
 /// Every seat that has sat in `run`'s chair, as far as the run itself can
-/// tell: the seat its chair names now, held or vacated, and the seat behind
+/// tell: the seat its chair names now, held or vacated, the seat behind
 /// every letter it signed as the run ([`Message::author_seat`]) — an address
-/// [`sender`] mints for the chair and nobody else. Derived, never stored:
-/// the history of a chair is read off the letters written from it.
+/// [`sender`] mints for the chair and nobody else — and every seat the
+/// ledger itself wrote down in the chair ([`chair_witnessed`]). Derived,
+/// never stored: the history of a chair is read off the letters written
+/// from it and about it.
+///
+/// The ledger's own word is not optional (t-83289). A chair that writes
+/// only into other runs signs nothing as its own: ZO's chair of 06:42–09:41
+/// on 2026-10-29 wrote sixteen letters, every one into another run, and
+/// once a restart sat a new pane in its place the letter it had answered
+/// m-81909 with stopped counting — though the ledger's notice m-81908 had
+/// named that pane in the chair.
 fn chair_seats(run: &Run) -> std::collections::HashSet<&str> {
     let address = run.address();
-    run.coordinator
+    let mut seats: std::collections::HashSet<&str> = run
+        .coordinator
         .iter()
         .map(|chair| chair.seat.as_str())
-        .chain(
-            run.messages()
-                .iter()
-                .filter(|letter| letter.from == address)
-                .filter_map(|letter| letter.author_seat.as_deref()),
-        )
-        .collect()
+        .collect();
+    for letter in run.messages() {
+        if letter.from == address {
+            seats.extend(letter.author_seat.as_deref());
+        } else if letter.from == LEDGER_ITSELF {
+            seats.extend(chair_witnessed(run, &address, letter));
+        }
+    }
+    seats
+}
+
+/// The seat the ledger's own `letter` in `run` saw in the run's chair, when
+/// it says so: a notice to an asker in a question's thread, naming the chair
+/// at `address` it waited on ([`ReceiverSeat::Coordinator`],
+/// [`Ledger::receivers_told`]), or the receipt a holder taken over was handed
+/// ([`SEAT_TAKEN_OVER`]). Only these two shapes are read, and only in the
+/// ledger's voice — a pane writing the same words is not the ledger.
+fn chair_witnessed<'a>(run: &Run, address: &str, letter: &'a Message) -> Option<&'a str> {
+    let notice = match letter.kind {
+        MessageKind::Status if letter.thread.is_some() => true,
+        MessageKind::Handoff => false,
+        _ => return None,
+    };
+    let said: ChairWitness<'a> = serde_json::from_str(letter.body.as_str()).ok()?;
+    if notice {
+        (said.receiver? == address).then_some(())?;
+        said.receiver_seat?.seat
+    } else {
+        (said.handoff? == SEAT_TAKEN_OVER && said.run? == run.id).then_some(())?;
+        said.from
+    }
+}
+
+/// The fields of the ledger's own lines [`chair_witnessed`] reads, borrowed
+/// from the body and nothing else parsed out of it.
+#[derive(serde::Deserialize)]
+struct ChairWitness<'a> {
+    #[serde(default, borrow)]
+    receiver: Option<&'a str>,
+    #[serde(default, borrow, rename = "receiverSeat")]
+    receiver_seat: Option<WitnessedSeat<'a>>,
+    #[serde(default, borrow)]
+    handoff: Option<&'a str>,
+    #[serde(default, borrow)]
+    run: Option<&'a str>,
+    #[serde(default, borrow)]
+    from: Option<&'a str>,
+}
+
+/// A notice's `receiverSeat`: a chair's names its seat, a worker's does not.
+#[derive(serde::Deserialize)]
+struct WitnessedSeat<'a> {
+    #[serde(default, borrow)]
+    seat: Option<&'a str>,
+}
+
+/// The last moment at or before `at_ms` that `seat` is known to have sat in
+/// `run`'s chair, read off the records [`chair_seats`] reads, each at its
+/// time: the chair while it names the seat (from `since_ms` until it was
+/// vacated), a letter signed as the run from it, and the ledger's own word
+/// that it sat there ([`chair_witnessed`]). Paired with when that sitting
+/// began, so of two chairs a pane held at once the one it sat in later is
+/// the later; `None` when nothing puts the seat in the chair by then.
+fn chair_seen(run: &Run, seat: &str, at_ms: i64) -> Option<(i64, i64)> {
+    let address = run.address();
+    let mut seen = run
+        .coordinator
+        .as_ref()
+        .filter(|chair| chair.seat == seat && chair.since_ms <= at_ms)
+        .map(|chair| {
+            let held_until = chair.vacated_ms.map_or(at_ms, |gone| gone.min(at_ms));
+            (held_until, chair.since_ms)
+        });
+    for letter in run.messages() {
+        if letter.created_ms > at_ms {
+            continue;
+        }
+        let named = if letter.from == address {
+            letter.author_seat.as_deref()
+        } else if letter.from == LEDGER_ITSELF && letter.body.as_str().contains(seat) {
+            chair_witnessed(run, &address, letter)
+        } else {
+            None
+        };
+        if named == Some(seat) {
+            seen = seen.max(Some((letter.created_ms, letter.created_ms)));
+        }
+    }
+    seen
 }
 
 /// The ledger's own lines in a question's thread, oldest first, each with
@@ -5656,11 +6079,26 @@ impl Ledger {
         fact_ms: i64,
         now_ms: i64,
     ) -> usize {
+        self.receiver_drafts(run_id, receiver, news, fact_ms, now_ms)
+            .into_iter()
+            .filter(|draft| self.post(run_id, draft.clone(), now_ms).is_ok())
+            .count()
+    }
+
+    /// The lines [`Self::receivers_told`] owes, one per asker.
+    fn receiver_drafts(
+        &self,
+        run_id: &str,
+        receiver: &(String, ReceiverSeat),
+        news: &ReceiverNews,
+        fact_ms: i64,
+        now_ms: i64,
+    ) -> Vec<Draft> {
         let (address, seat) = receiver;
         let seat_json = seat.json();
-        let drafts: Vec<Draft> = {
+        {
             let Some(run) = self.run(run_id) else {
-                return 0;
+                return Vec::new();
             };
             open_questions_to(self, run, address, now_ms)
                 .into_iter()
@@ -5703,11 +6141,7 @@ impl Ledger {
                     }
                 })
                 .collect()
-        };
-        drafts
-            .into_iter()
-            .filter(|draft| self.post(run_id, draft.clone(), now_ms).is_ok())
-            .count()
+        }
     }
 
     /// The same, for whoever a `team/pane` seat is the receiver of, in every
@@ -5744,12 +6178,37 @@ impl Ledger {
         fact_ms: i64,
         now_ms: i64,
     ) -> usize {
-        let Some((run_id, receiver)) = self.runs.iter().find_map(|run| {
-            receiver_of_worker(run, worker_id, fact_ms).map(|receiver| (run.id.clone(), receiver))
-        }) else {
+        let Some((run_id, receiver)) = self.worker_as_receiver(worker_id, fact_ms) else {
             return 0;
         };
         self.receivers_told(&run_id, &receiver, news, fact_ms, now_ms)
+    }
+
+    /// Whether [`Self::receiver_worker_told`] would write a line.
+    fn receiver_worker_owed(
+        &self,
+        worker_id: &str,
+        news: &ReceiverNews,
+        fact_ms: i64,
+        now_ms: i64,
+    ) -> bool {
+        self.worker_as_receiver(worker_id, fact_ms)
+            .is_some_and(|(run_id, receiver)| {
+                !self
+                    .receiver_drafts(&run_id, &receiver, news, fact_ms, now_ms)
+                    .is_empty()
+            })
+    }
+
+    /// The run a worker named by id is a receiver in, and as what.
+    fn worker_as_receiver(
+        &self,
+        worker_id: &str,
+        fact_ms: i64,
+    ) -> Option<(String, (String, ReceiverSeat))> {
+        self.runs.iter().find_map(|run| {
+            receiver_of_worker(run, worker_id, fact_ms).map(|receiver| (run.id.clone(), receiver))
+        })
     }
 
     /// A turn ended in a seat, or the person cut it short: every asker
@@ -6120,12 +6579,49 @@ pub struct Ledger {
     /// before this existed reads back as never swept, which is true.
     #[serde(default)]
     swept_at_ms: i64,
+    /// When this process last folded old letters out of the runs still
+    /// working ([`FoldedMail`], t-81273). In-process like the goodbye: zero
+    /// at every start, so a window folds at the first sweep it makes and then
+    /// once a day — never on a write, and never with every hourly sweep.
+    /// That first sweep keeps the ledger's own hourly clock (`swept_at_ms`),
+    /// so it comes up to an hour after the window opens, not at its boot.
+    #[serde(skip)]
+    folded_at_ms: i64,
     /// How often each verb was asked, by UTC day (t-6742) — see
     /// [`VerbTally`]. Counted by the runtime that carries every verb, not
     /// by [`plan`], so a plan stays the pure decision it is; kept here so
     /// the count rides every durable write and comes back with the rows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     verb_tallies: Vec<VerbTally>,
+}
+
+impl Clone for Ledger {
+    /// A whole copy, for the runtime's copy-on-write image (t-81273).
+    ///
+    /// The runtime shares its ledger with every reader it hands one to, and
+    /// copies it only when it must write while a reader still holds the
+    /// revision it was given. Hand-written so the copy is counted beside the
+    /// other whole-ledger walks ([`ledger_work`]); the in-process fields come
+    /// along, because the copy REPLACES the ledger it was taken from.
+    fn clone(&self) -> Self {
+        LEDGER_WORK
+            .clones
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            runs: self.runs.clone(),
+            bound: self.bound.clone(),
+            served: self.served.clone(),
+            next_id: self.next_id,
+            binding_revisions: self.binding_revisions.clone(),
+            next_binding_revision: self.next_binding_revision,
+            said_goodbye: self.said_goodbye,
+            asking: self.asking.clone(),
+            retention_days: self.retention_days,
+            swept_at_ms: self.swept_at_ms,
+            folded_at_ms: self.folded_at_ms,
+            verb_tallies: self.verb_tallies.clone(),
+        }
+    }
 }
 
 impl Default for Ledger {
@@ -6145,6 +6641,7 @@ impl Default for Ledger {
             asking: Vec::new(),
             retention_days: RETENTION_DEFAULT_DAYS,
             swept_at_ms: 0,
+            folded_at_ms: 0,
             verb_tallies: Vec::new(),
         }
     }
@@ -6164,7 +6661,7 @@ impl Default for Ledger {
 ///
 /// Forgotten when the name's receipt is filed ([`Ledger::remember`]), which
 /// is the moment the replay road takes over.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Asking {
     caller: String,
     request: String,
@@ -7199,18 +7696,30 @@ impl Ledger {
         self.runs.iter_mut().find(|run| run.id == id)
     }
 
-    /// The other run a pane coordinates, when `address` is that pane's.
+    /// The other run a pane asked `question` from, when the question's
+    /// asker is a pane.
     ///
     /// A question one run's coordinator puts to another (`send --run B`)
     /// lands in B under the asker's PANE address — a stranger there — while
     /// the asker reads its own run's inbox. This is how an answer finds the
-    /// run the asker actually sits in.
-    fn asker_run(&self, address: &str, answered_in: &str) -> Option<String> {
-        let seat = address.strip_prefix(PANE_ADDRESS_PREFIX)?;
-        self.runs
-            .iter()
-            .filter(|run| run.id != answered_in)
-            .find(|run| run.seat_is_coordinator(seat) == Some(true))
+    /// run the asker sits in, or sat in: whoever sits in that chair now
+    /// reads the answer, once a restart has moved it to a new pane (t-83289).
+    ///
+    /// The run whose chair the pane was last seen in when it asked
+    /// ([`chair_seen`]), because a pane sits in more than one chair over a
+    /// day: one that coordinated A and went on to B asked its later
+    /// questions from B, and the first run it had ever sat in took them all
+    /// (t-83289 r2). A pane seen in no chair by then — it sat down after
+    /// asking — is answered where it sits, or where it ever sat.
+    fn asker_run(&self, question: &Message, answered_in: &str) -> Option<String> {
+        let seat = question.from.strip_prefix(PANE_ADDRESS_PREFIX)?;
+        let others = || self.runs.iter().filter(|run| run.id != answered_in);
+        others()
+            .filter_map(|run| Some((chair_seen(run, seat, question.created_ms)?, run)))
+            .max_by_key(|(seen, _)| *seen)
+            .map(|(_, run)| run)
+            .or_else(|| others().find(|run| run.seat_is_coordinator(seat) == Some(true)))
+            .or_else(|| others().find(|run| chair_seats(run).contains(seat)))
             .map(|run| run.id.clone())
     }
 
@@ -7303,6 +7812,7 @@ impl Ledger {
             summary: None,
             coordinator: None,
             project: None,
+            folded: None,
         });
         id
     }
@@ -7451,7 +7961,7 @@ impl Ledger {
             to: format!("{PANE_ADDRESS_PREFIX}{}", held.seat),
             kind: MessageKind::Handoff,
             body: serde_json::json!({
-                "handoff": "coordinator seat taken over",
+                "handoff": SEAT_TAKEN_OVER,
                 "run": run_id,
                 "from": held.seat,
                 "to": seat,
@@ -7492,14 +8002,20 @@ impl Ledger {
         actor: Option<&str>,
         now_ms: i64,
     ) -> bool {
-        let Some(run) = self.run(run_id) else {
-            return false;
-        };
-        if run.coordinator_live().is_some() {
+        if !self.chair_empty(run_id) {
             return false;
         }
         self.seat_coordinator(run_id, seat, actor, now_ms)
             .is_ok_and(|seated| seated.moved)
+    }
+
+    /// Whether `run_id`'s chair stands empty, so a coordinator coming back
+    /// would take it ([`Self::coordinator_returned`]). The window asks on
+    /// every beat for every chair it sees taken; this is the answer that
+    /// costs no write (t-81273).
+    pub fn chair_empty(&self, run_id: &str) -> bool {
+        self.run(run_id)
+            .is_some_and(|run| run.coordinator_live().is_none())
     }
 
     /// Every seat this team's leader held is vacated — the leader exited.
@@ -7650,9 +8166,22 @@ impl Ledger {
             && let Some(team_pane) = message.to.strip_prefix(PANE_ADDRESS_PREFIX)
             && let Some(seat_run) = self.vacated_pane_seat(team_pane)
         {
+            /* An answer to a question that pane asked has two ways out
+             * (t-83289 r2): the run's next chair reads the copy `reply`
+             * delivers to the run, once somebody sits there, and the
+             * question closes without an answer by `question-close`. */
+            let ways_out = match (message.kind, message.thread.as_deref()) {
+                (MessageKind::Question, Some(question)) => format!(
+                    " — `reply` again once {RUN_ADDRESS_PREFIX}{seat_run}'s next coordinator \
+                     sits, and the answer reaches it there; or close the question without an \
+                     answer: `{QUESTION_CLOSE} --message {question} --reason <one line>`"
+                ),
+                _ => String::new(),
+            };
             return Err(format!(
                 "unroutable address: {} — that pane no longer holds a seat (its window \
-                 restarted or its pane ended); the run it sat in is {RUN_ADDRESS_PREFIX}{seat_run}",
+                 restarted or its pane ended); the run it sat in is \
+                 {RUN_ADDRESS_PREFIX}{seat_run}{ways_out}",
                 message.to
             ));
         }
@@ -11091,6 +11620,13 @@ impl Ledger {
         now_ms >= self.swept_at_ms.saturating_add(SWEEP_INTERVAL_MS)
     }
 
+    /// Whether a sweep should fold old letters again ([`FoldedMail`],
+    /// t-81273): at the first sweep a window makes — up to an hour after it
+    /// opens — then once a day.
+    const fn fold_due(&self, now_ms: i64) -> bool {
+        self.folded_at_ms == 0 || now_ms >= self.folded_at_ms.saturating_add(DAY_MS)
+    }
+
     /// Give up what a finished run no longer has to cost, and nothing else.
     ///
     /// **What this never does**, because each of these was a way to turn a
@@ -11224,6 +11760,24 @@ impl Ledger {
                 true
             });
             swept.tombstones_dropped = standing - TOMBSTONE_MAX;
+        }
+
+        /* And the letters of the runs still working, on their own day-long
+         * clock — after the receipts above, so a receipt the policy has just
+         * expired no longer holds its batch's letters here. */
+        if self.fold_due(now_ms) {
+            let questions = question_ids(&self.runs);
+            let replayed = ReplayedMail::of(&self.served);
+            for run in &mut self.runs {
+                if compacted.contains(&run.id) {
+                    continue;
+                }
+                let (letters, bytes) =
+                    fold_old_letters(run, cutoff_ms, &questions, &replayed, now_ms);
+                swept.letters_folded += letters;
+                swept.letter_bytes_folded += bytes;
+            }
+            self.folded_at_ms = self.folded_at_ms.max(now_ms);
         }
 
         // Never backwards: a clock that stepped back must not make a window
@@ -11914,47 +12468,7 @@ impl Ledger {
             if one.stalled_since_ms < 0 || one.cause.is_empty() {
                 continue;
             }
-            let Some((run_id, body, task, dispatch)) = self.runs.iter().find_map(|run| {
-                let worker = run.worker(&one.worker)?;
-                if !worker.state.is_live() || !worker.state.may_occupy_pane() || worker.taken_over {
-                    return None;
-                }
-                let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
-                if !dispatch.is_open() {
-                    return None;
-                }
-                let already = run.messages.iter().any(|held| {
-                    held.kind == MessageKind::WentQuiet
-                        && held.dispatch.as_deref() == Some(dispatch.id.as_str())
-                        && serde_json::from_str::<serde_json::Value>(held.body.as_str()).is_ok_and(
-                            |body| {
-                                body["reason"] == STALL_JUDGED_REASON
-                                    && body["stalledSinceMs"] == one.stalled_since_ms
-                            },
-                        )
-                });
-                if already {
-                    return None;
-                }
-                Some((
-                    run.id.clone(),
-                    serde_json::json!({
-                        "workerId": worker.id,
-                        "agent": worker.agent,
-                        "pane": worker.pane,
-                        "taskId": dispatch.task,
-                        "dispatchId": dispatch.id,
-                        "reason": STALL_JUDGED_REASON,
-                        "stalledSinceMs": one.stalled_since_ms,
-                        "observedAtMs": now_ms,
-                        "cause": one.cause,
-                        "confidence": one.confidence,
-                        "notification": true,
-                    }),
-                    dispatch.task.clone(),
-                    dispatch.id.clone(),
-                ))
-            }) else {
+            let Some((run_id, body, task, dispatch)) = self.judged_notice(one, now_ms) else {
                 continue;
             };
             if self
@@ -11967,6 +12481,55 @@ impl Ledger {
         told
     }
 
+    /// The notice [`Self::stall_causes_judged`] owes `one`, when it owes one.
+    fn judged_notice(
+        &self,
+        one: &StallJudged,
+        now_ms: i64,
+    ) -> Option<(String, serde_json::Value, String, String)> {
+        self.runs.iter().find_map(|run| {
+            let worker = run.worker(&one.worker)?;
+            if !worker.state.is_live() || !worker.state.may_occupy_pane() || worker.taken_over {
+                return None;
+            }
+            let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
+            if !dispatch.is_open() {
+                return None;
+            }
+            let already = run.messages.iter().any(|held| {
+                held.kind == MessageKind::WentQuiet
+                    && held.dispatch.as_deref() == Some(dispatch.id.as_str())
+                    && serde_json::from_str::<serde_json::Value>(held.body.as_str()).is_ok_and(
+                        |body| {
+                            body["reason"] == STALL_JUDGED_REASON
+                                && body["stalledSinceMs"] == one.stalled_since_ms
+                        },
+                    )
+            });
+            if already {
+                return None;
+            }
+            Some((
+                run.id.clone(),
+                serde_json::json!({
+                    "workerId": worker.id,
+                    "agent": worker.agent,
+                    "pane": worker.pane,
+                    "taskId": dispatch.task,
+                    "dispatchId": dispatch.id,
+                    "reason": STALL_JUDGED_REASON,
+                    "stalledSinceMs": one.stalled_since_ms,
+                    "observedAtMs": now_ms,
+                    "cause": one.cause,
+                    "confidence": one.confidence,
+                    "notification": true,
+                }),
+                dispatch.task.clone(),
+                dispatch.id.clone(),
+            ))
+        })
+    }
+
     pub fn workers_stalled(&mut self, stalled: &[(String, i64)], now_ms: i64) -> usize {
         if now_ms < 0 {
             return 0;
@@ -11976,55 +12539,9 @@ impl Ledger {
             if *stalled_since_ms < 0 {
                 continue;
             }
-            let Some((run_id, body, task, dispatch)) = self.runs.iter().find_map(|run| {
-                let worker = run.worker(worker_id)?;
-                if !worker.state.is_live() || !worker.state.may_occupy_pane() || worker.taken_over {
-                    return None;
-                }
-                let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
-                if !dispatch.is_open() || awaiting_reply(run, &worker.id) {
-                    return None;
-                }
-                /* Once per episode (t-15313). This used to remind every five
-                 * minutes the silence lasted, and a silence the coordinator
-                 * ordered — "wait until the release" — then drew a notice every
-                 * five minutes for as long as it was obeyed: more than ten
-                 * about one worker between 14:10 and 14:50 on 2026-09-29,
-                 * with a real silence buried among them. The notice stands on
-                 * the desk while the silence goes on (`quiet_notice_stands`),
-                 * so a reminder repeats a fact the coordinator already holds;
-                 * the worker's own next word closes the episode, and the
-                 * silence after it is news again. */
-                let episode = quiet_episode(run, &worker.id, &dispatch.id);
-                if episode.is_some_and(|held| held.last_notified_ms.is_some()) {
-                    return None;
-                }
-                let started = episode.map_or(*stalled_since_ms, |held| held.first_turn_ms);
-                let turns = episode.map_or(0, |held| held.turns);
-                let suppressed =
-                    episode.map_or(0, |held| held.turns.saturating_sub(held.notified_through));
-                let last_turn = episode.map(|held| held.last_turn_ms);
-                Some((
-                    run.id.clone(),
-                    serde_json::json!({
-                        "workerId": worker.id,
-                        "agent": worker.agent,
-                        "pane": worker.pane,
-                        "taskId": dispatch.task,
-                        "dispatchId": dispatch.id,
-                        "reason": "stalled",
-                        "stalledSinceMs": stalled_since_ms,
-                        "observedAtMs": now_ms,
-                        "episodeStartedMs": started,
-                        "lastTurnEndedMs": last_turn,
-                        "quietTurns": turns,
-                        "suppressedTurns": suppressed,
-                        "notification": true,
-                    }),
-                    dispatch.task.clone(),
-                    dispatch.id.clone(),
-                ))
-            }) else {
+            let Some((run_id, body, task, dispatch)) =
+                self.stalled_notice(worker_id, stalled_since_ms, now_ms)
+            else {
                 continue;
             };
             if self
@@ -12035,6 +12552,158 @@ impl Ledger {
             }
         }
         notified
+    }
+
+    /// The notice [`Self::workers_stalled`] owes a worker quiet since
+    /// `stalled_since_ms`, when it owes one.
+    fn stalled_notice(
+        &self,
+        worker_id: &str,
+        stalled_since_ms: &i64,
+        now_ms: i64,
+    ) -> Option<(String, serde_json::Value, String, String)> {
+        self.runs.iter().find_map(|run| {
+            let worker = run.worker(worker_id)?;
+            if !worker.state.is_live() || !worker.state.may_occupy_pane() || worker.taken_over {
+                return None;
+            }
+            let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
+            if !dispatch.is_open() || awaiting_reply(run, &worker.id) {
+                return None;
+            }
+            /* Once per episode (t-15313). This used to remind every five
+             * minutes the silence lasted, and a silence the coordinator
+             * ordered — "wait until the release" — then drew a notice every
+             * five minutes for as long as it was obeyed: more than ten
+             * about one worker between 14:10 and 14:50 on 2026-09-29,
+             * with a real silence buried among them. The notice stands on
+             * the desk while the silence goes on (`quiet_notice_stands`),
+             * so a reminder repeats a fact the coordinator already holds;
+             * the worker's own next word closes the episode, and the
+             * silence after it is news again. */
+            let episode = quiet_episode(run, &worker.id, &dispatch.id);
+            if episode.is_some_and(|held| held.last_notified_ms.is_some()) {
+                return None;
+            }
+            let started = episode.map_or(*stalled_since_ms, |held| held.first_turn_ms);
+            let turns = episode.map_or(0, |held| held.turns);
+            let suppressed =
+                episode.map_or(0, |held| held.turns.saturating_sub(held.notified_through));
+            let last_turn = episode.map(|held| held.last_turn_ms);
+            Some((
+                run.id.clone(),
+                serde_json::json!({
+                    "workerId": worker.id,
+                    "agent": worker.agent,
+                    "pane": worker.pane,
+                    "taskId": dispatch.task,
+                    "dispatchId": dispatch.id,
+                    "reason": "stalled",
+                    "stalledSinceMs": stalled_since_ms,
+                    "observedAtMs": now_ms,
+                    "episodeStartedMs": started,
+                    "lastTurnEndedMs": last_turn,
+                    "quietTurns": turns,
+                    "suppressedTurns": suppressed,
+                    "notification": true,
+                }),
+                dispatch.task.clone(),
+                dispatch.id.clone(),
+            ))
+        })
+    }
+
+    /// Whether the stall sweep's quiet workers are owed anything: a notice
+    /// ([`Self::workers_stalled`]) or an asker's line
+    /// ([`Self::receivers_told_stalled`]).
+    ///
+    /// The window hands every quiet worker over on every beat, and the
+    /// answer is almost always no. A runtime that lends its ledger to
+    /// readers copies the whole of it for a write while one still holds it
+    /// (t-81273), so it asks this first and takes the ledger to write only
+    /// on a yes. The `*_due` questions below are the same for the other
+    /// sweeps; each asks what its write decides, through the same function.
+    pub fn quiet_news_due(&self, stalled: &[(String, i64)], now_ms: i64) -> bool {
+        now_ms >= 0
+            && stalled
+                .iter()
+                .filter(|(_, since_ms)| *since_ms >= 0)
+                .any(|(worker, since_ms)| {
+                    self.stalled_notice(worker, since_ms, now_ms).is_some()
+                        || self.receiver_worker_owed(
+                            worker,
+                            &ReceiverNews::Stalled,
+                            *since_ms,
+                            now_ms,
+                        )
+                })
+    }
+
+    /// Whether [`Self::stall_causes_judged`] or
+    /// [`Self::receivers_told_judged`] would write a line.
+    pub fn judged_news_due(&self, judged: &[StallJudged], now_ms: i64) -> bool {
+        now_ms >= 0
+            && judged
+                .iter()
+                .filter(|one| one.stalled_since_ms >= 0 && !one.cause.is_empty())
+                .any(|one| {
+                    self.judged_notice(one, now_ms).is_some()
+                        || self.receiver_worker_owed(
+                            &one.worker,
+                            &ReceiverNews::Judged(one.cause.clone()),
+                            one.stalled_since_ms,
+                            now_ms,
+                        )
+                })
+    }
+
+    /// Whether [`Self::workers_idle`] would write a notice.
+    pub fn idle_news_due(&self, idle: &[IdleWorker], now_ms: i64) -> bool {
+        now_ms >= 0
+            && idle
+                .iter()
+                .any(|one| one.rested_ms >= 0 && self.idle_notice(one, now_ms).is_some())
+    }
+
+    /// Whether [`Self::workers_quota_walled`] would write a row or a line.
+    pub fn quota_walls_due(&self, walled: &[QuotaWallWitness], now_ms: i64) -> bool {
+        now_ms >= 0
+            && walled.iter().any(|witness| {
+                self.receiver_worker_owed(
+                    &witness.worker,
+                    &ReceiverNews::QuotaWalled,
+                    now_ms,
+                    now_ms,
+                ) || self.quota_wall_notice(witness, now_ms).is_some()
+            })
+    }
+
+    /// Whether [`Self::workers_quota_lifted`] would write a notice.
+    pub fn quota_lifts_due(&self, lifted: &[QuotaLift], now_ms: i64) -> bool {
+        now_ms >= 0
+            && lifted
+                .iter()
+                .any(|lift| lift.since_ms >= 0 && self.quota_lift_notice(lift, now_ms).is_some())
+    }
+
+    /// Whether [`Self::workers_classifier_declined`] would write a row.
+    pub fn classifier_declines_due(
+        &self,
+        declined: &[ClassifierDeclineWitness],
+        now_ms: i64,
+    ) -> bool {
+        now_ms >= 0
+            && declined
+                .iter()
+                .any(|witness| self.classifier_decline_notice(witness, now_ms).is_some())
+    }
+
+    /// Whether [`Self::workers_model_deviated`] would write a row.
+    pub fn model_deviations_due(&self, deviated: &[ModelDeviation], now_ms: i64) -> bool {
+        now_ms >= 0
+            && deviated
+                .iter()
+                .any(|deviation| self.model_deviation_notice(deviation, now_ms).is_some())
     }
 
     /// Tell each coordinator, once per quiet episode, about a worker at rest
@@ -12084,101 +12753,8 @@ impl Ledger {
             if one.rested_ms < 0 {
                 continue;
             }
-            let Some((run_id, body, subject, task, dispatch)) = self.runs.iter().find_map(|run| {
-                let worker = run.worker(&one.worker)?;
-                if !worker.state.is_live() || !worker.state.may_occupy_pane() {
-                    return None;
-                }
-                let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
-                if !dispatch.is_open() {
-                    return None;
-                }
-                let address = worker_address(&worker.id);
-                let unread: Vec<&Message> = run
-                    .unread(&address)
-                    .into_iter()
-                    .filter_map(|id| run.message(id))
-                    .collect();
-                /* A pane the person took is theirs to wait in: nothing is
-                 * typed there, and with nothing unread there is nothing to
-                 * tell. Its unread mail IS news — the pointer's skip of a
-                 * taken pane left run-4275's w-14439 with six letters nobody
-                 * was told about (t-15313). */
-                if unread.is_empty()
-                    && (worker.taken_over
-                        || !one.waiting_on_mail
-                        || awaiting_reply(run, &worker.id))
-                {
-                    return None;
-                }
-                let since = unread
-                    .iter()
-                    .map(|message| message.created_ms)
-                    .min()
-                    .map_or(one.rested_ms, |oldest| oldest.max(one.rested_ms));
-                /* A clock that stepped back behind the rest fails toward the
-                 * notice, not toward silence: the grace is the pointer's
-                 * chance, and a subtraction that never reaches it would mute
-                 * the one notice this silence has for as long as the clock
-                 * takes to climb back. Once per episode bounds it to one. */
-                if now_ms >= since && now_ms - since < IDLE_NOTICE_GRACE_MS {
-                    return None;
-                }
-                let episode = quiet_episode(run, &worker.id, &dispatch.id);
-                if episode.is_some_and(|held| held.last_notified_ms.is_some()) {
-                    return None;
-                }
-                let unread_ids: Vec<&str> = unread.iter().map(|message| message.id.as_str()).collect();
-                let reason = match unread.is_empty() {
-                    false => IDLE_UNREAD_REASON,
-                    true => IDLE_WAITING_REASON,
-                };
-                let rested_s = now_ms.saturating_sub(one.rested_ms) / 1000;
-                let taken = match worker.taken_over {
-                    true => ", taken over by the person,",
-                    false => ",",
-                };
-                let subject = match unread.is_empty() {
-                    false => format!(
-                        "unread mail waiting: {} for {} ({}){taken} at rest {rested_s} s",
-                        named_ids(&unread_ids),
-                        worker.id,
-                        dispatch.task
-                    ),
-                    true => format!(
-                        "waiting on mail: {} ({}) sleeps in its own check --wait with nothing \
-                         unread, at rest {rested_s} s",
-                        worker.id, dispatch.task
-                    ),
-                };
-                let turns = episode.map_or(0, |held| held.turns);
-                Some((
-                    run.id.clone(),
-                    serde_json::json!({
-                        "reason": reason,
-                        "unreadMail": unread_ids,
-                        "workerId": worker.id,
-                        "agent": worker.agent,
-                        "pane": worker.pane,
-                        "taskId": dispatch.task,
-                        "dispatchId": dispatch.id,
-                        "idleSinceMs": one.rested_ms,
-                        "observedAtMs": now_ms,
-                        "waitingOnMail": one.waiting_on_mail,
-                        "takenOver": worker.taken_over,
-                        "lastStatus": last_status_json(run, &worker.id),
-                        "episodeStartedMs": episode.map_or(one.rested_ms, |held| held.first_turn_ms),
-                        "lastTurnEndedMs": episode.map(|held| held.last_turn_ms),
-                        "quietTurns": turns,
-                        "suppressedTurns": episode
-                            .map_or(0, |held| held.turns.saturating_sub(held.notified_through)),
-                        "notification": true,
-                    }),
-                    subject,
-                    dispatch.task.clone(),
-                    dispatch.id.clone(),
-                ))
-            }) else {
+            let Some((run_id, body, subject, task, dispatch)) = self.idle_notice(one, now_ms)
+            else {
                 continue;
             };
             if self
@@ -12196,6 +12772,107 @@ impl Ledger {
             }
         }
         told
+    }
+
+    /// The notice [`Self::workers_idle`] owes `one`, when it owes one.
+    fn idle_notice(
+        &self,
+        one: &IdleWorker,
+        now_ms: i64,
+    ) -> Option<(String, serde_json::Value, String, String, String)> {
+        self.runs.iter().find_map(|run| {
+            let worker = run.worker(&one.worker)?;
+            if !worker.state.is_live() || !worker.state.may_occupy_pane() {
+                return None;
+            }
+            let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
+            if !dispatch.is_open() {
+                return None;
+            }
+            let address = worker_address(&worker.id);
+            let unread: Vec<&Message> = run
+                .unread(&address)
+                .into_iter()
+                .filter_map(|id| run.message(id))
+                .collect();
+            /* A pane the person took is theirs to wait in: nothing is
+             * typed there, and with nothing unread there is nothing to
+             * tell. Its unread mail IS news — the pointer's skip of a
+             * taken pane left run-4275's w-14439 with six letters nobody
+             * was told about (t-15313). */
+            if unread.is_empty()
+                && (worker.taken_over || !one.waiting_on_mail || awaiting_reply(run, &worker.id))
+            {
+                return None;
+            }
+            let since = unread
+                .iter()
+                .map(|message| message.created_ms)
+                .min()
+                .map_or(one.rested_ms, |oldest| oldest.max(one.rested_ms));
+            /* A clock that stepped back behind the rest fails toward the
+             * notice, not toward silence: the grace is the pointer's
+             * chance, and a subtraction that never reaches it would mute
+             * the one notice this silence has for as long as the clock
+             * takes to climb back. Once per episode bounds it to one. */
+            if now_ms >= since && now_ms - since < IDLE_NOTICE_GRACE_MS {
+                return None;
+            }
+            let episode = quiet_episode(run, &worker.id, &dispatch.id);
+            if episode.is_some_and(|held| held.last_notified_ms.is_some()) {
+                return None;
+            }
+            let unread_ids: Vec<&str> = unread.iter().map(|message| message.id.as_str()).collect();
+            let reason = match unread.is_empty() {
+                false => IDLE_UNREAD_REASON,
+                true => IDLE_WAITING_REASON,
+            };
+            let rested_s = now_ms.saturating_sub(one.rested_ms) / 1000;
+            let taken = match worker.taken_over {
+                true => ", taken over by the person,",
+                false => ",",
+            };
+            let subject = match unread.is_empty() {
+                false => format!(
+                    "unread mail waiting: {} for {} ({}){taken} at rest {rested_s} s",
+                    named_ids(&unread_ids),
+                    worker.id,
+                    dispatch.task
+                ),
+                true => format!(
+                    "waiting on mail: {} ({}) sleeps in its own check --wait with nothing \
+                     unread, at rest {rested_s} s",
+                    worker.id, dispatch.task
+                ),
+            };
+            let turns = episode.map_or(0, |held| held.turns);
+            Some((
+                run.id.clone(),
+                serde_json::json!({
+                    "reason": reason,
+                    "unreadMail": unread_ids,
+                    "workerId": worker.id,
+                    "agent": worker.agent,
+                    "pane": worker.pane,
+                    "taskId": dispatch.task,
+                    "dispatchId": dispatch.id,
+                    "idleSinceMs": one.rested_ms,
+                    "observedAtMs": now_ms,
+                    "waitingOnMail": one.waiting_on_mail,
+                    "takenOver": worker.taken_over,
+                    "lastStatus": last_status_json(run, &worker.id),
+                    "episodeStartedMs": episode.map_or(one.rested_ms, |held| held.first_turn_ms),
+                    "lastTurnEndedMs": episode.map(|held| held.last_turn_ms),
+                    "quietTurns": turns,
+                    "suppressedTurns": episode
+                        .map_or(0, |held| held.turns.saturating_sub(held.notified_through)),
+                    "notification": true,
+                }),
+                subject,
+                dispatch.task.clone(),
+                dispatch.id.clone(),
+            ))
+        })
     }
 
     /// Two witnesses to a worker's quota wall become news — once per wall,
@@ -12225,79 +12902,7 @@ impl Ledger {
                 now_ms,
                 now_ms,
             );
-            let Some((run_id, draft)) = self.runs.iter().find_map(|run| {
-                let worker = run.worker(&witness.worker)?;
-                if !worker.state.is_live() || !worker.state.may_occupy_pane() || worker.taken_over {
-                    return None;
-                }
-                let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
-                if !dispatch.is_open() {
-                    return None;
-                }
-                if newest_wall(run, &dispatch.id).is_some_and(|wall| wall.stands(now_ms)) {
-                    return None;
-                }
-                // Which rung the worker's standing order is on (t-6427): the
-                // declared ladder, and whether the wait holds this wall.
-                let order = QuotaWallOrder::standing(run, worker);
-                let (stands_until, waitable) = wall_window(now_ms, witness.headroom.resets_at_ms);
-                let wait = order.wait.then(|| match &waitable {
-                    Ok(()) => serde_json::json!({ "standsUntilMs": stands_until }),
-                    Err(why) => serde_json::json!({ "skipped": why }),
-                });
-                let next = if order.wait && waitable.is_ok() {
-                    "nothing was settled: the attempt is open and the task is carried, and \
-                     the wait rung holds this wall until `wait.standsUntilMs` — its agent \
-                     may continue by itself after the reset (Claude Code does, about a \
-                     minute after it), and nothing is handed over before then. If it is \
-                     still stopped at the wall once the provider's number says the wall \
-                     lifted, a `went_quiet` notice with `reason: quota_lifted` says so; \
-                     after that its silence is ordinary news"
-                } else {
-                    "nothing was settled: the attempt is open and the task is carried. Hand \
-                     it over yourself (commit the WIP in its checkout, `worker-stop \
-                     --worker <id> --reason quota-wall`, then `worker-start --agent <alt> \
-                     --task <same> --retry-of <dispatchId> --inherit-checkout`), or arm \
-                     `handover-policy --on-quota-wall <alt>` and the beat walks that road \
-                     and leaves a `handover` receipt"
-                };
-                let told = serde_json::json!({
-                    "workerId": worker.id,
-                    "agent": worker.agent,
-                    "pane": worker.pane,
-                    "taskId": dispatch.task,
-                    "dispatchId": dispatch.id,
-                    "provider": witness.headroom.provider,
-                    "usedPercent": witness.headroom.used_percent,
-                    "window": witness.headroom.window.as_str(),
-                    "resetsAtMs": witness.headroom.resets_at_ms,
-                    "updatedAtMs": witness.headroom.updated_at_ms,
-                    "checkout": worker.checkout,
-                    "marker": {
-                        "source": witness.marker.source,
-                        "line": witness.marker.line,
-                    },
-                    "observedAtMs": now_ms,
-                    "ladder": order.ladder(),
-                    "wait": wait,
-                    "next": next,
-                });
-                Some((
-                    run.id.clone(),
-                    Draft {
-                        from: LEDGER_ITSELF.to_string(),
-                        to: run.address(),
-                        kind: MessageKind::QuotaWalled,
-                        body: told.to_string().into(),
-                        subject: Text::default(),
-                        priority: Priority::Normal,
-                        payload: Text::default(),
-                        thread: None,
-                        task: Some(dispatch.task.clone()),
-                        dispatch: Some(dispatch.id.clone()),
-                    },
-                ))
-            }) else {
+            let Some((run_id, draft)) = self.quota_wall_notice(witness, now_ms) else {
                 continue;
             };
             if self.post(&run_id, draft, now_ms).is_ok() {
@@ -12305,6 +12910,87 @@ impl Ledger {
             }
         }
         told
+    }
+
+    /// The row [`Self::workers_quota_walled`] owes `witness`, when it owes one.
+    fn quota_wall_notice(
+        &self,
+        witness: &QuotaWallWitness,
+        now_ms: i64,
+    ) -> Option<(String, Draft)> {
+        self.runs.iter().find_map(|run| {
+            let worker = run.worker(&witness.worker)?;
+            if !worker.state.is_live() || !worker.state.may_occupy_pane() || worker.taken_over {
+                return None;
+            }
+            let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
+            if !dispatch.is_open() {
+                return None;
+            }
+            if newest_wall(run, &dispatch.id).is_some_and(|wall| wall.stands(now_ms)) {
+                return None;
+            }
+            // Which rung the worker's standing order is on (t-6427): the
+            // declared ladder, and whether the wait holds this wall.
+            let order = QuotaWallOrder::standing(run, worker);
+            let (stands_until, waitable) = wall_window(now_ms, witness.headroom.resets_at_ms);
+            let wait = order.wait.then(|| match &waitable {
+                Ok(()) => serde_json::json!({ "standsUntilMs": stands_until }),
+                Err(why) => serde_json::json!({ "skipped": why }),
+            });
+            let next = if order.wait && waitable.is_ok() {
+                "nothing was settled: the attempt is open and the task is carried, and \
+                 the wait rung holds this wall until `wait.standsUntilMs` — its agent \
+                 may continue by itself after the reset (Claude Code does, about a \
+                 minute after it), and nothing is handed over before then. If it is \
+                 still stopped at the wall once the provider's number says the wall \
+                 lifted, a `went_quiet` notice with `reason: quota_lifted` says so; \
+                 after that its silence is ordinary news"
+            } else {
+                "nothing was settled: the attempt is open and the task is carried. Hand \
+                 it over yourself (commit the WIP in its checkout, `worker-stop \
+                 --worker <id> --reason quota-wall`, then `worker-start --agent <alt> \
+                 --task <same> --retry-of <dispatchId> --inherit-checkout`), or arm \
+                 `handover-policy --on-quota-wall <alt>` and the beat walks that road \
+                 and leaves a `handover` receipt"
+            };
+            let told = serde_json::json!({
+                "workerId": worker.id,
+                "agent": worker.agent,
+                "pane": worker.pane,
+                "taskId": dispatch.task,
+                "dispatchId": dispatch.id,
+                "provider": witness.headroom.provider,
+                "usedPercent": witness.headroom.used_percent,
+                "window": witness.headroom.window.as_str(),
+                "resetsAtMs": witness.headroom.resets_at_ms,
+                "updatedAtMs": witness.headroom.updated_at_ms,
+                "checkout": worker.checkout,
+                "marker": {
+                    "source": witness.marker.source,
+                    "line": witness.marker.line,
+                },
+                "observedAtMs": now_ms,
+                "ladder": order.ladder(),
+                "wait": wait,
+                "next": next,
+            });
+            Some((
+                run.id.clone(),
+                Draft {
+                    from: LEDGER_ITSELF.to_string(),
+                    to: run.address(),
+                    kind: MessageKind::QuotaWalled,
+                    body: told.to_string().into(),
+                    subject: Text::default(),
+                    priority: Priority::Normal,
+                    payload: Text::default(),
+                    thread: None,
+                    task: Some(dispatch.task.clone()),
+                    dispatch: Some(dispatch.id.clone()),
+                },
+            ))
+        })
     }
 
     /// Workers whose provider's safety classifier declined their last
@@ -12333,101 +13019,7 @@ impl Ledger {
         }
         let mut told = 0;
         for witness in declined {
-            let Some((run_id, draft)) = self.runs.iter().find_map(|run| {
-                let worker = run.worker(&witness.worker)?;
-                if !worker.state.is_live() || !worker.state.may_occupy_pane() || worker.taken_over {
-                    return None;
-                }
-                let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
-                if !dispatch.is_open() || decline_told(run, &dispatch.id, &witness.record.key) {
-                    return None;
-                }
-                let category = witness.record.category.as_deref();
-                let routed = decline_is_routed(category);
-                let declared = run
-                    .handover
-                    .as_ref()
-                    .and_then(|policy| policy.on_classifier_decline.as_ref());
-                // A decline the screen alone witnessed is told and walked
-                // nowhere, whatever the run declared (t-7153, P1-3): the
-                // record is the witness that ends a worker, and a screen
-                // can be quoted.
-                let stops = witness.record.may_stop();
-                let (rung, next) = match (stops, routed, declared) {
-                    (false, _, _) => (
-                        ClassifierDeclineRung::Notify,
-                        "nothing was settled, and nothing will be by itself: this decline was \
-                         read off the pane's SCREEN only — Claude Code's pause dialog, which \
-                         writes no record until a key answers it — and a screen is not a \
-                         witness that ends a worker. Read the pane (`worker-read`); if it \
-                         stands at the dialog, hand the task over yourself (`worker-stop \
-                         --worker <id> --reason classifier-decline`, then `worker-start \
-                         --agent <alt> --task <same> --retry-of <dispatchId> \
-                         --inherit-checkout`, on the rung you choose), or answer the dialog \
-                         by hand",
-                    ),
-                    (true, true, Some(_)) => (
-                        ClassifierDeclineRung::Handover,
-                        "nothing was settled: the run's `handover-policy \
-                         --on-classifier-decline` hands this task to a fresh worker in the \
-                         same checkout, and the beat leaves a `handover` receipt",
-                    ),
-                    (true, true, None) => (
-                        ClassifierDeclineRung::Notify,
-                        "nothing was settled: the attempt is open and the task is carried. \
-                         Its CLI could not continue the declined turn on a fallback model. \
-                         Hand it over yourself (`worker-stop --worker <id> --reason \
-                         classifier-decline`, then `worker-start --agent <alt> --task <same> \
-                         --retry-of <dispatchId> --inherit-checkout`), or arm `handover-policy \
-                         --on-classifier-decline <agent[:model[:effort]]>` and the beat walks \
-                         that road",
-                    ),
-                    (true, false, _) => (
-                        ClassifierDeclineRung::Notify,
-                        "nothing was settled: the provider routes this category nowhere, so \
-                         its answer stands — no worker is handed the declined request. Read \
-                         the task with the person; do not paste a picture of the declined \
-                         screen into a conversation, read its words",
-                    ),
-                };
-                let body = serde_json::json!({
-                    "workerId": worker.id,
-                    "agent": worker.agent,
-                    "model": worker.model,
-                    "pane": worker.pane,
-                    "taskId": dispatch.task,
-                    "dispatchId": dispatch.id,
-                    "checkout": worker.checkout,
-                    "category": category,
-                    "routed": routed,
-                    "screenOnly": !stops,
-                    "screen": witness.screen,
-                    "record": {
-                        "source": witness.record.source,
-                        "line": witness.record.line,
-                        "key": witness.record.key,
-                    },
-                    "observedAtMs": now_ms,
-                    "rung": rung.as_str(),
-                    "ladder": CLASSIFIER_DECLINE_LADDER.map(ClassifierDeclineRung::as_str),
-                    "next": next,
-                });
-                Some((
-                    run.id.clone(),
-                    Draft {
-                        from: LEDGER_ITSELF.to_string(),
-                        to: run.address(),
-                        kind: MessageKind::ClassifierDeclined,
-                        body: body.to_string().into(),
-                        subject: Text::default(),
-                        priority: Priority::Normal,
-                        payload: Text::default(),
-                        thread: None,
-                        task: Some(dispatch.task.clone()),
-                        dispatch: Some(dispatch.id.clone()),
-                    },
-                ))
-            }) else {
+            let Some((run_id, draft)) = self.classifier_decline_notice(witness, now_ms) else {
                 continue;
             };
             if self.post(&run_id, draft, now_ms).is_ok() {
@@ -12435,6 +13027,110 @@ impl Ledger {
             }
         }
         told
+    }
+
+    /// The row [`Self::workers_classifier_declined`] owes `witness`, when it owes
+    /// one.
+    fn classifier_decline_notice(
+        &self,
+        witness: &ClassifierDeclineWitness,
+        now_ms: i64,
+    ) -> Option<(String, Draft)> {
+        self.runs.iter().find_map(|run| {
+            let worker = run.worker(&witness.worker)?;
+            if !worker.state.is_live() || !worker.state.may_occupy_pane() || worker.taken_over {
+                return None;
+            }
+            let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
+            if !dispatch.is_open() || decline_told(run, &dispatch.id, &witness.record.key) {
+                return None;
+            }
+            let category = witness.record.category.as_deref();
+            let routed = decline_is_routed(category);
+            let declared = run
+                .handover
+                .as_ref()
+                .and_then(|policy| policy.on_classifier_decline.as_ref());
+            // A decline the screen alone witnessed is told and walked
+            // nowhere, whatever the run declared (t-7153, P1-3): the
+            // record is the witness that ends a worker, and a screen
+            // can be quoted.
+            let stops = witness.record.may_stop();
+            let (rung, next) = match (stops, routed, declared) {
+                (false, _, _) => (
+                    ClassifierDeclineRung::Notify,
+                    "nothing was settled, and nothing will be by itself: this decline was \
+                     read off the pane's SCREEN only — Claude Code's pause dialog, which \
+                     writes no record until a key answers it — and a screen is not a \
+                     witness that ends a worker. Read the pane (`worker-read`); if it \
+                     stands at the dialog, hand the task over yourself (`worker-stop \
+                     --worker <id> --reason classifier-decline`, then `worker-start \
+                     --agent <alt> --task <same> --retry-of <dispatchId> \
+                     --inherit-checkout`, on the rung you choose), or answer the dialog \
+                     by hand",
+                ),
+                (true, true, Some(_)) => (
+                    ClassifierDeclineRung::Handover,
+                    "nothing was settled: the run's `handover-policy \
+                     --on-classifier-decline` hands this task to a fresh worker in the \
+                     same checkout, and the beat leaves a `handover` receipt",
+                ),
+                (true, true, None) => (
+                    ClassifierDeclineRung::Notify,
+                    "nothing was settled: the attempt is open and the task is carried. \
+                     Its CLI could not continue the declined turn on a fallback model. \
+                     Hand it over yourself (`worker-stop --worker <id> --reason \
+                     classifier-decline`, then `worker-start --agent <alt> --task <same> \
+                     --retry-of <dispatchId> --inherit-checkout`), or arm `handover-policy \
+                     --on-classifier-decline <agent[:model[:effort]]>` and the beat walks \
+                     that road",
+                ),
+                (true, false, _) => (
+                    ClassifierDeclineRung::Notify,
+                    "nothing was settled: the provider routes this category nowhere, so \
+                     its answer stands — no worker is handed the declined request. Read \
+                     the task with the person; do not paste a picture of the declined \
+                     screen into a conversation, read its words",
+                ),
+            };
+            let body = serde_json::json!({
+                "workerId": worker.id,
+                "agent": worker.agent,
+                "model": worker.model,
+                "pane": worker.pane,
+                "taskId": dispatch.task,
+                "dispatchId": dispatch.id,
+                "checkout": worker.checkout,
+                "category": category,
+                "routed": routed,
+                "screenOnly": !stops,
+                "screen": witness.screen,
+                "record": {
+                    "source": witness.record.source,
+                    "line": witness.record.line,
+                    "key": witness.record.key,
+                },
+                "observedAtMs": now_ms,
+                "rung": rung.as_str(),
+                "ladder": CLASSIFIER_DECLINE_LADDER.map(ClassifierDeclineRung::as_str),
+                "next": next,
+            });
+            Some((
+                run.id.clone(),
+                Draft {
+                    from: LEDGER_ITSELF.to_string(),
+                    to: run.address(),
+                    kind: MessageKind::ClassifierDeclined,
+                    body: body.to_string().into(),
+                    subject: Text::default(),
+                    priority: Priority::Normal,
+                    payload: Text::default(),
+                    thread: None,
+                    task: Some(dispatch.task.clone()),
+                    dispatch: Some(dispatch.id.clone()),
+                },
+            ))
+        })
     }
 
     /// Switches a worker's own CLI recorded — a classifier decline answered
@@ -12460,63 +13156,7 @@ impl Ledger {
         }
         let mut told = 0;
         for deviation in deviated {
-            let Some((run_id, draft)) = self.runs.iter().find_map(|run| {
-                let worker = run.worker(&deviation.worker)?;
-                let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
-                if !deviation.is_bound_to(worker, dispatch)
-                    || run.messages.iter().any(|held| {
-                        held.kind == MessageKind::ModelDeviated
-                            && held.dispatch.as_deref() == Some(dispatch.id.as_str())
-                            && serde_json::from_str::<serde_json::Value>(held.body.as_str())
-                                .is_ok_and(|body| body["key"] == deviation.key.as_str())
-                    })
-                {
-                    return None;
-                }
-                let category = deviation.category.as_deref();
-                let summary = format!(
-                    "model binding left: {} → {} for {} — the provider's safety classifier \
-                     declined a request on {}, and the CLI continued on the category's route \
-                     instead of stopping",
-                    category.unwrap_or("an unnamed category"),
-                    deviation.to,
-                    deviation.lasts(),
-                    deviation.from,
-                );
-                let body = serde_json::json!({
-                    "workerId": worker.id,
-                    "agent": worker.agent,
-                    "taskId": dispatch.task,
-                    "dispatchId": dispatch.id,
-                    "boundModel": worker.model,
-                    "from": deviation.from,
-                    "to": deviation.to,
-                    "category": category,
-                    "scope": deviation.scope,
-                    "lasts": deviation.lasts(),
-                    "key": deviation.key,
-                    "source": deviation.source,
-                    "sinceMs": deviation.at_ms,
-                    "observedAtMs": now_ms,
-                    "rung": ClassifierDeclineRung::Fallback.as_str(),
-                    "summary": summary,
-                });
-                Some((
-                    run.id.clone(),
-                    Draft {
-                        from: LEDGER_ITSELF.to_string(),
-                        to: run.address(),
-                        kind: MessageKind::ModelDeviated,
-                        body: body.to_string().into(),
-                        subject: Text::default(),
-                        priority: Priority::Normal,
-                        payload: Text::default(),
-                        thread: None,
-                        task: Some(dispatch.task.clone()),
-                        dispatch: Some(dispatch.id.clone()),
-                    },
-                ))
-            }) else {
+            let Some((run_id, draft)) = self.model_deviation_notice(deviation, now_ms) else {
                 continue;
             };
             if self.post(&run_id, draft, now_ms).is_ok() {
@@ -12524,6 +13164,72 @@ impl Ledger {
             }
         }
         told
+    }
+
+    /// The row [`Self::workers_model_deviated`] owes `deviation`, when it owes
+    /// one.
+    fn model_deviation_notice(
+        &self,
+        deviation: &ModelDeviation,
+        now_ms: i64,
+    ) -> Option<(String, Draft)> {
+        self.runs.iter().find_map(|run| {
+            let worker = run.worker(&deviation.worker)?;
+            let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
+            if !deviation.is_bound_to(worker, dispatch)
+                || run.messages.iter().any(|held| {
+                    held.kind == MessageKind::ModelDeviated
+                        && held.dispatch.as_deref() == Some(dispatch.id.as_str())
+                        && serde_json::from_str::<serde_json::Value>(held.body.as_str())
+                            .is_ok_and(|body| body["key"] == deviation.key.as_str())
+                })
+            {
+                return None;
+            }
+            let category = deviation.category.as_deref();
+            let summary = format!(
+                "model binding left: {} → {} for {} — the provider's safety classifier \
+                 declined a request on {}, and the CLI continued on the category's route \
+                 instead of stopping",
+                category.unwrap_or("an unnamed category"),
+                deviation.to,
+                deviation.lasts(),
+                deviation.from,
+            );
+            let body = serde_json::json!({
+                "workerId": worker.id,
+                "agent": worker.agent,
+                "taskId": dispatch.task,
+                "dispatchId": dispatch.id,
+                "boundModel": worker.model,
+                "from": deviation.from,
+                "to": deviation.to,
+                "category": category,
+                "scope": deviation.scope,
+                "lasts": deviation.lasts(),
+                "key": deviation.key,
+                "source": deviation.source,
+                "sinceMs": deviation.at_ms,
+                "observedAtMs": now_ms,
+                "rung": ClassifierDeclineRung::Fallback.as_str(),
+                "summary": summary,
+            });
+            Some((
+                run.id.clone(),
+                Draft {
+                    from: LEDGER_ITSELF.to_string(),
+                    to: run.address(),
+                    kind: MessageKind::ModelDeviated,
+                    body: body.to_string().into(),
+                    subject: Text::default(),
+                    priority: Priority::Normal,
+                    payload: Text::default(),
+                    thread: None,
+                    task: Some(dispatch.task.clone()),
+                    dispatch: Some(dispatch.id.clone()),
+                },
+            ))
+        })
     }
 
     /// A wall the wait rung held lifted while its worker stayed stopped at
@@ -12546,68 +13252,7 @@ impl Ledger {
             if lift.since_ms < 0 {
                 continue;
             }
-            let Some((run_id, body, task, dispatch)) = self.runs.iter().find_map(|run| {
-                let worker = run.worker(&lift.worker)?;
-                if !worker.state.is_live() || !worker.state.may_occupy_pane() || worker.taken_over {
-                    return None;
-                }
-                let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
-                if !dispatch.is_open() || awaiting_reply(run, &worker.id) {
-                    return None;
-                }
-                let (wall, phase) = wall_phase(run, worker, &dispatch.id, now_ms)?;
-                if wall.wall != lift.wall || phase != WallPhase::Lifting {
-                    return None;
-                }
-                if !matches!(
-                    read_lift(
-                        &worker.id,
-                        &wall,
-                        lift.since_ms,
-                        Some(lift.marker.clone()),
-                        Some(&lift.headroom),
-                        now_ms,
-                    ),
-                    LiftReading::Lifted(_)
-                ) {
-                    return None;
-                }
-                Some((
-                    run.id.clone(),
-                    serde_json::json!({
-                        "workerId": worker.id,
-                        "agent": worker.agent,
-                        "pane": worker.pane,
-                        "taskId": dispatch.task,
-                        "dispatchId": dispatch.id,
-                        "reason": QUOTA_LIFTED_REASON,
-                        "rung": QuotaWallRung::Wait.as_str(),
-                        "wallId": wall.wall,
-                        "stalledSinceMs": lift.since_ms,
-                        "observedAtMs": now_ms,
-                        "resetsAtMs": wall.resets_at_ms,
-                        "gauge": {
-                            "provider": lift.headroom.provider,
-                            "usedPercent": lift.headroom.used_percent,
-                            "window": lift.headroom.window.as_str(),
-                            "updatedAtMs": lift.headroom.updated_at_ms,
-                            "resetsAtMs": lift.headroom.resets_at_ms,
-                        },
-                        "marker": {
-                            "source": lift.marker.source,
-                            "line": lift.marker.line,
-                        },
-                        "next": "the wall lifted — the provider's number, read after its \
-                                 reset, is under it — and the worker is still stopped at it: \
-                                 its own continuation did not come. Wake it with a line of \
-                                 mail (`send --to worker:<id>`, which the pointer types into \
-                                 its composer), or hand it over",
-                        "notification": true,
-                    }),
-                    dispatch.task.clone(),
-                    dispatch.id.clone(),
-                ))
-            }) else {
+            let Some((run_id, body, task, dispatch)) = self.quota_lift_notice(lift, now_ms) else {
                 continue;
             };
             if self
@@ -12618,6 +13263,76 @@ impl Ledger {
             }
         }
         told
+    }
+
+    /// The notice [`Self::workers_quota_lifted`] owes `lift`, when it owes one.
+    fn quota_lift_notice(
+        &self,
+        lift: &QuotaLift,
+        now_ms: i64,
+    ) -> Option<(String, serde_json::Value, String, String)> {
+        self.runs.iter().find_map(|run| {
+            let worker = run.worker(&lift.worker)?;
+            if !worker.state.is_live() || !worker.state.may_occupy_pane() || worker.taken_over {
+                return None;
+            }
+            let dispatch = run.dispatch(worker.dispatch.as_deref()?)?;
+            if !dispatch.is_open() || awaiting_reply(run, &worker.id) {
+                return None;
+            }
+            let (wall, phase) = wall_phase(run, worker, &dispatch.id, now_ms)?;
+            if wall.wall != lift.wall || phase != WallPhase::Lifting {
+                return None;
+            }
+            if !matches!(
+                read_lift(
+                    &worker.id,
+                    &wall,
+                    lift.since_ms,
+                    Some(lift.marker.clone()),
+                    Some(&lift.headroom),
+                    now_ms,
+                ),
+                LiftReading::Lifted(_)
+            ) {
+                return None;
+            }
+            Some((
+                run.id.clone(),
+                serde_json::json!({
+                    "workerId": worker.id,
+                    "agent": worker.agent,
+                    "pane": worker.pane,
+                    "taskId": dispatch.task,
+                    "dispatchId": dispatch.id,
+                    "reason": QUOTA_LIFTED_REASON,
+                    "rung": QuotaWallRung::Wait.as_str(),
+                    "wallId": wall.wall,
+                    "stalledSinceMs": lift.since_ms,
+                    "observedAtMs": now_ms,
+                    "resetsAtMs": wall.resets_at_ms,
+                    "gauge": {
+                        "provider": lift.headroom.provider,
+                        "usedPercent": lift.headroom.used_percent,
+                        "window": lift.headroom.window.as_str(),
+                        "updatedAtMs": lift.headroom.updated_at_ms,
+                        "resetsAtMs": lift.headroom.resets_at_ms,
+                    },
+                    "marker": {
+                        "source": lift.marker.source,
+                        "line": lift.marker.line,
+                    },
+                    "next": "the wall lifted — the provider's number, read after its \
+                             reset, is under it — and the worker is still stopped at it: \
+                             its own continuation did not come. Wake it with a line of \
+                             mail (`send --to worker:<id>`, which the pointer types into \
+                             its composer), or hand it over",
+                    "notification": true,
+                }),
+                dispatch.task.clone(),
+                dispatch.id.clone(),
+            ))
+        })
     }
 
     /// Reserve one handover: the receipt row is written BEFORE the walk, so
@@ -12939,6 +13654,21 @@ impl Ledger {
         self.deliver_receipt(run_id, resume_id)
     }
 
+    /// Whether [`Self::resume_settled`] would settle `resume_id`: its
+    /// receipt is in the run and still typing. The window asks again on
+    /// every beat for a settlement it has not seen land, so this is the
+    /// answer that costs no write (t-81273).
+    pub fn resume_settle_due(&self, run_id: &str, resume_id: &str) -> bool {
+        self.run(run_id)
+            .and_then(|run| {
+                run.messages
+                    .iter()
+                    .find(|held| held.id == resume_id && held.kind == MessageKind::Resumed)
+            })
+            .and_then(|row| serde_json::from_str::<serde_json::Value>(row.body.as_str()).ok())
+            .is_some_and(|body| body["status"] == RESUME_TYPING)
+    }
+
     /// The first sound from a summoned pane retires its readiness window.
     ///
     /// Any sound: a finished turn, an interrupted one — the agent was
@@ -12970,12 +13700,21 @@ impl Ledger {
         else {
             return false;
         };
-        if worker.ready_by_ms.is_none() && worker.hook_unreachable_since_ms.is_none() {
+        if !awaits_a_sound(worker) {
             return false;
         }
         worker.ready_by_ms = None;
         worker.hook_unreachable_since_ms = None;
         true
+    }
+
+    /// Whether [`Self::worker_spoke`] would retire anything.
+    pub fn sound_due(&self, seat: (&str, &str), heard_ms: i64) -> bool {
+        let (team, pane) = seat;
+        self.runs
+            .iter()
+            .find_map(|run| occupant_at(run, team, pane, heard_ms))
+            .is_some_and(awaits_a_sound)
     }
 
     /// The installed hook script could not deliver a payload for this pane.
@@ -12985,20 +13724,23 @@ impl Ledger {
     /// later observation of the same marker. A subsequent [`Self::worker_spoke`]
     /// is the only proof the channel recovered.
     pub fn worker_hook_delivery_failed(&mut self, seat: (&str, &str), since_ms: i64) -> bool {
-        let (team, pane) = seat;
         for run in &mut self.runs {
             for worker in &mut run.workers {
-                if worker.team == team
-                    && worker.pane == pane
-                    && worker.state.may_occupy_pane()
-                    && worker.hook_unreachable_since_ms.is_none()
-                {
+                if hook_failure_is_news(worker, seat) {
                     worker.hook_unreachable_since_ms = Some(since_ms);
                     return true;
                 }
             }
         }
         false
+    }
+
+    /// Whether [`Self::worker_hook_delivery_failed`] would mark anybody.
+    pub fn hook_failure_due(&self, seat: (&str, &str)) -> bool {
+        self.runs
+            .iter()
+            .flat_map(|run| &run.workers)
+            .any(|worker| hook_failure_is_news(worker, seat))
     }
 
     /// Reconcile live pane claims against host observations.
@@ -13025,10 +13767,7 @@ impl Ledger {
                 let run = &mut self.runs[run_at];
                 let address = run.address();
                 let worker = &mut run.workers[worker_at];
-                if !worker.state.is_live()
-                    || !worker.state.may_occupy_pane()
-                    || worker.pane_missing_since_ms.is_some()
-                {
+                if !pane_absence_is_news(worker) {
                     continue;
                 }
                 worker.pane_missing_since_ms = Some(*since_ms);
@@ -13072,6 +13811,16 @@ impl Ledger {
         reported
     }
 
+    /// Whether [`Self::panes_missing`] would report any of `missing`.
+    pub fn panes_missing_due(&self, missing: &[(String, i64)]) -> bool {
+        missing.iter().any(|(worker_id, since_ms)| {
+            *since_ms >= 0
+                && self.locate(worker_id).is_ok_and(|(run_at, worker_at)| {
+                    pane_absence_is_news(&self.runs[run_at].workers[worker_at])
+                })
+        })
+    }
+
     /// Clear missing-pane episodes for workers the host can see again.
     ///
     /// Level-triggered like [`Self::panes_missing`]: unknown workers and rows
@@ -13091,6 +13840,19 @@ impl Ledger {
             );
         }
         cleared
+    }
+
+    /// Whether [`Self::panes_seen`] would close any episode. Asked on every
+    /// beat for every live worker whose pane the window sees, and almost
+    /// always no (t-81273).
+    pub fn panes_seen_due(&self, workers: &[String]) -> bool {
+        workers.iter().any(|worker_id| {
+            self.locate(worker_id).is_ok_and(|(run_at, worker_at)| {
+                self.runs[run_at].workers[worker_at]
+                    .pane_missing_since_ms
+                    .is_some()
+            })
+        })
     }
 
     /// The person took a pane: real keys, typed by a hand, landed in it.
@@ -13881,6 +14643,7 @@ impl Ledger {
             summary: None,
             coordinator: None,
             project: None,
+            folded: None,
         });
         id
     }
@@ -14257,8 +15020,7 @@ impl Ledger {
             .flat_map(|run| {
                 run.workers
                     .iter()
-                    .filter(|worker| worker.state.is_live())
-                    .filter(|worker| worker.ready_by_ms.is_some_and(|by| by <= now_ms))
+                    .filter(|worker| past_its_readiness(worker, now_ms))
                     .map(|worker| (run.id.clone(), worker.id.clone()))
             })
             .collect();
@@ -14305,6 +15067,14 @@ impl Ledger {
             let _ = self.post(&run_id, draft, now_ms);
         }
         counted
+    }
+
+    /// Whether [`Self::workers_overdue`] would report anybody.
+    pub fn workers_overdue_due(&self, now_ms: i64) -> bool {
+        self.runs
+            .iter()
+            .flat_map(|run| &run.workers)
+            .any(|worker| past_its_readiness(worker, now_ms))
     }
 
     /// Recheck the worker behind a resolved host seat before settling it.
@@ -19669,7 +20439,17 @@ pub const VERBS: &[(&str, &str, Doing)] = &[
     ),
     (
         "reply",
-        "--to-message <id> [--body <text>] · answer in thread",
+        "--to-message <id> [--body <text>] · answer in thread; when the pane that asked sat in \
+         another run's chair and sits there no more, the answer also goes to that run's chair",
+        Doing::Mutation,
+    ),
+    (
+        QUESTION_CLOSE,
+        "--message <questionId> --reason <one line> [--run <id>] · close a question without an \
+         answer, from the coordinator seat of the run asked or of the run that asked: the \
+         ledger's line in its thread, every count leaves it, a waiting `ask` wakes as closed \
+         and told `closedBy` and `note`, `reply` refuses it; a second close answers with the \
+         first (already: true)",
         Doing::Mutation,
     ),
     (
@@ -20801,11 +21581,22 @@ fn thread_look(ledger: &Ledger, run_id: &str, question: &str) -> Option<Decided>
         })));
     }
     if question_closed(run, asked) {
-        return Some(said(serde_json::json!({
+        let mut closed = serde_json::json!({
             "questionId": question,
             "answered": false,
             "closed": true,
-        })));
+        });
+        // Closed by a coordinator (t-83289 r2): who closed it and why, the
+        // words its line in the thread says, so the asker woken by it is
+        // not left to guess between a close and its own attempt ending.
+        if let Some(line) = hand_closed(run, asked) {
+            let record: serde_json::Value =
+                serde_json::from_str(line.body.as_str()).unwrap_or_default();
+            closed["closeId"] = line.id.as_str().into();
+            closed["closedBy"] = record["closedBy"].clone();
+            closed["note"] = record["note"].clone();
+        }
+        return Some(said(closed));
     }
     /* And the receiver being GONE (t-6740): a seat no road will ever sign
      * for again is not going to answer, and holding the asker to the
@@ -20876,15 +21667,87 @@ fn thread_answer<'a>(run: &'a Run, question: &Message) -> Option<&'a Message> {
 ///
 /// Derived, never stored: a question rode in on a dispatch, and when that
 /// dispatch ends the asker is gone — there is nobody to hand the answer to.
-/// A question with no dispatch (a coordinator's own) is not closed by this;
-/// the clocks in [`expiry`] end it for the counts and the reply verb
-/// (t-59383 r2). No Question table, no flag to fall out of step.
+/// And a coordinator of either side may close one without an answer
+/// (`question-close`, t-83289), which leaves the ledger's line in its thread
+/// ([`hand_closed`]). A question with no dispatch (a coordinator's own) is
+/// not otherwise closed by this; the clocks in [`expiry`] end it for the
+/// counts and the reply verb (t-59383 r2). No Question table, no flag to
+/// fall out of step.
 fn question_closed(run: &Run, question: &Message) -> bool {
     question
         .dispatch
         .as_deref()
         .and_then(|id| run.dispatch(id))
         .is_some_and(|held| held.ended_ms.is_some())
+        || hand_closed(run, question).is_some()
+}
+
+/// The line `question-close` left in `question`'s thread, if a coordinator
+/// closed it without an answer (t-83289): in the ledger's voice, so it is
+/// never the question's answer ([`Message::answers`]) nor a letter about it
+/// ([`Message::writes_about`]), and saying `closed` — the receiver notices
+/// beside it in the thread say `reason` instead ([`receiver_notices`]).
+fn hand_closed<'a>(run: &'a Run, question: &Message) -> Option<&'a Message> {
+    run.messages()
+        .iter()
+        .find(|held| closes_question(held, question))
+}
+
+/// Whether `held` is the line `question-close` left in `question`'s thread
+/// ([`hand_closed`]). The body is read only for the ledger's own lines in
+/// that thread.
+fn closes_question(held: &Message, question: &Message) -> bool {
+    held.thread.as_deref() == Some(question.id.as_str())
+        && held.from == LEDGER_ITSELF
+        && held.kind == MessageKind::Status
+        && serde_json::from_str::<serde_json::Value>(held.body.as_str())
+            .is_ok_and(|body| body[QUESTION_CLOSED_KEY] == true)
+}
+
+/// The key the line [`hand_closed`] reads says `true` under.
+const QUESTION_CLOSED_KEY: &str = "closed";
+
+/// The refusal of a copy `reply` or `question-close` delivers to the asking
+/// run, after the line it copies — the answer or the close, `filed` — is
+/// already in the question's thread (t-83289 r2). Said as what happened: the
+/// line stands, only the copy to `there` did not land, and the same verb
+/// again answers with the standing line (`already: true`) and writes no copy.
+fn copy_refused(filed: &str, there: &str, refused: &str) -> String {
+    format!(
+        "{filed} is filed in the question's thread and stands — only its copy to \
+         {RUN_ADDRESS_PREFIX}{there} was refused: {refused}; the same verb again answers \
+         already: true and copies nothing, so tell {RUN_ADDRESS_PREFIX}{there} by `send`"
+    )
+}
+
+/// The run a verb about the message `id` answers in when no `--run` names
+/// one: the caller's own (`standing`) when it holds the message, and
+/// otherwise the run that does — message ids are minted once for the whole
+/// ledger, so a question filed in another run's mail is found by its id
+/// alone (t-83289: the asking side closes its question where it was filed).
+fn run_holding(ledger: &Ledger, standing: Option<&str>, id: &str) -> Option<String> {
+    let holds = |run: &&Run| run.message(id).is_some();
+    standing
+        .and_then(|own| ledger.run(own))
+        .filter(holds)
+        .or_else(|| ledger.runs().iter().find(holds))
+        .map(|run| run.id.clone())
+}
+
+/// The chair `seat` closes `question` (filed in `run`) for, when it may:
+/// the live coordinator of `run` — the side asked, or the asking side when
+/// the run's own chair asked — or the live coordinator of the run whose
+/// chair the asking pane holds or held ([`Ledger::asker_run`]). Answered as
+/// that chair's address, the record's `closedBy`.
+fn question_closer(ledger: &Ledger, run: &Run, question: &Message, seat: &str) -> Option<String> {
+    if run.seat_is_coordinator(seat) == Some(true) {
+        return Some(run.address());
+    }
+    let asking = ledger.asker_run(question, &run.id)?;
+    ledger
+        .run(&asking)
+        .filter(|there| there.seat_is_coordinator(seat) == Some(true))
+        .map(Run::address)
 }
 
 /// The key a look that hands nothing over names its kind under, in the page
@@ -24575,7 +25438,7 @@ fn plan_inner(
             // coordinator: the answer is delivered there too, so one
             // `reply` reaches it whatever run the question was filed in.
             let asker_run = match kind == MessageKind::Question {
-                true => ledger.asker_run(&to, &run_id),
+                true => ledger.asker_run(answered, &run_id),
                 false => None,
             };
             let me = sender(ledger, &team.leader_pane, &run_id, (&team.id, pane));
@@ -24673,11 +25536,153 @@ fn plan_inner(
                     let id = ledger.post_as(&run_id, draft, Some(&seat), now_ms)?;
                     let mut said_back = serde_json::json!({ "messageId": id });
                     if let Some((asker, copy)) = carried {
-                        let held = ledger.post_as(&asker, copy, Some(&seat), now_ms)?;
+                        let held = ledger
+                            .post_as(&asker, copy, Some(&seat), now_ms)
+                            .map_err(|refused| copy_refused(&id, &asker, &refused))?;
                         said_back["deliveredTo"] =
                             serde_json::json!({ "runId": asker, "messageId": held });
                     }
                     said(said_back)
+                }
+            }
+        }
+
+        QUESTION_CLOSE => {
+            /* A question closed without an answer (t-83289), by the chair it
+             * was asked of or the chair that asked it — the one road out for
+             * a question nobody will answer and nobody can: on 2026-10-29
+             * m-81883 stood six hours on the inbox, its asking pane gone and
+             * `reply` refused. The close is the ledger's line in the thread,
+             * so it is never the answer and `ask` wakes on it as closed
+             * ([`thread_look`]); every count leaves the question out
+             * ([`question_closed`]); a second close answers with the first. */
+            let id = words
+                .value("--message")
+                .ok_or("question-close needs --message <questionId>")?
+                .to_string();
+            let note = words
+                .value("--reason")
+                .map(str::trim)
+                .filter(|held| !held.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "question-close needs --reason <one line> — why {id} closes \
+                         without an answer is the record it leaves"
+                    )
+                })?
+                .to_string();
+            let run_id = match words.value("--run") {
+                Some(_) => bound(ledger, &words, &caller, &seat)?,
+                None => run_holding(ledger, standing_in(ledger, &caller, &seat).as_deref(), &id)
+                    .ok_or_else(|| format!("unknown message: {id}"))?,
+            };
+            let run = ledger.run(&run_id).ok_or_else(|| unknown_run(&run_id))?;
+            let question = run
+                .message(&id)
+                .ok_or_else(|| format!("unknown message: {id}"))?;
+            if question.kind != MessageKind::Question || question.thread.is_some() {
+                return Err(format!(
+                    "{id} is not a question — only a thread's root question closes"
+                ));
+            }
+            let closer = question_closer(ledger, run, question, &seat).ok_or_else(|| {
+                format!(
+                    "question {id} was asked of {} by {} — only the coordinator of {run_id}, \
+                     or of the run that asked it, closes it",
+                    question.to, question.from
+                )
+            })?;
+            // Closed already — answered in its thread, by a close, or by its
+            // attempt ending: the standing fact, and nothing written. Read
+            // before anything is written, and answered as the arm's value
+            // so the retry name still files its receipt.
+            let already = |close_id: Option<&str>, closed_by: Option<&str>| {
+                serde_json::json!({
+                    "questionId": id,
+                    "runId": run_id,
+                    "closed": true,
+                    "already": true,
+                    "closeId": close_id,
+                    "closedBy": closed_by,
+                })
+            };
+            let standing = if let Some(answer) = thread_answer(run, question) {
+                let mut standing = already(None, None);
+                standing["answerId"] = serde_json::Value::String(answer.id.clone());
+                Some(standing)
+            } else if let Some(closed) = hand_closed(run, question) {
+                let first: serde_json::Value =
+                    serde_json::from_str(closed.body.as_str()).unwrap_or_default();
+                Some(already(Some(&closed.id), first["closedBy"].as_str()))
+            } else if question_closed(run, question) {
+                Some(already(None, None))
+            } else {
+                None
+            };
+            match standing {
+                Some(standing) => said(standing),
+                None => {
+                    let asking = ledger
+                        .asker_run(question, &run_id)
+                        .filter(|there| format!("{RUN_ADDRESS_PREFIX}{there}") != closer);
+                    let asker = question.from.clone();
+                    let asked = question.to.clone();
+                    let line = Draft {
+                        from: LEDGER_ITSELF.to_string(),
+                        to: asker,
+                        kind: MessageKind::Status,
+                        body: serde_json::json!({
+                            "questionId": id,
+                            QUESTION_CLOSED_KEY: true,
+                            "closedBy": closer,
+                            "note": note,
+                        })
+                        .to_string()
+                        .into(),
+                        subject: Text::default(),
+                        priority: Priority::Normal,
+                        payload: Text::default(),
+                        thread: Some(id.clone()),
+                        task: question.task.clone(),
+                        dispatch: question.dispatch.clone(),
+                    };
+                    /* Told to the asker; and where its address takes nothing
+                     * any more (a worker released under an attempt still
+                     * open), filed to the side asked instead — the record is
+                     * what closes it. */
+                    let close_id = match ledger.post_as(&run_id, line.clone(), Some(&seat), now_ms)
+                    {
+                        Ok(posted) => posted,
+                        Err(_) => ledger.post_as(
+                            &run_id,
+                            Draft {
+                                to: asked,
+                                ..line.clone()
+                            },
+                            Some(&seat),
+                            now_ms,
+                        )?,
+                    };
+                    let mut answer = serde_json::json!({
+                        "questionId": id,
+                        "runId": run_id,
+                        "closed": true,
+                        "already": false,
+                        "closeId": close_id,
+                        "closedBy": closer,
+                    });
+                    if let Some(there) = asking {
+                        let copy = Draft {
+                            to: format!("{RUN_ADDRESS_PREFIX}{there}"),
+                            ..line
+                        };
+                        let held = ledger
+                            .post_as(&there, copy, Some(&seat), now_ms)
+                            .map_err(|refused| copy_refused(&close_id, &there, &refused))?;
+                        answer["deliveredTo"] =
+                            serde_json::json!({ "runId": there, "messageId": held });
+                    }
+                    said(answer)
                 }
             }
         }
@@ -25585,9 +26590,29 @@ pub const PROJECTION_SCHEMA: u32 = 5;
 /// prose, so the redaction lives in ONE place and a new wide field gets it by
 /// choosing the type instead of by somebody remembering. Follows the shape
 /// already set by [`DurableRetryIdentity`]'s `Debug`.
-#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
-pub struct Text(String);
+///
+/// The words sit behind an `Arc` (t-81273): prose is most of what a ledger
+/// weighs — 41 of its 55 MB on the person's machine, 2026-10-29 — and a copy
+/// of the ledger (the runtime's export for a write, a copy-on-write image)
+/// then shares them instead of copying every letter. Nothing edits a `Text`
+/// in place; a new value replaces the old one, so sharing changes no answer.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Text(std::sync::Arc<str>);
+
+/// The one empty `Text` every empty field shares: most letters carry no
+/// subject and no payload, and an `Arc<str>` of nothing is still an
+/// allocation each.
+fn no_text() -> std::sync::Arc<str> {
+    static EMPTY: std::sync::LazyLock<std::sync::Arc<str>> =
+        std::sync::LazyLock::new(|| std::sync::Arc::from(""));
+    std::sync::Arc::clone(&EMPTY)
+}
+
+impl Default for Text {
+    fn default() -> Self {
+        Self(no_text())
+    }
+}
 
 impl Text {
     pub fn as_str(&self) -> &str {
@@ -25595,7 +26620,7 @@ impl Text {
     }
 
     pub fn into_string(self) -> String {
-        self.0
+        self.0.to_string()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -25605,13 +26630,33 @@ impl Text {
 
 impl From<String> for Text {
     fn from(held: String) -> Self {
-        Self(held)
+        if held.is_empty() {
+            return Self::default();
+        }
+        Self(std::sync::Arc::from(held))
     }
 }
 
 impl From<&str> for Text {
     fn from(held: &str) -> Self {
-        Self(held.to_string())
+        if held.is_empty() {
+            return Self::default();
+        }
+        Self(std::sync::Arc::from(held))
+    }
+}
+
+/* The disk shape is a bare string, as `#[serde(transparent)]` over a `String`
+ * wrote it: the `Arc` is how the words are held, not what they are. */
+impl serde::Serialize for Text {
+    fn serialize<S: serde::Serializer>(&self, into: S) -> Result<S::Ok, S::Error> {
+        into.serialize_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Text {
+    fn deserialize<D: serde::Deserializer<'de>>(from: D) -> Result<Self, D::Error> {
+        <String as serde::Deserialize>::deserialize(from).map(Self::from)
     }
 }
 
@@ -25628,13 +26673,13 @@ impl std::ops::Deref for Text {
 
 impl PartialEq<&str> for Text {
     fn eq(&self, other: &&str) -> bool {
-        self.0 == *other
+        &*self.0 == *other
     }
 }
 
 impl PartialEq<Text> for &str {
     fn eq(&self, other: &Text) -> bool {
-        *self == other.0
+        *self == &*other.0
     }
 }
 
@@ -25648,17 +26693,20 @@ impl std::fmt::Debug for Text {
     }
 }
 
-/// How many times this process walked a whole ledger — the three walks whose
+/// How many times this process walked a whole ledger — the walks whose
 /// price is the size of the ledger, not of the change (t-19506).
 ///
-/// Three relaxed counters beside the walks themselves, so a test or a bench
-/// can say how many each beat of the window causes. Reading them moves
-/// nothing and a walk pays one uncontended atomic add.
+/// Relaxed counters beside the walks themselves, so a test or a bench can
+/// say how many each beat of the window causes. Reading them moves nothing
+/// and a walk pays one uncontended atomic add. `clones` is the copy the
+/// runtime's copy-on-write image makes when it writes while a reader still
+/// holds the revision it was handed (t-81273).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LedgerWork {
     pub exports: u64,
     pub rebuilds: u64,
     pub validations: u64,
+    pub clones: u64,
 }
 
 impl LedgerWork {
@@ -25668,6 +26716,7 @@ impl LedgerWork {
             exports: self.exports - earlier.exports,
             rebuilds: self.rebuilds - earlier.rebuilds,
             validations: self.validations - earlier.validations,
+            clones: self.clones - earlier.clones,
         }
     }
 }
@@ -25676,12 +26725,14 @@ struct LedgerWorkCounters {
     exports: std::sync::atomic::AtomicU64,
     rebuilds: std::sync::atomic::AtomicU64,
     validations: std::sync::atomic::AtomicU64,
+    clones: std::sync::atomic::AtomicU64,
 }
 
 static LEDGER_WORK: LedgerWorkCounters = LedgerWorkCounters {
     exports: std::sync::atomic::AtomicU64::new(0),
     rebuilds: std::sync::atomic::AtomicU64::new(0),
     validations: std::sync::atomic::AtomicU64::new(0),
+    clones: std::sync::atomic::AtomicU64::new(0),
 };
 
 /// The whole-ledger walks this process has made so far.
@@ -25691,6 +26742,7 @@ pub fn ledger_work() -> LedgerWork {
         exports: LEDGER_WORK.exports.load(Relaxed),
         rebuilds: LEDGER_WORK.rebuilds.load(Relaxed),
         validations: LEDGER_WORK.validations.load(Relaxed),
+        clones: LEDGER_WORK.clones.load(Relaxed),
     }
 }
 
@@ -25999,6 +27051,10 @@ pub struct RunRow {
     /// store written before projects were recorded, read back as none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<RunProject>,
+    /// The letters folded out of the run while it worked (t-81273), on the
+    /// same posture: absent from every store written before folding existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folded: Option<FoldedMail>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -26357,7 +27413,7 @@ impl Ledger {
                 .bound
                 .iter()
                 .map(|(caller, run)| BoundRow {
-                    caller: Text(caller.clone()),
+                    caller: Text::from(caller.as_str()),
                     run: run.clone(),
                 })
                 .collect(),
@@ -26365,10 +27421,10 @@ impl Ledger {
                 .served
                 .iter()
                 .map(|held| ServedRow {
-                    caller: held.caller.clone().map(Text),
-                    request: Text(held.request.clone()),
+                    caller: held.caller.as_deref().map(Text::from),
+                    request: Text::from(held.request.as_str()),
                     answer: held.answer.clone(),
-                    fingerprint: held.fingerprint.clone().map(Text),
+                    fingerprint: held.fingerprint.as_deref().map(Text::from),
                     verb: held.verb.clone(),
                     filed_ms: held.filed_ms,
                     expired: held.expired,
@@ -26384,13 +27440,14 @@ impl Ledger {
         for run in &self.runs {
             projected.runs.push(RunRow {
                 id: run.id.clone(),
-                name: Text(run.name.clone()),
+                name: Text::from(run.name.as_str()),
                 created_ms: run.created_ms,
                 auto: run.auto.clone(),
                 handover: run.handover.clone(),
                 summary: run.summary.clone(),
                 coordinator: run.coordinator.clone(),
                 project: run.project.clone(),
+                folded: run.folded.clone(),
             });
             for task in &run.tasks {
                 projected.tasks.push(TaskRow {
@@ -26444,7 +27501,7 @@ impl Ledger {
                     checkout: worker.checkout.clone(),
                     in_worktree: worker.in_worktree,
                     quiet_at: worker.quiet_at,
-                    archive: worker.archive.clone().map(Text),
+                    archive: worker.archive.as_deref().map(Text::from),
                     adopted_by: worker.adopted_by,
                     on_quota_wall: worker.on_quota_wall.clone(),
                     quota_wait: worker.quota_wait,
@@ -26571,6 +27628,7 @@ impl Ledger {
             asking: Vec::new(),
             retention_days: projected.retention_days,
             swept_at_ms: projected.swept_at_ms,
+            folded_at_ms: 0,
             verb_tallies: projected.verb_tallies,
         };
 
@@ -26591,6 +27649,7 @@ impl Ledger {
                 summary: row.summary,
                 coordinator: row.coordinator,
                 project: row.project,
+                folded: row.folded,
             });
         }
 
