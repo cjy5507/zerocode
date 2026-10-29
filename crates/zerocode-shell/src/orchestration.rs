@@ -127,6 +127,14 @@ impl LedgerCache {
             return current.ledger.clone();
         }
 
+        // The old revision's image and report go before the new one is built
+        // (t-80604): held across the rebuild, the window carried the ledger
+        // four times at once — the actor's own, its projection, the copy
+        // being rebuilt and the stale image — a peak of one whole ledger
+        // (34,343 letters on the person's machine) more than it ever reads.
+        // A reader still holding the old `Arc` keeps it alive; the cache
+        // does not.
+        self.current = None;
         let ledger = Ledger::rebuild(projection.clone()).map(Arc::new);
         if let Ok(ledger) = &ledger {
             let workers = ledger
@@ -12591,6 +12599,41 @@ fn carried(
             match crate::land_batch::carry(&root, &ask, &held, now_ms) {
                 Ok(said) => {
                     let text = format!("{said}\n");
+                    if let Some(key) = decided.receipt.clone()
+                        && let Err(why) = actor.remember_served(key, text.clone(), now_ms)
+                    {
+                        return refused_by_runtime(why);
+                    }
+                    answer(zerocode_core::agent_teams::Reply::ok(text))
+                }
+                Err(why) => refused(why),
+            }
+        }
+        /* A stray process, listed or ended (t-78914). The window reads the table, asks the
+         * protection judgment and signals one pid at a time; an end call's line goes to its run
+         * as the ledger's own letter, once under its receipt. The answer is filed as the receipt,
+         * so a retry with the same name is told the same thing and nothing is signalled twice. */
+        Effect::ProcessSweep(ask) => {
+            let caller = crate::agent_teams::teams()
+                .get(team_id)
+                .and_then(|team| team.term_of(pane));
+            let roots = host.kill_roots(caller);
+            let trees = crate::process_sweep::coordinator_trees(ask.coordinator_seats(), host);
+            match crate::process_sweep::carry(&ask, roots, &trees) {
+                Ok(carried) => {
+                    if let Some(filed) = carried.filed {
+                        match actor.observation_once(
+                            Some(filed.run.clone()),
+                            format!("run:{}", filed.run),
+                            filed.line,
+                            Some(filed.receipt),
+                            now_ms,
+                        ) {
+                            Ok((moved, _)) => rang(moved),
+                            Err(_) => note_ledger_unwritten("a process-sweep line"),
+                        }
+                    }
+                    let text = format!("{}\n", carried.said);
                     if let Some(key) = decided.receipt.clone()
                         && let Err(why) = actor.remember_served(key, text.clone(), now_ms)
                     {

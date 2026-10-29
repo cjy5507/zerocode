@@ -130,6 +130,7 @@ mod google_login;
 mod hang_sample;
 mod hang_watchdog;
 mod harness_settings;
+mod history_budget;
 mod hooks;
 mod human_input;
 mod icon;
@@ -164,6 +165,7 @@ mod plain_read;
 mod preference_runtime;
 mod primary_selection;
 mod proc;
+mod process_sweep;
 mod project_runtime;
 mod project_search;
 mod prompt_transaction;
@@ -368,7 +370,7 @@ use cmd::{
     set_browser_workspace_mode, set_claude_autoswitch_mode, set_clipboard_image,
     set_compact_worktree_cards, set_computer_awake_mode, set_computer_confirm,
     set_computer_generator_road, set_computer_input_policy, set_computer_live_reflex,
-    set_computer_share_required, set_confirm_close_pinned, set_conversation_focus_view,
+    set_computer_share_required, set_confirm_close_pinned, set_conversation_timeline_view,
     set_crash_watchdog, set_ctrl_tab_order_mode, set_default_agent, set_default_task_source,
     set_diff_side_by_side, set_dock_badge, set_external_worktree_visibility,
     set_finish_notification_mode, set_guide_dismissed, set_harness_settings, set_hidden_shortcuts,
@@ -3313,7 +3315,7 @@ fn main() -> ExitCode {
             set_skip_delete_worktree_confirm,
             set_skip_delete_automation_confirm,
             set_diff_side_by_side,
-            set_conversation_focus_view,
+            set_conversation_timeline_view,
             patch_editing_prefs,
             read_primary_selection,
             write_primary_selection,

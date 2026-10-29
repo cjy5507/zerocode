@@ -7,7 +7,11 @@ import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { standIpcCensus } from "./ipc-census.mjs";
 import { PLATFORM_OVERRIDE, PRIMARY_EVENT, reportedPlatformScript } from "./test-platform.mjs";
-const UI = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+// Another tree's `ui/` to serve in place of this one — a census comparing two
+// releases' pages under the same harness (memory-census.mjs, t-80604).
+const UI = process.env.ZEROCODE_WINDOW_UI
+  ? resolve(process.env.ZEROCODE_WINDOW_UI)
+  : resolve(dirname(fileURLToPath(import.meta.url)), "..");
 /* The primary modifier as a synthetic-event spread — ⌘ on macOS, Ctrl
  * elsewhere (test-platform.mjs). `shell.js` reads the same platform; a test
  * that builds a ⌘/Ctrl event spreads `window.__TEST_PRIMARY_EVENT__` in. */
@@ -138,7 +142,11 @@ const BOOT = {
     },
   },
   diff_side_by_side: true,
-  conversation_focus_view: false,
+  // The harness reads every step's own row, so its pages stand on the whole
+  // timeline; the folded page — the product's default, pinned by
+  // `the_conversation_timeline_view_is_one_remembered_bit` — is read by the
+  // scenes that turn it on (`foldConversations`, t-81525 B1).
+  conversation_timeline_view: true,
   terminal_prefs: {
     font_size: 14,
     font_family: "",
@@ -2430,6 +2438,13 @@ const lagFrames = (surface) => {
  *    ring or the end of a flash fails for a reason that is the machine's. A
  *    check that wants the preference sets it itself (`emulateMedia`), and gives
  *    it back as THIS value — `null` would hand it back to the host. */
+/* The folded page (t-81525 B1): the tool work between two answers as pills,
+ * the product's default — the harness stands on the whole timeline. */
+export const foldConversations = (page) => page.evaluate(() => {
+  conversationTimelineView = false;
+  repaintTimelineView();
+});
+
 export const WINDOW_BROWSER_ARGS = Object.freeze(["--disable-3d-apis"]);
 export const WINDOW_MOTION_REST = "no-preference";
 
@@ -2465,11 +2480,13 @@ export async function waitBootSettled(page) {
  *            a fresh one otherwise.
  *   before — a hand on the page after the backend stands and before the
  *            window boots: the init script a fixture needs. */
-export async function openWindowTestPage(browser, origin, { faults = [], before = null } = {}) {
+export async function openWindowTestPage(browser, origin, { faults = [], before = null, context: shape = {} } = {}) {
   // A context of its own, not `browser.newPage()`: a context a page owns
   // refuses `context.newPage()`, and the axe check opens its blank page that
   // way ("Please use browser.newContext()"). The context leaves with the page.
-  const context = await browser.newContext({ viewport: { width: 1280, height: 860 }, reducedMotion: WINDOW_MOTION_REST });
+  // `shape` adds to the context — a census draws at the person's device scale.
+  const context = await browser.newContext({ viewport: { width: 1280, height: 860 }, reducedMotion: WINDOW_MOTION_REST,
+    ...shape });
   const page = await context.newPage();
   page.on("close", () => context.close().catch(() => {}));
   page.on("pageerror", (error) => faults.push(error?.stack ?? String(error)));
