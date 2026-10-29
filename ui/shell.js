@@ -13341,10 +13341,10 @@ async function openHelperPage(row, sub) {
  * exit, and the new tab stands where the pane's tab stood (`at`) carrying the
  * turns already said (`history`), so the swap reads as the same conversation
  * changing renderer, not as a new page. */
-async function openWirePage(agent, cwd, { resume = null, fromTerm = null, at = -1, history = [], historyFrom = 0, historyEnd = null, label = null, carry = null, refused = showError } = {}) {
+async function openWirePage(agent, cwd, { resume = null, fromTerm = null, deadline = null, at = -1, history = [], historyFrom = 0, historyEnd = null, label = null, carry = null, refused = showError } = {}) {
   let started;
   try {
-    started = await invoke("wire_start", { agent, cwd, resume, from_pane: fromTerm });
+    started = await invoke("wire_start", { agent, cwd, resume, from_pane: fromTerm, deadlineMs: deadline });
   } catch (error) {
     refused(error);
     return null;
@@ -13406,34 +13406,27 @@ function placeTabAt(id, at) {
   renderTabs();
 }
 
-/* The transcript a pane has so far, read through the same door the page
- * polls — its newest chunk's turns read back from the end, then on to the
- * file's end — for the wire tab that continues the conversation to open with
- * the words already said: the turns, where they begin (`start`, what the tab
- * reads up from once it is drawn) and where they end (`end`). The tab's own
- * hold bounds them (`holdHelperTurns`). */
+/* The transcript a pane has so far, for the wire tab that continues the
+ * conversation to open with the words already said: ONE read back from the
+ * file's end, the bounded read the conversation view opens with
+ * (`FIRST_REACH`) — the turns, where they begin (`start`, what the tab reads
+ * up from once it is drawn, 「이전 기록 더 보기」) and where they end (`end`).
+ * Never a walk to the file's end: a session hours long is a hundred MiB, and
+ * the hand-over holds what the person sends until this read answers
+ * (t-84670). */
 async function readPaneTranscript(term) {
-  const turns = [];
-  let after = null;
-  let start = 0;
-  let end = null;
-  for (let reads = 0; reads < 64; reads += 1) {
-    let more = null;
-    try {
-      more = await invoke("pane_log", { term, after });
-    } catch {
-      break;
-    }
-    // Nothing past the cursor: the file is read to its end.
-    if (!more?.found || !(after === null || more.next > after)) break;
-    if (after === null && Number.isFinite(more.start)) start = more.start;
-    end = more.next;
-    if (!more.turns?.length) break;
-    turns.push(...more.turns);
-    if (more.more === false) break;
-    after = more.next;
+  let read = null;
+  try {
+    read = await invoke("pane_log", { term, after: null });
+  } catch {
+    read = null;
   }
-  return { turns, start, end };
+  if (!read?.found) return { turns: [], start: 0, end: null };
+  return {
+    turns: read.turns ?? [],
+    start: Number.isFinite(read.start) ? read.start : 0,
+    end: Number.isFinite(read.next) ? read.next : null,
+  };
 }
 
 /* The wire an agent's pane can hand its conversation to: the catalog row
@@ -13466,16 +13459,32 @@ async function handPaneToWire(term) {
   }
   held.pendingWire = false;
   held.handing = true;
-  // The transcript view says the wire is taking over, and holds what is sent
-  // meanwhile (`composerHolding`, t-54304).
-  paintPaneChat(term);
+  // When it began: what is sent meanwhile is held at most `COMPOSER_HOLD_MS`
+  // from here, whatever the hand-over does (t-84670).
+  held.handingSince = Date.now();
   let tabId = null;
   try {
+    // The transcript view says the wire is taking over, and holds what is sent
+    // meanwhile (`composerHolding`, t-54304). Painted inside the `try`: a paint
+    // that threw left `handing` up for good, the queue with it.
+    paintPaneChat(term);
     const owner = tabOfTerm(term);
-    const history = await readPaneTranscript(term);
+    // By when the wire must stand: one that stands later leaves the pane
+    // alone, for by then the held words may have gone to it
+    // (`COMPOSER_HAND_OVER_DUE_MS`, t-84670).
+    const deadline = held.handingSince + COMPOSER_HAND_OVER_DUE_MS;
+    // The read before the wire is asked is the window's own, bounded by that
+    // deadline: one that has not answered by then hands nothing over — the
+    // wire is never asked, and no wire process is started only to be stopped.
+    const history = await beforeHandOverDeadline(readPaneTranscript(term), deadline);
+    if (history === null) {
+      held.wireRefusal = t("worker.handOverStalled", "대화 기록 읽기가 {{s}}초 안에 끝나지 않았습니다", { s: Math.round(COMPOSER_HAND_OVER_DUE_MS / 1000) });
+      return false;
+    }
     tabId = await openWirePage(row.id, owner?.worktree ?? activeWorktreePath, {
       resume: session,
       fromTerm: term,
+      deadline,
       at: owner ? tabs.indexOf(owner) : -1,
       history: history.turns,
       historyFrom: history.start,
@@ -13493,6 +13502,7 @@ async function handPaneToWire(term) {
     return tabId !== null;
   } finally {
     held.handing = false;
+    held.handingSince = null;
     // A wire that never stood leaves the pane its conversation: the view says
     // why, and what waited goes the pane's own way, once (t-54304).
     if (tabId === null) {
@@ -13500,6 +13510,17 @@ async function handPaneToWire(term) {
       settleComposerQueue(held.run);
     }
   }
+}
+
+/* What `promise` answers, or null when it has not answered before `deadline`
+ * (epoch ms) — a hand-over's (`COMPOSER_HAND_OVER_DUE_MS`, t-84670). A read
+ * that answers after the deadline is null too: the wire is not asked then. */
+function beforeHandOverDeadline(promise, deadline) {
+  let timer = null;
+  const late = new Promise((done) => { timer = setTimeout(() => done(null), Math.max(0, deadline - Date.now())); });
+  return Promise.race([promise, late])
+    .then((answer) => (Date.now() >= deadline ? null : answer))
+    .finally(() => clearTimeout(timer));
 }
 
 /* What a pane's transcript view hands the wire's page that continues its
@@ -13852,6 +13873,7 @@ function forgetPaneChat(term) {
   held.host?.remove();
   // 기다리던 글들은 이 대화의 것이었다 — 대화가 사라지면 같이 사라진다.
   held.run.queue = null;
+  dropComposerRelease(held.run);
   paneChats.delete(term);
   paneLive.delete(term);
   paneNow.delete(term);
@@ -16315,7 +16337,12 @@ function workerComposerNode(run, owner = null) {
       // So do words sent while the pane hands its conversation to its wire:
       // the wire's page sends them (`carryPaneChat`), or the pane, refused
       // (t-54304).
-      if (composerQueues(run, asking)) queueComposerMessage(run, message);
+      // A hand-over that never ends is let go by its own clock
+      // (`armComposerRelease`, t-84670).
+      if (composerQueues(run, asking)) {
+        queueComposerMessage(run, message);
+        armComposerRelease(run);
+      }
       // 아니면 그 자리에서 실행의 길로 — 선이면 한 요청, 판이면
       // 붙여넣기·숨·Enter. `pasted`는 Enter가 실패했을 때 글이 이미 부모의
       // 상자에 있다는 사실을 남긴다.

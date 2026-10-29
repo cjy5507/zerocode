@@ -154,6 +154,7 @@ import { testConversationRedesign } from "./conversation-redesign.mjs";
 import { testConversationB } from "./conversation-b.mjs";
 import { testConversationEarlier } from "./conversation-earlier.mjs";
 import { testConversationSwitch } from "./conversation-switch.mjs";
+import { testComposerHold } from "./composer-hold.mjs";
 import { testConversationDiagrams } from "./conversation-diagrams.mjs";
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
@@ -505,6 +506,7 @@ suite("conversation-earlier", ({ browser, origin, ok }) => testConversationEarli
 /* 대화를 바꿨다가 돌아오면 그 화면 그대로, 판의 「대화」는 전사부터(인계 중 보낸 글은 한 번만),
  * 늦은 첫 읽기는 늦게 한 줄 (t-54304 — Claude·Codex·Dots 역분석에서 가져온 1단계). */
 suite("conversation-switch", ({ browser, origin, ok }) => testConversationSwitch(browser, origin, ok));
+suite("composer-hold", ({ browser, origin, ok }) => testComposerHold(browser, origin, ok));
 /* 대화의 mermaid 울타리 — 닫힌 뒤에 한 번만 그림으로 서고(스트림 30프레임에 요청 1번), 답의 턴은
  * 이미 받은 레이아웃으로 바로 그리고, 늦게 온 그림 앞에서 끝 따라가기와 읽던 자리가 그대로다 (t-58437). */
 suite("conversation-diagrams", ({ browser, origin, ok }) => testConversationDiagrams(browser, origin, ok));
@@ -57429,7 +57431,8 @@ suite("wire-session", async ({ browser, origin, ok }) => {
       const tab = tabs.find((one) => one.id === tabId);
       seen.opened = Boolean(tab) && tab.kind === "worker" && tab.worker.wire === 7 && activeTabId === tabId;
       seen.startArgs = JSON.stringify(calls.find((call) => call[0] === "start")?.[1]);
-      seen.wantStartArgs = JSON.stringify({ agent: "codex", cwd: "/tmp/zerocode-window-test", resume: null, from_pane: null });
+      // A wire opened from the menu hands nothing over: no deadline (t-84670).
+      seen.wantStartArgs = JSON.stringify({ agent: "codex", cwd: "/tmp/zerocode-window-test", resume: null, from_pane: null, deadlineMs: null });
       const face = document.querySelector("#worker-view");
       seen.head = face?.querySelector(".worker-name")?.textContent ?? "";
       seen.wantHead = agentName("codex");
@@ -58378,13 +58381,22 @@ suite("pane-hands-over-to-wire", async ({ browser, origin, ok }) => {
       tell("hook:agent", { term, state: "working", agent: "claude", session: { key: "session_id", id: "s-hand" }, resumable: true });
       tell("hook:agent", { term, state: "done", agent: "claude", session: { key: "session_id", id: "s-hand" }, resumable: true });
       await window.__PAINTED__();
-      el("view-toggle-chat").click();
+      // The hand-over's wire must stand by its start plus
+      // `COMPOSER_HAND_OVER_DUE_MS` (t-84670): the press reads one known moment.
+      const realNow = Date.now;
+      const pressedAt = realNow();
+      Date.now = () => pressedAt;
+      try {
+        el("view-toggle-chat").click();
+      } finally {
+        Date.now = realNow;
+      }
       seen.handed = await until(() => tabs.some((tab) => tab.worker?.wire === 11));
       await window.__PAINTED__();
       await settle();
       const started = calls.find((call) => call[0] === "start")?.[1];
       seen.startArgs = JSON.stringify(started);
-      seen.wantStartArgs = JSON.stringify({ agent: "claude", cwd: paneTab.worktree, resume: "s-hand", from_pane: term });
+      seen.wantStartArgs = JSON.stringify({ agent: "claude", cwd: paneTab.worktree, resume: "s-hand", from_pane: term, deadlineMs: pressedAt + COMPOSER_HAND_OVER_DUE_MS });
       const wireTab = tabs.find((tab) => tab.worker?.wire === 11);
       seen.seat = tabs.indexOf(wireTab) === at;
       seen.active = activeTabId === wireTab?.id;
