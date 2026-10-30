@@ -25,6 +25,7 @@ mod git_doors;
 mod google_quota_api;
 mod hand_in_keep;
 mod handoff_code;
+mod has_reach;
 mod jev_pane_seats;
 mod land_batch;
 mod plain_words;
@@ -45,6 +46,7 @@ mod support;
 mod type_value_keys;
 mod update;
 mod window_forks;
+mod worker_question;
 pub(crate) use support as ui_source;
 
 mod tests {
@@ -36557,11 +36559,30 @@ mod tests {
     /// They were placed in column 2 of a one-column grid, which opens an
     /// implicit second column and puts them BESIDE the stage — the opposite
     /// of the folding the rule sets out to do.
+    ///
+    /// The fold is the media block holding the side panels' own rule, found
+    /// by that rule (t-77867). The first `max-width: 900px` block it was
+    /// once read from is a Jira table's, and the contract held nothing.
     #[test]
     fn a_narrow_window_stacks_instead_of_widening() {
         let css = include_str!("../../../../ui/shell.css");
-        let folded = block_after(css, "@media (max-width: 900px) {");
+        let panels = css
+            .find("\n  .threads,\n  .files {")
+            .expect("the side panels' rule in a narrow window");
+        let opens = css[..panels]
+            .rfind("\n@media")
+            .map(|at| at + 1)
+            .expect("the media block it stands in");
+        let folded = block_after(&css[opens..], "@media");
 
+        assert!(
+            folded.contains(".body {")
+                && folded.contains("grid-template-columns: minmax(0, 1fr);")
+                && folded.contains(".threads,\n  .files {")
+                && folded.contains("grid-column: 1;"),
+            "the block read is not the one that folds the panels under the \
+             stage:\n{folded}"
+        );
         assert!(
             !folded.contains("grid-column: 2"),
             "a folded panel is still placed in a column the grid does not \
@@ -39194,6 +39215,9 @@ fn every_conversation_page_reads_up_past_its_first_turn_down_one_road() {
         "worker.earlierMore",
         "worker.earlierMoreTip",
         "worker.earlierReading",
+        "worker.earlierFailed",
+        "worker.earlierSkipped",
+        "worker.earlierEmpty",
         "worker.toNewest",
     ] {
         assert!(
@@ -39213,7 +39237,9 @@ fn every_conversation_page_reads_up_past_its_first_turn_down_one_road() {
             && read.contains("invoke(\"pane_log\", { term: run.term, before })")
             && read.contains("invoke(\"wire_history\", { id: run.wire, before })")
             && read.contains("invoke(\"subagent_log\", { term: run.term, id: held.id, before })")
-            && read.contains("holdEarlierTurns(held, above.turns ?? [], above.start);"),
+            && read.contains(
+                "holdEarlierTurns(held, above.turns ?? [], above.start, { keepNewest: !readerAway(run) })"
+            ),
         "a page reads up down a road of its own:\n{read}"
     );
     let poll = support::block_after(shell, "async function pollHelperPages() {");
@@ -39288,7 +39314,10 @@ fn every_conversation_page_reads_up_past_its_first_turn_down_one_road() {
         "turns read from above do not stand over the rows, or move the reader:\n{sync}"
     );
     // The hold stays bounded: past it the end farther from the reader goes.
-    let cap = support::block_after(shell, "function holdEarlierTurns(held, turns, start) {");
+    let cap = support::block_after(
+        shell,
+        "function holdEarlierTurns(held, turns, start, { keepNewest = false } = {}) {",
+    );
     assert!(
         cap.contains("letNewestGo(held);") && shell.contains("const HELPER_TURN_CAP = 400;"),
         "turns read from above are held past the page's bound:\n{cap}"
