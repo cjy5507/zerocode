@@ -3545,12 +3545,28 @@ listen("pane:autonomy", (event) => {
 function rememberSessionUsage(session, frame) {
   const tokens = Number(frame?.ctx_tokens ?? 0);
   const window = Number(frame?.context_window ?? 0);
+  // zo's usage frame names no window yet; its session_status does
+  // (`rememberSessionWindow`) — a count keeps the window it was given until
+  // a frame names another (draft C9, t-82196).
+  const held = session ? sessionUsage.get(session) : null;
   const reading = {
     tokens: Number.isFinite(tokens) && tokens > 0 ? tokens : 0,
-    window: Number.isFinite(window) && window > 0 ? window : 0,
+    window: Number.isFinite(window) && window > 0 ? window : held?.window ?? 0,
   };
   if (session) sessionUsage.set(session, reading);
   return reading;
+}
+
+/* The window a session's status names (zo's `session_status`), kept beside
+ * its last count. Says whether it moved, so a status that says it again
+ * repaints nothing. */
+function rememberSessionWindow(session, frame) {
+  const window = Number(frame?.context_window ?? 0);
+  if (!session || !Number.isFinite(window) || window <= 0) return false;
+  const held = sessionUsage.get(session);
+  if (held?.window === window) return false;
+  sessionUsage.set(session, { tokens: held?.tokens ?? 0, window });
+  return true;
 }
 
 function usageCtxWord(reading) {
@@ -13362,7 +13378,7 @@ async function openHelperPage(row, sub) {
 async function openWirePage(agent, cwd, { resume = null, fromTerm = null, deadline = null, at = -1, history = [], historyFrom = 0, historyEnd = null, label = null, carry = null, refused = showError } = {}) {
   let started;
   try {
-    started = await invoke("wire_start", { agent, cwd, resume, from_pane: fromTerm, deadlineMs: deadline });
+    started = await invoke("wire_start", { agent, cwd, resume, fromPane: fromTerm, deadlineMs: deadline });
   } catch (error) {
     refused(error);
     return null;
@@ -13455,6 +13471,16 @@ function wireRowFor(term) {
   return row?.wire && row.wire_resumes ? row : null;
 }
 
+/* The opening words of the refusal the backend gives once it has typed the
+ * pane's exit command (`EXIT_TYPED_PANE_STANDS`, t-84850 r2): the pane still
+ * stands, and may yet read `/exit` or have left a shell behind — so what
+ * waited goes back to the box, never to the pane. */
+const WIRE_EXIT_TYPED = "the exit command was typed at the pane and the pane still stands";
+/* The opening words of the refusal for a pane whose CLI did not show a key
+ * typed at it (`PANE_NOT_READING_YET`, t-84850 r2): the page says what the
+ * person can do, in their language. */
+const WIRE_NOT_READING = "the pane's CLI did not show a key typed at it";
+
 /* Hand a pane's conversation to its wire — the toggle's 「대화」 on a Claude
  * Code pane. Same session, other renderer: the wire resumes the pane's
  * session id, the pane's CLI exits, and the tab that stood here is the
@@ -13477,6 +13503,7 @@ async function handPaneToWire(term) {
   }
   held.pendingWire = false;
   held.handing = true;
+  held.exitTyped = false;
   // When it began: what is sent meanwhile is held at most `COMPOSER_HOLD_MS`
   // from here, whatever the hand-over does (t-84670).
   held.handingSince = Date.now();
@@ -13512,18 +13539,50 @@ async function handPaneToWire(term) {
       // The refusal stays on the page (`paintPaneChat`), not only in a toast
       // — the backend logs it too (`refusal_line`), so the log and the page
       // give the same reason.
-      refused: (reason) => { held.wireRefusal = String(reason?.message ?? reason); },
+      // One that came after the exit command was typed says so in its own
+      // line, and what waited goes back to the box (`returnComposerQueueToBox`).
+      refused: (reason) => {
+        const said = String(reason?.message ?? reason);
+        held.exitTyped = held.exitTyped || said.startsWith(WIRE_EXIT_TYPED);
+        held.wireRefusal = held.exitTyped
+          ? null
+          : said.startsWith(WIRE_NOT_READING)
+            ? t("worker.handOverNotReading", "판의 CLI가 아직 입력을 읽지 않습니다 — 판에서 글을 한 번 보낸 뒤 「{{button}}」를 다시 누르세요", { button: t("view.conversation", "대화") })
+            : said;
+      },
     });
     // The conversation lives on the wire's tab now: the pane's own view steps
     // down, as it never stood when the hand-over came first.
-    if (tabId !== null) held.on = false;
+    if (tabId !== null) {
+      held.on = false;
+      held.exitTyped = false;
+    }
     return tabId !== null;
   } finally {
     held.handing = false;
     held.handingSince = null;
+    // The pane that left during the hand-over goes now, once the wire's page
+    // has taken its seat and what waited on it.
+    const left = held.left;
+    held.left = null;
+    // A pane that left while its wire was refused has no box and no screen
+    // for what waited: the words are said, with a way to copy them, rather
+    // than go nowhere.
+    if (left) {
+      if (tabId === null) sayComposerQueueLost(held.run);
+      left();
+    }
+    // A wire refused after the pane's exit command was typed: what waited
+    // goes back to the box, a draft the person sends again once they have
+    // looked at the pane — typed now, it would land after `/exit`, or at the
+    // shell a CLI left behind (t-84850 r2).
+    else if (tabId === null && held.exitTyped) {
+      returnComposerQueueToBox(held.run);
+      paintPaneChat(term);
+    }
     // A wire that never stood leaves the pane its conversation: the view says
     // why, and what waited goes the pane's own way, once (t-54304).
-    if (tabId === null) {
+    else if (tabId === null) {
       paintPaneChat(term);
       settleComposerQueue(held.run);
     }
@@ -13640,6 +13699,18 @@ function wireStateKey(log) {
 listen("wire:update", (event) => {
   const tab = activeHelperPage();
   if (tab?.worker.wire === event.payload?.id) void pollHelperPages();
+});
+
+/* The backend typed the pane's exit command (`wire:exit-typed`, t-84850 r2):
+ * from now on what is sent waits for the hand-over with no clock of its own —
+ * it goes to the wire's page, or back to the box, never to the pane, which
+ * may yet read `/exit` (`composerHolding`). */
+listen("wire:exit-typed", (event) => {
+  const held = paneChats.get(event.payload?.term);
+  if (!held?.handing) return;
+  held.exitTyped = true;
+  dropComposerRelease(held.run);
+  syncWorkerComposers(held.run);
 });
 
 /* A wire's question in the card's shape: an approval with the wire's own
@@ -13862,7 +13933,10 @@ async function setPaneChat(term, on, { wire = true } = {}) {
     if (on && wire && !held.handing) void handPaneToWire(term);
     return;
   }
-  if (!on) held.wireRefusal = null;
+  if (!on) {
+    held.wireRefusal = null;
+    held.exitTyped = false;
+  }
   // The late line's wait, read while nothing on the page has moved yet.
   if (on) chatLateMs();
   held.on = on;
@@ -14239,6 +14313,14 @@ function paintPaneChat(term) {
     "worker.wireRefused",
     typeof held.wireRefusal === "string" && held.wireRefusal !== "",
     t("worker.wireRefused", "실시간 대화로 넘기지 못했습니다: {{reason}} — 전사 뷰로 봅니다(답은 턴이 닫힐 때 한 번에). 「대화」를 다시 누르면 다시 시도합니다.", { reason: held.wireRefusal ?? "" }),
+  );
+  // Refused after the exit command went to the pane (t-84850 r2): one line,
+  // and what waited stands in the box.
+  noticeOnPaneChat(
+    held,
+    "worker.handOverExitTyped",
+    held.exitTyped === true && held.handing !== true,
+    t("worker.handOverExitTyped", "종료 명령을 보냈지만 판이 아직 떠 있습니다 — 판을 확인한 뒤 입력칸의 글을 다시 보내세요."),
   );
   // The first read is out. Said only once it is late: the stylesheet holds the
   // line hidden for `--chat-late-ms`, so a read that comes sooner is never seen
@@ -15161,7 +15243,9 @@ function paintHelperProse(host, text, base, { colour = true } = {}) {
   mdWhere = { base, page: null };
   try {
     paintMarkdown(host, text);
-    linkifyHelperProse(host);
+    // A settled answer's chips ask the disk whether they name a file; the
+    // words still being written are drawn again next frame and ask nothing.
+    linkifyHelperProse(host, { chips: colour });
     if (colour) paintMarkdownDiagrams(host);
     // Each code block wears the extension's copy over its corner (A9).
     dressCodeCopies(host);
@@ -15197,15 +15281,25 @@ function helperLinkHits(text) {
 }
 
 /* 문장 안의 경로·주소를 찾아 문으로 바꾼다. 코드 칩·블록과 이미 문인 것 안은
- * 건드리지 않는다 — 코드는 기계의 글이고, 문 안의 문은 없다. */
-function linkifyHelperProse(host) {
+ * 건드리지 않는다 — 코드는 기계의 글이고, 문 안의 문은 없다. 다만 글 전체가
+ * 경로 하나(뒤에 `:줄` 허용)이고 그 파일이 정말 있는 칩은 그 파일로 가는
+ * 문이다(시안 C7, t-82196, 검수 r1 P2-4, `doorChipsThatAreFiles`). `chips`가
+ * 거짓이면 칩은 묻지 않는다. 명령 칩과 블록 안의 경로는 그대로다. */
+function linkifyHelperProse(host, { chips: askChips = false } = {}) {
   const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
   const found = [];
+  const chips = [];
   for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-    if (node.parentElement?.closest("code, pre, .md-link, a")) continue;
+    const held = node.parentElement?.closest("code, pre, .md-link, a");
+    if (held) {
+      if (askChips && held.localName === "code" && held.childNodes.length === 1 &&
+        !held.parentElement.closest("pre, .md-link, a") && helperChipPath(node.data)) chips.push(held);
+      continue;
+    }
     const hits = helperLinkHits(node.data);
     if (hits.length) found.push([node, hits]);
   }
+  if (chips.length) void doorChipsThatAreFiles(chips, mdWhere?.base ?? "");
   for (const [node, hits] of found) {
     const parts = [];
     let last = 0;
@@ -15218,6 +15312,51 @@ function linkifyHelperProse(host) {
     }
     if (last < node.data.length) parts.push(node.data.slice(last));
     node.replaceWith(...parts);
+  }
+}
+
+/* 칩의 글이 경로 하나뿐인가 — 칩 전체를 덮는, 빈칸 없는 한 낱말에 슬래시나
+ * 점이 들고 뒤에 `:줄`이 붙을 수 있는 것. 낱말만으로는(`bundle`) 파일을 이름하지
+ * 않는다. 무엇이 파일인지는 이름의 모양이 아니라 디스크가 답한다. */
+const HELPER_CHIP_PATH_RE = /^(?:~\/|\.{1,2}\/|\/)?[\w.@%+~-]+(?:\/[\w.@%+~-]+)*(?::\d+(?:-\d+)?)?$/;
+
+function helperChipPath(words) {
+  return HELPER_CHIP_PATH_RE.test(words) && /[./]/.test(words.replace(HELPER_LINK_LINE_RE, ""));
+}
+
+/* 칩 가운데 정말 있는 파일을 이름한 것만 그 파일로 가는 문이 된다(시안 C7, 검수
+ * r1 P2-4) — 한 답의 칩을 한 번에, 그 답의 체크아웃에서 재어 디스크에 묻는다
+ * (`path_kinds`, 이름마다 stat 하나, 읽는 것은 없다). 슬래시 명령(`/compact`),
+ * 호출(`console.log`), 아무도 쓰지 않은 경로, 폴더는 칩으로 남는다 — 이름의 목록이
+ * 가르지 않는다. 문은 칩을 바깥에서 감싸고 칩 안의 글자는 한 자도 바뀌지 않는다.
+ * 답이 오기 전에 페이지가 놓은 칩은 건드리지 않는다. 체크아웃을 모르는 답의
+ * 상대 경로는 묻지 않는다. */
+async function doorChipsThatAreFiles(chips, base) {
+  const asked = [];
+  for (const chip of chips) {
+    const path = chip.textContent.replace(HELPER_LINK_LINE_RE, "");
+    if (base || path.startsWith("/")) asked.push({ chip, path: resolveDocPath(base, path) });
+  }
+  if (asked.length === 0) return;
+  let kinds;
+  try {
+    kinds = await invoke("path_kinds", { paths: asked.map((one) => one.path) });
+  } catch {
+    return;
+  }
+  // The door is `mdLink`'s, which reads where the words were drawn.
+  const previous = mdWhere;
+  mdWhere = { base, page: null };
+  try {
+    asked.forEach(({ chip }, at) => {
+      if (kinds?.[at] !== "file" || !chip.isConnected) return;
+      const door = helperLinkNode(chip.textContent, false);
+      door.classList.add("is-chip");
+      chip.replaceWith(door);
+      door.lastChild.replaceWith(chip);
+    });
+  } finally {
+    mdWhere = previous;
   }
 }
 
@@ -15290,12 +15429,66 @@ function standAnswerActions(list, row) {
 }
 
 /* The pointer and the focus carry the action row to the answer they reach —
+ * and the way back (`standRewindDoor`) to the person's words they reach —
  * listened for on the list, once, before the explain button looks for it
  * (`watchExplainTurns`). */
 function watchAnswerActions(list) {
-  const stand = (event) => standAnswerActions(list, event.target.closest?.(".helper-turn.is-assistant"));
+  const stand = (event) => {
+    standAnswerActions(list, event.target.closest?.(".helper-turn.is-assistant"));
+    const person = event.target.closest?.(".helper-turn.is-user");
+    if (person) standRewindDoor(list, person);
+  };
   list.addEventListener("pointerover", stand);
   list.addEventListener("focusin", stand);
+}
+
+/* 「여기서 고쳐 보내기」(시안 C10, t-82196 — 사람의 질문 3 답): 목록에 하나, 사람의
+ * 말 가운데 손이 닿은 것 — 없으면 가장 새것 — 아래에 선다. 누르면 판을 터미널로
+ * 돌리고 CLI 자신의 되감기 고르개를 연다(`rewindPane`). 그 명령을 이름하지 않은
+ * CLI의 대화에는 서지 않는다. */
+function rewindDoorNode(list) {
+  const door = document.createElement("button");
+  door.type = "button";
+  door.className = "helper-rewind";
+  // Enter and Space, while it has focus, are its own (`rearmKeySink`).
+  door.dataset.keyboardOwner = "true";
+  door.textContent = t("worker.rewindHere", "여기서 고쳐 보내기");
+  door.dataset.tip = t("worker.rewindTip", "터미널에서 되감기를 엽니다 — 돌아갈 말을 거기서 고릅니다");
+  door.addEventListener("click", () => {
+    const run = list.__run;
+    if (run && paneRewindable(run, agentSpecOf(run))) void rewindPane(run);
+  });
+  return door;
+}
+
+/* Stand the list's way back under `row` — or, given none, leave it where it
+ * stands, or under the newest words when it stands nowhere — while the pane
+ * takes the line; take it down while it does not (`paneRewindable`). Asked by
+ * every paint, so a turn that starts takes it down and one that ends stands
+ * it again. */
+function standRewindDoor(list, row = null) {
+  const run = list.__run;
+  if (!run || !paneRewindable(run, agentSpecOf(run))) {
+    list.__rewind?.remove();
+    return;
+  }
+  if (row && (row.__turn?.role !== "user" || !list.contains(row))) return;
+  const door = (list.__rewind ??= rewindDoorNode(list));
+  const at = row ?? (door.parentElement && list.contains(door) ? null : newestPersonRow(list));
+  if (at && door.parentElement !== at) at.appendChild(door);
+}
+
+/* The person's newest words on the page. */
+function newestPersonRow(list) {
+  for (let row = list.lastElementChild; row; row = row.previousElementSibling) {
+    if (row.__turn?.role === "user") return row;
+  }
+  return null;
+}
+
+/* The catalog's row for the agent a run speaks for. */
+function agentSpecOf(run) {
+  return installedAgents().find((row) => row.id === run.agent) ?? null;
 }
 
 /* The last thing the agent SAID on this page, or "" — what the copy under an
@@ -15549,16 +15742,87 @@ function paintActivityPill(group, run, spoken) {
   writeTextContent(cap.querySelector(".helper-group-words"), [head, took, lost].filter(Boolean).join(" · "));
   const now = cap.querySelector(".helper-group-live");
   writeHidden(now, live === null);
-  if (live) {
-    const kind = stepKindOf(live, run);
-    const words = toolWords(live);
-    writeTextContent(now, `${stepLook(kind).word()} ${stepTitleWords(kind, words.arg, words.whole)}`);
-  }
+  if (live) writeTextContent(now, pillStepWords(live, run));
   // 점은 알약의 상태다: 하나라도 나가 있으면 액센트, 아니면 실패가 있으면
   // 멈춤의 잉크, 아니면 초록 — 실패는 말로도 선다(색만으로 말하지 않는다).
   writeClass(group, "is-live", live !== null);
   writeClass(group, "is-failed", live === null && failed > 0);
   writeClass(group, "is-done", live === null && failed === 0);
+}
+
+/* 알약의 한 줄이 걸음을 말하는 법 — 종류의 말, 그리고 돌린 것이나 만진 것.
+ * 머리의 나가 있는 호출과 꼬리의 행이 같은 말을 쓴다. */
+function pillStepWords(turn, run) {
+  const kind = stepKindOf(turn, run);
+  const words = toolWords(turn);
+  return `${stepLook(kind).word()} ${stepTitleWords(kind, words.arg, words.whole)}`;
+}
+
+/* 알약의 꼬리(시안 C6, t-82196 — 사람의 질문 2 답): 에이전트가 일하는 동안
+ * 알약이 페이지의 마지막 턴이면, 그 마지막 세 걸음이 알약 아래 한 줄씩 선다 —
+ * 걸음이 선 모양의 표(✓ 돌아옴, ● 나가 있음, ✕ 실패 — 색만이 아니라 모양),
+ * 터미널의 고정폭으로 쓴 걸음, 걸린 시간이나 「진행 중」. VS Code의 compact
+ * 진행 표시다. 답이 서거나 에이전트가 멈추거나 알약을 펼치면(몸이 걸음을 다
+ * 보인다) 다시 한 줄이다. 세 행과 함께 한 번 짓고, 말이 바뀐 칸만 쓴다. 눈을
+ * 위한 것이다 — 화면 읽기에게는 펼친 알약이 있고, 목록은 다시 쓸 때마다 읽어
+ * 주는 log다. */
+const PILL_TAIL_STEPS = 3;
+const PILL_TAIL_MARKS = Object.freeze({ live: "●", done: "✓", failed: "✕" });
+
+function pillTailNode() {
+  const tail = document.createElement("div");
+  tail.className = "helper-group-tail";
+  tail.setAttribute("aria-hidden", "true");
+  for (let at = 0; at < PILL_TAIL_STEPS; at += 1) {
+    const row = document.createElement("div");
+    row.className = "helper-group-tail-row";
+    for (const part of ["mark", "what", "when"]) {
+      const span = document.createElement("span");
+      span.className = `helper-group-tail-${part}`;
+      row.appendChild(span);
+    }
+    tail.appendChild(row);
+  }
+  return tail;
+}
+
+function paintPillTail(group, run, spoken) {
+  const steps = [];
+  for (let at = group.__members.length - 1; at >= 0 && steps.length < PILL_TAIL_STEPS; at -= 1) {
+    const state = activityState(group.__members[at], run, spoken);
+    if (state !== "thought") steps.unshift({ turn: group.__members[at], state });
+  }
+  let tail = group.querySelector(":scope > .helper-group-tail");
+  if (steps.length === 0) {
+    tail?.remove();
+    return;
+  }
+  if (!tail) {
+    tail = pillTailNode();
+    group.firstElementChild.after(tail);
+  }
+  for (let at = 0; at < PILL_TAIL_STEPS; at += 1) {
+    const row = tail.children[at];
+    const step = steps[at];
+    writeHidden(row, !step);
+    if (!step) continue;
+    for (const state of ["live", "done", "failed"]) writeClass(row, `is-${state}`, step.state === state);
+    const [mark, what, when] = row.children;
+    writeTextContent(mark, PILL_TAIL_MARKS[step.state]);
+    writeTextContent(what, pillStepWords(step.turn, run));
+    writeTextContent(when, step.state === "live" ? t("worker.stepLive", "진행 중") : stepTook(step.turn, step.turn));
+  }
+}
+
+/* 꼬리를 입는 알약 — 일하는 동안의 페이지 마지막 턴 하나. 그림마다 한 번 읽고,
+ * 전에 입었던 알약은 내려놓는다. */
+function standPillTail(list, run, spoken) {
+  let last = list.lastElementChild;
+  while (last && last.dataset.turn === undefined) last = last.previousElementSibling;
+  const owner = run.status === "running" && last?.classList.contains("helper-group") ? last : null;
+  if (list.__tailed && list.__tailed !== owner) list.__tailed.querySelector(":scope > .helper-group-tail")?.remove();
+  list.__tailed = owner;
+  if (owner) paintPillTail(owner, run, spoken);
 }
 
 /* 알약을 펼치거나 접는다 — 사람의 한 동작에만. 펼치면 구성원의 행을 그때
@@ -15676,6 +15940,7 @@ function syncHelperTurns(list, run) {
     for (const row of list.querySelectorAll(":scope > [data-turn]")) row.remove();
     run.helper.gone?.clear();
     list.__lastAnswer = null;
+    list.__tailed = null;
     syncHelperTasks(list, run);
     syncStreamingTurns(list, run);
     syncHelperReport(list, run);
@@ -15804,6 +16069,8 @@ function syncHelperTurns(list, run) {
   }
   for (const group of list.querySelectorAll(":scope > .helper-group")) if (group.__waiting) pills.add(group);
   for (const group of pills) paintActivityPill(group, run, spoken);
+  // The pill at the foot shows its last steps while the agent works (C6).
+  standPillTail(list, run, spoken);
   // A turn that arrived stands whole, the moment it arrived — the terminal
   // already showed these words as they were said, and a page that released
   // them again a word at a time (09-16 → 09-20) only lagged behind it. The
@@ -15820,6 +16087,9 @@ function syncHelperTurns(list, run) {
   // height yet, and a read in this task would lay the page out once more than
   // its frame does (t-55369).
   if (people.length) requestAnimationFrame(() => clipPersonRows(people.filter((row) => row.isConnected)));
+  // The way back stands under the newest words until a hand reaches others —
+  // never pulled from under the keyboard's focus — while the pane takes it (C10).
+  standRewindDoor(list, people.length && document.activeElement !== list.__rewind ? people.at(-1) : null);
   if (follow && !reported) scrollHelperToBottom(list);
   // Whether anything stands above, and whether the newest turns are held.
   paintEarlierDoor(list);
@@ -18081,8 +18351,22 @@ listen("term:exited", (event) => {
   // every leaf has spawned, and a resume that dies inside that window would
   // otherwise slip this prune and mount as a pane nothing ever clears. The
   // id is parked and `mountStoredLayout` prunes it before the layout stands.
-  if (!dropClosedTermLeaf(term, "exit") && waking.size > 0) {
-    exitedUnheld.add(term);
+  const dropLeaf = () => {
+    if (!dropClosedTermLeaf(term, "exit") && waking.size > 0) exitedUnheld.add(term);
+  };
+  // A pane that leaves while its conversation is being handed to its wire
+  // leaves because of it: `wire_start` typed its exit command and answers
+  // only once the screen has gone, so this event comes first. Its tab, and
+  // what waited on its page, stay for the wire's page to take — the
+  // hand-over drops the leaf once that page stands (`handPaneToWire`).
+  const handing = paneChats.get(term);
+  if (handing?.handing) handing.left = dropLeaf;
+  else {
+    // A pane refused after its exit command was typed, whose CLI read it
+    // late: what waited stood in its box, and the box goes with the pane —
+    // said, with a way to copy it, rather than dropped (t-84850 r2).
+    if (handing?.exitTyped) sayComposerQueueLost(handing.run);
+    dropLeaf();
   }
 });
 
@@ -18854,6 +19138,10 @@ function laneSignal(session, frame) {
     // zo's status card carries what its working row says (`activity`); the
     // frame leaves it out while the pane is idle.
     notePaneNow(session, frame.activity && typeof frame.activity === "object" ? frame.activity : null);
+    // And the window its model holds: the composer's chip draws its share.
+    if (rememberSessionWindow(session, frame)) {
+      for (const term of paneTermsBySession(session)) paintComposerChipsFor(term);
+    }
   } else if (frame.type === "usage") {
     /* 상태바와 보드는 같은 손으로 읽는다 (t-2374). 두 번째 파서를 지으면
      * 「상태바는 24,489인데 카드는 비었다」가 언제든 생긴다 — 그리고 그것은
