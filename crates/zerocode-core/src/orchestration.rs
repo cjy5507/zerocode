@@ -58,7 +58,9 @@ pub mod text_file;
 pub use marked::{Marked, MarkedExport, RunShare, Share};
 pub use progress::{NextStep, WorkProgress, WorkStage};
 pub use project_scope::{ProjectSource, Reach, RunProject, Scope};
-pub use session_history::{CONVERSATION_HELD_ELSEWHERE, SessionHistory};
+pub use session_history::{
+    CONVERSATION_HELD_ELSEWHERE, CONVERSATION_PICKED_UNASKED, SessionHistory,
+};
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -4881,6 +4883,14 @@ const SEAT_TAKEN_OVER: &str = "coordinator seat taken over";
 /// ([`project_scope::acting_run`]).
 pub const QUESTION_CLOSE: &str = "question-close";
 
+/// The longest reason `question-close` takes, in characters (t-84271 ①): the
+/// one line of why a question closes without an answer is the record it
+/// leaves in the thread, so it is a line and not a pasted log. The ledger
+/// refuses a longer one; the desk (`desk_question_close`) refuses it before
+/// the ledger is asked; the inbox page's field stops at the same number
+/// (`INBOX_CLOSE_REASON_MAX`, held equal by a source contract).
+pub const QUESTION_CLOSE_REASON_MAX: usize = 200;
+
 /// The final word an ending is to the askers of the worker it ended: a
 /// terminal that died or a sleeper the restart lost EXITED, and everything
 /// else — a stop, an abandon — is its coordinator CANCELLING it. Read off
@@ -4968,8 +4978,9 @@ pub fn worker_done_succeeded(body: &str) -> Result<bool, String> {
         .and_then(|said| said.get("ok").and_then(serde_json::Value::as_bool))
         .ok_or_else(|| {
             format!(
-                "worker_done needs a verdict it can read — send \
-                 --body '{{\"ok\":true,\"summary\":\"…\"}}' or '{{\"ok\":false}}'. \
+                "worker_done needs a verdict it can read — write \
+                 {{\"ok\":true,\"summary\":\"…\"}} (or {{\"ok\":false}}) to a file with a quoted \
+                 heredoc and send --body-file <that file's absolute path>. \
                  This body said nothing either way: {body}"
             )
         })
@@ -11709,21 +11720,8 @@ impl Ledger {
          * A quiet look — no delivery, no messages — survives: it names nothing
          * to look up, and a re-look at a compacted run honestly answers empty,
          * which is exactly what it answered the first time.
-         */
-        for held in &mut self.served {
-            if held.is_tombstone() {
-                continue;
-            }
-            let ServedAnswer::Check(about) = &held.answer else {
-                continue;
-            };
-            if about.delivery.is_some() && compacted.iter().any(|id| id == &about.run) {
-                held.expire();
-                swept.receipts_expired += 1;
-            }
-        }
-
-        /* And an answer older than the policy, whatever verb it came from.
+         *
+         * And an answer older than the policy, whatever verb it came from.
          *
          * This is the part that actually bounds the table's SIZE. A receipt's
          * key is four short strings; its answer is whatever the verb printed,
@@ -11735,15 +11733,31 @@ impl Ledger {
          * alone rather than aged from now: guessing its date would be the one
          * mistake that cannot be undone, and the ceiling
          * (`SERVED_MAX`) retires it soon enough on its own.
+         *
+         * Read first, and only the rows to expire are reached for: a borrow of
+         * the receipts moves their stamp whether or not any of them changes,
+         * and a sweep that gave nothing up would have the next write digest
+         * them all (t-85378 r2).
          */
-        for held in &mut self.served {
-            if held.is_tombstone() {
-                continue;
-            }
-            if held.filed_ms.is_some_and(|at| at <= cutoff_ms) {
-                held.expire();
-                swept.receipts_expired += 1;
-            }
+        let expiring: Vec<usize> = self
+            .served
+            .iter()
+            .enumerate()
+            .filter(|(_, held)| {
+                let batch_gone = matches!(
+                    &held.answer,
+                    ServedAnswer::Check(about)
+                        if about.delivery.is_some()
+                            && compacted.iter().any(|id| id == &about.run)
+                );
+                !held.is_tombstone()
+                    && (batch_gone || held.filed_ms.is_some_and(|at| at <= cutoff_ms))
+            })
+            .map(|(at, _)| at)
+            .collect();
+        swept.receipts_expired += expiring.len();
+        for at in expiring {
+            self.served[at].expire();
         }
 
         /* Tombstones are bounded too. "Keep every key forever" is how a table
@@ -12091,7 +12105,12 @@ impl Ledger {
          * never typed at again. */
         let mut interrupted: Vec<(String, String)> = Vec::new();
         for run in &mut self.runs {
-            for row in &mut run.messages {
+            // Read first, and only the rows to rewrite are reached for: a
+            // restart runs on every open, and a borrow of the letters moves
+            // their stamp whether or not any of them changes, which would have
+            // the first write digest every letter again (t-85378 r2).
+            let mut reported: Vec<(usize, Text)> = Vec::new();
+            for (at, row) in run.messages.iter().enumerate() {
                 let unsettled = match row.kind {
                     MessageKind::Handover => HANDOVER_WALKING,
                     MessageKind::Resumed => RESUME_TYPING,
@@ -12123,7 +12142,11 @@ impl Ledger {
                 body["status"] = serde_json::Value::from(HANDOVER_INTERRUPTED);
                 body["why"] = serde_json::Value::from(why);
                 body["interruptedMs"] = serde_json::Value::from(now_ms);
-                row.body = body.to_string().into();
+                reported.push((at, body.to_string().into()));
+            }
+            for (at, body) in reported {
+                let row = &mut run.messages[at];
+                row.body = body;
                 interrupted.push((run.id.clone(), row.id.clone()));
             }
         }
@@ -13916,7 +13939,9 @@ impl Ledger {
     /// one pane ran its neighbour's conversation: an agent's own "continue"
     /// picks the newest conversation of its folder, and two workers make
     /// two of them. The summons that seats the second is where that is
-    /// still a choice — a `--worktree` cut is a folder of its own.
+    /// still a choice — a `--worktree` cut is a folder of its own. One folder
+    /// spelled two ways is one folder (t-85366), so this asks the disk once
+    /// per live row: asked at a summons, never from a verb the ledger replays.
     #[must_use]
     pub fn workers_sharing_checkout(
         &self,
@@ -13929,7 +13954,12 @@ impl Ledger {
             .filter(|(_, one)| {
                 one.id != worker
                     && one.state.may_occupy_pane()
-                    && one.checkout.as_deref() == Some(checkout)
+                    && one.checkout.as_deref().is_some_and(|held| {
+                        crate::git_dir::same_folder(
+                            std::path::Path::new(held),
+                            std::path::Path::new(checkout),
+                        )
+                    })
             })
             .map(|(run, one)| (run.id.clone(), one.id.clone(), one.agent.clone()))
             .collect()
@@ -21125,12 +21155,14 @@ pub fn worker_briefing(task: &str, title: &str, spec: &str) -> String {
     };
     format!(
         "You are a worker in this window's orchestration, carrying task {carrying}. \
-When your work is done, run: zerocode-orc send --type worker_done \
---retry-request done-{task} --body \
-'{{\"ok\":true,\"{summary}\":\"<what changed and how you verified it>\",\"{head}\":\"<the commit you hand in, when the work is code>\"}}' \
+When your work is done, write this JSON \
+{{\"ok\":true,\"{summary}\":\"<what changed and how you verified it>\",\"{head}\":\"<the commit you hand in, when the work is code>\"}} \
+to a file outside every checkout — in your scratchpad or `$TMPDIR`, under a name of your own such as \
+`done-{task}.json` — with a quoted heredoc (no shell reads a quoted heredoc; PowerShell writes `@'…'@`) and run: zerocode-orc send --type worker_done \
+--retry-request done-{task} --body-file <that file's absolute path> \
 — with \"ok\":false instead if you could not finish; the coordinator reviews \
-the commit you name. If you are blocked, run: \
-zerocode-orc ask --retry-request <a name of your own> --body '<your question>' \
+the commit you name. If you are blocked, write your question to a file the same way and run: \
+zerocode-orc ask --retry-request <a name of your own> --body-file <that file's absolute path> \
 — it waits for the answer itself (ten minutes; on a timeout, return with \
 `ask --resume <questionId>`) rather than asking the person, whose screen \
 nobody may be watching. Never raise your own CLI's question prompt: the \
@@ -21196,12 +21228,14 @@ pub fn federated_briefing(home_dispatch: &str) -> String {
     let trust = message_trust_briefing();
     format!(
         "You are a worker borrowed by another window's orchestration \
-(remote dispatch {home_dispatch}). When your work is done, run: zerocode-orc \
-send --type worker_done --retry-request done-{home_dispatch} --body \
-\'{{\"ok\":true,\"{summary}\":\"<what changed and how you verified it>\",\"{head}\":\"<the commit you hand in, when the work is code>\"}}\' \
+(remote dispatch {home_dispatch}). When your work is done, write this JSON \
+{{\"ok\":true,\"{summary}\":\"<what changed and how you verified it>\",\"{head}\":\"<the commit you hand in, when the work is code>\"}} \
+to a file outside every checkout — in your scratchpad or `$TMPDIR`, under a name of your own such as \
+`done-{home_dispatch}.json` — with a quoted heredoc (no shell reads a quoted heredoc; PowerShell writes `@'…'@`) and run: zerocode-orc \
+send --type worker_done --retry-request done-{home_dispatch} --body-file <that file's absolute path> \
 — with \"ok\":false instead if you could not finish; the coordinator reviews \
-the commit you name. If you are blocked, run: \
-zerocode-orc ask --retry-request <a name of your own> --body '<your question>' \
+the commit you name. If you are blocked, write your question to a file the same way and run: \
+zerocode-orc ask --retry-request <a name of your own> --body-file <that file's absolute path> \
 — it waits for the answer itself; your questions and reports travel to the \
 home window on their own. Never raise your own CLI's question prompt: \
 nobody on either side can answer one. Keep the summary short and carry a \
@@ -25604,6 +25638,13 @@ fn plan_inner(
                     )
                 })?
                 .to_string();
+            if note.chars().count() > QUESTION_CLOSE_REASON_MAX {
+                return Err(format!(
+                    "question-close --reason is one line of at most \
+                     {QUESTION_CLOSE_REASON_MAX} characters — {} given",
+                    note.chars().count()
+                ));
+            }
             let run_id = match words.value("--run") {
                 Some(_) => bound(ledger, &words, &caller, &seat)?,
                 None => run_holding(ledger, standing_in(ledger, &caller, &seat).as_deref(), &id)

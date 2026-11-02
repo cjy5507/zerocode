@@ -1061,6 +1061,7 @@ pub(super) fn note_zo_pane_state(
             prompt_id: None,
             named: None,
             said: None,
+            answer: None,
             ask,
             ask_prompt: None,
             approval: None,
@@ -3193,8 +3194,9 @@ pub(super) fn forget_term_state(state: &AppState, term: TermId, settlement: Term
     // helpers' keys are ones nothing else could ever name again — a `remove`
     // by term could not reach them.
     state.forget_activities(term);
-    // And its team environment.
+    // And its team environment, and where it was started.
     state.team_envs().remove(&term);
+    crate::conversation_wake::PANE_LAUNCHES.gone(term);
     state.delivery_waiters().remove(&term);
     state.worker_prompt_submits().remove(&term);
     state.completed_worker_cleanups().remove(&term);

@@ -148,6 +148,10 @@ const hookStamps = new Map();
  * already row-sized. Dropped with the shell in `dropTermView`. */
 const panePrompts = new Map();
 const paneSaid = new Map();
+/* What the agent ANSWERED when its last turn ended — and only that. `paneSaid` also follows the tool that just landed (a
+ * `cat` of a file is not something the agent said), so a line that quotes the agent reads this map: the 「당신 차례」 list's
+ * 「직전 답에서」 (r2 P2-3). Cleared by a turn ending with no answer, by a new session on the pane, and when the pane goes. */
+const paneAnswer = new Map();
 
 /* And WHICH CONVERSATION each shell is on, when its agent said so.
  *
@@ -574,6 +578,10 @@ function noteBell(term) {
  * menu — do not offer it. */
 function resumableSessionOf(tab) {
   if (tab.kind !== "term") return null;
+  // The pane in front first (t-68069): on a split tab the menu speaks for the
+  // pane somebody is looking at, not whichever leaf comes first.
+  const front = paneSessions.get(activePaneOf(tab));
+  if (front?.resumable) return front;
   for (const term of paneLeaves(tab.layout)) {
     const known = paneSessions.get(term);
     if (known?.resumable) return known;
@@ -969,6 +977,7 @@ function askPanelNode(card, draft) {
     why.className = "board-ask-raised";
     why.setAttribute("role", "status");
     why.textContent = raised;
+    why.dataset.tip = raised;
     panel.appendChild(why);
   }
 
@@ -2037,7 +2046,7 @@ function yourTurnsDrawing(turns) {
   return JSON.stringify([locale, turns.map((card) => {
     const key = yourTurnKey(card);
     const draft = yourTurnDrafts.get(key);
-    return [key, card.heading, card.changed_at, draft?.sending, draft?.refusal, draft?.index, draft?.selections];
+    return [key, card.heading, card.changed_at, yourTurnModelOf(card), draft?.sending, draft?.refusal, draft?.index, draft?.selections];
   })]);
 }
 
@@ -2082,8 +2091,23 @@ function yourTurnHeadNode(card, kind, now, open = null) {
   const agent = document.createElement("span");
   agent.className = "your-turn-agent";
   agent.textContent = card.agent;
-  head.append(mark, name, agent, yourTurnAgeNode(card.changed_at || card.at || now, now));
+  head.append(mark, name, agent);
+  // The model the agent runs (the draft's 「ZO · claude-opus-5-5」): what the window knows of the pane, nothing guessed.
+  const model = yourTurnModelOf(card);
+  if (model !== "") {
+    const run = document.createElement("span");
+    run.className = "your-turn-model";
+    run.textContent = model;
+    run.dataset.tip = model;
+    head.append(run);
+  }
+  head.append(yourTurnAgeNode(card.changed_at || card.at || now, now));
   return head;
+}
+
+function yourTurnModelOf(card) {
+  const pane = typeof card.pane === "string" && card.pane.startsWith("term:") ? Number(card.pane.slice(5)) : NaN;
+  return Number.isInteger(pane) ? String(paneModels.get(pane) ?? "") : "";
 }
 
 /* An age that moves on the clock's beat in place: the moment it counts from
@@ -2133,7 +2157,9 @@ function openTurnConversation(card) {
 }
 
 function yourTurnOpenNode(card) {
-  return yourTurnButton("btn your-turn-open", t("yourTurn.open", "대화 열기"), () => openTurnConversation(card));
+  const door = yourTurnButton("btn your-turn-open", t("yourTurn.open", "대화 열기"), () => openTurnConversation(card));
+  door.append(iconNode("forward"));
+  return door;
 }
 
 /* 「가장 오래 N분」 — how long the oldest of the turns has waited; nothing at none. */
@@ -2205,14 +2231,29 @@ function yourTurnRowNode(card, now) {
 
 /* ---- the list dropped from the chip ---- */
 
+/* Hung from the chip's own edge, wherever the title bar has put it — read
+ * before the list stands, so the read lays nothing out; and read again when
+ * the window changes size, which is what moves the title bar (t-84799 B4). */
+function hangYourTurnList() {
+  const box = el("your-turn").getBoundingClientRect();
+  const list = el("your-turn-list");
+  list.style.setProperty("--your-turn-top", `${Math.round(box.bottom)}px`);
+  list.style.setProperty("--your-turn-left", `${Math.round(box.left)}px`);
+}
+
+let yourTurnHangFrame = 0;
+window.addEventListener("resize", () => {
+  if (el("your-turn-list").hidden || yourTurnHangFrame !== 0) return;
+  yourTurnHangFrame = requestAnimationFrame(() => {
+    yourTurnHangFrame = 0;
+    if (!el("your-turn-list").hidden) hangYourTurnList();
+  });
+});
+
 function openYourTurnList() {
   const list = el("your-turn-list");
   const chip = el("your-turn");
-  // Hung from the chip's own edge, wherever the title bar has put it — read
-  // before the list stands, so the read lays nothing out.
-  const box = chip.getBoundingClientRect();
-  list.style.setProperty("--your-turn-top", `${Math.round(box.bottom)}px`);
-  list.style.setProperty("--your-turn-left", `${Math.round(box.left)}px`);
+  hangYourTurnList();
   if (list.hidden) {
     list.hidden = false;
     chip.setAttribute("aria-expanded", "true");
@@ -2298,13 +2339,13 @@ function yourTurnItemNode(card, now) {
   const acts = document.createElement("div");
   acts.className = "your-turn-acts";
   if (kind === "permission") {
-    item.append(yourTurnPermissionNode(card));
+    item.append(...yourTurnPermissionNodes(card, draft));
     acts.append(yourTurnAllowNode(card, draft, true), yourTurnDenyNode(card, draft));
   } else if (card.ask_prompt) {
     draft.open = true;
-    item.append(askPanelNode(card, draft));
+    item.append(...yourTurnContextNodes(card), askPanelNode(card, draft));
   } else if (kind === "question") {
-    item.append(yourTurnWordsNode(card, draft));
+    item.append(...yourTurnContextNodes(card), yourTurnWordsNode(card, draft));
   } else if (card.said) {
     item.append(Object.assign(document.createElement("p"), { className: "your-turn-question", textContent: card.said }));
   }
@@ -2314,17 +2355,47 @@ function yourTurnItemNode(card, now) {
   return item;
 }
 
-function yourTurnPermissionNode(card) {
+/* A tool whose permission reads as a shell command (the draft's 「셸 명령 허락 — npm install」): the names the CLIs give
+ * their shell tool. Any other tool is said by its own name. */
+const YOUR_TURN_SHELL_TOOLS = new Set(["bash", "shell", "sh", "zsh", "run_shell_command", "shell_command", "exec_command"]);
+
+/* A permission, as the list says it: the sentence (a plan permission asks about the plan) and, for the plan tool, the
+ * plan itself in the well the board's card gives it — one painter, so a heading and a numbered step look the same. */
+/* A question's one line of context (the draft's 「직전 답에서 — 「…」」): what the agent last said in its pane — the words the
+ * turn ended with (`paneAnswer`, never a tool's output) — so the question is read with what led to it. Nothing where the window knows no such
+ * words; the line is cut by its box, never by a count of letters. */
+function yourTurnContextNodes(card) {
+  const pane = typeof card.pane === "string" && card.pane.startsWith("term:") ? Number(card.pane.slice(5)) : NaN;
+  const said = Number.isInteger(pane) ? String(paneAnswer.get(pane) ?? "").replace(/\s+/g, " ").trim() : "";
+  if (said === "") return [];
+  const line = document.createElement("p");
+  line.className = "your-turn-context";
+  line.textContent = t("yourTurn.lastSaid", "직전 답에서 — 「{{said}}」", { said });
+  return [line];
+}
+
+function yourTurnPermissionNodes(card, draft) {
+  const plan = typeof card.approval.plan === "string" ? card.approval.plan : "";
   const box = document.createElement("p");
   box.className = "your-turn-question";
-  box.textContent = t("board.approve.title", "{{tool}} 허용할까요?", { tool: card.approval.tool });
+  if (plan) {
+    box.textContent = t("board.approve.planTitle", "계획을 승인할까요?");
+    const well = document.createElement("div");
+    well.className = "board-approve-plan your-turn-plan helper-said";
+    paintHelperProse(well, plan, draft.base ?? "");
+    return [box, well];
+  }
+  const tool = String(card.approval.tool ?? "");
+  box.textContent = YOUR_TURN_SHELL_TOOLS.has(tool.toLowerCase())
+    ? t("yourTurn.permShell", "셸 명령 허락")
+    : t("yourTurn.permTool", "{{tool}} 허락", { tool });
   if (card.approval.summary) {
     const mono = document.createElement("code");
     mono.className = "your-turn-mono";
     mono.textContent = card.approval.summary;
-    box.append(" ", mono);
+    box.append(" — ", mono);
   }
-  return box;
+  return [box];
 }
 
 /* The keys the list answers to. A number picks as far as the choices the
@@ -3545,9 +3616,9 @@ listen("pane:autonomy", (event) => {
 function rememberSessionUsage(session, frame) {
   const tokens = Number(frame?.ctx_tokens ?? 0);
   const window = Number(frame?.context_window ?? 0);
-  // zo's usage frame names no window yet; its session_status does
-  // (`rememberSessionWindow`) — a count keeps the window it was given until
-  // a frame names another (draft C9, t-82196).
+  // A frame may not name a window yet (zo before its first session_status):
+  // a count keeps the window it was given until a frame names another
+  // (`rememberSessionWindow`; draft C9, t-82196).
   const held = session ? sessionUsage.get(session) : null;
   const reading = {
     tokens: Number.isFinite(tokens) && tokens > 0 ? tokens : 0,
@@ -9123,16 +9194,24 @@ async function resumeVaultSession(session, worktree) {
   // rather than leaving a terminal in a workspace nobody is standing in.
   if (worktree && worktree !== activeWorktreePath && !(await activateWorktree(worktree))) return;
   try {
-    const term = await invoke("resume_vault_session", {
+    const woke = await invoke("resume_vault_session", {
       session,
       worktree: worktree ?? null,
       ...spawnGrid({ placement: "tab" }),
     });
+    // Held in a pane already: that pane is the answer, as on every other door
+    // (t-68069). One with no tab yet is on its way to the stage by itself.
+    if (woke.standing) {
+      const tab = tabOfTerm(woke.term);
+      if (tab) await focusAgentPane(tab.worktree, tab.id, woke.term, session.agent);
+      toast(t("vault.alreadyOpen", "이 대화는 이미 터미널 {{term}}번에서 열려 있어 새로 열지 않았습니다", { term: woke.term }), "warn");
+      return;
+    }
     // Named for what was SAID in it, not for the agent: a vault with five Claude
     // conversations would otherwise open five tabs all called `claude`, which is
     // the exact thing reopening a specific one is for. A tab for the same reason
     // the pane menu's 이어서 is one — a conversation reopened is somewhere to go.
-    mountTermTab(term, { agent: session.title }, { placement: "tab" });
+    mountTermTab(woke.term, { agent: session.title }, { placement: "tab" });
   } catch (error) {
     showError(String(error));
   }
@@ -12166,7 +12245,8 @@ function restartSessionGroups(items) {
 function paintWorktreeAgents() {
   if (revealStartupActiveProjects()) void refreshWorktrees();
   const held = worktreeLanes();
-  for (const host of worktreeList.querySelectorAll(".wt-agents[data-worktree-path]")) {
+  const hosts = worktreeList.querySelectorAll(".wt-agents[data-worktree-path]");
+  for (const host of hosts) {
     const path = host.dataset.worktreePath;
     const all = worktreeAgentRows(path);
     const open = expandedWorktrees.has(path);
@@ -12264,15 +12344,9 @@ function paintWorktreeAgents() {
     // content and must keep its handle; only a genuinely empty card hides the
     // host (a restore-waiting row also keeps it visible).
     host.hidden = all.length + deadSummary.total === 0 && !restoring;
-    const unseated = host.previousElementSibling?.querySelector(".wt-unseated");
-    if (unseated) {
-      // 「에이전트 창 없음」 is not said beside a stage the ledger holds (t-44016): the stage says more. On a folder
-      // with nothing to say, it stays as the explanation of its empty list.
-      unseated.hidden = !host.hidden || landingStageWord(worktreeStageOf(path)) !== "";
-      // The branch line's standing is one decision (`dressWorktreeTitle`):
-      // a name the title already said, a base chip, this marker.
-      dressWorktreeTitle(host.previousElementSibling);
-    }
+    // The branch line's standing is one decision (`dressWorktreeTitle`): a name the title already said and a base chip.
+    // 「에이전트 창 없음」 is no longer one of its parts: it stands once on the project's head (t-84799 A1).
+    dressWorktreeTitle(host.previousElementSibling);
     // The card boundary and the list read the SAME fact. Deriving ownership
     // again with `:has([hidden])` left an inactive worker looking like a
     // top-level sibling in the measured browser even though this painter had
@@ -12280,6 +12354,11 @@ function paintWorktreeAgents() {
     // only dresses it.
     host.closest(".wt-node")?.classList.toggle("has-agents", !host.hidden);
   }
+  // The project heads count the cards that hold nothing — read off the cards themselves, so a card that held (a
+  // restore-waiting row, a finished work's row) is not counted as empty (r2 P3-7).
+  const seatless = new Set();
+  for (const host of hosts) if (host.hidden) seatless.add(host.dataset.worktreePath);
+  paintProjectUnseated(seatless);
   retainedTicker.sync();
 }
 
@@ -12565,6 +12644,7 @@ listen("hook:agent", (event) => {
     (row) => row.id === `run:${agent}` && row.state !== "done",
   );
   if (agent && ownAgent && agent !== ownAgent && fromNested) return;
+  settlePaneConversationWord(term, state, session);
   // The snapshot fence is about observations, not transitions. A repeated
   // Working is still newer than a Done snapshot whose request was already in
   // flight, even though it must not reset the row's elapsed clock below.
@@ -12649,6 +12729,13 @@ listen("hook:agent", (event) => {
     paneAutonomy.delete(term);
   }
   const named = Boolean(session) && paneSessions.get(term)?.session?.id !== session.id;
+  // The answer the list quotes belongs to the session that gave it (r2 P2-3): a new one on this pane starts without it,
+  // and a turn that ended with no answer (an interrupt) leaves none to quote.
+  if (named) paneAnswer.delete(term);
+  if (state === "done") {
+    if (event.payload.answer) paneAnswer.set(term, event.payload.answer);
+    else paneAnswer.delete(term);
+  }
   // A pane that stood in for a conversation it could not bring back, and that
   // a new conversation has now taken (t-12063): the old one is kept as owed
   // once the new one holds the pane, never dropped with the old record.
@@ -12688,8 +12775,9 @@ listen("hook:agent", (event) => {
       scheduleAgentPaint(["tabs", "cards", "badge", "board"]);
     } else if (askNow !== askBefore) {
       // Another question under the same state: the column the badge reads
-      // is asked again, as a state move asks it (t-82287).
-      scheduleAgentPaint(["cards", "badge", "board"]);
+      // is asked again, as a state move asks it (t-82287). The tab says 질문 or 권한 by what it asks, so a
+      // question that turns into a permission inside one wait redraws the strip too (r2 P3-10).
+      scheduleAgentPaint(["tabs", "cards", "badge", "board"]);
     } else if (clearedRestoreBirth || event.payload.prompt || event.payload.said || modelMoved) {
       scheduleAgentPaint(["cards", "board"]);
     }
@@ -12702,6 +12790,9 @@ listen("hook:agent", (event) => {
   }
   const wasMidTurn = isMidTurn(hookStates.get(term));
   hookStates.set(term, state);
+  // Whether the agent stands in its pane is read off this very word (`paneWearsAgent`): the switch and the head
+  // that were painted above wore the old one (t-84799 B6b).
+  paintViewToggle();
   if (asking && !shaped) watchSignalledWait(term);
   else clearSignalledWait(term);
   // The state moved: whatever the notify seat said about the LAST ring of
@@ -13926,6 +14017,12 @@ function paneChatOn(term) {
   return paneChats.get(term)?.on === true;
 }
 
+/* Whether the conversation has ever stood on this pane. Its record is then something to go back to: the switch is the
+ * way back from the screen, so a pane holding one keeps its head and switch even after its agent left (r2 P3-5). */
+function paneHoldsConversation(term) {
+  return paneChats.get(term)?.stood === true;
+}
+
 async function setPaneChat(term, on, { wire = true } = {}) {
   const held = paneChatOf(term);
   if (held.on === on) {
@@ -13943,6 +14040,8 @@ async function setPaneChat(term, on, { wire = true } = {}) {
     held.wireRefusal = null;
     held.exitTyped = false;
   }
+  // Once the conversation has stood on this pane it is a record the pane holds (`paneHoldsConversation`).
+  if (on) held.stood = true;
   // The late line's wait, read while nothing on the page has moved yet.
   if (on) chatLateMs();
   held.on = on;
@@ -13990,7 +14089,15 @@ function activeAgentTerm() {
   const active = currentTab();
   if (active?.kind !== "term") return null;
   const term = activePaneOf(active);
-  return term !== null && paneAgents.has(term) ? term : null;
+  return term !== null && paneWearsAgent(term) ? term : null;
+}
+
+/* Whether a pane's head and switch stand for an agent. `paneAgents` is kept until the pane dies, so a pane the
+ * agent left (the shell took the terminal back: `paneProgramLeft`) would keep wearing its last head. It stands
+ * down — unless its conversation stands over the screen (the switch is then the way back to the shell), or has
+ * stood on it (the switch is then the way back to the conversation, r2 P3-5) (t-84799 B6b). */
+function paneWearsAgent(term) {
+  return paneAgents.has(term) && (!paneProgramLeft(term) || paneChatOn(term) || paneHoldsConversation(term));
 }
 
 /* The switch, held by node: it travels with its pane's head line, which a
@@ -14157,10 +14264,47 @@ function placePaneHeadLine(tab, term) {
 function paintPaneHeadPick(head, term) {
   const pick = head.__line.querySelector(".pane-head-pick");
   const session = paneSessions.get(term)?.session?.id ?? "";
-  writeHidden(pick, session === "");
-  writeTextContent(pick, session ? t("paneHead.pick", "대화 {{session}}", { session: shortSession(session) }) : "");
-  writeAttribute(pick, "data-tip", session);
+  const said = paneConversationWords.get(term);
+  const line = said && (said.session === null || said.session === session) ? said.line : null;
+  writeHidden(pick, session === "" && line === null);
+  // A word the window has to say stays on the line in the conversation's head
+  // too, where the plain session steps aside for the count (t-81786 P3-12).
+  pick.classList.toggle("is-said", line !== null);
+  writeTextContent(pick, line ?? (session ? t("paneHead.pick", "대화 {{session}}", { session: shortSession(session) }) : ""));
+  // A narrow pane cuts the line short; its tooltip reads it whole (t-68069).
+  writeAttribute(pick, "data-tip", line ?? session);
 }
+
+/* What the window has to say about a pane's conversation (t-68069), in place of
+ * its plain name: a conversation the CLI picked by itself, one another pane
+ * holds too, or a new one started because a saved selector stood aside. A word
+ * about one conversation lasts while the pane holds it; the word about a new
+ * one lasts until the pane has words or a conversation of its own
+ * (`settlePaneConversationWord`); the two that ask for a look also say so once
+ * as a toast. */
+const paneConversationWords = new Map();
+
+function paneConversationLine({ word, session, holder }) {
+  const short = session ? shortSession(session) : "";
+  if (word === "picked") return t("paneHead.picked", "CLI가 직접 고른 대화 {{session}}", { session: short });
+  if (word === "held") return t("paneHead.held", "대화 {{session}} — 터미널 {{holder}}번도 쓰는 중", { session: short, holder });
+  return t("paneHead.fresh", "터미널 {{holder}}번이 이 폴더를 쓰는 중이라 새 대화로 시작", { holder });
+}
+
+/* The word about a new conversation has said what it had to once the pane took
+ * its first prompt or reported its conversation: left there, it would keep the
+ * pane's name off its head for as long as the pane lives. */
+function settlePaneConversationWord(term, state, session) {
+  const said = paneConversationWords.get(term);
+  if (said && said.session === null && (session || state === "working")) paneConversationWords.delete(term);
+}
+
+listen("pane:conversation", ({ payload }) => {
+  const line = paneConversationLine(payload);
+  paneConversationWords.set(payload.term, { line, session: payload.session ?? null });
+  if (payload.word !== "picked") toast(line, "warn");
+  paintShownPaneHeads();
+});
 
 /* The heads on screen say what the hooks last said — on the beat the tab strip
  * repaints, so a busy agent costs one paint a frame, not one per event. */
@@ -14169,7 +14313,18 @@ function paintShownPaneHeads() {
     if (head.parentElement?.hidden !== false) continue;
     const tab = tabs.find((one) => one.id === id);
     const term = tab ? activePaneOf(tab) : null;
-    if (term !== null && paneAgents.has(term)) paintPaneHead(tab, term);
+    if (term === null) continue;
+    if (paneWearsAgent(term)) {
+      paintPaneHead(tab, term);
+    } else if (!head.hidden && !paneLeaves(tab.layout).some(paneWearsAgent)) {
+      // No pane of this tab runs an agent any more: its head goes, and the shells below take the room back. A tab split
+      // between an agent's pane and a plain shell keeps it whichever pane is chosen — taking it down and putting it back
+      // at every click would resize every pane and redraw the agent's TUI each time (r2 P2-4).
+      head.hidden = true;
+      // The head named the pane; with the head gone the name bar says it again (r2 P3-5).
+      for (const slot of paneHost(tab).querySelectorAll(".pane-slot.is-named-above")) writeClass(slot, "is-named-above", false);
+      remeasurePanes(tab);
+    }
   }
 }
 

@@ -762,6 +762,84 @@ fn the_fixture_reads_into_the_answer_the_board_draws() {
     );
 }
 
+/// A range holding no ended lane still names the last one that ended
+/// (t-84799 ⑤): the board's first line says "last release" from it. A range
+/// that holds one sends nothing extra, and a running lane is never the last.
+#[test]
+fn the_newest_ended_lane_rides_the_answer_when_the_range_holds_none() {
+    let scratch = copied();
+    let wide = fixture_reading(scratch.path());
+    let newest = wide
+        .lanes
+        .iter()
+        .filter(|run| !run.running)
+        .max_by_key(|run| run.end_ms.unwrap_or(run.start_ms))
+        .expect("the fixture has ended lanes")
+        .clone();
+    assert_eq!(
+        wide.last_lane, None,
+        "a range with an ended lane sends none"
+    );
+    let ask = Ask {
+        known: None,
+        from_ms: Some(NOW_MS - 1),
+        log: None,
+    };
+    let narrow = Book::default().read(&roots_in(scratch.path()), &ask, NOW_MS, KST);
+    assert!(narrow.lanes.iter().all(|run| run.running));
+    assert_eq!(narrow.last_lane, Some(newest));
+}
+
+/// An answer carries the newest finished jobs and says how many of the range's
+/// it could not carry and from when, so a day is never drawn short in silence.
+#[test]
+fn an_answer_says_how_many_finished_jobs_it_could_not_carry() {
+    let count = SENT_JOBS + 50;
+    let clock = |index: usize| (1 + (index / 60) as i64, (index % 60) as i64);
+    let at = |index: usize| kst(21, clock(index).0, clock(index).1, 0);
+    let text: String = (0..count)
+        .map(|index| {
+            let (hour, minute) = clock(index);
+            format!("DONE 1792500000-w1-t{index}-a rc=0 60s lane=1 {hour:02}:{minute:02}:00\n")
+        })
+        .collect();
+    let now = kst(21, 9, 0, 0);
+    let (_scratch, roots) = lone_queue(&text, now);
+    let ask_from = |from_ms| Ask {
+        known: None,
+        from_ms: Some(from_ms),
+        log: None,
+    };
+    let mut book = Book::default();
+
+    let whole = book.read(&roots, &ask_from(at(0)), now, KST);
+    assert_eq!(whole.jobs.len(), SENT_JOBS, "the newest, up to the cap");
+    assert_eq!(
+        whole.jobs_left_out,
+        Some(JobsLeftOut {
+            count: 50,
+            before_ms: at(50),
+        }),
+        "the oldest fifty, older than the oldest job carried"
+    );
+    assert_eq!(whole.jobs[0].end_ms, Some(at(50)));
+    let said = serde_json::to_value(&whole).expect("the answer serializes");
+    assert_eq!(said["jobs_left_out"]["count"], 50);
+    assert_eq!(said["jobs_left_out"]["before_ms"], at(50));
+
+    let exactly = book.read(&roots, &ask_from(at(50)), now, KST);
+    assert_eq!(exactly.jobs.len(), SENT_JOBS);
+    assert_eq!(exactly.jobs_left_out, None, "a range the cap holds whole");
+
+    let narrow = book.read(&roots, &ask_from(at(60)), now, KST);
+    assert_eq!(narrow.jobs_left_out, None, "a range under the cap");
+    let quiet = serde_json::to_value(&narrow).expect("the answer serializes");
+    assert!(
+        quiet.get("jobs_left_out").is_none(),
+        "no word when none is left out"
+    );
+}
+
 /// The window places a waiting job's start on the runner's lanes, so the
 /// answer carries the lanes the runner's log named — `lane=` on a `RUN` or a
 /// `DONE` line, in order, none before it names one — beside the flag that

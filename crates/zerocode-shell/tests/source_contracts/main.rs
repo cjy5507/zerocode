@@ -18420,7 +18420,7 @@ mod tests {
             .find("zerocode_core::launch_plan(spec.id, launch_override.as_ref())")
             .expect("the selected agent's launch plan is ignored");
         let plan_args = starting
-            .find("words.extend(plan.args);")
+            .find(".launch_args_without_selectors(&plan.args)")
             .expect("the launch plan's args do not reach the process");
         let plan_env = starting
             .find("launch_env = plan.env;")
@@ -21054,6 +21054,43 @@ mod tests {
             "the switch must observe and hold the pane's prompts under the prompt \
              registration lock, and wake the pump for one it held:\n{fence}"
         );
+        // t-75383: no lock the pump waits for stands through the ledger's
+        // write, on either road a move commits by; the pane's own hold does
+        // what they did, and the pump's walk asks it.
+        assert!(
+            fence.contains("observed_then_committed(") && fence.contains("&runtime.pane_holds,"),
+            "the switch's commit is no longer fenced by the pane's own hold:\n{fence}"
+        );
+        let quiet = block_after(backend, "    fn with_quiet_screen(");
+        let held = quiet
+            .find("state.shell_runtime().pane_holds.hold(term),")
+            .expect("a wall's move holds its pane under the locks it reads through");
+        let released = quiet[held..]
+            .find("};")
+            .expect("the locks are let go in a block of their own");
+        let observed = quiet
+            .find("observe(&screen, since_ms);")
+            .expect("the screen is still observed");
+        assert!(
+            held + released < observed && quiet[observed..].contains("drop(hold);"),
+            "a wall's move commits under `pane_states` or a terminal lock:\n{quiet}"
+        );
+        assert!(
+            quiet[observed..].contains("state.cadence().wake()"),
+            "the pump is not woken for what it left for the hold:\n{quiet}"
+        );
+        let walk = backend
+            .find("let mut pty = lock_pty(held);")
+            .expect("the pump still takes each pane's lock in its walk");
+        assert!(
+            backend[walk..walk + 600].contains("pane_holds.holds(*id)"),
+            "the pump reads and types at a pane whose move is being written"
+        );
+        let sweep = block_after(backend, "fn sweep_departed_agents(app: &AppHandle) {");
+        assert!(
+            sweep.contains("pane_holds.holds(term)"),
+            "the pump's sweep can wait out a pane's move at the hook word's door:\n{sweep}"
+        );
         let switch = include_str!("../../src/account_switch.rs");
         let rests = block_after(
             switch,
@@ -21068,6 +21105,69 @@ mod tests {
             1,
             "a switch asks \"between turns\" around the one function that also asks for \
              words on their way"
+        );
+    }
+
+    /// t-75383 r2: a report writes its word under `pane_states` once the pane
+    /// is free of a move, and asks the ledger nothing there. The ledger's
+    /// worker can be waiting for an observation that needs that very lock, and
+    /// the pump reads it for every pane with a delivery: told under it, one
+    /// question in any pane stood the whole window still. `note_pane_state`
+    /// takes a live `AppHandle`, and this crate builds no mock runtime, so the
+    /// order is read here and its two halves are run for real in
+    /// `orchestration::tests`.
+    #[test]
+    fn a_report_writes_the_pane_word_and_tells_the_ledger_with_the_lock_let_go() {
+        let backend = shipped_backend();
+        let noting = block_after(backend, "fn note_pane_state(");
+        let opened = noting
+            .find("let state = app.state::<AppState>();\n        let states = state.pane_states();")
+            .expect("the report still writes under the hook word's lock");
+        let closed = opened
+            + noting[opened..]
+                .find("\n    };")
+                .expect("the lock is let go at its block's end");
+        let (held, after) = (&noting[opened..closed], &noting[closed..]);
+        assert!(
+            held.contains("prompt_transaction::word_may_land("),
+            "a report writes its pane's word through a move that is reading it:\n{held}"
+        );
+        assert!(
+            held.contains("orchestration::pane_attention_seen("),
+            "the window's record of a wait no longer stands in the order of the words:\n{held}"
+        );
+        for ledger in [
+            "pane_attention_told(",
+            "pane_turn_",
+            "pane_lead_rested(",
+            ".actor",
+        ] {
+            assert!(
+                !held.contains(ledger),
+                "`{ledger}` reaches the ledger under the lock its observation needs:\n{held}"
+            );
+        }
+        let told = after
+            .find("orchestration::pane_attention_told(")
+            .expect("a wait is told after the lock goes");
+        let turn = after
+            .find("match ended {")
+            .expect("the turn's facts still follow");
+        assert!(
+            told < turn,
+            "a wait is told after what the same report says of the turn:\n{after}"
+        );
+        let shell = include_str!("../../src/orchestration.rs");
+        let seen = block_after(shell, "pub(crate) fn pane_attention_seen(");
+        assert!(
+            !seen.contains("actor") && !seen.contains("rang("),
+            "the part asked under `pane_states` reaches the ledger:\n{seen}"
+        );
+        let paying = block_after(backend, "fn publish_owed_rosters(");
+        assert!(
+            paying.contains("pane_holds.holds(parent)")
+                && paying.contains("unpublished_rosters().insert(parent);"),
+            "the pump's roster replay can wait out a pane's move at the hook word's door:\n{paying}"
         );
     }
 
@@ -22762,7 +22862,7 @@ mod tests {
     }
 
     /// The words the inbox page asks the catalog for.
-    const INBOX_KEYS: [&str; 37] = [
+    const INBOX_KEYS: [&str; 46] = [
         "inbox.title",
         "inbox.tabs.label",
         "inbox.tab.all",
@@ -22800,7 +22900,58 @@ mod tests {
         "inbox.close.needsReason",
         "inbox.closed",
         "inbox.note.closed",
+        "inbox.answered",
+        "inbox.note.answered",
+        "inbox.close.refused",
+        "inbox.close.refusedSeat",
+        "inbox.close.refusedRetry",
+        "inbox.reply.refused",
+        "inbox.reply.refusedGone",
+        "inbox.reply.refusedSeat",
+        "inbox.reply.refusedRetry",
     ];
+
+    /// The length of a close's reason is one number (t-84271 ①): the ledger's
+    /// `QUESTION_CLOSE_REASON_MAX`, which the desk's command refuses past and
+    /// the inbox page's field stops at. The page cannot import a Rust
+    /// constant, so its own named constant is held to the ledger's here.
+    #[test]
+    fn the_inbox_close_reason_has_one_length_in_the_ledger_the_desk_and_the_page() {
+        let ledger = include_str!("../../../zerocode-core/src/orchestration.rs");
+        let number_after = |source: &str, mark: &str| -> usize {
+            let at = source
+                .find(mark)
+                .unwrap_or_else(|| panic!("`{mark}` is gone"));
+            source[at + mark.len()..]
+                .trim_start()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or_else(|_| panic!("`{mark}` names no number"))
+        };
+        let named = number_after(ledger, "pub const QUESTION_CLOSE_REASON_MAX: usize =");
+        let page = number_after(
+            include_str!("../../../../ui/shell-inbox.js"),
+            "const INBOX_CLOSE_REASON_MAX =",
+        );
+        assert_eq!(page, named, "the page's field and the ledger's line differ");
+        assert!(
+            ledger.contains("QUESTION_CLOSE_REASON_MAX")
+                && ledger.matches("QUESTION_CLOSE_REASON_MAX").count() >= 3,
+            "the ledger no longer refuses a reason past its named length"
+        );
+        let desk = include_str!("../../src/orchestration/desk.rs");
+        assert!(
+            desk.contains("QUESTION_CLOSE_REASON_MAX"),
+            "the desk no longer holds a close's reason to the ledger's length"
+        );
+        assert!(
+            include_str!("../../../../ui/shell-inbox.js")
+                .contains("maxLength = INBOX_CLOSE_REASON_MAX"),
+            "the page's field takes any length"
+        );
+    }
 
     /// The inbox reads one snapshot (t-67483): its letters and its numbers are
     /// Rust's single reading (`board_inbox` → `orchestration::inbox::inbox_of`),
@@ -25158,7 +25309,7 @@ mod tests {
             launching.contains("stored_launch_override(state.settings(), spec.id)?")
                 && launching
                     .contains("zerocode_core::launch_plan(spec.id, launch_override.as_ref())")
-                && launching.contains("argv.extend(plan.args"),
+                && launching.contains("unnamed_launch_args("),
             "a launched agent no longer carries its arguments:\n{launching}"
         );
         // The env half matters for exactly one agent (goose has no flag), and
@@ -31876,7 +32027,10 @@ mod tests {
                 "let payload = zerocode_core::payload::HookPayload::of(&envelope.payload);"
             ) && reporting.contains("userpromptsubmit")
                 && reporting.contains("prompt_in_parsed")
-                && reporting.matches(".map(sanitize_card_text)").count() == 2
+                // The prompt, the pane's `said` line, and the agent's answer apart from tool output — the last
+                // scrubbed of credentials first (t-84799 r2 P2-3).
+                && reporting.matches(".map(sanitize_card_text)").count() == 3
+                && reporting.contains("zerocode_core::clone::scrub_credentials(&answer)")
                 && reporting.contains("HookState::Done {")
                 && reporting.contains("said_in_parsed")
                 && reporting.contains("\"posttooluse\" => ")
@@ -33214,7 +33368,11 @@ mod tests {
     /// killed and waited past it. The sixth is a wire session's child
     /// (`wire_runtime`): its stdout is read to the end on the session's
     /// reader thread, and the session kills and waits it when it is stopped
-    /// or dropped.
+    /// or dropped. The sampler's runner (`resource_usage::run_bounded`)
+    /// is also the one `output_within` and the `lsof` road run through
+    /// (r3w-4, t-84800 r2 P3-2): both streams read to the end on their own
+    /// threads, waited to its budget, and killed and let go of past it —
+    /// a thread reaps it, so no caller waits on a helper that holds its pipes.
     /// Emulator children moved behind the shared
     /// `SessionControl`: every adapter installs its child there and the one
     /// stop path kills and waits it. Everything truly fire-and-forget goes
@@ -35445,7 +35603,13 @@ mod tests {
             "the prompt fetch lost its bound or stopped sharing the row \
              cache:\n{fetching}"
         );
-        let tally = block_after(window, "function paintChecksSummary(");
+        // One count serves the summary row and the pile (t-84799 B11): the summary reads it, never counts again.
+        let summary = block_after(window, "function paintChecksSummary(");
+        assert!(
+            summary.contains("checksTally(checks)"),
+            "the summary counts the verdicts again instead of reading `checksTally`:\n{summary}"
+        );
+        let tally = block_after(window, "function checksTally(");
         assert!(
             tally.contains("\"action_required\""),
             "the failing count stopped counting approval blockers:\n{tally}"

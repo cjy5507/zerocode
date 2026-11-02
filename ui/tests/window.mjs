@@ -62,6 +62,7 @@ import { testAgentGraphRail } from "./agent-graph-rail.mjs";
 import { testBoardLive } from "./board-live.mjs";
 import { testBoardOrbit } from "./board-orbit.mjs";
 import { testBoardSchedule } from "./board-schedule.mjs";
+import { testBoardScheduleWeek } from "./board-schedule-week.mjs";
 import { testAutonomyBoard } from "./autonomy-board.mjs";
 import { testConnectedWorkbench } from "./connected-workbench.mjs";
 import { testWorkbenchResponsive } from "./workbench-responsive.mjs";
@@ -360,6 +361,8 @@ suite("board-orbit", ({ browser, origin, ok }) => testBoardOrbit(browser, origin
 // The task board's schedule (t-67482): the build line, its gates, the release lanes and the
 // worker tasks on one time axis, each running or waiting one with its ETA.
 suite("board-schedule", ({ browser, origin, ok }) => testBoardSchedule(browser, origin, ok));
+// The week zoom is a calendar of seven day cells (t-84802), its own suite beside the timetable's.
+suite("board-schedule-week", ({ browser, origin, ok }) => testBoardScheduleWeek(browser, origin, ok));
 suite("autonomy-board", ({ browser, origin, ok }) => testAutonomyBoard(browser, origin, ok));
 suite("connected-workbench", ({ browser, origin, ok }) => testConnectedWorkbench(browser, origin, ok));
 suite("workbench-responsive", ({ browser, origin, ok }) => testWorkbenchResponsive(browser, origin, ok));
@@ -7481,6 +7484,22 @@ const termFind = await page.evaluate(async () => {
   await feed({ full: true, rows: [row(0, "abc def ghi")], scrollback_len: 100, view_offset: 50, scrollback_trimmed: 80 });
   seen.paintedAfterGone = marked();
   seen.countAfterGone = bar.querySelector(".file-find-count").textContent;
+  // This scene runs in whichever language the scenes before it left, so the word is asked for, not written out.
+  seen.noneWord = t("file.findNone", "일치 없음");
+
+  // A search cut at its ceiling (t-84799 r2-P3-8): the list the backend gave was the first 2000, so after twenty of
+  // its lines leave the top the 1980 left are still only what was found — the count keeps its 「+」. The feed's counter
+  // only climbs: eighty lines have already left above, so twenty more makes it a hundred.
+  window.__ANSWER__.term_search = () => Array.from({ length: 2000 }, (_, at) => ({ line: at, col: 0, len: 3 }));
+  field.dispatchEvent(new Event("input", { bubbles: true }));
+  await new Promise((done) => setTimeout(done, 60));
+  seen.cappedCount = bar.querySelector(".file-find-count").textContent;
+  await feed({ full: true, rows: [row(0, "abc def ghi")], scrollback_len: 100, view_offset: 50, scrollback_trimmed: 100 });
+  seen.cappedAfterTrim = bar.querySelector(".file-find-count").textContent;
+  window.__ANSWER__.term_search = () => [{ line: 70, col: 4, len: 3 }];
+  field.dispatchEvent(new Event("input", { bubbles: true }));
+  await new Promise((done) => setTimeout(done, 60));
+  seen.uncappedCount = bar.querySelector(".file-find-count").textContent;
 
   // Typing into the bar must not also type at the shell.
   const before = window.__COUNTS__.term_text ?? 0;
@@ -7513,9 +7532,13 @@ ok(
   JSON.stringify(termFind.paintedAfterTrim) === JSON.stringify(["def"]) &&
     termFind.countAfterTrim === "1/1" &&
     termFind.paintedAfterGone.length === 0 &&
-    termFind.countAfterGone !== "1/1" &&
-    termFind.countAfterGone !== "",
+    termFind.countAfterGone === termFind.noneWord,
   JSON.stringify(termFind),
+);
+ok(
+  "a search cut at its ceiling keeps its 「+」 after lines leave the top (the 1980 left are still only what was found); an uncut one counts exactly",
+  termFind.cappedCount === "2000/2000+" && termFind.cappedAfterTrim === "1980/1980+" && termFind.uncappedCount === "1/1",
+  JSON.stringify({ capped: termFind.cappedCount, afterTrim: termFind.cappedAfterTrim, uncapped: termFind.uncappedCount }),
 );
 ok(
   "a hit is highlighted where it lands, the bar's keys stay out of the shell, and closing clears it",
@@ -28102,7 +28125,7 @@ const vaultDrop = await page.evaluate(async () => {
   // one id is two tabs sharing a screen.
   window.__ANSWER__.resume_vault_session = (args) => {
     window.__RESUMED_VAULT__ = args;
-    return 93;
+    return { term: 93, standing: false };
   };
   await refreshWorktrees();
 
@@ -52868,8 +52891,8 @@ ok(
     freezeWrites(freezeRenaming, "button.tab-close aria-label") === 0 &&
     freezeWrites(freezeRenaming, "span#sb-count.sb-figure childList") <= 1 &&
     // The empty-agent caption changes once when the first agent appears.
-    freezeWrites(freezeRenaming, "span.wt-unseated hidden") <= 1 &&
-    freezeRenaming.mutations - freezeWrites(freezeRenaming, "span.wt-unseated hidden") <= FREEZE_FRAMES * 2 + 4,
+    freezeWrites(freezeRenaming, "span.proj-unseated hidden") <= 1 &&
+    freezeRenaming.mutations - freezeWrites(freezeRenaming, "span.proj-unseated hidden") <= FREEZE_FRAMES * 2 + 4,
   JSON.stringify(freezeRenaming),
 );
 /* The workspace spinner writes a class only when it crosses one of its
@@ -55883,6 +55906,12 @@ suite("composer-chips", async ({ browser, origin, ok }) => {
         for (const handler of window.__LISTENERS__[name] ?? []) handler({ payload });
       };
       const settle = (ms = 60) => new Promise((done) => setTimeout(done, ms));
+      // What a step waits for is named, not timed: a machine under load (`taskpolicy -b`) takes longer to arrive and
+      // never shorter (t-84799 B8). A step that never arrives ends at the limit and the assertion after it fails.
+      const until = async (arrived, most = 8000) => {
+        const end = performance.now() + most;
+        while (!arrived() && performance.now() < end) await new Promise((done) => setTimeout(done, 16));
+      };
       const seen = {};
       const calls = [];
       // Which road each write named (t-57712): a chip's command is the
@@ -55922,7 +55951,7 @@ suite("composer-chips", async ({ browser, origin, ok }) => {
       tell("hook:agent", { term, state: "idle", agent: "claude", session: "s-chips", resumable: false, model: "claude-fable-5-1", permission_mode: "bypassPermissions" });
       await window.__PAINTED__();
       el("view-toggle-chat").click();
-      await settle(150);
+      await until(() => document.querySelector(`.pane-slot[data-term="${term}"] .pane-chat .worker-composer-box`));
       const chat = document.querySelector(`.pane-slot[data-term="${term}"] .pane-chat`);
       const composer = chat?.querySelector(".worker-composer");
       const box = composer?.querySelector(".worker-composer-box");
@@ -55945,7 +55974,7 @@ suite("composer-chips", async ({ browser, origin, ok }) => {
       seen.modeWords = modeChip?.querySelector(".worker-composer-pill-words")?.textContent;
       // The menu: models (current ticked, display names) and the other CLIs.
       agentChip?.click();
-      await settle(120);
+      await until(() => composer?.querySelector(".composer-menu .composer-menu-item"));
       const menu = composer?.querySelector(".composer-menu");
       seen.menuOpen = Boolean(menu) && agentChip?.getAttribute("aria-expanded") === "true";
       seen.menuModels = [...(menu?.querySelectorAll(".composer-menu-item") ?? [])]
@@ -55953,8 +55982,12 @@ suite("composer-chips", async ({ browser, origin, ok }) => {
       seen.chipModelNamed = agentChip?.querySelector(".worker-composer-model-words")?.textContent;
       // A pick: the CLI takes the id, so `/model <id>` travels the send road.
       const opus = [...menu.querySelectorAll(".composer-menu-item")].find((row) => row.querySelector(".composer-menu-name")?.textContent === "Opus 5");
+      const sentBeforeOpus = calls.length;
       opus?.click();
-      await settle(700);
+      await until(() => calls.length >= sentBeforeOpus + 2);
+      // A frame more, then the count exactly: a third call arriving late would move `slice(-2)` (r2 P3-11).
+      await settle(60);
+      seen.modelCalls = calls.length - sentBeforeOpus;
       seen.modelSent = JSON.stringify(calls.slice(-2));
       seen.wantModelSent = JSON.stringify([["paste", term, "/model claude-opus-5"], ["key", term, "Enter", false]]);
       seen.modelRoads = JSON.stringify(roads.slice(-2));
@@ -56021,8 +56054,11 @@ suite("composer-chips", async ({ browser, origin, ok }) => {
       box.value = "/cle";
       box.dispatchEvent(new Event("input", { bubbles: true }));
       await settle(30);
+      const sentBeforeClear = calls.length;
       press("Enter");
-      await settle(700);
+      await until(() => calls.length >= sentBeforeClear + 2);
+      await settle(60);
+      seen.enterCalls = calls.length - sentBeforeClear;
       seen.enterRan = JSON.stringify(calls.slice(-2));
       seen.wantEnterRan = JSON.stringify([["paste", term, "/clear"], ["key", term, "Enter", false]]);
       seen.enterRanRoads = JSON.stringify(roads.slice(-2));
@@ -56057,14 +56093,17 @@ suite("composer-chips", async ({ browser, origin, ok }) => {
       tell("hook:agent", { term: codexTerm, state: "working", agent: "codex", session: "s-codex", resumable: false, model: "gpt-6-astra" });
       await window.__PAINTED__();
       el("view-toggle-chat").click();
-      await settle(150);
+      await until(() => document.querySelector(`.pane-slot[data-term="${codexTerm}"] .pane-chat .worker-composer-agent`));
       const codexChat = document.querySelector(`.pane-slot[data-term="${codexTerm}"] .pane-chat`);
       const codexChip = codexChat?.querySelector(".worker-composer-agent");
       codexChip?.click();
-      await settle(120);
+      await until(() => codexChat?.querySelector(".composer-menu-item"));
       const astra = [...(codexChat?.querySelectorAll(".composer-menu-item") ?? [])].find((row) => row.querySelector(".composer-menu-name")?.textContent === "GPT-6-Astra");
+      const sentBeforeAstra = calls.length;
       astra?.click();
-      await settle(700);
+      await until(() => calls.length >= sentBeforeAstra + 2);
+      await settle(60);
+      seen.codexCalls = calls.length - sentBeforeAstra;
       seen.codexPick = JSON.stringify(calls.slice(-2));
       seen.wantCodexPick = JSON.stringify([["paste", codexTerm, "/model"], ["key", codexTerm, "Enter", false]]);
       seen.codexRoads = JSON.stringify(roads.slice(-2));
@@ -56072,10 +56111,10 @@ suite("composer-chips", async ({ browser, origin, ok }) => {
       // The palette head names a documented list as such.
       seen.codexHead = null;
       el("view-toggle-chat").click();
-      await settle(150);
+      await until(() => codexChat?.querySelector(".worker-composer-box"));
       const codexBox = codexChat?.querySelector(".worker-composer-box");
       if (codexBox) { codexBox.value = "/"; codexBox.dispatchEvent(new Event("input", { bubbles: true })); }
-      await settle(120);
+      await until(() => codexChat?.querySelector(".composer-slash-head")?.textContent);
       seen.codexHead = codexChat?.querySelector(".composer-slash-head")?.textContent ?? null;
       seen.wantCodexHead = `${agentName("codex")} 0.154.0 · ${t("composer.slash.sourceDocs", "문서 기준")}`;
       // A helper's page has no composer and so no door: its footer says which
@@ -56099,10 +56138,10 @@ suite("composer-chips", async ({ browser, origin, ok }) => {
       tell("hook:agent", { term: quietTerm, state: "idle", agent: "claude", session: "s-quiet", resumable: false, model: "claude-fable-5-1" });
       await window.__PAINTED__();
       el("view-toggle-chat").click();
-      await settle(150);
+      await until(() => document.querySelector(`.pane-slot[data-term="${quietTerm}"] .pane-chat .worker-composer-box`));
       const quietBox = document.querySelector(`.pane-slot[data-term="${quietTerm}"] .pane-chat .worker-composer-box`);
       if (quietBox) { quietBox.value = "/"; quietBox.dispatchEvent(new Event("input", { bubbles: true })); }
-      await settle(120);
+      await until(() => document.querySelector(`.pane-slot[data-term="${quietTerm}"] .pane-chat .composer-slash-row`));
       const quietRows = [...document.querySelectorAll(`.pane-slot[data-term="${quietTerm}"] .pane-chat .composer-slash-row .composer-slash-name`)]
         .map((one) => one.textContent);
       seen.helperRows = quietRows;
@@ -56129,7 +56168,7 @@ suite("composer-chips", async ({ browser, origin, ok }) => {
       // same CLI), so the menu's wire section names it after the other CLIs.
       seen.menuOpen && JSON.stringify(seen.menuModels) === JSON.stringify(["Fable 5.1*", "Opus 5", "Codex", "Claude"]) &&
         seen.chipModelNamed === " · Fable 5.1" &&
-        seen.modelSent === seen.wantModelSent && seen.menuClosed &&
+        seen.modelSent === seen.wantModelSent && seen.modelCalls === 2 && seen.menuClosed &&
         // The chip says the mode in Claude Code's own word — the catalog row's
         // label (t-6323 A3), not the spelling opened up.
         seen.modeShown && seen.modeWords === "Bypass permissions" && seen.modeKey === seen.wantModeKey &&
@@ -56144,7 +56183,7 @@ suite("composer-chips", async ({ browser, origin, ok }) => {
         JSON.stringify(seen.innerWord) === JSON.stringify(["/codex:review"]) &&
         seen.none === seen.wantNone &&
         seen.hotAfterDown === "/context" && seen.tabFilled === "/context " && seen.tabSentNothing && seen.paletteClosedAfterTab &&
-        seen.enterRan === seen.wantEnterRan && seen.boxClearedAfterRun &&
+        seen.enterRan === seen.wantEnterRan && seen.enterCalls === 2 && seen.boxClearedAfterRun &&
         seen.artifactListed === "/artifact" && seen.artifactFilled,
       JSON.stringify(seen),
     );
@@ -56156,7 +56195,7 @@ suite("composer-chips", async ({ browser, origin, ok }) => {
     );
     ok(
       "a CLI whose picker lives on its own screen gets the bare command and the screen back, and a documented list is named as such on the palette's head",
-      seen.codexPick === seen.wantCodexPick && seen.codexScreenBack && seen.codexHead === seen.wantCodexHead,
+      seen.codexPick === seen.wantCodexPick && seen.codexCalls === 2 && seen.codexScreenBack && seen.codexHead === seen.wantCodexHead,
       JSON.stringify(seen),
     );
     ok(
@@ -57438,6 +57477,40 @@ suite("worker-question-raised", async ({ browser, origin, ok }) => {
       "a worker's question the coordinator gave to the person says 「코디가 사람 몫이라 올림」, and one the person took, one that could not be sent and one the coordinator can no longer answer each say why on the card (t-84343 ①, t-84470 r1 P3-2)",
       Object.entries(reasons).every(([why, line]) => line !== "" && said[why] === line),
       JSON.stringify({ said, reasons }),
+    );
+
+    /* The reason is one quiet line at any width (t-85327, t-84343 r1 P3-4): in the five languages, at 320 px,
+     * every reason stays on one row, and the row carries the whole sentence as its title for what the ellipsis
+     * cut. */
+    await page.setViewportSize({ width: 320, height: 800 });
+    const rows = [];
+    for (const locale of ["ko", "en", "ja", "zh", "es"]) {
+      for (const why of Object.keys(reasons)) {
+        rows.push(await page.evaluate(async ({ locale, why }) => {
+          setLocale(locale);
+          window.__TELL__("hook:agent", { term: window.__TERM__, state: "working", agent: "claude", session: "s-raised" });
+          await window.__BEATS__();
+          window.__TELL__("ask:raised", { term: window.__TERM__, why });
+          window.__TELL__("hook:agent", { term: window.__TERM__, state: "waiting", agent: "claude", session: "s-raised",
+            ask_prompt: window.__ASK__(`${why} — 어느 계정으로 로그인할까요?`) });
+          await window.__BEATS__();
+          const line = document.querySelector(".pane-chat .pane-chat-ask .board-ask-raised");
+          if (!line) return { locale, why, found: false };
+          const rect = line.getBoundingClientRect();
+          const style = getComputedStyle(line);
+          return {
+            locale, why, found: true, rows: Math.round(rect.height / (parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.3)),
+            title: line.dataset.tip === line.textContent, text: line.textContent !== "",
+          };
+        }, { locale, why }));
+      }
+    }
+    await page.evaluate(() => setLocale("ko"));
+    await page.setViewportSize({ width: 1440, height: 900 });
+    ok(
+      "a raised question's reason stays on one row at 320 px in all five languages, and its title is the whole sentence (t-85327, t-84343 r1 P3-4)",
+      rows.length === 20 && rows.every((row) => row.found && row.rows === 1 && row.title && row.text),
+      JSON.stringify(rows.filter((row) => !(row.found && row.rows === 1 && row.title && row.text))),
     );
 
     /* A question given to the person goes with its pane, and its reason goes too (t-84343, 4275): a card a later

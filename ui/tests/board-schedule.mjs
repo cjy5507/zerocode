@@ -18,9 +18,9 @@ import { chromium, createWindowServer, openWindowTestPage } from "./window-boot.
 import { installBoardWaits } from "./board-waits.mjs";
 import { BOARD_SCHEDULE_BUDGET } from "./board-schedule-perf.mjs";
 
-/* 한 행이나 한 블록: 「한 주」는 가로 차트의 행(`.board-schedule-row`), 「지금 앞뒤」와 「하루」는 세로 시간표의
- * 블록(`.board-schedule-block`, t-77628)이다. 둘 다 같은 자료(`data-*`와 커스텀 속성)를 들어, 장면은 둘을 한
- * 모양으로 읽는다(`readBoardSchedule`). */
+/* 한 블록: 「지금 앞뒤」와 「하루」는 세로 시간표의 블록(`.board-schedule-block`, t-77628)이고, 「한 주」는 일곱 칸
+ * 달력의 같은 블록(t-84802)이다. 블록은 같은 자료(`data-*`와 커스텀 속성)를 들어, 장면은 둘을 한 모양으로 읽는다
+ * (`readBoardSchedule`). 달력에서 날을 넘는 일은 칸마다 한 조각이고, 조각은 키가 같아 한 행으로 읽힌다. */
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = resolve(HERE, "fixtures/board-schedule");
@@ -63,6 +63,7 @@ export function installBoardSchedule({ answer, desk }) {
   boardScheduleChoice.zoom = "day";
   boardScheduleChoice.folded.clear();
   boardScheduleChoice.opened.clear();
+  boardScheduleChoice.dayMore.clear();
   boardScheduleChoice.log = null;
   openBoard();
 }
@@ -74,7 +75,7 @@ export async function openBoardSchedule(page) {
     const tab = () => document.querySelector('#board-view [data-board-tab-button="schedule"]');
     await window.__UNTIL__(() => tab()?.checkVisibility(), "the schedule's tab");
     tab().click();
-    await window.__UNTIL__(() => document.querySelector("#board-view .board-schedule-row, #board-view .board-schedule-block"), "the schedule's rows", 5000);
+    await window.__UNTIL__(() => document.querySelector("#board-view .board-schedule-block"), "the schedule's rows", 5000);
     await new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)));
   });
 }
@@ -85,13 +86,10 @@ export async function readBoardSchedule(page) {
   return page.evaluate(() => {
     const host = document.querySelector("#board-view .task-board-schedule");
     const vertical = host.dataset.scheduleZoom !== "week";
-    const chart = host.querySelector(".board-schedule-chart");
     const body = host.querySelector(".board-schedule-cal-body");
     const shown = (node) => node?.checkVisibility() ?? false;
     // A row or a block, in the one shape: the words and the place the view wrote on it.
     const readRow = (row) => {
-      const bar = row.querySelector(".board-schedule-bar") ?? row;
-      const said = row.querySelector(".board-schedule-said");
       const label = row.querySelector(".board-schedule-label");
       const own = (name) => Number(row.style.getPropertyValue(name) || 0);
       return {
@@ -100,16 +98,16 @@ export async function readBoardSchedule(page) {
         late: row.classList.contains("is-late"),
         label: label.dataset.id ? `${label.dataset.id} ${label.textContent}` : label.textContent,
         // The row's sentence; before the draft's cells (t-71840) it was the words cell's own text.
-        said: row.dataset.said ?? said?.textContent ?? "",
+        said: row.dataset.said ?? "",
         // The passed draft's cells (t-71840): the line under the name, the end cell's two lines, the bar's two names.
         sub: label.dataset.sub ?? "",
-        eta: said ? said.textContent : row.dataset.eta ?? "",
-        etaSub: said ? said.dataset.sub ?? "" : row.dataset.etaSub ?? "",
+        eta: row.__row?.eta ?? "",
+        etaSub: row.__row?.etaSub ?? "",
         why: row.dataset.why ?? "",
-        nowLabel: bar.dataset.nowLabel ?? "",
-        aheadLabel: bar.dataset.aheadLabel ?? "",
-        from: Number(bar.style.getPropertyValue("--from")), to: Number(bar.style.getPropertyValue("--to")),
-        done: Number(bar.style.getPropertyValue("--done")),
+        nowLabel: row.__row?.nowLabel ?? "",
+        aheadLabel: row.__row?.aheadLabel ?? "",
+        from: Number(row.style.getPropertyValue("--from")), to: Number(row.style.getPropertyValue("--to")),
+        done: Number(row.style.getPropertyValue("--done")),
         // The vertical timetable's block (t-77628): its sub-column, its cut top, the gate's time it inherited.
         block: row.classList.contains("board-schedule-block"),
         col: own("--col"), cols: own("--cols") || 1, mark: own("--mark"),
@@ -121,7 +119,10 @@ export async function readBoardSchedule(page) {
     const groups = {};
     for (const box of host.querySelectorAll(".board-schedule-group")) {
       const head = box.querySelector(".board-schedule-group-head");
-      const drawn = new Map([...box.querySelectorAll(".board-schedule-row, .board-schedule-block")].map((row) => [row.dataset.key, readRow(row)]));
+      // A timetable's blocks stand in their column; a calendar's in the day cells, each naming its group.
+      const own = vertical ? box.querySelectorAll(".board-schedule-block")
+        : host.querySelectorAll(`.board-schedule-week-day .board-schedule-block[data-schedule-group="${box.dataset.group}"]`);
+      const drawn = new Map([...own].map((row) => [row.dataset.key, readRow(row)]));
       const rows = [...drawn.values()];
       groups[box.dataset.group] = {
         hidden: box.hidden,
@@ -141,11 +142,14 @@ export async function readBoardSchedule(page) {
     return {
       groups,
       vertical,
-      title: vertical
-        ? host.querySelector(".board-schedule-board-now")?.textContent ?? ""
-        : host.querySelector(".board-schedule-title")?.textContent ?? "",
+      title: host.querySelector(".board-schedule-board-now")?.textContent ?? "",
       chip: [...host.querySelectorAll(".board-schedule-now")].find(shown)?.textContent ?? "",
-      now: Number((vertical ? body : chart).style.getPropertyValue("--now")),
+      // The calendar's cells say the range they cover: 「now」 is read as a percent of it, as a block's place is.
+      now: vertical ? Number(body.style.getPropertyValue("--now")) : (() => {
+        const days = [...host.querySelectorAll(".board-schedule-week-day")];
+        const [first, last] = [Number(days[0].dataset.day), Number(days[6].dataset.dayEnd)];
+        return ((Date.now() - first) / (last - first)) * 100;
+      })(),
       hours: Number(body.style.getPropertyValue("--schedule-hours") || 0),
       ticks: [...host.querySelectorAll(".board-schedule-tick")].filter(shown).map((tick) => tick.textContent),
       note: host.querySelector(".board-schedule-note").hidden ? "" : host.querySelector(".board-schedule-note").textContent,
@@ -353,7 +357,7 @@ export async function testBoardSchedule(browser, origin, ok) {
     await page.keyboard.press("ArrowRight");
     const fresh = await page.evaluate(async (since) => {
       await window.__UNTIL__(() => !document.querySelector("#board-view .task-board-schedule").hidden
-        && document.querySelector("#board-view .board-schedule-row, #board-view .board-schedule-block"), "the schedule again");
+        && document.querySelector("#board-view .board-schedule-block"), "the schedule again");
       await window.__UNTIL__(() => !boardScheduleAsking, "the reopened tab's answer");
       await new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)));
       return window.__SCHEDULE_ASKED__.slice(since).filter((one) => one.known === null);
@@ -471,7 +475,8 @@ export async function testBoardSchedule(browser, origin, ok) {
     ok("a second press closes the log",
       await page.evaluate(() => document.querySelector("#board-view .board-schedule-log").hidden), "");
 
-    /* The queue's order and a paused line's words are read off the gate's job rows — drawn in the week chart. */
+    /* The queue's order and a paused line's words are read off the gate's job rows — they stand once its block in the
+     * week's calendar is unfolded (t-84802), and every day's folded blocks are opened so that all of them are read. */
     const zoomTo = async (zoom) => page.evaluate(async (zoom) => {
       const button = document.querySelector(`#board-view [data-schedule-zoom="${zoom}"]`);
       if (button.getAttribute("aria-pressed") !== "true") {
@@ -482,10 +487,17 @@ export async function testBoardSchedule(browser, origin, ok) {
       await new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)));
     }, zoom);
     await zoomTo("week");
+    await page.evaluate(async () => {
+      document.querySelector('#board-view .board-schedule-week-day [data-key="gate:l61"]').click();
+      for (const more of document.querySelectorAll("#board-view .board-schedule-week-day .board-schedule-more:not(.board-schedule-week-less)")) {
+        while (!more.hidden) more.click();
+      }
+      await new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)));
+    });
     drawn = await readBoardSchedule(page);
     const weekGates = drawn.groups.gates.rows;
     const lint = weekGates.find((row) => row.key === "job:0-1792543560-run11955-l61z-g3a-zo-lint");
-    ok("in the week chart a running job past its median says how late it is and reaches 「now」",
+    ok("in the week's calendar a running job past its median says how late it is and reaches 「now」",
       lint?.state === "running" && lint.said === "+1분 지연 중" && near(lint.to, drawn.now), JSON.stringify(lint));
     const held = weekGates.find((row) => row.key.includes("l61q-g5-window"));
     ok("a job a guard held says so, and its bar is not a start the runner will make",
@@ -526,6 +538,7 @@ export async function testBoardSchedule(browser, origin, ok) {
     }
     drawn = await moveScheduleLine(page, { runner_lanes: answer.line.runner_lanes, quiet_wanted: false, disk_low: false });
 
+    await page.evaluate(() => document.querySelector('#board-view .board-schedule-week-day [data-key="gate:l61"]').click());
     await zoomTo("day");
     /* ---- 워커 과업을 누르면 「기록」 탭의 그 과업으로 — 넘김·검증·비용이 서는 곳 ------------ */
     await page.evaluate(() => document.querySelector('#board-view [data-key="task:run-4275/t-67102"]').click());
@@ -544,8 +557,13 @@ export async function testBoardSchedule(browser, origin, ok) {
       went.tab === "history" && went.chosen === "true" && went.schedule && went.stage === "reported" && went.row,
       JSON.stringify(went));
 
-    /* ---- 한 주로 넓히면 ------------------------------------------------------------ */
+    /* ---- 한 주로 넓히면: 달력의 자세한 몫은 board-schedule-week.mjs가 잰다 ------------------ */
     await openBoardSchedule(page);
+    // Five days before the fixture's Wednesday, by the page's own clock and zone.
+    const weekFrom = await page.evaluate((now) => {
+      const day = new Date(now);
+      return new Date(day.getFullYear(), day.getMonth(), day.getDate() - 5).getTime();
+    }, SCHEDULE_NOW);
     await page.evaluate(async (weekFrom) => {
       window.__WEEK_FROM__ = weekFrom;
       document.querySelector('#board-view [data-schedule-zoom="week"]').click();
@@ -554,34 +572,39 @@ export async function testBoardSchedule(browser, origin, ok) {
       await window.__UNTIL__(() => !boardScheduleAsking, "the week's answer");
       await new Promise((done) => setTimeout(done, 0));
       await new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)));
-    }, SCHEDULE_NOW - 5 * DAY);
+    }, weekFrom);
     drawn = await readBoardSchedule(page);
-    ok("the week view asks five days back with no revision",
-      drawn.asked.some((one) => one.known === null && one.fromMs === SCHEDULE_NOW - 5 * DAY), JSON.stringify(drawn.asked.slice(-3)));
+    ok("the week view asks from its first cell, five days back, with no revision",
+      drawn.asked.some((one) => one.known === null && one.fromMs === weekFrom), JSON.stringify(drawn.asked.slice(-3)));
     ok("the week view holds every lane run since — v1.1.77's three runs are three rows",
       drawn.groups.lanes.rows.length === answer.lanes.length
         && drawn.groups.lanes.rows.filter((row) => row.label.startsWith("v1.1.77 ")).length === 3,
       JSON.stringify(drawn.groups.lanes.rows.map((row) => row.label)));
-    ok("the week's ticks are days, not hours", drawn.ticks.length > 0 && drawn.ticks.every((tick) => !tick.includes(":")),
-      JSON.stringify(drawn.ticks));
+    const dayHeads = await page.evaluate(() => [...document.querySelectorAll("#board-view .board-schedule-week-head")].map((head) => head.textContent));
+    ok("the week's heads are days, not hours: seven with no clock among them, and no hour tick stands",
+      dayHeads.length === 7 && dayHeads.every((head) => !head.includes(":")) && drawn.ticks.length === 0,
+      JSON.stringify({ dayHeads, ticks: drawn.ticks }));
     ok("the week view holds the task that landed two days ago",
       drawn.groups.workers.rows.some((row) => row.key.endsWith("t-62493")), JSON.stringify(drawn.groups.workers.rows.map((row) => row.key)));
     ok(`the schedule stays within ${BOARD_SCHEDULE_BUDGET.elements} elements`, drawn.elements <= BOARD_SCHEDULE_BUDGET.elements,
       String(drawn.elements));
 
-    /* ---- 좁은 그릇: 「지금 도는 일」 단 하나 폭 ------------------------------------- */
+    /* ---- 좁은 그릇: 달력은 가로로 넘치지 않고, 안내판과 머리도 그 폭 안에 선다 --------------------- */
     await mkdir("output/playwright/board-schedule", { recursive: true });
     for (const width of [1280, 640, 320]) {
       const size = await page.evaluate(async (width) => {
         const host = document.querySelector("#board-view .task-board-schedule");
         host.style.width = `${width}px`;
         await new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)));
-        const row = host.querySelector(".board-schedule-row");
-        return { width: host.clientWidth, scroll: host.scrollWidth, areas: getComputedStyle(row).gridTemplateAreas };
+        const days = [...host.querySelectorAll(".board-schedule-week-day")].map((day) => day.getBoundingClientRect());
+        return { width: host.clientWidth, scroll: host.scrollWidth, stacked: days.every((day, at) => at === 0 || day.top >= days[at - 1].bottom - 1),
+          sideBySide: days.every((day, at) => at === 0 || day.left > days[at - 1].left) };
       }, width);
       ok(`the schedule has no horizontal overflow in a ${width}px holder`, size.scroll <= size.width + 1, JSON.stringify(size));
       if (width === 320) {
-        ok("in a narrow holder a row's name and words stand over its bar", size.areas.includes("bar bar"), size.areas);
+        ok("in a narrow holder the week's days stack", size.stacked, JSON.stringify(size));
+      } else if (width === 1280) {
+        ok("in a wide holder the week's days stand side by side", size.sideBySide, JSON.stringify(size));
       }
       await page.screenshot({ path: `output/playwright/board-schedule/dark-${width}.png` });
     }
@@ -589,7 +612,7 @@ export async function testBoardSchedule(browser, origin, ok) {
     // 넓은 그릇의 축은 이름 칸과 말 칸을 뺀 자리다. 눈금 수를 그릇 폭으로 세면 1440 px 창에서
     // 「오후 06:00오후 09:00…」처럼 붙어 섰다. 두 글 사이에 4 px 넘는 틈이 있어야 따로 읽힌다.
     const crowded = [];
-    for (const zoom of ["week", "day"]) {
+    for (const zoom of ["day"]) {
       for (const width of [1280, 640]) {
         const gaps = await page.evaluate(async ({ zoom, width }) => {
           const host = document.querySelector("#board-view .task-board-schedule");
@@ -609,10 +632,10 @@ export async function testBoardSchedule(browser, origin, ok) {
         if (gaps.length === 0 || gaps.some((gap) => gap <= 4)) crowded.push({ zoom, width, gaps });
       }
     }
-    ok("the axis's labels stand apart in 1280px and 640px holders, a week or a day wide", crowded.length === 0,
+    ok("the axis's labels stand apart in 1280px and 640px holders, a day wide", crowded.length === 0,
       JSON.stringify(crowded));
     /* 좁은 그릇과 큰 글자: 글 폭은 잰다 — 고정한 자리가 아니라 (검토 t-69069 P3 ⑧). 480 px와 360 px의 그릇에서
-     * 다섯 언어의 세 확대가, 그리고 글꼴이 커진 축에서도 글 사이에 4 px 넘는 틈이 서야 한다. */
+     * 다섯 언어의 두 확대(한 주는 눈금 대신 요일 머리)가, 그리고 글꼴이 커진 축에서도 글 사이에 4 px 넘는 틈이 서야 한다. */
     const narrowCrowded = [];
     for (const big of [false, true]) {
       await page.evaluate((big) => {
@@ -624,7 +647,7 @@ export async function testBoardSchedule(browser, origin, ok) {
         document.head.append(style);
       }, big);
       for (const tongue of ["ko", "en", "ja", "zh", "es"]) {
-        for (const zoom of ["now", "day", "week"]) {
+        for (const zoom of ["now", "day"]) {
           for (const width of [480, 360]) {
             const seen = await page.evaluate(async ({ tongue, zoom, width }) => {
               setLocale(tongue, { refresh: false, persist: false });
@@ -661,18 +684,19 @@ export async function testBoardSchedule(browser, origin, ok) {
      * 약 350 px, 일정 그릇의 스크롤 칸은 약 190 px다. 일정의 몫은 가로로 넘치지 않고 모든 행이 그 칸을
      * 스스로 스크롤해 닿는 것이다. 칸이 낮은 까닭은 창의 배치 규칙이라 여기서 고치지 않고 숫자로 남긴다. */
     await page.setViewportSize({ width: 360, height: 800 });
+    await zoomTo("week");
     const small = await page.evaluate(async () => {
       paintBoardScheduleHosts();
       await new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)));
       const host = document.querySelector("#board-view .task-board-schedule");
       const surface = host.closest(".task-board-surface");
-      const rows = [...host.querySelectorAll(".board-schedule-row, .board-schedule-block")];
+      const rows = [...host.querySelectorAll(".board-schedule-block")];
       const unreached = [];
       for (const row of rows) {
         row.scrollIntoView({ block: "nearest", inline: "nearest" });
         const seat = surface.getBoundingClientRect();
         const box = row.getBoundingClientRect();
-        const narrow = row.classList.contains("board-schedule-row") ? box.width < 200 : box.width < 40;
+        const narrow = box.width < 200;
         if (box.top < seat.top - 1 || box.bottom > seat.bottom + 1 || narrow) unreached.push(row.dataset.key);
       }
       surface.scrollTop = 0;
@@ -1141,7 +1165,7 @@ export async function testBoardSchedule(browser, origin, ok) {
       queuedGate.what === "게이트 l61" && queuedGate.word === "도는 중" && queuedGate.heads.includes("gate:l62") && queuedGate.l62act === "",
       JSON.stringify(queuedGate));
 
-    /* ---- 안내판 게이트 줄의 규칙 — 한 문장, 스물한 경우의 표 (review r4~r6, t-77851·t-77880·t-77892): 「도는 단계가 있는 게이트
+    /* ---- 안내판 게이트 줄의 규칙 — 한 문장, 스물두 경우의 표 (review r4~r6, t-77851·t-77880·t-77892): 「도는 단계가 있는 게이트
      * → 없으면 실제로 시작한(끝난 단계가 하나라도 있는) 게이트 가운데 마지막 활동이 가장 늦은 것(통과·실패·단계 사이 대기)
      * → 없으면 마지막으로 줄 선 것」. 마지막 활동은 단계마다 마지막 일감 가운데 가장 늦은 시작이다 — 같은 이름으로 다시
      * 도는 게이트는 첫 시도가 아니라 지금 시도로(⑨·⑩), 한 단계만 다시 돈 것도 그 단계로(⑮) 비교된다. 같으면 실패 > 단계
@@ -1274,28 +1298,44 @@ export async function testBoardSchedule(browser, origin, ok) {
         { name: "⑳ l61 실패 → 재시도가 줄만 섬 → 시작 예상은 새 시도의 계획(지금), 첫 시도의 08:10이 아님(실린 과업 행도)", jobs: queuedAgain, paused: false,
           tasks: [carried("t-90002", now)], want: ["l61", "차례 기다림"], note: (note) => note.endsWith("09:50 시작 예상") && !note.includes("다음 단계"),
           said: (said) => said === "대기 1개 · 09:50 시작 예상", task: "t-90002", why: (why) => why === "l61에 실림 → 차례 기다림 · 09:50 시작 예상" },
-        { name: "㉑ l61 g1 통과 · 남은 단계는 held만 → 시작 모름(지난 09:30이 아님)", jobs: heldOnly, paused: false,
-          want: ["l61", "차례 기다림"], note: (note) => note.endsWith("시작 모름"), said: (said) => said === "대기 1개 · 시작 모름" },
+        { name: "㉑ l61 g1 통과 · 남은 단계는 held만 → 시작 모름(지난 09:30이 아님) · 실린 과업 행도 같은 말(t-84799 ①)", jobs: carry(heldOnly, heldOnly[1].name, "t-90003"), paused: false,
+          tasks: [carried("t-90003", now)], want: ["l61", "차례 기다림"], note: (note) => note.endsWith("시작 모름"), said: (said) => said === "대기 1개 · 시작 모름",
+          task: "t-90003", why: (why) => why === "l61에 실림 → 차례 기다림 · 시작 모름" },
+        /* ㉒ (t-84799 ⑥b): 끝 기록이 없는 단계만 있는 게이트는 통과한 단계가 0개다 — 「통과」가 아니다. */
+        { name: "㉒ l61의 모든 단계가 끝 기록 없음(lost) → 「통과」가 아니라 끝 기록 없음, 통과 단계 0개 · 걸림도 말하지 않음 · 실린 과업 행도 같은 말(r2 P2-1·P3-2)", jobs: carry([
+          l61r("g1-build", "lost", at(30), null, { queued_ms: at(31) }), l61r("g2-tests", "lost", at(20), null, { queued_ms: at(31) })],
+        l61r("g1-build", "lost", at(30), null, { queued_ms: at(31) }).name, "t-90004"),
+        paused: false, want: ["l61", "끝 기록 없음"], note: (note) => !note.includes("통과") && !note.includes("걸림"), state: "idle",
+        said: (said) => said === "끝 기록 없음 2개", tasks: [carried("t-90004", now - 40 * minute)], task: "t-90004",
+        why: (why) => why === "l61에 실림 → 끝 기록 없음", etaSub: (etaSub) => etaSub === "" },
+        /* ㉓ (r2 P3-3): 가장 새 게이트 l61이 끝 기록 없이 시작만 했으면 안내판은 그 이야기를 말한다 — 더 옛 l60의 「통과」가 아니라. */
+        { name: "㉓ l60은 통과, 더 나중에 시작한 l61은 끝 기록 없음 → 안내판 게이트 줄은 l61 끝 기록 없음(l60 통과가 아님) · 로그로 가는 길도 l61의 단계", jobs: [
+          job("0-1792543000-run11955-l60r-g1-build", "passed", at(90), at(80), "g1-build", { gate: "l60", queued_ms: at(91) }),
+          l61r("g1-build", "lost", at(30), null, { queued_ms: at(31) })],
+        paused: false, want: ["l61", "끝 기록 없음"], note: (note) => !note.includes("통과") && !note.includes("걸림"),
+        state: "idle", act: (act) => act?.log?.job?.includes("l61r") === true },
       ];
       const choice = { zoom: "now", folded: new Set(), opened: new Set(), log: null };
       return cases.map((one) => {
         const line = { ...base.line, runner_lanes: one.lanes ?? base.line.runner_lanes, paused: one.paused ?? base.line.paused };
-        const model = boardScheduleModel({ ...base, line, jobs: one.jobs, lanes: [] }, one.tasks ?? [], one.at ?? now, choice, 900);
+        const model = boardScheduleModel({ ...base, line, jobs: one.jobs, lanes: [] }, one.tasks ?? [], one.at ?? now, choice);
         const got = model.board.lines[1];
         const head = model.groups.find((group) => group.id === "gates")?.rows.find((row) => row.key === `gate:${one.want[0]}`) ?? null;
         const task = one.task ? model.groups.find((group) => group.id === "workers")?.rows.find((row) => row.id === one.task) ?? null : null;
         const ok = got.name === one.want[0] && got.word === one.want[1] && (one.note ? one.note(got.note) : true)
-          && (one.said ? head !== null && one.said(head.said) : true) && (one.why ? task !== null && one.why(task.why) : true);
-        return { name: one.name, want: one.want, got: [got.name, got.word, got.note, head?.said ?? null, task?.why ?? null], ok };
+          && (one.said ? head !== null && one.said(head.said) : true) && (one.why ? task !== null && one.why(task.why) : true)
+          && (one.state ? head?.state === one.state : true) && (one.etaSub ? one.etaSub(head?.etaSub) : true)
+          && (one.act ? one.act(got.act) : true);
+        return { name: one.name, want: one.want, got: [got.name, got.word, got.note, head?.said ?? null, task?.why ?? null, head?.etaSub ?? null], ok };
       });
     }, SCHEDULE_NOW);
-    ok("the board's gate line follows one rule in all twenty-one cases — running first, then the gate whose latest step began last (a gate or a step run again is its new attempt; on two lanes the later start, not the later end), then the one queued last; a tie is decided, and a waiting gate's row, its line and the task it carries say one present-attempt time, never a past moment as an expected start",
+    ok("the board's gate line follows one rule in all twenty-three cases — running first, then the gate whose latest step began last (a gate or a step run again is its new attempt; on two lanes the later start, not the later end), then the one queued last; a tie is decided, and a waiting gate's row, its line and the task it carries say one present-attempt time, never a past moment as an expected start",
       gateTable.every((row) => row.ok), JSON.stringify(gateTable.filter((row) => !row.ok)));
 
     /* ---- 비어 있어도 넉 줄: 레인도 게이트도 과업도 없는 답 ---- */
     const emptyAnswer = await page.evaluate((now) => {
       const model = boardScheduleModel({ revision: 1, unchanged: false, read_ms: now, line: { found: false, runner_lanes: [] },
-        jobs: [], lanes: [] }, [], now, { zoom: "now", folded: new Set(), opened: new Set(), log: null }, 900, false, null,
+        jobs: [], lanes: [] }, [], now, { zoom: "now", folded: new Set(), opened: new Set(), log: null }, false,
       { hourPx: 120, tickPx: 16, leastPx: 24 });
       return { aheadEmpty: model.aheadEmpty, sum: model.board.head.sum, gutter: model.gutter.length, hours: model.hours,
         lines: model.board.lines.map((line) => [line.id, line.big, line.word, line.note, line.act, line.tone]) };
@@ -1306,6 +1346,36 @@ export async function testBoardSchedule(browser, origin, ok) {
         && emptyAnswer.lines[3][1] === "0건" && emptyAnswer.lines[3][3] === "이 범위에 없음" && emptyAnswer.lines.every((line) => line[4] === null && line[5] === "quiet")
         && emptyAnswer.gutter >= 4 && emptyAnswer.hours === 4 && emptyAnswer.sum === "다음 발행 없음 · 착지 대기 0",
       JSON.stringify(emptyAnswer));
+
+    /* ---- ⑤ (t-84799): 범위 안에 끝난 레인이 없어도 답이 실은 마지막 레인(`last_lane`)을 안내판 첫 줄이 말한다 ---- */
+    const outsideLane = await page.evaluate((now) => {
+      const base = boardScheduleAnswer;
+      const ended = base.lanes.filter((run) => !run.running).sort((a, b) => b.end_ms - a.end_ms)[0];
+      const model = boardScheduleModel({ ...base, jobs: [], lanes: [], last_lane: ended }, [], now,
+        { zoom: "now", folded: new Set(), opened: new Set(), log: null }, false, { hourPx: 120, tickPx: 16, leastPx: 24 });
+      const none = boardScheduleModel({ ...base, jobs: [], lanes: [] }, [], now,
+        { zoom: "now", folded: new Set(), opened: new Set(), log: null }, false, { hourPx: 120, tickPx: 16, leastPx: 24 });
+      return { told: model.board.lines[0].note, act: model.board.lines[0].act, silent: none.board.lines[0].note };
+    }, SCHEDULE_NOW);
+    ok("with no lane ended in the range the first line names the answer's last lane, and says nothing of one when the answer has none",
+      /^마지막 v1\.1\.82 레인 \d{2}:\d{2} · /.test(outsideLane.told) && outsideLane.act?.log?.lane === "3e13aaef" && outsideLane.silent === "이 범위에 없음",
+      JSON.stringify(outsideLane));
+
+    /* ---- r2 P3-1: 조용한 동안 창이 옛 답을 그대로 쓰면 `last_lane`이 비어 있다 — 그 답의 레인이 범위 밖으로 밀려도 첫 줄은 그 답의 가장 최근 끝난 레인을 말한다 ---- */
+    const heldLane = await page.evaluate((now) => {
+      const base = boardScheduleAnswer;
+      // No lane running (a running lane is always in its range): only ended ones, every one far behind the later range.
+      const asked = (at) => boardScheduleModel({ ...base, jobs: [], lanes: base.lanes.filter((run) => !run.running), last_lane: undefined }, [], at,
+        { zoom: "now", folded: new Set(), opened: new Set(), log: null }, false, { hourPx: 120, tickPx: 16, leastPx: 24 });
+      // Thirty days on: every lane of the held answer is far behind the range, and the answer carries no `last_lane`.
+      const late = asked(now + 30 * 24 * 3_600_000);
+      const ended = base.lanes.filter((run) => !run.running).sort((a, b) => b.end_ms - a.end_ms)[0];
+      return { told: late.board.lines[0].note, act: late.board.lines[0].act, lanes: late.groups.find((group) => group.id === "lanes").rows.length,
+        sha: ended?.sha ?? null };
+    }, SCHEDULE_NOW);
+    ok("a held answer whose lanes fell out of the range, with no `last_lane` of its own, still has the first line name its newest ended lane",
+      heldLane.lanes === 0 && /^마지막 v1\.1\.\d+ 레인 .+ · /.test(heldLane.told) && heldLane.act?.log?.lane === heldLane.sha && heldLane.sha !== null,
+      JSON.stringify(heldLane));
 
     // The same empty answer drawn (review P3-9): the lines, the columns' heads and the empty-future line on the screen.
     const emptyDrawn = await page.evaluate(async (now) => {
@@ -1405,8 +1475,7 @@ export async function testBoardSchedule(browser, origin, ok) {
     });
     ok("a person's wheel moves the timetable sideways in a narrow holder", scrolled > 0, String(scrolled));
 
-    /* ---- 키보드: 블록은 단추라 초점이 서고, 서면 할 일과 제 말을 말한다. (Enter의 활성화는 창의 키 처리가
-     * 가로채 행도 블록도 시험 창에서 눌리지 않는다 — 블록 이전부터 같았고, 이 과업 밖이다.) ---- */
+    /* ---- 키보드: 블록은 단추라 초점이 서고, 서면 할 일과 제 말을 말한다. Enter가 눌리는지는 바로 아래 ③. ---- */
     const typed = await page.evaluate(() => {
       const block = document.querySelector('#board-view [data-key="job:1792543500-run11955-t-63492-walk"]');
       block.focus();
@@ -1416,6 +1485,39 @@ export async function testBoardSchedule(browser, origin, ok) {
     ok("a block takes keyboard focus: a button that says its action and its words",
       typed.focused && typed.tag === "BUTTON" && typed.act === "로그 →" && typed.label.includes("walk") && typed.label.includes("25분"),
       JSON.stringify(typed));
+
+    /* ---- ③ 키보드 Enter (t-84799): 초점이 선 블록에서 Enter가 눌린다. 창의 키 입력칸 되돌림(`rearmKeySink`)이
+     * 단추의 초점을 입력칸으로 옮기면 Enter는 블록에 닿지 않는다 — 진짜 키로 눌러 본다. ---- */
+    await page.evaluate(() => {
+      const block = document.querySelector('#board-view [data-key="job:1792543500-run11955-t-63492-walk"]');
+      window.__blockPressed = 0;
+      block.addEventListener("click", () => { window.__blockPressed += 1; });
+      block.focus();
+    });
+    await page.keyboard.press("Enter");
+    const pressed = await page.evaluate(() => ({ count: window.__blockPressed,
+      keptFocus: document.activeElement?.dataset?.key === "job:1792543500-run11955-t-63492-walk" }));
+    ok("Enter on a focused block presses it, and the block keeps the focus", pressed.count === 1 && pressed.keptFocus, JSON.stringify(pressed));
+
+    /* ---- r2 P2-5: 상황판 탭 위에 떠 있는 터미널이 있으면 키는 그 터미널의 것이다 — 단추의 초점을 지키는 일이 그 키를
+     * 가져가지 않는다. 떠 있는 터미널이 없으면 단추가 초점을 지킨다(위의 Enter). ---- */
+    const floating = await page.evaluate(() => {
+      const block = document.querySelector('#board-view [data-key="job:1792543500-run11955-t-63492-walk"]');
+      const press = () => rearmKeySink(new KeyboardEvent("keydown", { key: "x", code: "KeyX", bubbles: true }));
+      const seen = {};
+      block.focus();
+      termFloat.hidden = false;
+      seen.front = frontKeyboardTarget()?.kind ?? null;
+      press();
+      seen.sinkWithFloat = document.activeElement === keySink;
+      termFloat.hidden = true;
+      block.focus();
+      press();
+      seen.blockKept = document.activeElement === block;
+      return seen;
+    });
+    ok("a floating terminal over the board still gets the keys: the key sink takes the focus from the button then, and not without one",
+      floating.front === "term" && floating.sinkWithFloat && floating.blockKept, JSON.stringify(floating));
 
     ok("the schedule raises no browser errors", faults.length === 0, faults.join("\n"));
   } finally {

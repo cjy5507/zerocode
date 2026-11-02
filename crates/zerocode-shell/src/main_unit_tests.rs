@@ -1185,8 +1185,8 @@ fn the_settings_view_marks_staged_and_default_profiles() {
     browser_profile_data::save_imported(
         dir.path(),
         &b,
-        &carried,
-        &browser_profile_data::WebDataRead::default(),
+        Some(&carried),
+        Some(&browser_profile_data::WebDataRead::default()),
         1_793_200_000,
     )
     .expect("carried");
@@ -1265,8 +1265,8 @@ fn deleting_a_profile_takes_its_staging_and_default_with_it() {
     browser_profile_data::save_imported(
         dir.path(),
         &a,
-        &browser_profile_data::BookmarksRead::default(),
-        &browser_profile_data::WebDataRead::default(),
+        Some(&browser_profile_data::BookmarksRead::default()),
+        Some(&browser_profile_data::WebDataRead::default()),
         1,
     )
     .expect("carried");
@@ -27555,6 +27555,20 @@ fn a_read_back_keeps_its_budget_and_passes_over_a_line_too_long_to_take() {
     let words: Vec<&str> = next.turns.iter().map(|one| one.turn.text.as_str()).collect();
     assert_eq!(words, ["above"], "the next read passes the rest of it, to the line above");
     assert!(next.start == 0 && !next.skipped && read <= reach.long_line + reach.step);
+
+    // A line past the cap that is still being written — no line end below the
+    // cap to find: the read stops inside it having read the cap and a step
+    // past it, not the cap twice (t-85293, t-84136 r1 P3-a). The same for a
+    // read that begins inside a line longer than twice the cap.
+    let unended = format!("{}{}", said("above"), result(12_000).trim_end());
+    let (log, read) = back(&unended, None, reach);
+    assert!(log.turns.is_empty() && log.skipped, "the unended long line is said");
+    assert!(log.start > said("above").len() as u64, "it stops inside the line: {}", log.start);
+    assert!(read <= reach.long_line + 2 * reach.step, "{read} bytes read of an unended long line");
+    let inner = format!("{}{}", said("above"), result(12_000));
+    let (log, read) = back(&inner, Some(inner.len() as u64 - 1_000), reach);
+    assert!(log.turns.is_empty() && log.skipped, "a read inside a very long line says so");
+    assert!(read <= reach.long_line + 2 * reach.step, "{read} bytes read inside a very long line");
 
     // With the budget spent, a read stops under that line; the reads after
     // it pass it over — one says so and stops inside it, the next goes on

@@ -175,6 +175,82 @@ export async function testPaneHead(browser, origin, ok) {
       const atEnd = reads.get(quiet) ?? 0;
       await new Promise((done) => setTimeout(done, 2200));
       seen.endedReads = (reads.get(quiet) ?? 0) - atEnd;
+      // t-68069: a conversation no door named is said on the pane's own line
+      // while the pane holds it, and a new conversation takes its plain line.
+      const asked = await openTermTab({ placement: "tab" });
+      await window.__PAINTED__();
+      const report = (id) => tell("hook:agent", { term: asked, state: "working", agent: "claude", session: { id }, resumable: true });
+      report("s-head-0009");
+      await window.__PAINTED__();
+      await settle();
+      const askedLine = document.querySelector(`.pane-slot[data-term="${asked}"]`).closest(".panes").querySelector(":scope > .pane-head").__line;
+      const pickOf = () => askedLine.querySelector(".pane-head-pick")?.textContent ?? "";
+      seen.plainLine = pickOf();
+      tell("pane:conversation", { term: asked, word: "picked", session: "s-head-0009", holder: null });
+      await settle();
+      seen.pickedLine = pickOf();
+      const pickShown = () => getComputedStyle(askedLine.querySelector(".pane-head-pick")).display !== "none";
+      seen.pickedShown = pickShown();
+      seen.pickedInChat = Boolean(askedLine.closest(".chat-head-pane"));
+      report("s-head-0010");
+      await window.__PAINTED__();
+      await settle();
+      paintShownPaneHeads();
+      seen.nextLine = pickOf();
+      seen.nextShown = pickShown();
+      // t-68069 P3-1, P3-2: the word about a new conversation goes when the
+      // pane takes its first prompt or reports its conversation, and a word on
+      // the line can be read whole from its tooltip.
+      const tipOf = () => askedLine.querySelector(".pane-head-pick")?.getAttribute("data-tip") ?? "";
+      const freshHead = async (term, sayFirst) => {
+        // Only a pane known to hold an agent wears a head: a launch says so
+        // before its process has said anything of its conversation.
+        tell("hook:agent", { term, state: "idle", agent: "claude" });
+        await window.__PAINTED__();
+        await settle();
+        tell("pane:conversation", { term, word: "fresh", session: null, holder: 7 });
+        await settle();
+        const line = document.querySelector(`.pane-slot[data-term="${term}"]`).closest(".panes").querySelector(":scope > .pane-head").__line;
+        const pick = line.querySelector(".pane-head-pick");
+        const before = { text: pick.textContent, tip: pick.getAttribute("data-tip") };
+        tell("hook:agent", sayFirst);
+        await window.__PAINTED__();
+        await settle();
+        paintShownPaneHeads();
+        return { before, after: pick.textContent, afterTip: pick.getAttribute("data-tip") ?? "" };
+      };
+      seen.pickedTip = (tell("pane:conversation", { term: asked, word: "picked", session: "s-head-0010", holder: null }), await settle(), tipOf());
+      const reporting = await openTermTab({ placement: "tab" });
+      await window.__PAINTED__();
+      seen.freshReported = await freshHead(reporting, { term: reporting, state: "idle", agent: "claude", session: { id: "s-head-0011" }, resumable: true });
+      const prompted = await openTermTab({ placement: "tab" });
+      await window.__PAINTED__();
+      seen.freshPrompted = await freshHead(prompted, { term: prompted, state: "working", agent: "claude" });
+      // t-68069 P3-6: a vault row whose conversation stands in a pane goes to
+      // that pane and opens nothing; one that opens mounts what it was told.
+      const tabsNow = () => document.querySelectorAll(".tab").length;
+      const row = { agent: "claude", title: "vault-row" };
+      setActiveTab(tabOfTerm(prompted).id);
+      await window.__PAINTED__();
+      const tabsBefore = tabsNow();
+      const realMount = mountTermTab;
+      let mounts = 0;
+      mountTermTab = (...args) => {
+        mounts += 1;
+        return realMount(...args);
+      };
+      window.__ANSWER__.resume_vault_session = () => ({ term: asked, standing: true });
+      await resumeVaultSession(row);
+      await settle();
+      seen.vaultStanding = { added: tabsNow() - tabsBefore, mounts, front: tabOfTerm(asked)?.id === activeTabId };
+      mountTermTab = realMount;
+      const before = tabsNow();
+      const opened = 991_000;
+      window.__ANSWER__.resume_vault_session = () => ({ term: opened, standing: false });
+      await resumeVaultSession(row);
+      await settle();
+      seen.vaultOpened = { added: tabsNow() - before, mounted: Boolean(tabOfTerm(opened)) };
+      delete window.__ANSWER__.resume_vault_session;
       return seen;
     }, TRANSCRIPT);
     ok(
@@ -182,6 +258,26 @@ export async function testPaneHead(browser, origin, ok) {
       !seen.headBeforeAgent && seen.headFirst && seen.toggleInHead && seen.toggleOffTitlebar && seen.pickSlot &&
         seen.pick.includes("s-head-0001".slice(-4)) && seen.model.includes("claude-fable-5-1") && seen.state.length > 0,
       JSON.stringify(seen),
+    );
+    ok(
+      "a conversation no door named is said on the pane's own line, and only while the pane holds it (t-68069)",
+      seen.pickedLine !== seen.plainLine && seen.pickedLine.includes("0009") &&
+        seen.nextLine.includes("0010") && !seen.nextLine.includes("0009") &&
+        seen.pickedInChat && seen.pickedShown && !seen.nextShown,
+      JSON.stringify({ plain: seen.plainLine, picked: seen.pickedLine, next: seen.nextLine, inChat: seen.pickedInChat, shown: seen.pickedShown, nextShown: seen.nextShown }),
+    );
+    ok(
+      "the word about a new conversation goes with the first report or prompt, and any word reads whole in its tooltip (t-68069)",
+      seen.pickedTip.includes("0010") && seen.pickedTip.length > "0010".length &&
+        seen.freshReported.before.text.includes("7") && seen.freshReported.before.tip === seen.freshReported.before.text &&
+        seen.freshReported.after.includes("0011") && !seen.freshReported.after.includes(seen.freshReported.before.text) &&
+        seen.freshPrompted.before.text.length > 0 && seen.freshPrompted.after !== seen.freshPrompted.before.text,
+      JSON.stringify({ tip: seen.pickedTip, reported: seen.freshReported, prompted: seen.freshPrompted }),
+    );
+    ok(
+      "a vault row whose conversation stands in a pane goes to that pane, and one that opens mounts it (t-68069)",
+      seen.vaultStanding.added === 0 && seen.vaultStanding.mounts === 0 && seen.vaultStanding.front && seen.vaultOpened.mounted,
+      JSON.stringify({ standing: seen.vaultStanding, opened: seen.vaultOpened }),
     );
     ok(
       "a tab of one pane says its name once, in its head — the name bar keeps only its actions — and the head's name starts the rename (t-81525 C14)",
@@ -458,6 +554,97 @@ export async function testPaneFirstView(browser, origin, ok, outputDir) {
       !back.aloneAtFirst && back.checked === "conversation" && back.view === "conversation" && back.nextChat &&
         back.aloneKept && back.unknownRead === "conversation",
       JSON.stringify({ ...back, wires }),
+    );
+
+    /* t-84799 B6b: an agent that left its pane — the backend saw the shell take the terminal back, the hook word
+     * `idle` — leaves no head and no switch on a pane that shows its screen; a conversation standing over the
+     * screen keeps its head, which is the way back; the agent's next word brings the head back. */
+    const left = await page.evaluate(async () => {
+      applySettingsSnapshot({ revision: settingsRevision + 1, agent_pane_first_view: "terminal" });
+      await window.__PAINTED__();
+      const seen = {};
+      const headOf = (term) => {
+        const tab = tabOfTerm(term);
+        const head = paneHeads.get(tab.id);
+        return Boolean(head) && !head.hidden && head.getClientRects().length > 0;
+      };
+      const screenTerm = await window.__OPEN_AGENT_PANE__("s-left-0001");
+      seen.screenBefore = { head: headOf(screenTerm), toggle: !el("view-toggle").hidden, chat: paneChatOn(screenTerm) };
+      const named = (term) => document.querySelector(`.pane-slot[data-term="${term}"]`)?.classList.contains("is-named-above") === true;
+      seen.namedBefore = named(screenTerm);
+      await window.__AGAIN__(screenTerm, "s-left-0001", "idle");
+      seen.screenAfter = { head: headOf(screenTerm), toggle: !el("view-toggle").hidden };
+      // The name bar says the pane's name again once the head that named it is gone (r2 P3-5).
+      seen.namedAfter = named(screenTerm);
+      await window.__AGAIN__(screenTerm, "s-left-0001", "working");
+      seen.screenBack = { head: headOf(screenTerm), toggle: !el("view-toggle").hidden };
+      seen.namedBack = named(screenTerm);
+      el("view-toggle-chat").click();
+      await window.__PAINTED__();
+      await window.__AGAIN__(screenTerm, "s-left-0001", "idle");
+      seen.chatKept = { chat: paneChatOn(screenTerm), toggle: !el("view-toggle").hidden, pressed: el("view-toggle-chat").getAttribute("aria-pressed") };
+      // The person turns to the screen from the conversation of an agent that left: the way back stays (r2 P3-5).
+      el("view-toggle-term").click();
+      await window.__PAINTED__();
+      seen.toScreen = { chat: paneChatOn(screenTerm), head: headOf(screenTerm), toggle: !el("view-toggle").hidden };
+      el("view-toggle-chat").click();
+      await window.__PAINTED__();
+      seen.backToChat = { chat: paneChatOn(screenTerm), toggle: !el("view-toggle").hidden };
+      return seen;
+    });
+    ok(
+      "a pane whose agent left shows no head and no switch on its screen, keeps them under a conversation (the way back), and the agent's next word brings them back",
+      left.screenBefore.head && left.screenBefore.toggle && !left.screenBefore.chat &&
+        !left.screenAfter.head && !left.screenAfter.toggle && left.screenBack.head && left.screenBack.toggle &&
+        left.chatKept.chat && left.chatKept.toggle && left.chatKept.pressed === "true" &&
+        left.namedBefore && !left.namedAfter && left.namedBack,
+      JSON.stringify(left),
+    );
+    ok(
+      "a conversation the person has had on a pane keeps the head and the switch while the agent is gone, so 터미널 can be undone with 대화 (r2 P3-5)",
+      !left.toScreen.chat && left.toScreen.head && left.toScreen.toggle && left.backToChat.chat && left.backToChat.toggle,
+      JSON.stringify({ toScreen: left.toScreen, backToChat: left.backToChat }),
+    );
+
+    /* r2 P2-4: in a tab split between an agent's pane and a plain shell, choosing the shell does not take the head down — it
+     * stays while any pane of the tab wears an agent — so picking a pane never resizes the panes (no term_resize) and the
+     * agent's TUI is not redrawn at every click. */
+    const split = await page.evaluate(async () => {
+      const seen = {};
+      const resizes = [];
+      window.__ANSWER__.term_resize = (args) => { resizes.push(args.term); return null; };
+      const agentTerm = await window.__OPEN_AGENT_PANE__("s-split-0001");
+      await splitActivePane("vertical");
+      await window.__PAINTED__();
+      const tab = tabOfTerm(agentTerm);
+      const shellTerm = paneLeaves(tab.layout).find((term) => term !== agentTerm);
+      const headShown = () => {
+        const head = paneHeads.get(tab.id);
+        return Boolean(head) && !head.hidden && head.getClientRects().length > 0;
+      };
+      tab.activePane = agentTerm;
+      paintShownPaneHeads();
+      await window.__PAINTED__();
+      await new Promise((done) => setTimeout(done, 120));
+      seen.leaves = paneLeaves(tab.layout).length;
+      seen.headAtFirst = headShown();
+      const before = resizes.length;
+      const heads = [];
+      for (const term of [shellTerm, agentTerm, shellTerm, agentTerm]) {
+        tab.activePane = term;
+        paintShownPaneHeads();
+        await window.__PAINTED__();
+        heads.push(headShown());
+      }
+      seen.heads = heads;
+      seen.resizes = resizes.length - before;
+      // A tab with no agent in any pane takes the head down, as before.
+      return seen;
+    });
+    ok(
+      "choosing between an agent's pane and a plain shell in one tab leaves the head standing and sends no term_resize",
+      split.leaves === 2 && split.headAtFirst && split.heads.every(Boolean) && split.resizes === 0,
+      JSON.stringify(split),
     );
   } finally { await page.close(); }
 }

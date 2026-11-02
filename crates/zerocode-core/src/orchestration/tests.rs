@@ -51,6 +51,63 @@ fn worker_briefings_ask_for_a_plain_report_by_the_skills_name() {
     }
 }
 
+/// A worker is taught to hand in and to ask through a file (t-84800, t-80980 7): the briefing's
+/// own example used to be a `--body '…'` of JSON, the shape in which a shell expands whatever a
+/// summary holds in double quotes — the road that took the window's panes down twice.
+#[test]
+fn worker_briefings_teach_the_file_road_for_the_report_and_the_question() {
+    for briefing in [
+        worker_briefing("t-1", "lint", ""),
+        federated_briefing("d-1"),
+    ] {
+        let (before, _) = briefing
+            .split_once(BRIEFING_HANDS_OVER)
+            .expect("the briefing hands over");
+        assert!(
+            before.matches("--body-file").count() >= 2,
+            "the report and the question both come as a file: {before}"
+        );
+        assert!(!before.contains("--body '"), "{before}");
+        assert!(before.contains("worker_done"), "{before}");
+        assert!(before.contains("\"ok\":false"), "{before}");
+    }
+}
+
+/// The briefing says where the report file goes (t-84800 r2 P2-4): a file inside the checkout is
+/// an uncommitted change that keeps the checkout from being taken back and may be committed into a
+/// public repository, and a name every worker picks is a name two workers overwrite.
+#[test]
+fn worker_briefings_say_where_the_report_file_goes() {
+    for (briefing, id) in [
+        (worker_briefing("t-1", "lint", ""), "done-t-1.json"),
+        (federated_briefing("d-1"), "done-d-1.json"),
+    ] {
+        let (before, _) = briefing
+            .split_once(BRIEFING_HANDS_OVER)
+            .expect("the briefing hands over");
+        assert_eq!(
+            // The one-checkout paragraph says "outside every checkout" of evidence too, so the
+            // count is of the report file's own sentence.
+            before.matches("to a file outside every checkout").count(),
+            1,
+            "{before}"
+        );
+        assert!(before.contains(id), "a name of its own, {id}: {before}");
+        assert!(before.contains("$TMPDIR"), "{before}");
+        assert!(before.contains("@'"), "PowerShell has no heredoc: {before}");
+    }
+}
+
+/// A refusal of a report that said nothing either way teaches the file road, not the inline body
+/// the briefing no longer teaches (t-84800 r2 P3-5): a worker sending it again copies the shape in
+/// front of it.
+#[test]
+fn a_report_with_no_verdict_is_refused_with_the_file_road() {
+    let why = worker_done_succeeded("{}").expect_err("no verdict");
+    assert!(why.contains("--body-file"), "{why}");
+    assert!(!why.contains("--body '"), "{why}");
+}
+
 /// A worker is told that a report citing a file it named writes the file's absolute path in its
 /// text (t-79642, review t-79586 P3-8): a log called only `red.log` was cited in a report and found
 /// nowhere, because the path rode in the hand-in's payload and not in the words a reader has.
@@ -29250,4 +29307,147 @@ fn a_file_flag_the_window_did_not_read_writes_nothing() {
     );
     let listed = bench.json("task-list");
     assert_eq!(listed["tasks"].as_array().expect("tasks").len(), 0);
+}
+
+/// Every list's stamp in a ledger, run by run, and the receipts'.
+fn every_stamp(ledger: &Ledger) -> Vec<u64> {
+    let mut stamps: Vec<u64> = ledger.runs().iter().flat_map(stamps_of).collect();
+    stamps.push(ledger.served.edit());
+    stamps
+}
+
+fn stamps_of(run: &Run) -> [u64; 7] {
+    [
+        run.tasks.edit(),
+        run.dispatches.edit(),
+        run.workers.edit(),
+        run.messages.edit(),
+        run.inboxes.edit(),
+        run.gates.edit(),
+        run.attachments.edit(),
+    ]
+}
+
+/// A restart with nothing to settle reaches for no list (t-85378 r2): the
+/// store reads a moved stamp as rows that may have changed, and digests every
+/// letter of the run on the next write. A window opens through this sweep, so
+/// a stamp moved here is the first write of every window.
+#[test]
+fn a_restart_with_nothing_to_settle_moves_no_lists_stamp() {
+    let mut bench = a_bench_with_mail(5);
+    let before = every_stamp(&bench.ledger);
+    bench.ledger.window_restarted(5_000_000);
+    assert_eq!(every_stamp(&bench.ledger), before);
+}
+
+/// A continuation left typing is the one row a restart rewrites, as it always
+/// did. The letters beside it keep their words, another run keeps every stamp,
+/// and the next restart finds nothing left to rewrite (t-85378 r2).
+#[test]
+fn a_restart_rewrites_the_unsettled_row_and_moves_only_its_runs_letters() {
+    const NOW: i64 = 5_000_000;
+    let mut bench = Bench::new();
+    bench.json("run-create --name restart");
+    bench.json("handover-policy --on-transient-error resume");
+    let task = bench.json("task-create --spec build-it")["taskId"]
+        .as_str()
+        .expect("a task")
+        .to_string();
+    let (worker, _) = bench.seat(&format!("worker-start --agent claude --task {task}"));
+    let plan = resume_plan(
+        &bench.ledger.runs()[0],
+        &worker,
+        &a_transient_marker("k1"),
+        NOW,
+    )
+    .expect("a continuation");
+    let id = bench.ledger.resume_begin(&plan, NOW).expect("reserved");
+    bench.peer_status("a letter beside it");
+    let quiet = bench.ledger.create_run("quiet", 1);
+    bench
+        .ledger
+        .post(
+            &quiet,
+            Draft {
+                from: LEDGER_ITSELF.to_string(),
+                to: format!("run:{quiet}"),
+                kind: MessageKind::Status,
+                body: Text::from("in another run"),
+                subject: Text::default(),
+                priority: Priority::Normal,
+                payload: Text::default(),
+                thread: None,
+                task: None,
+                dispatch: None,
+            },
+            NOW,
+        )
+        .expect("a letter");
+    let words = |bench: &Bench| -> Vec<(String, String)> {
+        bench.ledger.runs()[0]
+            .messages
+            .iter()
+            .map(|held| (held.id.clone(), held.body.as_str().to_string()))
+            .collect()
+    };
+    let before = words(&bench);
+    let letters = bench.ledger.runs()[0].messages.edit();
+    let others = stamps_of(&bench.ledger.runs()[1]);
+
+    assert!(bench.ledger.window_restarted(NOW + 5).moved);
+
+    assert_eq!(stamps_of(&bench.ledger.runs()[1]), others);
+    assert_ne!(bench.ledger.runs()[0].messages.edit(), letters);
+    let after = words(&bench);
+    for (at, (held, body)) in before.iter().enumerate() {
+        assert_eq!(&after[at].0, held);
+        if held != &id {
+            assert_eq!(&after[at].1, body, "{held} is not the row to rewrite");
+        }
+    }
+    let body = resume_receipt(&bench, &id);
+    assert_eq!(body["status"], HANDOVER_INTERRUPTED);
+    assert_eq!(body["interruptedMs"], NOW + 5);
+    assert_eq!(
+        body["why"],
+        "the window restarted while the continuation was being typed; whether its \
+         words reached the composer is unknown, so this error is not typed at again \
+         — read the worker's screen"
+    );
+    assert_eq!(bench.json("check --peek --types resumed")["count"], 1);
+
+    let settled = every_stamp(&bench.ledger);
+    bench.ledger.window_restarted(NOW + 6);
+    assert_eq!(every_stamp(&bench.ledger), settled);
+}
+
+/// An hourly sweep that gives nothing up reaches for no list either (t-85378
+/// r2). A window's first beat makes one when the last was over an hour ago, so
+/// a stamp moved here is every receipt digested by the first write.
+#[test]
+fn a_sweep_that_gives_up_nothing_moves_no_lists_stamp() {
+    let mut bench = a_bench_with_mail(3);
+    bench.json("task-create --spec keep-it --retry-request a-receipt");
+    let now = 4_000_000;
+    assert!(bench.ledger.sweep_due(now));
+    let before = every_stamp(&bench.ledger);
+    let swept = bench.ledger.sweep_retention(now);
+    assert!(!swept.moved(), "{swept:?}");
+    assert_eq!(every_stamp(&bench.ledger), before);
+}
+
+/// A sweep that does give a receipt up counts it once, whichever rule took it,
+/// and moves the receipts' stamp (t-85378 r2).
+#[test]
+fn a_sweep_that_expires_a_receipt_counts_it_once_and_moves_the_stamp() {
+    let mut bench = a_bench_with_mail(1);
+    bench.json("task-create --spec keep-it --retry-request a-receipt");
+    let filed = bench.ledger.served.len();
+    assert!(filed > 0, "the verb filed a receipt");
+    let before = bench.ledger.served.edit();
+    let long_after = bench.clock + 400 * DAY_MS;
+    let swept = bench.ledger.sweep_retention(long_after);
+    assert_eq!(swept.receipts_expired, filed);
+    assert!(bench.ledger.served.iter().all(Served::is_tombstone));
+    assert_ne!(bench.ledger.served.edit(), before);
 }
