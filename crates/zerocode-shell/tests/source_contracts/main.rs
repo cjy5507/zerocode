@@ -1105,15 +1105,30 @@ mod tests {
             .filter(|line| line.starts_with("row.addEventListener(\"click\""))
             .collect();
 
-        // Most independent rows use `actsAsButton`. A workspace row is an
-        // option inside one focusable listbox instead: the list owns Arrow,
-        // Home, End and keyboard context-menu handling, which is the ARIA
-        // pattern Orca uses for its multi-selection surface.
+        // Most independent rows use `actsAsButton`. A checkout's row is the
+        // one exception: it stands inside a tree item, and the tree (the list)
+        // owns Arrow, Home, End, Left, Right, Enter and the keyboard
+        // context-menu key, which is the ARIA tree pattern. The handler must be
+        // the one in the checkout's own builder, and the tree's keys must be
+        // there — not just any `role` string somewhere in the window.
+        let node = block_after(source, "function makeWorktreeNode(worktree, held) {");
+        let keys = block_after(source, "worktreeList.addEventListener(\"keydown\"");
         assert!(
             bare.is_empty()
                 || (bare.len() == 1
-                    && source.contains("row.setAttribute(\"role\", \"option\")")
-                    && source.contains("worktreeList.addEventListener(\"keydown\"")),
+                    && node.contains("row.addEventListener(\"click\"")
+                    && node.contains("node.setAttribute(\"role\", \"treeitem\")")
+                    && [
+                        "ArrowUp",
+                        "ArrowDown",
+                        "Home",
+                        "End",
+                        "ArrowLeft",
+                        "ArrowRight",
+                        "Enter"
+                    ]
+                    .iter()
+                    .all(|key| keys.contains(&format!("\"{key}\"")))),
             "a row got a click handler and no keyboard-equivalent owner: {bare:?}"
         );
         // Otherwise deleting every row would satisfy the rule above.
@@ -4176,8 +4191,12 @@ mod tests {
         let painting = block_after(source, "function makeWorktreeNode(worktree, held) {");
 
         assert!(
-            markup.contains("role=\"listbox\"") && markup.contains("aria-multiselectable=\"true\""),
-            "the workspace list does not expose its selection model"
+            markup.contains("id=\"worktrees\" role=\"tree\" aria-multiselectable=\"true\"")
+                && painting.contains("node.setAttribute(\"role\", \"treeitem\")")
+                && source.contains("flat.setAttribute(\"role\", \"group\")")
+                && source.contains("line.setAttribute(\"role\", \"treeitem\")")
+                && source.contains("function treeParent(node, header, children, expanded) {"),
+            "the workspace list does not expose its selection model as a tree whose children are tree items and groups"
         );
         for contract in [
             "selectWorktree(worktree.path, event)",
@@ -6298,12 +6317,25 @@ mod tests {
         for kind in ["add", "del"] {
             assert!(
                 styles.contains(&format!(
-                    ".diff-line--{kind} .diff-word {{\n  background: color-mix(in srgb, var(--diff-{kind}) 32%, transparent);"
+                    ".diff-line--{kind} .diff-word {{\n  background: color-mix(in srgb, var(--diff-{kind}) var(--diff-word-strength), transparent);"
                 )),
                 "the {kind} word mark stopped riding its own line's \
                  diff token"
             );
         }
+        // The mark's strength is one token per theme (t-84460 ④): the dark wash of its line is 20%, and
+        // a mark at 32% over it stood nearer its line than it did over the old 14%.
+        let tokens = include_str!("../../../../ui/tokens.css");
+        assert_eq!(
+            tokens.matches("--diff-word-strength: ").count(),
+            2,
+            "the word mark's strength lost its dark or light value"
+        );
+        assert!(
+            tokens.contains("--diff-word-strength: 36%;")
+                && tokens.contains("--diff-word-strength: 32%;"),
+            "the word mark's strength moved from the measured 36% (dark) / 32% (light)"
+        );
 
         // The header's facts: present only while the panel's list holds the
         // path, tally from the one builder, letter in the decoration ink.
@@ -15448,7 +15480,7 @@ mod tests {
         }
         assert!(
             markup.contains(
-                r#"<div class="tabstrip" id="tabstrip" role="tablist" data-drag-surface"#
+                r#"<div class="tabstrip" id="tabstrip" data-drag-surface><div class="tab-list" role="tablist""#
             ),
             "the empty run of the tab strip stopped being a handle"
         );
@@ -22950,6 +22982,36 @@ mod tests {
             include_str!("../../../../ui/shell-inbox.js")
                 .contains("maxLength = INBOX_CLOSE_REASON_MAX"),
             "the page's field takes any length"
+        );
+    }
+
+    /// The sidebar's 답 없이 닫기 never closes a copy (t-88847 r2): the board's
+    /// own copy of the desk (`deskLedger`) is taken only while the board is
+    /// open, so a control that read it was missing before the board was opened
+    /// and pointed at an old question after it was left. The control's reading
+    /// is the team's (`row.asking`, `coordinator_seats`), and the press reads
+    /// the ledger itself.
+    #[test]
+    fn the_sidebar_close_control_reads_the_ledger_at_the_press_not_the_boards_copy() {
+        let window = window_source();
+        let code = strip_comments(window);
+        let eligible = block_after(&code, "function teamCloseEntry(node) {");
+        let press = block_after(&code, "async function openTeamClose() {");
+        assert!(
+            eligible.contains("row.asking !== true")
+                && eligible.contains("sidebarTeamData.seats")
+                && !eligible.contains("deskLedger")
+                && !eligible.contains("boardSeatOf"),
+            "the control is shown off the board's copy of the desk:\n{eligible}"
+        );
+        assert!(
+            press.contains("invoke(\"board_desk\")") && !press.contains("deskLedger"),
+            "the press does not read the ledger itself:\n{press}"
+        );
+        let paint = block_after(&code, "function paintSidebarTeam() {");
+        assert!(
+            paint.contains("placeTeamClose();"),
+            "the control and the form do not follow their row when the rows move"
         );
     }
 
