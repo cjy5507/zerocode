@@ -1143,6 +1143,10 @@
                (components/sidebar/index.tsx:117, SidebarNav.tsx:109). 뜨는
                조건 셋은 백엔드가 정한다(`entry_visible`) — 다 끝나면 스스로
                사라지고, 치운 사람에게는 돌아오지 않는다. -->
+          <!-- The rail's door to everything the rail folds away (the passed draft's item 17, t-84803): stands only there. -->
+          <button class="sidebar-rail-open" id="sidebar-rail-open" type="button" data-i18n-title="sidebar.railOpen" data-tip="사이드바 펼치기" data-i18n-aria="sidebar.railOpen" aria-label="사이드바 펼치기">
+            <svg class="icon" aria-hidden="true"><use href="#i-folder"></use></svg>
+          </button>
           <button class="guide-entry" id="guide-entry" type="button" hidden>
             <span class="guide-ring" id="guide-ring" aria-hidden="true"></span>
             <span id="guide-entry-label"></span>
@@ -1202,7 +1206,7 @@
                chord on hover. The old in-place tree filter died with the field —
                narrowing lives in the finder this button opens, which searches
                sessions as well as names. -->
-          <button class="nav-search" id="sidebar-search" type="button" data-i18n-aria="sidebar.searchWorktrees" aria-label="워크스페이스 검색">
+          <button class="nav-search" id="sidebar-search" type="button" data-i18n-aria="sidebar.searchWorktrees" aria-label="워크스페이스 검색" data-i18n-title="sidebar.searchWorktrees" data-tip="워크스페이스 검색">
             <svg class="icon nav-search-glyph" aria-hidden="true"><use href="#i-search"></use></svg>
             <span class="nav-search-word" data-i18n="sidebar.search">검색</span>
             <span class="nav-search-keys" id="sidebar-search-keys" aria-hidden="true"></span>
@@ -3082,6 +3086,7 @@
                    menu shows what exists rather than four disabled rows. -->
               <button class="scm-filter-toggle scm-overflow" id="scm-overflow" type="button"
                       data-i18n-title="sourceControl.moreActions" data-tip="소스 컨트롤 작업 더 보기"
+                      data-i18n-aria="sourceControl.moreActions" aria-label="소스 컨트롤 작업 더 보기"
                       aria-haspopup="menu">
                 <svg class="icon" aria-hidden="true"><use href="#i-more"></use></svg>
               </button>
@@ -4535,12 +4540,12 @@
                      is not here shows no pinned revision (t-69998). -->
                 <div id="managed-judgment-models"></div>
                 <p class="settings-row-desc" id="managed-judgment-no-matches" data-i18n="settings.managed.noMatches" hidden>조건에 맞는 모델이 없습니다. 검색어나 사용 방법을 바꿔보세요.</p>
-                <p class="settings-row-desc" id="managed-judgment-none" data-i18n="settings.managed.noneReceived" hidden>받은 판단 모델이 없습니다 — 아래에서 불러오세요</p>
+                <p class="settings-row-desc" id="managed-judgment-none" data-i18n="settings.managed.noneReceived" hidden>받은 판단 모델이 없습니다. 선택 사항이라 받지 않아도 판단은 연결한 모델로 돌아갑니다.</p>
                 <p class="settings-row-desc" id="managed-judgment-empty" data-i18n="settings.managed.empty" hidden>설치할 수 있는 모델이 없습니다. 이미 실행 중인 판단 서버를 연결할 수 있습니다.</p>
                 <details class="settings-fold" id="managed-judgment-candidates" hidden>
                   <summary id="managed-judgment-candidates-count"></summary>
                   <div class="managed-judgment-candidates">
-                    <p class="settings-notice" data-i18n="settings.managed.experimental">실험용 판단 모델입니다. 다운로드나 연결 확인은 작업 정확도 검증이 아닙니다. 설치만으로 현재 모델이 바뀌지는 않습니다.</p>
+                    <p class="settings-notice" data-i18n="settings.managed.experimental">선택 항목이고 실험용입니다. 받지 않아도 판단은 연결한 모델로 돌아갑니다. 다운로드나 연결 확인은 작업 정확도 검증이 아닙니다. 설치만으로 현재 모델이 바뀌지는 않습니다.</p>
                     <ul id="managed-judgment-candidate-list"></ul>
                   </div>
                 </details>
