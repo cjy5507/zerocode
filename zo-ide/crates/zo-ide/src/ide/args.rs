@@ -32,6 +32,7 @@ zo hooks list|show [--json] [--cwd <dir>]
 zo mcp diagnose|list|get|add|remove|login|logout [<name>] [--url <url>|-- <command>…] [--env K=V] [--header K=V]
        [--transport stdio|http|sse|ws] [--scopes <a,b>] [--project [--trust]] [--cwd <dir>] [--json]
 zo cron ensure|show|remove --description <name> [--schedule <expr>] [--prompt <text>|--prompt-file <path|->] [--cwd <dir>]
+zo vault search <words…> [--limit <n>] [--json] [--vault <dir>] [--cwd <dir>]
 zo vault path <from> <to> [--k <n>] [--json] [--vault <dir>] [--cwd <dir>]
 zo decision-shadow eval --labels <file.jsonl> [--cwd <dir>] [--json]
 zo decision-shadow check [--json]
@@ -697,12 +698,12 @@ mod tests {
         };
         assert!(error.contains("--last-message needs a file path"), "{error}");
 
-        let launch = super::parse(&["--last-message".to_string(), "/tmp/answer.txt".to_string()])
+        // An absolute path in this OS's own shape: `/tmp/...` has no drive on
+        // Windows, so it is not absolute there and would be joined to the cwd.
+        let answer = std::env::temp_dir().join("answer.txt");
+        let launch = super::parse(&["--last-message".to_string(), answer.display().to_string()])
             .expect("parse");
-        assert_eq!(
-            launch.last_message.as_deref(),
-            Some(std::path::Path::new("/tmp/answer.txt"))
-        );
+        assert_eq!(launch.last_message.as_deref(), Some(answer.as_path()));
     }
 
     /// The two are independent — a prose run may still want the answer in a
