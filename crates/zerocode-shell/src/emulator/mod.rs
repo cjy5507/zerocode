@@ -54,7 +54,14 @@ pub(crate) use wda::{
 };
 pub(crate) mod real_phone_door {
     pub(crate) use super::wda::{
-        button, check, foreground, install, remove, screenshot, swipe, tap, text, tree,
+        button, check, foreground, install, remove, screenshot, shot, swipe, tap, text, tree,
+    };
+}
+/// A real Android phone's verbs (t-93824), by the same names as an iPhone's.
+pub(crate) mod android_phone_door {
+    pub(crate) use super::android::phone::{
+        button, check, emulator_only, install, remove, rotate_refused, screenshot, swipe, tap,
+        text, tree,
     };
 }
 use session::{Loan, SessionControl, StartVerdict, loans, registry};

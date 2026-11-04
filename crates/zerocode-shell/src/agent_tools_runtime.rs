@@ -5301,6 +5301,7 @@ async fn answer_real_phone(
     cwd: Option<&Path>,
 ) -> zerocode_hookd::TeamAnswer {
     use crate::emulator::real_phone_door as phone;
+    use zerocode_core::agent_emulator::real_android::is_android_phone;
     use zerocode_core::agent_emulator::real_phone::{REAL_PHONE_PREFIX, is_real_phone};
     use zerocode_core::computer_use::{EmulatorMethod, EmulatorPlatform};
     use zerocode_core::computer_use_protocol::{ProviderError, error_code};
@@ -5314,6 +5315,9 @@ async fn answer_real_phone(
             &format!("this verb takes a real phone's id ({REAL_PHONE_PREFIX}…, from list)"),
         );
     };
+    if is_android_phone(&handle) {
+        return answer_android_phone(command, handle, cwd).await;
+    }
     if command.platform == Some(EmulatorPlatform::Android) {
         return emulator_cli_error(
             json,
@@ -5373,14 +5377,17 @@ async fn answer_real_phone(
         EmulatorMethod::Button => {
             phone::button(&handle, command.name.as_deref().unwrap_or_default()).await
         }
-        EmulatorMethod::Screenshot => capture_emulator_screenshot(
-            EmulatorPlatform::Ios,
-            handle.clone(),
-            command.out.as_deref(),
-            cwd,
-        )
-        .await
-        .map_err(crate::emulator::marks::backend_error),
+        // A refusal keeps its code: a locked phone's is `phone_locked` (t-93450).
+        EmulatorMethod::Screenshot => phone::shot(&handle).await.and_then(|bytes| {
+            screenshot_saved(
+                EmulatorPlatform::Ios,
+                &handle,
+                &bytes,
+                command.out.as_deref(),
+                cwd,
+            )
+            .map_err(crate::emulator::marks::backend_error)
+        }),
         EmulatorMethod::PhoneInstall => phone::install(&handle, command.team.as_deref()).await,
         EmulatorMethod::PhoneRemove => phone::remove(&handle).await,
         EmulatorMethod::PhoneCheck => phone::check(&handle).await,
@@ -5390,6 +5397,100 @@ async fn answer_real_phone(
                 format!("`{}` is not on a real phone's road", method.verb_name()),
             ))
         }
+    };
+    emulator_answer(method, json, result)
+}
+
+/// The verbs on a real Android phone (t-93824), by its id, with `--platform
+/// android` as for an emulator. What only an emulator has is refused with its
+/// code before anything reaches the phone.
+async fn answer_android_phone(
+    command: zerocode_core::computer_use::EmulatorCommand,
+    handle: String,
+    cwd: Option<&Path>,
+) -> zerocode_hookd::TeamAnswer {
+    use crate::emulator::android_phone_door as phone;
+    use zerocode_core::computer_use::{EmulatorMethod, EmulatorPlatform};
+    use zerocode_core::computer_use_protocol::{ProviderError, error_code};
+
+    let method = command.method;
+    let json = command.json;
+    if command.platform == Some(EmulatorPlatform::Ios) {
+        return emulator_cli_error(
+            json,
+            "invalid_argument",
+            "a real Android phone's road is --platform android",
+        );
+    }
+    let result: Result<serde_json::Value, ProviderError> = match method {
+        EmulatorMethod::Marks
+        | EmulatorMethod::Click
+        | EmulatorMethod::Find
+        | EmulatorMethod::Foreground => {
+            return answer_emulator_observation(command).await;
+        }
+        EmulatorMethod::Tree => {
+            // What a phone's screen says is its own, never an instruction.
+            let tree = phone::tree(&handle).await.map(|mut tree| {
+                tree[zerocode_core::untrusted::JSON_FLAG] = true.into();
+                tree
+            });
+            if !json && let Ok(tree) = &tree {
+                let text = serde_json::to_string_pretty(tree).unwrap_or_default();
+                return computer_said(zerocode_core::untrusted::fence(
+                    "emulator",
+                    &text,
+                    text.len(),
+                ));
+            }
+            tree
+        }
+        EmulatorMethod::Tap => {
+            phone::tap(
+                &handle,
+                command.x.unwrap_or_default(),
+                command.y.unwrap_or_default(),
+            )
+            .await
+        }
+        EmulatorMethod::Swipe => {
+            phone::swipe(
+                &handle,
+                (
+                    command.x1.unwrap_or_default(),
+                    command.y1.unwrap_or_default(),
+                ),
+                (
+                    command.x2.unwrap_or_default(),
+                    command.y2.unwrap_or_default(),
+                ),
+                command.ms,
+            )
+            .await
+        }
+        EmulatorMethod::Text => {
+            phone::text(&handle, command.text.as_deref().unwrap_or_default()).await
+        }
+        EmulatorMethod::Button => {
+            phone::button(&handle, command.name.as_deref().unwrap_or_default()).await
+        }
+        EmulatorMethod::Screenshot => capture_emulator_screenshot(
+            EmulatorPlatform::Android,
+            handle.clone(),
+            command.out.as_deref(),
+            cwd,
+        )
+        .await
+        .map_err(crate::emulator::marks::backend_error),
+        EmulatorMethod::PhoneInstall => phone::install(&handle).await,
+        EmulatorMethod::PhoneRemove => phone::remove(&handle).await,
+        EmulatorMethod::PhoneCheck => phone::check(&handle).await,
+        EmulatorMethod::Rotate => Err(phone::rotate_refused()),
+        EmulatorMethod::Open => Err(phone::emulator_only()),
+        EmulatorMethod::List => Err(ProviderError::new(
+            error_code::UNSUPPORTED_CAPABILITY,
+            format!("`{}` is not on a real phone's road", method.verb_name()),
+        )),
     };
     emulator_answer(method, json, result)
 }
@@ -5411,10 +5512,15 @@ pub(super) async fn answer_emulator_observation(
             )
         })?;
         let device = match platform {
-            EmulatorPlatform::Android => active_android_mark_target(&device)
-                .await
-                .map_err(marks::backend_error)?,
-            EmulatorPlatform::Ios => marks::Device {
+            // A real phone's id is its own identity and address (t-93824).
+            EmulatorPlatform::Android
+                if !zerocode_core::agent_emulator::real_phone::is_real_phone(&device) =>
+            {
+                active_android_mark_target(&device)
+                    .await
+                    .map_err(marks::backend_error)?
+            }
+            EmulatorPlatform::Android | EmulatorPlatform::Ios => marks::Device {
                 identity: device.clone(),
                 address: device,
             },
@@ -5493,6 +5599,9 @@ pub(super) async fn emulator_screenshot_bytes(
 ) -> Result<Vec<u8>, String> {
     use zerocode_core::computer_use::EmulatorPlatform;
 
+    if zerocode_core::agent_emulator::real_android::is_android_phone(device) {
+        return crate::emulator::android_phone_door::screenshot(device).await;
+    }
     if zerocode_core::agent_emulator::real_phone::is_real_phone(device) {
         return crate::emulator::real_phone_door::screenshot(device).await;
     }
@@ -5512,14 +5621,24 @@ pub(super) async fn capture_emulator_screenshot(
     cwd: Option<&Path>,
 ) -> Result<serde_json::Value, String> {
     let bytes = emulator_screenshot_bytes(platform, &device).await?;
-    let byte_count = bytes.len();
-    let path = write_agent_screenshot("emulator", &bytes, out, cwd)?;
+    screenshot_saved(platform, &device, &bytes, out, cwd)
+}
+
+/// A frame written where it was asked, as the screenshot verb answers it.
+fn screenshot_saved(
+    platform: zerocode_core::computer_use::EmulatorPlatform,
+    device: &str,
+    bytes: &[u8],
+    out: Option<&str>,
+    cwd: Option<&Path>,
+) -> Result<serde_json::Value, String> {
+    let path = write_agent_screenshot("emulator", bytes, out, cwd)?;
     Ok(json!({
         "surface": "zerocode-built-in",
         "platform": platform.as_str(),
         "device": device,
         "path": path,
-        "bytes": byte_count,
+        "bytes": bytes.len(),
     }))
 }
 
@@ -6653,7 +6772,7 @@ pub(super) fn answer_computer_command_with(
         command.method,
         ComputerMethod::RecipeSave | ComputerMethod::RecipeList | ComputerMethod::RecipeShow
     ) {
-        desktop_recipe(&command)
+        desktop_recipe(&command, permission_window)
     } else if command.method == ComputerMethod::Observe {
         computer_use::observe::observe(&command.params.as_object().cloned().unwrap_or_default())
     } else if command.method == ComputerMethod::Handoff {
@@ -7247,11 +7366,30 @@ pub(super) fn call_with_confirmation_asker(
     })
 }
 
+/// What the window can see now, which a recipe's words are read against when it
+/// is stood up as a Flow: its browser panes, and the apps the helper lists (a
+/// helper that does not answer leaves the words as they were typed). Nothing
+/// without a window: a headless call has no pane to read.
+fn recipe_seen_by(window: Option<&tauri::AppHandle>) -> computer_use::recipes::Seen {
+    let Some(app) = window else {
+        return computer_use::recipes::Seen::default();
+    };
+    let pages = app
+        .state::<AppState>()
+        .browser_urls()
+        .iter()
+        .map(|(label, url)| (label.clone(), url.clone()))
+        .collect();
+    let apps = computer_use::call("listApps", serde_json::json!({})).ok();
+    computer_use::recipes::Seen::of(pages, apps.as_ref())
+}
+
 /// Recipes (§7.2): saved from this session's steps (or a folder named), kept
 /// under the window's data root, and registered in the artifacts catalogue
 /// so a person finds and edits them where every other document is.
 pub(super) fn desktop_recipe(
     command: &zerocode_core::computer_use::ComputerCommand,
+    window: Option<&tauri::AppHandle>,
 ) -> Result<serde_json::Value, computer_use::ComputerUseError> {
     use zerocode_core::computer_use::ComputerMethod;
     use zerocode_core::computer_use_protocol::error_code;
@@ -7290,6 +7428,32 @@ pub(super) fn desktop_recipe(
                 .get("note")
                 .and_then(serde_json::Value::as_str);
             let file = computer_use::recipes::save(&root, name, note, &from, last, now_epoch_ms())?;
+            // `--flow-check` (t-93871): the words the screen shows when the run
+            // has worked stand the saved recipe up as a Flow — before it is
+            // catalogued, so the gallery's copy is the Flow's own document. A
+            // recipe that cannot be bound stays saved, and the answer says so.
+            let flow = command
+                .params
+                .get("flowCheck")
+                .and_then(serde_json::Value::as_str)
+                .map(|words| {
+                    computer_use::recipes::flow_register(
+                        &root,
+                        &zerocode_core::computer_use::recipe_slug(name),
+                        Some(words),
+                        &recipe_seen_by(window),
+                    )
+                })
+                .transpose()
+                .map_err(|error| {
+                    computer_use::ComputerUseError::new(
+                        error.code,
+                        format!(
+                            "the recipe '{name}' was saved, but could not be stood up as a Flow: {}",
+                            error.message
+                        ),
+                    )
+                })?;
             // Into the catalogue, so the gallery shows it beside the reports.
             let artifact = crate::artifact_runtime::store().and_then(|store| {
                 store
@@ -7304,12 +7468,16 @@ pub(super) fn desktop_recipe(
                     )
                     .ok()
             });
-            Ok(serde_json::json!({
+            let mut saved = serde_json::json!({
                 "name": name,
                 "file": file.display().to_string(),
                 "from": from.display().to_string(),
                 "artifactId": artifact.map(|one| one.id),
-            }))
+            });
+            if let Some(flow) = flow {
+                saved["flow"] = serde_json::to_value(flow).unwrap_or(serde_json::Value::Null);
+            }
+            Ok(saved)
         }
         ComputerMethod::RecipeList => {
             Ok(serde_json::json!({ "recipes": computer_use::recipes::list(&root) }))

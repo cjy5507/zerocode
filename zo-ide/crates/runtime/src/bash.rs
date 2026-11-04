@@ -816,18 +816,9 @@ pub fn execute_bash_with_tasks(
     // to ask (`PermissionPolicy`), so it goes ahead here — save in a pane the
     // ledger summoned as a worker, which nobody watches, where no path can
     // have asked it.
-    let refused = match crate::kill_guard::judge(&input.command) {
-        Some(zerocode_core::shell_rule::kill::KillVerdict::Deny { reason }) => {
-            Some(crate::kill_guard::refusal(&reason))
-        }
-        Some(zerocode_core::shell_rule::kill::KillVerdict::Ask { reason })
-            if crate::kill_guard::in_a_summoned_worker_pane() =>
-        {
-            Some(crate::kill_guard::unanswered(&reason))
-        }
-        _ => None,
-    };
-    if let Some(refused) = refused {
+    if let Some(refused) =
+        crate::kill_guard::refused_where_it_runs(crate::kill_guard::Shell::Bash, &input.command)
+    {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, refused));
     }
 
@@ -960,14 +951,16 @@ pub fn execute_bash_with_tasks(
             let owner_session = owner_session.clone();
             std::thread::spawn(move || {
                 let runtime = Builder::new_current_thread().enable_all().build()?;
-                runtime.block_on(execute_bash_async(
+                let result = runtime.block_on(execute_bash_async(
                     input,
                     sandbox_status,
                     cwd,
                     live_writer,
                     registry_backed,
                     owner_session,
-                ))
+                ));
+                end_call_runtime(runtime);
+                result
             })
             .join()
             .map_err(|_| io::Error::other("bash execution thread panicked"))?
@@ -987,16 +980,30 @@ pub fn execute_bash_with_tasks(
     }
 
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    runtime
-        .block_on(execute_bash_async(
-            input,
-            sandbox_status,
-            cwd,
-            live_writer,
-            registry_backed,
-            owner_session,
-        ))
-        .map(|output| attach_disk_warning(output, low_disk))
+    let result = runtime.block_on(execute_bash_async(
+        input,
+        sandbox_status,
+        cwd,
+        live_writer,
+        registry_backed,
+        owner_session,
+    ));
+    end_call_runtime(runtime);
+    result.map(|output| attach_disk_warning(output, low_disk))
+}
+
+/// Ends the runtime a call built for itself without waiting for its blocking
+/// pool. Dropping a runtime waits for every blocking task, and on Windows tokio
+/// reads a child's output pipes on that pool (`process/windows.rs`, `ChildStdio`
+/// over `Blocking`): a read cannot be cancelled and returns only when every
+/// holder of the pipe's write end has let go. A deadline that ended the `sh` but
+/// not what it started, or a `taskkill` that did not reach it, then kept the
+/// call for as long as the command ran: a `!` line with a 1 s limit and
+/// `sleep 20` under it returned after 20.6 s on the Windows run of PR #9 (run
+/// 41825393794). The detached read ends with the pipe. Nothing the call needs
+/// is left on the pool: its output was read, or its deadline gave the reply up.
+fn end_call_runtime(runtime: tokio::runtime::Runtime) {
+    runtime.shutdown_background();
 }
 
 /// `registry_backed` records whether the caller reached here through
@@ -1100,6 +1107,8 @@ async fn execute_bash_async(
         // Dropping `child` triggers `kill_on_drop` as the leader backstop (WI-G).
         #[cfg(unix)]
         end_registered_group(child_pid).await;
+        #[cfg(windows)]
+        end_process_tree(child_pid).await;
         spill
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1346,7 +1355,8 @@ fn prepare_tokio_command(
     // Make the child its own process-group leader so a timeout/cancel can signal
     // the whole tree (`kill -- -pgid`), not just the direct child. Without this,
     // `kill_on_drop` SIGKILLs only the `sh`/`unshare` pid and any backgrounded
-    // grandchildren orphan (WI-G). Unix-only; Windows keeps `kill_on_drop`.
+    // grandchildren orphan (WI-G). Unix-only; Windows keeps `kill_on_drop` and
+    // ends the tree at a timeout with `end_process_tree`.
     #[cfg(unix)]
     prepared.process_group(0);
     Ok(prepared)
@@ -1530,6 +1540,38 @@ async fn end_registered_group(pid: Option<u32>) {
         tokio::time::sleep(BASH_GROUP_GRACE).await;
         finish_registered(pid, &end);
     }
+}
+
+/// The timeout's end of a run's tree on Windows, which has no process group to
+/// signal (`prepare_tokio_command` makes none). `kill_on_drop` ends the `sh`, not
+/// the commands it started, and those hold the run's output pipes. tokio reads a
+/// child's pipes on the blocking pool on Windows, a blocked read cannot be
+/// cancelled, and dropping the runtime of the call waits for it: a `!` line with a
+/// 1 s limit and `sleep 20` under it returned after 20.3 s on the Windows run of
+/// PR #9 (run 41815515047, `a_bang_line_past_its_limit_is_stopped_and_says_a_slow_line_held_the_window`),
+/// when the limit is there so that a slow line does not hold the window. `taskkill
+/// /F /T` on the leader ends the tree, so the pipes close at once. The system
+/// folder's own `taskkill`, not the first one on `PATH`. Best effort and bounded: a
+/// tool that cannot start or does not answer leaves the run as it was, and the
+/// deadline's reply goes out either way.
+#[cfg(windows)]
+async fn end_process_tree(pid: Option<u32>) {
+    let Some(pid) = pid else {
+        return;
+    };
+    let system_root = env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let taskkill = std::path::Path::new(&system_root)
+        .join("System32")
+        .join("taskkill.exe");
+    let mut ended = TokioCommand::new(taskkill);
+    ended
+        .args(["/F", "/T", "/PID"])
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let _ = timeout(Duration::from_secs(5), ended.status()).await;
 }
 
 /// Waits for a run's child to end, and records the reap for the order tests

@@ -60,6 +60,8 @@ MODEL_CHECKS = {"answer_digits"}
 CHORD_DEAF = "chord_deaf"
 QUESTION_OPEN = "question_open"
 NO_HELPER = "no_helper"
+# A signal to the runner (Ctrl+C, the pane closing): its stop's prefix.
+RUNNER_STOP_PREFIX = "runner:"
 
 
 class Refused(Exception):
@@ -90,9 +92,15 @@ class Signals:
     def __init__(self):
         self.first = None
 
+    SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
     def install(self):
-        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        for sig in self.SIGNALS:
             signal.signal(sig, self.caught)
+        # A blocked signal is only held, never handled: a runner started with
+        # these blocked (the mask passes down through every exec) ran a stopped
+        # run to zo's own end and finished with 0 (release gate l102c, 11-04).
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, self.SIGNALS)
         return self
 
     def quiet(self):
@@ -102,7 +110,7 @@ class Signals:
     def caught(self, signum, _frame):
         if self.first is None:
             self.first = signal.Signals(signum).name
-            raise Stopped(f"runner:{self.first}")
+            raise Stopped(f"{RUNNER_STOP_PREFIX}{self.first}")
 
 
 class Clipboard:
@@ -477,19 +485,22 @@ class Bench:
         body["tool_calls"] = stream["tool_calls"]
         body["off_road"] = sorted(name for name in stream["tool_calls"] if name not in self.values["allowed_tools"])
         settled = True
-        try:
-            settled = self.settle_questions()
-            self.shim(["evidence", "--last", str(self.values["flush_last"])], folder)
-            steps = tally.read_steps(folder)
-            body["forbidden_verbs"] = sorted({row.get("verb") for row in steps if row.get("verb") in self.values["forbid_verbs"]})
-            after = self.status().get("helper")
-            if isinstance(after, dict) and isinstance(before.get("actions"), int):
-                body["hand_actions"] = after.get("actions", 0) - before["actions"]
-            message = read_text(last_message)
-            body["claimed"] = scenarios.claim(message, self.values["self_result_pattern"])
-            body["oracle"] = scenarios.oracle(work, scenario["oracle"], self.own(), message, hashes)
-        except Stopped as why:
-            stopped = stopped or str(why)  # a signal while the run was being judged: it is not judged
+        # A signal to the runner ends the bench now: its run is not judged, so
+        # the window is asked nothing more and the clipboard comes back next.
+        if not str(stopped or "").startswith(RUNNER_STOP_PREFIX):
+            try:
+                settled = self.settle_questions()
+                self.shim(["evidence", "--last", str(self.values["flush_last"])], folder)
+                steps = tally.read_steps(folder)
+                body["forbidden_verbs"] = sorted({row.get("verb") for row in steps if row.get("verb") in self.values["forbid_verbs"]})
+                after = self.status().get("helper")
+                if isinstance(after, dict) and isinstance(before.get("actions"), int):
+                    body["hand_actions"] = after.get("actions", 0) - before["actions"]
+                message = read_text(last_message)
+                body["claimed"] = scenarios.claim(message, self.values["self_result_pattern"])
+                body["oracle"] = scenarios.oracle(work, scenario["oracle"], self.own(), message, hashes)
+            except Stopped as why:
+                stopped = stopped or str(why)  # a signal while the run was being judged: it is not judged
         if stopped:
             body["stopped_by"] = stopped
         if stopped or not settled:

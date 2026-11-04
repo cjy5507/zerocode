@@ -35,6 +35,7 @@ mod quiet_children;
 mod quota_wall;
 mod raw_feed;
 mod readiness;
+mod recipe_store;
 mod release_versions;
 mod scm_observer_lock;
 mod seat_follows;
@@ -510,6 +511,9 @@ mod tests {
                             // t-67482: the schedule's look is timed the same
                             // way, beside its command (review t-69069, P2-1).
                             | "cmd/board.rs"
+                            // t-93871: which automations a recipe's delete takes is
+                            // judged on folders the test made, beside the command.
+                            | "cmd/review.rs"
                             // t-21017: a provider's done report reaches the
                             // human-input line through the one door
                             // `note_pane_state` calls, tested beside that door.
@@ -9977,10 +9981,24 @@ mod tests {
             );
         }
         let screenshot = block_after(shell, "async fn capture_emulator_screenshot(");
-        for owned in ["emulator_screenshot_bytes", "write_agent_screenshot"] {
+        for owned in ["emulator_screenshot_bytes", "screenshot_saved("] {
             assert!(
                 screenshot.contains(owned),
                 "the emulator screenshot route lost {owned}"
+            );
+        }
+        // One writer of the frame for both roads; a real phone's comes through
+        // `shot`, which keeps its refusal's code (t-93450).
+        let saved = block_after(shell, "fn screenshot_saved(");
+        assert!(
+            saved.contains("write_agent_screenshot"),
+            "the emulator screenshot route lost write_agent_screenshot"
+        );
+        let real_phone = block_after(shell, "async fn answer_real_phone(");
+        for owned in ["phone::shot(", "screenshot_saved("] {
+            assert!(
+                real_phone.contains(owned),
+                "a real phone's screenshot lost {owned}"
             );
         }
         let evidence = block_after(
