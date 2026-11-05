@@ -5971,10 +5971,14 @@ mod tests {
     /// `'Workspaces'`, stamped on `data-sidebar-section-title`
     /// (SidebarHeader.tsx:21,28), said in the person's language since the
     /// passed Geist draft (t-78107, 시안 7) — one scrolling list viewport
-    /// (VirtualizedWorktreeViewport.tsx:352), and a fixed toolbar whose right
-    /// pair is the crosshair and the board toggle wearing `aria-pressed`
-    /// (SidebarToolbar.tsx:78-119). The board door used to be a nav row and
-    /// the whole column used to scroll.
+    /// (VirtualizedWorktreeViewport.tsx:352), and a fixed toolbar that ends
+    /// on the crosshair (SidebarToolbar.tsx:78-119). The three destination
+    /// doors that stood beside the crosshair as bare icons — the agent board,
+    /// the Jev dashboard and the workspace board, still wearing
+    /// `aria-pressed` — end the nav's grid with their names since the
+    /// familiar-frame draft (2026-11-05: an icon with no word is a door only
+    /// its regulars find), and the search heads it. The whole column used to
+    /// scroll.
     #[test]
     fn the_sidebar_wears_its_original_frame() {
         let markup = include_str!("../../../../ui/index.html");
@@ -5993,7 +5997,13 @@ mod tests {
             nav < nav_end && nav_end < title && title < scroll && scroll < foot,
             "the four layers are out of the original's order"
         );
-        for inside_nav in ["id=\"guide-entry\"", "id=\"sidebar-search\""] {
+        for inside_nav in [
+            "id=\"guide-entry\"",
+            "id=\"sidebar-search\"",
+            "id=\"nav-agents\"",
+            "id=\"nav-jev\"",
+            "id=\"nav-board\"",
+        ] {
             let found = at(inside_nav);
             assert!(
                 nav < found && found < nav_end,
@@ -6007,16 +6017,15 @@ mod tests {
                 "`{inside_scroll}` does not ride the one scrolling layer"
             );
         }
-        for inside_foot in [
-            "id=\"foot-reveal\"",
-            "id=\"nav-agents\"",
-            "id=\"nav-board\"",
-        ] {
-            assert!(
-                at(inside_foot) > foot,
-                "`{inside_foot}` is not on the toolbar"
-            );
-        }
+        assert!(
+            at("id=\"foot-reveal\"") > foot,
+            "`id=\"foot-reveal\"` is not on the toolbar"
+        );
+        // The search heads the grid, above every destination it shares the nav with.
+        assert!(
+            at("id=\"sidebar-search\"") < at("id=\"nav-inbox\""),
+            "the search no longer heads the nav"
+        );
 
         let styles = include_str!("../../../../ui/shell.css");
         let column = block_after_css(styles, ".threads {");
@@ -30480,9 +30489,13 @@ mod tests {
                 .contains("held.iter().find(|one| one.id == Some(id))"),
             "a save wipes the stored screens of every tab still asleep"
         );
+        // The replay asks the held set for one screen (low-spec 1, the
+        // screens file beside the trees), by the tab's name all the same.
         assert!(
-            block_after(shipped, "fn replay_stored_screen(")
-                .contains("layout.id == Some(screen.id)"),
+            block_after(shipped, "fn replay_stored_screen(").contains(
+                "pane_layout::stored_screen(&file, &screen.worktree, screen.id, screen.ordinal)"
+            ) && block_after(rules, "pub(crate) fn stored_screen(")
+                .contains(".find(|layout| layout.id == Some(id))"),
             "the replay finds a tab by counting, so a closed tab hands its \
              last screen to whichever tab took its seat"
         );
@@ -37580,7 +37593,7 @@ mod tests {
         // read by one rule (t-82901).
         assert!(
             reading.contains("let read = LogRead::asked(after, before)?;")
-                && reading.contains("transcript_log_at(&path, read)"),
+                && reading.contains("transcript_log_detail(&path, read, whole.unwrap_or(false))"),
             "the helper page reads its file down a road of its own:\n{reading}"
         );
         // What the vendor wrote beside that file about the helper is found from the
@@ -37603,7 +37616,9 @@ mod tests {
             !pane.contains("path: String")
                 && pane.contains("pane_transcript::pane_transcript(&state, term)")
                 && pane.contains("let read = LogRead::asked(after, before)?;")
-                && pane.contains("transcript_log_at(&path, read)"),
+                && pane.contains(
+                    "transcript_log_source(&path, read, whole.unwrap_or(false), archive)"
+                ),
             "the pane's conversation door names a file, or reads it down another road:\n{pane}"
         );
         // A session's page reads what stands above it — the transcript of the
@@ -37626,7 +37641,12 @@ mod tests {
         // `worker-transcript` reads down the windowed reader
         // (t-6742) — never a walk of its own over the file — with the texts
         // whole for its masks, and no road past its own budget.
-        let door = block_after(shipped, "fn transcript_log_at(");
+        let clipped = block_after(shipped, "fn transcript_log_at(");
+        assert!(
+            clipped.contains("transcript_log_detail(path, read, false)"),
+            "ordinary painting keeps clipped bodies"
+        );
+        let door = block_after(shipped, "fn transcript_log_detail(");
         assert!(
             door.contains("transcript_log_window(")
                 && door.contains("SUBAGENT_LOG_CHUNK,")
@@ -37821,10 +37841,13 @@ mod tests {
         // set that marks its own claims exists nowhere else but its accessor.
         // (`managed_terminal_session` also names an agent from a program, and
         // that is not this: it reports what a terminal is running right now to
-        // a caller outside the window, and writes no roster.)
+        // a caller outside the window, and writes no roster. Nor is
+        // `codex_panes` (t-94962): it reads the claim set only to say whether
+        // a person typed a Codex pane, for the daemon's report, and writes
+        // nothing — the fourth call.)
         assert_eq!(
             shipped.matches("foreground_agents()").count(),
-            3,
+            4,
             "the kernel claim set gained an unaccounted owner — the state \
              adapter and the sweep should be the only runtime paths"
         );
@@ -38085,10 +38108,22 @@ mod tests {
             exiting.contains("write_last_statuses_now(handle);"),
             "quitting no longer flushes the survivor ledger"
         );
-        // 디바운스는 코어의 상수 하나를 읽는다 — 두 번째 숫자는 없다.
+        // 기다림은 코어의 상수를 읽는다 — 두 번째 숫자는 없다. 시계만 바뀐
+        // 소식은 적지 않고(저사양 1: 일하는 에이전트 열의 도구 이벤트가 시간당
+        // 약 1.2 GB의 fsync였다), 나머지는 소식의 무게만큼 뒤에 한 번에 적는다.
+        let persisting = block_after(shipped, "fn schedule_last_status_persist(");
+        let core = include_str!("../../src/last_status.rs");
         assert!(
-            shipped.contains("std::thread::sleep(last_status::PERSIST_DEBOUNCE)"),
-            "the persist debounce stopped reading the core constant"
+            persisting.contains("news.wait()")
+                && core.contains("News::Urgent => PERSIST_DEBOUNCE")
+                && core.contains("News::Settled => PERSIST_SETTLE"),
+            "the persist wait stopped reading the core constants"
+        );
+        let noting = block_after(shipped, "fn note_pane_state(");
+        assert!(
+            noting.contains("last_status::news(")
+                && noting.contains("schedule_last_status_persist(app, news)"),
+            "every hook report schedules a write again, clocks and all"
         );
         // 봉투 없는 소식은 **기억된 자리 하나**만 고친다. 꼬리 맞춤은
         // 워크트리를 가로질러 물었고, 번호는 재시작마다 다시 발급되므로
@@ -39617,13 +39652,15 @@ fn every_conversation_page_reads_up_past_its_first_turn_down_one_road() {
             && !scrolled.contains("readEarlierTurns"),
         "the way up is asked by a scroll no one pushed:\n{leave}\n{scrolled}"
     );
-    // What comes stands over the rows, the reader's row kept.
+    // What comes stands over the rows; keep the actual reader's row after
+    // final-answer spacing is assigned, rather than measuring too early.
     assert!(
-        sync.contains("const stood = { height: list.scrollHeight, top: list.scrollTop };")
+        sync.contains("reading: chatReading(list), height: list.scrollHeight, top: list.scrollTop")
             && sync.contains("standEarlierRows(list, run, earlier, folded, spoken, pills);")
             && sync.contains(
-                "if (!follow) list.scrollTop = stood.top + (list.scrollHeight - stood.height);"
+                "list.scrollTop += reading.row.getBoundingClientRect().top - list.getBoundingClientRect().top - reading.offset;"
             )
+            && sync.find("writeClass(row, \"is-turn-answer\"") < sync.find("if (abovePlace)")
             && sync.contains("const drawn = last ? Number(last.dataset.turn) : -Infinity;"),
         "turns read from above do not stand over the rows, or move the reader:\n{sync}"
     );
@@ -40349,5 +40386,42 @@ fn the_windows_table_of_zo_status_verbs_is_zos_own_words() {
     assert_eq!(
         spelled, sent,
         "the window's table of zo's status verbs is not the verbs zo sends:\n{table}"
+    );
+}
+
+/// Low-spec 2: the edge a working row wears turns on the compositor. It was a
+/// registered custom property animated inside a conic gradient, which the
+/// compositor cannot play: a style pass and a repaint on the main thread every
+/// frame (15.9 % of a 4×-throttled Chromium main thread for eight rows against
+/// 0.1 % for the turn, 2026-11-05). The arc is now a square turned by
+/// `transform` inside a ring-masked child of the row.
+#[test]
+fn the_working_edge_turns_on_the_compositor() {
+    let styles = include_str!("../../../../ui/shell.css");
+    assert!(
+        !styles.contains("@property --worktree-flow-angle"),
+        "the working edge animates a custom property again"
+    );
+    let square = support::block_after_css(styles, ".wt-flow::before {");
+    assert!(
+        square.contains("animation: wt-activity-turn"),
+        "the working edge's square no longer turns:\n{square}"
+    );
+    let turn = support::block_after_css(styles, "@keyframes wt-activity-turn {");
+    assert!(
+        turn.contains("transform:") && !turn.contains("--"),
+        "the working edge's turn is not a transform:\n{turn}"
+    );
+    let window = support::window_source();
+    let building = support::block_after(window, "function makeWorktreeNode(worktree, held) {");
+    assert!(
+        building.contains("node.append(workingEdge());"),
+        "a workspace row lost its working edge:\n{building}"
+    );
+    // The familiar frame (2026-11-05): a team row wears no ring of its own —
+    // its turning dot says it works — so it builds no hidden edge either.
+    assert!(
+        window.contains("const node = deskElement(\"button\", `team-row team-${entry.kind}`);\n  node.type = \"button\";"),
+        "a team row builds a working edge again"
     );
 }

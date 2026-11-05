@@ -8733,7 +8733,9 @@ function wakeStoredConversations(worktree, sleeping, staged) {
 async function restoreStandingWorkspaces() {
   let standing = [];
   try {
-    standing = await invoke("standing_pane_worktrees");
+    // The front is named so a machine with little memory can count its
+    // conversations against the boot's budget (low-spec 6, `low_memory.rs`).
+    standing = await invoke("standing_pane_worktrees", { front: activeWorktreePath ?? null });
   } catch {
     return;
   }
@@ -9611,7 +9613,7 @@ const TAB_GLYPH = {
   board: "columns",
   // 장부도 칸으로 선다 — 표와 보드가 쓰는 그 글리프다.
   tokens: "columns",
-  skills: "book",
+  skills: "sparkles",
   // The sprite has no globe; `external` is the outward-facing glyph it does
   // have, and a browser tab is the one tab that faces outward.
   browser: "external",

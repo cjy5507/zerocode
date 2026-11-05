@@ -103,7 +103,10 @@ async function testChromeSidebarAndTabs(browser, origin, ok) {
       };
       const nav = document.querySelector(".nav-rows");
       const rows = [...nav.querySelectorAll(":scope > .nav-row")].filter((row) => !row.hidden);
-      const cells = [...rows, nav.querySelector(":scope > .nav-search")];
+      // The search heads the grid across both columns (2026-11-05, the familiar-frame draft); the destinations fill
+      // the two columns under it, the three former footer doors among them.
+      const search = nav.querySelector(":scope > .nav-search");
+      const cells = rows;
       const lines = new Set(cells.map((row) => Math.round(box(row).top)));
       const lefts = new Set(cells.map((row) => Math.round(box(row).left)));
       const widths = new Set(cells.map((row) => Math.round(box(row).width)));
@@ -122,6 +125,10 @@ async function testChromeSidebarAndTabs(browser, origin, ok) {
         navColumns: lefts.size,
         navWidths: widths.size,
         navCells: cells.length,
+        searchSpans: search ? Math.abs(box(search).width - (box(nav).width - parseFloat(getComputedStyle(nav).paddingLeft) - parseFloat(getComputedStyle(nav).paddingRight))) < 1.5 : false,
+        searchFirst: search ? rows.every((row) => box(row).top >= box(search).bottom - 0.5) : false,
+        searchKeys: (() => { const keys = document.getElementById("sidebar-search-keys"); return keys ? keys.hidden || getComputedStyle(keys).display !== "none" : false; })(),
+        footDoors: ["nav-agents", "nav-jev", "nav-board"].every((id) => document.getElementById(id)?.parentElement === nav),
         navWhole: rows.every((row) => [...row.querySelectorAll(":scope > span:not(.nav-badge)")].every((name) => name.scrollWidth <= name.clientWidth + 1)),
         badgeInk: badge ? getComputedStyle(badge).backgroundColor : null,
         you: token("--signal-you-solid"),
@@ -143,11 +150,12 @@ async function testChromeSidebarAndTabs(browser, origin, ok) {
         workHeader: Boolean(document.querySelector('.proj-row[data-project-path="/w"]')),
         heading: el("sidebar-title").textContent,
         chatGround: token("--chat-ground"),
-        floor: token("--surface-abyss"),
+        surface: token("--surface-deck"),
       };
     });
-    ok("the destinations and the search stand in two even columns, every name whole (t-81525 S1)",
-      seen.navColumns === 2 && seen.navWidths === 1 && seen.navLines === Math.ceil(seen.navCells / 2) && seen.navRows >= 6 && seen.navWhole,
+    ok("the search heads the nav across both columns with its keys always shown, and the destinations — the former footer doors with them — stand in two even columns under it, every name whole (t-81525 S1, 2026-11-05)",
+      seen.navColumns === 2 && seen.navWidths === 1 && seen.navLines === Math.ceil(seen.navCells / 2) && seen.navRows >= 9 && seen.navWhole &&
+        seen.searchSpans && seen.searchFirst && seen.searchKeys && seen.footDoors,
       JSON.stringify(seen));
     ok("the inbox's number is the one blue, not a lane's hue (t-81525 S1)",
       seen.badgeInk === seen.you, JSON.stringify(seen));
@@ -184,8 +192,8 @@ async function testChromeSidebarAndTabs(browser, origin, ok) {
       seen.restingRows === 1 && seen.restingWord === "쉬는 프로젝트 5" && seen.restingHeaders === 0 && seen.workHeader,
       JSON.stringify(seen));
     ok("the sidebar heading speaks the person's language (시안 7)", seen.heading === "프로젝트", seen.heading);
-    ok("the conversation stands on the floor, one step under the panels (시안 10)",
-      seen.chatGround === seen.floor, JSON.stringify(seen));
+    ok("the conversation uses the approved neutral surface",
+      seen.chatGround === seen.surface, JSON.stringify(seen));
 
     // The resting line opens with a press and with the keyboard, and says so.
     const opened = await page.evaluate(async () => {
@@ -349,7 +357,7 @@ async function testOneGround(browser, origin, ok) {
         screen: screen ? ink(getComputedStyle(screen).backgroundColor) : null,
         panes: panes ? ink(getComputedStyle(panes).backgroundColor) : null,
         chat: ink("var(--chat-ground)"),
-        floor: ink("var(--surface-abyss)"),
+        surface: ink("var(--surface-deck)"),
         reported: reported ? ink(reported) : null,
         picked: picked ? ink(picked) : null,
       };
@@ -374,8 +382,8 @@ async function testOneGround(browser, origin, ok) {
       return { name, background: themes[name].background };
     });
     const chosen = await read(picked.background);
-    ok("the terminal on the default theme stands on the conversation's ground, the floor, in both treatments (시안 10)",
-      dark.screen === dark.chat && dark.panes === dark.chat && dark.chat === dark.floor &&
+    ok("the terminal on the default theme shares the conversation surface in both treatments",
+      dark.screen === dark.chat && dark.panes === dark.chat && dark.chat === dark.surface &&
         light.screen === light.chat && light.panes === light.chat,
       JSON.stringify({ dark, light }));
     ok("the shell is told the ground the terminal is drawn on (OSC 11)",

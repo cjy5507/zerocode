@@ -80,6 +80,7 @@ import { testWorkspaceBoard } from "./workspace-board.mjs";
 import { testFlowConsole } from "./flow-console.mjs";
 import { testWorktreeEvidence } from "./worktree-evidence.mjs";
 import { testAgentConversation } from "./agent-conversation.mjs";
+import { testConversationAfter, testConversationArchive, testConversationRecovery } from "./conversation-after.mjs";
 import { testHelperDoors } from "./helper-doors.mjs";
 import { testBrowserRecovery } from "./browser-recovery.mjs";
 import { testBrowserPanesSurvive } from "./browser-panes-survive.mjs";
@@ -536,6 +537,9 @@ suite("conversation-b-tail", ({ browser, origin, ok }) => testConversationBTail(
 /* 대화 안 찾기 ⌘F — 대화가 앞에 서면 대화에서, 알약 안 일치는 펼침, 400턴 한 프레임 (시안 C8, t-82196). */
 suite("conversation-find", ({ browser, origin, ok }) => testConversationFind(browser, origin, ok));
 suite("conversation-find-pane", ({ browser, origin, ok }) => testConversationFindPane(browser, origin, ok));
+suite("conversation-after", ({ browser, origin, ok }) => testConversationAfter(browser, origin, ok));
+suite("conversation-archive", ({ browser, origin, ok }) => testConversationArchive(browser, origin, ok));
+suite("conversation-recovery", ({ browser, origin, ok }) => testConversationRecovery(browser, origin, ok));
 /* 사람 말에서 고쳐 보내기 — 되감기 명령을 아는 CLI의 판에만, 누르면 판을 터미널로 돌리고 /rewind (시안 C10, t-82196). */
 suite("pane-rewind", ({ browser, origin, ok }) => testPaneRewind(browser, origin, ok));
 suite("conversation-earlier", ({ browser, origin, ok }) => testConversationEarlier(browser, origin, ok));
@@ -10610,7 +10614,15 @@ const sidebarFaces = await page.evaluate(async () => {
     tab: { worktree: null, id: "x" },
   });
   seen.face = card.children[1]?.classList.contains("wt-agent-face") ?? false;
-  seen.letter = card.querySelector(".wt-agent-face .agent-ico-letter")?.textContent;
+  // Codex's mark travels with the window (2026-11-05, ui/marks/): it shows from the first paint, never a letter.
+  seen.carried = card.querySelector(".wt-agent-face img")?.getAttribute("src") ?? null;
+  // An agent whose mark the backend fetches still wears its initial until the mark lands.
+  const fetched = makeAgentRow({
+    term: 7779, state: "working", agent: "opencode", depth: 0,
+    tab: { worktree: null, id: "z" },
+  });
+  seen.letter = fetched.querySelector(".wt-agent-face .agent-ico-letter")?.textContent;
+  seen.letterWant = (agentRows.find((one) => one.id === "opencode")?.name ?? "opencode").charAt(0).toUpperCase();
   const bare = makeAgentRow({
     term: 7778, state: "done", agent: null, depth: 0,
     tab: { worktree: null, id: "y" },
@@ -10621,7 +10633,8 @@ const sidebarFaces = await page.evaluate(async () => {
 ok(
   "the project folder follows its fold, and an agent row wears the registry's face",
   sidebarFaces.openGlyph === "#i-folder-open" && sidebarFaces.closedGlyph === "#i-folder" &&
-    sidebarFaces.face && sidebarFaces.letter === "C" && sidebarFaces.noFace,
+    sidebarFaces.face && sidebarFaces.carried === "marks/codex.svg" &&
+    sidebarFaces.letter === sidebarFaces.letterWant && sidebarFaces.noFace,
   JSON.stringify(sidebarFaces),
 );
 
@@ -17358,7 +17371,10 @@ ok(
  * agent-catalog-1Y3pTpm8.js:452-490) — but fetched by the BACKEND and handed
  * over as a `data:` URL, because the page reaches no host at all: the favicon
  * service 301s to another origin and a CSP source with a path does not follow
- * a redirect, which is what put a letter on all of them for a while.
+ * a redirect, which is what put a letter on all of them for a while. Claude's
+ * and Codex's marks travel with the window instead (2026-11-05, ui/marks/:
+ * their sites' favicons are the old tile and OpenAI's knot), so nothing asks
+ * the backend for those two.
  *
  * The 자동 pill alone has no mark — Orca leads it with the check instead — and
  * 에이전트 없음 carries the terminal glyph. */
@@ -17393,13 +17409,15 @@ ok(
   "every pill and row wears the agent's real mark, asked for once per agent",
   wornIcons.pills[0].mark === null && !wornIcons.pills[0].glyph &&
     wornIcons.pills[1].mark === null && wornIcons.pills[1].glyph &&
-    wornIcons.pills[2].mark === "data:image/png;base64,AAAA" &&
-    wornIcons.pills[3].mark === "data:image/png;base64,BBBB" &&
+    wornIcons.pills[2].mark === "marks/claude.svg" &&
+    wornIcons.pills[3].mark === "marks/codex.svg" &&
     wornIcons.chips.length === 4 &&
-    wornIcons.chips.every((src) => src?.startsWith("data:image/png;base64,")) &&
-    // Two pills and four rows draw claude.ai and openai.com between them; the
-    // backend is asked once per DOMAIN, not once per element.
-    wornIcons.asked.length === new Set(wornIcons.asked).size,
+    wornIcons.chips.filter((src) => src === "marks/claude.svg" || src === "marks/codex.svg").length === 2 &&
+    wornIcons.chips.filter((src) => src?.startsWith("data:image/png;base64,")).length === 2 &&
+    // The carried two are never asked for, and the backend is asked once per
+    // DOMAIN for the rest, not once per element.
+    !wornIcons.asked.includes("claude.ai") && !wornIcons.asked.includes("openai.com") &&
+    wornIcons.asked.length > 0 && wornIcons.asked.length === new Set(wornIcons.asked).size,
   JSON.stringify(wornIcons),
 );
 
@@ -17411,12 +17429,20 @@ const lettered = await page.evaluate(async () => {
   window.__ANSWER__.agent_icon = () => null;
   agentMarks.clear();
   paintAgentPills();
-  const icons = [...document.querySelectorAll('.agent-pill[data-agent="claude"] .agent-ico, .agent-pill[data-agent="codex"] .agent-ico')];
-  const before = icons.map((one) => ({
+  paintAgents();
+  // The agents whose marks the backend fetches: the rows of the two the catalog offers to install.
+  const icons = [...document.querySelectorAll("#agent-available .agent-row .agent-chip .agent-ico")];
+  const names = [...document.querySelectorAll("#agent-available .agent-row")].map((row) =>
+    agentRows.find((one) => one.id === row.dataset.agent)?.name ?? row.textContent.trim());
+  const before = icons.map((one, at) => ({
     lettered: one.classList.contains("is-lettered"),
     letter: one.querySelector(".agent-ico-letter")?.textContent,
+    want: (names[at] ?? "").charAt(0).toUpperCase(),
     img: Boolean(one.querySelector("img")),
   }));
+  // The carried two stand offline as well — no letter, their own mark.
+  const carried = [...document.querySelectorAll('.agent-pill[data-agent="claude"] .agent-ico, .agent-pill[data-agent="codex"] .agent-ico')]
+    .map((one) => ({ lettered: one.classList.contains("is-lettered"), src: one.querySelector("img")?.getAttribute("src") ?? null }));
   await new Promise((done) => setTimeout(done, 100));
   const after = icons.map((one) => ({
     lettered: one.classList.contains("is-lettered"),
@@ -17425,19 +17451,19 @@ const lettered = await page.evaluate(async () => {
   // And with a mark, the tile gives way.
   window.__ANSWER__.agent_icon = () => "data:image/png;base64,AAAA";
   agentMarks.clear();
-  paintAgentPills();
+  paintAgents();
   await new Promise((done) => setTimeout(done, 100));
-  const marked = document.querySelector('.agent-pill[data-agent="claude"] .agent-ico');
+  const marked = document.querySelector("#agent-available .agent-row .agent-chip .agent-ico");
   delete window.__ANSWER__.agent_icon;
   return {
-    before, after,
+    before, after, carried,
     swapped: !marked.classList.contains("is-lettered") && Boolean(marked.querySelector("img")),
   };
 });
 ok(
   "the initial stands in when there is no mark, and gives way when there is",
-  lettered.before.every((one) => one.lettered && !one.img) &&
-    lettered.before[0].letter === "C" && lettered.before[1].letter === "C" &&
+  lettered.before.length === 2 && lettered.before.every((one) => one.lettered && !one.img && one.letter === one.want) &&
+    lettered.carried.length === 2 && lettered.carried.every((one) => !one.lettered && one.src?.startsWith("marks/")) &&
     // Still lettered, still no img — a refusal must not leave a broken image.
     lettered.after.every((one) => one.lettered && !one.img) &&
     lettered.swapped,
@@ -24702,9 +24728,10 @@ const identity = await page.evaluate(() => {
   seen.bareBefore = kindOf()?.dataset.agentIcon ?? null;
   // 스폰 원장이 배운다 — 세션 훅 없이, 다음 렌더에서 글리프가 정체로 바뀐다.
   // 카탈로그가 아직 답하지 않은 부팅의 첫 그림: 도메인 없는 글자 타일이다.
+  // An agent whose mark the backend fetches (Claude's and Codex's travel with the window and never letter).
   const catalog = agentRows;
   agentRows = [];
-  paneAgents.set(term, "claude");
+  paneAgents.set(term, "opencode");
   renderTabs();
   seen.wearsBare = kindOf()?.dataset.agentIcon ?? null;
   const bareFace = kindOf()?.querySelector(".agent-ico");
@@ -24721,6 +24748,15 @@ const identity = await page.evaluate(() => {
   renderTabs();
   seen.heldStill = kindOf()?.querySelector(".agent-ico") === facedOnce &&
     kindOf()?.dataset.agentIcon === seen.wears;
+  seen.letterWant = (catalog.find((one) => one.id === "opencode")?.name ?? "opencode").charAt(0).toUpperCase();
+  // Claude's carried mark stands from the first paint, before the catalog answers.
+  agentRows = [];
+  paneAgents.set(term, "claude");
+  renderTabs();
+  seen.claudeBare = kindOf()?.querySelector(".agent-ico img")?.getAttribute("src") ?? null;
+  agentRows = catalog;
+  paneAgents.set(term, "opencode");
+  renderTabs();
   // 그리고 사이드바 행 모델도 같은 원장에서 같은 답을 꺼낸다.
   const heldWorktree = tab.worktree;
   tab.worktree = heldWorktree ?? "/tmp/identity-wt";
@@ -24738,9 +24774,9 @@ const identity = await page.evaluate(() => {
 });
 ok(
   "a tab holding an agent wears its identity mark keyed by agent and domain — the letter tile painted before the catalog answered gives way to a fresh face when it lands, a same-answer render holds the node still — and the sidebar row names it from the launch ledger",
-  identity.bareBefore === null && identity.wearsBare === "claude:" && identity.letter === "C" &&
-    identity.wears === "claude:claude.ai" && identity.face && identity.refaced && identity.heldStill &&
-    identity.rowAgent === "claude" &&
+  identity.bareBefore === null && identity.wearsBare === "opencode:" && identity.letter === identity.letterWant &&
+    identity.wears === "opencode:opencode.ai" && identity.face && identity.refaced && identity.heldStill &&
+    identity.claudeBare === "marks/claude.svg" && identity.rowAgent === "opencode" &&
     identity.bareAfter === null && identity.glyphAfter === "#i-terminal",
   JSON.stringify(identity),
 );
@@ -36475,7 +36511,7 @@ const chatFace = await page.evaluate(async () => {
   const briefingSaid = turns[0]?.querySelector(":scope > .helper-said") ?? null;
   seen.briefingBubble = turns[0]?.tagName === "ARTICLE" &&
     turns[0]?.classList.contains("is-briefing") && !["sticky", "fixed"].includes(getComputedStyle(turns[0]).position) &&
-    briefingSaid !== null && getComputedStyle(briefingSaid).borderTopWidth === "0px" &&
+    briefingSaid !== null && getComputedStyle(briefingSaid).borderTopWidth === "1px" &&
     getComputedStyle(briefingSaid).backgroundColor !== "rgba(0, 0, 0, 0)" &&
     Math.abs(briefingSaid.getBoundingClientRect().left - turns[0].getBoundingClientRect().left) <= 2;
   seen.briefingSaid = turns[0]?.querySelector(".helper-said")?.textContent?.split("\n", 1)[0];
@@ -37723,7 +37759,7 @@ const flatTranscript = await page.evaluate(async () => {
   seen.userQuiet = personStyle.position === briefStyle.position &&
     personBox.backgroundColor === briefBox.backgroundColor &&
     personBox.borderRadius === briefBox.borderRadius &&
-    personBox.borderLeftWidth === "0px" && briefBox.borderLeftWidth === "0px" &&
+    personBox.borderLeftWidth === "1px" && briefBox.borderLeftWidth === "1px" &&
     person.className === brief.className.replace(" is-briefing", "") &&
     !brief.querySelector(".helper-who") && !person.querySelector(".helper-who") &&
     brief.getAttribute("aria-label") === t("worker.briefing", "브리핑") &&
@@ -37966,7 +38002,7 @@ await page.evaluate(async (term) => {
 }, flatTranscript.term);
 console.log("HELPER_NODES", JSON.stringify({ turns: flatTranscript.count, listNodes: flatTranscript.listNodes }));
 ok(
-  "the helper page is a flat readable transcript: bare assistant prose with no dot, the person's bubbles on the right (t-81525 B3·B4), every tool step one closed line under its kind's word with mono only for machine excerpts, the rest of a long input in the row's body one press away behind its door — and no more nodes at 400 turns than the measured ceiling",
+  "the helper page is a flat readable transcript: bare assistant prose with no dot, the approved outlined prompts on the left, every tool step one closed line under its kind's word with mono only for machine excerpts, the rest of a long input in the row's body one press away behind its door — and no more nodes at 400 turns than the measured ceiling",
   flatTranscript.opened && flatTranscript.count === 400 &&
     flatTranscript.listNodes <= HELPER_LIST_NODES_CEILING &&
     flatTranscript.proseFlat && flatTranscript.inkFromToken &&
@@ -52749,6 +52785,16 @@ for (const combo of freezeCombos) {
         written.set(key, (written.get(key) ?? 0) + 1);
       }
     });
+    // The spinner-only segment counts every mutation against the spinner's own
+    // bound, so the open conversation's one-second clock (`tickWorkers`) is held
+    // for it: on a 60 Hz runner sixty frames last about a second and the clock's
+    // write landed inside (Windows, v1.1.121: 73 mutations, bound 72, the 73rd
+    // `span.worker-elapsed childList`). `tickWorkers` finds its page through the
+    // global `activeRunningPage` at each tick; with no page it writes nothing and
+    // `workerClock` stops, and `sync()` starts it again after the segment.
+    const holdClock = !combo.stream && combo.wsSpin && !combo.rowSpin;
+    const realActiveRunningPage = window.activeRunningPage;
+    if (holdClock) window.activeRunningPage = () => null;
     watcher.observe(document.body, { subtree: true, childList: true, attributes: true, characterData: true });
     const deltas = [];
     await new Promise((done) => {
@@ -52765,6 +52811,10 @@ for (const combo of freezeCombos) {
     });
     await new Promise((done) => setTimeout(done, 0));
     watcher.disconnect();
+    if (holdClock) {
+      window.activeRunningPage = realActiveRunningPage;
+      workerClock.sync();
+    }
     window.renderTabs = realRenderTabs;
     Element.prototype.getBoundingClientRect = rect;
     window.getComputedStyle = computed;
@@ -55538,6 +55588,10 @@ ok("the window raised no errors", faults.length === 0, faults.join(" | "));
 });
 
 suite("sidebar-activity-border", async ({ browser, origin, ok }) => {
+  /* Since the familiar-frame draft (2026-11-05) an agent row at work wears no ring of its own: the turning state
+   * mark says it works, and the moving ring drawn inside the card read as a second card (「카드 속 카드」). The
+   * workspace's own ring still takes over wherever the agent rows are folded away or hidden. The ring is the
+   * workspace's `.wt-flow` child, whose `::before` square turns (low-spec 2, a compositor turn, not a restyle). */
   const { page, faults } = await openWindowTestPage(browser, origin);
   try {
     await page.emulateMedia({ reducedMotion: "no-preference" });
@@ -55560,16 +55614,12 @@ suite("sidebar-activity-border", async ({ browser, origin, ok }) => {
       window.__FLOW_READ__ = () => {
         const node = document.querySelector("#worktrees .wt-node");
         const row = node.querySelector(".wt-agent");
-        const border = row?.querySelector(".wt-activity-border");
-        const style = border ? getComputedStyle(border) : null;
-        const parent = getComputedStyle(node, "::after");
+        const edge = node.querySelector(":scope > .wt-flow");
         const rect = row?.getBoundingClientRect();
         return {
-          row: row?.className, display: style?.display, animation: style?.animationName,
-          duration: style?.animationDuration, mask: style?.maskComposite,
-          image: style?.backgroundImage, ink: style?.backgroundColor,
-          pointer: style?.pointerEvents, hidden: border?.getAttribute("aria-hidden"),
-          parentDisplay: parent.display, parentAnimation: parent.animationName,
+          row: row?.className, ring: row?.querySelector(".wt-flow") !== null,
+          parentDisplay: edge ? getComputedStyle(edge).display : "none",
+          parentAnimation: edge ? getComputedStyle(edge, "::before").animationName : "none",
           agentsVisible: getComputedStyle(node.querySelector(".wt-agents")).display !== "none",
           width: rect?.width, height: rect?.height,
         };
@@ -55581,35 +55631,22 @@ suite("sidebar-activity-border", async ({ browser, origin, ok }) => {
       await page.evaluate((theme) => { document.documentElement.dataset.theme = theme; }, theme);
       await page.evaluate(() => window.__FLOW_STATE__("working"));
       const working = await page.evaluate(() => window.__FLOW_READ__());
-      ok(`${theme}: only the working agent wears a thin, non-interactive flow border`,
-        working.display === "block" && working.animation === "wt-activity-flow" &&
-        working.duration === "5s" && working.mask.split(", ").every((mode) => mode === "exclude") && working.image.includes("conic-gradient") &&
-        working.pointer === "none" && working.hidden === "true" && working.parentDisplay === "none",
+      ok(`${theme}: a working agent row wears no ring of its own, and the workspace draws none while the row shows`,
+        /\bis-working\b/.test(working.row ?? "") && !working.ring && working.parentDisplay === "none",
         JSON.stringify(working));
 
       await page.keyboard.press("Tab");
-      const motion = await page.evaluate(async () => {
+      const focus = await page.evaluate(() => {
         const row = document.querySelector("#worktrees .wt-agent");
-        const border = row.querySelector(".wt-activity-border");
-        const animation = border.getAnimations().find((one) => one.animationName === "wt-activity-flow");
-        if (!animation) return { exists: false };
-        await animation.ready;
-        animation.pause();
-        animation.currentTime = 500;
-        const first = getComputedStyle(border).backgroundImage;
-        animation.currentTime = 3000;
-        const second = getComputedStyle(border).backgroundImage;
         row.focus();
-        const focus = getComputedStyle(row);
-        return { exists: true, moved: first !== second, outline: focus.outlineStyle,
-          outlineWidth: focus.outlineWidth, target: document.elementFromPoint(
-            row.getBoundingClientRect().left + row.clientWidth / 2,
-            row.getBoundingClientRect().top + row.clientHeight / 2,
-          )?.closest(".wt-agent") === row };
+        const style = getComputedStyle(row);
+        return { outline: style.outlineStyle, outlineWidth: style.outlineWidth, target: document.elementFromPoint(
+          row.getBoundingClientRect().left + row.clientWidth / 2,
+          row.getBoundingClientRect().top + row.clientHeight / 2,
+        )?.closest(".wt-agent") === row };
       });
-      ok(`${theme}: the border advances without intercepting clicks or hiding keyboard focus`,
-        motion.exists && motion.moved && motion.target && motion.outline !== "none" &&
-        parseFloat(motion.outlineWidth) >= 2, JSON.stringify(motion));
+      ok(`${theme}: nothing covers the working row's clicks or its keyboard focus`,
+        focus.target && focus.outline !== "none" && parseFloat(focus.outlineWidth) >= 2, JSON.stringify(focus));
       await page.evaluate(() => document.activeElement?.blur());
       await page.locator("#worktrees").screenshot({ path: `/tmp/zerocode-sidebar-flow-${theme}.png` });
 
@@ -55619,8 +55656,8 @@ suite("sidebar-activity-border", async ({ browser, origin, ok }) => {
         // A row at work stands two lines tall and a resting one folds back to
         // one (the nav bar redesign), so the width is what must not move; a
         // row still waiting on a person keeps the working row's two lines.
-        ok(`${theme}: ${state} stops the flow without shifting the row`,
-          quiet.display === "none" && quiet.animation === "none" && quiet.parentDisplay === "none" &&
+        ok(`${theme}: ${state} keeps the row's width, with no ring anywhere`,
+          !quiet.ring && quiet.parentDisplay === "none" &&
           Math.abs(quiet.width - working.width) < 0.5 &&
           (state === "needs-attention" ? quiet.height === working.height : quiet.height < working.height),
           JSON.stringify(quiet));
@@ -55636,7 +55673,7 @@ suite("sidebar-activity-border", async ({ browser, origin, ok }) => {
         const folded = await page.evaluate(() => window.__FLOW_READ__());
         ok(`${theme}: ${setting} transfers the running effect to the workspace`,
           !folded.agentsVisible && folded.parentDisplay === "block" &&
-          folded.parentAnimation === "wt-activity-flow", JSON.stringify(folded));
+          folded.parentAnimation === "wt-activity-turn", JSON.stringify(folded));
         if (setting === "compact") {
           await page.locator("#worktrees").screenshot({ path: `/tmp/zerocode-sidebar-flow-${theme}-compact.png` });
         }
@@ -55651,12 +55688,6 @@ suite("sidebar-activity-border", async ({ browser, origin, ok }) => {
           document.querySelector("#worktrees .wt-agents").hidden = false;
         });
       }
-      await page.emulateMedia({ reducedMotion: "reduce" });
-      const still = await page.evaluate(() => window.__FLOW_READ__());
-      ok(`${theme}: reduced motion keeps a static edge and the existing state mark`,
-        still.display === "block" && still.animation === "none" && still.image === "none" &&
-        still.parentDisplay === "none", JSON.stringify(still));
-      await page.emulateMedia({ reducedMotion: "no-preference" });
     }
 
     const structure = await page.evaluate(() => {
@@ -55672,24 +55703,21 @@ suite("sidebar-activity-border", async ({ browser, origin, ok }) => {
       const outside = makeAgentRow({ ...model, term: 99004, kids: 0 });
       document.body.appendChild(outside);
       const seen = {
-        folded: getComputedStyle(folded.querySelector(".wt-activity-border")).animationName,
+        rings: [folded, ancestor, history, outside].filter((row) => row.querySelector(".wt-activity-border") !== null).length,
         guide: getComputedStyle(folded, "::before").borderLeftStyle,
         elbow: getComputedStyle(folded, "::after").borderTopStyle,
-        ancestor: getComputedStyle(ancestor.querySelector(".wt-activity-border")).display,
-        history: history.querySelector(".wt-activity-border") === null,
-        outside: getComputedStyle(outside.querySelector(".wt-activity-border")).display,
+        foldLast: folded.lastElementChild?.classList.contains("wt-agent-fold") ?? false,
         selectionShadow: getComputedStyle(node).boxShadow,
       };
       outside.remove();
       return seen;
     });
-    ok("folded agents retain their flow and lineage; history and other surfaces stay quiet",
-      structure.folded === "wt-activity-flow" && structure.guide === "solid" && structure.elbow === "solid" &&
-      structure.ancestor === "none" && structure.history && structure.outside === "none" &&
+    ok("no agent row of any kind carries a ring, while folded agents keep their lineage guide and elbow",
+      structure.rings === 0 && structure.guide === "solid" && structure.elbow === "solid" && structure.foldLast &&
       structure.selectionShadow === "none", JSON.stringify(structure));
     await page.setViewportSize({ width: 720, height: 860 });
     const fits = await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth);
-    ok("the activity border does not cause overflow at 720px", fits);
+    ok("the working row does not cause overflow at 720px", fits);
     ok("sidebar activity border raises no browser errors", faults.length === 0, faults.join(" | "));
   } finally {
     await page.close();
