@@ -78,6 +78,8 @@ const BACKEND_PARTS: &[(&str, &str)] = &[
     ("cmd/onboarding.rs", include_str!("cmd/onboarding.rs")),
     ("cmd/agent_launch.rs", include_str!("cmd/agent_launch.rs")),
     ("cmd/board.rs", include_str!("cmd/board.rs")),
+    ("cmd/build_buttons.rs", include_str!("cmd/build_buttons.rs")),
+    ("cmd/build_order.rs", include_str!("cmd/build_order.rs")),
     ("cmd/console.rs", include_str!("cmd/console.rs")),
     ("cmd/wire.rs", include_str!("cmd/wire.rs")),
     ("cmd/review.rs", include_str!("cmd/review.rs")),
@@ -834,6 +836,90 @@ fn plain_block_arrow_scope(chars: &[char], opening: usize) -> Option<(usize, Vec
     None
 }
 
+/// A function declaration's own plain parameters, scoped to its body:
+/// `function fold(row, flip) { flip(); }` calls the `flip` it was handed, not
+/// a global. Only `function name(a, b) {` and `function (a, b) {` are read —
+/// defaults and destructuring are left to the caller, as for block arrows.
+fn plain_function_scope(chars: &[char], opening: usize) -> Option<(usize, Vec<String>)> {
+    let mut back = opening;
+    let skip_space = |mut at: usize| {
+        while at > 0 && chars[at - 1].is_whitespace() {
+            at -= 1;
+        }
+        at
+    };
+    let word_before = |end: usize| {
+        let mut start = end;
+        while start > 0 && is_ident_char(chars[start - 1]) {
+            start -= 1;
+        }
+        chars[start..end].iter().collect::<String>()
+    };
+    back = skip_space(back);
+    let mut word = word_before(back);
+    if word != "function" {
+        if word.is_empty() {
+            return None;
+        }
+        back = skip_space(back - word.chars().count());
+        word = word_before(back);
+        if word != "function" {
+            return None;
+        }
+    }
+    let mut cursor = opening + 1;
+    let mut parameters = Vec::new();
+    loop {
+        while chars.get(cursor).is_some_and(|value| value.is_whitespace()) {
+            cursor += 1;
+        }
+        if chars.get(cursor) == Some(&')') {
+            cursor += 1;
+            break;
+        }
+        if !chars
+            .get(cursor)
+            .is_some_and(|value| is_ident_start(*value))
+        {
+            return None;
+        }
+        let start = cursor;
+        while chars.get(cursor).is_some_and(|value| is_ident_char(*value)) {
+            cursor += 1;
+        }
+        parameters.push(chars[start..cursor].iter().collect());
+        while chars.get(cursor).is_some_and(|value| value.is_whitespace()) {
+            cursor += 1;
+        }
+        match chars.get(cursor) {
+            Some(',') => cursor += 1,
+            Some(')') => {}
+            _ => return None,
+        }
+    }
+    while chars.get(cursor).is_some_and(|value| value.is_whitespace()) {
+        cursor += 1;
+    }
+    if parameters.is_empty() || chars.get(cursor) != Some(&'{') {
+        return None;
+    }
+    let mut depth = 0_usize;
+    while let Some(glyph) = chars.get(cursor) {
+        match glyph {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some((cursor + 1, parameters));
+                }
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    None
+}
+
 /// Bare `name(` call sites. A method call (`a.b()`) belongs to whatever
 /// object it is on, an object/class method declaration (`write(value) {`)
 /// introduces a member rather than calling a global, and a keyword's
@@ -870,6 +956,7 @@ fn called_names(code: &str) -> std::collections::BTreeSet<String> {
         parameter_scopes.retain(|(end, _)| *end > i);
         if chars[i] == '('
             && let Some(scope) = plain_block_arrow_scope(&chars, i)
+                .or_else(|| plain_function_scope(&chars, i))
         {
             parameter_scopes.push(scope);
         }
@@ -3898,6 +3985,49 @@ fn ide_font_is_orcas_geist_default_on_one_live_ui_token() {
     assert!(
         shipped_backend().contains("set_app_font_family,"),
         "the IDE font patch is not registered"
+    );
+}
+
+/// How big the conversation reads (2026-11-06, the person's 「대화 화면이 실제
+/// 화면에 비해 글자가 작아 보이는데」): a word the window knows or whole pixels
+/// on the terminal's own ruler, through the one canonical settings wire, onto
+/// the one root variable every conversation size reads.
+#[test]
+fn the_conversation_size_is_a_normalized_setting_on_one_root_pin() {
+    let defaults = SettingsDocument::default();
+    assert_eq!(defaults.chat_font_size, "screen");
+    let restored: SettingsDocument =
+        serde_json::from_value(serde_json::json!({})).expect("old settings document");
+    assert_eq!(restored.chat_font_size, "screen", "an older document reads the default");
+    let (low, high) = TERM_FONT_SIZE_BOUNDS;
+    assert_eq!(normalized_chat_font_size(" terminal "), "terminal");
+    assert_eq!(normalized_chat_font_size(&low.to_string()), low.to_string());
+    assert_eq!(normalized_chat_font_size(&high.to_string()), high.to_string());
+    for refused in [(high + 1).to_string(), (low - 1).to_string(), "15.5".into(), "big".into(), String::new()] {
+        assert_eq!(normalized_chat_font_size(&refused), "screen", "{refused:?} is not a size the window draws");
+    }
+
+    let window = window_source();
+    assert_canonical_setting_round_trip(
+        shipped_backend(),
+        window,
+        "set_chat_font_size",
+        "setting_key::CHAT_FONT_SIZE",
+        "settings.chat_font_size = size",
+        "function setChatFontSize(size) {",
+        "chat_font_size",
+        "paintChatFontSize();",
+    );
+    assert!(
+        shipped_backend().contains("set_chat_font_size,"),
+        "the conversation size patch is not registered"
+    );
+    let apply = block_after(window, "function applyChatFontSize() {");
+    let tokens = include_str!("../../../ui/tokens.css");
+    assert!(
+        apply.contains("\"--chat-prose-pin\"")
+            && tokens.contains("--chat-prose-size: var(--chat-prose-pin, var(--term-font-size));"),
+        "the setting does not reach the one variable the conversation's sizes read:\n{apply}"
     );
 }
 
@@ -8215,9 +8345,10 @@ fn a_typed_jql_travels_verbatim_and_a_blank_one_never_leaves() {
 /// digest disagreeing — this recomputes it the way
 /// `scripts/build-ui-dist.mjs` does, so a change to either chain alone
 /// goes red instead of shipping a number that means nothing. And the two
-/// spellings of the LIST disagreeing, which is the one that matters
-/// most: the digest is only an identity if the Rust side and the JS side
-/// hash the same eight files.
+/// readings of the LIST disagreeing — `build.rs` reads the script's list
+/// since v1.1.125 went red on two spellings of it — which is the one that
+/// matters most: the digest is only an identity if the Rust side and the JS
+/// side hash the same files.
 fn names_of(list: &[String]) -> std::collections::BTreeSet<&str> {
     list.iter().map(String::as_str).collect()
 }
@@ -21050,6 +21181,19 @@ fn block_arrow_parameters_are_local_calls_not_window_globals() {
     assert!(!calls.contains("complete") && !calls.contains("fail"));
     assert!(calls.contains("stillMissing"));
     assert!(!declared_names(&code).contains("fail"));
+}
+
+/// A function's own parameter called in its body is the function it was
+/// handed (`foldWithScrollAnchor(headerRow, flip)` calls `flip()`), and the
+/// same name called outside that body is still caught.
+#[test]
+fn a_function_parameter_is_a_local_call_inside_its_body_only() {
+    let inside = "function fold(row, flip) { const top = row.top; flip(); }";
+    assert!(!called_names(&strip_literals(inside)).contains("flip"));
+    let outside = format!("{inside} flip();");
+    assert!(called_names(&strip_literals(&outside)).contains("flip"));
+    let anonymous = "const fold = function (row, flip) { flip(); };";
+    assert!(!called_names(&strip_literals(anonymous)).contains("flip"));
 }
 
 #[test]

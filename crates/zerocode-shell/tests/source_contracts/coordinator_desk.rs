@@ -266,7 +266,7 @@ fn the_desks_numbers_are_the_backends_and_the_window_counts_no_letter() {
             "the letters stopped reading the table (`{rule}`):\n{letters}"
         );
     }
-    let snapshot = block_after(&desk, "pub(crate) fn desk_snapshot(");
+    let snapshot = block_after(&desk, "pub(crate) fn desk_snapshot_of(");
     for count in ["mail: mail.len(),", "news: news.len(),", "folded,"] {
         assert!(
             snapshot.contains(count),
@@ -598,10 +598,12 @@ fn the_role_words_come_off_one_table_on_every_surface() {
     let row = block_after(window, "function makeAgentRow(row, gutter = false) {");
     assert!(
         row.contains("const chip = role ? agentRoleChip(role) : null;")
-            && row.contains("[fold, dot, chip, face, body, uses, status, when, peek]")
+            // The reading hand is not a part of the row: it stands beside it in the helper's line (t-95957 r3);
+            // the count of changes nobody opened in review stands after what the row uses (t-95969 G2).
+            && row.contains("[fold, dot, chip, face, body, uses, changes, status, when]")
             // The resting row wears the account its pane runs as beside its
             // model (t-46106); the role chip keeps its place all the same.
-            && row.contains("[fold, dot, chip, face, body, wears, runsAs, uses, status, when, peek]")
+            && row.contains("[fold, dot, chip, face, body, wears, runsAs, uses, changes, status, when]")
             && row.contains("face?.classList.add(\"is-coordinator\")"),
         "the row's role left its place between the dot and the face:\n{row}"
     );

@@ -1616,6 +1616,14 @@ kbd {
   display: none;
 }
 
+/* What waits on the person in another project (`dressProjectWaiting`): the
+ * inbox door's own blue count, beside the name — the inbox shows the open
+ * project alone (the build card's plan, §8). */
+.proj-row .proj-waiting {
+  flex: none;
+  margin-left: var(--space-2);
+}
+
 /* The task id, the stage and the worker of the work standing in a checkout (t-44016): small, and set after the
  * name. They shrink and elide before the title or the landing word does, and take no more than a share of the
  * row; `line-height: 1` keeps a chip from taller than the line it sits in, so a row with a chip is as tall as
@@ -1831,6 +1839,15 @@ kbd {
 .team-chip.is-held {
   background: color-mix(in srgb, var(--signal-wait) 12%, transparent);
   color: var(--signal-wait-ink);
+}
+
+/* A reclaim on its way and a pane already closed (t-95957): nothing for the
+ * person to do, so no signal colour — the sidebar's 「회수 중」 and 「회수됨」
+ * grey, inside the hairline ring a quiet badge wears. Only a blocker is red. */
+.team-chip.is-calm {
+  background: transparent;
+  box-shadow: inset 0 0 0 var(--rule-width) var(--nav-plane-rule);
+  color: var(--ink-mist);
 }
 
 .team-badge.is-question,
@@ -2329,6 +2346,16 @@ kbd {
   background: color-mix(in srgb, var(--nav-plane-ink) 1.25%, transparent);
 }
 
+/* The same wash while the pointer is on the row's reading hand, which stands beside the row's button and not inside
+ * it (t-95957 r3): the specificity is the row's own `:hover`, so the focused row's fill below still wins. */
+:where(.wt-agent-line):hover > .wt-agent {
+  background: color-mix(in srgb, var(--nav-plane-accent) 18%, transparent);
+}
+
+:root[data-theme="light"] :where(.wt-agent-line):hover > .wt-agent {
+  background: color-mix(in srgb, var(--nav-plane-ink) 1.25%, transparent);
+}
+
 .wt-agent.is-here {
   background: color-mix(in srgb, var(--nav-plane-accent) 70%, transparent);
 }
@@ -2515,6 +2542,28 @@ svg.wt-agent-dot {
  * right edge without an auto margin. */
 /* 헬퍼 행의 도구 수 — 부모 행에서 모델 칩이 서는 그 자리에, 같은 3xs 곁말
  * 무게로. 숫자가 자리를 흔들지 않도록 tabular. */
+/* A pane's 「변경 N」: its last answer's files wait for the person's review (t-95969 G2) — the blue that
+ * means "waits for you", with the words beside it. */
+.wt-agent-changes {
+  flex: none;
+  font-size: var(--text-3xs);
+  color: var(--signal-you);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* The card's foot: 「검토 대기 N」, only while some pane here waits. */
+.wt-review-foot {
+  margin: 0 var(--space-2) var(--space-1) var(--nav-indent);
+  color: var(--ink-mist);
+  font-size: var(--text-3xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.wt-review-foot[hidden] {
+  display: none;
+}
+
 .wt-agent-uses {
   flex: none;
   font-size: var(--text-3xs);
@@ -2555,6 +2604,26 @@ svg.wt-agent-dot {
 }
 
 .wt-agent.is-review .wt-agent-state {
+  color: var(--signal-wait-ink);
+}
+
+/* Inside an opened 「완료 N개」 a finished pane says its reclaim where its
+ * status word stands (t-95957, draft v4) — in the label's grey whatever the
+ * ledger said of the work, and 보류 alone in the caution's ink. 「보류 · <the
+ * reason>」 may be a sentence: it gives way before the name does, and the
+ * tip holds it whole. */
+.wt-agent.is-reclaim-done > .wt-agent-state,
+.wt-agent.is-reclaim-busy > .wt-agent-state {
+  color: var(--ink-label);
+}
+
+.wt-agent.is-reclaim-held > .wt-agent-state {
+  flex: 0 1 auto;
+  min-width: 0;
+  /* At most two fifths of the row: at 313px the name keeps about 60px. */
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--signal-wait-ink);
 }
 
@@ -2612,8 +2681,7 @@ svg.wt-agent-dot {
 
 .wt-agent.is-live > .wt-agent-state,
 .wt-agent.is-live > .wt-agent-when,
-.wt-agent.is-live > .wt-agent-uses,
-.wt-agent.is-live > .wt-agent-peek {
+.wt-agent.is-live > .wt-agent-uses {
   align-self: flex-start;
   line-height: 11px;
 }
@@ -3294,7 +3362,7 @@ svg.wt-agent-dot {
 /* The workspace takes over only when no working agent row is visible.
  * Its existing state dot also keeps permission requests ahead of motion.
  * Agent and team rows wear no ring of their own (the familiar frame). */
-#worktrees .wt-node:has(> .wt-row > .wt-dot[data-state="working"]):not(:has(> .wt-agents:not([hidden]) > .wt-agent.is-working:not(.is-ancestry))) > .wt-flow,
+#worktrees .wt-node:has(> .wt-row > .wt-dot[data-state="working"]):not(:has(> .wt-agents:not([hidden]) .wt-agent.is-working:not(.is-ancestry))) > .wt-flow,
 :root:is([data-worktree-card-layout="compact"], [data-worktree-card-off~="agents"]) #worktrees .wt-node:has(> .wt-row > .wt-dot[data-state="working"]) > .wt-flow {
   display: block;
 }
@@ -15463,7 +15531,9 @@ details.worker-command {
 .helper-turn.is-window-note {
   margin: var(--space-2) 0;
   color: var(--ink-mist);
-  font-size: var(--text-xs);
+  /* A pixel under a step, never under the 12px floor: 12px beside 14px prose,
+   * and grown with a wide page's words (2026-11-06). */
+  font-size: max(var(--text-xs), calc(var(--chat-step-size) - 1px));
 }
 
 .helper-window-note-line {
@@ -15922,6 +15992,45 @@ pre.md-block > .chat-code-deleted { color: var(--syntax-deleted); }
   font-size: var(--text-xs);
 }
 
+/* The title takes the slack, so 「이 변경 되돌리기」 and 닫기 stand together at the right (t-95969 G1). */
+.chat-review-head > strong {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Disabled when the files scope cannot be chosen; its tooltip says why. */
+.chat-review-undo {
+  transition: color var(--motion-fast) var(--ease-standard), background var(--motion-fast) var(--ease-standard);
+}
+
+.chat-review-undo:disabled {
+  color: var(--ink-label);
+  background: none;
+  cursor: default;
+}
+
+/* The turn's test line: the glyph and the words say the outcome, the ink repeats it. */
+.chat-review-tests {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-2xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-review-tests[data-state="passed"] {
+  color: var(--signal-ready-ink);
+}
+
+.chat-review-tests[data-state="failed"] {
+  color: var(--signal-halt-ink);
+}
+
+/* Where find jumped when the reader did not scroll there: one quiet line before the hit (t-95969 G4). */
+.chat-find-marker {
+  margin-block: var(--space-1);
+  color: var(--ink-mist);
+  font-size: var(--text-2xs);
+}
+
 .helper-copy:hover {
   color: var(--ink-chalk);
   background: var(--chat-pill-bg);
@@ -16312,11 +16421,46 @@ pre.md-block > .chat-code-deleted { color: var(--syntax-deleted); }
 }
 
 .helper-turn.is-thinking > .helper-step-line > .helper-thought-lead {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
   max-width: none;
   overflow: visible;
   font-size: 1em;
   font-weight: 600;
   color: var(--ink-figure);
+}
+
+/* The brain that stands for the word (2026-11-05), sized with the row's
+ * words, in the lead's ink; while the thought goes it breathes as a live
+ * step's dot does, and stands still under reduced motion. */
+.helper-thought-lead > .icon {
+  --icon-size: var(--chat-thought-mark);
+}
+
+.helper-turn.is-thinking.is-streaming:not(.is-done) > .helper-step-line > .helper-thought-lead > .icon {
+  animation: helper-live-pulse 1s linear infinite;
+}
+
+/* The lead's words — 「생각 2초」 — are for a reader that speaks the line;
+ * the eye reads the brain and the seconds (`writeThoughtLead`). */
+.helper-thought-words {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The seconds an eye reads (`writeThoughtLead`), out of the lead's text. */
+.helper-thought-time::after {
+  content: attr(data-seconds);
+}
+
+.helper-thought-time:not([data-seconds]),
+.helper-thought-time[data-seconds=""] {
+  display: none;
 }
 
 .helper-thought-body {
@@ -16433,10 +16577,12 @@ pre.md-block > .chat-code-deleted { color: var(--syntax-deleted); }
   background: var(--chat-tool-bg);
 }
 
-/* The chevron says the line opens, and turns down when it has. */
+/* The chevron says the line opens, and turns down when it has. It keeps the
+ * row's far end whether the words fill the row or not. */
 .helper-step-line::after {
   content: "›";
   flex: none;
+  margin-left: auto;
   color: var(--ink-mist);
   transition: transform var(--motion-fast) var(--ease-standard);
 }
@@ -16495,6 +16641,26 @@ details[open] > .helper-step-line::after {
   white-space: nowrap;
 }
 
+/* What came of a step and how long it took read beside its words (2026-11-06):
+ * on the widened column they stood at the row's far end, 700px from the
+ * command they belong to. A line with nothing to wrap under it does not wrap,
+ * so the words take their own width and give way first; a row that carries a
+ * shell step's first lines (`.has-out`, written with `.helper-step-out` by
+ * `dressStepOut`) keeps the basis above. Read off the row's class, not a
+ * `:has()` — a page coming back from behind its terminal restyles no row. */
+.helper-turn:not(.has-out) > .helper-step-line {
+  flex-wrap: nowrap;
+}
+
+.helper-turn:not(.has-out) > .helper-step-line > .helper-step-what {
+  flex: 0 1 auto;
+}
+
+.helper-step-what + .helper-step-res:not(:empty)::before,
+.helper-step-what + .helper-step-res:empty + .helper-step-meta:not(:empty)::before {
+  content: "· ";
+}
+
 .helper-step-kind {
   font-weight: 500;
   color: var(--ink-chalk);
@@ -16510,7 +16676,7 @@ details[open] > .helper-step-line::after {
 .helper-step-res,
 .helper-step-meta {
   flex: none;
-  font-size: var(--text-xs);
+  font-size: var(--chat-step-meta-size);
   color: var(--ink-mist);
   white-space: nowrap;
 }
@@ -16992,7 +17158,9 @@ details[open] > .helper-step-line::after {
   border-radius: var(--radius-pill);
   background: none;
   font-family: var(--font-ui);
-  font-size: var(--text-sm);
+  /* A step's size, as the steps under it read (2026-11-06): it grows with a
+   * wide page's prose instead of standing at 13px beside 16px words. */
+  font-size: var(--chat-step-size);
   color: var(--ink-mist);
   text-align: left;
   cursor: pointer;
@@ -17029,7 +17197,7 @@ details[open] > .helper-step-line::after {
   min-width: 0;
   overflow: hidden;
   font-family: var(--font-mono);
-  font-size: var(--text-xs);
+  font-size: max(var(--text-xs), var(--chat-mono-size));
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -17093,7 +17261,7 @@ details[open] > .helper-step-line::after {
   min-width: 0;
   overflow: hidden;
   font-family: var(--font-mono);
-  font-size: var(--text-sm);
+  font-size: var(--chat-step-size);
   color: var(--ink-chalk);
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -17885,6 +18053,19 @@ details[open] > .helper-cap::after {
  * 그 명령을 나를 수 없는 세션에서는 읽기만 하는 알약으로 선다. */
 .worker-composer-context {
   cursor: pointer;
+}
+
+/* Beside the context chip: a queued message goes with the next turn (t-95969 G3). */
+.worker-composer-next {
+  flex: none;
+  align-self: center;
+  color: var(--ink-mist);
+  font-size: var(--text-2xs);
+  white-space: nowrap;
+}
+
+.worker-composer-next[hidden] {
+  display: none;
 }
 
 .worker-composer-context:disabled {
@@ -18968,6 +19149,7 @@ button.helper-sib:hover {
   }
 
   .helper-turn.is-tool.is-live > .helper-step-line > .helper-step-dot,
+  .helper-turn.is-thinking.is-streaming:not(.is-done) > .helper-step-line > .helper-thought-lead > .icon,
   .helper-group.is-live > .helper-group-cap::before,
   .helper-state-dot,
   .helper-agent-dot,
@@ -19003,6 +19185,23 @@ button.helper-sib:hover {
 .worker-view.is-chat-page > *,
 .worker-view.is-chat-page::after {
   --chat-dock-max: var(--reading-column);
+}
+
+/* The words grow with the column (2026-11-06, the person's 「대화 화면이 실제
+ * 화면에 비해 글자가 작아 보이는데」): the steps below widen the column to
+ * 1120px, drawn for 70 Korean characters a line at 16px, while the prose had
+ * stayed the terminal's 14px — 80 a line. The prose is the column over
+ * `--chat-measure`, to the pixel, and never under the terminal's size: 14px up
+ * to a 960px column, 15px at 1040px, 16px at 1120px; a step and a thought stay
+ * a pixel under it. 15px stands off the 11–16 type scale on purpose — the
+ * measure sets it, not the ramp. A size the person picked (`--chat-prose-pin`)
+ * stands instead, and a narrow page's step below still wins. An engine without
+ * `round()` keeps the terminal's size. */
+@supports (width: round(1px, 1px)) {
+  .worker-view.is-chat-page > * {
+    --chat-prose-size: var(--chat-prose-pin, max(var(--term-font-size), round(var(--reading-column) / var(--chat-measure), 1px)));
+    --chat-step-size: max(var(--text-xs), calc(var(--chat-prose-size) - 1px));
+  }
 }
 
 @container (min-width: 1000px) {
@@ -19046,6 +19245,7 @@ button.helper-sib:hover {
 @container (max-width: 559px) {
   .worker-view.is-chat-page > * {
     --chat-prose-size: var(--chat-read-size-narrow);
+    --chat-step-size: var(--chat-step-size-narrow);
   }
 
   /* A line of code longer than a narrow page folds inside its block (t-81525
@@ -21868,7 +22068,38 @@ button.helper-sib:hover {
  * (`.project-row-action`): 쉴 때는 폭도 잉크도 없어 낱말이 서는 자리를
  * 밀지 않고, 행에 손이 닿거나 키보드가 그 안에 들어올 때에만 자리를 얻는다.
  * 상자와 잉크는 `.wt-agent-fold`의 것 그대로 — 한 행에 두 크기의 손이 서면
- * 목록이 두 표가 된다. */
+ * 목록이 두 표가 된다.
+ *
+ * 손은 행 안이 아니라 행 곁의 단추다(t-95957 r3): 행이 단추인데 그 안에 누를
+ * 자리를 하나 더 두면 axe의 nested-interactive다. 행과 손은 한 줄
+ * (`.wt-agent-line`)에 나란히 서고, 손은 행의 오른쪽 끝, 행 안쪽 여백이 있던
+ * 자리에 겹쳐 선다. 모양은 그대로다 — 쉴 때 낱말 자리, 닿을 때 16px 물러남. */
+.wt-agent-line {
+  position: relative;
+  display: flex;
+  min-width: 0;
+}
+
+/* The row gives the hand its seat the way the flex gap did: at rest the 4px edge and the 4px gap the hand's zero width
+ * left, and 16px more when the hand is shown. The row's own transition list (the shared one below) stands, with this. */
+.wt-agent-line > .wt-agent {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-right: calc(var(--space-1) * 2);
+  transition:
+    color var(--motion-fast) var(--ease-standard),
+    background-color var(--motion-fast) var(--ease-standard),
+    border-color var(--motion-fast) var(--ease-standard),
+    opacity var(--motion-fast) var(--ease-standard),
+    box-shadow var(--motion-fast) var(--ease-standard),
+    padding-right var(--motion-fast) var(--ease-standard);
+}
+
+.wt-agent-line:hover > .wt-agent,
+.wt-agent-line:focus-within > .wt-agent {
+  padding-right: calc(var(--space-1) * 2 + 16px);
+}
+
 .wt-agent-peek {
   display: inline-flex;
   flex: none;
@@ -21880,6 +22111,12 @@ button.helper-sib:hover {
   overflow: hidden;
   opacity: 0;
   pointer-events: none;
+  /* A real button now: the browser's own box and ink are not wanted. */
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  cursor: pointer;
   border-radius: var(--radius-xs);
   color: var(--ink-mist);
   transition:
@@ -21889,8 +22126,18 @@ button.helper-sib:hover {
     background-color var(--motion-fast) var(--ease-standard);
 }
 
+/* In its line the hand takes the row's right end; the lane list's helper row keeps its hand inside the row as a flex item
+ * (`.wt-agent > .wt-agent-peek`), where the row's own hover and focus reveal it as they always did. */
+.wt-agent-line > .wt-agent-peek {
+  position: absolute;
+  top: 4px;
+  right: var(--space-1);
+}
+
 .wt-agent:hover .wt-agent-peek,
 .wt-agent:focus-within .wt-agent-peek,
+.wt-agent-line:hover > .wt-agent-peek,
+.wt-agent-line:focus-within > .wt-agent-peek,
 .wt-agent-peek:focus-visible {
   max-width: 16px;
   opacity: 1;
@@ -35361,7 +35608,7 @@ details.task-board-section > summary {
 /* ---- 코디네이터 데스크 (t-6588 → t-67607) ---------------------------------
  *
  * 데스크는 상황판의 탭 위에 선다(사람이 통과시킨 시안 B). 「지금」 탭은 두 단과
- * 넓은 한 단이다: 왼쪽 넓은 열에 당신 차례, 오른쪽에 빌드 줄, 그 아래 통합 묶음과
+ * 넓은 한 단이다: 왼쪽 넓은 열에 당신 차례, 오른쪽에 빌드, 그 아래 통합 묶음과
  * 지금 도는 일이 판의 폭 전체를 쓴다. 한 장만 서면 그 장이 행을 다 쓴다. 「워커」와
  * 「기록」은 한 열이다. 판의 폭을 다 쓰고(t-70028), 빈 블록은 접히고 나머지가 차례대로
  * 자리를 채운다 — 숨은 블록은 자리를 차지하지 않으므로 행 사이는 격자의 간격 하나다.
@@ -35376,10 +35623,7 @@ details.task-board-section > summary {
 }
 
 .task-board-desk[hidden],
-.board-desk-block[hidden],
-.board-desk-release-reason[hidden],
-.board-desk-release-stalled[hidden],
-.board-desk-release-skips[hidden] {
+.board-desk-block[hidden] {
   display: none;
 }
 
@@ -35395,11 +35639,11 @@ details.task-board-section > summary {
 }
 
 .board-desk-block[data-desk-block="asks"] { grid-column: 1; }
-.board-desk-block[data-desk-block="release"] { grid-column: 2; }
+.board-desk-block[data-desk-block="builds"] { grid-column: 2; }
 
 /* 한 장만 서면 그 장이 행을 다 쓴다. */
-.task-board-desk:not(:has(> [data-desk-block="release"]:not([hidden]))) > [data-desk-block="asks"],
-.task-board-desk:not(:has(> [data-desk-block="asks"]:not([hidden]))) > [data-desk-block="release"] {
+.task-board-desk:not(:has(> [data-desk-block="builds"]:not([hidden]))) > [data-desk-block="asks"],
+.task-board-desk:not(:has(> [data-desk-block="asks"]:not([hidden]))) > [data-desk-block="builds"] {
   grid-column: 1 / -1;
 }
 
@@ -36164,82 +36408,6 @@ details.task-board-section > summary {
   display: none;
 }
 
-.board-desk-release-line {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2) var(--space-3);
-  margin: 0;
-  color: var(--ink-chalk);
-  font-size: var(--text-sm);
-}
-
-.board-desk-release-version {
-  font-weight: 600;
-}
-
-.board-desk-release-sha {
-  color: var(--ink-label);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-}
-
-.board-desk-release-phases {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-1);
-  margin: var(--space-2) 0 0;
-  padding: 0;
-  list-style: none;
-}
-
-.board-desk-release-phase {
-  padding: 0 var(--space-2);
-  border: var(--rule-width) solid var(--edge-rule);
-  border-radius: var(--radius-pill);
-  color: var(--ink-label);
-  font-size: var(--text-2xs);
-  font-variant-numeric: tabular-nums;
-  line-height: 1.8;
-}
-
-.board-desk-release-phase.is-running {
-  border-color: color-mix(in srgb, var(--signal-ready) 45%, var(--edge-rule));
-  color: var(--signal-ready);
-}
-
-.board-desk-release-phase.is-failed {
-  border-color: color-mix(in srgb, var(--signal-halt) 45%, var(--edge-rule));
-  color: var(--signal-halt-ink);
-}
-
-.board-desk-release-phase.is-skipped {
-  border-style: dashed;
-}
-
-.board-desk-release-reason,
-.board-desk-release-stalled,
-.board-desk-release-skips {
-  margin: var(--space-2) 0 0;
-  color: var(--ink-label);
-  font-size: var(--text-xs);
-  line-height: 1.6;
-  overflow-wrap: anywhere;
-}
-
-.board-desk-release-reason {
-  color: var(--signal-halt-ink);
-}
-
-/* 「멈춘 듯」(t-83513): 아직 빨강이 아닌 주의 — 말이 상태를 말하고, 색은 기다림의 잉크다. */
-.board-desk-release-stalled {
-  color: var(--signal-wait-ink);
-}
-
-.board-desk-release-skips {
-  padding-left: var(--space-4);
-}
-
 /* ---- 일정 (t-67482 → t-71840 → t-77628 → t-84802) ----------------------------------
  * 작업 상황판의 「일정」 탭(`shell-board-schedule.js`): 발행 레인·결합 게이트·빌드 줄·워커 과업을 블록으로
  * 세운다. 입은 것은 시안 B(Geist)의 토큰과 부품뿐이다. 상태는 색과 함께 모양이 말한다: 끝남은 꽉 참, 도는
@@ -36260,6 +36428,8 @@ details.task-board-section > summary {
 
 .task-board-schedule[hidden],
 .board-schedule-group[hidden],
+.board-schedule-cal-body > .board-schedule-group[hidden],
+.board-schedule-line[hidden],
 .board-schedule-rows[hidden],
 .board-schedule-note[hidden],
 .board-schedule-more[hidden],
@@ -36631,10 +36801,13 @@ details.task-board-section > summary {
   overflow-y: hidden;
 }
 
+/* 시각 홈통 뒤로 서는 묶음마다 한 열 — 이 프로젝트에 서지 않는 묶음은 자리를 남기지 않는다. */
 .board-schedule-cal-body {
   position: relative;
   display: grid;
-  grid-template-columns: var(--schedule-gutter) repeat(4, minmax(auto, 1fr));
+  grid-template-columns: var(--schedule-gutter);
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(auto, 1fr);
 }
 
 .board-schedule-gutter {
@@ -37349,7 +37522,7 @@ details.task-board-section > summary {
 
 /* 카드 — Geist의 base 재질: 판 위의 패널, 6px, 테두리는 1px 고리 그림자. 머리는
  * 제목(heading-14)과 오른쪽 한 줄(label-13), 그 아래 룰. */
-.board-desk-block:is([data-desk-block="asks"], [data-desk-block="release"], [data-desk-block="running"]) {
+.board-desk-block:is([data-desk-block="asks"], [data-desk-block="builds"], [data-desk-block="running"]) {
   display: flex;
   flex-direction: column;
   border-radius: var(--radius-sm);
@@ -37358,7 +37531,7 @@ details.task-board-section > summary {
   overflow: hidden;
 }
 
-.board-desk-block:is([data-desk-block="asks"], [data-desk-block="release"], [data-desk-block="running"]) > .board-desk-head {
+.board-desk-block:is([data-desk-block="asks"], [data-desk-block="builds"], [data-desk-block="running"]) > .board-desk-head {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -37396,11 +37569,10 @@ details.task-board-section > summary {
 
 /* 상태 점 (t-70028, 시안 B): 낱말 곁의 채운 점 하나. 색은 tokens.css의 `--status-dot-*`,
  * 차례 기다림의 회색 점만 1px 룰을 두른다. 점은 돌지 않는다 — 움직이는 것은 시간 글자다.
- * 행·범례·빌드 줄의 점은 제 칸의 `::before`다(행 하나에 요소 하나를 더 들고 다니지 않게). */
+ * 행·범례·빌드의 점은 제 칸의 `::before`다(행 하나에 요소 하나를 더 들고 다니지 않게). */
 .board-dot,
 .board-run-state::before,
 .board-legend > li::before,
-.board-desk-release-status::before,
 .board-state::before {
   content: "";
   display: inline-block;
@@ -37412,26 +37584,23 @@ details.task-board-section > summary {
   box-shadow: inset 0 0 0 var(--rule-width) var(--edge-rule);
 }
 
-:is(.board-dot.is-run, .board-run.is-run .board-run-state, .board-legend > li.is-run,
-  .board-desk-release.is-running .board-desk-release-status, .board-state[data-dot="run"])::before,
+:is(.board-dot.is-run, .board-run.is-run .board-run-state, .board-legend > li.is-run, .board-state[data-dot="run"])::before,
 .board-dot.is-run {
   background: var(--status-dot-run);
   box-shadow: none;
 }
 
-:is(.board-run.is-halt .board-run-state, .board-legend > li.is-halt,
-  .board-desk-release.is-red .board-desk-release-status, .board-state[data-dot="halt"])::before {
+:is(.board-run.is-halt .board-run-state, .board-legend > li.is-halt, .board-state[data-dot="halt"])::before {
   background: var(--status-dot-halt);
   box-shadow: none;
 }
 
-:is(.board-run.is-done .board-run-state, .board-legend > li.is-done,
-  .board-desk-release.is-green .board-desk-release-status, .board-state[data-dot="done"])::before {
+:is(.board-run.is-done .board-run-state, .board-legend > li.is-done, .board-state[data-dot="done"])::before {
   background: var(--status-dot-done);
   box-shadow: none;
 }
 
-.board-desk-block:is([data-desk-block="asks"], [data-desk-block="release"], [data-desk-block="running"]) > .board-desk-body {
+.board-desk-block:is([data-desk-block="asks"], [data-desk-block="builds"], [data-desk-block="running"]) > .board-desk-body {
   display: flex;
   flex: 1;
   flex-direction: column;
@@ -37727,8 +37896,7 @@ details.task-board-section > summary {
 }
 
 .board-asks-foot,
-.board-runs-foot,
-.board-line-foot {
+.board-runs-foot {
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -37742,10 +37910,6 @@ details.task-board-section > summary {
 /* 시안의 발 한 줄: 「오늘 끝난 일 6개 · 기록에서 보기」 — 글과 문이 한 글줄로 흐른다. */
 .board-runs-foot {
   display: block;
-}
-
-.board-line-foot[hidden] {
-  display: none;
 }
 
 /* 발의 체크 원 — 시안의 회색 16px 아이콘(gray-700). 끝남의 색이 아니라 「더 없음」의 표시다. */
@@ -37763,7 +37927,7 @@ details.task-board-section > summary {
 }
 
 .board-raw-head,
-.board-desk-release-log > summary {
+.board-build-log-head {
   width: fit-content;
   border-radius: var(--radius-xs);
   color: var(--ink-mist);
@@ -37773,7 +37937,7 @@ details.task-board-section > summary {
 }
 
 .board-raw-head:hover,
-.board-desk-release-log > summary:hover {
+.board-build-log-head:hover {
   color: var(--ink-chalk);
 }
 
@@ -37789,185 +37953,520 @@ details.task-board-section > summary {
   word-break: normal;
 }
 
-/* 빌드 줄 — 시안의 카드(t-70028): 첫 줄은 이름 · 버전 · 오른쪽 끝의 상태(점과 낱말), 둘째
- * 줄은 커밋과 차례(「네 단계 중 셋째」)나 걸린 시간, 그 아래 단계 목록 — 표식 · 이름 · 오른쪽
- * 낱말(끝 · 도는 단계의 경과 · 대기 · 건너뜀 · 실패). 끝난 레인은 두 줄로 접히고(「초록 · 07:31
- * 끝남」), 단계는 「단계별 시간 · 원문 로그」 안에 있다. 그 밑의 발은 줄의 다음 차례다. */
-.board-desk-block[data-desk-block="release"] .board-desk-release {
-  display: grid;
-  gap: 0;
-  padding: var(--space-3) var(--space-4) var(--space-2);
-  border: 0;
-  background: none;
+/* 빌드 — 시안(Geist, 빌드 카드 일반화): 기록이 있는 빌드마다 한 장, 프로젝트가 정한 차례대로. 첫 줄은
+ * 차례 · 이름 · 표지 · 도구 · 오른쪽 끝의 상태(점과 낱말), 둘째 줄은 커밋 · 몇째 단계 · 시간, 그 밑은 단계
+ * 띠다 — 칸 길이는 그 단계가 평소 걸린 시간(`flex-grow`)이고, 도는 칸은 평소 대비 경과만큼 차며
+ * (`--fill`), 평소를 모르면 빗금이다. 끝난 빌드는 띠가 얇아지고 시간 글자를 접는다. 단계마다의 시간은
+ * 「단계 N개」 안에 있다. 둘째 줄부터는 차례 원의 폭만큼 들어선다(`--build-indent`). */
+.board-build {
+  --build-order-size: calc(var(--space-4) + var(--space-1));
+  --build-indent: calc(var(--build-order-size) + var(--space-2));
+  /* 칸 이름이 읽히는 가장 좁은 폭 — 12px 글자로 네 글자쯤. */
+  --build-seg-least: 3.25rem;
+  --build-bar-height: var(--board-gap-small);
+  --build-run-track: color-mix(in srgb, var(--status-dot-run) 22%, transparent);
+  padding: var(--space-4);
 }
 
-.board-desk-block[data-desk-block="release"] .board-desk-release.is-folded {
-  padding-bottom: var(--space-3);
+.board-build + .board-build {
+  box-shadow: inset 0 var(--rule-width) 0 var(--edge-rule);
 }
 
-.board-desk-release-line {
+.board-build [hidden] {
+  display: none;
+}
+
+.board-build-line {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
+  min-width: 0;
   margin: 0;
 }
 
-.board-desk-release-title {
-  color: var(--ink-chalk);
-  font: var(--type-label-14);
+.board-build-order {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: var(--build-order-size);
+  height: var(--build-order-size);
+  border-radius: var(--radius-pill);
+  box-shadow: inset 0 0 0 var(--rule-width) var(--edge-rule);
+  color: var(--ink-mist);
+  font: var(--type-label-12-mono);
   font-weight: 500;
 }
 
-.board-desk-block[data-desk-block="release"] .board-desk-release-version {
-  color: var(--ink-mist);
-  font: var(--type-label-13-mono);
+/* 빌드가 하나뿐이면 차례는 말할 것이 없다: 차례 원은 접히고, 둘째 줄부터의 들여쓰기도 없다. 카드 밑의 한 줄은
+ * 카드가 아니다(`p`) — 카드끼리만 센다. */
+.board-build:only-of-type {
+  --build-indent: 0;
 }
 
-.board-desk-release-status {
-  display: inline-flex;
+.board-build:only-of-type .board-build-order {
+  display: none;
+}
+
+/* 카드 밑의 한 줄(`buildFoot`): 찾은 빌드나 돌릴 수 없는 순서 파일의 말, 그리고 오른쪽 끝의 행동 — 「빌드」와
+ * 「순서 정하기」. */
+.board-build-foot {
+  display: flex;
+  justify-content: flex-end;
+  align-items: baseline;
+  gap: var(--space-3);
+  margin: 0;
+  padding: var(--space-2) var(--space-4) var(--space-3);
+  color: var(--ink-mist);
+  font: var(--type-copy-13);
+}
+
+.board-build + .board-build-foot {
+  box-shadow: inset 0 var(--rule-width) 0 var(--edge-rule);
+  padding-top: var(--space-3);
+}
+
+.board-build-foot-words {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.board-build-foot.is-refused .board-build-foot-words {
+  color: var(--signal-wait-ink);
+}
+
+.board-build-foot-act,
+.board-build-act {
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--workbench-accent-ink);
+  font: var(--type-label-13);
+  font-weight: 500;
+  text-decoration: underline transparent;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  transition: text-decoration-color var(--motion-fast);
+}
+
+/* 「멈추기」는 조용한 말이다. */
+.board-build-act[data-act="stop"] {
+  color: var(--ink-mist);
+}
+
+.board-build-foot-act:hover,
+.board-build-act:hover {
+  text-decoration-color: currentColor;
+}
+
+.board-build-foot-act:disabled,
+.board-build-act:disabled {
+  color: var(--ink-chalk);
+  cursor: default;
+}
+
+/* 빌드 순서 편집기(`openBuildOrder`): 빌드마다 한 행 — 차례, 이름과 도구, 단계들, 위로·아래로·빼기 — 그 밑에
+ * 쓰일 파일. */
+.qo--build-order {
+  width: min(560px, 100%);
+}
+
+.build-order-from,
+.build-order-note {
+  margin: 0;
+  padding: var(--space-2) var(--space-4) 0;
+  color: var(--ink-mist);
+  font: var(--type-copy-13);
+  overflow-wrap: anywhere;
+}
+
+.build-order-from.is-refused,
+.build-order-note.is-problem {
+  color: var(--signal-wait-ink);
+}
+
+.build-order-list {
+  margin: var(--space-3) var(--space-4) 0;
+  padding: 0;
+  border-radius: var(--radius-md);
+  box-shadow: inset 0 0 0 var(--rule-width) var(--edge-rule);
+  list-style: none;
+}
+
+.build-order-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+}
+
+.build-order-row + .build-order-row {
+  box-shadow: inset 0 var(--rule-width) 0 var(--edge-rule);
+}
+
+.build-order-at {
+  min-width: var(--space-4);
+  color: var(--ink-mist);
+  font: var(--type-label-12-mono);
+  text-align: right;
+}
+
+.build-order-what {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.build-order-head {
+  display: flex;
   align-items: center;
   gap: var(--space-2);
-  margin-left: auto;
+  min-width: 0;
+  margin: 0;
+}
+
+.build-order-name {
+  min-width: 0;
+  overflow: hidden;
   color: var(--ink-chalk);
-  font: var(--type-label-14);
+  font: var(--type-heading-14);
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.board-desk-release-meta {
+.build-order-steps {
+  margin: 0;
+  overflow: hidden;
+  color: var(--ink-mist);
+  font: var(--type-copy-13);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.build-order-moves {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.build-order-moves .icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.build-order-preview {
+  margin: var(--space-3) var(--space-4) 0;
+}
+
+.build-order-preview[hidden] {
+  display: none;
+}
+
+.build-order-preview summary {
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  cursor: pointer;
+}
+
+.build-order-text,
+.build-approve-list {
+  max-height: 14rem;
+  margin: var(--space-2) 0 0;
+  padding: var(--space-3);
+  overflow: auto;
+  border-radius: var(--radius-sm);
+  background: var(--gray-alpha-100);
+  color: var(--ink-chalk);
+  font: var(--type-label-12-mono);
+  white-space: pre;
+}
+
+/* 허락을 묻는 명령(`openBuildApproval`): 한 줄에 하나, 긴 명령은 접혀서 다 읽힌다. */
+.build-approve-list {
+  display: grid;
+  gap: var(--space-1);
+  margin: var(--space-3) var(--space-4) 0;
+  list-style: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The dialog scrolls as a whole (`.qo`); its actions stay at its foot, so 「이대로 쓰기」 is never scrolled away
+ * under a long order or file. */
+.qo--build-order .wt-form-actions {
+  position: sticky;
+  bottom: 0;
+  margin-top: var(--space-4);
+  background: var(--surface-deck);
+}
+
+.board-build-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-chalk);
+  font: var(--type-heading-14);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.board-build-label {
+  flex: none;
+  color: var(--ink-chalk);
+  font: var(--type-label-13-mono);
+  font-weight: 500;
+}
+
+.board-build-tool {
+  flex: none;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--gray-alpha-200);
+  color: var(--ink-chalk);
+  font: var(--type-label-12);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.board-build-state {
+  margin-left: auto;
+  padding-left: var(--space-2);
+  font: var(--type-label-13);
+  white-space: nowrap;
+}
+
+.board-build-meta {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
-  gap: var(--board-gap-small);
-  margin: var(--space-1) 0 0;
+  gap: 0 var(--board-gap-small);
+  margin: var(--space-1) 0 0 var(--build-indent);
   color: var(--ink-mist);
   font: var(--type-label-13);
+  font-variant-numeric: tabular-nums;
 }
 
-.board-desk-release-meta > .icon {
-  flex: none;
-  width: var(--space-4);
-  height: var(--space-4);
+/* 조각 사이의 「·」 — 접힌 조각(커밋이 없는 빌드, 도는 단계가 없는 빌드)은 자리를 남기지 않고, 단추 묶음은 조각이
+ * 아니다. */
+.board-build-meta > :not([hidden]) ~ :not([hidden], .board-build-acts)::before {
+  content: "·";
+  margin-right: var(--board-gap-small);
 }
 
-.board-desk-block[data-desk-block="release"] .board-desk-release-sha {
-  font: var(--type-label-13-mono);
+/* 카드의 단추(`paintBuildActs`): 메타 줄의 오른쪽 끝. */
+.board-build-meta > .board-build-acts:not([hidden]) {
+  display: inline-flex;
+  gap: var(--space-3);
+  margin-left: auto;
 }
 
-.board-desk-block[data-desk-block="release"] .board-desk-release-phases {
-  display: grid;
-  gap: 0;
-  margin: var(--space-3) 0 0;
+.board-build-sha {
+  font: var(--type-label-12-mono);
+}
+
+.board-build-band {
+  display: flex;
+  gap: var(--space-1);
+  margin: var(--space-3) 0 0 var(--build-indent);
   padding: 0;
   list-style: none;
 }
 
-.board-desk-block[data-desk-block="release"] .board-desk-release-phases[hidden] {
+.board-build-seg {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  gap: var(--board-gap-small);
+  min-width: var(--build-seg-least);
+}
+
+/* 도는 칸과 실패한 칸은 사람이 읽는 칸이다: 제 글자 폭에서 시작하고, 남는 폭만 평소 시간대로 나눈다 — 좁으면
+ * 다른 칸처럼 최소 폭까지 줄어든다. */
+.board-build-seg:is(.is-running, .is-failed) {
+  flex-basis: auto;
+}
+
+.board-build-bar {
+  position: relative;
+  height: var(--build-bar-height);
+  overflow: hidden;
+  border-radius: var(--radius-pill);
+  background: var(--gray-alpha-200);
+}
+
+.board-build-bar > i {
+  position: absolute;
+  inset: 0 auto 0 0;
   display: none;
+  width: var(--fill, 0%);
+  border-radius: var(--radius-pill);
+  background: var(--status-dot-run);
 }
 
-.board-desk-block[data-desk-block="release"] .board-desk-release-phase {
-  display: grid;
-  grid-template-columns: var(--space-4) minmax(0, 1fr) auto;
-  column-gap: var(--space-2);
-  align-items: center;
-  padding: var(--space-1) 0;
-  border: 0;
-  border-radius: 0;
+.board-build-seg.is-done .board-build-bar {
+  background: var(--ink-chalk);
+}
+
+.board-build-seg.is-running .board-build-bar {
+  background: var(--build-run-track);
+}
+
+.board-build-seg.is-running:not(.is-unknown) .board-build-bar > i {
+  display: block;
+}
+
+.board-build-seg.is-running.is-unknown .board-build-bar {
+  background: repeating-linear-gradient(135deg, var(--status-dot-run) 0 var(--space-1),
+    var(--build-run-track) var(--space-1) var(--space-2));
+}
+
+.board-build-seg.is-failed .board-build-bar {
+  background: var(--status-dot-halt);
+}
+
+.board-build-seg.is-skipped .board-build-bar {
+  background: repeating-linear-gradient(135deg, var(--gray-alpha-400) 0 var(--space-1), transparent var(--space-1) var(--space-2));
+}
+
+.board-build-seg-name,
+.board-build-seg-time {
+  overflow: hidden;
+  font: var(--type-label-12);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.board-build-seg-name {
   color: var(--ink-chalk);
-  font: var(--type-label-14);
-}
-
-/* 단계의 표식 칸(16px): 끝남은 체크 원, 도는 단계는 호박 점, 대기는 빈 원, 실패는 ✕ 원,
- * 건너뜀은 끊긴 원 — 시안의 아이콘과 같은 굵기의 묶음 아이콘이다. */
-.board-desk-release-phase > .icon {
-  width: var(--space-4);
-  height: var(--space-4);
-  color: var(--ink-mist);
-}
-
-.board-desk-release-phase > .board-dot {
-  justify-self: center;
-}
-
-.board-desk-release-phase.is-ahead > .icon {
-  color: var(--gray-700);
-}
-
-.board-desk-release-phase.is-failed > .icon {
-  color: var(--signal-halt-ink);
-}
-
-.board-desk-block[data-desk-block="release"] .board-desk-release-phase:is(.is-skipped, .is-ahead),
-.board-desk-block[data-desk-block="release"] .board-desk-release-phase.is-skipped .board-desk-release-step-word {
-  color: var(--ink-mist);
-}
-
-.board-desk-release-step-word {
-  color: var(--ink-mist);
-  font: var(--type-label-13-mono);
-  text-align: right;
-}
-
-.board-desk-release-phase.is-running .board-desk-release-step {
   font-weight: 500;
 }
 
-.board-desk-release-phase.is-running .board-desk-release-step-word {
-  color: var(--ink-chalk);
+.board-build-seg-time {
+  color: var(--ink-mist);
+  font-variant-numeric: tabular-nums;
 }
 
-.board-desk-release-phase.is-failed .board-desk-release-step-word {
+.board-build-seg:is(.is-ahead, .is-skipped) .board-build-seg-name {
+  color: var(--ink-mist);
+  font-weight: 400;
+}
+
+.board-build-seg.is-running .board-build-seg-time {
+  color: var(--signal-wait-ink);
+}
+
+.board-build-seg.is-failed :is(.board-build-seg-name, .board-build-seg-time) {
   color: var(--signal-halt-ink);
 }
 
-/* 단계별 시간 · 원문 로그 — 카드의 폭 끝에서 끝까지 룰 하나 위에, 꺾쇠가 펼치면 돈다. */
-.board-desk-release-log {
-  padding: var(--space-2) var(--space-4) var(--space-3);
-  box-shadow: inset 0 var(--rule-width) 0 var(--edge-rule);
+/* 끝난 빌드: 띠는 얇아지고 칸의 시간 글자는 접힌다 — 단계마다의 시간은 「단계 N개」 안에 있다. */
+.board-build.is-ended {
+  --build-bar-height: var(--space-1);
 }
 
-.board-desk-release-log[hidden] {
+.board-build.is-ended .board-build-seg-time {
   display: none;
 }
 
-.board-desk-release-log > summary {
-  display: inline-flex;
+/* 카드 밑의 한 줄: 실패나 취소의 까닭, 멈춘 듯한 단계(아직 실패가 아닌 주의 — 색은 기다림의 잉크). */
+.board-build-note {
+  margin: var(--space-3) 0 0 var(--build-indent);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--gray-alpha-100);
+  color: var(--ink-mist);
+  font: var(--type-copy-13);
+  overflow-wrap: anywhere;
+}
+
+.board-build-note.is-failed {
+  background: color-mix(in srgb, var(--signal-halt) 10%, transparent);
+  color: var(--signal-halt-ink);
+}
+
+.board-build-note.is-stalled {
+  background: color-mix(in srgb, var(--signal-wait) 12%, transparent);
+  color: var(--signal-wait-ink);
+}
+
+.board-build-log {
+  margin: var(--space-2) 0 0 var(--build-indent);
+}
+
+.board-build-log-head {
+  display: flex;
   align-items: center;
   gap: var(--board-gap-small);
   list-style: none;
 }
 
-.board-desk-release-log > summary::-webkit-details-marker {
+.board-build-log-head::-webkit-details-marker {
   display: none;
 }
 
-.board-desk-release-log > summary > .icon {
-  width: var(--space-4);
-  height: var(--space-4);
-  transition: transform var(--motion-fast) var(--ease-standard);
-}
-
-.board-desk-release-log[open] > summary > .icon {
+.board-build-log[open] > .board-build-log-head .icon--twist {
   transform: rotate(90deg);
 }
 
-.board-desk-release-times {
-  width: 100%;
+.board-build-log-steps {
   margin: var(--space-2) 0 0;
-  border-collapse: collapse;
+  padding: 0;
+  overflow: hidden;
+  border-radius: var(--radius-md);
+  box-shadow: inset 0 0 0 var(--rule-width) var(--edge-rule);
+  list-style: none;
+}
+
+/* 펼친 단계 하나: 표식(16px — 끝남은 체크 원, 도는 단계는 호박 점, 대기는 빈 원, 실패는 ✕ 원, 건너뜀은
+ * 끊긴 원) · 이름 · 오른쪽 끝의 시간. */
+.board-build-log-step {
+  display: grid;
+  grid-template-columns: var(--space-4) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  color: var(--ink-chalk);
   font: var(--type-label-13);
 }
 
-.board-desk-release-times td {
-  padding: var(--board-gap-small) 0;
+.board-build-log-step + .board-build-log-step {
   box-shadow: inset 0 var(--rule-width) 0 var(--edge-rule);
 }
 
-.board-desk-release-step-time {
+.board-build-log-step > .icon {
+  width: var(--space-4);
+  height: var(--space-4);
   color: var(--ink-mist);
-  font: var(--type-label-13-mono);
+}
+
+.board-build-log-step > .board-dot {
+  justify-self: center;
+}
+
+.board-build-log-step.is-ahead > .icon {
+  color: var(--gray-700);
+}
+
+.board-build-log-step:is(.is-ahead, .is-skipped) .board-build-log-name,
+.board-build-log-time {
+  color: var(--ink-mist);
+}
+
+.board-build-log-time {
+  font-variant-numeric: tabular-nums;
   text-align: right;
+  white-space: nowrap;
+}
+
+.board-build-log-step.is-running .board-build-log-name {
+  font-weight: 500;
+}
+
+.board-build-log-step.is-running .board-build-log-time {
+  color: var(--signal-wait-ink);
+}
+
+.board-build-log-step.is-failed :is(.icon, .board-build-log-name, .board-build-log-time) {
+  color: var(--signal-halt-ink);
 }
 
 /* 지금 도는 일 — 배포 목록처럼: 이름 · 상태 점과 낱말 · 하는 일 · 워커 · 가지 · 끝. */
@@ -38209,6 +38708,10 @@ details.task-board-section > summary {
 @container board (max-width: 543px) {
   .board-asks > li {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .board-build {
+    --build-indent: 0;
   }
 
   /* A question row (`li.board-desk-letter`) keeps four columns from the wide rule above, which outranks the line
@@ -55038,7 +55541,7 @@ body.sftp-active #ask-scrim { z-index: var(--sftp-confirm-layer); }
 
 .pile-project,
 .pile-section-count,
-.pile-release-state,
+.pile-build-state,
 .pile-repo-changed,
 .pile-checks,
 .pile-note,
@@ -55061,7 +55564,7 @@ body.sftp-active #ask-scrim { z-index: var(--sftp-confirm-layer); }
   font-weight: 600;
 }
 
-.pile-release,
+.pile-build,
 .pile-gate,
 .pile-total,
 .pile-repo,
@@ -55075,7 +55578,7 @@ body.sftp-active #ask-scrim { z-index: var(--sftp-confirm-layer); }
   margin: 0;
 }
 
-.pile-release-state {
+.pile-build-state {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);

@@ -2295,18 +2295,34 @@ function stepTargetWords(arg) {
  * command that opens by changing folder — `cd <dir> && …`, `cd <dir> ; …`, one after another — says
  * where it ran, not what it did, so the title drops it and closes with the folder's last name after
  * 「 · 」 (the mockup's 「셸 grep SCREEN_WIDTH… · src」). The opened row keeps the whole command. A
- * `cd` that is not the command's opening is part of what it does, and stays in. */
+ * `cd` that is not the command's opening is part of what it does, and stays in.
+ *
+ * A command that opens by setting a name — `ORC="…/zerocode-orc"; "$ORC" check`, `export X=1 &&
+ * make`, or `RUST_LOG=debug cargo test` as one command's environment — says how it is set up, not
+ * what it does, and the title drops that too (2026-11-06: on the person's page every row read
+ * `ORC="/Users/…/Application Support/dev…` and never what it ran). Where the rest runs the name it
+ * set as its program, the title names the program by its file's name: `zerocode-orc check`. */
 const SHELL_CD_LEAD = /^\s*cd\s+(?:"([^"]*)"|'([^']*)'|((?:\\.|[^\s;&|"'\\])+))\s*(?:&&|;)\s*/;
+const SHELL_SET_LEAD = /^\s*(?:export\s+)?([A-Za-z_]\w*)=(?:"([^"]*)"|'([^']*)'|((?:\\.|[^\s;&|"'\\])*))(?:\s*(?:&&|;)\s*|\s+)/;
+const SHELL_NAME_RUN = /^"?\$\{?([A-Za-z_]\w*)\}?"?(?=\s|$)/;
 
 function shellTargetWords(command) {
   let rest = command;
   let folder = "";
-  for (let lead = SHELL_CD_LEAD.exec(rest); lead !== null; lead = SHELL_CD_LEAD.exec(rest)) {
-    folder = lead[1] ?? lead[2] ?? lead[3];
-    rest = rest.slice(lead[0].length);
+  const names = new Map();
+  for (;;) {
+    const cd = SHELL_CD_LEAD.exec(rest);
+    const set = cd === null ? SHELL_SET_LEAD.exec(rest) : null;
+    if (cd !== null) folder = cd[1] ?? cd[2] ?? cd[3];
+    else if (set !== null) names.set(set[1], set[2] ?? set[3] ?? set[4]);
+    else break;
+    rest = rest.slice((cd ?? set)[0].length);
   }
-  // Nothing after the change of folder: the change is what the step did.
+  // Nothing after the change of folder or the setting: that is what the step did.
   if (rest.trim() === "") return command;
+  const run = SHELL_NAME_RUN.exec(rest);
+  const program = run === null ? "" : names.get(run[1]) ?? "";
+  if (/[\\/]/.test(program)) rest = `${basename(program.replace(/[\\/]+$/, ""))}${rest.slice(run[0].length)}`;
   const fitted = rest.length > STEP_TARGET_FIT ? `${rest.slice(0, STEP_TARGET_FIT - 1).trimEnd()}…` : rest;
   const where = basename(folder.replace(/[\\/]+$/, ""));
   return where === "" ? fitted : `${fitted} · ${where}`;
@@ -2845,16 +2861,29 @@ function thoughtHeading(text, finished = false) {
 }
 
 /* A thought's line (t-22100): how long it thought, then what it was about —
- * the label leads, as the approved conversation draws it (「생각 2초 목록
- * 화면부터 ›」), and no mark stands before it: a thought is no step. The
- * label is the line's word for what came of the thought, so it wears the
- * class a step's result wears (`helper-step-res`) and is read there. */
+ * the lead first, then the heading (「🧠 2초 목록 화면부터 ›」). The lead is
+ * the line's word for what came of the thought, so it wears the class a
+ * step's result wears (`helper-step-res`) and is read there.
+ *
+ * The lead is a mark, not a word (the person, 2026-11-05: 「생각이라는
+ * 글씨보다 아이콘 두뇌」): the brain the effort chip already wears, then the
+ * seconds once they are known. The words — 「생각 2초」, 「생각 중…」 — stay
+ * inside the lead as its only text, out of sight, for a reader that speaks
+ * the line; the seconds an eye reads are drawn beside the mark and hidden
+ * from that reader, which hears them in the words already
+ * (`writeThoughtLead`). */
 function thoughtLineNode() {
   const line = document.createElement("summary");
   line.className = "helper-step-line";
   line.dataset.keyboardOwner = "true";
   const label = document.createElement("span");
   label.className = "helper-step-res helper-thought-lead";
+  const words = document.createElement("span");
+  words.className = "helper-thought-words";
+  const time = document.createElement("span");
+  time.className = "helper-thought-time";
+  time.setAttribute("aria-hidden", "true");
+  label.append(iconNode("brain"), words, time);
   const what = document.createElement("span");
   what.className = "helper-step-what";
   const target = document.createElement("span");
@@ -2928,10 +2957,7 @@ function dressStreamingThought(row, piece) {
   const heading = thoughtHeading(piece.text, over);
   if (heading !== null) writeTextContent(row.querySelector(".helper-step-target"), heading);
   writeClass(row, "is-done", over);
-  writeTextContent(
-    row.querySelector(":scope > .helper-step-line > .helper-step-res"),
-    over ? thoughtLabel(piece) : t("worker.thinking", "생각 중…"),
-  );
+  writeThoughtLead(row, over ? thoughtLabel(piece) : t("worker.thinking", "생각 중…"), over ? piece : null);
   if (row.open) paintLiveThought(row);
 }
 
@@ -3846,7 +3872,8 @@ function runChatFind(page, step) {
     count: hits.length >= FIND_MAX ? `${FIND_MAX}+` : hits.length,
   }));
   // The row of the hit is built before the paint, so the paint walks it.
-  if (find.at) chatFindSpot(list, run, find.at.turn, find.at.part);
+  const words = find.at ? chatFindSpot(list, run, find.at.turn, find.at.part) : null;
+  placeChatFindMarker(page, words, find.at && (find.at.part === "input" || find.at.part === "output") ? "tool" : null);
   const active = paintChatFind(list, query, hits, find.at);
   if (active) showChatFindHit(list, active);
 }
@@ -3929,11 +3956,33 @@ function closeChatFind(page) {
   find.query = null;
   find.archive = null;
   find.at = null;
+  placeChatFindMarker(page, null, null);
   const api = mdviewHighlightApi();
   api?.registry.delete(CHAT_FIND_HIGHLIGHT);
   api?.registry.delete(CHAT_FIND_ACTIVE_HIGHLIGHT);
   const box = page.turns.closest(".worker-view")?.querySelector(".worker-composer-box");
   (box ?? page.turns).focus({ preventScroll: true });
+}
+
+/* One line at the hit when find has jumped somewhere the reader did not scroll to: a tool's raw output, or
+ * history outside the loaded turns. It stands before the hit's words (outside them, so the find never
+ * matches it) and goes with the next jump or when the bar closes. */
+function placeChatFindMarker(page, words, kind) {
+  page.find?.marker?.remove();
+  if (page.find) page.find.marker = null;
+  if (!words || !kind || !page.find) return;
+  const marker = document.createElement("div");
+  marker.className = "chat-find-marker";
+  marker.setAttribute("role", "status");
+  marker.textContent = kind === "archive"
+    ? t("worker.findJumpArchive", "이전 기록의 검색 결과로 이동 · 같은 세션")
+    : t("worker.findJumpTool", "도구 원문의 검색 결과로 이동 · 같은 세션");
+  // It stands outside what the page re-dresses by position: a tool body's wells are read by index
+  // (`dressToolBody`), so the line goes before the whole body; words in a step's summary would put it in
+  // the summary's own line, so it goes before the step.
+  const anchor = words.closest(".helper-tool-body") ?? words.closest("summary")?.parentElement ?? words;
+  anchor.before(marker);
+  page.find.marker = marker;
 }
 
 function searchPage(run, before, archive = false) {
@@ -4032,7 +4081,7 @@ async function showArchiveMatch(page, archive) {
     held.gone?.clear();
     syncHelperTurns(page.turns, run);
     find.at = matched;
-    chatFindSpot(page.turns, run, matched.turn, matched.part);
+    placeChatFindMarker(page, chatFindSpot(page.turns, run, matched.turn, matched.part), "archive");
     const range = paintChatFind(page.turns, archive.query, [matched], matched);
     if (range) showChatFindHit(page.turns, range);
     writeTextContent(find.count, t("file.findHits", "{{at}}/{{count}}", {
@@ -4046,15 +4095,125 @@ async function showArchiveMatch(page, archive) {
 
 /* The answer's changes belong to the user turn that produced it. A preamble
  * has no edits yet; an earlier answer must never pick up a later turn's work. */
-function answerChanges(list, answer) {
+function answerTurns(list, answer) {
   const turns = list.__run?.helper?.turns ?? [];
   const end = turns.indexOf(answer);
   if (end < 0) return [];
   let start = end;
   while (start > 0 && turns[start].role !== "user") start -= 1;
-  return turns.slice(start, end + 1)
+  return turns.slice(start, end + 1);
+}
+
+function answerChanges(list, answer) {
+  return answerTurns(list, answer)
     .filter((turn) => turn.outputError !== true && turn.tool?.is_error !== true)
     .flatMap((turn) => turn.tool?.edits ?? []);
+}
+
+/* How many files the edits touch — one file edited twice is one change to review. */
+function changedFileCount(changes) {
+  return new Set(changes.map((edit) => edit.path)).size;
+}
+
+/* A shell command that runs tests: the runners people type, and a `just` recipe named for them. */
+const TEST_COMMAND = /(?:^|[\s;&|(])(?:cargo\s+(?:\+\S+\s+)?(?:test|nextest)\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b|node\s+(?:\S+\s+)*--test\b|(?:python3?\s+-m\s+)?pytest(?=\s|$)|go\s+test\b|(?:npx\s+|pnpm\s+exec\s+|yarn\s+)?(?:jest|vitest)(?=\s|$)|just\s+(?:-\S+\s+)*[\w:-]*test[\w:-]*)/;
+
+/* The passed and failed counts a test runner's own summary carries, or null. Never a count the output
+ * does not say: cargo's 「test result」 lines (summed over its binaries), node --test's 「ℹ pass/fail」,
+ * jest's and vitest's 「Tests」 line, pytest's closing 「N passed, M failed in Xs」. */
+function testRunCounts(output) {
+  const text = String(output ?? "");
+  const cargo = [...text.matchAll(/^test result: (?:\w+\.\s*)?(\d+) passed; (\d+) failed/gm)];
+  if (cargo.length > 0) return cargo.reduce((sum, one) => ({ passed: sum.passed + Number(one[1]), failed: sum.failed + Number(one[2]) }), { passed: 0, failed: 0 });
+  const pass = [...text.matchAll(/^[ℹ#] pass (\d+)\s*$/gm)].at(-1);
+  const fail = [...text.matchAll(/^[ℹ#] fail (\d+)\s*$/gm)].at(-1);
+  if (pass || fail) return { passed: Number(pass?.[1] ?? 0), failed: Number(fail?.[1] ?? 0) };
+  const tally = (line) => ({
+    passed: Number(line.match(/(\d+) passed/)?.[1] ?? 0),
+    failed: Number(line.match(/(\d+) failed/)?.[1] ?? 0),
+  });
+  const jest = [...text.matchAll(/^\s*Tests:?\s+(.*\d+ (?:passed|failed).*)$/gm)].at(-1);
+  if (jest) return tally(jest[1]);
+  const pytest = [...text.matchAll(/^[=\s]*(.*\b\d+ (?:passed|failed)\b.*\bin [\d.]+s\b.*)$/gm)].at(-1);
+  if (pytest) return tally(pytest[1]);
+  return null;
+}
+
+/* ---- 「변경 N」 on a pane's sidebar row (t-95969 G2) ----
+ * Read only from the conversation the window already holds for the pane (`paneChats`): no read, poll or
+ * timer of its own. The answer opened in review is remembered per pane by its place in the transcript, so
+ * the same turns read again do not raise the mark again. */
+const reviewedAnswers = new Map();
+const paneReviewSaid = new Map();
+
+function answerReviewKey(answer) {
+  const at = Number.isFinite(answer.line) ? `l${answer.line}`
+    : Number.isSafeInteger(answer.messageIndex) ? `m${answer.messageIndex}` : `s${answer.seq}`;
+  return `${answer.sourceSession ?? ""}|${at}`;
+}
+
+/* The answer of the last turn that ended: while a turn runs, the one before its prompt. */
+function lastFinishedAnswer(run) {
+  const turns = run.helper?.turns ?? [];
+  let end = turns.length;
+  if (composerWorking(run)) {
+    end = turns.findLastIndex((turn) => turn.role === "user");
+    if (end < 0) return null;
+  }
+  for (let at = end - 1; at >= 0; at -= 1) if (turns[at].role === "assistant") return turns[at];
+  return null;
+}
+
+/* How many files the pane's last finished answer changed that nobody opened in review; 0 for a pane whose
+ * conversation the window does not hold. */
+function paneReviewWaiting(term) {
+  const run = paneChats.get(term)?.run;
+  if (!run || run.helper?.id !== PANE_LOG_ID) return 0;
+  const answer = lastFinishedAnswer(run);
+  if (!answer || reviewedAnswers.get(term) === answerReviewKey(answer)) return 0;
+  return changedFileCount(answerChanges({ __run: run }, answer));
+}
+
+/* The review of the pane's last finished answer was opened — its mark is spent. */
+function markAnswerReviewed(run, answer) {
+  if (run?.helper?.id !== PANE_LOG_ID || run.term === undefined || run.term === null) return;
+  if (answer !== lastFinishedAnswer(run)) return;
+  reviewedAnswers.set(run.term, answerReviewKey(answer));
+  noticePaneReview(run.term);
+}
+
+/* The held turns moved or a review opened: the sidebar repaints only when the pane's mark did. */
+function noticePaneReview(term) {
+  const waiting = paneReviewWaiting(term);
+  if ((paneReviewSaid.get(term) ?? 0) === waiting) return;
+  if (waiting === 0) paneReviewSaid.delete(term);
+  else paneReviewSaid.set(term, waiting);
+  scheduleAgentPaint(["cards"]);
+}
+
+function forgetPaneReview(term) {
+  reviewedAnswers.delete(term);
+  paneReviewSaid.delete(term);
+}
+
+/* The turn's test line, from its own steps the list already holds: the last finished shell step that ran
+ * tests. A count only when the output says one; without, the step's own outcome and its command. */
+function answerTestLine(list, answer) {
+  // A shell step by the core's own word for its tool (`stepKindOf`), not by a list of vendor names.
+  const step = answerTurns(list, answer).findLast((turn) => turn.role === "tool" && turn.output !== undefined
+    && stepLook(stepKindOf(turn, list.__run)).family === "shell"
+    && TEST_COMMAND.test(toolWords(turn).input ?? ""));
+  if (!step) return null;
+  const command = String(toolWords(step).input ?? "").split("\n", 1)[0].trim();
+  const failed = step.outputError === true || step.tool?.is_error === true;
+  const counts = testRunCounts(step.output);
+  if (counts && counts.failed > 0) {
+    return { ok: false, words: t("worker.reviewTestsFailed", "✗ 테스트 {{n}}개 중 {{m}}개 실패", { n: counts.passed + counts.failed, m: counts.failed }) };
+  }
+  if (counts && counts.passed > 0 && !failed) return { ok: true, words: t("worker.reviewTestsPassed", "✓ 테스트 {{n}}개 통과", { n: counts.passed }) };
+  return failed
+    ? { ok: false, words: t("worker.reviewTestsBroke", "✗ 테스트 실패 · {{command}}", { command }) }
+    : { ok: true, words: t("worker.reviewTestsOk", "✓ 테스트 성공 · {{command}}", { command }) };
 }
 
 function conversationReviewButton(actions) {
@@ -4081,14 +4240,19 @@ function updateConversationActions(actions, list, row) {
   const removed = lines.filter((line) => line.kind === "del").length;
   const words = t("worker.reviewChanges", "변경 검토");
   writeTextContent(button, `${words} +${added} −${removed}`);
-  writeAttribute(button, "aria-label", t("worker.reviewTurnChanges", "이 턴의 변경 검토 · 파일 {{n}}개", { n: new Set(changes.map((edit) => edit.path)).size }));
+  writeAttribute(button, "aria-label", t("worker.reviewTurnChanges", "이 턴의 변경 검토 · 파일 {{n}}개", { n: changedFileCount(changes) }));
   const owner = final ? conversationControlOwner(list, row.__turn) : null;
   for (const control of actions.querySelectorAll("[data-conversation-control]")) {
     writeHidden(control, owner === null);
-    const busy = owner && (hookStates.get(owner.run.term) !== "done" || owner.run.conversationActionPending === true);
+    const busy = owner && conversationControlBusy(owner);
     if (control.disabled !== Boolean(busy)) control.disabled = Boolean(busy);
     writeAttribute(control, "title", busy ? t("worker.recoveryBusy", "진행 중인 작업과 대기 메시지를 마친 뒤 사용할 수 있습니다.") : control.textContent);
   }
+}
+
+/* A control waits while the turn runs or another control is out: the owner would refuse it anyway. */
+function conversationControlBusy(owner) {
+  return hookStates.get(owner.run.term) !== "done" || owner.run.conversationActionPending === true;
 }
 
 function conversationControlOwner(list, answer) {
@@ -4118,10 +4282,7 @@ function conversationControlButton(actions, intent) {
     owner.run.conversationActionPending = true;
     updateConversationActions(actions, list, actions.__row);
     try {
-      const preview = await invoke("pane_conversation_action", { term: owner.run.term, session: owner.session,
-        action: { kind: "preview", message_index: owner.prompt.messageIndex } });
-      if (paneSessions.get(owner.run.term)?.session?.id !== owner.session) throw new Error("conversation-session-changed");
-      openConversationRecovery(owner, preview, intent);
+      openConversationRecovery(owner, await conversationControlPreview(owner), intent);
     } catch (error) {
       showError(conversationControlError(error));
     } finally {
@@ -4130,6 +4291,21 @@ function conversationControlButton(actions, intent) {
     }
   });
   return button;
+}
+
+/* The live owner's preview of a turn — what each scope can restore and the revision a restore is bound to. */
+async function conversationControlPreview(owner) {
+  const preview = await invoke("pane_conversation_action", { term: owner.run.term, session: owner.session,
+    action: { kind: "preview", message_index: owner.prompt.messageIndex } });
+  if (paneSessions.get(owner.run.term)?.session?.id !== owner.session) throw new Error("conversation-session-changed");
+  if (!preview || typeof preview !== "object") throw new Error("recovery-unavailable");
+  return preview;
+}
+
+/* Why the files scope cannot be chosen, in the dialog's own words — or null when it can. */
+function conversationFilesProblem(preview) {
+  if (preview?.files_available === true) return null;
+  return conversationControlError(preview?.file_problem ?? "recovery-unavailable");
 }
 
 function conversationControlError(error) {
@@ -4146,7 +4322,7 @@ function conversationControlError(error) {
 
 /* The approved three choices operate on the live owner's preview and revision.
  * Closing a dialog cannot submit a control; only its explicit final button can. */
-function openConversationRecovery(owner, preview, intent) {
+function openConversationRecovery(owner, preview, intent, scope = null) {
   const back = document.activeElement;
   const ground = document.createElement("div");
   ground.className = "chat-recovery-ground";
@@ -4172,7 +4348,7 @@ function openConversationRecovery(owner, preview, intent) {
     ["conversation", t("worker.recoveryConversation", "대화만"), t("worker.recoveryConversationDetail", "현재 파일을 유지하고 대화에서 다시 시작합니다."), preview.conversation_available],
     ["files", t("worker.recoveryFiles", "파일만"), t("worker.recoveryFilesDetail", "대화를 유지하고 추적된 파일 변경을 복원합니다."), preview.files_available],
   ];
-  let selected = options.find((option) => option[3])?.[0] ?? null;
+  let selected = options.find((option) => option[0] === scope && option[3])?.[0] ?? options.find((option) => option[3])?.[0] ?? null;
   for (const [value, words, detail, enabled] of options) {
     const label = document.createElement("label");
     label.className = "chat-recovery-option";
@@ -4313,14 +4489,26 @@ function openConversationReview(list, answer) {
   const head = document.createElement("div");
   head.className = "chat-review-head";
   const title = document.createElement("strong");
-  title.textContent = t("worker.reviewTurnChanges", "이 턴의 변경 검토 · 파일 {{n}}개", { n: new Set(changes.map((edit) => edit.path)).size });
+  title.textContent = t("worker.reviewTurnChanges", "이 턴의 변경 검토 · 파일 {{n}}개", { n: changedFileCount(changes) });
   const close = document.createElement("button");
   close.type = "button";
   close.className = "chat-answer-action";
   close.textContent = t("worker.reviewClose", "닫기");
   close.addEventListener("click", () => closeConversationReview(page));
-  head.append(title, close);
-  panel.append(head, toolDiffNode(changes, ""));
+  const undo = conversationReviewUndoButton(list, answer);
+  head.append(...[title, undo, close].filter(Boolean));
+  panel.appendChild(head);
+  const tests = answerTestLine(list, answer);
+  if (tests) {
+    const line = document.createElement("p");
+    line.className = "chat-review-tests";
+    line.dataset.state = tests.ok ? "passed" : "failed";
+    line.textContent = tests.words;
+    panel.appendChild(line);
+  }
+  panel.appendChild(toolDiffNode(changes, ""));
+  // The changes were opened in review: the sidebar's 「변경 N」 for this answer is spent (t-95969 G2).
+  markAnswerReviewed(list.__run, answer);
   panel.addEventListener("keydown", (event) => {
     event.stopPropagation();
     if (event.key === "Escape") {
@@ -4335,6 +4523,51 @@ function openConversationReview(list, answer) {
   host.appendChild(panel);
   watch.observe(panel);
   close.focus({ preventScroll: true });
+}
+
+/* 「이 변경 되돌리기」 — the one recovery dialog for this answer, 「파일만」 preselected. It asks the live owner
+ * once, as the panel opens, whether the files scope can be chosen: without it the button stands disabled
+ * and its tooltip is the dialog's own reason. A pane with no recovery path has no button. */
+function conversationReviewUndoButton(list, answer) {
+  const owner = conversationControlOwner(list, answer);
+  if (!owner) return null;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "chat-answer-action chat-review-undo";
+  button.dataset.keyboardOwner = "true";
+  const words = t("worker.reviewUndo", "이 변경 되돌리기");
+  button.textContent = words;
+  const stand = (problem) => {
+    button.disabled = problem !== null;
+    labelButton(button, problem ?? words);
+  };
+  const ask = async () => {
+    if (conversationControlBusy(owner)) {
+      stand(t("worker.recoveryBusy", "진행 중인 작업과 대기 메시지를 마친 뒤 사용할 수 있습니다."));
+      return null;
+    }
+    owner.run.conversationActionPending = true;
+    try {
+      const preview = await conversationControlPreview(owner);
+      stand(conversationFilesProblem(preview));
+      return preview;
+    } catch (error) {
+      stand(conversationControlError(error));
+      return null;
+    } finally {
+      owner.run.conversationActionPending = false;
+    }
+  };
+  stand(null);
+  button.disabled = true;
+  void ask();
+  button.addEventListener("click", async () => {
+    if (button.disabled) return;
+    button.disabled = true;
+    const preview = await ask();
+    if (preview && preview.files_available === true) openConversationRecovery(owner, preview, "restore", "files");
+  });
+  return button;
 }
 
 function closeConversationReview(page, focus = true) {

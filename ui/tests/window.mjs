@@ -80,7 +80,7 @@ import { testWorkspaceBoard } from "./workspace-board.mjs";
 import { testFlowConsole } from "./flow-console.mjs";
 import { testWorktreeEvidence } from "./worktree-evidence.mjs";
 import { testAgentConversation } from "./agent-conversation.mjs";
-import { testConversationAfter, testConversationArchive, testConversationRecovery } from "./conversation-after.mjs";
+import { testConversationAfter, testConversationArchive, testConversationComposerNext, testConversationRecovery, testConversationReviewTests, testConversationReviewUndo } from "./conversation-after.mjs";
 import { testHelperDoors } from "./helper-doors.mjs";
 import { testBrowserRecovery } from "./browser-recovery.mjs";
 import { testBrowserPanesSurvive } from "./browser-panes-survive.mjs";
@@ -110,6 +110,7 @@ import { testSftpAndTeam } from "./sftp.mjs";
 import { testPaneFollowsCwd } from "./pane-follow.mjs";
 import { testPaneStrays } from "./pane-strays.mjs";
 import { testZoRestore } from "./zo-restore.mjs";
+import { testIdleSleep } from "./idle-sleep.mjs";
 import { testTerminalGridFit } from "./terminal-grid-fit.mjs";
 import { testRestartSamePanes } from "./restart-same-panes.mjs";
 import { testFinishedWorkerResume, testFinishedWorkerInspection } from "./finished-worker-resume.mjs";
@@ -139,11 +140,12 @@ import { testImeBrokenCommit } from "./ime-broken-commit.mjs";
 import { testImeKoreanRegression } from "./ime-korean-regression.mjs";
 import { testWorkers } from "./workers.mjs";
 import { testSupersededModel } from "./superseded-model.mjs";
-import { testSidebarAgents } from "./sidebar-agents.mjs";
+import { testSidebarAgents, testSidebarReviewMark } from "./sidebar-agents.mjs";
 import { testSidebarReviewState } from "./sidebar-review-state.mjs";
 import { testSidebarLandingState } from "./sidebar-landing-state.mjs";
 import { testSidebarActivity } from "./sidebar-activity.mjs";
 import { testSidebarRoles } from "./sidebar-roles.mjs";
+import { testSidebarCrewReclaim } from "./sidebar-crew-reclaim.mjs";
 import { testCloseGuard, testRestartNotice } from "./close-guard.mjs";
 import { testSidebarTaskFold } from "./sidebar-task-fold.mjs";
 import { testSidebarFinishedFold } from "./sidebar-finished-fold.mjs";
@@ -423,6 +425,8 @@ suite("pane-strays", ({ browser, origin, ok }) => testPaneStrays(browser, origin
 suite("terminal-grid-fit", ({ browser, origin, ok }) => testTerminalGridFit(browser, origin, ok));
 // The zo panes a restart brings back, in their own workspaces (t-12063).
 suite("zo-restore", ({ browser, origin, ok }) => testZoRestore(browser, origin, ok));
+/* A resting tab behind the front put to sleep on a machine with little memory (low-spec 6, in session). */
+suite("idle-sleep", ({ browser, origin, ok }) => testIdleSleep(browser, origin, ok));
 // The panes a restart opens again, where they stood, in every workspace (t-14036).
 suite("restart-same-panes", ({ browser, origin, ok }) => testRestartSamePanes(browser, origin, ok));
 suite("finished-worker-resume", ({ browser, origin, ok }) => testFinishedWorkerResume(browser, origin, ok));
@@ -457,6 +461,8 @@ suite("workers", testWorkers);
 // A pane on a release the catalog superseded says so, in one word (t-46882).
 suite("superseded-model", testSupersededModel);
 suite("sidebar-agents", testSidebarAgents);
+/* 판의 마지막 답이 바꾼 파일을 아직 검토하지 않았으면 행에 「변경 N」, 카드 끝에 「검토 대기 N」 (t-95969 G2). */
+suite("sidebar-review-mark", testSidebarReviewMark);
 // The sidebar tells 작업 중, 검증 대기 and 완료 apart, by the ledger (t-18902).
 suite("sidebar-review-state", testSidebarReviewState);
 suite("sidebar-landing-state", testSidebarLandingState);
@@ -464,6 +470,7 @@ suite("sidebar-landing-state", testSidebarLandingState);
 suite("sidebar-activity", testSidebarActivity);
 // Who is the coordinator, a worker or the person, read off the sidebar, the tabs and the desk (t-45938).
 suite("sidebar-roles", testSidebarRoles);
+suite("sidebar-crew-reclaim", testSidebarCrewReclaim);
 // A tab holding a coordinator's or a worker's seat asks before it closes, and a restart stands its notice first (t-67936).
 suite("close-guard", testCloseGuard);
 suite("restart-notice", testRestartNotice);
@@ -540,6 +547,10 @@ suite("conversation-find-pane", ({ browser, origin, ok }) => testConversationFin
 suite("conversation-after", ({ browser, origin, ok }) => testConversationAfter(browser, origin, ok));
 suite("conversation-archive", ({ browser, origin, ok }) => testConversationArchive(browser, origin, ok));
 suite("conversation-recovery", ({ browser, origin, ok }) => testConversationRecovery(browser, origin, ok));
+/* 검토 패널의 테스트 줄·「이 변경 되돌리기」, 실행 중 입력창의 보낼 시점 안내 (t-95969). */
+suite("conversation-review-tests", ({ browser, origin, ok }) => testConversationReviewTests(browser, origin, ok));
+suite("conversation-review-undo", ({ browser, origin, ok }) => testConversationReviewUndo(browser, origin, ok));
+suite("conversation-composer-next", ({ browser, origin, ok }) => testConversationComposerNext(browser, origin, ok));
 /* 사람 말에서 고쳐 보내기 — 되감기 명령을 아는 CLI의 판에만, 누르면 판을 터미널로 돌리고 /rewind (시안 C10, t-82196). */
 suite("pane-rewind", ({ browser, origin, ok }) => testPaneRewind(browser, origin, ok));
 suite("conversation-earlier", ({ browser, origin, ok }) => testConversationEarlier(browser, origin, ok));
@@ -48440,9 +48451,12 @@ const agentFold = await page.evaluate(async () => {
   // ② 행: 셰브론이 서고, 누르면 접힘이 뒤집힌다. 조용한 자리는 정렬만 지킨다.
   const parent = makeAgentRow(folded[0], true);
   const fold = parent.querySelector(".wt-agent-fold");
+  // 행이 단추 하나다(t-95957 r2): 셰브론은 눈에 그려질 뿐이고, 열렸는지는 행이 말한다.
   seen.foldStands =
-    fold?.getAttribute("role") === "button" &&
-    fold?.getAttribute("aria-expanded") === "false" &&
+    fold?.getAttribute("aria-hidden") === "true" &&
+    fold?.getAttribute("role") === null &&
+    fold?.getAttribute("tabindex") === null &&
+    parent.getAttribute("aria-expanded") === "false" &&
     fold?.querySelector(".icon--twist") !== null &&
     fold?.querySelector(".icon--twist.is-open") === null;
   seen.foldSummary =
@@ -48461,7 +48475,7 @@ const agentFold = await page.evaluate(async () => {
   const wideOpen = makeAgentRow(opened[0], true);
   seen.foldTurns =
     wideOpen.querySelector(".wt-agent-fold .icon--twist.is-open") !== null &&
-    wideOpen.querySelector(".wt-agent-fold")?.getAttribute("aria-expanded") === "true";
+    wideOpen.getAttribute("aria-expanded") === "true";
   // 접힘은 행이 하는 말이다 — 같은 행에서 그것만 달라도 서명이 갈라져야
   // 다음 박자가 다시 그린다.
   seen.signatureSeesFold =
@@ -48581,13 +48595,15 @@ const activeHistory = await page.evaluate(async () => {
       open.some((row) => row.sub?.id === "h-live") &&
       open.some((row) => row.term === 7913 && !row.sub && row.depth === 2);
     // The one line is drawn as a count with a chevron, and never as a
-    // session: no face, no model, no clock.
+    // session: no face, no model, no clock. It is one button (t-95957): the
+    // row says whether it is open, and its chevron is drawn for the eye only.
     const line = makeAgentRow(historyRow, true);
     seen.historyDrawn =
       line.classList.contains("is-history") &&
       line.querySelector(".wt-agent-name")?.textContent ===
         t("board.historyCount", "완료 {{count}}개", { count: 4 }) &&
-      line.querySelector(".wt-agent-fold")?.getAttribute("aria-expanded") === "false" &&
+      line.getAttribute("aria-expanded") === "false" &&
+      line.querySelector(".wt-agent-fold")?.getAttribute("aria-hidden") === "true" &&
       line.querySelector(".wt-agent-face") === null &&
       line.querySelector(".wt-agent-when") === null;
     // ② Opened: the four stand, each with its transcript hand, and the count
@@ -54410,7 +54426,7 @@ await page.evaluate(async () => {
 /* ---- 「새 빌드 준비됨」 (t-3005 · t-3237) -----------------------------------
  *
  * The release lane (docs/design/release-lane-off-the-window.md §2.3–2.4)
- * leaves `status.json` and `installed.json` behind; the backend judges them
+ * leaves `installed.json` behind; the backend judges it
  * into one notice and the window says it twice — a sticky toast whose one
  * button is the one restart road, and the settings notice saying the same
  * sentence with the same button. The sentence follows the change the
@@ -54421,21 +54437,19 @@ await page.evaluate(async () => {
  * (`settings.update.running`, t-3191's key, no second word). Once per
  * sha, however many polls; the words follow the language in five
  * catalogs; zo-only carries no button; equal builds take the toast away.
- * The fixtures are the two files as the lane writes them
- * (`ui/tests/release-status.json`, `ui/tests/release-installed.json`), fed
- * through the invoke stub as `release_status` answers them. */
-const RELEASE_STATUS = JSON.parse(await readFile(resolve(UI, "tests", "release-status.json"), "utf8"));
+ * The fixture is the installed file as the lane writes it
+ * (`ui/tests/release-installed.json`), fed through the invoke stub as
+ * `release_status` answers it. */
 const RELEASE_INSTALLED = JSON.parse(await readFile(resolve(UI, "tests", "release-installed.json"), "utf8"));
-const updateNotice = await page.evaluate(async ({ status, installed, running, runningVersion, zoRunning }) => {
+const updateNotice = await page.evaluate(async ({ installed, running, runningVersion, zoRunning }) => {
   const seen = {};
   const held = window.__ANSWER__.release_status;
   const tick = () => new Promise((done) => setTimeout(done, 40));
   const short = (sha) => sha.slice(0, 7);
-  // The backend's judgement over the two files, as `release_status` answers
-  // it: the files verbatim and the notice (`update_runtime::update_notice`),
+  // The backend's judgement over the installed file, as `release_status`
+  // answers it: the file verbatim and the notice (`update_runtime::update_notice`),
   // each half carrying the versions and the change the words name.
   const answer = (app, zo) => ({
-    status,
     installed,
     notice: app || zo ? { app: app ?? null, zo: zo ?? null } : null,
   });
@@ -54710,7 +54724,6 @@ const updateNotice = await page.evaluate(async ({ status, installed, running, ru
   }
   return seen;
 }, {
-  status: RELEASE_STATUS,
   installed: RELEASE_INSTALLED,
   running: "9b576e43aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   runningVersion: "0.1.0",
@@ -56233,7 +56246,7 @@ suite("composer-chips", async ({ browser, origin, ok }) => {
     ok(
       "the composer wears the extension's row — `+`, the agent chip (mark · name · model), the pane's effort beside it (t-81532), the mode chip, then `/` and send — a pane's own conversation speaks to the pane without a door, and a helper's page has no composer at all: its footer speaks to the parent instead",
       seen.placeholder === seen.wantPlaceholder && seen.noDoorOnOwnPane &&
-        JSON.stringify(seen.rowOrder) === JSON.stringify(["composer-attach-plus", "worker-composer-agent", "worker-composer-effort", "worker-composer-mode", "worker-composer-context", "worker-composer-agents", "worker-composer-right"]) &&
+        JSON.stringify(seen.rowOrder) === JSON.stringify(["composer-attach-plus", "worker-composer-agent", "worker-composer-effort", "worker-composer-mode", "worker-composer-context", "worker-composer-next", "worker-composer-agents", "worker-composer-right"]) &&
         seen.agentsPillQuiet &&
         seen.chipMark === "✻" && seen.chipName === "Claude" && seen.chipModelRaw === " · claude-fable-5-1" &&
         seen.helperStandsWithoutComposer,
@@ -58044,10 +58057,10 @@ suite("composer-queue", async ({ browser, origin, ok }) => {
       const box = composer?.querySelector(".worker-composer-box");
       const items = () => [...(composer?.querySelectorAll(".composer-queue-item") ?? [])]
         .map((item) => item.querySelector(".composer-queue-words")?.textContent);
-      // 실행 중에도 쉬는 동안에도 상자는 한 문장 — 일하는 중이면 대기열에 든다고 —
-      // 을 말한다(t-22100).
+      // 쉬는 동안 상자는 한 문장 — 일하는 중이면 대기열에 든다고 — 을 말하고(t-22100),
+      // 실행 중에 끼워 넣기·바로 보내기를 고를 수 있으면 보낼 시점을 고를 수 있다고 말한다(t-95969 G3).
       seen.workingPlaceholder = box?.placeholder;
-      seen.wantWorkingPlaceholder = t("composer.placeholder", "다음 지시를 쓰세요. 일하는 중이면 대기열에 들어갑니다");
+      seen.wantWorkingPlaceholder = t("composer.placeholderRunning", "다음 지시를 입력하세요. 실행 중에는 보낼 시점을 고를 수 있습니다.");
       const before = calls.length;
       type(box, "첫째");
       await settle();

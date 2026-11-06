@@ -290,6 +290,7 @@ const RUST_DEFAULT_DOCUMENT_JSON = String.raw`{
   "theme": "system",
   "ui_zoom_level": 0.0,
   "app_font_family": "Geist",
+  "chat_font_size": "screen",
   "status_bar_items": ["claude", "codex", "antigravity", "kimi", "grok", "opencode-go", "resource-usage", "ports"],
   "status_bar_items_seen": ["claude", "codex", "antigravity", "kimi", "grok", "opencode-go", "resource-usage", "ports"],
   "status_bar_items_off": [],
@@ -831,7 +832,7 @@ function scmTreeRows(area, paths, folded) {
 }
 
 const SETTINGS_MUTATION_COMMANDS = new Set([
-  "set_crash_watchdog", "set_theme", "set_locale", "set_ui_zoom", "set_app_font_family", "set_show_titlebar_app_name", "set_show_menu_bar_icon", "set_minimize_to_tray_on_close", "set_compact_worktree_cards", "set_show_git_ignored_files", "set_source_control_group_order", "set_source_control_compare_base", "set_refresh_local_base_ref_on_worktree_create", "patch_left_sidebar_appearance", "set_status_bar_item", "set_usage_percentage_display", "set_status_bar_usage_mode", "set_usage_analytics_enabled", "set_source_control_view_mode", "set_terminal_command", "set_setup_script_launch_mode", "set_terminal_shortcut_policy", "set_terminal_prefs",
+  "set_crash_watchdog", "set_theme", "set_locale", "set_ui_zoom", "set_app_font_family", "set_chat_font_size", "set_show_titlebar_app_name", "set_show_menu_bar_icon", "set_minimize_to_tray_on_close", "set_compact_worktree_cards", "set_show_git_ignored_files", "set_source_control_group_order", "set_source_control_compare_base", "set_refresh_local_base_ref_on_worktree_create", "patch_left_sidebar_appearance", "set_status_bar_item", "set_usage_percentage_display", "set_status_bar_usage_mode", "set_usage_analytics_enabled", "set_source_control_view_mode", "set_terminal_command", "set_setup_script_launch_mode", "set_terminal_shortcut_policy", "set_terminal_prefs",
   "patch_terminal_prefs", "patch_editing_prefs", "patch_update_prefs", "apply_ghostty_import", "set_panel_width",
   "set_notification_preference", "set_finish_notification_mode", "set_browser_home_page", "set_browser_search_engine",
   "patch_browser_link_routing", "patch_browser_user_agents", "set_browser_restore_tabs", "set_browser_default_zoom", "set_browser_open_tabs",
@@ -1298,6 +1299,14 @@ class StatefulBackend {
       case "set_app_font_family":
         this.settings.app_font_family = args.family.trim() || "Geist";
         keys = ["app_font_family"];
+        break;
+      case "set_chat_font_size":
+        // The backend's own reading (`normalized_chat_font_size`): a word it
+        // knows or whole pixels on the terminal's ruler, else the default.
+        this.settings.chat_font_size = ["screen", "terminal"].includes(args.size) ||
+          (/^\d+$/.test(args.size) && Number(args.size) >= 10 && Number(args.size) <= 24)
+          ? args.size : "screen";
+        keys = ["chat_font_size"];
         break;
       case "set_compact_worktree_cards":
         this.settings.compact_worktree_cards = args.compact === true;
@@ -2075,10 +2084,14 @@ class StatefulBackend {
       // 않으므로 늘 같은 답이고, 목록은 다시 읽히지 않는다.
       case "worktree_stamp": return "";
       case "worktree_landing_stamp": return "";
-      // The release lane's two files, read once at boot and on the usage
-      // gauge's period (t-3005). This fixture's machine has no lane: two
-      // nulls and no notice, which is what a fresh install answers.
-      case "release_status": return { status: null, installed: null, notice: null };
+      // The installed build's file, read once at boot and on the usage
+      // gauge's period (t-3005). This fixture's machine has no lane: null
+      // and no notice, which is what a fresh install answers.
+      case "release_status": return { installed: null, notice: null };
+      // The project's builds (`board_builds`, zerocode_core::builds): this
+      // fixture's repository holds no build record, so none — which is what
+      // a project that never reported a build answers.
+      case "board_builds": return { revision: 0, unchanged: false, builds: [] };
       // What a restart left for the window it started (t-67936): this
       // fixture's window was started fresh, so nothing.
       case "boot_after_restart": return null;
@@ -2106,6 +2119,8 @@ class StatefulBackend {
       case "pane_layouts": return [];
       // 재시작 때 대화가 돌던 다른 작업 공간(t-14036) — 이 픽스처에는 없다.
       case "standing_pane_worktrees": return [];
+      // 쉬는 탭 재우기의 시간(저사양 6) — 메모리가 넉넉한 기계의 답처럼 없다.
+      case "idle_sleep_policy": return null;
       // 원장이 이 체크아웃에 앉힌 마지막 에이전트 — 이 픽스처의 워크스페이스는
       // 어느 워커도 잘라 준 적이 없으니, 실제 백엔드가 그럴 때 답하는 그대로.
       case "worktree_last_agent": return null;
@@ -4142,6 +4157,7 @@ const controlValue = async (page, kind) => page.evaluate((name) => {
     locale: () => document.getElementById("app-locale")?.value,
     ui_zoom: () => Number(document.documentElement.dataset.uiZoomLevel),
     app_font_family: () => document.getElementById("app-font-family")?.value,
+    chat_font_size: () => document.getElementById("chat-font-size")?.value,
     titlebar_app_name: () => document.getElementById("show-titlebar-app-name")?.checked,
     menu_bar_icon: () => document.getElementById("show-menu-bar-icon")?.checked,
     minimize_to_tray: () => document.getElementById("minimize-to-tray-on-close")?.checked,
@@ -4202,6 +4218,7 @@ const chooseControl = async (page, kind, value) => {
     case "locale": return page.selectOption("#app-locale", value);
     case "artifacts_retention": return blurField(page, "#artifacts-retention-days", value);
     case "ui_zoom": return page.evaluate((level) => setUiZoomLevel(level), value);
+    case "chat_font_size": return page.selectOption("#chat-font-size", value);
     case "app_font_family":
       await page.fill("#app-font-family", value);
       return page.$eval("#app-font-family", (field) =>
@@ -11199,6 +11216,7 @@ await test("non-default writes become canonical state before the second window b
     ["locale", "set_locale", "ja", "appearance"],
     ["ui_zoom", "set_ui_zoom", 1.5, "appearance"],
     ["app_font_family", "set_app_font_family", "Inter", "appearance"],
+    ["chat_font_size", "set_chat_font_size", "terminal", "appearance"],
     ["titlebar_app_name", "set_show_titlebar_app_name", false, "appearance"],
     ["menu_bar_icon", "set_show_menu_bar_icon", false, "appearance"],
     ["minimize_to_tray", "set_minimize_to_tray_on_close", true, "appearance"],
@@ -14550,6 +14568,34 @@ await test("Claude rows distinguish organization types and badge only identical 
   assert(result[0].under.includes("Team") && result[1].under.includes("Max")
     && result[3].under.includes("Pro") && result[4].under.includes("Free"), JSON.stringify(result));
   assert(same(result.map((row) => row.duplicate), [false, true, true, false, false]), JSON.stringify(result));
+});
+
+await test("a Claude plan's own name goes before the type word in the row and the badge", async () => {
+  await setQualityLocale(pageA, "en");
+  const result = await pageA.evaluate(() => {
+    const base = { email: "same@example.test", signed_in: true, organization_name: "Organization" };
+    accountReport = { can_add: true, accounts: [
+      { ...base, id: "ultra", account_uuid: "one", organization_uuid: "one", organization_type: "claude_max", plan_display_name: "Ultra" },
+      { ...base, id: "max", account_uuid: "two", organization_uuid: "two", organization_type: "claude_max" },
+      { ...base, id: "team", account_uuid: "three", organization_uuid: "three", organization_type: "claude_team" },
+      { ...base, id: "marked", account_uuid: "four", organization_uuid: "four", organization_type: "claude_max", plan_display_name: "<b>Ultra</b>" },
+    ] };
+    const held = accountUsageReport;
+    accountUsageReport = { accounts: [{ id: "ultra", organization_type: "claude_max", plan_display_name: "Ultra", active: true, usage: null, fetching: false }] };
+    paintClaudeAccounts();
+    const rows = [...document.querySelectorAll("#account-list .account-row")].slice(1);
+    const said = {
+      under: rows.map((row) => row.querySelector(".agent-row-cmd").textContent),
+      markup: !!rows[3]?.querySelector(".agent-row-cmd b"),
+      badges: ["ultra", "max", "team"].map((id) => accountBadge(id)),
+    };
+    accountUsageReport = held;
+    return said;
+  });
+  assert(result.under[0].includes("Ultra") && !result.under[0].includes("Max")
+    && result.under[1].includes("Max") && result.under[2].includes("Team"), JSON.stringify(result));
+  assert(!result.markup && result.under[3].includes("<b>Ultra</b>"), JSON.stringify(result));
+  assert(same(result.badges, ["Ultra ultra", "Max max", "Team team"]), JSON.stringify(result));
 });
 
 await test("Claude pending identity keeps its old label and offers both explicit resolutions", async () => {

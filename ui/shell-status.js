@@ -3671,19 +3671,6 @@ let releaseNotice = null;
  * every one of them — a turn sleeps and is seated again, a job dies — so
  * the app notice says so beside its button. Nothing busy says nothing. */
 let releaseBusy = null;
-/* The lane's own `status.json` as that same answer carried it — sha, version,
- * phase, outcome, its steps and their words — for the task board's release card
- * (t-6588, `paintDeskRelease`). Kept here because this is the one reader of the
- * file; the card only draws what was read. `null` is "no lane here" or "unread".
- * The backend answers it only for a project of the repository the lane says it
- * releases (t-83513), so it is held with the checkout it was asked for. */
-let releaseLane = null;
-let releaseLaneFor;
-let releaseLaneAsking = false;
-/* The lane as last drawn, spelled out with the checkout it was asked for: the board's
- * 빌드 줄 card and the sentence above it read `releaseLane` (t-67607), so a lane that
- * moved repaints the desk once and the same lane, polled again, repaints nothing. */
-let releaseLaneSaid = "";
 const noticedBuilds = new Set();
 let updateToast = null;
 let updateToastKey = null;
@@ -3835,21 +3822,9 @@ function raiseUpdateToast() {
   if (updateToast) updateToast.dataset.notice = "update";
 }
 
-function absorbReleaseStatus(answer, asked = activeWorktreePath) {
+function absorbReleaseStatus(answer) {
   releaseNotice = answer?.notice ?? null;
   releaseBusy = answer?.busy ?? null;
-  releaseLaneFor = asked;
-  releaseLane = answer?.status && typeof answer.status === "object" ? answer.status : null;
-  // The checkout rides in the spelling: the same lane read again for the checkout now on screen
-  // repaints the card that drew no lane while it was asked.
-  const laneSaid = JSON.stringify([asked, releaseLane]);
-  if (laneSaid !== releaseLaneSaid) {
-    releaseLaneSaid = laneSaid;
-    scheduleDeskPaint();
-    // 쌓인 일 says the lane too, while its tab is up (shell-scm.js loads after this file).
-    if (typeof paintStackedWorkCount === "function") paintStackedWorkCount();
-    if (typeof paintStackedWork === "function" && !el("activity-pile").hidden) paintStackedWork();
-  }
   paintUpdateNotice();
   raiseUpdateToast();
   // A toast already standing for this pair keeps saying the truth: the
@@ -3868,21 +3843,9 @@ function absorbReleaseStatus(answer, asked = activeWorktreePath) {
  * files are its own, and a window that cannot read them has nothing to
  * say. Not settled and not on focus — a release is a minutes-scale event. */
 function askReleaseStatus() {
-  const asked = activeWorktreePath;
-  releaseLaneAsking = true;
-  return invoke("release_status", { worktree: asked })
-    .then((answer) => absorbReleaseStatus(answer, asked))
-    .catch(() => {})
-    .finally(() => { releaseLaneAsking = false; });
-}
-
-/* The lane as the project on screen may show it (t-83513): the answer asked for
- * this checkout, or nothing — a lane read for the checkout before a switch says
- * nothing of this one, and is asked again for it. */
-function releaseLaneHere() {
-  if (releaseLaneFor === activeWorktreePath) return releaseLane;
-  if (!releaseLaneAsking) void askReleaseStatus();
-  return null;
+  return invoke("release_status")
+    .then(absorbReleaseStatus)
+    .catch(() => {});
 }
 
 const releaseAmbient = idlePoller({
@@ -4956,7 +4919,10 @@ function paintTabNode(node, tab) {
   const turn = tab.asleep && tab.wakeOrder
     ? ` \u00b7 ${t("tab.wakingOrder", "깨우는 중 — {{n}}번째", { n: tab.wakeOrder })}`
     : "";
-  const wording = tabLabel(tab) + turn;
+  // Put to sleep in session to give its memory back (low-spec 6, `sleepTab`):
+  // said, so a resting conversation never reads as one that ended.
+  const slept = tab.asleep && tab.slept && !tab.wakeOrder ? ` \u00b7 ${t("tab.slept", "잠듦")}` : "";
+  const wording = tabLabel(tab) + turn + slept;
   if (label.textContent !== wording) label.textContent = wording;
   const age = node.querySelector(".tab-age");
   if (age.textContent !== ago) age.textContent = ago;
@@ -7122,9 +7088,24 @@ el("link-menu-settings").addEventListener("click", () => {
   setSettingsOpen(true, "browser-terminal-link-actions");
 });
 
+/* The tabs that are open — or null when shell-term.js stopped while it loaded,
+ * before its `const tabs` line ran. V8 reads that never-initialized binding as
+ * "tabs is not defined" from every other script: on a Windows run on
+ * 2026-11-05 a page whose terminal script stopped early turned an
+ * `open_term_tab` failure into that ReferenceError, and the failure itself was
+ * never said (t-94962). The one function that reports errors must not throw
+ * over the error it was handed. */
+function openTabsIfLoaded() {
+  try {
+    return tabs;
+  } catch {
+    return null;
+  }
+}
 
 function showError(error) {
-  if (tabs.length === 0) {
+  const open = openTabsIfLoaded();
+  if (open !== null && open.length === 0) {
     // Held rather than written: `paintStagePlaceholder` is the one thing that
     // draws this element and a language change runs it, so a failure written
     // behind its back is erased the moment somebody switches language.
@@ -7135,7 +7116,8 @@ function showError(error) {
     // With a tab open there is no placeholder to write on, and this used to
     // stop at the console — a failure the person was never told about. The
     // origin of the call may be anywhere or already gone, which is precisely
-    // the case the toast layer exists for.
+    // the case the toast layer exists for. A terminal script that stopped
+    // while loading comes here too: the placeholder is that script's.
     console.error(error);
     if (standingToast(String(error), "halt")) return;
     toast(String(error), "halt");

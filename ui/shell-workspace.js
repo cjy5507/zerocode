@@ -3654,6 +3654,8 @@ function workspaceStateGroups() {
  * built before that counts the checkouts with no live agent row — the first paint then corrects it from the cards
  * (r2 P3-7), so the head never stands without its words while the list is being built. */
 let projectSeatless = null;
+/* What waits on the person in each other project, by its path (Rust's `Inbox::elsewhere`, `paintProjectWaiting`). */
+let projectWaiting = new Map();
 
 /* How many of a project's checkouts hold no agent window and say no stage of the ledger's (a stage says more —
  * t-44016): what 「에이전트 창 없음」 on the project's head counts. A checkout folded under its task's row is not
@@ -3679,6 +3681,25 @@ function dressProjectUnseated(row, project) {
   writeHidden(note, count === 0);
   writeTextContent(note, count === 0 ? "" : t("worktree.unseatedGroup", "에이전트 창 없음 {{count}}", { count }));
   writeAttribute(note, "data-tip", count === 0 ? "" : t("worktree.unseatedTip", "이 워크스페이스에서 열린 에이전트 창이 없습니다. 다른 창의 에이전트가 이 폴더의 파일을 수정할 수는 있습니다."));
+}
+
+/* 다른 프로젝트에서 사람을 기다리는 일의 수 — 받은 편지함은 지금 프로젝트의 것만 보이고, 다른 프로젝트의 수는 제 행에
+ * 선다(빌드 카드 계획 §8). 지금 프로젝트의 수는 받은 편지함의 문에 있어, 그 행에는 서지 않는다(Rust가 싣지 않는다). */
+function dressProjectWaiting(row, project) {
+  const badge = row.querySelector(".proj-waiting");
+  const waiting = projectWaiting.get(project.path) ?? 0;
+  writeTextContent(badge, waiting === 0 ? "" : String(waiting));
+  writeAttribute(badge, "data-tip", waiting === 0 ? "" : t("worktree.waitingTip", "이 프로젝트에서 당신을 기다리는 일 {{count}}개", { count: waiting }));
+  writeHidden(badge, waiting === 0);
+}
+
+/* The heads' waiting counts, again when the inbox's answer moved. */
+function paintProjectWaiting(elsewhere) {
+  projectWaiting = new Map(elsewhere.map((one) => [one.project, one.waiting]));
+  for (const row of worktreeList.querySelectorAll(".proj-row[data-project-path]")) {
+    const project = projects.find((one) => one.path === row.dataset.projectPath);
+    if (project) dressProjectWaiting(row, project);
+  }
 }
 
 /* The heads' counts, again when the agents' cards moved: `seatless` is the paths whose card holds nothing. */
@@ -3712,6 +3733,8 @@ function makeProjectHeader(project) {
     '<span class="proj-name"></span>' +
     // 「에이전트 창 없음 N」 — once for the checkouts of this project that hold no agent window (`paintProjectUnseated`).
     '<span class="proj-unseated" hidden></span>' +
+    // What waits on the person in this project while another is open (`dressProjectWaiting`).
+    '<span class="nav-badge is-attention proj-waiting" hidden></span>' +
     '<span class="project-actions">' +
     // Hover-only bare-goes-to-the-Task-screen shortcuts. Orca's own row shows
     // GitHub/GitLab/Linear/Jira icons only on hover/focus-within (measured,
@@ -3725,6 +3748,7 @@ function makeProjectHeader(project) {
 
   row.querySelector(".proj-name").textContent = project.name;
   dressProjectUnseated(row, project);
+  dressProjectWaiting(row, project);
   row.querySelector(".project-twist").innerHTML = icon("chevron", !folded);
   row.dataset.tip = project.path;
 
@@ -6083,6 +6107,7 @@ async function refreshWorktrees() {
   const activeProject = projects.find((project) =>
     project.worktrees.some((worktree) => worktree.active));
   activeProjectPath = activeProject?.path ?? projects[0]?.path ?? null;
+  followSelectedProject();
   // 목록이 비었는지에 따라 빈 무대가 할 말이 달라진다. 목록을 다시 읽은 바로
   // 이 자리에서 — 프로젝트가 마지막 하나까지 빠지는 순간이 곧 이 화면이
   // 바뀌어야 하는 순간이다.
@@ -6584,6 +6609,10 @@ function teamTurnFailedLine(failed) {
     : t("sidebar.team.turnFailedLine", "턴 실패 — {{error}}", { error });
 }
 
+/* The ledger states of a worker whose work ended and whose pane the window is to close (t-94842): queued for the
+ * close, being closed, or a close nobody confirmed. */
+const TEAM_RECLAIM_LEDGER = new Set(["reclaimable", "release_pending", "release_unknown"]);
+
 /* One worker's row, as words: its state and the one word of what holds it, its title, its pane, what it last
  * said it was doing, and its steps. */
 function teamWorkerEntry(row, at, now) {
@@ -6600,17 +6629,23 @@ function teamWorkerEntry(row, at, now) {
   else if (stage === "handedIn" || stage === "reviewing" || stage === "landWait") state = "waiting";
   // 일이 끝나 창의 회수를 기다리는 판(t-94842): 「끝남 · 회수 중」, 회수가 거절됐으면 「끝남 · 회수 보류」와 그 까닭.
   // 판이 이미 닫힌 워커(released, 일만 코디의 검토를 기다린다)는 「회수됨」(2026-11-05, 사이드바의 「완료 N개 · 회수됨」과 한 말).
-  const finished = row.ledger === "reclaimable";
-  const held = finished && typeof row.release_held === "string" ? row.release_held : "";
+  // The ledger's three reclaim states read as the sidebar's 「완료 N개」 reads them (t-95957, `finishedPaneReclaim`): a
+  // close the window is making or has queued is 회수 중, a refused or unconfirmed one 회수 보류.
+  const finished = TEAM_RECLAIM_LEDGER.has(row.ledger);
+  const reason = finished && typeof row.release_held === "string" ? row.release_held : "";
+  const held = reason !== "" || row.ledger === "release_unknown";
   const finishedWord = !finished ? "" : [
     t("sidebar.team.finished", "끝남"),
     held ? t("sidebar.team.releaseHeld", "회수 보류") : t("agent.reclaim.going", "회수 중"),
   ].join(" · ");
   const reclaimedWord = row.settled === true ? t("agent.reclaim.done", "회수됨") : "";
   const chip = blocker || (hook === "needs-attention" ? bucketWord("attention") : "") || finishedWord || reclaimedWord;
-  const chipTip = chip === finishedWord && held
-    ? t("sidebar.team.releaseHeldTip", "창이 이 판을 닫지 못했습니다: {{reason}}", { reason: held }) : "";
-  const chipHeld = chip === finishedWord && held !== "";
+  const chipTip = chip !== finishedWord || !held ? ""
+    : reason ? t("sidebar.team.releaseHeldTip", "창이 이 판을 닫지 못했습니다: {{reason}}", { reason })
+    : t("agent.reclaim.unknownTip", "창이 이 판을 닫았는지 확인하지 못했습니다");
+  // Only a blocker wears the chip's red: a reclaim on its way and a closed pane are quiet, a held one the caution.
+  const chipHeld = chip === finishedWord && held;
+  const chipCalm = chip !== "" && !chipHeld && (chip === finishedWord || chip === reclaimedWord);
   const steps = teamSteps(row, state === "blocked" || state === "asking");
   const said = row.last_status;
   const told = failedTurn ? teamTurnFailedLine(failedTurn) : said?.line ?? "";
@@ -6625,6 +6660,7 @@ function teamWorkerEntry(row, at, now) {
     chip,
     chipTip,
     chipHeld,
+    chipCalm,
     agent: row.agent || null,
     title: row.task?.trim() || row.task_id || agentName(row.agent),
     // Where the pane number stood, the row's state in a word — the sidebar's rows say theirs in the same place
@@ -6846,7 +6882,7 @@ function teamEntrySaid(entry) {
       // The line's tip carries a clock that moves every minute; what the row is written again for is the sentence
       // and the time it was said (`nowAt`), not the minute count.
       return [entry.child ? "c" : "", entry.nowIdle ? "i" : "", entry.nowLine, entry.nowAt,
-        entry.state, entry.chip, entry.chipTip, entry.chipHeld ? "h" : "", entry.agent ?? "", entry.title, entry.pane, entry.paneTip, entry.now,
+        entry.state, entry.chip, entry.chipTip, entry.chipHeld ? "h" : "", entry.chipCalm ? "q" : "", entry.agent ?? "", entry.title, entry.pane, entry.paneTip, entry.now,
         TEAM_STEPS.map((step) => entry.steps.cells[step.id]).join(","), entry.step, entry.stepsTip, entry.tip,
         entry.taken ? 1 : 0, entry.term ?? "", t(TEAM_STATES[entry.state].key, TEAM_STATES[entry.state].word)].join("|");
     case "coordinator":
@@ -7046,6 +7082,7 @@ function dressTeamNode(node, entry) {
   writeTeamText(parts.chip, entry.chip, entry.chipTip ?? "");
   parts.chip.classList.toggle("is-question", entry.state === "asking");
   parts.chip.classList.toggle("is-held", entry.chipHeld === true);
+  parts.chip.classList.toggle("is-calm", entry.chipCalm === true);
   writeTeamText(parts.pane, entry.pane, entry.paneTip);
   dressTeamNow(parts.now, entry);
   TEAM_STEPS.forEach((step, at) => {
@@ -7292,7 +7329,8 @@ async function openTeamClose() {
   teamCloseOpening = true;
   let desk = null;
   try {
-    desk = await invoke("board_desk");
+    // The worker's own project's desk: the sidebar lists every project's workers.
+    desk = await invoke("board_desk", { worktree: entry.row.checkout || activeWorktreePath });
   } catch {
     desk = null;
   } finally {
@@ -9853,6 +9891,25 @@ async function activateWorktree(
   ]);
   recordNavVisit(path);
   return true;
+}
+
+/* 고른 프로젝트가 바뀌면, 고른 프로젝트의 것만 보이는 화면들이 그 프로젝트로 다시 묻는다(빌드 카드 계획 §8): 작업 상황판의
+ * 데스크, 받은 편지함과 사이드바의 다른 프로젝트 수, 프로젝트를 범위로 둔 보관함, 지금 보는 프로젝트를 따르는 아티팩트.
+ * 한 프로젝트의 워크트리 사이를 오가면 그 프로젝트의 답은 그대로라 묻지 않는다 — 워크스페이스를 범위로 둔 보관함만 다시
+ * 묻는다. 같은 자리의 다시 읽기는 아무것도 다시 묻지 않는다. */
+let followedProjectPath;
+let followedWorktreePath;
+function followSelectedProject() {
+  const project = followedProjectPath !== activeProjectPath;
+  const worktree = followedWorktreePath !== activeWorktreePath;
+  followedProjectPath = activeProjectPath;
+  followedWorktreePath = activeWorktreePath;
+  if (project) {
+    if (deskViews().length > 0) refreshDeskLedger();
+    void refreshInbox();
+    followArtifactsProject();
+  }
+  if (vaultAnswer && (vaultScope === "project" ? project : vaultScope === "workspace" && worktree)) void refreshVault();
 }
 
 /* Repaint only surfaces whose meaning follows the active checkout. The

@@ -38,6 +38,8 @@ const MODAL_SPECS = Object.freeze({
   "continue-scrim": { initial: "continue-agent", cancel: () => closeContinueDialog() },
   "qo-scrim": { initial: "qo-input", cancel: () => closePalette() },
   "wt-edit-scrim": { initial: "wt-edit-name", cancel: () => setWorktreeEditor() },
+  "build-order-scrim": { initial: "build-order-cancel", cancel: () => closeBuildOrder() },
+  "build-approve-scrim": { initial: "build-approve-cancel", cancel: () => closeBuildApproval() },
   "wt-evidence-scrim": { initial: "wt-evidence-refresh", cancel: () => closeWorktreeEvidence() },
   "ssh-cred-scrim": { initial: "ssh-cred-value", cancel: () => answerSshCredential(null) },
   "composer-scrim": { initial: "composer-template", cancel: () => closeComposer() },
@@ -872,6 +874,7 @@ function routeText(text) {
   hideTerminalPointerForInput(target);
   if (target.kind === "term") {
     noteTyped();
+    noteTypedInto(target.term);
     invoke("term_text", { term: target.term, text, human: true }).catch(() => {});
   } else {
     invoke("text_input", { id: target.id, text }).catch(() => {});
@@ -907,6 +910,7 @@ function routeKeyPress(target, press) {
   hideTerminalPointerForInput(target);
   if (target.kind === "term") {
     noteTyped();
+    noteTypedInto(target.term);
     invoke("term_key", { term: target.term, press }).catch(() => {});
   } else {
     invoke("key_input", { id: target.id, press }).catch(() => {});

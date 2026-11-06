@@ -159,6 +159,10 @@ function applyAppearanceSettingsSnapshot(snapshot, first) {
     appFontFamily = snapshot.app_font_family?.trim() ?? "";
     paintAppFontFamily();
   }
+  if (hasSetting(snapshot, "chat_font_size")) {
+    chatFontSize = snapshot.chat_font_size ?? "screen";
+    paintChatFontSize();
+  }
   if (hasSetting(snapshot, "show_titlebar_app_name")) {
     showTitlebarAppName = snapshot.show_titlebar_app_name !== false;
     paintTitlebarAppName();
@@ -1591,6 +1595,9 @@ let uiZoomLevel = 0;
 let appliedUiZoomLevel = null;
 let uiZoomApplyGeneration = 0;
 let appFontFamily = "";
+/* How big the conversation reads (`chat_font_size`): "screen", "terminal" or
+ * a whole number of pixels, as the backend normalised it. */
+let chatFontSize = "screen";
 let showTitlebarAppName = true;
 let showMenuBarIcon = true;
 let minimizeToTrayOnClose = false;
@@ -1886,6 +1893,60 @@ el("app-font-family").addEventListener("change", (event) => {
     return;
   }
   setAppFontFamily(family);
+});
+
+/* The conversation's size is one variable on the root (2026-11-06): left
+ * unset, a wide page raises its words with its column (shell.css,
+ * `--chat-measure`); set, it pins every size the conversation reads — the
+ * prose, and the steps, notes and composer that read a pixel or two under
+ * it. "terminal" pins it to the terminal's own size, which then follows the
+ * terminal setting. */
+const chatFontPinned = () => /^\d+$/.test(chatFontSize);
+
+function applyChatFontSize() {
+  const root = document.documentElement;
+  if (chatFontSize === "terminal") root.style.setProperty("--chat-prose-pin", "var(--term-font-size)");
+  else if (chatFontPinned()) root.style.setProperty("--chat-prose-pin", `${chatFontSize}px`);
+  else root.style.removeProperty("--chat-prose-pin");
+}
+
+/* The pixels field stands on the terminal's ruler (the backend checks against
+ * the same bounds), never under the window's 12px floor, and offers the
+ * terminal's own size until the person types one. */
+function paintChatFontSize() {
+  const pinned = chatFontPinned();
+  el("chat-font-size").value = pinned ? "pixels" : chatFontSize;
+  const root = getComputedStyle(document.documentElement);
+  const offered = pinned ? chatFontSize : String(parseFloat(root.getPropertyValue("--term-font-size")) || "");
+  const spec = termPrefsSpec?.font_size;
+  const floor = parseFloat(root.getPropertyValue("--text-xs")) || 0;
+  if (spec) paintNumberSetting("chat-font-pixels", { ...spec, min: Math.max(spec.min, floor) }, offered);
+  else el("chat-font-pixels").value = offered;
+  el("chat-font-pixels").disabled = !pinned;
+  applyChatFontSize();
+}
+
+function setChatFontSize(size) {
+  chatFontSize = size;
+  paintChatFontSize();
+  void commitSetting("chat_font_size", "set_chat_font_size", { size });
+}
+
+el("chat-font-size").addEventListener("change", (event) => {
+  const choice = event.target.value;
+  setChatFontSize(choice === "pixels" ? el("chat-font-pixels").value : choice);
+});
+
+el("chat-font-pixels").addEventListener("change", (event) => {
+  const field = event.target;
+  const typed = Math.round(Number(field.value));
+  if (!Number.isFinite(typed)) {
+    paintChatFontSize();
+    return;
+  }
+  const low = Number(field.min) || typed;
+  const high = Number(field.max) || typed;
+  setChatFontSize(String(Math.min(high, Math.max(low, typed))));
 });
 
 function paintTitlebarAppName() {
@@ -4842,9 +4903,15 @@ const CLAUDE_ORGANIZATION_TYPES = new Map([
 ]);
 
 function claudeOrganizationLabel(identity) {
-  const kind = identity.organization_type?.replace(/^claude_/, "");
-  const type = CLAUDE_ORGANIZATION_TYPES.get(kind)?.() ?? "";
-  return [identity.organization_name || identity.organization_uuid, type].filter(Boolean).join(" · ");
+  return [identity.organization_name || identity.organization_uuid, claudePlanWord(identity)].filter(Boolean).join(" · ");
+}
+
+// The word a plan is called by: the name its provider gave it, else the type
+// table's — one organizationType covers two plans (claude_max is Max and Ultra).
+function claudePlanWord(row) {
+  if (row?.plan_display_name) return row.plan_display_name;
+  const kind = row?.organization_type?.replace(/^claude_/, "");
+  return CLAUDE_ORGANIZATION_TYPES.get(kind)?.() ?? "";
 }
 
 async function resolveClaudeIdentity(row, choice) {
@@ -4975,12 +5042,9 @@ function accountFitness(id) {
  * 이메일은 사람이 관리하는 계정 목록 줄에만 있다(t-7538: 토큰·이메일은 로그·
  * UI·원장에 싣지 않는다). */
 function accountBadge(id) {
-  const kind = (
-    accountUsageRow(id)?.organization_type ??
-    accountReport.accounts?.find((row) => row.id === id)?.organization_type
-  )?.replace(/^claude_/, "");
-  const type = CLAUDE_ORGANIZATION_TYPES.get(kind)?.() ?? "";
-  return [type, id].filter(Boolean).join(" ");
+  const row = [accountUsageRow(id), accountReport.accounts?.find((one) => one.id === id)]
+    .find((one) => one?.plan_display_name || one?.organization_type);
+  return [claudePlanWord(row), id].filter(Boolean).join(" ");
 }
 
 /* 새 표면이 계정을 짧게 부르는 이름(t-46106) — 계정 id의 앞 글자와 끝 몇 글자,
@@ -9528,6 +9592,7 @@ function paintTerminalColorOverrides() {
 }
 
 function paintTermPrefs() {
+  paintChatFontSize();
   if (termPrefs === null) return;
   paintTerminalThemeControls();
   paintTerminalColorOverrides();

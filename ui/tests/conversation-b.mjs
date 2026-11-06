@@ -38,6 +38,10 @@ function draftTurns() {
       at_ms: last.at_ms - 900,
     },
     { role: "window", text: "The window restarted and cut your last turn short. Continue exactly where you left off.", at_ms: last.at_ms - 600 },
+    // The prompts nobody typed besides it (2026-11-06): the window's mail pointer
+    // and the summary a CLI hands itself when it compacts.
+    { role: "window_mail", text: "You have 2 orchestration messages. Run `zerocode-orc check`.", at_ms: last.at_ms - 500 },
+    { role: "summary", text: "This session is being continued from a previous conversation that ran out of context.", at_ms: last.at_ms - 400 },
     { role: "user", text: "코드도 보여 줘.", at_ms: last.at_ms - 300 },
     { ...last, text: `${last.text}\n\n\`\`\`typescript\n// the screen less its two margins\nexport const width = (screen: { width: number }) => screen.width - 32;\n\`\`\`\n\n\`\`\`\nplain words in a fence with no language\n\`\`\`` },
   );
@@ -142,6 +146,9 @@ function readPage() {
     pageWidth: Math.round(box(page).width),
     // The column's measure at this page's width, and the base one (t-81786 P3-16).
     measure: window.__READING_MEASURE__(box(page).width),
+    // The prose size the page's width asks for (2026-11-06): the terminal's,
+    // raised on a wide page to its column over the line's measure.
+    readingSize: window.__READING_SIZE__(box(page).width),
     baseMeasure: window.__READING_MEASURE__(0),
     dockMax: dock ? parseFloat(getComputedStyle(dock).maxWidth) : null,
     fadeMax: parseFloat(getComputedStyle(page, "::after").maxWidth),
@@ -169,6 +176,17 @@ function readPage() {
     codeWord: t("mdview.code", "코드"),
     // The rail's handle names the window's note by its line.
     noteRail: railRowWords(list.querySelector(":scope > .is-window-note")),
+    // Every prompt nobody typed, one thin line each, and the size the lines read at.
+    notes: [...list.querySelectorAll(":scope > .is-window-note")].map((row) => ({
+      words: row.querySelector(".helper-window-note-words")?.textContent ?? "",
+      person: row.classList.contains("is-user"),
+      size: parseFloat(getComputedStyle(row).fontSize),
+    })),
+    wantNotes: [
+      `${t("worker.windowNote", "창 알림 · 창이 다시 시작되어 이어 가라고 알렸습니다")} · ${t("worker.windowNoteOpen", "원문")}`,
+      `${t("worker.windowNoteMail", "창 알림 · 원장 편지 {{n}}통", { n: 2 })} · ${t("worker.windowNoteOpen", "원문")}`,
+      `${t("worker.summaryNote", "이어가기 요약 · 이전 대화가 길어 요약을 넘겼습니다")} · ${t("worker.summaryNoteOpen", "펼치기")}`,
+    ],
     noteWords: t("worker.windowNote", "창 알림 · 창이 다시 시작되어 이어 가라고 알렸습니다"),
     personLeft: person ? Math.round(box(person).left - column.left) : null,
     personInside: person ? inside(person) : false,
@@ -295,15 +313,21 @@ export async function testConversationB(browser, origin, ok, { shots = process.e
     // The steps are the PAGE's width, not the window's: the window's side
     // columns take their share first.
     const step = (one) => (one.pageWidth < 560 ? "narrow" : one.pageWidth >= 1000 ? "wide" : "middle");
-    ok("B: the reading steps with the page's own width — a step smaller under 560 px, the approved 1.8 line spacing, the column never wider than its measure",
+    // The prose is the terminal's size (2026-11-05, 「우리 화면에 맞게 글짜 크기」):
+    // the same pane reads alike in its two modes, a pixel smaller under 560 px.
+    // A wide page raises it with its column (2026-11-06, 「대화 화면이 실제 화면에
+    // 비해 글자가 작아 보이는데」): the column over `--chat-measure`, to the pixel.
+    ok("B: the reading steps with the page's own width — the terminal's size, a pixel smaller under 560 px but never under 12, raised on a wide page so its column holds the measure, the approved 1.8 line spacing, the column never wider than its measure",
       B_WIDTHS.every((width) => {
         const one = dark(width);
         const want = step(one);
-        return one.columnWidth > 0 && one.columnWidth <= one.measure &&
-          (want === "narrow" ? one.proseSize === 12 : one.proseSize === 13) &&
-          one.proseLeading === 1.8;
-      }) && new Set(B_WIDTHS.map((width) => step(dark(width)))).size >= 2,
-      JSON.stringify(B_WIDTHS.map((width) => [width, dark(width).pageWidth, dark(width).proseSize, dark(width).proseLeading, dark(width).columnWidth])));
+        return one.columnWidth > 0 && one.columnWidth <= one.measure && one.termSize >= 12 &&
+          (want === "narrow" ? one.proseSize === Math.max(12, one.termSize - 1) : one.proseSize >= one.termSize) &&
+          one.proseSize === one.readingSize && one.proseLeading === 1.8;
+      }) && new Set(B_WIDTHS.map((width) => step(dark(width)))).size >= 2 &&
+        // The widest page reads larger than the terminal; the 1440 px window's does not.
+        dark(2560).proseSize > dark(2560).termSize && dark(1440).proseSize === dark(1440).termSize,
+      JSON.stringify(B_WIDTHS.map((width) => [width, dark(width).pageWidth, dark(width).proseSize, dark(width).readingSize, dark(width).termSize, dark(width).proseLeading, dark(width).columnWidth])));
     ok("B: a wide page widens its column to the step its width reached — 880, 960, 1040, then at most 1120 px — and the composer and the fade under it follow; under 1000 px the column stays at 760 px (t-81786 P3-16)",
       all.every((one) => one.measure > 0 && one.dockMax === one.measure && one.fadeMax === one.measure &&
         (one.pageWidth >= 1000 ? Math.abs(one.columnWidth - one.measure) <= 1 : one.columnWidth <= one.baseMeasure)) &&
@@ -320,8 +344,8 @@ export async function testConversationB(browser, origin, ok, { shots = process.e
     ok("B: the answer, the person's words and a pill are drawn with the platform's smoothing, as the terminal is — not the chrome's thinner antialiasing (draft C1, t-82195)",
       all.every((one) => one.smoothing.length === 3 && one.smoothing.every((value) => value === "auto")),
       JSON.stringify(Object.fromEntries(Object.entries(seen).map(([key, one]) => [key, one.smoothing]))));
-    ok("B: a heading in an answer stands at the prose's own size — 13 px on a 1440 px window — h1 and h2 at weight 700, h3 at 600, with a section's air above and a step under it; not the browser's 32 and 24 px (draft C3, t-82195)",
-      dark(1440).proseSize === 13 &&
+    ok("B: a heading in an answer stands at the prose's own size — the terminal's on a 1440 px window — h1 and h2 at weight 700, h3 at 600, with a section's air above and a step under it; not the browser's 32 and 24 px (draft C3, t-82195)",
+      dark(1440).proseSize === dark(1440).termSize &&
         all.every((one) => ["h1", "h2", "h3"].every((level) => one.heads.some((head) => head.level === level)) &&
           one.heads.every((head) => head.size === one.proseSize &&
             head.weight === (["h1", "h2"].includes(head.level) ? "700" : "600") &&
@@ -332,13 +356,17 @@ export async function testConversationB(browser, origin, ok, { shots = process.e
         one.rule.top[2] === one.rule.divider && one.rule.sides.every((side) => side === "none") &&
         one.rule.above === one.rule.air && one.rule.below === one.rule.air),
       JSON.stringify(Object.fromEntries(["dark-1440", "light-1440"].map((key) => [key, seen[key].rule]))));
-    ok("B: inline code stays legible at 12 px and never exceeds the approved prose size",
-      all.every((one) => one.chip !== null && one.chip >= 11 && one.chip <= one.proseSize) &&
-        dark(1440).chip === 12,
+    ok("B: inline code stays legible — 12 px or seven eighths of the prose, whichever is larger — and never exceeds the prose size",
+      all.every((one) => one.chip !== null && one.chip >= 12 && one.chip <= one.proseSize) &&
+        Math.abs(dark(1440).chip - Math.max(12, dark(1440).proseSize * 0.875)) < 0.01,
       JSON.stringify(Object.fromEntries(Object.entries(seen).map(([key, one]) => [key, [one.proseSize, one.chip, one.termSize]]))));
     ok("B: an answer wears no dot and the tool work stands as pills with no step built",
       all.every((one) => one.answerDots === 0 && one.stepRows === 0),
       JSON.stringify(dark(1440)));
+    ok("B: the prompts nobody typed — the window's restart nudge, its mail pointer and a CLI's compaction summary — stand as one thin line each with their own words, none as the person's bubble, read two pixels under the prose and never under 12 px (2026-11-06)",
+      all.every((one) => JSON.stringify(one.notes.map((note) => note.words)) === JSON.stringify(one.wantNotes) &&
+        one.notes.every((note) => !note.person && note.size === Math.max(12, one.proseSize - 2))),
+      JSON.stringify(Object.fromEntries(["dark-390", "dark-1440", "dark-2560"].map((key) => [key, [seen[key].proseSize, seen[key].notes]]))));
     ok("B: the rail's handle, standing on the window's note, says the note's line — not nothing, not its door",
       dark(1440).noteRail === dark(1440).noteWords, JSON.stringify([dark(1440).noteRail, dark(1440).noteWords]));
     ok("B: a code block opens with the language its fence names — 「코드」 when it names none",

@@ -8,6 +8,8 @@ pub(crate) mod api_routers;
 pub(crate) mod appearance;
 pub(crate) mod artifacts;
 pub(crate) mod board;
+pub(crate) mod build_buttons;
+pub(crate) mod build_order;
 pub(crate) mod console;
 pub(crate) use console::{agent_models, slash_commands, superseded_models};
 pub(crate) mod wire;
@@ -116,8 +118,8 @@ pub(crate) use appearance::{
     leave_cancel, leave_hold, leave_now, leave_when_idle, listening_ports, log_window_error,
     patch_left_sidebar_appearance, patch_terminal_prefs, preview_ghostty_import,
     preview_warp_terminal_themes, process_memory, report_terminal_colors, resource_snapshot,
-    set_agent_activity_display, set_app_font_family, set_compact_worktree_cards,
-    set_computer_awake_mode, set_locale, set_minimize_to_tray_on_close,
+    set_agent_activity_display, set_app_font_family, set_chat_font_size,
+    set_compact_worktree_cards, set_computer_awake_mode, set_locale, set_minimize_to_tray_on_close,
     set_refresh_local_base_ref_on_worktree_create, set_setup_script_launch_mode,
     set_show_git_ignored_files, set_show_menu_bar_icon, set_show_titlebar_app_name,
     set_source_control_compare_base, set_source_control_group_order, set_status_bar_item,
@@ -151,8 +153,10 @@ pub(crate) use board::{
     term_snapshot, turn_failed_retry, worker_screen,
 };
 pub(crate) use board::{
-    land_batch_bisect, land_batch_cancel, land_batch_promote, land_batch_restack,
+    board_builds, land_batch_bisect, land_batch_cancel, land_batch_promote, land_batch_restack,
 };
+pub(crate) use build_buttons::{build_start, build_stop};
+pub(crate) use build_order::{build_order_draft, build_order_preview, build_order_write};
 
 pub(crate) use review::{
     automation_born_worktrees, clear_delivered_diff_notes, clear_diff_notes, delete_automation,
@@ -267,11 +271,11 @@ pub(crate) use settings::{
     agent_teams_mode, claude_autoswitch_mode, computer_confirm_answer, computer_give_back,
     computer_guard_status, computer_handoff_code, computer_resume, computer_self_answer,
     computer_share_hand_over, computer_share_state, computer_stop, computer_take_control,
-    emulator_real_phone_said, floating_workspace_seat, harness_status, list_system_fonts,
-    pane_layouts, patch_editing_prefs, patch_floating_workspace, patch_open_in_applications,
-    patch_workspace_board_items, patch_workspace_board_status, patch_workspace_creation_prefs,
-    read_primary_selection, save_pane_layouts, save_stage_layouts, scm_tree_rows,
-    set_agent_pane_first_view, set_agent_teams_mode, set_artifacts_auto_open_beside,
+    emulator_real_phone_said, floating_workspace_seat, harness_status, idle_sleep_policy,
+    list_system_fonts, pane_layouts, patch_editing_prefs, patch_floating_workspace,
+    patch_open_in_applications, patch_workspace_board_items, patch_workspace_board_status,
+    patch_workspace_creation_prefs, read_primary_selection, save_pane_layouts, save_stage_layouts,
+    scm_tree_rows, set_agent_pane_first_view, set_agent_teams_mode, set_artifacts_auto_open_beside,
     set_artifacts_retention_days, set_claude_autoswitch_mode, set_computer_confirm,
     set_computer_generator_road, set_computer_input_policy, set_computer_live_reflex,
     set_computer_share_required, set_confirm_close_pinned, set_conversation_timeline_view,
@@ -285,8 +289,8 @@ pub(crate) use settings::{
     set_skip_delete_worktree_confirm, set_source_control_view_mode, set_status_bar_usage_mode,
     set_task_source_visibility, set_terminal_command, set_usage_analytics_enabled,
     set_usage_percentage_display, set_vault_session_limit, set_workspace_board_column_width,
-    set_worktree_card_property, stage_layouts, standing_pane_worktrees, terminal_command,
-    write_primary_selection,
+    set_worktree_card_property, sleep_terminal_tab, stage_layouts, standing_pane_worktrees,
+    terminal_command, write_primary_selection,
 };
 
 pub(crate) use session::{
