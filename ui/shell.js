@@ -19064,6 +19064,8 @@ function orphanWorkersOf(term) {
 listen("term:exited", (event) => {
   zoIntegrationRecords.delete(`term-${event.payload.term}`);
   if (event.payload.term === skillsInstallTerm) { skillsNeedsRescan = true; void refreshSkills(true); }
+  // 작업 화면에서 연 GitLab 로그인 터미널이 끝났으면 그 판이 다시 확인한다.
+  noteGitlabLoginTermEnded(event.payload.term);
   const { term } = event.payload;
   const closing = terminalCloseRequests.get(term);
   if (closing) closing.exited = true;
@@ -19399,8 +19401,12 @@ listen("term:worker", (event) => {
   seatLedgerManagedTerm(term, worktree, agent);
   // Then the placement seat, off this handler: the tab above is what every
   // worker got before the seat existed and what it keeps unless a seat that
-  // ACTS names another room (`reseatWorkerByAnswer`).
-  void roomForWorker({ parent, term, worktree, seat }).then((room) => reseatWorkerByAnswer(term, parent, worktree, agent, room));
+  // ACTS names another room (`reseatWorkerByAnswer`). That move is this
+  // event's, though it lands after the seat's answer: a split beside the
+  // coordinator takes the keyboard, and the person's typing there stays with
+  // the pane it began in (t-97132).
+  void roomForWorker({ parent, term, worktree, seat }).then((room) =>
+    answeringBackendEvent("term:worker", () => reseatWorkerByAnswer(term, parent, worktree, agent, room)));
   void (async () => {
     try {
       await refreshWorktrees();
@@ -21847,6 +21853,10 @@ const DOC_VIEWS = {
   artifacts: { build: buildArtifactsView, paint: paintArtifactsStage },
   jev: { build: buildJevView, paint: paintJevStage, wire: wireJevView },
   inbox: { build: buildInboxView, paint: paintInboxStage, wire: wireInboxView },
+  // 작업 — 판은 마크업의 것 하나뿐이고(`single`), 둘째 판에도 그 하나를 옮겨 세운다.
+  tasks: { build: buildTasksView, paint: paintTasksStage, single: true },
+  // 따로 연 Jira 이슈 — 작업 판의 그 패널 하나를 옮겨 세운다(복제하지 않는다).
+  jira: { build: buildJiraIssueView, paint: paintJiraIssueStage, single: true },
   tokens: { build: buildTokensView, paint: paintTokensView, wire: wireTokensView },
 };
 

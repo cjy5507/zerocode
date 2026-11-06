@@ -531,6 +531,10 @@ mod tests {
                             // verdict and the press-key combinations are
                             // tested beside the private doors they decide.
                             | "agent_tools_runtime.rs"
+                            // 2026-11-06: the Skills·MCP keeper's look and
+                            // its file edits run on a home the test made,
+                            // beside the private doors that read and write it.
+                            | "library_runtime.rs"
                     ),
                 "`{name}` acquired a test fence; only the shell and command crates \
                  may own source-contract fences"
@@ -11065,8 +11069,9 @@ mod tests {
     /// hover:bg-transparent` (`App-BaqTRjaA.js:8737,8761`). Ours was always
     /// live, so on a folder project it opened a finder with nothing in it —
     /// the row led nowhere, which is the one thing this column may not do. The
-    /// same predicate already gates `worktree-new`, so this is that rule
-    /// reaching the row Orca applies it to.
+    /// same predicate gated `worktree-new` too until 2026-11-06, when a folder
+    /// project's creation door began offering `start_git` instead of hiding;
+    /// a finder with nothing to find has no such offer, so 작업 keeps it.
     #[test]
     fn the_tasks_row_is_refused_where_there_is_nothing_to_browse() {
         let window = window_source();
@@ -11212,7 +11217,6 @@ mod tests {
             "app.settingsTitle",
             "terminal.labelTitle",
             "sidebar.newSessionTitle",
-            "sidebar.openFolderTitle",
             "sidebar.newWorktreeTitle",
             "terminal.runCommand",
             "view.tasksTitle",
@@ -11229,13 +11233,15 @@ mod tests {
             }
         }
         // Each such control names the action it performs, so the chord can be
-        // looked up rather than repeated.
+        // looked up rather than repeated. `project-open` left this list on
+        // 2026-11-06: it opens the 프로젝트 window, while ⌘O (`project.open`)
+        // still opens the system folder panel — a tooltip naming ⌘O there
+        // would name a key that does something else.
         for id in [
             "toggle-sidebar",
             "toggle-aside",
             "foot-settings",
             "toggle-term",
-            "project-open",
             "run-command",
         ] {
             let opening = markup
@@ -13109,9 +13115,12 @@ mod tests {
     fn the_tasks_row_opens_the_task_screen() {
         let window = window_source();
 
+        // A stage tab since 2026-11-06, so the row toggles the way its
+        // neighbours (작업 상황판, 의사결정 모델) do: it brings the tab forward,
+        // and on the tab in front it closes it.
         assert!(
             window.contains(
-                "el(\"nav-tasks\").addEventListener(\"click\", () => setTaskOpen(true));"
+                "el(\"nav-tasks\").addEventListener(\"click\", () => setTaskOpen(activeTabId !== TASKS_TAB.id));"
             ),
             "작업 still opens something other than the Task screen"
         );
@@ -13211,12 +13220,18 @@ mod tests {
         // — exactly the invented-not-measured mistake 1-j forbids — and it is
         // the one thing that could make this screen look finished while
         // asking nobody.
+        // The groups are ordered by status category since 2026-11-06 (doing,
+        // to do, then the closed ones folded below) — still grouped by the
+        // one hand that groups rows, over the rows that were answered.
         let rows = block_after(window, "function paintJiraIssues() {");
+        let ordered = block_after(window, "function orderedJiraGroups(rows) {");
         assert!(
-            rows.contains("jiraIssues.length === 0") && rows.contains("groupJiraIssues("),
-            "the Jira list no longer draws from the answer it was given:\n{rows}"
+            rows.contains("jiraIssues.length === 0")
+                && rows.contains("orderedJiraGroups(jiraIssues)")
+                && ordered.contains("groupJiraIssues(rows)"),
+            "the Jira list no longer draws from the answer it was given:\n{rows}\n{ordered}"
         );
-        let row = block_after(window, "function jiraRowNode(issue) {");
+        let row = block_after(window, "function jiraRowNode(issue, {");
         for field in ["issue.key", "issue.title", "issue.status"] {
             assert!(
                 row.contains(field),
@@ -13226,7 +13241,7 @@ mod tests {
         // The URL moved off the row and onto the card the row opens (1-g57a):
         // the browser is the card's [Open in Jira], so `issue.url` is read where
         // the card is built, not painted as a row column.
-        let card = block_after(window, "function openJiraItem(issue) {");
+        let card = block_after(window, "function openJiraItem(issue, {");
         assert!(
             card.contains("issue.url"),
             "the Jira card no longer carries the issue url from the answer:\n{card}"
@@ -13448,12 +13463,14 @@ mod tests {
     }
 
     /// The rich Jira card (t-105): attachments and the browser button ride
-    /// existing doors, never new ones. The ZeroCode-browser button lowers the
-    /// task view first — the native pane sits above the DOM, so a browser
-    /// opened under a page still covering the stage was hidden by
-    /// `browserCovered()` the moment it was born ("깜박이고 열리지 않음") —
-    /// then walks `openBrowserTab` at the seat the + palette last chose
-    /// (`lastBrowserPlacement`); a preview becomes an `<img>` only as a
+    /// existing doors, never new ones. The ZeroCode-browser button walks
+    /// `openBrowserTab` at the seat the + palette last chose
+    /// (`lastBrowserPlacement`). It used to lower the task view first — the
+    /// native pane sits above the DOM, and a browser born under a page still
+    /// covering the stage was hidden by `browserCovered()` ("깜박이고 열리지
+    /// 않음"). 작업 has been a stage tab since 2026-11-06, so nothing covers the
+    /// stage any more and closing the task tab would only lose the issue the
+    /// person came from; a preview becomes an `<img>` only as a
     /// renderer-checked `data:` image under the named byte limit; and the one
     /// context command materializes the manifest, so worktree creation and
     /// orchestration read the same context.
@@ -13467,15 +13484,9 @@ mod tests {
             ),
             "the card's browser button left the one existing browser road:\n{open_app}"
         );
-        let lowered = open_app
-            .find("setTaskOpen(false);")
-            .expect("the card's browser button no longer lowers the task view first");
-        let opened = open_app
-            .find("openBrowserTab(at.url,")
-            .expect("the card's browser button no longer opens a browser");
         assert!(
-            lowered < opened,
-            "the browser is opened under a task view still covering the stage:\n{open_app}"
+            !open_app.contains("setTaskOpen(false)"),
+            "the card's browser button closes the 작업 tab the person came from:\n{open_app}"
         );
         let preview_ask = block_after(window, "function jiraAttachmentPreviewOf(");
         assert!(
@@ -13970,9 +13981,11 @@ mod tests {
             painted.contains("aria-current")
                 // 작업 now opens the Task screen (`the_tasks_row_opens_the_task_screen`),
                 // not the worktree finder `⌘J` also reaches — so its `you are
-                // here` mark tracks the Task scrim, the surface it actually
-                // opens, not a palette mode it shares with an unrelated chord.
-                && painted.contains("!taskView.hidden")
+                // here` mark tracks the surface it actually opens, not a
+                // palette mode it shares with an unrelated chord. That surface
+                // is a stage tab since 2026-11-06, so the mark is the tab in
+                // front — the same fact the tab strip paints.
+                && painted.contains("\"nav-tasks\": activeTabId === TASKS_TAB.id")
                 && painted.contains("settingsSection"),
             "nothing tracks which shortcut's surface is on screen:\n{painted}"
         );
@@ -14735,9 +14748,14 @@ mod tests {
     fn a_project_click_brings_the_terminal_back_over_the_board() {
         let window = window_source();
         let moving = block_after(window, "async function activateWorktree(");
+        // The 작업 tab (a stage tab since 2026-11-06) is a stage the click
+        // looks past the same way: a project click means that project's
+        // terminal, and the tab stays in the strip for the way back.
         assert!(
             moving.contains("    const staged = tabs.find((held) => held.id === activeTabId);\n")
-                && moving.contains("    const boarded = staged?.kind === \"board\";\n"),
+                && moving.contains(
+                    "    const boarded = staged?.kind === \"board\" || staged?.kind === \"tasks\";\n"
+                ),
             "the same-worktree branch no longer reads what is staged:\n{moving}"
         );
         // A removal re-roots the backend before this function hears about it,
@@ -14753,10 +14771,10 @@ mod tests {
         assert!(
             moving.contains(concat!(
                 "        const owned = tabs.filter(\n",
-                "          (held) => held.worktree === path && held.kind !== \"board\",\n",
+                "          (held) => held.worktree === path && held.kind !== \"board\" && held.kind !== \"tasks\",\n",
                 "        );\n",
             )),
-            "the way back can hand the board tab right back:\n{moving}"
+            "the way back can hand the board or the 작업 tab right back:\n{moving}"
         );
         // The living agent of the checkout is the first way back (t-44057): a
         // worker the ledger seated here is raised, and only without one does the
@@ -24133,13 +24151,22 @@ mod tests {
              itself with the commit it started at:\n{recording}"
         );
 
-        // 그리고 override가 접두사를 건너뛴다는 사실 자체.
+        // 그리고 override가 접두사를 건너뛴다는 사실 자체. 이름 찾기의 한 걸음은
+        // 만들기와 그 미리보기(`planned_worktree`)가 함께 걷는 `free_name`에 있다.
         let orchestrator = include_str!("../../../zerocode-orchestrator/src/lib.rs");
         let cutting = block_after(orchestrator, "    pub fn create_with(");
+        let naming = block_after(orchestrator, "    fn free_name(");
         assert!(
-            cutting.contains("Some(named) => named.to_string(),"),
+            cutting.contains("self.free_name(&base, attempt, options)?")
+                && naming.contains("Some(named) => named.to_string(),"),
             "a branch somebody named now takes the repository's prefix, which \
-             makes a PR checkout land on a branch the PR does not point at:\n{cutting}"
+             makes a PR checkout land on a branch the PR does not point at:\n{cutting}\n{naming}"
+        );
+        assert!(
+            block_after(orchestrator, "    pub fn planned_worktree(")
+                .contains("self.free_name(&base, attempt, options)?"),
+            "the create dialog's preview walks a different name search than the \
+             create, so it can name a folder the create will not cut"
         );
     }
 
@@ -24963,13 +24990,19 @@ mod tests {
 
         // ④ 대상은 부모 안의 한 마디이고, 시작 전에 없어야 하며, 실패하면
         //    이 복제가 만든 것만 지워진다. 셋이 한 순서다.
+        //    부모를 푸는 일은 `resolve_new_parent`의 몫이다(2026-11-06, 사람:
+        //    「폴더 생성 막고있는 부분」): 아직 없는 위 폴더도 자리로 받되, 서
+        //    있는 데까지는 canonicalize하고 없는 마디는 하나하나 이름 검사를 지난다.
         let placing = block_after(source, "fn place_inside(");
+        let resolving = block_after(source, "fn resolve_new_parent(");
         assert!(
             placing.contains("zerocode_core::clone::is_dir_name(name)")
-                && placing.contains(".canonicalize()")
+                && placing.contains("resolve_new_parent(parent)?")
+                && resolving.contains(".canonicalize()")
+                && resolving.contains("zerocode_core::clone::is_dir_name(name)")
                 && placing.contains("if target.exists() {"),
             "the destination stopped being checked as one segment inside a \
-             resolved parent that is empty:\n{placing}"
+             resolved parent that is empty:\n{placing}\n{resolving}"
         );
         let checked_at = cloning
             .find("place_inside(&parent, &named)?")
@@ -25014,7 +25047,6 @@ mod tests {
             "project.addTitle",
             "project.browse",
             "project.browseWhy",
-            "project.otherWays",
             "project.clone",
             "project.cloneWhy",
             "project.new",
@@ -25042,6 +25074,59 @@ mod tests {
                 "`{key}` is in every catalog but nothing on screen reads it"
             );
         }
+    }
+
+    /// 커밋 없는 저장소에서의 작업 트리 만들기 (2026-11-06, 사람: 「폴더 생성 막고있는
+    /// 부분」). `git init`만 한 프로젝트는 `git worktree add … HEAD`가 `invalid
+    /// reference: HEAD`로 실패했고, 그 실패는 창이 닫힌 뒤 사이드바 한 줄에서
+    /// 잘려 읽히지도 않았다.
+    ///
+    /// 셋을 고정한다. **① 자르기 전에 저장소에 묻는다** — git의 문장을 읽어서가
+    /// 아니라 `ref_exists`로. **② 빈 첫 커밋은 사람이 고른 때만** — 체크가 없으면
+    /// 한 문장(`UNBORN_HEAD`)으로 멈춘다. **③ 미리 보기도 같은 사실을 묻는다** —
+    /// 창이 누르기 전에 그 안내를 세우는 근거가 `plan_worktree`의 같은 물음이다.
+    #[test]
+    fn a_repository_with_no_commit_is_asked_about_before_the_cut() {
+        let source = shipped_backend();
+        let creating = block_after(source, "async fn create_worktree(");
+        let asked = creating
+            .find("!ref_exists(&host, &repo_root, \"HEAD\")")
+            .expect("the create stopped asking the repository whether it has a commit");
+        let cut = creating
+            .find(".create_with(")
+            .expect("the create stopped cutting the worktree");
+        assert!(
+            asked < cut,
+            "the repository is asked about its commit after the cut, so git's \
+             `invalid reference: HEAD` reaches the person again:\n{creating}"
+        );
+        assert!(
+            creating.contains("if first_commit == Some(true) {")
+                && creating.contains("make_first_commit(&host, &repo_root)?;")
+                && creating.contains("return Err(UNBORN_HEAD.to_string());"),
+            "the empty first commit is made without the person asking, or the \
+             refusal went back to git's own words:\n{creating}"
+        );
+        let planning = block_after(source, "async fn plan_worktree(");
+        assert!(
+            planning.contains("ref_exists(&host, &repo_root, \"HEAD\")")
+                && planning.contains(".planned_worktree("),
+            "the preview stopped asking the facts the create acts on:\n{planning}"
+        );
+        let committing = block_after(source, "fn make_first_commit(");
+        assert!(
+            committing.contains("if ref_exists(host, root, \"HEAD\")"),
+            "the first commit is no longer made only where HEAD is unborn:\n{committing}"
+        );
+        // Built past the index (v1.1.128 review t-97103 P2-1): `commit
+        // --allow-empty` would commit what the person staged after `git init`.
+        assert!(
+            committing.contains("&[\"mktree\"]")
+                && committing.contains("\"commit-tree\"")
+                && committing.contains("\"update-ref\", \"HEAD\"")
+                && !committing.contains("\"--allow-empty\""),
+            "the empty first commit goes through the index again:\n{committing}"
+        );
     }
 
     /// 만들기 다이얼로그가 Orca의 배치를 입는다 — 그리고 컨트롤 둘이 바뀐다.
@@ -29209,10 +29294,17 @@ mod tests {
              be 자동 or 에이전트 없음 — neither is startable"
         );
 
-        // The stage doors step off the covering pages.
+        // The stage doors step off the covering pages — settings and 자동화.
+        // 작업 has been a stage tab since 2026-11-06 ("창다는 방식도 다른
+        // 화면들과 달라"): it stands beside the board's and the vault's tabs, so
+        // stepping off it would close a tab nobody asked to close.
+        let stepping_off = block_after(window, "function leavePagesForStage(");
         assert!(
-            block_after(window, "function leavePagesForStage(").contains("setTaskOpen(false)"),
-            "a board or vault click under the 작업 page is a dead click again"
+            stepping_off.contains("setSettingsOpen(false)")
+                && stepping_off.contains("setAutoOpen(false)")
+                && !stepping_off.contains("setTaskOpen(false)"),
+            "a board or vault click under a covering page is a dead click again, \
+             or it closes the 작업 tab:\n{stepping_off}"
         );
 
         // The remove is the list's, never the disk's — no filesystem removal
@@ -31523,13 +31615,27 @@ mod tests {
         );
     }
 
+    /// The Skills·MCP page changes files (2026-11-06, the person: 「기능은
+    /// 다되야함 삭제 등록등」), and every change goes through one keeper —
+    /// `library_runtime`. The keeper moves a skill it removes to the Trash
+    /// instead of deleting it, backs an agent's config up before it edits
+    /// it, and only reads the person's own Claude home. What the page always
+    /// promised stays: the reveal is bounded to the scanned roots, and the
+    /// roots are one table, in Rust.
     #[test]
-    fn the_skills_page_only_reads_and_reveals_within_its_roots() {
+    fn the_skills_page_changes_files_only_through_the_library_keeper() {
         let shell = shipped_backend();
         let (shipped, _) = shell.split_once("#[cfg(test)]").unwrap_or((shell, ""));
+        let keeper_file = include_str!("../../src/library_runtime.rs");
+        let (keeper, _) = keeper_file
+            .split_once("#[cfg(test)]")
+            .unwrap_or((keeper_file, ""));
+        let doors = include_str!("../../src/cmd/library.rs");
         let source = window_source();
 
-        // 1. No writing command, under any of the words one would be called.
+        // 1. No skill writer outside the keeper, under any of the words one
+        //    would be called, and every door the page knocks on hands its
+        //    work to the keeper.
         for absent in [
             "fn write_skill",
             "fn save_skill",
@@ -31539,17 +31645,59 @@ mod tests {
         ] {
             assert!(
                 !shipped.contains(absent),
-                "`{absent}` exists — the skills surface is read-only by design, \
-                 and a writer here edits files this product does not own"
+                "`{absent}` exists — a skill is changed by the library keeper \
+                 alone, so its Trash, its backups and its log see every change"
             );
         }
-        // And the window asks for nothing of the sort either.
+        let mut counted = 0;
+        for door in doors.split("#[tauri::command").skip(1) {
+            counted += 1;
+            assert!(
+                door.contains("library_runtime::"),
+                "a Skills·MCP command does its own work instead of the keeper's:\n{door}"
+            );
+        }
+        assert!(
+            counted >= 19,
+            "the Skills·MCP doors are fewer than the page asks for"
+        );
         assert!(
             !source.contains("invoke(\"write_skill") && !source.contains("invoke(\"delete_skill"),
-            "the skills page asks to change a skill"
+            "the page asks a door outside the keeper to change a skill"
         );
 
-        // 2. The reveal is bounded, and bounded by canonical paths.
+        // 2. Removed goes to the Trash; the only folder deleted outright is
+        //    the keeper's own half-made copy.
+        assert!(
+            keeper.contains("file_tree_io::trash_path(&target)"),
+            "the keeper no longer moves a removed skill to the Trash"
+        );
+        assert_eq!(
+            keeper.matches("remove_dir_all(").count(),
+            keeper.matches("remove_dir_all(&incoming)").count(),
+            "the keeper deletes a folder outright that is not its own staging copy"
+        );
+        let edit = block_after(keeper, "fn run_mcp(");
+        assert!(
+            edit.matches("back_up(ctx, agent, &file, &mut backed_up);")
+                .count()
+                >= 2,
+            "an agent's config is edited without the backup taken before it:\n{edit}"
+        );
+
+        // 3. The person's own Claude home is read and never written: both of
+        //    its lists go to the planner marked read-only.
+        for list in [
+            "agent: MAC_CLAUDE.to_string(),\n            writable: false,",
+            "agent: MAC_CLAUDE.to_string(),\n        sees_store: false,\n        writable: false,",
+        ] {
+            assert!(
+                keeper.contains(list),
+                "the person's own Claude list reaches the planner as writable"
+            );
+        }
+
+        // 4. The reveal is bounded, and bounded by canonical paths.
         let revealing = block_after(shipped, "fn checked_file(");
         assert!(
             revealing.contains("is_file()"),
@@ -31566,7 +31714,7 @@ mod tests {
              were actually scanned:\n{revealing}"
         );
 
-        // 3. One roots table, in Rust. The window must not carry its own.
+        // 5. One roots table, in Rust. The window must not carry its own.
         let core = include_str!("../../../zerocode-core/src/skill.rs");
         for root in [".codex", ".claude", ".grok", ".omp", "antigravity"] {
             assert!(
@@ -33348,6 +33496,42 @@ mod tests {
         assert!(
             refusal.contains("orchestration_seat && !probe"),
             "the guard blocks probes or permits delegated work:\n{refusal}"
+        );
+    }
+
+    /// An interactive run through the mirror is handed its terminal words
+    /// before it becomes the agent (t-97015): without them a typed `codex`
+    /// runs its commands in a shared daemon wearing another pane's identity.
+    /// The answer is kept in the mirror directory, and a start that goes
+    /// without them is said through the bridge and lands in the window's log
+    /// (t-97498).
+    #[test]
+    fn an_interactive_run_is_handed_its_terminal_words() {
+        let mirror = include_str!("../../src/bin/zerocode-mirror.rs");
+        let tty = block_after(mirror, "if std::io::stdout().is_terminal() {");
+        let handed = tty
+            .find("with_terminal_args(")
+            .unwrap_or_else(|| panic!("the tty road no longer hands the words:\n{tty}"));
+        let becomes = tty
+            .find(".exec()")
+            .unwrap_or_else(|| panic!("the tty road no longer becomes the agent:\n{tty}"));
+        assert!(
+            handed < becomes,
+            "the words are handed after the run starts:\n{tty}"
+        );
+        assert!(
+            tty.contains("mirror_dir().as_deref()")
+                && tty.contains("TERMINAL_ARGS_MISSED_EVENT")
+                && tty.contains("announce("),
+            "the answer is not kept, or a missed start is not said:\n{tty}"
+        );
+        let runtime = include_str!("../../src/pane_runtime.rs");
+        let hooks = block_after(runtime, "pub(super) async fn hook_loop(");
+        assert!(
+            hooks.contains("TERMINAL_ARGS_MISSED_EVENT")
+                && hooks.contains("TerminalArgsMissedNote::line_of(")
+                && hooks.contains("note_window_event("),
+            "the window no longer logs a start that missed its words:\n{hooks}"
         );
     }
 
@@ -37089,46 +37273,54 @@ mod tests {
         // (worktree-activation-C2aVGSrf.js). A cursor left sitting on the
         // page while the stage shows the terminal makes the first 뒤로 a
         // dead click.
-        let tasks_door = block_after(window, "function setTaskOpen(on) {");
-        assert!(
-            tasks_door.contains("recordNavVisit(activeWorktreePath)"),
-            "closing 작업 leaves the history cursor on the page:\n{tasks_door}"
+        // 작업 is a stage tab since 2026-11-06, and a tab closes by more than
+        // one hand (the sidebar row, the tab's ×, ⌘W) — so the return is
+        // recorded where every one of them passes: the tab's drop.
+        let dropping = block_after(
+            window,
+            "function dropTab(id, { closed = false, nativeClosed = false } = {}) {",
         );
+        assert!(
+            dropping.contains("removed.kind === \"tasks\"")
+                && dropping.contains("recordNavVisit(activeWorktreePath)")
+                && dropping.contains("!crossingPages"),
+            "closing the 작업 tab leaves the history cursor on the page:\n{dropping}"
+        );
+        let tasks_door = block_after(window, "function setTaskOpen(on) {");
         let auto_door = block_after(window, "function setAutoOpen(on) {");
         assert!(
             auto_door.contains("recordNavVisit(activeWorktreePath)"),
             "closing 자동화 leaves the history cursor on the page:\n{auto_door}"
         );
-        // Going STRAIGHT from one page to the other must not thread the
-        // terminal into the walk: each page's door closes the other under
-        // `crossingPages`, so the close is read as a crossing rather than as
-        // a return. Both directions, or one of them records a stop nobody
-        // visited and 뒤로 lands on a terminal instead of the page.
-        for (door, name, closes) in [
-            (tasks_door, "작업", "setAutoOpen(false)"),
-            (auto_door, "자동화", "setTaskOpen(false)"),
-        ] {
-            let from = door.find("crossingPages = true;").unwrap_or_else(|| {
-                panic!("{name}'s door crosses to the other page unguarded:\n{door}")
-            });
-            let until = door[from..]
-                .find("crossingPages = false;")
-                .unwrap_or_else(|| panic!("{name}'s door never lowers the flag:\n{door}"));
-            assert!(
-                door[from..from + until].contains(closes),
-                "{name}'s door does not end the other page's stay as a \
-                 crossing:\n{door}"
-            );
-        }
-        // Settings is never a stop, so its door ends both pages' stays and
-        // the close records the return to the terminal. It used to make an
-        // exception for the automations pane, back when 자동화 meant a
-        // settings field rather than a screen of its own.
+        // Going STRAIGHT from 자동화 to 작업 must not thread the terminal into
+        // the walk: the tasks door closes the page under `crossingPages`, so
+        // the close is read as a crossing rather than as a return. The other
+        // way round there is nothing to close — 자동화 covers the 작업 tab and
+        // the tab is still there when the page goes.
+        let from = tasks_door.find("crossingPages = true;").unwrap_or_else(|| {
+            panic!("작업's door crosses to the other page unguarded:\n{tasks_door}")
+        });
+        let until = tasks_door[from..]
+            .find("crossingPages = false;")
+            .unwrap_or_else(|| panic!("작업's door never lowers the flag:\n{tasks_door}"));
+        assert!(
+            tasks_door[from..from + until].contains("setAutoOpen(false)"),
+            "작업's door does not end 자동화's stay as a crossing:\n{tasks_door}"
+        );
+        assert!(
+            !auto_door.contains("setTaskOpen(false)"),
+            "opening 자동화 closes the 작업 tab under it:\n{auto_door}"
+        );
+        // Settings is never a stop, so its door ends 자동화's stay and the
+        // close records the return to the terminal. The 작업 tab stays under
+        // it like every other tab. It used to make an exception for the
+        // automations pane, back when 자동화 meant a settings field rather
+        // than a screen of its own.
         let settings_door = block_after(window, "function setSettingsOpen(on, focus = null) {");
         assert!(
-            settings_door.contains("setTaskOpen(false)")
-                && settings_door.contains("setAutoOpen(false)"),
-            "the gear leaves a page on the stage under itself:\n{settings_door}"
+            settings_door.contains("setAutoOpen(false)")
+                && !settings_door.contains("setTaskOpen(false)"),
+            "the gear leaves a page on the stage under itself, or closes the 작업 tab:\n{settings_door}"
         );
         assert!(
             !settings_door.contains("crossingPages"),
@@ -39157,8 +39349,7 @@ mod tests {
             "artifacts.feedbackCount",
             "artifacts.new",
             "artifacts.newDraft",
-            "artifacts.editedOn",
-            "artifacts.editedAgo",
+            // 카드의 시각은 문구가 아니라 Intl의 날 · 시각이다(2026-11-06, 「🔒 …에 편집됨」을 걷으며).
             "artifacts.strip.by",
             "artifacts.strip.version",
             "artifacts.strip.share",
@@ -39310,12 +39501,18 @@ mod tests {
             draft.contains("invoke(\"term_paste\"") && !draft.contains("term_key"),
             "a draft is sent rather than left in the input line:\n{draft}"
         );
+        // Since the Geist pass (2026-11-06) a card's time carries no emoji mark: a claude.ai row says so in its
+        // kind badge, and a row on this machine says nothing.
         for glyph in ["🌐", "🔒"] {
             assert!(
-                window.contains(glyph),
-                "the card's line lost its `{glyph}` glyph"
+                !window.contains(glyph),
+                "the card's line marks its time with `{glyph}` again"
             );
         }
+        assert!(
+            window.contains("web: { key: \"artifacts.kind.web\", word: \"claude.ai\" }"),
+            "a claude.ai row no longer says so in its kind badge"
+        );
         let sheet = include_str!("../../../../ui/shell.css");
         assert!(
             sheet.contains(".artifact-strip {") && sheet.contains(".artifacts-tabs {"),

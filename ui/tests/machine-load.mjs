@@ -17,7 +17,9 @@
 // A GitHub-hosted runner is a shared VM: its loadavg does not show the host's contention, so a quiet reading there
 // says nothing about speed. Its absolute frame budgets are recorded and never judged (t-43414, run-4275's rule); the
 // same env pair is what justfile's windows package smoke reads (justfile:218). The ratio of a round's own pair still
-// judges, and so does a self-hosted runner.
+// judges, and so does a self-hosted runner — but for a pair of screenshot wall clocks (pairedRatioHolds): the knowledge
+// halo's circle/filter pair read 0.95, 0.91, 1.0 and 1.14 on four macOS CI runs of the same code (11-05), so there it
+// is recorded too.
 //
 // A frame that a slower machine slows along with everything else is judged against references measured in the same
 // run instead (referencesHold, t-63638): the paths frame at 1020 nodes read 84 ms and 121.8 ms on the same code nine
@@ -104,6 +106,15 @@ export function referencesHold(ms, lowMs, highMs, opts = {}) {
   return ms < referenceMidpoint(lowMs, highMs) || machineIsLoudNow(opts);
 }
 
+/** A ratio of two modes timed in the same rounds holds at or under its limit, or when it cannot be judged: the machine
+ * cannot judge it (see unjudgedBecause), or the runner is GitHub-hosted. Each side of such a round is a screenshot's wall
+ * clock, and on a shared VM steal time lands on one side of a round as it lands on one of referencesHold's readings:
+ * the knowledge halo's pair read 1.14 at load 2.1/5 on the same code that read 0.91 to 1.0 in three other runs. */
+export function pairedRatioHolds(ratio, limit, opts = {}) {
+  if (onHostedRunner(opts.env)) return true;
+  return ratio <= limit || machineIsLoudNow(opts);
+}
+
 /** The margin of a frame judged against two references, midpoint minus frame in ms, for a METRIC line: `margin 8ms`.
  * The midpoint is rounded as the line prints it, so the margin is the difference of two printed numbers. On a
  * GitHub-hosted runner it also says which way the recorded verdict went:
@@ -113,6 +124,15 @@ export function referencesNote(ms, lowMs, highMs, opts = {}) {
   const reading = `margin ${Math.round((midpoint - ms) * 100) / 100}ms`;
   if (!onHostedRunner(opts.env)) return reading;
   return `${reading}, ${ms < referenceMidpoint(lowMs, highMs) ? "held" : "crossed"} (hosted runner — recorded)`;
+}
+
+/** A paired ratio judged against its limit, for a METRIC line: `paired 0.95`. On a GitHub-hosted runner, where
+ * pairedRatioHolds records rather than judges, it also says the limit and which way the verdict would have gone, as
+ * referencesNote does: `paired 1.14, crossed limit 1.1 (hosted runner — recorded)`. */
+export function pairedRatioNote(ratio, limit, opts = {}) {
+  const reading = `paired ${ratio}`;
+  if (!onHostedRunner(opts.env)) return reading;
+  return `${reading}, ${ratio <= limit ? "held" : "crossed"} limit ${limit} (hosted runner — recorded)`;
 }
 
 /** A command's output, or "" when it cannot run: a note then says unknown instead of failing the run. */

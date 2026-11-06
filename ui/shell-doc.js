@@ -5834,22 +5834,62 @@ async function loadCsvSheet(tab) {
 }
 
 /* ---- Skills: a shared, keyed document surface ---- */
+/* 스킬·MCP (2026-11-06, the person: 「codex에서 a 스킬 설치하고 cc에서 b 스킬
+ * 설치시 gemini는 ab를 다 봐야함」, 「링크를 거는 게 아닌 공통 스킬 mcp 저장소를
+ * 보게」). One page for the common store every agent in the window reads: the
+ * skills, the MCP servers, and what changed. The backend's keeper
+ * (`library_runtime`) keeps the store in step with every agent; this page reads
+ * its report beside the skill discovery report and asks it to act. Values a
+ * server is handed never reach this page — only their names. */
 let skillsReport = null;
 let skillsPending = null;
 let skillsNeedsRescan = false;
 let skillsInstallTerm = null;
 let skillsOnboardingSuspended = false;
 let skillsInstallWatch = null;
+let libraryReport = null;
 const skillsViews = new WeakMap();
 const skillsBadgeWired = new WeakSet();
+
+/* The three tabs, the three filters and the store's own root id. */
+const LIBRARY_TABS = Object.freeze(["skills", "mcp", "log"]);
+const LIBRARY_FILTERS = Object.freeze(["all", "attention", "own"]);
+const LIBRARY_STORE_ROOT = "home-agents";
+const LIBRARY_TOAST_MS = 6000;
 
 function openSkillsView() {
   setSettingsOpen(false);
   openTab({ id: "skills", kind: "skills" });
 }
 function skillText(key, vars = {}) { return t(`skills.${key}`, CATALOG.ko[`skills.${key}`] ?? key, vars); }
+
+/* The backend's refusals, by key. */
+const LIBRARY_ERRORS = Object.freeze({
+  "library.homeUnavailable": () => t("library.err.homeUnavailable", "사용자 홈 경로를 찾을 수 없습니다."),
+  "library.storeUnreadable": () => t("library.err.storeUnreadable", "공통 저장소 파일(~/.agents/mcp.json)을 읽을 수 없습니다. JSON이 깨지지 않았는지 확인하세요."),
+  "library.commandMissing": () => t("library.err.commandMissing", "그 에이전트의 명령을 PATH에서 찾지 못했습니다."),
+  "library.commandTimedOut": () => t("library.err.commandTimedOut", "에이전트 명령이 제때 끝나지 않았습니다."),
+  "library.listUnreadable": () => t("library.err.listUnreadable", "에이전트의 설정 파일을 읽을 수 없어 건드리지 않았습니다."),
+  "library.unsupported.sse": () => t("library.err.unsupportedSse", "이 에이전트는 SSE 원격 서버를 받지 않습니다."),
+  "library.notWritten": () => t("library.err.notWritten", "명령은 끝났지만 설정에 들어가지 않았습니다."),
+  "library.notRemoved": () => t("library.err.notRemoved", "명령은 끝났지만 설정에서 빠지지 않았습니다."),
+  "library.skillExists": () => t("library.err.skillExists", "공통 저장소에 같은 이름의 스킬이 이미 있습니다."),
+  "library.skillTooLarge": () => t("library.err.skillTooLarge", "스킬 폴더가 너무 커서 공통 저장소에 복사하지 않았습니다. 프로젝트 전체나 node_modules가 든 폴더로 보입니다."),
+  "library.invalidServer": () => t("library.err.invalidServer", "명령이나 http(s) 주소를 적어 주세요."),
+  "library.invalidName": () => t("library.err.invalidName", "이름은 영문 소문자·숫자·-·_·.·@·/만 쓸 수 있습니다."),
+  "library.invalidSkillName": () => t("library.err.invalidSkillName", "스킬 이름은 영문 소문자·숫자·-만 쓸 수 있습니다."),
+  "library.pasteUnreadable": () => t("library.err.pasteUnreadable", "JSON을 읽을 수 없습니다. 괄호와 따옴표를 확인하세요."),
+  "library.pasteEmpty": () => t("library.err.pasteEmpty", "붙여 넣은 내용에서 서버를 찾지 못했습니다."),
+  "library.notFound": () => t("library.err.notFound", "이미 바뀌었습니다. 다시 읽어 주세요."),
+  "library.noLogin": () => t("library.err.noLogin", "이 에이전트는 로그인 명령이 없습니다. 처음 쓸 때 스스로 묻습니다."),
+  "library.noSkillFile": () => t("library.err.noSkillFile", "고른 폴더에 SKILL.md가 없습니다."),
+  "library.cannotUndo": () => t("library.err.cannotUndo", "이 변경은 지금 되돌릴 수 없습니다(창을 다시 연 뒤에는 휴지통·백업에서)."),
+  "tree.failed": () => t("library.err.trash", "휴지통으로 옮기지 못했습니다."),
+  "tree.changed": () => t("library.err.trashChanged", "휴지통의 항목이 바뀌어 되살리지 못했습니다."),
+});
 function skillsError(error) {
   const key = String(error).replace(/^Error: /, "");
+  if (LIBRARY_ERRORS[key]) return LIBRARY_ERRORS[key]();
   return key.startsWith("skills.") ? skillText(key.slice("skills.".length)) : key;
 }
 function skillElement(tag, className, text) {
@@ -5864,64 +5904,127 @@ function skillButton(key, click, className = "btn", vars = {}) {
   button.addEventListener("click", click);
   return button;
 }
-function skillOption(label, value, _defaultSelected = false, selected = false) {
-  const option = document.createElement("option"); option.textContent = label; option.value = value; option.selected = selected; return option;
+function libraryButton(label, click, className = "btn btn--sm", glyph = null) {
+  const button = skillElement("button", className);
+  button.type = "button";
+  if (glyph) button.append(iconNode(glyph));
+  button.append(document.createTextNode(label));
+  button.addEventListener("click", click);
+  return button;
 }
+function librarySwitch(on, label, change, disabled = false) {
+  const button = skillElement("button", "lib-switch");
+  button.type = "button";
+  button.setAttribute("role", "switch");
+  button.setAttribute("aria-checked", String(on));
+  button.setAttribute("aria-label", label);
+  button.dataset.tip = label;
+  button.disabled = disabled;
+  button.addEventListener("click", () => change(!on));
+  return button;
+}
+
+/* Who did something, in the person's words. */
+function libraryWho(id) {
+  if (id === "person") return t("library.who.person", "직접");
+  if (id === "store") return t("library.who.store", "공통 저장소");
+  if (id === "claude-mac") return t("library.who.claudeMac", "이 Mac의 Claude Code");
+  if (id === "codex-window") return t("library.who.codexWindow", "창의 Codex");
+  if (id === "bundle") return t("library.who.bundle", "ZeroCode 동봉");
+  return libraryReport?.agents?.find((agent) => agent.id === id)?.label ?? id;
+}
+function libraryAgents() {
+  return (libraryReport?.agents ?? []).filter((agent) => agent.present);
+}
+
+/* ---- the skeleton ---------------------------------------------------------- */
 function buildSkillsView() {
   const view = skillElement("section", "file-view skills-view");
   view.dataset.keyboardOwner = "true";
   view.hidden = true;
   // docHost clones templates, so listeners are wired on the actual host below.
-  view.innerHTML = `<header class="skills-heading"><div><p class="skills-eyebrow"></p><h1></h1><p class="skills-about"></p></div><div class="skills-actions"><button type="button" class="btn skills-onboarding-return" hidden></button><button type="button" class="btn skills-rescan"></button><button type="button" class="btn primary skills-bundle-open"></button></div></header>
-    <div class="skills-toolbar"><input type="search" class="skills-search"/><select class="skills-root-filter"></select><select class="skills-agent-filter"></select><span class="skills-total" role="status"></span></div>
-    <div class="skills-required"></div><details class="skills-bundled-panel" hidden><summary></summary><div class="skills-bundled"></div></details><p class="skills-evidence-scope skills-usage-scope"></p><p class="skills-error" role="alert" hidden></p><p class="skills-plan-status" role="status" hidden></p><p class="skills-native-status" role="status" hidden></p>
-    <div class="skills-columns"><div class="skills-list-pane"><div class="skills-card-list" role="list"></div><p class="skills-empty"></p><details class="skills-roots-panel"><summary></summary><div></div></details></div><aside class="skills-detail"><p class="skills-detail-empty"></p><div class="skills-detail-content" hidden></div></aside></div>
-    <section class="skills-bundle" hidden></section>`;
+  view.innerHTML = `<div class="lib-top"><header class="lib-head"><div class="lib-titles"><p class="lib-eyebrow"></p><h1 class="lib-title"></h1><p class="lib-about"></p></div><div class="lib-acts"><button type="button" class="btn skills-onboarding-return" hidden></button><button type="button" class="lib-sync" aria-pressed="false"><span class="lib-sync-dot" aria-hidden="true"></span><span class="lib-sync-text"></span></button><button type="button" class="btn skills-rescan"></button><button type="button" class="btn btn--primary lib-add"></button></div></header>
+    <div class="lib-agents"></div><div class="lib-tabs" role="tablist"></div><div class="lib-attention"></div>
+    <div class="skills-required" hidden></div><div class="skills-bundled" hidden></div><p class="skills-error" role="alert" hidden></p><p class="skills-plan-status" role="status" hidden></p><p class="skills-native-status" role="status" hidden></p>
+    <div class="lib-tools"><label class="lib-search"><span class="lib-search-glyph" aria-hidden="true"></span><input type="search" class="skills-search" autocomplete="off"/></label><div class="lib-filters" role="group"></div><span class="skills-total" role="status"></span></div></div>
+    <div class="lib-body"><div class="lib-list skills-card-list"><div class="lib-part" data-part="skills" role="list"></div><div class="lib-part" data-part="mcp" role="list" hidden></div><div class="lib-part" data-part="log" role="list" hidden></div><p class="lib-empty skills-empty" hidden></p></div><aside class="lib-detail skills-detail"><p class="skills-detail-empty"></p><div class="skills-detail-content" hidden></div></aside></div>
+    <div class="lib-scrim" hidden></div><div class="lib-toast" role="status" aria-live="polite"></div>`;
   return view;
 }
+
 function wireSkillsView(view) {
   if (skillsViews.has(view)) return skillsViews.get(view);
-  const state = { rows: new Map(), selected: null, generation: 0, report: null, query: "", root: "all", agent: "all" };
+  const state = {
+    tab: "skills", query: "", filter: "all", selected: { skills: null, mcp: null }, generation: 0,
+    detailOpen: false, language: null, painted: null, toastTimer: 0, toastUndo: null,
+    rows: { skills: new Map(), mcp: new Map() },
+  };
   skillsViews.set(view, state);
   // A new leaf can be cloned from the populated first leaf. Its cache owns
   // exactly its own rows, never dead copies of another leaf's listeners.
-  view.querySelector(".skills-card-list").replaceChildren();
-  view.querySelector(".skills-root-filter").replaceChildren();
+  for (const part of view.querySelectorAll(".lib-part")) part.replaceChildren();
+  view.querySelector(".lib-filters").replaceChildren();
   view.querySelector(".skills-detail-content").replaceChildren();
   view.querySelector(".skills-detail-content").hidden = true;
   view.querySelector(".skills-detail-empty").hidden = false;
-  view.querySelector(".skills-bundle").hidden = true;
-  view.classList.remove("has-detail");
+  view.querySelector(".lib-scrim").hidden = true;
+  view.querySelector(".lib-scrim").replaceChildren();
+  view.querySelector(".lib-search-glyph").replaceChildren(iconNode("search"));
   localizeSkillsView(view);
   const query = view.querySelector(".skills-search");
-  query.placeholder = skillText("search"); query.setAttribute("aria-label", skillText("search"));
-  query.addEventListener("input", () => { state.query = query.value.trim().toLowerCase(); filterSkillsView(view); });
-  const root = view.querySelector(".skills-root-filter"); root.setAttribute("aria-label", skillText("root"));
-  for (const key of ["all", "home", "repo", "bundled", "plugin"]) root.append(skillOption(skillText(`root_${key}`), key));
-  root.addEventListener("change", () => { state.root = root.value; filterSkillsView(view); });
-  const agent = view.querySelector(".skills-agent-filter"); agent.setAttribute("aria-label", skillText("provider"));
-  agent.addEventListener("change", () => { state.agent = agent.value; filterSkillsView(view); });
+  query.addEventListener("input", () => { state.query = query.value.trim().toLowerCase(); filterLibraryList(view, state); });
   view.querySelector(".skills-onboarding-return").addEventListener("click", resumeSkillsOnboarding);
   view.querySelector(".skills-rescan").addEventListener("click", () => void refreshSkills(true));
-  view.querySelector(".skills-bundle-open").addEventListener("click", () => openSkillBundle(view));
+  view.querySelector(".lib-add").addEventListener("click", () => openLibraryAdd(view, state));
+  view.querySelector(".lib-sync").addEventListener("click", () => void toggleLibraryPause(view, state));
   view.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !view.querySelector(".skills-bundle").hidden) {
-      event.stopPropagation(); view.querySelector(".skills-bundle").hidden = true;
-      view.querySelector(".skills-bundle-open").focus();
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
+      event.preventDefault(); event.stopPropagation(); view.querySelector(".skills-search").focus(); return;
     }
-    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key) || !event.target.closest(".skills-card")) return;
-    const buttons = [...state.rows.values()].filter((r) => !r.node.hidden).map((r) => r.button);
-    let at = buttons.indexOf(document.activeElement);
+    if (event.key === "Escape" && !view.querySelector(".lib-scrim").hidden) {
+      event.stopPropagation(); closeLibraryDialog(view); return;
+    }
+    if (event.key === "Escape" && state.detailOpen) {
+      event.stopPropagation(); state.detailOpen = false; view.querySelector(".lib-detail").classList.remove("is-open"); return;
+    }
+    const tab = event.target.closest?.(".lib-tab");
+    if (tab && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+      let at = LIBRARY_TABS.indexOf(state.tab);
+      at = event.key === "Home" ? 0 : event.key === "End" ? LIBRARY_TABS.length - 1 : (at + (event.key === "ArrowRight" ? 1 : -1) + LIBRARY_TABS.length) % LIBRARY_TABS.length;
+      event.preventDefault(); event.stopPropagation(); pickLibraryTab(view, state, LIBRARY_TABS[at], true); return;
+    }
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key) || !event.target.closest(".lib-row-open")) return;
+    const buttons = [...view.querySelectorAll(`.lib-part[data-part="${state.tab}"] .lib-row:not([hidden]) .lib-row-open`)];
+    let at = buttons.indexOf(event.target.closest(".lib-row-open"));
     at = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1 : at + (event.key === "ArrowDown" ? 1 : -1);
     event.preventDefault(); event.stopPropagation(); buttons[Math.max(0, Math.min(buttons.length - 1, at))]?.focus();
   });
   return state;
 }
+
+function localizeSkillsView(view) {
+  view.querySelector(".lib-eyebrow").textContent = skillText("library");
+  view.querySelector(".lib-title").textContent = skillText("title");
+  view.querySelector(".lib-about").textContent = t("library.about", "ZeroCode 안의 모든 에이전트가 이 저장소를 함께 봅니다. 어느 에이전트에서 설치해도 자동으로 여기 들어옵니다.");
+  view.querySelector(".skills-rescan").textContent = skillText("reload");
+  const add = view.querySelector(".lib-add");
+  add.replaceChildren(iconNode("plus"), document.createTextNode(t("library.add", "추가")));
+  view.querySelector(".skills-detail-empty").textContent = t("library.pickOne", "왼쪽에서 하나를 고르면 여기에서 보고 고칩니다.");
+  const search = view.querySelector(".skills-search");
+  search.placeholder = t("library.search", "이름·설명·출처로 찾기");
+  search.setAttribute("aria-label", t("library.search", "이름·설명·출처로 찾기"));
+  view.querySelector(".lib-filters").setAttribute("aria-label", t("library.filters", "거르기"));
+  view.querySelector(".lib-tabs").setAttribute("aria-label", t("library.tabs", "보기"));
+}
+
+/* ---- reading -------------------------------------------------------------- */
 async function refreshSkills(force = false) {
   if (skillsPending) return skillsPending;
   skillsPending = (async () => {
     try {
+      const library = refreshLibrary(force);
       const answer = await invoke(force ? "skills_rescan" : "skills_list", force ? { term: skillsInstallTerm } : {});
+      await library;
       if (!answer) return;
       skillsReport = answer; skillsNeedsRescan = false;
       for (const tab of tabs.filter((tab) => tab.kind === "skills")) paintSkillsView(docHost(tab.pane, "skills"));
@@ -5935,6 +6038,20 @@ async function refreshSkills(force = false) {
   })();
   return skillsPending;
 }
+
+/* The keeper's report. A look is asked for on a forced read: what the person
+ * just installed by hand reaches the store before the page draws it. */
+async function refreshLibrary(force = false) {
+  try {
+    libraryReport = await invoke(force ? "library_look" : "library_report");
+  } catch (error) {
+    libraryReport = libraryReport ?? null;
+    for (const view of document.querySelectorAll(".skills-view")) {
+      const note = view.querySelector(".skills-error"); note.hidden = false; note.textContent = skillsError(error);
+    }
+  }
+}
+
 function paintSkillsSummary() {
   const node = el("skills-summary");
   if (node) node.textContent = skillsReport ? skillText("summary", { count: skillsReport.families.length, roots: skillsReport.sources.length }) : skillText("loading");
@@ -5955,98 +6072,244 @@ function paintSkillsStage(tab) {
   paintSkillsView(view);
   void refreshSkills(skillsNeedsRescan);
 }
-function skillAgents(variant) {
-  return skillsReport?.installed_agents_by_skill?.[variant.id] ?? variant.providers;
+
+/* ---- what a row says ---------------------------------------------------------- */
+function storeVariant(family) {
+  return family.variants.find((variant) => variant.source_id === LIBRARY_STORE_ROOT) ?? null;
 }
-function createSkillCard(family, view) {
-  const node = skillElement("article", "skills-card"); node.setAttribute("role", "listitem"); node.dataset.skill = family.id;
-  const button = skillElement("button", "skills-card-open"); button.type = "button";
-  const name = skillElement("strong", "skills-card-name");
-  const desc = skillElement("span", "skills-card-description");
-  const marks = skillElement("span", "skills-card-marks");
-  const usage = skillElement("span", "skills-card-usage");
-  const conflict = skillElement("span", "skills-conflict");
-  button.append(name, desc, marks, usage, conflict); node.append(button);
-  button.addEventListener("click", () => void selectSkillFamily(view, node.dataset.skill));
-  return { node, button, name, desc, marks, usage, conflict, family, search: "" };
+function librarySkillRecord(name) {
+  return libraryReport?.skills?.find((row) => row.name === name) ?? null;
 }
-function localizeSkillsView(view) {
-  for (const [selector, key] of [["h1", "title"], [".skills-eyebrow", "library"], [".skills-about", "overview"], [".skills-rescan", "reload"], [".skills-bundle-open", "bundle"], [".skills-detail-empty", "selectDetail"], [".skills-roots-panel summary", "where"], [".skills-usage-scope", "hooksOnly"]]) view.querySelector(selector).textContent = skillText(key);
-  const search = view.querySelector(".skills-search"); search.placeholder = skillText("search"); search.setAttribute("aria-label", skillText("search"));
-  view.querySelector(".skills-root-filter").setAttribute("aria-label", skillText("root"));
-  view.querySelector(".skills-agent-filter").setAttribute("aria-label", skillText("provider"));
-  for (const option of view.querySelectorAll(".skills-root-filter option")) option.textContent = skillText(`root_${option.value}`);
+/* Which present agents see a skill: the store's, through the store; any
+ * other, through the folder it sits in. */
+function skillSeenBy(family) {
+  const inStore = Boolean(storeVariant(family));
+  return libraryAgents().filter((agent) => {
+    if (inStore && agent.skills_state === "sees") return true;
+    return family.variants.some((variant) => variant.source_id === `home-${agent.id}`
+      || (variant.roots ?? []).some((root) => root.owner === agent.id));
+  });
 }
+function skillOrigin(family) {
+  const record = librarySkillRecord(family.name);
+  if (family.bundled_name) return t("library.origin.bundle", "ZeroCode 동봉");
+  if (record?.origin && !["store", "person"].includes(record.origin)) {
+    return t("library.origin.from", "{{who}}에서 설치", { who: libraryWho(record.origin) });
+  }
+  if (record?.origin === "person") return t("library.origin.person", "직접 추가");
+  if (storeVariant(family)) return t("library.origin.store", "공통 저장소");
+  const variant = family.variants[0];
+  if (variant?.source_kind === "plugin") return t("library.origin.plugin", "플러그인");
+  if (variant?.source_kind === "repo") return t("library.origin.repo", "이 프로젝트");
+  return variant?.source_label ?? "";
+}
+/* The status a row ends with: a dot and its words, never the dot alone. */
+function skillStatus(family) {
+  const record = librarySkillRecord(family.name);
+  if (record?.pick?.length) return { tone: "you", text: t("library.status.pick", "고르기 필요") };
+  const seen = skillSeenBy(family).length;
+  const total = libraryAgents().length;
+  if (!storeVariant(family)) {
+    const variant = family.variants[0];
+    if (variant?.source_kind === "plugin") return { tone: "own", text: t("library.status.plugin", "플러그인에서 관리") };
+    if (variant?.source_kind === "repo") return { tone: "own", text: t("library.status.repo", "이 프로젝트만") };
+    return { tone: "own", text: t("library.status.only", "에이전트 {{count}}곳만", { count: seen }) };
+  }
+  if (total > 0 && seen >= total) return { tone: "ok", text: t("library.status.all", "모든 에이전트") };
+  return { tone: "part", text: t("library.status.some", "에이전트 {{seen}}/{{total}}", { seen, total }) };
+}
+function serverStatus(server) {
+  if (server.pick?.length) return { tone: "you", text: t("library.status.pick", "고르기 필요") };
+  if (server.own && !server.shared) return { tone: "own", text: t("library.status.own", "{{who}} 전용", { who: libraryWho(server.own) }) };
+  if (server.disabled) return { tone: "off", text: t("library.status.off", "꺼짐") };
+  const counted = server.agents.filter((agent) => !["elsewhere", "unsupported", "unreadable"].includes(agent.state));
+  const has = counted.filter((agent) => agent.state === "has").length;
+  if (counted.length > 0 && has >= counted.length) return { tone: "ok", text: t("library.status.all", "모든 에이전트") };
+  return { tone: "part", text: t("library.status.some", "에이전트 {{seen}}/{{total}}", { seen: has, total: counted.length }) };
+}
+function libraryKindWord(kind) {
+  if (kind === "http") return t("library.kind.http", "원격 HTTP");
+  if (kind === "sse") return t("library.kind.sse", "원격 SSE");
+  return t("library.kind.stdio", "로컬 실행");
+}
+function statusNode(status) {
+  const node = skillElement("span", `lib-status is-${status.tone}`);
+  node.append(skillElement("span", "lib-status-dot"));
+  node.append(document.createTextNode(status.text));
+  return node;
+}
+
+/* ---- painting -------------------------------------------------------------- */
 function paintSkillsView(view) {
   const state = wireSkillsView(view);
   if (state.language !== locale) {
-    state.language = locale; state.report = null; localizeSkillsView(view);
-    if (state.selected) void selectSkillFamily(view, state.selected);
+    state.language = locale; localizeSkillsView(view);
   }
   const resume = view.querySelector(".skills-onboarding-return"); resume.hidden = !skillsOnboardingSuspended; resume.textContent = skillText("resumeOnboarding");
+  paintLibraryHead(view, state);
+  paintLibraryAgents(view);
+  paintLibraryTabs(view, state);
+  paintLibraryAttention(view, state);
+  paintLibraryRequired(view);
+  paintLibraryFilters(view, state);
+  paintLibraryList(view, state);
+  // A server's detail is cheap and follows every report; a skill's reads its
+  // file, so it is read again only when another skill is picked.
+  if (state.tab === "mcp" || state.painted !== `${state.tab}:${state.selected[state.tab] ?? ""}`) void paintLibraryDetail(view, state);
+  view.querySelector(".lib-tools").hidden = state.tab === "log";
   const report = skillsReport;
-  if (!report) { view.querySelector(".skills-empty").textContent = skillText("loading"); return; }
-  if (state.report !== report) {
-    state.report = report;
-    const list = view.querySelector(".skills-card-list");
-    const ids = new Set(report.families.map((f) => f.id));
-    for (const [id, row] of state.rows) if (!ids.has(id)) { row.node.remove(); state.rows.delete(id); }
-    for (const family of report.families) {
-      let row = state.rows.get(family.id);
-      if (!row) { row = createSkillCard(family, view); state.rows.set(family.id, row); list.append(row.node); }
-      row.family = family;
-      const variants = family.variants ?? [];
-      row.name.textContent = family.name;
-      row.desc.textContent = variants.find((v) => v.description)?.description ?? "";
-      row.desc.hidden = !row.desc.textContent;
-      row.marks.textContent = [...new Set(variants.flatMap(skillAgents))].join(" · ");
-      const usage = family.usage ?? {};
-      row.usage.textContent = usage.count_7d ? skillText("usage", { count: usage.count_7d, last: agoWord(usage.last_used_ms, Date.now()), agents: (usage.agents ?? []).join(", ") }) : skillText("unused");
-      row.conflict.hidden = !family.conflict;
-      row.conflict.textContent = skillText("conflict");
-      row.search = [family.name, ...variants.flatMap((v) => [v.description ?? "", v.file, v.source_label, ...v.providers])].join(" ").toLowerCase();
-    }
-    const pick = view.querySelector(".skills-agent-filter");
-    const agents = [...new Set(report.families.flatMap((f) => f.variants.flatMap(skillAgents)))].sort();
-    pick.replaceChildren(skillOption(skillText("allProviders"), "all"), ...agents.map((agent) => skillOption(agent, agent)));
-    if (!agents.includes(state.agent)) state.agent = "all"; pick.value = state.agent;
-    const roots = view.querySelector(".skills-roots-panel div");
-    roots.replaceChildren(...report.sources.map((source) => skillElement("p", "skills-root-line", `${source.path} · ${source.found}`)));
-    const required = view.querySelector(".skills-required"); required.replaceChildren();
-    const missing = (report.required ?? []).filter((r) => r.missing_agents.length);
-    if (missing.length) {
-      required.append(skillElement("strong", "", skillText("requiredMissing", { count: missing.length })));
-      required.append(skillElement("span", "skills-evidence-scope", skillText("nativeNotice")));
-      for (const item of missing) {
-        const button = skillButton("bundledItem", () => void installRequiredSkill(view, item.name), "btn", { name: item.name });
-        button.dataset.tip = skillText("requiredItem", { name: item.name, agents: item.missing_agents.join(", ") });
-        required.append(button);
+  const note = view.querySelector(".skills-error");
+  if (report?.capped) { note.hidden = false; note.textContent = skillText("capped"); }
+  const latestPlan = report?.plans?.at(-1);
+  const planStatus = view.querySelector(".skills-plan-status"); planStatus.hidden = !latestPlan;
+  planStatus.textContent = latestPlan ? (latestPlan.error || skillText(`plan_${latestPlan.status}`)) : "";
+  if (latestPlan) planStatus.dataset.tip = latestPlan.command;
+}
+
+function paintLibraryHead(view) {
+  const sync = view.querySelector(".lib-sync");
+  const paused = Boolean(libraryReport?.paused);
+  const running = Boolean(libraryReport?.running);
+  sync.classList.toggle("is-paused", paused);
+  sync.classList.toggle("is-running", running && !paused);
+  sync.setAttribute("aria-pressed", String(!paused));
+  const words = paused
+    ? t("library.sync.paused", "자동 공통화 멈춤")
+    : running ? t("library.sync.running", "맞추는 중…") : t("library.sync.on", "자동 공통화 켜짐");
+  sync.querySelector(".lib-sync-text").textContent = words;
+  labelButton(sync, paused
+    ? t("library.sync.resumeTip", "눌러서 다시 켭니다. 켜면 어느 에이전트에서 설치해도 공통 저장소로 들어옵니다.")
+    : t("library.sync.pauseTip", "눌러서 멈춥니다. 멈추면 에이전트마다 따로 둡니다."));
+}
+
+function paintLibraryAgents(view) {
+  const host = view.querySelector(".lib-agents");
+  const agents = libraryAgents();
+  if (!agents.length) { host.replaceChildren(); return; }
+  const label = skillElement("span", "lib-agents-label", t("library.agents", "이 저장소를 보는 에이전트 {{count}}", { count: agents.length }));
+  host.replaceChildren(label, ...agents.map((agent) => {
+    const chip = skillElement("span", `lib-chip is-${agent.skills_state}`);
+    chip.append(agentIcon({ id: agent.id, name: agent.label, favicon_domain: agent.favicon_domain }));
+    chip.append(skillElement("span", "lib-chip-name", agent.label));
+    const how = libraryAgentHow(agent);
+    chip.dataset.tip = `${agent.label} · ${how}`;
+    chip.setAttribute("aria-label", `${agent.label}: ${how}`);
+    return chip;
+  }));
+}
+function libraryAgentHow(agent) {
+  switch (agent.skills_state) {
+    case "machine-login": return t("library.how.machineLogin", "이 Mac의 Claude 로그인으로 실행 중입니다 — 거기서 설치한 스킬·MCP는 공통 저장소로 들어오지만, 공통 저장소의 것을 그 설정에 쓰지는 않습니다");
+    case "not-linked": return t("library.how.notLinked", "스킬 저장소에 아직 잇지 못했습니다");
+    case "own-only": return t("library.how.ownOnly", "자기 스킬 폴더만 읽습니다 — 저장소의 스킬이 그 폴더로 들어가지 않습니다(MCP는 공통)");
+    default: break;
+  }
+  if (agent.skills === "window-home") return t("library.how.windowHome", "창 전용 홈의 스킬 폴더가 공통 저장소입니다");
+  if (agent.skills === "window-env") return t("library.how.windowEnv", "ZeroCode 터미널에서 공통 저장소를 읽습니다");
+  return t("library.how.native", "공용 폴더(~/.agents/skills)를 바로 읽습니다");
+}
+
+function paintLibraryTabs(view, state) {
+  const host = view.querySelector(".lib-tabs");
+  const counts = {
+    skills: skillsReport?.families?.length ?? 0,
+    mcp: libraryReport?.servers?.length ?? 0,
+    log: libraryReport?.log?.length ?? 0,
+  };
+  const asked = libraryAttention().length;
+  host.replaceChildren(...LIBRARY_TABS.map((id) => {
+    const button = skillElement("button", "lib-tab");
+    button.type = "button";
+    button.setAttribute("role", "tab");
+    button.id = `lib-tab-${id}`;
+    button.setAttribute("aria-selected", String(state.tab === id));
+    button.tabIndex = state.tab === id ? 0 : -1;
+    const word = id === "skills" ? t("library.tab.skills", "스킬") : id === "mcp" ? t("library.tab.mcp", "MCP 서버") : t("library.tab.log", "최근 변경");
+    button.append(document.createTextNode(word), skillElement("span", "lib-tab-count", String(counts[id])));
+    if (id === "mcp" && asked) button.append(skillElement("span", "lib-tab-ask", t("library.tab.ask", "확인 {{count}}", { count: asked })));
+    button.addEventListener("click", () => pickLibraryTab(view, state, id, false));
+    return button;
+  }));
+}
+function pickLibraryTab(view, state, id, focus) {
+  state.tab = id; state.detailOpen = false; state.painted = null;
+  view.querySelector(".lib-detail").classList.remove("is-open");
+  paintSkillsView(view);
+  if (focus) view.querySelector(`#lib-tab-${id}`)?.focus();
+}
+
+/* What waits for the person: a version to choose, a list that could not be
+ * read. Said on the MCP tab, counted on its tab label. */
+function libraryAttention() {
+  const out = [];
+  for (const server of libraryReport?.servers ?? []) if (server.pick?.length) out.push({ kind: "pick", server });
+  for (const agent of libraryAgents()) if (agent.mcp_state === "unreadable") out.push({ kind: "unreadable", agent });
+  return out;
+}
+function paintLibraryAttention(view, state) {
+  const host = view.querySelector(".lib-attention");
+  const items = [];
+  if (state.tab === "mcp") {
+    for (const item of libraryAttention()) {
+      const line = skillElement("li", "lib-attention-line");
+      if (item.kind === "pick") {
+        line.append(skillElement("strong", "", item.server.name), document.createTextNode(` — ${t("library.attention.pick", "에이전트마다 내용이 달랐습니다.")} `));
+        line.append(libraryButton(t("library.attention.choose", "하나 고르기"), () => selectLibraryServer(view, state, item.server.name), "lib-link"));
+      } else {
+        line.append(skillElement("strong", "", item.agent.label), document.createTextNode(` — ${t("library.attention.unreadable", "MCP 설정 파일을 읽을 수 없어 건드리지 않습니다.")}`));
+        line.dataset.tip = item.agent.mcp_file;
       }
-    }
-    required.hidden = !missing.length;
-    const bundled = report.bundled ?? [];
-    const panel = view.querySelector(".skills-bundled-panel"); panel.hidden = !bundled.length;
-    const current = bundled.filter((item) => item.copies.every((copy) => copy.state === "current")).length;
-    panel.querySelector("summary").textContent = skillText("bundledSummary", { count: bundled.length, current });
-    panel.querySelector(".skills-bundled").replaceChildren(...bundled.map((item) => bundledSkillLine(view, item)));
-    const latestPlan = report.plans?.at(-1);
-    const planStatus = view.querySelector(".skills-plan-status"); planStatus.hidden = !latestPlan;
-    planStatus.textContent = latestPlan ? (latestPlan.error || skillText(`plan_${latestPlan.status}`)) : "";
-    if (latestPlan) planStatus.dataset.tip = latestPlan.command;
-    const note = view.querySelector(".skills-error"); note.hidden = !report.capped; note.textContent = report.capped ? skillText("capped") : "";
-    if (state.selected && !ids.has(state.selected)) {
-      state.selected = null; state.generation++;
-      view.querySelector(".skills-detail-content").replaceChildren();
-      view.querySelector(".skills-detail-content").hidden = true;
-      view.querySelector(".skills-detail-empty").hidden = false;
+      items.push(line);
     }
   }
-  filterSkillsView(view);
+  if (state.tab === "skills") {
+    for (const record of libraryReport?.skills ?? []) {
+      if (!record.pick?.length) continue;
+      const line = skillElement("li", "lib-attention-line");
+      line.append(skillElement("strong", "", record.name), document.createTextNode(` — ${t("library.attention.skillPick", "같은 이름의 다른 내용이 있습니다.")} `));
+      const family = skillsReport?.families?.find((one) => one.name === record.name);
+      if (family) line.append(libraryButton(t("library.attention.choose", "하나 고르기"), () => void selectSkillFamily(view, family.id), "lib-link"));
+      items.push(line);
+    }
+  }
+  if (!items.length) { host.replaceChildren(); host.hidden = true; return; }
+  host.hidden = false;
+  const box = skillElement("div", "lib-note is-you");
+  box.setAttribute("role", "note");
+  box.append(iconNode("alert"));
+  const list = skillElement("ul", "lib-attention-list"); list.append(...items);
+  box.append(list);
+  host.replaceChildren(box);
 }
-/* One line per skill this build ships. 「고쳐 쓰기」 stands only where a copy is
- * missing or an earlier release, and the backend writes only those: a copy
- * edited by hand is named and never offered, and nothing is rewritten until
- * the person presses it (t-55424). */
+
+/* The skills a fresh agent still lacks and the shipped copies an earlier
+ * release left: both the person's to press, so both stand above the list
+ * while there is anything to say, and not otherwise. */
+function paintLibraryRequired(view) {
+  const report = skillsReport;
+  const required = view.querySelector(".skills-required");
+  const bundledHost = view.querySelector(".skills-bundled");
+  required.replaceChildren(); bundledHost.replaceChildren();
+  if (!report) { required.hidden = true; bundledHost.hidden = true; return; }
+  const missing = (report.required ?? []).filter((r) => r.missing_agents.length);
+  if (missing.length) {
+    required.append(skillElement("strong", "", skillText("requiredMissing", { count: missing.length })));
+    required.append(skillElement("span", "lib-quiet", skillText("nativeNotice")));
+    for (const item of missing) {
+      const button = skillButton("bundledItem", () => void installRequiredSkill(view, item.name), "btn btn--sm", { name: item.name });
+      button.dataset.tip = skillText("requiredItem", { name: item.name, agents: item.missing_agents.join(", ") });
+      required.append(button);
+    }
+  }
+  required.hidden = !missing.length;
+  const stale = (report.bundled ?? []).filter((item) => item.copies.some((copy) => copy.state === "stale" || copy.state === "missing"));
+  for (const item of stale) bundledHost.append(bundledSkillLine(view, item));
+  bundledHost.hidden = !stale.length;
+}
+/* One line per shipped skill with a copy to write. 「고쳐 쓰기」 stands only
+ * where a copy is missing or an earlier release, and the backend writes only
+ * those: a copy edited by hand is named and never offered, and nothing is
+ * rewritten until the person presses it (t-55424). */
 const BUNDLED_COPY_WORDS = Object.freeze({ current: "copyCurrent", stale: "copyStale", edited: "copyEdited", missing: "copyMissing" });
 function bundledSkillLine(view, item) {
   const line = skillElement("p", "skills-bundled-line");
@@ -6060,76 +6323,800 @@ function bundledSkillLine(view, item) {
   line.append(skillElement("strong", "", item.name), skillElement("span", "skills-bundled-state", said));
   line.dataset.tip = item.copies.map((copy) => `${copy.path} · ${skillText(BUNDLED_COPY_WORDS[copy.state] ?? "copyEdited")}`).join("\n");
   if (item.copies.some((copy) => copy.state === "stale" || copy.state === "missing")) {
-    const button = skillButton("rewrite", () => void installRequiredSkill(view, item.name));
+    const button = skillButton("rewrite", () => void installRequiredSkill(view, item.name), "btn btn--sm");
     button.dataset.tip = skillText("rewriteTip");
     line.append(button);
   }
   return line;
 }
-function filterSkillsView(view) {
-  const state = skillsViews.get(view); if (!state) return;
+
+/* The three filters are made once and dressed after, so picking one makes no
+ * node — the same promise the rows keep. */
+function paintLibraryFilters(view, state) {
+  const host = view.querySelector(".lib-filters");
+  if (host.childElementCount !== LIBRARY_FILTERS.length) {
+    host.replaceChildren(...LIBRARY_FILTERS.map((id) => {
+      const button = skillElement("button", "lib-seg");
+      button.type = "button";
+      button.dataset.filter = id;
+      button.addEventListener("click", () => { state.filter = id; paintLibraryFilters(view, state); filterLibraryList(view, state); });
+      return button;
+    }));
+  }
+  for (const button of host.children) {
+    const id = button.dataset.filter;
+    const word = id === "all" ? t("library.filter.all", "전체") : id === "attention" ? t("library.filter.attention", "확인 필요") : t("library.filter.own", "에이전트 전용");
+    if (button.textContent !== word) button.textContent = word;
+    button.setAttribute("aria-pressed", String(state.filter === id));
+  }
+}
+
+
+/* A row is made once per item and dressed in place after: a new report
+ * changes words, a search or a filter only hides rows — no node is made, so
+ * three hundred skills filter as fast as three. */
+function makeLibraryRow(view, state, tab, key) {
+  const node = skillElement("div", "lib-row");
+  node.setAttribute("role", "listitem");
+  node.dataset.key = key;
+  const open = skillElement("button", "lib-row-open");
+  open.type = "button";
+  const main = skillElement("span", "lib-row-main");
+  const head = skillElement("span", "lib-row-title");
+  const name = skillElement("strong", "");
+  const badges = skillElement("span", "lib-row-badges");
+  head.append(name, badges);
+  const line = skillElement("span", "lib-row-line");
+  main.append(head, line);
+  const origin = skillElement("span", "lib-row-origin");
+  const status = skillElement("span", "lib-status");
+  const words = document.createTextNode("");
+  status.append(skillElement("span", "lib-status-dot"), words);
+  open.append(main, origin, status);
+  open.addEventListener("click", () => {
+    if (tab === "mcp") selectLibraryServer(view, state, node.dataset.key);
+    else void selectSkillFamily(view, node.dataset.key);
+  });
+  node.append(open);
+  let toggle = null;
+  if (tab === "mcp") {
+    toggle = skillElement("button", "lib-switch");
+    toggle.type = "button";
+    toggle.setAttribute("role", "switch");
+    toggle.addEventListener("click", () => {
+      const server = libraryReport?.servers?.find((one) => one.name === node.dataset.key);
+      if (server) void libraryAct(view, state, "library_server_switch", { name: server.name, on: Boolean(server.disabled) });
+    });
+    node.append(toggle);
+  }
+  return { node, open, name, badges, badgeWords: "", line, origin, status, words, toggle, search: "", tone: "" };
+}
+function dressLibraryRow(entry, { title, badges, line, mono, origin, status, search, toggle }) {
+  if (entry.name.textContent !== title) entry.name.textContent = title;
+  const badgeWords = badges.join("\u0000");
+  if (entry.badgeWords !== badgeWords) {
+    entry.badgeWords = badgeWords;
+    entry.badges.replaceChildren(...badges.map((badge) => skillElement("span", "lib-badge", badge)));
+  }
+  if (entry.line.textContent !== line) entry.line.textContent = line;
+  entry.line.hidden = !line;
+  entry.line.classList.toggle("is-mono", Boolean(mono));
+  if (entry.origin.textContent !== origin) entry.origin.textContent = origin;
+  entry.status.className = `lib-status is-${status.tone}`;
+  if (entry.words.data !== status.text) entry.words.data = status.text;
+  entry.tone = status.tone;
+  entry.search = search;
+  if (entry.toggle) {
+    entry.toggle.hidden = !toggle;
+    if (toggle) {
+      entry.toggle.setAttribute("aria-checked", String(toggle.on));
+      entry.toggle.setAttribute("aria-label", toggle.label);
+      entry.toggle.dataset.tip = toggle.label;
+    }
+  }
+}
+/* Bring one tab's rows in step with its report: new items get a row, gone
+ * ones lose theirs, the rest are dressed where they stand. */
+function syncLibraryRows(view, state, tab, items) {
+  const part = view.querySelector(`.lib-part[data-part="${tab}"]`);
+  const rows = state.rows[tab];
+  const keep = new Set(items.map((item) => item.key));
+  for (const [key, entry] of rows) if (!keep.has(key)) { entry.node.remove(); rows.delete(key); }
+  let previous = null;
+  for (const item of items) {
+    let entry = rows.get(item.key);
+    if (!entry) { entry = makeLibraryRow(view, state, tab, item.key); rows.set(item.key, entry); }
+    dressLibraryRow(entry, item);
+    const next = previous ? previous.nextSibling : part.firstChild;
+    if (next !== entry.node) part.insertBefore(entry.node, next);
+    previous = entry.node;
+  }
+}
+function libraryServerItems() {
+  return (libraryReport?.servers ?? []).map((server) => ({
+    key: server.name, title: server.name, badges: [libraryKindWord(server.kind)], line: server.summary, mono: true,
+    origin: server.origin ? libraryWho(server.origin) : "", status: serverStatus(server),
+    search: [server.name, server.summary, server.origin ? libraryWho(server.origin) : "", libraryKindWord(server.kind)].join(" ").toLowerCase(),
+    toggle: server.in_store ? { on: !server.disabled, label: t("library.mcp.switchTip", "{{name}}: 모든 에이전트에서 켜기·끄기", { name: server.name }) } : null,
+  }));
+}
+function librarySkillItems() {
+  return (skillsReport?.families ?? []).map((family) => {
+    const variant = family.variants.find((v) => v.description) ?? family.variants[0];
+    const usage = family.usage?.count_7d ? t("library.usage", "7일 {{count}}회", { count: family.usage.count_7d }) : "";
+    const badges = [];
+    if (family.bundled_name) badges.push(t("library.badge.bundle", "동봉"));
+    if (family.conflict) badges.push(skillText("conflict"));
+    const origin = skillOrigin(family);
+    return {
+      key: family.id, title: family.name, badges, line: variant?.description ?? "", mono: false,
+      origin: [origin, usage].filter(Boolean).join(" · "), status: skillStatus(family), toggle: null,
+      search: [family.name, origin, ...family.variants.flatMap((v) => [v.description ?? "", v.source_label])].join(" ").toLowerCase(),
+    };
+  });
+}
+
+function paintLibraryList(view, state) {
+  for (const part of view.querySelectorAll(".lib-part")) part.hidden = part.dataset.part !== state.tab;
+  if (state.tab === "log") {
+    const part = view.querySelector('.lib-part[data-part="log"]');
+    part.setAttribute("aria-label", t("library.tab.log", "최근 변경"));
+    part.replaceChildren(...(libraryReport?.log ?? []).map((row) => libraryLogRow(view, state, row)));
+  } else if (state.tab === "mcp") {
+    view.querySelector('.lib-part[data-part="mcp"]').setAttribute("aria-label", t("library.tab.mcp", "MCP 서버"));
+    syncLibraryRows(view, state, "mcp", libraryServerItems());
+  } else {
+    view.querySelector('.lib-part[data-part="skills"]').setAttribute("aria-label", t("library.tab.skills", "스킬"));
+    syncLibraryRows(view, state, "skills", librarySkillItems());
+  }
+  filterLibraryList(view, state);
+}
+
+/* The search and the filter: rows are shown or hidden, never made. */
+function filterLibraryList(view, state) {
+  const total = view.querySelector(".skills-total");
+  const empty = view.querySelector(".lib-empty");
+  if (state.tab === "log") {
+    total.textContent = "";
+    empty.hidden = (libraryReport?.log ?? []).length > 0;
+    empty.textContent = t("library.log.empty", "아직 바뀐 것이 없습니다.");
+    return;
+  }
+  const rows = state.rows[state.tab];
   let shown = 0;
-  for (const row of state.rows.values()) {
-    const matches = (!state.query || row.search.includes(state.query)) && row.family.variants.some((v) =>
-      (state.root === "all" || v.source_kind === state.root) && (state.agent === "all" || skillAgents(v).includes(state.agent)));
-    row.node.hidden = !matches;
-    row.button.setAttribute("aria-pressed", String(state.selected === row.family.id));
+  for (const entry of rows.values()) {
+    const matches = (state.filter === "all"
+      || (state.filter === "attention" && entry.tone === "you")
+      || (state.filter === "own" && entry.tone === "own"))
+      && (!state.query || entry.search.includes(state.query));
+    entry.node.hidden = !matches;
+    entry.node.setAttribute("aria-current", String(state.selected[state.tab] === entry.node.dataset.key));
     if (matches) shown++;
   }
-  view.querySelector(".skills-total").textContent = skillText("filtered", { shown, count: state.rows.size });
-  const empty = view.querySelector(".skills-empty"); empty.hidden = shown > 0;
-  empty.textContent = skillText(state.rows.size ? "noneMatch" : "none");
+  total.textContent = skillText("filtered", { shown, count: rows.size });
+  empty.hidden = shown > 0;
+  if (state.tab === "mcp") {
+    empty.textContent = rows.size ? skillText("noneMatch") : t("library.mcp.none", "공통 저장소에 MCP 서버가 없습니다. 「추가」로 넣거나, 아무 에이전트에서 추가하면 여기에 들어옵니다.");
+  } else {
+    empty.textContent = !skillsReport ? skillText("loading") : rows.size ? skillText("noneMatch") : skillText("none");
+  }
 }
+
+/* ---- 최근 변경 ---------------------------------------------------------------- */
+function libraryLogWords(row) {
+  const vars = { who: libraryWho(row.who), name: row.name, skills: row.count_skills, servers: row.count_servers, asked: row.count_asked };
+  const skill = row.item === "skill";
+  switch (row.kind) {
+    case "taken-in": return skill ? t("library.log.takenInSkill", "{{who}}가 스킬 {{name}}을(를) 설치 → 공통 저장소로", vars) : t("library.log.takenInMcp", "{{who}}가 MCP {{name}}을(를) 추가 → 공통 저장소 → 모든 에이전트", vars);
+    case "edited": return t("library.log.edited", "{{who}}에서 {{name}}을(를) 고침 → 모든 에이전트에 반영", vars);
+    case "removed": return row.who === "store" ? t("library.log.removedStore", "공통 저장소에서 {{name}}이(가) 빠짐", vars) : t("library.log.removed", "{{who}}에서 {{name}}을(를) 지움 → 모든 에이전트에서 뺌", vars);
+    case "asked": return t("library.log.asked", "{{name}}: 에이전트마다 내용이 달라 고르기를 기다립니다", vars);
+    case "added": return t("library.log.added", "직접 추가: {{name}}", vars);
+    case "deleted": return t("library.log.deleted", "직접 삭제: {{name}}", vars);
+    case "switched-off": return t("library.log.switchedOff", "{{name}} 끔 · 모든 에이전트", vars);
+    case "switched-on": return t("library.log.switchedOn", "{{name}} 켬 · 모든 에이전트", vars);
+    case "agent-off": return t("library.log.agentOff", "{{who}}에서 {{name}} 끔", vars);
+    case "agent-on": return t("library.log.agentOn", "{{who}}에서 {{name}} 켬", vars);
+    case "chosen": return t("library.log.chosen", "{{name}}: 고른 내용으로 맞춤", vars);
+    case "shared": return t("library.log.shared", "{{who}} 전용이던 {{name}}을(를) 모두에게 공유", vars);
+    case "linked": return t("library.log.linked", "창의 Claude Code가 공통 스킬 저장소를 읽게 연결", vars);
+    case "first-merge": return t("library.log.firstMerge", "처음 합침: 스킬 {{skills}}개 · MCP 서버 {{servers}}개를 공통 저장소로 · 고르기 필요 {{asked}}", vars);
+    case "failed": return t("library.log.failed", "{{who}}에 {{name}} 반영 못 함 — 다음 확인 때 다시 합니다", vars);
+    case "undone": return t("library.log.undone", "되돌림: {{name}}", vars);
+    default: return `${row.kind} ${row.name}`;
+  }
+}
+function libraryLogRow(view, state, row) {
+  const line = skillElement("div", "lib-log-row");
+  line.setAttribute("role", "listitem");
+  const when = skillElement("time", "lib-log-time", agoWord(row.at_ms, Date.now()));
+  when.dateTime = new Date(row.at_ms).toISOString();
+  when.dataset.tip = new Date(row.at_ms).toLocaleString();
+  const agent = libraryReport?.agents?.find((one) => one.id === row.who);
+  const face = agent ? agentIcon({ id: agent.id, name: agent.label, favicon_domain: agent.favicon_domain }) : skillElement("span", "lib-log-face");
+  if (!agent) face.append(iconNode(row.who === "person" ? "pencil" : "sparkles"));
+  const words = skillElement("span", "lib-log-words");
+  words.append(skillElement("span", "lib-log-what", libraryLogWords(row)));
+  if (row.detail) words.append(skillElement("span", "lib-log-detail", skillsError(row.detail)));
+  line.append(when, face, words);
+  if (row.undo) line.append(libraryButton(t("library.undo", "되돌리기"), () => void libraryAct(view, state, "library_undo", { id: row.id }), "btn btn--sm", "undo-2"));
+  return line;
+}
+
+/* ---- the detail ---------------------------------------------------------------- */
+async function paintLibraryDetail(view, state) {
+  const host = view.querySelector(".skills-detail-content");
+  const blank = view.querySelector(".skills-detail-empty");
+  state.painted = `${state.tab}:${state.selected[state.tab] ?? ""}`;
+  if (state.tab === "log") {
+    blank.hidden = true; host.hidden = false;
+    host.replaceChildren(skillElement("p", "lib-eyebrow", t("library.tab.log", "최근 변경")),
+      skillElement("h2", "", t("library.log.title", "자동으로 한 일")),
+      skillElement("p", "lib-quiet", t("library.log.help", "에이전트가 설치·추가·삭제한 것과 ZeroCode가 저장소에 맞춘 것이 모두 남습니다. 지운 스킬은 휴지통에서, 바꾼 설정은 백업에서 되살립니다.")));
+    return;
+  }
+  const key = state.selected[state.tab];
+  if (state.tab === "mcp") {
+    const server = libraryReport?.servers?.find((one) => one.name === key);
+    if (!server) { host.hidden = true; host.replaceChildren(); blank.hidden = false; return; }
+    paintServerDetail(view, state, server);
+    return;
+  }
+  const family = skillsReport?.families?.find((one) => one.id === key);
+  if (!family) { host.hidden = true; host.replaceChildren(); blank.hidden = false; return; }
+  await selectSkillFamily(view, family.id);
+}
+
+function libraryDetailBack(view, state) {
+  const back = libraryButton(t("library.back", "목록"), () => {
+    state.detailOpen = false; view.querySelector(".lib-detail").classList.remove("is-open");
+    view.querySelector(`.lib-row[aria-current="true"] .lib-row-open`)?.focus();
+  }, "btn btn--ghost btn--sm lib-back", "arrow-left");
+  return back;
+}
+function openLibraryDetail(view, state) {
+  state.detailOpen = true;
+  view.querySelector(".lib-detail").classList.add("is-open");
+}
+
+function selectLibraryServer(view, state, name) {
+  state.tab = "mcp"; state.selected.mcp = name; state.filter = state.filter === "own" ? "all" : state.filter;
+  paintSkillsView(view);
+  const server = libraryReport?.servers?.find((one) => one.name === name);
+  if (server) paintServerDetail(view, state, server);
+  openLibraryDetail(view, state);
+}
+
+function libraryFacts(rows) {
+  const facts = skillElement("dl", "lib-facts");
+  for (const [term, value, mono] of rows) {
+    if (!value) continue;
+    facts.append(skillElement("dt", "", term));
+    const dd = skillElement("dd", mono ? "is-mono" : "");
+    if (value instanceof Node) dd.append(value); else dd.textContent = value;
+    facts.append(dd);
+  }
+  return facts;
+}
+
+function paintServerDetail(view, state, server) {
+  const host = view.querySelector(".skills-detail-content");
+  view.querySelector(".skills-detail-empty").hidden = true; host.hidden = false;
+  state.painted = `mcp:${server.name}`;
+  const parts = [libraryDetailBack(view, state), skillElement("p", "lib-eyebrow", t("library.mcp.eyebrow", "MCP 서버")), skillElement("h2", "lib-detail-name", server.name)];
+  parts.push(skillElement("p", "lib-path", `${libraryReport?.store_mcp ?? "~/.agents/mcp.json"} · ${server.name}`));
+  if (server.pick?.length) parts.push(...libraryPickBlock(view, state, server));
+  if (server.own && !server.shared) {
+    const note = skillElement("div", "lib-note is-you");
+    note.append(skillElement("strong", "", t("library.own.title", "{{who}} 전용", { who: libraryWho(server.own) })));
+    note.append(document.createTextNode(` — ${t("library.own.body", "그 에이전트가 자기 기능으로 넣은 서버라 다른 에이전트와 나누지 않습니다.")} `));
+    note.append(libraryButton(t("library.own.share", "모두에게 공유"), () => void libraryAct(view, state, "library_server_share", { name: server.name }), "btn btn--sm"));
+    parts.push(note);
+  }
+  const actions = skillElement("div", "lib-actions");
+  const check = libraryButton(t("library.mcp.check", "연결 확인"), async () => {
+    check.disabled = true; check.replaceChildren(iconNode("loader"), document.createTextNode(t("library.mcp.checking", "확인 중…")));
+    try {
+      const answer = await invoke("library_server_check", { name: server.name });
+      const words = answer.state === "connected" ? t("library.mcp.connected", "연결됨") : answer.state === "failed" ? t("library.mcp.failed", "연결 안 됨") : t("library.mcp.unknown", "확인할 수 없음(창의 Claude Code가 필요)");
+      result.textContent = answer.detail ? `${words} · ${answer.detail}` : words;
+      result.className = `lib-check is-${answer.state}`;
+    } catch (error) { result.textContent = skillsError(error); }
+    finally { check.disabled = false; check.replaceChildren(iconNode("activity"), document.createTextNode(t("library.mcp.check", "연결 확인"))); }
+  }, "btn btn--sm", "activity");
+  check.disabled = server.disabled || !server.in_store;
+  const result = skillElement("p", "lib-check", "");
+  actions.append(check);
+  if (server.in_store) actions.append(libraryButton(t("library.mcp.edit", "고치기"), () => openLibraryAdd(view, state, { server }), "btn btn--sm", "pencil"));
+  if (server.in_store) actions.append(libraryButton(t("library.delete", "삭제…"), () => confirmLibraryDelete(view, state, { server }), "btn btn--sm btn--halt", "trash"));
+  parts.push(actions, result);
+  const secretsWord = server.kind === "stdio" ? t("library.mcp.env", "환경 변수") : t("library.mcp.headers", "헤더");
+  const secrets = server.secrets?.length ? skillElement("span", "lib-secrets") : null;
+  if (secrets) for (const name of server.secrets) { const item = skillElement("span", "lib-secret"); item.append(skillElement("span", "", name), skillElement("span", "lib-secret-mask", "••••••")); secrets.append(item); }
+  parts.push(libraryFacts([
+    [t("library.mcp.kind", "실행"), libraryKindWord(server.kind)],
+    [server.kind === "stdio" ? t("library.mcp.command", "명령") : t("library.mcp.address", "주소"), server.summary, true],
+    [secretsWord, secrets],
+    [t("library.mcp.origin", "출처"), server.origin ? `${libraryWho(server.origin)}${server.at_ms ? ` · ${agoWord(server.at_ms, Date.now())}` : ""}` : ""],
+  ]));
+  const agents = server.agents ?? [];
+  const head = skillElement("h3", "lib-section");
+  head.append(document.createTextNode(t("library.mcp.agents", "에이전트별")), skillElement("span", "lib-quiet", `${agents.filter((a) => a.state === "has").length}/${agents.length}`));
+  parts.push(head);
+  const list = skillElement("ul", "lib-agent-list");
+  for (const row of agents) {
+    const agent = libraryReport?.agents?.find((one) => one.id === row.id);
+    if (!agent) continue;
+    const item = skillElement("li", "lib-agent-row");
+    item.append(agentIcon({ id: agent.id, name: agent.label, favicon_domain: agent.favicon_domain }), skillElement("span", "lib-agent-name", agent.label));
+    item.append(statusNode(libraryAgentState(row.state)));
+    const tail = skillElement("span", "lib-agent-tail");
+    if (server.kind !== "stdio" && agent.login && row.state === "has") {
+      // A sign-in is the person's: an agent pressing in the window is refused here and by the backend.
+      const login = libraryButton(t("library.mcp.login", "로그인"), () => void libraryLogin(server.name, agent.id), "btn btn--sm");
+      login.dataset.personOnly = "";
+      tail.append(login);
+    }
+    if (!["elsewhere", "unsupported", "unreadable"].includes(row.state)) {
+      const on = !(server.off ?? []).includes(agent.id);
+      tail.append(librarySwitch(on, t("library.mcp.agentTip", "{{agent}}에서 {{name}}", { agent: agent.label, name: server.name }), (next) => void libraryAct(view, state, "library_server_agent", { name: server.name, agent: agent.id, on: next }), server.disabled || !server.in_store));
+    }
+    item.append(tail);
+    list.append(item);
+  }
+  parts.push(list, skillElement("p", "lib-quiet", t("library.mcp.loginNote", "로그인은 에이전트마다 따로입니다. 토큰을 에이전트끼리 복사하지 않습니다. 이미 열린 세션은 다시 열면 바뀐 목록을 봅니다.")));
+  host.replaceChildren(...parts);
+}
+function libraryAgentState(state) {
+  switch (state) {
+    case "has": return { tone: "ok", text: t("library.agent.has", "봄") };
+    case "missing": return { tone: "part", text: t("library.agent.missing", "맞추는 중") };
+    case "off": return { tone: "off", text: t("library.agent.off", "끔") };
+    case "elsewhere": return { tone: "own", text: t("library.agent.elsewhere", "나누지 않음") };
+    case "differs": return { tone: "you", text: t("library.agent.differs", "다른 내용") };
+    case "unreadable": return { tone: "you", text: t("library.agent.unreadable", "설정을 못 읽음") };
+    case "unsupported": return { tone: "off", text: t("library.agent.unsupported", "이 방식은 못 받음") };
+    default: return { tone: "part", text: state };
+  }
+}
+function libraryPickBlock(view, state, server) {
+  const note = skillElement("div", "lib-note is-you");
+  note.append(skillElement("strong", "", t("library.pick.title", "하나 고르기")), document.createTextNode(` — ${t("library.pick.body", "같은 이름이 에이전트마다 다르게 적혀 있었습니다. 고르면 모든 에이전트가 그것을 씁니다.")}`));
+  const group = skillElement("div", "lib-pick");
+  group.setAttribute("role", "radiogroup");
+  group.setAttribute("aria-label", t("library.pick.title", "하나 고르기"));
+  server.pick.forEach((candidate, index) => {
+    const label = skillElement("label", "lib-pick-option");
+    const input = document.createElement("input");
+    input.type = "radio"; input.name = `lib-pick-${server.name}`; input.value = candidate.fingerprint; input.checked = index === 0;
+    const words = skillElement("span", "lib-pick-words");
+    words.append(skillElement("strong", "is-mono", candidate.summary), skillElement("span", "lib-quiet", `${candidate.remote ? t("library.kind.remote", "원격") : t("library.kind.stdio", "로컬 실행")} · ${candidate.agents.map(libraryWho).join(", ")}`));
+    label.append(input, words);
+    group.append(label);
+  });
+  const choose = libraryButton(t("library.pick.apply", "이것으로 맞추기"), () => {
+    const picked = group.querySelector("input:checked")?.value;
+    if (picked) void libraryAct(view, state, "library_server_choose", { name: server.name, fingerprint: picked });
+  }, "btn btn--primary btn--sm");
+  return [note, group, choose];
+}
+async function libraryLogin(name, agent) {
+  const started = handNow();
+  try {
+    const command = await invoke("library_server_login", { name, agent }, { hand: flowHand(started) });
+    await openSkillTerminal(command, skillsReport?.policy);
+  } catch (error) { showError(skillsError(error)); }
+}
+
 async function selectSkillFamily(view, id, variantId = null) {
-  const state = skillsViews.get(view), row = state.rows.get(id); if (!row) return;
+  const state = wireSkillsView(view);
+  const family = skillsReport?.families?.find((one) => one.id === id);
+  if (!family) return;
+  state.tab = "skills";
   view.classList.add("has-detail");
-  state.selected = id; const generation = ++state.generation;
-  filterSkillsView(view);
+  state.selected.skills = id; const generation = ++state.generation;
+  state.painted = `skills:${id}`;
+  filterLibraryList(view, state);
+  openLibraryDetail(view, state);
   const host = view.querySelector(".skills-detail-content");
   view.querySelector(".skills-detail-empty").hidden = true; host.hidden = false;
   host.replaceChildren(skillElement("p", "", skillText("loading")));
   try {
-    const variant = row.family.variants.find((v) => v.id === variantId) ?? row.family.variants[0];
+    const variant = family.variants.find((v) => v.id === variantId) ?? storeVariant(family) ?? family.variants[0];
     const detail = await invoke("skill_detail", { id: variant.id });
     if (generation !== state.generation || !view.isConnected) return;
-    host.replaceChildren();
-    host.append(skillElement("p", "skills-eyebrow", skillText("detail")), skillElement("h2", "", row.family.name));
-    const select = skillElement("select", "skills-variant"); select.setAttribute("aria-label", skillText("variant"));
-    for (const v of row.family.variants) select.append(skillOption(`${v.source_label} · ${v.version ?? skillText("unversioned")}`, v.id, false, v.id === variant.id));
-    select.addEventListener("change", () => void selectSkillFamily(view, id, select.value)); host.append(select);
-    host.append(skillElement("p", "skills-detail-path", variant.file));
-    if (variant.version) host.append(skillElement("p", "skills-meta", skillText("version", { version: variant.version })));
-    if (row.family.outdated_ids?.includes(variant.id)) host.append(skillElement("p", "skills-conflict", skillText("outdated", { latest: row.family.latest_version })));
-    if (variant.digest) host.append(skillElement("p", "skills-digest", `SHA-256 · ${variant.digest}`));
-    const actions = skillElement("div", "skills-actions");
-    if (row.family.bundled_name) {
-      actions.append(skillButton("bundledSync", () => void installRequiredSkill(view, row.family.bundled_name)));
-    } else {
-      actions.append(skillButton("install", () => openSkillBundle(view, [row.family.name])),
-        skillButton("update", () => void prepareSkillInstall(view, [row.family.name], [], "update")));
+    const record = librarySkillRecord(family.name);
+    const parts = [libraryDetailBack(view, state), skillElement("p", "lib-eyebrow", skillText("detail")), skillElement("h2", "lib-detail-name", family.name)];
+    if (family.variants.length > 1) {
+      const select = skillElement("select", "skills-variant"); select.setAttribute("aria-label", skillText("variant"));
+      for (const v of family.variants) {
+        const option = document.createElement("option"); option.value = v.id; option.selected = v.id === variant.id;
+        option.textContent = `${v.source_label} · ${v.version ?? skillText("unversioned")}`; select.append(option);
+      }
+      select.addEventListener("change", () => void selectSkillFamily(view, id, select.value)); parts.push(select);
     }
-    actions.append(skillButton("reveal", () => void invoke("skill_reveal", { path: variant.file }).catch(showError)));
-    host.append(actions);
+    parts.push(skillElement("p", "lib-path skills-detail-path", variant.file));
+    if (record?.pick?.length) parts.push(...librarySkillPickBlock(view, state, family, record));
+    if (family.outdated_ids?.includes(variant.id)) parts.push(skillElement("p", "lib-note", skillText("outdated", { latest: family.latest_version })));
+    const actions = skillElement("div", "lib-actions");
+    actions.append(libraryButton(t("library.skill.edit", "편집기로 열기"), () => void openFile(variant.file).catch(showError), "btn btn--sm", "pencil"));
+    actions.append(libraryButton(skillText("reveal"), () => void invoke("skill_reveal", { path: variant.file }).catch(showError), "btn btn--sm", "folder-open"));
+    if (family.bundled_name) {
+      actions.append(libraryButton(skillText("bundledSync"), () => void installRequiredSkill(view, family.bundled_name), "btn btn--sm", "refresh"));
+    } else if (storeVariant(family)) {
+      actions.append(libraryButton(skillText("update"), () => void prepareSkillInstall(view, [family.name], [], "update"), "btn btn--sm", "refresh"));
+    }
+    if (!storeVariant(family) && variant.source_kind !== "plugin") {
+      actions.append(libraryButton(t("library.skill.share", "모든 에이전트에 공유"), () => void libraryAct(view, state, "library_skill_import", { path: variant.directory }), "btn btn--sm", "share"));
+    }
+    if (storeVariant(family)) {
+      actions.append(libraryButton(t("library.delete", "삭제…"), () => confirmLibraryDelete(view, state, { family }), "btn btn--sm btn--halt", "trash"));
+    }
+    parts.push(actions);
+    const usage = family.usage ?? {};
+    parts.push(libraryFacts([
+      [t("library.skill.origin", "출처"), skillOrigin(family)],
+      [skillText("evidence"), usage.count_7d ? skillText("usage", { count: usage.count_7d, last: agoWord(usage.last_used_ms, Date.now()), agents: (usage.agents ?? []).join(", ") }) : skillText("unused")],
+      [t("library.skill.version", "버전"), variant.version ?? ""],
+    ]));
+    const seen = new Set(skillSeenBy(family).map((agent) => agent.id));
+    const head = skillElement("h3", "lib-section");
+    head.append(document.createTextNode(t("library.skill.agents", "보는 에이전트")), skillElement("span", "lib-quiet", `${seen.size}/${libraryAgents().length}`));
+    const list = skillElement("ul", "lib-agent-list");
+    for (const agent of libraryAgents()) {
+      const item = skillElement("li", "lib-agent-row");
+      item.append(agentIcon({ id: agent.id, name: agent.label, favicon_domain: agent.favicon_domain }), skillElement("span", "lib-agent-name", agent.label));
+      item.append(statusNode(seen.has(agent.id) ? { tone: "ok", text: t("library.agent.has", "봄") } : { tone: "off", text: t("library.agent.notSeen", "못 봄") }));
+      item.dataset.tip = libraryAgentHow(agent);
+      list.append(item);
+    }
+    parts.push(head, list);
     const evidence = skillElement("div", "skills-detail-evidence");
-    evidence.append(skillElement("h3", "", skillText("evidence")));
-    if (!detail?.evidence?.length) evidence.append(skillElement("p", "", skillText("unused")));
     for (const event of detail?.evidence ?? []) {
       const line = skillElement("p", "", `${event.agent} · ${event.pane} · ${new Date(event.at_ms).toLocaleString()}`);
       line.dataset.tip = event.source; evidence.append(line);
     }
-    host.append(evidence);
-    const markdown = skillElement("div", "md-page skills-markdown"); host.append(markdown);
+    if (evidence.childElementCount) parts.push(evidence);
+    const markdown = skillElement("div", "md-page skills-markdown");
+    parts.push(markdown);
+    host.replaceChildren(...parts);
     const previous = mdWhere;
     try { mdWhere = { base: variant.directory, page: markdown }; paintMarkdownView(markdown, detail?.markdown ?? ""); } finally { mdWhere = previous; }
-    view.querySelector(".skills-detail").scrollIntoView({ block: "nearest" });
   } catch (error) { if (generation === state.generation) host.replaceChildren(skillElement("p", "skills-error", skillsError(error))); }
 }
+function librarySkillPickBlock(view, state, family, record) {
+  const note = skillElement("div", "lib-note is-you");
+  note.append(skillElement("strong", "", t("library.pick.title", "하나 고르기")), document.createTextNode(` — ${t("library.pick.skillBody", "같은 이름의 스킬이 다른 내용으로 있습니다. 고른 내용이 공통 저장소에 남고, 다른 내용은 다시 묻지 않습니다.")}`));
+  const group = skillElement("div", "lib-pick");
+  group.setAttribute("role", "radiogroup");
+  const option = (value, title, line, checked) => {
+    const label = skillElement("label", "lib-pick-option");
+    const input = document.createElement("input"); input.type = "radio"; input.name = `lib-skill-pick-${family.name}`; input.value = value; input.checked = checked;
+    const words = skillElement("span", "lib-pick-words"); words.append(skillElement("strong", "", title), skillElement("span", "lib-quiet is-mono", line));
+    label.append(input, words); group.append(label);
+  };
+  option("", t("library.pick.store", "공통 저장소의 내용 그대로"), storeVariant(family)?.file ?? "", true);
+  for (const candidate of record.pick) option(candidate.path, libraryWho(candidate.agent), candidate.path, false);
+  const choose = libraryButton(t("library.pick.apply", "이것으로 맞추기"), () => {
+    const picked = group.querySelector("input:checked")?.value ?? "";
+    void libraryAct(view, state, "library_skill_choose", { name: family.name, path: picked || null });
+  }, "btn btn--primary btn--sm");
+  return [note, group, choose];
+}
+
+/* ---- acting --------------------------------------------------------------------- */
+async function libraryAct(view, state, command, args, options = undefined) {
+  try {
+    const answer = await invoke(command, args, options);
+    if (answer && typeof answer === "object" && Array.isArray(answer.servers)) libraryReport = answer;
+    // A skill moved on disk: the discovery reads its folders again. A
+    // server's change is all in the answer.
+    if (command.startsWith("library_skill") || command === "library_undo" || command === "library_pause") await refreshSkills(true);
+    else for (const tab of tabs.filter((one) => one.kind === "skills")) paintSkillsView(docHost(tab.pane, "skills"));
+    const newest = libraryReport?.log?.find((row) => row.undo);
+    const done = newest && Date.now() - newest.at_ms < LIBRARY_TOAST_MS ? newest : null;
+    libraryToast(view, state, done ? libraryLogWords(done) : t("library.done", "반영했습니다"), done ? () => libraryAct(view, state, "library_undo", { id: done.id }) : null);
+    return answer;
+  } catch (error) {
+    libraryToast(view, state, skillsError(error), null);
+    return null;
+  }
+}
+function libraryToast(view, state, words, undo) {
+  const toast = view.querySelector(".lib-toast");
+  toast.replaceChildren(skillElement("span", "lib-toast-words", words));
+  if (undo) toast.append(libraryButton(t("library.undo", "되돌리기"), () => { toast.classList.remove("is-on"); void undo(); }, "btn btn--sm", "undo-2"));
+  const close = libraryButton("", () => toast.classList.remove("is-on"), "btn btn--ghost btn--sm", "x");
+  labelButton(close, t("library.close", "닫기"));
+  toast.append(close);
+  toast.classList.add("is-on");
+  clearTimeout(state.toastTimer);
+  state.toastTimer = setTimeout(() => toast.classList.remove("is-on"), LIBRARY_TOAST_MS);
+}
+async function toggleLibraryPause(view, state) {
+  await libraryAct(view, state, "library_pause", { paused: !libraryReport?.paused });
+}
+
+/* ---- dialogs -------------------------------------------------------------------- */
+function openLibraryDialog(view, title, about, body, footer) {
+  const scrim = view.querySelector(".lib-scrim");
+  const dialog = skillElement("div", "lib-dialog");
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  const head = skillElement("header", "lib-dialog-head");
+  const heading = skillElement("h2", "", title);
+  heading.id = `lib-dialog-${Date.now()}`;
+  dialog.setAttribute("aria-labelledby", heading.id);
+  head.append(heading);
+  if (about) head.append(skillElement("p", "lib-quiet", about));
+  const inner = skillElement("div", "lib-dialog-body"); inner.append(...body);
+  const foot = skillElement("footer", "lib-dialog-foot"); foot.append(...footer);
+  dialog.append(head, inner, foot);
+  scrim.replaceChildren(dialog);
+  scrim.hidden = false;
+  scrim.onclick = (event) => { if (event.target === scrim) closeLibraryDialog(view); };
+  dialog.addEventListener("keydown", (event) => {
+    if (event.key !== "Tab") return;
+    const focusable = [...dialog.querySelectorAll("button, input, textarea, select, summary")].filter((node) => !node.disabled && node.offsetParent !== null);
+    if (!focusable.length) return;
+    if (event.shiftKey && document.activeElement === focusable[0]) { event.preventDefault(); focusable.at(-1).focus(); }
+    else if (!event.shiftKey && document.activeElement === focusable.at(-1)) { event.preventDefault(); focusable[0].focus(); }
+  });
+  (dialog.querySelector("[data-autofocus]") ?? dialog.querySelector("input, textarea, button"))?.focus();
+  return dialog;
+}
+function closeLibraryDialog(view) {
+  const scrim = view.querySelector(".lib-scrim");
+  scrim.hidden = true; scrim.replaceChildren();
+  view.querySelector(".lib-add")?.focus();
+}
+function libraryField(label, control, hint = null) {
+  const field = skillElement("label", "lib-field");
+  field.append(skillElement("span", "lib-field-label", label), control);
+  if (hint) field.append(skillElement("span", "lib-quiet", hint));
+  return field;
+}
+function libraryInput(placeholder, value = "", type = "text") {
+  const input = document.createElement("input");
+  input.type = type; input.placeholder = placeholder; input.value = value; input.autocomplete = "off"; input.spellcheck = false;
+  input.className = "lib-input";
+  return input;
+}
+function librarySegments(options, picked, change) {
+  const group = skillElement("div", "lib-filters");
+  group.setAttribute("role", "group");
+  const paint = (current) => {
+    group.replaceChildren(...options.map(([value, label]) => {
+      const button = skillElement("button", "lib-seg", label); button.type = "button";
+      button.setAttribute("aria-pressed", String(value === current));
+      button.addEventListener("click", () => { paint(value); change(value); });
+      return button;
+    }));
+  };
+  paint(picked);
+  return group;
+}
+
+/* A command line as words: quotes keep spaces, a backslash keeps the next
+ * character. What a person pastes from a README is what this reads. */
+function splitCommandLine(line) {
+  const words = []; let word = ""; let quote = null; let pending = false;
+  for (let at = 0; at < line.length; at++) {
+    const glyph = line[at];
+    if (glyph === "\\" && quote !== "'" && at + 1 < line.length) { word += line[++at]; pending = true; continue; }
+    if (quote) { if (glyph === quote) quote = null; else word += glyph; continue; }
+    if (glyph === "\"" || glyph === "'") { quote = glyph; pending = true; continue; }
+    if (/\s/.test(glyph)) { if (pending || word) { words.push(word); word = ""; pending = false; } continue; }
+    word += glyph; pending = true;
+  }
+  if (pending || word) words.push(word);
+  return words;
+}
+
+function openLibraryAdd(view, state, { server = null } = {}) {
+  const editing = Boolean(server);
+  let kind = editing ? "mcp" : state.tab === "skills" ? "skill" : "mcp";
+  let how = "form";
+  let from = "repo";
+  const nameInput = libraryInput(t("library.add.namePlaceholder", "github"), server?.name ?? "");
+  nameInput.dataset.autofocus = "true";
+  let transport = server?.kind ?? "stdio";
+  const lineInput = libraryInput(transport === "stdio" ? "npx -y @modelcontextprotocol/server-github" : "https://api.example.com/mcp", server?.summary ?? "");
+  const lineLabel = skillElement("span", "lib-field-label");
+  const secrets = skillElement("div", "lib-secret-rows");
+  const addSecret = (name = "", known = false) => {
+    const row = skillElement("div", "lib-secret-row");
+    const key = libraryInput(t("library.add.secretName", "이름"), name);
+    const value = libraryInput(known ? t("library.add.secretKeep", "비워 두면 그대로") : t("library.add.secretValue", "값 — 화면·기록에 안 남음"), "", "password");
+    const drop = libraryButton("", () => row.remove(), "btn btn--ghost btn--sm", "x");
+    labelButton(drop, t("library.add.secretDrop", "이 줄 빼기"));
+    row.append(key, value, drop);
+    secrets.append(row);
+  };
+  for (const name of server?.secrets ?? []) addSecret(name, true);
+  const secretsLabel = skillElement("span", "lib-field-label");
+  const moreSecret = libraryButton(t("library.add.secretMore", "더하기"), () => addSecret(), "btn btn--ghost btn--sm", "plus");
+  const paint = () => {
+    lineLabel.textContent = transport === "stdio" ? t("library.add.command", "명령") : t("library.add.address", "주소");
+    secretsLabel.textContent = transport === "stdio" ? t("library.mcp.env", "환경 변수") : t("library.mcp.headers", "헤더");
+    lineInput.placeholder = transport === "stdio" ? "npx -y @modelcontextprotocol/server-github" : "https://api.example.com/mcp";
+  };
+  const transportPick = librarySegments([["stdio", t("library.kind.stdio", "로컬 실행")], ["http", t("library.kind.http", "원격 HTTP")], ["sse", t("library.kind.sse", "원격 SSE")]], transport, (value) => { transport = value; paint(); });
+  const lineField = skillElement("label", "lib-field"); lineField.append(lineLabel, lineInput);
+  const secretsField = skillElement("div", "lib-field"); secretsField.append(secretsLabel, secrets, moreSecret);
+  const formPane = skillElement("div", "lib-pane");
+  formPane.append(libraryField(t("library.add.name", "이름"), nameInput), libraryField(t("library.mcp.kind", "실행"), transportPick), lineField, secretsField);
+  if (editing) formPane.append(skillElement("p", "lib-quiet", t("library.add.editNote", "명령·주소를 그대로 두면 지금 값이 유지됩니다. 비밀 값은 비워 두면 그대로입니다.")));
+  paint();
+  const json = document.createElement("textarea");
+  json.className = "lib-json"; json.spellcheck = false;
+  json.placeholder = "{ \"mcpServers\": { \"github\": { \"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-github\"] } } }";
+  json.setAttribute("aria-label", t("library.add.json", "JSON 붙여넣기"));
+  const jsonRead = skillElement("div", "lib-result", t("library.add.jsonHint", "MCP 서버 문서에 흔한 mcpServers 모양을 그대로 붙여 넣으면 이름과 실행 방식을 읽어 냅니다."));
+  let jsonTimer = 0;
+  json.addEventListener("input", () => {
+    clearTimeout(jsonTimer);
+    jsonTimer = setTimeout(async () => {
+      const found = await invoke("library_paste_read", { text: json.value }).catch(() => []);
+      jsonRead.replaceChildren();
+      if (!found.length) { jsonRead.textContent = json.value.trim() ? t("library.err.pasteEmpty", "붙여 넣은 내용에서 서버를 찾지 못했습니다.") : t("library.add.jsonHint", "MCP 서버 문서에 흔한 mcpServers 모양을 그대로 붙여 넣으면 이름과 실행 방식을 읽어 냅니다."); return; }
+      jsonRead.append(skillElement("strong", "", t("library.add.jsonFound", "서버 {{count}}개", { count: found.length })));
+      for (const row of found) jsonRead.append(skillElement("span", "lib-result-line is-mono", `${row.name} · ${libraryKindWord(row.kind)} · ${row.summary}${row.secrets.length ? ` · ${row.secrets.join(", ")}` : ""}`));
+    }, 250);
+  });
+  const jsonPane = skillElement("div", "lib-pane"); jsonPane.hidden = true; jsonPane.append(json, jsonRead);
+  const howPick = librarySegments([["form", t("library.add.form", "직접 입력")], ["json", t("library.add.json", "JSON 붙여넣기")]], how, (value) => { how = value; formPane.hidden = value !== "form"; jsonPane.hidden = value !== "json"; });
+  const mcpPane = skillElement("div", "lib-pane");
+  if (!editing) mcpPane.append(howPick);
+  mcpPane.append(formPane, jsonPane);
+
+  const repo = libraryInput("https://github.com/acme/agent-skills");
+  const repoChoices = skillElement("div", "lib-checks"); repoChoices.hidden = true;
+  const repoCommand = skillElement("pre", "lib-command");
+  const repoCommandBox = document.createElement("details"); repoCommandBox.className = "lib-command-box";
+  repoCommandBox.append(skillElement("summary", "", t("library.add.showCommand", "실행할 명령 보기")), repoCommand);
+  const repoNames = () => [...repoChoices.querySelectorAll("input:checked")].map((input) => input.value);
+  const paintRepoCommand = () => { repoCommand.textContent = `npx skills add ${repo.value.trim()} ${repoNames().map((name) => `--skill ${name}`).join(" ")} --agent codex --global`.replace(/\s+/g, " "); };
+  repo.addEventListener("input", paintRepoCommand);
+  const readRepo = libraryButton(t("library.add.readList", "목록 읽기"), async () => {
+    readRepo.disabled = true; repoChoices.hidden = false; repoChoices.replaceChildren(skillElement("p", "lib-quiet", t("library.add.reading", "저장소의 스킬 목록을 읽는 중… (처음엔 npx가 도구를 받아 옵니다)")));
+    try {
+      const names = await invoke("library_skill_list", { repository: repo.value.trim() });
+      repoChoices.replaceChildren(skillElement("p", "lib-quiet", t("library.add.found", "스킬 {{count}}개를 찾았습니다", { count: names.length })));
+      for (const name of names) {
+        const label = skillElement("label", "lib-check-row"); const input = document.createElement("input");
+        input.type = "checkbox"; input.value = name; input.checked = true; input.addEventListener("change", paintRepoCommand);
+        label.append(input, document.createTextNode(name)); repoChoices.append(label);
+      }
+    } catch (error) { repoChoices.replaceChildren(skillElement("p", "skills-error", skillsError(error))); }
+    finally { readRepo.disabled = false; paintRepoCommand(); }
+  }, "btn btn--sm", "download");
+  const repoRow = skillElement("div", "lib-inline"); repoRow.append(repo, readRepo);
+  const repoPane = skillElement("div", "lib-pane"); repoPane.append(libraryField(t("library.add.repository", "저장소 주소"), repoRow, t("library.add.typedNote", "설치 명령을 새 터미널에 입력해 둡니다. Enter는 직접 누릅니다.")), repoChoices, repoCommandBox);
+  const folder = libraryInput("~/Downloads/my-skill");
+  const pickFolder = libraryButton(t("library.add.pickFolder", "고르기…"), async () => {
+    const picked = await openPathBrowser({ mode: "folder" });
+    const path = Array.isArray(picked) ? picked[0] : picked;
+    if (path) folder.value = path;
+  }, "btn btn--sm", "folder-open");
+  const folderRow = skillElement("div", "lib-inline"); folderRow.append(folder, pickFolder);
+  const folderPane = skillElement("div", "lib-pane"); folderPane.hidden = true;
+  folderPane.append(libraryField(t("library.add.folder", "폴더"), folderRow, t("library.add.folderHint", "폴더 안에 SKILL.md가 있으면 그 폴더 이름으로 공통 저장소에 복사합니다.")));
+  const newName = libraryInput("release-notes"); const newAbout = libraryInput(t("library.add.newAboutPlaceholder", "언제 쓰는 스킬인지 한 줄"));
+  const newPane = skillElement("div", "lib-pane"); newPane.hidden = true;
+  newPane.append(libraryField(t("library.add.name", "이름"), newName, t("library.add.newHint", "공통 저장소에 SKILL.md를 만들고 편집기로 엽니다.")), libraryField(t("library.add.newAbout", "설명"), newAbout));
+  const fromPick = librarySegments([["repo", t("library.add.fromRepo", "저장소 주소")], ["folder", t("library.add.fromFolder", "폴더")], ["new", t("library.add.fromNew", "새로 만들기")]], from, (value) => {
+    from = value; repoPane.hidden = value !== "repo"; folderPane.hidden = value !== "folder"; newPane.hidden = value !== "new"; paintSubmit();
+  });
+  const skillPane = skillElement("div", "lib-pane"); skillPane.append(fromPick, repoPane, folderPane, newPane);
+
+  const kindPick = librarySegments([["mcp", t("library.tab.mcp", "MCP 서버")], ["skill", t("library.tab.skills", "스킬")]], kind, (value) => { kind = value; mcpPane.hidden = value !== "mcp"; skillPane.hidden = value !== "skill"; paintSubmit(); });
+  mcpPane.hidden = kind !== "mcp"; skillPane.hidden = kind !== "skill";
+  const status = skillElement("p", "lib-dialog-status", ""); status.setAttribute("role", "status");
+  const submit = libraryButton("", () => void submitLibraryAdd(), "btn btn--primary");
+  const paintSubmit = () => {
+    submit.textContent = editing ? t("library.add.save", "저장") : kind === "skill" && from === "repo" ? t("library.add.install", "터미널에서 설치") : kind === "skill" && from === "new" ? t("library.add.create", "만들기") : t("library.add", "추가");
+  };
+  paintSubmit();
+  const cancel = libraryButton(t("library.cancel", "취소"), () => closeLibraryDialog(view), "btn");
+  const hint = skillElement("span", "lib-quiet lib-dialog-hint", t("library.add.hint", "공통 저장소에 넣으면 ZeroCode 안의 모든 에이전트가 봅니다. 이미 열린 세션은 다시 열면 보입니다."));
+  const body = editing ? [mcpPane, status] : [kindPick, mcpPane, skillPane, status];
+  openLibraryDialog(view, editing ? t("library.add.editTitle", "{{name}} 고치기", { name: server.name }) : t("library.add.title", "추가"), null, body, [hint, cancel, submit]);
+
+  async function submitLibraryAdd() {
+    status.textContent = "";
+    if (kind === "mcp" && how === "json" && !editing) {
+      const done = await libraryAct(view, state, "library_paste_add", { text: json.value });
+      if (done) { closeLibraryDialog(view); state.tab = "mcp"; paintSkillsView(view); }
+      return;
+    }
+    if (kind === "mcp") {
+      const name = nameInput.value.trim();
+      const words = splitCommandLine(lineInput.value.trim());
+      if (!name) { nameInput.focus(); return; }
+      if (!words.length) { lineInput.focus(); return; }
+      const pairs = {};
+      for (const row of secrets.querySelectorAll(".lib-secret-row")) {
+        const [key, value] = row.querySelectorAll("input");
+        if (key.value.trim()) pairs[key.value.trim()] = value.value;
+      }
+      const server_ = transport === "stdio"
+        ? { type: "stdio", command: words[0], args: words.slice(1), env: pairs }
+        : { type: transport, url: words[0], headers: pairs };
+      const done = await libraryAct(view, state, "library_server_save", { name, server: server_, previous: server?.name ?? null, shown: server?.summary ?? null });
+      if (done) { closeLibraryDialog(view); selectLibraryServer(view, state, name); }
+      return;
+    }
+    if (from === "repo") {
+      const names = repoNames();
+      if (!names.length) { readRepo.focus(); status.textContent = skillText("selectTargets"); return; }
+      closeLibraryDialog(view);
+      await prepareSkillInstall(view, names, ["codex"], "install", repo.value.trim() || null);
+      return;
+    }
+    if (from === "folder") {
+      if (!folder.value.trim()) { folder.focus(); return; }
+      const done = await libraryAct(view, state, "library_skill_import", { path: folder.value.trim() });
+      if (done) closeLibraryDialog(view);
+      return;
+    }
+    if (!newName.value.trim()) { newName.focus(); return; }
+    try {
+      const path = await invoke("library_skill_create", { name: newName.value.trim(), description: newAbout.value.trim() });
+      closeLibraryDialog(view);
+      await refreshSkills(true);
+      await openFile(path);
+    } catch (error) { status.textContent = skillsError(error); }
+  }
+}
+
+function confirmLibraryDelete(view, state, { server = null, family = null }) {
+  const name = server?.name ?? family?.name;
+  const list = skillElement("ul", "lib-delete-list");
+  const row = (where, what, mono = true) => { const item = skillElement("li", ""); item.append(skillElement("span", mono ? "is-mono" : "", where), skillElement("span", "lib-quiet", what)); list.append(item); };
+  let copies = null;
+  let copiesLabel = null;
+  if (server) {
+    row(`${libraryReport?.store_mcp ?? "~/.agents/mcp.json"}`, t("library.delete.storeServer", "항목 빼기"));
+    for (const agent of (server.agents ?? []).filter((one) => one.state === "has")) row(libraryWho(agent.id), t("library.delete.fromAgent", "그 에이전트 설정에서 빼기 · 바꾸기 전 백업"), false);
+  } else {
+    row(storeVariant(family)?.directory ?? name, t("library.delete.trash", "휴지통으로"));
+    const others = family.variants.filter((variant) => variant.source_id !== LIBRARY_STORE_ROOT && variant.source_kind === "home");
+    if (others.length) {
+      const label = skillElement("label", "lib-check-row");
+      copies = document.createElement("input"); copies.type = "checkbox";
+      label.append(copies, document.createTextNode(t("library.delete.copies", "에이전트 폴더의 사본 {{count}}개도 휴지통으로 (이 Mac의 Claude 폴더는 그대로)", { count: others.length })));
+      copiesLabel = label;
+    }
+  }
+  const body = [list];
+  if (copiesLabel) body.push(copiesLabel);
+  body.push(skillElement("p", "lib-quiet", t("library.delete.undo", "「최근 변경」에서 되돌릴 수 있습니다.")));
+  const cancel = libraryButton(t("library.cancel", "취소"), () => closeLibraryDialog(view), "btn");
+  cancel.dataset.autofocus = "true";
+  const go = libraryButton(t("library.delete.go", "삭제"), async () => {
+    const started = handNow();
+    go.disabled = true;
+    const done = server
+      ? await libraryAct(view, state, "library_server_remove", { name }, { hand: flowHand(started) })
+      : await libraryAct(view, state, "library_skill_remove", { name, copies: Boolean(copies?.checked) }, { hand: flowHand(started) });
+    closeLibraryDialog(view);
+    if (done) { state.selected[state.tab] = null; state.painted = null; state.detailOpen = false; paintSkillsView(view); }
+  }, "btn btn--halt", "trash");
+  const dialog = openLibraryDialog(view, server ? t("library.delete.titleServer", "MCP 서버 {{name}}을(를) 삭제할까요?", { name }) : t("library.delete.titleSkill", "스킬 {{name}}을(를) 삭제할까요?", { name }),
+    t("library.delete.about", "공통 저장소에서 지워 ZeroCode 안의 모든 에이전트에서 사라집니다."), body, [cancel, go]);
+  // A removal is the person's: an agent pressing in the window is refused here and by the backend.
+  dialog.dataset.personOnly = "";
+}
+
+/* ---- terminals: the npx road, kept for the update and the repository install -- */
 async function openSkillTerminal(command, policy = skillsReport?.policy) {
   if (!policy) { await refreshSkills(); policy = skillsReport?.policy; }
   if (!policy || /[\r\n]/.test(command)) throw new Error(skillText("invalidPlan"));
   setSettingsOpen(false);
   const term = await invoke("open_term_tab", { rows: policy.terminal_rows, cols: policy.terminal_cols, plain: true });
   mountTermTab(term);
+  // Typed, never run: the Enter is the person's.
   await invoke("term_text", { term, text: command });
   skillsInstallTerm = term; skillsNeedsRescan = true;
   watchSkillInstall(term, skillsReport?.policy);
@@ -6138,57 +7125,19 @@ async function openSkillTerminal(command, policy = skillsReport?.policy) {
 async function prepareSkillInstall(view, names, agents, action = "install", repository = null) {
   try {
     const plan = await invoke("skill_install_plan", { names, agents, action, repository });
-    if (action !== "list") view.querySelector(".skills-bundle").hidden = true;
     await openSkillTerminal(plan.command, { terminal_rows: plan.rows, terminal_cols: plan.cols });
   } catch (error) {
-    const note = view.querySelector(".skills-bundle:not([hidden]) .skills-bundle-note") ?? view.querySelector(".skills-error"); note.hidden = false; note.textContent = skillsError(error);
+    const note = view.querySelector(".skills-error"); note.hidden = false; note.textContent = skillsError(error);
   }
-}
-function openSkillBundle(view, selectedNames = null) {
-  const box = view.querySelector(".skills-bundle"); box.hidden = false; box.replaceChildren();
-  box.append(skillElement("h2", "", skillText("bundle")), skillElement("p", "", skillText("manualRun")));
-  const repo = skillElement("input", "skills-repository"); repo.type = "url"; repo.placeholder = skillText("repository"); repo.setAttribute("aria-label", skillText("repository"));
-  const output = skillElement("textarea", "skills-bundle-output"); output.placeholder = skillText("pasteOutput"); output.setAttribute("aria-label", skillText("pasteOutput"));
-  if (skillsReport?.policy?.max_evidence_bytes) output.maxLength = skillsReport.policy.max_evidence_bytes;
-  const choices = skillElement("fieldset", "skills-bundle-choices"); choices.append(skillElement("legend", "", skillText("chooseSkills")));
-  const agents = skillElement("fieldset", "skills-bundle-agents"); agents.append(skillElement("legend", "", skillText("chooseAgents")));
-  const addChoice = (parent, name, label, checked) => {
-    const node = skillElement("label", "skills-choice"); const input = document.createElement("input"); input.type = "checkbox"; input.value = name; input.checked = checked;
-    node.append(input, document.createTextNode(label)); parent.append(node);
-  };
-  const fill = (names) => { for (const node of choices.querySelectorAll("label")) node.remove(); for (const name of names) addChoice(choices, name, name, true); };
-  const externalAgents = skillsReport?.external_agents ?? skillsReport?.agents ?? [];
-  for (const [id, label] of externalAgents) addChoice(agents, id, label, true);
-  const unavailable = skillsReport?.external_unavailable ?? [];
-  if (unavailable.length) agents.append(skillElement("p", "skills-evidence-scope", skillText("externalUnavailable", { agents: unavailable.join(", ") })));
-  if (selectedNames) fill(selectedNames);
-  const note = skillElement("p", "skills-bundle-note"); note.setAttribute("role", "status");
-  const parse = async () => {
-    try {
-      const result = await invoke("skill_bundle_parse", { output: output.value });
-      fill(result.names ?? []); note.textContent = result.error || (result.names?.length ? "" : skillText("noBundleSkills"));
-    } catch (error) { note.textContent = skillsError(error); }
-  };
-  const list = skillButton("listBundle", () => void prepareSkillInstall(view, [], [], "list", repo.value));
-  const read = skillButton("readTerminal", async () => {
-    if (skillsInstallTerm === null) { note.textContent = skillText("noTerminal"); return; }
-    try {
-      const frame = await invoke("term_snapshot", { term: skillsInstallTerm });
-      output.value = (frame?.rows ?? []).map((row) => row.text ?? "").join("\n"); await parse();
-    } catch (error) { note.textContent = skillsError(error); }
-  });
-  const run = skillButton("prepare", () => {
-    const names = [...choices.querySelectorAll("input:checked")].map((n) => n.value);
-    const targets = [...agents.querySelectorAll("input:checked")].map((n) => n.value);
-    if (!names.length || !targets.length) { note.textContent = skillText("selectTargets"); return; }
-    void prepareSkillInstall(view, names, targets, "install", repo.value || null);
-  });
-  run.disabled = externalAgents.length === 0;
-  box.append(repo, list, output, read, skillButton("parseOutput", () => void parse()), choices, agents, note, run, skillButton("close", () => { box.hidden = true; view.querySelector(".skills-bundle-open").focus(); }));
-  repo.focus();
 }
 window.addEventListener("focus", () => {
   if (skillsNeedsRescan && tabs.some((tab) => tab.kind === "skills" && stillShowing(tab))) void refreshSkills(true);
+});
+/* The keeper moved something: the page shows it if it is showing, and reads
+ * again when it is next opened if it is not. */
+listen("library:changed", () => {
+  if (tabs.some((tab) => tab.kind === "skills" && stillShowing(tab))) void refreshSkills(true);
+  else skillsNeedsRescan = true;
 });
 
 function skillInstallSummary(outcomes) {
@@ -6224,13 +7173,14 @@ function releaseSkillsView(tab) {
   const view = groups.get(tab.pane)?.skillsView;
   const state = view && skillsViews.get(view);
   if (!state) return;
-  state.generation++; state.rows.clear(); state.selected = null; state.report = null;
-  view.querySelector(".skills-card-list").replaceChildren();
+  state.generation++; state.selected = { skills: null, mcp: null }; state.painted = null; state.detailOpen = false;
+  for (const part of view.querySelectorAll(".lib-part")) part.replaceChildren();
+  state.rows.skills.clear(); state.rows.mcp.clear();
   view.querySelector(".skills-detail-content").replaceChildren();
-  view.querySelector(".skills-bundle").replaceChildren();
-  view.querySelector(".skills-bundle").hidden = true;
   view.querySelector(".skills-detail-content").hidden = true;
   view.querySelector(".skills-detail-empty").hidden = false;
+  view.querySelector(".lib-scrim").hidden = true;
+  view.querySelector(".lib-scrim").replaceChildren();
   view.classList.remove("has-detail");
 }
 
@@ -6308,6 +7258,8 @@ const ARTIFACT_TOKENS = Object.freeze({
   outlineOffset: "--artifact-outline-offset",
   taskRow: "--artifact-task-row-height",
   tierRail: "--artifact-tier-rail",
+  listMin: "--artifact-list-min",
+  gripStep: "--artifact-grip-step",
 });
 const ARTIFACT_KIND_GLYPH = Object.freeze({
   report: "ft-file-text",
@@ -6370,7 +7322,8 @@ const ARTIFACT_TABS = Object.freeze([
   { tab: "reports", kinds: ["report"], key: "artifacts.kind.report", word: "보고서", plain: true },
   { tab: "evidence", kinds: ["screenshot", "evidence"], key: "artifacts.kind.evidence", word: "증거", plain: true },
   { tab: "pages", kinds: ["page", "document", "web"], key: "artifacts.tab.pages", word: "페이지·문서" },
-  { tab: "other", kinds: ["export", "transcript", "other"], key: "artifacts.kind.other", word: "기타" },
+  // 기타(내보내기 · 대화록)도 그림이 없는 종류라 글이 얼굴이다(2026-11-06) — 빈 얼굴에 아이콘 하나가 서던 것.
+  { tab: "other", kinds: ["export", "transcript", "other"], key: "artifacts.kind.other", word: "기타", plain: true },
 ]);
 /* 작업별 탭의 이름 — 카드가 아니라 작업의 줄이 서는 단 하나의 탭 — 과, 작업이 없는
  * 카탈로그가 서는 탭(늘 서 있는 탭이기도 하다). */
@@ -6412,12 +7365,16 @@ const ARTIFACT_CLEAR_WORDS = Object.freeze({
 });
 /* 목차가 서는 보고서의 머리말 수 — 하나뿐이면 목차가 말할 것이 없다. */
 const ARTIFACT_OUTLINE_MIN_HEADS = 2;
-/* 카드 아래 줄의 표식 — claude.ai의 🌐(공유됨)/🔒(비공개)를 우리 뜻으로: 🌐는
- * claude.ai에 올라간 것, 🔒는 이 기계에만 있는 것. 낱말이 아니라 글리프라
- * 카탈로그를 타지 않는다. */
-const ARTIFACT_WHEN_GLYPH = Object.freeze({ remote: "🌐", local: "🔒" });
 /* 렌더 썸네일을 청하는 종류 — 백엔드 `ArtifactKind::renders_thumbnail`과 같은 둘. */
 const ARTIFACT_THUMB_KINDS = new Set(["page", "web"]);
+/* 카드에만 작은 그림을 청하는 종류(2026-11-06) — 백엔드 `ArtifactKind::renders_thumbnail`이 함께 그리는
+ * 스크린샷. 그림은 글 카드의 오른쪽 위에 서고, 읽는 칸은 여전히 원본 미리보기를 읽는다. 원본(최대 4 MiB)을
+ * 카드마다 들던 것이 t-54317의 까닭이었다 — 런타임이 줄인 그림은 페이지 썸네일과 같은 캐시 상한 안이다. */
+const ARTIFACT_SMALL_THUMB_KINDS = new Set(["screenshot"]);
+/* 자동화가 만든 것(Computer Use 기록)은 에이전트 대신 자동화의 이름이 만든 이로 선다. */
+const ARTIFACT_AUTOMATION_WORDS = Object.freeze({
+  "computer-use": { key: "computerUse.title", word: "Computer Use" },
+});
 /* 출처의 칸과 그 칸이 서랍에서 부르는 낱말. 순서는 서랍의 표 순서다. 낱말은
  * `{ key, word }`로 실려 `t`가 갈아입힌다 — 테마 픽커와 같은 문법. */
 const ARTIFACT_ORIGIN_FIELDS = Object.freeze([
@@ -6468,7 +7425,38 @@ const ARTIFACT_LABELS = Object.freeze({
   compare: { key: "artifacts.strip.compare", word: "나란히" },
   export: { key: "artifacts.strip.export", word: "내보내기" },
   more: { key: "artifacts.strip.more", word: "머리띠의 다른 행동" },
+  // 읽는 칸(2026-11-06): 넓게 읽기 · 손잡이 · 목차 열 · 그림 자리 · 검색이 비운 화면.
+  wide: { key: "artifacts.wide", word: "넓게 읽기", glyph: "panel" },
+  copy: ARTIFACT_ACTIONS.find((row) => row.action === "copy"),
+  grip: { key: "artifacts.grip", word: "읽는 칸 폭 — 끌어서 바꾸고, 두 번 눌러 되돌립니다" },
+  outlineRail: { key: "artifacts.outline.rail", word: "이 보고서의 목차" },
+  placeholder: { key: "artifacts.placeholder", word: "아직 그림이 없습니다 — 한 번 열면 그림이 생깁니다." },
+  emptySearch: { key: "artifacts.emptySearch", word: "「{{query}}」와 맞는 것이 없습니다" },
+  emptySearchHint: { key: "artifacts.emptySearchHint", word: "제목에서 찾았습니다. Enter를 누르면 본문까지 찾습니다." },
+  clearSearch: { key: "artifacts.clearSearch", word: "검색 지우기" },
 });
+
+/* 읽는 칸의 사람 몫(2026-11-06): 손잡이로 끈 서랍의 폭(px — 없으면 판의 반)과 넓게 읽기. 이 창의 편의라
+ * 브라우저 저장소에 두고, 못 읽으면 기본으로 선다. */
+const ARTIFACT_READER_KEY = "zerocode.artifacts.reader.v1";
+const artifactReader = readArtifactReader();
+
+function readArtifactReader() {
+  try {
+    const held = JSON.parse(localStorage.getItem(ARTIFACT_READER_KEY) ?? "{}");
+    return { width: Number.isFinite(held?.width) && held.width > 0 ? held.width : null, wide: held?.wide === true };
+  } catch {
+    return { width: null, wide: false };
+  }
+}
+
+function keepArtifactReader() {
+  try {
+    localStorage.setItem(ARTIFACT_READER_KEY, JSON.stringify(artifactReader));
+  } catch {
+    // 편의일 뿐이다 — 저장소가 막혀도 이번 창에서는 그대로 선다.
+  }
+}
 
 /* 카탈로그 — 백엔드가 마지막으로 답한 행들, id로. 이 맵 하나가 창이 아는 전부다. */
 const artifactRows = new Map();
@@ -6571,6 +7559,8 @@ function artifactTuning(view) {
     outlineOffset: read(ARTIFACT_TOKENS.outlineOffset, 84),
     taskRow: read(ARTIFACT_TOKENS.taskRow, 96),
     tierRail: read(ARTIFACT_TOKENS.tierRail, 1100),
+    listMin: read(ARTIFACT_TOKENS.listMin, 240),
+    gripStep: read(ARTIFACT_TOKENS.gripStep, 24),
   };
   artifactTunings.set(view, tuning);
   return tuning;
@@ -6692,6 +7682,10 @@ async function refreshArtifacts() {
       artifactThumbs.delete(id);
       artifactThumbFailed.delete(id);
       artifactPreviews.delete(id);
+      // The page's shot key goes with its picture: a card that leaves the list
+      // and comes back with the same key would otherwise read as 「being shot」
+      // with no picture, and stay a glyph (v1.1.128 review t-97710 P2).
+      artifactSeenShots.delete(id);
     }
     artifactRows.clear();
     for (const [id, row] of incoming) artifactRows.set(id, row);
@@ -7751,28 +8745,67 @@ function buildArtifactsView() {
   unlinkedShow.dataset.i18n = "artifacts.missing.show";
   unlinkedShow.textContent = t("artifacts.missing.show", "보기");
   unlinked.append(unlinkedWord, unlinkedShow);
+  // 빈 화면(2026-11-06): 그림 · 한 줄 · 설명 · 할 일 단추. 말은 그리기마다 t()가 정한다 — 검색이 비운 것과
+  // 정말 빈 것이 다른 말을 한다(`paintArtifactEmpty`).
   const empty = document.createElement("div");
   empty.className = "artifacts-empty";
   empty.hidden = true;
+  const emptyMark = document.createElement("span");
+  emptyMark.className = "artifacts-empty-mark";
+  emptyMark.innerHTML = icon("sparkles");
   const emptyWord = document.createElement("p");
   emptyWord.className = "artifacts-empty-word";
-  emptyWord.dataset.i18n = "artifacts.empty";
   emptyWord.textContent = t("artifacts.empty", "아직 아티팩트가 없습니다");
   const emptyHint = document.createElement("p");
   emptyHint.className = "artifacts-empty-hint";
-  emptyHint.dataset.i18n = "artifacts.emptyHint";
   emptyHint.textContent = t(
     "artifacts.emptyHint",
     "에이전트가 만든 페이지, claude.ai 아티팩트, 보고서와 스크린샷이 출처와 함께 모입니다.",
   );
-  empty.append(emptyWord, emptyHint);
+  const emptyAct = document.createElement("button");
+  emptyAct.type = "button";
+  emptyAct.className = "btn artifacts-empty-act";
+  emptyAct.textContent = t(ARTIFACT_LABELS.fresh.key, ARTIFACT_LABELS.fresh.word);
+  empty.append(emptyMark, emptyWord, emptyHint, emptyAct);
   grid.append(spacer, cards, empty);
   const main = document.createElement("div");
   main.className = "artifacts-main";
   main.append(buildArtifactFlow(), ...buildArtifactTaskList(), grid, unlinked, missing);
-  body.append(main, buildArtifactDrawer());
+  body.append(main, buildArtifactGrip(), buildArtifactDrawer());
   root.append(head, buildArtifactStudio(), trouble, body, buildArtifactNewMenu());
   return root;
+}
+
+/* 목록과 서랍 사이의 손잡이(2026-11-06) — WAI-ARIA Window Splitter: 끌기 · 두 번 눌러 기본 · ←/→ · Home/End.
+ * 값은 서랍의 폭(px)이다. 카드를 고르기 전에는 서지 않는다(`paintArtifactDrawer`). */
+function buildArtifactGrip() {
+  const grip = document.createElement("div");
+  grip.className = "artifacts-grip";
+  grip.hidden = true;
+  grip.tabIndex = 0;
+  grip.setAttribute("role", "separator");
+  grip.setAttribute("aria-orientation", "vertical");
+  // 초점을 받는 손잡이는 제 값을 말한다(WAI-ARIA): 서랍의 폭(px). 처음은 토큰의 바탕 폭이고, 서랍을 지켜보는
+  // 관찰자가 실제 폭으로 갈아 적는다.
+  grip.setAttribute("aria-valuemin", "0");
+  grip.setAttribute("aria-valuenow", "0");
+  labelButton(grip, t(ARTIFACT_LABELS.grip.key, ARTIFACT_LABELS.grip.word));
+  return grip;
+}
+
+/* 서랍 머리의 조용한 행동 하나 — 그림과 이름. 좁은 서랍에서는 이름이 접히고 풍선과 접근성 이름이 말한다. */
+function artifactActButton(className, row) {
+  const one = document.createElement("button");
+  one.type = "button";
+  one.className = `artifact-detail-act ${className}`;
+  one.innerHTML = icon(row.glyph);
+  const label = document.createElement("span");
+  label.dataset.i18n = row.key;
+  label.textContent = t(row.key, row.word);
+  one.appendChild(label);
+  one.dataset.i18nAria = row.key;
+  labelButton(one, t(row.key, row.word));
+  return one;
 }
 
 function artifactMetaRow(list, row) {
@@ -7894,7 +8927,14 @@ function buildArtifactDrawer() {
   more.dataset.i18n = "artifacts.detail.more";
   more.textContent = t("artifacts.detail.more", "세부 정보");
   more.setAttribute("aria-expanded", "false");
-  bar.append(back, task, landing, when, maker, attempts, gap, open, more);
+  // 종류 배지 · 넓게 읽기 · Finder에서 보기 · 경로 복사(2026-11-06) — 「세부 정보」를 펼치지 않고. 삭제는 그 안에 남는다.
+  const kind = document.createElement("span");
+  kind.className = "artifact-detail-kind";
+  const wide = artifactActButton("artifact-detail-wide", ARTIFACT_LABELS.wide);
+  wide.setAttribute("aria-pressed", "false");
+  const reveal = artifactActButton("artifact-detail-reveal", ARTIFACT_LABELS.reveal);
+  const copy = artifactActButton("artifact-detail-copy", ARTIFACT_LABELS.copy);
+  bar.append(back, task, kind, landing, when, maker, attempts, gap, open, wide, reveal, copy, more);
 
   const facts = document.createElement("div");
   facts.className = "artifact-detail-facts";
@@ -7948,7 +8988,12 @@ function buildArtifactDrawer() {
   const outlineList = document.createElement("ol");
   outlineList.className = "artifact-outline-list";
   outlineList.hidden = true;
-  outline.append(outlineToggle, outlineNow, outlineList);
+  // 넓게 읽기에서 목차는 글 곁의 열이다 — 그 머리 한 줄.
+  const outlineRail = document.createElement("p");
+  outlineRail.className = "artifact-outline-rail-head";
+  outlineRail.dataset.i18n = ARTIFACT_LABELS.outlineRail.key;
+  outlineRail.textContent = t(ARTIFACT_LABELS.outlineRail.key, ARTIFACT_LABELS.outlineRail.word);
+  outline.append(outlineToggle, outlineNow, outlineRail, outlineList);
 
   const preview = document.createElement("div");
   preview.className = "artifact-preview";
@@ -8000,7 +9045,16 @@ function buildArtifactDrawer() {
   const writingHits = document.createElement("span");
   writingHits.className = "artifact-preview-writing-hits";
   writing.append(writingLine, writingHits);
-  preview.append(md, img, digest, text, none, truncated);
+  // 그림이 아직 없는 페이지: 막다른 한 줄 대신 그림 자리와 「열기」(2026-11-06).
+  const placeholder = document.createElement("div");
+  placeholder.className = "artifact-preview-placeholder";
+  placeholder.hidden = true;
+  const placeholderWord = document.createElement("span");
+  placeholderWord.dataset.i18n = ARTIFACT_LABELS.placeholder.key;
+  placeholderWord.textContent = t(ARTIFACT_LABELS.placeholder.key, ARTIFACT_LABELS.placeholder.word);
+  const placeholderOpen = artifactWordButton("btn--primary artifact-preview-open", ARTIFACT_ACTIONS.find((row) => row.action === "open"));
+  placeholder.append(placeholderWord, placeholderOpen);
+  preview.append(md, img, digest, text, none, placeholder, truncated);
 
   // 작업별 탭의 읽는 칸: 제목 아래에 그 작업의 묶음(빠진 것 · 증거 · 전후 비교 · 페이지)이 선다.
   detail.append(bar, facts, title, buildArtifactBundle(), outline, preview, writing);
@@ -8184,8 +9238,20 @@ function wireArtifactsView(view) {
     if (button && artifactSelectedId) void artifactAction(view, button.dataset.artifactAction, artifactSelectedId);
   });
   wireArtifactDrawer(view);
+  wireArtifactGrip(view);
   wireArtifactTasks(view);
   wireArtifactFlow(view);
+  // 빈 화면의 단추: 검색이 비웠으면 검색을 지우고, 정말 비었으면 「새로 만들기」 메뉴를 연다.
+  view.querySelector(".artifacts-empty-act").addEventListener("click", (event) => {
+    if (event.currentTarget.dataset.act === "clear") {
+      const query = view.querySelector(".artifacts-query");
+      query.value = "";
+      query.dispatchEvent(new Event("input", { bubbles: true }));
+      query.focus({ preventScroll: true });
+    } else {
+      openArtifactNewMenu(view);
+    }
+  });
   // 판의 폭이 열의 수다: 관찰자 하나가 다시 앉힌다. 서랍의 폭이 바뀌면 글이 다시 접히므로
   // 재어 둔 머리말의 자리도 버린다 — 다음 스크롤이 한 번 다시 잰다.
   if (typeof ResizeObserver === "function") {
@@ -8193,7 +9259,10 @@ function wireArtifactsView(view) {
     const tasks = view.querySelector(".artifacts-tasks");
     const observer = new ResizeObserver((entries) => {
       const resized = (node) => entries.some((entry) => entry.target === node);
-      if (resized(drawer)) drawer.querySelector(".artifact-outline")._tops = null;
+      if (resized(drawer)) {
+        drawer.querySelector(".artifact-outline")._tops = null;
+        noteArtifactGripValue(view, entries.find((entry) => entry.target === drawer));
+      }
       // 티어는 판의 폭이다 — 작업을 연 동안에는 목록이 띠라 폭이 그대로이므로, 읽는 칸이 달라져도 다시 잰다.
       paintArtifactTier(view);
       if (view.hidden) return;
@@ -8226,6 +9295,11 @@ function wireArtifactDrawer(view) {
     if (artifactRows.has(event.currentTarget.value)) selectArtifact(view, event.currentTarget.value, { reveal: true });
   });
   drawer.querySelector(".artifact-detail-back").addEventListener("click", () => {
+    // 넓게 읽기의 「목록」은 접은 목록을 다시 편다(2026-11-06).
+    if (view.classList.contains("is-reading-wide")) {
+      setArtifactReadingWide(view, false);
+      return;
+    }
     // 흐름에서 연 읽기는 흐름으로 돌아간다 — 읽는 칸이 흐름을 덮는 좁은 판(t-68458).
     const flow = artifactFilter.tab === ARTIFACT_FLOW_TAB;
     if (flow) closeArtifactFlowReading();
@@ -8237,6 +9311,31 @@ function wireArtifactDrawer(view) {
   });
   drawer.querySelector(".artifact-detail-open").addEventListener("click", () => {
     if (artifactSelectedId) void artifactAction(view, "open", artifactSelectedId);
+  });
+  // 머리의 조용한 행동 셋과 그림 자리의 「열기」, 눌러서 여는 페이지 그림(2026-11-06).
+  drawer.querySelector(".artifact-detail-wide").addEventListener("click", () => {
+    setArtifactReadingWide(view, !artifactReader.wide);
+  });
+  for (const [selector, action] of [
+    [".artifact-detail-reveal", "reveal"],
+    [".artifact-detail-copy", "copy"],
+    [".artifact-preview-open", "open"],
+  ]) {
+    drawer.querySelector(selector).addEventListener("click", () => {
+      if (artifactSelectedId) void artifactAction(view, action, artifactSelectedId);
+    });
+  }
+  drawer.querySelector(".artifact-preview-image").addEventListener("click", (event) => {
+    if (event.currentTarget.classList.contains("is-openable") && artifactSelectedId) {
+      void artifactAction(view, "open", artifactSelectedId);
+    }
+  });
+  // 넓게 읽기는 Esc로 돌아간다 — 초점은 그 단추로.
+  drawer.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || !view.classList.contains("is-reading-wide")) return;
+    event.preventDefault();
+    setArtifactReadingWide(view, false);
+    drawer.querySelector(".artifact-detail-wide").focus({ preventScroll: true });
   });
   const more = drawer.querySelector(".artifact-detail-more");
   more.addEventListener("click", () => {
@@ -8257,7 +9356,8 @@ function wireArtifactDrawer(view) {
     // (움직임 줄이기 설정과도 같은 답이다).
     const top = artifactOutlineTops(drawer, outline)[Number(jump.dataset.at)] ?? 0;
     drawer.scrollTop = Math.max(0, top - artifactTuning(view).outlineOffset + 1);
-    setArtifactOutlineOpen(outline, false);
+    // 넓게 읽기의 목차 열은 늘 펼쳐져 있다 — 뛴 뒤에도 접지 않는다.
+    if (!view.classList.contains("is-reading-wide")) setArtifactOutlineOpen(outline, false);
     noteArtifactOutlinePlace(view);
   });
   // 읽는 자리의 머리말 — 스크롤마다가 아니라 프레임에 한 번, 재어 둔 자리에서.
@@ -8275,6 +9375,106 @@ function wireArtifactDrawer(view) {
   });
 }
 
+/* 손잡이의 손(2026-11-06) — 끄는 동안은 판에 폭만 적고, 놓을 때 기억한다. 폭은 서랍의 최소에서 목록이
+ * 카드 한 열을 남기는 데까지다. 키보드는 ←가 서랍을 넓히고 →가 좁힌다(손잡이가 그쪽으로 간다). */
+function wireArtifactGrip(view) {
+  const grip = view.querySelector(".artifacts-grip");
+  const body = view.querySelector(".artifacts-body");
+  const drawer = view.querySelector(".artifacts-drawer");
+  const bounds = () => {
+    const tuning = artifactTuning(view);
+    return { least: tuning.drawerMin, most: Math.max(tuning.drawerMin, body.clientWidth - tuning.listMin) };
+  };
+  const hold = (width) => {
+    const { least, most } = bounds();
+    artifactReader.width = Math.round(Math.min(most, Math.max(least, width)));
+    paintArtifactReaderWidth(view);
+    grip.setAttribute("aria-valuemin", String(least));
+    grip.setAttribute("aria-valuemax", String(Math.round(most)));
+    grip.setAttribute("aria-valuenow", String(artifactReader.width));
+  };
+  grip.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    grip.setPointerCapture(event.pointerId);
+    grip.classList.add("is-dragging");
+    const startX = event.clientX;
+    const startWidth = drawer.getBoundingClientRect().width;
+    const move = (moved) => hold(startWidth + (startX - moved.clientX));
+    const end = () => {
+      grip.classList.remove("is-dragging");
+      grip.removeEventListener("pointermove", move);
+      grip.removeEventListener("pointerup", end);
+      grip.removeEventListener("pointercancel", end);
+      keepArtifactReader();
+    };
+    grip.addEventListener("pointermove", move);
+    grip.addEventListener("pointerup", end);
+    grip.addEventListener("pointercancel", end);
+  });
+  grip.addEventListener("dblclick", () => {
+    artifactReader.width = null;
+    paintArtifactReaderWidth(view);
+    grip.removeAttribute("aria-valuenow");
+    keepArtifactReader();
+  });
+  grip.addEventListener("keydown", (event) => {
+    const width = drawer.getBoundingClientRect().width;
+    const step = artifactTuning(view).gripStep;
+    const { least, most } = bounds();
+    const next = { ArrowLeft: width + step, ArrowRight: width - step, Home: least, End: most }[event.key];
+    if (next === undefined) return;
+    event.preventDefault();
+    hold(next);
+    keepArtifactReader();
+  });
+}
+
+/* 손잡이의 값 — 관찰자가 잰 서랍의 폭과 그 범위(배치를 다시 시키지 않는다: 관찰자의 답을 읽는다). */
+function noteArtifactGripValue(view, entry) {
+  const grip = view.querySelector(".artifacts-grip");
+  const width = Math.round(entry?.borderBoxSize?.[0]?.inlineSize ?? entry?.contentRect?.width ?? 0);
+  if (width <= 0) return;
+  const tuning = artifactTuning(view);
+  writeAttribute(grip, "aria-valuenow", String(width));
+  writeAttribute(grip, "aria-valuemin", String(tuning.drawerMin));
+  writeAttribute(grip, "aria-valuemax", String(Math.max(width, Math.round(view.querySelector(".artifacts-body").clientWidth - tuning.listMin))));
+}
+
+/* 끈 폭을 판에 적는다 — 바뀐 때에만(같은 값을 다시 쓰는 것도 쓰기다). CSS의 `--artifact-drawer-held`가 판의
+ * 반 대신 이긴다. */
+function paintArtifactReaderWidth(view) {
+  const held = artifactReader.width === null ? "" : `${artifactReader.width}px`;
+  if (view._artifactHeld === held) return;
+  view._artifactHeld = held;
+  if (held === "") view.style.removeProperty("--artifact-drawer-held");
+  else view.style.setProperty("--artifact-drawer-held", held);
+}
+
+/* 넓게 읽기를 켜고 끈다 — 고른 것은 기억하고, 목록이 접히고 펴진 폭으로 목차를 다시 잰다. */
+function setArtifactReadingWide(view, on) {
+  artifactReader.wide = on;
+  keepArtifactReader();
+  paintArtifactReading(view);
+  const drawer = view.querySelector(".artifacts-drawer");
+  const md = drawer.querySelector(".artifact-preview-md");
+  paintArtifactOutline(view, md.hidden ? null : md);
+}
+
+/* 넓게 읽기가 서는 때: 사람이 켰고, 서랍이 무엇을 읽고 있고, 작업별 탭이 아닐 때(그 탭은 띠와 읽는 칸이
+ * 이미 판을 나눈다). 흐름에서는 칩으로 연 읽기가 선 동안만. */
+function paintArtifactReading(view) {
+  const row = artifactSelectedId ? artifactRows.get(artifactSelectedId) : null;
+  const reading = Boolean(row)
+    && artifactFilter.tab !== ARTIFACT_TASKS_TAB
+    && (artifactFilter.tab !== ARTIFACT_FLOW_TAB || artifactFlowReading !== null);
+  const wide = artifactReader.wide && reading;
+  if (view.classList.contains("is-reading-wide") !== wide) view.classList.toggle("is-reading-wide", wide);
+  writeAttribute(view.querySelector(".artifact-detail-wide"), "aria-pressed", artifactReader.wide ? "true" : "false");
+  const strip = view.querySelector(".artifacts-drawer .artifact-outline");
+  if (wide && !strip.hidden && strip.querySelector(".artifact-outline-list").hidden) setArtifactOutlineOpen(strip, true);
+}
+
 /* ---- 그리기 ----------------------------------------------------------- */
 
 function paintArtifactsView(tab = artifactsTab()) {
@@ -8282,6 +9482,7 @@ function paintArtifactsView(tab = artifactsTab()) {
   const view = docHost(tab.pane, ARTIFACTS_TAB.kind);
   wireArtifactsView(view);
   paintWorkbenchNavigation(view, "artifacts");
+  paintArtifactReaderWidth(view);
   applyArtifactFilter();
   const trouble = view.querySelector(".artifacts-error");
   trouble.hidden = artifactError === null;
@@ -8329,7 +9530,8 @@ function paintArtifactHead(view) {
     // 머리에만 선다(t-68458).
     const count = button.querySelector(".artifacts-tab-count");
     writeTextContent(count, tab === ARTIFACT_FLOW_TAB ? "" : String(artifactTabCounts.get(tab) ?? 0));
-    writeHidden(count, artifactFilter.tab === ARTIFACT_FLOW_TAB);
+    // 0은 보이지 않는다(2026-11-06) — 탭은 서 있고 수만 물러난다.
+    writeHidden(count, artifactFilter.tab === ARTIFACT_FLOW_TAB || count.textContent === "0");
   }
   paintArtifactPicks(view);
   paintArtifactProject(view);
@@ -8495,14 +9697,20 @@ function dressArtifactCard(node, row, selected) {
     subtype.textContent = plain ? artifactKindWord(row) : "";
     subtype.hidden = !plain;
     dressArtifactTaskChip(node.querySelector(".artifact-card-task"), row);
-    dressArtifactMaker(node.querySelector(".artifact-card-maker"), row.origin ?? {});
-    node.querySelector(".artifact-card-kind").hidden = plain;
-    node.querySelector(".artifact-card-kind").textContent = row.version
-      ? t("artifacts.publishedVersion", "발행 · 버전 {{n}}", { n: row.version })
+    dressArtifactMaker(node.querySelector(".artifact-card-maker"), row.origin ?? {}, { knownBranch: true });
+    // 그림 있는 카드의 종류 배지(2026-11-06) — 발행한 판은 「v2」, 아니면 종류의 낱말. 글 카드는 하위 종류가 말한다.
+    const kind = node.querySelector(".artifact-card-kind");
+    kind.hidden = plain;
+    kind.textContent = plain ? "" : row.version
+      ? t("artifacts.publishedVersion", "v{{n}}", { n: row.version })
       : t(
       ARTIFACT_KIND_WORDS[row.kind]?.key ?? "artifacts.kind.other",
       ARTIFACT_KIND_WORDS[row.kind]?.word ?? "기타",
     );
+    const lead = node.querySelector(".artifact-card-lead");
+    const leadWords = plain ? artifactLeadWords(row) : "";
+    lead.textContent = leadWords;
+    lead.hidden = leadWords === "";
     const feedback = node.querySelector(".artifact-card-feedback");
     const said = Number(row.feedback_count) || 0;
     feedback.hidden = said === 0;
@@ -8520,7 +9728,9 @@ function dressArtifactCard(node, row, selected) {
     doc.textContent = block;
     doc.hidden = block === "";
     const thumb = node.querySelector(".artifact-card-thumb");
-    const rendered = ARTIFACT_THUMB_KINDS.has(row.kind) ? artifactThumbs.get(row.id) ?? null : null;
+    // 스크린샷은 글 카드의 오른쪽 위에 런타임이 줄인 그림을 입는다(2026-11-06, `has-thumb`).
+    const small = plain && ARTIFACT_SMALL_THUMB_KINDS.has(row.kind);
+    const rendered = ARTIFACT_THUMB_KINDS.has(row.kind) || small ? artifactThumbs.get(row.id) ?? null : null;
     // 글이 얼굴인 카드(`plain`)에는 그림을 띄울 얼굴이 없다 — 그 카드가 스크린숏을 청하면 원본
     // 파일 전체(최대 4 MiB)가 서랍의 캐시로 와서, 보이지 않는 그림을 카드 120장 몫까지 들고
     // 있었다(t-54317). 그림은 서랍이 열 때 청한다.
@@ -8530,18 +9740,14 @@ function dressArtifactCard(node, row, selected) {
     thumb.hidden = src === "";
     thumb.src = src;
     node._thumbSrc = src;
+    node.classList.toggle("has-thumb", small && src !== "");
     if (pictured && !held && !artifactMissing.has(row.id)) void askArtifactThumb(node, row.id);
   }
-  if (ARTIFACT_THUMB_KINDS.has(row.kind) && !artifactMissing.has(row.id)) {
+  if (artifactAsksThumbnail(row) && !artifactMissing.has(row.id)) {
     // 본 판이 준 그림(t-59665 ⑤)은 카드가 옷을 입은 뒤에 올 수 있다 — 캐시의 그림이 입은 것과 다른
     // 참조면 갈아입는다(같은 그림은 같은 참조라 비교가 한 번의 식별 비교다).
     const kept = artifactThumbs.get(row.id);
-    if (kept !== undefined && kept !== node._thumbSrc) {
-      const thumb = node.querySelector(".artifact-card-thumb");
-      thumb.src = kept;
-      thumb.hidden = false;
-      node._thumbSrc = kept;
-    }
+    if (kept !== undefined && kept !== node._thumbSrc) wearArtifactThumb(node, row, kept);
     askArtifactThumbnail(row);
   }
   // 반영 상태는 행과 따로 움직인다(git의 답이 뒤에 온다): 행이 바뀌었거나 그 답이 움직인
@@ -8551,9 +9757,7 @@ function dressArtifactCard(node, row, selected) {
     node._landingGeneration = artifactLandingGeneration;
     const landing = node.querySelector(".artifact-card-landing");
     dressArtifactLanding(landing, artifactLandingSay(row));
-    // 글이 얼굴인 카드는 종류 낱말이 이 줄에 서므로 줄이 비는 일이 없다; 얼굴 있는 카드만 작업도
-    // 반영 상태도 없을 때 줄을 접는다(t-47423).
-    node.querySelector(".artifact-card-chips").hidden = !artifactKindPlain(row.kind) && !row.origin?.task && landing.hidden;
+    // 배지 줄은 비는 일이 없다(2026-11-06): 글 카드는 하위 종류가, 그림 있는 카드는 종류 · 판의 배지가 선다.
   }
   // 바뀐 것만 쓴다: 같은 글자와 같은 값을 다시 쓰는 것도 쓰기라, 고른 표시만 옮기는 그리기가
   // 보이는 카드마다 글자 노드를 갈고 속성을 다시 세우게 된다(t-40649).
@@ -8562,12 +9766,17 @@ function dressArtifactCard(node, row, selected) {
   writeAttribute(node, "aria-selected", selected ? "true" : "false");
 }
 
-/* 만든 이의 한 줄 — 에이전트의 표식(모델 계열), 판, 브랜치. 출처가 말하는 것만
- * 서고, 아무것도 말하지 않으면 줄째 숨는다: 「출처 없음」은 서랍의 말이다. */
-function dressArtifactMaker(line, origin) {
+/* 만든 이의 한 줄 — 에이전트의 표식, 모델(자동화가 만든 것은 그 자동화의 이름), 판, 브랜치. 카드는 창이 아는
+ * 워크트리의 브랜치만 단다(2026-11-06 — 모르는 워크트리의 폴더 이름 `team-<해시>`는 출처 구실을 못 했다); 페이지
+ * 머리띠는 제 브랜치 낱말을 그대로 쓰고 모델 칸이 없다. 출처가 말하는 것만 서고, 아무것도 말하지 않으면 줄째
+ * 숨는다: 「출처 없음」은 서랍의 말이다. */
+function dressArtifactMaker(line, origin, { knownBranch = false } = {}) {
   const agent = origin.agent ?? "";
   const pane = artifactPaneWord(origin.pane);
-  const branch = artifactBranchWord(origin);
+  // A card names only a branch the window knows (a worktree it lists); the page strip keeps the word the origin gives.
+  const branch = knownBranch ? artifactKnownBranch(origin) : artifactBranchWord(origin);
+  const model = line.querySelector(".artifact-card-maker-model");
+  const said = model ? artifactModelWords(agent, origin.model ?? "") || artifactAutomationWord(origin.automation) : "";
   const mark = line.querySelector(".artifact-card-maker-mark");
   if (line.dataset.agent !== agent) {
     line.dataset.agent = agent;
@@ -8576,6 +9785,10 @@ function dressArtifactMaker(line, origin) {
   }
   mark.hidden = agent === "";
   mark.dataset.tip = agent ? [agentName(agent), origin.model].filter(Boolean).join(" · ") : "";
+  if (model) {
+    writeTextContent(model, said);
+    model.hidden = said === "";
+  }
   const paneNode = line.querySelector(".artifact-card-maker-pane");
   paneNode.textContent = pane;
   paneNode.hidden = pane === "";
@@ -8583,7 +9796,48 @@ function dressArtifactMaker(line, origin) {
   branchNode.textContent = branch;
   branchNode.hidden = branch === "";
   line.querySelector(".artifact-card-maker-sep").hidden = pane === "" || branch === "";
-  line.hidden = agent === "" && pane === "" && branch === "";
+  line.hidden = agent === "" && said === "" && pane === "" && branch === "";
+}
+
+/* 모델의 낱말 — 에이전트 이름으로 시작하면 되풀이하지 않는다(`claude` + `claude-opus-5-5` → 「opus-5-5」).
+ * 카드와 서랍 머리가 이 한 함수를 쓴다. 온전한 값은 풍선과 세부 정보에 있다. */
+function artifactModelWords(agent, model) {
+  return agent !== "" && model.startsWith(`${agent}-`) ? model.slice(agent.length + 1) : model;
+}
+
+/* 자동화의 이름 — 아는 것은 카탈로그의 낱말, 모르는 것은 그 낱말 그대로. */
+function artifactAutomationWord(automation) {
+  if (!automation) return "";
+  const held = ARTIFACT_AUTOMATION_WORDS[automation];
+  return held ? t(held.key, held.word) : automation;
+}
+
+/* 창이 아는 워크트리의 브랜치 — 모르는 워크트리는 빈 낱말이다(폴더 이름을 브랜치인 듯 세우지 않는다). */
+function artifactKnownBranch(origin) {
+  return origin.worktree ? worktreeAt(origin.worktree)?.branch ?? "" : "";
+}
+
+/* 보고서 카드의 결론 — 목록이 이미 실어 온 앞 글(`preview_chars`)에서 제목 다음 첫 문단(2026-11-06). 마크다운
+ * 미리보기에만: 대화록 · 로그의 원문은 결론이 아니다. 머리말 · 표의 줄은 건너뛴다. */
+function artifactLeadWords(row) {
+  if (row.preview?.kind !== "markdown") return "";
+  const body = String(row.preview.text ?? "").replace(ARTIFACT_FENCE, "\n").replace(/^\s*#[^\n]*\n/, "");
+  const first = body.split(/\n\s*\n/).map((one) => one.trim()).find((one) => one !== "" && !one.startsWith("#") && !one.startsWith("|"));
+  return first ? artifactExcerpt(first) : "";
+}
+
+/* 카드가 그림을 청하는가 — 페이지 · claude.ai의 얼굴, 그리고 글 카드의 스크린샷 그림. */
+function artifactAsksThumbnail(row) {
+  return ARTIFACT_THUMB_KINDS.has(row.kind) || (ARTIFACT_SMALL_THUMB_KINDS.has(row.kind) && artifactKindPlain(row.kind));
+}
+
+/* 카드에 그림을 입힌다 — 캐시에서 왔든 펌프에서 왔든 한 길. 스크린샷이면 글 카드가 그림 자리를 연다. */
+function wearArtifactThumb(node, row, src) {
+  const thumb = node.querySelector(".artifact-card-thumb");
+  thumb.src = src;
+  thumb.hidden = false;
+  node._thumbSrc = src;
+  if (ARTIFACT_SMALL_THUMB_KINDS.has(row.kind) && node.classList.contains("is-plain")) node.classList.add("has-thumb");
 }
 
 /* 판의 이름 — 훅의 판 키(`term-4`)는 판이 머리에 다는 `term:4`로 읽는다. */
@@ -8601,21 +9855,14 @@ function artifactBranchWord(origin) {
   return worktreeAt(path)?.branch ?? basename(path);
 }
 
-/* 카드 아래 줄: 「🌐 9월 1일에 편집됨」/「🔒 …」. 오늘 것은 상대 낱말(`spaceAgo`,
- * `Intl.RelativeTimeFormat`), 그보다 오래된 것은 로케일의 달·날(`Intl.DateTimeFormat`)
- * — claude.ai의 줄과 같은 문법, 낱말은 카탈로그. */
+/* 카드 아래 줄과 서랍 머리의 시각 — 이모지 없이(2026-11-06): 오늘 것은 상대 낱말(「3시간 전」, `spaceAgo`),
+ * 그보다 오래된 것은 로케일의 날과 시각(「11월 5일 20:17」, `Intl.DateTimeFormat`). claude.ai에 올라간 것은
+ * 종류 배지(「claude.ai」)가 말한다. */
 function artifactWhenWords(row) {
-  const glyph = ARTIFACT_WHEN_GLYPH[row.kind === "web" ? "remote" : "local"];
   const ms = row.modified_ms;
-  const words = artifactEditedWords(ms);
-  return [glyph, words].join(" ");
-}
-
-function artifactEditedWords(ms) {
   if (!ms) return spaceAgo(ms);
   const then = new Date(ms);
-  if (artifactIsToday(then)) return t("artifacts.editedAgo", "{{ago}} 편집됨", { ago: spaceAgo(ms) });
-  return t("artifacts.editedOn", "{{when}}에 편집됨", { when: artifactFormatters().day.format(then) });
+  return artifactIsToday(then) ? spaceAgo(ms) : artifactFormatters().dayClock.format(then);
 }
 
 function artifactIsToday(then, now = new Date()) {
@@ -8655,6 +9902,7 @@ function artifactFormatters() {
     artifactFormats = {
       count: new Intl.NumberFormat(code),
       day: new Intl.DateTimeFormat(code, ARTIFACT_DAY_WORDS),
+      dayClock: new Intl.DateTimeFormat(code, { ...ARTIFACT_DAY_WORDS, ...ARTIFACT_CLOCK_TODAY }),
       clockToday: new Intl.DateTimeFormat(code, ARTIFACT_CLOCK_TODAY),
       clockOlder: new Intl.DateTimeFormat(code, ARTIFACT_CLOCK_OLDER),
     };
@@ -8716,14 +9964,23 @@ function makeArtifactCardNode() {
   const landing = document.createElement("span");
   landing.className = "artifact-card-landing";
   landing.hidden = true;
-  chips.append(subtype, task, landing);
+  // 그림 있는 카드의 종류 · 판 배지 — 아래 줄에서 배지 줄로 올라왔다(2026-11-06).
+  const kind = document.createElement("span");
+  kind.className = "artifact-card-kind";
+  chips.append(subtype, task, kind, landing);
   const title = document.createElement("span");
   title.className = "artifact-card-title";
+  const lead = document.createElement("span");
+  lead.className = "artifact-card-lead";
+  lead.hidden = true;
   const maker = document.createElement("span");
   maker.className = "artifact-card-maker";
   maker.hidden = true;
   const mark = document.createElement("span");
   mark.className = "artifact-card-maker-mark";
+  const model = document.createElement("span");
+  model.className = "artifact-card-maker-model";
+  model.hidden = true;
   const pane = document.createElement("span");
   pane.className = "artifact-card-maker-pane";
   const sep = document.createElement("span");
@@ -8732,21 +9989,19 @@ function makeArtifactCardNode() {
   sep.textContent = "·";
   const branch = document.createElement("span");
   branch.className = "artifact-card-maker-branch";
-  maker.append(mark, pane, sep, branch);
+  maker.append(mark, model, pane, sep, branch);
   const foot = document.createElement("span");
   foot.className = "artifact-card-foot";
   const said = document.createElement("span");
   said.className = "artifact-card-said";
-  const kind = document.createElement("span");
-  kind.className = "artifact-card-kind";
   const feedback = document.createElement("span");
   feedback.className = "artifact-card-feedback";
   feedback.hidden = true;
-  said.append(kind, feedback);
+  said.append(feedback);
   const when = document.createElement("span");
   when.className = "artifact-card-when";
   foot.append(said, when);
-  node.append(face, chips, title, maker, foot);
+  node.append(face, chips, title, lead, maker, foot);
   return node;
 }
 
@@ -8904,6 +10159,27 @@ function paintArtifactCards(view) {
   for (const node of free) {
     if (node.parentElement) node.remove();
   }
+  paintArtifactEmpty(view);
+}
+
+/* 빈 화면의 말(2026-11-06) — 검색이 비운 것과 정말 빈 것을 가른다: 검색이 비웠으면 검색어와 「검색 지우기」,
+ * 아니면 무엇이 모이는지와 「새로 만들기」. 그림은 제 <use>만 갈아입는다 — 카드 판은 노드를 새로 짓지 않는다. */
+function paintArtifactEmpty(view) {
+  const empty = view.querySelector(".artifacts-empty");
+  if (empty.hidden) return;
+  const query = artifactFilter.query.trim();
+  writeAttribute(empty.querySelector(".artifacts-empty-mark use"), "href", `#i-${query ? "search" : "sparkles"}`);
+  writeTextContent(empty.querySelector(".artifacts-empty-word"), query
+    ? t(ARTIFACT_LABELS.emptySearch.key, ARTIFACT_LABELS.emptySearch.word, { query })
+    : t("artifacts.empty", "아직 아티팩트가 없습니다"));
+  writeTextContent(empty.querySelector(".artifacts-empty-hint"), query
+    ? t(ARTIFACT_LABELS.emptySearchHint.key, ARTIFACT_LABELS.emptySearchHint.word)
+    : t("artifacts.emptyHint", "에이전트가 만든 페이지, claude.ai 아티팩트, 보고서와 스크린샷이 출처와 함께 모입니다."));
+  const act = empty.querySelector(".artifacts-empty-act");
+  writeTextContent(act, query
+    ? t(ARTIFACT_LABELS.clearSearch.key, ARTIFACT_LABELS.clearSearch.word)
+    : t(ARTIFACT_LABELS.fresh.key, ARTIFACT_LABELS.fresh.word));
+  act.dataset.act = query ? "clear" : "new";
 }
 
 /* 썸네일 — 보이는 스크린샷 카드만 청한다. 답은 서랍과 같은 캐시에 들고, 카드가
@@ -8984,6 +10260,7 @@ function askArtifactThumbnail(row) {
   const id = row.id;
   if (artifactThumbs.has(id) || artifactThumbFailed.has(id)) return;
   if (artifactThumbActiveId === id || artifactThumbQueue.includes(id)) return;
+  if (artifactSeenShotHolds(row)) return;
   const cap = artifactListing.thumb?.queue_max ?? 1;
   if (artifactThumbQueue.length >= cap) return;
   artifactThumbQueue.push(id);
@@ -8991,6 +10268,13 @@ function askArtifactThumbnail(row) {
   // 다 입은 뒤에야 판에 붙는다 — 지금 펌프를 돌리면 그 카드를 「안 보인다」고
   // 건너뛴다.
   queueMicrotask(() => void pumpArtifactThumbs());
+}
+
+/* 본 판이 이 행의 지금 열쇠로 그림을 찍었거나 찍는 중이다 — 그림이 아직 캐시에 없으면 그 답이 오는 중이므로
+ * 숨은 판에 한 번 더 그리게 하지 않는다. 그 답이 그림이면 카드에 입히고, 아니면 대기열을 다시 채워 이 카드가
+ * 제 차례를 얻는다. 청하는 쪽과 대기열을 비우는 쪽이 같이 읽는다. */
+function artifactSeenShotHolds(row) {
+  return row != null && artifactSeenShots.get(row.id) === artifactThumbnailKey(row);
 }
 
 /* 큐의 펌프 — 동시 1. 청할 차례가 온 카드가 그 사이 스크롤로 사라졌으면
@@ -9004,7 +10288,7 @@ async function pumpArtifactThumbs() {
       if (artifactThumbQueue.length === 0) refillArtifactThumbQueue();
       if (artifactThumbQueue.length === 0) break;
       const id = artifactThumbQueue.shift();
-      if (artifactThumbs.has(id) || artifactThumbFailed.has(id)) continue;
+      if (artifactThumbs.has(id) || artifactThumbFailed.has(id) || artifactSeenShotHolds(artifactRows.get(id))) continue;
       if (artifactCardNodeFor(id) === null) continue;
       artifactThumbActiveId = id;
       const key = artifactThumbnailKey(artifactRows.get(id));
@@ -9021,16 +10305,12 @@ async function pumpArtifactThumbs() {
       }
       if (typeof answer?.data_url === "string" && answer.data_url !== "") {
         rememberArtifactThumb(id, answer.data_url);
+        const row = artifactRows.get(id);
         const node = artifactCardNodeFor(id);
-        if (node) {
-          const thumb = node.querySelector(".artifact-card-thumb");
-          thumb.src = answer.data_url;
-          thumb.hidden = false;
-          node._thumbSrc = answer.data_url;
-        }
-        // 서랍이 이 페이지를 들고 있으면 그 미리보기도 이 그림이다.
+        if (node && row) wearArtifactThumb(node, row, answer.data_url);
+        // 서랍이 이 페이지를 들고 있으면 그 미리보기도 이 그림이다 — 스크린샷의 서랍은 원본을 읽는다.
         const view = artifactsView();
-        if (view && artifactSelectedId === id) void paintArtifactPreview(view, artifactRows.get(id));
+        if (view && artifactSelectedId === id && row && ARTIFACT_THUMB_KINDS.has(row.kind)) void paintArtifactPreview(view, row);
       } else {
         artifactThumbFailed.add(id);
       }
@@ -9048,7 +10328,7 @@ function refillArtifactThumbQueue() {
   if (!view) return;
   for (const node of view.querySelectorAll(".artifact-card")) {
     const row = artifactRows.get(node.dataset.id);
-    if (row && ARTIFACT_THUMB_KINDS.has(row.kind)) askArtifactThumbnail(row);
+    if (row && artifactAsksThumbnail(row)) askArtifactThumbnail(row);
   }
 }
 
@@ -9061,10 +10341,15 @@ function artifactCardNodeFor(id) {
 
 function rememberArtifactThumb(id, dataUrl) {
   const cap = artifactTuning(artifactsView() ?? document.documentElement).thumbCache;
+  // 같은 id를 다시 적으면 캐시는 자라지 않는다 — 먼저 빼서 비우기가 그 id(와 방금 적힌 본 판의 열쇠)를 밀어내지
+  // 않게 하고, 다시 넣어 가장 새 것으로 세운다.
+  artifactThumbs.delete(id);
   while (artifactThumbs.size >= cap) {
     const oldest = artifactThumbs.keys().next().value;
     if (oldest === undefined) break;
     artifactThumbs.delete(oldest);
+    // 본 판의 열쇠는 그림이 캐시에 있는 동안만 「찍었다」는 뜻이다 — 밀려난 그림은 다시 청할 수 있다.
+    artifactSeenShots.delete(oldest);
   }
   artifactThumbs.set(id, dataUrl);
 }
@@ -9128,6 +10413,9 @@ function paintArtifactDrawer(view) {
     detail.hidden = !row;
     sayDrawersDocked();
   }
+  // 손잡이는 무엇을 읽는 동안만, 넓게 읽기는 사람이 켰고 읽는 것이 있을 때만 선다(2026-11-06).
+  writeHidden(view.querySelector(".artifacts-grip"), !row);
+  paintArtifactReading(view);
   if (!row) {
     detail.dataset.artifactId = "";
     paintArtifactBundle(view);
@@ -9196,19 +10484,27 @@ function paintArtifactBar(drawer, row, landed) {
   const bar = drawer.querySelector(".artifact-detail-bar");
   dressArtifactTaskChip(bar.querySelector(".artifact-detail-task"), row);
   dressArtifactLanding(bar.querySelector(".artifact-detail-landing"), landed);
-  writeTextContent(bar.querySelector(".artifact-detail-when"), t(
-    "artifacts.detail.when",
-    "{{what}} {{time}}",
-    { what: artifactKindWord(row), time: artifactClockWords(row.modified_ms) },
-  ));
-  // 만든 이: 에이전트와 모델을 한 낱말씩. 모델 이름이 에이전트 이름으로 시작하면 되풀이하지
-  // 않는다(`claude` + `claude-sonnet-5-5` → 「claude sonnet-5-5」). 온전한 값은 풍선과 세부 정보에 있다.
+  // 무엇의 시각인지는 곁의 종류 배지가 말하고(2026-11-06), 풍선은 둘을 한 줄로 다시 말한다 — 시각만 서면
+  // 무엇의 시각인지 모른다.
+  const what = artifactKindWord(row);
+  const time = artifactWhenWords(row);
+  writeTextContent(bar.querySelector(".artifact-detail-kind"), what);
+  const when = bar.querySelector(".artifact-detail-when");
+  writeTextContent(when, time);
+  when.dataset.tip = t("artifacts.detail.when", "{{what}} {{time}}", { what, time });
+  // 만든 이: 에이전트의 표식과 모델의 낱말(자동화가 만든 것은 그 이름). 온전한 값은 풍선과 세부 정보에 있다.
   const maker = bar.querySelector(".artifact-detail-maker");
   const agent = row.origin?.agent ?? "";
   const model = row.origin?.model ?? "";
-  const said = [agent, agent !== "" && model.startsWith(`${agent}-`) ? model.slice(agent.length + 1) : model].filter(Boolean).join(" ");
-  writeTextContent(maker, said);
-  maker.hidden = said === "";
+  const said = artifactModelWords(agent, model) || artifactAutomationWord(row.origin?.automation);
+  if (maker.dataset.agent !== agent || maker.dataset.said !== said) {
+    maker.dataset.agent = agent;
+    maker.dataset.said = said;
+    maker.replaceChildren();
+    if (agent) maker.appendChild(agentIcon(agentRows.find((held) => held.id === agent) ?? { id: agent, name: agentName(agent) }));
+    if (said !== "") maker.append(document.createTextNode(said));
+  }
+  maker.hidden = agent === "" && said === "";
   maker.dataset.tip = [agent ? agentName(agent) : "", model].filter(Boolean).join(" · ");
   paintArtifactAttempts(bar.querySelector(".artifact-detail-attempts"), row);
 }
@@ -9251,6 +10547,7 @@ async function paintArtifactPreview(view, row) {
       md._painted = payload.text;
       md.replaceChildren();
       paintMarkdownView(md, payload.text ?? "");
+      splitArtifactCodePaths(md);
     }
   } else if (payload.kind === "image" && payload.data_url) {
     img.src = payload.data_url;
@@ -9264,9 +10561,30 @@ async function paintArtifactPreview(view, row) {
         ? t("artifacts.previewTooBig", "표 상한보다 큰 이미지입니다 — 「열기」로 보세요.")
         : t("artifacts.previewNone", "이 종류는 미리보기가 없습니다.");
   }
+  // 그림이 아직 없는 페이지 · claude.ai는 막다른 한 줄 대신 그림 자리와 「열기」(2026-11-06). 사라진 파일은
+  // 그 말 그대로 선다. 창 안에서 열리는 것의 그림은 눌러서 연다.
+  const awaiting = !none.hidden && !payload.error && ARTIFACT_THUMB_KINDS.has(row.kind);
+  writeHidden(drawer.querySelector(".artifact-preview-placeholder"), !awaiting);
+  if (awaiting) none.hidden = true;
+  img.classList.toggle("is-openable", artifactOpensInWindow(row));
   const body = payload.kind === "markdown" ? md : null;
   paintArtifactTitle(drawer, row, body);
   paintArtifactOutline(view, body);
+}
+
+/* 읽는 칸의 코드에서 경로는 「/」 뒤에서만 줄을 바꾼다(2026-11-06): 마디마다 한 덩어리로 싸고 그 사이에
+ * <wbr>을 둔다 — 복사하면 원래 글자 그대로다. 「/」가 없는 코드는 그대로 둔다. */
+function splitArtifactCodePaths(body) {
+  for (const code of body.querySelectorAll(".md-code")) {
+    const text = code.textContent;
+    if (!text.includes("/")) continue;
+    code.replaceChildren(...text.split(/(?<=\/)/).flatMap((part, at) => {
+      const seg = document.createElement("span");
+      seg.className = "md-code-seg";
+      seg.textContent = part;
+      return at === 0 ? [seg] : [document.createElement("wbr"), seg];
+    }));
+  }
 }
 
 /* 제목은 한 번만 선다: 본문이 제 제목으로 시작하면(보고서의 첫 머리말이 곧 행의 제목이다)
@@ -9298,6 +10616,8 @@ function paintArtifactOutline(view, body) {
   const fromTheTop = long && drawer.scrollTop === 0;
   strip.hidden = !long;
   strip._heads = long ? heads : null;
+  // 첫 머리말이 본문의 맨 앞이면 그것은 제목이다 — 처음부터 읽는 동안 목차 줄은 그 제목을 되풀이하지 않는다.
+  strip._titled = long && heads[0] === body.firstElementChild;
   strip._tops = null;
   strip._at = -1;
   setArtifactOutlineOpen(strip, false);
@@ -9320,9 +10640,23 @@ function paintArtifactOutline(view, body) {
   // 사람이 처음 스크롤할 때 한 번 잰다: 여는 순간에 재면 방금 세운 본문을 한 번 더 배치시킨다(t-40649).
   if (fromTheTop) {
     strip._at = 0;
-    writeTextContent(strip.querySelector(".artifact-outline-now"), heads[0].textContent);
+    markArtifactOutlineNow(strip);
   } else {
     noteArtifactOutlinePlace(view);
+  }
+  // 넓게 읽기의 목차는 글 곁의 열이고 늘 펼쳐져 있다.
+  if (view.classList.contains("is-reading-wide")) setArtifactOutlineOpen(strip, true);
+}
+
+/* 지금 읽는 머리말을 목차 줄과 목차 열에 적는다(2026-11-06) — 제목 위에 있는 동안 목차 줄은 「목차 · N」만
+ * 말하고(제목이 바로 아래 서 있다), 열은 첫 절을 밝힌다. */
+function markArtifactOutlineNow(strip) {
+  const at = strip._at;
+  const onTitle = at === 0 && strip._titled === true;
+  writeTextContent(strip.querySelector(".artifact-outline-now"), onTitle ? "" : strip._heads[at]?.textContent ?? "");
+  const lit = onTitle ? 1 : at;
+  for (const [index, button] of [...strip.querySelectorAll(".artifact-outline-list button")].entries()) {
+    if (button.classList.contains("is-now") !== (index === lit)) button.classList.toggle("is-now", index === lit);
   }
 }
 
@@ -9358,7 +10692,7 @@ function noteArtifactOutlinePlace(view) {
   }
   if (strip._at === at) return;
   strip._at = at;
-  writeTextContent(strip.querySelector(".artifact-outline-now"), strip._heads[at].textContent);
+  markArtifactOutlineNow(strip);
 }
 
 /* ---- 증거의 요약 — 원문 대신 수와 단계 (t-36910) -------------------------- */
@@ -11409,8 +12743,16 @@ async function snapArtifactSeen(clock) {
   } catch {
     answer = null;
   }
+  // 찍는 동안 목록이 이 행을 새 파일로 바꿨다 — 옛 그림을 새 열쇠의 캐시에 넣지 않는다(대기열 쪽과 같은 비교).
+  if (key !== artifactThumbnailKey(artifactRows.get(row.id) ?? row)) {
+    if (artifactSeenShots.get(row.id) === key) artifactSeenShots.delete(row.id);
+    refillArtifactThumbQueue();
+    return;
+  }
   if (typeof answer?.data_url !== "string" || answer.data_url === "") {
     artifactSeenShots.delete(row.id);
+    // 찍는 동안 갤러리가 이 카드를 건너뛰었다 — 이제 숨은 판에 청할 차례를 준다.
+    refillArtifactThumbQueue();
     return;
   }
   artifactThumbFailed.delete(row.id);

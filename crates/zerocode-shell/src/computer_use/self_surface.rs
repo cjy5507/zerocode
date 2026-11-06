@@ -121,6 +121,9 @@ pub(crate) const PERSON_ONLY_COMMANDS: &[&str] = &[
     "jira_disconnect",
     "linear_connect",
     "linear_disconnect",
+    // A GitLab token the person pasted, handed to `glab auth login --stdin`
+    // (the tasks page, 2026-11-06).
+    "gitlab_token_login",
     // An account added, removed, switched, signed in or out.
     "add_claude_account",
     "add_codex_account",
@@ -141,6 +144,10 @@ pub(crate) const PERSON_ONLY_COMMANDS: &[&str] = &[
     "cancel_google_login",
     "github_login_intent",
     "github_select_account",
+    // gh's browser login started from the tasks page, and let go of — the
+    // same sign-in as the intent above, without a terminal (2026-11-06).
+    "github_web_login_start",
+    "github_web_login_cancel",
     // Work that cannot be had back (t-74975): the person's uncommitted
     // changes and a merge or rebase in progress, a push, a checkout, a
     // project, a lane or a terminal and the program in it, a browser's
@@ -178,6 +185,12 @@ pub(crate) const PERSON_ONLY_COMMANDS: &[&str] = &[
     "end_terminal_session",
     "end_all_terminal_sessions",
     "set_computer_confirm",
+    // The Skills·MCP page (2026-11-06): a server taken out of every agent's
+    // list, a skill and its copies sent to the Trash, and a remote server's
+    // sign-in started in an agent's own command.
+    "library_server_remove",
+    "library_skill_remove",
+    "library_server_login",
 ];
 
 /// Commands whose names touch a key, a secret, a token, a password, a

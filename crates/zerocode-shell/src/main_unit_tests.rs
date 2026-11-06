@@ -817,7 +817,26 @@ fn plain_block_arrow_scope(chars: &[char], opening: usize) -> Option<(usize, Vec
         cursor += 1;
     }
     if chars.get(cursor) != Some(&'{') {
-        return None;
+        // An expression body (`(a, b) => call(a, () => b())`, gate l108b): the
+        // parameters reach to the end of that expression — the first `,`, `;`
+        // or line end at its own depth, or the bracket that closes the call it
+        // is handed to.
+        let mut depth = 0_usize;
+        while let Some(glyph) = chars.get(cursor) {
+            match glyph {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    if depth == 0 {
+                        return Some((cursor, parameters));
+                    }
+                    depth -= 1;
+                }
+                ',' | ';' | '\n' if depth == 0 => return Some((cursor, parameters)),
+                _ => {}
+            }
+            cursor += 1;
+        }
+        return Some((cursor, parameters));
     }
     let mut depth = 0_usize;
     while let Some(glyph) = chars.get(cursor) {
@@ -1971,12 +1990,26 @@ fn a_folder_project_is_selectable_but_cannot_name_an_arbitrary_cwd() {
         window.contains("worktree.branch || basename(worktree.path)"),
         "a folder workspace exposes its full path instead of its compact name"
     );
+    // A folder project keeps its creation doors since 2026-11-06 (the person:
+    // 「막히는 구간 없이」): they open the composer, which lists the folder as
+    // 「git 아님」 and offers `start_git` under its project field instead of
+    // the door simply being missing.
     assert!(
-        window.contains(
-            "const canCreateWorktree = project.worktrees.some((worktree) => !worktree.is_folder);"
-        ) && window.contains("add.hidden = !canCreateWorktree")
-            && window.contains("el(\"worktree-new\").disabled = !canCreateWorktree"),
-        "a folder project still offers a git-only worktree creation action"
+        window.contains("add.hidden = false;")
+            && window.contains("el(\"worktree-new\").disabled = !activeProject;"),
+        "a folder project's creation door is hidden again, so the person meets no door and no word"
+    );
+    let composing = block_after(window, "function paintWorktreeProjects() {");
+    assert!(
+        composing.contains("const able = projects;")
+            && composing.contains("t(\"worktree.projectNotGit\", "),
+        "the composer left folder projects out again:\n{composing}"
+    );
+    let noting = block_after(window, "function paintWorktreeProjectNote() {");
+    assert!(
+        noting.contains("startGitForWorktreeForm(start)")
+            && window.contains("await invoke(\"start_git\", { path });"),
+        "a folder project's note lost the press that makes it git:\n{noting}"
     );
 }
 
@@ -4028,6 +4061,40 @@ fn the_conversation_size_is_a_normalized_setting_on_one_root_pin() {
         apply.contains("\"--chat-prose-pin\"")
             && tokens.contains("--chat-prose-size: var(--chat-prose-pin, var(--term-font-size));"),
         "the setting does not reach the one variable the conversation's sizes read:\n{apply}"
+    );
+}
+
+/// Tables and code take a wide page's room (2026-11-06, the person's 「⑤번도
+/// 다음 판에 넣어줘」): off unless the person turns it on, through the one
+/// canonical settings wire, onto the one root mark the conversation's rules read.
+#[test]
+fn wide_tables_and_code_are_one_setting_on_one_root_mark() {
+    assert!(!SettingsDocument::default().chat_wide_blocks);
+    let restored: SettingsDocument =
+        serde_json::from_value(serde_json::json!({})).expect("old settings document");
+    assert!(!restored.chat_wide_blocks, "an older document keeps every block on the column");
+
+    let window = window_source();
+    assert_canonical_setting_round_trip(
+        shipped_backend(),
+        window,
+        "set_chat_wide_blocks",
+        "setting_key::CHAT_WIDE_BLOCKS",
+        "settings.chat_wide_blocks = wide",
+        "function setChatWideBlocks(wide) {",
+        "chat_wide_blocks",
+        "paintChatWideBlocks();",
+    );
+    assert!(
+        shipped_backend().contains("set_chat_wide_blocks,"),
+        "the wide tables and code patch is not registered"
+    );
+    let apply = block_after(window, "function applyChatWideBlocks() {");
+    let css = include_str!("../../../ui/shell.css");
+    assert!(
+        apply.contains("dataset.chatWideBlocks")
+            && css.contains(":root[data-chat-wide-blocks=\"on\"] .is-chat-page .helper-turn.is-assistant > .helper-said {"),
+        "the setting does not reach the one mark the conversation's wide blocks read:\n{apply}"
     );
 }
 
@@ -7405,6 +7472,15 @@ fn no_label_reaches_the_window_hardcoded() {
         // probe's fixed Korean sentence (api_routers.rs `연결 실패: {err}`)
         // whatever the window speaks; the pattern never reaches the screen.
         "const PROBE_TRANSPORT_FAILURE = /^연결 실패/;",
+        // Readers, not labels: a Jira site names its priorities in its own
+        // language (a Korean site's 긴급·높음·보통·낮음), and these patterns
+        // only sort such a name into one of four bar shapes
+        // (`JIRA_PRIORITY_MARKS`, 2026-11-06). The word on screen is the
+        // site's own name, never one of these.
+        r#"[/^(highest|blocker|critical|urgent|긴급|최상)/i, "signal", "is-top"],"#,
+        r#"[/^(high|major|높음)/i, "signal-high", "is-high"],"#,
+        r#"[/^(medium|normal|보통|중간)/i, "signal-medium", "is-mid"],"#,
+        r#"[/^(low|minor|lowest|trivial|낮음|최하)/i, "signal-low", "is-low"],"#,
     ];
 
     // The catalog-bearing part is exactly one file. The byte range used
@@ -21196,6 +21272,25 @@ fn a_function_parameter_is_a_local_call_inside_its_body_only() {
     assert!(!called_names(&strip_literals(anonymous)).contains("flip"));
 }
 
+/// An expression-bodied arrow's own parameter is its own through the arrows
+/// inside that expression (gate l108b, v1.1.128): shell-boot.js's
+/// `const listen = (name, handler) => listenToBackend(name, (event) =>
+/// answeringBackendEvent(name, () => handler(event)));` calls the `handler`
+/// it was handed. The statement's end closes the scope, so the same name
+/// called after it is still caught.
+#[test]
+fn an_expression_arrow_parameter_is_local_through_its_nested_arrows_only() {
+    let inside = "const listen = (name, handler) => listenToBackend(name, (event) => answeringBackendEvent(name, () => handler(event)));";
+    let calls = called_names(&strip_literals(inside));
+    assert!(!calls.contains("handler"), "{calls:?}");
+    assert!(calls.contains("listenToBackend") && calls.contains("answeringBackendEvent"));
+    let after = format!("{inside}\nhandler();");
+    assert!(called_names(&strip_literals(&after)).contains("handler"));
+    let argument = "items.map((one) => one.name).forEach((name) => paint(name)); one();";
+    let calls = called_names(&strip_literals(argument));
+    assert!(calls.contains("one") && calls.contains("paint"), "{calls:?}");
+}
+
 #[test]
 fn a_callback_parameter_does_not_hide_a_missing_call_outside_its_body() {
     let inside = "new Promise((complete, fail) => { setTimeout(() => { fail(); }, 0); });";
@@ -34251,4 +34346,263 @@ fn transcript_archive_keeps_evicted_messages_without_retained_duplicates() {
     let current = transcript_log_source(&path, LogRead::Tail, true, false).expect("current page");
     assert_eq!(current.turns.len(), 1);
     assert_eq!(current.turns[0].message_index, Some(10));
+}
+
+
+/* ---- 만들기 흐름의 폴더 (2026-11-06, 사람: 「폴더 생성 막고있는 부분」) ---- */
+
+fn first_commit_fixture() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().expect("a repository with no commit");
+    let repo = temp.path();
+    test_git(repo, &["init", "-b", "main"]);
+    // Local identity only: the machine running this may have none, or sign.
+    test_git(repo, &["config", "user.name", "ZeroCode Test"]);
+    test_git(repo, &["config", "user.email", "zerocode@example.invalid"]);
+    test_git(repo, &["config", "commit.gpgsign", "false"]);
+    temp
+}
+
+#[test]
+fn a_new_folder_is_placed_under_a_parent_that_need_not_exist_yet() {
+    let temp = tempfile::tempdir().expect("a place");
+    let root = temp.path().canonicalize().expect("a real place");
+    let parent = root.join("projects").join("2026");
+    let placed = place_inside(&parent.to_string_lossy(), "my-app")
+        .unwrap_or_else(|refusal| panic!("a missing parent was refused: {refusal}"));
+    assert_eq!(placed.target, parent.join("my-app"));
+    assert_eq!(placed.missing, vec![root.join("projects"), parent.clone()]);
+    assert!(
+        !root.join("projects").exists(),
+        "placing made a folder before the making"
+    );
+
+    // `~` is the home folder, read where the person typed it.
+    let home = workspace_home_directory()
+        .expect("a home folder")
+        .canonicalize()
+        .expect("home");
+    let (resolved, missing) =
+        resolve_new_parent("~").unwrap_or_else(|refusal| panic!("`~` was refused: {refusal}"));
+    assert_eq!((resolved, missing.len()), (home, 0));
+
+    // Three refusals, each told apart for the dialog.
+    assert!(matches!(
+        place_inside(&root.to_string_lossy(), "a/b"),
+        Err(PlaceRefusal::Name(_))
+    ));
+    assert!(matches!(
+        place_inside("relative/place", "app"),
+        Err(PlaceRefusal::Place(_))
+    ));
+    assert!(matches!(
+        place_inside(&format!("{}/gone/../up", root.display()), "app"),
+        Err(PlaceRefusal::Place(_))
+    ));
+    std::fs::create_dir(root.join("taken")).expect("a folder already there");
+    match place_inside(&root.to_string_lossy(), "taken") {
+        Err(PlaceRefusal::Exists(target)) => assert_eq!(target, root.join("taken")),
+        Err(refusal) => panic!("a folder already there was refused as {refusal}"),
+        Ok(placed) => panic!(
+            "a folder already there was placed again: {:?}",
+            placed.target
+        ),
+    }
+}
+
+#[test]
+fn a_failed_making_takes_back_only_what_it_made() {
+    let temp = tempfile::tempdir().expect("a place");
+    let root = temp.path().canonicalize().expect("a real place");
+    let placed = place_inside(&root.join("a").join("b").to_string_lossy(), "app")
+        .unwrap_or_else(|refusal| panic!("{refusal}"));
+    std::fs::create_dir_all(&placed.target).expect("the making");
+    // Somebody wrote into the outer folder meanwhile: it is theirs now.
+    std::fs::write(root.join("a").join("kept.txt"), "kept\n").expect("a file of theirs");
+    unmake_placement(&placed);
+    assert!(!placed.target.exists() && !root.join("a").join("b").exists());
+    assert!(
+        root.join("a").join("kept.txt").exists(),
+        "a folder somebody wrote into was taken"
+    );
+}
+
+#[test]
+fn a_catalogued_repository_is_found_by_its_own_entry_and_nothing_else_is() {
+    let temp = tempfile::tempdir().expect("a place");
+    let root = temp.path().canonicalize().expect("a real place");
+    let config = root.join("config");
+    std::fs::create_dir_all(&config).expect("a config folder");
+    let first = root.join("first");
+    let second = root.join("second");
+    for repo in [&first, &second] {
+        std::fs::create_dir_all(repo).expect("a repository folder");
+        test_git(repo, &["init", "-b", "main"]);
+    }
+    // A stale entry first, as a catalog that outlived a folder has.
+    let gone = root.join("gone");
+    std::fs::write(
+        recent_projects_file(&config),
+        serde_json::to_string(&vec![
+            gone.to_string_lossy().into_owned(),
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+        ])
+        .expect("json"),
+    )
+    .expect("the catalog");
+    let found = known_project_orchestrator(&config, &second.to_string_lossy())
+        .unwrap_or_else(|said| panic!("a catalogued repository was refused: {said}"));
+    assert_eq!(found.repo_root(), second.as_path());
+    // The same folder asked by another spelling of its path.
+    let spelled = format!("{}/./second", root.display());
+    assert_eq!(
+        known_project_orchestrator(&config, &spelled)
+            .unwrap_or_else(|said| panic!("{said}"))
+            .repo_root(),
+        second.as_path()
+    );
+    // A repository the catalog does not hold is not a project of this window.
+    let stranger = root.join("stranger");
+    std::fs::create_dir_all(&stranger).expect("a stranger");
+    test_git(&stranger, &["init", "-b", "main"]);
+    assert!(known_project_orchestrator(&config, &stranger.to_string_lossy()).is_err());
+}
+
+#[test]
+fn the_first_commit_is_made_only_where_head_is_unborn() {
+    let temp = first_commit_fixture();
+    let repo = temp.path();
+    let host = Host::for_workspace(repo);
+    assert!(
+        !ref_exists(&host, repo, "HEAD"),
+        "a fresh repository already has a commit"
+    );
+    make_first_commit(&host, repo).unwrap_or_else(|said| panic!("{said}"));
+    assert!(ref_exists(&host, repo, "HEAD"));
+    assert_eq!(
+        test_git(repo, &["log", "--format=%s"]),
+        FIRST_COMMIT_MESSAGE
+    );
+    let head = test_git(repo, &["rev-parse", "HEAD"]);
+    make_first_commit(&host, repo).unwrap_or_else(|said| panic!("{said}"));
+    assert_eq!(
+        test_git(repo, &["rev-parse", "HEAD"]),
+        head,
+        "a repository with history was given a commit nobody asked for"
+    );
+}
+
+/// Review of v1.1.128 (t-97103 P2-1): 「빈 첫 커밋」 is empty even when the
+/// person staged files after `git init` — `git commit --allow-empty` would have
+/// committed them; they stay staged, uncommitted.
+#[test]
+fn the_empty_first_commit_leaves_what_was_staged_staged() {
+    let temp = first_commit_fixture();
+    let repo = temp.path();
+    std::fs::write(repo.join("staged.txt"), "not for the first commit\n").expect("a file");
+    test_git(repo, &["add", "staged.txt"]);
+    let host = Host::for_workspace(repo);
+    make_first_commit(&host, repo).unwrap_or_else(|said| panic!("{said}"));
+    assert_eq!(
+        test_git(repo, &["ls-tree", "-r", "--name-only", "HEAD"]),
+        "",
+        "the first commit took what was staged"
+    );
+    assert_eq!(
+        test_git(repo, &["diff", "--cached", "--name-only"]),
+        "staged.txt",
+        "what was staged is no longer staged"
+    );
+    assert_eq!(test_git(repo, &["symbolic-ref", "--short", "HEAD"]), "main");
+}
+
+#[test]
+fn a_new_project_is_a_repository_whose_first_commit_is_made_or_named() {
+    let temp = tempfile::tempdir().expect("a place");
+    let parent = temp.path().join("not").join("yet");
+    let made = runtime()
+        .block_on(cmd::create_project(
+            parent.to_string_lossy().into_owned(),
+            "app".to_string(),
+            None,
+        ))
+        .unwrap_or_else(|said| panic!("a new project under a missing parent: {said}"));
+    let path = PathBuf::from(&made.path);
+    assert!(
+        path.join(".git").is_dir(),
+        "the project is not a repository"
+    );
+    // A machine with a git identity gets the commit; one without is told why,
+    // and the project still stands either way.
+    assert_eq!(
+        ref_exists(&Host::for_workspace(&path), &path, "HEAD"),
+        made.first_commit_refused.is_none(),
+        "{:?}",
+        made.first_commit_refused
+    );
+    let plain = runtime()
+        .block_on(cmd::create_project(
+            parent.to_string_lossy().into_owned(),
+            "notes".to_string(),
+            Some(false),
+        ))
+        .unwrap_or_else(|said| panic!("a folder project: {said}"));
+    assert!(PathBuf::from(&plain.path).is_dir());
+    assert!(
+        !PathBuf::from(&plain.path).join(".git").exists(),
+        "a folder project became git"
+    );
+}
+
+#[test]
+fn the_new_project_preview_reads_the_rule_the_making_does() {
+    let temp = tempfile::tempdir().expect("a place");
+    let root = temp.path().canonicalize().expect("a real place");
+    let parent = root.join("p").join("q").to_string_lossy().into_owned();
+    let plan = cmd::plan_project_folder(parent.clone(), "app".to_string());
+    assert_eq!(plan.new_folders, 3);
+    assert_eq!(
+        plan.target,
+        Some(shown_path(&root.join("p").join("q").join("app")))
+    );
+    assert!(plan.problem.is_none() && plan.exists.is_none());
+
+    std::fs::create_dir_all(root.join("p").join("q").join("app")).expect("taken now");
+    let taken = cmd::plan_project_folder(parent.clone(), "app".to_string());
+    assert!(taken.exists.is_some() && taken.new_folders == 0);
+    assert!(
+        taken
+            .problem
+            .is_some_and(|words| words.contains("이미 있습니다"))
+    );
+
+    let named = cmd::plan_project_folder(parent.clone(), "a/b".to_string());
+    assert!(named.target.is_none() && named.problem.is_some() && named.name_problem);
+
+    // A refused segment of the PLACE is the place's to fix, though it is refused
+    // in the same words a name is.
+    let placed = cmd::plan_project_folder(format!("{parent}/-x"), "app".to_string());
+    assert!(placed.problem.is_some() && !placed.name_problem, "{:?}", placed.problem);
+}
+
+#[test]
+fn a_new_folder_is_made_once_and_its_way_is_checked_name_by_name() {
+    let temp = tempfile::tempdir().expect("a place");
+    let root = temp.path().canonicalize().expect("a real place");
+    let asked = root.join("x").join("y").to_string_lossy().into_owned();
+    let made = runtime()
+        .block_on(cmd::make_folder(asked.clone()))
+        .unwrap_or_else(|said| panic!("{said}"));
+    assert_eq!(PathBuf::from(&made), root.join("x").join("y"));
+    assert!(root.join("x").join("y").is_dir());
+    let again = runtime()
+        .block_on(cmd::make_folder(asked))
+        .expect_err("a folder already there was made again");
+    assert!(again.contains("이미 있습니다"), "{again}");
+    assert!(
+        runtime()
+            .block_on(cmd::make_folder(format!("{}/gone/../up", root.display())))
+            .is_err(),
+        "a `..` on the way was walked"
+    );
 }

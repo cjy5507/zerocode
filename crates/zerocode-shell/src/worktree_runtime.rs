@@ -305,7 +305,89 @@ pub(super) fn matching_worktree<'a>(
         .find(|worktree| worktree.path.as_path() == requested)
 }
 
+/// How many names of a folder project are read, and how many of its
+/// checkouts are kept (in name order) — a folder of thousands of downloads is
+/// not walked to the end on every read, and which ones make the cut does not
+/// depend on the order the disk lists them.
+const FOLDER_ENTRY_SCAN: usize = 5000;
+const FOLDER_REPOSITORY_SCAN: usize = 200;
+
+/// Every repository the sidebar catalog reaches: each catalogued repository,
+/// and — for a catalogued folder that is not one — the repositories directly
+/// inside it, one level and no deeper (2026-11-06: the person's `work` folder
+/// holds ten company checkouts, and the tasks page asked none of them). Hidden
+/// folders are skipped. Deduplicated by canonical root, in catalog order.
+///
+/// A checkout is told by its `.git` (a folder, or a worktree's file) — a stat,
+/// not a git process. The catalog holds dozens of projects, a git spawn is
+/// ~12 ms on this Mac, and this runs whenever the tasks page reads its sources
+/// (the same cost `known_project_orchestrator` stopped paying for its own
+/// entry). Only a catalogued folder with no checkout in or under it asks git,
+/// once, whether it sits inside one.
+pub(super) fn catalog_repository_roots(config_root: &Path) -> Vec<PathBuf> {
+    let is_checkout = |path: &Path| path.join(".git").exists();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut keep = |root: PathBuf| {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    };
+    // One spelling for every root: `dunce` keeps the plain `C:\…` form on
+    // Windows where `canonicalize` gives `\\?\C:\…` and git gives `C:/…`, so
+    // one checkout is never two rows, and git is handed a path it reads.
+    let plain = |path: &Path| dunce::canonicalize(path).ok();
+    for stored in stored_projects(config_root) {
+        let Some(folder) = plain(Path::new(&stored)) else {
+            continue;
+        };
+        if is_checkout(&folder) {
+            keep(folder);
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        let mut names: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .take(FOLDER_ENTRY_SCAN)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !name.starts_with('.'))
+            })
+            .collect();
+        names.sort();
+        let inner: Vec<PathBuf> = names
+            .iter()
+            .filter(|path| is_checkout(path))
+            .take(FOLDER_REPOSITORY_SCAN)
+            .filter_map(|path| plain(path))
+            .collect();
+        if inner.is_empty() {
+            // A catalogued folder inside a checkout: git names the root.
+            if let Ok(orchestrator) = Orchestrator::open(&folder)
+                && let Some(root) = plain(orchestrator.repo_root())
+            {
+                keep(root);
+            }
+            continue;
+        }
+        for path in inner {
+            keep(path);
+        }
+    }
+    roots
+}
+
 /// Resolve a repository only when it already belongs to the sidebar catalog.
+///
+/// The catalog's own entry for the folder is opened first — one `git
+/// rev-parse` — and the rest, in order, only when that is not it. Opening every
+/// entry in order was one git spawn per stored project before any answer: 34
+/// entries on the machine it was measured on, about 12 ms a spawn (2026-11-06),
+/// on a road the create dialog's preview walks at every pause in the typing.
+/// Which entries count is unchanged: a stored path whose checkout is this one.
 pub(super) fn known_project_orchestrator(
     config_root: &Path,
     requested: &str,
@@ -313,13 +395,26 @@ pub(super) fn known_project_orchestrator(
     let requested = PathBuf::from(requested)
         .canonicalize()
         .map_err(|_| NOT_A_REPOSITORY.to_string())?;
-    for stored in stored_projects(config_root) {
-        let Ok(orchestrator) = Orchestrator::open(&stored) else {
+    let stored = stored_projects(config_root);
+    let (same, rest): (Vec<&String>, Vec<&String>) = stored.iter().partition(|one| {
+        Path::new(one.as_str())
+            .canonicalize()
+            .is_ok_and(|path| path == requested)
+    });
+    for candidate in same.into_iter().chain(rest) {
+        let Ok(orchestrator) = Orchestrator::open(candidate) else {
             continue;
         };
         if orchestrator.repo_root() == requested {
             return Ok(orchestrator);
         }
+    }
+    // A repository directly inside a catalogued folder is the catalog's too
+    // (one level, `catalog_repository_roots`): the tasks page lists the
+    // company checkouts inside a folder project, and their rows open here.
+    let plain = dunce::simplified(&requested).to_path_buf();
+    if catalog_repository_roots(config_root).contains(&plain) {
+        return Orchestrator::open(&plain).map_err(|_| NOT_A_REPOSITORY.to_string());
     }
     Err(NOT_A_REPOSITORY.to_string())
 }
@@ -330,16 +425,27 @@ pub(super) fn known_project_repositories(
     config_root: &Path,
     requested: &[String],
 ) -> Result<Vec<(String, PathBuf)>, String> {
-    let known: Vec<PathBuf> = stored_projects(config_root)
+    let mut known: Vec<PathBuf> = stored_projects(config_root)
         .into_iter()
         .filter_map(|path| PathBuf::from(path).canonicalize().ok())
         .collect();
+    // A repository inside a catalogued folder is the catalog's too (one
+    // level). Looked for only when a requested path is not a catalogued one:
+    // the scan opens every inner repository, and most reads never need it.
+    let mut widened = false;
     let mut homes = Vec::new();
     for name in requested {
         let canonical = PathBuf::from(name)
             .canonicalize()
             .map_err(|_| NOT_A_REPOSITORY.to_string())?;
-        if !known.contains(&canonical) {
+        // The catalog's inner roots are in `dunce`'s plain spelling.
+        let plain = dunce::simplified(&canonical).to_path_buf();
+        let listed = |known: &[PathBuf]| known.contains(&canonical) || known.contains(&plain);
+        if !widened && !listed(&known) {
+            known.extend(catalog_repository_roots(config_root));
+            widened = true;
+        }
+        if !listed(&known) {
             return Err(NOT_A_REPOSITORY.to_string());
         }
         if let Ok(orchestrator) = Orchestrator::open(&canonical) {
@@ -597,6 +703,21 @@ pub(super) fn resolve_branch_prefix(
             .filter(|name| prefix_is_usable(name))
             .map(clean_prefix)),
     }
+}
+
+/// 이 저장소에서 자를 작업 트리의 브랜치 접두사 — 사람 이름은 설정이 그것을
+/// 쓸 때만 git에 묻는다. 만들기 창의 미리 보기(`plan_worktree`)가 칠 때마다
+/// 이 길을 지나고, `git config` 한 번이 이 기계에서 12 ms쯤이다(2026-11-06 잼).
+pub(super) fn branch_prefix_for(
+    prefs: &WorktreePrefs,
+    host: &Host,
+    repo_root: &Path,
+) -> Result<Option<String>, String> {
+    let username = match prefs.branch_prefix {
+        BranchPrefixMode::GitUsername => git_username(host, repo_root),
+        BranchPrefixMode::Custom | BranchPrefixMode::None => None,
+    };
+    resolve_branch_prefix(prefs, username.as_deref())
 }
 
 /// 이 저장소가 아는 커밋 작성자 이름, 브랜치 마디로 쓸 수 있게 슬러그로.
@@ -1002,6 +1123,40 @@ pub(super) fn ref_exists(host: &Host, repo_root: &Path, reference: &str) -> bool
         )
         .is_ok_and(|said| !said.trim().is_empty())
 }
+
+/// 커밋이 하나도 없는 저장소에서 작업 트리를 만들려 할 때의 한 문장. git의
+/// 문장(`fatal: invalid reference: HEAD`)을 읽어 고른 것이 아니라 저장소에
+/// 커밋이 있는지 직접 물어(`ref_exists(…, "HEAD")`) 고른 것이다.
+pub(super) const UNBORN_HEAD: &str = "이 저장소에는 아직 커밋이 없어 작업 트리를 만들 수 없습니다. 빈 첫 커밋을 만든 뒤 다시 시도하세요.";
+
+/// 새 저장소의 빈 첫 커밋. 작업 트리는 커밋에서 갈라지므로, 커밋 없는 저장소에서
+/// `git worktree add … HEAD`는 거절된다(git 2.50.1: `fatal: invalid reference:
+/// HEAD`). 커밋이 이미 있는 저장소에는 아무것도 하지 않는다 — 사람이 부르지 않은
+/// 커밋이 역사에 끼는 일은 없다.
+pub(super) fn make_first_commit(host: &Host, root: &Path) -> Result<(), String> {
+    if ref_exists(host, root, "HEAD") {
+        return Ok(());
+    }
+    // Built past the index, so what the person staged stays staged and out of
+    // the commit the window calls empty: the empty tree (`mktree` reads its
+    // entries from stdin, which the runner closes), a commit of it, and the
+    // branch HEAD names set to that commit. No commit hook runs for it.
+    let refused = |said: String| format!("첫 커밋을 만들지 못했습니다: {said}");
+    let vcs = host.vcs();
+    let tree = vcs.text(root, &["mktree"]).map_err(refused)?;
+    let commit = vcs
+        .text(
+            root,
+            &["commit-tree", tree.trim(), "-m", FIRST_COMMIT_MESSAGE],
+        )
+        .map_err(refused)?;
+    vcs.text(root, &["update-ref", "HEAD", commit.trim()])
+        .map(drop)
+        .map_err(refused)
+}
+
+/// 빈 첫 커밋의 메시지 — GitHub Desktop이 새 저장소에 남기는 그 말.
+pub(super) const FIRST_COMMIT_MESSAGE: &str = "Initial commit";
 
 /// 기준을 자르기 전에 원격을 한 번 새로 고친다. **실패해도 계속 간다.**
 ///

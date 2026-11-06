@@ -55,8 +55,8 @@ const MODAL_SPECS = Object.freeze({
   },
   "pr-new-scrim": { initial: "pr-new-title", cancel: () => closePullRequestForm() },
   "wt-new-scrim": { initial: "wt-spec", cancel: () => setWorktreeForm(false) },
-  "addproj-scrim": { initial: "addproj-browse", cancel: () => setAddProject(false) },
-  "pb-scrim": { initial: "pb-list", cancel: () => closePathBrowser([]) },
+  "addproj-scrim": { initial: "addproj-q", cancel: () => setAddProject(false) },
+  "pb-scrim": { initial: "pb-list", cancel: () => escapePathBrowser() },
   "save-scrim": { initial: "save-keep", cancel: () => answerLosing("cancel") },
   "pin-scrim": { initial: "pin-cancel", cancel: () => answerPinned(false) },
   "wt-remove-scrim": { initial: "wt-remove-cancel", cancel: () => closeRemovalPrompt() },
@@ -123,7 +123,6 @@ const MODAL_SPECS = Object.freeze({
     },
   },
   "gh-item-scrim": { initial: "gh-item-shut", cancel: () => closeGithubItem() },
-  "jira-item-scrim": { initial: "jira-item-shut", cancel: () => closeJiraItem() },
   "linear-item-scrim": { initial: "linear-item-shut", cancel: () => closeLinearItem() },
   "gl-item-scrim": { initial: "gl-item-shut", cancel: () => closeGitlabItem() },
   "jira-connect-scrim": {
@@ -423,7 +422,7 @@ function rearmKeySink(event) {
   // A screen is covering the terminal, so the sink is not what these keys
   // are for — pulling focus back to it would take the arrow keys away from
   // the screen the person is actually reading.
-  if (!settingsView.hidden || !taskView.hidden || workspaceBoardOpen) return;
+  if (!settingsView.hidden || tasksInFront() || workspaceBoardOpen) return;
   // The task board's tab covers the stage the same way, and its blocks, rows and cards are buttons: a focused
   // one that lost the focus to the sink on its Enter never saw the press (t-84799 ③). The board that is a window of its
   // own (`isPopout`) has no tab list, so it is asked by the window. And only while the keys have no other owner: a floating
@@ -466,7 +465,7 @@ function rearmKeySink(event) {
  * would send. */
 function sinkLetterToConversation(event) {
   if (!typedCharacter(event) || modalTop()) return;
-  if (!settingsView.hidden || !taskView.hidden || workspaceBoardOpen) return;
+  if (!settingsView.hidden || tasksInFront() || workspaceBoardOpen) return;
   const front = frontKeyboardTarget();
   if (front !== null || typingHold(front) !== undefined) return;
   frontConversationBox()?.focus();
@@ -516,12 +515,30 @@ window.addEventListener("focus", rearmKeySink);
  * a ⌘ chord, Ctrl+Tab, a key aimed at the window rather than at a pane (a
  * row's arrow, the Escape that closes a document), a paste. So a click on a
  * tab and the typing right after it land together. A pause ends it too, and
- * so does the end of its pane: the next key goes where the screen is.
+ * so does the end of its pane: the next key goes where the screen is — but
+ * not a short pause over a composition still open in it. The Korean IME keeps
+ * the last syllable open until the next key, so the key that takes it up again
+ * within `OPEN_COMPOSITION_GAP_MS` goes on with the run while the run's pane
+ * is on screen (t-97132); after a longer one only the open syllable finishes
+ * there (t-97449).
+ *
+ * The backend's moves are known by the event being answered
+ * (`backendEventNow`); one that lands after an `await` names its event again
+ * (`answeringBackendEvent`), or the run would read it as nobody's and follow
+ * it with the next space or Enter (t-97132).
  *
  * One second, the beat the rescue below trusts for the same question: longer
  * than any gap between the keys of a word, shorter than a person's look at a
  * screen that changed under them. */
 const TYPING_RUN_GAP_MS = 1000;
+
+/* How long a pause over an open composition still belongs to its run
+ * (t-97449). The open syllable is the IME's habit, not a sign the person is
+ * still at that pane: a pause to pick the next word mid-sentence is a beat or
+ * two, but past three beats they have looked up and seen whatever the screen
+ * did meanwhile, so the next syllable goes where the screen is, as after any
+ * pause. Without an end, ten minutes away from the keys held the keyboard. */
+const OPEN_COMPOSITION_GAP_MS = 3 * TYPING_RUN_GAP_MS;
 
 /* The run in progress: `{ target, at, closed, moved }` — where it began, its
  * last key's moment, whether a move of the person's has ended it (only its
@@ -575,8 +592,16 @@ function noteTypingAtPane() {
     return;
   }
   // What a composition began, it finishes where it began — however long it
-  // stays open and whatever moved meanwhile.
-  if (run !== null && pending) return;
+  // stays open and whatever moved meanwhile. And an open composition is
+  // typing in progress: the key that takes it up again after a short pause is
+  // the run's next beat while the run's pane is on screen, so the syllables
+  // after it do not start a new run where the screen went meanwhile
+  // (t-97132). After a long one the run is not renewed, and the next
+  // syllable starts its own where the screen is (t-97449).
+  if (run !== null && pending) {
+    if (!run.closed && now - run.at < OPEN_COMPOSITION_GAP_MS && typedPaneShown(run.target)) run.at = now;
+    return;
+  }
   const front = frontInputTarget();
   typingRun = front === null ? null : { target: front, at: now, closed: false, moved: false };
 }
@@ -671,7 +696,7 @@ function typedPaneShown(target) {
   if (target.kind !== "term") return false;
   if (target.term === FLOAT_TERM) return !termFloat.hidden;
   if (target.term === peekTerm && !el("peek-scrim").hidden) return true;
-  if (!settingsView.hidden || !taskView.hidden || workspaceBoardOpen) return false;
+  if (!settingsView.hidden || tasksInFront() || workspaceBoardOpen) return false;
   const view = termViews.get(target.term);
   return view !== undefined && termShown(view);
 }
@@ -782,7 +807,7 @@ function frontKeyboardTarget() {
   // A screen that covers the stage has taken the terminal off the screen, and
   // a key sent to a shell nobody can see is a key nobody can take back. Both
   // of these cover it whole; the finder and the dialogs do not.
-  if (!settingsView.hidden || !taskView.hidden || workspaceBoardOpen) return null;
+  if (!settingsView.hidden || tasksInFront() || workspaceBoardOpen) return null;
   // The visible tab in the focused leaf is the only safe keyboard owner.
   // `activeTabId` can briefly name a background or cross-workspace tab while
   // the stage has already fallen back to what this leaf can actually draw.
@@ -805,7 +830,7 @@ function frontKeyboardTarget() {
 }
 
 function frontEmulatorKeyboardTarget() {
-  if (!termFloat.hidden || !settingsView.hidden || !taskView.hidden || workspaceBoardOpen)
+  if (!termFloat.hidden || !settingsView.hidden || tasksInFront() || workspaceBoardOpen)
     return null;
   const tab = currentTab();
   if (tab?.kind !== "emulator" || !tab.live || !tab.interactive) return null;
@@ -1718,15 +1743,19 @@ window.addEventListener("keydown", (event) => {
       setWorkspaceBoardOpen(false);
       return;
     }
-    if (!taskView.hidden) {
-      event.preventDefault();
+    // 작업은 탭이라 Escape가 탭을 닫지 않는다(다른 탭처럼). 한 번에 한 겹:
+    // 칸에서 손을 떼고, 그다음 열린 이슈를 접는다.
+    if (tasksInFront()) {
       const focused = document.activeElement;
       if (taskView.contains(focused) && focused.matches("input, textarea, select")) {
+        event.preventDefault();
         focused.blur();
         return;
       }
-      setTaskOpen(false);
-      return;
+      if (closeTaskDetail()) {
+        event.preventDefault();
+        return;
+      }
     }
     // The automation form is a layer inside its page, so one Escape puts the
     // list back and the next puts the page away. Written as two steps rather
@@ -2549,6 +2578,9 @@ keySink.addEventListener("compositionupdate", (event) => {
 
 keySink.addEventListener("compositionend", () => {
   traceIme("comp.end");
+  // The commit is a beat of the run it closes, asked while the composition is
+  // still open (t-97132).
+  noteTypingAtPane();
   // Drained before the flag comes down: the run this composition began holds
   // through its own text and the Enter that committed it (t-69526).
   drainKeySink();
@@ -3693,9 +3725,9 @@ function openPalette(mode, seed = null) {
   if (!finder) return;
   const opener = document.activeElement;
   // Both float on the same scrim, so two of them open at once is two dialogs
-  // stacked on one darkening layer with only the later one reachable.
+  // stacked on one darkening layer with only the later one reachable. 작업은
+  // 탭이라(2026-11-06) 찾기 창 밑에 그대로 남는다.
   setSettingsOpen(false);
-  setTaskOpen(false);
   paletteMode = mode;
   qoScrim.dataset.finder = mode;
   el("qo-finder-mark-icon").setAttribute(

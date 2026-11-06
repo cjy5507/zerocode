@@ -4296,6 +4296,423 @@ svg.wt-agent-dot {
   transform: rotate(90deg);
 }
 
+/* ---- the create dialogs, IntelliJ's arrangement in Geist's tokens ---------
+ *
+ * 2026-11-06, the person: 「사용하기 편하게 프로젝트 intelij 처럼 … 디자인과
+ * 위치 잘해서」 and 「디자인 토큰은 geist처럼」. IntelliJ's forms put the label
+ * BESIDE the field and say under the location where the thing will be made;
+ * Geist gives the values — label-13 in the secondary ink for a label, a field
+ * at control height with a 1px edge on the recess, heading-16 for a title, a
+ * 200-step ground for a note. Nothing below is a new value but the label
+ * column, which is a token of its own. */
+.qo-head.qo-head--sub {
+  align-items: flex-start;
+  padding-top: var(--space-4);
+}
+
+.qo-head-words {
+  display: grid;
+  flex: 1 1 auto;
+  gap: var(--space-1);
+  min-width: 0;
+  padding: 0 var(--space-4) var(--space-4);
+}
+
+/* The way back from a form to the project list stands before the title. */
+.qo-back {
+  flex: none;
+  margin-left: var(--space-3);
+}
+
+.qo-back:not([hidden]) + .qo-head-words {
+  padding-left: var(--space-1);
+}
+
+.qo-head--sub .qo-title {
+  padding: 0;
+  font: var(--type-heading-16);
+  letter-spacing: var(--tracking-heading-16);
+  color: var(--ink-chalk);
+}
+
+.qo-sub {
+  margin: 0;
+  font: var(--type-copy-13);
+  color: var(--ink-mist);
+}
+
+.qo--worktree,
+.qo--addproj {
+  container-type: inline-size;
+}
+
+.qo--worktree .wt-sect {
+  display: grid;
+  grid-template-columns: var(--create-form-label) minmax(0, 1fr);
+  column-gap: var(--space-4);
+  align-items: start;
+}
+
+.qo--worktree .wt-sect > :not(.wt-label) {
+  grid-column: 2;
+  min-width: 0;
+}
+
+/* The label stands on the field's middle line: label-13 is 16px high and the
+ * field is the control height. */
+.qo--worktree .wt-sect > .wt-label,
+.addproj-form > .wt-label {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0;
+  padding-top: calc((var(--control-height-md) - var(--space-4)) / 2);
+  font: var(--type-label-13);
+  color: var(--ink-mist);
+}
+
+.wt-cell {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+/* 480: two label columns and a field no narrower than the label — below it the
+ * label rides above its field. A container query cannot read a token. */
+@container (max-width: 480px) {
+  .qo--worktree .wt-sect {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: var(--space-2);
+  }
+
+  .qo--worktree .wt-sect > :not(.wt-label) {
+    grid-column: 1;
+  }
+
+  .qo--worktree .wt-sect > .wt-label {
+    flex-direction: row;
+    gap: var(--space-2);
+    padding-top: 0;
+  }
+
+  .qo--worktree .wt-advanced {
+    padding-left: var(--space-4);
+  }
+}
+
+/* Every field in these dialogs is the same box: the control height, the 1px
+ * edge, the recess under the deck. They were 36, 48 and 20px high. */
+.qo--worktree .wt-combo {
+  height: var(--control-height-md);
+  background: var(--surface-well);
+}
+
+.qo--worktree .wt-smart {
+  min-height: var(--control-height-md);
+  background: var(--surface-well);
+}
+
+.qo--worktree .wt-spec {
+  font: var(--type-copy-13);
+}
+
+.wt-run {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  margin: 0;
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+}
+
+.wt-run .icon {
+  width: var(--space-4);
+  height: var(--space-4);
+}
+
+.wt-run-where {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: var(--type-label-12-mono);
+}
+
+.wt-inline {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.wt-inline > .wt-combo {
+  flex: 1;
+  min-width: 0;
+}
+
+/* A field with its own small button inside — Geist's button-12 is the one
+ * size made for a button that stands in an input. */
+.wt-box {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  height: var(--control-height-md);
+  padding: 0 var(--space-1) 0 var(--space-3);
+  border: var(--rule-width) solid var(--edge-rule);
+  border-radius: var(--radius-sm);
+  background: var(--surface-well);
+  transition: border-color var(--motion-fast) var(--ease-standard);
+}
+
+.wt-box:focus-within {
+  border-color: var(--edge-mark);
+}
+
+.wt-box.is-wrong {
+  border-color: var(--signal-halt);
+}
+
+.qo .wt-box-input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  outline: none;
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+}
+
+.qo .wt-box-input--mono {
+  font: var(--type-label-13-mono);
+}
+
+.qo .wt-box-input::placeholder {
+  color: var(--ink-mist);
+}
+
+.wt-box-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: calc(var(--control-height-md) - var(--space-2));
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--row-hover);
+  color: var(--ink-chalk);
+  font: var(--type-label-12);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.wt-box-btn:hover {
+  background: var(--gray-alpha-200);
+}
+
+.wt-box-btn .icon {
+  width: var(--space-4);
+  height: var(--space-4);
+}
+
+/* What the create will make, said under the field that decides it — the line
+ * IntelliJ writes under Location. A path reads in mono and breaks after its
+ * slashes, not inside a name. */
+.wt-plan {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  min-width: 0;
+  margin: 0;
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+}
+
+.wt-plan:empty {
+  display: none;
+}
+
+.wt-plan code {
+  color: var(--ink-chalk);
+  font: var(--type-label-12-mono);
+  overflow-wrap: anywhere;
+}
+
+.wt-plan b {
+  font-weight: 600;
+}
+
+.wt-plan-new {
+  display: inline-flex;
+  align-items: center;
+  height: var(--space-5);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--gray-200);
+  color: var(--ink-chalk);
+  font: var(--type-label-12);
+  white-space: nowrap;
+}
+
+.wt-dir-extra {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.wt-dir-extra:not(:has(> :not([hidden]))) {
+  display: none;
+}
+
+/* A caution about the project, under the project, with the one press that
+ * fixes it: Geist's note on the amber 200 ground, words in the ink made for
+ * that ground. */
+.wt-note {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-2);
+  align-items: start;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--signal-wait-ground);
+  color: var(--signal-wait-ink);
+  font: var(--type-copy-13);
+}
+
+.wt-note[hidden] {
+  display: none;
+}
+
+.wt-note > .icon {
+  width: var(--space-4);
+  height: var(--space-4);
+  margin-top: 1px; /* the alert glyph's own optical centre on an 18px line */
+}
+
+.wt-note-actions {
+  grid-column: 2;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+}
+
+.wt-note-btn {
+  height: calc(var(--control-height-md) - var(--space-1));
+  padding: 0 var(--space-3);
+  border: var(--rule-width) solid currentColor;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: inherit;
+  font: var(--type-label-13);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.wt-note-btn:hover {
+  background: color-mix(in srgb, currentColor 12%, transparent);
+}
+
+.wt-note-btn:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+/* Geist's checkbox: a 16px box, the edge in the mark tone, filled with the ink
+ * when ticked. The class names the input so it outranks the dialogs' general
+ * checkbox reset. */
+.qo-check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: fit-content;
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+  cursor: pointer;
+}
+
+.qo-check[hidden] {
+  display: none;
+}
+
+.qo .qo-check > input.qo-check-box[type="checkbox"] {
+  appearance: none;
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: var(--space-4);
+  height: var(--space-4);
+  margin: 0;
+  border: var(--rule-width) solid var(--edge-mark);
+  border-radius: var(--radius-xs);
+  background: transparent;
+  cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    border-color var(--motion-fast) var(--ease-standard);
+}
+
+.qo .qo-check > input.qo-check-box[type="checkbox"]:checked {
+  border-color: currentColor;
+  background: currentColor;
+}
+
+.qo .qo-check > input.qo-check-box[type="checkbox"]:checked::after {
+  content: "";
+  width: var(--space-2);
+  height: var(--space-1);
+  margin-top: -2px; /* the tick's own optical centre */
+  border: solid var(--surface-deck);
+  border-width: 0 0 2px 2px; /* the tick's stroke, the weight of the icon set's */
+  transform: rotate(-45deg);
+}
+
+.wt-note .qo-check {
+  color: inherit;
+}
+
+.qo-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  text-decoration: underline;
+  text-underline-offset: 3px; /* clear of Hangul's descent at label-12 */
+  cursor: pointer;
+  transition: color var(--motion-fast) var(--ease-standard);
+}
+
+.qo-link:hover {
+  color: var(--ink-chalk);
+}
+
+.qo-link[hidden] {
+  display: none;
+}
+
+.qo--worktree .wt-advanced {
+  padding-left: calc(var(--space-4) + var(--create-form-label) + var(--space-4));
+}
+
+.qo--worktree .wt-advanced-summary {
+  padding: 0;
+}
+
+/* The footer stands on Geist's second background, as its modal's does. */
+.qo--worktree .wt-form-actions,
+.qo--addproj .wt-form-actions {
+  background: var(--surface-abyss);
+}
+
 .wt-hint {
   margin: 0;
   padding: var(--space-2) var(--space-4) 0;
@@ -4308,83 +4725,84 @@ svg.wt-agent-dot {
   display: none;
 }
 
-/* ---- the add-a-project dialog ---------------------------------------------
+/* ---- 프로젝트 창 (2026-11-06) ---------------------------------------------
  *
- * Orca's `AddRepoLocalStartStep` (스펙 §12): one big card and a short list
- * under a quiet heading. The shape is the message — "browse a folder" is what
- * almost everybody wants, and putting it in the same list as the other two
- * would make three equal choices out of one common one and two rare ones. */
+ * IntelliJ's welcome screen in Geist's tokens. The person: 「사용하기 편하게
+ * 프로젝트 intelij 처럼 … 막히는 구간 없이」. A search field with the three ways
+ * at its right (IntelliJ moved Get from VCS to the upper right corner for the
+ * same reason: the common press is opening what is already there), the recent
+ * projects under them as full-bleed rows ruled by 1px, and — with no project
+ * yet — the three ways again as large cards. The forms are the composer's
+ * grid: the label at the left, the field and the line that says what will be
+ * made under it. The palette's width, so a step changes nothing but its body. */
 .qo--addproj {
-  width: min(480px, 100%);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .addproj-step {
   display: flex;
   flex-direction: column;
-  padding-bottom: var(--space-2);
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
-.addproj-card {
+.addproj-step[hidden] {
+  display: none;
+}
+
+.addproj-top {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+}
+
+.addproj-search {
+  flex: 1 1 auto;
+}
+
+.addproj-search > .icon {
+  flex: none;
+  width: var(--space-4);
+  height: var(--space-4);
+  color: var(--ink-mist);
+}
+
+.addproj-ways {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.addproj-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden auto;
+  padding-bottom: var(--space-2);
+  border-top: var(--rule-width) solid var(--edge-rule);
+}
+
+.addproj-list[hidden],
+.addproj-welcome[hidden] {
+  display: none;
+}
+
+.addproj-group {
+  margin: 0;
+  padding: var(--space-3) var(--space-4) var(--space-1);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+}
+
+.addproj-recent {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: var(--space-3);
-  margin: var(--space-3) var(--space-4) 0;
-  padding: var(--space-3);
-  border: var(--rule-width) solid var(--edge-rule);
-  border-radius: var(--radius-sm);
-  background: var(--surface-raised);
-  color: var(--ink-chalk);
-  text-align: left;
-  cursor: pointer;
-  transition:
-    background-color var(--motion-fast) var(--ease-standard),
-    border-color var(--motion-fast) var(--ease-standard);
-}
-
-.addproj-card:hover,
-.addproj-card:focus-visible {
-  border-color: var(--edge-mark);
-  background: var(--row-hover);
-}
-
-.addproj-card-words {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.addproj-name {
-  color: var(--ink-chalk);
-  font-size: var(--text-xs);
-  font-weight: 500;
-}
-
-.addproj-why {
-  color: var(--ink-mist);
-  font-size: var(--text-2xs);
-  font-weight: 400;
-}
-
-/* Orca's "다른 추가 방법" — a heading that says the list under it is the
- * uncommon half. */
-.addproj-other {
-  margin: 0;
-  padding: var(--space-4) var(--space-4) var(--space-1);
-  color: var(--ink-mist);
-  font-size: var(--text-2xs);
-  letter-spacing: var(--tracking-label);
-}
-
-.addproj-rows {
-  display: flex;
-  flex-direction: column;
-}
-
-.addproj-row {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-2);
+  width: 100%;
   padding: var(--space-2) var(--space-4);
   border: 0;
   background: none;
@@ -4394,27 +4812,185 @@ svg.wt-agent-dot {
   transition: background-color var(--motion-fast) var(--ease-standard);
 }
 
-.addproj-row .icon {
-  align-self: center;
-  color: var(--ink-mist);
-}
-
-.addproj-row:hover,
-.addproj-row:focus-visible {
+.addproj-recent:hover,
+.addproj-recent.is-sel {
   background: var(--row-hover);
 }
 
-/* A path field and the button that fills it from the operating system's own
- * panel — typing a path is allowed, but nobody should have to. */
-.addproj-pathrow {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
+/* The square IntelliJ draws for a project: its initials, and the mark colour
+ * the sidebar gave it as the ring — the hue points at this project and
+ * nothing else, and the letters keep the neutral ink a yellow mark could not. */
+.addproj-mark {
+  display: inline-grid;
+  place-items: center;
+  width: var(--space-6);
+  height: var(--space-6);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-border-small);
+  color: var(--ink-chalk);
+  font: var(--type-label-12-mono);
+  font-weight: 600;
 }
 
-.addproj-pathrow .settings-input {
-  flex: 1;
+.addproj-mark.is-marked {
+  box-shadow: inset 0 0 0 calc(var(--rule-width) * 2) var(--repo-mark);
+}
+
+.addproj-mark .icon {
+  width: var(--space-4);
+  height: var(--space-4);
+  color: var(--ink-mist);
+}
+
+.addproj-recent-words {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
+}
+
+.addproj-recent-name,
+.addproj-recent-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.addproj-recent-name {
+  font: var(--type-label-13);
+  font-weight: 500;
+}
+
+.addproj-recent-path {
+  color: var(--ink-mist);
+  font: var(--type-label-12-mono);
+}
+
+.addproj-recent-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--ink-mist);
+  font: var(--type-label-12-mono);
+  white-space: nowrap;
+}
+
+.addproj-recent-meta .icon {
+  width: var(--icon-size-sm);
+  height: var(--icon-size-sm);
+}
+
+.addproj-none {
+  margin: 0;
+  padding: var(--space-2) var(--space-4);
+  color: var(--ink-mist);
+  font: var(--type-copy-13);
+}
+
+/* No project yet: IntelliJ's first run — the three ways as cards. */
+.addproj-welcome {
+  padding: var(--space-5) var(--space-4);
+  border-top: var(--rule-width) solid var(--edge-rule);
+}
+
+.addproj-welcome-title {
+  margin: 0;
+  color: var(--ink-chalk);
+  font: var(--type-heading-16);
+}
+
+.addproj-welcome-sub {
+  margin: var(--space-1) 0 0;
+  color: var(--ink-mist);
+  font: var(--type-copy-13);
+}
+
+.addproj-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
+.addproj-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+  padding: var(--space-4);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-border-small);
+  color: var(--ink-chalk);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.addproj-card:hover {
+  background: var(--row-hover);
+}
+
+.addproj-card .icon {
+  width: var(--space-5);
+  height: var(--space-5);
+  margin-bottom: var(--space-2);
+  color: var(--ink-mist);
+}
+
+.addproj-card-name {
+  font: var(--type-label-14);
+  font-weight: 500;
+}
+
+.addproj-why {
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+}
+
+.addproj-keys {
+  margin: 0;
+  padding: var(--space-2) var(--space-4);
+  border-top: var(--rule-width) solid var(--edge-rule);
+  background: var(--surface-abyss);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+}
+
+/* The two forms: the composer's label-left grid. */
+.addproj-form {
+  display: grid;
+  grid-template-columns: var(--create-form-label) minmax(0, 1fr);
+  gap: var(--space-4);
+  align-items: start;
+  min-height: 0;
+  padding: var(--space-4);
+  overflow: hidden auto;
+}
+
+.addproj-form .wt-error {
+  padding: 0;
+}
+
+/* 480 — the composer's threshold, for the composer's reason. */
+@container (max-width: 480px) {
+  .addproj-cards,
+  .addproj-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .addproj-form {
+    row-gap: var(--space-2);
+  }
+
+  .addproj-form > .wt-label {
+    padding-top: 0;
+  }
+
+  .addproj-form > span.wt-label {
+    display: none;
+  }
 }
 
 /* What the clone is doing right now. Bounded and quiet: it exists so that a
@@ -4424,7 +5000,6 @@ svg.wt-agent-dot {
   align-items: center;
   gap: var(--space-2);
   margin: 0;
-  padding: var(--space-3) var(--space-4) 0;
 }
 
 .addproj-progress[hidden] {
@@ -4501,9 +5076,20 @@ svg.wt-agent-dot {
   left: 0;
   right: 0;
   box-sizing: border-box;
+}
+
+/* Qualified by the dialog: `.qo-row` stands later in this sheet with its own
+ * 42px floor, 2px margins, padding and mono face, and a bare `.pb-row` loses
+ * every one of them to it by order — the 46px row hid the floor until the
+ * rows went to the control height (2026-11-06) and measured 42. */
+.qo--pathbrowser .pb-row {
   height: var(--pb-row-height);
   min-height: 0;
   margin: 0;
+  padding-block: 0;
+  /* A file name is read, not compared column by column: the UI face, as
+   * Finder sets it. The path field above keeps its mono. */
+  font: var(--type-label-13);
 }
 
 /* The listbox holds the focus; its ring is the highlighted row's, not a box
@@ -4556,6 +5142,56 @@ svg.wt-agent-dot {
 .pb-check .icon {
   width: 12px;
   height: 12px;
+}
+
+.pb-tool {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.pb-tool[hidden] {
+  display: none;
+}
+
+.pb-tool .icon {
+  width: var(--space-4);
+  height: var(--space-4);
+}
+
+/* The new folder's name, over the list, and the offer for a typed path that
+ * is not there yet — both one row in the path row's inset. */
+.pb-new,
+.pb-missing {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-4) var(--space-3);
+}
+
+.pb-new[hidden],
+.pb-missing[hidden] {
+  display: none;
+}
+
+.pb-new-box {
+  flex: 1 1 auto;
+}
+
+.pb-new-box > .icon {
+  flex: none;
+  width: var(--space-4);
+  height: var(--space-4);
+  color: var(--ink-mist);
+}
+
+.pb-missing-words {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--ink-mist);
+  font: var(--type-copy-13);
+  overflow-wrap: anywhere;
 }
 
 .pb-error {
@@ -4665,6 +5301,21 @@ svg.wt-agent-dot {
 
 .wt-pending.is-failed .wt-pending-phase {
   color: var(--signal-halt);
+}
+
+/* A failed creation reads whole: the name, the reason wrapped under it, and the
+ * door on a line of its own. One line cut it at 「…failed (exit statu」 and put
+ * the retry past the column's edge (measured on v1.1.126, 2026-11-06). */
+.wt-pending.is-failed {
+  flex-wrap: wrap;
+  align-items: baseline;
+}
+
+.wt-pending.is-failed .wt-pending-phase {
+  flex-basis: 100%;
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .wt-pending-retry {
@@ -5264,6 +5915,7 @@ svg.wt-agent-dot {
 }
 
 .qo-x,
+.qo-back,
 .wsclean-x {
   border: 0;
   background: none;
@@ -5277,6 +5929,7 @@ svg.wt-agent-dot {
 }
 
 .qo-x:hover,
+.qo-back:hover,
 .wsclean-x:hover {
   background: var(--row-hover);
   color: var(--ink-chalk);
@@ -15607,6 +16260,38 @@ details.worker-command {
   margin-bottom: 0;
 }
 
+/* Tables and code take the page's room (2026-11-06, the person's 「⑤번도 다음
+ * 판에 넣어줘」 — window artifact p-b6479cdac0a243dd ⑤; Claude Code's
+ * `maxProseWidth`, codex #33916): with 설정 › 모양 › 「표·코드는 넓게」 on
+ * (`data-chat-wide-blocks` on the root), an answer's words stand across the
+ * list's room — the list less its two gutters, which its padding centres the
+ * column in — and every block but a table and a code block steps back onto the
+ * column, so the prose keeps its measure. A table or a code block is as wide as
+ * what it holds: never narrower than the column, so one that fits stands where
+ * it stood; never wider than the room, so a wider one still scrolls inside
+ * itself; centred on the column's axis. The room is the page's own width (the
+ * page is the query container) less the turn rail's column the list stands
+ * beside and the gutters — a page without the rail reads half the rail short,
+ * never over. A page with no room beside its column draws as before. The
+ * streaming answer's two holders stand across the room like the answer. */
+:root[data-chat-wide-blocks="on"] .is-chat-page .helper-turn.is-assistant > .helper-said {
+  --chat-wide-spill: max(0px, (100cqi - var(--chat-turn-rail-w) - 2 * var(--helper-gutter, var(--chat-list-pad-x)) - var(--reading-column)) / 2);
+  margin-inline: calc(-1 * var(--chat-wide-spill));
+}
+
+:root[data-chat-wide-blocks="on"] .is-chat-page .helper-turn.is-assistant > .helper-said > :not(.md-table, .helper-code, .helper-said-settled, .helper-said-tail),
+:root[data-chat-wide-blocks="on"] .is-chat-page .helper-turn.is-assistant > .helper-said > :is(.helper-said-settled, .helper-said-tail) > :not(.md-table, .helper-code) {
+  margin-inline: var(--chat-wide-spill);
+}
+
+:root[data-chat-wide-blocks="on"] .is-chat-page .helper-turn.is-assistant > .helper-said > :is(.md-table, .helper-code),
+:root[data-chat-wide-blocks="on"] .is-chat-page .helper-turn.is-assistant > .helper-said > :is(.helper-said-settled, .helper-said-tail) > :is(.md-table, .helper-code) {
+  width: fit-content;
+  min-width: calc(100% - 2 * var(--chat-wide-spill));
+  max-width: 100%;
+  margin-inline: auto;
+}
+
 /* A heading an answer writes steps by weight, not by size (t-82195 C3): the
  * prose's own size — the narrow page's step with it — h1 and h2 bold, the
  * rest semibold. With no rule of its own the conversation drew the browser's
@@ -19717,10 +20402,13 @@ button.helper-sib:hover {
  * here instead, for every dialog the rule reaches.
  *
  * `[type="checkbox"]` outranks `.qo input`, so this does not depend on standing
- * later in the file — and the settings switch, which does stand later and turns
- * its own box into a 36×20 pill, still wins where it applies. That one is a
- * DESIGN and not an undo, which is why it stays. */
-.qo input[type="checkbox"] {
+ * later in the file. It outranks the settings switch too (0-2-1 against
+ * `.settings-check input`'s 0-1-1), and standing later does not win against
+ * that: the composer's 「더 만들기」 switch — `appearance: none` and sized by
+ * nothing else — drew 0×0 under this undo (2026-11-06, measured on v1.1.126),
+ * so a person could not see whether it was on. The switch is a DESIGN and not
+ * an undo, so it is left out by name. */
+.qo input[type="checkbox"]:not(.settings-check > input) {
   width: auto;
   height: auto;
   padding: 0;
@@ -24393,12 +25081,17 @@ progress:indeterminate::-webkit-progress-bar {
  * 1-i) — so this covers the stage the way a file view does. It was a centred
  * popup first, and that read as small and borrowed: a 31,000-line client's
  * shell has no business in a 720px box floating over a dimmed window. */
+/* 작업 — 가운데 탭의 판(2026-11-06 사람 승인, 창 아티팩트 p-b664d42447395ef3 v2).
+ * 무대를 덮는 페이지였을 때는 탭 줄과 오른쪽 열을 숨기고 닫기 ×를 맨 왼쪽에 두었다.
+ * 이제 받은 편지함·아티팩트처럼 판 칸을 채우는 문서이고, 닫기는 탭의 것이다. */
 .task-view {
-  position: absolute;
-  inset: 0;
-  z-index: 5;
+  position: relative;
+  container: tasks / inline-size;
   display: flex;
   flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
   background: var(--surface-deck);
 }
 
@@ -24408,104 +25101,253 @@ progress:indeterminate::-webkit-progress-bar {
   flex: 1;
   min-height: 0;
   width: 100%;
-  padding: 6px var(--space-5) var(--space-5);
 }
 
+/* 머리 — 아티팩트 탭 머리와 같은 줄: 왼쪽 글자 탭, 오른쪽 범위·새로 고침·주 동작. */
 .task-head {
   display: flex;
   align-items: center;
   flex: none;
-  gap: var(--space-2);
-  min-height: 32px;
-}
-
-.task-close {
-  flex: none;
-  display: grid;
-  place-items: center;
-  width: 28px;
-  height: 28px;
-  border: 0;
-  border-radius: 999px;
-  background: none;
-  color: var(--ink-mist);
-  cursor: pointer;
-}
-
-.task-close .icon {
-  width: 16px;
-  height: 16px;
-}
-
-.task-close:hover,
-.task-close:focus-visible {
-  background: var(--row-hover);
-  color: var(--ink-chalk);
-}
-
-.task-head-rule {
-  flex: none;
-  width: 0;
-  height: 20px;
-  margin-inline: var(--space-1);
-  border-left: var(--rule-width) solid var(--edge-rule);
+  gap: var(--space-3);
+  padding: 0 var(--space-5) 0 var(--space-3);
+  border-bottom: var(--rule-width) solid var(--edge-rule);
 }
 
 .task-tabs {
   display: flex;
-  align-items: center;
-  flex: none;
+  align-items: stretch;
+  align-self: stretch;
+  /* 탭이 먼저 줄면 이름이 잘린다(「Linea」) — 줄어드는 것은 범위 글자의 몫. */
+  flex: 0 0 auto;
   min-width: 0;
-  gap: var(--space-2);
-  flex-wrap: wrap;
+  gap: var(--space-1);
+  overflow-x: auto;
+  scrollbar-width: none;
 }
 
+/* 그림 + 이름 + 상태. 고른 탭은 글자색과 아래 2px 선으로 — Geist Tabs의 모양. */
 .task-tab {
-  display: grid;
-  place-items: center;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
   flex: none;
-  width: 32px;
-  height: 32px;
-  padding: 0;
-  border: var(--rule-width) solid color-mix(in srgb, var(--edge-rule) 70%, transparent);
-  border-radius: var(--radius-edge);
-  background: transparent;
+  gap: var(--space-2);
+  /* 머리 높이 = 단추 32 + 위아래 12, 아티팩트 탭 머리와 같은 56. */
+  min-height: calc(var(--control-height-md) + 2 * var(--space-3));
+  padding: 0 var(--space-3);
+  border: 0;
+  background: none;
   color: var(--ink-mist);
+  font: var(--type-label-14);
+  font-weight: 500;
+  white-space: nowrap;
   cursor: pointer;
+  transition: color var(--motion-fast) var(--ease-standard);
 }
 
 .task-tab .icon {
+  width: 16px;
+  height: 16px;
+}
+
+.task-tab:hover,
+.task-tab.is-active {
+  color: var(--ink-chalk);
+}
+
+.task-tab.is-active::after {
+  content: "";
+  position: absolute;
+  right: var(--space-3);
+  bottom: calc(-1 * var(--rule-width));
+  left: var(--space-3);
+  height: 2px;
+  border-radius: 2px;
+  background: var(--ink-chalk);
+}
+
+.task-tab:focus-visible {
+  outline: 2px solid var(--ink-chalk);
+  outline-offset: -2px;
+}
+
+/* 상태 칸 — 건수(회색 알약), 「로그인 필요」(노랑 배지 + 점), 「연결 안 됨」(흐린 글자).
+ * 색만으로 말하지 않는다: 셋은 낱말이 다르다. */
+.task-tab-state {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px; /* Geist badge의 점과 글자 사이 */
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px; /* Geist badge sm */
+  border-radius: var(--radius-pill);
+  background: var(--gray-alpha-200);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.task-tab-state[data-state="need"] {
+  padding: 0 var(--space-2);
+  background: var(--amber-200);
+  color: var(--signal-wait-ink);
+}
+
+.task-tab-state[data-state="need"]::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--signal-wait);
+}
+
+.task-tab-state[data-state="off"] {
+  padding: 0;
+  background: none;
+  color: var(--ink-glyph);
+  font-weight: 400;
+}
+
+.task-head-gap {
+  flex: 1;
+}
+
+/* 범위 — 어느 사이트·프로젝트를 보는지. 무엇을 보는지는 늘 보여야 하지만 단추처럼
+ * 보이면 누를 것이 된다: 조용한 글자. */
+.task-context {
+  display: block;
+  flex: 0 1 auto;
+  min-width: 0;
+  line-height: var(--control-height-sm);
+  max-width: min(360px, 32cqw);
+  height: var(--control-height-sm);
+  color: var(--ink-mist);
+  font: var(--type-label-13);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-head-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: var(--control-height-md);
+  height: var(--control-height-md);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-edge);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border-small);
+  color: var(--ink-chalk);
+  cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
+}
+
+.task-head-icon .icon {
+  width: 16px;
+  height: 16px;
+}
+
+.task-head-icon:hover {
+  background: var(--row-hover);
+}
+
+.task-head-new {
+  flex: none;
+  gap: var(--space-1);
+}
+
+.task-head-new .icon {
   width: 14px;
   height: 14px;
 }
 
-.task-tab:hover {
-  background: var(--row-hover);
-  color: var(--ink-chalk);
-}
-
-.task-tab.is-active {
-  border-color: color-mix(in srgb, var(--ink-chalk) 40%, transparent);
-  background: var(--row-active);
-  color: var(--ink-chalk);
-  box-shadow: var(--shadow-1);
-}
-
-.task-context {
-  display: flex;
-  align-items: center;
-  min-width: 0;
-  max-width: min(420px, 40vw);
-  height: 28px;
-  padding-inline: var(--space-2);
-  border: var(--rule-width) solid var(--edge-rule);
-  border-radius: var(--radius-edge);
-  background: color-mix(in srgb, var(--surface-raised) 36%, transparent);
-  color: var(--ink-mist);
-  font-size: var(--text-xs);
-  overflow: hidden;
-  text-overflow: ellipsis;
+/* 머리는 폭에 맞춰 덜 중요한 것부터 접는다 — 문은 접히지 지워지지 않는다.
+ * 하네스 실측(2026-11-06): 상태 낱말 셋(「로그인 필요」 둘, 「연결 안 됨」)이 서면 머리는
+ * 810px가 있어야 했고, 1440 창의 작업 판은 809px였다. 접는 순서: 범위 글자 → 상태 낱말
+ * (점만, 낱말은 화면 낭독에 남는다) → 탭 이름 → 「새 …」 낱말(그림 단추). */
+.task-tab-state-word {
   white-space: nowrap;
+}
+
+@container tasks (max-width: 900px) {
+  .task-context {
+    display: none;
+  }
+}
+
+@container tasks (max-width: 820px) {
+  .task-tab-state[data-state="need"],
+  .task-tab-state[data-state="off"] {
+    min-width: 0;
+    padding: 0;
+    gap: 0;
+    background: none;
+  }
+
+  .task-tab-state[data-state="off"]::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--edge-mark);
+  }
+
+  .task-tab-state[data-state="need"] .task-tab-state-word,
+  .task-tab-state[data-state="off"] .task-tab-state-word {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+}
+
+@container tasks (max-width: 600px) {
+  .task-tab-name {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  .task-tab {
+    padding: 0 var(--space-2);
+  }
+}
+
+@container tasks (max-width: 400px) {
+  .task-head {
+    gap: var(--space-2);
+    padding-right: var(--space-3);
+  }
+
+  /* 마지막 단계 — 그래도 모자라면 탭 줄이 줄어들며 가로로 구른다(탭 하나하나는 줄지 않는다). */
+  .task-tabs {
+    flex: 0 1 auto;
+  }
+
+  .task-head-new {
+    width: var(--control-height-md);
+    padding: 0;
+    justify-content: center;
+  }
+
+  .task-head-new > span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
 }
 
 /* The list takes whatever height the stage has left, rather than a fixed
@@ -24513,14 +25355,16 @@ progress:indeterminate::-webkit-progress-bar {
  * and a scroll region that stops halfway down it is the popup all over
  * again. */
 .task-body {
+  /* 목록의 칸은 목록 자신의 폭을 잰다 — 이슈 패널이 옆에 서면 작업 판보다 좁다. */
+  container: tasklist / inline-size;
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  margin-top: var(--space-2);
+  padding: 0 var(--space-5) var(--space-5);
 }
 
 .task-panel {
-  padding: var(--space-2) 0 0;
+  padding: 0;
   height: 100%;
 }
 
@@ -24601,6 +25445,327 @@ progress:indeterminate::-webkit-progress-bar {
   border-radius: var(--radius-edge);
   color: var(--signal-halt);
   font-size: var(--text-xs);
+}
+
+/* ---- 연결(2026-11-06): 브라우저 로그인의 코드 칸, 연결 줄, GitLab 서버 줄 ----
+ *
+ * 로그인 카드는 같은 판(.task-empty) 안에서 자란다 — 코드를 보이는 동안에도 사람은
+ * 같은 자리를 본다. 서버 줄은 카드가 아니라 1px 선으로 나뉜 줄이다(작업 목록과 같은
+ * 결). 상태는 색만으로 말하지 않는다: 점 옆에 「연결됨」·「로그인 필요」가 함께 선다. */
+.task-login-code {
+  display: grid;
+  gap: var(--space-2);
+  justify-items: center;
+  width: min(100%, 520px);
+  margin-top: var(--space-2);
+  padding: var(--space-4);
+  border-radius: var(--radius);
+  background: var(--surface-well);
+  box-shadow: var(--shadow-border-small);
+}
+
+.task-login-say {
+  margin: 0;
+  font: var(--type-copy-13);
+  color: var(--ink-mist);
+  word-break: keep-all;
+}
+
+.task-login-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  width: 100%;
+}
+
+/* 일회용 코드는 이 칸의 주인공 — 읽고 옮겨 적을 글자라 고정폭에 넓은 자간. */
+.task-login-otp {
+  font-family: var(--font-mono);
+  font-size: var(--text-lg);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  color: var(--ink-chalk);
+  font-variant-numeric: tabular-nums;
+}
+
+.task-login-note,
+.task-login-wait {
+  font: var(--type-label-12);
+  color: var(--ink-mist);
+}
+
+.task-login-wait {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.task-login-wait::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--signal-wait);
+}
+
+/* 연결 줄 — 누구로 어디를. 목록 위 한 줄, 조용히. */
+.task-conn {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  padding: var(--space-2) 0;
+  font: var(--type-label-12);
+  color: var(--ink-mist);
+}
+
+.task-conn-who {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--ink-chalk);
+}
+
+.task-conn-who::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--signal-ready);
+}
+
+.task-conn-repos {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.task-conn-switch {
+  margin-left: auto;
+}
+
+.task-repo-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 6px; /* Geist badge sm */
+  border-radius: var(--radius-edge);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-border-small);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  white-space: nowrap;
+}
+
+.task-gl-title .task-repo-chip {
+  margin-right: var(--space-2);
+  vertical-align: 1px;
+}
+
+.task-repo-chip.is-more {
+  background: transparent;
+  box-shadow: none;
+}
+
+/* GitLab 서버 줄들 — 판 하나, 줄은 선으로 나뉜다. */
+.task-hosts {
+  display: grid;
+  gap: var(--space-4);
+  align-content: start;
+  padding: var(--space-5) 0;
+}
+
+.task-hosts-head {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.task-hosts-title {
+  margin: 0;
+  color: var(--ink-chalk);
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.task-hosts-body {
+  margin: 0;
+  font: var(--type-copy-13);
+  color: var(--ink-mist);
+  word-break: keep-all;
+}
+
+.task-hosts-list {
+  border-radius: var(--radius);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border-small);
+}
+
+.task-host {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border-top: var(--rule-width) solid var(--edge-rule);
+}
+
+.task-host:first-child {
+  border-top: 0;
+}
+
+.task-host-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+}
+
+.task-host-name {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--ink-chalk);
+}
+
+.task-host-repos {
+  min-width: 0;
+  font: var(--type-label-12);
+  color: var(--ink-mist);
+}
+
+.task-host-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px; /* Geist badge의 점과 글자 사이 */
+  height: 20px;
+  margin-left: auto;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--amber-200);
+  color: var(--signal-wait-ink);
+  font: var(--type-label-12);
+}
+
+.task-host-state::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--signal-wait);
+}
+
+.task-host[data-state="on"] .task-host-state {
+  background: transparent;
+  color: var(--ink-mist);
+}
+
+.task-host[data-state="on"] .task-host-state::before {
+  background: var(--signal-ready);
+}
+
+.task-host-acts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.task-host-paste {
+  display: flex;
+  gap: var(--space-2);
+  max-width: 520px;
+}
+
+/* 작업 화면의 검색칸과 같은 얼굴 — 줄 바닥(deck) 위라 한 단 낮은 바닥(well)에 선다. */
+.task-host-token {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: var(--control-height-md);
+  padding-inline: var(--space-3);
+  border: 0;
+  border-radius: var(--radius-edge);
+  background: var(--surface-well);
+  box-shadow: var(--shadow-border);
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+}
+
+/* 보기 단추의 이름은 한 줄 — 「내 할 일」이 단추 안에서 접히지 않게. */
+.task-view .segment-btn {
+  white-space: nowrap;
+}
+
+/* 조용한 글자 단추 — 둘째 길(옛 주소, 계정 바꾸기, 남은 서버로). */
+.task-link {
+  justify-self: start;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  text-decoration: underline;
+  text-decoration-color: var(--edge-mark);
+  text-underline-offset: 3px;
+  cursor: pointer;
+  transition: color var(--motion-fast) var(--ease-standard);
+}
+
+.task-link:hover,
+.task-link:focus-visible {
+  color: var(--ink-chalk);
+}
+
+.task-host-said {
+  margin: 0;
+  font: var(--type-label-12);
+  color: var(--ink-mist);
+}
+
+.task-host-said[data-state="error"] {
+  color: var(--signal-halt-ink);
+}
+
+.task-hosts-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  font: var(--type-label-12);
+  color: var(--ink-mist);
+}
+
+.task-hosts-foot > .icon {
+  width: 14px;
+  height: 14px;
+}
+
+/* 몇 서버만 로그인됐을 때 — 목록 위 한 줄. */
+.task-waiting {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-2) 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border-small);
+  font: var(--type-label-12);
+  color: var(--ink-mist);
+}
+
+.task-waiting-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--signal-wait);
+}
+
+.jira-token-make {
+  display: flex;
+  margin-top: calc(-1 * var(--space-2));
 }
 
 /* 작업판의 GitHub(1-g50·1-g77a): 두 단과 검색 한 줄, 그리고 컴포저의 행
@@ -25008,7 +26173,7 @@ progress:indeterminate::-webkit-progress-bar {
   flex-wrap: wrap;
   gap: var(--space-2);
   align-items: center;
-  padding: var(--space-2) 0;
+  padding: var(--space-3) 0;
 }
 
 .task-jira-new {
@@ -25040,11 +26205,46 @@ progress:indeterminate::-webkit-progress-bar {
   gap: var(--space-2);
 }
 
+/* 프리셋 넷은 한 덩어리의 고르개 — Geist 세그먼트처럼 한 바닥 위에 칸이 선다. */
 .task-jira-presets {
-  display: flex;
+  display: inline-flex;
   flex: none;
-  gap: var(--space-1);
   align-items: center;
+  gap: 2px;
+  height: var(--control-height-md);
+  padding: 3px; /* 32 안에 26 칸 — Geist 세그먼트의 안쪽 여백 */
+  border-radius: var(--radius-edge);
+  background: var(--surface-well);
+  box-shadow: var(--shadow-border);
+}
+
+.task-jira-presets .task-chip {
+  height: 100%;
+  border: 0;
+  border-radius: var(--radius-xs);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
+}
+
+.task-jira-presets .task-chip.is-active {
+  background: var(--gray-200);
+  color: var(--ink-chalk);
+  box-shadow: var(--shadow-border-small);
+}
+
+:root[data-theme="light"] .task-jira-presets .task-chip.is-active {
+  background: var(--surface-deck);
+}
+
+/* 무엇이 섰고 무엇이 접혔는지 — 툴바 끝의 조용한 한 줄. */
+.task-count {
+  flex: none;
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  white-space: nowrap;
 }
 
 .task-chip {
@@ -25071,15 +26271,18 @@ progress:indeterminate::-webkit-progress-bar {
   color: var(--surface-abyss);
 }
 
+/* 검색칸 — Geist 입력: 판 바닥 위 1px 테두리, 32 높이. */
 .task-jira-search {
   display: flex;
   flex: 1;
   gap: var(--space-2);
   align-items: center;
-  min-width: 240px;
-  padding-inline: var(--space-2);
-  border-radius: var(--radius-sm);
-  background: var(--surface-raised);
+  min-width: 200px;
+  height: var(--control-height-md);
+  padding-inline: var(--space-3);
+  border-radius: var(--radius-edge);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border);
 }
 
 .task-jira-search .icon {
@@ -25117,28 +26320,47 @@ progress:indeterminate::-webkit-progress-bar {
   color: var(--ink-chalk);
 }
 
-/* One status group. `divide-y` in Orca's own class list (measured, 1-i) is
- * this: a rule between rows and none around the group, so groups read as
- * one continuous list with headers in it rather than as boxed cards. */
-.task-jira-group + .task-jira-group {
-  border-top: var(--rule-width) solid var(--edge-rule);
+/* 열 머리와 행은 한 격자 — 키 · 제목 · 우선순위 · 사람 · 수정 · 손.
+ * 상태 칸은 없다: 묶음 머리가 이미 그 이름을 말한다(끝난 묶음 안에서만 제목 곁에). */
+.task-jira-columns,
+.task-jira-row {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr) 112px 132px 64px minmax(132px, auto);
+  align-items: center;
+  column-gap: var(--space-4);
+  padding: 0 var(--space-3);
 }
 
+.task-jira-columns {
+  min-height: var(--control-height-md);
+  border-bottom: var(--rule-width) solid var(--edge-rule);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+}
+
+.task-jira-columns .is-end {
+  justify-self: end;
+}
+
+/* 묶음 머리 — 같은 바닥 위의 1px 선. 검은 띠(`--surface-well`)는 목록을 토막 냈다. */
 .task-jira-group-head {
   display: flex;
   align-items: center;
   gap: var(--space-2);
   width: 100%;
-  height: 36px;
+  white-space: nowrap;
+  /* 행과 같은 40 = 32 + 8 */
+  min-height: calc(var(--control-height-md) + var(--space-2));
   padding: 0 var(--space-3);
   border: 0;
-  background: var(--surface-well);
+  border-bottom: var(--rule-width) solid var(--edge-rule);
+  background: none;
   color: var(--ink-chalk);
-  font: inherit;
-  font-size: var(--text-sm);
+  font: var(--type-label-13);
   font-weight: 500;
   text-align: left;
   cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard);
 }
 
 .task-jira-group-head:hover {
@@ -25146,20 +26368,74 @@ progress:indeterminate::-webkit-progress-bar {
 }
 
 .task-jira-group-count {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px; /* Geist badge sm */
+  border-radius: var(--radius-pill);
+  background: var(--gray-alpha-200);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.task-jira-group-sub {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-jira-group-hint {
+  flex: none;
   margin-left: auto;
   color: var(--ink-mist);
-  font-size: var(--text-3xs);
+  font: var(--type-label-12);
+  font-weight: 400;
+}
+
+.task-jira-group.is-done-bundle {
+  margin-top: var(--space-3);
+  border-top: var(--rule-width) solid var(--edge-rule);
+}
+
+/* 갈래 표시 — 할 일(점선 원)·하는 중(점 원)·끝남(체크 원). 모양이 먼저, 색은 곁. */
+.task-jira-mark {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+
+.task-jira-mark .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.task-jira-mark.is-todo {
+  color: var(--ink-mist);
+}
+
+.task-jira-mark.is-doing {
+  color: var(--signal-ready);
+}
+
+.task-jira-mark.is-done {
+  color: var(--signal-done);
 }
 
 .task-jira-row {
-  display: grid;
-  grid-template-columns: 92px minmax(240px, 1fr) 112px 90px 132px 76px auto;
-  align-items: center;
-  gap: var(--space-2);
-  min-height: 48px;
-  padding: var(--space-2) var(--space-3);
-  border-top: var(--rule-width) solid var(--edge-rule);
+  min-height: calc(var(--control-height-md) + var(--space-2));
+  border-bottom: var(--rule-width) solid var(--gray-alpha-100);
   cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard);
 }
 
 .task-jira-row:hover {
@@ -25167,57 +26443,94 @@ progress:indeterminate::-webkit-progress-bar {
 }
 
 .task-jira-key {
-  flex: none;
+  min-width: 0;
+  overflow: hidden;
   color: var(--ink-mist);
-  font-family: var(--font-mono);
-  font-size: var(--text-2xs);
+  font: var(--type-label-12-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .task-jira-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+}
+
+.task-jira-title-words {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: var(--text-xs);
 }
 
 .task-jira-priority,
-.task-jira-assignee,
-.task-jira-updated {
+.task-jira-person {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  white-space: nowrap;
+}
+
+.task-jira-priority .icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--ink-chalk);
+}
+
+.task-jira-priority.is-mid .icon,
+.task-jira-priority.is-low .icon {
+  color: var(--ink-mist);
+}
+
+.task-jira-priority-word,
+.task-jira-person-name {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--ink-mist);
-  font-size: var(--text-2xs);
+}
+
+/* 사람 — 이름 첫 글자 하나를 20px 동그라미에(Geist avatar xs). */
+.task-person-mark {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-border);
+  color: var(--ink-chalk);
+  font: 600 var(--text-3xs) / 1 var(--font-ui);
 }
 
 .task-jira-updated {
+  justify-self: end;
+  color: var(--ink-mist);
+  font: var(--type-label-12);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .task-jira-status {
-  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  height: 20px;
   padding: 0 var(--space-2);
-  border-radius: var(--radius-edge);
-  background: var(--row-active);
+  border-radius: var(--radius-pill);
+  background: var(--gray-alpha-200);
   color: var(--ink-mist);
-  font-size: var(--text-2xs);
-}
-
-@media (max-width: 1120px) {
-  .task-jira-row {
-    grid-template-columns: 86px minmax(220px, 1fr) 104px 84px 112px auto;
-  }
-  .task-jira-updated { display: none; }
-}
-
-@media (max-width: 900px) {
-  .task-jira-row {
-    grid-template-columns: 80px minmax(180px, 1fr) 96px 96px auto;
-  }
-  .task-jira-priority,
-  .task-jira-updated { display: none; }
+  font: var(--type-label-12);
+  font-weight: 500;
+  white-space: nowrap;
 }
 
 /* Three tones, not one per status name.
@@ -25242,21 +26555,87 @@ progress:indeterminate::-webkit-progress-bar {
   color: var(--signal-ready);
 }
 
-/* Kept out of the reading line until the row is under the pointer, the way
- * Orca's own row actions are (`md:opacity-0 … group-hover/row:opacity-100`) —
- * a column of buttons down the right of every row is a second list competing
- * with the titles. Focus reveals it too, or the keyboard could never reach
- * it. */
-.task-jira-act {
-  flex: none;
-  padding: 0 var(--space-2);
-  font-size: var(--text-2xs);
+/* 행의 손 — 마우스를 올린 행에만(Orca의 행 손이 그렇다: 줄마다 단추 한 열은 제목과
+ * 다투는 둘째 목록이다). 초점이 와도 보인다 — 키보드가 닿을 수 있어야 한다. */
+.task-jira-acts {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-1);
   opacity: 0;
+  transition: opacity var(--motion-fast) var(--ease-standard);
 }
 
-.task-jira-row:hover .task-jira-act,
-.task-jira-act:focus-visible {
+.task-jira-row:hover .task-jira-acts,
+.task-jira-acts:focus-within {
   opacity: 1;
+}
+
+.task-jira-act {
+  flex: none;
+  height: var(--control-height-sm);
+  padding: 0 var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.task-jira-open {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: var(--control-height-sm);
+  height: var(--control-height-sm);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-edge);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border-small);
+  color: var(--ink-chalk);
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.task-jira-open:hover {
+  background: var(--row-hover);
+}
+
+.task-jira-open .icon {
+  width: 14px;
+  height: 14px;
+}
+
+/* 목록 폭이 정한다(창 폭이 아니라) — 옆 패널이 열리거나 판이 나뉘면 이 폭이 좁아진다. */
+@container tasklist (max-width: 1000px) {
+  .task-jira-columns,
+  .task-jira-row {
+    grid-template-columns: 88px minmax(0, 1fr) 104px 120px minmax(120px, auto);
+  }
+
+  .task-jira-updated,
+  .task-jira-columns > :nth-child(5) {
+    display: none;
+  }
+}
+
+/* 패널 옆의 좁은 목록 — 키 · 제목 · 우선순위 그림 · 사람 표시. 손은 패널이 갖는다. */
+@container tasklist (max-width: 680px) {
+  .task-jira-columns {
+    display: none;
+  }
+
+  .task-jira-row {
+    grid-template-columns: 80px minmax(0, 1fr) 16px 20px;
+    column-gap: var(--space-2);
+  }
+
+  .task-jira-priority-word,
+  .task-jira-person-name,
+  .task-jira-updated,
+  .task-jira-acts,
+  .task-jira-group-sub,
+  .task-jira-group-hint,
+  .task-count {
+    display: none;
+  }
 }
 
 /* Asked, and the answer was none. Not the connect card — that one is a card
@@ -25271,6 +26650,532 @@ progress:indeterminate::-webkit-progress-bar {
   padding: var(--space-6) var(--space-4);
   text-align: center;
   color: var(--ink-mist);
+}
+
+/* ---- 열린 Jira 이슈 — 목록 옆 패널(2026-11-06 v2) ---------------------------
+ * 본문은 왼쪽, 속성은 오른쪽 칸 — Jira 웹의 이슈 화면과 같은 자리라 새로 익힐 것이
+ * 적다. 셋의 모양: 옆 패널(경계를 끌어 폭), 넓게 보기·좁은 판(판 전체, 본문은 읽기
+ * 폭에서 멈춤), 따로 연 탭(가운데 탭 하나, 판 칸을 채움). */
+.task-split {
+  /* 패널의 기본 폭 — 1440 창(가운데 1170)에서 목록 약 500 · 패널 약 650. */
+  --task-detail-width: 56%;
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.task-split > .task-body {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* 경계 — 9px 잡을 자리에 1px 선(선은 테두리: --edge-rule은 칠하지 않는다). */
+.task-grip {
+  position: relative;
+  z-index: 2;
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 9px;
+  margin: 0 -4px;
+  cursor: col-resize;
+}
+
+.task-grip::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 4px;
+  border-left: var(--rule-width) solid var(--edge-rule);
+}
+
+.task-grip::after {
+  content: "";
+  width: 4px;
+  height: 36px;
+  border-radius: 2px;
+  background: var(--edge-mark);
+  opacity: 0;
+  transition: opacity var(--motion-fast) var(--ease-standard);
+}
+
+.task-grip:hover::after,
+.task-grip:focus-visible::after {
+  opacity: 1;
+}
+
+.task-grip:focus-visible {
+  outline: 2px solid var(--ink-chalk);
+  outline-offset: -2px;
+}
+
+.task-detail {
+  container: taskdetail / inline-size;
+  display: flex;
+  flex: 0 0 var(--task-detail-width);
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--surface-deck);
+}
+
+/* 넓게 보기와 좁은 판(900 미만) — 패널이 판 전체, 목록은 「← 목록」 한 단추로 접힌다. */
+.task-view.is-detail-wide .task-split.has-detail > .task-body,
+.task-view.is-detail-wide .task-grip,
+.task-view.is-narrow .task-split.has-detail > .task-body,
+.task-view.is-narrow .task-grip {
+  display: none;
+}
+
+.task-view.is-detail-wide .task-detail,
+.task-view.is-narrow .task-detail,
+.task-detail.is-own-tab {
+  flex: 1 1 auto;
+}
+
+.task-detail.is-own-tab {
+  height: 100%;
+}
+
+.task-detail-top {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: var(--space-1);
+  min-height: calc(var(--control-height-md) + var(--space-3));
+  padding: 0 var(--space-3) 0 var(--space-5);
+  border-bottom: var(--rule-width) solid var(--edge-rule);
+}
+
+.task-detail-back {
+  display: none;
+  align-items: center;
+  gap: var(--space-1);
+  height: var(--control-height-sm);
+  margin-left: calc(-1 * var(--space-2));
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-edge);
+  background: none;
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.task-detail-back .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.task-detail-back:hover {
+  background: var(--row-hover);
+}
+
+.task-view.is-detail-wide .task-detail-back,
+.task-view.is-narrow .task-detail-back {
+  display: inline-flex;
+}
+
+.task-detail-crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  white-space: nowrap;
+}
+
+.task-detail-crumb .icon {
+  width: 12px;
+  height: 12px;
+}
+
+.task-detail-site {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.task-detail-key {
+  color: var(--ink-chalk);
+  font: var(--type-label-12-mono);
+  font-weight: 500;
+}
+
+.task-detail-place {
+  margin-left: var(--space-2);
+  color: var(--ink-glyph);
+  font: var(--type-label-12);
+  white-space: nowrap;
+}
+
+.task-detail-tool {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: var(--control-height-sm);
+  height: var(--control-height-sm);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-edge);
+  background: none;
+  color: var(--ink-mist);
+  cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
+}
+
+.task-detail-tool .icon {
+  width: 16px;
+  height: 16px;
+}
+
+.task-detail-tool:hover:enabled {
+  background: var(--row-hover);
+  color: var(--ink-chalk);
+}
+
+.task-detail-tool:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* 본문과 속성 칸 — 한 판이 함께 스크롤된다. 넓을 때는 본문이 읽기 폭에서 멈추고
+ * 남는 폭은 여백이 받는다(Jira·Linear·GitHub 이슈 화면의 넓은 배치). */
+.task-detail-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) clamp(200px, 30cqi, 300px);
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.task-detail-body:focus-visible {
+  outline: 2px solid var(--ink-chalk);
+  outline-offset: -2px;
+}
+
+.task-view.is-detail-wide .task-detail-body,
+.task-detail.is-own-tab .task-detail-body {
+  grid-template-columns: minmax(0, 880px) clamp(220px, 24cqi, 300px);
+  justify-content: center;
+}
+
+.task-detail-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+  padding: var(--space-5) var(--space-5) var(--space-6);
+}
+
+.task-detail-title {
+  margin: 0;
+  color: var(--ink-chalk);
+  font: var(--type-heading-24);
+  letter-spacing: -0.6px;
+  word-break: keep-all;
+}
+
+.task-detail-acts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.task-detail-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: var(--control-height-sm);
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-edge);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border-small);
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.task-detail-status:hover {
+  background: var(--row-hover);
+}
+
+.task-detail-status > .icon {
+  width: 12px;
+  height: 12px;
+  color: var(--ink-mist);
+  transform: rotate(90deg);
+}
+
+.task-detail-start,
+.task-detail-edit {
+  height: var(--control-height-sm);
+  font-size: var(--text-sm);
+}
+
+.task-detail-start {
+  gap: var(--space-1);
+}
+
+.task-detail-start .icon {
+  width: 14px;
+  height: 14px;
+}
+
+/* 본문 글자는 패널 폭을 따라 — 대화 화면과 같은 규칙(폭 ÷ 70, 14px에서 16px까지).
+ * 27인치 창의 넓은 패널에서는 16px, 노트북의 옆 패널에서는 14px. */
+.task-detail-prose {
+  color: var(--ink-chalk);
+  font-size: clamp(var(--text-md), calc(100cqi / 70), var(--text-lg));
+  line-height: 1.6;
+  word-break: keep-all;
+}
+
+.task-detail-prose .jira-item-line {
+  margin: 0 0 var(--space-2);
+}
+
+.task-detail-prose .jira-item-heading {
+  margin-top: var(--space-3);
+  font-weight: 600;
+}
+
+.task-detail-prose .jira-item-code {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-edge);
+  background: var(--surface-well);
+  box-shadow: var(--shadow-border);
+  font: var(--type-label-13-mono);
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
+.task-detail-prose .jira-item-table-wrap {
+  margin: 0 0 var(--space-3);
+  overflow-x: auto;
+}
+
+.task-detail-prose .jira-item-table {
+  border-collapse: separate;
+  border-spacing: 0;
+  border-radius: var(--radius-edge);
+  box-shadow: var(--shadow-border);
+  font: var(--type-label-13);
+  font-variant-numeric: tabular-nums;
+}
+
+.task-detail-prose .jira-item-table td {
+  padding: var(--space-1) var(--space-3);
+  border-top: var(--rule-width) solid var(--edge-rule);
+}
+
+.task-detail-prose .jira-item-table tr:first-child td {
+  border-top: 0;
+}
+
+.task-detail-sec {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-2) 0 0;
+  color: var(--ink-chalk);
+  font: var(--type-heading-14);
+}
+
+/* 첨부는 카드 — 그림이면 작은 미리보기가 위에, 이름과 크기가 아래에. */
+.task-detail-files {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: var(--space-2);
+}
+
+.task-detail-files .jira-item-attachment {
+  display: flex;
+  flex-direction: column;
+  flex-wrap: nowrap;
+  align-items: stretch;
+  gap: 2px;
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-edge);
+  box-shadow: var(--shadow-border);
+}
+
+.task-detail-files .jira-item-attachment-img {
+  order: -1;
+  flex-basis: auto;
+  width: 100%;
+  max-width: 100%;
+  max-height: none;
+  height: 120px;
+  margin-bottom: var(--space-2);
+  border-radius: var(--radius-xs);
+  box-shadow: var(--shadow-border);
+  object-fit: cover;
+}
+
+.task-detail-files .jira-item-attachment-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-detail-files .jira-item-attachment-fact {
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+}
+
+.task-detail-talk {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* 댓글 입력은 댓글 끝에 — 바닥에 붙박지 않는다(읽다가 바로 이어 쓴다). */
+.task-detail-compose {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-edge);
+  box-shadow: var(--shadow-border);
+}
+
+.task-detail-compose-field {
+  width: 100%;
+  min-width: 0;
+  min-height: 56px;
+  max-height: 240px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink-chalk);
+  font: var(--type-label-14);
+  resize: vertical;
+  outline: none;
+}
+
+.task-detail-compose:focus-within {
+  box-shadow: 0 0 0 var(--rule-width) var(--ink-mist);
+}
+
+.task-detail-compose-field:focus-visible {
+  outline: 2px solid var(--ink-chalk);
+  outline-offset: var(--space-1);
+}
+
+.task-detail-compose-row {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* 고쳐쓰기의 글자 칸 — 옛 창(.qo)의 칸 규칙을 잃은 자리에 작업 화면 검색칸과 같은 얼굴.
+ * 고르개(select)는 창의 공용 얼굴(제 꺾쇠까지)을 그대로 입는다. */
+.task-detail .detail-card-edit input {
+  min-width: 0;
+  height: var(--control-height-md);
+  padding-inline: var(--space-3);
+  border: 0;
+  border-radius: var(--radius-edge);
+  background: var(--surface-well);
+  box-shadow: var(--shadow-border);
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+}
+
+.task-detail .detail-card-edit .detail-card-edit-title {
+  font: var(--type-label-14);
+  font-weight: 600;
+}
+
+.task-detail .detail-card-edit input:focus-visible {
+  outline: 2px solid var(--ink-chalk);
+  outline-offset: 1px;
+}
+
+/* 속성 칸 — 이름 위, 값 아래(좁은 칸에서도 값이 잘리지 않게). */
+.task-detail-side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-5) var(--space-4);
+  border-left: var(--rule-width) solid var(--edge-rule);
+}
+
+.task-detail-prop {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.task-detail-prop-name {
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+}
+
+.task-detail-prop-value {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  min-height: 20px;
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+}
+
+.task-detail-prop-value .task-jira-priority,
+.task-detail-prop-value .task-jira-person {
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+}
+
+.task-detail-prop-value .detail-card-labels {
+  margin: 0;
+}
+
+/* 좁은 패널 — 속성 칸이 본문 아래로 내려온다. */
+@container taskdetail (max-width: 600px) {
+  .task-detail-body,
+  .task-view.is-detail-wide .task-detail-body,
+  .task-detail.is-own-tab .task-detail-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .task-detail-side {
+    border-top: var(--rule-width) solid var(--edge-rule);
+    border-left: 0;
+  }
+
+  .task-detail-place {
+    display: none;
+  }
+
+  /* 고쳐쓰기의 콤보 셋도 좁은 패널에서는 한 줄에 하나씩. */
+  .task-detail .jira-edit-picks {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* 목록에서 패널이 보고 있는 이슈의 행. 색이 아니라 왼쪽 2px 선과 바닥으로. */
+.task-jira-row.is-selected {
+  background: var(--row-hover);
+  box-shadow: inset 2px 0 0 var(--ink-chalk);
 }
 
 /* ---- Automations -------------------------------------------------------- */
@@ -27693,13 +29598,12 @@ progress:indeterminate::-webkit-progress-bar {
  * field on this surface, and a bare class loses to it — which is exactly how
  * this field ended up inset 16px further than every label around it. */
 .qo--settings .settings-input,
-/* The composer's Advanced fields and the add-project forms are labelled
- * sections in a padded column, exactly like the settings ones — left to
+/* The composer's Advanced fields are labelled sections in a padded column,
+ * exactly like the settings ones — left to
  * `.qo input` above they took that rule's own 16px inset ON TOP of the
  * section's, which put every value one step further in than the label over
  * it, and stood each of them in a 48px row built for a command palette. */
 .qo--worktree .settings-input,
-.qo--addproj .settings-input,
 .settings-view .settings-input,
 .artifacts-view .settings-input,
 .auto-view .settings-input {
@@ -27730,7 +29634,6 @@ progress:indeterminate::-webkit-progress-bar {
  * room for the mark is spelled here too — with the control's own number. */
 .qo--settings select.settings-input,
 .qo--worktree select.settings-input,
-.qo--addproj select.settings-input,
 .settings-view select.settings-input,
 .auto-view select.settings-input,
 .artifacts-view select.settings-input {
@@ -29090,7 +30993,10 @@ body:has(
  * draws a second rectangle inside the first — which is what the composer's
  * smart field looked like when it was reported. */
 .wt-smart .wt-spec:focus-visible,
-.wt-combo-pick:focus-visible {
+.wt-combo-pick:focus-visible,
+/* and the field inside a `.wt-box` (저장 위치, the projects window's search and
+ * forms, the folder browser's new name): the box lights its edge instead. */
+.qo .wt-box-input:focus-visible {
   box-shadow: none;
 }
 
@@ -50028,349 +51934,1175 @@ button.jev-token:hover {
   overflow-wrap: anywhere;
 }
 
+/* ---- 스킬·MCP: the common store's page (2026-11-06) -----------------------
+ * Geist's own pieces, nothing new: a heading over one line of agents, tabs
+ * underlined in ink, rows divided by hairline rules (no card stacks), a detail
+ * column on the deck, a dialog on the float material. Every state is a word
+ * beside a mark whose SHAPE changes too — a filled dot for every agent, a
+ * ring for some, a square for one agent's own, a diamond for what waits on
+ * the person. Sizes are the scales'; the few the page adds are tokens. */
 .skills-view {
   position: relative;
   container: skills / inline-size;
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
   min-width: 0;
   height: 100%;
-  padding: var(--space-5);
-  overflow: auto;
+  overflow: hidden;
   color: var(--ink-chalk);
   background: var(--surface-deck);
-
 }
 
 .skills-view[hidden], .skills-view [hidden] {
   display: none !important;
-
-}
-
-.skills-heading, .skills-toolbar, .skills-actions, .skills-required {
-  display: flex;
-  gap: var(--space-2);
-  align-items: center;
-  flex-wrap: wrap;
-
-}
-
-.skills-heading {
-  justify-content: space-between;
-  align-items: flex-start;
-
-}
-
-.skills-heading h1 {
-  font-size: var(--skills-title-size);
-  margin: var(--space-1) 0;
-
-}
-
-.skills-eyebrow {
-  color: var(--ink-mist);
-  font-size: var(--skills-meta-size);
-  margin: 0;
-
-}
-
-.skills-about, .skills-evidence-scope, .skills-card-usage, .skills-meta, .skills-detail-path, .skills-digest {
-  color: var(--ink-mist);
-  font-size: var(--skills-meta-size);
-
-}
-
-.skills-about, .skills-evidence-scope {
-  margin: 0;
-
-}
-
-.skills-view input:not([type=checkbox]),
-.skills-view select,
-.skills-view textarea {
-  background-color: var(--surface-well);
-  color: var(--ink-chalk);
-  border: var(--skills-line) solid var(--edge-mark);
-  border-radius: var(--radius-sm);
-  padding: var(--space-2);
-  font: inherit;
-  min-width: 0;
-  max-width: 100%;
-
-}
-
-/* The shorthand above out-specifies the room every select reserves for its
- * arrow (`select`'s own padding-inline-end), so the screen asks for it again
- * with the control's own number (t-58297). */
-.skills-view select {
-  padding-inline-end: var(--select-room);
-}
-
-.skills-search {
-  flex: 1;
-
-}
-
-.skills-total {
-  color: var(--ink-mist);
-  font-variant-numeric: tabular-nums;
-
-}
-
-.skills-columns {
-  display: grid;
-  grid-template-columns: minmax(0, var(--skills-list-share)) minmax(var(--skills-detail-min), var(--skills-detail-share));
-  gap: var(--space-4);
-  min-height: 0;
-  flex: 1;
-
-}
-
-.skills-list-pane, .skills-detail {
-  min-width: 0;
-  overflow: auto;
-  scrollbar-gutter: stable;
-
-}
-
-.skills-card-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-
-}
-
-.skills-card {
-  border: var(--skills-line) solid var(--edge-rule);
-  border-radius: var(--radius-md);
-  content-visibility: auto;
-  contain-intrinsic-size: auto var(--skills-card-height);
-
-}
-
-.skills-card-open {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  width: 100%;
-  padding: var(--space-4);
-  border: 0;
-  border-radius: inherit;
-  text-align: left;
-  color: var(--ink-chalk);
-  background: var(--surface-raised);
-  font: inherit;
-  cursor: pointer;
-  transition: background-color var(--motion-fast) var(--ease-standard);
-
-}
-
-.skills-card-open:hover {
-  background: var(--row-hover);
-
-}
-
-.skills-card-open[aria-pressed=true] {
-  box-shadow: inset var(--accent-rule) 0 var(--skills-focus);
-  background: var(--row-selected);
-
 }
 
 .skills-view :focus-visible {
-  outline: var(--accent-rule) solid var(--skills-focus);
-  outline-offset: var(--skills-line);
-
+  outline: var(--accent-rule) solid var(--ink-chalk);
+  outline-offset: var(--rule-width);
 }
 
-.skills-card-name {
-  font-size: var(--skills-body-size);
-
+.lib-top {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5) 0;
 }
 
-.skills-card-description {
-  color: var(--ink-mist);
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-
+.lib-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
 }
 
-.skills-card-marks {
-  color: var(--ink-figure);
-  font-size: var(--skills-meta-size);
-
-}
-
-.skills-conflict {
-  border: var(--skills-line) solid var(--edge-mark);
-  border-radius: var(--radius-pill);
-  color: var(--skills-alert);
-  align-self: flex-start;
-  padding: 0 var(--space-2);
-  font-size: var(--skills-meta-size);
-
-}
-
-.skills-detail {
-  padding: var(--space-4);
-  border-radius: var(--radius-md);
-  background: var(--skills-detail-bg);
-
-}
-
-.skills-detail h2 {
-  margin: var(--space-2) 0 var(--space-3);
-
-}
-
-.skills-detail-path, .skills-digest, .skills-root-line {
-  overflow-wrap: anywhere;
-
-}
-
-.skills-digest {
-  font-family: var(--font-mono);
-
-}
-
-.skills-markdown {
-  padding: var(--space-3) 0;
+.lib-titles {
   min-width: 0;
-  overflow-wrap: anywhere;
-
 }
 
-.skills-markdown pre {
-  max-width: 100%;
-  overflow: auto;
-
-}
-
-.skills-detail-evidence {
-  border-top: var(--skills-line) solid var(--edge-rule);
-  margin-top: var(--space-4);
-  font-size: var(--skills-meta-size);
-
-}
-
-.skills-roots-panel {
-  margin-top: var(--space-4);
+.lib-eyebrow {
+  margin: 0;
+  font: var(--type-label-12);
   color: var(--ink-mist);
-  font-size: var(--skills-meta-size);
-
 }
 
-.skills-required {
-  padding: var(--space-3);
-  border: var(--skills-line) solid var(--edge-mark);
+.lib-title {
+  margin: 0;
+  font: var(--type-heading-24);
+}
+
+.lib-about {
+  margin: var(--space-1) 0 0;
+  font: var(--type-copy-13);
+  color: var(--ink-mist);
+}
+
+.lib-acts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.lib-sync {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: var(--control-height-sm);
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-pill);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  background: none;
+  box-shadow: var(--shadow-border);
+  cursor: pointer;
+  transition: color var(--motion-fast) var(--ease-standard), box-shadow var(--motion-fast) var(--ease-standard);
+}
+
+.lib-sync:hover {
+  color: var(--ink-chalk);
+  box-shadow: 0 0 0 var(--rule-width) var(--ink-mist);
+}
+
+.lib-sync-dot {
+  flex: none;
+  width: var(--library-dot);
+  height: var(--library-dot);
+  border-radius: 50%;
+  background: var(--signal-ready);
+}
+
+.lib-sync.is-paused .lib-sync-dot {
+  background: none;
+  box-shadow: inset 0 0 0 var(--rule-width) var(--ink-glyph);
+}
+
+.lib-sync.is-running .lib-sync-dot {
+  background: none;
+  border: var(--accent-rule) solid var(--signal-ready);
+  border-top-color: transparent;
+  animation: lib-spin var(--library-spin) linear infinite;
+}
+
+@keyframes lib-spin {
+  to { transform: rotate(1turn); }
+}
+
+.lib-agents {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  font: var(--type-label-12);
+  color: var(--ink-mist);
+}
+
+.lib-agents-label {
+  margin-right: var(--space-1);
+}
+
+.lib-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: var(--library-chip-height);
+  padding: 0 var(--space-2) 0 var(--space-1);
+  border-radius: var(--radius-pill);
+  color: var(--ink-chalk);
+  box-shadow: var(--shadow-border);
+}
+
+/* An agent the store does not reach says so with its ring's shape too. */
+.lib-chip.is-own-only, .lib-chip.is-machine-login, .lib-chip.is-not-linked {
+  color: var(--ink-mist);
+  box-shadow: none;
+  outline: var(--rule-width) dashed var(--edge-mark);
+  outline-offset: calc(var(--rule-width) * -1);
+}
+
+.skills-view .agent-ico {
+  flex: none;
+  width: var(--library-mark);
+  height: var(--library-mark);
+}
+
+.skills-view .agent-ico img {
+  width: 100%;
+  height: 100%;
+}
+
+/* A narrow pane wraps whole tabs onto a second row, never a tab's own words:
+ * scrolling the row instead would clip the selected tab's mark on the rule. */
+.lib-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 var(--space-4);
+  margin: 0 calc(var(--space-5) * -1);
+  padding: 0 var(--space-5);
+  border-bottom: var(--rule-width) solid var(--edge-rule);
+}
+
+.lib-tab {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-2);
+  height: var(--library-tab-height);
+  white-space: nowrap;
+  padding: 0;
+  border: 0;
+  color: var(--ink-mist);
+  font: var(--type-label-14);
+  font-weight: 500;
+  background: none;
+  cursor: pointer;
+  transition: color var(--motion-fast) var(--ease-standard);
+}
+
+.lib-tab:hover {
+  color: var(--ink-chalk);
+}
+
+.lib-tab[aria-selected="true"] {
+  color: var(--ink-chalk);
+}
+
+.lib-tab[aria-selected="true"]::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: calc(var(--rule-width) * -1);
+  left: 0;
+  height: var(--accent-rule);
+  border-radius: var(--rule-width);
+  background: var(--ink-chalk);
+}
+
+.lib-tab-count {
+  font: var(--type-label-12);
+  color: var(--ink-mist);
+}
+
+.lib-tab-ask {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  color: var(--signal-you);
+  font: var(--type-label-12);
+  background: var(--signal-you-ground);
+}
+
+.lib-note {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-md);
-
+  font: var(--type-copy-13);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-border);
 }
 
-.skills-bundled-panel {
-  color: var(--ink-mist);
-  font-size: var(--skills-meta-size);
+.lib-note.is-you {
+  background: var(--signal-you-ground);
+  box-shadow: none;
+}
+
+.lib-note.is-you > .icon {
+  flex: none;
+  color: var(--signal-you);
+}
+
+.lib-attention-list {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.lib-link {
+  padding: 0;
+  border: 0;
+  color: var(--signal-you);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: var(--library-link-offset);
+  background: none;
+  cursor: pointer;
+  transition: color var(--motion-fast) var(--ease-standard);
+}
+
+.lib-link:hover {
+  color: var(--ink-chalk);
+}
+
+.skills-required, .skills-bundled {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  font: var(--type-copy-13);
+  box-shadow: var(--shadow-border);
 }
 
 .skills-bundled-line {
   display: flex;
-  gap: var(--space-2);
-  align-items: center;
   flex-wrap: wrap;
-  margin: var(--space-1) 0;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.skills-bundled-state, .lib-quiet {
+  font: var(--type-label-12);
+  color: var(--ink-mist);
+}
+
+.skills-error, .skills-plan-status, .skills-native-status {
+  margin: 0;
+  font: var(--type-label-12);
 }
 
 .skills-error {
-  color: var(--skills-alert);
-  overflow-wrap: anywhere;
-
+  color: var(--ink-chalk);
 }
 
-.skills-bundle {
+.skills-plan-status, .skills-native-status {
+  color: var(--ink-mist);
+}
+
+.lib-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding-bottom: var(--space-3);
+}
+
+.lib-search {
+  position: relative;
+  display: flex;
+  flex: 1 1 var(--library-search-min);
+  align-items: center;
+  min-width: 0;
+}
+
+.lib-search-glyph {
   position: absolute;
-  inset: var(--space-4);
-  max-width: var(--skills-bundle-width);
-  margin: auto;
-  padding: var(--space-5);
-  overflow: auto;
-  background: var(--surface-deck);
-  border: var(--skills-line) solid var(--edge-mark);
-  border-radius: var(--radius-xl);
-  box-shadow: var(--shadow-soft);
-  z-index: 1;
-
+  left: var(--space-3);
+  display: flex;
+  color: var(--ink-glyph);
+  pointer-events: none;
 }
 
-.skills-bundle input[type=url], .skills-bundle-output {
+.lib-search input {
   width: 100%;
-  margin: var(--space-2) 0;
-
-}
-
-.skills-bundle-output {
-  min-height: var(--skills-output-height);
-  resize: vertical;
-
-}
-
-.skills-bundle fieldset {
-  margin: var(--space-3) 0;
-  border: var(--skills-line) solid var(--edge-rule);
+  height: var(--control-height-md);
+  padding: 0 var(--space-3) 0 calc(var(--space-3) * 3);
+  border: 0;
   border-radius: var(--radius-sm);
-
+  color: var(--ink-chalk);
+  font: var(--type-label-14);
+  background-color: var(--surface-well);
+  box-shadow: var(--shadow-border);
 }
 
-.skills-choice {
+.lib-filters {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--rule-width);
+  padding: calc(var(--space-1) / 2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-well);
+  box-shadow: var(--shadow-border);
+}
+
+/* In a dialog's column a choice is as wide as its words, not the column. */
+.lib-dialog .lib-filters {
+  align-self: flex-start;
+  justify-self: start;
+}
+
+.lib-seg {
+  height: calc(var(--control-height-sm) - var(--space-1));
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  white-space: nowrap;
+  background: none;
+  cursor: pointer;
+  transition: color var(--motion-fast) var(--ease-standard), background-color var(--motion-fast) var(--ease-standard);
+}
+
+.lib-seg:hover {
+  color: var(--ink-chalk);
+}
+
+.lib-seg[aria-pressed="true"] {
+  color: var(--ink-chalk);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border-small);
+}
+
+.skills-total {
+  font: var(--type-label-12);
+  color: var(--ink-mist);
+  white-space: nowrap;
+}
+
+.lib-body {
+  position: relative;
+  display: grid;
+  flex: 1;
+  grid-template-columns: minmax(0, 1fr) var(--library-detail-width);
+  min-height: 0;
+  overflow: hidden;
+  border-top: var(--rule-width) solid var(--edge-rule);
+}
+
+.lib-list {
+  min-height: 0;
+  overflow: auto;
+}
+
+.lib-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: var(--space-3);
+  min-height: var(--library-row-min);
+  padding-right: var(--space-5);
+  border-bottom: var(--rule-width) solid var(--edge-rule);
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.lib-row:hover {
+  background: var(--row-hover);
+}
+
+.lib-row[aria-current="true"] {
+  background: var(--row-active);
+}
+
+.lib-row-open {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  column-gap: var(--space-4);
+  min-width: 0;
+  min-height: var(--library-row-min);
+  padding: var(--space-2) 0 var(--space-2) var(--space-5);
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  background: none;
+  cursor: pointer;
+}
+
+.lib-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--space-1) / 2);
+  min-width: 0;
+}
+
+.lib-row-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.lib-row-badges {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.lib-row-title strong {
+  overflow: hidden;
+  font: var(--type-heading-14);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.lib-row-line {
+  overflow: hidden;
+  color: var(--ink-mist);
+  font: var(--type-copy-13);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.lib-row-line.is-mono, .lib-facts dd.is-mono, .lib-pick-words .is-mono, .lib-result-line.is-mono, .lib-delete-list .is-mono {
+  font: var(--type-label-12-mono);
+}
+
+.lib-row-origin {
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  white-space: nowrap;
+}
+
+.lib-badge {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  height: var(--library-badge-height);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  white-space: nowrap;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-border);
+}
+
+.lib-status {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
-  padding: var(--space-2);
-
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  white-space: nowrap;
 }
 
-.skills-choice input {
-  accent-color: var(--skills-focus);
-
+.lib-status-dot {
+  flex: none;
+  width: var(--library-dot);
+  height: var(--library-dot);
+  border-radius: 50%;
+  background: var(--signal-ready);
 }
 
+.lib-status.is-ok {
+  color: var(--ink-chalk);
+}
+
+.lib-status.is-part .lib-status-dot {
+  background: none;
+  box-shadow: inset 0 0 0 var(--rule-width) var(--signal-ready);
+}
+
+.lib-status.is-off .lib-status-dot {
+  background: none;
+  box-shadow: inset 0 0 0 var(--rule-width) var(--ink-glyph);
+}
+
+.lib-status.is-own .lib-status-dot {
+  border-radius: var(--radius-xs);
+  background: none;
+  box-shadow: inset 0 0 0 var(--rule-width) var(--ink-glyph);
+}
+
+.lib-status.is-you {
+  color: var(--signal-you);
+}
+
+.lib-status.is-you .lib-status-dot {
+  border-radius: var(--radius-xs);
+  background: var(--signal-you);
+  transform: rotate(45deg);
+}
+
+.lib-switch {
+  position: relative;
+  flex: none;
+  width: var(--library-switch-width);
+  height: var(--library-switch-height);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--edge-mark);
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.lib-switch::after {
+  content: "";
+  position: absolute;
+  top: calc((var(--library-switch-height) - var(--library-switch-knob)) / 2);
+  left: calc((var(--library-switch-height) - var(--library-switch-knob)) / 2);
+  width: var(--library-switch-knob);
+  height: var(--library-switch-knob);
+  border-radius: 50%;
+  background: var(--surface-deck);
+  transition: transform var(--motion-fast) var(--ease-standard);
+}
+
+.lib-switch:hover {
+  background: var(--ink-mist);
+}
+
+.lib-switch[aria-checked="true"] {
+  background: var(--ink-chalk);
+}
+
+.lib-switch[aria-checked="true"]::after {
+  transform: translateX(calc(var(--library-switch-width) - var(--library-switch-height)));
+}
+
+.lib-switch:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.lib-empty {
+  margin: 0;
+  padding: var(--space-6) var(--space-5);
+  color: var(--ink-mist);
+  font: var(--type-copy-13);
+}
+
+.lib-detail {
+  min-height: 0;
+  padding: var(--space-4) var(--space-5) var(--space-6);
+  overflow: auto;
+  border-left: var(--rule-width) solid var(--edge-rule);
+  background: var(--surface-deck);
+  transition: transform var(--motion-fast) var(--ease-standard), visibility 0s linear var(--motion-fast);
+}
+
+.lib-back {
+  display: none;
+}
+
+.skills-detail-empty, .skills-detail-content > p {
+  margin: 0;
+  color: var(--ink-mist);
+  font: var(--type-copy-13);
+}
+
+.lib-detail-name {
+  margin: 0;
+  font: var(--type-heading-16);
+  overflow-wrap: anywhere;
+}
+
+.lib-path {
+  margin: var(--space-1) 0 var(--space-3);
+  color: var(--ink-mist);
+  font: var(--type-label-12-mono);
+  overflow-wrap: anywhere;
+}
+
+.lib-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+.lib-check {
+  margin: 0 0 var(--space-3);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+}
+
+.lib-check.is-connected {
+  color: var(--ink-chalk);
+}
+
+.lib-check.is-failed {
+  color: var(--signal-halt-ink);
+}
+
+.lib-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--space-2) var(--space-3);
+  margin: 0 0 var(--space-4);
+  font: var(--type-label-13);
+}
+
+.lib-facts dt {
+  color: var(--ink-mist);
+}
+
+.lib-facts dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.lib-secrets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.lib-secret {
+  display: inline-flex;
+  gap: var(--space-1);
+  font: var(--type-label-12-mono);
+}
+
+.lib-secret-mask {
+  color: var(--ink-mist);
+}
+
+.lib-section {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: var(--space-4) 0 var(--space-2);
+  font: var(--type-heading-14);
+}
+
+.lib-agent-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-border);
+}
+
+.lib-agent-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: calc(var(--control-height-md) + var(--space-2));
+  padding: 0 var(--space-3);
+  border-top: var(--rule-width) solid var(--edge-rule);
+  font: var(--type-label-13);
+}
+
+.lib-agent-row:first-child {
+  border-top: 0;
+}
+
+.lib-agent-name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.lib-agent-tail {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.lib-pick {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-2) 0;
+}
+
+.lib-pick-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-border);
+  cursor: pointer;
+  transition: box-shadow var(--motion-fast) var(--ease-standard);
+}
+
+.lib-pick-option:hover {
+  box-shadow: 0 0 0 var(--rule-width) var(--ink-mist);
+}
+
+.lib-pick-option:has(input:checked) {
+  box-shadow: 0 0 0 var(--rule-width) var(--ink-chalk);
+}
+
+.lib-pick-option input, .lib-check-row input {
+  margin: 0;
+  accent-color: var(--ink-chalk);
+}
+
+.lib-pick-words {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--space-1) / 2);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.lib-log-row {
+  display: grid;
+  grid-template-columns: var(--library-time-width) auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: var(--library-row-min);
+  padding: var(--space-2) var(--space-5);
+  border-bottom: var(--rule-width) solid var(--edge-rule);
+  font: var(--type-copy-13);
+}
+
+.lib-log-time {
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  white-space: nowrap;
+}
+
+.lib-log-face {
+  display: inline-flex;
+  width: var(--library-mark);
+  height: var(--library-mark);
+  color: var(--ink-mist);
+}
+
+.lib-log-words {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.lib-log-detail {
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  overflow-wrap: anywhere;
+}
+
+.lib-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: var(--library-layer-dialog);
+  display: grid;
+  place-items: center;
+  padding: var(--space-4);
+  background: var(--scrim);
+}
+
+.lib-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(var(--library-dialog-width), 100%);
+  max-height: calc(100% - var(--space-4));
+  overflow: hidden;
+  border-radius: var(--radius-xl);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border), var(--shadow-float);
+}
+
+.lib-dialog-head {
+  padding: var(--space-5) var(--space-5) var(--space-3);
+}
+
+.lib-dialog-head h2 {
+  margin: 0;
+  font: var(--type-heading-16);
+}
+
+.lib-dialog-head .lib-quiet {
+  margin: var(--space-1) 0 0;
+}
+
+.lib-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: 0 var(--space-5) var(--space-4);
+  overflow: auto;
+}
+
+.lib-dialog-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-5);
+  border-top: var(--rule-width) solid var(--edge-rule);
+  background: var(--surface-raised);
+}
+
+.lib-dialog-hint {
+  flex: 1 1 var(--library-search-min);
+}
+
+.lib-dialog-status {
+  margin: 0;
+  color: var(--ink-chalk);
+  font: var(--type-label-12);
+}
+
+.lib-pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.lib-field {
+  display: grid;
+  grid-template-columns: var(--library-label-width) minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+}
+
+.lib-field > .lib-quiet, .lib-field > .lib-secret-rows, .lib-field > .btn {
+  grid-column: 2;
+}
+
+.lib-field > .btn {
+  justify-self: start;
+}
+
+.lib-field-label {
+  color: var(--ink-mist);
+  font: var(--type-label-13);
+}
+
+.lib-input, .skills-view select {
+  width: 100%;
+  min-width: 0;
+  height: var(--control-height-md);
+  padding: 0 var(--space-3);
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--ink-chalk);
+  font: var(--type-label-14);
+  background-color: var(--surface-well);
+  box-shadow: var(--shadow-border);
+}
+
+/* The pasted block: a textarea of the page's own; its face sets the colour
+ * alone, never the `background` shorthand that would erase what a control
+ * wears (the select face rule). */
+.skills-view textarea {
+  width: 100%;
+  min-width: 0;
+  height: var(--library-json-height);
+  padding: var(--space-2) var(--space-3);
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--ink-chalk);
+  font: var(--type-label-12-mono);
+  background-color: var(--surface-well);
+  box-shadow: var(--shadow-border);
+  resize: vertical;
+}
+
+.lib-secret-rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.lib-secret-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: var(--space-2);
+}
+
+.lib-inline {
+  display: flex;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.lib-checks {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.lib-check-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font: var(--type-label-13);
+}
+
+.lib-result {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  color: var(--ink-mist);
+  font: var(--type-copy-13);
+  background: var(--surface-well);
+  box-shadow: var(--shadow-border);
+}
+
+.lib-result strong {
+  color: var(--ink-chalk);
+}
+
+.lib-command-box summary {
+  color: var(--ink-mist);
+  font: var(--type-label-13);
+  cursor: pointer;
+}
+
+.lib-command {
+  margin: var(--space-2) 0 0;
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  font: var(--type-label-12-mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--surface-well);
+  box-shadow: var(--shadow-border);
+}
+
+.lib-delete-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-border);
+}
+
+.lib-delete-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-top: var(--rule-width) solid var(--edge-rule);
+  font: var(--type-label-13);
+  overflow-wrap: anywhere;
+}
+
+.lib-delete-list li:first-child {
+  border-top: 0;
+}
+
+.lib-toast {
+  position: absolute;
+  bottom: var(--space-4);
+  left: 50%;
+  z-index: var(--library-layer-toast);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  max-width: min(var(--library-dialog-width), calc(100% - var(--space-6)));
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
+  border-radius: var(--radius-md);
+  font: var(--type-label-13);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-border), var(--shadow-drop);
+  opacity: 0;
+  transform: translate(-50%, var(--space-2));
+  pointer-events: none;
+  transition: opacity var(--motion-fast) var(--ease-standard), transform var(--motion-fast) var(--ease-standard);
+}
+
+.lib-toast.is-on {
+  opacity: 1;
+  transform: translate(-50%, 0);
+  pointer-events: auto;
+}
+
+.lib-toast-words {
+  min-width: 0;
+}
+
+/* The page's small buttons and its quiet ones: the window's `.btn`, sized
+ * down to the control height the rows use. */
+.skills-view .btn--sm {
+  gap: var(--space-1);
+  height: var(--control-height-sm);
+  padding: 0 var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.skills-view .btn--ghost {
+  border-color: transparent;
+  color: var(--ink-mist);
+  transition: color var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard);
+}
+
+.skills-view .btn--ghost:hover {
+  color: var(--ink-chalk);
+}
+
+.skills-view .btn .icon {
+  flex: none;
+}
+
+.skills-markdown {
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: var(--rule-width) solid var(--edge-rule);
+}
+
+.skills-markdown pre {
+  overflow: auto;
+}
+
+.skills-detail-evidence {
+  margin-top: var(--space-3);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+}
+
+.skills-detail-evidence p {
+  margin: 0;
+}
+
+/* A narrow pane: the detail is its own page over the list, and the agents
+ * keep their marks with their names in the tooltip. */
 @container skills (max-width: 760px) {
-  .skills-columns {
-  grid-template-columns: minmax(0, 1fr);
-  min-height: auto;
+  .lib-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
 
+  .lib-detail {
+    position: absolute;
+    inset: 0;
+    z-index: var(--library-layer-detail);
+    border-left: 0;
+    visibility: hidden;
+    transform: translateX(100%);
+  }
+
+  .lib-detail.is-open {
+    visibility: visible;
+    transform: none;
+    transition: transform var(--motion-fast) var(--ease-standard), visibility 0s linear 0s;
+  }
+
+  .lib-back {
+    display: inline-flex;
+    margin-bottom: var(--space-3);
+  }
+
+  .lib-row-origin, .lib-chip-name {
+    display: none;
+  }
+
+  .lib-chip {
+    padding: 0 var(--space-1);
+  }
 }
 
-  .skills-list-pane, .skills-detail {
-  overflow: visible;
+@container skills (max-width: 480px) {
+  .lib-top {
+    padding: var(--space-3) var(--space-4) 0;
+  }
 
+  .lib-tabs {
+    gap: 0 var(--space-3);
+    margin: 0 calc(var(--space-4) * -1);
+    padding: 0 var(--space-4);
+  }
+
+  /* The sync pill keeps its words: a dot alone would say its state by colour. */
+  .lib-about, .lib-agents-label {
+    display: none;
+  }
+
+  .lib-row {
+    padding-right: var(--space-4);
+  }
+
+  .lib-row-open {
+    grid-template-columns: minmax(0, 1fr) auto;
+    padding-left: var(--space-4);
+  }
+
+  .lib-log-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    padding: var(--space-2) var(--space-4);
+  }
+
+  .lib-log-time, .lib-log-row > .agent-ico, .lib-log-face {
+    display: none;
+  }
+
+  .lib-field {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .lib-field > .lib-quiet, .lib-field > .lib-secret-rows, .lib-field > .btn {
+    grid-column: 1;
+  }
+
+  .lib-detail {
+    padding: var(--space-4);
+  }
 }
 
-  .skills-view.has-detail .skills-detail {
-  grid-row: 1;
-
-}
-
-  .skills-search {
-  flex-basis: 100%;
-
-}
-
-}
 @media (prefers-reduced-motion: reduce) {
   .skills-view *, .skills-view *::before, .skills-view *::after {
-  animation: none !important;
-  transition: none !important;
-  scroll-behavior: auto !important;
-
+    transition: none !important;
+    animation: none !important;
+  }
 }
 
-}
-
+/* A placeholder is an example, never a value: dimmer than what was typed. */
 .skills-view input::placeholder,
 .skills-view textarea::placeholder {
-  color: var(--ink-mist);
+  color: var(--ink-glyph);
   opacity: 1;
 }
 
@@ -50590,7 +53322,6 @@ button.jev-token:hover {
   border: var(--rule-width) solid var(--artifact-studio-edge);
   border-radius: var(--artifact-studio-radius);
   background: var(--artifact-studio-background);
-  box-shadow: var(--artifact-studio-shadow);
 }
 .artifacts-studio[hidden] { display: none; }
 .artifacts-studio-intro {
@@ -50603,8 +53334,8 @@ button.jev-token:hover {
   flex: none;
   margin: 0;
   color: var(--ink-chalk);
-  font-size: var(--text-sm);
-  font-weight: var(--artifact-studio-weight);
+  font: var(--type-heading-16);
+  letter-spacing: var(--tracking-heading-16);
   word-break: keep-all;
 }
 .artifacts-studio-hint {
@@ -50622,20 +53353,44 @@ button.jev-token:hover {
   width: var(--artifact-studio-glyph-side);
   height: var(--artifact-studio-glyph-side);
   border-radius: var(--radius-sm);
-  color: var(--artifact-studio-accent);
-  background: var(--artifact-studio-glyph-background);
+  color: var(--ink-chalk);
+  box-shadow: var(--shadow-border);
 }
 .artifacts-studio-choice-copy { min-width: 0; }
 .artifacts-studio-choice-title,
 .artifacts-studio-choice-hint { display: block; word-break: keep-all; }
-.artifacts-studio-choice-title { font-size: var(--text-xs); font-weight: var(--artifact-studio-weight); }
-.artifacts-studio-choice-hint { margin-top: 2px; font-size: var(--text-2xs); color: var(--ink-mist); }
+.artifacts-studio-choice-title { font: var(--type-label-14); font-weight: 500; }
+.artifacts-studio-choice-hint { margin-top: 2px; font: var(--type-label-12); color: var(--ink-mist); }
 
 .artifacts-studio-form {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
+  max-width: var(--artifact-prose-max);
   margin-top: var(--space-3);
+}
+
+/* The studio's fields are Geist inputs (2026-11-06): a ring, a 6px corner and
+ * the sans face — not the settings surfaces' underlined mono row they borrowed. */
+.artifacts-view .artifacts-studio .settings-input {
+  height: var(--control-height-md);
+  padding: 0 var(--control-pad-inline);
+  border: 0;
+  border-radius: var(--radius-md);
+  background-color: var(--surface-abyss);
+  box-shadow: var(--shadow-border);
+  font: var(--type-label-14);
+  transition: box-shadow var(--motion-fast) var(--ease-standard);
+}
+.artifacts-view .artifacts-studio select.settings-input { padding-inline-end: var(--select-room); }
+.artifacts-view .artifacts-studio textarea.settings-input {
+  height: auto;
+  min-height: calc(var(--control-height-md) * 3);
+  padding: var(--space-2) var(--control-pad-inline);
+  line-height: 22px; /* Label 14 over a three-row brief: the 20px label line plus the 2px a typed paragraph wants */
+}
+.artifacts-view .artifacts-studio .settings-input:focus-visible {
+  box-shadow: 0 0 0 var(--rule-width) var(--ink-mist), 0 0 0 var(--ring-width) var(--row-selected);
 }
 .artifacts-studio-form[hidden] { display: none; }
 .artifacts-studio-brief-label,
@@ -50672,12 +53427,19 @@ button.jev-token:hover {
 .artifacts-new-menu {
   width: var(--artifact-new-menu-width);
   max-width: calc(100vw - var(--space-4));
+  padding: var(--space-1);
+  border-radius: var(--radius-menu);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border), var(--shadow-soft);
 }
 .artifacts-new-menu[hidden] { display: none; }
 .artifacts-new-item {
   align-items: center;
+  border-radius: var(--radius-sm);
   text-align: left;
+  transition: background-color var(--motion-fast) var(--ease-standard);
 }
+.artifacts-new-item:hover { background: var(--row-hover); }
 .artifacts-new-item .artifacts-studio-glyph {
   width: var(--artifact-new-glyph-side);
   height: var(--artifact-new-glyph-side);
@@ -50716,11 +53478,27 @@ button.jev-token:hover {
   max-width: 100%;
 }
 
-/* 머리의 칸은 모두 한 높이 — 워크벤치 머리의 28px 줄(`--control-height-sm`). */
+/* 머리의 칸은 모두 한 높이 — 워크벤치 머리의 28px 줄(`--control-height-sm`). 칸은 Geist의 것이다
+ * (2026-11-06): 밑줄 · 고정폭 대신 링 · 6px 모서리 · Label 13. 검색칸은 돋보기를 제 바탕에 입는다. */
 .artifacts-view .artifacts-head :is(.artifacts-query, .artifacts-pick-select) {
   height: var(--control-height-sm);
   padding-block: 0;
+  font: var(--type-label-13);
 }
+
+.artifacts-view .artifacts-head .artifacts-query {
+  padding-inline: calc(var(--control-pad-inline) + var(--icon-size) + var(--space-2)) var(--control-pad-inline);
+  border: 0;
+  border-radius: var(--radius-md);
+  background-image: var(--search-glyph);
+  background-position: var(--control-pad-inline) center;
+  background-repeat: no-repeat;
+  background-size: var(--icon-size) var(--icon-size);
+  box-shadow: var(--shadow-border);
+  transition: box-shadow var(--motion-fast) var(--ease-standard);
+}
+
+.artifacts-view .artifacts-head .artifacts-query:hover { box-shadow: 0 0 0 var(--rule-width) var(--edge-mark); }
 
 .artifacts-head .btn {
   height: var(--control-height-sm);
@@ -50782,20 +53560,31 @@ button.jev-token:hover {
   font-variant-numeric: tabular-nums;
 }
 
-/* 고르개 셋 — 이름표와 select 한 벌. select는 판의 입력 옷(`.settings-input`)이다. */
+/* 고르개 셋 — 이름표와 select 한 벌이 Geist 컨트롤 하나로 선다(2026-11-06): 링 안에 흐린 이름표와
+ * 잉크의 값. select는 판의 입력 옷(`.settings-input`)을 입되 제 테두리는 링이 대신한다. */
 .artifacts-pick {
   display: inline-flex;
   flex: none;
   align-items: center;
   gap: var(--space-1);
+  height: var(--control-height-sm);
+  padding-left: var(--control-pad-inline);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-border);
   color: var(--ink-mist);
-  font-size: var(--text-xs);
+  font: var(--type-label-13);
   white-space: nowrap;
+  transition: box-shadow var(--motion-fast) var(--ease-standard);
 }
+
+.artifacts-pick:hover { box-shadow: 0 0 0 var(--rule-width) var(--edge-mark); }
 
 .artifacts-view .artifacts-pick-select {
   width: auto;
   max-width: var(--artifact-pick-max-width);
+  border: 0;
+  color: var(--ink-chalk);
+  font-weight: 500;
 }
 
 .artifacts-new {
@@ -50810,6 +53599,19 @@ button.jev-token:hover {
   align-items: center;
   min-width: 0;
 }
+
+/* ✕는 지우는 고르개 바로 곁에 선다(검색칸이 그 뒤로 물러났다) — 테두리 없는 조용한 단추. */
+.artifacts-head .artifacts-origin-clear {
+  width: var(--control-height-sm);
+  padding: 0;
+  border: 0;
+  background: none;
+  box-shadow: none;
+  color: var(--ink-mist);
+  transition: background-color var(--motion-fast) var(--ease-standard), color var(--motion-fast) var(--ease-standard);
+}
+
+.artifacts-head .artifacts-origin-clear:hover { background: var(--row-hover); color: var(--ink-chalk); }
 
 .artifacts-origin-chip {
   display: inline-flex;
@@ -50957,15 +53759,21 @@ button.jev-token:hover {
   width: 100%;
 }
 
+/* 카드 한 장은 격자다(2026-11-06): 그림 · 제목 · (빈 칸) · 배지와 만든 이와 시각의 한 줄. 배지는 그림 위에
+ * 얹지 않는다. 글이 얼굴인 카드는 그림 자리에 배지가 먼저 서고 제목 아래 결론 두 줄이 붙는다. 칸의 높이는
+ * 가상화가 읽는 토큰이다. */
 .artifact-card {
   position: absolute;
   top: 0;
   left: 0;
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-areas: "face face face" "title title title" "gap gap gap" "chips maker foot";
+  align-content: start;
+  gap: var(--space-2);
   box-sizing: border-box;
-  padding: var(--space-2);
+  padding: var(--space-3);
   border: var(--rule-width) solid var(--artifact-card-edge);
   border-radius: var(--radius-md);
   background: var(--artifact-card-bg);
@@ -50975,28 +53783,30 @@ button.jev-token:hover {
   overflow: hidden;
   transition:
     border-color var(--motion-fast) var(--ease-standard),
-    box-shadow var(--motion-fast) var(--ease-standard);
+    background-color var(--motion-fast) var(--ease-standard);
 }
 
 .artifact-card:hover {
   border-color: color-mix(in srgb, var(--ink-chalk) 24%, var(--artifact-card-edge));
-  box-shadow: var(--artifact-studio-shadow);
 }
 
+/* 고른 카드는 이 보기의 색 1px과 그 색을 옅게 탄 바탕 — 2px 테두리는 화면에서 가장 밝은 것이 됐다. */
 .artifact-card.is-selected {
   border-color: var(--artifact-selected-edge);
-  box-shadow: 0 0 0 1px var(--artifact-selected-edge);
+  background: color-mix(in srgb, var(--artifact-selected-edge) 7%, var(--artifact-card-bg));
 }
 
 .artifact-card-face {
   position: relative;
   display: flex;
   flex: none;
+  grid-area: face;
   align-items: center;
   justify-content: center;
   aspect-ratio: calc(1 / var(--artifact-face-ratio));
   border-radius: var(--radius-sm);
   background: var(--artifact-studio-face-background);
+  box-shadow: inset 0 0 0 var(--rule-width) var(--edge-rule);
   overflow: hidden;
 }
 
@@ -51033,43 +53843,68 @@ button.jev-token:hover {
   line-height: 1;
 }
 
-/* 문서의 얼굴은 첫 블록의 활자 — 몇 줄만, 나머지는 자른다. */
+/* 문서의 얼굴은 첫 블록의 활자 — 종이처럼 판의 면에 Copy 13으로, 몇 줄만, 나머지는 자른다. */
 .artifact-card-doc {
   position: absolute;
   inset: 0;
   display: -webkit-box;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: var(--artifact-doc-lines);
-  padding: var(--space-2);
+  padding: var(--space-3);
   overflow: hidden;
-  color: var(--artifact-card-ink);
-  font-size: var(--text-xs);
-  line-height: 1.5;
+  background: var(--surface-deck);
+  color: var(--ink-mist);
+  font: var(--type-copy-13);
   text-align: left;
-  word-break: break-word;
+  word-break: keep-all;
+  overflow-wrap: break-word;
 }
 
 .artifact-card-title {
+  grid-area: title;
   overflow: hidden;
-  font-size: var(--text-sm);
-  font-weight: 600;
+  font: var(--type-heading-14);
+  letter-spacing: var(--tracking-heading-14);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-/* 만든 이의 한 줄 — 에이전트 표식 · 판 · 브랜치. 출처가 비면 줄째 숨는다. */
+/* 보고서 카드의 결론 두 줄 — 목록이 이미 실어 온 앞 글에서 제목 다음 첫 문단(2026-11-06). */
+.artifact-card-lead {
+  display: -webkit-box;
+  grid-area: lead;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  color: var(--ink-mist);
+  font: var(--type-copy-13);
+  word-break: keep-all;
+  overflow-wrap: break-word;
+}
+
+.artifact-card-lead[hidden] { display: none; }
+
+/* 만든 이의 한 줄 — 에이전트 표식 · 모델(또는 자동화의 이름) · 판 · 창이 아는 브랜치. 출처가 비면 줄째 숨는다. */
 .artifact-card-maker {
   display: flex;
   flex: none;
+  grid-area: maker;
   align-items: center;
   gap: var(--space-1);
   min-width: 0;
   overflow: hidden;
   color: var(--artifact-card-ink-soft);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
+  font: var(--type-label-12);
   white-space: nowrap;
 }
+
+.artifact-card-maker-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.artifact-card-maker :is(.artifact-card-maker-pane, .artifact-card-maker-branch) { font-family: var(--font-mono); }
 
 .artifact-card-maker[hidden],
 .artifact-card-maker > [hidden] { display: none; }
@@ -51121,106 +53956,165 @@ button.jev-token:hover {
 
 .artifact-no-origin[hidden] { display: none; }
 
+/* 아래 줄의 오른쪽: 피드백 수와 시각(이모지 없이 — 오늘 것은 「3시간 전」, 그보다 오래된 것은 날과 시각). */
 .artifact-card-foot {
-  display: flex;
+  display: inline-flex;
+  grid-area: foot;
+  align-self: center;
   gap: var(--space-2);
-  justify-content: space-between;
-  /* 보고서 카드는 제목이 세 줄보다 짧아도 아래 줄이 바닥에 선다. */
-  margin-top: auto;
   color: var(--artifact-card-ink-soft);
-  font-size: var(--text-xs);
+  font: var(--type-label-12);
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
 .artifact-card-kind[hidden] { display: none; }
 
-/* 보고서 카드(t-36910) — 얼굴은 글이다: 칩 한 줄, 세 줄까지의 제목, 만든 이, 아래 줄. */
+/* 글이 얼굴인 카드(보고서 · 증거 · 기타, t-36910): 배지 한 줄, 두 줄까지의 제목, 결론 두 줄, 만든 이와 시각. */
+.artifact-card.is-plain {
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  grid-template-areas: "chips chips" "title title" "lead lead" "gap gap" "maker foot";
+}
+
+/* 그림 있는 카드의 아래 줄은 배지 · 만든 이(표식과 모델) · 시각 — 판과 브랜치는 서랍의 세부 정보가 말한다. */
+.artifact-card:not(.is-plain) :is(.artifact-card-maker-pane, .artifact-card-maker-sep, .artifact-card-maker-branch) { display: none; }
+
 .artifact-card.is-plain .artifact-card-face { display: none; }
 
 .artifact-card.is-plain .artifact-card-title {
   display: -webkit-box;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-  line-height: 1.4;
+  -webkit-line-clamp: 2;
   white-space: normal;
-  overflow-wrap: anywhere;
+  word-break: keep-all;
+  overflow-wrap: break-word;
 }
 
-/* 칩 한 줄: 보고서의 종류 · 작업 · 반영 상태. 테두리는 회색이다 — 호박색은 고른 카드의 것.
- * 얼굴이 있는 카드에서는 얼굴의 왼쪽 위에 얹혀 카드의 높이를 바꾸지 않는다. */
+/* 스크린샷 카드: 글 카드의 오른쪽 위에 런타임이 줄인 그림(2026-11-06) — 이름보다 그림으로 찾는다. */
+.artifact-card.is-plain.has-thumb {
+  grid-template-columns: minmax(0, 1fr) var(--artifact-evidence-thumb-width);
+  grid-template-areas: "chips thumb" "title thumb" "lead lead" "gap gap" "maker foot";
+  column-gap: var(--space-3);
+}
+
+.artifact-card.is-plain.has-thumb .artifact-card-face {
+  display: block;
+  grid-area: thumb;
+  width: var(--artifact-evidence-thumb-width);
+  height: var(--artifact-evidence-thumb-height);
+  aspect-ratio: auto;
+}
+
+.artifact-card.is-plain.has-thumb .artifact-card-glyph { display: none; }
+
+/* 배지 한 줄: 종류 · 과업 · 판(버전) · 반영 상태. 그림 위에 얹지 않는다 — 얹으면 그림의 왼쪽 위, 대개
+ * 페이지 제목 자리를 가렸다(2026-11-06). 호박색은 고른 카드의 것. */
 .artifact-card-chips {
   display: flex;
   flex: none;
+  grid-area: chips;
   gap: var(--space-1);
   align-items: center;
   min-width: 0;
   overflow: hidden;
 }
 
-.artifact-card:not(.is-plain) .artifact-card-chips {
-  position: absolute;
-  top: calc(var(--space-2) + var(--space-1));
-  left: calc(var(--space-2) + var(--space-1));
-  z-index: 1;
-  max-width: calc(100% - var(--space-5));
-}
-
 .artifact-card-chips[hidden],
 .artifact-card-chips > [hidden],
 .artifact-detail-bar > [hidden] { display: none; }
 
+/* 배지(2026-11-06) — 작업 상황판과 같은 Geist 배지: 24px 알약, 200 바탕, 테두리 없음. */
 .artifact-card-subtype,
 .artifact-card-task,
+.artifact-card-kind,
 .artifact-card-landing,
 .artifact-task-id,
 .artifact-task-landing,
 .artifact-detail-task,
+.artifact-detail-kind,
 .artifact-detail-landing {
   display: inline-flex;
   flex: none;
   align-items: center;
   box-sizing: border-box;
-  height: var(--artifact-press-min);
+  height: var(--badge-height);
   padding: 0 var(--space-2);
-  border: var(--rule-width) solid var(--artifact-chip-edge);
-  border-radius: var(--radius-sm);
-  background: var(--artifact-card-bg);
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--artifact-badge-ground);
   color: var(--artifact-card-ink);
-  font: inherit;
-  font-size: var(--text-xs);
+  font: var(--type-label-12);
+  font-weight: 500;
   line-height: 1;
   white-space: nowrap;
 }
 
+/* 누르는 배지(과업 번호)는 누르는 면 28px을 지키고 알약만 24px로 그린다 — 알약은 제 뒤의 ::before다. */
 .artifact-card-task,
 .artifact-detail-task {
+  position: relative;
+  isolation: isolate;
+  height: var(--artifact-press-min);
+  background: none;
   font-family: var(--font-mono);
   cursor: pointer;
   /* hover가 바꾸는 유일한 속성만 눕힌다 — 줄어든 움직임 규칙이 끈다. */
-  transition: border-color var(--motion-fast) var(--ease-standard);
+  transition: color var(--motion-fast) var(--ease-standard);
 }
 
-.artifact-card-task:hover,
-.artifact-detail-task:hover {
-  border-color: var(--artifact-card-ink-soft);
+.artifact-card-task::before,
+.artifact-detail-task::before {
+  position: absolute;
+  inset: calc((var(--artifact-press-min) - var(--badge-height)) / 2) 0;
+  z-index: -1;
+  border-radius: var(--radius-pill);
+  background: var(--artifact-badge-ground);
+  content: "";
+  transition: background-color var(--motion-fast) var(--ease-standard);
 }
 
-/* 반영 상태의 색 — 사이드바의 칩과 같은 뜻, 그러나 「미반영」은 호박색을 입지 않는다. */
+.artifact-card-task:hover::before,
+.artifact-detail-task:hover::before {
+  background: var(--row-active);
+}
+
+/* 반영 상태는 점 + 낱말(2026-11-06) — 색만으로 말하지 않는다. 「미반영」은 호박색을 입지 않는다. */
 .artifact-card-landing,
 .artifact-task-landing,
 .artifact-detail-landing {
+  padding-inline: var(--space-1);
+  background: none;
   color: var(--artifact-card-ink-soft);
 }
 
+:is(.artifact-card-landing, .artifact-task-landing, .artifact-detail-landing)::before {
+  display: inline-block;
+  flex: none;
+  width: var(--status-dot);
+  height: var(--status-dot);
+  margin-right: var(--space-1);
+  border-radius: 50%;
+  background: var(--edge-mark);
+  vertical-align: middle;
+  content: "";
+}
+
 :is(.artifact-card-landing, .artifact-task-landing, .artifact-detail-landing)[data-landing="landed"] {
-  border-color: color-mix(in srgb, var(--signal-ready-ink) 45%, transparent);
   color: var(--signal-ready-ink);
+}
+
+:is(.artifact-card-landing, .artifact-task-landing, .artifact-detail-landing)[data-landing="landed"]::before {
+  background: var(--signal-ready);
 }
 
 :is(.artifact-card-landing, .artifact-task-landing, .artifact-detail-landing)[data-landing="check"],
 :is(.artifact-card-landing, .artifact-task-landing, .artifact-detail-landing)[data-landing="conflict"] {
-  border-color: color-mix(in srgb, var(--signal-halt-ink) 45%, transparent);
   color: var(--signal-halt-ink);
+}
+
+:is(.artifact-card-landing, .artifact-task-landing, .artifact-detail-landing):is([data-landing="check"], [data-landing="conflict"])::before {
+  background: var(--signal-halt);
 }
 
 /* 아티팩트 페이지의 머리띠(t-3233 §5, t-11959): 첫 줄은 「제목 · 피드백 N · vN ·
@@ -51531,7 +54425,7 @@ button.jev-token:hover {
   inset: 0;
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
+  gap: var(--space-3);
   align-items: center;
   justify-content: center;
   padding: var(--space-6);
@@ -51539,24 +54433,41 @@ button.jev-token:hover {
   text-align: center;
 }
 
+/* 빈 화면(2026-11-06): 링 원 안의 그림 · 한 줄 · 흐린 설명 · 할 일 단추. 검색이 비운 것은 검색어와 「검색
+ * 지우기」, 정말 빈 것은 「새로 만들기」. */
+.artifacts-empty-mark {
+  display: grid;
+  place-items: center;
+  width: calc(var(--space-6) + var(--space-2));
+  height: calc(var(--space-6) + var(--space-2));
+  border-radius: 50%;
+  box-shadow: var(--shadow-border);
+  color: var(--ink-mist);
+}
+
 .artifacts-empty-word {
   margin: 0;
   color: var(--ink-chalk);
-  font-weight: 600;
+  font: var(--type-heading-16);
+  letter-spacing: var(--tracking-heading-16);
 }
 
 .artifacts-empty-hint {
-  max-width: 40ch;
+  max-width: 44ch;
   margin: 0;
-  font-size: var(--text-xs);
+  color: var(--ink-mist);
+  font: var(--type-copy-13);
 }
 
 /* 서랍 (t-36910) — 넓은 판에서는 옆에, 좁은 판에서는 목록 위로. 폭은 560이 바탕이고, 탭이
  * 좁으면 360까지 줄어 카드 한 열을 곁에 남긴다. 머리 한 줄과 목차는 서랍의 위에 붙어 있고,
  * 본문은 서랍과 함께 흐른다 — 안쪽에 따로 스크롤되는 상자가 없다. */
+/* 2026-11-06: 넓은 판에서는 판의 반(560보다 좁아지지 않는다) — 27인치 판 1,849px에서 560 → 925px.
+ * 사람이 손잡이로 끈 폭(`--artifact-drawer-held`, 창이 판에 적는다)이 그 위에 이긴다. 서랍은 제 폭의
+ * 컨테이너(`artifact-reader`)라 안의 글자 · 행동의 낱말이 판이 아니라 서랍의 폭을 따른다. */
 .artifacts-drawer {
   display: flex;
-  flex: 0 1 calc(var(--artifact-drawer-width) * 1px);
+  flex: 0 1 var(--artifact-drawer-held, max(calc(var(--artifact-drawer-width) * 1px), var(--artifact-drawer-share)));
   flex-direction: column;
   box-sizing: border-box;
   min-width: calc(var(--artifact-drawer-min) * 1px);
@@ -51564,7 +54475,49 @@ button.jev-token:hover {
   background: var(--artifact-drawer-bg);
   overflow-y: auto;
   transition: transform var(--motion-fast) var(--ease-standard);
+  container: artifact-reader / inline-size;
 }
+
+/* 목록과 서랍 사이의 손잡이 — 끌어 폭을 바꾸고, 두 번 눌러 기본으로, 초점을 두고 ←/→(WAI-ARIA Window
+ * Splitter). 보이는 것은 가운데 작은 홈 하나, 누르는 면은 테두리 양쪽 4px씩. 작업별 탭(띠와 읽는 칸이
+ * 제 몫을 정한다) · 좁은 판(서랍이 목록을 덮는다) · 넓게 읽기(목록이 접혔다)에서는 서지 않는다. */
+.artifacts-grip {
+  position: relative;
+  z-index: 3;
+  flex: none;
+  width: 0;
+  outline: none;
+}
+
+.artifacts-grip::before {
+  position: absolute;
+  inset: 0 calc(var(--artifact-grip-hit) / -2);
+  cursor: col-resize;
+  content: "";
+}
+
+.artifacts-grip::after {
+  position: absolute;
+  top: 50%;
+  left: calc(var(--rule-width) * -2);
+  width: calc(var(--rule-width) * 4);
+  height: var(--artifact-grip-mark);
+  margin-top: calc(var(--artifact-grip-mark) / -2);
+  border-radius: var(--radius-pill);
+  background: var(--edge-mark);
+  content: "";
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.artifacts-grip:hover::after,
+.artifacts-grip.is-dragging::after { background: var(--ink-mist); }
+
+.artifacts-grip:focus-visible::after {
+  background: var(--ink-chalk);
+  box-shadow: 0 0 0 var(--accent-rule) var(--ink-chalk);
+}
+
+.artifacts-view:is(.is-tab-tasks, .is-tier-compact, .is-reading-wide) .artifacts-grip { display: none; }
 
 /* 아무것도 고르지 않은 서랍(넓은 판에서만 선다)은 좁게 서서 카드에 자리를 준다. */
 .artifacts-drawer:has(.artifacts-detail[hidden]) {
@@ -51601,11 +54554,20 @@ button.jev-token:hover {
   .artifacts-drawer,
   .artifacts-studio-choice,
   .artifacts-tab,
+  .artifacts-pick,
+  .artifacts-new-item,
+  .artifacts-grip::after,
   .artifact-card,
   .artifact-card-task,
+  .artifact-card-task::before,
+  .artifact-detail-task::before,
   .artifact-task,
+  .artifact-evidence,
+  .artifact-bundle-page,
+  .artifact-flow-chip,
   .artifact-detail-bar *,
-  .artifact-outline * {
+  .artifact-outline *,
+  .artifacts-studio .settings-input {
     transition: none;
   }
 }
@@ -51649,7 +54611,7 @@ button.jev-token:hover {
   height: var(--artifact-bar-height);
   border-bottom: var(--rule-width) solid var(--edge-rule);
   background: var(--artifact-drawer-bg);
-  font-size: var(--text-sm);
+  font: var(--type-label-13);
   white-space: nowrap;
 }
 
@@ -51662,18 +54624,54 @@ button.jev-token:hover {
   background: none;
 }
 
+/* 줄이 모자라면 만든 이, 그다음 시각의 낱말이 줄어든다 — 온전한 값은 풍선과 세부 정보에 있다. */
 .artifact-detail-when {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
   font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
 }
 
-/* 줄이 모자라면 만든 이의 낱말이 먼저 줄어든다 — 온전한 값은 풍선과 세부 정보에 있다. */
 .artifact-detail-maker {
-  flex: 0 1 auto;
+  display: inline-flex;
+  flex: 0 9 auto;
+  align-items: center;
+  gap: var(--space-1);
   min-width: 0;
   overflow: hidden;
   color: var(--ink-mist);
   text-overflow: ellipsis;
 }
+
+/* 머리의 조용한 행동(2026-11-06): 넓게 읽기 · Finder에서 보기 · 경로 복사 — 「세부 정보」를 펼치지 않고. */
+.artifact-detail-act {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-1);
+  box-sizing: border-box;
+  height: var(--artifact-press-min);
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--ink-mist);
+  font: var(--type-label-13);
+  cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
+}
+
+.artifact-detail-act:hover { background: var(--row-hover); color: var(--ink-chalk); }
+.artifact-detail-act[aria-pressed="true"] { background: var(--row-selected); color: var(--ink-chalk); }
+.artifact-detail-act:disabled { color: var(--ink-disabled); cursor: default; }
+.artifact-detail-act .icon { width: var(--icon-size); height: var(--icon-size); }
+.artifact-detail-act[hidden] { display: none; }
+
+/* 작업별 탭은 띠와 읽는 칸이 이미 판을 나눈다 — 넓게 읽기는 서지 않는다. */
+.artifacts-view.is-tab-tasks .artifact-detail-wide { display: none; }
 
 .artifacts-view .artifact-detail-attempts {
   flex: 0 1 auto;
@@ -51732,10 +54730,12 @@ button.jev-token:hover {
 .artifact-detail-facts[hidden] { display: none; }
 
 /* 제목은 위아래 여백만 지운다 — 옆 여백은 서랍이 조각마다 주는 것이라, 지우면 제목만 본문보다
- * 왼쪽에 붙는다. */
+ * 왼쪽에 붙는다. 제목도 읽는 폭까지. */
 .artifact-detail-title {
+  max-width: var(--artifact-prose-max);
   margin-block: 0;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
+  word-break: keep-all;
   font-size: var(--artifact-title-size);
   font-weight: 600;
   line-height: 1.3;
@@ -51818,15 +54818,152 @@ button.jev-token:hover {
   color: var(--ink-mist);
 }
 
+/* 넓게 읽기의 목차 열 머리 — 목록이 접혀 판이 남을 때만 선다. */
+.artifact-outline-rail-head {
+  display: none;
+  margin: 0 0 var(--space-2);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  font-weight: 500;
+}
+
+/* ---- 넓게 읽기 (2026-11-06) ------------------------------------------------------------------
+ * 머리의 「넓게 읽기」가 목록을 접고 읽는 칸이 판 전체를 쓴다: 글은 가운데 읽는 폭, 목차는 그 곁의 열에
+ * 늘 펼쳐져 지금 읽는 절을 밝힌다. 「목록」이나 Esc로 돌아가고, 고른 상태는 창이 기억한다. */
+.artifacts-view.is-reading-wide .artifacts-main { display: none; }
+
+.artifacts-view.is-reading-wide .artifacts-drawer {
+  flex: 1 1 auto;
+  border-left: 0;
+}
+
+.artifacts-view.is-reading-wide .artifact-detail-back { display: inline-flex; }
+
+.artifacts-view.is-reading-wide .artifacts-detail {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, var(--artifact-prose-max)) var(--artifact-outline-rail-width) minmax(0, 1fr);
+  align-content: start;
+  column-gap: var(--space-6);
+}
+
+.artifacts-view.is-reading-wide .artifacts-detail > * {
+  grid-column: 2;
+  margin-inline: 0;
+}
+
+.artifacts-view.is-reading-wide .artifacts-detail > .artifact-detail-bar {
+  grid-column: 1 / -1;
+  padding-inline: var(--space-6);
+}
+
+.artifacts-view.is-reading-wide .artifacts-detail > .artifact-outline {
+  position: sticky;
+  top: calc(var(--artifact-bar-height) + var(--space-5));
+  display: block;
+  grid-column: 3;
+  grid-row: 2 / span 8;
+  align-self: start;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+
+.artifacts-view.is-reading-wide :is(.artifact-outline-toggle, .artifact-outline-now) { display: none; }
+.artifacts-view.is-reading-wide .artifact-outline-rail-head { display: block; }
+
+.artifacts-view.is-reading-wide .artifact-outline-list {
+  position: static;
+  max-height: none;
+  padding: 0 0 0 var(--space-3);
+  border: 0;
+  border-left: var(--rule-width) solid var(--edge-rule);
+  background: none;
+  box-shadow: none;
+}
+
+.artifacts-view.is-reading-wide .artifact-outline-list button {
+  min-height: var(--artifact-press-min);
+  padding: var(--space-1) var(--space-2);
+  color: var(--ink-mist);
+  font: var(--type-label-13);
+  white-space: normal;
+}
+
+.artifacts-view.is-reading-wide .artifact-outline-list button.is-now { color: var(--ink-chalk); font-weight: 500; }
+.artifacts-view.is-reading-wide .artifact-outline-list button[data-level="1"] { display: none; }
+
 /* 본문 — 상자도 높이 상한도 없다. 서랍이 넘기고, 글은 서랍의 폭으로 읽힌다. */
 .artifact-preview {
   min-width: 0;
 }
 
+/* 글은 단어로 줄을 바꾸고(한국어 keep-all), 코드는 통째로 둔다 — `anywhere`는 표를 한 글자 폭까지 좁혀
+ * 「558aa / 96f」처럼 해시와 경로를 글자 중간에서 끊었다(2026-11-06, 코드 9개 중 4개). 문단 · 목록 · 제목은
+ * 읽는 폭까지, 표 · 코드 블록 · 그림은 칸 전체를 쓴다. */
 .artifact-preview-md {
   font-size: var(--artifact-read-size);
   line-height: 1.7;
-  overflow-wrap: anywhere;
+  word-break: keep-all;
+  overflow-wrap: break-word;
+}
+
+.artifact-preview-md > :not(.md-table, .md-block, .mmd-block, .md-image) { max-width: var(--artifact-prose-max); }
+
+/* 표는 제 칸 안에서 가로로 넘긴다 — 넘칠 때만(GitHub의 마크다운 표와 같은 길). */
+.artifact-preview-md .md-table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.artifact-preview-md .md-table :is(th, td) { padding: var(--space-2) var(--space-3); }
+
+/* 코드는 통째로, 경로는 「/」 뒤에서만 줄을 바꾼다 — 창이 마디마다 한 덩어리로 싸고 그 사이에 <wbr>을
+ * 둔다(복사하면 원래 글자 그대로). 「/」가 없는 표 안의 코드(해시)는 한 덩어리다. */
+.artifact-preview-md .md-code { word-break: normal; overflow-wrap: normal; }
+.artifact-preview-md :is(.md-code-seg, .md-table .md-code:not(:has(wbr))) { white-space: nowrap; }
+
+/* (아래 두 질의는 서랍 · 글의 기본 규칙 뒤에 선다 — 특이도가 같아서 앞에 서면 기본 규칙이 이긴다.) */
+/* 안쪽이 640px를 넘는 서랍(704 = 640 + 옆 여백 32×2)은 16px로 읽는다(2026-11-06) — KRDS 본문 17px · 150%,
+ * 27인치 대화 화면 16px과 같은 값. 좁은 서랍은 14px 그대로. */
+@container artifact-reader (min-width: 704px) {
+  .artifacts-detail > * { margin-inline: var(--space-6); }
+
+  .artifacts-detail > :is(.artifact-detail-bar, .artifact-outline) {
+    margin-inline: 0;
+    padding-inline: var(--space-6);
+  }
+
+  .artifact-preview-md {
+    font-size: var(--text-lg);
+    line-height: 1.75;
+  }
+
+  .artifact-preview-md .md-code { font-size: 0.875em; }
+  .artifact-preview-md :is(.md-table, .md-block) { font-size: var(--text-md); }
+
+  .artifact-preview-md h1,
+  .artifact-detail-title {
+    font: var(--type-heading-24);
+    letter-spacing: var(--tracking-heading-24);
+  }
+
+  .artifact-preview-md h2 {
+    margin-top: var(--space-6);
+    font: var(--type-heading-20);
+    letter-spacing: var(--tracking-heading-20);
+  }
+
+  .artifact-preview-md :is(h3, h4, h5, h6) {
+    color: var(--ink-chalk);
+    font: var(--type-heading-16);
+    letter-spacing: var(--tracking-heading-16);
+  }
+}
+
+/* 좁은 서랍에서 머리의 행동은 그림만 남는다 — 이름은 풍선과 접근성 이름이 말한다. */
+@container artifact-reader (max-width: 640px) {
+  .artifact-detail-act > span { display: none; }
 }
 
 .artifact-preview-md h1 { font-size: var(--artifact-title-size); }
@@ -51845,7 +54982,30 @@ button.jev-token:hover {
   display: block;
   max-width: 100%;
   height: auto;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-border);
 }
+
+/* 창 안에서 열리는 아티팩트(페이지 · claude.ai)의 그림은 눌러서 연다. */
+.artifact-preview-image.is-openable { cursor: pointer; }
+
+/* 그림이 아직 없는 페이지: 막다른 한 줄 대신 그림 자리와 「열기」(2026-11-06). */
+.artifact-preview-placeholder {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: var(--space-3);
+  max-width: var(--artifact-prose-max);
+  aspect-ratio: calc(1 / var(--artifact-face-ratio));
+  border-radius: var(--radius-md);
+  background: var(--surface-well);
+  box-shadow: inset 0 0 0 var(--rule-width) var(--edge-rule);
+  color: var(--ink-mist);
+  font: var(--type-label-13);
+  text-align: center;
+}
+
+.artifact-preview-placeholder[hidden] { display: none; }
 
 .artifact-preview-text {
   margin: 0;
@@ -51884,14 +55044,15 @@ button.jev-token:hover {
 
 .artifact-digest-summary {
   margin: 0;
-  font-size: var(--artifact-read-size);
-  font-weight: 600;
+  font: var(--type-heading-16);
+  letter-spacing: var(--tracking-heading-16);
 }
 
 .artifact-digest-notes {
   margin: 0;
   color: var(--ink-mist);
-  overflow-wrap: anywhere;
+  font: var(--type-label-13);
+  overflow-wrap: break-word;
 }
 
 .artifact-digest-notes:empty,
@@ -51915,9 +55076,13 @@ button.jev-token:hover {
 .artifact-step,
 .artifact-step-fold {
   grid-column: 1 / -1;
-  padding: var(--space-1) 0;
+  padding: var(--space-2);
   border-bottom: var(--rule-width) solid var(--edge-rule);
+  font: var(--type-label-13);
 }
+
+/* 실패한 단계는 옅은 신호 바탕 — ✕와 「실패」가 곁에 서서 색만으로 말하지 않는다(2026-11-06). */
+.artifact-step[data-ok="false"] { background: var(--artifact-step-fail-ground); }
 
 .artifact-step {
   display: grid;
@@ -51941,7 +55106,7 @@ button.jev-token:hover {
 
 .artifact-step-verb,
 .artifact-step-target {
-  font-family: var(--font-mono);
+  font: var(--type-label-13-mono);
   white-space: nowrap;
 }
 
@@ -52035,13 +55200,14 @@ button.jev-token:hover {
 
 /* 작업의 줄은 두 줄이다(높이는 가상화가 읽는 토큰): 첫 줄은 번호와 제목, 둘째 줄은 반영 칩 · 수 ·
  * 시각. 격자의 칸이 두 줄을 맞춘다 — 좁은 띠에서는 둘째 줄의 수가 말줄임으로 줄어든다. */
+/* 제목 칸은 읽는 폭까지(2026-11-06) — 시각과 반영이 판 끝(제목에서 1,697px)이 아니라 제목 곁(798px)에 선다. */
 .artifact-task {
   position: absolute;
   top: 0;
   right: 0;
   left: 0;
   display: grid;
-  grid-template-columns: var(--artifact-task-lead-width) minmax(0, 1fr) auto;
+  grid-template-columns: var(--artifact-task-lead-width) minmax(0, var(--artifact-row-max)) auto minmax(0, 1fr);
   grid-template-rows: auto auto;
   align-items: center;
   column-gap: var(--space-2);
@@ -52059,13 +55225,13 @@ button.jev-token:hover {
 }
 
 .artifact-task:hover {
-  background: color-mix(in srgb, var(--ink-chalk) 4%, transparent);
+  background: var(--row-hover);
 }
 
 /* 호박색은 고른 줄의 모서리에만 선다. */
 .artifact-task.is-selected {
   border-left-color: var(--artifact-selected-edge);
-  background: var(--surface-raised);
+  background: var(--row-selected);
 }
 
 /* 머리 상자는 격자의 칸이 된다(`contents`): 번호 · 반영 칩 · 시각이 줄의 칸에 든다. */
@@ -52100,9 +55266,8 @@ button.jev-token:hover {
   grid-column: 2;
   min-width: 0;
   overflow: hidden;
-  font-size: var(--text-sm);
-  font-weight: 600;
-  line-height: 1.4;
+  font: var(--type-heading-14);
+  letter-spacing: var(--tracking-heading-14);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -52119,7 +55284,7 @@ button.jev-token:hover {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  line-height: calc(var(--artifact-task-chip-height) - 2 * var(--rule-width));
+  line-height: var(--artifact-task-chip-height);
 }
 
 .artifact-task-parts {
@@ -52128,7 +55293,7 @@ button.jev-token:hover {
   min-width: 0;
   overflow: hidden;
   color: var(--artifact-card-ink-soft);
-  font-size: var(--text-xs);
+  font: var(--type-label-12);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -52138,7 +55303,7 @@ button.jev-token:hover {
   grid-column: 3;
   justify-self: end;
   color: var(--artifact-card-ink-soft);
-  font-size: var(--text-xs);
+  font: var(--type-label-12);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
@@ -52165,14 +55330,14 @@ button.jev-token:hover {
   padding: var(--space-1) var(--space-4) var(--space-2);
   border-top: var(--rule-width) solid var(--edge-rule);
   color: var(--ink-label);
-  font-size: var(--text-xs);
+  font: var(--type-label-12);
 }
 
 .artifacts-loose-name {
   margin: 0;
   padding-top: var(--space-1);
   color: var(--ink-chalk);
-  font-size: var(--text-xs);
+  font: var(--type-label-12);
   font-weight: 600;
 }
 
@@ -52243,9 +55408,14 @@ button.jev-token:hover {
   order: 2;
 }
 
+/* 검색칸은 고르개들 뒤 오른쪽 끝, 220~360px — 남는 폭을 다 먹으면 작업 거르기의 ✕가 그 끝으로 밀려
+ * 고르개에서 1,400px 떨어졌다(2026-11-06, 27인치 판). */
 .artifacts-view .artifacts-head > .artifacts-query {
+  order: 3;
   flex: 1 1 var(--artifact-search-width);
   width: auto;
+  max-width: var(--artifact-search-max);
+  margin-left: auto;
 }
 
 .artifacts-project {
@@ -52362,6 +55532,8 @@ button.jev-token:hover {
 }
 
 /* 묶음의 머리 — 지금 · 다음 발행 전 · 발행된 것. 수는 여기에만 선다. */
+/* 묶음의 머리는 Geist의 절 머리(2026-11-06): 판의 면 위 Label 13, 이름은 잉크로 굵게, 수는 알약, 메모는
+ * 흐리게, 아래 1px 줄 — 검은 띠 위의 작은 글이 아니다. */
 .artifact-flow-group-head {
   position: sticky;
   top: 0;
@@ -52371,15 +55543,27 @@ button.jev-token:hover {
   gap: var(--space-2);
   min-height: calc(var(--artifact-group-head) * 1px);
   margin: 0;
-  padding: 0 var(--space-4);
-  background: var(--surface-abyss);
+  padding: var(--space-1) var(--space-4);
+  border-bottom: var(--rule-width) solid var(--edge-rule);
+  background: var(--surface-deck);
   color: var(--ink-mist);
-  font: var(--type-label-12);
-  font-weight: 500;
+  font: var(--type-label-13);
   font-variant-numeric: tabular-nums;
 }
 
-.artifact-flow-group-head b { color: var(--ink-chalk); font-weight: 600; }
+.artifact-flow-group-name { color: var(--ink-chalk); font-weight: 600; }
+
+.artifact-flow-group-head b {
+  display: inline-flex;
+  align-items: center;
+  height: calc(var(--badge-height) - var(--space-1));
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--artifact-badge-ground);
+  color: var(--ink-chalk);
+  font: var(--type-label-12);
+  font-weight: 600;
+}
 
 .artifact-flow-group-note {
   min-width: 0;
@@ -52408,10 +55592,12 @@ button.jev-token:hover {
   border-left: var(--rule-width) solid var(--edge-rule);
 }
 
+/* 줄의 글 칸은 읽는 폭까지(2026-11-06) — 상태 · 과업 번호가 판의 오른쪽 끝(27인치에서 문장에서 1,757px)이
+ * 아니라 글 곁(884px)에 서고, 줄마다 같은 x라 위아래로 훑으면 한 열이다. 남는 폭은 마지막 빈 칸이 받는다. */
 .artifact-flow-item {
   position: relative;
   display: grid;
-  grid-template-columns: var(--icon-size) minmax(0, 1fr) auto;
+  grid-template-columns: var(--icon-size) minmax(0, var(--artifact-row-max)) auto minmax(0, 1fr);
   align-items: start;
   column-gap: var(--space-3);
   row-gap: var(--space-2);
@@ -52516,15 +55702,16 @@ button.jev-token:hover {
   gap: var(--space-2);
   min-height: calc(var(--space-5) - var(--space-1));
   color: var(--ink-chalk);
-  font: var(--type-label-12);
+  font: var(--type-label-13);
   font-weight: 500;
   white-space: nowrap;
 }
 
+/* 여섯 걸음의 띠 — 96×6(지금 88×4에서는 27인치에서 칸이 점처럼 보였다). */
 .artifact-flow-track {
   display: block;
-  width: calc(var(--space-6) * 2 + var(--space-5));
-  height: var(--space-1);
+  width: calc(var(--space-6) * 3);
+  height: calc(var(--space-1) * 1.5);
 }
 
 .artifact-flow-track rect { fill: var(--row-active); }
@@ -52535,7 +55722,7 @@ button.jev-token:hover {
 
 /* 둘째 줄: 아티팩트 칩 · 누가 · 몇 번째에 · 과업 번호 · 펼침 */
 .artifact-flow-meta {
-  grid-column: 2 / -1;
+  grid-column: 2 / 4;
   grid-row: 2;
   display: flex;
   flex-wrap: wrap;
@@ -52561,23 +55748,26 @@ button.jev-token:hover {
   border: 0;
   border-radius: var(--radius-sm);
   background: var(--surface-deck);
-  box-shadow: inset 0 0 0 var(--rule-width) var(--edge-rule);
+  box-shadow: var(--shadow-border);
   color: var(--ink-chalk);
-  font: var(--type-label-12);
+  font: var(--type-label-13);
   white-space: nowrap;
   cursor: pointer;
-  transition: box-shadow var(--motion-fast) var(--ease-standard);
+  transition:
+    box-shadow var(--motion-fast) var(--ease-standard),
+    background-color var(--motion-fast) var(--ease-standard);
 }
 
-.artifact-flow-chip:hover { box-shadow: inset 0 0 0 var(--rule-width) var(--ink-mist); }
+.artifact-flow-chip:hover { box-shadow: 0 0 0 var(--rule-width) var(--edge-mark); }
 .artifact-flow-chip:focus-visible {
   outline: var(--focus-ring);
   outline-offset: var(--focus-ring-offset);
 }
 
+/* 누른 칩은 무채색 — 이 보기의 호박색은 고른 줄의 왼쪽 모서리에만 선다. */
 .artifact-flow-chip[aria-pressed="true"] {
   background: var(--row-selected);
-  box-shadow: inset 0 0 0 var(--rule-width) var(--artifact-selected-edge);
+  box-shadow: 0 0 0 var(--rule-width) var(--ink-mist);
 }
 
 .artifact-flow-chip > .icon { color: var(--ink-mist); }
@@ -52590,7 +55780,12 @@ button.jev-token:hover {
   cursor: default;
 }
 
-.artifact-flow-chip.is-task { font: var(--type-label-12-mono); }
+.artifact-flow-chip.is-task {
+  border-radius: var(--radius-pill);
+  background: var(--artifact-badge-ground);
+  box-shadow: none;
+  font: var(--type-label-12-mono);
+}
 
 .artifact-flow-who,
 .artifact-flow-none {
@@ -52628,7 +55823,7 @@ button.jev-token:hover {
 
 /* 펼친 줄: 무엇 · 왜 · 대가 세 줄, 그리고 걸음마다 한 줄 */
 .artifact-flow-detail {
-  grid-column: 2 / -1;
+  grid-column: 2 / 4;
   grid-row: 3;
   display: grid;
   gap: var(--space-3);
@@ -52734,7 +55929,8 @@ button.jev-token:hover {
 
 .artifact-flow-release-head {
   display: grid;
-  grid-template-columns: var(--icon-size) auto auto minmax(0, 1fr) auto var(--icon-size);
+  grid-template-columns: var(--icon-size) auto auto minmax(0, var(--artifact-row-max)) auto var(--icon-size);
+  justify-content: start;
   align-items: center;
   column-gap: var(--space-3);
   width: 100%;
@@ -52960,10 +56156,13 @@ button.jev-token:hover {
 /* 판의 자세 — 넓게(880 이상): 읽는 칸이 열리면 흐름은 왼쪽에 남는다 · 보통: 흐름이 좁은 기둥이 된다 ·
  * 좁게(600 미만): 읽는 칸이 흐름을 덮고 「← 목록」으로 돌아간다. */
 .artifacts-view.is-tab-flow .artifacts-main { flex: 1 1 auto; }
-.artifacts-view.is-tab-flow:not(.is-flow-reading) .artifacts-drawer { display: none; }
+.artifacts-view.is-tab-flow:not(.is-flow-reading) :is(.artifacts-drawer, .artifacts-grip) { display: none; }
 .artifacts-view.is-tab-flow.is-flow-reading .artifacts-main { flex: 0 0 calc(var(--artifact-list-min) * 1px + var(--space-6) + var(--space-4)); }
-.artifacts-view.is-tab-flow.is-flow-reading.is-tier-wide .artifacts-main { flex: 1 1 0; }
-.artifacts-view.is-tab-flow.is-flow-reading.is-tier-wide .artifacts-drawer { flex: 0 0 calc(var(--artifact-drawer-width) * 1px + var(--space-6) * 2); }
+.artifacts-view.is-tab-flow.is-flow-reading.is-tier-wide .artifacts-main { flex: 1 0 calc(var(--artifact-list-min) * 1px); }
+/* 흐름에서 연 읽는 칸도 판의 반을 쓴다(2026-11-06, 624px 고정이던 것) — 끈 폭이 있으면 그것. */
+.artifacts-view.is-tab-flow.is-flow-reading.is-tier-wide .artifacts-drawer {
+  flex: 0 1 var(--artifact-drawer-held, max(calc(var(--artifact-drawer-width) * 1px + var(--space-6) * 2), var(--artifact-drawer-share)));
+}
 .artifacts-view.is-tab-flow.is-flow-reading:not(.is-tier-wide) .artifacts-drawer { flex: 1 1 auto; min-width: 0; }
 .artifacts-view.is-tab-flow.is-tier-compact .artifact-detail-back { display: inline-flex; }
 
@@ -53060,8 +56259,9 @@ button.jev-token:hover {
 
 .artifact-bundle-head {
   margin: 0 0 var(--space-1);
-  color: var(--ink-label);
-  font-size: var(--text-xs);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  font-weight: 500;
 }
 
 .artifact-bundle-none {
@@ -53125,33 +56325,41 @@ button.jev-token:hover {
   width: 100%;
   min-height: calc(var(--artifact-press-min) * 2);
   padding: var(--space-2);
-  border: var(--rule-width) solid var(--artifact-card-edge);
+  border: 0;
   border-radius: var(--radius-sm);
-  background: var(--artifact-card-bg);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border);
   color: var(--artifact-card-ink);
-  font: inherit;
-  font-size: var(--text-xs);
+  font: var(--type-label-12);
   text-align: left;
   cursor: pointer;
+  transition:
+    box-shadow var(--motion-fast) var(--ease-standard),
+    background-color var(--motion-fast) var(--ease-standard);
 }
+
+/* 증거 카드와 묶음의 페이지 줄은 링 카드(2026-11-06); 고른 것은 이 보기의 색 1px과 옅은 바탕. */
+.artifact-evidence:hover,
+.artifact-bundle-page:hover { box-shadow: 0 0 0 var(--rule-width) var(--edge-mark); }
 
 .artifact-evidence.is-selected,
 .artifact-bundle-page.is-selected {
-  border-color: var(--artifact-selected-edge);
-  box-shadow: 0 0 0 1px var(--artifact-selected-edge);
+  box-shadow: 0 0 0 var(--rule-width) var(--artifact-selected-edge);
+  background: color-mix(in srgb, var(--artifact-selected-edge) 7%, var(--surface-deck));
 }
 
 .artifact-evidence-name {
   max-width: 100%;
   overflow: hidden;
-  font-family: var(--font-mono);
+  color: var(--ink-chalk);
+  font: var(--type-label-13-mono);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .artifact-evidence-said {
   color: var(--artifact-card-ink-soft);
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .artifact-evidence[data-verdict="pass"] .artifact-evidence-said { color: var(--signal-ready-ink); }
@@ -53180,14 +56388,18 @@ button.jev-token:hover {
   width: 100%;
   min-height: var(--artifact-press-min);
   padding: var(--space-1) var(--space-2);
-  border: var(--rule-width) solid var(--artifact-card-edge);
+  border: 0;
   border-radius: var(--radius-sm);
-  background: var(--artifact-card-bg);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border);
   color: var(--artifact-card-ink);
-  font: inherit;
-  font-size: var(--text-sm);
+  font: var(--type-label-14);
+  font-weight: 500;
   text-align: left;
   cursor: pointer;
+  transition:
+    box-shadow var(--motion-fast) var(--ease-standard),
+    background-color var(--motion-fast) var(--ease-standard);
 }
 
 .artifact-bundle-page-title {
@@ -53206,9 +56418,10 @@ button.jev-token:hover {
 
 /* 증거의 열: 판이 넓으면 띠가 읽는 칸의 오른쪽 열이 된다. 머리 한 줄은 두 열을 다 쓰고,
  * 열은 머리 아래 붙어 제 높이 안에서 넘긴다. */
+/* 증거 열은 글(읽는 폭) 바로 곁에 선다(2026-11-06) — 글이 판 끝까지 늘고 열이 판 끝에 붙던 것. */
 .artifacts-view.is-tab-tasks.is-rail .artifacts-detail {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) var(--artifact-rail-width);
+  grid-template-columns: minmax(0, calc(var(--artifact-prose-max) + var(--space-6) * 2)) var(--artifact-rail-width) minmax(0, 1fr);
   align-content: start;
   column-gap: 0;
 }
@@ -53238,8 +56451,7 @@ button.jev-token:hover {
   align-self: start;
   max-height: var(--artifact-rail-max-height);
   margin-inline: 0;
-  padding: var(--space-3) var(--space-4);
-  border-left: var(--rule-width) solid var(--edge-rule);
+  padding: var(--space-4) 0 var(--space-4) var(--space-2);
   overflow-y: auto;
 }
 

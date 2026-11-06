@@ -57,6 +57,7 @@ pub(crate) mod session;
 pub(crate) mod settings;
 pub(crate) mod settings_secrets;
 pub(crate) use settings_secrets::{move_settings_secrets, settings_secret_literals};
+pub(crate) mod library;
 pub(crate) mod skills;
 pub(crate) mod supply_chain;
 pub(crate) mod system;
@@ -118,7 +119,7 @@ pub(crate) use appearance::{
     leave_cancel, leave_hold, leave_now, leave_when_idle, listening_ports, log_window_error,
     patch_left_sidebar_appearance, patch_terminal_prefs, preview_ghostty_import,
     preview_warp_terminal_themes, process_memory, report_terminal_colors, resource_snapshot,
-    set_agent_activity_display, set_app_font_family, set_chat_font_size,
+    set_agent_activity_display, set_app_font_family, set_chat_font_size, set_chat_wide_blocks,
     set_compact_worktree_cards, set_computer_awake_mode, set_locale, set_minimize_to_tray_on_close,
     set_refresh_local_base_ref_on_worktree_create, set_setup_script_launch_mode,
     set_show_git_ignored_files, set_show_menu_bar_icon, set_show_titlebar_app_name,
@@ -130,9 +131,9 @@ pub(crate) use appearance::{
 
 pub(crate) use onboarding::{
     cancel_folder_panel, choose_paths, choose_project, clone_repository, clone_target_name,
-    close_onboarding, create_project, default_project_parent, mark_first_run_seen, mark_onboarding,
-    recall_folder_panel, reopen_onboarding, save_onboarding_step, set_guide_dismissed, setup_guide,
-    tip_verdict, tour_decision,
+    close_onboarding, create_project, default_project_parent, make_folder, mark_first_run_seen,
+    mark_onboarding, plan_project_folder, recall_folder_panel, reopen_onboarding,
+    save_onboarding_step, set_guide_dismissed, setup_guide, start_git, tip_verdict, tour_decision,
 };
 
 pub(crate) use agent_launch::{
@@ -210,10 +211,11 @@ pub(crate) use repo_policy::{integration_queue_setting, set_integration_queue_en
 
 pub(crate) use integration_prefs::{
     github_disconnect, github_login_intent, github_select_account, github_status,
-    github_test_connection, gitlab_status, notification_probe, patch_browser_link_routing,
-    patch_browser_user_agents, set_browser_default_zoom, set_browser_home_page,
-    set_browser_open_tabs, set_browser_restore_tabs, set_browser_search_engine, set_browser_visits,
-    set_finish_notification_mode, set_notification_preference,
+    github_test_connection, github_web_login_cancel, github_web_login_start, gitlab_status,
+    gitlab_token_login, notification_probe, patch_browser_link_routing, patch_browser_user_agents,
+    set_browser_default_zoom, set_browser_home_page, set_browser_open_tabs,
+    set_browser_restore_tabs, set_browser_search_engine, set_browser_visits,
+    set_finish_notification_mode, set_notification_preference, task_sources,
 };
 
 pub(crate) use waiting::{board_inbox, clear_finish_mark};
@@ -261,7 +263,7 @@ pub(crate) use worktree::{
     gitlab_item_detail, gitlab_job_trace, gitlab_merge_mr, gitlab_mr_review, gitlab_pipeline_jobs,
     gitlab_project_members, gitlab_retry_job, gitlab_set_item_open, gitlab_set_mr_reviewers,
     gitlab_todos, gitlab_update_mr, gitlab_work_items, list_branches, list_worktrees,
-    merge_and_remove_worktree, remove_worktree, resolve_mr_base, resolve_pr_base,
+    merge_and_remove_worktree, plan_worktree, remove_worktree, resolve_mr_base, resolve_pr_base,
     save_worktree_prefs, set_active_worktree, validate_branch_name, work_item_seed,
     worktree_evidence, worktree_landing_stamp, worktree_last_agent, worktree_loss, worktree_prefs,
     worktree_stamp,
@@ -315,6 +317,13 @@ pub(crate) use artifacts::{
     artifact_preview, artifact_register, artifact_reveal, artifact_search, artifact_tasks,
     artifact_thumbnail, artifact_versions, artifacts_list, explain_cancel, explain_preview,
     explain_roads, explain_start,
+};
+pub(crate) use library::{
+    library_look, library_paste_add, library_paste_read, library_pause, library_report,
+    library_server_agent, library_server_check, library_server_choose, library_server_login,
+    library_server_remove, library_server_save, library_server_share, library_server_switch,
+    library_skill_choose, library_skill_create, library_skill_import, library_skill_list,
+    library_skill_remove, library_undo,
 };
 pub(crate) use skills::{
     computer_use_skill_report, install_bundled_skill, list_skills, orchestration_report,

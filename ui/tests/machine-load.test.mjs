@@ -56,6 +56,17 @@ test("the hosted rule is for absolute budgets only: the ratio rule still judges 
   assert.equal(machineLoad.machineIsLoudNow({ platform: "darwin", load: 0, env: HOSTED }), false);
 });
 
+test("a paired ratio of two paint modes is judged by the load on this machine and recorded on a hosted runner", () => {
+  // The knowledge halo's circle/filter pair is two screenshot wall clocks per round. Four macOS CI runs read it at
+  // 0.95, 0.91, 1.0 and 1.14 (run 42022092437, load 2.1/5) on the same halo code: steal time on a shared VM lands on
+  // one side of a round, as it does on referencesHold's two readings.
+  assert.equal(machineLoad.pairedRatioHolds(1.14, 1.1, { platform: "darwin", load: 0, env: HOSTED }), true);
+  assert.equal(machineLoad.pairedRatioHolds(1.14, 1.1, { platform: "darwin", load: 0, env: {} }), false);
+  assert.equal(machineLoad.pairedRatioHolds(1.14, 1.1, { platform: "darwin", load: 1e3, env: {} }), true);
+  assert.equal(machineLoad.pairedRatioHolds(1.1, 1.1, { platform: "darwin", load: 0, env: {} }), true);
+  assert.equal(machineLoad.pairedRatioHolds(1.14, 1.1, { platform: "win32", load: 0, env: {} }), true);
+});
+
 test("the load note this run saw is logged for the record", () => {
   console.log(`load note at this run: ${machineLoad.loadNote()} on ${process.platform}`);
 });
@@ -97,6 +108,12 @@ test("a GitHub-hosted runner records a crossed midpoint and says so; the same nu
     "margin -58ms, crossed (hosted runner — recorded)");
   assert.equal(machineLoad.referencesNote(84, 80, 104, { env: HOSTED }), "margin 8ms, held (hosted runner — recorded)");
   assert.equal(machineLoad.referencesNote(...crossed, { env: {} }), "margin -58ms");
+});
+
+test("a paired ratio's METRIC note says the limit and the recorded verdict on a hosted runner, and only the ratio elsewhere", () => {
+  assert.equal(machineLoad.pairedRatioNote(1.14, 1.1, { env: HOSTED }), "paired 1.14, crossed limit 1.1 (hosted runner — recorded)");
+  assert.equal(machineLoad.pairedRatioNote(1.1, 1.1, { env: HOSTED }), "paired 1.1, held limit 1.1 (hosted runner — recorded)");
+  assert.equal(machineLoad.pairedRatioNote(1.14, 1.1, { env: {} }), "paired 1.14");
 });
 
 test("the power note reads the source and the power mode in pmset's own words, and says what it cannot read", () => {

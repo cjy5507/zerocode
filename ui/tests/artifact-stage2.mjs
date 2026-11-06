@@ -223,8 +223,10 @@ export async function testArtifactStage2(browser, origin, ok) {
       const HIDDEN = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
       held.thumbAsks = [];
       window.__ANSWER__.artifact_thumbnail = async (args) => {
-        held.thumbAsks.push({ id: args.id, label: args.label ?? null });
+        const ask = { id: args.id, label: args.label ?? null, answered: false };
+        held.thumbAsks.push(ask);
         await new Promise((done) => setTimeout(done, 4));
+        ask.answered = true;
         return { data_url: args.label ? SEEN : HIDDEN, cached: false };
       };
       // A beat after the first paint, not half a second: the number is the table's, overridden here.
@@ -241,7 +243,10 @@ export async function testArtifactStage2(browser, origin, ok) {
       const url = pathAsFileUrl(artifactRows.get("gal-0")?.path ?? "");
       await held.navigate(tab, url, "started");
       await held.navigate(tab, url, "finished");
-      for (let beat = 0; beat < 40 && !held.thumbAsks.some((one) => one.id === "gal-0" && one.label); beat += 1) await held.settle(30);
+      // Waited for until the seen ask is answered, not only asked: the answer comes 4 ms after the ask, and on CI's
+      // loaded macOS runner the beat that saw the ask came before it (heldThumb false, then the gallery asked the
+      // hidden pane at once — runs 42000454668 and 42000455539).
+      for (let beat = 0; beat < 40 && !held.thumbAsks.some((one) => one.id === "gal-0" && one.label && one.answered); beat += 1) await held.settle(30);
       out.seenAsks = held.thumbAsks.filter((one) => one.id === "gal-0" && one.label === tab?.label).length;
       out.hiddenAsksWhileOpen = held.thumbAsks.filter((one) => one.id === "gal-0" && one.label === null).length;
       out.heldThumb = artifactThumbs.get("gal-0") === SEEN;
@@ -269,6 +274,173 @@ export async function testArtifactStage2(browser, origin, ok) {
       "⑤ back in the gallery the card wears the seen picture and the hidden pane is asked for nothing (hidden renders for a seen page 1 → 0)",
       seen.cardShowsSeen === true && seen.hiddenAsksInGallery === 0,
       JSON.stringify(seen),
+    );
+
+    /* ---- ⑤ the gallery opened while the seen picture is still being taken ------------------ */
+    // The review of t-97133 (t-97492): between the seen ask and its answer the seen key is written and no picture is
+    // held; a gallery opened in that gap queued the card and asked the HIDDEN pane as well — one extra render.
+    const midShot = await page.evaluate(async () => {
+      const held = window.__STAGE2__;
+      const SEEN = "data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==";
+      const HIDDEN = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+      /* One take: the seen answer is held until `release` says what it is (a picture or nothing). */
+      const take = async (seenAnswer) => {
+        const out = {};
+        let release = null;
+        const gate = new Promise((done) => {
+          release = done;
+        });
+        held.thumbAsks = [];
+        window.__ANSWER__.artifact_thumbnail = async (args) => {
+          const ask = { id: args.id, label: args.label ?? null };
+          held.thumbAsks.push(ask);
+          if (args.label) return (await gate) ? { data_url: SEEN, cached: false } : null;
+          return { data_url: HIDDEN, cached: false };
+        };
+        document.documentElement.style.setProperty("--artifact-seen-thumb-ms", "40");
+        artifactThumbs.delete("gal-0");
+        artifactThumbFailed.delete("gal-0");
+        artifactSeenShots.delete("gal-0");
+        await openArtifactPageAt(artifactRows.get("gal-0")?.path ?? "");
+        await held.settle();
+        const tab = held.tabsOf("gal-0")[0] ?? null;
+        setActiveTab(tab?.id);
+        await held.settle();
+        const url = pathAsFileUrl(artifactRows.get("gal-0")?.path ?? "");
+        await held.navigate(tab, url, "started");
+        await held.navigate(tab, url, "finished");
+        // The seen ask is out and unanswered.
+        for (let beat = 0; beat < 40 && !held.thumbAsks.some((one) => one.id === "gal-0" && one.label); beat += 1) await held.settle(30);
+        out.seenAsked = held.thumbAsks.some((one) => one.id === "gal-0" && one.label === tab?.label);
+        await held.toGallery(null);
+        await held.settle(200);
+        const view = artifactsView();
+        view?.querySelector('[data-artifact-tab="pages"]')?.click();
+        await held.settle(200);
+        out.hiddenAsksWhileTaking = held.thumbAsks.filter((one) => one.id === "gal-0" && one.label === null).length;
+        release(seenAnswer);
+        await held.settle(200);
+        const card = view?.querySelector('.artifact-card[data-id="gal-0"]');
+        const thumb = card?.querySelector(".artifact-card-thumb");
+        out.cardSrc = thumb && thumb.hidden === false ? (thumb.getAttribute("src") === SEEN ? "seen" : thumb.getAttribute("src") === HIDDEN ? "hidden" : "other") : "none";
+        out.hiddenAsksAfter = held.thumbAsks.filter((one) => one.id === "gal-0" && one.label === null).length;
+        document.documentElement.style.removeProperty("--artifact-seen-thumb-ms");
+        await held.fresh();
+        return out;
+      };
+      return { pictured: await take(true), failed: await take(false) };
+    });
+    ok(
+      "⑤ a gallery opened while the seen picture is being taken asks the hidden pane for nothing, and the card wears the seen picture when it comes",
+      midShot.pictured.seenAsked && midShot.pictured.hiddenAsksWhileTaking === 0 && midShot.pictured.hiddenAsksAfter === 0 && midShot.pictured.cardSrc === "seen",
+      JSON.stringify(midShot.pictured),
+    );
+    ok(
+      "⑤ when that seen picture fails, the card asks the hidden pane once and wears its picture",
+      midShot.failed.seenAsked && midShot.failed.hiddenAsksWhileTaking === 0 && midShot.failed.hiddenAsksAfter === 1 && midShot.failed.cardSrc === "hidden",
+      JSON.stringify(midShot.failed),
+    );
+
+    /* ---- ⑤ a card already queued when the seen picture starts is not drawn on the hidden pane ---- */
+    // The second review of t-97519 (t-97596): the skip guarded only the ask side. A card waiting in the queue behind
+    // another card's hidden render when the seen pane starts its shot was still dequeued and drawn a second time.
+    const queuedShot = await page.evaluate(async () => {
+      const held = window.__STAGE2__;
+      const HIDDEN = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+      const out = {};
+      let release = null;
+      const gate = new Promise((done) => {
+        release = done;
+      });
+      held.thumbAsks = [];
+      // The first hidden render is held open, so every other visible card waits in the queue behind it.
+      window.__ANSWER__.artifact_thumbnail = async (args) => {
+        const ask = { id: args.id, label: args.label ?? null };
+        held.thumbAsks.push(ask);
+        if (!args.label && held.thumbAsks.filter((one) => one.label === null).length === 1) await gate;
+        return { data_url: HIDDEN, cached: false };
+      };
+      for (const id of artifactRows.keys()) {
+        artifactThumbs.delete(id);
+        artifactThumbFailed.delete(id);
+        artifactSeenShots.delete(id);
+      }
+      await held.toGallery(null);
+      for (let beat = 0; beat < 40 && !held.thumbAsks.some((one) => one.label === null); beat += 1) await held.settle(30);
+      const first = held.thumbAsks.find((one) => one.label === null)?.id ?? null;
+      const waiting = artifactThumbQueue.find((id) => id !== first) ?? null;
+      out.waiting = waiting;
+      // The seen pane starts its shot of the waiting card: its key is written, no picture is held yet.
+      if (waiting) artifactSeenShots.set(waiting, artifactThumbnailKey(artifactRows.get(waiting)));
+      release();
+      await held.settle(200);
+      out.hiddenAsksWhileTaking = held.thumbAsks.filter((one) => one.id === waiting && one.label === null).length;
+      // The seen shot fails: its key goes and the queue is refilled, as snapArtifactSeen does — the card's own turn.
+      if (waiting) artifactSeenShots.delete(waiting);
+      refillArtifactThumbQueue();
+      await held.settle(200);
+      out.hiddenAsksAfter = held.thumbAsks.filter((one) => one.id === waiting && one.label === null).length;
+      await held.fresh();
+      return out;
+    });
+    ok(
+      "⑤ a card already queued when the seen picture starts is not drawn on the hidden pane, and gets its own turn when that picture fails",
+      queuedShot.waiting !== null && queuedShot.hiddenAsksWhileTaking === 0 && queuedShot.hiddenAsksAfter === 1,
+      JSON.stringify(queuedShot),
+    );
+
+    /* ---- ⑤ a seen picture taken while the row changed is not kept under the new key -------- */
+    // The second review of t-97519: snapArtifactSeen wrote its answer without comparing the key after the await, so a
+    // picture of the old file went into the cache while the catalog already named a newer one.
+    const movedShot = await page.evaluate(async () => {
+      const held = window.__STAGE2__;
+      const SEEN = "data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==";
+      const HIDDEN = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+      const out = {};
+      let release = null;
+      const gate = new Promise((done) => {
+        release = done;
+      });
+      held.thumbAsks = [];
+      window.__ANSWER__.artifact_thumbnail = async (args) => {
+        const ask = { id: args.id, label: args.label ?? null };
+        held.thumbAsks.push(ask);
+        if (args.label) return (await gate) ? { data_url: SEEN, cached: false } : null;
+        return { data_url: HIDDEN, cached: false };
+      };
+      document.documentElement.style.setProperty("--artifact-seen-thumb-ms", "40");
+      artifactThumbs.delete("gal-0");
+      artifactThumbFailed.delete("gal-0");
+      artifactSeenShots.delete("gal-0");
+      const before = artifactRows.get("gal-0") ?? null;
+      const oldKey = artifactThumbnailKey(before);
+      await openArtifactPageAt(before?.path ?? "");
+      await held.settle();
+      const tab = held.tabsOf("gal-0")[0] ?? null;
+      setActiveTab(tab?.id);
+      await held.settle();
+      const url = pathAsFileUrl(before?.path ?? "");
+      await held.navigate(tab, url, "started");
+      await held.navigate(tab, url, "finished");
+      for (let beat = 0; beat < 40 && !held.thumbAsks.some((one) => one.id === "gal-0" && one.label); beat += 1) await held.settle(30);
+      out.seenAsked = held.thumbAsks.some((one) => one.id === "gal-0" && one.label === tab?.label);
+      // The catalog moves on while the seen pane is still taking the old file.
+      if (before) artifactRows.set("gal-0", { ...before, modified_ms: before.modified_ms + 1 });
+      release(true);
+      await held.settle(200);
+      out.keptOldPicture = artifactThumbs.get("gal-0") === SEEN;
+      out.oldKeyStays = artifactSeenShots.get("gal-0") === oldKey;
+      if (before) artifactRows.set("gal-0", before);
+      artifactThumbs.delete("gal-0");
+      artifactSeenShots.delete("gal-0");
+      document.documentElement.style.removeProperty("--artifact-seen-thumb-ms");
+      await held.fresh();
+      return out;
+    });
+    ok(
+      "⑤ a seen picture whose row changed while it was taken is not cached under the new key",
+      movedShot.seenAsked && movedShot.keptOldPicture === false && movedShot.oldKeyStays === false,
+      JSON.stringify(movedShot),
     );
 
     /* ---- ⑤ a Markdown card's face is an excerpt without its fenced blocks ------------------ */
@@ -504,7 +676,8 @@ export async function testArtifactStage2(browser, origin, ok) {
       const held = window.__STAGE2__;
       const out = {};
       // The marks are the table's (8 s, 30 s), pulled in here so the suite does not wait on them.
-      document.documentElement.style.setProperty("--artifact-open-slow-ms", "150");
+      out.slowMark = 150;
+      document.documentElement.style.setProperty("--artifact-open-slow-ms", String(out.slowMark));
       document.documentElement.style.setProperty("--artifact-open-stalled-ms", "400");
       const noteOf = (tab) => held.hostOf(tab)?.querySelector(".artifact-strip-note") ?? null;
       const noteWords = (tab) => (noteOf(tab)?.hidden === false ? noteOf(tab).querySelector(".artifact-strip-note-words")?.textContent ?? "" : null);
@@ -548,6 +721,11 @@ export async function testArtifactStage2(browser, origin, ok) {
       const tabC = await held.openFromGallery(slow.id);
       setActiveTab(tabC?.id);
       await held.settle(60);
+      // How long the page has been in sight as the early note is read: before the slow mark the strip says nothing.
+      // A fixed beat cannot promise that it is still before the mark — with the page's CPU slowed 4x the beats ran
+      // late and the note was read past it (job 1793773002-t97133-red-green) — so the read says when it was taken.
+      const earlyClock = artifactOpenClocks.get(tabC?.label) ?? null;
+      out.visibleEarly = earlyClock ? Math.round(artifactOpenVisibleMs(earlyClock)) : null;
       out.noteEarly = noteWords(tabC);
       await held.settle(200);
       out.noteSlow = noteWords(tabC);
@@ -580,7 +758,8 @@ export async function testArtifactStage2(browser, origin, ok) {
     );
     ok(
       "⑧ past the slow mark the strip says the page is still loading; past the stalled mark the open is recorded as stalled and the strip says so, and the note goes when the page comes",
-      clock.noteEarly === null && typeof clock.noteSlow === "string" && clock.noteSlow.includes("아직 읽는 중") && clock.recordsSlow === 0
+      Number.isFinite(clock.visibleEarly) && (clock.noteEarly === null || clock.visibleEarly >= clock.slowMark)
+        && typeof clock.noteSlow === "string" && clock.noteSlow.includes("아직 읽는 중") && clock.recordsSlow === 0
         && typeof clock.noteStalled === "string" && clock.noteStalled.includes("멈춘") && clock.recordsStalled >= 1
         && clock.outcomeStalled === "stalled" && Number.isFinite(clock.visibleStalled) && clock.visibleStalled >= 380
         && clock.actStalled === "다시 읽기" && clock.noteAfter === null,
