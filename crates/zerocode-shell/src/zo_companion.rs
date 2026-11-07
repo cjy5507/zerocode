@@ -1,8 +1,10 @@
 //! zo rides along with the app (t-3191, docs/design/versioned-auto-update.md
 //! §2.4): the release bundle carries `Resources/bin/zo`, and at boot the
-//! window makes `~/.local/bin/zo` that binary when it is missing or older —
-//! `.zo.new` beside it, then one rename, so a zo that is running keeps its
-//! inode. A zo a person installed themselves (a *higher* version) is left
+//! window makes `~/.local/bin/zo` (`zo.exe` on Windows) that binary when it is missing or older —
+//! `.zo.new` beside it, then one rename. On Unix a running zo keeps its
+//! inode; Windows can refuse replacement while the executable is in use,
+//! leaving the old binary intact and reporting the failure. A zo a person
+//! installed themselves (a *higher* version) is left
 //! alone and said so in the settings pane. Versions are semver, never
 //! strings: 1.3.0 follows the older zo's 1.2.7 (§2.7).
 //!
@@ -17,7 +19,7 @@ use serde::{Deserialize, Serialize};
 /// Where a person's zo lives, relative to the home directory — the path the
 /// release lane swaps too (`RELEASE_ZO_BIN`, tools/release/lane.sh), and the
 /// one the older lineage's `install.sh` wrote.
-const ZO_BIN: &[&str] = &[".local", "bin", "zo"];
+const ZO_BIN: &[&str] = &[".local", "bin"];
 /// The staging name beside it; one rename away.
 const ZO_NEW: &str = ".zo.new";
 /// Where the bundle carries zo, under the app's resource directory
@@ -25,9 +27,16 @@ const ZO_NEW: &str = ".zo.new";
 const BUNDLED_ZO: &[&str] = &["bin", "zo"];
 
 pub(crate) fn zo_path_under(home: &Path) -> PathBuf {
+    zo_path_under_for(home, cfg!(windows))
+}
+
+// Windows resolves the installed command by its executable suffix. The bundle
+// resource keeps its platform-neutral key, but the installed image needs .exe.
+fn zo_path_under_for(home: &Path, windows: bool) -> PathBuf {
     ZO_BIN
         .iter()
         .fold(home.to_path_buf(), |path, part| path.join(part))
+        .join(if windows { "zo.exe" } else { "zo" })
 }
 
 /// The bundled zo, if this build carries one. A dev build (`cargo run`,
@@ -221,6 +230,25 @@ mod tests {
         );
         assert_eq!(parse_zo_version("usage: zo [options]"), None);
         assert_eq!(parse_zo_version(""), None);
+    }
+
+    #[test]
+    fn the_companion_uses_a_windows_executable_name() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("bundled-zo");
+        std::fs::write(&source, b"companion fixture").unwrap();
+        let home = fixture.path().join("home");
+        for (windows, filename) in [(false, "zo"), (true, "zo.exe")] {
+            let target = zo_path_under_for(&home, windows);
+            assert_eq!(target.file_name().unwrap(), filename);
+            assert_eq!(target.parent().unwrap(), home.join(".local").join("bin"));
+            install(&source, &target).unwrap();
+            assert_eq!(std::fs::read(target).unwrap(), b"companion fixture");
+        }
+        assert_eq!(
+            zo_path_under(&home).file_name().unwrap(),
+            if cfg!(windows) { "zo.exe" } else { "zo" }
+        );
     }
 
     /// §2.4: missing or older is replaced; the same is left; a newer one a

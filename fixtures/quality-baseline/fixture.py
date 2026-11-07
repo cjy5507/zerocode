@@ -4,6 +4,7 @@ ROOT contains repo/, evidence/, and (Q4) worktree/. Evidence is written by the
 harness observing tools, requests and CLI receipts, never by parsing a final answer.
 """
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -14,7 +15,17 @@ POLICY = json.loads((BASE / 'baseline.json').read_text())
 TASKS = POLICY['Tasks']
 
 def run(args, cwd, check=True):
-    return subprocess.run(args, cwd=cwd, check=check, capture_output=True, text=True)
+    env = os.environ.copy()
+    # Git invoked directly or by a fixture child must stay in its own repo.
+    for key in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR',
+                'GIT_OBJECT_DIRECTORY', 'GIT_NAMESPACE', 'GIT_PREFIX'):
+        env.pop(key, None)
+    if args[0] == 'cargo':
+        # A coordinator's build target must not redirect fixture output into
+        # the product's release build. Each disposable repo owns its target.
+        env['CARGO_TARGET_DIR'] = str(Path(cwd) / 'target')
+        env.pop('CARGO_BUILD_TARGET', None)
+    return subprocess.run(args, cwd=cwd, env=env, check=check, capture_output=True, text=True)
 
 def git(repo, *args):
     return run(['git', *args], repo).stdout.strip()
@@ -79,6 +90,7 @@ def verify(task, root):
         repo = root / 'worktree' if task == 'Q4' else main
         paths = changed(root, repo)
         if paths != sorted(TASKS[task]['allowed']): return False
+        if any((repo / path).is_symlink() or not (repo / path).is_file() for path in paths): return False
         if task in ('Q1','Q3','Q4'):
             if run(['cargo','test','--offline','-p','fixture'], repo, False).returncode: return False
         if task == 'Q2':
