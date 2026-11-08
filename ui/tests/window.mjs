@@ -138,7 +138,7 @@ import { testComputerProgress } from "./computer-progress.mjs";
 import { testEditorSelection } from "./editor-selection.mjs";
 import { testEditorRecovery } from "./editor-recovery.mjs";
 import { testComposerAttach } from "./attach.mjs";
-import { testComposerMenuPosition } from "./composer-menu-position.mjs";
+import { testComposerMenuHandling, testComposerMenuPosition } from "./composer-menu-position.mjs";
 import { testComposerEffort } from "./composer-effort.mjs";
 import { testImeBrokenCommit } from "./ime-broken-commit.mjs";
 import { testImeKoreanRegression } from "./ime-korean-regression.mjs";
@@ -16813,10 +16813,8 @@ const workspaceBoard = await page.evaluate(async () => {
   // the manual-width kanban's existing drag/pin/resize settings contract here.
   const initialMode = workspaceBoardMode;
   const initialFit = workspaceBoardFit;
-  const initialEmpty = workspaceBoardShowEmpty;
   workspaceBoardMode = "kanban";
   workspaceBoardFit = false;
-  workspaceBoardShowEmpty = true;
   const initialBoard = structuredClone(workspaceBoardSettings);
   const bare = (path, branch, main, active, at) => ({
     path, branch, is_main: main, active, is_folder: false,
@@ -16902,6 +16900,15 @@ const workspaceBoard = await page.evaluate(async () => {
   )].map((card) => card.dataset.worktreePath);
   seen.open = !board.hidden && document.getElementById("nav-board").getAttribute("aria-pressed");
   seen.agentSeparate = document.getElementById("nav-agents") !== null;
+  // The four born stages are said in the language the window speaks here
+  // (`workspaceBoardStatusLabel`); the board suite pins the Korean words.
+  const born = {
+    todo: t("workspaceBoard.stage.todo", "할 일"),
+    progress: t("workspaceBoard.stage.inProgress", "진행 중"),
+    review: t("workspaceBoard.stage.inReview", "검토 중"),
+    done: t("workspaceBoard.stage.done", "완료"),
+  };
+  seen.born = born;
   seen.labels = labels();
   // A card with no status of its own lands in the FIRST stage, not a fixed
   // "in-progress" — the board's default was rectified there to stop every
@@ -16961,7 +16968,7 @@ const workspaceBoard = await page.evaluate(async () => {
   await new Promise((done) => setTimeout(done, 80));
   seen.renamed = labels()[0];
   rows = [...document.querySelectorAll(".workspace-board-status-row")];
-  rows.find((row) => row.querySelector(".workspace-board-status-name").value === "Done")
+  rows.find((row) => row.querySelector(".workspace-board-status-name").value === born.done)
     ?.querySelector(".is-left")?.click();
   await new Promise((done) => setTimeout(done, 80));
   seen.reordered = labels();
@@ -16973,7 +16980,11 @@ const workspaceBoard = await page.evaluate(async () => {
   await new Promise((done) => setTimeout(done, 80));
   seen.removed = labels().length;
 
-  document.getElementById("workspace-board-close").click();
+  // The board is a stage tab (2026-11-08): its door closes it as it opened
+  // it, and the next opening reads the same saved board.
+  document.getElementById("nav-board").click();
+  seen.closed = !tabs.some((tab) => tab.id === "workspaces") &&
+    document.getElementById("nav-board").getAttribute("aria-pressed") === "false";
   document.getElementById("nav-board").click();
   await new Promise((done) => setTimeout(done, 80));
   seen.persisted = lanePaths("in-review").includes("/r/work") &&
@@ -16983,7 +16994,6 @@ const workspaceBoard = await page.evaluate(async () => {
   workspaceBoardSettings = initialBoard;
   workspaceBoardMode = initialMode;
   workspaceBoardFit = initialFit;
-  workspaceBoardShowEmpty = initialEmpty;
   delete window.__WBOARD__;
   delete window.__WBOARD_ITEM__;
   delete window.__WBOARD_STATUS__;
@@ -16998,7 +17008,8 @@ const workspaceBoard = await page.evaluate(async () => {
 ok(
   "the workspace board keeps user statuses through search, drag, pin, resize, edit, and reopen",
   workspaceBoard.open === "true" && workspaceBoard.agentSeparate &&
-    workspaceBoard.labels.join() === "Todo,In progress,In review,Done" &&
+    workspaceBoard.labels.join() === [workspaceBoard.born.todo, workspaceBoard.born.progress,
+      workspaceBoard.born.review, workspaceBoard.born.done].join() &&
     workspaceBoard.defaultLane.includes("/r/work") && workspaceBoard.pinnedBadge &&
     workspaceBoard.stableLane && workspaceBoard.stableCard &&
     workspaceBoard.horizontal && workspaceBoard.heightBudget && workspaceBoard.settingsFits &&
@@ -17007,8 +17018,10 @@ ok(
     workspaceBoard.moveWrite?.status === "in-review" && workspaceBoard.pinned &&
     workspaceBoard.width === "328px" && workspaceBoard.widthWrite === 328 &&
     workspaceBoard.renamed === "Backlog" &&
-    workspaceBoard.reordered.join() === "Backlog,In progress,Done,In review" &&
-    workspaceBoard.added === 5 && workspaceBoard.removed === 4 && workspaceBoard.persisted,
+    workspaceBoard.reordered.join() === ["Backlog", workspaceBoard.born.progress,
+      workspaceBoard.born.done, workspaceBoard.born.review].join() &&
+    workspaceBoard.added === 5 && workspaceBoard.removed === 4 && workspaceBoard.closed &&
+    workspaceBoard.persisted,
   JSON.stringify(workspaceBoard),
 );
 
@@ -56719,6 +56732,77 @@ suite("composer-menu-position", async ({ browser, origin, ok }) => {
   const { page } = await openWindowTestPage(browser, origin);
   try {
     await testComposerMenuPosition(page, ok);
+  } finally {
+    await page.close();
+  }
+});
+
+/* How those menus open and close under a hand: the chip's words close what
+ * the chip opened, a scrolled list stays scrolled, a late answer stands no
+ * second menu, and a burst of scrolls stands the menu once a frame
+ * (2026-11-08: 「모델 열고 effort 열고 닫을때 재대로 안열리고 렉이 걸림」). */
+/* 「새 세션에서 계속」 in Geist's modal, as the create dialogs wear it (2026-11-08: 「모달도 giest 스타일로
+ * 개선」): heading-16 over copy-13 with a close beside them, label-13 in the secondary ink over each field at
+ * control height, the actions right-aligned on the footer's second background over a 1px rule with the primary
+ * last, the first focus on the first field, and the close closing. Read off computed style, not a picture. */
+suite("continue-dialog-geist", async ({ browser, origin, ok }) => {
+  const { page } = await openWindowTestPage(browser, origin);
+  try {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const seen = await page.evaluate(async () => {
+      const settle = () => new Promise((done) => setTimeout(done, 120));
+      await openTermTab({ placement: "tab" });
+      const tab = [...tabs].reverse().find((one) => one.kind === "term");
+      window.__ANSWER__.continuation_source = () => ({ agent: "codex", transcript_path: "/Users/dev/.codex/sessions/s.jsonl", you: "go", said: "done" });
+      await openContinueDialog(tab, tab.term);
+      await settle();
+      const dialog = document.querySelector("#continue-scrim .qo--continue");
+      const style = (node) => (node ? getComputedStyle(node) : null);
+      const title = style(el("continue-title"));
+      const sub = style(el("continue-sub"));
+      const label = style(dialog?.querySelector('.wt-label[for="continue-agent"]'));
+      const combo = dialog?.querySelector(".wt-combo");
+      const foot = dialog?.querySelector(":scope > .wt-form-actions");
+      const footStyle = style(foot);
+      const start = el("continue-start").getBoundingClientRect();
+      const cancel = el("continue-cancel").getBoundingClientRect();
+      const footBox = foot?.getBoundingClientRect();
+      const probe = document.createElement("div");
+      probe.style.background = "var(--surface-abyss)";
+      probe.style.color = "var(--ink-mist)";
+      document.body.appendChild(probe);
+      const abyss = getComputedStyle(probe).backgroundColor;
+      const mist = getComputedStyle(probe).color;
+      probe.remove();
+      const read = {
+        open: !el("continue-scrim").hidden,
+        titleSize: title?.fontSize, subSize: sub?.fontSize, subInk: sub?.color === mist,
+        labelSize: label?.fontSize, labelInk: label?.color === mist,
+        comboHeight: Math.round(combo?.getBoundingClientRect().height ?? 0),
+        footGround: footStyle?.backgroundColor === abyss, footRule: footStyle?.borderTopWidth === "1px",
+        primaryLast: cancel.right <= start.left, primaryRight: footBox ? Math.round(footBox.right - start.right) : -1,
+        firstFocus: document.activeElement === el("continue-agent"),
+      };
+      el("continue-close").click();
+      await settle();
+      read.closed = el("continue-scrim").hidden;
+      delete window.__ANSWER__.continuation_source;
+      return read;
+    });
+    ok("the continue dialog wears Geist's modal — heading-16 over copy-13 in the secondary ink, label-13 labels in that ink over 32px fields, the actions on the footer's second background over a 1px rule with the primary last at the right, the first field focused, and its close closing",
+      seen.open && seen.titleSize === "16px" && seen.subSize === "13px" && seen.subInk && seen.labelSize === "13px" && seen.labelInk &&
+        seen.comboHeight === 32 && seen.footGround && seen.footRule && seen.primaryLast && seen.primaryRight >= 0 && seen.primaryRight <= 24 &&
+        seen.firstFocus && seen.closed,
+      JSON.stringify(seen));
+  } finally {
+    await page.close();
+  }
+});
+
+suite("composer-menu-handling", async ({ browser, origin, ok }) => {
+  const { page } = await openWindowTestPage(browser, origin);
+  try {
+    await testComposerMenuHandling(page, ok);
   } finally {
     await page.close();
   }

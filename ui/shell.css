@@ -14668,15 +14668,61 @@ body.is-dragging-pane {
   height: 16px;
 }
 
-/* The continue-in-new-session dialog's source card — Orca's bordered strip
- * with the session's name over the original agent's
- * (`AgentSessionContinuationDialog`, :363-372). Everything else in the
- * dialog wears the settings vocabulary it already shares. */
-.continue-dialog {
+/* ---- continue in a new session (2026-11-08) --------------------------------
+ *
+ * The person: 「모달도 giest 스타일로 개선」. The create dialogs' Geist modal,
+ * worn whole: the title and its one line (heading-16, copy-13) with the close
+ * beside them, each field under its label-13 in the secondary ink at control
+ * height on the recess, and the actions right-aligned on the footer's second
+ * background over a 1px rule, the primary last. The session it continues from
+ * is a card ringed by Geist's 1px shadow edge — Orca's bordered strip with the
+ * session's name over the original agent's (`AgentSessionContinuationDialog`,
+ * :363-372). */
+.qo--continue {
+  width: var(--dialog-width);
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
-  width: 440px;
+  overflow: hidden;
+}
+
+.continue-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 var(--space-4) var(--space-4);
+}
+
+.continue-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.qo--continue .wt-label {
+  font: var(--type-label-13);
+  color: var(--ink-mist);
+}
+
+.qo--continue .wt-combo {
+  height: var(--control-height-md);
+  background: var(--surface-well);
+}
+
+.continue-hint {
+  margin: 0;
+  font: var(--type-copy-13);
+  color: var(--ink-mist);
+}
+
+.continue-hint:empty {
+  display: none;
+}
+
+.qo--continue .wt-form-actions {
+  background: var(--surface-abyss);
 }
 
 .continue-source {
@@ -14684,10 +14730,10 @@ body.is-dragging-pane {
   align-items: center;
   gap: var(--space-3);
   min-width: 0;
-  padding: var(--space-2.5) var(--space-3);
-  border: var(--rule-width) solid var(--edge-rule);
-  border-radius: var(--radius-edge);
-  background: color-mix(in srgb, var(--surface-well) 40%, transparent);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--surface-well);
+  box-shadow: var(--shadow-border);
 }
 
 .continue-source-ico {
@@ -14698,39 +14744,38 @@ body.is-dragging-pane {
 }
 
 .continue-source-ico .agent-ico {
-  width: 20px;
-  height: 20px;
+  width: 16px;
+  height: 16px;
 }
 
 .continue-source-body {
+  display: grid;
   flex: 1;
+  gap: var(--space-1);
   min-width: 0;
 }
 
 .continue-source-name {
   overflow: hidden;
   color: var(--ink-chalk);
-  font-size: var(--text-xs);
-  font-weight: 600;
+  font: var(--type-label-14);
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .continue-source-agent {
-  margin-top: 2px;
   color: var(--ink-mist);
-  font-size: var(--text-2xs);
+  font: var(--type-label-12);
 }
 
+/* Where the new session starts: the path in mono, quiet, under the fields. */
 .continue-cwd {
-  font-family: var(--font-mono);
-  font-size: var(--text-2xs);
+  margin: 0;
   color: var(--ink-mist);
+  font: var(--type-label-12);
+  font-family: var(--font-mono);
   overflow-wrap: anywhere;
-  padding: var(--space-1.5) var(--space-2.5);
-  background: color-mix(in srgb, var(--surface-well) 30%, transparent);
-  border-radius: var(--radius-sm);
-  border: var(--rule-width) solid color-mix(in srgb, var(--edge-rule) 60%, transparent);
 }
 
 /* Common modal agent selection combo wrapper */
@@ -20798,44 +20843,51 @@ button.helper-sib:hover {
   background: var(--surface-abyss);
 }
 
-/* Orca's SettingsSidebar, measured: group heads in 11px uppercase +0.18em,
- * items 13px on rounded-lg rows with a 16px glyph, the active one on an
- * accent wash with a 1px ring and `aria-current="page"`. The rail is 280px
- * against a settings that replaces the WHOLE window — which this one now
- * does (index-ftls8Hg_.js:150533 drops the sidebar for settings), so the
- * 208px it wore while sharing the stage with the project column is gone
- * with the sharing. */
+/* Orca's SettingsSidebar gave the shape: a 280px column against a settings
+ * that replaces the WHOLE window (index-ftls8Hg_.js:150533 drops the sidebar
+ * for settings), the way back, the search, then the grouped sections with a
+ * 16px glyph on each row and `aria-current="page"` on the open one.
+ *
+ * The paint is the window's Geist column (2026-11-08, 「설정에 geist 스타일
+ * 아닌걸 개선」): the nav plane over the black floor like the project
+ * sidebar, group heads in Label 12 as written — Orca's 11px uppercase at
+ * +0.18em spaced Korean into 「AI 기 능」 — and the open row on the column's
+ * chosen grey with no ring. */
 .settings-rail {
   flex: none;
   width: 280px;
-  border-right: 1px solid var(--edge-rule);
+  border-right: var(--rule-width) solid var(--nav-plane-rule);
   display: flex;
   flex-direction: column;
   min-height: 0;
+  background: var(--nav-plane);
 }
 
 /* The two ruled boxes above the list — the way back, then the search. Orca's
  * own `border-b … px-3 py-3` twice over (:29922-29956). */
 .settings-rail-top {
   flex: none;
-  padding: 12px;
-  border-bottom: 1px solid var(--edge-rule);
+  padding: var(--space-3);
+  border-bottom: var(--rule-width) solid var(--nav-plane-rule);
 }
 
 .settings-back {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   width: 100%;
-  padding: 4px 8px;
+  min-height: var(--control-height-sm);
+  padding: 0 var(--space-2);
   border: 0;
   border-radius: var(--radius-md);
   background: none;
-  font-family: inherit;
-  font-size: 13px;
+  font: var(--type-label-13);
   text-align: left;
   color: var(--ink-mist);
   cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
 }
 
 .settings-back:hover {
@@ -20867,16 +20919,29 @@ button.helper-sib:hover {
   pointer-events: none;
 }
 
+/* A Geist input in the column's own recess: the ring instead of a border,
+ * the search glyph's room on the left (10px in, 16px wide, 8px to the text). */
 .settings-search-input {
   width: 100%;
-  height: var(--segment-height);
-  padding: 0 var(--space-2) 0 34px;
-  border: var(--rule-width) solid var(--edge-rule);
-  border-radius: var(--radius-edge);
+  height: var(--control-height-sm);
+  padding: 0 var(--space-2) 0 calc(var(--control-pad-inline) + 16px + var(--space-2));
+  border: 0;
+  border-radius: var(--radius-md);
   background: var(--surface-well);
+  box-shadow: var(--shadow-border);
   color: var(--ink-chalk);
-  font: inherit;
-  font-size: 13px;
+  font: var(--type-label-13);
+  transition: box-shadow var(--motion-fast) var(--ease-standard);
+}
+
+.settings-search-input:hover {
+  box-shadow: 0 0 0 var(--rule-width) var(--edge-mark);
+}
+
+.settings-search-input:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: calc(var(--focus-ring-offset) * -1);
+  box-shadow: none;
 }
 
 .settings-search-input::placeholder {
@@ -20893,39 +20958,39 @@ button.helper-sib:hover {
   padding: var(--space-4) var(--space-3);
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: var(--space-4);
 }
 
 .settings-rail-group-box {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-1);
 }
 
 .settings-rail-group {
-  margin: 0 0 4px;
-  padding: 0 12px;
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
+  margin: 0 0 var(--space-1);
+  padding: 0 var(--space-3);
+  font: var(--type-label-12);
   color: var(--ink-mist);
 }
 
 .settings-rail-item {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   width: 100%;
-  padding: 6px 12px;
+  min-height: var(--control-height-sm);
+  padding: 0 var(--space-3);
   border: 0;
   border-radius: var(--radius-md);
   background: none;
-  font-family: inherit;
-  font-size: 13px;
+  font: var(--type-label-13);
   text-align: left;
   color: var(--ink-mist);
   cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
 }
 
 .settings-rail-item .icon {
@@ -20934,15 +20999,21 @@ button.helper-sib:hover {
 }
 
 .settings-rail-item:hover {
-  background: var(--row-selected);
+  background: var(--row-hover);
   color: var(--ink-chalk);
 }
 
 .settings-rail-item[aria-current="page"] {
-  background: var(--row-active);
+  background: var(--nav-plane-accent);
   font-weight: 500;
-  color: var(--ink-chalk);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--ring) 25%, transparent);
+  color: var(--nav-plane-accent-ink);
+}
+
+.settings-rail-item:focus-visible,
+.settings-back:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: calc(var(--focus-ring-offset) * -1);
+  box-shadow: none;
 }
 
 /* The reading column inside it — the same measure the Task screen keeps, for
@@ -21017,9 +21088,32 @@ button.helper-sib:hover {
   max-width: 60ch;
 }
 
+/* On the settings screen the words under a control are read, so they are
+ * Geist's Copy 13 and the label over them its Label 14 — the 12px at 1.55
+ * they wear in a dialog was the old screen's ladder, where a label and its
+ * sentence sat 19px apart line from line. Scoped: the automation editor and
+ * the dialogs that share these classes keep their own measure. */
+.settings-view .settings-hint,
+.settings-view .settings-note {
+  font: var(--type-copy-13);
+}
+
+.settings-view .settings-label {
+  font: var(--type-label-14);
+  font-weight: 500;
+}
+
+/* A command or a path quoted inside a sentence is set in Geist Mono — left
+ * bare, the `<code>` fell to the platform's own monospace. */
+.settings-view code {
+  font-family: var(--font-mono);
+}
+
 /* The persistence status is one operational line above whichever settings
  * pane is open. It is not another card: the narrow tinted rule says “review
  * this first” without competing with the section somebody came to change. */
+/* Geist's Note: the tinted ground inside a ring of its own hue, 6px corners,
+ * Heading 14 over Copy 13. */
 .settings-health {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
@@ -21027,14 +21121,14 @@ button.helper-sib:hover {
   gap: var(--space-3);
   margin: 0 0 var(--space-5);
   padding: var(--space-3) var(--space-4);
-  border: var(--rule-width) solid color-mix(in srgb, var(--signal-wait) 45%, transparent);
-  border-radius: var(--radius-edge);
-  background: color-mix(in srgb, var(--signal-wait) 9%, transparent);
+  border-radius: var(--radius-md);
+  background: var(--signal-wait-ground);
+  box-shadow: 0 0 0 var(--rule-width) color-mix(in srgb, var(--signal-wait) 45%, transparent);
 }
 
 .settings-health[data-health="error"] {
-  border-color: color-mix(in srgb, var(--signal-halt) 45%, transparent);
   background: color-mix(in srgb, var(--signal-halt) 9%, transparent);
+  box-shadow: 0 0 0 var(--rule-width) color-mix(in srgb, var(--signal-halt) 45%, transparent);
 }
 
 .settings-health-mark {
@@ -21042,17 +21136,15 @@ button.helper-sib:hover {
   place-items: center;
   width: 20px;
   height: 20px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: color-mix(in srgb, var(--signal-wait) 18%, transparent);
-  color: var(--signal-wait);
-  font-size: var(--text-xs);
-  font-weight: 700;
-  line-height: 1;
+  color: var(--signal-wait-ink);
+  font: 600 var(--text-xs) / 1 var(--font-ui);
 }
 
 .settings-health[data-health="error"] .settings-health-mark {
   background: color-mix(in srgb, var(--signal-halt) 18%, transparent);
-  color: var(--signal-halt);
+  color: var(--signal-halt-ink);
 }
 
 .settings-health-copy {
@@ -21062,19 +21154,17 @@ button.helper-sib:hover {
 .settings-health-title,
 .settings-health-detail {
   margin: 0;
-  line-height: var(--leading-body);
 }
 
 .settings-health-title {
   color: var(--ink-chalk);
-  font-size: var(--text-xs);
-  font-weight: 600;
+  font: var(--type-heading-14);
 }
 
 .settings-health-detail {
   margin-top: 2px;
   color: var(--ink-mist);
-  font-size: var(--text-2xs);
+  font: var(--type-copy-13);
   overflow-wrap: anywhere;
 }
 
@@ -21095,9 +21185,10 @@ button.helper-sib:hover {
 
 /* Every section opens with its own name and a sentence saying what it is for,
  * ruled off from the controls under it — Orca's `SettingsSection` header
- * (:18592-18613): `text-2xl font-semibold` over `text-sm text-muted-foreground`,
- * `border-b border-border/60 pb-5`. This is why the content area has no
- * "Settings" heading of its own. */
+ * (:18592-18613), `border-b border-border/60 pb-5`. This is why the content
+ * area has no "Settings" heading of its own. The name is a page title, so it
+ * is set the way every other Geist page in this window sets one (the inbox,
+ * the library, the board): Heading 24 over Copy 13. */
 .settings-section-head {
   padding: 0 0 var(--space-4);
   border-bottom: var(--rule-width) solid var(--edge-rule);
@@ -21105,11 +21196,8 @@ button.helper-sib:hover {
 
 .settings-section-title {
   margin: 0;
-  font-family: var(--font-display);
-  font-size: var(--text-lg);
-  font-weight: 600;
-  line-height: 1.2;
-  letter-spacing: -0.01em;
+  font: var(--type-heading-24);
+  letter-spacing: var(--tracking-heading-24);
   color: var(--ink-chalk);
 }
 
@@ -21117,27 +21205,27 @@ button.helper-sib:hover {
   max-width: 60ch;
   margin: var(--space-2) 0 0;
   color: var(--ink-mist);
-  font-size: var(--text-xs);
-  line-height: var(--leading-body);
+  font: var(--type-copy-13);
   word-break: var(--prose-word-break);
 }
 
-/* And the controls sit in a card under it, not loose on the page — Orca's
- * `rounded-xl border border-border/50 bg-card/50 px-7 py-6 shadow-xs`. The
+/* And the controls sit in a card under it, not loose on the page. Geist's
+ * base material: background-100 with the 1px ring and its small drop, the
+ * 6px corner a card shares with a control (12px is for what floats). The
  * fields inside keep their own 16px inset, so the card's own padding is the
  * difference. */
 .settings-card {
   margin-top: var(--space-4);
   padding: var(--space-4) var(--space-3);
-  border: var(--rule-width) solid var(--edge-rule);
-  border-radius: var(--radius);
-  background: color-mix(in srgb, var(--surface-raised) 50%, transparent);
-  box-shadow: var(--shadow-1);
+  border-radius: var(--radius-md);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border-small);
 }
 
 /* A group of rows inside a section — Orca's `SettingsSubsectionHeader`
- * (SettingsFormControls-uaNnORrN.js:176): `text-sm font-semibold` over an
- * optional `text-xs text-muted-foreground`. */
+ * (SettingsFormControls-uaNnORrN.js:176) gave the place; Geist gives the
+ * type: Heading 16 over Copy 13, a step above the Label 14 rows it names so
+ * a group and a row stop reading as one weight. */
 .settings-subhead {
   padding: var(--space-4) var(--space-4) var(--space-1);
 }
@@ -21166,28 +21254,33 @@ button.helper-sib:hover {
   min-width: 0;
 }
 
+/* A Geist control at a control's height: the ring around the whole stepper,
+ * rules only between its cells. */
 .ui-zoom-control {
   display: grid;
-  grid-template-columns: var(--segment-height) minmax(58px, auto) var(--segment-height) auto;
+  grid-template-columns: var(--control-height-md) minmax(58px, auto) var(--control-height-md) auto;
   align-items: center;
   min-width: 230px;
   margin-left: auto;
-  border: var(--rule-width) solid var(--edge-rule);
-  border-radius: var(--radius-edge);
+  border: 0;
+  border-radius: var(--radius-md);
   overflow: hidden;
-  background: var(--surface-well);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border-small);
 }
 
 .ui-zoom-step,
 .ui-zoom-reset {
-  height: var(--segment-height);
+  height: var(--control-height-md);
   border: 0;
   border-left: var(--rule-width) solid var(--edge-rule);
   background: transparent;
   color: var(--ink-mist);
-  font: inherit;
-  font-size: var(--text-xs);
+  font: var(--type-label-13);
   cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
 }
 
 .ui-zoom-step:first-child {
@@ -21195,7 +21288,7 @@ button.helper-sib:hover {
 }
 
 .ui-zoom-step {
-  font-size: var(--text-md);
+  font: var(--type-label-14);
 }
 
 .ui-zoom-reset {
@@ -21205,7 +21298,7 @@ button.helper-sib:hover {
 .ui-zoom-step:hover:not(:disabled),
 .ui-zoom-reset:hover:not(:disabled) {
   color: var(--ink-chalk);
-  background: var(--surface-raised);
+  background: var(--row-hover);
 }
 
 .ui-zoom-step:disabled,
@@ -21217,10 +21310,10 @@ button.helper-sib:hover {
 .ui-zoom-percent {
   display: grid;
   place-items: center;
-  min-height: var(--segment-height);
+  min-height: var(--control-height-md);
   border-left: var(--rule-width) solid var(--edge-rule);
   color: var(--ink-chalk);
-  font-size: var(--text-xs);
+  font: var(--type-label-13);
   font-variant-numeric: tabular-nums;
 }
 
@@ -21271,15 +21364,27 @@ button.helper-sib:hover {
   min-width: 0;
 }
 
+/* The well beside a colour's text field: a square Geist control the field's
+ * height, the colour inset 4px inside the ring. */
 .settings-color-swatch {
   flex: none;
-  width: 40px;
-  height: var(--segment-height);
-  padding: 3px;
-  border: var(--rule-width) solid var(--edge-rule);
-  border-radius: var(--radius-edge);
+  width: var(--control-height-md);
+  height: var(--control-height-md);
+  padding: var(--space-1);
+  border: 0;
+  border-radius: var(--radius-md);
   background: transparent;
+  box-shadow: var(--shadow-border);
   cursor: pointer;
+}
+
+.settings-color-swatch::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+
+.settings-color-swatch::-webkit-color-swatch {
+  border: 0;
+  border-radius: var(--radius-xs);
 }
 
 .settings-view .settings-color-control .settings-input,
@@ -21290,7 +21395,7 @@ button.helper-sib:hover {
 .settings-number-suffix {
   flex: none;
   color: var(--ink-mist);
-  font-size: var(--text-2xs);
+  font: var(--type-label-12);
   font-variant-numeric: tabular-nums;
 }
 
@@ -21313,7 +21418,8 @@ button.helper-sib:hover {
 .terminal-color-group-title {
   margin: 0 0 var(--space-2);
   color: var(--ink-mist);
-  font-size: var(--text-xs);
+  font: var(--type-label-13);
+  font-weight: 500;
 }
 
 .terminal-color-grid {
@@ -21473,29 +21579,33 @@ button.helper-sib:hover {
 .settings-subhead-title {
   margin: 0;
   color: var(--ink-chalk);
-  font-size: 14px;
-  font-weight: 600;
+  font: var(--type-heading-16);
+  letter-spacing: var(--tracking-heading-16);
 }
 
 .settings-subhead-desc {
   max-width: 52ch;
   margin: var(--space-1) 0 0;
   color: var(--ink-mist);
-  font-size: var(--text-xs);
-  line-height: var(--leading-body);
+  font: var(--type-copy-13);
   word-break: var(--prose-word-break);
 }
 
-/* A count beside a heading — Orca's `SettingsBadge`. */
+/* A count beside a heading — Orca's `SettingsBadge` in Geist's small badge:
+ * a 20px pill on the grey 200 ground, Label 12. */
 .settings-badge {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+  height: calc(var(--badge-height) - var(--space-1));
   margin-left: var(--space-2);
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: var(--row-active);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--gray-alpha-200);
   color: var(--ink-mist);
-  font-size: var(--text-3xs);
+  font: var(--type-label-12);
   font-weight: 500;
+  letter-spacing: normal;
   font-variant-numeric: tabular-nums;
 }
 
@@ -21514,13 +21624,14 @@ button.helper-sib:hover {
 .settings-scope {
   display: inline-flex;
   align-items: center;
-  min-height: 22px;
-  padding: 1px var(--space-2);
-  border: var(--rule-width) solid var(--edge-rule);
-  border-radius: 999px;
+  min-height: calc(var(--badge-height) - var(--space-1));
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-pill);
   background: var(--surface-well);
+  box-shadow: var(--shadow-border);
   color: var(--ink-mist);
-  font-size: var(--text-2xs);
+  font: var(--type-label-12);
   font-weight: 500;
   white-space: nowrap;
 }
@@ -21534,7 +21645,7 @@ button.helper-sib:hover {
   padding-bottom: var(--space-3);
   border-bottom: var(--rule-width) solid var(--edge-rule);
   color: var(--ink-mist);
-  font-size: var(--text-2xs);
+  font: var(--type-label-12);
 }
 
 .settings-scope-line code {
@@ -21588,82 +21699,71 @@ button.helper-sib:hover {
   min-width: 0;
 }
 
+/* A provider's monogram tile: a Geist control's square, ring instead of a
+ * border, the letters in Label 12 (10px was off the type steps). */
 .integration-mark {
   display: grid;
   place-items: center;
   flex: none;
-  width: 32px;
-  height: 32px;
-  border: var(--rule-width) solid var(--edge-rule);
+  width: var(--control-height-md);
+  height: var(--control-height-md);
+  border: 0;
   border-radius: var(--radius-md);
   background: var(--surface-well);
+  box-shadow: var(--shadow-border);
   color: var(--ink-chalk);
-  font-family: var(--font-display);
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: -0.02em;
+  font: var(--type-label-12);
+  font-weight: 600;
 }
 
 .integration-provider-title {
   margin: 0;
   color: var(--ink-chalk);
-  font-size: 14px;
-  font-weight: 600;
+  font: var(--type-heading-16);
+  letter-spacing: var(--tracking-heading-16);
 }
 
 .integration-provider-desc {
   max-width: 56ch;
   margin: var(--space-1) 0 0;
   color: var(--ink-mist);
-  font-size: var(--text-xs);
-  line-height: var(--leading-body);
+  font: var(--type-copy-13);
   word-break: var(--prose-word-break);
 }
 
+/* A state beside a name is Geist's small badge: a 20px pill on the 200
+ * ground of its hue with the hue's own ink, Label 12 — the word says the
+ * state too, so the colour never speaks alone. Each treatment answers for
+ * its own pair through the ramp, so no theme needs a tint of its own. */
 .settings-state {
   display: inline-flex;
   align-items: center;
   flex: none;
-  min-height: 20px;
-  padding: 1px var(--space-2);
-  border-radius: 999px;
-  background: var(--row-hover);
+  min-height: calc(var(--badge-height) - var(--space-1));
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--gray-alpha-200);
   color: var(--ink-mist);
-  font-size: var(--text-3xs);
-  font-weight: 600;
+  font: var(--type-label-12);
+  font-weight: 500;
   white-space: nowrap;
 }
 
 .settings-state[data-state="connected"],
 .settings-state[data-state="available"] {
-  background: color-mix(in srgb, var(--signal-ready) 12%, transparent);
-  color: var(--signal-ready);
-}
-
-/* The light success ink clears AA on the panel itself, but a 12% tint behind
- * its 10px label lowers the pair to 4.09:1. A quieter tint keeps the same
- * semantic colour and restores a measured 4.6:1 without darkening the token
- * used throughout the rest of the window. */
-:root[data-theme="light"] .settings-state[data-state="connected"],
-:root[data-theme="light"] .settings-state[data-state="available"] {
-  background: color-mix(in srgb, var(--signal-ready) 3%, transparent);
-}
-
-:root[data-theme="light"] .settings-state[data-state="auth-error"],
-:root[data-theme="light"] .settings-state[data-state="error"] {
-  background: color-mix(in srgb, var(--signal-halt) 2%, transparent);
-  color: color-mix(in srgb, var(--signal-halt) 88%, black);
+  background: var(--green-200);
+  color: var(--signal-ready-ink);
 }
 
 .settings-state[data-state="checking"] {
-  background: color-mix(in srgb, var(--signal-wait) 12%, transparent);
-  color: var(--signal-wait);
+  background: var(--amber-200);
+  color: var(--signal-wait-ink);
 }
 
 .settings-state[data-state="auth-error"],
 .settings-state[data-state="error"] {
-  background: color-mix(in srgb, var(--signal-halt) 12%, transparent);
-  color: var(--signal-halt);
+  background: var(--red-200);
+  color: var(--signal-halt-ink);
 }
 
 .settings-state[data-state="unsupported"],
@@ -21676,7 +21776,7 @@ button.helper-sib:hover {
 .integration-facts {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  margin: var(--space-4) 0 0 44px;
+  margin: var(--space-4) 0 0 var(--integration-indent);
   border-top: var(--rule-width) solid var(--edge-rule);
   border-bottom: var(--rule-width) solid var(--edge-rule);
 }
@@ -21694,8 +21794,7 @@ button.helper-sib:hover {
 .integration-facts span {
   margin: 0;
   color: var(--ink-mist);
-  font-size: var(--text-3xs);
-  font-weight: 500;
+  font: var(--type-label-12);
 }
 
 .integration-facts dd,
@@ -21705,7 +21804,7 @@ button.helper-sib:hover {
   margin: var(--space-1) 0 0;
   overflow: hidden;
   color: var(--ink-chalk);
-  font-size: var(--text-xs);
+  font: var(--type-label-13);
   font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -21722,7 +21821,7 @@ button.helper-sib:hover {
 .integration-actions {
   justify-content: space-between;
   gap: var(--space-2);
-  margin: var(--space-3) 0 0 44px;
+  margin: var(--space-3) 0 0 var(--integration-indent);
 }
 
 .integration-actions--end {
@@ -21734,7 +21833,7 @@ button.helper-sib:hover {
   grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: end;
   gap: var(--space-2);
-  margin: var(--space-4) 0 0 44px;
+  margin: var(--space-4) 0 0 var(--integration-indent);
 }
 
 .second-brain-picker #second-brain-detected-field {
@@ -21742,7 +21841,7 @@ button.helper-sib:hover {
 }
 
 .second-brain-new-hint {
-  margin-left: 44px;
+  margin-left: var(--integration-indent);
 }
 
 .second-brain-facts > div:nth-child(3),
@@ -21768,15 +21867,34 @@ button.helper-sib:hover {
 .integration-context-action {
   min-width: 0;
   color: var(--ink-mist);
-  font-size: var(--text-xs);
+  font: var(--type-label-13);
+}
+
+/* The two that are presses stand inside a sentence (「켜기」 after the ingest
+ * warning, obsidian.md after 「Obsidian이 없어도 됩니다」), so they take a
+ * link's face in the sentence's own type — left to the platform they drew a
+ * grey Arial box with an outset border. */
+button.integration-context-action {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink-chalk);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  transition: color var(--motion-fast) var(--ease-standard);
+}
+
+button.integration-context-action:hover {
+  color: var(--ink-mist);
 }
 
 .integration-error,
 .integration-empty {
-  margin: var(--space-3) 0 0 44px;
+  margin: var(--space-3) 0 0 var(--integration-indent);
   color: var(--ink-mist);
-  font-size: var(--text-xs);
-  line-height: var(--leading-body);
+  font: var(--type-copy-13);
 }
 
 .integration-error {
@@ -23499,7 +23617,7 @@ button.helper-sib:hover {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  margin: var(--space-3) 0 0 44px;
+  margin: var(--space-3) 0 0 var(--integration-indent);
   padding: var(--space-3);
   border: 1px solid var(--edge-rule);
   border-radius: var(--radius-md);
@@ -23538,7 +23656,7 @@ button.helper-sib:hover {
 }
 
 .integration-site-list {
-  margin: var(--space-3) 0 0 44px;
+  margin: var(--space-3) 0 0 var(--integration-indent);
   border-top: var(--rule-width) solid var(--edge-rule);
 }
 
@@ -23592,8 +23710,8 @@ button.helper-sib:hover {
 .developer-permission-title {
   display: block;
   color: var(--ink-chalk);
-  font-size: var(--text-xs);
-  font-weight: 550;
+  font: var(--type-label-14);
+  font-weight: 500;
 }
 
 .developer-permission-row > .settings-state {
@@ -23608,7 +23726,7 @@ button.helper-sib:hover {
   display: grid;
   grid-template-columns: minmax(0, 2fr) minmax(96px, 1fr);
   gap: var(--space-3);
-  margin: var(--space-3) 0 0 44px;
+  margin: var(--space-3) 0 0 var(--integration-indent);
 }
 
 .integration-provider--unavailable {
@@ -23643,6 +23761,16 @@ button.helper-sib:hover {
   margin-right: var(--space-4);
 }
 
+/* A control at the end of an option row takes a rung, not the row. With no
+ * `--field-w` of its own a select there resolved to the full 100% and
+ * pressed the words beside it into a one-word column (알림 › 「작업을
+ * 마쳤을 때」). It stands where the switches above it stand, 16px in. */
+.settings-view .settings-option-row > .settings-input {
+  flex: none;
+  width: min(100%, var(--field-md));
+  margin-inline-end: var(--space-4);
+}
+
 .settings-option-row--copy .settings-check {
   align-items: flex-start;
   padding-top: var(--space-3);
@@ -23671,8 +23799,7 @@ button.helper-sib:hover {
   display: block;
   margin-top: 2px;
   color: var(--ink-mist);
-  font-size: var(--text-2xs);
-  line-height: var(--leading-body);
+  font: var(--type-copy-13);
 }
 
 .settings-field--separated,
@@ -23731,7 +23858,7 @@ button.helper-sib:hover {
 
 .managed-judgment-model h4 {
   margin: 0;
-  font-size: var(--text-xs);
+  font: var(--type-heading-14);
 }
 
 .settings-pane[data-pane="judgment-models"] > .settings-card {
@@ -23754,7 +23881,7 @@ button.helper-sib:hover {
 }
 
 .judgment-model-source h4 {
-  font-size: var(--text-sm);
+  font: var(--type-heading-14);
   margin-block: var(--space-3);
 }
 
@@ -23770,6 +23897,7 @@ button.helper-sib:hover {
 .judgment-source-choices [aria-pressed="true"] {
   background: var(--row-selected);
   border-color: var(--ink-chalk);
+  box-shadow: 0 0 0 var(--rule-width) var(--ink-mist);
 }
 
 .judgment-model-destination {
@@ -23792,9 +23920,10 @@ button.helper-sib:hover {
   margin-block: var(--space-3);
   padding: var(--space-3);
   min-width: 0;
-  border: var(--rule-width) solid var(--ink-chalk);
-  border-radius: var(--radius-sm);
+  border: 0;
+  border-radius: var(--radius-md);
   background: var(--row-selected);
+  box-shadow: 0 0 0 var(--rule-width) var(--ink-mist);
   overflow-wrap: anywhere;
 }
 
@@ -23823,16 +23952,20 @@ button.helper-sib:hover {
 }
 
 .judgment-source-badge {
+  display: inline-flex;
+  align-items: center;
+  height: calc(var(--badge-height) - var(--space-1));
   padding: 0 var(--space-2);
-  border: var(--rule-width) solid var(--edge-mark);
   border-radius: var(--radius-pill);
+  background: var(--gray-alpha-200);
   color: var(--ink-mist);
-  font-size: var(--text-2xs);
+  font: var(--type-label-12);
+  font-weight: 500;
 }
 
 .judgment-source-badge[data-badge="current"] {
-  border-color: var(--ink-chalk);
   color: var(--ink-chalk);
+  box-shadow: 0 0 0 var(--rule-width) var(--ink-mist);
 }
 
 .judgment-source-steps {
@@ -24126,8 +24259,7 @@ progress:indeterminate::-webkit-progress-bar {
   max-width: var(--field-copy);
   margin: 0;
   color: var(--ink-chalk);
-  font-size: var(--text-2xs);
-  line-height: var(--leading-body);
+  font: var(--type-copy-13);
   word-break: var(--prose-word-break);
 }
 
@@ -24136,10 +24268,9 @@ progress:indeterminate::-webkit-progress-bar {
  * exactly once, when you go looking for them. */
 .settings-fold > summary {
   color: var(--ink-mist);
-  font-size: var(--text-2xs);
-  line-height: var(--leading-body);
+  font: var(--type-label-13);
   cursor: pointer;
-  transition: color 140ms ease;
+  transition: color var(--motion-fast) var(--ease-standard);
 }
 
 .settings-fold > summary:hover {
@@ -24150,8 +24281,7 @@ progress:indeterminate::-webkit-progress-bar {
   max-width: 60ch;
   margin: var(--space-1) 0 0;
   color: var(--ink-mist);
-  font-size: var(--text-2xs);
-  line-height: var(--leading-body);
+  font: var(--type-copy-13);
   word-break: var(--prose-word-break);
 }
 
@@ -24385,24 +24515,31 @@ progress:indeterminate::-webkit-progress-bar {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
-  padding: 6px var(--space-3);
-  border: var(--rule-width) solid var(--edge-rule);
-  border-radius: var(--radius-edge);
-  background: color-mix(in srgb, var(--surface-well) 50%, transparent);
+  min-height: var(--control-height-md);
+  padding: 0 var(--space-3);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border-small);
   color: var(--ink-mist);
-  font: inherit;
-  font-size: 14px;
+  font: var(--type-label-14);
   cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    box-shadow var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
 }
 
 .agent-pill:hover {
-  border-color: var(--edge-mark);
+  background: var(--row-hover);
   color: var(--ink-chalk);
 }
 
+/* Pressed is the ring in ink, the fill a step up and the words in weight —
+ * three answers, so it reads without the check beside it too. */
 .agent-pill[aria-pressed="true"] {
-  border-color: var(--edge-mark);
-  background: var(--row-active);
+  background: var(--row-selected);
+  box-shadow: 0 0 0 var(--rule-width) var(--ink-mist);
   color: var(--ink-chalk);
   font-weight: 500;
 }
@@ -24499,11 +24636,12 @@ progress:indeterminate::-webkit-progress-bar {
   display: grid;
   flex: none;
   place-items: center;
-  width: 28px;
-  height: 28px;
-  border: var(--rule-width) solid color-mix(in srgb, var(--edge-rule) 50%, transparent);
-  border-radius: var(--radius-edge);
-  background: color-mix(in srgb, var(--surface-well) 50%, transparent);
+  width: var(--control-height-sm);
+  height: var(--control-height-sm);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--surface-well);
+  box-shadow: var(--shadow-border);
 }
 
 .agent-chip .agent-ico {
@@ -24526,8 +24664,9 @@ progress:indeterminate::-webkit-progress-bar {
 
 /* Orca's row name: `text-sm font-medium leading-none` (`AgentRow`, :1301). */
 .agent-row-name {
+  margin: 0;
   color: var(--ink-chalk);
-  font-size: 14px;
+  font: var(--type-label-14);
   font-weight: 500;
 }
 
@@ -24535,8 +24674,7 @@ progress:indeterminate::-webkit-progress-bar {
  * of the "available" list: put this on PATH and the agent moves up. */
 .agent-row-cmd {
   color: var(--ink-mist);
-  font-family: var(--font-mono);
-  font-size: var(--text-2xs);
+  font: var(--type-label-12-mono);
 }
 .agent-support {
   display: block;
@@ -24907,6 +25045,13 @@ progress:indeterminate::-webkit-progress-bar {
   min-width: 0;
 }
 
+/* An account row's second line is a sentence or an address, not a command:
+ * it reads in Label 12. The mono face spread its Korean into
+ * 「이 기기의 Claude 로그인을 그대로 씁니다」 a letter apart. */
+.account-row .agent-row-cmd {
+  font: var(--type-label-12);
+}
+
 .account-pick:hover .agent-row-name {
   color: var(--ink-chalk);
 }
@@ -24933,7 +25078,10 @@ progress:indeterminate::-webkit-progress-bar {
    * Mist is what the unchosen row name already wears, and it passes both
    * treatments. */
   color: var(--ink-mist);
-  font-size: var(--text-2xs);
+  /* The whole face, not the size alone: a bare size left the family to the
+   * platform's button default, and these drew in Arial beside Geist words. */
+  font: var(--type-label-12);
+  font-weight: 500;
   cursor: pointer;
 }
 
@@ -25034,15 +25182,17 @@ progress:indeterminate::-webkit-progress-bar {
  * two strengths the row above does, so a person seeing both sees one colour
  * used twice rather than two reds. */
 .account-alarm {
+  display: inline-flex;
   flex: none;
-  height: 16px;
+  align-items: center;
+  height: calc(var(--badge-height) - var(--space-1));
   padding: 0 var(--space-2);
-  border: var(--rule-width) solid color-mix(in srgb, var(--signal-halt) 50%, transparent);
-  border-radius: var(--radius-xs);
-  background: color-mix(in srgb, var(--signal-halt) 10%, transparent);
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--red-200);
   color: var(--signal-halt-ink);
-  font-size: var(--text-3xs);
-  line-height: 14px;
+  font: var(--type-label-12);
+  font-weight: 500;
   white-space: nowrap;
 }
 
@@ -25094,18 +25244,21 @@ progress:indeterminate::-webkit-progress-bar {
  * agent edits files without asking — so it wears the wait signal rather than
  * the quiet ink a settings row would otherwise give it. */
 .agent-perm {
+  display: inline-flex;
   flex: none;
-  padding: 0 var(--space-1);
-  border-radius: var(--radius-xs);
-  font-size: var(--text-3xs);
-  font-weight: 600;
+  align-items: center;
+  height: calc(var(--badge-height) - var(--space-1));
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  font: var(--type-label-12);
+  font-weight: 500;
   color: var(--ink-mist);
-  background: var(--row-hover);
+  background: var(--gray-alpha-200);
 }
 
 .agent-perm[data-mode="unattended"] {
-  color: var(--signal-wait);
-  background: color-mix(in srgb, var(--signal-wait) 5%, transparent);
+  color: var(--signal-wait-ink);
+  background: var(--amber-200);
 }
 
 .agent-perm[data-mode="mixed"] {
@@ -25125,8 +25278,7 @@ progress:indeterminate::-webkit-progress-bar {
   border-radius: var(--radius-xs);
   background: none;
   color: var(--ink-mist);
-  font-family: var(--font-mono);
-  font-size: var(--text-2xs);
+  font: var(--type-label-12-mono);
 }
 
 .agent-launch-args:hover,
@@ -29217,14 +29369,25 @@ progress:indeterminate::-webkit-progress-bar {
 .qo--settings .keys-search,
 .settings-view .keys-search {
   width: 100%;
-  height: var(--segment-height);
-  padding: 0 var(--space-2);
-  border: var(--rule-width) solid var(--edge-rule);
-  border-radius: var(--radius-edge);
-  background: var(--surface-well);
+  height: var(--control-height-md);
+  padding: 0 var(--control-pad-inline);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border);
   color: var(--ink-chalk);
-  font: inherit;
-  font-size: var(--text-xs);
+  font: var(--type-label-14);
+  transition: box-shadow var(--motion-fast) var(--ease-standard);
+}
+
+.settings-view .keys-search:hover {
+  box-shadow: 0 0 0 var(--rule-width) var(--edge-mark);
+}
+
+.settings-view .keys-search:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: calc(var(--focus-ring-offset) * -1);
+  box-shadow: none;
 }
 
 .qo--settings .keys-search::placeholder,
@@ -29248,11 +29411,9 @@ progress:indeterminate::-webkit-progress-bar {
  * above it, tracked out the way the panel titles in this window are. */
 .keys-group {
   margin: var(--space-3) 0 var(--space-1);
-  color: var(--ink-label);
-  font-size: var(--text-2xs);
-  font-weight: 600;
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  font-weight: 500;
 }
 
 .keys-group:first-child {
@@ -29816,34 +29977,211 @@ select {
   border-bottom-color: var(--ink-mist);
 }
 
-/* Something is set but not in force yet. Orca draws this as a bordered amber
+/* ---- the settings screen's controls are Geist's (2026-11-08) -------------
+ *
+ * The person: 「설정에 디자인중에 geist 스타일 아닌걸 개선해야할거같아」. The
+ * face above is the dialogs' — an underlined mono row — and it stays theirs;
+ * the settings screen had borrowed it along with them, so every value on
+ * the screen read as a line of code and a Korean option spread out in a
+ * fixed-width face (「최근  사용  순서」). Here a field, a select, a button and
+ * a segmented choice are the Geist controls the artifact studio and the
+ * workbench already wear: a control's 32px, the 1px ring instead of a
+ * border, the 6px corner, Label 14 for words and Geist Mono only for a value
+ * read as code (`.settings-input--mono`). Focus is the contract's 2px ink
+ * line, drawn as an outline so the resting ring cannot cover it. */
+.settings-view .settings-input {
+  height: var(--control-height-md);
+  padding: 0 var(--control-pad-inline);
+  border: 0;
+  border-radius: var(--radius-md);
+  background-color: var(--surface-deck);
+  box-shadow: var(--shadow-border);
+  font: var(--type-label-14);
+  font-variant-numeric: tabular-nums;
+  transition: box-shadow var(--motion-fast) var(--ease-standard);
+}
+
+.settings-view .settings-input--mono {
+  font: var(--type-label-13-mono);
+}
+
+/* The chevron stands a step in from the ring rather than against it, and the
+ * longest option keeps its room. */
+.settings-view select.settings-input {
+  --select-room: calc(var(--space-2) + 16px + var(--space-1));
+  padding-inline-end: var(--select-room);
+  background-position: right var(--space-2) center;
+}
+
+.settings-view textarea.settings-input {
+  height: auto;
+  min-height: calc(var(--control-height-md) * 3);
+  padding: var(--space-2) var(--control-pad-inline);
+}
+
+.settings-view .settings-input:hover:enabled {
+  box-shadow: 0 0 0 var(--rule-width) var(--edge-mark);
+}
+
+.settings-view .settings-input:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: calc(var(--focus-ring-offset) * -1);
+  box-shadow: none;
+}
+
+/* A file field is its button and the name it chose: the button is a Geist
+ * button, the name a quiet label beside it, and no box around the pair. */
+.settings-view input[type="file"].settings-input {
+  height: auto;
+  padding: 0;
+  background-color: transparent;
+  box-shadow: none;
+  color: var(--ink-mist);
+  font: var(--type-label-13);
+}
+
+.settings-view input[type="file"].settings-input::file-selector-button {
+  height: var(--control-height-md);
+  margin-inline-end: var(--space-2);
+  padding: 0 var(--control-pad-inline);
+  border: 0;
+  border-radius: var(--radius-md);
+  background-color: var(--surface-deck);
+  box-shadow: var(--shadow-border-small);
+  color: var(--ink-chalk);
+  font: var(--type-label-14);
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.settings-view .btn {
+  justify-content: center;
+  min-height: var(--control-height-md);
+  padding: 0 var(--control-pad-inline);
+  border: 0;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-border-small);
+  font: var(--type-label-14);
+  font-weight: 500;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    box-shadow var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
+}
+
+.settings-view .btn:not(.btn--primary):hover:enabled {
+  background-color: var(--row-hover);
+}
+
+.settings-view .btn--primary {
+  box-shadow: none;
+}
+
+.settings-view .btn--primary:hover:enabled {
+  background-color: color-mix(in srgb, var(--ink-chalk) 86%, transparent);
+}
+
+/* Destructive keeps its word in the halt ink, and its ring takes the same
+ * hue at the strength the border had. */
+.settings-view .btn--halt {
+  box-shadow:
+    0 0 0 var(--rule-width) color-mix(in srgb, var(--signal-halt) 45%, var(--edge-rule)),
+    var(--material-drop);
+}
+
+/* A glyph-only button beside a word button wears the same face (통계 ›
+ * 사용량 분석's filters and refresh beside the provider): the ring and drop,
+ * the 6px corner and the ink — a step smaller, square, centred on the row. */
+.settings-view .icon-btn {
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border-small);
+  color: var(--ink-chalk);
+}
+
+/* A segmented choice is the workbench's switch (`.board-mode`): a recessed
+ * track a control's height, and the chosen segment a raised thumb that says
+ * so with weight and depth as well as fill. The words never wrap inside a
+ * segment — 「내가 연 판」 folded onto two lines in a 24px cell and lost its
+ * second line — so the track grows to them, and where the column is too
+ * narrow for every segment on one line (Spanish at 720px: 「Dividir
+ * horizontalmente」) the track wraps its segments, as the board's does. */
+.settings-view .segment:not(.segment--line) {
+  flex-wrap: wrap;
+  max-width: 100%;
+  gap: var(--workbench-track-inset);
+  padding: var(--workbench-track-inset);
+  border-radius: var(--radius-md);
+  background: var(--surface-well);
+  overflow: visible;
+}
+
+.settings-view .segment:not(.segment--line) > .segment-btn {
+  height: auto;
+  min-height: calc(var(--control-height-sm) - var(--workbench-track-inset) * 2);
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-sm);
+  color: var(--ink-label);
+  font: var(--type-label-13);
+  white-space: nowrap;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    box-shadow var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
+}
+
+.settings-view .segment:not(.segment--line) > .segment-btn + .segment-btn {
+  border-left: 0;
+}
+
+.settings-view .segment:not(.segment--line) > .segment-btn:hover {
+  background: var(--row-hover);
+  color: var(--ink-chalk);
+}
+
+.settings-view .segment:not(.segment--line) > .segment-btn.is-active {
+  background: var(--workbench-thumb);
+  box-shadow: var(--shadow-2);
+  color: var(--ink-chalk);
+  font-weight: 600;
+}
+
+.settings-view :is(.btn, .segment-btn, .icon-btn):focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+/* Something is set but not in force yet. Orca drew this as a bordered amber
  * panel with the heading, the sentence and the way out of it
- * (`rounded-md border border-yellow-500/50 bg-yellow-500/10 px-3 py-2.5`,
- * Settings-Db2c7R7D.js:5228). The amber is our `--signal-wait` role, which is
- * what that colour MEANS here — a thing waiting on a person. */
+ * (Settings-Db2c7R7D.js:5228); Geist draws the same Note as the tinted
+ * ground inside a ring of its own hue. The amber is our `--signal-wait`
+ * role, which is what that colour MEANS here — a thing waiting on a person —
+ * and words on it take the wait ink. */
 .settings-notice {
   display: grid;
   justify-items: start;
   gap: var(--space-2);
   margin: var(--space-2) var(--space-4) 0;
   padding: var(--space-3);
-  border: var(--rule-width) solid color-mix(in srgb, var(--signal-wait) 50%, transparent);
-  border-radius: var(--radius-edge);
-  background: color-mix(in srgb, var(--signal-wait) 10%, transparent);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--signal-wait-ground);
+  box-shadow: 0 0 0 var(--rule-width) color-mix(in srgb, var(--signal-wait) 45%, transparent);
+  color: var(--ink-chalk);
+  font: var(--type-copy-13);
 }
 
 .settings-notice-title {
   margin: 0;
-  color: var(--signal-wait);
-  font-size: var(--text-xs);
-  font-weight: 600;
+  color: var(--signal-wait-ink);
+  font: var(--type-heading-14);
 }
 
 .settings-notice-body {
   margin: 0;
   color: var(--ink-mist);
-  font-size: var(--text-xs);
-  line-height: var(--leading-body);
+  font: var(--type-copy-13);
 }
 
 /* The same dim auxiliary inside a notice line (the toast's `.toast-aux`). */
@@ -31128,8 +31466,10 @@ input[type="search"]::-webkit-search-cancel-button {
   place-items: center;
   width: 40px;
   height: 40px;
-  border: 1px solid var(--edge-rule);
-  border-radius: var(--radius-sm);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--surface-well);
+  box-shadow: var(--shadow-border);
   color: var(--ink-chalk);
 }
 
@@ -31145,27 +31485,34 @@ input[type="search"]::-webkit-search-cancel-button {
 
 .orch-title {
   margin: 0;
-  font-size: 15px;
-  font-weight: 600;
+  font: var(--type-heading-16);
+  letter-spacing: var(--tracking-heading-16);
   color: var(--ink-chalk);
 }
 
+/* The skill's state beside its name: Geist's small badge, ready on the green
+ * 200 ground. */
 .orch-pill {
-  border: 1px solid var(--edge-rule);
-  border-radius: 999px;
-  padding: 1px var(--space-2);
-  font-size: var(--text-2xs);
+  display: inline-flex;
+  align-items: center;
+  height: calc(var(--badge-height) - var(--space-1));
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--gray-alpha-200);
   color: var(--ink-mist);
+  font: var(--type-label-12);
+  font-weight: 500;
+  white-space: nowrap;
 }
 
 .orch-pill.is-on {
-  border-color: color-mix(in srgb, var(--signal-ready) 45%, var(--edge-rule));
-  color: var(--signal-ready);
+  background: var(--green-200);
+  color: var(--signal-ready-ink);
 }
 
 .orch-note {
   margin: var(--space-1) 0 0;
-  font-size: 13px;
+  font: var(--type-copy-13);
   color: var(--ink-mist);
 }
 
@@ -31180,11 +31527,13 @@ input[type="search"]::-webkit-search-cancel-button {
   display: flex;
   gap: var(--space-2);
   align-items: center;
+  min-height: var(--control-height-md);
   margin-top: var(--space-3);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--edge-rule);
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--surface-raised) 35%, transparent);
+  padding: 0 var(--space-1) 0 var(--space-3);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--surface-well);
+  box-shadow: var(--shadow-border);
 }
 
 .orch-command code {
@@ -31227,14 +31576,13 @@ input[type="search"]::-webkit-search-cancel-button {
 
 .orch-coverage-title {
   margin: 0;
-  font-size: var(--text-sm);
-  font-weight: 500;
+  font: var(--type-heading-14);
   color: var(--ink-chalk);
 }
 
 .orch-summary {
   margin: var(--space-1) 0 0;
-  font-size: var(--text-xs);
+  font: var(--type-copy-13);
   color: var(--ink-mist);
 }
 
@@ -31247,12 +31595,14 @@ input[type="search"]::-webkit-search-cancel-button {
 
 .orch-chip {
   display: inline-flex;
-  gap: 6px;
+  gap: var(--space-2);
   align-items: center;
-  border: 1px solid var(--edge-rule);
-  border-radius: 999px;
-  padding: 3px 10px;
-  font-size: var(--text-xs);
+  min-height: var(--badge-height);
+  padding: 0 var(--control-pad-inline);
+  border: 0;
+  border-radius: var(--radius-pill);
+  box-shadow: var(--shadow-border);
+  font: var(--type-label-12);
   color: var(--ink-mist);
 }
 
@@ -31262,12 +31612,11 @@ input[type="search"]::-webkit-search-cancel-button {
 }
 
 .orch-chip-state {
-  font-size: var(--text-3xs);
   font-weight: 500;
 }
 
 .orch-chip.is-ready {
-  border-color: color-mix(in srgb, var(--signal-ready) 45%, var(--edge-rule));
+  box-shadow: 0 0 0 var(--rule-width) color-mix(in srgb, var(--signal-ready) 45%, var(--edge-rule));
 }
 
 .orch-chip.is-ready .orch-chip-state {
@@ -31435,11 +31784,17 @@ input[type="search"]::-webkit-search-cancel-button {
   gap: var(--space-1);
 }
 
-.worker-models-fields .settings-input {
+/* A table's cell holds two pickers side by side, so they are Geist's dense
+ * control: 28px, an 8px lead and the chevron's own room on the right, the
+ * model id in Label 12 Mono — the screen's 10px lead and wider chevron room
+ * cut 「gpt-6-luna」 to 「gpt-6-lu」 here. */
+.settings-view .worker-models-fields .settings-input {
   width: 100%;
   min-width: 0;
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
+  height: var(--control-height-sm);
+  padding-inline: var(--space-2) var(--space-5);
+  background-position: right var(--space-1) center;
+  font: var(--type-label-12-mono);
 }
 
 .worker-models-fields .settings-input.is-auto {
@@ -31634,20 +31989,21 @@ input[type="search"]::-webkit-search-cancel-button {
 }
 
 .computer-use-permission-state {
-  padding: 1px var(--space-2);
-  border: 1px solid var(--edge-rule);
-  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  height: calc(var(--badge-height) - var(--space-1));
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--gray-alpha-200);
   color: var(--ink-mist);
-  font-size: var(--text-3xs);
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  font: var(--type-label-12);
+  font-weight: 500;
 }
 
 .computer-use-permission-state.is-on {
-  border-color: color-mix(in srgb, var(--signal-ready) 40%, var(--edge-rule));
-  background: color-mix(in srgb, var(--signal-ready) 9%, transparent);
-  color: var(--signal-ready);
+  background: var(--green-200);
+  color: var(--signal-ready-ink);
 }
 
 .computer-use-permission-open {
@@ -32907,114 +33263,354 @@ input[type="search"]::-webkit-search-cancel-button {
  * and the ordinary card surface for everything in between. */
 /* ------------------------------------------------------- workspace board
  *
- * A non-modal working sheet beside the workspace rail. The visual hierarchy
- * follows Orca 1.4.187's WorkspaceKanbanDrawer: one quiet plane, a compact
- * header, a pinned drop rail, then horizontally scrolling status lanes. */
+ * A stage tab like 작업 · 아티팩트 · 받은 편지함 (2026-11-08, window artifact
+ * p-a729f620c8f3efc7 v2, passed as recommended). It used to be Orca's
+ * WorkspaceKanbanDrawer — a sheet over the stage and the right column, shut
+ * by its own ×. Now the stage moves its one host into the leaf that shows it
+ * and the tab's ×, ⌘W or the sidebar row close it.
+ *
+ * Geist throughout: the page is background-100 ruled by gray-alpha-400, the
+ * head is the artifacts head's two rows (underline tabs and the primary at
+ * the right end; the chips and the search under them), the list is 40px rows
+ * under one sticky column head, the kanban is background-100 cards ringed on
+ * background-200 lanes. No gradient, no node shadow, no lift, no hex — every
+ * value is a role from tokens.css, and every state eases on the motion pair. */
 .workspace-board {
   container: workspace-board / inline-size;
   --workspace-board-column-width: 308px;
-  position: absolute;
-  z-index: 18;
-  inset: 0 0 0 var(--sidebar-width);
+  /* Name · activity · stage · changes·PR · doors. The doors column is fixed
+   * so the column head and the rows divide the width the same way: 변경,
+   * 작업 and ⋯ at the control height, and the gaps between them. */
+  --workspace-board-doors-width: calc(var(--control-height-sm) * 3 + var(--space-5));
+  --workspace-board-row-columns: minmax(0, 1.45fr) minmax(0, 1.4fr) minmax(9em, 0.7fr) minmax(0, 1.5fr) var(--workspace-board-doors-width);
+  --workspace-board-row-height: calc(var(--space-6) + var(--space-2));
+  --workspace-board-mark: calc(var(--space-2) + var(--space-1));
+  --workspace-board-folded-lane: calc(var(--space-6) + var(--space-3));
+  --workspace-board-search-width: calc(var(--space-6) * 10);
+  position: relative;
   display: flex;
+  width: 100%;
+  height: 100%;
   min-width: 0;
+  min-height: 0;
   flex-direction: column;
   overflow: hidden;
-  color: var(--nav-plane-ink);
-  background: var(--nav-plane);
-  border-left: var(--rule-width) solid var(--nav-plane-rule);
-  box-shadow: var(--shadow-drop);
-  animation: workspace-board-enter 180ms cubic-bezier(0.2, 0, 0, 1) both;
+  color: var(--ink-chalk);
+  background: var(--surface-deck);
 }
 
 .workspace-board[hidden] {
   display: none;
 }
 
-.body.is-sidebar-folded .workspace-board {
-  left: 0;
-}
-
-@keyframes workspace-board-enter {
-  from {
-    opacity: 0;
-    transform: translateX(-10px);
-  }
-}
-
+/* ---- the head: the artifacts head's two rows ---- */
 .workspace-board-head {
   position: relative;
   display: flex;
-  min-height: var(--workbench-head-min-height);
   flex: none;
-  align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-2) var(--space-3) var(--space-2) var(--space-4);
-  border-bottom: var(--rule-width) solid var(--nav-plane-rule);
-  background: var(--workbench-ambient), color-mix(in srgb, var(--nav-plane) 96%, var(--ink-chalk));
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: var(--rule-width) solid var(--edge-rule);
 }
 
-.workspace-board-heading-row {
+.workspace-board-head-row {
   display: flex;
-  min-width: max-content;
+  min-width: 0;
   align-items: center;
   gap: var(--space-2);
 }
 
-.workspace-board-title {
+.workspace-board-head-row.is-second {
+  flex-wrap: wrap;
+}
+
+.workspace-board-head-spacer {
+  flex: 1 1 auto;
+}
+
+/* The view switch is the artifacts head's underline tabs: the chosen tab is
+ * ink words over one rule. */
+.workspace-board-views {
+  display: inline-flex;
+  flex: none;
+  align-self: stretch;
+}
+
+.workspace-board-views button {
+  position: relative;
+  height: var(--control-height-sm);
+  padding: 0 var(--space-3);
+  border: 0;
+  background: none;
+  color: var(--ink-mist);
+  font: var(--type-label-14);
+  cursor: pointer;
+  transition: color var(--motion-fast) var(--ease-standard);
+}
+
+.workspace-board-views button:hover,
+.workspace-board-views button[aria-pressed="true"] {
+  color: var(--ink-chalk);
+}
+
+/* The rule stands at the tab's own foot, as under the artifacts tabs — the
+ * head has a second row under this one, and a rule dropped to the head's
+ * edge would land on that row's chips. */
+.workspace-board-views button[aria-pressed="true"]::after {
+  position: absolute;
+  inset: auto var(--space-3) 0;
+  height: var(--accent-rule);
+  background: var(--ink-chalk);
+  content: "";
+}
+
+.workspace-board-views button:focus-visible {
+  outline: var(--accent-rule) solid var(--ink-chalk);
+  outline-offset: calc(var(--accent-rule) * -1);
+}
+
+.workspace-board-records {
+  display: inline-flex;
+  flex: none;
+  height: var(--control-height-sm);
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--ink-label);
+  font: var(--type-label-13);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard), color var(--motion-fast) var(--ease-standard);
+}
+
+.workspace-board-records[hidden] {
+  display: none;
+}
+
+.workspace-board-records:hover,
+.workspace-board-records[aria-expanded="true"] {
+  background: var(--row-hover);
+  color: var(--ink-chalk);
+}
+
+.workspace-board-records .icon {
+  width: var(--icon-size-sm);
+  height: var(--icon-size-sm);
+}
+
+.workspace-board-records-short {
+  display: none;
+}
+
+.workspace-board-actions {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.workspace-board-actions .foot-icon {
+  width: var(--control-height-sm);
+  height: var(--control-height-sm);
+  border-radius: var(--radius-md);
+}
+
+.workspace-board-filter {
+  position: relative;
+}
+
+.workspace-board-filter .workspace-board-filter-count {
+  top: calc(var(--space-1) * -1);
+  right: calc(var(--space-1) * -1);
+}
+
+.workspace-board-new {
+  flex: none;
+  height: var(--control-height-sm);
+  padding: 0 var(--space-3);
+  gap: var(--space-1);
+  border-radius: var(--radius-md);
+  font: var(--type-label-13);
+  font-weight: 600;
+}
+
+.workspace-board-new .icon {
+  width: var(--icon-size);
+  height: var(--icon-size);
+}
+
+/* The second row: how many, the three chips, the fit switch, the search. */
+.workspace-board-summary {
+  display: flex;
+  min-width: 0;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
   margin: 0;
-  color: var(--nav-plane-ink);
+}
+
+.workspace-board-total {
+  margin-right: var(--space-1);
+  color: var(--ink-label);
+  font: var(--type-label-13);
+}
+
+/* A chip is a filter: its word, its count, and a mark that says the same in
+ * shape — a ring for what waits on the person (the one blue), a filled dot
+ * for work, a square for what git has not landed. */
+.workspace-board-chip {
+  display: inline-flex;
+  height: calc(var(--control-height-sm) - var(--space-1));
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-3) 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  box-shadow: var(--shadow-border);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard), color var(--motion-fast) var(--ease-standard), box-shadow var(--motion-fast) var(--ease-standard);
+}
+
+.workspace-board-chip[hidden] {
+  display: none;
+}
+
+.workspace-board-chip:hover {
+  background: var(--row-hover);
+  color: var(--ink-chalk);
+}
+
+.workspace-board-chip[aria-pressed="true"] {
+  background: var(--row-selected);
+  color: var(--ink-chalk);
+  box-shadow: 0 0 0 var(--rule-width) var(--ink-mist);
+}
+
+.workspace-board-chip::before {
+  width: var(--status-dot);
+  height: var(--status-dot);
+  flex: none;
+  box-sizing: border-box;
+  border-radius: 50%;
+  content: "";
+}
+
+.workspace-board-chip-count {
+  color: var(--ink-chalk);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.workspace-board-chip[data-chip="you"] {
+  color: var(--signal-you);
+  box-shadow: 0 0 0 var(--rule-width) color-mix(in srgb, var(--signal-you) 45%, transparent);
+}
+
+.workspace-board-chip[data-chip="you"] .workspace-board-chip-count {
+  color: var(--signal-you);
+}
+
+.workspace-board-chip[data-chip="you"]::before {
+  border: var(--status-dot-ring) solid var(--signal-you);
+}
+
+.workspace-board-chip[data-chip="work"]::before {
+  background: var(--signal-ready);
+}
+
+.workspace-board-chip[data-chip="ahead"]::before {
+  border: var(--status-dot-ring) solid var(--edge-mark);
+  border-radius: var(--radius-xs);
 }
 
 .workspace-board-selected {
-  padding: 3px 7px;
-  border-radius: 999px;
-  color: var(--ink-mist);
-  background: var(--nav-plane-accent);
-  font-size: 10px;
-  font-weight: 600;
-  line-height: 1;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--row-selected);
+  color: var(--ink-chalk);
+  font: var(--type-label-12);
 }
 
-.workspace-board-search {
-  position: relative;
+.workspace-board-selected[hidden] {
+  display: none;
+}
+
+.workspace-board-layout-controls {
   display: flex;
-  width: min(400px, 42vw);
-  height: 32px;
-  min-width: 180px;
-  align-items: center;
-  gap: 7px;
-  margin-right: auto;
-  padding: 0 9px;
-  color: var(--ink-mist);
-  border: var(--rule-width) solid var(--nav-plane-rule);
+  flex: none;
+  gap: var(--space-2);
+}
+
+.workspace-board-layout-controls[hidden] {
+  display: none;
+}
+
+.workspace-board-layout-controls .btn {
+  height: var(--control-height-sm);
+  padding: 0 var(--space-3);
+  border: 0;
   border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--surface-abyss) 34%, transparent);
-  transition: border-color var(--motion-fast) var(--ease-standard), background-color var(--motion-fast) var(--ease-standard);
+  box-shadow: var(--shadow-border);
+  color: var(--ink-mist);
+  font: var(--type-label-13);
+  transition: background-color var(--motion-fast) var(--ease-standard), color var(--motion-fast) var(--ease-standard);
+}
+
+.workspace-board-layout-controls .btn[aria-pressed="true"] {
+  background: var(--row-selected);
+  color: var(--ink-chalk);
+}
+
+/* The search is the artifacts head's: a ring, the glass, the field, and the
+ * window's keycap while nothing is typed. */
+.workspace-board-search {
+  display: flex;
+  min-width: 12em;
+  flex: 0 1 var(--workspace-board-search-width);
+  height: var(--control-height-sm);
+  align-items: center;
+  gap: var(--space-2);
+  margin-left: auto;
+  padding: 0 var(--space-2) 0 var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border);
+  color: var(--ink-mist);
+  transition: box-shadow var(--motion-fast) var(--ease-standard);
+}
+
+.workspace-board-search:hover {
+  box-shadow: 0 0 0 var(--rule-width) var(--edge-mark);
 }
 
 .workspace-board-search:focus-within {
-  border-color: color-mix(in srgb, var(--nav-plane-ring) 70%, transparent);
-  background: color-mix(in srgb, var(--surface-abyss) 48%, transparent);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--nav-plane-ring) 15%, transparent);
+  box-shadow: 0 0 0 var(--rule-width) var(--ink-mist);
 }
 
 .workspace-board-search > .icon {
-  width: 14px;
-  height: 14px;
+  width: var(--icon-size);
+  height: var(--icon-size);
   flex: none;
 }
 
 .workspace-board-search input {
   width: 100%;
   min-width: 0;
+  flex: 1;
   padding: 0;
-  color: var(--nav-plane-ink);
   border: 0;
   outline: 0;
   background: transparent;
-  font: inherit;
-  font-size: 12px;
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
 }
 
 .workspace-board-search input::-webkit-search-cancel-button {
@@ -33023,374 +33619,393 @@ input[type="search"]::-webkit-search-cancel-button {
 
 .workspace-board-search-count {
   flex: none;
-  color: var(--ink-mist);
-  font-size: 10px;
+  color: var(--ink-label);
+  font: var(--type-label-12);
   font-variant-numeric: tabular-nums;
+}
+
+.workspace-board-search-keys {
+  flex: none;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-xs);
+  box-shadow: var(--shadow-border);
+  color: var(--ink-label);
+  font: var(--type-label-12-mono);
+  pointer-events: none;
+}
+
+.workspace-board-search-count[hidden],
+.workspace-board-search-keys[hidden],
+.workspace-board-search-clear[hidden] {
+  display: none;
 }
 
 .workspace-board-search-clear {
   display: grid;
-  width: 20px;
-  height: 20px;
+  width: var(--space-5);
+  height: var(--space-5);
   flex: none;
   place-items: center;
   padding: 0;
-  color: var(--ink-mist);
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
+  color: var(--ink-mist);
   transition: color var(--motion-fast) var(--ease-standard), background-color var(--motion-fast) var(--ease-standard);
 }
 
 .workspace-board-search-clear:hover {
-  color: var(--ink-chalk);
   background: var(--row-hover);
+  color: var(--ink-chalk);
 }
 
 .workspace-board-search-clear .icon {
-  width: 12px;
-  height: 12px;
+  width: var(--icon-size-sm);
+  height: var(--icon-size-sm);
 }
 
-.workspace-board-actions {
-  display: flex;
-  flex: none;
-  align-items: center;
-  gap: 2px;
+/* The orchestration record, folded behind its button and opened as what
+ * floats: radius 12, the float shadow. */
+.workspace-board-accuracy {
+  position: absolute;
+  z-index: 9;
+  top: calc(var(--space-3) + var(--control-height-sm) + var(--space-1));
+  right: var(--space-4);
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: var(--space-2) var(--space-5);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-menu);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-float);
 }
 
-.workspace-board-actions .foot-icon {
-  width: 28px;
-  height: 28px;
+.workspace-board-accuracy[hidden] {
+  display: none;
 }
 
-.workspace-board-filter {
-  position: relative;
+.workspace-board-accuracy-title {
+  grid-column: 1 / -1;
+  color: var(--ink-chalk);
+  font: var(--type-heading-14);
 }
 
-.workspace-board-filter .workspace-board-filter-count {
-  top: -3px;
-  right: -3px;
+.workspace-board-accuracy-chip {
+  display: inline-flex;
+  justify-content: space-between;
+  gap: var(--space-4);
+  color: var(--ink-mist);
+  font: var(--type-label-13);
 }
 
+.workspace-board-accuracy-chip strong {
+  color: var(--ink-chalk);
+  font-variant-numeric: tabular-nums;
+}
+
+.workspace-board-accuracy-samples {
+  grid-column: 1 / -1;
+  color: var(--ink-label);
+  font: var(--type-label-12);
+}
+
+/* ---- the body ---- */
 .workspace-board-body {
   position: relative;
   display: flex;
   min-height: 0;
   flex: 1;
   flex-direction: column;
-  padding: 12px;
+  padding: 0 var(--space-4);
+}
+
+.workspace-board[data-view="kanban"] .workspace-board-body {
+  padding: var(--space-3) var(--space-4) var(--space-4);
 }
 
 .workspace-board-pin {
   display: flex;
-  height: 34px;
+  height: var(--control-height-md);
   flex: none;
   align-items: center;
   gap: var(--space-2);
-  margin-bottom: 12px;
-  padding: 0 12px;
+  margin-bottom: var(--space-3);
+  padding: 0 var(--space-3);
   color: var(--ink-mist);
-  border: var(--rule-width) dashed color-mix(in srgb, var(--nav-plane-ring) 42%, transparent);
+  border: var(--rule-width) dashed var(--edge-mark);
   border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--surface-abyss) 22%, transparent);
-  font-size: 11px;
+  font: var(--type-label-12);
   transition: color var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard), background-color var(--motion-fast) var(--ease-standard);
 }
 
 .workspace-board-pin > .icon {
-  width: 14px;
-  height: 14px;
+  width: var(--icon-size);
+  height: var(--icon-size);
 }
 
 .workspace-board-pin strong {
-  color: var(--nav-plane-ink);
-  font-size: 12px;
+  color: var(--ink-chalk);
   font-weight: 600;
 }
 
 .workspace-board-pin.is-drop-target {
-  color: var(--nav-plane-ink);
-  border-color: var(--nav-plane-ring);
-  background: var(--nav-plane-accent);
+  color: var(--ink-chalk);
+  border-color: var(--ink-mist);
+  background: var(--row-selected);
 }
+
+.workspace-board[data-pin-zone="hidden"] .workspace-board-pin { display: none; }
 
 .workspace-board-lanes {
   display: grid;
-  min-height: 0;
   min-width: 100%;
+  min-height: 0;
   flex: 1;
-  grid-auto-columns: var(--workspace-board-column-width);
+  grid-auto-columns: max-content;
   grid-auto-flow: column;
-  gap: 12px;
+  gap: var(--space-3);
   overflow-x: auto;
   overflow-y: hidden;
   overscroll-behavior-x: contain;
   scrollbar-width: thin;
 }
 
-.workspace-board-lane {
-  --workspace-status: var(--ink-mist);
-  --workspace-status-tint: color-mix(in srgb, var(--workspace-status) 4%, transparent);
-  position: relative;
-  display: flex;
-  width: var(--workspace-board-column-width);
+/* ---- the list: 40px rows under one column head ---- */
+.workspace-board[data-view="list"] .workspace-board-lanes {
+  display: block;
   min-width: 0;
-  min-height: 0;
-  flex-direction: column;
-  overflow: hidden;
-  border: var(--rule-width) solid var(--nav-plane-rule);
-  border-top: 2px solid color-mix(in srgb, var(--workspace-status) 70%, transparent);
-  border-radius: var(--workbench-card-radius);
-  background: var(--workspace-status-tint);
-  transition: border-color var(--motion-fast) var(--ease-standard), background-color var(--motion-fast) var(--ease-standard);
+  overflow: auto;
+  padding-bottom: var(--space-4);
+  scrollbar-gutter: stable;
 }
 
-/* One map from a stage's persisted colour id to its role, read by the lane,
- * the settings row and (list view) the card's stage chip — t-3818 folded the
- * two copies this used to be into one. */
-:is(.workspace-board-lane, .workspace-board-status-row, .workspace-board-card-stage)[data-color="blue"] { --workspace-status: var(--workspace-board-blue); }
-:is(.workspace-board-lane, .workspace-board-status-row, .workspace-board-card-stage)[data-color="sky"] { --workspace-status: var(--workspace-board-sky); }
-:is(.workspace-board-lane, .workspace-board-status-row, .workspace-board-card-stage)[data-color="violet"] { --workspace-status: var(--workspace-board-violet); }
-:is(.workspace-board-lane, .workspace-board-status-row, .workspace-board-card-stage)[data-color="amber"] { --workspace-status: var(--workspace-board-amber); }
-:is(.workspace-board-lane, .workspace-board-status-row, .workspace-board-card-stage)[data-color="emerald"] { --workspace-status: var(--workspace-board-emerald); }
-:is(.workspace-board-lane, .workspace-board-status-row, .workspace-board-card-stage)[data-color="rose"] { --workspace-status: var(--workspace-board-rose); }
-:is(.workspace-board-lane, .workspace-board-status-row, .workspace-board-card-stage)[data-color="zinc"] { --workspace-status: var(--workspace-board-zinc); }
-:is(.workspace-board-lane, .workspace-board-status-row, .workspace-board-card-stage)[data-color="conductor-progress"] { --workspace-status: var(--pr-lane-progress); }
-:is(.workspace-board-lane, .workspace-board-status-row, .workspace-board-card-stage)[data-color="conductor-review"] { --workspace-status: var(--pr-lane-review); }
-:is(.workspace-board-lane, .workspace-board-status-row, .workspace-board-card-stage)[data-color="conductor-done"] { --workspace-status: var(--pr-lane-done); }
-
-.workspace-board-lane.is-drop-target {
-  border-color: color-mix(in srgb, var(--workspace-status) 78%, var(--nav-plane-ring));
-  background: color-mix(in srgb, var(--workspace-status) 10%, transparent);
+.workspace-board-columns {
+  position: sticky;
+  z-index: 3;
+  top: 0;
+  display: grid;
+  height: var(--control-height-sm);
+  grid-template-columns: var(--workspace-board-row-columns);
+  grid-template-areas: "name live plan git doors";
+  align-items: center;
+  gap: 0 var(--space-4);
+  padding: 0 var(--space-2);
+  border-bottom: var(--rule-width) solid var(--edge-rule);
+  background: var(--surface-deck);
+  color: var(--ink-label);
+  font: var(--type-label-12);
 }
 
-.workspace-board-lane-head {
+.workspace-board-columns > :nth-child(1) { grid-area: name; }
+.workspace-board-columns > :nth-child(2) { grid-area: live; }
+.workspace-board-columns > :nth-child(3) { grid-area: plan; }
+.workspace-board-columns > :nth-child(4) { grid-area: git; }
+.workspace-board-columns > :nth-child(5) { grid-area: doors; }
+
+.workspace-board-project-group {
+  min-width: 0;
+}
+
+.workspace-board-project-head {
+  position: sticky;
+  z-index: 2;
+  top: var(--control-height-sm);
   display: flex;
-  height: 38px;
-  flex: none;
+  width: 100%;
+  height: var(--control-height-md);
   align-items: center;
   gap: var(--space-2);
-  padding: 0 var(--space-2) 0 var(--space-3);
-  border-bottom: var(--rule-width) solid var(--nav-plane-rule);
-  /* The stage's own colour washes down from the rule that names it, so a
-   * column reads as one planned stage before its name is read. */
-  background: linear-gradient(180deg, color-mix(in srgb, var(--workspace-status) 12%, transparent), transparent);
+  padding: 0 var(--space-2);
+  border: 0;
+  border-bottom: var(--rule-width) solid var(--edge-rule);
+  background: var(--surface-deck);
+  color: var(--ink-chalk);
+  font: var(--type-heading-14);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard), color var(--motion-fast) var(--ease-standard);
 }
 
-.workspace-board-lane-icon {
-  width: 14px;
-  height: 14px;
+.workspace-board-project-head:hover {
+  background: color-mix(in srgb, var(--ink-mist) 8%, var(--surface-deck));
+}
+
+.workspace-board-project-head .icon {
+  width: var(--icon-size);
+  height: var(--icon-size);
   flex: none;
-  color: var(--workspace-status);
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 2;
-  stroke-linecap: round;
-  stroke-linejoin: round;
+  color: var(--ink-label);
 }
 
-.workspace-board-lane-name {
+.workspace-board-project-name {
   min-width: 0;
   overflow: hidden;
-  color: var(--nav-plane-ink);
-  font-size: 12px;
-  font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.workspace-board-lane-count {
-  min-width: 18px;
+.workspace-board-project-count {
   flex: none;
-  padding: 2px 6px;
-  color: var(--ink-mist);
-  border-radius: var(--radius-pill);
-  background: color-mix(in srgb, var(--surface-abyss) 34%, transparent);
-  font-size: var(--text-3xs);
-  font-weight: 600;
-  line-height: 1.2;
-  text-align: center;
+  color: var(--ink-label);
+  font: var(--type-label-13);
   font-variant-numeric: tabular-nums;
 }
 
-.workspace-board-lane-add {
+.workspace-board-project-cards {
   display: grid;
-  width: 24px;
-  height: 24px;
-  flex: none;
-  place-items: center;
-  margin-left: auto;
-  padding: 0;
-  color: var(--ink-mist);
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  transition: color var(--motion-fast) var(--ease-standard), background-color var(--motion-fast) var(--ease-standard);
 }
 
-.workspace-board-lane-add:hover {
-  color: var(--ink-chalk);
-  background: var(--row-hover);
+.workspace-board-project-cards[hidden] {
+  display: none;
 }
 
-.workspace-board-lane-add .icon {
-  width: 14px;
-  height: 14px;
-}
-
-.workspace-board-lane-cards {
-  display: flex;
-  min-height: 0;
-  flex: 1;
-  flex-direction: column;
-  gap: 8px;
-  overflow-x: hidden;
-  overflow-y: auto;
-  padding: 8px 6px;
-  scrollbar-width: thin;
-}
-
-.workspace-board-empty {
-  display: grid;
-  min-height: 82px;
-  place-items: center;
-  margin: 0;
-  color: var(--ink-mist);
-  border: var(--rule-width) dashed var(--nav-plane-rule);
-  border-radius: var(--radius-md);
-  font-size: 11px;
-}
-
-.workspace-board-lane-bottom-add {
-  display: grid;
-  width: 100%;
-  min-height: 30px;
-  flex: none;
-  place-items: center;
-  color: var(--ink-mist);
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  opacity: 0;
-  transition: color var(--motion-fast) var(--ease-standard), background-color var(--motion-fast) var(--ease-standard), opacity var(--motion-fast) var(--ease-standard);
-}
-
-.workspace-board-lane:hover .workspace-board-lane-bottom-add,
-.workspace-board-lane:focus-within .workspace-board-lane-bottom-add {
-  opacity: 1;
-}
-
-.workspace-board-lane-bottom-add:hover {
-  color: var(--ink-chalk);
-  background: var(--row-hover);
-}
-
-.workspace-board-lane-bottom-add .icon {
-  width: 14px;
-  height: 14px;
-}
-
-.workspace-board-column-resize {
-  position: absolute;
-  z-index: 3;
-  top: 0;
-  right: 0;
-  width: 8px;
-  height: 38px;
-  cursor: col-resize;
-  touch-action: none;
-}
-
-.workspace-board-column-resize::after {
-  content: "";
-  position: absolute;
-  top: 9px;
-  bottom: 9px;
-  left: 50%;
-  width: 1px;
-  background: transparent;
-  transform: translateX(-50%);
-  transition: background-color var(--motion-fast) var(--ease-standard);
-}
-
-.workspace-board-column-resize:hover::after,
-.workspace-board-column-resize:focus-visible::after,
-.workspace-board-column-resize.is-resizing::after {
-  background: var(--nav-plane-ring);
-}
-
+/* ---- one workspace: the cells both arrangements share ---- */
 .workspace-board-card {
   position: relative;
-  display: flex;
   min-width: 0;
-  flex: none;
-  flex-direction: column;
-  gap: 7px;
-  padding: 10px;
   color: var(--ink-mist);
-  border: var(--rule-width) solid color-mix(in srgb, var(--nav-plane-ring) 28%, transparent);
-  border-radius: var(--workbench-card-radius);
   outline: 0;
-  background: linear-gradient(180deg, var(--workbench-sheen), transparent 56%),
-    color-mix(in srgb, var(--surface-raised) 72%, var(--nav-plane));
-  box-shadow: var(--shadow-node);
   cursor: default;
   user-select: none;
   content-visibility: auto;
-  contain-intrinsic-size: auto 72px;
-  animation: workspace-board-card-enter 180ms cubic-bezier(0.2, 0, 0, 1) both;
-  animation-delay: min(calc(var(--workspace-card-index, 0) * 18ms), 144ms);
-  transition: border-color var(--motion-fast) var(--ease-standard), box-shadow var(--motion-fast) var(--ease-standard), transform var(--motion-fast) var(--ease-standard);
+  contain-intrinsic-size: auto var(--workspace-board-row-height);
+  transition: background-color var(--motion-fast) var(--ease-standard), box-shadow var(--motion-fast) var(--ease-standard);
 }
 
-@keyframes workspace-board-card-enter {
-  from {
-    opacity: 0;
-    transform: translateY(5px) scale(0.985);
-  }
-}
-
-.workspace-board-card:hover,
 .workspace-board-card:focus-visible {
-  color: var(--ink-chalk);
-  border-color: color-mix(in srgb, var(--nav-plane-ring) 62%, transparent);
-  box-shadow: var(--shadow-node-raised);
-  transform: translateY(-1px);
-}
-
-.workspace-board-card.no-enter {
-  animation: none;
-}
-
-.workspace-board-card.is-active {
-  border-color: color-mix(in srgb, var(--nav-plane-ring) 72%, transparent);
-  background: var(--nav-plane-accent);
-}
-
-/* Chosen for a drag or a bulk move — the board's own selection, so it takes
- * the board's hue. `is-active` (the checkout the window stands in) stays on
- * the neutral plane accent: two facts, two treatments. */
-.workspace-board-card.is-selected {
-  border-color: var(--workbench-accent);
-  box-shadow: 0 0 0 var(--rule-width) var(--workbench-edge), var(--shadow-node-raised);
+  outline: var(--accent-rule) solid var(--ink-chalk);
+  outline-offset: calc(var(--accent-rule) * -1);
 }
 
 .workspace-board-card.is-dragging {
   opacity: 0.42;
-  transform: scale(0.98);
 }
 
-.workspace-board-card-top {
+.workspace-board-card-name {
   display: flex;
   min-width: 0;
   align-items: center;
-  gap: 7px;
+  gap: var(--space-2);
+  grid-area: name;
 }
 
+.workspace-board-card-title {
+  min-width: 3em;
+  flex: 0 1 auto;
+  overflow: hidden;
+  color: var(--ink-chalk);
+  font: var(--type-label-14);
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-board-card.is-unread .workspace-board-card-title {
+  font-weight: 700;
+}
+
+.workspace-board-card-badge {
+  flex: none;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-xs);
+  box-shadow: var(--shadow-border);
+  color: var(--ink-label);
+  font: var(--type-label-12);
+}
+
+/* The base gives way before the name does — down to its arrow and an
+ * ellipsis, never a sliver of a glyph; the whole of it is the tooltip. */
+.workspace-board-card-branch {
+  min-width: 3ch;
+  flex: 0 100 auto;
+  overflow: hidden;
+  color: var(--ink-label);
+  font: var(--type-label-12-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-board-card-pin {
+  display: grid;
+  flex: none;
+  place-items: center;
+  color: var(--ink-label);
+}
+
+.workspace-board-card-pin .icon {
+  width: var(--icon-size-sm);
+  height: var(--icon-size-sm);
+}
+
+.workspace-board-card-owner {
+  flex: none;
+  color: var(--ink-label);
+  font: var(--type-label-12);
+}
+
+/* A host is one token: it shortens to an ellipsis on one line rather than
+ * breaking at its hyphen (the tooltip says it whole). */
+.workspace-board-card-host {
+  display: inline-flex;
+  min-width: 0;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-xs);
+  box-shadow: var(--shadow-border);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+}
+
+.workspace-board-card-host > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-board-card-host .icon {
+  flex: none;
+  width: var(--icon-size-sm);
+  height: var(--icon-size-sm);
+}
+
+.workspace-board-card-project {
+  display: none;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+}
+
+.workspace-board-card-project .icon {
+  width: var(--icon-size-sm);
+  height: var(--icon-size-sm);
+  flex: none;
+}
+
+.workspace-board-card-project span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-board-card-age {
+  display: none;
+  color: var(--ink-label);
+  font: var(--type-label-12);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* The workspace's own mark: a spinner while an agent works, the question
+ * mark in the one blue while it waits on the person, a check when a turn
+ * ended, a quiet ring otherwise. */
 .workspace-board-card-state {
-  width: 12px;
-  height: 12px;
+  width: var(--icon-size-sm);
+  height: var(--icon-size-sm);
   flex: none;
   fill: none;
   stroke: currentColor;
@@ -33401,14 +34016,14 @@ input[type="search"]::-webkit-search-cancel-button {
 
 .workspace-board-card-state.is-working {
   color: var(--signal-wait);
-  border: 1.5px solid currentColor;
+  border: var(--status-dot-ring) solid currentColor;
   border-right-color: transparent;
   border-radius: 50%;
   animation: worktree-spin 850ms linear infinite;
 }
 
 .workspace-board-card-state.is-attention {
-  color: var(--signal-wait);
+  color: var(--signal-you);
 }
 
 .workspace-board-card-state.is-done {
@@ -33419,218 +34034,640 @@ input[type="search"]::-webkit-search-cancel-button {
   color: var(--ink-mist);
 }
 
-.workspace-board-card-title {
+.workspace-board-card-live {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-1);
+  grid-area: live;
+}
+
+.workspace-board-card-live .wt-agent {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.workspace-board-card-quiet {
   min-width: 0;
   overflow: hidden;
-  color: var(--nav-plane-ink);
-  font-size: 12px;
-  font-weight: 550;
+  color: var(--ink-label);
+  font: var(--type-label-12);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.workspace-board-card.is-unread .workspace-board-card-title {
-  font-weight: 700;
+/* A ledger phase is said in the sidebar's own ink (`.wt-phase`): a report
+ * waiting on review in the wait ink, work the coordinator vouched for in the
+ * ready ink — and in words, never by colour alone. */
+.workspace-board-card-quiet[data-phase="review"] {
+  color: var(--signal-wait-ink);
 }
 
-.workspace-board-card-badge,
-.workspace-board-card-pin {
-  flex: none;
-  padding: 2px 5px;
-  color: var(--ink-mist);
-  border: var(--rule-width) solid var(--nav-plane-rule);
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--surface-abyss) 24%, transparent);
-  font-size: 9px;
-  line-height: 1.1;
+.workspace-board-card-quiet[data-phase="vouched"] {
+  color: var(--signal-ready-ink);
 }
 
-.workspace-board-card-pin {
-  display: grid;
-  width: 18px;
-  height: 18px;
-  place-items: center;
-  margin-left: auto;
-  padding: 0;
-  border-radius: 999px;
-}
-
-.workspace-board-card-pin .icon {
-  width: 10px;
-  height: 10px;
-}
-
-.workspace-board-card-meta {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 6px;
-  color: var(--ink-mist);
-  font-size: 10px;
-}
-
-.workspace-board-card-project {
-  display: inline-flex;
-  min-width: 0;
-  align-items: center;
-  gap: 4px;
-  padding: 2px 5px;
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--surface-abyss) 28%, transparent);
-  font-weight: 600;
-}
-
-.workspace-board-card-project .icon {
-  width: 11px;
-  height: 11px;
-}
-
-.workspace-board-card-host {
-  display: inline-flex;
-  min-width: 0;
-  align-items: center;
-  gap: 4px;
-  padding: 2px 5px;
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--surface-abyss) 38%, transparent);
-  color: var(--ink-mist);
-  font-size: 11px;
-}
-
-.workspace-board-card-host .icon {
-  width: 11px;
-  height: 11px;
-}
-
-.workspace-board-card-branch {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.workspace-board-card-agents {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 2px;
-  padding-top: 2px;
-  border-top: var(--rule-width) solid color-mix(in srgb, var(--nav-plane-rule) 70%, transparent);
-}
-
-.workspace-board-card-agents .wt-agent {
-  width: 100%;
+.workspace-board-card-quiet[data-state="active"]::before {
+  display: inline-block;
+  width: var(--status-dot);
+  height: var(--status-dot);
+  margin-right: var(--space-2);
+  box-sizing: border-box;
+  border: var(--status-dot-ring) solid var(--edge-mark);
+  border-radius: 50%;
+  vertical-align: middle;
+  content: "";
 }
 
 /* 「+N」 is the card's fold: a button dressed as the word it replaced. */
 .workspace-board-card-more {
-  align-self: flex-start;
+  flex: none;
+  height: calc(var(--control-height-sm) - var(--space-2));
   padding: 0 var(--space-2);
   border: 0;
   border-radius: var(--radius-xs);
   background: transparent;
-  color: var(--ink-mist);
-  font: inherit;
-  font-size: 10px;
+  color: var(--ink-label);
+  font: var(--type-label-12);
+  font-variant-numeric: tabular-nums;
   cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard), color var(--motion-fast) var(--ease-standard);
 }
-.workspace-board-card-more:hover { color: var(--ink-chalk); background: var(--row-hover); }
+
+.workspace-board-card-more:hover {
+  background: var(--row-hover);
+  color: var(--ink-chalk);
+}
+
+/* The plan: a square in the stage's colour and the stage's name. The four
+ * stages the board was born with wear no hue — the square's fill says them
+ * (빈 네모 → 아래 반 → 꽉 참 → ✓): a hue is a live signal's, and a plan does
+ * not borrow it. A colour the person chose is Geist's 700 step (tokens.css). */
+.workspace-board-card-plan {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  grid-area: plan;
+}
+
+:is(.workspace-board-card-plan, .workspace-board-lane, .workspace-board-status-row) {
+  --workspace-status: var(--ink-label);
+  --workspace-board-mark-fill: transparent;
+  --workspace-board-mark-level: 0%;
+  --workspace-board-mark-glyph: "";
+}
+
+:is(.workspace-board-card-plan, .workspace-board-lane, .workspace-board-status-row)[data-color="conductor-progress"] {
+  --workspace-status: var(--ink-mist);
+  --workspace-board-mark-fill: var(--ink-mist);
+  --workspace-board-mark-level: 50%;
+}
+
+:is(.workspace-board-card-plan, .workspace-board-lane, .workspace-board-status-row)[data-color="conductor-review"] {
+  --workspace-status: var(--ink-mist);
+  --workspace-board-mark-fill: var(--ink-mist);
+  --workspace-board-mark-level: 100%;
+}
+
+:is(.workspace-board-card-plan, .workspace-board-lane, .workspace-board-status-row)[data-color="conductor-done"] {
+  --workspace-status: var(--ink-chalk);
+  --workspace-board-mark-fill: var(--ink-chalk);
+  --workspace-board-mark-level: 100%;
+  --workspace-board-mark-glyph: "✓";
+}
+
+:is(.workspace-board-card-plan, .workspace-board-lane, .workspace-board-status-row)[data-color="zinc"] { --workspace-status: var(--workspace-stage-gray); }
+:is(.workspace-board-card-plan, .workspace-board-lane, .workspace-board-status-row):is([data-color="blue"], [data-color="violet"]) { --workspace-status: var(--workspace-stage-blue); }
+:is(.workspace-board-card-plan, .workspace-board-lane, .workspace-board-status-row)[data-color="sky"] { --workspace-status: var(--workspace-stage-cyan); }
+:is(.workspace-board-card-plan, .workspace-board-lane, .workspace-board-status-row)[data-color="emerald"] { --workspace-status: var(--workspace-stage-green); }
+:is(.workspace-board-card-plan, .workspace-board-lane, .workspace-board-status-row)[data-color="amber"] { --workspace-status: var(--workspace-stage-amber); }
+:is(.workspace-board-card-plan, .workspace-board-lane, .workspace-board-status-row)[data-color="rose"] { --workspace-status: var(--workspace-stage-red); }
+
+.workspace-board-card-stage::before,
+.workspace-board-lane[data-mark="square"] .workspace-board-lane-name::before {
+  display: inline-grid;
+  width: var(--workspace-board-mark);
+  height: var(--workspace-board-mark);
+  flex: none;
+  box-sizing: border-box;
+  place-items: center;
+  border: var(--status-dot-ring) solid var(--workspace-status);
+  border-radius: var(--radius-xs);
+  background: linear-gradient(to top, var(--workspace-board-mark-fill) var(--workspace-board-mark-level), transparent var(--workspace-board-mark-level));
+  color: var(--surface-deck);
+  font: 700 calc(var(--workspace-board-mark) - var(--space-1)) / 1 var(--font-ui);
+  content: var(--workspace-board-mark-glyph);
+}
+
+.workspace-board-card-stage {
+  display: inline-flex;
+  max-width: 100%;
+  min-width: 0;
+  height: calc(var(--control-height-sm) - var(--space-1));
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-2) 0 var(--space-1);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.workspace-board-card-stage:hover {
+  background: var(--row-hover);
+}
+
+.workspace-board-card-stage-word {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-board-card-stage-auto {
+  flex: none;
+  color: var(--ink-label);
+  font: var(--type-label-12);
+}
+
+/* Verification: git's own chip (the sidebar's, sized for a 40px row), the
+ * PR pill, and the 완료 offer — the one bordered button a row may carry. */
+.workspace-board-card-git {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+  grid-area: git;
+}
+
+.workspace-board-card-git .wt-landing {
+  max-width: 100%;
+  height: auto;
+  flex: none;
+  padding: 0 var(--space-2);
+  line-height: var(--space-4);
+}
+
+.workspace-board-card-git .board-card-review {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  font-size: var(--text-3xs);
+}
+
+.workspace-board-card-git .board-card-review-words {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-board-card-none {
+  color: var(--ink-label);
+  font: var(--type-label-12);
+}
+
+.workspace-board-card-offer {
+  height: calc(var(--control-height-sm) - var(--space-2));
+  flex: none;
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  box-shadow: var(--shadow-border);
+  color: var(--ink-chalk);
+  font: var(--type-label-12);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.workspace-board-card-offer:hover {
+  background: var(--row-hover);
+}
+
+/* The doors stay in sight as quiet words (NN/g: a hidden menu is found a
+ * fifth less often); a press lights them. The task door keeps its view's dot
+ * (the connected workbench's related-door grammar). */
+.workspace-board-card-doors {
+  display: flex;
+  align-items: center;
+  justify-self: end;
+  grid-area: doors;
+}
+
+.workspace-board-changes,
+.workspace-board-tasks {
+  display: inline-flex;
+  height: calc(var(--control-height-sm) - var(--space-1));
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  box-shadow: none;
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard), color var(--motion-fast) var(--ease-standard);
+}
+
+.workspace-board-changes:hover,
+.workspace-board-tasks:hover {
+  background: var(--row-hover);
+  color: var(--ink-chalk);
+}
 
 .workspace-board-card-menu {
   display: grid;
-  width: 22px;
-  height: 22px;
+  width: calc(var(--control-height-sm) - var(--space-1));
+  height: calc(var(--control-height-sm) - var(--space-1));
+  flex: none;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--ink-mist);
+  transition: opacity var(--motion-fast) var(--ease-standard), background-color var(--motion-fast) var(--ease-standard), color var(--motion-fast) var(--ease-standard);
+}
+
+.workspace-board-card-menu:hover {
+  background: var(--row-hover);
+  color: var(--ink-chalk);
+}
+
+.workspace-board-card-menu .icon {
+  width: var(--icon-size);
+  height: var(--icon-size);
+}
+
+/* ---- the list row ---- */
+.workspace-board[data-view="list"] .workspace-board-card {
+  display: grid;
+  min-height: var(--workspace-board-row-height);
+  grid-template-columns: var(--workspace-board-row-columns);
+  grid-template-areas: "name live plan git doors";
+  align-items: center;
+  gap: 0 var(--space-4);
+  padding: 0 var(--space-2);
+  border-bottom: var(--rule-width) solid var(--edge-rule);
+}
+
+.workspace-board[data-view="list"] .workspace-board-card:hover {
+  background: var(--row-hover);
+}
+
+.workspace-board[data-view="list"] .workspace-board-card.is-active {
+  background: var(--row-selected);
+}
+
+.workspace-board[data-view="list"] .workspace-board-card.is-selected {
+  box-shadow: inset 0 0 0 var(--rule-width) var(--ink-mist);
+}
+
+/* ---- the kanban card: background-100 ringed on a background-200 lane ---- */
+.workspace-board[data-view="kanban"] .workspace-board-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "name age"
+    "project doors"
+    "git git"
+    "live live";
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border-small);
+}
+
+.workspace-board[data-view="kanban"] .workspace-board-card:hover {
+  box-shadow: 0 0 0 var(--rule-width) var(--edge-mark), var(--material-drop);
+}
+
+.workspace-board[data-view="kanban"] .workspace-board-card.is-active {
+  box-shadow: 0 0 0 var(--rule-width) var(--ink-mist), var(--material-drop);
+}
+
+.workspace-board[data-view="kanban"] .workspace-board-card.is-selected {
+  box-shadow: 0 0 0 var(--accent-rule) var(--ink-mist);
+}
+
+.workspace-board[data-view="kanban"] .workspace-board-card-plan,
+.workspace-board[data-view="kanban"] .workspace-board-card-owner,
+.workspace-board[data-view="kanban"] .workspace-board-card-name .workspace-board-card-branch {
+  display: none;
+}
+
+.workspace-board[data-view="kanban"] .workspace-board-card-project {
+  display: inline-flex;
+  grid-area: project;
+}
+
+.workspace-board[data-view="kanban"] .workspace-board-card-age {
+  display: block;
+  justify-self: end;
+  grid-area: age;
+}
+
+.workspace-board[data-view="kanban"] .workspace-board-card:not([data-git="facts"]) .workspace-board-card-git,
+.workspace-board[data-view="kanban"] .workspace-board-card[data-agents="none"] .workspace-board-card-live {
+  display: none;
+}
+
+.workspace-board[data-view="kanban"] .workspace-board-card-live {
+  padding-top: var(--space-2);
+  border-top: var(--rule-width) solid var(--edge-rule);
+}
+
+.workspace-board[data-view="kanban"] .workspace-board-card .workspace-board-card-menu {
+  opacity: 0;
+}
+
+.workspace-board[data-view="kanban"] .workspace-board-card:hover .workspace-board-card-menu,
+.workspace-board[data-view="kanban"] .workspace-board-card:focus-within .workspace-board-card-menu,
+.workspace-board[data-view="kanban"] .workspace-board-card.is-selected .workspace-board-card-menu {
+  opacity: 1;
+}
+
+/* ---- the lanes ---- */
+.workspace-board-lane {
+  position: relative;
+  display: flex;
+  width: var(--workspace-board-column-width);
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: var(--radius-md);
+  background: var(--surface-well);
+  transition: box-shadow var(--motion-fast) var(--ease-standard), background-color var(--motion-fast) var(--ease-standard);
+}
+
+.workspace-board-lane.is-drop-target {
+  background: var(--row-selected);
+  box-shadow: 0 0 0 var(--rule-width) var(--ink-mist);
+}
+
+.workspace-board-lane-head {
+  display: flex;
+  height: var(--control-height-md);
+  flex: none;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-2) 0 var(--space-3);
+}
+
+.workspace-board-lane-icon {
+  width: var(--icon-size);
+  height: var(--icon-size);
+  flex: none;
+  color: var(--workspace-status);
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.workspace-board-lane-name {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+  overflow: hidden;
+  color: var(--ink-chalk);
+  font: var(--type-heading-14);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-board-lane-count {
+  min-width: var(--space-5);
+  flex: none;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--row-hover);
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.workspace-board-lane-add {
+  display: grid;
+  width: calc(var(--control-height-sm) - var(--space-1));
+  height: calc(var(--control-height-sm) - var(--space-1));
   flex: none;
   place-items: center;
   margin-left: auto;
   padding: 0;
-  color: var(--ink-mist);
   border: 0;
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   background: transparent;
-  opacity: 0;
-  transition: opacity var(--motion-fast) var(--ease-standard), background-color var(--motion-fast) var(--ease-standard);
+  color: var(--ink-mist);
+  transition: color var(--motion-fast) var(--ease-standard), background-color var(--motion-fast) var(--ease-standard);
 }
 
-.workspace-board-card:hover .workspace-board-card-menu,
-.workspace-board-card:focus-within .workspace-board-card-menu,
-.workspace-board-card.is-selected .workspace-board-card-menu {
+.workspace-board-lane-add:hover {
+  background: var(--row-hover);
+  color: var(--ink-chalk);
+}
+
+.workspace-board-lane-add .icon {
+  width: var(--icon-size);
+  height: var(--icon-size);
+}
+
+.workspace-board-lane-cards {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--space-2);
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: var(--space-1) var(--space-2) var(--space-2);
+  scrollbar-width: thin;
+}
+
+.workspace-board-empty {
+  display: grid;
+  min-height: calc(var(--space-6) * 2);
+  place-items: center;
+  margin: 0;
+  border: var(--rule-width) dashed var(--edge-rule);
+  border-radius: var(--radius-md);
+  color: var(--ink-label);
+  font: var(--type-label-12);
+}
+
+.workspace-board-lane-bottom-add {
+  display: grid;
+  width: 100%;
+  min-height: var(--control-height-sm);
+  flex: none;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--ink-mist);
+  opacity: 0;
+  transition: color var(--motion-fast) var(--ease-standard), background-color var(--motion-fast) var(--ease-standard), opacity var(--motion-fast) var(--ease-standard);
+}
+
+.workspace-board-lane:hover .workspace-board-lane-bottom-add,
+.workspace-board-lane:focus-within .workspace-board-lane-bottom-add {
   opacity: 1;
 }
 
-.workspace-board-card-menu:hover {
-  color: var(--ink-chalk);
+.workspace-board-lane-bottom-add:hover {
   background: var(--row-hover);
+  color: var(--ink-chalk);
 }
 
-.workspace-board-card-menu .icon {
-  width: 13px;
-  height: 13px;
+.workspace-board-lane-bottom-add .icon {
+  width: var(--icon-size);
+  height: var(--icon-size);
 }
 
+.workspace-board-column-resize {
+  position: absolute;
+  z-index: 3;
+  top: 0;
+  right: 0;
+  width: var(--space-2);
+  height: var(--control-height-md);
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.workspace-board-column-resize::after {
+  position: absolute;
+  top: var(--space-2);
+  bottom: var(--space-2);
+  left: 50%;
+  width: var(--rule-width);
+  background: transparent;
+  content: "";
+  transform: translateX(-50%);
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.workspace-board-column-resize:hover::after,
+.workspace-board-column-resize:focus-visible::after,
+.workspace-board-column-resize.is-resizing::after {
+  background: var(--ink-mist);
+}
+
+/* Fit: the lanes share the width, and a wide lane flows its cards into
+ * columns of its own. */
+.workspace-board[data-view="kanban"] .workspace-board-lanes.is-fit {
+  display: flex;
+}
+
+.workspace-board[data-view="kanban"] .workspace-board-lanes.is-fit > .workspace-board-lane {
+  width: auto;
+  min-width: 0;
+  flex: 1 1 0;
+}
+
+.workspace-board-lanes.is-fit .workspace-board-lane-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 19em), 1fr));
+  grid-auto-rows: max-content;
+  align-content: start;
+  align-items: start;
+}
+
+.workspace-board-lanes.is-fit :is(.workspace-board-lane-bottom-add, .workspace-board-empty) {
+  grid-column: 1 / -1;
+}
+
+/* An empty stage folds to a narrow strip — its name upright, its count and
+ * its 「＋」 — and is still a drop target. A drag unfolds it. */
+.workspace-board:not([data-dragging="true"]) .workspace-board-lanes > .workspace-board-lane[data-empty="true"] {
+  width: var(--workspace-board-folded-lane);
+  flex: 0 0 var(--workspace-board-folded-lane);
+}
+
+.workspace-board:not([data-dragging="true"]) .workspace-board-lane[data-empty="true"] .workspace-board-lane-head {
+  height: auto;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) 0;
+}
+
+.workspace-board:not([data-dragging="true"]) .workspace-board-lane[data-empty="true"] .workspace-board-lane-name {
+  writing-mode: vertical-rl;
+}
+
+.workspace-board:not([data-dragging="true"]) .workspace-board-lane[data-empty="true"] .workspace-board-lane-add {
+  margin: 0;
+}
+
+.workspace-board:not([data-dragging="true"]) .workspace-board-lane[data-empty="true"] :is(.workspace-board-lane-cards, .workspace-board-lane-bottom-add, .workspace-board-column-resize) {
+  display: none;
+}
+
+/* ---- the settings popover ---- */
 .workspace-board-settings-pop {
   position: absolute;
   z-index: 8;
-  top: 44px;
-  right: 12px;
-  width: min(390px, calc(100% - 24px));
+  top: calc(var(--space-3) + var(--control-height-sm) + var(--space-1));
+  right: var(--space-4);
+  width: min(390px, calc(100% - var(--space-5)));
   max-height: min(72vh, 680px);
   overflow-y: auto;
-  padding: 8px;
-  color: var(--ink-chalk);
-  border: var(--rule-width) solid var(--edge-rule);
+  padding: var(--space-2);
   border-radius: var(--radius-menu);
   background: var(--surface-deck);
   box-shadow: var(--shadow-float);
-  animation: workspace-board-settings-enter 130ms cubic-bezier(0.2, 0, 0, 1) both;
+  color: var(--ink-chalk);
 }
 
 .workspace-board-settings-pop[hidden] {
   display: none;
 }
 
-@keyframes workspace-board-settings-enter {
-  from {
-    opacity: 0;
-    transform: translateY(-4px) scale(0.985);
-  }
-}
-
 .workspace-board-settings-head {
   display: flex;
-  height: 30px;
+  height: var(--control-height-sm);
   align-items: center;
   justify-content: space-between;
-  padding: 0 2px 4px 6px;
-  color: var(--ink-mist);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  padding: 0 var(--space-1) var(--space-1) var(--space-2);
+  color: var(--ink-label);
+  font: var(--type-label-12);
+  font-weight: 600;
 }
 
 .workspace-board-settings-list {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: var(--space-2);
 }
 
+/* The row's columns are the editor's own measures: a name field that keeps
+ * a stage name readable (82px), a colour select wide enough for its words
+ * (96px), the icon select (72px), and three square actions. */
 .workspace-board-status-row {
-  --workspace-status: var(--ink-mist);
   display: grid;
-  grid-template-columns: 22px minmax(82px, 1fr) 68px 72px repeat(3, 24px);
+  grid-template-columns: var(--space-5) minmax(82px, 1fr) minmax(96px, auto) 72px repeat(3, var(--space-5));
   align-items: center;
-  gap: 4px;
-  padding: 6px;
-  border: var(--rule-width) solid var(--edge-rule);
+  gap: var(--space-1);
+  padding: var(--space-2);
   border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--surface-raised) 55%, transparent);
+  box-shadow: var(--shadow-border);
 }
-
 
 .workspace-board-status-mark {
-  width: 14px;
-  height: 14px;
+  width: var(--icon-size);
+  height: var(--icon-size);
   justify-self: center;
   color: var(--workspace-status);
   fill: none;
@@ -33643,40 +34680,39 @@ input[type="search"]::-webkit-search-cancel-button {
 .workspace-board-status-name,
 .workspace-board-status-select {
   width: 100%;
-  height: 28px;
   min-width: 0;
-  padding: 0 7px;
-  color: var(--ink-chalk);
-  border: var(--rule-width) solid var(--edge-rule);
-  border-radius: var(--radius-sm);
+  height: var(--control-height-sm);
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-md);
   outline: 0;
-  background-color: var(--surface-abyss);
-  font: inherit;
-  font-size: 11px;
+  background-color: var(--surface-well);
+  box-shadow: var(--shadow-border);
+  color: var(--ink-chalk);
+  font: var(--type-label-12);
 }
 
 .workspace-board-status-name:focus,
 .workspace-board-status-select:focus {
-  border-color: var(--nav-plane-ring);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--nav-plane-ring) 16%, transparent);
+  box-shadow: 0 0 0 var(--rule-width) var(--ink-mist);
 }
 
 .workspace-board-status-action {
   display: grid;
-  width: 26px;
-  height: 26px;
+  width: var(--space-5);
+  height: var(--space-5);
   place-items: center;
   padding: 0;
-  color: var(--ink-mist);
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
+  color: var(--ink-mist);
   transition: color var(--motion-fast) var(--ease-standard), background-color var(--motion-fast) var(--ease-standard);
 }
 
 .workspace-board-status-action:hover:not(:disabled) {
-  color: var(--ink-chalk);
   background: var(--row-hover);
+  color: var(--ink-chalk);
 }
 
 .workspace-board-status-action.is-danger:hover:not(:disabled) {
@@ -33684,12 +34720,12 @@ input[type="search"]::-webkit-search-cancel-button {
 }
 
 .workspace-board-status-action:disabled {
-  opacity: 0.28;
+  color: var(--ink-disabled);
 }
 
 .workspace-board-status-action .icon {
-  width: 13px;
-  height: 13px;
+  width: var(--icon-size-sm);
+  height: var(--icon-size-sm);
 }
 
 .workspace-board-status-action.is-right .icon {
@@ -33699,263 +34735,187 @@ input[type="search"]::-webkit-search-cancel-button {
 .workspace-board-add-status {
   display: flex;
   width: 100%;
-  height: 30px;
+  height: var(--control-height-sm);
   align-items: center;
-  gap: 7px;
-  margin-top: 8px;
-  padding: 0 8px;
-  color: var(--ink-mist);
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding: 0 var(--space-2);
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
-  font: inherit;
-  font-size: 11px;
+  color: var(--ink-mist);
+  font: var(--type-label-12);
   transition: color var(--motion-fast) var(--ease-standard), background-color var(--motion-fast) var(--ease-standard);
 }
 
 .workspace-board-add-status:hover {
-  color: var(--ink-chalk);
   background: var(--row-hover);
+  color: var(--ink-chalk);
 }
 
 .workspace-board-add-status .icon {
-  width: 13px;
-  height: 13px;
+  width: var(--icon-size-sm);
+  height: var(--icon-size-sm);
 }
 
-@container workspace-board (max-width: 900px) {
-  .workspace-board-head {
+/* ---- the board's own width ---- */
+/* The kanban wraps its lanes when the board is narrower than four of them;
+ * a folded empty stage is then a bar of its own along the bottom. */
+@container workspace-board (max-width: 1050px) {
+  .workspace-board[data-view="kanban"] .workspace-board-lanes.is-fit {
     flex-wrap: wrap;
+    align-content: flex-start;
+    overflow-y: auto;
   }
 
-  .workspace-board-search {
-    order: 3;
-    width: 100%;
+  .workspace-board[data-view="kanban"] .workspace-board-lanes.is-fit > .workspace-board-lane {
+    flex: 1 1 var(--workspace-board-column-width);
   }
 
-  .workspace-board-actions {
+  .workspace-board:not([data-dragging="true"]) .workspace-board-lanes.is-fit > .workspace-board-lane[data-empty="true"] {
+    width: auto;
+    flex: 1 1 100%;
+  }
+
+  .workspace-board:not([data-dragging="true"]) .workspace-board-lanes.is-fit .workspace-board-lane[data-empty="true"] .workspace-board-lane-head {
+    height: var(--control-height-md);
+    flex-direction: row;
+    padding: 0 var(--space-2) 0 var(--space-3);
+  }
+
+  .workspace-board:not([data-dragging="true"]) .workspace-board-lanes.is-fit .workspace-board-lane[data-empty="true"] .workspace-board-lane-name {
+    writing-mode: horizontal-tb;
+  }
+
+  .workspace-board:not([data-dragging="true"]) .workspace-board-lanes.is-fit .workspace-board-lane[data-empty="true"] .workspace-board-lane-add {
     margin-left: auto;
   }
 }
 
-/* One workspace inventory, two arrangements: project rows for reading, and
- * user-owned status lanes for planning. Both use the same cards and actions. */
-.workspace-board-head { flex-wrap: wrap; }
-.workspace-board-search { flex: 1; width: auto; min-width: min(16em, 100%); }
-.workspace-board-overview { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-1) var(--space-4); }
-.workspace-board-overview p { margin: 0; color: var(--ink-label); font-size: var(--text-sm); }
-/* The accuracy strip: zo's orchestration accuracy for the active project, one
- * chip per rate. Same recipe as .workspace-board-card-host (tokens only). */
-.workspace-board-accuracy { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
-.workspace-board-accuracy-title { color: var(--ink-label); font-size: var(--text-sm); }
-.workspace-board-accuracy-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 2px 6px;
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--surface-abyss) 38%, transparent);
-  color: var(--ink-mist);
-  font-size: var(--text-sm);
-}
-.workspace-board-accuracy-chip strong { color: var(--ink-figure); }
-.workspace-board-accuracy-samples { color: var(--ink-label); font-size: var(--text-sm); }
-.workspace-board-layout-controls { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-left: auto; }
-.workspace-board-layout-controls[hidden] { display: none; }
-.workspace-board-layout-controls .btn { font-size: var(--text-xs); }
-.workspace-board-layout-controls .btn[aria-pressed="true"] { background: var(--row-hover); color: var(--ink-chalk); }
+/* A narrow list folds each row: the name and its stage, the activity, then
+ * the git facts and the doors — the doors rise beside the activity when git
+ * has nothing to say. */
+@container workspace-board (max-width: 800px) {
+  .workspace-board[data-view="list"] .workspace-board-card {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "name plan" "live live" "git doors";
+    gap: var(--space-1) var(--space-3);
+    padding: var(--space-2);
+  }
 
-.workspace-board-lanes.is-fit {
-  grid-auto-flow: row;
-  grid-template-columns: repeat(var(--workspace-board-lane-count, 1), minmax(0, 1fr));
-  grid-auto-columns: auto;
-}
-.workspace-board-lanes.is-fit .workspace-board-lane { width: auto; }
-.workspace-board-lanes.is-fit .workspace-board-lane-cards {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 19em), 1fr));
-  grid-auto-rows: max-content;
-  align-content: start;
-  align-items: start;
-}
-.workspace-board-lanes.is-fit .workspace-board-lane-bottom-add,
-.workspace-board-lanes.is-fit .workspace-board-empty { grid-column: 1 / -1; }
+  .workspace-board[data-view="list"] .workspace-board-card:not([data-git="facts"]):not([data-git="none"]) {
+    grid-template-areas: "name plan" "live doors";
+  }
 
-.workspace-board-card-title { font-size: var(--text-sm); }
-/* A workspace row says three different facts, and each keeps its own mark so
- * none can be mistaken for another (t-3818):
- *
- *   plan          the stage a PERSON set — a hollow square in the stage's colour
- *   activity      what an AGENT is doing — a status dot in the signal colours
- *   verification  changes and review — the PR pill and the doors beside it
- *
- * The stage chip is a door to the stage menu, the changes chip to source
- * control, and the tasks chip to the task board scoped to this checkout. */
-.workspace-board-card-stage,
-.workspace-board-changes,
-.workspace-board-tasks {
-  min-height: var(--control-height-sm);
-  padding: 0 var(--space-3);
-  border: var(--rule-width) solid var(--nav-plane-rule);
-  border-radius: var(--radius-pill);
-  background: transparent;
-  color: var(--ink-label);
-  font: inherit;
-  font-size: var(--text-xs);
-  cursor: pointer;
-  transition: color var(--motion-fast) var(--ease-standard), background-color var(--motion-fast) var(--ease-standard);
-}
-.workspace-board-changes,
-.workspace-board-tasks { display: inline-flex; align-items: center; gap: var(--space-2); }
-/* The stage chip is a block in list view so its label can ellipsize; one
- * line at the chip's inner height centres it without a flex box. */
-.workspace-board-card-stage { line-height: calc(var(--control-height-sm) - var(--rule-width) * 2); }
-.workspace-board-card-stage:hover,
-.workspace-board-changes:hover,
-.workspace-board-tasks:hover,
-.workspace-board-project-head:hover { color: var(--ink-chalk); background: var(--row-hover); }
-.workspace-board-card-stage::before {
-  display: inline-block;
-  width: var(--workbench-mark-size);
-  height: var(--workbench-mark-size);
-  margin-right: var(--space-2);
-  border: var(--status-dot-ring) solid var(--workspace-status, var(--edge-mark));
-  border-radius: var(--radius-xs);
-  vertical-align: middle;
-  content: "";
-}
-.workspace-board-card-live { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; color: var(--ink-label); font-size: var(--text-xs); }
-.workspace-board-card-live strong { display: inline-flex; align-items: center; gap: var(--space-2); font-weight: 500; }
-.workspace-board-card-live strong::before {
-  flex: none;
-  width: var(--status-dot);
-  height: var(--status-dot);
-  border: var(--status-dot-ring) solid var(--edge-mark);
-  border-radius: 50%;
-  content: "";
-}
-.workspace-board-card-live > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.workspace-board-card-live[data-state="streaming"] strong { color: var(--signal-ready); }
-.workspace-board-card-live[data-state="waiting"] strong,
-.workspace-board-card-live[data-state="blocked"] strong { color: var(--signal-wait); }
-/* Filled while an agent runs, a hollow amber ring while it asks, a filled
- * amber square while a permission holds it — the shape carries the state
- * for a reader who cannot tell the two ambers from a green. */
-.workspace-board-card-live[data-state="active"] strong::before { background: var(--edge-mark); }
-.workspace-board-card-live[data-state="streaming"] strong::before { border-color: var(--signal-ready); background: var(--signal-ready); }
-.workspace-board-card-live[data-state="waiting"] strong::before { border-color: var(--signal-wait); }
-.workspace-board-card-live[data-state="blocked"] strong::before {
-  border-color: var(--signal-wait);
-  border-radius: var(--radius-xs);
-  background: var(--signal-wait);
-}
-.workspace-board-card-git { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); min-width: 0; }
-.workspace-board-card-git .board-card-review { max-width: 100%; font-size: var(--text-xs); }
-.workspace-board-card-stage,
-.workspace-board-card-live { display: none; }
+  /* The side column is as wide as each row's widest cell, so the stage
+   * keeps to its right edge — under the doors — and reads as one column. */
+  .workspace-board[data-view="list"] .workspace-board-card-plan {
+    justify-self: end;
+  }
 
-.workspace-board[data-pin-zone="hidden"] .workspace-board-pin { display: none; }
-.workspace-board[data-pin-zone="hint"] .workspace-board-pin,
-.workspace-board[data-pin-zone="drop"] .workspace-board-pin { display: flex; }
-.workspace-board[data-view="list"] .workspace-board-lanes {
-  display: block;
-  overflow: auto;
-  min-width: 0;
-  scrollbar-gutter: stable;
-}
-.workspace-board-project-group { margin-bottom: var(--space-5); min-width: 0; }
-.workspace-board-project-head {
-  display: block;
-  width: 100%;
-  padding: var(--space-3) var(--space-2);
-  border: 0;
-  background: transparent;
-  color: var(--ink-chalk);
-  font: inherit;
-  font-size: var(--text-md);
-  font-weight: 600;
-  text-align: left;
-  cursor: pointer;
-  transition: background-color var(--motion-fast) var(--ease-standard), color var(--motion-fast) var(--ease-standard);
-}
-.workspace-board-project-cards { display: grid; gap: var(--space-2); }
-.workspace-board-project-cards[hidden], .workspace-board-columns[hidden] { display: none; }
-.workspace-board[data-view="list"] .workspace-board-card,
-.workspace-board-columns {
-  display: grid;
-  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1.7fr) minmax(7em, .7fr) minmax(9em, .8fr);
-  gap: var(--space-2) var(--space-4);
-  align-items: center;
-  padding: var(--space-4);
-  min-width: 0;
-}
-.workspace-board-columns {
-  padding-block: var(--space-2);
-  border-bottom: var(--rule-width) solid var(--nav-plane-rule);
-  color: var(--ink-label);
-  font-family: var(--font-display);
-  font-size: var(--text-2xs);
-  font-weight: 600;
-  letter-spacing: var(--workbench-eyebrow-tracking);
-  text-transform: uppercase;
-}
-.workspace-board[data-view="list"] .workspace-board-card { margin: 0; contain-intrinsic-size: auto 6em; }
-.workspace-board[data-view="list"] .workspace-board-card-top { grid-column: 1; grid-row: 1; }
-.workspace-board[data-view="list"] .workspace-board-card-meta { grid-column: 1; grid-row: 2; }
-.workspace-board[data-view="list"] .workspace-board-card-live { display: flex; grid-column: 2; grid-row: 1 / 3; }
-.workspace-board[data-view="list"] .workspace-board-card-stage { display: block; grid-column: 3; grid-row: 1 / 3; justify-self: start; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.workspace-board[data-view="list"] .workspace-board-card-git { grid-column: 4; grid-row: 1 / 3; }
-.workspace-board[data-view="list"] .workspace-board-card-agents { display: none; }
-.workspace-board[data-view="list"] .workspace-board-card-project { display: none; }
-.workspace-board[data-view="list"] .is-pinned .workspace-board-card-project { display: inline-flex; }
-.workspace-board[data-view="list"] .workspace-board-card-title { white-space: normal; overflow-wrap: anywhere; line-height: 1.5; }
-.workspace-board[data-view="list"] .workspace-board-card-menu { opacity: 1; }
-.workspace-board[data-view="list"] .workspace-board-card:hover { transform: none; }
+  .workspace-board-columns {
+    display: none;
+  }
 
-@container workspace-board (max-width: 1050px) {
-  .workspace-board-lanes.is-fit {
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--workspace-board-column-width)), 1fr));
-    grid-auto-rows: minmax(20em, 1fr);
-    overflow-y: auto;
+  .workspace-board-project-head {
+    top: 0;
   }
 }
-@container workspace-board (max-width: 800px) {
-  .workspace-board[data-view="list"] .workspace-board-card { grid-template-columns: minmax(0, 1fr) auto; }
-  .workspace-board[data-view="list"] .workspace-board-card-top { grid-column: 1; grid-row: 1; }
-  .workspace-board[data-view="list"] .workspace-board-card-meta { grid-column: 1; grid-row: 2; }
-  .workspace-board[data-view="list"] .workspace-board-card-live { grid-column: 1 / -1; grid-row: 3; }
-  .workspace-board[data-view="list"] .workspace-board-card-stage { grid-column: 2; grid-row: 1 / 3; max-width: 10em; }
-  .workspace-board[data-view="list"] .workspace-board-card-git { grid-column: 1 / -1; grid-row: 4; }
-  .workspace-board-columns { display: none; }
+
+/* A narrow head keeps every control and lets the words go: 「기록」 for the
+ * record, 「＋」 for a new workspace (their names stay on the tooltip and the
+ * label), and the search takes a line of its own. */
+@container workspace-board (max-width: 720px) {
+  .workspace-board-records-long {
+    display: none;
+  }
+
+  .workspace-board-records-short {
+    display: inline;
+  }
+
+  .workspace-board-new {
+    width: var(--control-height-sm);
+    justify-content: center;
+    padding: 0;
+  }
+
+  .workspace-board-new-word {
+    display: none;
+  }
+
+  .workspace-board-views button {
+    padding: 0 var(--space-2);
+  }
+
+  .workspace-board-search {
+    flex-basis: 100%;
+    margin-left: 0;
+  }
 }
+
 @container workspace-board (max-width: 420px) {
-  .workspace-board-head { padding: var(--space-3); gap: var(--space-2); }
-  .workspace-board-heading-row { min-width: 0; width: 100%; }
-  .workspace-board-search { min-width: 0; flex-basis: 100%; }
-  .workspace-board-body { padding: var(--space-2); }
-  .workspace-board-settings-pop { inset-inline: var(--space-2); width: auto; }
-  .workspace-board-pin { height: auto; min-height: 3em; }
-  .workspace-board-pin > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .workspace-board-head {
+    padding: var(--space-3);
+  }
+
+  .workspace-board-body {
+    padding: 0 var(--space-2);
+  }
+
+  .workspace-board-settings-pop,
+  .workspace-board-accuracy {
+    right: var(--space-2);
+    left: var(--space-2);
+    width: auto;
+  }
+
+  .workspace-board-pin {
+    height: auto;
+    min-height: var(--control-height-md);
+  }
+
+  .workspace-board-pin > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 }
 
 @media (hover: none) {
   .workspace-board-lane-bottom-add,
-  .workspace-board-card-menu {
+  .workspace-board[data-view="kanban"] .workspace-board-card .workspace-board-card-menu {
     opacity: 1;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .workspace-board,
+  .workspace-board-views button,
+  .workspace-board-records,
+  .workspace-board-chip,
+  .workspace-board-layout-controls .btn,
+  .workspace-board-search,
+  .workspace-board-search-clear,
+  .workspace-board-pin,
+  .workspace-board-project-head,
   .workspace-board-card,
-  .workspace-board-settings-pop {
-    animation: none;
+  .workspace-board-card-more,
+  .workspace-board-card-stage,
+  .workspace-board-card-offer,
+  .workspace-board-changes,
+  .workspace-board-tasks,
+  .workspace-board-card-menu,
+  .workspace-board-lane,
+  .workspace-board-lane-add,
+  .workspace-board-lane-bottom-add,
+  .workspace-board-column-resize::after,
+  .workspace-board-status-action,
+  .workspace-board-add-status {
+    transition: none;
   }
 
-  .workspace-board-card,
-  .workspace-board-pin,
-  .workspace-board-lane {
-    transition: none;
+  .workspace-board-card-state.is-working {
+    animation: none;
   }
 }
 
@@ -37636,8 +38596,49 @@ details.task-board-section > summary {
 
 /* 목록은 데스크의 다음 줄이다 (t-34501): 데스크가 서 있으면 필터 알약은 데스크의
  * 발에서 블록 사이와 같은 간격으로 이어 붙는다. */
-.task-board-desk:not([hidden]) + .task-board-tally {
+.task-board-desk:not([hidden]) + .task-board-tally,
+.task-board-desk:not([hidden]) + .task-board-agents-fold {
   margin-top: var(--space-5);
+}
+
+/* 「에이전트 대화 N」(11-08 시안 v3): 원장이 있는 창의 기록 탭에서 옛 목록을 그 밑에 접는 한 줄. 원장이 없는 창은
+ * 이 줄 없이 목록이 판 전체다. */
+.task-board-agents-fold {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-4);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--surface-deck);
+  box-shadow: inset 0 0 0 var(--rule-width) var(--edge-rule);
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.task-board-agents-fold:hover {
+  background: var(--row-hover);
+}
+
+.task-board-agents-fold .icon {
+  transition: transform var(--motion-fast) var(--ease-standard);
+}
+
+.task-board-agents-fold .icon.is-open {
+  transform: rotate(90deg);
+}
+
+.task-board-surface[data-board-ledger="none"] .task-board-agents-fold {
+  display: none;
+}
+
+.task-board-surface[data-board-ledger="on"][data-board-tab="history"][data-agents-open="off"] :is(.task-board-tally, .task-board-filters, .task-board-sections, .task-board-empty) {
+  display: none;
 }
 
 .board-desk-block {
@@ -37647,6 +38648,26 @@ details.task-board-section > summary {
 
 .board-desk-block[data-desk-block="asks"] { grid-column: 1; }
 .board-desk-block[data-desk-block="builds"] { grid-column: 2; }
+
+/* 세 장이 다 서면(11-08 시안 v3) 「지금 도는 일」이 당신 차례 밑으로 올라오고 빌드가 오른쪽 열을 두 줄 내내 쓴다 —
+ * 질문을 세 줄로 접어 생긴 왼쪽 빈 칸을 표가 메우고, 빌드 줄이 붙어 길어진 빌드 카드가 표를 밀어내지 않는다. 남는
+ * 높이는 둘째 줄(1fr)이 받아 당신 차례와 표 사이가 벌어지지 않고, 통합 묶음과 남은 일은 그 밑에서 폭을 다 쓴다. */
+.task-board-desk:has(> [data-desk-block="asks"]:not([hidden])):has(> [data-desk-block="builds"]:not([hidden])):has(> [data-desk-block="running"]:not([hidden])) {
+  grid-template-rows: auto 1fr;
+  grid-auto-flow: row dense;
+}
+
+.task-board-desk:has(> [data-desk-block="asks"]:not([hidden])):has(> [data-desk-block="running"]:not([hidden])) > [data-desk-block="builds"]:not([hidden]) {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: start;
+}
+
+.task-board-desk:has(> [data-desk-block="asks"]:not([hidden])):has(> [data-desk-block="builds"]:not([hidden])) > [data-desk-block="running"]:not([hidden]) {
+  grid-column: 1;
+  grid-row: 2;
+  align-self: start;
+}
 
 /* 한 장만 서면 그 장이 행을 다 쓴다. */
 .task-board-desk:not(:has(> [data-desk-block="builds"]:not([hidden]))) > [data-desk-block="asks"],
@@ -37660,12 +38681,11 @@ details.task-board-section > summary {
 
 /* 기계 띠: 한 줄, 조각마다 제 말. 붐빔·빠듯은 기다림의 잉크, 거절은 멈춤의 잉크 —
  * 보드의 색 어휘 그대로다. */
+/* 이 기계 (11-08 시안 v3): 사실마다 한 칸 — 값, 몫이면 막대, 그 밑에 한 줄. 칸 사이는 세로 룰이고 좁으면 두 칸씩. */
 .board-desk-machine {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-1) var(--space-4);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
   margin: 0;
-  padding: var(--space-2) var(--space-3);
   border: var(--rule-width) solid var(--edge-rule);
   border-radius: var(--radius-md);
   background: var(--surface-deck);
@@ -37674,13 +38694,230 @@ details.task-board-section > summary {
   font-variant-numeric: tabular-nums;
 }
 
-.board-desk-machine-segment.is-wait {
+.board-desk-machine-segment {
+  display: grid;
+  gap: var(--space-1);
+  align-content: start;
+  min-width: 0;
+  padding: var(--space-3) var(--space-4);
+}
+
+.board-desk-machine-segment + .board-desk-machine-segment {
+  box-shadow: inset var(--rule-width) 0 0 var(--edge-rule);
+}
+
+.board-desk-machine-value {
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+  font-weight: 600;
+}
+
+.board-desk-machine-meter {
+  height: var(--space-1);
+  overflow: hidden;
+  border-radius: var(--radius-pill);
+  /* A filled shape takes the mark, never the border-only rule (it would vanish at 8 %). */
+  background: var(--edge-mark);
+}
+
+.board-desk-machine-meter[hidden] {
+  display: none;
+}
+
+.board-desk-machine-meter > i {
+  display: block;
+  width: var(--fill, 0%);
+  height: 100%;
+  border-radius: inherit;
+  background: var(--ink-mist);
+}
+
+.board-desk-machine-segment.is-wait .board-desk-machine-meter > i {
+  background: var(--signal-wait);
+}
+
+.board-desk-machine-note[hidden] {
+  display: none;
+}
+
+.board-desk-machine-segment.is-wait .board-desk-machine-note {
   color: var(--signal-wait-ink);
 }
 
-.board-desk-machine-segment.is-halt {
+.board-desk-machine-segment.is-halt .board-desk-machine-note {
   color: var(--signal-halt-ink);
   font-weight: 600;
+}
+
+/* 워커 표 (11-08 시안 v3): 워커 칸의 둘째 줄이 과업, 런마다 머리 행, 지금 하는 일은 한 줄로 물러나고, 「판 열기」는
+ * 손이 닿은 행(또는 초점)에서 선다 — 표의 행이 단추 줄로 시끄럽지 않게. */
+.board-desk-worker-task {
+  display: block;
+  overflow: hidden;
+  color: var(--ink-mist);
+  /* 13px, as the task cell was: the tab keeps to four type sizes (board-now.mjs). */
+  font: var(--type-label-13);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.board-desk-worker-run-name {
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-well);
+  color: var(--ink-chalk);
+  font: var(--type-label-12);
+  font-weight: 600;
+  text-align: left;
+}
+
+.board-desk-worker-work {
+  max-width: 24rem;
+  overflow: hidden;
+  color: var(--ink-mist);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.board-desk-worker-act {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.board-desk-worker-open {
+  opacity: 0;
+  transition: opacity var(--motion-fast) var(--ease-standard);
+}
+
+.board-desk-worker-row:hover .board-desk-worker-open,
+.board-desk-worker-row:focus-within .board-desk-worker-open {
+  opacity: 1;
+}
+
+/* 기록 (11-08 시안 v3): 날마다 접는 머리 행, 결과 거르개와 찾기 칸, 흐름 막대. */
+.board-today-day-head {
+  padding: 0;
+  background: var(--surface-well);
+  text-align: left;
+}
+
+.board-today-day-fold {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 0;
+  background: none;
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.board-today-day-fold:hover {
+  background: var(--row-hover);
+}
+
+.board-today-day-fold .icon {
+  align-self: center;
+  transition: transform var(--motion-fast) var(--ease-standard);
+}
+
+.board-today-day-fold .icon.is-open {
+  transform: rotate(90deg);
+}
+
+.board-today-day-count {
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+}
+
+.board-desk-block[data-desk-block="today"] .board-desk-block-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.board-history-filter {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--rule-width);
+  padding: var(--rule-width);
+  border-radius: var(--radius-sm);
+  box-shadow: inset 0 0 0 var(--rule-width) var(--edge-rule);
+}
+
+.board-history-result {
+  padding: var(--space-1) var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard), color var(--motion-fast) var(--ease-standard);
+}
+
+.board-history-result:hover {
+  color: var(--ink-chalk);
+}
+
+.board-history-result[aria-pressed="true"] {
+  background: var(--row-hover);
+  color: var(--ink-chalk);
+}
+
+.board-history-search {
+  flex: 0 1 14rem;
+  min-width: 8rem;
+  margin-left: auto;
+  padding: var(--space-1) var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--surface-well);
+  box-shadow: inset 0 0 0 var(--rule-width) var(--edge-rule);
+  color: var(--ink-chalk);
+  font: var(--type-label-12);
+}
+
+.board-desk-flowbar {
+  display: flex;
+  gap: var(--rule-width);
+  height: var(--space-2);
+  margin: 0 0 var(--space-3);
+  overflow: hidden;
+  border-radius: var(--radius-pill);
+}
+
+.board-desk-flowbar-part {
+  flex: var(--share, 1) 1 0;
+  min-width: var(--space-1);
+  background: var(--status-dot-queue);
+}
+
+:is(.board-desk-flowbar-part, .board-desk-stage)[data-tone="run"] { --flow-tone: var(--status-dot-run); }
+:is(.board-desk-flowbar-part, .board-desk-stage)[data-tone="you"] { --flow-tone: var(--status-dot-you); }
+:is(.board-desk-flowbar-part, .board-desk-stage)[data-tone="ok"] { --flow-tone: var(--signal-ready); }
+:is(.board-desk-flowbar-part, .board-desk-stage)[data-tone="done"] { --flow-tone: var(--status-dot-done); }
+:is(.board-desk-flowbar-part, .board-desk-stage)[data-tone="halt"] { --flow-tone: var(--status-dot-halt); }
+
+.board-desk-flowbar-part[data-tone] {
+  background: var(--flow-tone, var(--status-dot-queue));
+}
+
+/* 칩은 막대의 범례다: 낱말 앞에 그 색의 작은 칸. */
+.board-desk-stage-word::before {
+  content: "";
+  display: inline-block;
+  width: var(--space-2);
+  height: var(--space-2);
+  margin-right: var(--space-1);
+  border-radius: var(--radius-xs);
+  background: var(--flow-tone, var(--status-dot-queue));
+  vertical-align: -1px;
 }
 
 /* 답할 우편: 편지 한 통이 두 줄짜리 한 장이고, 앞 레일이 기다림(끝난 워커는
@@ -38617,31 +39854,19 @@ details.task-board-section > summary {
 /* ---- 일정 B (t-77628): 출발 안내판 + 세로 시간표 ----------------------------------------
  * 사람이 통과시킨 시안 B(p-e7e48c0f0a3959fa): 「지금 앞뒤」와 「하루」 확대는 카드 위에 공항 출발 안내판의
  * 문법으로 넉 줄 — 한 줄에 무엇 · 큰 시각이나 수 · 낱말 · 비고 · 행동 칩, 왼쪽 띠가 상태의 색 — 을 세우고,
- * 그 아래 캘린더 하루 보기처럼 시간이 아래로 흐르는 시간표를 둔다. 열은 묶음 넷(발행·게이트·빌드 줄·워커
- * 과업)이고 묶음 상자는 달력의 머리 줄과 같은 것이다 — 확대가 상자를 옮긴다. 블록 하나 = 단추 하나와 이름(`<b>`),
- * 게이트만 단계 칸 줄(`<i>`) 하나 더; 둘째 줄(상태 점과 낱말)·셋째 줄(까닭)·행동 칩은 `data-*`를 읽는 가상
- * 요소다. 자리는 커스텀 속성 — `--from`·`--to`는 범위의 퍼센트, `--col`·`--cols`는 겹친 블록의 부열 — 이고
- * 시간당 높이(`--schedule-hour`)는 여기 하나뿐이다. 상태는 색과 모양과 낱말이 함께 말한다: 끝남은 꽉 참,
- * 도는 것은 지금까지 칠하고 그 아래 빗금, 기다림은 점선 테두리와 넘김까지의 칠, 범위 앞에서 시작한 것은
- * 톱니 윗변. 「한 주」는 이 절 뒤의 달력이다. */
+ * 그 아래 가로 레인 타임라인(11-08 시안 v3)을 둔다: 묶음 넷(발행·게이트·빌드 줄·워커 과업)마다 머리 줄과 레인들,
+ * 시간이 오른쪽으로 흐르고 고른 막대는 오른쪽 쪽지가 말한다. 묶음 상자는 달력의 머리 줄과 같은 것이다 — 확대가 상자를
+ * 옮긴다. 막대 하나 = 단추 하나와 이름(`<b>`), 게이트만 단계 칸 줄(`<i>`) 하나 더. 자리는 커스텀 속성 — `--from`·`--to`는
+ * 범위의 퍼센트, `--col`·`--cols`는 레인 안에서 겹친 막대의 줄 — 이다. 상태는 색과 모양과 낱말이 함께 말한다: 끝남은
+ * 꽉 참, 도는 것은 지금까지 칠하고 그 뒤 빗금, 기다림은 점선 테두리와 넘김까지의 칠, 범위 앞에서 시작한 것은 톱니
+ * 왼변. 「한 주」는 이 절 뒤의 달력이다. */
 .task-board-schedule {
-  /* 눈금 밖 값마다 까닭(디자인 스킬 5): 시간당 높이 120px — 지금 앞뒤의 네 시간이 480px, 시험 그릇(약 590 px)의
-   * 한 화면에 든다; 홈통 4rem — 「지금 09:50」 칩(12px 글 여덟 자 + 안쪽 8px)이 선다; 열 머리 32px — 13px 글 한 줄과
-   * 위아래 8px; 열 최소 7rem — 「워커 과업 7 · 끝남 3」 머리 글; 부열 최소 5rem — 과업 id 「t-77628」 고정폭 12px
-   * 일곱 자; 시간표 최소 40rem — 홈통 + 열 넷의 최소 폭(4 + 4×7 = 32rem)에 나란히 선 블록 둘의 여유. */
-  --schedule-hour: var(--schedule-hour-now);
-  --schedule-gutter: 4rem;
-  --schedule-col-head: var(--head-height);
-  --schedule-col-min: 7rem;
-  --schedule-subcol-min: 5rem;
-  --schedule-cal-min: 40rem;
-  /* 블록의 최소 높이: 글 한 줄(16px)과 위아래 4px — 그보다 짧은 일도 한 줄은 선다. 모델이 그릇에서 읽어 겹침을 센다. */
+  /* 레인 타임라인(11-08 시안 v3)의 치수는 tokens.css의 것이다: 이름 칸, 레인 높이, 쪽지 폭. 달력의 블록은 글 한 줄(16px)과
+   * 위아래 4px보다 낮아지지 않는다. */
+  --schedule-name: var(--schedule-lane-name);
   --schedule-block-least: var(--space-5);
-}
-
-.task-board-schedule[data-schedule-zoom="day"] {
-  /* 하루: 스물네 시간이 960px — 한 번의 스크롤 안. */
-  --schedule-hour: var(--schedule-hour-day);
+  /* 달력의 머리 줄 높이: 13px 글 한 줄과 위아래 8px. */
+  --schedule-col-head: var(--head-height);
 }
 
 .board-schedule-day[hidden],
@@ -38651,7 +39876,10 @@ details.task-board-section > summary {
 }
 
 /* 안내판 — 카드 하나에 머리 한 줄과 넉 줄. */
+/* 요약 네 칸(11-08 시안 v3): 머리 줄 밑에 다음 발행 · 게이트 · 착지 대기 · 끝남이 나란히 — 좁으면 두 칸씩. */
 .board-schedule-board {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   margin-bottom: var(--space-4);
   border-radius: var(--radius-sm);
   background: var(--surface-deck);
@@ -38660,6 +39888,7 @@ details.task-board-section > summary {
 }
 
 .board-schedule-board-head {
+  grid-column: 1 / -1;
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
@@ -38675,24 +39904,28 @@ details.task-board-section > summary {
   letter-spacing: var(--tracking-heading-14);
 }
 
-/* 한 줄 = 단추 하나: 무엇(이름과 작은 둘째 줄) · 큰 글(시각이나 수, 곁에 낱말) · 비고 · 행동 칩. 왼쪽 띠는
- * 상태의 색(`--schedule-strip`)이고 큰 글의 잉크가 같은 것을 말한다. */
+/* 한 칸 = 단추 하나: 무엇(이름과 작은 둘째 줄)과 행동 칩, 큰 글(시각이나 수, 곁에 낱말), 비고. 윗변의 띠는
+ * 상태의 색(`--schedule-strip`)이고 큰 글의 잉크가 같은 것을 말한다. 칸 사이는 세로 룰. */
 .board-schedule-line {
   --schedule-strip: transparent;
   position: relative;
   display: grid;
-  /* 무엇 9rem — 「착지 대기」 넉 자와 둘째 줄 「보고·검증 뒤 · 코디 차례」; 큰 글 11rem — 24px 시각 다섯 자와 곁의 낱말 */
-  grid-template-columns: 9rem 11rem minmax(0, 1fr) auto;
-  grid-template-areas: "what big note act";
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "what act"
+    "big big"
+    "note note";
+  align-content: start;
   align-items: center;
-  column-gap: var(--space-4);
-  width: 100%;
+  gap: var(--space-1) var(--space-2);
+  min-width: 0;
   padding: var(--space-3) var(--space-4);
   border: 0;
   background: transparent;
   box-shadow:
+    inset 0 calc(var(--accent-rule) + var(--rule-width)) 0 var(--schedule-strip),
     inset 0 var(--rule-width) 0 var(--edge-rule),
-    inset calc(var(--accent-rule) + var(--rule-width)) 0 0 var(--schedule-strip);
+    inset var(--rule-width) 0 0 var(--edge-rule);
   color: var(--ink-chalk);
   font: var(--type-label-13);
   text-align: start;
@@ -38732,7 +39965,6 @@ details.task-board-section > summary {
   grid-area: big;
   font: var(--type-heading-24);
   font-variant-numeric: tabular-nums;
-  white-space: nowrap;
 }
 
 .board-schedule-line-big::after {
@@ -38785,6 +40017,11 @@ details.task-board-section > summary {
   inset-inline-end: var(--space-1);
 }
 
+/* 레인의 막대는 누르면 쪽지가 말하고 문은 쪽지에 선다 — 막대 위의 행동 칩은 달력의 것이다. */
+.board-schedule-cal-body .board-schedule-block::after {
+  display: none;
+}
+
 .board-schedule-line:hover::after,
 .board-schedule-line:focus-visible::after,
 .board-schedule-block:hover::after,
@@ -38797,76 +40034,88 @@ details.task-board-section > summary {
   display: none;
 }
 
-/* 세로 시간표 — 카드 하나: 홈통(정시 글과 「지금」 칩)과 열 넷. 열은 묶음 상자 그대로다. */
-/* 열의 최소 폭(나란히 선 블록 수 × 블록 최소 폭)이 카드보다 넓어지면 어느 그릇에서든 옆으로 민다 — 잘리지 않는다.
- * `overflow`의 두 값은 가로·세로 차례다(review r2 P1: 거꾸로 적어 어느 그릇에서도 안 밀렸다). */
+/* 레인 타임라인(11-08 시안 v3) — 카드 하나: 왼쪽은 축 한 줄과 묶음마다 머리 줄과 레인들, 오른쪽은 고른 막대의 쪽지.
+ * 레인은 이름 칸(`--schedule-name`)과 길로 나뉘고, 길의 자리(0~100%)는 축의 자리와 같다 — 같은 열이라 같은 폭이다. */
 .board-schedule-day {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--schedule-drawer-width);
   border-radius: var(--radius-sm);
   background: var(--surface-deck);
   box-shadow: var(--shadow-border-small);
-  overflow-x: auto;
-  overflow-y: hidden;
+  overflow: hidden;
 }
 
-/* 시각 홈통 뒤로 서는 묶음마다 한 열 — 이 프로젝트에 서지 않는 묶음은 자리를 남기지 않는다. */
 .board-schedule-cal-body {
   position: relative;
-  display: grid;
-  grid-template-columns: var(--schedule-gutter);
-  grid-auto-flow: column;
-  grid-auto-columns: minmax(auto, 1fr);
+  min-width: 0;
+  box-shadow: inset calc(-1 * var(--rule-width)) 0 0 var(--edge-rule);
 }
 
+/* 「지금」 세로선: 이름 칸 뒤 길의 `--now` 자리, 축부터 끝 레인까지. */
+.board-schedule-cal-body::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  inset-inline-start: calc(var(--schedule-name) + (100% - var(--schedule-name)) * var(--now) / 100);
+  width: var(--accent-rule);
+  translate: -50% 0;
+  background: var(--ink-chalk);
+  pointer-events: none;
+}
+
+/* 축: 이름 칸에 확대의 말, 길에 눈금·접힌 칸·「지금」 칩. */
 .board-schedule-gutter {
   display: grid;
-  grid-template-rows: var(--schedule-col-head) auto;
+  grid-template-columns: var(--schedule-name) minmax(0, 1fr);
+  height: var(--head-height);
   background: var(--surface-abyss);
+  box-shadow: inset 0 calc(-1 * var(--rule-width)) 0 var(--edge-rule);
 }
 
 .board-schedule-gutter-head {
-  height: var(--schedule-col-head);
-  box-shadow: inset 0 calc(-1 * var(--rule-width)) 0 var(--edge-rule);
-}
-
-/* 홈통의 트랙과 열의 트랙은 같은 높이다: 범위의 시간 수 × 시간당 높이. */
-.board-schedule-gutter-track,
-.board-schedule-cal-body .board-schedule-rows {
-  position: relative;
-  height: calc(var(--schedule-hours) * var(--schedule-hour));
-}
-
-.board-schedule-gutter-track .board-schedule-tick {
-  top: calc(var(--at) * 1%);
-  inset-inline-start: auto;
-  inset-inline-end: var(--space-2);
-  translate: 0 -50%;
-}
-
-.board-schedule-gutter-track .board-schedule-now {
-  top: calc(var(--now) * 1%);
-  inset-inline-start: var(--space-1);
-  translate: 0 -50%;
-}
-
-/* 열의 폭: 제 몫(1fr)이되 열의 최소 폭과, 나란히 선 블록 수 × 블록 하나의 최소 폭보다는 넓다. 열은 제 안의
- * 글로 넓어지지 않는다(`container-type`이 인라인 크기를 가둔다) — 머리 글은 잘리고 블록은 제 부열 안에 선다. */
-.board-schedule-cal-body > .board-schedule-group {
-  container-type: inline-size;
-  display: grid;
-  grid-template-rows: var(--schedule-col-head) auto auto;
-  min-width: max(var(--schedule-col-min), calc(var(--schedule-subcols, 1) * var(--schedule-subcol-min)));
-  box-shadow: inset var(--rule-width) 0 0 var(--edge-rule);
-}
-
-/* 열 머리: 이름과, 그 열이 든 수(`data-sub`) — 「7 · 차례 기다림 4 · 끝남 3」, 비면 「이 범위에 없음」. */
-.board-schedule-cal-body .board-schedule-group-head {
-  height: var(--schedule-col-head);
-  padding: 0 var(--space-3);
+  align-self: center;
   overflow: hidden;
-  box-shadow: inset 0 calc(-1 * var(--rule-width)) 0 var(--edge-rule);
+  padding: 0 var(--space-3);
+  color: var(--ink-label);
+  font: var(--type-label-12);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.board-schedule-gutter-track {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  font: var(--type-label-12-mono);
+}
+
+/* 접힌 빈 시간: 옅은 빗금 칸 하나와 그 길이 한 마디(「⋯ 3시간 20분」). */
+.board-schedule-gap {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  inset-inline-start: calc(var(--from) * 1%);
+  width: calc((var(--to) - var(--from)) * 1%);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: repeating-linear-gradient(135deg, var(--edge-mark) 0 var(--rule-width), transparent var(--rule-width) var(--space-2));
+  color: var(--ink-label);
+  font: var(--type-label-12);
+  white-space: nowrap;
+}
+
+/* 묶음: 머리 줄 하나와 그 밑의 레인들. */
+.board-schedule-cal-body > .board-schedule-group {
+  display: block;
+}
+
+.board-schedule-cal-body .board-schedule-group-head {
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-well);
   color: var(--ink-chalk);
   font-weight: 500;
-  white-space: nowrap;
 }
 
 .board-schedule-cal-body .board-schedule-group-head::after,
@@ -38880,44 +40129,62 @@ details.task-board-section > summary {
   font-weight: 400;
 }
 
-/* 열의 트랙: 우물 바탕, 정시 선(`--schedule-grid`, 몸통이 정한다 — 위→아래), 맨 위 「지금」 선. */
-.board-schedule-cal-body .board-schedule-rows {
-  display: block;
-  background:
-    linear-gradient(to bottom, transparent calc(var(--now) * 1% - var(--accent-rule) / 2), var(--ink-chalk) 0,
-      var(--ink-chalk) calc(var(--now) * 1% + var(--accent-rule) / 2), transparent 0),
-    var(--schedule-grid, none),
-    var(--surface-well);
+/* 레인: 이름 칸과 길. 길은 우물 바탕에 눈금 선과 접힌 칸의 띠(`--schedule-grid`), 지금 뒤는 한 겹 더 옅게. 겹친 막대가
+ * 있으면 레인이 그 줄 수(`--lane-rows`)만큼 높아진다. */
+.board-schedule-lane {
+  display: grid;
+  grid-template-columns: var(--schedule-name) minmax(0, 1fr);
+  min-height: calc(var(--schedule-lane-height) * var(--lane-rows, 1));
+  box-shadow: inset 0 var(--rule-width) 0 var(--edge-rule);
 }
 
-/* 지금 뒤가 비면 시간표가 그렇다고 말한다 — 「지금」 선 바로 아래, 열 넷을 가로질러. */
+.board-schedule-lane-name {
+  align-self: center;
+  overflow: hidden;
+  padding: 0 var(--space-3);
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.board-schedule-lane-track {
+  position: relative;
+  min-width: 0;
+  /* A bar at the range's right edge keeps its least width inside the lane, never past the card. */
+  overflow: hidden;
+  background:
+    linear-gradient(to right, transparent calc(var(--now) * 1%), var(--surface-well) 0),
+    var(--schedule-grid, none);
+}
+
+/* 지금 뒤가 비면 레인 밑 한 줄이 그렇다고 말한다. */
 .board-schedule-ahead-empty {
-  position: absolute;
-  inset-inline: var(--schedule-gutter) 0;
-  top: calc(var(--schedule-col-head) + var(--schedule-hours) * var(--schedule-hour) * var(--now) / 100 + var(--space-5));
   margin: 0;
+  padding: var(--space-2) var(--space-3);
+  box-shadow: inset 0 var(--rule-width) 0 var(--edge-rule);
   color: var(--ink-label);
   font: var(--type-label-13);
-  text-align: center;
-  pointer-events: none;
+  text-align: end;
 }
 
-/* 블록 — 단추 하나. 왼쪽 띠(`--schedule-rail`)가 상태의 색, 손이 닿으면 1px 고리. 글은 위에서부터 이름 ·
- * 둘째 줄 · 까닭 · 단계 칸 줄의 차례(가상 요소는 flex 항목이라 `order`로 선다). */
+/* 막대 — 단추 하나. 왼쪽 띠(`--schedule-rail`)가 상태의 색, 손이 닿거나 고르면 1px 고리. 겹친 막대는 레인 안의 제
+ * 줄(`--col`/`--cols`)에 선다. 글은 이름 한 줄, 게이트면 그 밑에 단계 칸 줄. */
 .board-schedule-block {
   --schedule-rail: var(--edge-mark);
   --schedule-ring: transparent;
-  /* 칠이 차오르는 쪽: 시간이 아래로 흐르는 시간표는 아래로, 달력의 칸 안에서는 오른쪽으로. */
-  --schedule-fill-to: to bottom;
+  /* 칠이 차오르는 쪽: 시간이 오른쪽으로 흐른다. */
+  --schedule-fill-to: to right;
   position: absolute;
-  top: calc(var(--from) * 1%);
-  inset-inline-start: calc(var(--col) / var(--cols) * 100% + var(--space-1));
+  top: calc(var(--col) / var(--cols) * 100% + var(--space-1));
+  inset-inline-start: calc(var(--from) * 1%);
   display: flex;
   flex-direction: column;
+  justify-content: center;
   align-items: stretch;
-  width: calc(100% / var(--cols) - var(--space-2));
-  height: max(var(--schedule-block-least), calc((var(--to) - var(--from)) * 1%));
-  padding: var(--space-1) var(--space-2);
+  width: max(var(--space-1), calc((var(--to) - var(--from)) * 1%));
+  height: calc(100% / var(--cols) - var(--space-2));
+  padding: 0 var(--space-2);
   border: 0;
   border-radius: var(--radius-xs);
   overflow: hidden;
@@ -38933,7 +40200,8 @@ details.task-board-section > summary {
 }
 
 .board-schedule-block:hover,
-.board-schedule-block:focus-visible {
+.board-schedule-block:focus-visible,
+.board-schedule-block[aria-pressed="true"] {
   --schedule-ring: var(--ink-chalk);
 }
 
@@ -38948,16 +40216,20 @@ details.task-board-section > summary {
   order: 0;
   padding: 0;
   color: var(--ink-chalk);
-  font: var(--type-label-13);
+  font: var(--type-label-12);
   font-weight: 500;
 }
 
-/* 이름 칸: id는 고정폭·흐린 잉크, 제목은 또렷한 잉크 — 요소 하나, id는 가상 요소. */
+/* 이름 칸: id는 고정폭·흐린 잉크, 제목은 또렷한 잉크 — 요소 하나, id는 가상 요소. 둘째 줄은 쪽지가 말한다. */
 .board-schedule-block .board-schedule-label::before {
   content: attr(data-id) " ";
   color: var(--ink-mist);
   font: var(--type-label-12-mono);
   font-weight: 500;
+}
+
+.board-schedule-cal-body .board-schedule-block .board-schedule-label::after {
+  display: none;
 }
 
 .board-schedule-block .board-schedule-label::after {
@@ -38978,6 +40250,7 @@ details.task-board-section > summary {
   font: var(--type-label-12);
 }
 
+.board-schedule-cal-body .board-schedule-block::before,
 .board-schedule-block[data-why=""]::before {
   display: none;
 }
@@ -38991,7 +40264,7 @@ details.task-board-section > summary {
   color: var(--ink-mist);
 }
 
-/* 시간표 아래 한 줄: 블록의 칠·빗금·점선·톱니가 무엇을 말하는지(review P3-6). */
+/* 레인 밑 한 줄: 막대의 칠·빗금·점선·톱니와 접힌 칸이 무엇을 말하는지(review P3-6). */
 .board-schedule-cal-legend {
   margin: var(--space-2) 0 0;
   color: var(--ink-label);
@@ -39039,7 +40312,7 @@ details.task-board-section > summary {
     linear-gradient(var(--schedule-fill-to), var(--schedule-worked-fill) calc(var(--done) * 1%), transparent calc(var(--done) * 1%));
 }
 
-/* 실린 게이트가 돌아 그 예상 끝을 물려받은 것: 지금(`--mark`) 아래는 게이트의 시간이라 빗금. */
+/* 실린 게이트가 돌아 그 예상 끝을 물려받은 것: 지금(`--mark`) 뒤는 게이트의 시간이라 빗금. */
 .board-schedule-block.is-inherited:is([data-bar-state="waiting"], [data-bar-state="held"]) {
   background:
     linear-gradient(var(--schedule-fill-to), transparent calc(var(--done) * 1% - var(--rule-width)),
@@ -39053,36 +40326,100 @@ details.task-board-section > summary {
   outline-offset: calc(var(--rule-width) * -1);
 }
 
-/* 범위 앞에서 시작한 블록: 윗변이 톱니 — 여기서 시작한 것이 아니라고 모양이 말한다. */
+/* 범위 앞에서 시작한 막대: 왼변이 톱니 — 여기서 시작한 것이 아니라고 모양이 말한다. */
 .board-schedule-block.is-cut {
   border-start-start-radius: 0;
-  border-start-end-radius: 0;
-  clip-path: polygon(0 var(--space-1), 2.5% 0, 5% var(--space-1), 7.5% 0, 10% var(--space-1), 12.5% 0, 15% var(--space-1), 17.5% 0, 20% var(--space-1), 22.5% 0, 25% var(--space-1), 27.5% 0, 30% var(--space-1), 32.5% 0, 35% var(--space-1), 37.5% 0, 40% var(--space-1), 42.5% 0, 45% var(--space-1), 47.5% 0, 50% var(--space-1), 52.5% 0, 55% var(--space-1), 57.5% 0, 60% var(--space-1), 62.5% 0, 65% var(--space-1), 67.5% 0, 70% var(--space-1), 72.5% 0, 75% var(--space-1), 77.5% 0, 80% var(--space-1), 82.5% 0, 85% var(--space-1), 87.5% 0, 90% var(--space-1), 92.5% 0, 95% var(--space-1), 97.5% 0, 100% var(--space-1), 100% 100%, 0 100%);
+  border-end-start-radius: 0;
+  clip-path: polygon(var(--space-1) 0, 100% 0, 100% 100%, var(--space-1) 100%, 0 87.5%, var(--space-1) 75%, 0 62.5%, var(--space-1) 50%, 0 37.5%, var(--space-1) 25%, 0 12.5%);
 }
 
-/* 좁은 그릇: 안내판 줄은 두 줄로 접히고 칩은 오른쪽 위에; 세로 시간표는 폰의 캘린더처럼 옆으로 민다 —
- * 겹친 과업의 나란한 부열은 접지 않는다. */
+/* 쪽지(11-08 시안 v3): 고른 막대의 이름과 상태 점, 문장, 둘째 줄, 까닭, 게이트의 단계, 자세한 한 줄, 문. */
+.board-schedule-drawer {
+  display: grid;
+  align-content: start;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-3) var(--space-4);
+  color: var(--ink-mist);
+  font: var(--type-label-13);
+}
+
+.board-schedule-drawer [hidden] {
+  display: none;
+}
+
+.board-schedule-drawer p,
+.board-schedule-drawer ol {
+  margin: 0;
+}
+
+.board-schedule-drawer-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--ink-chalk);
+  font: var(--type-label-14);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.board-schedule-drawer-said {
+  color: var(--ink-chalk);
+}
+
+.board-schedule-drawer-why {
+  color: var(--signal-wait-ink);
+}
+
+.board-schedule-drawer-steps {
+  display: grid;
+  gap: var(--space-1);
+  padding: var(--space-2) 0 0;
+  box-shadow: inset 0 var(--rule-width) 0 var(--edge-rule);
+  list-style: none;
+}
+
+/* 한 단계 = 요소 하나: 상태 점은 `.board-state`의 ::before — 그 규칙보다 뒤에 와도 이기도록 목록을 함께 적는다. */
+.board-schedule-drawer-steps .board-schedule-drawer-step {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  overflow: hidden;
+  font: var(--type-label-12);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.board-schedule-drawer-tip {
+  color: var(--ink-label);
+  font: var(--type-label-12-mono);
+  overflow-wrap: anywhere;
+}
+
+.board-schedule-drawer-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* 좁은 그릇: 안내판 칸은 두 칸씩, 쪽지는 레인 밑으로, 이름 칸은 좁게. */
 @container board-schedule (max-width: 47.5rem) {
-  .board-schedule-line {
-    grid-template-columns: minmax(0, 1fr) auto;
-    grid-template-areas:
-      "what big"
-      "note note";
-    row-gap: var(--space-1);
+  .task-board-schedule {
+    --schedule-name: 8rem;
   }
 
-  .board-schedule-line::after {
-    position: absolute;
-    top: var(--space-3);
-    inset-inline-end: var(--space-4);
-  }
-
-  .board-schedule-line-note {
-    white-space: normal;
+  .board-schedule-day {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .board-schedule-cal-body {
-    min-width: var(--schedule-cal-min);
+    box-shadow: inset 0 calc(-1 * var(--rule-width)) 0 var(--edge-rule);
+  }
+
+  .board-schedule-board {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -39270,8 +40607,7 @@ details.task-board-section > summary {
 }
 
 /* 좁은 그릇: 날을 쌓는다 — 위에서 아래로 일곱 날, 가로 스크롤 없이. 시안의 「옆으로 민다」는 시간표의 부열을 위한 규칙이고,
- * 칸 일곱은 밀 까닭이 없다. 경계 36rem: 칸 하나의 최소 5rem(과업 id 「t-77628」 고정폭 12px 일곱 자, `--schedule-subcol-min`
- * 과 같은 까닭)이 일곱에 틈 1rem. 칸마다 제 블록만 서니 달력의 줄은 풀고, 이어지는 끝은 낱말과 납작한 모양이 말한다. */
+ * 칸 일곱은 밀 까닭이 없다. 경계 36rem: 칸 하나의 최소 5rem(과업 id 「t-77628」 고정폭 12px 일곱 자)이 일곱에 틈 1rem. 칸마다 제 블록만 서니 달력의 줄은 풀고, 이어지는 끝은 낱말과 납작한 모양이 말한다. */
 @container board-schedule (max-width: 36rem) {
   .board-schedule-week-days {
     grid-template-columns: minmax(0, 1fr);
@@ -39415,12 +40751,18 @@ details.task-board-section > summary {
 /* 한 열, DOM 차례 (t-7448 → t-67607 → t-70028): 시안 B의 문턱 그대로 — 1012 px 아래에서 두 카드는
  * 위아래로 선다(시안 `.g-grid`의 `max-width: 1011.98px`). 그 위에서만 2 : 1로 나란히. */
 @container board (max-width: 1011px) {
-  .task-board-desk {
+  .task-board-desk,
+  .task-board-desk:has(> [data-desk-block="asks"]:not([hidden])):has(> [data-desk-block="builds"]:not([hidden])):has(> [data-desk-block="running"]:not([hidden])) {
     grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+    grid-auto-flow: row;
   }
 
-  .task-board-desk > .board-desk-block {
+  .task-board-desk > .board-desk-block,
+  .task-board-desk:has(> [data-desk-block="asks"]:not([hidden])):has(> [data-desk-block="running"]:not([hidden])) > [data-desk-block="builds"]:not([hidden]),
+  .task-board-desk:has(> [data-desk-block="asks"]:not([hidden])):has(> [data-desk-block="builds"]:not([hidden])) > [data-desk-block="running"]:not([hidden]) {
     grid-column: 1;
+    grid-row: auto;
   }
 }
 
@@ -39796,6 +41138,21 @@ details.task-board-section > summary {
   white-space: normal;
 }
 
+/* 긴 질문은 세 줄로 접힌다(11-08 사람의 화면: 질문 하나가 열세 줄). 「전체 보기」가 편다(`paintBoardAskFold`). */
+.board-asks > li .board-desk-letter-body.is-folded:not(.is-open) {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.board-asks > li .board-ask-fold {
+  grid-column: 2;
+  justify-self: start;
+  margin-top: var(--space-1);
+  font: var(--type-label-12);
+}
+
 .board-asks > li .board-desk-letter-body {
   grid-column: 2;
   grid-row: 1;
@@ -39964,10 +41321,9 @@ details.task-board-section > summary {
  * 차례 · 이름 · 표지 · 도구 · 오른쪽 끝의 상태(점과 낱말), 둘째 줄은 커밋 · 몇째 단계 · 시간, 그 밑은 단계
  * 띠다 — 칸 길이는 그 단계가 평소 걸린 시간(`flex-grow`)이고, 도는 칸은 평소 대비 경과만큼 차며
  * (`--fill`), 평소를 모르면 빗금이다. 끝난 빌드는 띠가 얇아지고 시간 글자를 접는다. 단계마다의 시간은
- * 「단계 N개」 안에 있다. 둘째 줄부터는 차례 원의 폭만큼 들어선다(`--build-indent`). */
+ * 「단계 N개」 안에 있다. 둘째 줄부터는 상태 점의 폭만큼 들어선다(`--build-indent`). */
 .board-build {
-  --build-order-size: calc(var(--space-4) + var(--space-1));
-  --build-indent: calc(var(--build-order-size) + var(--space-2));
+  --build-indent: calc(var(--status-dot-size) + var(--space-2));
   /* 칸 이름이 읽히는 가장 좁은 폭 — 12px 글자로 네 글자쯤. */
   --build-seg-least: 3.25rem;
   --build-bar-height: var(--board-gap-small);
@@ -39991,28 +41347,30 @@ details.task-board-section > summary {
   margin: 0;
 }
 
-.board-build-order {
-  display: grid;
+/* 이름 앞의 상태 점(11-08 시안 v3) — 차례 번호 원은 단계로 읽혀서 걷었다. 점의 색은 행·범례의 점과 같은 토큰이고,
+ * 오른쪽의 상태 낱말은 점을 다시 그리지 않는다(`.board-build-state::before`). */
+.board-build-dot {
   flex: none;
-  place-items: center;
-  width: var(--build-order-size);
-  height: var(--build-order-size);
+  width: var(--status-dot-size);
+  height: var(--status-dot-size);
   border-radius: var(--radius-pill);
+  background: var(--status-dot-queue);
   box-shadow: inset 0 0 0 var(--rule-width) var(--edge-rule);
-  color: var(--ink-mist);
-  font: var(--type-label-12-mono);
-  font-weight: 500;
 }
 
-/* 빌드가 하나뿐이면 차례는 말할 것이 없다: 차례 원은 접히고, 둘째 줄부터의 들여쓰기도 없다. 카드 밑의 한 줄은
- * 카드가 아니다(`p`) — 카드끼리만 센다. */
-.board-build:only-of-type {
-  --build-indent: 0;
-}
+.board-build-dot[data-dot="run"] { background: var(--status-dot-run); box-shadow: none; }
+.board-build-dot[data-dot="halt"] { background: var(--status-dot-halt); box-shadow: none; }
+.board-build-dot[data-dot="done"] { background: var(--status-dot-done); box-shadow: none; }
+.board-build-dot[data-dot="you"] { background: var(--status-dot-you); box-shadow: none; }
 
-.board-build:only-of-type .board-build-order {
+.board-build-state::before {
   display: none;
 }
+
+.board-build.is-failed .board-build-state {
+  color: var(--signal-halt-ink);
+}
+
 
 /* 카드 밑의 한 줄(`buildFoot`): 찾은 빌드나 돌릴 수 없는 순서 파일의 말, 그리고 오른쪽 끝의 행동 — 「빌드」와
  * 「순서 정하기」. */
@@ -40042,35 +41400,147 @@ details.task-board-section > summary {
   color: var(--signal-wait-ink);
 }
 
+/* 카드와 발의 단추(11-08 시안 v3): 파란 글자가 아니라 단추다 — 사람이 「다시」를 링크로 읽고 지나쳤다. 높이 24px,
+ * 1px 룰, Geist의 작은 단추. 발의 「빌드 실행」만 채운 주 단추다. */
 .board-build-foot-act,
-.board-build-act {
+.board-build-act,
+.board-build-aux,
+.board-build-caret {
+  display: inline-flex;
   flex: none;
-  padding: 0;
+  align-items: center;
+  gap: var(--space-1);
+  height: var(--space-5);
+  padding: 0 var(--space-2);
   border: 0;
-  background: none;
-  color: var(--workbench-accent-ink);
-  font: var(--type-label-13);
+  border-radius: var(--radius-sm);
+  background: var(--surface-deck);
+  box-shadow: inset 0 0 0 var(--rule-width) var(--edge-rule);
+  color: var(--ink-chalk);
+  font: var(--type-label-12);
   font-weight: 500;
-  text-decoration: underline transparent;
-  text-underline-offset: 2px;
+  white-space: nowrap;
   cursor: pointer;
-  transition: text-decoration-color var(--motion-fast);
+  transition: background-color var(--motion-fast) var(--ease-standard), box-shadow var(--motion-fast) var(--ease-standard);
 }
 
-/* 「멈추기」는 조용한 말이다. */
-.board-build-act[data-act="stop"] {
-  color: var(--ink-mist);
+.board-build-foot-act:hover:enabled,
+.board-build-act:hover:enabled,
+.board-build-aux:hover:enabled,
+.board-build-caret:hover:enabled {
+  background: var(--row-hover);
+  box-shadow: inset 0 0 0 var(--rule-width) var(--ink-mist);
 }
 
-.board-build-foot-act:hover,
-.board-build-act:hover {
-  text-decoration-color: currentColor;
+.board-build-foot-act.is-primary {
+  background: var(--ink-chalk);
+  box-shadow: none;
+  color: var(--surface-deck);
+}
+
+.board-build-foot-act.is-primary:hover:enabled {
+  background: color-mix(in srgb, var(--ink-chalk) 86%, transparent);
+  box-shadow: none;
 }
 
 .board-build-foot-act:disabled,
-.board-build-act:disabled {
-  color: var(--ink-chalk);
+.board-build-act:disabled,
+.board-build-aux:disabled,
+.board-build-caret:disabled {
+  opacity: 0.5;
   cursor: default;
+}
+
+/* 「다시 ▾」: 단계부터 다시가 주 단추이고, ▾가 처음부터를 고른다 — 둘은 붙은 한 단추로 읽힌다. */
+.board-build-act[data-act="again"]:has(+ .board-build-caret:not([hidden])) {
+  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+}
+
+.board-build-caret {
+  margin-left: calc(var(--space-2) * -1 + var(--rule-width));
+  padding: 0 var(--space-1);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+
+.board-build-caret .icon {
+  transform: rotate(90deg);
+}
+
+.board-build-aux[data-act="more"] {
+  justify-content: center;
+  width: var(--space-5);
+  padding: 0;
+}
+
+.board-build-acts {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-2) 0 0 var(--build-indent);
+}
+
+.board-build-acts[hidden] {
+  display: none;
+}
+
+/* 열린 메뉴 — 단추 줄 밑에 뜬다(떠 있는 것은 반지름 12). */
+.board-build-menu {
+  position: absolute;
+  z-index: 5;
+  top: calc(100% + var(--space-1));
+  left: 0;
+  display: grid;
+  min-width: 12rem;
+  padding: var(--space-1);
+  border-radius: var(--radius);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border-small), var(--shadow-soft);
+}
+
+.board-build-menu[hidden] {
+  display: none;
+}
+
+.board-build-menu-item {
+  padding: var(--space-1) var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+
+.board-build-menu-item:hover,
+.board-build-menu-item:focus-visible {
+  background: var(--row-hover);
+}
+
+.board-build-menu-item.is-halt {
+  color: var(--signal-halt-ink);
+}
+
+/* 「로그」가 펴는 실행의 로그 끝 — 우물(recess) 하나, 넘치면 그 안에서만 넘긴다. */
+.board-build-tail {
+  max-height: 15rem;
+  margin: var(--space-2) 0 0 var(--build-indent);
+  padding: var(--space-2) var(--space-3);
+  overflow: auto;
+  border-radius: var(--radius-sm);
+  background: var(--surface-well);
+  box-shadow: inset 0 0 0 var(--rule-width) var(--edge-rule);
+  color: var(--ink-mist);
+  font: var(--type-label-12-mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.board-build-tail[hidden] {
+  display: none;
 }
 
 /* 빌드 순서 편집기(`openBuildOrder`): 빌드마다 한 행 — 차례, 이름과 도구, 단계들, 위로·아래로·빼기 — 그 밑에
@@ -40252,18 +41722,11 @@ details.task-board-section > summary {
   font-variant-numeric: tabular-nums;
 }
 
-/* 조각 사이의 「·」 — 접힌 조각(커밋이 없는 빌드, 도는 단계가 없는 빌드)은 자리를 남기지 않고, 단추 묶음은 조각이
- * 아니다. */
-.board-build-meta > :not([hidden]) ~ :not([hidden], .board-build-acts)::before {
+/* 조각 사이의 「·」 — 접힌 조각(커밋이 없는 빌드, 도는 단계가 없는 빌드)은 자리를 남기지 않는다. 단추는 메타 줄이
+ * 아니라 제 줄(`.board-build-acts`)에 선다. */
+.board-build-meta > :not([hidden]) ~ :not([hidden])::before {
   content: "·";
   margin-right: var(--board-gap-small);
-}
-
-/* 카드의 단추(`paintBuildActs`): 메타 줄의 오른쪽 끝. */
-.board-build-meta > .board-build-acts:not([hidden]) {
-  display: inline-flex;
-  gap: var(--space-3);
-  margin-left: auto;
 }
 
 .board-build-sha {
@@ -40383,6 +41846,148 @@ details.task-board-section > summary {
   color: var(--ink-mist);
   font: var(--type-copy-13);
   overflow-wrap: anywhere;
+}
+
+/* 빌드 줄(11-08 시안 v3): 카드 밑에 기계의 줄 한 칸 — 머리(이름 · 수 · 줄 멈추기), 멈춤 한 줄, 일감마다 한 줄(상태 · 무엇 ·
+ * 어디 · 언제 · 단추). 단추는 빌드 카드의 보조 단추와 같은 모양이다. */
+.board-line {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--surface-deck);
+  box-shadow: var(--shadow-border-small);
+}
+
+.board-line[hidden],
+.board-line-paused[hidden] {
+  display: none;
+}
+
+.board-line-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.board-line-title {
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+  font-weight: 600;
+}
+
+.board-line-sum {
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+}
+
+.board-line-pause {
+  margin-inline-start: auto;
+}
+
+.board-line-paused {
+  margin: 0;
+  color: var(--signal-wait-ink);
+  font: var(--type-label-12);
+}
+
+.board-line-jobs {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.board-line-job {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-areas:
+    "state what when acts"
+    "state where when acts";
+  align-items: center;
+  column-gap: var(--space-2);
+  padding: var(--space-2) 0;
+  box-shadow: inset 0 var(--rule-width) 0 var(--edge-rule);
+}
+
+.board-line-state {
+  grid-area: state;
+  font: var(--type-label-12);
+}
+
+.board-line-what,
+.board-line-where {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.board-line-what {
+  grid-area: what;
+  color: var(--ink-chalk);
+  font: var(--type-label-13);
+}
+
+.board-line-where {
+  grid-area: where;
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+}
+
+.board-line-when {
+  grid-area: when;
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.board-line-acts {
+  grid-area: acts;
+  display: inline-flex;
+  gap: var(--space-1);
+}
+
+/* 실패 까닭(11-08 시안 v3): 실패 하나에 한 줄 — 이름과 「파일:줄」. 자리가 있으면 단추라 누르면 편집기가 그 줄을 연다. */
+.board-build-failures {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.board-build-failures[hidden] {
+  display: none;
+}
+
+.board-build-failure-part {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--signal-halt-ink);
+  font: var(--type-label-12-mono);
+  text-align: start;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+button.board-build-failure-part {
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  text-underline-offset: var(--space-1);
+  transition: text-decoration-color var(--motion-fast) var(--ease-standard);
+}
+
+button.board-build-failure-part:hover,
+button.board-build-failure-part:focus-visible {
+  text-decoration-color: currentColor;
 }
 
 .board-build-note.is-failed {
@@ -40875,7 +42480,7 @@ details.task-board-section > summary {
   outline-offset: var(--focus-ring-offset);
 }
 
-:is(.board-desk-worker-id, .board-today-id, .board-desk-worker-pane, .board-today-at) {
+:is(.board-desk-worker-id, .board-today-id, .board-today-at) {
   color: var(--ink-mist);
   font: var(--type-label-13-mono);
 }
@@ -40958,14 +42563,14 @@ details.task-board-section > summary {
 }
 
 /* 누적·소식·과업 흐름 — 지금 탭의 카드와 같은 재질: 판 위의 패널, 머리는 제목과 오른쪽 한 줄. */
-.board-desk-block:is([data-desk-block="totals"], [data-desk-block="mail"], [data-desk-block="pipeline"], [data-desk-block="machine"]) {
+.board-desk-block:is([data-desk-block="mail"], [data-desk-block="pipeline"], [data-desk-block="machine"]) {
   border-radius: var(--radius-sm);
   background: var(--surface-deck);
   box-shadow: var(--shadow-border-small);
   overflow: hidden;
 }
 
-.board-desk-block:is([data-desk-block="totals"], [data-desk-block="mail"], [data-desk-block="pipeline"]) > .board-desk-head {
+.board-desk-block:is([data-desk-block="mail"], [data-desk-block="pipeline"]) > .board-desk-head {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -40977,35 +42582,6 @@ details.task-board-section > summary {
   color: var(--ink-chalk);
   font: var(--type-heading-14);
   letter-spacing: var(--tracking-heading-14);
-}
-
-/* 누적 — 시안의 수 칸: 13px 낱말 위 24px 수, 칸 사이는 세로 룰. */
-.board-totals {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
-  margin: 0;
-}
-
-.board-total {
-  min-width: 0;
-  padding: var(--space-4);
-}
-
-.board-total:not(:first-child) {
-  box-shadow: inset var(--rule-width) 0 0 var(--edge-rule);
-}
-
-.board-total-word {
-  color: var(--ink-mist);
-  font: var(--type-label-13);
-}
-
-.board-total-count {
-  margin: var(--space-1) 0 0;
-  color: var(--ink-chalk);
-  font: var(--type-heading-24);
-  font-variant-numeric: tabular-nums;
-  letter-spacing: var(--tracking-heading-24);
 }
 
 /* 소식 — 편지 한 통이 카드의 한 행이다: 상자와 레일 대신 행 사이의 룰, 종류와 둘째 줄은 14px. */
@@ -41093,9 +42669,9 @@ details.task-board-section > summary {
   box-shadow: inset 0 var(--rule-width) 0 var(--edge-rule);
 }
 
-/* 이 기계 — 워커 표 밑의 한 줄짜리 카드. */
+/* 이 기계 — 워커 표 밑의 카드: 칸마다 제 안쪽 여백을 가진다(11-08 시안 v3). */
 .board-desk-block[data-desk-block="machine"] .board-desk-machine {
-  padding: var(--space-3) var(--space-4);
+  padding: 0;
   border: 0;
   border-radius: 0;
   background: none;
@@ -41117,13 +42693,13 @@ details.task-board-section > summary {
   .board-today-fold {
     flex-wrap: wrap;
   }
+}
 
-  .board-totals {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .board-total:not(:first-child) {
-    box-shadow: inset 0 var(--rule-width) 0 var(--edge-rule);
+/* 폰 폭의 판(30rem 아래): 「판 열기」 칸도 물러난다 — 줄바꿈 없는 단추가 표를 카드 밖으로 민다. 판은 행을 펼친 자세한 줄의
+ * 「작업 자세히 보기」로 연다. */
+@container board (max-width: 30rem) {
+  .board-table .is-act {
+    display: none;
   }
 }
 
@@ -57588,8 +59164,7 @@ body.sftp-active #ask-scrim { z-index: var(--sftp-confirm-layer); }
  * toolbar, led by the view's mark — a small square in its hue with a halo of
  * the same, which the nav repeats as the tab's dot. */
 .knowledge-name,
-.board-title,
-.workspace-board-title {
+.board-title {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
@@ -57601,8 +59176,7 @@ body.sftp-active #ask-scrim { z-index: var(--sftp-confirm-layer); }
 }
 
 .knowledge-name::before,
-.board-title::before,
-.workspace-board-title::before {
+.board-title::before {
   flex: none;
   width: var(--workbench-mark-size);
   height: var(--workbench-mark-size);
@@ -57904,11 +59478,6 @@ body.sftp-active #ask-scrim { z-index: var(--sftp-confirm-layer); }
 /* Preserve the card's existing grid while exposing its nested controls as
  * one cell of a selectable row to desktop accessibility clients. */
 .workspace-board-card-content { display: contents; }
-
-.workspace-board-card-stage,
-.workspace-board-changes,
-.workspace-board-tasks { color: var(--ink-mist); }
-.workspace-board-card-stage[data-source="activity"] { color: var(--workbench-accent-ink); }
 
 /* Flow cards (t-4260): the recipes that are Flows, listed and set here. The
  * roster is a column of selectable rows; the detail below it borrows the

@@ -21,12 +21,14 @@
 //! The window's own reads — the sidebar, the board, the mail triage seat —
 //! are not a pane's verb and are not held here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use zerocode_core::orchestration::project_scope::{label, refusal};
-use zerocode_core::orchestration::{Ledger, ProjectSource, Run, RunProject, Scope};
+use zerocode_core::orchestration::{
+    Ledger, PANE_ADDRESS_PREFIX, ProjectSource, RUN_ADDRESS_PREFIX, Run, RunProject, Scope,
+};
 
 use crate::agent_teams::Host;
 
@@ -166,6 +168,9 @@ pub(super) fn verb_gate(
         Some(root) => Some(root.to_string()),
         None => term.and_then(|term| pane_root(host, term)),
     };
+    if let (None, Some(_), Some(conversation)) = (for_run, term, actor) {
+        remember_seat_conversation(&format!("{team}/{pane}"), conversation);
+    }
     let Some(held) = runtime() else {
         return Ok(Gate {
             root: caller,
@@ -221,6 +226,7 @@ pub(super) fn verb_gate(
      * restart brought back, its launch environment gone — is judged by the
      * project of the run the ledger seats it in (t-97078). The caller is
      * not: a verb is answered from a pane the window knows. */
+    let filed_in = reach.run.as_ref().map(|(run, _)| run.as_str());
     for recipient in &reach.recipient_seats {
         recipient_gate(
             host,
@@ -228,6 +234,7 @@ pub(super) fn verb_gate(
             caller.as_deref(),
             recipient,
             reach.seated_root(recipient),
+            filed_in,
         )?;
     }
     if let Some((run_id, project)) = &reach.carried_run {
@@ -316,13 +323,15 @@ pub(super) fn place_federation_run(
 /// name a participant whose pane has since moved to another project.
 ///
 /// `seated` is the project of the run the recipient sits in, the judge for a
-/// pane whose folder the window has no record of (t-97078).
+/// pane whose folder the window has no record of (t-97078); `filed_in` is the
+/// run the letter would be filed in.
 fn recipient_gate(
     host: &dyn Host,
     verb: &str,
     caller: Option<&str>,
     recipient: &str,
     seated: Option<&str>,
+    filed_in: Option<&str>,
 ) -> Result<(), String> {
     let term = recipient.rsplit_once('/').and_then(|(team, pane)| {
         crate::agent_teams::teams()
@@ -337,6 +346,9 @@ fn recipient_gate(
         // Legacy, unplaced participants are already restricted to their own
         // unscoped run above. They never enter a known project's run.
         (None, None) => Ok(()),
+        // No pane holds the address and no run seats it: not a project the
+        // window failed to identify, but a pane that is not here.
+        (Some(_), None) if term.is_none() => Err(gone_recipient(host, verb, recipient, filed_in)),
         _ => {
             let reason = format!(
                 "the recipient {recipient} works in {}, and this pane works in {} — `{verb}` was not sent across different or unidentified projects. Use a recipient in this project.",
@@ -352,6 +364,281 @@ fn recipient_gate(
             Err(reason)
         }
     }
+}
+
+/// The refusal for a letter to a pane address no pane in this window holds,
+/// and no run seats.
+///
+/// A pane's address is minted with its pane: a pane the person closed has
+/// none, and a conversation a restart brings back answers at a new one. Its
+/// correspondents still hold the old one — the letter they answer is signed
+/// with it — and the refusal used to say the recipient "works in an
+/// unidentified project", which sent a coordinator looking for a project
+/// problem (2026-11-08 21:41–22:50, four letters to two panes the restart had
+/// re-minted or the person had closed). So it says what is so: that address
+/// is no pane here now, and — when the window knows which conversation wrote
+/// from it ([`remember_seat_conversation`]) and that conversation stands in a
+/// pane again — where it can be written to now ([`written_to_at`]).
+fn gone_recipient(host: &dyn Host, verb: &str, recipient: &str, filed_in: Option<&str>) -> String {
+    // The pane table is let go before the ledger is asked: the actor takes
+    // that table itself.
+    let goes_on = conversation_of_seat(recipient).and_then(|conversation| {
+        crate::agent_teams::teams().iter().find_map(|(id, team)| {
+            team.pane(&team.leader_pane)?;
+            (host.actor_for(team.leader_term).as_deref() == Some(conversation.as_str()))
+                .then(|| (format!("{id}/{}", team.leader_pane), team.leader_term))
+        })
+    });
+    let reason = match goes_on {
+        Some((seat, term)) => {
+            let at = format!(
+                "the recipient {recipient} is no pane in this window now — the conversation \
+                 that wrote from it goes on in terminal {term}, at pane:{seat}. `{verb}` was not \
+                 sent"
+            );
+            match written_to_at(&seat, filed_in) {
+                Some(road) => format!("{at}; {road}."),
+                None => format!(
+                    "{at}, and that pane has written nothing{} since — a pane is written to once \
+                     it has written there. Answer once it writes, or ask the person to point it \
+                     at this letter.",
+                    filed_in.map(|run| format!(" in {run}")).unwrap_or_default()
+                ),
+            }
+        }
+        None => format!(
+            "the recipient {recipient} is no pane in this window now — its pane was closed, or \
+             the window restarted since it wrote and a conversation that comes back answers at \
+             a new address. `{verb}` was not sent; write to the run it works in (run:<id>), or \
+             answer once it writes again."
+        ),
+    };
+    note(&reason);
+    reason
+}
+
+/// Where the pane at `seat` can be written to now, as the words that say how:
+/// the run's chair or the worker it sits as ([`Ledger::seat_reader`]), else
+/// its own pane address once it answers in `filed_in` — it has written there,
+/// or the ledger told it there that it goes on for a pane that had
+/// ([`zerocode_core::orchestration::Run::answers_at`], the rule the ledger
+/// routes by). `None` when neither holds yet.
+fn written_to_at(seat: &str, filed_in: Option<&str>) -> Option<String> {
+    let held = runtime()?;
+    let image = held.actor.view().ok()?;
+    let ledger = super::cached_ledger(&held, &image);
+    if let Some((run, address)) = ledger.seat_reader(seat) {
+        return Some(if address.starts_with(RUN_ADDRESS_PREFIX) {
+            format!("send it to {address}")
+        } else {
+            format!("send it with --run {run} --to {address}")
+        });
+    }
+    let pane = format!("{PANE_ADDRESS_PREFIX}{seat}");
+    ledger
+        .run(filed_in?)?
+        .answers_at(&pane)
+        .then(|| format!("send it to {pane}"))
+}
+
+/// How many panes' conversations the window keeps on disk. A window holds a
+/// few dozen panes over a day; this holds weeks of them and bounds the file.
+const SEAT_CONVERSATIONS_KEPT: usize = 256;
+
+/// `(seat, conversation)` pairs, oldest first: the conversation each pane
+/// address last sent a verb from.
+type SeatConversations = VecDeque<(String, String)>;
+
+fn seat_conversations_path() -> Option<PathBuf> {
+    BLACKBOX
+        .get()
+        .map(|root| root.join("orchestration-seat-conversations.json"))
+}
+
+fn seat_conversations() -> &'static Mutex<Option<SeatConversations>> {
+    static KNOWN: OnceLock<Mutex<Option<SeatConversations>>> = OnceLock::new();
+    KNOWN.get_or_init(|| Mutex::new(None))
+}
+
+fn load_seat_conversations() -> SeatConversations {
+    seat_conversations_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|raw| serde_json::from_str::<Vec<(String, String)>>(&raw).ok())
+        .map(SeatConversations::from)
+        .unwrap_or_default()
+}
+
+/// Write down that the pane at `seat` (`team/pane`) speaks for `conversation`
+/// — its agent and provider session, as the verb road names its caller —
+/// so a letter to that address can still find the conversation after the
+/// address is gone ([`gone_recipient`]). Kept on disk, because the address
+/// goes with the window that minted it. Written only when the pair is new: a
+/// pane sends many verbs from one conversation.
+fn remember_seat_conversation(seat: &str, conversation: &str) {
+    let mut store = seat_conversations()
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+    let known = store.get_or_insert_with(load_seat_conversations);
+    if known
+        .iter()
+        .any(|(held, spoke)| held == seat && spoke == conversation)
+    {
+        return;
+    }
+    known.retain(|(held, _)| held != seat);
+    known.push_back((seat.to_string(), conversation.to_string()));
+    save_seat_conversations(known);
+}
+
+/// Bound the book and write it whole.
+fn save_seat_conversations(known: &mut SeatConversations) {
+    while known.len() > SEAT_CONVERSATIONS_KEPT {
+        known.pop_front();
+    }
+    let Some(path) = seat_conversations_path() else {
+        return;
+    };
+    let rows: Vec<&(String, String)> = known.iter().collect();
+    if let Ok(payload) = serde_json::to_vec(&rows) {
+        let _ = zerocode_core::atomic_file::write_atomically(&path, &payload);
+    }
+}
+
+/// A pane whose conversation the seat book knows from another pane no team
+/// holds any more: a restart minted the pane again ([`continuing`]).
+pub(super) struct Continuing {
+    old: String,
+    new: String,
+    term: u32,
+    conversation: String,
+}
+
+/// The panes in `tables` whose conversation the seat book knows from a seat
+/// whose team is not in the table — the same conversation under the address a
+/// restart gave it. Read under the pane table's lock, once a beat; it writes
+/// nothing. A conversation shown in two live panes, or only in a pane the
+/// person closed, is left alone: which pane goes on for it was not witnessed.
+pub(super) fn continuing(
+    host: &dyn Host,
+    tables: &HashMap<String, zerocode_core::agent_teams::Team>,
+) -> Vec<Continuing> {
+    let mut shown: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+    for (id, team) in tables {
+        if team.pane(&team.leader_pane).is_none() || host.pane_detached(team.leader_term) {
+            continue;
+        }
+        if let Some(conversation) = host.actor_for(team.leader_term) {
+            shown
+                .entry(conversation)
+                .or_default()
+                .push((format!("{id}/{}", team.leader_pane), team.leader_term));
+        }
+    }
+    if shown.is_empty() {
+        return Vec::new();
+    }
+    let told = continued().lock().unwrap_or_else(|held| held.into_inner());
+    let mut store = seat_conversations()
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+    store
+        .get_or_insert_with(load_seat_conversations)
+        .iter()
+        .filter_map(|(old, conversation)| {
+            let [(new, term)] = shown.get(conversation)?.as_slice() else {
+                return None;
+            };
+            let gone = old
+                .split_once('/')
+                .is_some_and(|(team, _)| !tables.contains_key(team));
+            (gone && old != new && !told.contains(&(old.clone(), new.clone()))).then(|| {
+                Continuing {
+                    old: old.clone(),
+                    new: new.clone(),
+                    term: *term,
+                    conversation: conversation.clone(),
+                }
+            })
+        })
+        .collect()
+}
+
+/// The `(old, new)` pairs this process has already told the ledger about
+/// ([`continue_seat`]), so the beat does not ask again every second. Process
+/// memory: after the next restart both seats are gone, and both are told the
+/// pane the conversation goes on in then.
+fn continued() -> &'static Mutex<std::collections::HashSet<(String, String)>> {
+    static TOLD: OnceLock<Mutex<std::collections::HashSet<(String, String)>>> = OnceLock::new();
+    TOLD.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// The ledger is told that `one`'s conversation goes on in its new pane
+/// ([`zerocode_core::orchestration::Ledger::seat_continued`]), and the seat
+/// book learns the new pane beside the old one — the old row still names the
+/// conversation a letter to the old address belongs to ([`gone_recipient`]),
+/// and the new one lets a second restart find it again, also for a pane that
+/// only receives mail and never sends a verb of its own. Asked after the beat
+/// let go of the pane table: the actor takes that table itself.
+pub(super) fn continue_seat(held: &LiveRuntime, one: &Continuing, now_ms: i64) {
+    let Ok((filed, _)) = held
+        .actor
+        .seat_continued(one.old.clone(), one.new.clone(), now_ms)
+    else {
+        return;
+    };
+    rang(filed);
+    continued()
+        .lock()
+        .unwrap_or_else(|held| held.into_inner())
+        .insert((one.old.clone(), one.new.clone()));
+    {
+        let mut store = seat_conversations()
+            .lock()
+            .unwrap_or_else(|held| held.into_inner());
+        let known = store.get_or_insert_with(load_seat_conversations);
+        if !known
+            .iter()
+            .any(|(seat, conversation)| *seat == one.new && *conversation == one.conversation)
+        {
+            known.retain(|(seat, _)| *seat != one.new);
+            known.push_back((one.new.clone(), one.conversation.clone()));
+            save_seat_conversations(known);
+        }
+    }
+    if filed && let Some(root) = BLACKBOX.get() {
+        crate::note_window_event(
+            root,
+            &format!(
+                "orchestration: the conversation that wrote from {PANE_ADDRESS_PREFIX}{} goes on at \
+                 {PANE_ADDRESS_PREFIX}{} (terminal {}) after the window restarted; it was told so \
+                 where the old address spoke, and is answerable there",
+                one.old, one.new, one.term
+            ),
+        );
+    }
+}
+
+/// The conversation the pane at `seat` last sent a verb from, in this life of
+/// the window or an earlier one.
+fn conversation_of_seat(seat: &str) -> Option<String> {
+    let mut store = seat_conversations()
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+    store
+        .get_or_insert_with(load_seat_conversations)
+        .iter()
+        .rev()
+        .find(|(held, _)| held == seat)
+        .map(|(_, conversation)| conversation.clone())
+}
+
+/// Forget what this process read of the seat book, so the next read comes
+/// from disk — what a window restart does, minus the window.
+#[cfg(test)]
+pub(super) fn forget_seat_conversations_for_tests() {
+    *seat_conversations()
+        .lock()
+        .unwrap_or_else(|held| held.into_inner()) = None;
 }
 
 /// A verb into another project's run is refused and recorded.

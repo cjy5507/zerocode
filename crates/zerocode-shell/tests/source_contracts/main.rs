@@ -14744,15 +14744,22 @@ mod tests {
     fn a_project_click_brings_the_terminal_back_over_the_board() {
         let window = window_source();
         let moving = block_after(window, "async function activateWorktree(");
-        // The 작업 tab (a stage tab since 2026-11-06) is a stage the click
-        // looks past the same way: a project click means that project's
-        // terminal, and the tab stays in the strip for the way back.
+        // The 작업 tab (a stage tab since 2026-11-06) and the workspace board
+        // (a stage tab since 2026-11-08) are stages the click looks past the
+        // same way: a project click means that project's terminal, and the
+        // tab stays in the strip for the way back.
         assert!(
             moving.contains("    const staged = tabs.find((held) => held.id === activeTabId);\n")
-                && moving.contains(
-                    "    const boarded = staged?.kind === \"board\" || staged?.kind === \"tasks\";\n"
-                ),
+                && moving.contains("    const boarded = PAGE_TAB_KINDS.has(staged?.kind);\n"),
             "the same-worktree branch no longer reads what is staged:\n{moving}"
+        );
+        assert!(
+            window.contains(
+                "const PAGE_TAB_KINDS = new Set([\"board\", \"tasks\", WORKSPACE_BOARD_TAB.kind]);\n"
+            ) && window.contains(
+                "const WORKSPACE_BOARD_TAB = Object.freeze({ id: \"workspaces\", kind: \"workspaces\" });\n"
+            ),
+            "a page tab the project click looks past is missing from PAGE_TAB_KINDS"
         );
         // A removal re-roots the backend before this function hears about it,
         // so the click can arrive with the active tab gone or foreign — that
@@ -14765,12 +14772,10 @@ mod tests {
             "a stage stranded by a removal reads as \"already fine\" again:\n{moving}"
         );
         assert!(
-            moving.contains(concat!(
-                "        const owned = tabs.filter(\n",
-                "          (held) => held.worktree === path && held.kind !== \"board\" && held.kind !== \"tasks\",\n",
-                "        );\n",
-            )),
-            "the way back can hand the board or the 작업 tab right back:\n{moving}"
+            moving.contains(
+                "        const owned = tabs.filter((held) => held.worktree === path && !PAGE_TAB_KINDS.has(held.kind));\n"
+            ),
+            "the way back can hand a page tab (보드 · 작업 · 워크스페이스 보드) right back:\n{moving}"
         );
         // The living agent of the checkout is the first way back (t-44057): a
         // worker the ledger seated here is raised, and only without one does the
@@ -37543,10 +37548,12 @@ mod tests {
         );
         let item = block_after_css(styles, ".settings-rail-item {");
         assert!(
-            // 8px is `--radius-md` now that the scale has that rung. The
-            // measurement is the same value; it stopped being a literal.
-            item.contains("border-radius: var(--radius-md)") && item.contains("font-size: 13px"),
-            "the rail item is not Orca's measured 13px/rounded-md row:\n{item}"
+            // The corner is `--radius-md`, and Orca's measured 13px is
+            // Geist's Label 13 since the settings Geist pass (2026-11-08):
+            // the same size, now the named style with its own line.
+            item.contains("border-radius: var(--radius-md)")
+                && item.contains("font: var(--type-label-13)"),
+            "the rail item is not the 13px/rounded-md row in Geist's Label 13:\n{item}"
         );
 
         // The query narrows the rail AND decides the page. Orca's
@@ -39747,6 +39754,7 @@ fn a_pane_conversations_notices_are_keyed_by_what_they_say_and_speak_four_locale
         "worker.handingOver",
         "worker.readingTranscript",
         "worker.wireRefused",
+        "worker.paneStays",
     ] {
         assert!(
             paint.contains(&format!("t(\"{key}\", ")),

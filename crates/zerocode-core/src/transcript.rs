@@ -60,6 +60,43 @@ fn reasoning_text(part: &serde_json::Value) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
+/// How every steer zo stores opens: the first words of its
+/// `STEERING_PREAMBLE` (`runtime::conversation` in zo-ide; spelled once more
+/// here because this crate cannot depend on zo), the line zo puts ahead of
+/// words the person sent while a turn ran. The line is the model's to read,
+/// never the person's (2026-11-08: the conversation page drew it in the
+/// person's bubble, after their words).
+pub const STEERING_FRAME_HEAD: &str = "[User steering — ";
+
+/// The person's words in a text block zo stored as steers — each
+/// `<preamble line>\n<words>`, several joined by a blank line — with every
+/// preamble line taken off, or `None` when the block does not open with one.
+/// The head and the line's closing `]` are matched, not the whole sentence,
+/// as zo's own replay does (`plain_session::steered_words`), so a steer stored
+/// before the sentence last changed reads back too. A block that held only
+/// frames gives no words.
+fn steered_words(text: &str) -> Option<String> {
+    let next_frame = format!("\n\n{STEERING_FRAME_HEAD}");
+    let mut steers = Vec::new();
+    let mut framed = false;
+    let mut rest = text.trim_start();
+    while let Some(frame) = rest.strip_prefix(STEERING_FRAME_HEAD) {
+        let (preamble, said) = frame.split_once('\n').unwrap_or((frame, ""));
+        if !preamble.trim_end().ends_with(']') {
+            break;
+        }
+        framed = true;
+        let (words, after) = said
+            .find(&next_frame)
+            .map_or((said, ""), |at| (&said[..at], &said[at + 2..]));
+        if !words.trim().is_empty() {
+            steers.push(words.trim());
+        }
+        rest = after;
+    }
+    framed.then(|| steers.join("\n\n"))
+}
+
 /// The words out of a `content` value, whatever shape it came in.
 ///
 /// A string for one vendor, an array of typed parts for another, and inside the
@@ -190,6 +227,61 @@ impl Tail {
 pub fn tail_lines(path: &Path) -> Option<Vec<String>> {
     let tail = Tail::read(path)?;
     Some(tail.lines().map(str::to_string).collect())
+}
+
+/// How far back from a transcript's end [`newest_line_holding`] reads.
+pub const LOOK_BACK_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The newest whole line of the file at `path` that holds `needle`, read
+/// backwards from the end in [`MAX_TAIL_BYTES`] steps, never further than
+/// `cap` bytes back — `None` when no such line stands that near the end, or
+/// the file cannot be read.
+///
+/// For a record a transcript writes once per turn rather than on every line:
+/// Codex stamps a turn's effort in the `turn_context` that opens it, and a
+/// long turn's tool output pushes that line out of the bounded tail (this
+/// machine's rollouts on 2026-11-08: 1.8–2.3 MiB from the end, past the
+/// 256 KiB tail, so the effort chip read nothing and said 「기본」).
+#[must_use]
+pub fn newest_line_holding(path: &Path, needle: &str, cap: u64) -> Option<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let floor = len.saturating_sub(cap);
+    let mut end = len;
+    // The front of the chunk read last: a line that may go on in the chunk
+    // before it, so it is joined to that chunk rather than judged half read.
+    let mut carry: Vec<u8> = Vec::new();
+    while end > floor {
+        let start = end.saturating_sub(MAX_TAIL_BYTES).max(floor);
+        let mut chunk = vec![0; usize::try_from(end - start).ok()?];
+        file.seek(SeekFrom::Start(start)).ok()?;
+        file.read_exact(&mut chunk).ok()?;
+        chunk.extend_from_slice(&carry);
+        let whole = if start == 0 {
+            &chunk[..]
+        } else {
+            // Everything after the first newline is whole lines; what is
+            // before it is carried into the next, earlier read.
+            let Some(cut) = chunk.iter().position(|byte| *byte == b'\n') else {
+                carry = chunk;
+                end = start;
+                continue;
+            };
+            carry = chunk[..cut].to_vec();
+            &chunk[cut + 1..]
+        };
+        let found = String::from_utf8_lossy(whole)
+            .lines()
+            .rev()
+            .find(|line| line.contains(needle))
+            .map(str::to_string);
+        if found.is_some() {
+            return found;
+        }
+        end = start;
+    }
+    None
 }
 
 /// The last assistant turn in the transcript at `path`, clamped for a card.
@@ -2248,6 +2340,21 @@ fn turns_of(chunk: &str, detail: Detail, meta: Meta) -> Vec<TranscriptTurn> {
                     tool: None,
                     images: Vec::new(),
                 }),
+                // A steer zo stored is the person's words behind a line for
+                // the model: the words stay, the line goes.
+                _ if kind == "user" => match part
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(steered_words)
+                {
+                    Some(words) if words.is_empty() => {}
+                    Some(words) => {
+                        let mut kept = part.clone();
+                        kept["text"] = serde_json::Value::String(words);
+                        spoken.push(kept);
+                    }
+                    None => spoken.push(part.clone()),
+                },
                 _ => spoken.push(part.clone()),
             }
         }
@@ -3852,7 +3959,148 @@ mod tests {
         let person = r#"{"message":{"blocks":[{"text":"[earlier reasoning] is what it printed","type":"text"}],"role":"user"},"turn_index":0,"type":"message"}"#;
         assert_eq!(turns_in(person)[0].role, "user");
     }
+
+    /// A steer zo stored is the person's words behind a line for the model
+    /// (`STEERING_PREAMBLE`): the person's turn says the words and never the
+    /// line — one steer beside the words that started the turn, several in one
+    /// block joined by a blank line, a steer stored under an older wording of
+    /// the line. A block that only opens like one, with no closing `]` on its
+    /// line, is the person's own words; the assistant's text is never read so.
+    #[test]
+    fn a_person_turn_says_the_steered_words_and_never_the_steering_line() {
+        let row = |role: &str, blocks: &[&str]| {
+            serde_json::json!({
+                "message": {
+                    "blocks": blocks.iter().map(|text| serde_json::json!({"text": text, "type": "text"})).collect::<Vec<_>>(),
+                    "role": role,
+                },
+                "turn_index": 0,
+                "type": "message",
+            })
+            .to_string()
+        };
+        let line = "[User steering — sent mid-turn; it outranks conflicting earlier guidance. Answer it in words first.]";
+        let older = "[User steering — the person sent this while you were working; it outranks earlier guidance.]";
+        let said = |chunk: &str| -> Vec<(String, String)> {
+            turns_in(chunk)
+                .into_iter()
+                .map(|turn| (turn.role, turn.text))
+                .collect()
+        };
+        let person = |text: &str| vec![("user".to_string(), text.to_string())];
+        assert_eq!(
+            said(&row(
+                "user",
+                &[
+                    "더 고칠 것은 없나요?",
+                    &format!("{line}\n도구를 더 강하게 하는 방법")
+                ]
+            )),
+            person("더 고칠 것은 없나요? 도구를 더 강하게 하는 방법"),
+            "the steering line stood in the person's turn"
+        );
+        assert_eq!(
+            said(&row("user", &[&format!("{line}\n하나\n\n{older}\n둘")])),
+            person("하나\n\n둘"),
+            "a block of several steers kept a line, or lost a steer"
+        );
+        assert!(
+            said(&row("user", &[line])).is_empty(),
+            "a block of nothing but the line became the person's turn"
+        );
+        assert_eq!(
+            said(&row(
+                "user",
+                &["[User steering — is how the log names it\nand more"]
+            )),
+            person("[User steering — is how the log names it\nand more"),
+            "the person's own words that only open like a steer were cut"
+        );
+        assert_eq!(
+            said(&row("assistant", &[&format!("{line}\n답")])),
+            vec![("assistant".to_string(), format!("{line}\n답"))],
+            "the assistant's text was read as a steer"
+        );
+    }
+
+    /// What this reader takes off is zo's own words: its steering line opens
+    /// with [`STEERING_FRAME_HEAD`] and its passport is
+    /// [`REASONING_PASSPORT_LABEL`]. Reworded on zo's side alone, the line
+    /// would stand in the person's bubble again, or the passport as an answer.
+    #[test]
+    fn the_frames_this_reader_takes_off_are_zos_own_words() {
+        let conversation = include_str!("../../../zo-ide/crates/runtime/src/conversation/mod.rs");
+        let convert = include_str!("../../../zo-ide/crates/runtime/src/convert_messages.rs");
+        let opening = "const STEERING_PREAMBLE: &str = \"";
+        let preamble = &conversation[conversation
+            .find(opening)
+            .expect("zo's `STEERING_PREAMBLE` is gone")
+            + opening.len()..];
+        assert!(
+            preamble.starts_with(STEERING_FRAME_HEAD),
+            "zo's steering line no longer opens with {STEERING_FRAME_HEAD:?}"
+        );
+        assert!(
+            convert.contains(&format!(
+                "pub const REASONING_PASSPORT_LABEL: &str = \"{REASONING_PASSPORT_LABEL}\";"
+            )),
+            "zo's passport label is no longer {REASONING_PASSPORT_LABEL:?}"
+        );
+    }
     use std::io::Write as _;
+
+    /// A record written once per turn is found past the bounded tail: a
+    /// Codex rollout's `turn_context` 2 MiB back under a long turn's output
+    /// (2026-11-08: the effort chip read nothing there and said 「기본」), the
+    /// newest of two, nothing past the cap, and a line longer than one read
+    /// read whole.
+    #[test]
+    fn the_newest_line_holding_a_record_is_found_past_the_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("rollout.jsonl");
+        let older = r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol","effort":"low"}}"#;
+        let opening =
+            r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol","effort":"xhigh"}}"#;
+        let output = format!(
+            r#"{{"type":"response_item","payload":{{"output":"{}"}}}}"#,
+            "x".repeat(1_000)
+        );
+        let mut text = format!("{older}\n{opening}\n");
+        for _ in 0..2_000 {
+            text.push_str(&output);
+            text.push('\n');
+        }
+        std::fs::write(&file, &text).expect("write");
+        let tail = tail_lines(&file).expect("tail").join("\n");
+        assert_eq!(
+            effort_in(&tail),
+            None,
+            "the turn's effort stands past the tail"
+        );
+        let found = newest_line_holding(&file, "\"turn_context\"", LOOK_BACK_BYTES)
+            .expect("the turn's opening is found past the tail");
+        assert_eq!(found, opening, "the newest opening, not an older one");
+        assert_eq!(
+            effort_in(&format!("{found}\n{tail}")).as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            newest_line_holding(&file, "\"turn_context\"", 64 * 1024),
+            None,
+            "a line past the cap was read"
+        );
+        let long = format!(
+            r#"{{"type":"turn_context","payload":{{"effort":"max","note":"{}"}}}}"#,
+            "y".repeat(600 * 1024)
+        );
+        let spanning = dir.path().join("long.jsonl");
+        std::fs::write(&spanning, format!("{long}\n{output}\n")).expect("write");
+        assert_eq!(
+            newest_line_holding(&spanning, "\"turn_context\"", LOOK_BACK_BYTES).as_deref(),
+            Some(long.as_str()),
+            "a line longer than one read came back cut"
+        );
+    }
 
     /// The two real shapes, from real files: claude's nested message and a
     /// flat `role`/`content` line; tool-result and user lines answer nothing.

@@ -186,3 +186,78 @@ fn a_calibrated_figure_stays_inside_the_compaction_window() {
     assert_eq!(runtime.provider_tokens_for_estimate(4_000), 0);
     assert_eq!(runtime.estimate_tokens_for_provider(40_000), window);
 }
+
+/// The last gate before a request counts it as the compaction gates do. Kept
+/// thinking, which the estimate counts by its signatures' length, carries the
+/// estimate past the window while the provider billed a quarter of it: the
+/// request fits by the provider's count and is not refused for the
+/// estimate's. A result past the budget after that answer still is.
+#[test]
+fn the_last_gate_before_a_request_counts_it_as_the_provider_did() {
+    let mut runtime = runtime();
+    for step in 0..3 {
+        runtime
+            .session
+            .push_message(ConversationMessage::assistant(vec![
+                ContentBlock::Thinking {
+                    thinking: "t".repeat(1_000),
+                    signature: "s".repeat(400_000),
+                },
+                ContentBlock::Text { text: format!("step {step}") },
+            ]))
+            .expect("kept thinking");
+    }
+    assert!(runtime.estimated_request_context_tokens() > 200_000);
+    answer_counted_at(&mut runtime, 0.25);
+    runtime
+        .ensure_request_context_budget(&[])
+        .expect("a request the provider counts at a quarter of the estimate was refused");
+
+    runtime
+        .session
+        .push_message(ConversationMessage::tool_result(
+            "read".to_string(),
+            "read_file",
+            "x".repeat(800_000),
+            false,
+        ))
+        .expect("result");
+    assert!(runtime.ensure_request_context_budget(&[]).is_err());
+}
+
+/// A kept answer stamped in the compaction's own millisecond — the summary
+/// came back at once, as the local one does — counted the history the
+/// compaction folded away. It is not the context now: the request after the
+/// compaction is counted by the estimate until an answer comes back on it.
+/// Read as current, it refused v1.1.132's compacted request as still over
+/// budget (200,097 tokens against 191,808, the gate's
+/// `turn_input_token_budget_stops_a_cache_dead_loop`).
+#[test]
+fn a_kept_answer_in_the_compactions_millisecond_is_not_the_context_now() {
+    let _env = crate::test_env_lock();
+    let mut runtime = runtime();
+    runtime.session.push_user_text("read these").expect("task");
+    push_results(&mut runtime, 30, 8_000);
+    answer_counted_at(&mut runtime, 4.0);
+    let config = runtime.compaction_config_if_possible().expect("compactable");
+    let result = crate::compact::compact_session(&runtime.session, config);
+    assert!(runtime.finish_auto_compaction(result).is_some(), "a full compaction folded the transcript");
+
+    let messages = std::sync::Arc::make_mut(&mut runtime.session.messages);
+    let compacted_at = messages
+        .first()
+        .and_then(|message| message.updated_at_ms)
+        .expect("the compaction stamps its continuation");
+    let kept = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.usage.is_some())
+        .expect("the kept tail holds the answered request");
+    kept.updated_at_ms = Some(compacted_at);
+
+    assert_eq!(
+        runtime.provider_anchored_context_tokens(),
+        None,
+        "an answer from the compaction's millisecond was read as the context after it"
+    );
+}

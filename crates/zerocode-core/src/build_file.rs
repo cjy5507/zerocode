@@ -71,10 +71,62 @@ pub struct BuildSpec {
     pub tool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
+    /// The folder under the checkout its steps run in (`backend`, `apps/web`):
+    /// a project in a monorepo's subfolder. None runs them at the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
     #[serde(default, skip_serializing_if = "Source::runs_here")]
     pub source: Source,
     #[serde(default, rename = "step", skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<StepSpec>,
+    /// A build another script reports may say how to run it again and how to
+    /// stop it: the board's 「다시」 and 「멈추기」 run these through
+    /// `zo build act`, after a person allowed them like any step's command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<String>,
+}
+
+impl BuildSpec {
+    /// The command of `act` this build names (a reported build's
+    /// [`retry`](Self::retry) or [`stop`](Self::stop)).
+    #[must_use]
+    pub fn act_command(&self, act: Act) -> Option<&str> {
+        match act {
+            Act::Retry => self.retry.as_deref(),
+            Act::Stop => self.stop.as_deref(),
+        }
+        .filter(|command| !command.trim().is_empty())
+    }
+}
+
+/// What a person asks of a build another script reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Act {
+    Retry,
+    Stop,
+}
+
+impl Act {
+    /// The act a word names: `retry` or `stop`.
+    #[must_use]
+    pub fn of(word: &str) -> Option<Self> {
+        match word {
+            "retry" => Some(Self::Retry),
+            "stop" => Some(Self::Stop),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Retry => "retry",
+            Self::Stop => "stop",
+        }
+    }
 }
 
 /// Who runs a build.
@@ -181,8 +233,37 @@ pub fn check(file: &BuildFile) -> Result<(), String> {
             ));
         }
         check_name(build.name.as_ref(), id)?;
+        if let Some(dir) = build.dir.as_deref()
+            && !is_folder_under(dir)
+        {
+            return Err(format!(
+                "the build `{id}` runs in `{dir}`, which is not a folder under the checkout (a relative path with no `..`)"
+            ));
+        }
         if build.source.runs_here() && build.steps.is_empty() {
             return Err(format!("the build `{id}` has no step to run"));
+        }
+        for (key, command) in [
+            ("retry", build.retry.as_deref()),
+            ("stop", build.stop.as_deref()),
+        ] {
+            let Some(command) = command else { continue };
+            if build.source.runs_here() {
+                return Err(format!(
+                    "the build `{id}` names `{key}`, which only a build another script reports does (`source = \"report\"`); `zo build` runs and stops its own"
+                ));
+            }
+            if command.trim().is_empty() {
+                return Err(format!("the build `{id}` has an empty `{key}` command"));
+            }
+            for name in placeholders(command)? {
+                if !PLACEHOLDERS.contains(&name) {
+                    return Err(format!(
+                        "the `{key}` command of `{id}` uses `${{{name}}}`, which no run fills (only {})",
+                        PLACEHOLDERS.map(|one| format!("`${{{one}}}`")).join(", ")
+                    ));
+                }
+            }
         }
         let mut steps: HashSet<&str> = HashSet::new();
         for step in &build.steps {
@@ -197,6 +278,29 @@ pub fn check(file: &BuildFile) -> Result<(), String> {
         above.insert(id);
     }
     Ok(())
+}
+
+/// A folder a build may run in: relative, each part a plain name — never the
+/// root itself, a parent, or a path that leaves the checkout.
+#[must_use]
+pub fn is_folder_under(dir: &str) -> bool {
+    let path = std::path::Path::new(dir);
+    !dir.trim().is_empty()
+        && !dir.contains('\\')
+        && path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+}
+
+impl BuildSpec {
+    /// The folder its steps run in: `checkout`, or the build's `dir` under it.
+    #[must_use]
+    pub fn folder(&self, checkout: &std::path::Path) -> std::path::PathBuf {
+        match self.dir.as_deref().filter(|dir| is_folder_under(dir)) {
+            Some(dir) => checkout.join(dir),
+            None => checkout.to_path_buf(),
+        }
+    }
 }
 
 fn check_step(build: &BuildSpec, step: &StepSpec) -> Result<(), String> {
@@ -459,8 +563,11 @@ fn with_recorded(mut file: BuildFile, recorded: &[BuildName]) -> BuildFile {
             name,
             tool,
             after: None,
+            dir: None,
             source: Source::Report,
             steps: Vec::new(),
+            retry: None,
+            stop: None,
         };
         let stands = |spec: &BuildSpec| {
             check(&BuildFile {
@@ -546,8 +653,17 @@ pub fn to_toml(file: &BuildFile) -> String {
         if let Some(after) = &build.after {
             let _ = writeln!(text, "after = {}", quoted(after));
         }
+        if let Some(dir) = &build.dir {
+            let _ = writeln!(text, "dir = {}", quoted(dir));
+        }
         if build.source == Source::Report {
             text.push_str("source = \"report\"\n");
+        }
+        if let Some(retry) = &build.retry {
+            let _ = writeln!(text, "retry = {}", quoted(retry));
+        }
+        if let Some(stop) = &build.stop {
+            let _ = writeln!(text, "stop = {}", quoted(stop));
         }
         if !build.steps.is_empty() {
             text.push_str("step = [\n");
@@ -677,6 +793,7 @@ source = "report"
                 name: Some(Text::One(tricky.into())),
                 tool: None,
                 after: None,
+                dir: None,
                 source: Source::Run,
                 steps: vec![StepSpec {
                     id: "one".into(),
@@ -686,6 +803,8 @@ source = "report"
                     cap: None,
                     when: When::Always,
                 }],
+                retry: None,
+                stop: None,
             }],
         };
         assert_eq!(parse(&to_toml(&file)), Ok(file));
@@ -808,6 +927,65 @@ source = "report"
     /// order file does not name it yet. The draft gives it a place at the end,
     /// with its name and tool — its id alone when its tool is no id — and a
     /// build the file already names is not added twice.
+    /// 「다시」·「멈추기」 for a build another script reports (11-08): it may name
+    /// its own retry and stop commands, with the placeholders any step fills; a
+    /// build `zo build` runs may not, and the file writes them back as it read them.
+    #[test]
+    fn a_build_runs_in_a_folder_under_the_checkout_and_nowhere_else() {
+        let file = |dir: &str| {
+            parse(&format!(
+                "[[build]]\nid = \"api\"\ndir = \"{dir}\"\nstep = [{{ id = \"test\", run = \"go test ./...\" }}]\n"
+            ))
+        };
+        let written = file("services/api").expect("a build in a subfolder");
+        assert_eq!(written.builds[0].dir.as_deref(), Some("services/api"));
+        assert_eq!(
+            written.builds[0].folder(std::path::Path::new("/repo")),
+            std::path::Path::new("/repo/services/api")
+        );
+        assert_eq!(
+            parse(&to_toml(&written)),
+            Ok(written.clone()),
+            "the writer keeps the folder"
+        );
+        for outside in ["../elsewhere", "/etc", "api/../..", ".", ""] {
+            assert!(
+                file(outside).is_err(),
+                "`{outside}` is not a folder under the checkout, yet the file stood"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reported_build_may_name_its_retry_and_stop_and_a_run_build_may_not() {
+        let text = "[[build]]\nid = \"release\"\nsource = \"report\"\nretry = \"tools/lane.sh ${sha}\"\nstop = \"tools/lane.sh stop\"\n";
+        let file = parse(text).expect("a reported build with its acts");
+        let release = &file.builds[0];
+        assert_eq!(
+            release.act_command(Act::Retry),
+            Some("tools/lane.sh ${sha}")
+        );
+        assert_eq!(release.act_command(Act::Stop), Some("tools/lane.sh stop"));
+        assert_eq!(parse(&to_toml(&file)).expect("written back"), file);
+        assert_eq!(
+            (Act::of("retry"), Act::of("stop"), Act::of("again")),
+            (Some(Act::Retry), Some(Act::Stop), None)
+        );
+
+        let run = parse(
+            "[[build]]\nid = \"app\"\nretry = \"make\"\nstep = [{ id = \"a\", run = \"make\" }]\n",
+        )
+        .expect_err("a build zo build runs names no retry");
+        assert!(run.contains("only a build another script reports"), "{run}");
+        let empty = parse("[[build]]\nid = \"r\"\nsource = \"report\"\nstop = \" \"\n")
+            .expect_err("an empty stop");
+        assert!(empty.contains("empty `stop`"), "{empty}");
+        let unfilled =
+            parse("[[build]]\nid = \"r\"\nsource = \"report\"\nretry = \"x ${branch}\"\n")
+                .expect_err("a placeholder no run fills");
+        assert!(unfilled.contains("`${branch}`"), "{unfilled}");
+    }
+
     #[test]
     fn a_build_that_keeps_runs_joins_the_draft_as_one_another_script_reports() {
         let checkout = tempfile::tempdir().expect("a checkout");

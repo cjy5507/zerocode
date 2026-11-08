@@ -1828,7 +1828,7 @@ async function askBoardReviews(checkouts) {
   if (sameBoardReviews(boardReviews, next)) return;
   boardReviews = next;
   scheduleWorkspaceBoardPaint();
-  if (!workspaceBoardOpen) void paintBoardView();
+  if (!workspaceBoardInFront()) void paintBoardView();
 }
 
 /* The badge on the door: how many agents are waiting on a person.
@@ -12685,7 +12685,10 @@ function restartSessionGroups(items) {
 }
 
 function paintWorktreeAgents() {
-  if (revealStartupActiveProjects()) void refreshWorktrees();
+  // 시작 뒤 저절로 펼치기는 포인터가 목록을 떠날 때까지 미룬다 — 손 밑에서 프로젝트
+  // 하나가 통째로 펼쳐지면 겨누던 머리가 그 높이만큼 밀린다(sidebarAnchorLine).
+  if (sidebarPointerY !== null) sidebarRevealHeld ||= startupFoldProjects.size > 0;
+  else if (revealStartupActiveProjects()) void refreshWorktrees();
   const held = worktreeLanes();
   const hosts = worktreeList.querySelectorAll(".wt-agents[data-worktree-path]");
   for (const host of hosts) {
@@ -14032,6 +14035,31 @@ const WIRE_EXIT_TYPED = "the exit command was typed at the pane and the pane sti
  * typed at it (`PANE_NOT_READING_YET`, t-84850 r2): the page says what the
  * person can do, in their language. */
 const WIRE_NOT_READING = "the pane's CLI did not show a key typed at it";
+/* The other refusals the backend gives before anything is typed (`cmd::wire`:
+ * the ledger's three and the pane CLI's four), word for word — a source
+ * contract holds each to the backend's constant — with the page's words for
+ * each in the person's language (2026-11-08: a coordinator's page read the
+ * backend's English inside a Korean line, and offered a second press that
+ * could only be refused again). `stays`: the pane keeps its screen for good —
+ * a worker's or a coordinator's seat, a CLI started from the pane's shell —
+ * so the line says so and offers no second press. The log keeps the
+ * backend's words (`refusal_line`). */
+const WIRE_PANE_REFUSALS = [
+  ["a worker's pane stays a pane: the ledger drives it through its screen", true,
+    () => t("worker.paneStaysWorker", "워커 판은 원장이 이 화면으로 일을 맡기므로 실시간 대화로 넘기지 않습니다")],
+  ["a coordinator's pane stays a pane: the ledger brings its run's mail to that screen", true,
+    () => t("worker.paneStaysCoordinator", "코디네이터 판은 원장 편지를 이 화면에서 받으므로 실시간 대화로 넘기지 않습니다")],
+  ["a CLI started from the pane's shell stays in the pane: the terminal is its live view", true,
+    () => t("worker.paneStaysShell", "판의 셸에서 직접 띄운 CLI는 터미널이 실시간 화면이므로 실시간 대화로 넘기지 않습니다")],
+  ["the ledger cannot be read now, so this pane may be a coordinator's: it stays a pane", false,
+    () => t("worker.handOverLedgerUnread", "원장을 지금 읽을 수 없어 코디네이터 판인지 알 수 없습니다")],
+  ["the pane's CLI is not at rest — a turn, a question or an approval is open: try again once it rests", false,
+    () => t("worker.handOverNotAtRest", "판의 CLI가 아직 일하는 중입니다(차례·질문·승인이 열려 있음)")],
+  ["the pane's CLI still runs background work its exit would end: try again once it is done", false,
+    () => t("worker.handOverBackgroundWork", "판의 CLI가 끝나면 멈출 배경 작업이 아직 돌고 있습니다")],
+  ["the pane's input line is not shown empty — words may be written there: nothing was typed", false,
+    () => t("worker.handOverLineHoldsWords", "판의 입력줄에 글이 있을 수 있어 아무것도 입력하지 않았습니다")],
+];
 
 /* Hand a pane's conversation to its wire — the toggle's 「대화」 on a Claude
  * Code pane. Same session, other renderer: the wire resumes the pane's
@@ -14076,6 +14104,7 @@ async function handPaneToWire(term) {
     const history = await beforeHandOverDeadline(readPaneTranscript(term), deadline);
     if (history === null) {
       held.wireRefusal = t("worker.handOverStalled", "대화 기록 읽기가 {{s}}초 안에 끝나지 않았습니다", { s: Math.round(COMPOSER_HAND_OVER_DUE_MS / 1000) });
+      held.wireStays = false;
       return false;
     }
     tabId = await openWirePage(row.id, owner?.worktree ?? activeWorktreePath, {
@@ -14089,18 +14118,21 @@ async function handPaneToWire(term) {
       label: owner ? tabLabel(owner) : null,
       carry: (run) => carryPaneChat(held, run),
       // The refusal stays on the page (`paintPaneChat`), not only in a toast
-      // — the backend logs it too (`refusal_line`), so the log and the page
-      // give the same reason.
+      // — the backend logs it too (`refusal_line`): a refusal the window
+      // knows (`WIRE_PANE_REFUSALS`) the page says in the person's language,
+      // any other in the backend's words.
       // One that came after the exit command was typed says so in its own
       // line, and what waited goes back to the box (`returnComposerQueueToBox`).
       refused: (reason) => {
         const said = String(reason?.message ?? reason);
         held.exitTyped = held.exitTyped || said.startsWith(WIRE_EXIT_TYPED);
+        const known = WIRE_PANE_REFUSALS.find(([words]) => said.startsWith(words));
+        held.wireStays = !held.exitTyped && known?.[1] === true;
         held.wireRefusal = held.exitTyped
           ? null
           : said.startsWith(WIRE_NOT_READING)
             ? t("worker.handOverNotReading", "판의 CLI가 아직 입력을 읽지 않습니다 — 판에서 글을 한 번 보낸 뒤 「{{button}}」를 다시 누르세요", { button: t("view.conversation", "대화") })
-            : said;
+            : known ? known[2]() : said;
       },
     });
     // The conversation lives on the wire's tab now: the pane's own view steps
@@ -14502,6 +14534,7 @@ async function setPaneChat(term, on, { wire = true } = {}) {
   }
   if (!on) {
     held.wireRefusal = null;
+    held.wireStays = false;
     held.exitTyped = false;
   }
   // Once the conversation has stood on this pane it is a record the pane holds (`paneHoldsConversation`).
@@ -14942,13 +14975,18 @@ function paintPaneChat(term) {
   if (runChip && handing) writeAttribute(runChip, "data-tip", handing);
   else runChip?.removeAttribute("data-tip");
   // A hand-over the backend refused (a worker's pane, a wire that failed to
-  // stand, a screen that kept its conversation): the page says why, in the
-  // backend's words, and stays the transcript view — 「대화」 again asks again.
+  // stand, a screen that kept its conversation): the page says why — in the
+  // person's language when the window knows the refusal (`WIRE_PANE_REFUSALS`)
+  // — and stays the transcript view. 「대화」 again asks again, so the line
+  // offers it, except on a pane that keeps its screen for good (`wireStays`),
+  // where a second press could only be refused again.
   noticeOnPaneChat(
     held,
     "worker.wireRefused",
     typeof held.wireRefusal === "string" && held.wireRefusal !== "",
-    t("worker.wireRefused", "실시간 대화로 넘기지 못했습니다: {{reason}} — 전사 뷰로 봅니다(답은 턴이 닫힐 때 한 번에). 「대화」를 다시 누르면 다시 시도합니다.", { reason: held.wireRefusal ?? "" }),
+    held.wireStays === true
+      ? t("worker.paneStays", "{{reason}} — 전사 뷰로 봅니다(답은 턴이 닫힐 때 한 번에).", { reason: held.wireRefusal ?? "" })
+      : t("worker.wireRefused", "실시간 대화로 넘기지 못했습니다: {{reason}} — 전사 뷰로 봅니다(답은 턴이 닫힐 때 한 번에). 「대화」를 다시 누르면 다시 시도합니다.", { reason: held.wireRefusal ?? "" }),
   );
   // Refused after the exit command went to the pane (t-84850 r2): one line,
   // and what waited stands in the box.
@@ -18943,7 +18981,10 @@ function watchChatDock(host, dock) {
   // wrapped a draft (t-22095). Even on the list alone a new value restyles
   // every row it holds (Chromium, 2.5 ms for 400 turns; ten times the rows of
   // a pane's first page at a 4x CPU), so it is written before they stand.
-  const readers = () => host.querySelectorAll(":scope > .helper-body > :is(.helper-turns, .chat-foot-door)");
+  // The third is the turn's change review (`openConversationReview`), which
+  // stands over the dock: without the height it read 0 and sat at the foot,
+  // behind the floating composer (2026-11-08).
+  const readers = () => host.querySelectorAll(":scope > .helper-body > :is(.helper-turns, .chat-foot-door), :scope > .chat-review");
   if (chatDockSeen !== null) for (const reader of readers()) reader.style.setProperty("--chat-dock-h", chatDockSeen);
   const watch = new ResizeObserver(() => {
     // The list's foot moves with the dock (the dock's height is the list's
@@ -20223,31 +20264,60 @@ listen("session:frame", (event) => {
   laneSignal(event.payload.session, event.payload.frame);
 });
 
+/* The label zo puts on reasoning it carries into a later request as text —
+ * its "reasoning passport" (`zerocode_core::transcript::REASONING_PASSPORT_LABEL`;
+ * a source contract holds the two the same). A model that imitates it opens
+ * its own block with it, live on the channel, and the transcript reads such a
+ * block as a thought (`reasoning_text`). */
+const REASONING_PASSPORT_LABEL = "[earlier reasoning]";
+
 /* One delta of a pane's live text: appended to the piece it continues (same
  * voice, same block, still open) or begun as a new piece — the shape a wire's
  * live list has (`WireLive`: role, text, done), so the page draws both alike.
  * The pane on screen paints it by the next frame (`paintLiveAnswer`); a pane
  * whose conversation is not up keeps the words for when it is. */
 function notePaneLive(session, frame) {
-  const role = frame.type === "reasoning" ? "thinking" : "assistant";
+  const voice = frame.type === "reasoning" ? "thinking" : "assistant";
   const words = frame.text ?? "";
   for (const term of paneTermsBySession(session)) {
     const pieces = paneLive.get(term) ?? [];
     const last = pieces.at(-1);
-    if (last && last.role === role && last.id === frame.id && !last.done) {
-      last.text += words;
+    if (last && last.voice === voice && last.id === frame.id && !last.done) {
+      last.said += words;
       last.done = frame.done === true;
+      wearLivePiece(last);
     } else if (words !== "") {
       // Whitespace is kept as it came: the first delta of an answer may be its indentation or the
       // blank lines before a fence, and it is the start of what follows. `liveWords` is what leaves a
       // piece with nothing but blanks undrawn.
-      pieces.push({ role, id: frame.id, text: words, done: frame.done === true });
+      const piece = { voice, id: frame.id, said: words, done: frame.done === true };
+      wearLivePiece(piece);
+      pieces.push(piece);
     } else {
       // A block opened or closed with no text at all leaves nothing to keep.
       continue;
     }
     paneLive.set(term, pieces);
     paintPaneLive(term);
+  }
+}
+
+/* What a live piece shows — its `role` and `text` — out of what its voice has
+ * said so far (`said`, kept as it came). An answer that opens with the passport
+ * label is the thought the transcript will make of it: drawn as the answer it
+ * wore the label on the page, and the thought that landed never settled it, so
+ * it stood until the person's next words (2026-11-08). While the opening is
+ * still the label arriving, the piece shows nothing yet. */
+function wearLivePiece(piece) {
+  piece.role = piece.voice;
+  piece.text = piece.said;
+  if (piece.voice !== "assistant") return;
+  const opening = piece.said.trimStart();
+  if (opening.startsWith(REASONING_PASSPORT_LABEL)) {
+    piece.role = "thinking";
+    piece.text = opening.slice(REASONING_PASSPORT_LABEL.length).trimStart();
+  } else if (!piece.done && opening !== "" && REASONING_PASSPORT_LABEL.startsWith(opening)) {
+    piece.text = "";
   }
 }
 
@@ -22123,6 +22193,8 @@ const DOC_VIEWS = {
   tasks: { build: buildTasksView, paint: paintTasksStage, single: true },
   // 따로 연 Jira 이슈 — 작업 판의 그 패널 하나를 옮겨 세운다(복제하지 않는다).
   jira: { build: buildJiraIssueView, paint: paintJiraIssueStage, single: true },
+  // 워크스페이스 보드 — 작업처럼 판은 마크업의 것 하나(`single`), 창을 덮던 시트가 탭이 됐다(2026-11-08).
+  workspaces: { build: buildWorkspaceBoardView, paint: paintWorkspaceBoardStage, single: true },
   tokens: { build: buildTokensView, paint: paintTokensView, wire: wireTokensView },
 };
 

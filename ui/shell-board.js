@@ -45,7 +45,12 @@ let deskLedgerAgain = false;
 
 /* 사람이 고른 것: 목록을 펼친 단계, 우편을 다 펼쳤는가, 자세히를 펼친 워커와 오늘 끝난
  * 과업(t-70264). 판이 다시 그려져도 남는다 — 창의 기억이지 원장의 것이 아니다. */
-const deskChoice = { stage: undefined, mailAll: false, workersOpen: new Set(), todayOpen: new Set() };
+const deskChoice = {
+  stage: undefined, mailAll: false, workersOpen: new Set(), todayOpen: new Set(),
+  // The History tab's record (11-08 draft v3): the days a person opened or shut (today is open until shut), the result
+  // shown, the words searched for.
+  daysOpen: new Set(), daysShut: new Set(), historyResult: "all", historyQuery: "",
+};
 
 /* 쓰는 중인 답(편지 id마다)과 누른 확인(묶음 id마다). 초안은 판이 다시 그려져도
  * 남고, 보낸 요청의 이름(`retry`)은 답이 불확실하면 그대로 남아 다시 누르면 같은
@@ -197,7 +202,6 @@ const DESK_BLOCKS = Object.freeze([
   { id: "workers", tab: "workers", paint: paintDeskWorkers },
   { id: "machine", tab: "workers", paint: paintDeskMachine, quietHead: true },
   { id: "today", tab: "history", paint: paintDeskToday },
-  { id: "totals", tab: "history", paint: paintDeskTotals },
   { id: "mail", tab: "history", paint: paintDeskMail },
   { id: "pipeline", tab: "history", paint: paintDeskPipeline },
 ]);
@@ -288,7 +292,7 @@ function deskMachineSegments(machine, now) {
     const room = DESK_DISK_ROOM[disk.room] ?? DESK_DISK_ROOM.room;
     const free = t("board.desk.disk", "디스크 {{free}} 남음", { free: disk.free });
     const note = room.key ? t(room.key, room.word, { held: disk.held_checkouts }) : "";
-    segments.push({ id: "disk", tone: room.tone, text: [free, note].filter(Boolean).join(" · "), tip: disk.at ?? "" });
+    segments.push({ id: "disk", tone: room.tone, text: free, note, tip: disk.at ?? "" });
   }
   const load = machine?.load;
   if (load && Number.isFinite(load.one_minute)) {
@@ -298,6 +302,8 @@ function deskMachineSegments(machine, now) {
       text: load.loud
         ? t("board.desk.loadBusy", "부하 {{load}} · 코어 {{cores}} · 붐빔", figures)
         : t("board.desk.load", "부하 {{load}} · 코어 {{cores}}", figures),
+      // The meter is the load per core, full at one waiting process a core.
+      meter: Number(load.cores) > 0 ? Math.min(1, load.one_minute / Number(load.cores)) : null,
     });
   }
   const devices = machine?.devices ?? {};
@@ -325,11 +331,23 @@ function paintDeskMachine(block, now) {
     body.replaceChildren(line);
   }
   const held = new Map([...line.children].map((node) => [node.dataset.segment, node]));
+  // A cell a fact (11-08 draft v3): its value, a meter where the fact is a share, and the note under it.
   reconcileElementOrder(line, segments.map((segment) => {
-    const node = held.get(segment.id) ?? deskElement("span", "");
+    let node = held.get(segment.id);
+    if (!node) {
+      node = deskElement("span", "");
+      const meter = deskElement("span", "board-desk-machine-meter");
+      meter.append(deskElement("i", ""));
+      node.append(deskElement("strong", "board-desk-machine-value"), meter, deskElement("span", "board-desk-machine-note"));
+    }
+    const [value, meter, note] = node.children;
     writeAttribute(node, "data-segment", segment.id);
     writeClassName(node, `board-desk-machine-segment${segment.tone ? ` is-${segment.tone}` : ""}`);
-    writeTextContent(node, segment.text);
+    writeTextContent(value, segment.text);
+    writeHidden(meter, !Number.isFinite(segment.meter));
+    if (Number.isFinite(segment.meter)) writeCustomProperty(meter.firstElementChild, "--fill", `${Math.round(segment.meter * 100)}%`);
+    writeTextContent(note, segment.note ?? "");
+    writeHidden(note, !segment.note);
     if (segment.tip) writeAttribute(node, "data-tip", segment.tip);
     return node;
   }));
@@ -846,20 +864,20 @@ function paintDeskFoldedAcks(line, batches, seats, view) {
  * 위의 것이 먼저 맞으면 아래는 묻지 않는다. `dot`은 시안 B의 상태 점이다(t-70264):
  * 멈춘 것은 빨강, 사람의 답을 기다리는 것은 파랑, 턴 중은 호박, 쉬는 것은 회색. */
 const DESK_HEALTH = Object.freeze([
-  { id: "gone", state: "failed", dot: "halt", key: "board.desk.healthGone", word: "판 없음",
+  { id: "gone", state: "failed", dot: "halt", key: "board.desk.healthGone", word: "창이 닫힘",
     holds: (row) => Number.isFinite(row.pane_missing_since_ms) },
   { id: "walled", state: "needs-attention", dot: "halt", key: "board.desk.healthWalled", word: "한도 도달",
     holds: (row, card, now) => Boolean(row.wall) && now < row.wall.stands_until_ms },
-  { id: "asking", state: "needs-attention", dot: "you", key: "board.desk.healthAsking", word: "답 기다림",
+  { id: "asking", state: "needs-attention", dot: "you", key: "board.desk.healthAsking", word: "답을 기다림",
     holds: (row, card) => row.asking === true || card?.state === "needs-attention" },
   // 일이 끝나 판이 회수를 기다린다(t-94842): 사람 손 없이 창이 닫는다. 「유휴」로 그리면 끝났는지 모른다.
   { id: "finished", state: "idle", dot: "done", key: "board.desk.healthFinished", word: "끝남",
     holds: (row) => row.ledger === "reclaimable" },
   { id: "asleep", state: "idle", dot: "queue", key: "board.desk.healthAsleep", word: "잠듦",
     holds: (row) => row.ledger === "sleeping" },
-  { id: "turn", state: "working", dot: "run", key: "board.desk.healthTurn", word: "턴 중",
+  { id: "turn", state: "working", dot: "run", key: "board.desk.healthTurn", word: "일하는 중",
     holds: (row, card) => card?.state === "working" },
-  { id: "idle", state: "idle", dot: "queue", key: "board.desk.healthIdle", word: "유휴", holds: () => true },
+  { id: "idle", state: "idle", dot: "queue", key: "board.desk.healthIdle", word: "쉬는 중", holds: () => true },
 ]);
 
 function deskWorkerHealth(row, card, now) {
@@ -879,6 +897,7 @@ function deskWorkerFacts(row, now) {
     agentName(row.agent),
     model && row.effort ? t("board.desk.workerModel", "{{model}} · {{effort}}", { model, effort: row.effort }) : model,
     row.term != null ? t("board.desk.workerTerm", "판 {{term}}", { term: row.term }) : row.pane,
+    row.gate ? t("board.workers.calls", "호출 {{count}}", { count: row.gate.metrics?.steps ?? 0 }) : "",
     row.checkout ? basename(row.checkout) : "",
     Number.isInteger(git?.beyond_base) ? t("board.desk.workerAhead", "커밋 {{count}}개 앞섬", { count: git.beyond_base }) : "",
     Number.isInteger(git?.dirty_files) ? t("board.desk.workerDirty", "바뀐 파일 {{count}}", { count: git.dirty_files }) : "",
@@ -1098,15 +1117,16 @@ function paintDeskTableFold(group, open) {
 /* 워커 표의 여덟 칸, 시안 B의 차례 그대로(t-70264): 워커 · 모델, 판, 과업, 상태, 경과, 비용, 호출,
  * 바뀐 줄. 비용과 호출은 계속 판정이 읽은 그 수(`row.gate`), 바뀐 줄은 체크아웃이 갈라져 나온 뒤의
  * 줄(`desk_checkouts`의 `lines`)이다 — 모르면 「—」이고 0이라 쓰지 않는다. */
+/* 칸 일곱(11-08 시안 v3): 「판」 칸(터미널 번호·%0)은 사람에게 뜻이 없어 「판 열기」 단추가 되었고, 호출 수는
+ * 자세히로 갔다. 과업은 워커 칸의 둘째 줄이고, 그 자리에 워커가 지금 하는 일이 선다. */
 const DESK_WORKER_COLUMNS = Object.freeze([
-  { id: "who", key: "board.workers.colWho", word: "워커 · 모델" },
-  { id: "pane", key: "board.workers.colPane", word: "판", wide: true },
-  { id: "task", key: "board.workers.colTask", word: "과업", wide: true },
+  { id: "who", key: "board.workers.colWho", word: "워커 · 과업" },
   { id: "state", key: "board.workers.colState", word: "상태" },
+  { id: "work", key: "board.workers.colWork", word: "지금 하는 일", wide: true },
   { id: "took", key: "board.workers.colTook", word: "경과", number: true, wide: true },
   { id: "cost", key: "board.workers.colCost", word: "비용", number: true, wide: true },
-  { id: "calls", key: "board.workers.colCalls", word: "호출", number: true, wide: true },
   { id: "lines", key: "board.workers.colLines", word: "바뀐 줄", number: true, wide: true },
+  { id: "act", key: "board.workers.colAct", word: "할 일" },
 ]);
 
 /* 바뀐 줄 — 「+1,204 −0」: 더한 줄과 뺀 줄, 창의 언어로 자릿수를 끊는다. */
@@ -1127,18 +1147,24 @@ function deskWorkerRow(view) {
   fold.append(deskElement("strong", "board-desk-worker-model"), document.createTextNode(" "),
     deskElement("code", "board-desk-worker-id"));
   deskTableFold(view, group, row, fold, deskChoice.workersOpen, "worker");
-  const [who, pane, task, state, took, cost, calls, lines] = DESK_WORKER_COLUMNS;
+  const [who, state, work, took, cost, lines, act] = DESK_WORKER_COLUMNS;
   const cell = (column, className, ...parts) => {
     const one = deskTableCell("td", column, className);
     one.append(...parts);
     return one;
   };
-  row.append(cell(who, "board-desk-worker-who", fold), cell(pane, "board-desk-worker-pane"),
-    cell(task, "board-desk-worker-task"),
+  // 「판 열기」: the worker's own terminal, its worktree brought forward first (`openPaneFromBoard`).
+  const openPane = deskElement("button", "board-btn board-desk-worker-open");
+  openPane.type = "button";
+  openPane.onclick = () => {
+    if (group.__term != null) void openPaneFromBoard(group.__term);
+  };
+  row.append(cell(who, "board-desk-worker-who", fold, deskElement("span", "board-desk-worker-task")),
     cell(state, "board-desk-worker-state", deskElement("span", "board-desk-worker-health board-state"),
       deskElement("span", "board-desk-worker-verdict")),
+    cell(work, "board-desk-worker-work"),
     cell(took, "board-desk-worker-took"), cell(cost, "board-desk-worker-cost"),
-    cell(calls, "board-desk-worker-calls"), cell(lines, "board-desk-worker-lines"));
+    cell(lines, "board-desk-worker-lines"), cell(act, "board-desk-worker-act", openPane));
   // The details, built the first time the row opens (`deskTableDetail`).
   group.__detail = () => {
     const heard = deskElement("p", "board-desk-worker-heard");
@@ -1164,23 +1190,80 @@ function deskWorkerRow(view) {
   return group;
 }
 
+/* 워커가 지금 하는 일 — 판이 있으면 그 판이 말한 일(작업 목록·지금 도는 일과 같은 말, `taskBoardActivity`), 없으면
+ * 건강이 말하는 한 줄과 마지막 활동. */
+const DESK_WORKER_WORK = Object.freeze({
+  asking: { key: "board.workers.workAsking", word: "답을 기다립니다 · 당신 차례에 있습니다" },
+  finished: { key: "board.workers.workFinished", word: "일을 마쳤습니다 · 창이 판을 거둡니다" },
+});
+
+function deskWorkerWork(row, entry, health, now) {
+  if (entry && health.id === "turn") return taskBoardActivity(entry);
+  // A gone or walled worker is said as the Now table says it (`BOARD_HALTS`, shell-board-now.js — read when painting,
+  // since that file loads after this one).
+  const said = health.id === "gone" || health.id === "walled" ? BOARD_HALTS[health.id] : DESK_WORKER_WORK[health.id];
+  if (said) return t(said.key, said.word);
+  const at = deskWorkerAt(row, entry?.card);
+  return at > 0 ? t("board.workers.lastHeard", "마지막 활동 · {{time}} 전", { time: agoWord(at, now) }) : "";
+}
+
+/* 머리 줄: 건강마다의 수(0은 빼고)와 오늘 쓴 돈 — 계속 판정이 읽은 하루 합계(`day_spent_usd`). */
+function deskWorkerSummary(judged) {
+  const pieces = DESK_HEALTH.map((health) => [health, judged.filter((one) => one.health === health).length])
+    .filter(([, count]) => count > 0)
+    .map(([health, count]) => `${t(health.key, health.word)} ${count}`);
+  const day = Math.max(0, ...judged.map(({ row }) => Number(row.gate?.day_spent_usd) || 0));
+  if (day > 0) pieces.push(t("board.workers.daySpent", "오늘 {{spent}}", { spent: formatCost(day) }));
+  return pieces.join(" · ");
+}
+
+/* 런 하나의 머리 행 — 그 아래 워커가 누구의 것인가(11-08 시안 v3: 코디마다 묶는다). */
+function deskWorkerRunHead() {
+  const group = deskElement("tbody", "board-desk-worker-run");
+  const row = deskElement("tr", "");
+  const head = deskElement("th", "board-desk-worker-run-name");
+  head.scope = "rowgroup";
+  head.colSpan = DESK_WORKER_COLUMNS.length;
+  row.append(head);
+  group.append(row);
+  return group;
+}
+
 function paintDeskWorkers(block, now, view) {
   const rows = deskAgents;
   if (rows.length === 0) return false;
   writeTextContent(block.firstElementChild, t("board.workers.title", "워커 {{count}}", { count: rows.length }));
   const table = deskTableBlock(block, "board-desk-workers", DESK_WORKER_COLUMNS);
-  writeTextContent(table.parentElement.previousElementSibling,
-    t("board.workers.note", "모델·비용·호출 수·바뀐 줄은 여기서만 봅니다 — 첫 화면에서는 뺐습니다."));
   const model = agentGraphModels.get(view);
-  const cards = new Map((model?.agents ?? []).map((entry) => [entry.card.pane, entry.card]));
+  const entries = new Map((model?.agents ?? []).map((entry) => [entry.card.pane, entry]));
+  const runOrder = (deskLedger?.runs ?? []).map((one) => one.run);
   const judged = rows.map((row) => {
-    const card = row.term != null ? cards.get(`term:${row.term}`) : null;
-    return { row, card, health: deskWorkerHealth(row, card, now) };
-  }).sort((a, b) => DESK_HEALTH.indexOf(a.health) - DESK_HEALTH.indexOf(b.health) ||
-    (Number(a.row.at) || 0) - (Number(b.row.at) || 0));
-  const held = new Map([...table.tBodies].map((node) => [node.dataset.worker, node]));
+    const seen = row.term != null ? entries.get(`term:${row.term}`) : null;
+    const entry = seen ? { card: seen.card, facts: agentCardFacts(seen.card, seen.bucket, now) } : null;
+    return { row, card: seen?.card ?? null, entry, health: deskWorkerHealth(row, seen?.card ?? null, now) };
+  }).sort((a, b) => (runOrder.indexOf(a.row.run) - runOrder.indexOf(b.row.run)) ||
+    DESK_HEALTH.indexOf(a.health) - DESK_HEALTH.indexOf(b.health) || (Number(a.row.at) || 0) - (Number(b.row.at) || 0));
+  writeTextContent(table.parentElement.previousElementSibling, deskWorkerSummary(judged));
+  const held = new Map([...table.tBodies].map((node) => [node.dataset.worker ?? `run:${node.dataset.run}`, node]));
   const keys = new Set();
-  reconcileElementOrder(table, [table.tHead, ...judged.map(({ row, card, health }) => {
+  const counted = new Map();
+  for (const { row } of judged) counted.set(row.run, (counted.get(row.run) ?? 0) + 1);
+  const ordered = [];
+  let lastRun;
+  for (const one of judged) {
+    if (one.row.run !== lastRun) {
+      lastRun = one.row.run;
+      const head = held.get(`run:${lastRun}`) ?? deskWorkerRunHead();
+      writeAttribute(head, "data-run", lastRun);
+      writeTextContent(head.querySelector("th"), t("board.workers.runHead", "{{run}} · 워커 {{count}}", {
+        run: boardRunName(lastRun) || lastRun, count: counted.get(lastRun) }));
+      ordered.push(head);
+    }
+    ordered.push(one);
+  }
+  reconcileElementOrder(table, [table.tHead, ...ordered.map((one) => {
+    if (one instanceof Element) return one;
+    const { row, card, entry, health } = one;
     const key = `${row.run}/${row.worker}`;
     keys.add(key);
     const node = held.get(key) ?? deskWorkerRow(view);
@@ -1196,7 +1279,6 @@ function paintDeskWorkers(block, now, view) {
       ? t("board.desk.workerModel", "{{model}} · {{effort}}", { model: modelName, effort: row.effort }) : modelName);
     writeTextContent(node.querySelector(".board-desk-worker-id"),
       workerRoleWords(ledgerWorkerRole({ worker: row.worker, takenOver: row.taken_over === true })));
-    writeTextContent(node.querySelector(".board-desk-worker-pane"), row.term != null ? String(row.term) : row.pane || "—");
     const review = ledgerReviewWord(row);
     writeTextContent(node.querySelector(".board-desk-worker-task"),
       [row.task || row.task_id, review, ledgerClosedReason(row.closed)].filter(Boolean).join(" · "));
@@ -1223,7 +1305,10 @@ function paintDeskWorkers(block, now, view) {
     const costCell = node.querySelector(".board-desk-worker-cost");
     writeTextContent(costCell, gate?.cost === "read" ? gateSpentWords(gate) : "—");
     writeAttribute(costCell, "data-tip", gate && gate.cost !== "read" ? gateCostNoteWords(gate) : "");
-    writeTextContent(node.querySelector(".board-desk-worker-calls"), gate ? String(gate.metrics?.steps ?? 0) : "—");
+    writeTextContent(node.querySelector(".board-desk-worker-work"), deskWorkerWork(row, entry, health, now));
+    const openPane = node.querySelector(".board-desk-worker-open");
+    writeTextContent(openPane, t("board.workers.openPane", "판 열기"));
+    writeHidden(openPane, card == null);
     const lines = deskCheckouts.get(row.checkout)?.lines;
     writeTextContent(node.querySelector(".board-desk-worker-lines"), lines ? deskLinesWords(lines) : "—");
     paintDeskWall(node, row, now);
@@ -2479,8 +2564,9 @@ function deskTaskRow(held, task, runs, now) {
 function paintDeskTaskLines(host, task, now) {
   const { note: noteLine, work: workLine, owner: ownerLine, step: stepLine, next: nextLine, cost: costLine, writing: writingLine,
     conditions: conditionsLine, handIn: handInLine, kept: keptLine } = host.__lines;
+  // A gate is said in the person's words, as the Now tab says it (`deskHoldWords`); the ledger's English stays behind it.
   const note = task.gate
-    ? t("board.desk.taskGate", "{{gate}} · {{question}}", { gate: task.gate.id, question: task.gate.question })
+    ? deskHoldWords(task.gate)
     : task.closed
       ? [ledgerClosedReason(task.closed), task.closed.why].filter(Boolean).join(" · ")
     : task.blocked_by?.length
@@ -2520,6 +2606,13 @@ function paintDeskTaskLines(host, task, now) {
   paintDeskKept(keptLine, task.kept, task);
 }
 
+/* 흐름 막대와 칩의 색 — 판의 상태 점과 같은 말: 도는 일은 호박, 사람 차례는 파랑, 막힘·실패는 빨강, 착지·검증은 초록,
+ * 발행은 청록, 나머지는 회색. 색만이 아니라 칩의 낱말과 수가 같이 선다. */
+const DESK_FLOW_TONES = Object.freeze({
+  dispatched: "run", reported: "you", gate: "you", verified: "ok", merged: "ok", deployed: "done",
+  blocked: "halt", failed: "halt",
+});
+
 function paintDeskPipeline(block, now, view) {
   const ledger = deskLedger;
   if (!ledger || !Array.isArray(ledger.stages) || ledger.runs?.length === 0) return false;
@@ -2532,23 +2625,44 @@ function paintDeskPipeline(block, now, view) {
   writeTextContent(block.firstElementChild, t("board.desk.pipeline", "과업 흐름 · {{count}}", { count: total }));
   const body = block.lastElementChild;
   let strip = body.querySelector(":scope > .board-desk-stages");
+  let bar = body.querySelector(":scope > .board-desk-flowbar");
   if (!strip) {
     strip = deskElement("div", "board-desk-stages");
     strip.setAttribute("role", "group");
     // The flow and the stuck stages are two runs of chips that wrap as one
     // line: the stuck run starts beside the flow's last chip, one space on.
     strip.append(deskElement("span", "board-desk-stage-run is-flow"), deskElement("span", "board-desk-stage-run"));
-    body.replaceChildren(strip, deskElement("ol", "board-desk-tasks"), deskElement("p", "board-desk-more"));
+    // One bar over the chips (11-08 draft v3): where the tasks stand, by share — the chips stay its legend and its doors.
+    bar = deskElement("p", "board-desk-flowbar");
+    bar.setAttribute("aria-hidden", "true");
+    body.replaceChildren(bar, strip, deskElement("ol", "board-desk-tasks"), deskElement("p", "board-desk-more"));
   }
+  // Closed tasks were folded, handed over or outdated — bookkeeping, not work — so their chip counts them but the bar
+  // leaves them out: two hundred of them would paint the whole bar one grey.
+  const standing = DESK_STAGES.filter((stage) => stage.id !== "closed" && (counts.get(stage.id) ?? 0) > 0);
+  // A segment names its stage as `data-part`, never `data-stage`: that is the chips' (a press finds them by it).
+  const heldSegments = new Map([...bar.children].map((node) => [node.dataset.part, node]));
+  reconcileElementOrder(bar, standing.map((stage) => {
+    const segment = heldSegments.get(stage.id) ?? deskElement("i", "board-desk-flowbar-part");
+    writeAttribute(segment, "data-part", stage.id);
+    writeAttribute(segment, "data-tone", DESK_FLOW_TONES[stage.id] ?? "queue");
+    // Its share as a custom property, written only when it moved: a paint over the same counts writes nothing.
+    writeCustomProperty(segment, "--share", String(counts.get(stage.id)));
+    return segment;
+  }));
   writeAttribute(strip, "aria-label", t("board.desk.pipeline", "과업 흐름 · {{count}}", { count: total }));
   let open = deskChoice.stage === undefined ? deskDefaultStage(counts) : deskChoice.stage;
   if (open && (counts.get(open) ?? 0) === 0) open = deskDefaultStage(counts);
   const [flowRun, stuckRun] = strip.children;
   for (const [run, flow] of [[flowRun, true], [stuckRun, false]]) {
-    const chips = DESK_STAGES.filter((stage) => stage.flow === flow && !(stage.evidence && counts.get(stage.id) === 0))
+    // A stage with no task draws no chip (11-08: nine of fifteen chips said 0). The evidence stage keeps its rule: only an
+    // exact zero hides it, and a count the ledger did not give stands as 「—」, never as a quiet nothing.
+    const chips = DESK_STAGES.filter((stage) => stage.flow === flow &&
+      (stage.evidence ? counts.get(stage.id) !== 0 : (counts.get(stage.id) ?? 0) > 0))
       .map((stage) => {
         const chip = deskStageChip(run, stage, counts, view);
         writeAttribute(chip, "aria-pressed", String(open === stage.id));
+        writeAttribute(chip, "data-tone", DESK_FLOW_TONES[stage.id] ?? "queue");
         return chip;
       });
     for (const gone of [...run.children]) if (!chips.includes(gone)) gone.remove();
@@ -2605,83 +2719,165 @@ function deskTodayRow(view) {
   return group;
 }
 
+/* 기록의 거르개(11-08 시안 v3): 끝난 결과마다 하나, 0인 것은 서지 않는다. */
+const DESK_HISTORY_RESULTS = Object.freeze([
+  { id: "all", key: "board.history.resultAll", word: "전체", holds: () => true },
+  { id: "deployed", key: "board.now.doneShipped", word: "발행됨", holds: (task) => task.stage === "deployed" },
+  { id: "merged", key: "board.history.resultLanded", word: "착지", holds: (task) => task.stage === "merged" },
+  { id: "other", key: "board.history.resultOther", word: "착지할 것 없이 끝남", holds: (task) => task.stage !== "deployed" && task.stage !== "merged" },
+]);
+
+/* 끝난 과업의 날 — 그 끝난 때의 지역 날짜. */
+function deskDayKey(ms) {
+  const day = new Date(ms);
+  return `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, "0")}-${String(day.getDate()).padStart(2, "0")}`;
+}
+
+function deskDayWords(key, now) {
+  if (key === deskDayKey(now)) return t("board.history.dayToday", "오늘");
+  if (key === deskDayKey(now - 86_400_000)) return t("board.history.dayYesterday", "어제");
+  const [year, month, date] = key.split("-").map(Number);
+  return new Date(year, month - 1, date).toLocaleDateString(document.documentElement.lang || undefined,
+    { month: "long", day: "numeric", weekday: "short" });
+}
+
+function deskDayOpen(key, now) {
+  return key === deskDayKey(now) ? !deskChoice.daysShut.has(key) : deskChoice.daysOpen.has(key);
+}
+
+function deskDayHead(view) {
+  const group = deskElement("tbody", "board-today-day");
+  const row = deskElement("tr", "");
+  const head = deskElement("th", "board-today-day-head");
+  head.scope = "rowgroup";
+  head.colSpan = DESK_TODAY_COLUMNS.length;
+  const fold = deskElement("button", "board-today-day-fold");
+  fold.type = "button";
+  fold.insertAdjacentHTML("afterbegin", icon("chevron", false));
+  fold.append(deskElement("strong", "board-today-day-name"), deskElement("span", "board-today-day-count"));
+  fold.onclick = () => {
+    const key = group.dataset.day;
+    const today = key === deskDayKey(Date.now());
+    const shut = today ? deskChoice.daysShut : deskChoice.daysOpen;
+    if (shut.has(key)) shut.delete(key);
+    else shut.add(key);
+    paintCoordinatorDesk(view);
+  };
+  head.append(fold);
+  row.append(head);
+  group.append(row);
+  return group;
+}
+
+/* 기록의 거르개와 찾기 칸 — 블록의 메모 자리에 한 번 짓는다. */
+function deskHistoryControls(note, view) {
+  if (note.querySelector(".board-history-filter")) return note;
+  const filter = deskElement("span", "board-history-filter");
+  filter.setAttribute("role", "group");
+  filter.onclick = (event) => {
+    const button = event.target.closest("button[data-result]");
+    if (!button) return;
+    deskChoice.historyResult = button.dataset.result;
+    paintCoordinatorDesk(view);
+  };
+  const search = deskElement("input", "board-history-search");
+  search.type = "search";
+  search.oninput = () => {
+    deskChoice.historyQuery = search.value;
+    paintCoordinatorDesk(view);
+  };
+  note.replaceChildren(filter, search);
+  return note;
+}
+
 function paintDeskToday(block, now, view) {
   const ledger = deskLedger;
   if (!ledger || !Array.isArray(ledger.tasks)) return false;
-  writeTextContent(block.firstElementChild, t("board.history.today", "오늘 끝난 일"));
+  writeTextContent(block.firstElementChild, t("board.history.today", "끝난 일"));
   const table = deskTableBlock(block, "board-today", DESK_TODAY_COLUMNS);
   const card = table.parentElement;
-  writeTextContent(card.previousElementSibling, t("board.history.todayNote", "끝나는 대로 위에 쌓입니다."));
+  const note = deskHistoryControls(card.previousElementSibling, view);
   const empty = card.querySelector(":scope > .board-today-empty") ?? card.appendChild(deskElement("p", "board-today-empty"));
-  const tasks = boardFinishedTodayTasks(ledger, now);
+  // Every finished task the desk carries, the latest first; the tab's one record (11-08: 「오늘 것만」 was the complaint).
+  const finished = (ledger.tasks ?? []).filter((task) => boardFinishedAt(task) !== null)
+    .sort((a, b) => boardFinishedAt(b) - boardFinishedAt(a));
+  const [filter, search] = note.children;
+  const counts = new Map(DESK_HISTORY_RESULTS.map((result) => [result.id, finished.filter(result.holds).length]));
+  if (!counts.get(deskChoice.historyResult)) deskChoice.historyResult = "all";
+  const heldButtons = new Map([...filter.children].map((node) => [node.dataset.result, node]));
+  reconcileElementOrder(filter, DESK_HISTORY_RESULTS.filter((result) => result.id === "all" || counts.get(result.id) > 0)
+    .map((result) => {
+      let button = heldButtons.get(result.id);
+      if (!button) {
+        button = deskElement("button", "board-history-result");
+        button.type = "button";
+      }
+      writeAttribute(button, "data-result", result.id);
+      writeAttribute(button, "aria-pressed", String(deskChoice.historyResult === result.id));
+      writeTextContent(button, `${t(result.key, result.word)} ${counts.get(result.id)}`);
+      return button;
+    }));
+  writeAttribute(filter, "aria-label", t("board.history.filter", "결과로 거르기"));
+  writeAttribute(search, "placeholder", t("board.history.search", "과업·id 찾기"));
+  writeAttribute(search, "aria-label", t("board.history.search", "과업·id 찾기"));
+  if (document.activeElement !== search && search.value !== deskChoice.historyQuery) search.value = deskChoice.historyQuery;
+  const shown = DESK_HISTORY_RESULTS.find((result) => result.id === deskChoice.historyResult) ?? DESK_HISTORY_RESULTS[0];
+  const query = deskChoice.historyQuery.trim().toLowerCase();
+  const tasks = finished.filter((task) => shown.holds(task)
+    && (!query || `${task.title} ${task.id}`.toLowerCase().includes(query)));
+  const days = new Map();
+  for (const task of tasks) {
+    const key = deskDayKey(boardFinishedAt(task));
+    if (!days.has(key)) days.set(key, []);
+    days.get(key).push(task);
+  }
   const runs = ledger.runs?.length ?? 1;
-  const held = new Map([...table.tBodies].map((node) => [node.dataset.task, node]));
+  const held = new Map([...table.tBodies].map((node) => [node.dataset.task ?? `day:${node.dataset.day}`, node]));
   const keys = new Set();
-  reconcileElementOrder(table, [table.tHead, ...tasks.map((task) => {
-    const key = `${task.run}/${task.id}`;
-    keys.add(key);
-    const node = held.get(key) ?? deskTodayRow(view);
-    writeAttribute(node, "data-task", key);
-    const open = deskChoice.todayOpen.has(key);
-    paintDeskTableFold(node, open);
-    writeTextContent(node.querySelector(".board-today-name"), runs > 1 ? `${task.title} · ${task.run}` : task.title);
-    writeTextContent(node.querySelector(".board-today-id"), task.id);
-    const result = DESK_TODAY_RESULTS[task.stage];
-    const word = node.querySelector(".board-today-word");
-    writeAttribute(word, "data-dot", result?.dot ?? "queue");
-    writeTextContent(word, result ? t(result.key, result.word) : deskStageWord(task.stage));
-    const started = Number(task.times?.started_ms) || 0;
-    const finished = boardFinishedAt(task);
-    writeTextContent(node.querySelector(".board-today-took"),
-      started > 0 && finished > started ? deskSpanWords(finished - started) : "—");
-    writeTextContent(node.querySelector(".board-today-at"), boardClock(finished, now));
-    if (open) paintDeskTaskLines(deskTableDetail(node, () => deskTaskLines(deskElement("div", "board-today-detail"))), task, now);
-    return node;
-  })]);
-  // A task that left today's list takes its opened lines with it.
+  const wanted = [table.tHead];
+  for (const [day, dayTasks] of days) {
+    const head = held.get(`day:${day}`) ?? deskDayHead(view);
+    writeAttribute(head, "data-day", day);
+    const open = deskDayOpen(day, now) || query !== "";
+    writeAttribute(head.querySelector(".board-today-day-fold"), "aria-expanded", String(open));
+    head.querySelector(".board-today-day-fold .icon")?.classList.toggle("is-open", open);
+    writeTextContent(head.querySelector(".board-today-day-name"), deskDayWords(day, now));
+    writeTextContent(head.querySelector(".board-today-day-count"), t("board.history.dayCount", "{{count}}개", { count: dayTasks.length }));
+    wanted.push(head);
+    if (open) wanted.push(...dayTasks.map((task) => deskTodayTaskRow(held, keys, task, runs, now, view)));
+  }
+  reconcileElementOrder(table, wanted);
+  // A task that left the record takes its opened lines with it.
   for (const key of deskChoice.todayOpen) if (!keys.has(key)) deskChoice.todayOpen.delete(key);
   writeHidden(table, tasks.length === 0);
-  writeTextContent(empty, t("board.now.runsTodayNone", "오늘 끝난 일은 아직 없습니다"));
+  writeTextContent(empty, finished.length === 0 ? t("board.history.none", "끝난 일이 아직 없습니다")
+    : t("board.history.noMatch", "거르개와 찾는 말에 맞는 일이 없습니다"));
   writeHidden(empty, tasks.length > 0);
   return true;
 }
 
-/* 누적 — 배포됨과 흐름을 떠난 단계(`DESK_OVER_STAGES`)의 과업 수: 시안의 셋(배포 · 종료 · 닫힘)에 그 뒤
- * 제 단계가 된 「완료 — 착지할 것 없음」(t-34501)과 「종료 — 검토 생략(사람)」(t-71220)이 더해진 것이다.
- * 상태 모름은 증거라 빠진다. 목록을 그 단계표에서 끌어 써서, 새 끝 단계가 생기면 누적에도 저절로 선다.
- * 수는 원장이 센 그대로(`stages`)이고 낱말은 과업 흐름의 칩과 같은 말이다. 원장이 세지 않은 단계는
- * 0이 아니라 「—」. */
-const DESK_TOTAL_STAGES = Object.freeze(["deployed",
-  ...DESK_OVER_STAGES.filter((stage) => !DESK_STAGES.find((one) => one.id === stage)?.evidence)]);
-
-function paintDeskTotals(block) {
-  const ledger = deskLedger;
-  if (!ledger || !Array.isArray(ledger.stages)) return false;
-  const counts = new Map(ledger.stages.map((one) => [one.stage, one.count]));
-  const head = block.firstElementChild;
-  if (!head.firstElementChild) {
-    head.append(deskElement("span", "board-desk-head-word"), deskElement("span", "board-desk-head-note"));
-  }
-  writeTextContent(head.firstElementChild, t("board.history.totals", "누적"));
-  writeTextContent(head.lastElementChild,
-    t("board.history.totalsNote", "누적 수는 첫 화면에서 이리로 옮겼습니다 — 지금 일과 겨루지 않게."));
-  const body = block.lastElementChild;
-  const stats = body.firstElementChild ?? body.appendChild(deskElement("dl", "board-totals"));
-  const held = new Map([...stats.children].map((node) => [node.dataset.stage, node]));
-  reconcileElementOrder(stats, DESK_TOTAL_STAGES.map((stage) => {
-    let node = held.get(stage);
-    if (!node) {
-      node = deskElement("div", "board-total");
-      node.dataset.stage = stage;
-      node.append(deskElement("dt", "board-total-word"), deskElement("dd", "board-total-count"));
-    }
-    const count = counts.get(stage);
-    writeTextContent(node.firstElementChild, deskStageWord(stage));
-    writeTextContent(node.lastElementChild, Number.isInteger(count) ? String(count) : "—");
-    return node;
-  }));
-  return true;
+function deskTodayTaskRow(held, keys, task, runs, now, view) {
+  const key = `${task.run}/${task.id}`;
+  keys.add(key);
+  const node = held.get(key) ?? deskTodayRow(view);
+  writeAttribute(node, "data-task", key);
+  const open = deskChoice.todayOpen.has(key);
+  paintDeskTableFold(node, open);
+  writeTextContent(node.querySelector(".board-today-name"), runs > 1 ? `${task.title} · ${task.run}` : task.title);
+  writeTextContent(node.querySelector(".board-today-id"), task.id);
+  const result = DESK_TODAY_RESULTS[task.stage];
+  const word = node.querySelector(".board-today-word");
+  writeAttribute(word, "data-dot", result?.dot ?? "queue");
+  writeTextContent(word, result ? t(result.key, result.word) : deskStageWord(task.stage));
+  const started = Number(task.times?.started_ms) || 0;
+  const finished = boardFinishedAt(task);
+  writeTextContent(node.querySelector(".board-today-took"),
+    started > 0 && finished > started ? deskSpanWords(finished - started) : "—");
+  writeTextContent(node.querySelector(".board-today-at"), boardClock(finished, now));
+  if (open) paintDeskTaskLines(deskTableDetail(node, () => deskTaskLines(deskElement("div", "board-today-detail"))), task, now);
+  return node;
 }
+
 
 /* ---- 빌드 --------------------------------------------------------------------
  *
@@ -2746,6 +2942,9 @@ function askBoardBuilds() {
         file: typeof answer.file?.state === "string" ? answer.file : BUILD_FILE_NONE,
         suggest: Array.isArray(answer.suggest) ? answer.suggest : [],
         runnable: Array.isArray(answer.runnable) ? answer.runnable : [],
+        report_acts: answer.report_acts && typeof answer.report_acts === "object" ? answer.report_acts : {},
+        // The machine's build line (`zo line`, 11-08): every project's heavy work here, and its pause.
+        line: answer.line && Array.isArray(answer.line.jobs) ? answer.line : null,
       };
       boardBuildsFor = asked;
       scheduleDeskPaint();
@@ -2972,6 +3171,14 @@ function dressBuildStepMark(item, state) {
   item.firstElementChild.replaceWith(holder.content.firstElementChild);
 }
 
+/* 건너뛴 까닭 — 「…부터 다시」가 앞 단계를 건너뛸 때 러너가 적는 말(`SKIPPED_BEFORE_FROM`, zerocode-core builds.rs)은
+ * 사람의 말로, 다른 까닭은 쓴 쪽의 말 그대로. */
+const BUILD_SKIPPED_BEFORE_FROM = "before the step this run went on from";
+
+function buildSkippedWords(why) {
+  return why === BUILD_SKIPPED_BEFORE_FROM ? t("board.build.skippedBefore", "다시 돈 단계 앞") : String(why);
+}
+
 /* 단계마다의 시간 — 펼친 사람에게만 짓는다: 접힌 목록은 행을 들고 다니지 않는다. */
 function paintBuildLog(log, build, steps, now) {
   const list = log.lastElementChild;
@@ -2991,7 +3198,7 @@ function paintBuildLog(log, build, steps, now) {
     dressBuildStepMark(row, step.state);
     writeTextContent(row.children[1], buildWords(step.words, step.name));
     writeTextContent(row.children[2], step.skipped
-      ? t("board.build.skippedWhy", "건너뜀 · {{why}}", { why: step.skipped })
+      ? t("board.build.skippedWhy", "건너뜀 · {{why}}", { why: buildSkippedWords(step.skipped) })
       : buildStepTime(step, build, now));
     return row;
   }));
@@ -3001,6 +3208,11 @@ function paintBuildLog(log, build, steps, now) {
  * 시작한 뒤의 시간. 단계가 도는 동안은 그 칸이 경과를 말하고 맨 위 문장이 끝날 시각을 말하므로, 둘째 줄은
  * 시계를 되풀이하지 않는다(빈 글). */
 function buildTookWords(build, now) {
+  const stopped = buildHaltedStep(build);
+  if (build.state === "cancelled" && stopped && Number.isFinite(Number(stopped.secs))) {
+    return t("board.build.stoppedAt", "{{step}} {{took}}에서 멈춤", {
+      step: buildWords(stopped.words, stopped.name), took: buildSecsWords(Number(stopped.secs)) });
+  }
   if (build.state === "silent") {
     return t("board.build.lastHeard", "마지막 기록 {{at}}", { at: boardClock(Number(build.updated_ms), now) });
   }
@@ -3010,6 +3222,17 @@ function buildTookWords(build, now) {
   }
   if (buildRunningStep(build)) return "";
   return runningWord(Number(build.started_ms) || now, now) ?? t("board.now.justStarted", "방금 시작");
+}
+
+/* 실패하거나 멈춘 단계 — 끝난 실행에서 다시 돌 자리(「…부터 다시」)이고, 멈춘 자리를 말하는 단계다. */
+function buildHaltedStep(build) {
+  if (build.state !== "failed" && build.state !== "cancelled") return null;
+  return (Array.isArray(build.steps) ? build.steps : []).find((step) => step.state === "failed") ?? null;
+}
+
+/* 초 단위 걸린 시간: 1분 안이면 초로(「4초」), 넘으면 판의 시간 글로. */
+function buildSecsWords(secs) {
+  return secs < 60 ? t("board.build.seconds", "{{count}}초", { count: Math.max(1, Math.round(secs)) }) : deskSpanWords(secs * 1000);
 }
 
 /* 사람이 누를 단계의 이름 — 기록의 단계 낱말, 없으면 단계 id. */
@@ -3034,26 +3257,92 @@ function buildNote(build, now) {
 function buildCardNode() {
   const card = deskElement("article", "board-build");
   const line = deskElement("p", "board-build-line");
-  line.append(deskElement("span", "board-build-order"), deskElement("span", "board-build-name"),
+  // 상태는 이름 앞의 점 하나다(시안 v3): 차례 번호 원은 단계로 읽혀서 걷었다 — 차례는 카드가 선 차례다.
+  line.append(deskElement("span", "board-build-dot"), deskElement("span", "board-build-name"),
     deskElement("strong", "board-build-label"), deskElement("span", "board-build-tool"),
     deskElement("span", "board-state board-build-state"));
   const meta = deskElement("p", "board-build-meta");
-  const acts = deskElement("span", "board-build-acts");
+  meta.append(deskElement("code", "board-build-sha"), deskElement("span", "board-build-at"), deskElement("span", "board-build-took"));
+  // 단추 줄: 돌리기(다시·멈추기·누를 단계)는 `.board-build-act`, 그 곁의 로그와 ⋯는 `.board-build-aux`.
+  const acts = deskElement("p", "board-build-acts");
   for (const act of BUILD_CARD_ACTS) {
     const button = deskElement("button", "board-build-act");
     button.type = "button";
     button.dataset.act = act;
     acts.append(button);
+    if (act === "again") {
+      const caret = deskElement("button", "board-build-caret");
+      caret.type = "button";
+      caret.dataset.menu = "again";
+      caret.setAttribute("aria-haspopup", "menu");
+      caret.insertAdjacentHTML("afterbegin", icon("chevron"));
+      acts.append(caret);
+    }
   }
-  acts.onclick = (event) => pressBuildCardAct(card, event.target.closest("button"));
-  meta.append(deskElement("code", "board-build-sha"), deskElement("span", "board-build-at"), deskElement("span", "board-build-took"), acts);
+  for (const aux of BUILD_CARD_AUX) {
+    const button = deskElement("button", "board-build-aux");
+    button.type = "button";
+    button.dataset.act = aux;
+    if (aux === "more") {
+      button.setAttribute("aria-haspopup", "menu");
+      button.insertAdjacentHTML("afterbegin", icon("more"));
+    }
+    acts.append(button);
+  }
+  acts.append(deskElement("span", "board-build-menu"));
+  acts.onclick = (event) => pressBuildCardButton(card, event.target.closest("button"));
   const log = deskElement("details", "board-build-log");
   const summary = deskElement("summary", "board-build-log-head");
   summary.insertAdjacentHTML("afterbegin", icon("chevron"));
   log.append(summary, deskElement("ol", "board-build-log-steps"));
   log.ontoggle = () => scheduleDeskPaint();
-  card.append(line, meta, deskElement("ol", "board-build-band"), deskElement("p", "board-build-note"), log);
+  // 실패 까닭(11-08 시안 v3): 실패한 단계가 제 출력과 시험 보고서로 말한 실패 — 파일과 줄이 있으면 누르면 편집기가 거기를 연다.
+  const failures = deskElement("ul", "board-build-failures");
+  failures.onclick = (event) => {
+    const button = event.target.closest("button[data-file]");
+    if (button) openPath(button.dataset.file, button.dataset.line ? { line: Number(button.dataset.line) } : {});
+  };
+  card.append(line, meta, deskElement("ol", "board-build-band"), deskElement("p", "board-build-note"), failures, acts,
+    deskElement("pre", "board-build-tail"), log);
   return card;
+}
+
+/* 창이 그대로 열 수 있는 경로: 맥·리눅스의 「/…」, 윈도의 「C:\…」·「C:/…」·「\\서버\…」. 백엔드는 실패가 폴더 안에 선
+ * 파일을 말할 때만 이렇게 준다. */
+function buildPathIsWhole(path) {
+  return /^(?:\/|[A-Za-z]:[\\/]|\\\\)/.test(path);
+}
+
+/* 한 실패의 자리 글: 파일 이름과 줄(「order_test.go:31」) — 경로는 마지막 토막만, 전체는 풍선 도움말이 말한다. */
+function buildFailurePlace(failure) {
+  if (!failure.file) return "";
+  const name = basename(failure.file);
+  return Number.isInteger(failure.line) ? `${name}:${failure.line}` : name;
+}
+
+/* 실패 까닭의 줄들: 실패한 빌드만, 기록이 실은 만큼(백엔드가 스물로 자른다). 절대 경로가 있는 실패는 단추라 누르면 그 파일의
+ * 그 줄이 열리고, 자리를 모르거나 폴더 밖의 이름이면 글만 선다. */
+function paintBuildFailures(list, build) {
+  const failures = build.state === "failed" && Array.isArray(build.failures) ? build.failures : [];
+  const items = [...list.children];
+  reconcileElementOrder(list, failures.map((failure, at) => {
+    const item = items[at] ?? deskElement("li", "board-build-failure");
+    const opens = typeof failure.file === "string" && buildPathIsWhole(failure.file);
+    let part = item.firstElementChild;
+    if (!part || (part.tagName === "BUTTON") !== opens) {
+      part = deskElement(opens ? "button" : "span", "board-build-failure-part");
+      if (opens) part.type = "button";
+      item.replaceChildren(part);
+    }
+    const place = buildFailurePlace(failure);
+    writeTextContent(part, place ? `${failure.what} · ${place}` : failure.what);
+    writeAttribute(part, "data-file", opens ? failure.file : "");
+    writeAttribute(part, "data-line", Number.isInteger(failure.line) ? String(failure.line) : "");
+    writeAttribute(part, "data-tip", opens ? t("board.build.failureOpen", "{{place}} 열기", { place: failure.file }) : "");
+    return item;
+  }));
+  writeAttribute(list, "aria-label", t("board.build.failures", "실패 까닭 {{count}}", { count: failures.length }));
+  writeHidden(list, failures.length === 0);
 }
 
 function paintBuildCard(card, build, order, now, hands) {
@@ -3062,9 +3351,11 @@ function paintBuildCard(card, build, order, now, hands) {
     : BUILD_STATES[build.state] ?? BUILD_STATES.ended;
   const ended = BUILD_ENDED.has(build.state);
   writeClassName(card, `board-build is-${build.state}${ended ? " is-ended" : ""}`);
-  const [line, meta, band, note, log] = card.children;
-  const [ord, name, label, tool, state] = line.children;
-  writeTextContent(ord, String(order));
+  writeAttribute(card, "data-started", String(build.started_ms ?? ""));
+  writeAttribute(card, "data-order", String(order));
+  const [line, meta, band, note, failures, acts, tail, log] = card.children;
+  const [dot, name, label, tool, state] = line.children;
+  writeAttribute(dot, "data-dot", said.dot);
   writeTextContent(name, buildWords(build.name, build.id));
   writeTextContent(label, build.label ?? "");
   writeHidden(label, !build.label);
@@ -3086,13 +3377,15 @@ function paintBuildCard(card, build, order, now, hands) {
   const tookWords = buildTookWords(build, now);
   writeTextContent(took, tookWords);
   writeHidden(took, tookWords === "");
-  paintBuildActs(meta.lastElementChild, build, hands);
+  paintBuildActs(acts, build, hands);
+  paintBuildTail(tail, build);
   paintBuildBand(band, build, steps, now);
   writeHidden(band, steps.length === 0);
   const { tone, words } = buildNote(build, now);
   writeClassName(note, tone ? `board-build-note is-${tone}` : "board-build-note");
   writeTextContent(note, words);
   writeHidden(note, words === "");
+  paintBuildFailures(failures, build);
   writeTrailingText(log.firstElementChild, t("board.build.steps", "단계 {{count}}개", { count: steps.length }));
   writeHidden(log, steps.length === 0);
   paintBuildLog(log, build, steps, now);
@@ -3105,7 +3398,9 @@ function paintDeskBuilds(block, now) {
   const body = block.lastElementChild;
   const answer = buildsAnswerHere();
   const foot = builds === null ? null : buildFoot(answer, builds);
-  if (!foot?.stands) {
+  const line = answer?.line ?? null;
+  const lineStands = Boolean(line) && (line.jobs.length > 0 || Boolean(line.pause));
+  if (!foot?.stands && !lineStands) {
     if (body.childElementCount > 0) body.replaceChildren();
     return false;
   }
@@ -3116,13 +3411,157 @@ function paintDeskBuilds(block, now) {
   const cards = builds.map((build, index) => {
     const card = held.get(build.id) ?? buildCardNode();
     writeAttribute(card, "data-build", build.id);
-    paintBuildCard(card, build, index + 1, now, { runnable: runnable.includes(build.id), runnerHolds });
+    paintBuildCard(card, build, index + 1, now, {
+      runnable: runnable.includes(build.id), runnerHolds, report: answer?.report_acts?.[build.id] ?? null });
     return card;
   });
   const footNode = body.querySelector(":scope > .board-build-foot") ?? buildFootNode();
-  paintBuildFoot(footNode, foot);
-  reconcileElementOrder(body, [...cards, footNode]);
+  if (foot?.stands) paintBuildFoot(footNode, foot);
+  writeHidden(footNode, !foot?.stands);
+  // Held by the block, so a paint while the line has nothing to say builds no node to throw away.
+  const lineNode = block.__line ??= buildLineNode();
+  paintBuildLine(lineNode, line, now);
+  writeHidden(lineNode, !lineStands);
+  // The line stands under the foot only while it has something to say; the foot stays the cards' last line otherwise.
+  reconcileElementOrder(body, [...cards, footNode, ...(lineStands ? [lineNode] : [])]);
   return true;
+}
+
+/* ---- 빌드 줄 (11-08 시안 v3): 기계 하나에 줄 하나 — `zo line` ----
+ * 어느 프로젝트의 무거운 일이든 이 기계의 빌드 칸에서 차례로 돈다. 카드 밑의 이 칸은 지금 도는 일, 기다리는 일(차례와
+ * 함께), 방금 끝난 일을 한 줄씩 세우고, 그 자리의 단추(맨 앞으로 · 빼기 · 멈추기 · 다시 · 지우기)와 줄 멈추기를 둔다.
+ * 창은 기록을 쓰지 않는다 — 단추는 `zo line`을 부른다(`line_act`·`line_pause`). */
+const LINE_STATES = Object.freeze({
+  waiting: { dot: "queue", key: "board.line.waiting", word: "차례 기다림", acts: ["front", "withdraw"] },
+  running: { dot: "run", key: "board.line.running", word: "도는 중", acts: ["stop"] },
+  passed: { dot: "done", key: "board.line.passed", word: "통과", acts: ["forget"] },
+  failed: { dot: "halt", key: "board.line.failed", word: "실패", acts: ["retry", "forget"] },
+  capped: { dot: "halt", key: "board.line.capped", word: "상한 넘어 끝남", acts: ["retry", "forget"] },
+  stopped: { dot: "halt", key: "board.line.stopped", word: "멈춤", acts: ["retry", "forget"] },
+  withdrawn: { dot: "queue", key: "board.line.withdrawn", word: "뺌", acts: ["forget"] },
+  lost: { dot: "halt", key: "board.line.lost", word: "끝 모름", acts: ["retry", "forget"] },
+});
+const LINE_ACT_WORDS = Object.freeze({
+  front: { key: "board.line.front", word: "맨 앞으로" },
+  withdraw: { key: "board.line.withdraw", word: "빼기" },
+  stop: { key: "board.line.stop", word: "멈추기" },
+  retry: { key: "board.line.retry", word: "다시" },
+  forget: { key: "board.line.forget", word: "지우기" },
+});
+let linePressing = false;
+
+function buildLineNode() {
+  const line = deskElement("section", "board-line");
+  const head = deskElement("header", "board-line-head");
+  const pause = deskElement("button", "board-build-aux board-line-pause");
+  pause.type = "button";
+  pause.onclick = () => void pressLinePause(!buildsAnswerHere()?.line?.pause);
+  head.append(deskElement("strong", "board-line-title"), deskElement("span", "board-line-sum"), pause);
+  const jobs = deskElement("ol", "board-line-jobs");
+  jobs.onclick = (event) => {
+    const button = event.target.closest("button[data-verb]");
+    const job = buildsAnswerHere()?.line?.jobs?.find((one) => one.id === button?.closest("[data-job]")?.dataset.job);
+    if (button && job) void pressLineAct(job, button.dataset.verb);
+  };
+  line.append(head, deskElement("p", "board-line-paused"), jobs);
+  return line;
+}
+
+/* 한 일감의 「언제」: 도는 것은 걸린 시간, 기다리는 것은 차례, 끝난 것은 상태와 끝난 시각. */
+function lineJobWhen(job, places, now) {
+  if (job.state === "running") {
+    return Number(job.started_ms) > 0 ? t("board.line.runningFor", "{{time}}째", { time: deskSpanWords(now - Number(job.started_ms)) }) : "";
+  }
+  if (job.state === "waiting") {
+    const place = places?.[job.id];
+    return Number.isInteger(place) ? t("board.line.place", "{{place}}번째", { place }) : "";
+  }
+  return Number(job.ended_ms) > 0 ? boardClock(Number(job.ended_ms), now) : "";
+}
+
+function paintBuildLine(node, line, now) {
+  const [head, paused, list] = node.children;
+  const [title, sum, pause] = head.children;
+  const jobs = line?.jobs ?? [];
+  writeTextContent(title, t("board.line.title", "빌드 줄 · 이 기계"));
+  const running = jobs.filter((job) => job.state === "running").length;
+  const waiting = jobs.filter((job) => job.state === "waiting").length;
+  writeTextContent(sum, t("board.line.sum", "도는 {{running}} · 기다림 {{waiting}}", { running, waiting }));
+  writeTextContent(pause, line?.pause ? t("board.line.resume", "줄 다시 열기") : t("board.line.pause", "줄 멈추기"));
+  writeDisabled(pause, linePressing);
+  const why = line?.pause?.why || line?.pause?.by || "";
+  writeTextContent(paused, !line?.pause ? ""
+    : why ? t("board.line.paused", "줄 멈춤 · {{why}}", { why }) : t("board.line.pausedPlain", "줄 멈춤"));
+  writeHidden(paused, !line?.pause);
+  const held = new Map([...list.children].map((item) => [item.dataset.job, item]));
+  reconcileElementOrder(list, jobs.map((job) => {
+    const state = LINE_STATES[job.state] ?? LINE_STATES.lost;
+    let item = held.get(job.id);
+    if (!item) {
+      item = deskElement("li", "board-line-job");
+      item.append(deskElement("span", "board-state board-line-state"), deskElement("span", "board-line-what"),
+        deskElement("span", "board-line-where"), deskElement("span", "board-line-when"), deskElement("span", "board-line-acts"));
+    }
+    writeAttribute(item, "data-job", job.id);
+    writeAttribute(item, "data-state", job.state);
+    const [dot, what, where, when, acts] = item.children;
+    writeAttribute(dot, "data-dot", state.dot);
+    writeTextContent(dot, t(state.key, state.word));
+    const command = Array.isArray(job.command) ? job.command.join(" ") : "";
+    writeTextContent(what, job.what || command);
+    writeAttribute(what, "data-tip", command);
+    writeTextContent(where, [basename(String(job.checkout ?? "")), job.owner].filter(Boolean).join(" · "));
+    writeTextContent(when, lineJobWhen(job, line?.places, now));
+    const buttons = new Map([...acts.children].map((button) => [button.dataset.verb, button]));
+    reconcileElementOrder(acts, state.acts.map((verb) => {
+      let button = buttons.get(verb);
+      if (!button) {
+        button = deskElement("button", "board-build-aux board-line-act");
+        button.type = "button";
+      }
+      writeAttribute(button, "data-verb", verb);
+      writeTextContent(button, t(LINE_ACT_WORDS[verb].key, LINE_ACT_WORDS[verb].word));
+      writeDisabled(button, linePressing);
+      return button;
+    }));
+    return item;
+  }));
+}
+
+/* 한 일감에 단추 하나: `zo line <verb> <id>`. 지우기는 토스트에 되돌리기가 선다(`restore`). */
+async function pressLineAct(job, verb) {
+  if (linePressing) return;
+  linePressing = true;
+  scheduleDeskPaint();
+  try {
+    await invoke("line_act", { job: job.id, verb });
+    if (verb === "forget") {
+      toast(t("board.line.forgot", "{{what}} 기록을 지웠습니다", { what: job.what || job.id }), "", {
+        action: { label: t("board.build.forgetUndo", "되돌리기"), run: () => void pressLineAct(job, "restore") },
+      });
+    }
+  } catch (error) {
+    toast(String(error?.message ?? error), "halt");
+  } finally {
+    linePressing = false;
+    await Promise.resolve(boardBuildsAsking).then(() => askBoardBuilds());
+    scheduleDeskPaint();
+  }
+}
+
+async function pressLinePause(pause) {
+  if (linePressing) return;
+  linePressing = true;
+  scheduleDeskPaint();
+  try {
+    await invoke("line_pause", { pause, why: pause ? t("board.line.pausedFromBoard", "상황판에서 멈춤") : null });
+  } catch (error) {
+    toast(String(error?.message ?? error), "halt");
+  } finally {
+    linePressing = false;
+    await Promise.resolve(boardBuildsAsking).then(() => askBoardBuilds());
+    scheduleDeskPaint();
+  }
 }
 
 /* 카드 밑의 한 줄(빌드 카드 계획 5단계). 순서 파일이 없으면 이 프로젝트의 뿌리에서 찾은 빌드를 말하고 — 감지는
@@ -3150,7 +3589,7 @@ function buildFoot(answer, builds) {
 
 function buildFootNode() {
   const foot = deskElement("p", "board-build-foot");
-  const run = deskElement("button", "board-build-foot-act");
+  const run = deskElement("button", "board-build-foot-act is-primary");
   run.type = "button";
   run.dataset.act = "build";
   run.onclick = () => void pressBuild(buildsAnswerHere()?.runnable ?? []);
@@ -3166,7 +3605,7 @@ function paintBuildFoot(foot, said) {
   writeClass(foot, "is-refused", said.act === "file");
   writeTextContent(words, said.words);
   writeHidden(words, said.words === "");
-  writeTextContent(run, t("board.build.run", "빌드"));
+  writeTextContent(run, t("board.build.run", "빌드 실행"));
   writeHidden(run, !said.run);
   writeDisabled(run, buildPressing);
   writeAttribute(act, "data-act", said.act);
@@ -3183,6 +3622,8 @@ const BUILD_CARD_ACT_WORDS = Object.freeze({
   again: { key: "board.build.again", word: "다시" },
   stop: { key: "board.build.stop", word: "멈추기" },
 });
+/* 곁의 둘: 실행의 로그 끝을 카드 안에 펴고, ⋯는 드문 일(로그 파일 열기 · 기록 지우기)을 든다. */
+const BUILD_CARD_AUX = Object.freeze(["log", "more"]);
 
 /* 누른 단추의 물음이 가는 동안은 단추가 다시 눌리지 않는다. */
 let buildPressing = false;
@@ -3197,48 +3638,291 @@ function buildRunnerHolds(builds, runnable) {
 }
 
 /* 카드의 단추: 누를 단계에서 기다리면 그 단계와 「멈추기」, 돌거나 차례를 기다리면 「멈추기」, 끝났으면 「다시」 —
- * 러너가 이 프로젝트를 쥔 동안 「다시」는 서지 않는다. */
+ * 러너가 이 프로젝트를 쥔 동안 「다시」는 서지 않는다. 다른 스크립트가 알리는 빌드는 프로젝트가 순서 파일에
+ * 그 다시·멈추기 명령을 적었을 때만 같은 단추를 든다(`report`). */
 function buildCardActs(build, hands) {
-  if (!hands.runnable) return [];
+  if (!hands.runnable) {
+    const report = hands.report ?? {};
+    if (BUILD_LIVE.has(build.state)) return report.stop ? ["stop"] : [];
+    return report.retry ? ["again"] : [];
+  }
   if (build.state === "waiting" && build.waiting) return ["step", "stop"];
   if (BUILD_LIVE.has(build.state)) return ["stop"];
   return hands.runnerHolds ? [] : ["again"];
 }
 
+/* 「다시」가 어디서 다시 도는가: 실패하거나 멈춘 단계가 첫 단계가 아니면 그 단계부터(GitHub Actions의 「실패한 것만
+ * 다시」, CircleCI의 「실패한 곳부터」), 아니면 처음부터. 단계부터는 `zo build`가 도는 빌드만 — 다른 스크립트는 제
+ * 명령 하나로 다시 돈다. */
+function buildAgainFrom(build, hands) {
+  if (!hands.runnable) return null;
+  const halted = buildHaltedStep(build);
+  const steps = Array.isArray(build.steps) ? build.steps : [];
+  return halted && steps.indexOf(halted) > 0 ? halted : null;
+}
+
 function paintBuildActs(acts, build, hands) {
   const shown = buildCardActs(build, hands);
-  for (const button of acts.children) {
+  const from = shown.includes("again") ? buildAgainFrom(build, hands) : null;
+  const ended = BUILD_ENDED.has(build.state);
+  for (const button of acts.querySelectorAll(":scope > .board-build-act")) {
     const act = button.dataset.act;
     writeHidden(button, !shown.includes(act));
     writeDisabled(button, buildPressing);
     const said = BUILD_CARD_ACT_WORDS[act];
-    writeTextContent(button, said
-      ? t(said.key, said.word)
-      : t("board.build.stepRun", "{{step}} 실행", { step: buildWaitingStepWords(build) }));
+    writeTextContent(button, act === "again" && from
+      ? t("board.build.againFrom", "{{step}}부터 다시", { step: buildWords(from.words, from.name) })
+      : said
+        ? t(said.key, said.word)
+        : t("board.build.stepRun", "{{step}} 실행", { step: buildWaitingStepWords(build) }));
   }
-  writeHidden(acts, shown.length === 0);
+  const caret = acts.querySelector(":scope > .board-build-caret");
+  writeHidden(caret, !from);
+  writeDisabled(caret, buildPressing);
+  writeAttribute(caret, "aria-label", t("board.build.againMenu", "다시 돌릴 자리 고르기"));
+  writeAttribute(caret, "data-tip", t("board.build.againMenu", "다시 돌릴 자리 고르기"));
+  const hasLog = Boolean(build.log);
+  const [log, more] = acts.querySelectorAll(":scope > .board-build-aux");
+  writeHidden(log, !hasLog);
+  writeTextContent(log, t("board.build.log", "로그"));
+  const open = buildTailsOpen.has(buildRunKey(build));
+  writeAttribute(log, "aria-expanded", String(open));
+  const rare = ended || Boolean(build.log_path);
+  writeHidden(more, !rare);
+  writeAttribute(more, "aria-label", t("board.build.more", "더 보기"));
+  writeAttribute(more, "data-tip", t("board.build.more", "더 보기"));
+  writeAttribute(more, "aria-expanded", String(buildMenuOpen?.card === acts.parentElement.dataset.build && buildMenuOpen.menu === "more"));
+  writeAttribute(caret, "aria-expanded", String(buildMenuOpen?.card === acts.parentElement.dataset.build && buildMenuOpen.menu === "again"));
+  const menu = acts.querySelector(":scope > .board-build-menu");
+  const menuOf = buildMenuOpen?.card === acts.parentElement.dataset.build ? buildMenuOpen.menu : null;
+  paintBuildMenu(menu, menuOf, build, from, ended, hands);
+  writeHidden(acts, shown.length === 0 && !hasLog && !rare);
 }
 
-function pressBuildCardAct(card, button) {
+/* 열린 메뉴 하나: `{ card, menu }` — 「다시 ▾」의 자리 고르기, 「⋯」의 드문 일. */
+let buildMenuOpen = null;
+
+function buildMenuItems(menu, build, from, ended, hands) {
+  if (menu === "again") {
+    return from ? [{ id: "again-start", words: t("board.build.againStart", "처음부터 다시") },
+      { id: "again-from", words: t("board.build.againFrom", "{{step}}부터 다시", { step: buildWords(from.words, from.name) }) }] : [];
+  }
+  if (menu === "more") {
+    const items = [];
+    if (build.log_path) items.push({ id: "log-file", words: t("board.build.logFile", "로그 파일 열기") });
+    if (ended) items.push({ id: "forget", words: t("board.build.forget", "기록 지우기"), halt: true });
+    return items;
+  }
+  return [];
+}
+
+function paintBuildMenu(menu, which, build, from, ended, hands) {
+  const items = which ? buildMenuItems(which, build, from, ended, hands) : [];
+  writeHidden(menu, items.length === 0);
+  writeAttribute(menu, "role", "menu");
+  writeAttribute(menu, "data-menu", which ?? "");
+  const held = new Map([...menu.children].map((node) => [node.dataset.item, node]));
+  reconcileElementOrder(menu, items.map((item) => {
+    let node = held.get(item.id);
+    if (!node) {
+      node = deskElement("button", "board-build-menu-item");
+      node.type = "button";
+    }
+    writeAttribute(node, "role", "menuitem");
+    writeAttribute(node, "data-item", item.id);
+    writeClassName(node, `board-build-menu-item${item.halt ? " is-halt" : ""}`);
+    writeTextContent(node, item.words);
+    return node;
+  }));
+}
+
+function closeBuildMenu() {
+  if (!buildMenuOpen) return;
+  buildMenuOpen = null;
+  scheduleDeskPaint();
+}
+
+document.addEventListener("pointerdown", (event) => {
+  if (buildMenuOpen && !event.target.closest?.(".board-build-acts")) closeBuildMenu();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && buildMenuOpen) closeBuildMenu();
+});
+
+function pressBuildCardButton(card, button) {
   if (!button || button.disabled) return;
   const id = card.dataset.build;
-  if (button.dataset.act === "stop") {
+  const build = (buildsHere() ?? []).find((one) => one.id === id);
+  if (!build) return;
+  const hands = buildHandsOf(id);
+  if (button.classList.contains("board-build-act")) {
+    closeBuildMenu();
+    pressBuildCardAct(build, hands, button.dataset.act);
+    return;
+  }
+  if (button.classList.contains("board-build-caret") || button.dataset.act === "more") {
+    const menu = button.dataset.menu ?? button.dataset.act;
+    buildMenuOpen = buildMenuOpen?.card === id && buildMenuOpen.menu === menu ? null : { card: id, menu };
+    scheduleDeskPaint();
+    return;
+  }
+  if (button.dataset.act === "log") {
+    toggleBuildTail(build);
+    return;
+  }
+  if (button.classList.contains("board-build-menu-item")) {
+    closeBuildMenu();
+    const item = button.dataset.item;
+    if (item === "again-start") void pressBuild([id]);
+    else if (item === "again-from") void pressBuild([id], null, [], buildAgainFrom(build, hands)?.name ?? null);
+    else if (item === "log-file" && build.log_path) void openFile(String(build.log_path));
+    else if (item === "forget") void forgetBuildRun(build);
+  }
+}
+
+function pressBuildCardAct(build, hands, act) {
+  const id = build.id;
+  if (!hands.runnable) {
+    if (act === "again" || act === "stop") void pressBuildReport(id, act === "again" ? "retry" : "stop");
+    return;
+  }
+  if (act === "stop") {
     void stopBuilds([id]);
     return;
   }
-  const build = (buildsHere() ?? []).find((one) => one.id === id);
-  void pressBuild([id], button.dataset.act === "step" ? build?.waiting ?? null : null);
+  if (act === "step") {
+    void pressBuild([id], build.waiting ?? null);
+    return;
+  }
+  void pressBuild([id], null, [], buildAgainFrom(build, hands)?.name ?? null);
+}
+
+/* 이 카드의 손: `zo build`가 돌리는가, 그 러너가 이 프로젝트를 쥐었는가, 다른 스크립트의 다시·멈추기 명령. */
+function buildHandsOf(id) {
+  const answer = buildsAnswerHere();
+  const runnable = answer?.runnable ?? [];
+  return {
+    runnable: runnable.includes(id), runnerHolds: buildRunnerHolds(buildsHere() ?? [], runnable),
+    report: answer?.report_acts?.[id] ?? null,
+  };
+}
+
+/* ---- 로그 끝 (카드 안) ----
+ * 「로그」는 그 실행의 로그 끝을 카드 안에 편다 — 일정 탭과 같은 물음(`schedule_timeline`의 `log`)이라 창은 기록이 연 실행의
+ * 로그만 읽는다. 도는 실행은 기록이 바뀔 때마다 다시 읽는다. */
+const buildTailsOpen = new Set();
+const buildTails = new Map();
+
+function buildRunKey(build) {
+  return `${build.id}:${build.started_ms ?? ""}`;
+}
+
+function toggleBuildTail(build) {
+  const key = buildRunKey(build);
+  if (buildTailsOpen.has(key)) buildTailsOpen.delete(key);
+  else {
+    buildTailsOpen.add(key);
+    void readBuildTail(build);
+  }
+  scheduleDeskPaint();
+}
+
+async function readBuildTail(build) {
+  const key = buildRunKey(build);
+  const stamp = Number(build.updated_ms) || 0;
+  const held = buildTails.get(key);
+  if (held && (held.stamp === stamp || held.asking)) return;
+  buildTails.set(key, { lines: held?.lines ?? [], cut: held?.cut ?? false, missing: false, stamp, asking: true });
+  try {
+    const answer = await invoke("schedule_timeline", {
+      worktree: activeWorktreePath, known: null, fromMs: null,
+      log: { build: { id: build.id, started_ms: Number(build.started_ms) } },
+    });
+    const log = answer?.log ?? null;
+    buildTails.set(key, { lines: Array.isArray(log?.lines) ? log.lines : [], cut: Boolean(log?.cut), missing: Boolean(log?.missing), stamp, asking: false });
+  } catch (error) {
+    buildTails.set(key, { lines: [], cut: false, missing: true, error: String(error?.message ?? error), stamp, asking: false });
+  }
+  scheduleDeskPaint();
+}
+
+function paintBuildTail(tail, build) {
+  const key = buildRunKey(build);
+  const open = buildTailsOpen.has(key);
+  writeHidden(tail, !open);
+  if (!open) return;
+  const held = buildTails.get(key);
+  if (!held || (held.stamp !== (Number(build.updated_ms) || 0) && BUILD_LIVE.has(build.state))) void readBuildTail(build);
+  const lines = held?.lines ?? [];
+  writeTextContent(tail, held?.asking && lines.length === 0 ? t("board.build.logReading", "로그를 읽는 중…")
+    : held?.missing ? t("board.build.logMissing", "이 실행의 로그 파일이 없습니다")
+      : lines.slice(-BUILD_TAIL_LINES).join("\n"));
+}
+
+/* 카드가 펴는 로그 끝의 줄 수 — 나머지는 「⋯ → 로그 파일 열기」. */
+const BUILD_TAIL_LINES = 40;
+
+/* ---- 기록 지우기 ----
+ * 지우기는 `zo build forget`이 기록과 로그를 휴지통으로 옮기는 일이다(창은 기록을 쓰지 않는다). 확인 창 대신 5초 동안
+ * 「되돌리기」가 서고(NN/g: 자주 묻는 확인은 습관으로 눌린다), 휴지통은 하루 뒤 비워진다. */
+async function forgetBuildRun(build) {
+  if (buildPressing) return;
+  buildPressing = true;
+  scheduleDeskPaint();
+  const asked = { worktree: activeWorktreePath, build: build.id, startedMs: Number(build.started_ms) };
+  try {
+    await invoke("build_forget", asked);
+    toast(t("board.build.forgot", "{{build}} {{at}} 기록을 지웠습니다", {
+      build: buildWords(build.name, build.id), at: boardClock(Number(build.started_ms), Date.now()) }), "", {
+      action: { label: t("board.build.forgetUndo", "되돌리기"), run: () => void restoreBuildRun(asked) },
+    });
+  } catch (error) {
+    toast(String(error?.message ?? error), "halt");
+  } finally {
+    buildPressing = false;
+    await Promise.resolve(boardBuildsAsking).then(() => askBoardBuilds());
+    scheduleDeskPaint();
+  }
+}
+
+async function restoreBuildRun(asked) {
+  try {
+    await invoke("build_restore", asked);
+  } catch (error) {
+    toast(String(error?.message ?? error), "halt");
+  } finally {
+    await Promise.resolve(boardBuildsAsking).then(() => askBoardBuilds());
+    scheduleDeskPaint();
+  }
+}
+
+/* 다른 스크립트가 알리는 빌드의 다시·멈추기: 프로젝트가 순서 파일에 적은 명령을 `zo build act`가 돌린다 — 아무도
+ * 허락하지 않은 명령이면 빌드처럼 먼저 묻는다. */
+async function pressBuildReport(id, act, allowed = []) {
+  if (buildPressing) return;
+  buildPressing = true;
+  scheduleDeskPaint();
+  try {
+    const pressed = await invoke("build_act", { worktree: activeWorktreePath, build: id, act, allowed });
+    if (pressed?.state === "approve") openBuildApproval({ builds: [id], step: null, from: null, act, commands: pressed.commands ?? [] });
+  } catch (error) {
+    toast(String(error?.message ?? error), "halt");
+  } finally {
+    buildPressing = false;
+    await Promise.resolve(boardBuildsAsking).then(() => askBoardBuilds());
+    scheduleDeskPaint();
+  }
 }
 
 /* 빌드를 띄우고, 허락할 명령이 남았으면 그 목록을 연다. 띄운 뒤에는 기록을 다시 묻는다 — `build_start`는 러너가
  * 이 프로젝트를 쥘 때까지 기다렸다 답하므로 다음 답에 그 빌드가 선다. */
-async function pressBuild(builds, step = null, allowed = []) {
+async function pressBuild(builds, step = null, allowed = [], from = null) {
   if (buildPressing || builds.length === 0) return;
   buildPressing = true;
   scheduleDeskPaint();
   try {
-    const pressed = await invoke("build_start", { worktree: activeWorktreePath, builds, step, allowed });
-    if (pressed?.state === "approve") openBuildApproval({ builds, step, commands: pressed.commands ?? [] });
+    const pressed = await invoke("build_start", { worktree: activeWorktreePath, builds, step, from, allowed });
+    if (pressed?.state === "approve") openBuildApproval({ builds, step, from, commands: pressed.commands ?? [] });
   } catch (error) {
     toast(String(error?.message ?? error), "halt");
   } finally {
@@ -3284,7 +3968,9 @@ function closeBuildApproval() {
 function approveBuild() {
   const asked = buildApproval;
   closeBuildApproval();
-  if (asked) void pressBuild(asked.builds, asked.step, asked.commands);
+  if (!asked) return;
+  if (asked.act) void pressBuildReport(asked.builds[0], asked.act, asked.commands);
+  else void pressBuild(asked.builds, asked.step, asked.commands, asked.from ?? null);
 }
 
 el("build-approve-yes").addEventListener("click", approveBuild);

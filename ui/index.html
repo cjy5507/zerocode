@@ -1390,54 +1390,68 @@
         </div>
       </aside>
 
-      <!-- Orca's workspace board is a non-modal sheet beside the sidebar. It
-           covers the workbench, keeps the workspace list available, and is a
-           different product surface from the live-agent dashboard tab. -->
+      <!-- The workspace board is a stage tab like 작업 · 아티팩트 · 받은 편지함
+           (2026-11-08, window artifact p-a729f620c8f3efc7 v2): one host the
+           stage moves into the leaf that shows it (`DOC_VIEWS.workspaces`,
+           `single`). The tab's ×, ⌘W or the sidebar row close it — the head
+           carries no × of its own, and the right column stays. -->
       <section class="workspace-board" id="workspace-board" hidden
                data-i18n-aria="workspaceBoard.label" aria-label="워크스페이스 보드">
         <header class="workspace-board-head">
-          <div class="workspace-board-heading-row">
-            <h2 class="workspace-board-title" data-i18n="workspaceBoard.label">워크스페이스 보드</h2>
+          <div class="workspace-board-head-row">
+            <div class="workspace-board-views" role="group" data-i18n-aria="workspaceBoard.view" aria-label="워크스페이스 보기">
+              <button type="button" data-workspace-view="list" aria-pressed="true" data-i18n="workspaceBoard.list">프로젝트 목록</button>
+              <button type="button" data-workspace-view="kanban" aria-pressed="false" data-i18n="workspaceBoard.kanban">칸반</button>
+            </div>
+            <span class="workspace-board-head-spacer"></span>
+            <button class="workspace-board-records" id="workspace-board-records" type="button"
+                    aria-expanded="false" aria-controls="workspace-board-accuracy" hidden>
+              <span class="workspace-board-records-long" id="workspace-board-records-long"></span>
+              <span class="workspace-board-records-short" data-i18n="board.accuracy.short">기록</span>
+              <svg class="icon" aria-hidden="true"><use href="#i-chevron"></use></svg>
+            </button>
+            <div class="workspace-board-actions">
+              <button class="foot-icon workspace-board-filter" id="workspace-board-filter" type="button"
+                      aria-haspopup="true" data-i18n-aria="workspaceBoard.filters" aria-label="워크스페이스 필터"
+                      data-i18n-title="workspaceBoard.filters" data-tip="워크스페이스 필터">
+                <svg class="icon" aria-hidden="true"><use href="#i-list-filter"></use></svg>
+                <span class="nav-badge workspace-board-filter-count" id="workspace-board-filter-count" hidden></span>
+              </button>
+              <button class="foot-icon" id="workspace-board-settings" type="button"
+                      aria-haspopup="dialog" aria-expanded="false"
+                      data-i18n-aria="workspaceBoard.settings" aria-label="보드 설정"
+                      data-i18n-title="workspaceBoard.settings" data-tip="보드 설정">
+                <svg class="icon" aria-hidden="true"><use href="#i-gear"></use></svg>
+              </button>
+            </div>
+            <button class="btn btn--primary workspace-board-new" id="workspace-board-new" type="button"
+                    data-i18n-aria="workspaceBoard.new" aria-label="새 워크스페이스"
+                    data-i18n-title="workspaceBoard.new" data-tip="새 워크스페이스">
+              <svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>
+              <span class="workspace-board-new-word" data-i18n="workspaceBoard.new">새 워크스페이스</span>
+            </button>
+          </div>
+          <div class="workspace-board-head-row is-second">
+            <p class="workspace-board-summary" id="workspace-board-summary" role="status" aria-live="polite"></p>
             <span class="workspace-board-selected" id="workspace-board-selected" hidden></span>
+            <div class="workspace-board-layout-controls">
+              <button class="btn" id="workspace-board-fit" type="button" aria-pressed="true" data-i18n="workspaceBoard.fit">화면에 맞춤</button>
+            </div>
+            <label class="workspace-board-search">
+              <svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>
+              <input id="workspace-board-query" type="search" autocomplete="off" spellcheck="false"
+                     data-i18n-aria="workspaceBoard.search" aria-label="워크스페이스 검색"
+                     data-i18n-placeholder="workspaceBoard.search" placeholder="워크스페이스 검색…" />
+              <span class="workspace-board-search-count" id="workspace-board-search-count" hidden></span>
+              <kbd class="workspace-board-search-keys" id="workspace-board-search-keys" aria-hidden="true" hidden></kbd>
+              <button class="workspace-board-search-clear" id="workspace-board-search-clear" type="button"
+                      data-i18n-aria="workspaceBoard.searchClear" aria-label="검색 지우기" hidden>
+                <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+              </button>
+            </label>
           </div>
-          <div class="board-mode" role="group" data-i18n-aria="workspaceBoard.view" aria-label="워크스페이스 보기">
-            <button type="button" data-workspace-view="list" aria-pressed="true" data-i18n="workspaceBoard.list">프로젝트 목록</button>
-            <button type="button" data-workspace-view="kanban" aria-pressed="false" data-i18n="workspaceBoard.kanban">칸반</button>
-          </div>
-          <label class="workspace-board-search">
-            <svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>
-            <input id="workspace-board-query" type="search" autocomplete="off" spellcheck="false"
-                   data-i18n-aria="workspaceBoard.search" aria-label="워크스페이스 검색"
-                   data-i18n-placeholder="workspaceBoard.search" placeholder="워크스페이스 검색…" />
-            <span class="workspace-board-search-count" id="workspace-board-search-count" hidden></span>
-            <button class="workspace-board-search-clear" id="workspace-board-search-clear" type="button"
-                    data-i18n-aria="workspaceBoard.searchClear" aria-label="검색 지우기" hidden>
-              <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
-            </button>
-          </label>
-          <div class="workspace-board-actions">
-            <button class="foot-icon workspace-board-filter" id="workspace-board-filter" type="button"
-                    aria-haspopup="true" data-i18n-aria="workspaceBoard.filters" aria-label="워크스페이스 필터"
-                    data-i18n-title="workspaceBoard.filters" data-tip="워크스페이스 필터">
-              <svg class="icon" aria-hidden="true"><use href="#i-list-filter"></use></svg>
-              <span class="nav-badge workspace-board-filter-count" id="workspace-board-filter-count" hidden></span>
-            </button>
-            <button class="foot-icon" id="workspace-board-agent" type="button"
-                    data-i18n-aria="workspaceBoard.openAgentBoard" aria-label="에이전트 그래프 열기"
-                    data-i18n-title="workspaceBoard.openAgentBoard" data-tip="에이전트 그래프 열기">
-              <svg class="icon" aria-hidden="true"><use href="#i-orbit"></use></svg>
-            </button>
-            <button class="foot-icon" id="workspace-board-settings" type="button"
-                    aria-haspopup="dialog" aria-expanded="false"
-                    data-i18n-aria="workspaceBoard.settings" aria-label="보드 설정"
-                    data-i18n-title="workspaceBoard.settings" data-tip="보드 설정">
-              <svg class="icon" aria-hidden="true"><use href="#i-gear"></use></svg>
-            </button>
-            <button class="foot-icon" id="workspace-board-close" type="button"
-                    data-i18n-aria="workspaceBoard.close" aria-label="워크스페이스 보드 닫기">
-              <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
-            </button>
-          </div>
+          <div class="workspace-board-accuracy" id="workspace-board-accuracy" role="region"
+               data-i18n-aria="board.accuracy.title" aria-label="오케스트레이션 기록" hidden></div>
         </header>
 
         <div class="workspace-board-settings-pop" id="workspace-board-settings-pop" hidden
@@ -1457,14 +1471,6 @@
         </div>
 
         <div class="workspace-board-body" id="workspace-board-body">
-          <div class="workspace-board-overview">
-            <p id="workspace-board-summary" role="status" aria-live="polite"></p>
-            <div class="workspace-board-accuracy" id="workspace-board-accuracy" hidden></div>
-            <div class="workspace-board-layout-controls">
-              <button class="btn" id="workspace-board-empty-toggle" type="button" aria-pressed="false"></button>
-              <button class="btn" id="workspace-board-fit" type="button" aria-pressed="true" data-i18n="workspaceBoard.fit">화면에 맞춤</button>
-            </div>
-          </div>
           <div class="workspace-board-pin" id="workspace-board-pin" data-workspace-board-pin>
             <svg class="icon" aria-hidden="true"><use href="#i-pin"></use></svg>
             <strong data-i18n="workspaceBoard.pinned">고정됨</strong>
@@ -1873,6 +1879,9 @@
                    세우고, 탭마다 제 블록이 선다 — 지금: 당신 차례·빌드 줄·지금 도는 일,
                    워커: 워커·이 기계, 기록: 소식·과업 흐름. -->
               <section class="task-board-desk" data-person-only hidden data-i18n-aria="board.desk.label" aria-label="코디네이터 데스크"></section>
+              <!-- 원장이 있는 창의 기록 탭(11-08 시안 v3): 원장 밖 에이전트 대화 목록은 이 한 줄 밑에 접힌다 —
+                   `paintBoardTabs`가 쓰고, 원장이 없는 창에서는 서지 않고 목록이 판 전체에 그대로 선다. -->
+              <button type="button" class="task-board-agents-fold" data-board-tab-of="history" aria-expanded="false"></button>
               <p class="task-board-tally" data-board-tab-of="history"></p>
               <nav class="task-board-filters" data-board-tab-of="history" data-i18n-aria="board.tasks.filter" aria-label="작업 상태 필터"></nav>
               <div class="task-board-sections" data-board-tab-of="history"></div>
@@ -4322,7 +4331,7 @@
              moves — a working pane keeps the login it was started with. -->
         <div class="settings-grid">
           <label class="settings-field">
-            <span data-i18n="settings.accounts.autoSwitch">한도 앞에서 계정 자동 전환</span>
+            <span class="settings-label" data-i18n="settings.accounts.autoSwitch">한도 앞에서 계정 자동 전환</span>
             <select class="settings-input" id="account-autoswitch">
               <option value="off" data-i18n="settings.accounts.autoSwitchOff">끔</option>
               <option value="ask" data-i18n="settings.accounts.autoSwitchAsk">물어보기</option>
@@ -4532,7 +4541,7 @@
                 모델 목록을 묻는 주소입니다. 끝의 /models는 붙이지 않습니다.
               </span>
             </span>
-            <input class="settings-input" id="router-base-url-input" type="text"
+            <input class="settings-input settings-input--mono" id="router-base-url-input" type="text"
                    autocomplete="off" spellcheck="false" placeholder="https://openrouter.ai/api/v1" />
           </label>
 
@@ -4563,16 +4572,16 @@
             <summary data-i18n="settings.connections.advanced">인증 방식 · 모델 ID 직접 입력</summary>
             <label class="settings-field" data-field="md" for="router-auth-header">
               <span class="settings-label" data-i18n="settings.connections.authHeader">인증 헤더</span>
-              <input class="settings-input" id="router-auth-header" value="Authorization" autocomplete="off" spellcheck="false" />
+              <input class="settings-input settings-input--mono" id="router-auth-header" value="Authorization" autocomplete="off" spellcheck="false" />
             </label>
             <label class="settings-field" data-field="md" for="router-auth-scheme">
               <span class="settings-label" data-i18n="settings.connections.authScheme">인증 접두어 · 없으면 비움</span>
-              <input class="settings-input" id="router-auth-scheme" value="Bearer" autocomplete="off" spellcheck="false" />
+              <input class="settings-input settings-input--mono" id="router-auth-scheme" value="Bearer" autocomplete="off" spellcheck="false" />
             </label>
             <label class="settings-field" data-field="lg" for="router-manual-models">
               <span class="settings-field-copy"><span class="settings-label" data-i18n="settings.connections.manualModels">모델 ID · 한 줄에 하나</span>
                 <span class="settings-row-desc" data-i18n="settings.connections.manualHint">서버가 모델 목록을 제공하지 않을 때 직접 등록합니다. 응답 확인은 별도로 진행합니다.</span></span>
-              <textarea class="settings-input" id="router-manual-models" rows="3" spellcheck="false"></textarea>
+              <textarea class="settings-input settings-input--mono" id="router-manual-models" rows="3" spellcheck="false"></textarea>
             </label>
           </details>
 
@@ -4697,7 +4706,7 @@
                 <div id="judgment-source-hub-fields">
                   <label class="settings-field" data-field="full" for="judgment-source-repository">
                     <span class="settings-field-copy"><span class="settings-label" data-i18n="settings.models.address">Hugging Face 모델 주소 또는 ID</span></span>
-                    <input class="settings-input" type="text" id="judgment-source-repository" aria-describedby="judgment-source-status" placeholder="https://huggingface.co/..." maxlength="8192" autocomplete="off" spellcheck="false" />
+                    <input class="settings-input settings-input--mono" type="text" id="judgment-source-repository" aria-describedby="judgment-source-status" placeholder="https://huggingface.co/..." maxlength="8192" autocomplete="off" spellcheck="false" />
                   </label>
                 </div>
                 <div id="judgment-source-local-fields" hidden>
@@ -4797,7 +4806,7 @@
                   <p id="managed-judgment-import-model"></p>
                   <label class="settings-field" data-field="lg" for="managed-judgment-import-path">
                     <span class="settings-field-copy"><span class="settings-label" data-i18n="settings.managed.importPath">선택한 모델 파일이 있는 폴더</span></span>
-                    <input type="text" class="settings-input" id="managed-judgment-import-path" aria-describedby="managed-judgment-import-status" autocomplete="off" spellcheck="false" />
+                    <input type="text" class="settings-input settings-input--mono" id="managed-judgment-import-path" aria-describedby="managed-judgment-import-status" autocomplete="off" spellcheck="false" />
                   </label>
                   <p class="settings-row-desc" data-i18n="settings.managed.importHint">목록에서 등록할 모델을 고르세요. 파일의 무결성을 확인해 앱에 복사하며, 원본은 이동하거나 삭제하지 않습니다.</p>
                   <div class="settings-action-row">
@@ -4851,7 +4860,7 @@
                     <span class="settings-label" data-i18n="settings.judgment.endpoint">판단 서버 주소</span>
                     <span class="settings-row-desc" data-i18n="settings.judgment.endpointHint">API 라우터처럼 기본 URL을 입력하세요. 외부 서버는 HTTPS, 이 컴퓨터와 사설망 IP는 HTTP로도 연결할 수 있습니다.</span>
                   </span>
-                  <input class="settings-input" id="judgment-endpoint" type="url" maxlength="8192" autocomplete="off" spellcheck="false" disabled />
+                  <input class="settings-input settings-input--mono" id="judgment-endpoint" type="url" maxlength="8192" autocomplete="off" spellcheck="false" disabled />
                 </label>
                 <label class="settings-check" id="judgment-auth-field" for="judgment-requires-auth" hidden>
                   <input type="checkbox" id="judgment-requires-auth" disabled />
@@ -4876,7 +4885,7 @@
                     <span class="settings-label" data-i18n="settings.judgment.model">판단 모델</span>
                     <span class="settings-row-desc" data-i18n="settings.judgment.modelHint">서버의 모델 목록에서 고르거나 모델 ID를 직접 입력합니다. 목록을 새로 읽어도 선택은 사라지지 않습니다.</span>
                   </span>
-                  <input class="settings-input" id="typesafe-model-input" list="judgment-model-options" type="text" maxlength="256" autocomplete="off" spellcheck="false" disabled />
+                  <input class="settings-input settings-input--mono" id="typesafe-model-input" list="judgment-model-options" type="text" maxlength="256" autocomplete="off" spellcheck="false" disabled />
                   <datalist id="judgment-model-options"></datalist>
                 </label>
                 <label class="settings-field" data-field="md" id="judgment-listed-model-field" for="judgment-listed-model" hidden>
@@ -5561,12 +5570,12 @@
             </header>
             <div class="second-brain-picker">
               <label class="settings-field" id="second-brain-detected-field" for="second-brain-detected" hidden>
-                <span data-i18n="settings.secondBrain.detected">감지된 Obsidian 볼트</span>
+                <span class="settings-label" data-i18n="settings.secondBrain.detected">감지된 Obsidian 볼트</span>
                 <select class="settings-input" id="second-brain-detected"></select>
               </label>
               <label class="settings-field" for="second-brain-path">
-                <span data-i18n="settings.secondBrain.path">볼트 경로</span>
-                <input class="settings-input" id="second-brain-path" type="text" readonly
+                <span class="settings-label" data-i18n="settings.secondBrain.path">볼트 경로</span>
+                <input class="settings-input settings-input--mono" id="second-brain-path" type="text" readonly
                        data-i18n-placeholder="settings.secondBrain.pathPlaceholder"
                        placeholder="볼트 폴더를 선택하세요" />
               </label>
@@ -5968,7 +5977,7 @@
             <div class="integration-form-grid">
               <label class="settings-field" for="local-network-host">
                 <span class="settings-label" data-i18n="settings.permissions.host">호스트</span>
-                <input class="settings-input" id="local-network-host" type="text"
+                <input class="settings-input settings-input--mono" id="local-network-host" type="text"
                        autocomplete="off" spellcheck="false" placeholder="build-box.local" />
               </label>
               <label class="settings-field" for="local-network-port">
@@ -6057,7 +6066,7 @@
           </label>
           <label class="settings-field" for="worktree-prefix-custom" id="worktree-prefix-custom-field" hidden>
             <span class="settings-label" data-i18n="worktree.prefixWord">접두사</span>
-            <input class="settings-input" id="worktree-prefix-custom" type="text"
+            <input class="settings-input settings-input--mono" id="worktree-prefix-custom" type="text"
                    autocomplete="off" spellcheck="false" placeholder="feature" />
           </label>
           <p class="settings-hint" id="worktree-prefix-error"></p>
@@ -6250,7 +6259,7 @@
         <label class="settings-field" for="terminal-command">
           <span class="settings-label" data-i18n="terminal.command">새 터미널이 실행할 명령</span>
           <input
-            class="settings-input"
+            class="settings-input settings-input--mono"
             id="terminal-command"
             type="text"
             data-i18n-placeholder="terminal.commandPlaceholder" placeholder="비워 두면 내 셸"
@@ -6902,7 +6911,7 @@
             </div>
           </div>
           <label class="settings-field">
-            <span data-i18n="orch.teamsMode">팀원을 어디에</span>
+            <span class="settings-label" data-i18n="orch.teamsMode">팀원을 어디에</span>
             <select class="settings-input" id="orch-teams-mode">
               <option value="off" data-i18n="orch.teamsOff">띄우지 않음</option>
               <option value="panes" data-i18n="orch.teamsPanes">분할 판으로</option>
@@ -7342,11 +7351,11 @@
           </label>
           <label class="settings-field" for="project-local-setup">
             <span class="settings-label" data-i18n="settings.project.localSetup">이 기기의 준비 스크립트</span>
-            <textarea class="settings-input" id="project-local-setup" rows="3" spellcheck="false"></textarea>
+            <textarea class="settings-input settings-input--mono" id="project-local-setup" rows="3" spellcheck="false"></textarea>
           </label>
           <label class="settings-field" for="project-local-archive">
             <span class="settings-label" data-i18n="settings.project.localArchive">이 기기의 정리 스크립트</span>
-            <textarea class="settings-input" id="project-local-archive" rows="3" spellcheck="false"></textarea>
+            <textarea class="settings-input settings-input--mono" id="project-local-archive" rows="3" spellcheck="false"></textarea>
           </label>
           <label class="settings-field" for="project-run-policy">
             <span class="settings-label" data-i18n="project.runPolicy">준비 스크립트 실행</span>
@@ -7598,7 +7607,7 @@
             <span class="settings-row-desc" data-i18n="settings.opencode.workspaceHint">
               비워 두면 사이트가 알려 주는 워크스페이스를 차례로 시도합니다.
             </span>
-            <input type="text" id="opencode-workspace" class="settings-input" autocomplete="off"
+            <input type="text" id="opencode-workspace" class="settings-input settings-input--mono" autocomplete="off"
                    spellcheck="false" placeholder="wrk_…" />
           </label>
         </div>
@@ -7924,7 +7933,7 @@
         <div class="settings-card">
           <label class="settings-field" for="browser-home-page">
             <span class="settings-label" data-i18n="settings.browser.home">홈 페이지</span>
-            <input class="settings-input" id="browser-home-page" type="text" autocomplete="off" spellcheck="false"
+            <input class="settings-input settings-input--mono" id="browser-home-page" type="text" autocomplete="off" spellcheck="false"
                    placeholder="about:blank" data-i18n-placeholder="settings.browser.homePlaceholder" />
           </label>
           <p class="settings-hint" data-i18n="settings.browser.homeHint">
@@ -8664,41 +8673,55 @@
          the new session starts, and one start button. The prompt itself is
          built by the window from the backend's `continuation_source`. -->
     <div class="scrim scrim--top" id="continue-scrim" hidden>
-      <section class="qo qo--settings continue-dialog" role="dialog" aria-modal="true"
-               aria-labelledby="continue-title">
-        <h2 class="qo-title" id="continue-title" data-i18n="continue.dialogTitle">새 세션에서 계속</h2>
-        <p class="settings-hint" data-i18n="continue.dialogDescription">
-          이 지점부터 새 에이전트 세션을 시작합니다. 원래 세션은 변경되지 않습니다.
-        </p>
-        <div class="continue-source">
-          <span class="continue-source-ico" id="continue-source-ico" aria-hidden="true"></span>
-          <div class="continue-source-body">
-            <div class="continue-source-name" id="continue-source-name"></div>
-            <div class="continue-source-agent" id="continue-source-agent" hidden></div>
+      <!-- Geist's modal, as the create dialogs wear it (2026-11-08, the person:
+           「모달도 giest 스타일로 개선」): the title and the one line that says
+           what happens, with the close beside them; each field under its
+           label; the actions on the footer's second background, the primary
+           last. -->
+      <section class="qo qo--continue" role="dialog" aria-modal="true"
+               aria-labelledby="continue-title" aria-describedby="continue-sub">
+        <header class="qo-head qo-head--sub">
+          <div class="qo-head-words">
+            <h2 class="qo-title" id="continue-title" data-i18n="continue.dialogTitle">새 세션에서 계속</h2>
+            <p class="qo-sub" id="continue-sub" data-i18n="continue.dialogDescription">이 지점부터 새 에이전트 세션을 시작합니다. 원래 세션은 변경되지 않습니다.</p>
           </div>
+          <button class="qo-x" id="continue-close" type="button" data-i18n-title="app.close" data-tip="닫기">
+            <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+            <span class="sr" data-i18n="app.close">닫기</span>
+          </button>
+        </header>
+        <div class="continue-body">
+          <div class="continue-source">
+            <span class="continue-source-ico" id="continue-source-ico" aria-hidden="true"></span>
+            <div class="continue-source-body">
+              <div class="continue-source-name" id="continue-source-name"></div>
+              <div class="continue-source-agent" id="continue-source-agent" hidden></div>
+            </div>
+          </div>
+          <div class="continue-field">
+            <label class="wt-label" for="continue-agent" data-i18n="continue.agent">에이전트</label>
+            <div class="wt-combo agent-select-combo">
+              <span class="wt-combo-ico" id="continue-agent-ico" aria-hidden="true"></span>
+              <select class="wt-combo-pick" id="continue-agent"></select>
+              <svg class="icon wt-combo-chev" aria-hidden="true"><use href="#i-chevron"></use></svg>
+            </div>
+          </div>
+          <div class="continue-field">
+            <label class="wt-label" for="continue-mode" data-i18n="continue.context">컨텍스트</label>
+            <div class="wt-combo">
+              <select class="wt-combo-pick" id="continue-mode"></select>
+              <svg class="icon wt-combo-chev" aria-hidden="true"><use href="#i-chevron"></use></svg>
+            </div>
+            <p class="continue-hint" id="continue-mode-hint"></p>
+          </div>
+          <p class="continue-cwd" id="continue-cwd" hidden></p>
         </div>
-        <label class="settings-field">
-          <span class="settings-label" data-i18n="continue.agent">에이전트</span>
-          <div class="wt-combo agent-select-combo">
-            <span class="wt-combo-ico" id="continue-agent-ico" aria-hidden="true"></span>
-            <select class="settings-input wt-combo-pick" id="continue-agent"></select>
-            <svg class="icon wt-combo-chev" aria-hidden="true"><use href="#i-chevron-right"></use></svg>
-          </div>
-        </label>
-        <label class="settings-field">
-          <span class="settings-label" data-i18n="continue.context">컨텍스트</span>
-          <div class="wt-combo">
-            <select class="settings-input wt-combo-pick" id="continue-mode"></select>
-            <svg class="icon wt-combo-chev" aria-hidden="true"><use href="#i-chevron-right"></use></svg>
-          </div>
-          <span class="settings-hint" id="continue-mode-hint"></span>
-        </label>
-        <p class="settings-hint continue-cwd" id="continue-cwd" hidden></p>
-        <p class="settings-note">
+        <div class="wt-form-actions">
+          <span class="wt-spacer"></span>
           <button class="btn" id="continue-cancel" type="button" data-i18n="app.cancel">취소</button>
           <button class="btn btn--primary" id="continue-start" type="button"
                   data-i18n="continue.startSession">새 세션 시작</button>
-        </p>
+        </div>
       </section>
     </div>
 
