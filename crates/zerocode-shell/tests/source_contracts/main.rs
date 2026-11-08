@@ -21965,7 +21965,7 @@ mod tests {
         assert!(
             dropped
                 < refreshing
-                    .find("worktreeList.replaceChildren();")
+                    .find("worktreeList.replaceChildren(...nextNodes);")
                     .expect("the rebuild"),
             "the windows are dropped AFTER the DOM they observe is replaced"
         );
@@ -26604,6 +26604,27 @@ mod tests {
             gathering.contains("if target.exists() {") && gathering.contains("kind.is_symlink()"),
             "the move overwrites a conversation already home, or follows a link \
              out of the directory:\n{gathering}"
+        );
+    }
+
+    /// The launch door carries the person's status line into the runtime home
+    /// before it returns for a launch with no account chosen: a carry placed
+    /// after that return, or on the account switch, never reaches such a launch,
+    /// and no unit test can see it because the door reads the person's real home.
+    #[test]
+    fn every_launch_into_the_runtime_home_carries_the_persons_status_line() {
+        let accounts = include_str!("../../src/accounts.rs");
+        let door = block_after(accounts, "pub fn launch_env_for(");
+        let carried = door
+            .find("carry_own_status_line(config_root, &isolated, external_runtime_home()")
+            .unwrap_or_else(|| panic!("a launch no longer carries the status line:\n{door}"));
+        let unchosen = door
+            .find("let Some(account) = account else")
+            .unwrap_or_else(|| panic!("the door's no-account return moved:\n{door}"));
+        assert!(
+            carried < unchosen,
+            "the status line is carried only after a launch with no account has \
+             returned:\n{door}"
         );
     }
 
@@ -33847,6 +33868,42 @@ mod tests {
             reopened.contains("openCommitFileDiff(tab.commit, tab.path,"),
             "a reopened commit diff answers with the working tree — the \
              right file, the wrong moment:\n{reopened}"
+        );
+    }
+
+    /// The split seats a worker from its leader's record in `team_envs`. A
+    /// launch writes it when it opens a team; an agent typed into a plain shell
+    /// is granted its team after it starts (`hooks::grant_pane_capabilities`),
+    /// so the grant writes it too — without it the ledger accepts that agent's
+    /// worker-start and the split refuses it. And a leader with no record is
+    /// refused with the reason, so the shim says why.
+    #[test]
+    fn a_leader_granted_its_team_by_file_has_a_record_to_split_from() {
+        let backend = shipped_backend();
+        let granting = block_after(backend, "fn note_pane_state(");
+        let granted = granting
+            .find("agent_teams::grant_team_env(state.local_data_root(), report.term)")
+            .unwrap_or_else(|| {
+                panic!("a hand-started agent is no longer granted a team:\n{granting}")
+            });
+        let recorded = granting
+            .find("state.team_envs().insert(report.term, record);")
+            .unwrap_or_else(|| panic!("a granted leader has no record to split from:\n{granting}"));
+        assert!(
+            granted < recorded,
+            "the record is written before the team it names is granted:\n{granting}"
+        );
+        let seating = block_after(backend, "impl agent_teams::Host for TeamWindow {");
+        let looked_up = seating
+            .find("let Some(leader_env) = state.team_envs().get(&leader).cloned() else {")
+            .unwrap_or_else(|| panic!("the split no longer reads its leader's record:\n{seating}"));
+        let refused = &seating[looked_up..];
+        let refused = &refused[..refused
+            .find("return None;")
+            .unwrap_or_else(|| panic!("a leader with no record is not refused:\n{refused}"))];
+        assert!(
+            refused.contains("carry_worker_start_refusal(token, worker_surface, &reason);"),
+            "a leader with no record is refused without the reason:\n{refused}"
         );
     }
 

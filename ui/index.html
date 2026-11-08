@@ -2976,6 +2976,20 @@
              it can never have. -->
         <div class="activity-tabs">
           <div class="activity-tabset" role="tablist" data-i18n-aria="view.activityLabel" aria-label="사이드바 항목">
+          <!-- 2026-11-08 (the T3 Code chat view, D6): the conversation in front,
+               told in one panel — who answers, what its last turn changed and
+               how its tests went, its checkout, the helpers it runs
+               (`paintChatActivity`). -->
+          <button
+            class="activity-tab"
+            id="activity-chat-tab"
+            role="tab"
+            aria-selected="false"
+            data-i18n-title="chatPanel.title" data-tip="대화"
+            data-i18n-aria="chatPanel.title" aria-label="대화"
+          >
+            <svg class="icon" aria-hidden="true"><use href="#i-message-square"></use></svg>
+          </button>
           <!-- 2차 B: what is piling up in this project — the release lane, the
                work not in main, the repository — before the source-control
                list (`paintStackedWork`). The number is the commits not in main. -->
@@ -3084,6 +3098,9 @@
             </button>
           </div>
         </div>
+
+        <!-- 2026-11-08: 대화. Drawn while its tab is up (`paintChatActivity`). -->
+        <section class="activity-item chat-panel" id="activity-chat" data-i18n-aria="chatPanel.title" aria-label="대화" hidden></section>
 
         <!-- 2차 B: 쌓인 일. Empty until its tab is up, emptied when it goes. -->
         <section class="activity-item pile" id="activity-pile" data-i18n-aria="pile.title" aria-label="쌓인 일" hidden></section>
@@ -4213,6 +4230,25 @@
           </div>
         </div>
 
+        <!-- The phone link's first step: the Claude panes a person opens start
+             with Claude Code's Remote Control. Two answers — a pane the ledger
+             summons never gets it, so there is no third to offer. -->
+        <div class="settings-subhead settings-subhead--acts">
+          <div>
+            <h3 class="settings-subhead-title" data-i18n="settings.agents.remoteControl">폰에서 이어 쓰기 · Claude</h3>
+            <p class="settings-subhead-desc" data-i18n="settings.agents.remoteControlHint">
+              내가 여는 Claude 판을 원격 제어로 띄워, 폰의 Claude 앱과 claude.ai에서 보고 답합니다. claude.ai로 로그인한 판만 되고, 워커 판은 켜지 않습니다. 새로 여는 판부터 적용됩니다.
+            </p>
+          </div>
+          <div class="segment agent-remote-control-choice" id="agent-remote-control-choice" role="group"
+               data-i18n-aria="settings.agents.remoteControl" aria-label="폰에서 이어 쓰기 · Claude">
+            <button class="segment-btn" id="agent-remote-control-off" type="button" data-mode="off"
+                    aria-pressed="false" data-i18n="settings.agents.remoteControlOff">끔</button>
+            <button class="segment-btn" id="agent-remote-control-mine" type="button" data-mode="mine"
+                    aria-pressed="false" data-i18n="settings.agents.remoteControlMine">내가 연 판</button>
+          </div>
+        </div>
+
         <!-- Two lists, because "installed" and "could be installed" are
              different sentences. Orca counts both in a badge beside the
              heading and offers a re-read of PATH — a tool installed while this
@@ -4616,7 +4652,7 @@
                 </label>
               </div>
             </div>
-            <p class="settings-row-desc model-judgment-about" data-i18n="settings.models.judgmentAbout">판단 모델이란? ZeroCode가 작은 결정을 빠르게 내릴 때 쓰는 모델입니다. 예를 들어 「이 명령이 위험한가」, 「어느 파일부터 볼까」 같은 것입니다. 코딩 모델과 따로 고르며, 작고 빠른 모델이면 충분합니다.</p>
+            <p class="settings-row-desc model-judgment-about" data-i18n="settings.models.judgmentAbout">판단 모델이란? ZeroCode가 작은 결정을 빠르게 내릴 때 쓰는 모델입니다. 예를 들어 「이 명령이 위험한가」, 「어느 파일부터 볼까」 같은 것입니다. 이 컴퓨터의 모델, 사내 서버, 외부 서비스(Jev 등) 중 무엇이든 고를 수 있고, 고른 모델에 맞는 방식으로 묻습니다. 잘 이어지지 않으면 의사결정 모델 화면이 까닭을 보여 줍니다.</p>
             <div class="settings-notice settings-notice--row settings-jev-partial" data-jev-partial hidden>
               <span class="settings-jev-partial-said" data-jev-partial-said></span>
               <button class="btn" type="button" data-jev-everywhere data-i18n="settings.typesafe.everyFolder">모든 폴더에서 사용</button>
@@ -4802,9 +4838,10 @@
                 <label class="settings-field" data-field="lg" id="judgment-protocol-field" for="judgment-protocol" hidden>
                   <span class="settings-field-copy">
                     <span class="settings-label" data-i18n="settings.judgment.protocol">연결 방식</span>
-                    <span class="settings-row-desc" data-i18n="settings.judgment.protocolHint">API 라우터·일반 모델 서버는 OpenAI 호환을 선택하세요. 구조화된 판단 응답을 지원해야 합니다.</span>
+                    <span class="settings-row-desc" data-i18n="settings.judgment.protocolHint">API 라우터·일반 모델 서버는 OpenAI 호환을 고르세요. 서버가 답 토큰 확률(logprobs)을 주면 「답 토큰 확률」이 더 빠르고 자동 적용 기준이 섭니다. 확률을 글로 적게 하는 방식은 기록만 합니다.</span>
                   </span>
                   <select class="settings-input" id="judgment-protocol" disabled>
+                    <option value="openai_logprobs" data-i18n="settings.judgment.logprobsProtocol">OpenAI 호환 · 답 토큰 확률</option>
                     <option value="openai_json" data-i18n="settings.judgment.openaiProtocol">OpenAI 호환 · 구조화된 응답</option>
                     <option value="system_one" data-i18n="settings.judgment.systemOneProtocol">System One · 판단 전용</option>
                   </select>
