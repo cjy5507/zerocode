@@ -14,6 +14,7 @@ mod ios;
 mod ios_hid;
 pub(crate) mod lists;
 pub(crate) mod marks;
+mod phone_awake;
 mod physical;
 mod prefs;
 mod process;
@@ -37,8 +38,8 @@ pub(crate) use android::{
     android_emulators_direct, android_install_app, android_launch_app, android_logs,
     android_rotate, android_rotate_direct, android_screenshot_direct, android_set_permission,
     android_swipe, android_swipe_direct, android_tap, android_tap_direct, android_text,
-    android_text_direct, managed_resource_processes, shutdown_android_emulator,
-    start_android_stream, start_emulator_video,
+    android_text_direct, managed_resource_processes, phone_wireless_offers, phone_wireless_pair,
+    shutdown_android_emulator, start_android_stream, start_emulator_video,
 };
 pub(crate) use ios::{
     ios_accessibility_tree, ios_accessibility_tree_direct, ios_button, ios_button_direct,
@@ -46,6 +47,9 @@ pub(crate) use ios::{
     ios_screenshot_direct, ios_set_permission, ios_swipe, ios_swipe_direct, ios_tap,
     ios_tap_direct, ios_text, ios_text_direct, ios_touch, mobile_emulators,
     mobile_emulators_direct, open_mobile_emulator, shutdown_mobile_emulator, start_emulator_stream,
+};
+pub(crate) use phone_awake::{
+    phone_awake_phones, phone_awake_sessions, phone_awake_start, phone_awake_stop,
 };
 pub(crate) use physical::list_answer_now;
 pub(crate) use wda::{

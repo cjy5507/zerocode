@@ -169,6 +169,10 @@ function applyAppearanceSettingsSnapshot(snapshot, first) {
     chatWideBlocks = snapshot.chat_wide_blocks === true;
     paintChatWideBlocks();
   }
+  if (hasSetting(snapshot, "chat_list_sidebar")) {
+    chatListSidebar = snapshot.chat_list_sidebar !== false;
+    paintChatListSidebar();
+  }
   if (hasSetting(snapshot, "show_titlebar_app_name")) {
     showTitlebarAppName = snapshot.show_titlebar_app_name !== false;
     paintTitlebarAppName();
@@ -346,6 +350,10 @@ function applyAgentSettingsSnapshot(snapshot) {
   if (hasSetting(snapshot, "agent_pane_first_view")) {
     agentPaneFirstView = normalizeAgentPaneFirstView(snapshot.agent_pane_first_view);
     paintAgentPaneFirstView();
+  }
+  if (hasSetting(snapshot, "new_chat_engine")) {
+    newChatEngine = normalizeNewChatEngine(snapshot.new_chat_engine);
+    paintNewChatEngine();
   }
 }
 
@@ -1018,6 +1026,7 @@ function showSettingsPane(pane) {
   if (pane === "orchestration" && arriving) void refreshTypeSafe();
   if (pane === "computer-use" && arriving) {
     void refreshComputerUse();
+    void refreshPhoneAwakeRows();
   }
   // 프로필은 다른 창이 만든 것도 이 목록의 것이라, 올 때마다 파일을 다시
   // 읽는다 — 읽기 하나 값이고 이 페이지는 자주 열리지 않는다.
@@ -1612,6 +1621,9 @@ let appFontFamily = "";
 let chatFontSize = "screen";
 /* Whether an answer's tables and code take the page's room (`chat_wide_blocks`). */
 let chatWideBlocks = false;
+/* Whether the sidebar opens with the conversation list (`chat_list_sidebar`,
+ * 2026-11-08, the T3 Code chat view, stage 2) — on unless the person turned it off. */
+let chatListSidebar = true;
 let showTitlebarAppName = true;
 let showMenuBarIcon = true;
 let minimizeToTrayOnClose = false;
@@ -1984,6 +1996,32 @@ function setChatWideBlocks(wide) {
 
 el("chat-wide-blocks").addEventListener("change", (event) => {
   setChatWideBlocks(event.target.checked);
+});
+
+/* The conversation list heads the sidebar (2026-11-08, the T3 Code chat view,
+ * stage 2, D7): one mark on the root (`data-chat-list`) the sidebar's rules
+ * read — the destinations fold to one line of marks under the list, named still
+ * (shell.css) — and the list itself (`paintChatList`, shell-workspace.js). Off,
+ * the sidebar is the one it was. */
+function applyChatListSidebar() {
+  if (chatListSidebar) document.documentElement.dataset.chatList = "on";
+  else delete document.documentElement.dataset.chatList;
+}
+
+function paintChatListSidebar() {
+  el("chat-list-sidebar").checked = chatListSidebar;
+  applyChatListSidebar();
+  if (typeof paintChatList === "function") paintChatList();
+}
+
+function setChatListSidebar(shown) {
+  chatListSidebar = Boolean(shown);
+  paintChatListSidebar();
+  void commitSetting("chat_list_sidebar", "set_chat_list_sidebar", { shown: chatListSidebar });
+}
+
+el("chat-list-sidebar").addEventListener("change", (event) => {
+  setChatListSidebar(event.target.checked);
 });
 
 function paintTitlebarAppName() {
@@ -3363,7 +3401,258 @@ async function paintRealPhone() {
   el("real-phone-allowed-off").hidden = on;
   unattended.checked = on && said.unattended === true;
   unattended.disabled = !on;
+  // The phones to keep awake are asked of adb: only while this card is on screen, not on every settings answer.
+  if (!settingsView.hidden && settingsPane === "computer-use") void refreshPhoneAwakeRows();
 }
+
+/* ---- keeping an Android phone awake (T7, 2026-11-09) ----
+ *
+ * The person starts it here, on the real-phone card, for one of a few set
+ * lengths; the backend pokes the phone with a key no app is sent while it is
+ * open, waits while it is locked or asleep, and ends the session by itself
+ * (`emulator::phone_awake`). The status bar's chip says it stands, how long is
+ * left, and stops it on a press. No verb an agent sends can start one. */
+const PHONE_AWAKE_MINUTES = Object.freeze([15, 30, 60]);
+const PHONE_AWAKE_TICK_MS = 30_000;
+let phoneAwake = { sessions: [], phones: [] };
+
+function phoneAwakeLeft(session, now = Date.now()) {
+  return Math.max(1, Math.ceil((session.until_ms - now) / 60_000));
+}
+
+function phoneAwakeState(session, now = Date.now()) {
+  if (session.waiting === "locked") return t("phoneAwake.waitingLocked", "잠겨 있어 기다리는 중");
+  if (session.waiting === "unreachable") return t("phoneAwake.waitingGone", "연결을 기다리는 중");
+  return t("phoneAwake.left", "{{minutes}}분 남음", { minutes: phoneAwakeLeft(session, now) });
+}
+
+function paintPhoneAwakeChip(now = Date.now()) {
+  const chip = el("sb-phone-awake");
+  const sessions = phoneAwake.sessions;
+  writeHidden(chip, sessions.length === 0);
+  if (sessions.length === 0) return;
+  const soonest = sessions.reduce((one, two) => (two.until_ms < one.until_ms ? two : one));
+  const minutes = phoneAwakeLeft(soonest, now);
+  writeTextContent(el("sb-phone-awake-words"), sessions.length === 1
+    ? t("phoneAwake.chip", "폰 깨어 있음 · {{minutes}}분", { minutes })
+    : t("phoneAwake.chipMany", "폰 {{count}}대 깨어 있음 · {{minutes}}분", { count: sessions.length, minutes }));
+  labelButton(chip, sessions.map((session) => `${session.name} · ${phoneAwakeState(session, now)}`).join("\n"));
+}
+
+function phoneAwakeButton(words, label, run) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "btn";
+  button.textContent = words;
+  button.setAttribute("aria-label", label);
+  button.addEventListener("click", run);
+  return button;
+}
+
+function paintPhoneAwakeRows(now = Date.now()) {
+  const host = document.getElementById("phone-awake-rows");
+  if (!host) return;
+  const standing = new Map(phoneAwake.sessions.map((session) => [session.device, session]));
+  const phones = [...phoneAwake.phones];
+  // A phone kept awake stands here even while `adb` cannot list it for a moment.
+  for (const session of phoneAwake.sessions) {
+    if (!phones.some((phone) => phone.device === session.device)) phones.push({ device: session.device, name: session.name });
+  }
+  if (phones.length === 0) {
+    const none = document.createElement("p");
+    none.className = "settings-hint";
+    none.textContent = t("phoneAwake.none", "허락한 안드로이드 폰이 연결돼 있지 않습니다. 폰은 에이전트가 처음 쓸 때 뜨는 카드에서 허락합니다.");
+    host.replaceChildren(none);
+    return;
+  }
+  host.replaceChildren(...phones.map((phone) => {
+    const row = document.createElement("div");
+    row.className = "phone-awake-row";
+    row.dataset.device = phone.device;
+    const name = document.createElement("span");
+    name.className = "phone-awake-name";
+    name.textContent = phone.name;
+    row.append(name);
+    const session = standing.get(phone.device);
+    if (session) {
+      const state = document.createElement("span");
+      state.className = "phone-awake-state";
+      state.textContent = phoneAwakeState(session, now);
+      row.append(state, phoneAwakeButton(t("phoneAwake.stop", "멈추기"),
+        t("phoneAwake.stopNamed", "멈추기 — {{name}}", { name: phone.name }), () => void stopPhoneAwake(phone.device)));
+    } else {
+      for (const minutes of PHONE_AWAKE_MINUTES) {
+        row.append(phoneAwakeButton(t("phoneAwake.minutes", "{{minutes}}분", { minutes }),
+          t("phoneAwake.keepFor", "{{name}}을 {{minutes}}분 동안 깨어 있게 두기", { name: phone.name, minutes }),
+          () => void startPhoneAwake(phone.device, minutes)));
+      }
+    }
+    return row;
+  }));
+}
+
+function holdPhoneAwakeSessions(sessions) {
+  phoneAwake.sessions = Array.isArray(sessions) ? sessions : [];
+  paintPhoneAwakeChip();
+  paintPhoneAwakeRows();
+  phoneAwakeTick.sync();
+}
+
+async function refreshPhoneAwakeRows() {
+  try {
+    phoneAwake.phones = (await invoke("phone_awake_phones")) ?? [];
+  } catch {
+    phoneAwake.phones = [];
+  }
+  paintPhoneAwakeRows();
+}
+
+async function startPhoneAwake(device, minutes) {
+  try {
+    holdPhoneAwakeSessions(await invoke("phone_awake_start", { device, minutes }));
+  } catch (error) {
+    showError(error);
+  }
+}
+
+async function stopPhoneAwake(device) {
+  try {
+    holdPhoneAwakeSessions(await invoke("phone_awake_stop", { device }));
+  } catch (error) {
+    showError(error);
+  }
+}
+
+const phoneAwakeTick = idlePoller({
+  wanted: () => phoneAwake.sessions.length > 0,
+  every: PHONE_AWAKE_TICK_MS,
+  tick: () => {
+    paintPhoneAwakeChip();
+    paintPhoneAwakeRows();
+  },
+});
+
+/* A session that ended for a reason other than its time or the person's stop
+ * says so once: the phone's permission went, or the phone stopped answering. */
+function sayPhoneAwakeEnded(ended) {
+  if (!ended) return;
+  if (ended.why === "not_allowed") {
+    toast(t("phoneAwake.endedNotAllowed", "{{name}} 깨어 있게 두기를 마쳤습니다 — 이 폰의 허락이 꺼졌습니다", { name: ended.name }));
+  } else if (ended.why === "unreachable") {
+    toast(t("phoneAwake.endedGone", "{{name}} 깨어 있게 두기를 마쳤습니다 — 폰과 연결이 끊겼습니다", { name: ended.name }));
+  }
+}
+
+listen("phone:awake", (event) => {
+  if (isPopout) return;
+  holdPhoneAwakeSessions(event?.payload?.sessions);
+  sayPhoneAwakeEnded(event?.payload?.ended);
+});
+
+el("sb-phone-awake").addEventListener("click", (event) => {
+  const bounds = event.currentTarget.getBoundingClientRect();
+  openSidebarMenu(bounds.left, bounds.top - 6, phoneAwake.sessions.map((session) => ({
+    label: t("phoneAwake.stopNamed", "멈추기 — {{name}}", { name: session.name }),
+    run: () => void stopPhoneAwake(session.device),
+  })));
+});
+
+if (!isPopout) void invoke("phone_awake_sessions").then(holdPhoneAwakeSessions).catch(() => {});
+
+/* ---- connecting an Android phone without a cable (T6, 2026-11-09) ----
+ *
+ * The person opens 「페어링 코드로 기기 페어링」 on the phone and presses 찾기:
+ * the phones offering pairing stand here by address, each with a box for the
+ * six digits it shows. The backend pairs, then waits for `adb` to connect the
+ * phone (`emulator::android::wireless`), and answers in codes this page words. */
+function phoneWirelessWords(error) {
+  const said = String(error?.message ?? error ?? "");
+  const [code, ...rest] = said.split(": ");
+  const detail = rest.join(": ").trim();
+  switch (code) {
+    case "wireless_code_shape":
+      return t("phoneWireless.codeShape", "짝짓기 코드는 폰에 보이는 여섯 자리 숫자입니다");
+    case "wireless_not_offered":
+      return t("phoneWireless.notOffered", "그 폰이 지금 짝짓기를 열어 두지 않았습니다 — 폰에서 다시 열고 찾기를 누르세요");
+    case "wireless_pair_failed":
+      return detail
+        ? t("phoneWireless.pairFailedWhy", "짝짓기가 되지 않았습니다 — 코드를 다시 확인하세요 ({{why}})", { why: detail })
+        : t("phoneWireless.pairFailed", "짝짓기가 되지 않았습니다 — 코드를 다시 확인하세요");
+    case "wireless_not_connected":
+      return t("phoneWireless.notConnected", "짝짓기는 됐지만 연결되지 않았습니다 — 폰의 무선 디버깅이 켜져 있는지 보고 다시 찾으세요");
+    case "wireless_timed_out":
+      return t("phoneWireless.timedOut", "폰이 답하지 않았습니다 — 폰과 이 Mac이 같은 Wi-Fi에 있는지 확인하세요");
+    case "wireless_no_adb":
+      return t("phoneWireless.noAdb", "adb를 찾지 못했습니다 — Android SDK의 platform-tools가 있어야 합니다");
+    default:
+      return said;
+  }
+}
+
+function sayPhoneWireless(words) {
+  const line = el("phone-wireless-said");
+  writeTextContent(line, words);
+  writeHidden(line, words === "");
+}
+
+function phoneWirelessOfferRow(offer) {
+  const row = document.createElement("div");
+  row.className = "phone-awake-row";
+  row.dataset.addr = offer.addr;
+  const where = document.createElement("span");
+  where.className = "phone-awake-name";
+  where.textContent = offer.addr;
+  const code = document.createElement("input");
+  code.className = "settings-input phone-wireless-code";
+  code.type = "text";
+  code.inputMode = "numeric";
+  code.maxLength = 6;
+  code.autocomplete = "one-time-code";
+  code.placeholder = t("phoneWireless.codePlaceholder", "여섯 자리");
+  code.setAttribute("aria-label", t("phoneWireless.codeLabel", "짝짓기 코드 — {{addr}}", { addr: offer.addr }));
+  const pair = phoneAwakeButton(t("phoneWireless.pair", "연결"),
+    t("phoneWireless.pairNamed", "{{addr}}에 연결", { addr: offer.addr }), () => void pairPhoneWireless(offer.addr, code.value.trim(), pair));
+  code.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.isComposing) pair.click();
+  });
+  row.append(where, code, pair);
+  return row;
+}
+
+async function findPhoneWireless() {
+  const host = el("phone-wireless-offers");
+  sayPhoneWireless(t("phoneWireless.finding", "찾는 중…"));
+  try {
+    const offers = (await invoke("phone_wireless_offers")) ?? [];
+    host.replaceChildren(...offers.map(phoneWirelessOfferRow));
+    sayPhoneWireless(offers.length === 0
+      ? t("phoneWireless.noneFound", "짝짓기를 연 폰이 보이지 않습니다 — 폰에서 「페어링 코드로 기기 페어링」을 열어 둔 채 다시 찾으세요")
+      : "");
+    host.querySelector(".phone-wireless-code")?.focus();
+  } catch (error) {
+    host.replaceChildren();
+    sayPhoneWireless(phoneWirelessWords(error));
+  }
+}
+
+async function pairPhoneWireless(addr, code, button) {
+  button.disabled = true;
+  sayPhoneWireless(t("phoneWireless.pairing", "연결하는 중…"));
+  try {
+    const paired = await invoke("phone_wireless_pair", { addr, code });
+    el("phone-wireless-offers").replaceChildren();
+    sayPhoneWireless(paired?.allowed
+      ? t("phoneWireless.pairedAllowed", "연결했습니다 — {{name}}. 이미 허락한 폰이라 바로 씁니다.", { name: paired.name })
+      : t("phoneWireless.paired", "연결했습니다 — {{name}}. 에이전트가 처음 쓸 때 허락 카드가 뜹니다.", { name: paired?.name ?? "" }));
+    void refreshPhoneAwakeRows();
+  } catch (error) {
+    sayPhoneWireless(phoneWirelessWords(error));
+  } finally {
+    button.disabled = false;
+  }
+}
+
+el("phone-wireless-find").addEventListener("click", () => void findPhoneWireless());
 
 el("real-phone-allowed").addEventListener("change", () => {
   void commitSetting("emulator.realPhoneConsent", "set_emulator_real_phone", { allowed: false }, { hand: handNow() });
@@ -8883,6 +9172,42 @@ function setAgentPaneFirstView(view) {
 for (const radio of agentPaneFirstViewRadios()) {
   radio.addEventListener("change", (event) => {
     if (event.currentTarget.checked) setAgentPaneFirstView(event.currentTarget.value);
+  });
+}
+
+/* ---- what a new conversation runs on (2026-11-08, the T3 Code chat view, stage 3) ----
+ *
+ * A conversation opened from the 「새 대화」 start screen runs on its agent's
+ * CLI in a pane, or on the wire as a GUI session (`new_chat_engine`; the words
+ * are the core's `NewChatEngine`). The pane is the default: measured on
+ * 2026-11-08, a wire tab was not restored after a restart, took no `--remote-
+ * control` (the CLI keeps it to interactive sessions) and was not moved at a
+ * quota wall. An agent with no wire opens in a pane whatever this says. */
+const NEW_CHAT_ENGINES = Object.freeze({ terminal: "terminal", wire: "wire" });
+let newChatEngine = NEW_CHAT_ENGINES.terminal;
+
+function newChatEngineRadios() {
+  return [...el("new-chat-engine").querySelectorAll('input[type="radio"]')];
+}
+
+function normalizeNewChatEngine(engine) {
+  return Object.values(NEW_CHAT_ENGINES).includes(engine) ? engine : NEW_CHAT_ENGINES.terminal;
+}
+
+function paintNewChatEngine() {
+  for (const radio of newChatEngineRadios()) radio.checked = radio.value === newChatEngine;
+  if (typeof paintNewChatViews === "function") paintNewChatViews();
+}
+
+function setNewChatEngine(engine) {
+  newChatEngine = normalizeNewChatEngine(engine);
+  paintNewChatEngine();
+  void commitSetting("new_chat_engine", "set_new_chat_engine", { engine: newChatEngine });
+}
+
+for (const radio of newChatEngineRadios()) {
+  radio.addEventListener("change", (event) => {
+    if (event.currentTarget.checked) setNewChatEngine(event.currentTarget.value);
   });
 }
 

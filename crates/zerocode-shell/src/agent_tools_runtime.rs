@@ -2582,16 +2582,36 @@ impl agent_teams::Host for TeamWindow {
         // (reported 2026-08-30: "이건 계속 멈춰있어"). Announced only when a
         // shell was actually here: a term the reaper already announced is not
         // told twice.
-        if retire_terminal(&state, term).unwrap_or(false) {
-            state.cadence().wake();
-            announce_retired_terminal(&self.app, term);
-            true
-        } else if already_absent {
-            forget_term_state(&state, term, TermLedgerSettlement::Recorded(None));
-            state.cadence().wake();
-            true
-        } else {
-            false
+        //
+        // And a shell the reaper took is GONE, not unconfirmed — whether it
+        // was gone before this close began or went while this close waited
+        // on it. The kill below is what ends it, and the pump reaps a shell
+        // that ended inside the map on its own clock, so it routinely takes
+        // the entry between the kill and the retirement's own removal; the
+        // retirement then answers `Ok(false)` after it had watched the exit
+        // itself. Presence read BEFORE the retirement called that
+        // unconfirmed, and so refused every `respawn-pane` with its
+        // replacement already running — Claude Code's teammates split `cat`
+        // and respawn it, so not one of them could open (2026-11-09, terms
+        // 15→16, 17→18 and 22→23: "판을 가르다 오류남"). Only the ANSWER moves:
+        // a shell the pump took mid-close is forgotten and announced by the
+        // pump's own round, with its last screen, so this door forgets only
+        // what was gone before it began, as it always has. A refusal is still
+        // a refusal: the handle stays and no exit is claimed.
+        match retire_terminal(&state, term) {
+            Ok(true) => {
+                state.cadence().wake();
+                announce_retired_terminal(&self.app, term);
+                true
+            }
+            Ok(false) => {
+                if already_absent {
+                    forget_term_state(&state, term, TermLedgerSettlement::Recorded(None));
+                }
+                state.cadence().wake();
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -3283,14 +3303,22 @@ pub(super) async fn computer_loop(
             let parsed = zerocode_core::computer_use::parse_command(&argv).ok();
             // This guard outlives spawn_blocking and every walked step. The
             // provider mutex alone covered only one step of a batch.
+            // A batch's apps are let go one by one as it is done with each (B4):
+            // the step after which it never acts in them again, asked with the names.
+            let mut last_steps = std::collections::HashMap::new();
             let _sequence = if let Some(command) = parsed.as_ref() {
                 let names = if computer_use::sequence::takes_a_turn(command.method) {
                     let (asked, root) = (command.clone(), local_data_root.clone());
-                    tauri::async_runtime::spawn_blocking(move || {
-                        computer_use::sequence::names_of(&asked, &root)
+                    let (names, last) = tauri::async_runtime::spawn_blocking(move || {
+                        (
+                            computer_use::sequence::names_of(&asked, &root),
+                            computer_use::sequence::last_steps(&asked),
+                        )
                     })
                     .await
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                    last_steps = last;
+                    names
                 } else {
                     std::collections::BTreeSet::new()
                 };
@@ -3359,7 +3387,7 @@ pub(super) async fn computer_loop(
                 let (app, root) = (steering.clone(), local_data_root.clone());
                 let deadline_ms = zerocode_core::computer_use::computer_deadline_ms(&argv);
                 let _ = tauri::async_runtime::spawn_blocking(move || {
-                    let _sequence = _sequence;
+                    let mut sequence = _sequence;
                     let _acting = run_evidence::acting_for(actor);
                     let _input_policy = computer_use::input_policy::enter_with(|| {
                         crate::settings_runtime::computer_input_policy(
@@ -3410,6 +3438,14 @@ pub(super) async fn computer_loop(
                                 leave_step(&app, &root, evidence.as_deref(), step, step, refusal)
                             },
                             || !reply.is_closed(),
+                            |n| {
+                                // Done with these apps: another agent's turn there now.
+                                if let Some(lease) = sequence.as_mut() {
+                                    for app in last_steps.get(&n).into_iter().flatten() {
+                                        lease.release(app);
+                                    }
+                                }
+                            },
                         )
                     } else {
                         // The walk's folder, known before its first step: the
@@ -3986,6 +4022,8 @@ fn run_parallel(
                         },
                         |step, refusal| leave_step(app, root, evidence, step, step, refusal),
                         caller_waits,
+                        // A parallel group's apps are the whole request's: held to its end.
+                        |_| {},
                     )
                 })
             })
@@ -4024,6 +4062,7 @@ pub(super) fn run_batch(
     mut step: impl FnMut(&[String]) -> zerocode_hookd::TeamAnswer,
     refused: impl FnOnce(&[String], &zerocode_hookd::TeamAnswer),
     caller_waits: impl Fn() -> bool,
+    mut after: impl FnMut(usize),
 ) -> zerocode_hookd::TeamAnswer {
     use zerocode_core::computer_use::{
         Next, WalkBudget, batch_answer, batch_steps, batch_text, parse_command, walk,
@@ -4060,6 +4099,7 @@ pub(super) fn run_batch(
         |_, argv: &Vec<String>| Next::Run(argv.clone()),
         |n, _, argv| {
             let answer = step(argv);
+            after(n);
             let report = walk_step_report(
                 n,
                 argv,

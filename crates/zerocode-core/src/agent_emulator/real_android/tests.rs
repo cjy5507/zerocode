@@ -431,3 +431,113 @@ fn a_phones_dump_is_read_by_the_iphones_money_guard() {
     assert_eq!(money_refusal(&chat, MoneyAct::Press(540.0, 2100.0)), None);
     assert_eq!(money_refusal(&chat, MoneyAct::Enter), None);
 }
+
+/// The keep-awake session's one key (T7, 2026-11-09): the poke goes, and every
+/// key that wakes, sleeps or locks a phone is still the person's — the session
+/// never wakes a sleeping phone or writes a setting to keep one on.
+#[test]
+fn the_keep_awake_poke_is_one_key_that_wakes_nothing() {
+    assert_eq!(
+        adb_refusal(&["shell", "input", "keyevent", AWAKE_POKE]),
+        None,
+        "the poke is on the list"
+    );
+    for key in [
+        "KEYCODE_WAKEUP",
+        "224",
+        "KEYCODE_POWER",
+        "26",
+        "KEYCODE_SLEEP",
+        "223",
+    ] {
+        assert_eq!(
+            adb_refusal(&["shell", "input", "keyevent", key]).map(|(code, _)| code),
+            Some(PHONE_POWER_REFUSED),
+            "{key} stays the person's"
+        );
+    }
+    assert_eq!(
+        adb_refusal(&["shell", "svc", "power", "stayon", "true"]).map(|(code, _)| code),
+        Some(PHONE_POWER_REFUSED),
+        "a stay-on setting is never written"
+    );
+    assert!(
+        AWAKE_MINUTES
+            .iter()
+            .all(|minutes| (1..=60).contains(minutes))
+    );
+}
+
+/// Wireless debugging (T6, 2026-11-09): the phone `adb` connected through mDNS
+/// is the phone the cable showed — one id, one answer — read off the name, so
+/// nothing is asked of the phone; any other serial keeps its own id.
+#[test]
+fn a_phone_on_wireless_debugging_is_the_phone_its_cable_showed() {
+    let wireless = format!("adb-{SERIAL}-AbC123.{WIRELESS_CONNECT_SERVICE}");
+    assert_eq!(phone_identity(&wireless), SERIAL);
+    assert_eq!(
+        android_phone_handle(&wireless),
+        android_phone_handle(SERIAL)
+    );
+    assert_eq!(
+        phone_identity(SERIAL),
+        SERIAL,
+        "a cable's serial is the phone's own"
+    );
+    assert_eq!(phone_identity("192.0.2.10:5555"), "192.0.2.10:5555");
+    assert_ne!(
+        android_phone_handle("192.0.2.10:5555"),
+        android_phone_handle(SERIAL),
+        "an address alone names no phone"
+    );
+    // A serial with a dash in it keeps it; only the random word goes.
+    assert_eq!(
+        phone_identity(&format!("adb-R5-CT01-xyz9.{WIRELESS_CONNECT_SERVICE}")),
+        "R5-CT01"
+    );
+    for odd in [
+        format!("adb--x.{WIRELESS_CONNECT_SERVICE}"),
+        format!("adb-{SERIAL}.{WIRELESS_CONNECT_SERVICE}"),
+        format!("phone-{SERIAL}-x.{WIRELESS_CONNECT_SERVICE}"),
+    ] {
+        assert_eq!(
+            phone_identity(&odd),
+            odd,
+            "a name of another shape stands as it is"
+        );
+    }
+}
+
+#[test]
+fn mdns_answers_name_their_pairing_and_connection_services_and_nothing_else() {
+    let listing = format!(
+        "List of discovered mdns services\n\
+         adb-{SERIAL}-AbC123\t_adb-tls-pairing._tcp.\t192.0.2.10:37123\n\
+         adb-{SERIAL}-AbC123\t_adb-tls-connect._tcp.\t192.0.2.10:41001\n\
+         adb-OTHER9-Zz\t_adb._tcp.\t192.0.2.11:5555\n\
+         adb-{SERIAL}-AbC123\t_adb-tls-pairing._tcp.\tnot-an-address\n"
+    );
+    let found = parse_mdns_services(&listing);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found[0].pairing && found[0].addr == "192.0.2.10:37123");
+    assert!(!found[1].pairing && found[1].addr == "192.0.2.10:41001");
+    assert_eq!(mdns_serial(&found[0].name), Some(SERIAL));
+    assert!(wireless_addr_ok("[2001:db8::1]:5555"));
+    for bad in [
+        "192.0.2.10",
+        "192.0.2.10:0",
+        "192.0.2.10:70000",
+        "host;rm:5555",
+        ":5555",
+    ] {
+        assert!(!wireless_addr_ok(bad), "{bad}");
+    }
+    assert!(pairing_code_ok("042519"));
+    for bad in ["42519", "0425190", "04251a", ""] {
+        assert!(!pairing_code_ok(bad), "{bad}");
+    }
+    assert!(paired(
+        "Successfully paired to 192.0.2.10:37123 [guid=adb-x]"
+    ));
+    assert!(!paired("Failed: Wrong password or connection was dropped."));
+}
