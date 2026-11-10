@@ -36,6 +36,10 @@ function expandDoorNode(target, build = null) {
   const door = document.createElement("button");
   door.type = "button";
   door.className = "helper-expand";
+  // Enter and Space, while it has focus, are its own — on a pane's page the
+  // window's key sink (`rearmKeySink`) took them for the terminal, and the
+  // door a Tab had reached could not be pressed.
+  door.dataset.keyboardOwner = "true";
   paintExpandDoor(door, false);
   door.addEventListener("click", () => {
     const open = !target.classList.contains("is-open");
@@ -87,7 +91,8 @@ function toolBodyNode() {
     copy.className = "helper-code-copy";
     copy.appendChild(iconNode("copy"));
     labelButton(copy, kind === "input" ? t("worker.copyCode", "코드 복사") : t("worker.copyOutput", "출력 복사"));
-    copyOnPress(copy, () => words.textContent);
+    // The whole of it, also while only its two ends stand (`dressToolOut`).
+    copyOnPress(copy, () => words.__said ?? words.textContent);
     well.append(words, copy);
     body.appendChild(well);
   }
@@ -108,10 +113,99 @@ function dressToolBody(row, input, output) {
     const words = well.firstElementChild;
     const content = words.querySelector(".helper-tool-text");
     if (words.classList.contains("helper-tool-output")) {
-      if (content.textContent !== text) content.replaceChildren(...stepOutParts(text, true));
-    } else writeTextContent(content, text);
-    clipWith(words, text !== "" && chatClips(text));
+      dressToolOut(words, content, text);
+    } else {
+      writeTextContent(content, text);
+      clipWith(words, text !== "" && chatClips(text));
+    }
   }
+}
+
+/* ---- a long output's two ends (2026-11-10) ------------------------------------
+ *
+ * What a command printed was cut at its first 60px — and what it came to is
+ * most often on its last lines (window artifact p-1c1bbf75726ff227, 「긴 명령
+ * 출력」): 214 tests ran, and the line that says so was behind 「더 보기」. An
+ * output of twelve lines or more stands as its first lines and its last, with
+ * one line between them that says how many it holds back and opens them;
+ * opened, 「접기」 under it folds it again. A shorter output, and one long only
+ * by its width, keeps the clip's grammar. The copy takes the whole either way
+ * (`__said`). */
+const CHAT_OUT_ENDS = 3;
+
+/* The two ends of an output, or null when it stands whole or is cut by the
+ * clip: an output takes this shape once it holds back at least as many lines
+ * as it shows — twelve lines and up. A shorter one keeps the clip, which is
+ * the smaller of the two for it (three lines and the door). */
+function outEnds(text) {
+  const lines = text.replace(/\n+$/, "").split("\n");
+  const hidden = lines.length - 2 * CHAT_OUT_ENDS;
+  if (hidden < 2 * CHAT_OUT_ENDS) return null;
+  return { head: lines.slice(0, CHAT_OUT_ENDS).join("\n"), tail: lines.slice(-CHAT_OUT_ENDS).join("\n"), hidden };
+}
+
+function dressToolOut(words, content, text) {
+  if (words.__said === text) return;
+  words.__said = text;
+  const ends = text === "" ? null : outEnds(text);
+  if (ends === null) {
+    writeClass(words, "is-ends", false);
+    words.__ends = undefined;
+    content.replaceChildren(...stepOutParts(text, true));
+    clipWith(words, text !== "" && chatClips(text));
+    return;
+  }
+  // Its ends stand: the clip and the clip's door are not this output's.
+  clipWith(words, false);
+  writeClass(words, "is-ends", true);
+  words.__ends = ends;
+  paintOutEnds(words, content, ends);
+}
+
+/* The whole of an output whose ends stand, opened without a press — find
+ * walks into a line it held back, and the keyboard stays in the find's box. */
+function openToolOut(words) {
+  if (!words.classList.contains("is-ends") || words.classList.contains("is-open")) return;
+  words.classList.add("is-open");
+  paintOutEnds(words, words.querySelector(".helper-tool-text"), words.__ends);
+}
+
+/* The output as its reader left it: whole with 「접기」 under it, or its two
+ * ends around the line that opens the rest. The keyboard goes with the press
+ * to the control that undoes it. */
+function paintOutEnds(words, content, ends, pressed = false) {
+  const door = words.nextElementSibling?.classList.contains("helper-expand") ? words.nextElementSibling : null;
+  if (words.classList.contains("is-open")) {
+    content.replaceChildren(...stepOutParts(words.__said, true));
+    if (door) return;
+    const fold = document.createElement("button");
+    fold.type = "button";
+    fold.className = "helper-expand";
+    // Enter and Space, while it has focus, are its own (`rearmKeySink`).
+    fold.dataset.keyboardOwner = "true";
+    paintExpandDoor(fold, true);
+    fold.addEventListener("click", () => {
+      words.classList.remove("is-open");
+      paintOutEnds(words, content, ends, true);
+    });
+    words.after(fold);
+    if (pressed) fold.focus({ preventScroll: true });
+    return;
+  }
+  door?.remove();
+  const gap = document.createElement("button");
+  gap.type = "button";
+  gap.className = "helper-tool-gap";
+  // Enter and Space, while it has focus, are its own (`rearmKeySink`).
+  gap.dataset.keyboardOwner = "true";
+  gap.setAttribute("aria-expanded", "false");
+  gap.textContent = `… ${t("worker.moreLines", "{{n}}줄 더", { n: ends.hidden })}`;
+  gap.addEventListener("click", () => {
+    words.classList.add("is-open");
+    paintOutEnds(words, content, ends, true);
+  });
+  content.replaceChildren(...stepOutParts(ends.head, true), gap, ...stepOutParts(ends.tail, true));
+  if (pressed) gap.focus({ preventScroll: true });
 }
 
 /* ---- the diff --------------------------------------------------------------
@@ -305,7 +399,16 @@ function clipPersonRows(rows) {
     const words = said.scrollHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
     if (words > clip + 1) tall.push(said);
   }
+  if (tall.length === 0) return;
+  // Words cut above a reader who left the foot pull the page up under them —
+  // sixty lines become three: the row they read stays where it stood (rows a
+  // long conversation's open stands above its reader, turns read from above).
+  const list = pageTurnsOf(tall[0]);
+  const reading = list && chatAway(list) ? chatReading(list) : null;
   for (const said of tall) clipWith(said, true);
+  if (reading?.row.isConnected) {
+    list.scrollTop += reading.row.getBoundingClientRect().top - list.getBoundingClientRect().top - reading.offset;
+  }
 }
 
 /* ---- a tool's file is a door (t-6323 A2) -----------------------------------
@@ -408,12 +511,18 @@ function chatFootGap(list) {
  * task — is read here as that event would read it, so no answer lags the
  * list. */
 function chatFollowState(list) {
+  // Asked once, as the list's following is first read — whichever way a new
+  // answer starts here, the wish is this list's and no later one's.
+  const first = list.__follow === undefined && takeFirstAsk(list.__run);
   list.__follow ??= {
     away: false, top: list.scrollTop, height: list.scrollHeight, intent: null, at: 0, touch: null, gliding: null, placed: false,
     // A new answer starts under its question (`pinChatQuestion`): the row the list is pinned under, whether
-    // the next words the person sends are to be one, the room kept under the words, and whether the person
-    // has moved the list since.
-    pin: null, pinNext: false, room: 0, pinMoved: false,
+    // the next words the person sends are to be one — or the words the conversation was opened with, sent
+    // from the start page (`takeFirstAsk`) — the room kept under the words, and whether the person has moved
+    // the list since.
+    pin: null, pinNext: first && chatFollowMode === "question", room: 0, pinMoved: false,
+    // The page's own glide to a pinned question (`standChatPinRoom`): where it goes, and when it began.
+    pinGlide: null,
   };
   noteChatScroll(list, list.__follow);
   return list.__follow;
@@ -429,6 +538,19 @@ function noteChatScroll(list, state) {
   const top = list.scrollTop;
   if (top === state.top || list.clientHeight === 0) return;
   const height = list.scrollHeight;
+  const intent = Date.now() - state.at < CHAT_FOLLOW.intent ? state.intent : null;
+  // While the page glides the list up to a pinned question (`glideChatPin`)
+  // its steps write `top` themselves, and a move none of them made — the
+  // browser keeping the list inside a page that changed under it — is the
+  // page's too. The reader's own hand ends the glide where it is.
+  if (state.pinGlide) {
+    if (intent === null) {
+      state.top = top;
+      state.height = height;
+      return;
+    }
+    state.pinGlide = null;
+  }
   // A move the page did not make (`standChatPinRoom` writes `top` itself): the
   // pinned place is the person's now, and no paint puts it back. Not so a list
   // that went up and stands at its very foot — nobody scrolls up to a foot:
@@ -437,7 +559,6 @@ function noteChatScroll(list, state) {
   // (`standChatPinRoom`, from the list's `scroll`).
   if (!(top < state.top && height - top - list.clientHeight <= 1)) state.pinMoved = true;
   const gap = height - top - list.clientHeight - state.room;
-  const intent = Date.now() - state.at < CHAT_FOLLOW.intent ? state.intent : null;
   const grew = height - state.height;
   const kept = intent === null && grew > 0 && Math.abs(top - state.top - grew) <= 1;
   const up = top < state.top;
@@ -532,6 +653,44 @@ function returnToFoot(list) {
  * foot (`chatFootGap`), not the room's. */
 const CHAT_FOLLOW_MODE_KEY = "zerocode.chat.follow";
 const CHAT_PIN_LEAD = 12;
+
+/* The page's glide up to the words just sent, a frame at a time: the window's
+ * own clock and curve (`--chat-pin-glide`, `--ease-standard`), read through
+ * the engine's animation timing so the curve is the token's, not a copy of
+ * it. Drawn here rather than by the engine's `scrollTo({behavior: "smooth"})`:
+ * WebKit's glide went on after the page wrote another place, and a pin let go
+ * mid-glide was dragged on to where the glide had been going. A glide ends
+ * when its clock does, when the pin is let go, or at the reader's own hand
+ * (`noteChatScroll`). */
+function glideChatPin(list, state, to) {
+  const root = getComputedStyle(document.documentElement);
+  const duration = Number.parseFloat(root.getPropertyValue("--chat-pin-glide")) || 0;
+  const easing = root.getPropertyValue("--ease-standard").trim() || "ease";
+  // The list's own animation with no keyframes: a clock and a curve, changing nothing it draws.
+  const clock = list.animate([], { duration, easing, fill: "forwards" });
+  const glide = { from: list.scrollTop, to, clock, frame: 0, began: performance.now() };
+  state.pinGlide = glide;
+  const step = () => {
+    if (state.pinGlide !== glide || !list.isConnected) {
+      clock.cancel();
+      return;
+    }
+    // A clock not started yet stands at the glide's start; one that never
+    // runs (a page whose frames stopped) is not waited on past twice its time.
+    const over = performance.now() - glide.began > 2 * duration + CHAT_FOLLOW.intent;
+    const progress = over ? 1 : clock.effect.getComputedTiming().progress ?? (clock.playState === "finished" ? 1 : 0);
+    list.scrollTop = glide.from + (glide.to - glide.from) * progress;
+    state.top = list.scrollTop;
+    state.height = list.scrollHeight;
+    if (progress >= 1 || clock.playState === "finished") {
+      state.pinGlide = null;
+      clock.cancel();
+      return;
+    }
+    glide.frame = requestAnimationFrame(step);
+  };
+  glide.frame = requestAnimationFrame(step);
+}
 let chatFollowMode = "question";
 try {
   if (localStorage.getItem(CHAT_FOLLOW_MODE_KEY) === "foot") chatFollowMode = "foot";
@@ -547,6 +706,26 @@ function setChatFollowMode(mode) {
   for (const list of document.querySelectorAll(".helper-turns")) dropChatPin(list);
 }
 
+/* The conversations the start page opened with the person's first words (a
+ * pane's, by its terminal; a wire's run carries `pinFirst` itself): their
+ * lists are born wishing to pin those words (`chatFollowState`), as a list
+ * pins the words sent from its own composer. */
+const chatFirstAsks = new Set();
+
+function noteFirstAsk(term) {
+  chatFirstAsks.add(term);
+}
+
+function takeFirstAsk(run) {
+  if (!run) return false;
+  if (run.pinFirst === true) {
+    run.pinFirst = false;
+    return true;
+  }
+  // A pane's own conversation, not a helper's page that shares its terminal.
+  return !run.wire && run.helper?.id === PANE_LOG_ID && chatFirstAsks.delete(run.term);
+}
+
 /* A send: the list goes to its foot, where the words will stand — and, in the
  * question's way, the next words of the person that stand are pinned to its
  * top (`pinChatQuestion`, from the paint that stands them). */
@@ -560,11 +739,25 @@ function carryAfterSend(list) {
 function dropChatPin(list) {
   const state = list?.__follow;
   if (!state) return;
+  const glide = state.pinGlide;
   state.pin = null;
+  state.pinGlide = null;
+  if (glide) {
+    cancelAnimationFrame(glide.frame);
+    glide.clock.cancel();
+  }
   state.pinNext = false;
   if (state.room !== 0) {
     state.room = 0;
     list.style.removeProperty("--chat-pin-room");
+  }
+  // A glide the page began is let go where it stands: the list goes back to
+  // its words' foot, where its reader stood before it — nobody moved it — and
+  // follows from there.
+  if (glide) {
+    list.scrollTop = list.scrollHeight;
+    state.top = list.scrollTop;
+    state.height = list.scrollHeight;
   }
 }
 
@@ -572,7 +765,7 @@ function dropChatPin(list) {
  * and — while the person has not moved the list — the list stood there again:
  * a turn that folds (its steps into one line) shortens the page under it. One
  * layout, asked by a paint that moved rows. */
-function standChatPinRoom(list) {
+function standChatPinRoom(list, { glide = false } = {}) {
   const state = list.__follow;
   const row = state?.pin;
   if (!row) return;
@@ -596,8 +789,19 @@ function standChatPinRoom(list) {
   // another layout: the words and the room just written.
   state.height = words + room;
   if (!state.pinMoved && Math.abs(list.scrollTop - at) > 1) {
-    list.scrollTop = Math.max(0, at);
-    state.top = list.scrollTop;
+    const to = Math.max(0, at);
+    if (state.pinGlide) {
+      // A glide under way goes on to where the words stand now.
+      state.pinGlide.to = to;
+    } else if (glide && !motionReduced()) {
+      // The words just sent glide up to the top, as the person's approved
+      // picture drew them (window artifact p-1c1bbf75726ff227): the eye
+      // follows them there rather than losing them in a jump.
+      glideChatPin(list, state, to);
+    } else {
+      list.scrollTop = to;
+      state.top = list.scrollTop;
+    }
   }
 }
 
@@ -635,25 +839,29 @@ function releaseOutrunChatPin(list, run) {
 }
 
 /* The person's words that just stood go to the list's top, and the answer has
- * the screen under them. Not under a reader who left for the rows above. */
-function pinChatQuestion(list, row) {
+ * the screen under them — gliding there when the list already stood where the
+ * person saw it (`glide`, a paint after a send). Not under a reader who left
+ * for the rows above. */
+function pinChatQuestion(list, row, { glide = false } = {}) {
   const state = chatFollowState(list);
+  // A list with no box yet keeps the wish: its first place stands the words (`standChatPlace`).
+  if (state.placed === false || list.clientHeight === 0) return false;
   state.pinNext = false;
-  if (state.away || state.placed === false || list.clientHeight === 0) return false;
+  if (state.away) return false;
   state.pin = row;
   state.pinMoved = false;
   state.gliding = null;
-  standChatPinRoom(list);
+  standChatPinRoom(list, { glide });
   paintFootDoor(list);
   return state.pin === row;
 }
 
 /* Whether the list is not following its words — the reader left, or it
- * stands beyond the slack with no glide on the way: what the foot's button
- * is shown for. */
+ * stands beyond the slack with no glide on the way (home, or up to a pinned
+ * question): what the foot's button is shown for. */
 function chatOffFoot(list) {
   const state = chatFollowState(list);
-  return state.away || (state.gliding === null && chatFootGap(list) >= CHAT_FOLLOW.slack);
+  return state.away || (state.gliding === null && state.pinGlide === null && chatFootGap(list) >= CHAT_FOLLOW.slack);
 }
 
 /* The foot's button worn as the list stands: one class, and no write when
@@ -781,6 +989,11 @@ function standChatPlace(list) {
   } else {
     state.away = false;
     list.scrollTop = list.scrollHeight;
+    // The words this conversation was opened with stood before the list had a
+    // box to pin them in (`pinChatQuestion` kept the wish): they stand at its
+    // top now, the answer under them.
+    const asked = state.pinNext ? [...list.querySelectorAll(":scope > .helper-turn.is-user")].at(-1) : null;
+    if (asked) pinChatQuestion(list, asked);
   }
   paintFootDoor(list);
 }
@@ -1629,40 +1842,109 @@ const CHAT_COPIED_MS = 2000;
  * moment: an icon's button with the check, a word's (`words`: what it says,
  * and what it says once it copied) with its other word. */
 function copyOnPress(button, text, words = null) {
-  button.addEventListener("click", async (event) => {
+  button.addEventListener("click", (event) => {
     event.stopPropagation();
-    try {
-      await clipboardText.write(text());
-    } catch (error) {
-      showError(error);
-      return;
-    }
-    clearTimeout(button.__copied);
-    if (words) writeTextContent(button, words.copied);
-    else button.replaceChildren(iconNode("check"));
-    button.classList.add("is-copied");
-    button.__copied = setTimeout(() => {
-      if (words) writeTextContent(button, words.copy);
-      else button.replaceChildren(iconNode("copy"));
-      button.classList.remove("is-copied");
-    }, CHAT_COPIED_MS);
+    void copyAndSay(button, text(), words);
   });
 }
 
+/* Write `text` and have `button` say so for the panel's while: the one road
+ * every copy on this page takes — a press on the button itself (`copyOnPress`)
+ * or a pick in the menu it opened (a table's, `openTableCopyMenu`). */
+async function copyAndSay(button, text, words = null) {
+  try {
+    await clipboardText.write(text);
+  } catch (error) {
+    showError(error);
+    return;
+  }
+  clearTimeout(button.__copied);
+  if (words) writeTextContent(button, words.copied);
+  else button.replaceChildren(iconNode("check"));
+  button.classList.add("is-copied");
+  button.__copied = setTimeout(() => {
+    if (words) writeTextContent(button, words.copy);
+    else button.replaceChildren(iconNode("copy"));
+    button.classList.remove("is-copied");
+  }, CHAT_COPIED_MS);
+}
+
+/* What a fence's first line says of its code: the language, and the file when
+ * the line names one — 「rust title="src/a.rs"」, 「rust:src/a.rs」, a cited range
+ * 「12:15:src/a.rs」, or the path alone, whose extension is then the language. A
+ * word with no slash and no extension is a language (「c++」, 「objective-c」). */
+const FENCE_FILE_ATTR = /(?:^|\s)(?:title|filename|file|path)=(?:"([^"]+)"|'([^']+)'|(\S+))/;
+const FENCE_FILE_NAME = /^[\w@%+~-][\w.@%+~-]*\.[A-Za-z][A-Za-z0-9]{0,7}$/;
+
+function fenceLooksLikeFile(word) {
+  return /[\\/]/.test(word) || FENCE_FILE_NAME.test(word);
+}
+
+function fenceExtension(file) {
+  const name = file.split(/[\\/]/).at(-1) ?? "";
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+}
+
+function fenceInfoOf(info) {
+  const said = String(info ?? "").trim();
+  if (said === "") return { language: "", file: "" };
+  const word = said.split(/[\s,{]/, 1)[0];
+  const named = FENCE_FILE_ATTR.exec(said);
+  if (named) return { language: word.includes("=") ? "" : word, file: named[1] ?? named[2] ?? named[3] };
+  // A drive's colon is the path's own (「C:\\src\\a.rs」).
+  const drive = /^[A-Za-z]:[\\/]/.test(word);
+  const colon = drive ? -1 : word.lastIndexOf(":");
+  if (colon > 0 && fenceLooksLikeFile(word.slice(colon + 1))) {
+    const head = word.slice(0, colon);
+    const file = word.slice(colon + 1);
+    return { language: /^\d+(?::\d+)?$/.test(head) ? fenceExtension(file) : head, file };
+  }
+  if (fenceLooksLikeFile(word)) return { language: fenceExtension(word), file: word };
+  return { language: word, file: "" };
+}
+
+/* How many lines a block of code shows before the rest waits behind 「전체
+ * 보기 (N줄)」 (2026-11-10, window artifact p-1c1bbf75726ff227: a block past a
+ * screen's worth buried the prose around it; Streamdown's default folds at the
+ * same 400px, `--chat-code-clip`). */
+const CHAT_CODE_CLIP_LINES = 24;
+
 /* Every code block the prose drew stands on a flat panel (t-22100): a bar over
- * the code with the fence's language — the document viewer's word for it
- * (`fenceLanguageWords`) — and its copy, then the code. The colours inside the
- * code are the fence's own (`colourCodeIn`, t-22095). */
-function dressCodeCopies(host) {
-  for (const block of host.querySelectorAll("pre.md-block")) {
-    if (block.parentElement?.classList.contains("helper-code")) continue;
+ * the code with what the fence says of it — the file it names, when it names
+ * one, then its language (`fenceInfoOf`; 「코드」 when it says neither) — and
+ * its copy, then the code. The bar stays at the list's top while a long block
+ * passes under it (shell.css). The colours inside the code are the fence's own
+ * (`colourCodeIn`, t-22095), read by the language alone — so the fence keeps
+ * that, and the file beside it (`data-file`).
+ *
+ * A block past `CHAT_CODE_CLIP_LINES` stands folded with a door under it that
+ * says how many lines it holds — unless `clip` is false (an answer still being
+ * written is read as it comes), or its row keeps it open (`row.__codeOpen`: a
+ * door the person pressed, an answer they watched being written). 「줄바꿈」
+ * joins the bar the first time a hand reaches the block (`watchCodeBlocks`). */
+function dressCodeCopies(host, { clip = true } = {}) {
+  const kept = clip ? host.closest?.(".helper-turn")?.__codeOpen ?? null : null;
+  host.querySelectorAll("pre.md-block").forEach((block, at) => {
+    if (block.parentElement?.classList.contains("helper-code")) return;
+    const info = fenceInfoOf(block.dataset.language);
+    if (info.language) block.dataset.language = info.language;
+    else delete block.dataset.language;
     const frame = document.createElement("div");
     frame.className = "helper-code";
     const bar = document.createElement("div");
     bar.className = "helper-code-bar";
+    if (info.file) {
+      block.dataset.file = info.file;
+      const file = document.createElement("span");
+      file.className = "helper-code-file";
+      file.textContent = info.file;
+      bar.appendChild(file);
+    }
     const language = document.createElement("span");
     language.className = "helper-code-lang";
-    language.textContent = fenceLanguageWords(block);
+    // A file's name says what the code is; with none, the fence's language or the window's 「코드」.
+    language.textContent = info.file ? info.language : fenceLanguageWords(block);
     const copy = document.createElement("button");
     copy.type = "button";
     copy.className = "helper-code-copy";
@@ -1674,7 +1956,223 @@ function dressCodeCopies(host) {
     bar.append(language, copy);
     block.replaceWith(frame);
     frame.append(bar, block);
+    const lines = stepLineCount(block.textContent);
+    if (!clip || lines <= CHAT_CODE_CLIP_LINES) return;
+    frame.classList.add("is-long");
+    frame.__at = at;
+    frame.__lines = lines;
+    const door = document.createElement("button");
+    door.type = "button";
+    door.className = "helper-code-more";
+    door.dataset.keyboardOwner = "true";
+    door.addEventListener("click", () => openCodeBlock(frame, door.getAttribute("aria-expanded") !== "true"));
+    frame.appendChild(door);
+    dressCodeDoor(frame, kept === "all" || kept?.has(at) === true);
+  });
+}
+
+/* A long block's door as the block stands: 「전체 보기 (N줄)」 folded, 「접기」 open. */
+function dressCodeDoor(frame, open) {
+  const door = frame.lastElementChild;
+  writeClass(frame, "is-open", open);
+  writeAttribute(door, "aria-expanded", open ? "true" : "false");
+  writeTextContent(door, open ? t("worker.showLess", "접기") : t("worker.codeAll", "전체 보기 ({{n}}줄)", { n: frame.__lines }));
+}
+
+/* A long block opened or folded by its door. Its row remembers which of its
+ * blocks stand open, so a row that takes its body back (the shelf) draws them
+ * as the person left them; folded from below its head, the block's head comes
+ * back into view rather than leave the reader in the answer's later words. */
+function openCodeBlock(frame, open) {
+  dressCodeDoor(frame, open);
+  const row = frame.closest(".helper-turn");
+  if (row) {
+    if (row.__codeOpen === "all" || row.__codeOpen === undefined) {
+      const all = row.__codeOpen === "all";
+      row.__codeOpen = new Set(all ? [...row.querySelectorAll(".helper-code.is-long")].map((one) => one.__at) : []);
+    }
+    if (open) row.__codeOpen.add(frame.__at);
+    else row.__codeOpen.delete(frame.__at);
   }
+  const list = open ? null : pageTurnsOf(frame);
+  if (!list) return;
+  const above = frame.getBoundingClientRect().top - list.getBoundingClientRect().top;
+  if (above < 0) list.scrollTop += above;
+}
+
+/* Every long block of `row` stands open and stays so: the answer a reader
+ * watched being written does not fold its code shut under them when its turn
+ * takes the streaming row's place (`removeStreamingRow`). A page that opens the
+ * same turn later folds it as any other. */
+function keepCodeOpenIn(row) {
+  row.__codeOpen = "all";
+  for (const frame of row.querySelectorAll(".helper-code.is-long:not(.is-open)")) dressCodeDoor(frame, true);
+}
+
+/* ---- 「줄바꿈」: a block's long lines, wrapped (2026-11-10) ---------------------
+ *
+ * One reading for every block on this window's pages (`data-chat-code-wrap` on
+ * the root, read by shell.css), kept where 「결과만」 is kept: a person who
+ * wants code wrapped wants it in the next block too, and a block that takes
+ * its body back from the shelf wears it without being told. The control is a
+ * word on the block's bar, built the first time the pointer or the keyboard
+ * reaches the block — a page of thirty blocks nobody touched pays for none.
+ * The block the person pressed stays where it stood while the others above it
+ * change their height. */
+const CHAT_CODE_WRAP_KEY = "zerocode.chat.codeWrap";
+let chatCodeWrap = false;
+try {
+  chatCodeWrap = localStorage.getItem(CHAT_CODE_WRAP_KEY) === "on";
+} catch {}
+
+function applyChatCodeWrap() {
+  if (chatCodeWrap) document.documentElement.dataset.chatCodeWrap = "on";
+  else delete document.documentElement.dataset.chatCodeWrap;
+}
+
+applyChatCodeWrap();
+
+function setChatCodeWrap(on, from = null) {
+  chatCodeWrap = on;
+  try {
+    localStorage.setItem(CHAT_CODE_WRAP_KEY, on ? "on" : "off");
+  } catch {}
+  const list = from ? pageTurnsOf(from) : null;
+  const stood = list ? from.getBoundingClientRect().top : 0;
+  applyChatCodeWrap();
+  for (const button of document.querySelectorAll(".helper-code-wrap")) writeAttribute(button, "aria-pressed", on ? "true" : "false");
+  if (list) list.scrollTop += from.getBoundingClientRect().top - stood;
+}
+
+function ensureCodeWrapToggle(frame) {
+  const bar = frame.firstElementChild;
+  const copy = bar?.querySelector(":scope > .helper-code-copy");
+  if (!copy || bar.querySelector(":scope > .helper-code-wrap")) return;
+  const wrap = document.createElement("button");
+  wrap.type = "button";
+  wrap.className = "helper-code-wrap";
+  // Enter and Space, while it has focus, are its own (`rearmKeySink`).
+  wrap.dataset.keyboardOwner = "true";
+  wrap.textContent = t("worker.codeWrap", "줄바꿈");
+  wrap.setAttribute("aria-pressed", chatCodeWrap ? "true" : "false");
+  wrap.addEventListener("click", (event) => {
+    event.stopPropagation();
+    setChatCodeWrap(!chatCodeWrap, frame);
+  });
+  bar.insertBefore(wrap, copy);
+}
+
+/* One pair of listeners a list, for every block it will ever hold. */
+function watchCodeBlocks(list) {
+  const reach = (event) => {
+    const frame = event.target.closest?.(".helper-code");
+    if (frame) ensureCodeWrapToggle(frame);
+  };
+  list.addEventListener("pointerover", reach);
+  list.addEventListener("focusin", reach);
+}
+
+/* ---- a table in an answer (2026-11-10) ---------------------------------------
+ *
+ * The person's pick (window artifact p-1c1bbf75726ff227, 「출력 형태」): a table
+ * is a frame with a ground under its head, drawn by its own cells so the frame
+ * hugs the grid whatever room the table's box takes (shell.css), and it can be
+ * taken away as what it is — markdown for a document or an issue, CSV for a
+ * sheet. The copy is one mark beside the head row, named twice, shown under
+ * the pointer or the keyboard; it opens the two ways as a menu, and says it
+ * copied as every copy here does (`copyAndSay`).
+ *
+ * The mark stands BESIDE the table, in a frame that holds the two — never in
+ * a head cell. In the last head cell it covered that cell's words whenever
+ * the pointer was on a narrow table (a three-column table lost 「고친 뒤」 to
+ * it), it was part of the column header a screen reader names, and on a table
+ * wider than its box it scrolled out of sight with the cell. The frame is the
+ * block the answer lays out, as a code block's frame is (`dressCodeCopies`);
+ * the table inside it is still its own scroll box. */
+function dressTables(host) {
+  for (const table of host.querySelectorAll("table.md-table")) {
+    if (table.rows.length === 0 || table.parentElement?.classList.contains("helper-table")) continue;
+    const frame = document.createElement("div");
+    frame.className = "helper-table";
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "helper-table-copy";
+    // Enter and Space, while it has focus, are its own (`rearmKeySink`).
+    copy.dataset.keyboardOwner = "true";
+    copy.setAttribute("aria-haspopup", "menu");
+    copy.setAttribute("aria-expanded", "false");
+    copy.appendChild(iconNode("copy"));
+    labelButton(copy, t("worker.tableCopy", "표 복사"));
+    copy.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (copy.getAttribute("aria-expanded") === "true") closeComposerMenu(copy);
+      else openTableCopyMenu(copy, table);
+    });
+    table.replaceWith(frame);
+    frame.append(table, copy);
+  }
+}
+
+function openTableCopyMenu(chip, table) {
+  takeComposerMenuTurn();
+  const menu = composerMenuNode();
+  composerMenuSection(menu, t("worker.tableCopy", "표 복사"));
+  const ways = [
+    [t("worker.tableCopyMarkdown", "마크다운으로 복사"), tableAsMarkdown],
+    [t("worker.tableCopyCsv", "CSV로 복사"), tableAsCsv],
+  ];
+  for (const [words, write] of ways) {
+    composerMenuItem(menu, words, "", () => {
+      chip.focus();
+      void copyAndSay(chip, write(table));
+    });
+  }
+  standOpenComposerMenu(chip, menu);
+}
+
+/* A cell's words as the markdown that draws them: code, bold, struck and
+ * slanted words keep their marks and an address its link. */
+function cellMarkdown(node) {
+  let said = "";
+  for (const child of node.childNodes) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      said += child.textContent;
+      continue;
+    }
+    if (child.nodeType !== Node.ELEMENT_NODE) continue;
+    const inner = cellMarkdown(child);
+    if (child.tagName === "CODE") said += `\x60${child.textContent}\x60`;
+    else if (child.tagName === "STRONG") said += `**${inner}**`;
+    else if (child.tagName === "EM") said += `*${inner}*`;
+    else if (child.tagName === "S") said += `~~${inner}~~`;
+    else if (child.tagName === "A" && /^https?:/.test(child.getAttribute("href") ?? "")) said += `[${inner}](${child.getAttribute("href")})`;
+    else said += inner;
+  }
+  return said;
+}
+
+/* The words a cell shows, for a sheet. */
+function cellText(cell) {
+  return cell.textContent.replace(/\s+/g, " ").trim();
+}
+
+/* The table as GFM writes one: the head, the rule that carries each column's
+ * alignment, the rows. A pipe inside a cell is escaped, a line break a space. */
+function tableAsMarkdown(table) {
+  const rows = [...table.rows].map((row) => [...row.cells].map((cell) => cellMarkdown(cell).replace(/\s+/g, " ").trim().replace(/\|/g, "\\|")));
+  const rule = [...table.rows[0].cells].map((cell) => {
+    const align = cell.style.textAlign;
+    return align === "center" ? ":---:" : align === "right" ? "---:" : align === "left" ? ":---" : "---";
+  });
+  const line = (cells) => `| ${cells.join(" | ")} |`;
+  return [line(rows[0]), line(rule), ...rows.slice(1).map(line)].join("\n");
+}
+
+/* The table as comma-separated values (RFC 4180): a field with a comma, a
+ * quote or a line break stands in quotes, its own quotes doubled. */
+function tableAsCsv(table) {
+  const field = (text) => (/[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text);
+  return [...table.rows].map((row) => [...row.cells].map((cell) => field(cellText(cell))).join(",")).join("\n");
 }
 
 /* ---- the code in a fence wears colours (t-22095) ---------------------------
@@ -2530,6 +3028,15 @@ function stepFirstLine(text) {
   return line.length > 120 ? `${line.slice(0, 119)}…` : line;
 }
 
+/* Why a step failed, in the first line it printed — past a bare 「Exit code N」
+ * when more follows: that line says that it failed, the next one why. A
+ * failed step's row says it, and so does the fold that holds the step
+ * (`paintPillWhy`). */
+function stepWhyLine(output) {
+  const rest = output.replace(/^\s*exit code \d+[ \t]*\n/i, "");
+  return stepFirstLine(rest.trim() === "" ? output : rest);
+}
+
 function stepLineCount(text) {
   return text === "" ? 0 : text.replace(/\n+$/, "").split("\n").length;
 }
@@ -2591,7 +3098,7 @@ function stepFetchFacts(turn) {
  * how many results it found. */
 function stepResultWords(kind, turn, output, failed, row) {
   if (failed) {
-    return t("worker.stepFailed", "실패: {{why}}", { why: stepFirstLine(output) || t("worker.noOutput", "출력 없음") });
+    return t("worker.stepFailed", "실패: {{why}}", { why: stepWhyLine(output) || t("worker.noOutput", "출력 없음") });
   }
   const pictured = (turn.role === "tool_result" ? turn.images : turn.outputImages)?.length ?? 0;
   if (pictured > 0 && output.trim() === "") return t("worker.stepImages", "이미지 {{n}}장", { n: pictured });
@@ -3168,6 +3675,17 @@ function noteThoughtSettled(list, turn, row) {
  * held the keyboard, in a closed pill, hands it to the pill's head
  * (t-81786 P3-5). */
 function removeStreamingRow(stale, run) {
+  // An answer that was read as it came: the turn standing in its place — the
+  // nearest answer above, when it opens with the same words — keeps its long
+  // code open (`keepCodeOpenIn`).
+  if (!stale.classList.contains("is-thinking")) {
+    const said = (stale.__text ?? "").trim().slice(0, 200);
+    for (let row = stale.previousElementSibling; row && said !== ""; row = row.previousElementSibling) {
+      if (!row.classList.contains("is-assistant") || row.classList.contains("is-streaming")) continue;
+      if (cleanseAssistantText(row.__turn?.text ?? "").trim().startsWith(cleanseAssistantText(said).trim())) keepCodeOpenIn(row);
+      break;
+    }
+  }
   const held = stale.firstElementChild === document.activeElement;
   let row = stale.__settled?.row;
   if (row?.isConnected && row.classList.contains("helper-group")) {
@@ -3908,6 +4426,8 @@ function chatFindWordsNode(row, part = "said") {
 /* Unfold only the hit's row and body. Finding a log never interrupts the
  * agent and never changes the composer draft. */
 function chatFindSpot(list, run, turn, part = "said") {
+  // A hit can be in a turn a long conversation's open has not drawn yet.
+  completeChatOpen(list);
   let row = null;
   for (const one of list.querySelectorAll(":scope > [data-turn]")) {
     if (Number(one.dataset.turn) >= turn.seq) { row = one; break; }
@@ -3931,6 +4451,8 @@ function chatFindSpot(list, run, turn, part = "said") {
   }
   const words = chatFindWordsNode(row, part);
   if (words?.classList.contains("is-clipped") && !words.classList.contains("is-open")) words.nextElementSibling?.click();
+  // An output whose two ends stand holds the hit's line back: the whole of it stands for the find.
+  if (words) openToolOut(words);
   return words;
 }
 
@@ -4513,12 +5035,6 @@ function answerResultNode(list, row) {
     all.dataset.keyboardOwner = "true";
     all.setAttribute("aria-expanded", "false");
     all.textContent = t("worker.resultReview", "검토");
-    all.addEventListener("click", () => {
-      const open = all.getAttribute("aria-expanded") !== "true";
-      const follow = chatFollows(list);
-      openResultFiles(list, card, open);
-      if (open) showOpenedResult(list, card, follow);
-    });
     head.append(iconNode("diff"), title, ...resultTallyNodes(facts.added, facts.removed), all);
     const undo = conversationReviewUndoButton(list, answer);
     if (undo) {
@@ -4549,12 +5065,6 @@ function answerResultNode(list, row) {
       path.textContent = shown(file.path);
       // The chevron that says the line opens is the line's own (`::after`), as a step's is.
       line.append(path, resultBarNode(file.added, file.removed), ...resultTallyNodes(file.added, file.removed));
-      line.addEventListener("click", () => {
-        const open = line.getAttribute("aria-expanded") !== "true";
-        const follow = chatFollows(list);
-        openResultFile(list, card, item, open);
-        if (open) showOpenedResult(list, item, follow);
-      });
       item.appendChild(line);
       return item;
     };
@@ -4576,15 +5086,6 @@ function answerResultNode(list, row) {
         for (const file of facts.files.slice(standing)) rest.appendChild(lineOf(file));
         more.replaceWith(rest);
       };
-      more.addEventListener("click", () => {
-        const follow = chatFollows(list);
-        card.__rest();
-        card.__kept = true;
-        // The keyboard goes on from the first line that just stood.
-        const first = card.querySelectorAll(":scope > .chat-result-item")[standing];
-        first?.firstElementChild.focus({ preventScroll: true });
-        if (first) showOpenedResult(list, first, follow);
-      });
       card.appendChild(more);
     }
   }
@@ -4602,6 +5103,36 @@ function answerResultNode(list, row) {
     card.appendChild(tests);
   }
   return card;
+}
+
+/* The presses a card takes — a file's line, 「검토」, 「파일 N개 더 보기」 —
+ * heard once a list (`helperTurnsNode`): a card stands under every turn that
+ * ends, and each of its lines carried a listener of its own. */
+function watchResultPresses(list) {
+  list.addEventListener("click", (event) => {
+    const hit = event.target instanceof Element ? event.target.closest(".chat-result-file, .chat-result-all, .chat-result-more") : null;
+    const card = hit?.closest(".chat-result");
+    if (!card || !list.contains(card)) return;
+    const follow = chatFollows(list);
+    if (hit.classList.contains("chat-result-more")) {
+      const stood = card.querySelectorAll(":scope > .chat-result-item").length;
+      card.__rest?.();
+      card.__kept = true;
+      // The keyboard goes on from the first line that just stood.
+      const first = card.querySelectorAll(":scope > .chat-result-item")[stood];
+      first?.firstElementChild.focus({ preventScroll: true });
+      if (first) showOpenedResult(list, first, follow);
+      return;
+    }
+    const open = hit.getAttribute("aria-expanded") !== "true";
+    if (hit.classList.contains("chat-result-all")) {
+      openResultFiles(list, card, open);
+      if (open) showOpenedResult(list, card, follow);
+    } else {
+      openResultFile(list, card, hit.parentElement, open);
+      if (open) showOpenedResult(list, hit.parentElement, follow);
+    }
+  });
 }
 
 /* A file's rows, built by the press that opens them and let go by the one that

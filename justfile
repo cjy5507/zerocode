@@ -10,7 +10,7 @@ set windows-shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 # 않도록 zerocode-shell을 제외하고, 창은 shell-lint/shell-test 단계가 따로
 # 게이트한다.
 # The small source/runner checks answer before the Rust builds start.
-verify: pii-check fmt-check package-runner-test quality-runner-test window-runner-test lint doc test shell-lint shell-test tools-test swift-test settings-browser-test window-browser-test browser-observation-test browser-door-test knowledge-browser-test win-check-if-available
+verify: pii-check fmt-check package-runner-test quality-runner-test window-runner-test lint doc test shell-lint shell-test tools-test swift-test settings-browser-test window-browser-test profile-browser-test browser-observation-test browser-door-test knowledge-browser-test win-check-if-available
 
 # The re-entry gate for private values (3.9 s over 1,687 tracked files, the
 # median of 3 on an idle machine): a home directory, an office address, a
@@ -53,13 +53,19 @@ shell-lint:
 # launchd, swiftc, osascript, the release lane) say SKIPPED aloud elsewhere, as
 # `swift-test` does.
 # On Windows Python reads files as UTF-8 here, as it does on a Mac.
+# The scripts run one after another, except the long ones marked `beside`: each of
+# those starts at once and runs beside the rest, its output held and printed when
+# it ends, its verdict counted with the others'. v1.1.138's gate spent 157 s of
+# this recipe's 387 s in test_lane.py, 72 s in test_bench.py and 56 s in
+# test_gate_receipt.py, each waiting on the one before it.
 tools-test:
-    @rc=0; red=; skipped=; \
+    @rc=0; red=; skipped=; held=$(mktemp -d "${TMPDIR:-/tmp}/tools-test.XXXXXX"); beside_n=0; \
     case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) export PYTHONUTF8=1 ;; esac; \
     t() { echo "python3 $*" >&2; python3 "$@" || { rc=1; red="$red $*"; }; }; \
-    macos() { why=$1; shift; if [ "$(uname -s)" = Darwin ]; then t "$@"; else echo "SKIPPED python3 $* — macOS-only: $why"; skipped="$skipped $*"; fi; }; \
-    t -I -S -B tools/release/tests/test_gate_receipt.py --receipt-mode routine -v; \
-    macos "the release lane runs on this Mac: launchd, plutil, POSIX signals, the build line's done folder" tools/release/tests/test_lane.py; \
+    beside() { beside_n=$((beside_n + 1)); printf '%s' "$*" > "$held/$beside_n.cmd"; echo "python3 $* — beside the rest; its output when it ends" >&2; ( python3 "$@" > "$held/$beside_n.out" 2>&1; echo $? > "$held/$beside_n.rc" ) & }; \
+    macos() { how=t; [ "$1" = beside ] && { how=beside; shift; }; why=$1; shift; if [ "$(uname -s)" = Darwin ]; then $how "$@"; else echo "SKIPPED python3 $* — macOS-only: $why"; skipped="$skipped $*"; fi; }; \
+    beside -I -S -B tools/release/tests/test_gate_receipt.py --receipt-mode routine -v; \
+    macos beside "the release lane runs on this Mac: launchd, plutil, POSIX signals, the build line's done folder" tools/release/tests/test_lane.py; \
     t tools/release/tests/test_cargo_turn.py; \
     t tools/release/tests/test_coord_receipt.py; \
     t tools/release/tests/test_prebatch.py; \
@@ -78,7 +84,7 @@ tools-test:
     t tools/computer-bench/test_tally.py; \
     macos "walks the macOS screen and accessibility permissions" tools/computer-bench/test_onboarding.py; \
     t tools/computer-bench/test_scenarios.py; \
-    macos "scripts macOS ioreg, pgrep, defaults, open and osascript" tools/computer-bench/test_bench.py; \
+    macos beside "scripts macOS ioreg, pgrep, defaults, open and osascript" tools/computer-bench/test_bench.py; \
     t tools/computer-bench/test_marks.py; \
     t tools/computer-bench/test_eye.py; \
     t tools/computer-bench/test_fixture_apm.py; \
@@ -116,6 +122,8 @@ tools-test:
     t tools/tests/test_test_times.py; \
     macos "reads proc_pid_rusage through macOS libproc.dylib and mach_absolute_time" tools/tests/test_memory_census_idle.py; \
     macos "ends the measured CLI's process group (os.killpg)" tools/login-renewal-probe/test_probe.py; \
+    wait; \
+    for cmd in "$held"/*.cmd; do [ -e "$cmd" ] || continue; one=${cmd%.cmd}; echo "python3 $(cat "$cmd") — ended beside the rest:" >&2; cat "$one.out"; [ "$(cat "$one.rc" 2>/dev/null)" = 0 ] || { rc=1; red="$red $(cat "$cmd")"; }; done; rm -rf "$held"; \
     [ -z "$skipped" ] || echo "tools-test: skipped (macOS-only):$skipped"; \
     [ -z "$red" ] || { echo "tools-test: red scripts:$red" >&2; exit 1; }; exit $rc
 
@@ -160,27 +168,35 @@ settings-browser-test:
 # And the error reporter, which never throws over the error it was handed when
 # the terminal script stopped while loading (t-94962).
 window-runner-test:
-    node --test ui/tests/window-runner.test.mjs ui/tests/ipc-census.test.mjs ui/tests/hidden-pane-bridge.test.mjs ui/tests/machine-load.test.mjs ui/tests/background-surface-focus.test.mjs ui/tests/jev-real-summary.test.mjs ui/tests/show-error.test.mjs ui/tests/pane-lifecycle.test.mjs ui/tests/pane-close-door.test.mjs ui/tests/pane-late-answer.test.mjs ui/tests/pane-late-seed.test.mjs ui/tests/pane-late-log.test.mjs ui/tests/window-scope.test.mjs ui/tests/vm-fixtures.test.mjs
-    node scripts/window-scope.mjs
+    status=0; node --test ui/tests/window-runner.test.mjs ui/tests/ipc-census.test.mjs ui/tests/hidden-pane-bridge.test.mjs ui/tests/machine-load.test.mjs ui/tests/background-surface-focus.test.mjs ui/tests/jev-real-summary.test.mjs ui/tests/show-error.test.mjs ui/tests/pane-lifecycle.test.mjs ui/tests/pane-close-door.test.mjs ui/tests/pane-late-answer.test.mjs ui/tests/pane-late-seed.test.mjs ui/tests/pane-late-log.test.mjs ui/tests/window-scope.test.mjs ui/tests/vm-fixtures.test.mjs || status=$?; [ "$status" -lt 128 ] || exit "$status"; node scripts/window-scope.mjs || status=$?; exit "$status"
 
 # 설정뿐 아니라 전체 renderer interaction을 실제 layout engine에서 확인한다.
 # 이 gate가 있어야 설정 변경이 탭/보드/온보딩 같은 인접 UI를 깨뜨리지 않았다는
 # 전체 renderer interaction 계약도 CI와 로컬에서 같은 명령으로 검증된다.
+# One harness a recipe (2026-11-10): just ends a recipe at its first red line, so
+# a second script after window.mjs never ran when a window check was red — the
+# v1.1.139 lane shipped without the profile-data checks having run. The release
+# lane names a check by its recipe (`ui:<harness>/<suite>:<check>`) and judges a
+# suite alone by running that recipe with WINDOW_SUITES, so each harness the
+# lane judges is one script under one `<harness>-browser-test`.
 window-browser-test:
     node ui/tests/window.mjs
+
+# A browser profile's imported Chrome data in the window (t-79331).
+profile-browser-test:
     node ui/tests/browser-profile-data.mjs
 
 # Guest error/network observation must also run in a fresh protocol session.
+# Every script runs, whatever the one before it said: the recipe is red when any
+# was, and a script ended by a signal (128+N, the lane's cap) ends it at once.
 browser-observation-test:
-    node ui/tests/browser-ring.mjs
-    node ui/tests/browser-form-fill.mjs
+    rc=0; for script in browser-ring browser-form-fill; do status=0; node "ui/tests/$script.mjs" || status=$?; [ "$status" -lt 128 ] || exit "$status"; [ "$status" = 0 ] || rc=1; done; exit "$rc"
 
 # The browser door's page scripts (zcSelect, click, wait) against a page with
 # hidden twins of its controls: the element a selector names is the first one
 # a person could see. Reads the strings the Rust hands the pane.
 browser-door-test:
-    node ui/tests/browser-door.mjs
-    node ui/tests/expense-workflow.mjs
+    rc=0; for script in browser-door expense-workflow; do status=0; node "ui/tests/$script.mjs" || status=$?; [ "$status" -lt 128 ] || exit "$status"; [ "$status" = 0 ] || rc=1; done; exit "$rc"
 
 # The knowledge graph's 14 browser tests (first paint, frame gap, DOM budget,
 # determinism, hex-literal ban, slicer, path). Outside the gate this file sat
@@ -252,7 +268,15 @@ win-check:
 # there). A skip is printed, never silent, so a machine without the tools
 # knows it did not look.
 win-check-if-available:
-    if ! command -v cargo-xwin >/dev/null 2>&1 || [ ! -x /opt/homebrew/opt/llvm/bin/llvm-lib ]; then echo "win-check SKIPPED: cargo-xwin or llvm-lib not installed (the Windows CI leg compiles this for real)"; elif [ ! -d "${CARGO_TARGET_DIR:-target}/x86_64-pc-windows-msvc" ]; then echo "win-check SKIPPED: cold Windows target — a fresh checkout would cross-compile every dependency (the release lane's scratch clone sat in it for 2 h on 2026-09-10); run \`just win-check\` once to warm this checkout"; else just win-check; fi
+    if ! command -v cargo-xwin >/dev/null 2>&1 || [ ! -x /opt/homebrew/opt/llvm/bin/llvm-lib ]; then echo "win-check SKIPPED: cargo-xwin or llvm-lib not installed (the Windows CI leg compiles this for real)"; elif [ ! -d "${CARGO_TARGET_DIR:-target}/x86_64-pc-windows-msvc" ]; then echo "win-check SKIPPED — not a check: cold Windows target. \`just win-check\` cross-compiles every dependency once (1–2 min on this Mac in 2026-10; the release lane's scratch clone sat in it 2 h on 2026-09-10), and \`just pre-handin\` runs it for a branch that changed Rust"; else just win-check; fi
+
+# A recipe as the release lane's launchd job runs it — HOME and PATH only, no
+# controlling terminal, launchd's open-file limit (tools/release/lane-env.sh) —
+# for a test that is red in the lane and green in a terminal:
+#   just lane-env shell-test        just lane-env test -p zerocode-core
+[positional-arguments]
+lane-env recipe *args:
+    tools/release/lane-env.sh just "$@"
 
 package-windows:
     npm run test:package-contract
@@ -293,6 +317,12 @@ fmt:
 #   the gate runs those (the last lines say so). The contracts build the window
 #   once, so a first run in a fresh checkout takes minutes on every core,
 #   whichever crate the branch changed.
+#   Then the Windows build of each workspace the branch changed a Rust source or
+#   manifest of (`changed_crates.py` names it): the gate's own `just win-check`
+#   there, never `win-check-if-available` — whose SKIPPED on a cold target is
+#   rc 0 and was counted as a check in a hand-in (2026-11-10). It cross-compiles
+#   every dependency the first time in a checkout (1–2 min on this Mac, 2026-10),
+#   and a machine without cargo-xwin and Homebrew llvm is red here, not skipped.
 #   Stage 2, only when ui/ changed: the window suites you name, with
 #   `just pre-handin a,b` (names or patterns, as WINDOW_SUITES takes them).
 #   The whole window gate is 23 min on a quiet machine, so a worker never runs
@@ -369,6 +399,11 @@ pre-handin suites='':
                 step "doc:$package" env RUSTDOCFLAGS="$doc_flags" cargo doc -p "$package" --no-deps
             fi
         done <<< "$picked"
+        for workspace in $(printf '%s\n' "$picked" | awk -F'\t' '$1 == "windows" { print $2 }'); do
+            name=win; [ "$workspace" = . ] || name="win-$workspace"
+            hint="fix what the cross-compile says above, then rerun (cd $workspace && just win-check); without cargo-xwin or Homebrew llvm here: cargo install cargo-xwin; brew install llvm"
+            step "$name" bash -c 'cd "$1" && just win-check' _ "$workspace"
+        done
         ui=$(printf '%s\n' "$picked" | awk -F'\t' '$1 == "ui" { print $2 }')
     else
         ui=

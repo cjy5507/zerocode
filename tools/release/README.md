@@ -11,6 +11,17 @@ starts. Any isolated browser retry judgments also finish before release builds.
 This ordering is fixed; there is no parallel-gate override. App and zo release
 builds may still overlap after verification, when no harness is running.
 
+## A recipe as the lane runs it (`lane-env.sh`, 2026-11-10)
+
+    just lane-env shell-test          # or: tools/release/lane-env.sh <command…>
+
+runs the command with what the lane's launchd job has and nothing else: HOME
+and `LAUNCHD_PATH` (no TERM, COLORTERM, LANG or TMPDIR), no controlling
+terminal and stdin at its end, and launchd's open-file limit (`launchctl limit
+maxfiles`, 256). `CARGO_TARGET_DIR`, `CARGO_INCREMENTAL` and `NODE_PATH` go
+along when set: the lane sets its own, and a checkout's are the equivalent. A test red in the lane and green in a pane is
+run this way first. `tests/test_lane.py LaneEnv` pins it.
+
 ## The version (one hand: `bump.sh`)
 
     tools/release/bump.sh {patch|minor|major}
@@ -213,7 +224,10 @@ of them: `skill-release`, `backend-count` (a count assert over a crate's
 checkout of the head made for it and removed after, four at once (over 30 s it
 is said unchecked: the gate's to run). `test_lane.py` and the computer bench's
 `test_bench.py` ran past that on every 10-25 head, so they run only with
-`--slow` and are otherwise said unchecked; the default run stays under 10 s. It prints `RC <check>=<rc> (<s>s)` with reasons,
+`--slow` and are otherwise said unchecked; the default run stays under 10 s. A changed path a crate of the other Cargo workspace reads at compile time
+(`include_str!` and the like) is printed `owed <crate dir> — …`, not red: on
+2026-11-11 a zo landing reworded a line of zo's resume.rs that the window
+crate's jev_scope test reads, and v1.1.140's lane went red on it. It prints `RC <check>=<rc> (<s>s)` with reasons,
 `unchecked <path>` for a path no check reads, and `RC prebatch=<rc>`; it exits 1
 on a red and 2 when a revision cannot be read. It runs no cargo and stands in for
 no gate: a green says only that these checks found nothing, and every recipe the
@@ -369,6 +383,18 @@ zo-gate's 12.4 GiB and 11.4 of root-gate's 19 GiB. Only a target still over
 `TARGET_CAP_GB` after that is cleaned whole, which costs its next gate every
 registry crate (245 for v1.1.62's zo gate, about 6 minutes).
 `tests/test_workspace_units.py` proves the drop on a real cargo build.
+
+A target copied in from elsewhere is read too (2026-11-10): cargo keys a
+registry crate's units by nothing that holds the target's path, and of a copied
+build-script run it rewrites only the OUT_DIR in the recorded output, never the
+paths the script wrote into files. A worktree's target copied into root-gate
+kept tauri's permission lists naming that worktree; the worktree was removed
+and v1.1.140's root gate stopped on them. Before the gates,
+`workspace_units.py foreign` drops each build-script run that ran in another
+target (its `root-output` is not its own `out`), with its fingerprint, and that
+build script runs again (`target <lane>: removed N build-script run(s) that ran
+in another target` in the lane log). Copy a target out of the lane, never into
+it.
 
 ## The two phases after the swaps
 

@@ -77,6 +77,8 @@ pub mod task_packet;
 pub mod task_registry;
 mod team_inbox_digest;
 pub mod team_cron_registry;
+#[cfg(test)]
+pub(crate) mod test_root;
 pub mod todo_progress;
 pub mod todo_store;
 pub mod tool_cancel;
@@ -350,6 +352,7 @@ pub use prompt::{
     ReminderCandidate, SKILLS_INDEX_HEADING, SKILL_INDEX_BUDGET_TOKENS, MAX_REMINDER_LINES,
     MAX_REMINDER_TOKENS,
     REMINDERS_SECTION_HEADING, REMINDER_LINE_PREFIX,
+    PROJECT_INSTRUCTIONS_HEADING, SCOPED_INSTRUCTIONS_HEADING,
     frontier_model_name, retarget_prompt_model, CLAUDE_CODE_IDENTITY,
     SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };

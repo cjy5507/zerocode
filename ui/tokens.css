@@ -1269,6 +1269,13 @@
 
   --motion-dialog: 200ms;
 
+  /* The glide that takes the words a person just sent up to the top of the
+   * conversation (`glideChatPin`, 2026-11-10, the approved picture's 「부드럽게
+   * 올라감」, window artifact p-1c1bbf75726ff227): a screen's travel, so longer
+   * than a state change's 150ms — about what the engines' own smooth scroll
+   * takes over a screen — and over as the answer's first words arrive. */
+  --chat-pin-glide: 300ms;
+
   /* How long a conversation's first read may take before the page says it is
    * reading (t-54304). Claude's empty conversation fades in 0.2 s late
    * (`shared-12-6xBCRyAw.js@151413`) and Dots' loading spinner waits too
@@ -2844,6 +2851,12 @@
   --chat-dot-failed: #c74e39;
   --chat-tool-bg: color-mix(in srgb, var(--ink-chalk) 4%, transparent);
   --chat-code-bg: color-mix(in srgb, var(--ink-chalk) 8%, transparent);
+  /* The code ground as it reads on the page, opaque: a long block's bar stays
+   * at the list's top while its code passes under it (2026-11-10). */
+  --chat-code-bar-bg: color-mix(in srgb, var(--ink-chalk) 8%, var(--chat-ground));
+  /* How tall a long block of code stands before 「전체 보기 (N줄)」: about a
+   * screen's third, Streamdown's default. */
+  --chat-code-clip: 400px;
   /* The approved conversation (t-22100): a step's argument in a soft link
    * ink — the link's colour leaning to the words', so a column of addresses,
    * queries and commands reads as the machine's without shouting — and the
@@ -3017,6 +3030,9 @@
   --chat-tally-bar-min: 80px;
   --chat-actions-h: 36px; /* An answer's action marks (2026-11-10): 28px marks and 8px separation. */
   --chat-actions-space: var(--chat-actions-h);
+  /* From the end of one turn's answer to the next turn's words (2026-11-10,
+   * window artifact p-1c1bbf75726ff227: 「차례 사이 32px, 그 안은 12px」). */
+  --chat-turn-gap: var(--space-6);
   --chat-actions-gap: 2px;
   --chat-recovery-width: 480px; /* Approved recovery dialog. */
   --chat-recovery-title-size: 20px; /* Approved modal title, distinct from prose. */
@@ -3688,6 +3704,7 @@
   --chat-dot-failed: #c74e39;
   --chat-tool-bg: color-mix(in srgb, var(--ink-chalk) 3%, transparent);
   --chat-code-bg: color-mix(in srgb, var(--ink-chalk) 6%, transparent);
+  --chat-code-bar-bg: color-mix(in srgb, var(--ink-chalk) 6%, var(--chat-ground));
   --chat-arg-ink: var(--chat-link);
   --chat-rail-tick: color-mix(in srgb, var(--ink-mist) 30%, transparent);
   --chat-accent: var(--ai-accent);

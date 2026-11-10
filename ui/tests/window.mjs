@@ -1,4 +1,5 @@
 import { endRun } from "./end-run.mjs";
+import { runShards, shardCount } from "./window-shards.mjs";
 import "./scm-notices.mjs";
 import "./mail-waiting.mjs";
 import "./prompt-parked.mjs";
@@ -85,6 +86,11 @@ import { testFlowConsole } from "./flow-console.mjs";
 import { testWorktreeEvidence } from "./worktree-evidence.mjs";
 import { testAgentConversation } from "./agent-conversation.mjs";
 import { testConversationAfter, testConversationArchive, testConversationComposerNext, testConversationRecovery, testConversationReviewTests, testConversationReviewUndo, testConversationT3, testConversationBehindTab } from "./conversation-after.mjs";
+import { testConversationBudget } from "./conversation-budget.mjs";
+import {
+  testConversationCliNotes, testConversationCode, testConversationFailedFold, testConversationFirstAsk, testConversationLongOutput,
+  testConversationTable, testConversationTurnGap,
+} from "./conversation-outputs.mjs";
 import { testConversationPin, testConversationResult, testConversationViewMenu } from "./conversation-result.mjs";
 import { testHelperDoors } from "./helper-doors.mjs";
 import { testBrowserRecovery } from "./browser-recovery.mjs";
@@ -130,8 +136,9 @@ import { testYourTurn } from "./your-turn.mjs";
 import { testPassTwoBFit } from "./pass2-b-fit.mjs";
 import { testPaneFirstView, testPaneHead, testPaneHeadReach } from "./pane-head.mjs";
 import { testStackedWork } from "./stacked-work.mjs";
+import { testRightColumnGeist } from "./right-column-geist.mjs";
 import { testPhoneAwake } from "./phone-awake.mjs";
-import { testChatList, testNewChat } from "./chat-list.mjs";
+import { testChatList, testChatListKeyed, testNewChat, testNewChatStart } from "./chat-list.mjs";
 import { testSelfAct } from "./self-act.mjs";
 import { testComputerShare } from "./computer-share.mjs";
 import { testExplain } from "./explain.mjs";
@@ -229,6 +236,12 @@ const primaryPress = (...keys) => [PRIMARY_KEY, ...keys].join("+");
 // Both halves of the reported platform (`shell.js` prefers userAgentData and falls back to navigator.platform): a
 // Windows shortcut test stays Windows even when this harness itself runs on macOS or Linux.
 const addReportedPlatform = (page, platform) => page.addInitScript(reportedPlatformScript, platform);
+
+/* `WINDOW_SHARDS=<n>`: a whole run split across n browsers at once (window-shards.mjs). This process opens no
+ * browser and plans nothing: it starts n shares of itself, each with its own server and browser, and prints
+ * their checks as one report. */
+const shardTotal = shardCount();
+if (shardTotal > 1) process.exit(await runShards({ count: shardTotal, script: fileURLToPath(import.meta.url) }));
 
 /* The window asks the backend for everything it draws, so the backend is
  * stubbed down to the answers a first frame needs. Anything missing here does
@@ -357,11 +370,14 @@ suite("pane-head", ({ browser, origin, ok }) => testPaneHead(browser, origin, ok
 suite("pane-head-reach", ({ browser, origin, ok }) => testPaneHeadReach(browser, origin, ok));
 suite("pane-first-view", ({ browser, origin, ok }) => testPaneFirstView(browser, origin, ok, join(UI, "..", "output/playwright")));
 suite("stacked-work", ({ browser, origin, ok }) => testStackedWork(browser, origin, ok));
+suite("right-column-geist", ({ browser, origin, ok }) => testRightColumnGeist(browser, origin, ok));
 // Keeping an Android phone awake (T7, 2026-11-09): the settings card's rows and the status bar's chip.
 suite("phone-awake", ({ browser, origin, ok }) => testPhoneAwake(browser, origin, ok));
 // The T3 Code chat view, stages 2 and 3 (2026-11-08): the sidebar's conversation list, and the 「새 대화」 start page.
 suite("chat-list", ({ browser, origin, ok }) => testChatList(browser, origin, ok));
+suite("chat-list-keyed", ({ browser, origin, ok }) => testChatListKeyed(browser, origin, ok));
 suite("new-chat", ({ browser, origin, ok }) => testNewChat(browser, origin, ok));
+suite("new-chat-start", ({ browser, origin, ok }) => testNewChatStart(browser, origin, ok));
 /* IDE design pass 2 B at five widths, in dark and light. */
 suite("pass2-b-fit", ({ browser, origin, ok }) => testPassTwoBFit(browser, origin, ok));
 /* ZeroCode's own window as a Computer Use target: the page's half (t-73906). */
@@ -605,6 +621,14 @@ suite("conversation-behind-tab", ({ browser, origin, ok }) => testConversationBe
 suite("conversation-result", ({ browser, origin, ok }) => testConversationResult(browser, origin, ok));
 suite("conversation-view-menu", ({ browser, origin, ok }) => testConversationViewMenu(browser, origin, ok));
 suite("conversation-pin", ({ browser, origin, ok }) => testConversationPin(browser, origin, ok));
+suite("conversation-outputs-notes", ({ browser, origin, ok }) => testConversationCliNotes(browser, origin, ok));
+suite("conversation-outputs-failed", ({ browser, origin, ok }) => testConversationFailedFold(browser, origin, ok));
+suite("conversation-outputs-table", ({ browser, origin, ok }) => testConversationTable(browser, origin, ok));
+suite("conversation-outputs-code", ({ browser, origin, ok }) => testConversationCode(browser, origin, ok));
+suite("conversation-outputs-long", ({ browser, origin, ok }) => testConversationLongOutput(browser, origin, ok));
+suite("conversation-first-ask", ({ browser, origin, ok }) => testConversationFirstAsk(browser, origin, ok));
+suite("conversation-turn-gap", ({ browser, origin, ok }) => testConversationTurnGap(browser, origin, ok));
+suite("conversation-budget", ({ browser, origin, ok }) => testConversationBudget(browser, origin, ok));
 suite("conversation-archive", ({ browser, origin, ok }) => testConversationArchive(browser, origin, ok));
 suite("conversation-recovery", ({ browser, origin, ok }) => testConversationRecovery(browser, origin, ok));
 /* 검토 패널의 테스트 줄·「이 변경 되돌리기」, 실행 중 입력창의 보낼 시점 안내 (t-95969). */
@@ -9837,7 +9861,9 @@ const graph = await page.evaluate(async (rows) => {
   seen.headCircles = drawn[1]?.querySelectorAll("circle").length;
   const badge = drawn[1]?.querySelector(".history-ref");
   seen.badgeWords = badge?.textContent;
-  seen.badgeInk = badge?.style.color;
+  // The ref's lane hue, handed to the sheet as `--ref-hue` (2026-11-10): the
+  // sheet tints the ground with it and leans the word toward the ink.
+  seen.badgeInk = badge?.style.getPropertyValue("--ref-hue");
   // The side branch's lane is inked with the rotation's first colour.
   seen.laneInk = drawn[3]?.querySelector('path[stroke="var(--git-graph-lane-1)"]') !== null;
   // Every stroke is an element handed over, none invented: this row's
@@ -27180,9 +27206,9 @@ ok(
 /* The two `.btn` wearers are the measured sizes as RENDERED, not as declared.
  * Both were written at 11px in the panel's own CSS section and drew at 14px,
  * because the base `.btn` rule is later in the file and wins at equal
- * specificity — a bug no attribute assertion can see. The sizes are the
- * panel's own steps, read from the tokens: on the Geist steps the person
- * passed on 10-21 (t-67607) the away button's 2xs step is 12px, not 11. */
+ * specificity — a bug no attribute assertion can see. Since the right
+ * column's Geist pass (2026-11-10, p-39057edd7d8a28d6) both are the column's
+ * one button: Label 13 on the side column's 28px, read from the tokens. */
 const checkButtons = await page.evaluate(() => {
   const face = (node) => {
     const seen = getComputedStyle(node);
@@ -27192,13 +27218,14 @@ const checkButtons = await page.evaluate(() => {
   return {
     away: face(document.querySelector(".check-pane-away")),
     fix: face(document.getElementById("pr-fix")),
-    steps: { away: tokens.getPropertyValue("--text-2xs").trim(), fix: tokens.getPropertyValue("--text-xs").trim() },
+    steps: { away: tokens.getPropertyValue("--text-sm").trim(), fix: tokens.getPropertyValue("--text-sm").trim() },
+    height: Math.round(Number.parseFloat(tokens.getPropertyValue("--control-height-sm"))),
   };
 });
 ok(
-  "the panel's buttons render at the panel's own type steps, not at the base button's",
-  checkButtons.away.size === checkButtons.steps.away && checkButtons.away.height === 24 &&
-    checkButtons.fix.size === checkButtons.steps.fix && checkButtons.fix.height < 30,
+  "the panel's buttons render as the column's button, not at the base button's",
+  checkButtons.away.size === checkButtons.steps.away && checkButtons.away.height === checkButtons.height &&
+    checkButtons.fix.size === checkButtons.steps.fix && checkButtons.fix.height === checkButtons.height,
   JSON.stringify(checkButtons),
 );
 
@@ -32451,15 +32478,20 @@ const pullRequest = await page.evaluate(async () => {
   const headBox = dialog.querySelector(".prc-head").getBoundingClientRect();
   const actionBox = dialog.querySelector(".prc-actions").getBoundingClientRect();
   const contentStyle = getComputedStyle(dialog.querySelector(".prc-content"));
-  seen.titleWorn = titleBox.height === "36px" && parseFloat(titleBox.borderTopWidth) > 0;
+  // Geist's dialog field since the 2026-11-10 pass: 32px, its edge a ring.
+  seen.titleWorn = titleBox.height === getComputedStyle(document.documentElement).getPropertyValue("--control-height-md").trim() &&
+    (parseFloat(titleBox.borderTopWidth) > 0 || titleBox.boxShadow !== "none");
   seen.titleNotMono = !/mono/i.test(titleBox.fontFamily);
   seen.draftBoxSized = document.getElementById("pr-new-draft").offsetWidth < 30;
   seen.polishedLayout =
     document.querySelectorAll(".prc-route .prc-route-node").length === 2 &&
     document.querySelectorAll(".prc-field-group").length === 2 &&
     contentStyle.overflowY === "auto" &&
-    headBox.top >= dialogBox.top &&
-    actionBox.bottom <= dialogBox.bottom;
+    // The dialog's edge is a ring outside its box since the 2026-11-10 Geist
+    // pass, so the head and the footer meet the box's edges exactly; a box
+    // read while the dialog scales open rounds by a fraction of a pixel.
+    headBox.top >= dialogBox.top - 0.5 &&
+    actionBox.bottom <= dialogBox.bottom + 0.5;
   const close = document.getElementById("pr-new-close");
   seen.closeVisible = !close.hidden && close.getBoundingClientRect().width >= 30;
   close.click();
@@ -33057,10 +33089,28 @@ const scmChrome = await page.evaluate(async () => {
       primary: {
         height: Math.round(Number.parseFloat(primaryStyle.height)),
         font: Number.parseFloat(primaryStyle.fontSize),
-        // The step it is set at, read from the tokens: 2xs is 12px on the
-        // Geist steps the person passed on 10-21 (t-67607), 11px before.
-        step: Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--text-2xs")),
+        // The Geist pass (2026-11-10, p-39057edd7d8a28d6, C): the side
+        // column's control height and Label 13, read from the tokens, and
+        // the ink fill only while the commit can act — Geist's quiet raised
+        // face while it cannot. Orca's outlined xs button before.
+        controlHeight: Math.round(Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--control-height-sm"))),
+        step: Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--text-sm")),
         fill: primaryStyle.backgroundColor,
+        disabled: document.getElementById("scm-primary").disabled,
+        quiet: (() => {
+          const probe = document.body.appendChild(document.createElement("i"));
+          probe.style.background = "var(--surface-raised)";
+          const colour = getComputedStyle(probe).backgroundColor;
+          probe.remove();
+          return colour;
+        })(),
+        ink: (() => {
+          const probe = document.body.appendChild(document.createElement("i"));
+          probe.style.background = "var(--ink-chalk)";
+          const colour = getComputedStyle(probe).backgroundColor;
+          probe.remove();
+          return colour;
+        })(),
       },
       duplicateAllHidden: getComputedStyle(document.getElementById("changes-open")).display,
       compareBaseBorder: compareBaseStyle.borderTopWidth,
@@ -33109,9 +33159,9 @@ ok(
     scmChrome.stickyHead === "sticky" &&
     scmChrome.headInset === "12px" &&
     scmChrome.commitInset === "12px" &&
-    scmChrome.primary.height === 26 &&
+    scmChrome.primary.height === scmChrome.primary.controlHeight &&
     scmChrome.primary.font === scmChrome.primary.step &&
-    scmChrome.primary.fill === "rgba(0, 0, 0, 0)" &&
+    scmChrome.primary.fill === (scmChrome.primary.disabled ? scmChrome.primary.quiet : scmChrome.primary.ink) &&
     scmChrome.duplicateAllHidden === "none" &&
     scmChrome.compareBaseBorder === "0px" &&
     JSON.stringify(scmChrome.committedOpen) === JSON.stringify([24, 24]) &&
@@ -37800,8 +37850,11 @@ ok(
  * 같은 종류가 붙어 서는 걸음은 한 줄로 접히므로 400걸음의 실측
  * (measure-steps)은 오히려 준다. 이 검사가 돌 때마다 실측이 `HELPER_NODES`
  * 줄로 로그에 남는다. 09-30(t-16914): 표식이 svg·use 대신 span 하나(마스크)가 되어
- * 행마다 둘이 줄어 실측 2153이고 상한도 그 값이다. */
-const HELPER_LIST_NODES_CEILING = 2153;
+ * 행마다 둘이 줄어 실측 2153이고 상한도 그 값이다. 11-10(v1.1.140): 차례 사이가
+ * 32px로 좁아져(사람이 승인한 대화 화면, 아티팩트 p-1c1bbf75726ff227) 선반이 몸을
+ * 입히는 두 화면 안에 답 하나가 더 들어온다 — 몸을 입은 답 8 → 9, 그 문단 하나가
+ * 늘어 실측 2154이고 상한도 그 값이다. 노드를 지은 쪽은 아무것도 늘지 않았다. */
+const HELPER_LIST_NODES_CEILING = 2154;
 await page.setViewportSize({ width: 1280, height: 860 });
 const flatTranscript = await page.evaluate(async () => {
   const seen = {};
@@ -53419,7 +53472,8 @@ ok(
  * (HudWindow / acrylic) is what blurs the desktop. The four chrome bands wear
  * the veil alone — a `backdrop-filter` on each was a second backdrop layer
  * per window edge, re-rendered by the compositor on every commit the streaming
- * stage made. The overlays keep theirs: they sit over the window's own content. */
+ * stage made. The overlays kept theirs until the 2026-11-10 Geist pass (G):
+ * they are the one solid floating material now, so nothing blurs at all. */
 const blurChrome = await page.evaluate(async () => {
   const root = document.documentElement;
   const prior = root.getAttribute("data-blur");
@@ -53442,9 +53496,9 @@ const blurChrome = await page.evaluate(async () => {
   return { bands, overlays, veil };
 });
 ok(
-  "under blur the chrome bands leave the blur to the platform and only overlays carry a backdrop",
+  "under blur the chrome bands leave the blur to the platform and the overlays are solid, so nothing carries a backdrop",
   blurChrome.bands.every(({ backdrop }) => backdrop === "none") &&
-    blurChrome.overlays.every(({ backdrop }) => backdrop !== null && backdrop !== "none") &&
+    blurChrome.overlays.every(({ backdrop }) => backdrop === "none") &&
     blurChrome.veil !== "rgba(0, 0, 0, 0)",
   JSON.stringify(blurChrome),
 );
@@ -56821,7 +56875,11 @@ suite("continue-dialog-geist", async ({ browser, origin, ok }) => {
         open: !el("continue-scrim").hidden,
         titleSize: title?.fontSize, subSize: sub?.fontSize, subInk: sub?.color === mist,
         labelSize: label?.fontSize, labelInk: label?.color === mist,
-        comboHeight: Math.round(combo?.getBoundingClientRect().height ?? 0),
+        // The layout height, not the painted box: the dialog scales in from
+        // --enter-scale over --motion-dialog, and a box read 120 ms after the
+        // open is the field times that scale — 31px on a slow CI runner while
+        // the field itself is the 32px token (v1.1.139 tag CI, 2026-11-10).
+        comboHeight: combo?.offsetHeight ?? 0,
         footGround: footStyle?.backgroundColor === abyss, footRule: footStyle?.borderTopWidth === "1px",
         primaryLast: cancel.right <= start.left, primaryRight: footBox ? Math.round(footBox.right - start.right) : -1,
         firstFocus: document.activeElement === el("continue-agent"),

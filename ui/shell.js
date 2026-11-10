@@ -2119,6 +2119,8 @@ function paintYourTurn() {
   const drawing = yourTurnsDrawing(turns);
   paintYourTurnGroup(turns, drawing);
   if (!el("your-turn-list").hidden) paintYourTurnList(turns, drawing);
+  // The conversation list's 「waiting」 rows are these turns (2026-11-10).
+  if (typeof paintChatList === "function") paintChatList();
 }
 
 function yourTurnButton(className, words, run) {
@@ -11786,8 +11788,9 @@ function fittedAgentRowWords(node, row) {
  * Words are text nodes and can be written in place. Anything that would
  * change a row's SHAPE — its agent, state, depth, fold, or a span that
  * would have to appear or go — is left to the rebuild, and the answer says
- * which it was. A card is re-dressed whole or rebuilt whole, never half of
- * each: every row is checked before any is written. */
+ * which it was. Every row is checked before any is written: a card whose
+ * rows all fit is re-dressed whole, and one that does not goes to
+ * `fittedOrMadeAgentSlots`, which keeps every row that still fits. */
 function redressAgentRows(host, rows) {
   // A helper's row stands in a line with its reading hand (t-95957 r3); the words are the row's.
   const held = [...host.children].map(agentRowOfSlot);
@@ -11798,40 +11801,66 @@ function redressAgentRows(host, rows) {
     if (fit === null) return false;
     fitted.push(fit);
   }
-  for (const fit of fitted) {
-    const { node, row, state } = fit;
-    if (fit.history) continue;
-    if (fit.foldedSummary) {
-      const words = foldedSummaryWords(row, state);
-      if (node.dataset.tip !== words.tip) node.dataset.tip = words.tip;
-      writeAttribute(node, "aria-label", words.label);
-      continue;
-    }
-    writeTextContent(fit.name, fit.primary);
-    if (fit.said !== null) writeTextContent(fit.said, fit.secondary);
-    if (fit.wears !== null) {
-      writeTextContent(fit.wears, fit.model);
-      const modelTip = agentRowModelTip(row);
-      if (fit.wears.dataset.tip !== modelTip) fit.wears.dataset.tip = modelTip;
-    }
-    if (fit.accountNode !== null) {
-      writeTextContent(fit.accountNode, fit.account.words);
-      if (fit.accountNode.dataset.tip !== fit.account.tip) fit.accountNode.dataset.tip = fit.account.tip;
-    }
-    if (fit.usesNode !== null) writeTextContent(fit.usesNode, fit.uses);
-    if (fit.chip !== null) {
-      writeTextContent(fit.chip, paneRoleWord(fit.role));
-      const roleTip = paneRoleTip(fit.role);
-      if (fit.chip.dataset.tip !== roleTip) fit.chip.dataset.tip = roleTip;
-    }
-    writeTextContent(fit.stateNode, fit.status);
-    writeTextContent(node.querySelector(".wt-agent-when"), agentRowAgo(row));
-    const tip = agentRowTip(fit.primary, fit.secondary, fit.uses, row);
-    if (node.dataset.tip !== tip) node.dataset.tip = tip;
-    writeAttribute(node, "aria-label", agentRowSpoken(tip, fit.status, agentRowAgo(row), fit.role,
-      row.kids > 0 ? agentFoldLabel(row) : ""));
-  }
+  for (const fit of fitted) dressFittedAgentRow(fit);
   return true;
+}
+
+/* The slots a card's rows stand in when the card could not be re-dressed whole (t-102869): a row that still
+ * fits a standing one — the same pane or helper, the same shape (`fittedAgentRowWords`) — keeps that node and has
+ * its words written in place; only a row that changed shape, or came, is built. Before, one row changing shape
+ * rebuilt every row of the card: new nodes for agents nothing had happened to, their rings started again, the
+ * pointer's hover and a focused row lost (review t-102362 #2). */
+function fittedOrMadeAgentSlots(host, rows) {
+  const standing = [...host.children];
+  const taken = new Set();
+  return rows.map((row) => {
+    for (const slot of standing) {
+      if (taken.has(slot)) continue;
+      const node = agentRowOfSlot(slot);
+      if (!node?.classList.contains("wt-agent")) continue;
+      const fit = fittedAgentRowWords(node, row);
+      if (fit === null) continue;
+      taken.add(slot);
+      dressFittedAgentRow(fit);
+      return slot;
+    }
+    return makeAgentRow(row, true);
+  });
+}
+
+/* Write one fitted row's words into the nodes it already holds (`fittedAgentRowWords` said they fit). */
+function dressFittedAgentRow(fit) {
+  const { node, row, state } = fit;
+  if (fit.history) return;
+  if (fit.foldedSummary) {
+    const words = foldedSummaryWords(row, state);
+    if (node.dataset.tip !== words.tip) node.dataset.tip = words.tip;
+    writeAttribute(node, "aria-label", words.label);
+    return;
+  }
+  writeTextContent(fit.name, fit.primary);
+  if (fit.said !== null) writeTextContent(fit.said, fit.secondary);
+  if (fit.wears !== null) {
+    writeTextContent(fit.wears, fit.model);
+    const modelTip = agentRowModelTip(row);
+    if (fit.wears.dataset.tip !== modelTip) fit.wears.dataset.tip = modelTip;
+  }
+  if (fit.accountNode !== null) {
+    writeTextContent(fit.accountNode, fit.account.words);
+    if (fit.accountNode.dataset.tip !== fit.account.tip) fit.accountNode.dataset.tip = fit.account.tip;
+  }
+  if (fit.usesNode !== null) writeTextContent(fit.usesNode, fit.uses);
+  if (fit.chip !== null) {
+    writeTextContent(fit.chip, paneRoleWord(fit.role));
+    const roleTip = paneRoleTip(fit.role);
+    if (fit.chip.dataset.tip !== roleTip) fit.chip.dataset.tip = roleTip;
+  }
+  writeTextContent(fit.stateNode, fit.status);
+  writeTextContent(node.querySelector(".wt-agent-when"), agentRowAgo(row));
+  const tip = agentRowTip(fit.primary, fit.secondary, fit.uses, row);
+  if (node.dataset.tip !== tip) node.dataset.tip = tip;
+  writeAttribute(node, "aria-label", agentRowSpoken(tip, fit.status, agentRowAgo(row), fit.role,
+    row.kids > 0 ? agentFoldLabel(row) : ""));
 }
 
 /* A pane row's own 「변경 N」 (t-95969 G2): only a pane's row — a helper's row carries its parent's term. */
@@ -12711,10 +12740,16 @@ function restartSessionGroups(items) {
  * project header jumping into view — and the rows' real height comes back without the scroll. Laid out beside the
  * old rows, the list is never shorter than where it ends. Chromium never cut it. */
 function swapAgentRows(host, rows, leaving) {
-  const old = [...host.childNodes];
-  host.append(...rows);
   const kept = new Set(rows);
-  for (const node of old) if (!kept.has(node)) leaving.push(node);
+  for (const node of [...host.childNodes]) if (!kept.has(node)) leaving.push(node);
+  // A kept row stays where it stands unless the order moved (t-102869): a node taken out and put back starts its
+  // ring and its hover again. The leaving rows are stepped over, not moved — they go once the list is laid out.
+  let cursor = host.firstChild;
+  for (const row of rows) {
+    while (cursor !== null && !kept.has(cursor)) cursor = cursor.nextSibling;
+    if (cursor === row) cursor = cursor.nextSibling;
+    else host.insertBefore(row, cursor);
+  }
 }
 
 function paintWorktreeAgents() {
@@ -12726,6 +12761,8 @@ function paintWorktreeAgents() {
   const hosts = worktreeList.querySelectorAll(".wt-agents[data-worktree-path]");
   // The rows the new ones replace, taken out once every card's new rows stand and are laid out (`swapAgentRows`).
   const leaving = [];
+  // The cards this pass changed, whose rings are pinned once after the last of them (`keepTurnsInStep`).
+  const stirred = [];
   for (const host of hosts) {
     const path = host.dataset.worktreePath;
     const all = worktreeAgentRows(path);
@@ -12802,6 +12839,7 @@ function paintWorktreeAgents() {
       + `|review:${waiting}`;
     if (host.dataset.said === signature) continue;
     host.dataset.said = signature;
+    stirred.push(host);
     dressWorktreeReviewFoot(host, waiting);
     dressWorktreeTwist(host.previousElementSibling, path, hidden);
     dressWorktreeTitle(host.previousElementSibling);
@@ -12812,7 +12850,7 @@ function paintWorktreeAgents() {
       // exact axis and the two levels read as siblings. Rows that later gain
       // children replace the quiet seat with the real chevron in place.
       if (!redressAgentRows(host, rows)) {
-        swapAgentRows(host, rows.map((row) => makeAgentRow(row, true)), leaving);
+        swapAgentRows(host, fittedOrMadeAgentSlots(host, rows), leaving);
       }
     } else {
       swapAgentRows(host, [
@@ -12838,6 +12876,11 @@ function paintWorktreeAgents() {
     // only dresses it.
     host.closest(".wt-node")?.classList.toggle("has-agents", !host.hidden);
   }
+  // Every ring a changed card holds turns from where the old one stood, not from the top — its new rows' rings, and
+  // the card's own ring that a row going quiet or hidden just uncovered. Pinned once, after the last card: asking
+  // the animations brings the style forward, and asked card by card it was one style pass for each card changed
+  // (review t-102958 #1). The first ask settles the style; the asks after it find nothing left to compute.
+  for (const host of stirred) keepTurnsInStep(host.closest(".wt-node") ?? host);
   if (leaving.length > 0) {
     // One layout with the new rows beside the old — the read is what lays them out — then the old ones go.
     void sidebarScroller.scrollHeight;
@@ -12904,6 +12947,9 @@ function flushAgentPaint() {
     paintWorktreeAgents();
     // The team view's rows read the same panes' states (t-56141); a row whose words did not move is not touched.
     paintSidebarTeam();
+    // So does the sidebar's conversation list, and a wire's state (`holdWireState`): it follows the news on
+    // this beat, putting its rows in place by their keys (`paintChatList`, 2026-11-10).
+    if (typeof paintChatList === "function") paintChatList();
     paintStageCard();
     // 같은 사실의 다섯째 표면: 아티팩트 스튜디오의 「초안을 받을 에이전트」는
     // 에이전트가 앉은 판의 목록이다. 서 있을 때만 그린다(2026-09-13, 「에이전트가
@@ -15812,8 +15858,27 @@ function personFootNode(turn) {
  * window's resume nudge (`window`) and its mail pointer (`window_mail`), both
  * marked by `pane_log`, and the summary a CLI hands itself when it compacts
  * (`summary`, the transcript reader). On the person's page of 2026-11-06 they
- * were six of six bubbles. */
-const NOTE_ROLES = new Set(["window", "window_mail", "summary"]);
+ * were six of six bubbles.
+ *
+ * And what a CLI writes for the model in the person's place (2026-11-10, the
+ * same reader): the body of a skill it read (`skill_note`), a hook's feedback
+ * (`hook_note`), any other line of its own — another session's message, a
+ * usage notice (`cli_note`). On the person's page of that day a skill's whole
+ * body stood as their bubble. */
+const CLI_NOTE_ROLES = new Set(["skill_note", "hook_note", "cli_note"]);
+const NOTE_ROLES = new Set(["window", "window_mail", "summary", ...CLI_NOTE_ROLES]);
+
+/* How much of a CLI's own line its note says before the door: one line of it. */
+const CLI_NOTE_HEAD = 72;
+
+/* What a CLI's line opens with, for its note: its first line that says
+ * anything, without the tags the CLI wraps its plumbing in, cut at
+ * `CLI_NOTE_HEAD` — the whole of it stands behind the door. */
+function cliNoteHead(text) {
+  const line = text.split("\n").map((one) => one.replace(/<[^>]*>/g, " ").trim()).find(Boolean) ?? "";
+  const said = line.replace(/\s+/g, " ").replace(/[:：]$/, "");
+  return said.length > CLI_NOTE_HEAD ? `${said.slice(0, CLI_NOTE_HEAD - 1).trimEnd()}…` : said;
+}
 
 /* The line a note says, and its door's word. The pointer's count is read off
  * the words the backend already named as the pointer, not matched again. */
@@ -15823,6 +15888,21 @@ function windowNoteWords(turn) {
   }
   if (turn.role === "summary") {
     return [t("worker.summaryNote", "이어가기 요약 · 이전 대화가 길어 요약을 넘겼습니다"), t("worker.summaryNoteOpen", "펼치기")];
+  }
+  if (turn.role === "skill_note") {
+    // The body opens by naming the skill's folder (`Base directory for this
+    // skill: …/<name>`): the folder's name is the skill's.
+    const folder = turn.text.split("\n", 1)[0].split(":").slice(1).join(":").trim();
+    const name = folder.split(/[\\/]/).filter(Boolean).at(-1) ?? folder;
+    return [t("worker.skillNote", "스킬을 읽음 · {{name}}", { name }), t("worker.windowNoteOpen", "원문")];
+  }
+  if (turn.role === "hook_note") {
+    // 「Stop hook feedback:」 — the hook's event is what the line opens with.
+    const event = turn.text.split("\n", 1)[0].split(" hook feedback")[0].trim();
+    return [t("worker.hookNote", "훅 알림 · {{event}}", { event }), t("worker.windowNoteOpen", "원문")];
+  }
+  if (turn.role === "cli_note") {
+    return [t("worker.cliNote", "CLI 알림 · {{said}}", { said: cliNoteHead(turn.text) }), t("worker.windowNoteOpen", "원문")];
   }
   return [t("worker.windowNote", "창 알림 · 창이 다시 시작되어 이어 가라고 알렸습니다"), t("worker.windowNoteOpen", "원문")];
 }
@@ -15835,6 +15915,8 @@ function windowNoteWords(turn) {
 function windowNoteNode(turn) {
   const row = document.createElement("details");
   row.className = "helper-turn is-window-note";
+  // A CLI's own line can be a skill's whole body: opened, it scrolls in its box (shell.css).
+  if (CLI_NOTE_ROLES.has(turn.role)) row.classList.add("is-cli-note");
   row.dataset.turn = String(turn.seq);
   row.__turn = turn;
   const line = document.createElement("summary");
@@ -15852,9 +15934,9 @@ function windowNoteNode(turn) {
     if (!row.open || row.querySelector(":scope > .helper-window-note-said")) return;
     const said = document.createElement("p");
     said.className = "helper-window-note-said";
-    // The window's own lines are English; a CLI's summary is in whatever
-    // language the conversation was.
-    if (turn.role !== "summary") said.lang = "en";
+    // The window's own lines are English; a CLI's summary and its other
+    // lines are in whatever language the conversation — or the skill — was.
+    if (turn.role === "window" || turn.role === "window_mail") said.lang = "en";
     said.textContent = turn.text;
     row.appendChild(said);
   });
@@ -16030,10 +16112,17 @@ function helperStatusNode(run) {
 function updateHelperStatus(line, run) {
   const shown = run.status === "running";
   if (line.hidden === shown) {
+    // The line is the list's last row. Standing, it stands under the words a
+    // reader at the foot follows — asked before it stands, and the list goes
+    // down with it: a paint of the words alone (`paintHelperWords`) carries
+    // nothing, and the line stood behind the dock until the next whole paint.
+    // Standing or gone, it moves the height under a pinned question, which
+    // measures its room again.
+    const list = line.parentElement;
+    const follows = shown && list?.__follow ? chatFollows(list) : false;
     writeHidden(line, !shown);
-    // The line is the list's last row: standing or gone, it moves the height
-    // under a pinned question, which measures its room again.
-    if (line.parentElement?.__follow?.pin) standChatPinRoom(line.parentElement);
+    if (list?.__follow?.pin) standChatPinRoom(list);
+    else if (follows) carryToFoot(list);
   }
   // The ring wears the permission mode's reach, as the extension's spinner
   // does (`[data-permission-mode]` on its container).
@@ -16061,7 +16150,7 @@ function updateHelperStatus(line, run) {
  * draws once it has settled, and is laid out once: the settled part is drawn
  * once (`settledCut`). The diagrams come after the doors, which walk the words
  * and would walk a drawing's labels too. */
-function paintHelperProse(host, text, base, { colour = true } = {}) {
+function paintHelperProse(host, text, base, { colour = true, clip = true } = {}) {
   const previous = mdWhere;
   mdWhere = { base, page: null };
   try {
@@ -16070,8 +16159,12 @@ function paintHelperProse(host, text, base, { colour = true } = {}) {
     // words still being written are drawn again next frame and ask nothing.
     linkifyHelperProse(host, { chips: colour });
     if (colour) paintMarkdownDiagrams(host);
-    // Each code block wears the extension's copy over its corner (A9).
-    dressCodeCopies(host);
+    // Each code block wears the extension's copy over its corner (A9); a long
+    // one stands folded unless the caller reads it as it comes (`clip`).
+    dressCodeCopies(host, { clip });
+    // A settled table wears its copy at the end of its head row (2026-11-10);
+    // the block still being written is drawn again next frame and wears none.
+    if (colour) dressTables(host);
   } catch {
     // The words still stand as one paragraph, so the prose rules (the column,
     // 「표·코드는 넓게」's measure) reach them as they reach a drawn answer.
@@ -16749,6 +16842,8 @@ function paintActivityPill(group, run, spoken) {
   let live = null;
   let first = null;
   let last = null;
+  // The first step that failed: what the fold says under its line (`paintPillWhy`).
+  let broke = null;
   // Each kind with how many of it, in the order it first came.
   const kinds = new Map();
   // A call whose result has not come yet: the pill is counted again on each
@@ -16765,7 +16860,10 @@ function paintActivityPill(group, run, spoken) {
     kinds.set(kind, (kinds.get(kind) ?? 0) + 1);
     first ??= turn;
     last = turn;
-    if (state === "failed") failed += 1;
+    if (state === "failed") {
+      failed += 1;
+      broke ??= turn;
+    }
     if (state === "live") live = turn;
   }
   // A settled turn's one line says the turn: how long it worked and what it did.
@@ -16790,6 +16888,22 @@ function paintActivityPill(group, run, spoken) {
   writeClass(group, "is-live", live !== null);
   writeClass(group, "is-failed", live === null && failed > 0);
   writeClass(group, "is-done", live === null && failed === 0);
+  paintPillWhy(group, live === null ? broke : null, run);
+}
+
+/* A fold that failed says why without being opened (2026-11-10, window artifact
+ * p-1c1bbf75726ff227 — 「까닭은 펼쳐야 보입니다」 was the page's way): under its
+ * line, the first step that failed and the first line it printed, as that
+ * step's own row says it (`stepWhyLine`). The fold's own line (`::after`, read
+ * off `data-why`) and no node: a 400-turn page with eleven failed folds would
+ * pay eleven. Opened, the rows say it and the line steps aside (shell.css). */
+function paintPillWhy(group, turn, run) {
+  if (!turn) {
+    if (group.dataset.why !== undefined) delete group.dataset.why;
+    return;
+  }
+  const output = turn.role === "tool_result" ? turn.text : turn.output ?? "";
+  writeAttribute(group, "data-why", `${pillStepWords(turn, run)} — ${stepWhyLine(output) || t("worker.noOutput", "출력 없음")}`);
 }
 
 /* 알약의 한 줄이 걸음을 말하는 법 — 종류의 말, 그리고 돌린 것이나 만진 것.
@@ -16960,9 +17074,11 @@ function foldSettledTurns(list, run, pills) {
   const settle = () => {
     const rows = block;
     block = [];
-    // The turn's last words: every answer after its last work.
-    const lastWork = rows.findLastIndex((row) => row.classList.contains("helper-group"));
+    // The turn's last words: every answer after its last work — and after the
+    // skill bodies that work read, which fold with it.
+    let lastWork = rows.findLastIndex((row) => row.classList.contains("helper-group"));
     if (lastWork < 0 || Number(rows.at(-1).dataset.turn) > working) return;
+    while (rows[lastWork + 1]?.__turn?.role === "skill_note") lastWork += 1;
     const folding = rows.slice(0, lastWork + 1);
     const target = folding.find((row) => row.classList.contains("helper-group"));
     const answer = rows[lastWork + 1] ?? null;
@@ -16990,7 +17106,9 @@ function foldSettledTurns(list, run, pills) {
   };
   for (let row = list.firstElementChild; row; row = row.nextElementSibling) {
     if (row.dataset.turn === undefined) continue;
-    if (row.classList.contains("helper-group") || row.classList.contains("is-assistant")) {
+    // A skill's body is part of the work that read it (the Skill call stands
+    // in the turn's pill): it folds with the turn rather than cut it in two.
+    if (row.classList.contains("helper-group") || row.classList.contains("is-assistant") || row.__turn?.role === "skill_note") {
       block.push(row);
       continue;
     }
@@ -17057,6 +17175,99 @@ function applyFoldedView(list, folded) {
     row.remove();
   }
   list.__lastAnswer = null;
+  // The page is drawn anew: a long one from its last turns up, as when it opened.
+  list.__openFloor = undefined;
+}
+
+/* ---- a long conversation opens on its last turns (2026-11-10) ------------------
+ *
+ * The open built a row for every turn the page holds — 397 of them for a
+ * 400-turn conversation on the whole timeline — in the one task before its
+ * first frame: 74–112 ms of row building, a long task or two, 176 ms to the
+ * first paint in WebKit (window artifact p-1c1bbf75726ff227, 「성능·메모리」).
+ * A list with no row yet draws its last `CHAT_OPEN.first` turns — two screens
+ * and more, back to the person's words that began the turn they fall in — and
+ * the turns above them stand in steps of `CHAT_OPEN.step`, each after a frame
+ * has been drawn, by the road turns read from above already take
+ * (`standEarlierRows`): a reader at the foot stays at the foot, one who went
+ * up keeps the row they read. `list.__openFloor` is the first turn drawn while
+ * steps remain, `null` once all stand, `undefined` before the list has decided.
+ *
+ * Whole at once, as before: a conversation short of `first + least` turns, and
+ * one that comes back to the row its reader left (`chatPlace`), which may be
+ * above the floor. What must see every row asks for them (`completeChatOpen`):
+ * a find, whose hit can be in a turn not drawn yet. */
+const CHAT_OPEN = Object.freeze({ first: 80, step: 160, least: 40 });
+
+/* The index of the first turn at or past `seq` — the turns stand in order. */
+function turnIndexFrom(turns, seq) {
+  let low = 0;
+  let high = turns.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (turns[mid].seq < seq) low = mid + 1;
+    else high = mid;
+  }
+  return low;
+}
+
+/* Back from `at` to the person's words that began that turn — a turn is drawn
+ * whole or not at all. */
+function turnStartFrom(turns, at) {
+  let from = at;
+  while (from > 0 && turns[from].role !== "user") from -= 1;
+  return from;
+}
+
+function openHeldTurns(list, turns) {
+  if (list.__openFloor === undefined) {
+    // Nothing held yet: the list decides when it has turns to draw.
+    if (turns.length === 0) return turns;
+    const from = turns.length > CHAT_OPEN.first + CHAT_OPEN.least && firstTurnRow(list) === null && !list.__run?.chatPlace
+      ? turnStartFrom(turns, turns.length - CHAT_OPEN.first)
+      : 0;
+    list.__openFloor = from > 0 ? turns[from].seq : null;
+    if (from > 0) standRestOfOpen(list);
+  }
+  if (list.__openFloor === null) return turns;
+  const from = turnIndexFrom(turns, list.__openFloor);
+  return from > 0 ? turns.slice(from) : turns;
+}
+
+/* The next step up: after a frame was drawn, in a task of its own. */
+function standRestOfOpen(list) {
+  if (list.__openStep) return;
+  list.__openStep = requestAnimationFrame(() => {
+    list.__openStep = setTimeout(() => {
+      list.__openStep = 0;
+      if (lowerChatOpen(list, CHAT_OPEN.step)) standRestOfOpen(list);
+    }, 0);
+  });
+}
+
+/* Lower the floor by `step` turns and draw them. Whether more remain. */
+function lowerChatOpen(list, step) {
+  const run = list.__run;
+  if (!run || list.__openFloor === null || list.__openFloor === undefined) return false;
+  const turns = run.helper.turns;
+  const at = turnIndexFrom(turns, list.__openFloor);
+  const from = at <= 0 ? 0 : turnStartFrom(turns, Math.max(0, at - step));
+  list.__openFloor = from > 0 ? turns[from].seq : null;
+  if (at > 0) {
+    list.__openStepping = true;
+    try {
+      syncHelperTurns(list, run);
+    } finally {
+      list.__openStepping = false;
+    }
+  }
+  return list.__openFloor !== null;
+}
+
+/* Every turn the page holds, drawn now. */
+function completeChatOpen(list) {
+  if (!list || list.__openFloor === null || list.__openFloor === undefined) return;
+  lowerChatOpen(list, Infinity);
 }
 
 /* 전사를 장부에 맞춘다 — 통째로 다시 세우지 않고.
@@ -17070,12 +17281,15 @@ function applyFoldedView(list, folded) {
  * (그래서 CSS가 브라우저의 자동 앵커를 끈다 — 보정이 두 벌이면 한 벌이
  * 거짓말이 된다). */
 function syncHelperTurns(list, run) {
-  const held = run.helper.turns;
   list.__run = run;
   // 이 목록이 입고 있는 값이 토글의 값과 다르면 먼저 맞춘다 — 같으면
   // 아무것도 만지지 않으므로 조용한 폴은 여기서 값을 치르지 않는다.
   const folded = foldedView();
   applyFoldedView(list, folded);
+  // A long conversation opens on its last turns; the ones above them stand in
+  // the moments after (`openHeldTurns`) — and so does a page the toggle above
+  // just cleared to draw anew.
+  const held = openHeldTurns(list, run.helper.turns);
   if (!held.length) {
     for (const row of list.querySelectorAll(":scope > [data-turn]")) row.remove();
     run.helper.gone?.clear();
@@ -17259,7 +17473,7 @@ function syncHelperTurns(list, run) {
   // The words the person just sent go to the list's top (2026-11-10); a list
   // already pinned measures the room under its words again.
   const pinned = list.__follow?.pinNext && people.length > 0
-    ? pinChatQuestion(list, people.at(-1))
+    ? pinChatQuestion(list, people.at(-1), { glide: true })
     : (standChatPinRoom(list), Boolean(list.__follow?.pin));
   if (follow && !reported && !pinned) scrollHelperToBottom(list);
   // Words that grew past the foot of a list standing still: no `scroll` says so.
@@ -17384,7 +17598,11 @@ function dropGoneRows(list, run, pills) {
 function standEarlierRows(list, run, earlier, folded, spoken, pills) {
   let front = firstTurnRow(list);
   if (!front || !earlier.length) return;
-  let warm = CHAT_SHELF.warm;
+  // Turns a reader pushed up to read stand whole nearest them; the ones a long
+  // conversation's open steps up to (`lowerChatOpen`) are far above its reader
+  // and born without their bodies, as the open's own early rows are — the
+  // shelf builds each when it comes within reach.
+  let warm = list.__openStepping ? 0 : CHAT_SHELF.warm;
   const people = [];
   for (let at = earlier.length - 1; at >= 0; at -= 1) {
     const turn = earlier[at];
@@ -17505,7 +17723,8 @@ function paintLiveAnswerNow(row, text, run) {
   const cut = settledCut(text, text.length);
   if (cut > row.__settledEnd) {
     const closed = document.createDocumentFragment();
-    paintHelperProse(closed, text.slice(row.__settledEnd, cut), helperBase(run));
+    // The answer being written is read as it comes: none of its code folds.
+    paintHelperProse(closed, text.slice(row.__settledEnd, cut), helperBase(run), { clip: false });
     settled.append(closed);
     row.__settledEnd = cut;
   }
@@ -17513,7 +17732,7 @@ function paintLiveAnswerNow(row, text, run) {
   if (rest !== row.__tailText) {
     row.__tailText = rest;
     tail.replaceChildren();
-    if (rest.trim() !== "") paintHelperProse(tail, rest, helperBase(run), { colour: false });
+    if (rest.trim() !== "") paintHelperProse(tail, rest, helperBase(run), { colour: false, clip: false });
   }
   if (follow) carryToFoot(list);
   else if (list.__follow?.pin) askFootDoor(list);
@@ -17553,6 +17772,10 @@ function helperTurnsNode(run) {
   // 「그림·페이지로 설명」 단추는 답변 행에 포인터나 초점이 처음 닿을 때 짓는다(t-32787).
   watchAnswerActions(list);
   watchExplainTurns(list);
+  // A code block's 「줄바꿈」 is built the first time a hand reaches the block.
+  watchCodeBlocks(list);
+  // The presses an answer's card takes, heard here once for every card.
+  watchResultPresses(list);
   // It keeps to its foot until the person leaves it (t-6323 A5).
   keepToFoot(list);
   syncHelperTurns(list, run);
@@ -19185,6 +19408,8 @@ function releaseWorkerPage(tab) {
  * pace (t-22100), its watchers — let go when its page leaves for good. */
 function forgetChatList(list) {
   list.__actions?.__sizeWatch?.disconnect();
+  // A page that leaves while its open still steps up draws no more.
+  list.__openFloor = null;
   if (list.__rail?.__frame) cancelAnimationFrame(list.__rail.__frame);
   clearTimeout(list.__rail?.__scrolled);
   list.__shelf?.disconnect();

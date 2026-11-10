@@ -110,7 +110,7 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: READ_FILE_TOOL_NAME,
-            description: "Read workspace text, PDF pages, or notebook cells and outputs. Read one generous range and batch independent files. Do not reread after a successful edit unless disk may have changed. A whole code-file read ends with [neighbours].",
+            description: "Read workspace text, images, PDF pages, or notebook cells and outputs. Read one generous range and batch independent files. Do not reread after a successful edit unless disk may have changed. A whole code-file read ends with [neighbours].",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -152,7 +152,13 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "Replace exact, previously read workspace text. old_string must be unique unless replace_all. Success means applied; do not reread only to verify.",
+            // No word here says the text must have been read: an `old_string`
+            // that stands in the file once is applied to a file never read
+            // (`prepare_guarded_edit`), and a description that still asked
+            // for the read sent a model that follows it to `Read` first — a
+            // whole request the guard no longer wants. The sentence is no
+            // longer than the one it replaces, so the tool budget stands.
+            description: "Replace exact text. old_string must be unique unless replace_all; unique needs no prior Read. Success means applied; do not reread to verify.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -298,6 +304,9 @@ pub(crate) fn dispatch(
         READ_FILE_TOOL_NAME => Some(
             maybe_enforce_permission_check(enforcer, name, input).and_then(|()| {
                 from_value::<ReadFileInput>(input).and_then(|inp| {
+                    if let Some(image) = read_as_an_image(&inp, enforcer, ctx) {
+                        return image;
+                    }
                     run_read_file(
                         &inp,
                         enforcer,
@@ -709,6 +718,55 @@ pub(crate) fn run_read_file(
     to_pretty_json(output)
 }
 
+/// `Read` pointed at an image: the picture, staged for the model exactly as
+/// `read_image` stages one. `None` for any other file, which is read as text.
+///
+/// One tool reads a file, whatever the file is. A model shown `Read` asks it
+/// for a screenshot as it asks it for a source file — the agent CLIs it
+/// learned from read both with the one tool — and until now that read failed
+/// on the bytes not being text, and the picture took a lookup of `read_image`
+/// and a second call to reach. What the file is comes from its first bytes
+/// ([`sniff_image_mime`]), not from its name, so a `.png` holding text is
+/// still read as text and a picture with no extension is still seen.
+///
+/// The read boundary is `Read`'s own: a path it would refuse is handed on to
+/// [`run_read_file`], which refuses it in its usual words.
+fn read_as_an_image(
+    input: &ReadFileInput,
+    enforcer: Option<&PermissionEnforcer>,
+    ctx: &ToolContext,
+) -> Option<Result<String, ToolError>> {
+    let resolved = enforce_read_boundary(
+        enforcer,
+        ctx.session_permission_mode(),
+        &input.path,
+        ctx.workspace_root.as_deref(),
+    )
+    .ok()?;
+    let target = resolved
+        .or_else(|| resolve_against_cwd(&input.path, ctx.cwd.as_deref()))
+        .unwrap_or_else(|| std::path::PathBuf::from(&input.path));
+    if !starts_as_an_image(&target) {
+        return None;
+    }
+    Some(run_read_image(
+        &ReadImageInput {
+            path: target.to_string_lossy().into_owned(),
+        },
+        ctx,
+    ))
+}
+
+/// Whether the file's first bytes are those of an image the model can be
+/// shown. A file that cannot be opened is not one; its reader says why.
+fn starts_as_an_image(path: &Path) -> bool {
+    use std::io::Read as _;
+    let mut head = [0_u8; 12];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read(&mut head))
+        .is_ok_and(|read| sniff_image_mime(&head[..read]).is_some())
+}
+
 /// Read an image file and stage it (`media_type`, base64) in the context's image
 /// sink so the conversation loop can attach it to this tool's result — the
 /// model then *sees* the image. Returns a short text summary as the textual
@@ -881,13 +939,10 @@ pub(crate) fn run_edit_file(
     enforcer: Option<&PermissionEnforcer>,
     ctx: &ToolContext,
 ) -> Result<String, ToolError> {
-    let (target, target_path) = prepare_guarded_file_write(ctx, enforcer, "edit_file", &input.path)?;
-    let output = edit_file(
-        &target,
-        &input.old_string,
-        &input.new_string,
-        input.replace_all.unwrap_or(false),
-    )?;
+    let replace_all = input.replace_all.unwrap_or(false);
+    let (target, target_path) =
+        prepare_guarded_edit(ctx, enforcer, &input.path, &input.old_string, replace_all)?;
+    let output = edit_file(&target, &input.old_string, &input.new_string, replace_all)?;
     ctx.record_workspace_checkpoint_write(&target_path);
     // 자기 자신이 만든 변경은 신선한 것으로 등재 — 연속 edit 허용.
     record_file_observation(&ctx.file_reads, &output.file_path);
@@ -976,6 +1031,16 @@ impl PatchedFile<'_> {
 ///
 /// Unlike `Edit`, a file need not have been read first: an update's context
 /// lines must match the file as it is now, which is the freshness proof.
+///
+/// The operations apply in the order the patch wrote them, each to what the
+/// ones before it left ([`planned_state`]) — as they would if every one were a
+/// patch of its own, except that nothing is written until all of them have
+/// been computed. A model that writes two `*** Update File` sections for one
+/// file means the second to follow the first, which is how codex-cli applies
+/// them. Until 2026-11-11 such a patch was refused whole, because each
+/// operation read the file as the disk held it and the second would have
+/// undone the first: 5 of 29 failed `apply_patch` calls in seven days on one
+/// machine, each answered with a second request to say the same thing again.
 pub(crate) fn run_apply_patch(
     input: &ApplyPatchInput,
     enforcer: Option<&PermissionEnforcer>,
@@ -983,19 +1048,62 @@ pub(crate) fn run_apply_patch(
 ) -> Result<String, ToolError> {
     let operations = runtime::apply_patch::parse_patch(&input.input)
         .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
-    let files = operations
-        .iter()
-        .map(|operation| plan_patched_file(operation, enforcer, ctx))
-        .collect::<Result<Vec<_>, _>>()?;
-    refuse_repeated_patch_paths(&files)?;
+    let mut files: Vec<PatchedFile<'_>> = Vec::with_capacity(operations.len());
+    for operation in &operations {
+        let file = plan_patched_file(operation, &files, enforcer, ctx)?;
+        files.push(file);
+    }
     for file in &files {
         write_patched_file(file, ctx)?;
     }
     patch_report(&files)
 }
 
+/// What the operations planned so far have made of one path, before anything
+/// is written.
+enum Planned<'f> {
+    /// They have not touched it: its state is the disk's.
+    Untouched,
+    /// They leave a file there, holding this text.
+    File(&'f str),
+    /// They deleted it or moved it away.
+    Gone,
+}
+
+/// The state the last planned operation on `path` left it in.
+fn planned_state<'f>(planned: &'f [PatchedFile<'_>], path: &Path) -> Planned<'f> {
+    planned
+        .iter()
+        .rev()
+        .find_map(|file| {
+            if file.written() == path {
+                Some(file.contents.as_deref().map_or(Planned::Gone, Planned::File))
+            } else if file.source == path {
+                Some(Planned::Gone)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(Planned::Untouched)
+}
+
+/// Whether a file stands at `path` once the operations planned so far have
+/// run; `on_disk` answers for a path they left alone.
+fn stands_after(
+    planned: &[PatchedFile<'_>],
+    path: &Path,
+    on_disk: impl FnOnce(&Path) -> bool,
+) -> bool {
+    match planned_state(planned, path) {
+        Planned::Untouched => on_disk(path),
+        Planned::File(_) => true,
+        Planned::Gone => false,
+    }
+}
+
 fn plan_patched_file<'p>(
     operation: &runtime::apply_patch::PatchOperation<'p>,
+    planned: &[PatchedFile<'_>],
     enforcer: Option<&PermissionEnforcer>,
     ctx: &ToolContext,
 ) -> Result<PatchedFile<'p>, ToolError> {
@@ -1003,7 +1111,7 @@ fn plan_patched_file<'p>(
     let file = match *operation {
         PatchOperation::Add { path, ref lines } => {
             let source = guard_patch_path(ctx, enforcer, CoreTool::Write, path)?;
-            if source.exists() {
+            if stands_after(planned, &source, Path::exists) {
                 return Err(ToolError::InvalidInput(format!(
                     "{path} already exists; change it with `*** Update File: {path}`"
                 )));
@@ -1019,7 +1127,7 @@ fn plan_patched_file<'p>(
         }
         PatchOperation::Delete { path } => {
             let source = guard_patch_path(ctx, enforcer, CoreTool::Write, path)?;
-            if !source.is_file() {
+            if !stands_after(planned, &source, Path::is_file) {
                 return Err(ToolError::InvalidInput(format!("{path} is not a file to delete")));
             }
             PatchedFile {
@@ -1033,7 +1141,15 @@ fn plan_patched_file<'p>(
         }
         PatchOperation::Update { path, move_to, ref hunks } => {
             let source = guard_patch_path(ctx, enforcer, CoreTool::Edit, path)?;
-            let original = std::fs::read_to_string(&source)?;
+            let original = match planned_state(planned, &source) {
+                Planned::File(text) => std::borrow::Cow::Borrowed(text),
+                Planned::Gone => {
+                    return Err(ToolError::InvalidInput(format!(
+                        "{path} is gone by this point of the patch: an earlier operation deleted or moved it"
+                    )));
+                }
+                Planned::Untouched => std::borrow::Cow::Owned(std::fs::read_to_string(&source)?),
+            };
             let contents = apply_hunks(&original, hunks, path)
                 .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
             let destination = move_to
@@ -1041,7 +1157,7 @@ fn plan_patched_file<'p>(
                 .transpose()?
                 .filter(|destination| destination != &source);
             if let (Some(to), Some(destination)) = (move_to, &destination) {
-                if destination.exists() {
+                if stands_after(planned, destination, Path::exists) {
                     return Err(ToolError::InvalidInput(format!(
                         "cannot move {path} to {to}: {to} already exists"
                     )));
@@ -1084,24 +1200,6 @@ fn guard_patch_path(
     resolve_guarded_write_target(ctx, enforcer, path)
 }
 
-/// Two operations on one file would each read the file as it was before the
-/// patch, and the second would silently undo the first.
-fn refuse_repeated_patch_paths(files: &[PatchedFile<'_>]) -> Result<(), ToolError> {
-    let mut seen: Vec<&std::path::Path> = Vec::with_capacity(files.len() * 2);
-    for file in files {
-        for path in std::iter::once(file.source.as_path()).chain(file.destination.as_deref()) {
-            if seen.contains(&path) {
-                return Err(ToolError::InvalidInput(format!(
-                    "the patch changes {} more than once; merge those hunks into one `*** Update File`",
-                    file.label
-                )));
-            }
-            seen.push(path);
-        }
-    }
-    Ok(())
-}
-
 fn write_patched_file(file: &PatchedFile<'_>, ctx: &ToolContext) -> Result<(), ToolError> {
     let written = file.written();
     let moved = written != file.source;
@@ -1135,6 +1233,11 @@ fn write_patched_file(file: &PatchedFile<'_>, ctx: &ToolContext) -> Result<(), T
 /// codex-cli's success text, plus the files in the envelope shape
 /// `runtime::edited_file_paths` reads (`files[].filePath`). No diff: the
 /// model wrote the patch, and echoing it back is paid on every later turn.
+///
+/// The text has a line for every operation, in order. `files` has one entry a
+/// path — the last operation's — because its readers act on the file each
+/// entry names (auto-format, diagnostics), and an earlier operation's entry
+/// would name a file a later one rewrote, moved or removed.
 fn patch_report(files: &[PatchedFile<'_>]) -> Result<String, ToolError> {
     let mut summary = String::from("Success. Updated the following files:");
     for file in files {
@@ -1149,7 +1252,14 @@ fn patch_report(files: &[PatchedFile<'_>]) -> Result<String, ToolError> {
     }
     let listed: Vec<Value> = files
         .iter()
-        .map(|file| {
+        .enumerate()
+        .filter(|(index, file)| {
+            let path = file.written();
+            !files[index + 1..]
+                .iter()
+                .any(|later| later.source == path || later.written() == path)
+        })
+        .map(|(_, file)| {
             let mut entry = json!({
                 "filePath": file.written().to_string_lossy(),
                 "kind": file.kind.key(),
@@ -1174,6 +1284,56 @@ fn prepare_guarded_file_write(
     enforce_read_before_write(&ctx.file_reads, tool_name, &target)?;
     ctx.record_workspace_checkpoint_before(&target_path)?;
     Ok((target, target_path))
+}
+
+/// [`prepare_guarded_file_write`] for `edit_file`, which can prove what a
+/// whole-file write cannot.
+///
+/// The read-before-write guard keeps a change from landing on text the model
+/// does not hold. A whole-file write gives no sign of what it knows, so the
+/// guard asks for a read. An edit does: an `old_string` that stands in the
+/// file on disk exactly once is the text at the place it changes, read or
+/// not — which is the whole of what pi's `edit` asks, and what the model
+/// usually has from a `grep` or a `cat` the registry never hears of. Seven
+/// days on one machine to 2026-11-10: 30 of 41 failed `edit_file` calls were
+/// a file never read and 4 were a string that did not match, and each
+/// refusal cost a read and a second edit — two more requests over a context
+/// that averaged 283k tokens.
+///
+/// Two refusals stay. A file that changed on disk since it was read still has
+/// to be read again: there the model holds an OLD file, and what the person
+/// did to it meanwhile is the thing it must see. And `replace_all` changes
+/// every occurrence, of which one matching string says nothing.
+fn prepare_guarded_edit(
+    ctx: &ToolContext,
+    enforcer: Option<&PermissionEnforcer>,
+    path: &str,
+    old_string: &str,
+    replace_all: bool,
+) -> Result<(String, std::path::PathBuf), ToolError> {
+    let target_path = resolve_guarded_write_target(ctx, enforcer, path)?;
+    let target = target_path.to_string_lossy().into_owned();
+    let never_read = ctx
+        .file_reads
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .check(&target_path)
+        == FileFreshness::NeverRead;
+    let placed = never_read && !replace_all && names_one_place_on_disk(&target_path, old_string);
+    if !placed {
+        enforce_read_before_write(&ctx.file_reads, "edit_file", &target)?;
+    }
+    ctx.record_workspace_checkpoint_before(&target_path)?;
+    Ok((target, target_path))
+}
+
+/// Whether `old_string` stands in the file as it is on disk exactly once. A
+/// file that cannot be read as text answers no, and the guard's own refusal
+/// stands.
+fn names_one_place_on_disk(path: &Path, old_string: &str) -> bool {
+    !old_string.is_empty()
+        && std::fs::read_to_string(path)
+            .is_ok_and(|content| content.matches(old_string).take(2).count() == 1)
 }
 
 fn resolve_guarded_write_target(
@@ -1985,6 +2145,52 @@ mod read_image_tests {
         path
     }
 
+    /// `Read` reads a file whatever it is. Pointed at a picture it stages the
+    /// picture, as `read_image` does, and what decides is what the file holds:
+    /// a picture with no image extension is seen, and text named `.png` is
+    /// still read as text.
+    #[test]
+    fn read_stages_an_image_by_what_the_file_holds_not_by_its_name() {
+        let ctx = ToolContext::new();
+        let picture = temp_file("read-as-image", PNG_1X1);
+        let out = super::dispatch(
+            &ctx,
+            None,
+            "read_file",
+            &serde_json::json!({ "path": picture.to_string_lossy() }),
+        )
+        .expect("read_file dispatches")
+        .expect("a picture is read");
+        let staged: serde_json::Value = serde_json::from_str(&out).expect("the staged envelope");
+        assert_eq!(staged["staged"], true, "{out}");
+        assert_eq!(staged["media_type"], "image/png", "{out}");
+        assert_eq!(
+            ctx.image_sink.lock().expect("image sink").len(),
+            1,
+            "the picture reached the model's image sink"
+        );
+
+        let named = temp_file("text-named-png", b"not a picture\n").with_extension("png");
+        std::fs::write(&named, b"not a picture\n").expect("write text");
+        let out = super::dispatch(
+            &ctx,
+            None,
+            "read_file",
+            &serde_json::json!({ "path": named.to_string_lossy() }),
+        )
+        .expect("read_file dispatches")
+        .expect("text is read as text");
+        assert!(out.contains("not a picture"), "{out}");
+        assert_eq!(
+            ctx.image_sink.lock().expect("image sink").len(),
+            1,
+            "text named like a picture staged nothing"
+        );
+        let _ = std::fs::remove_file(picture);
+        let _ = std::fs::remove_file(named.with_extension("bin"));
+        let _ = std::fs::remove_file(named);
+    }
+
     fn oversized_rgba_png(width: u32, height: u32) -> Vec<u8> {
         assert!(width > runtime::image_guard::IMAGE_CLAMP_DIMENSION);
         assert_eq!(height, 1, "test helper keeps the zlib stream single-block");
@@ -2312,8 +2518,8 @@ mod read_image_tests {
 mod boundary_tests {
     use super::{
         enforce_read_before_write, record_file_observation, restore_workspace_checkpoint,
-        run_edit_file, run_grep_search, run_read_file, run_write_file, EditFileInput,
-        ReadFileInput, WriteFileInput,
+        run_apply_patch, run_edit_file, run_grep_search, run_read_file, run_write_file,
+        ApplyPatchInput, EditFileInput, ReadFileInput, WriteFileInput,
     };
     use crate::{error::ToolError, ToolContext};
     use runtime::permission_enforcer::PermissionEnforcer;
@@ -2500,6 +2706,104 @@ mod boundary_tests {
         }
         // Sanity: the file must not exist after a denied write.
         assert!(!outside.exists(), "file should not have been created");
+    }
+
+    /// An enforcer that knows what each tool needs, as a session's does. A
+    /// bare policy asks full access of every tool it was not told of, and
+    /// would turn a patch away at its first operation — before the boundary
+    /// or a rule was ever asked about a later one.
+    fn session_enforcer(denied: &[&str]) -> PermissionEnforcer {
+        let rules = runtime::RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            denied.iter().map(|rule| (*rule).to_string()).collect(),
+            Vec::new(),
+        );
+        let policy = crate::mvp_tool_specs()
+            .iter()
+            .fold(PermissionPolicy::new(PermissionMode::WorkspaceWrite), |policy, spec| {
+                policy.with_tool_requirement(spec.name, spec.required_permission)
+            })
+            .with_permission_rules(&rules);
+        PermissionEnforcer::new(policy)
+    }
+
+    fn patch(ctx: &ToolContext, enforcer: &PermissionEnforcer, text: String) -> Result<String, ToolError> {
+        run_apply_patch(&ApplyPatchInput { input: text }, Some(enforcer), ctx)
+    }
+
+    /// A patch is guarded one operation at a time, and nothing is written
+    /// until every operation has passed: a later operation that leaves the
+    /// workspace refuses the patch, and the file two earlier sections named —
+    /// inside the workspace, and a patch of their own this session may apply
+    /// — keeps every byte.
+    #[test]
+    fn a_patch_whose_later_operation_leaves_the_workspace_writes_nothing() {
+        let workspace = temp_dir("outside-patch-ws");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let inside = workspace.join("a.txt");
+        std::fs::write(&inside, "one\ntwo\n").expect("seed");
+        let outside = temp_dir("outside-patch-target.txt");
+        let enforcer = session_enforcer(&[]);
+        let ctx = context(Some(&workspace));
+        let twice = format!(
+            "*** Update File: {0}\n-one\n+ONE\n*** Update File: {0}\n-two\n+TWO\n",
+            inside.display()
+        );
+
+        let result = patch(
+            &ctx,
+            &enforcer,
+            format!("*** Begin Patch\n{twice}*** Add File: {}\n+escaped\n*** End Patch", outside.display()),
+        );
+        assert!(
+            matches!(result, Err(ToolError::PermissionDenied { .. })),
+            "expected PermissionDenied, got {result:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&inside).expect("read inside"), "one\ntwo\n");
+        assert!(!outside.exists(), "file should not have been created");
+
+        // The two sections alone are a patch this session may apply: it was
+        // the third operation that refused the one above.
+        patch(&ctx, &enforcer, format!("*** Begin Patch\n{twice}*** End Patch"))
+            .expect("the two sections apply by themselves");
+        assert_eq!(std::fs::read_to_string(&inside).expect("read inside"), "ONE\nTWO\n");
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// The same for a rule: a deny rule that covers a later section refuses
+    /// the patch before the earlier sections are written.
+    #[test]
+    fn a_deny_rule_on_a_later_section_keeps_the_earlier_ones_from_being_written() {
+        let workspace = temp_dir("deny-patch-ws");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let notes = workspace.join("notes.txt");
+        let secret = workspace.join(".env");
+        std::fs::write(&notes, "one\n").expect("seed notes");
+        std::fs::write(&secret, "TOKEN=1\n").expect("seed secret");
+        let enforcer = session_enforcer(&["edit_file(*.env)"]);
+        let ctx = context(Some(&workspace));
+        let twice = format!(
+            "*** Update File: {0}\n-one\n+ONE\n*** Update File: {0}\n-ONE\n+1\n",
+            notes.display()
+        );
+
+        let error = patch(
+            &ctx,
+            &enforcer,
+            format!(
+                "*** Begin Patch\n{twice}*** Update File: {}\n-TOKEN=1\n+TOKEN=2\n*** End Patch",
+                secret.display()
+            ),
+        )
+        .expect_err("the deny rule on edit_file covers the last section");
+        assert!(error.to_string().contains("edit_file"), "{error}");
+        assert_eq!(std::fs::read_to_string(&notes).expect("read notes"), "one\n");
+        assert_eq!(std::fs::read_to_string(&secret).expect("read secret"), "TOKEN=1\n");
+
+        patch(&ctx, &enforcer, format!("*** Begin Patch\n{twice}*** End Patch"))
+            .expect("the two sections apply by themselves");
+        assert_eq!(std::fs::read_to_string(&notes).expect("read notes"), "1\n");
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     /// A DANGLING symlink leaf inside the workspace pointing OUT of it must be
@@ -3215,22 +3519,64 @@ mod read_guard_tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// ③ 이 대화에서 읽은 적 없는 기존 파일의 edit은 거부 — `read_file`을
-    /// 지시하는 actionable 에러.
+    /// ③ 이 대화에서 읽은 적 없는 기존 파일이라도, `old_string`이 디스크의
+    /// 파일에 정확히 한 번 있으면 그 edit은 통과한다 — 고칠 자리의 글을 모델이
+    /// 쥐고 있다는 증거가 그 문자열이다. 통과한 edit은 관측으로 등재되어 이어지는
+    /// edit도 재읽기 없이 허용된다.
     #[test]
-    fn edit_without_prior_read_is_rejected() {
+    fn an_edit_that_names_one_place_in_an_unread_file_is_applied() {
         let path = temp_file("never-read-edit");
-        std::fs::write(&path, "alpha\n").expect("seed");
+        std::fs::write(&path, "alpha beta\n").expect("seed");
         let ctx = crate::tests::tool_context_outside_cwd_windows();
 
-        let err = edit(&ctx, &path, "alpha", "omega").expect_err("unread edit must be refused");
-        let message = err.to_string();
-        assert!(
-            message.contains("has not been read") && message.contains(&format!("with {}", core_types::tool_names::CoreTool::Read.wire())),
-            "error must be actionable: {message}"
-        );
-        assert_eq!(std::fs::read_to_string(&path).expect("read back"), "alpha\n");
+        edit(&ctx, &path, "alpha", "omega").expect("a placed edit needs no prior read");
+        assert_eq!(std::fs::read_to_string(&path).expect("read back"), "omega beta\n");
+        edit(&ctx, &path, "beta", "gamma").expect("the edit itself is an observation");
+        assert_eq!(std::fs::read_to_string(&path).expect("read back"), "omega gamma\n");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// ③-a 자리를 못 박는 edit은 여전히 거부 — 문자열이 파일에 없거나, 두 번
+    /// 있거나, `replace_all`이면 모델이 무엇을 아는지 알 수 없으므로 `read_file`을
+    /// 지시하는 actionable 에러를 내고 파일은 그대로 둔다.
+    #[test]
+    fn an_edit_that_cannot_be_placed_in_an_unread_file_is_told_to_read_it() {
+        let seed = "alpha alpha\n";
+        let refused = |old: &str, replace_all: bool| {
+            let path = temp_file("never-read-unplaced");
+            std::fs::write(&path, seed).expect("seed");
+            let ctx = crate::tests::tool_context_outside_cwd_windows();
+            let err = run_edit_file(
+                &EditFileInput {
+                    path: path.to_string_lossy().into_owned(),
+                    old_string: old.to_owned(),
+                    new_string: "omega".to_owned(),
+                    replace_all: Some(replace_all),
+                },
+                None,
+                &ctx,
+            )
+            .expect_err("an unplaced edit of an unread file must be refused");
+            assert_eq!(std::fs::read_to_string(&path).expect("read back"), seed);
+            let _ = std::fs::remove_file(&path);
+            err.to_string()
+        };
+        for (old, replace_all, why) in [
+            ("missing", false, "the string is not in the file"),
+            ("alpha", false, "the string is there twice"),
+            ("alpha", true, "replace_all changes places the string does not name"),
+            ("", false, "an empty string names no place"),
+        ] {
+            let message = refused(old, replace_all);
+            assert!(
+                message.contains("has not been read")
+                    && message.contains(&format!(
+                        "with {}",
+                        core_types::tool_names::CoreTool::Read.wire()
+                    )),
+                "{why}: error must be actionable: {message}"
+            );
+        }
     }
 
     /// ③-b 기존 파일을 통째로 덮어쓰는 `write_file`도 같은 가드를 받는다.
@@ -3285,16 +3631,22 @@ mod read_guard_tests {
             .expect("read_file dispatches")
             .expect("conversation A reads the file");
 
-        // A의 읽기는 B의 가드를 만족시키지 못한다.
+        // A의 읽기는 B의 가드를 만족시키지 못한다. (통째로 덮어쓰는 write로
+        // 본다 — 자리를 못 박은 edit은 읽기 없이도 통과하기 때문이다.)
         let err = dispatch(
             &ctx_b,
             None,
-            "edit_file",
-            &json!({ "path": path_str, "old_string": "alpha", "new_string": "omega" }),
+            "write_file",
+            &json!({ "path": path_str, "content": "clobbered\n" }),
         )
-        .expect("edit_file dispatches")
+        .expect("write_file dispatches")
         .expect_err("conversation B must be told to read first");
         assert!(err.to_string().contains("has not been read"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "shared alpha\n",
+            "B's refused overwrite left the file alone"
+        );
 
         // A 자신은 편집 가능.
         dispatch(

@@ -83,8 +83,16 @@ pub fn frontier_model_name() -> String {
         .and_then(crate::model_catalog::model_family_label)
         .unwrap_or_else(|| "Claude".to_string())
 }
-const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
-const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
+/// One instruction file's share of the prompt, and every file's together.
+///
+/// These are the workspace's own rules, and a rule past the cut is a rule the
+/// model was never shown: at 4,000 characters this repository's own 5,650-byte
+/// `AGENTS.md` lost its last third. The numbers follow what the other agent
+/// CLIs read whole — Codex stops at 32 KiB, Claude Code warns from 40,000
+/// characters — and the text sits in the cached system prefix, so a turn pays
+/// a twentieth of it.
+const MAX_INSTRUCTION_FILE_CHARS: usize = 32_000;
+const MAX_TOTAL_INSTRUCTION_CHARS: usize = 48_000;
 const MAX_SKILL_INDEX_ENTRIES: usize = 32;
 /// The skill index's share of the fixed harness (r15 §2.2, made the release
 /// contract in r49): 900 tokens in the repo's `chars / 4 + 1` estimate. The
@@ -630,7 +638,10 @@ impl SystemPromptBuilder {
             }
         }
         if let Some(vault) = &self.second_brain {
-            sections.push(render_second_brain_section(vault));
+            let rules_loaded = self.project_context.as_ref().is_some_and(|context| {
+                vault_rules_are_among(vault, &context.instruction_files)
+            });
+            sections.push(render_second_brain_section(vault, rules_loaded));
         }
         if let Some(config) = &self.config {
             sections.push(render_config_section(config));
@@ -803,19 +814,40 @@ fn discover_instruction_files(cwd: &Path) -> Vec<ContextFile> {
 
     let mut files = Vec::new();
     for dir in directories {
-        for candidate in [
-            dir.join("context.md"),
-            dir.join("CONTEXT.md"),
-            dir.join("context.local.md"),
-            dir.join("CONTEXT.local.md"),
-            dir.join(".zo").join("context.md"),
-            dir.join(".zo").join("CONTEXT.md"),
-        ] {
-            push_context_file(&mut files, candidate);
+        for name in INSTRUCTION_FILE_NAMES {
+            push_context_file(&mut files, dir.join(name));
+        }
+        for (folder, name) in INSTRUCTION_FOLDER_FILES {
+            push_context_file(&mut files, dir.join(folder).join(name));
         }
     }
     dedupe_instruction_files(files)
 }
+
+/// The instruction files one directory may hold, in the order they are read.
+///
+/// `AGENTS.md` and `CLAUDE.md` are the names the other agent CLIs read, and
+/// the names most repositories already carry: until 2026-11-10 only the
+/// `context.md` family was read, and of 851 conversations on one machine 12
+/// were shown any project rule at all. zo's own family comes after them, so a
+/// rule written for zo alone has the last word in its directory. A file that
+/// repeats another — an `AGENTS.md` beside an identical `CLAUDE.md`, or a
+/// `CLAUDE.md` that only imports it — is shown once
+/// (`dedupe_instruction_files`).
+const INSTRUCTION_FILE_NAMES: &[&str] = &[
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    "context.md",
+    "CONTEXT.md",
+    "context.local.md",
+    "CONTEXT.local.md",
+];
+
+/// The same, one folder down: `(folder, file)`. Only zo's own folder: the walk
+/// climbs to the filesystem root, and another CLI's folder under the home
+/// directory holds that CLI's private notes to itself, not a project's rules.
+const INSTRUCTION_FOLDER_FILES: &[(&str, &str)] = &[(".zo", "context.md"), (".zo", "CONTEXT.md")];
 
 /// Find the persistent-memory index for `cwd` in Zo's global per-project
 /// store (`memory/MEMORY.md`) and then the machine-local overlay
@@ -1375,8 +1407,29 @@ fn render_project_context(project_context: &ProjectContext) -> String {
     lines.join("\n")
 }
 
+/// Heading of the section that carries the workspace's instruction files.
+/// Public for the same reason [`SKILLS_INDEX_HEADING`] is: the prompt-input
+/// accounting keeps this section out of the harness budget, and it has to ask
+/// the renderer which section that is.
+pub const PROJECT_INSTRUCTIONS_HEADING: &str = "# Project instructions";
+
+/// Heading of the index of instruction files that apply to some paths only.
+pub const SCOPED_INSTRUCTIONS_HEADING: &str = "# Scoped instructions";
+
+/// Where the workspace's rules stand among everything else the model is told.
+///
+/// The trust label lists what is evidence and never an order — files, logs,
+/// tool output. These files are neither: the person who owns the workspace
+/// wrote them to be followed, which is how Claude Code, Codex and pi read
+/// theirs. Saying so here, beside the rules, costs nothing in a workspace that
+/// has none.
+const PROJECT_INSTRUCTIONS_STANDING: &str = "These are this workspace's standing rules, written by its owner. Follow them for work here unless they conflict with system policy, the user's explicit request, or a safety or tool boundary. Where a rule states a fact about the code and the code says otherwise, the code decides.";
+
 fn render_instruction_files(files: &[ContextFile]) -> String {
-    let mut sections = vec!["# Project instructions".to_string()];
+    let mut sections = vec![
+        PROJECT_INSTRUCTIONS_HEADING.to_string(),
+        PROJECT_INSTRUCTIONS_STANDING.to_string(),
+    ];
     let mut remaining_chars = MAX_TOTAL_INSTRUCTION_CHARS;
     for file in files {
         if remaining_chars == 0 {
@@ -1399,7 +1452,7 @@ fn render_instruction_files(files: &[ContextFile]) -> String {
 
 fn render_scoped_instruction_index(files: &[ContextFile]) -> String {
     let mut lines = vec![
-        "# Scoped instructions".to_string(),
+        SCOPED_INSTRUCTIONS_HEADING.to_string(),
         "These instruction files declare path globs and are not always applied. Read the file when the task touches a matching path; do not assume the rule applies globally.".to_string(),
     ];
     lines.extend(prepend_bullets(
@@ -1416,6 +1469,23 @@ fn render_scoped_instruction_index(files: &[ContextFile]) -> String {
             .collect(),
     ));
     lines.join("\n")
+}
+
+/// Whether the vault's own rules file is one of the instruction files this
+/// session was shown — true only for a session working inside the vault.
+///
+/// Both sides are resolved before they are compared: the walk spells a path
+/// the way the working directory was given, the vault the way the variable
+/// was written, and on macOS `/tmp` and `/private/tmp` are one folder.
+fn vault_rules_are_among(
+    vault: &crate::second_brain::SecondBrain,
+    files: &[ContextFile],
+) -> bool {
+    let rules = vault.root().join(crate::second_brain::AGENTS_FILE);
+    let resolved = fs::canonicalize(&rules).unwrap_or(rules);
+    files
+        .iter()
+        .any(|file| fs::canonicalize(&file.path).unwrap_or_else(|_| file.path.clone()) == resolved)
 }
 
 fn dedupe_instruction_files(files: Vec<ContextFile>) -> Vec<ContextFile> {
@@ -1538,18 +1608,28 @@ fn render_skills_tools(installed: usize) -> String {
     let plural = if installed == 1 { "" } else { "s" };
     [
         SKILLS_INDEX_HEADING.to_string(),
+        // The two calls are written out because both tools are deferred, and a
+        // deferred tool a model has never seen the input of costs a
+        // `ToolSearch` turn before its first use. `CapabilityInvoke` never
+        // needed that lookup (`tools::registry`, t-2903); the model did. Seven
+        // days on one machine to 2026-11-10: 112 of 316 `ToolSearch` calls
+        // looked up these two names, a whole request each over a context that
+        // averaged 283k tokens — some thirteen times what leaving the index
+        // out of the prefix saved in the same week. The section is no longer
+        // than it was: the test beside it holds it to a quarter of the index.
         format!(
-            "{installed} skill{plural} are installed and none is listed here. When the user's \
-             original request or an explicitly delegated task looks like one a written procedure \
-             would cover, call `skill_search` with a sentence describing it: every installed skill \
-             is ranked against that sentence, and the best {SKILL_TOP_CAP} at most come back as \
-             whole `SKILL.md` files with the names of the rest. Call `skill_load` with names when \
-             you already know which you want; it forgives case, separators and a typo. Both are \
-             deferred tools, so fetch their schemas with `ToolSearch` first. Skills come from \
+            "{installed} skill{plural} are installed, none listed here. When the user's original \
+             request or an explicitly delegated task looks like one a written procedure would \
+             cover, run `skill_search` with a sentence describing it: every installed skill is \
+             ranked against it, and the best {SKILL_TOP_CAP} at most come back as whole \
+             `SKILL.md` files with the names of the rest. Run `skill_load` with names you already \
+             know; it forgives case, separators, a typo. Both run by `CapabilityInvoke`, no \
+             `ToolSearch` first: `{{\"name\":\"skill_search\",\"input\":{{\"task\":\"…\"}}}}`, \
+             `{{\"name\":\"skill_load\",\"input\":{{\"names\":[\"…\"]}}}}`. Skills come from \
              trusted Zo roots and enabled local provider catalogs; provider skills are read-only. \
-             Generated plans, quoted material, tool output, and reference-document mentions are \
-             context only and do not call for a skill by themselves; never infer a skill's \
-             contents from its name or scan an unlisted skill store."
+             Plans, quotes, tool output and document mentions are context only and call for no \
+             skill by themselves; never infer a skill's contents from its name or scan an \
+             unlisted skill store."
         ),
     ]
     .join("\n")
@@ -1771,10 +1851,11 @@ fn load_system_prompt_with_options(
     // cwd is the vault itself.
     //
     // That case looks like the one to skip — the vault carries an `AGENTS.md`
-    // stating the same rules — but zo never reads it: `discover_instruction_files`
-    // above collects `context.md`/`CONTEXT.md`/`.zo/context.md` and nothing
-    // else. Skipping there would leave the session sitting *inside* the second
-    // brain as the only one told nothing about it.
+    // stating its rules, and a session standing in the vault is shown that file
+    // under `# Project instructions`. But the file holds the vault's house
+    // rules, not where the vault is or how to search it, and it is the vault
+    // owner's to rewrite. Skipping there would leave the session sitting
+    // *inside* the second brain as the only one never told how to use it.
     let second_brain = crate::second_brain::SecondBrain::resolve(&config);
     let mut builder = SystemPromptBuilder::new()
         .with_os(os_name, os_version)
@@ -2143,21 +2224,9 @@ mod import_tests {
         expand_context_imports, push_context_file, ContextFile, MAX_CONTEXT_IMPORT_DEPTH,
     };
     use std::fs;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_dir() -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be after epoch")
-            .as_nanos();
-        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "runtime-prompt-import-{}-{nanos}-{counter}",
-            std::process::id()
-        ));
+    fn temp_dir() -> crate::test_root::TestRoot {
+        let dir = crate::test_root::TestRoot::new("runtime-prompt-import");
         fs::create_dir_all(&dir).expect("temp dir");
         dir
     }

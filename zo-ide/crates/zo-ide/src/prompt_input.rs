@@ -69,7 +69,15 @@ impl Bucket {
             // and `MultiEdit` (147, in neither) left — 2,142 measured
             // 2026-11-05, about 340 × (1.25 + 112 × 0.1) ≈ 4,200 tokens' worth
             // per 113-request conversation, cached.
-            Self::Tools => 2_142,
+            //
+            // 2,142 until 2026-11-10, and lower since: 2,136 measured (Anthropic
+            // and Google; OpenAI 2,135). The manifest and `CapabilityInvoke` no
+            // longer send a model to `ToolSearch` before a deferred tool — a
+            // call with the wrong input is answered with the shape the tool
+            // takes — and saying that took fewer words than saying the other,
+            // `Read`'s new word for the images it now opens included. The line
+            // comes down with the measurement so the room is not spent unseen.
+            Self::Tools => 2_136,
             // The renderer's own ceiling (`runtime::SKILL_INDEX_BUDGET_TOKENS`):
             // the index folds its tail to stay under it, so the gate and the
             // prompt ask one number.
@@ -106,6 +114,13 @@ const DEFERRED_TOOLS_HEADING: &str = "# Deferred tools";
 /// Reminders row — the one this heading feeds — is the row that reads `0 / 300`
 /// when nothing is counting.
 const REMINDERS_HEADING: &str = runtime::REMINDERS_SECTION_HEADING;
+
+/// First lines of the sections that carry the workspace's own instruction
+/// files, taken from the runtime that renders them.
+const WORKSPACE_RULE_HEADINGS: [&str; 2] = [
+    runtime::PROJECT_INSTRUCTIONS_HEADING,
+    runtime::SCOPED_INSTRUCTIONS_HEADING,
+];
 
 /// One measured piece of the fixed prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +176,12 @@ pub struct PromptInput {
     /// number next to the estimate whenever it can get one — and the gap between
     /// them is the calibration nobody had.
     pub provider_tokens: Option<ProviderCount>,
+    /// Estimated tokens of the workspace's own instruction files
+    /// (`AGENTS.md`, `CLAUDE.md`, `context.md`), which ride in the system
+    /// prompt but are not harness: the workspace's owner wrote them, and a
+    /// longer rule file is not a product that grew. They are reported on a row
+    /// of their own and held out of every budget above.
+    pub workspace_rule_tokens: u64,
 }
 
 impl PromptInput {
@@ -178,8 +199,13 @@ impl PromptInput {
         reminders: &[String],
     ) -> Self {
         let mut pieces = Vec::with_capacity(system.len() + tools.len() + reminders.len());
+        let mut workspace_rule_tokens = 0;
         for section in system {
             let label = first_line(section);
+            if WORKSPACE_RULE_HEADINGS.contains(&label.as_str()) {
+                workspace_rule_tokens += piece(Bucket::System, label, section).est_tokens;
+                continue;
+            }
             let bucket = if label == SKILLS_HEADING {
                 Bucket::Skills
             } else if label == DEFERRED_TOOLS_HEADING {
@@ -215,6 +241,7 @@ impl PromptInput {
             pieces,
             wire_tools: tools.len(),
             provider_tokens: None,
+            workspace_rule_tokens,
         }
     }
 
@@ -229,7 +256,12 @@ impl PromptInput {
     /// percent of the provider's number. Positive means the estimate is HIGH.
     #[must_use]
     pub fn estimate_error_percent(&self) -> Option<i64> {
-        error_percent(self.fixed_harness_tokens(), self.provider_tokens?.total)
+        // The provider counted the whole system prompt, the workspace's rules
+        // included, so the estimate it is held against includes them too.
+        error_percent(
+            self.fixed_harness_tokens() + self.workspace_rule_tokens,
+            self.provider_tokens?.total,
+        )
     }
 
     /// The same gap for the wire tool block alone.
@@ -301,6 +333,19 @@ impl PromptInput {
             ));
         }
         over
+    }
+
+    /// The row for the workspace's own instruction files, under the budget
+    /// rows and outside them; nothing when the workspace has none.
+    fn workspace_rules_row(&self) -> String {
+        if self.workspace_rule_tokens == 0 {
+            return String::new();
+        }
+        format!(
+            "    {:<16}{:>7}            the workspace's own instruction files, outside the budget\n",
+            "Workspace rules",
+            thousands(self.workspace_rule_tokens)
+        )
     }
 
     /// The report, in the `/status` two-column shape.
@@ -383,6 +428,7 @@ impl PromptInput {
                 "ok"
             }
         );
+        out.push_str(&self.workspace_rules_row());
         let _ = writeln!(out);
         let _ = writeln!(out, "  Pieces (largest first)");
         let mut ordered: Vec<&Piece> = self.pieces.iter().collect();
@@ -535,6 +581,40 @@ mod tests {
         assert_eq!(bucket(DEFERRED_TOOLS_HEADING), Some(Bucket::Tools));
         assert_eq!(bucket("# Zo"), Some(Bucket::System));
         assert_eq!(bucket("tool Read"), Some(Bucket::Tools));
+    }
+
+    /// A workspace's `AGENTS.md` is the workspace's, not the product's: a
+    /// repository with a long rule file must not read as a harness that went
+    /// over its budget, and must still say what the file costs.
+    #[test]
+    fn the_workspaces_own_rules_are_reported_apart_from_the_harness() {
+        let rules = format!(
+            "{}\n\n## AGENTS.md (scope: /w)\n\n{}",
+            runtime::PROJECT_INSTRUCTIONS_HEADING,
+            "never push to main. ".repeat(2_000)
+        );
+        let scoped = format!("{}\n - rules.md", runtime::SCOPED_INSTRUCTIONS_HEADING);
+        let bare = measured();
+        let with_rules = PromptInput::measure(
+            "claude-opus-5",
+            "/w",
+            &[
+                "# Zo\nyou are a coding agent".to_string(),
+                format!("{SKILLS_HEADING}\n- `a`: does a\n- `b`: does b"),
+                format!("{DEFERRED_TOOLS_HEADING}\nAlpha, Beta"),
+                rules,
+                scoped,
+            ],
+            &[tool("Read", "read a file")],
+            &["<system-reminder>todo</system-reminder>".to_string()],
+        );
+        assert_eq!(with_rules.pieces, bare.pieces, "the rules are not a harness piece");
+        assert_eq!(with_rules.fixed_harness_tokens(), bare.fixed_harness_tokens());
+        assert!(with_rules.overruns().is_empty(), "{:?}", with_rules.overruns());
+        assert!(with_rules.workspace_rule_tokens > 10_000);
+        assert_eq!(bare.workspace_rule_tokens, 0);
+        assert!(with_rules.render().contains("Workspace rules"));
+        assert!(!bare.render().contains("Workspace rules"));
     }
 
     /// The Reminders row read `0 / 300` for as long as there was nothing to

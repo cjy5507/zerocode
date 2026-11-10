@@ -1876,6 +1876,19 @@ fn spawn_session_retention_cleanup(config: &runtime::RuntimeConfig) {
                 tools::prune_artifact_files_older_than(std::time::Duration::from_secs(
                     u64::from(days).saturating_mul(24 * 60 * 60),
                 ));
+            // …and every other project's store, which only a session opened in
+            // that project would otherwise ever sweep.
+            let pruned_elsewhere = std::time::SystemTime::now()
+                .checked_sub(std::time::Duration::from_secs(
+                    u64::from(days).saturating_mul(24 * 60 * 60),
+                ))
+                .map_or(0, |cutoff| {
+                    tools::prune_artifact_stores_under(
+                        &runtime::session_control::managed_projects_root(),
+                        cutoff,
+                    )
+                });
+            let pruned_artifacts = pruned_artifacts + pruned_elsewhere;
             if pruned_artifacts > 0 {
                 eprintln!(
                     "[zo] artifact retention: removed {pruned_artifacts} stale artifact file(s) (older than {days}d)"
@@ -1886,10 +1899,11 @@ fn spawn_session_retention_cleanup(config: &runtime::RuntimeConfig) {
                 // Boot-time stderr reaches zo.log on the TUI path and the
                 // terminal on headless runs; silent when nothing expired.
                 eprintln!(
-                    "[zo] session retention: removed {} transcript(s), {} pref file(s), {} stale lock(s), {} empty dir(s) (~{} MB, older than {days}d)",
+                    "[zo] session retention: removed {} transcript(s), {} pref file(s), {} stale lock(s), {} sidecar(s), {} empty dir(s) (~{} MB, older than {days}d)",
                     report.removed_sessions,
                     report.removed_prefs,
                     report.removed_locks,
+                    report.removed_sidecars,
                     report.removed_dirs,
                     report.reclaimed_bytes / (1024 * 1024),
                 );

@@ -2417,10 +2417,32 @@ function freezeWorkspaceActivity() {
     }
   }
   if (!moved) return false;
+  const arranged = activityArrangement();
   activityFrozen.clear();
   for (const [path, said] of next) activityFrozen.set(path, said);
+  // A reading that moved only where nothing is ordered by it — a row still between the same two neighbours, a
+  // group that keeps the same rows — draws the same list: the generation stays, and so does every node
+  // (review t-102362 #8). Taken while the old reading still stands, then again on the new one.
+  if (activityArrangement() === arranged) return false;
   activityGeneration += 1;
   return true;
+}
+
+/* What the frozen reading arranges, and nothing else: each state group with its rows in their order, or each
+ * project's rows in the activity order (one run when the list is flat). The trunk-first rule is the grouping's,
+ * as in `refreshWorktrees`; sorted afresh here, because the rows keep the order of the last refresh. */
+function activityArrangement() {
+  const ordered = (rows, trunkFirst) => [...rows]
+    .sort((left, right) => (trunkFirst ? Number(right.is_main) - Number(left.is_main) : 0)
+      || compareWorktrees(left, right))
+    .map((worktree) => worktree.path)
+    .join(",");
+  if (sidebarGroupBy === "state") {
+    return workspaceStateGroups().map((group) => `${group.id}:${ordered(group.members, true)}`).join("|");
+  }
+  const listed = listedProjects();
+  if (sidebarGroupBy === "none") return ordered(listed.flatMap((project) => shownWorktrees(project)), false);
+  return listed.map((project) => `${project.path}:${ordered(shownWorktrees(project), true)}`).join("|");
 }
 
 /* A workspace that has just appeared has no frozen reading at all, and a list
@@ -4422,15 +4444,20 @@ function worktreeLedgerMerged(path) {
   return ledgerLandingStage(checkoutLedger.get(checkoutKey(path))) === "landed";
 }
 
-/* The part of a landing that moves the rows: a change of it rebuilds them. The
- * time the compare ref last moved is left out on purpose — it only words the
- * tooltip, and a row rebuilt for it would hop under the pointer. */
+/* The part of a landing a chip says: two landings with one shape wear one chip.
+ * The artifact cards and the commit landings compare by it, to dress again only
+ * when it moved. It is NOT part of the sidebar's shape (`worktreeListShape`):
+ * the sidebar's landing chip is painted in place, through the dot's door
+ * (`dressWorktreeDot` → `dressWorktreeLanding`), so a stamp poll or a
+ * `worktree:landing` notice that moves a number rebuilds nothing (1fcfd6c52,
+ * t-102869). The time the compare ref last moved is left out on purpose — it
+ * only words the tooltip. */
 function landingShape(landing) {
   if (!landing) return "";
   return `${landing.state}.${landing.ahead}.${landing.dirty ? 1 : 0}.${landing.ignored ? 1 : 0}` +
     `.${landing.detached ? 1 : 0}.${landing.compare_ref ?? ""}.${landing.landed_in?.sha ?? ""}` +
     // How far behind, what a merge would clash on and what the unsaved files share with the compare ref
-    // move the chip and its tooltip, so they move the row.
+    // move the chip and its tooltip.
     `.${landing.behind ?? ""}.${landing.far_behind ? 1 : 0}.${landing.conflict ? landing.conflict.total : ""}` +
     `.${(landing.conflict?.files ?? []).join(",")}` +
     `.${landing.overlap ? landing.overlap.total : ""}.${(landing.overlap?.files ?? []).join(",")}` +
@@ -5005,13 +5032,16 @@ function dressWorktreeDot(row, state) {
   }
   dressWorktreeLanding(row, state, phase);
   dressWorktreeWall(row);
-  if (dot.dataset.state === indicator && dot.dataset.tip === label) return;
+  if (dot.dataset.state === indicator && dot.dataset.tip === label) return false;
+  const started = indicator === "working" && dot.dataset.state !== "working";
   dot.dataset.state = indicator;
-  dot.className = `wt-dot is-${indicator}`;
+  dot.className = turningDotClass("wt-dot", indicator);
   dot.dataset.tip = label;
   // The tree item carries the name; the row inside it is a plain box (t-88672).
   (row.closest(".wt-node") ?? row).setAttribute("aria-label", `${row.querySelector(".wt-title").textContent}, ${label}`);
   if (indicator === "working") wakeWorktreeSpin();
+  // Whether the card's own ring may just have started on this standing row (`paintWorktreeDots` pins it).
+  return started;
 }
 
 /* 도는 반지는 CSS 키프레임이 아니라 창이 직접 돌린다. 분할+글라스 무대의
@@ -5054,6 +5084,52 @@ function spinWorktreeDots(now) {
   }, stepMs - (now % stepMs));
 }
 
+/* The step the turning dots stand on now, by the document's clock — the same
+ * sum the loop does on its frame's time. A dot that starts working, or one a
+ * rebuild has just made, wears it at once (t-102869): without it the new dot
+ * stood at 0° until the loop's next step, and a rebuild under several working
+ * agents made every ring hop back to the top together. */
+function turningDotClass(base, state) {
+  if (state !== "working") return `${base} is-${state}`;
+  const now = performance.now();
+  const step = Math.floor(((now % WORKTREE_SPIN_PERIOD_MS) / WORKTREE_SPIN_PERIOD_MS) * WORKTREE_SPIN_STEPS);
+  return `${base} is-working wt-spin-${step}`;
+}
+
+/* The turns the stylesheet runs — the card's flowing ring (`wt-activity-turn`
+ * on `.wt-flow::before`) and the agent rows' ticking ring (`wt-agent-spin`) —
+ * keep one clock too (t-102869). A CSS animation starts at its node's birth,
+ * so a node rebuilt under a ring began its turn again from the top: the hop
+ * the person saw as the sidebar blinking (「네비바의 판이 한번씩 깜박거려」,
+ * 2026-11-08). Pinned to the document timeline's origin, every turn of one
+ * period stands at the same angle on any node, old or just built, and a
+ * rebuild draws the ring where it already was. The rebuilds call this on what
+ * they just built, before a frame is drawn — the sidebar's rebuild, the cards
+ * whose agent rows changed (once, after the last card), the rows a scroll
+ * builds — and so does the dot painter for a row that just began working,
+ * whose card ring starts on a node that stands (review t-102958 #2). Any turn
+ * none of them reached is pinned when it says it started, a frame late.
+ * Reduced motion names no animation, so there is nothing here to pin. */
+const SHARED_TURNS = new Set(["wt-activity-turn", "wt-agent-spin"]);
+
+function keepTurnsInStep(root) {
+  if (typeof root?.getAnimations !== "function") return;
+  for (const turn of root.getAnimations({ subtree: true })) {
+    if (SHARED_TURNS.has(turn.animationName) && turn.startTime !== 0) turn.startTime = 0;
+  }
+}
+
+/* The listener hears the whole document, on purpose (review t-102958 #3): `wt-agent-spin` is also the board card's
+ * spinner (`.board-card-state.is-spin`) and the agent graph's working ring (`.agent-graph-node-state.is-working`).
+ * One agent at work is drawn by all three at once, side by side when the board stands beside the sidebar, and a
+ * spinner pinned to the same clock ticks in step with its row instead of a beat apart; a board repaint does not
+ * send its spinners back to the top either. It costs a name looked up in a set for every other animation, and one
+ * `getAnimations` on the node for a turn that is pinned. The sidebar's own rebuilds still pin what they build
+ * before a frame is drawn — this listener is the late road, a frame after the turn has started. */
+document.addEventListener("animationstart", (event) => {
+  if (SHARED_TURNS.has(event.animationName)) keepTurnsInStep(event.target);
+});
+
 /* Waking forgets the step it slept on, so the first frame back always writes:
  * a dot that has just started working must not wait out the rest of a step
  * for its first angle. */
@@ -5073,10 +5149,14 @@ function wakeWorktreeSpin() {
  * and every listener under it once a second while four agents ran. */
 function paintWorktreeDots() {
   const owned = worktreeLanes();
+  const started = [];
   for (const row of worktreeList.querySelectorAll(".wt-row[data-worktree-path]")) {
     const path = row.dataset.worktreePath;
-    dressWorktreeDot(row, worktreeDotState(path, owned.get(path) ?? []));
+    if (dressWorktreeDot(row, worktreeDotState(path, owned.get(path) ?? []))) started.push(row);
   }
+  // A row that starts working starts its card's ring on a node that stands: pinned now, before the frame that
+  // draws it, instead of one frame at the top and then where the others stand (review t-102958 #2).
+  for (const row of started) keepTurnsInStep(row.closest(".wt-node") ?? row);
   noteAgentsStirred();
 }
 
@@ -5855,6 +5935,10 @@ function renderSidebarWindows() {
   if (built) {
     paintWorktreeAgents();
     paintWorktreePortPins();
+    // A row the scroll just built wears its rings from the frame that first shows it, where every other ring
+    // stands — not one frame at the top until it says it started (review t-102958 #2). The measure below lays
+    // the list out anyway, so the style this brings forward is not a pass of its own.
+    keepTurnsInStep(worktreeList);
   }
   measureSidebarRows();
   const top = anchor ? sidebarAnchorTop(anchor) : null;
@@ -6688,6 +6772,8 @@ async function refreshWorktrees() {
     } catch {
       fetched = new Map();
     }
+    // A newer refresh started while this one waited: it draws, this one would only draw twice.
+    if (generation !== worktreeRefreshGeneration) return [];
     const said = (held) => [...held].sort().map((pair) => pair.join(":")).join(",");
     if (said(fetched) !== said(sidebarReviewStates)) reviewGeneration += 1;
     sidebarReviewStates = fetched;
@@ -6846,6 +6932,8 @@ async function refreshWorktrees() {
   // What can be walked to follows the catalog: a workspace deleted since it
   // was visited greys the arrow that only had it left to offer.
   paintHistoryButtons();
+  // Every ring just built picks up the angle the old one stood at, before the frame that shows it.
+  keepTurnsInStep(worktreeList);
   scheduleWorkspaceBoardPaint();
   return allWorktrees;
 }
@@ -7599,7 +7687,7 @@ function dressTeamNode(node, entry) {
   }
   const state = TEAM_STATES[entry.state];
   if (entry.kind === "group") {
-    parts.dot.className = `team-dot is-${entry.state}`;
+    parts.dot.className = turningDotClass("team-dot", entry.state);
     node.classList.toggle("is-open", entry.open);
     node.setAttribute("aria-expanded", entry.open ? "true" : "false");
     writeTextContent(parts.title, entry.title);
@@ -7611,7 +7699,7 @@ function dressTeamNode(node, entry) {
     return;
   }
   node.classList.toggle("is-child", entry.child === true);
-  parts.dot.className = `team-dot is-${entry.state}`;
+  parts.dot.className = turningDotClass("team-dot", entry.state);
   if ((parts.face.dataset.agent ?? "") !== (entry.agent ?? "")) {
     parts.face.dataset.agent = entry.agent ?? "";
     const face = entry.agent ? agentIcon(agentRows.find((one) => one.id === entry.agent)
@@ -13899,10 +13987,16 @@ async function finishWorktreeRemoval(worktree, hand) {
   // same-workspace early return mistakes for "already fine" — the blank-stage
   // bug this sweep exists to end.
   if (!(await dropWorktreeSurfaces(path, hand))) return;
-  const worktrees = await refreshWorktrees();
+  await refreshWorktrees();
   // The backend has already moved off a removed worktree; this catches the
   // titlebar and the tree up with it.
   if (active) {
+    // Looked up in the catalog the window holds once the refresh is over, not
+    // in what the refresh answered: a refresh a newer one overtook answers
+    // `[]` — the newer one draws the list — and the landing found no main and
+    // left the stage on the checkout just removed (review t-102958 #6). Which
+    // refresh drew the list does not move a project's main.
+    const worktrees = projects.flatMap((project) => project.worktrees ?? []);
     // This project's OWN main, not the first main of the flat cross-project
     // list — with two projects open those are different rows, and landing in
     // a stranger's repository is worse than the ghost this replaces.
@@ -17156,6 +17250,13 @@ const CHAT_LIST_UNDO_MS = 5000;
 /* The groups that stand open; 「오늘 끝남」 starts folded, as in the draft. */
 const chatListOpen = new Set(["pinned", "waiting", "working"]);
 let chatListDrawn = "";
+/* The groups as they stand, by name, each with its rows by their key
+ * (`chatListKey` — a pane's, a wire session's, a turn's): a paint puts each
+ * in place again and builds only a row whose shape moved; a row whose time
+ * alone moved — 「3분 전」 to 「4분 전」 — keeps its node and its words change
+ * where they stand (2026-11-10, the navigation bar's flicker review, #10:
+ * every repaint built the whole list anew, its time words in its signature). */
+const chatListNodes = new Map();
 
 function readChatListNotes() {
   try {
@@ -17352,6 +17453,7 @@ function paintChatList() {
   if (!shown) {
     if (chatListDrawn !== "") {
       el("chat-list-groups").replaceChildren();
+      chatListNodes.clear();
       chatListDrawn = "";
     }
     return;
@@ -17361,31 +17463,96 @@ function paintChatList() {
     locale,
     focusedTerm,
     [...chatListOpen],
-    [...groups].map(([name, rows]) => [name, rows.map((row) => [
-      row.term, row.key, row.said, row.title, row.agent, row.project, row.mark, row.branch, row.word,
-      chatListNotes.pinned.has(row.key), row.card ? yourTurnKey(row.card) : "",
-    ])]),
+    [...groups].map(([name, rows]) => [name, rows.map((row) => [chatRowShape(row), row.word])]),
   ]);
   if (drawing === chatListDrawn) return;
   chatListDrawn = drawing;
   const parts = [];
   for (const group of CHAT_LIST_GROUPS) {
     const rows = groups.get(group.name);
-    if (rows.length === 0) continue;
-    parts.push(chatListGroupNode(group, rows));
+    if (rows.length === 0) {
+      chatListNodes.delete(group.name);
+      continue;
+    }
+    parts.push(standChatGroup(group, rows));
   }
-  el("chat-list-groups").replaceChildren(...parts);
+  reconcileElementOrder(el("chat-list-groups"), parts);
 }
 
-function chatListGroupNode(group, rows) {
+/* What a row is built from, but for its time words and whether its pane is
+ * the one in front, which it writes in place (`standChatRow`). A permission's
+ * row carries what its last answer refused. */
+function chatRowShape(row) {
+  const permission = row.card && yourTurnKind(row.card) === "permission";
+  return JSON.stringify([
+    locale, row.term, row.key, row.said, row.title, row.agent, row.project, row.mark, row.branch,
+    chatListNotes.pinned.has(row.key), row.card ? yourTurnKey(row.card) : "",
+    permission ? yourTurnDraft(row.card).refusal ?? "" : "",
+  ]);
+}
+
+/* A group as it stands: its head in place, its count and its fold written,
+ * its rows put in order by their keys. A group built in another language is
+ * built again — its head's words are its own. */
+function standChatGroup(group, rows) {
+  let held = chatListNodes.get(group.name);
+  if (!held || held.locale !== locale) {
+    held = chatListGroupNode(group);
+    chatListNodes.set(group.name, held);
+  }
+  const open = chatListOpen.has(group.name);
+  writeAttribute(held.head, "aria-expanded", String(open));
+  writeTextContent(held.count, String(rows.length));
+  if (!open) {
+    held.list?.remove();
+    held.list = null;
+    held.rows.clear();
+    return held.node;
+  }
+  if (!held.list) {
+    held.list = document.createElement("div");
+    held.list.className = "chat-group-rows";
+    held.list.setAttribute("role", "list");
+    held.node.append(held.list);
+  }
+  const keys = new Set(rows.map((row) => row.key));
+  for (const key of [...held.rows.keys()]) if (!keys.has(key)) held.rows.delete(key);
+  reconcileElementOrder(held.list, rows.map((row) => standChatRow(held.rows, row)));
+  return held.node;
+}
+
+/* A row as it stands: built again only when its shape moved, its time words
+ * and the 「here」 mark written in place. */
+function standChatRow(held, row) {
+  const shape = chatRowShape(row);
+  let node = held.get(row.key);
+  if (!node || node.__shape !== shape) {
+    node = chatRowNode(row);
+    node.__shape = shape;
+    held.set(row.key, node);
+  }
+  writeTextContent(node.__word, row.word);
+  const tip = chatRowTip(row);
+  if (node.__open.dataset.tip !== tip) {
+    node.__open.dataset.tip = tip;
+    node.__open.setAttribute("aria-label", tip);
+  }
+  writeClass(node, "is-here", row.term === focusedTerm);
+  return node;
+}
+
+function chatRowTip(row) {
+  const agentWords = row.agent ? agentName(row.agent) : "";
+  return [row.title, row.project, row.branch, agentWords, row.word].filter(Boolean).join(" · ");
+}
+
+function chatListGroupNode(group) {
   const node = document.createElement("section");
   node.className = "chat-group";
   node.dataset.group = group.name;
-  const open = chatListOpen.has(group.name);
   const head = document.createElement("button");
   head.type = "button";
   head.className = "chat-group-head";
-  head.setAttribute("aria-expanded", String(open));
   const mark = group.icon ? iconNode(group.icon) : document.createElement("span");
   mark.classList.add("chat-group-mark");
   mark.setAttribute("aria-hidden", "true");
@@ -17394,7 +17561,6 @@ function chatListGroupNode(group, rows) {
   words.textContent = t(group.key, group.word);
   const count = document.createElement("span");
   count.className = "chat-group-count";
-  count.textContent = String(rows.length);
   const chevron = iconNode("chevron");
   chevron.classList.add("chat-group-chevron");
   chevron.setAttribute("aria-hidden", "true");
@@ -17405,14 +17571,7 @@ function chatListGroupNode(group, rows) {
     paintChatList();
   });
   node.append(head);
-  if (open) {
-    const list = document.createElement("div");
-    list.className = "chat-group-rows";
-    list.setAttribute("role", "list");
-    list.append(...rows.map(chatRowNode));
-    node.append(list);
-  }
-  return node;
+  return { node, head, count, list: null, rows: new Map(), locale };
 }
 
 /* One conversation: the row's door opens its pane in its own workspace
@@ -17455,9 +17614,11 @@ function chatRowNode(row) {
   word.className = "chat-row-word";
   word.textContent = row.word;
   open.append(mono, body, word);
-  const agentWords = row.agent ? agentName(row.agent) : "";
-  open.dataset.tip = [row.title, row.project, row.branch, agentWords, row.word].filter(Boolean).join(" · ");
+  open.dataset.tip = chatRowTip(row);
   open.setAttribute("aria-label", open.dataset.tip);
+  // What a paint writes in place (`standChatRow`).
+  node.__word = word;
+  node.__open = open;
   open.addEventListener("click", () => {
     if (row.open) row.open();
     else void openPaneFromBoard(row.term);
@@ -17601,7 +17762,7 @@ function buildNewChatView() {
   const box = newChatNode("textarea", "newchat-box");
   box.rows = 3;
   box.dataset.i18nPlaceholder = "newChat.placeholder";
-  box.placeholder = t("newChat.placeholder", "무엇이든 시키세요 — 여러 줄은 Shift+Enter");
+  box.placeholder = t("newChat.placeholder", "무엇이든 시키세요");
   box.dataset.i18nAria = "newChat.boxLabel";
   box.setAttribute("aria-label", t("newChat.boxLabel", "첫 지시"));
   // The composer's own row: the `+` (wired per leaf, `wireNewChatView`), the
@@ -17632,6 +17793,15 @@ function buildNewChatView() {
   terminalWords.dataset.i18n = "newChat.terminalShort";
   terminal.append(iconNode("terminal"), terminalWords);
   under.append(where, engine, newChatNode("span", "newchat-under-gap"), terminal);
+  // What the checkout could use next, as buttons that fill the box (`paintNewChatSuggestions`).
+  const suggest = newChatNode("div", "newchat-suggest");
+  suggest.setAttribute("role", "group");
+  suggest.dataset.i18nAria = "newChat.suggest";
+  suggest.setAttribute("aria-label", t("newChat.suggest", "지금 할 수 있는 일"));
+  suggest.hidden = true;
+  // The keys the box takes, said beside it where the placeholder said one of them.
+  const keys = newChatNode("p", "newchat-keys", t("newChat.keys", "Enter 보내기 · Shift+Enter 줄바꿈 · + 파일 첨부"));
+  keys.dataset.i18n = "newChat.keys";
   const note = newChatNode("p", "newchat-note");
   note.hidden = true;
   const refusal = newChatNode("p", "newchat-refusal");
@@ -17641,7 +17811,7 @@ function buildNewChatView() {
   const recentHead = newChatNode("h2", "newchat-recent-head", t("newChat.recent", "이어서 하기"));
   recentHead.dataset.i18n = "newChat.recent";
   recent.append(recentHead, newChatNode("div", "newchat-recent-rows"));
-  center.append(heading, form, under, note, refusal, recent);
+  center.append(heading, form, under, suggest, keys, note, refusal, recent);
   root.append(center);
   return root;
 }
@@ -17656,6 +17826,10 @@ function wireNewChatView(host) {
   // leaf was wired with came along as dead markup, and are wired anew here.
   form.querySelector(":scope > .composer-attach-row")?.remove();
   tools.querySelector(":scope > .composer-attach-plus")?.remove();
+  // So did the offers under the box, their presses dead: they stand anew at the first paint.
+  const suggest = host.querySelector(".newchat-suggest");
+  suggest.replaceChildren();
+  delete suggest.dataset.drawn;
   composerAttachments(form, box, tools, { start: newChatWhere(), changed: () => paintNewChatSend(host) });
   box.addEventListener("input", () => {
     newChatChoice.draft = box.value;
@@ -17701,6 +17875,8 @@ function paintNewChatViews() {
 
 function paintNewChatStage(tab) {
   const host = docHost(tab.pane, "newchat");
+  // Each visit asks again whether the checkout has a pull request (`newChatHasReview`).
+  newChatReviews.clear();
   paintNewChatView(host);
   requestAnimationFrame(() => {
     const box = host.querySelector(".newchat-box");
@@ -17830,7 +18006,110 @@ function paintNewChatView(host) {
   writeHidden(refusal, newChatRefusal === "");
   writeTextContent(refusal, newChatRefusal);
   paintNewChatSend(host);
+  paintNewChatSuggestions(host);
   paintNewChatRecent(host.querySelector(".newchat-recent"));
+}
+
+/* ---- what the checkout could use next (2026-11-10) ----------------------------
+ *
+ * An empty box asks the person to know what can be asked (window artifact
+ * p-1c1bbf75726ff227; NN/g 2024: suggestions as buttons, and specific). Under
+ * the box stand up to four offers, each read off what the window already holds
+ * of the checkout the conversation will open in — never a guess, and none when
+ * nothing is known: a merge that would clash (`landing.conflict`), changes not
+ * committed (`landing.dirty`, with their count when source control last looked
+ * at this checkout), commits the compare ref lacks with no pull request for
+ * them, a compare ref that moved ahead. A press fills the box — after what is
+ * already typed — and sends nothing. */
+const NEW_CHAT_SUGGESTIONS = 4;
+
+/* Whether the checkout has a pull request: the board's answer when it holds
+ * one, else asked of the board's own source (`github_review_states`, kept a
+ * minute by the backend) once a visit. `null` until an answer came — and for
+ * good on a machine without `gh` — and the offer that needs it does not stand. */
+const newChatReviews = new Map();
+
+function newChatHasReview(where) {
+  if (boardReviews.has(where)) return true;
+  if (newChatReviews.has(where)) return newChatReviews.get(where);
+  newChatReviews.set(where, null);
+  void invoke("github_review_states", { worktrees: [where] }).then((rows) => {
+    if (newChatReviews.get(where) !== null) return;
+    newChatReviews.set(where, Array.isArray(rows) && rows.some((row) => row.worktree === where));
+    paintNewChatViews();
+  }).catch(() => {});
+  return null;
+}
+
+function newChatSuggestions() {
+  const where = newChatWhere();
+  const landing = worktreeLandings.get(where) ?? null;
+  if (!landing) return [];
+  const ref = landing.compare_ref ? landingRefName(landing.compare_ref) : "";
+  const offers = [];
+  const clashing = landing.conflict?.total ?? 0;
+  if (clashing > 0 && ref) {
+    offers.push({
+      id: "conflict",
+      words: t("newChat.offer.conflict", "충돌 {{n}}개 풀기", { n: clashing }),
+      fill: t("newChat.offer.conflictFill", "{{ref}}와 충돌하는 파일 {{n}}개를 풀어 줘.", { ref, n: clashing }),
+    });
+  }
+  if (landing.dirty) {
+    const changed = where === scmStatusOf ? scmCapState?.total ?? scmEntries.length : 0;
+    offers.push({
+      id: "dirty",
+      words: changed > 0 ? t("newChat.offer.dirtyCount", "변경 {{n}}개 검토", { n: changed }) : t("newChat.offer.dirty", "커밋 안 한 변경 검토"),
+      fill: t("newChat.offer.dirtyFill", "커밋하지 않은 변경을 검토해 줘."),
+    });
+  }
+  if (landing.state === "unlanded" && landing.ahead > 0 && ref && newChatHasReview(where) === false) {
+    offers.push({
+      id: "pr",
+      words: t("newChat.offer.pr", "PR 설명 쓰기"),
+      fill: t("newChat.offer.prFill", "{{ref}}에 없는 커밋 {{n}}개로 PR 설명을 써 줘.", { ref, n: landing.ahead }),
+    });
+  }
+  if (Number.isFinite(landing.behind) && landing.behind > 0 && ref) {
+    offers.push({
+      id: "behind",
+      words: t("newChat.offer.behind", "{{ref}} 따라잡기", { ref }),
+      fill: t("newChat.offer.behindFill", "{{ref}}의 새 커밋 {{n}}개를 이 브랜치에 반영해 줘.", { ref, n: landing.behind }),
+    });
+  }
+  return offers.slice(0, NEW_CHAT_SUGGESTIONS);
+}
+
+function paintNewChatSuggestions(host) {
+  const row = host.querySelector(".newchat-suggest");
+  const offers = newChatAgent() ? newChatSuggestions() : [];
+  writeHidden(row, offers.length === 0);
+  const drawing = JSON.stringify([locale, offers.map((offer) => [offer.id, offer.words, offer.fill])]);
+  if (row.dataset.drawn === drawing) return;
+  row.dataset.drawn = drawing;
+  row.replaceChildren(...offers.map((offer) => {
+    const pill = newChatNode("button", "newchat-suggestion", offer.words);
+    pill.type = "button";
+    pill.dataset.offer = offer.id;
+    // Enter and Space, while it has focus, are its own (`rearmKeySink`).
+    pill.dataset.keyboardOwner = "true";
+    pill.addEventListener("click", () => fillNewChat(host, offer.fill));
+    return pill;
+  }));
+}
+
+/* An offer pressed: its words go into the box — on a line of their own after
+ * what the person already typed — and the keyboard with them, at their end.
+ * Nothing is sent. */
+function fillNewChat(host, words) {
+  const box = host.querySelector(".newchat-box");
+  const held = box.value.trimEnd();
+  box.value = held === "" ? words : `${held}\n${words}`;
+  newChatChoice.draft = box.value;
+  fitNewChatBox(box);
+  paintNewChatSend(host);
+  box.focus();
+  box.setSelectionRange(box.value.length, box.value.length);
 }
 
 /* A pick from a chip's menu: the choice moves, every start page says it, and
@@ -17956,11 +18235,24 @@ function newChatRowState(row) {
  * work, a tick that ended. */
 function paintNewChatRecent(section) {
   const groups = chatListGroups();
-  const rows = NEW_CHAT_ORDER.flatMap((name) => [...(groups.get(name) ?? [])].sort((one, two) => two.at - one.at))
+  // With the sidebar's list standing, the same conversations were on screen a
+  // third time here (the list, the project tree, this page): the page keeps
+  // the ones that wait for the person — the longest wait first, as the list
+  // has them — and stands nothing when none does. A person who turned the
+  // list off sees the five as before (window artifact p-1c1bbf75726ff227,
+  // decision 5, which replaced the five of 2026-11-09).
+  const listed = chatListShown();
+  const rows = (listed
+    ? [...(groups.get("waiting") ?? [])]
+    : NEW_CHAT_ORDER.flatMap((name) => [...(groups.get(name) ?? [])].sort((one, two) => two.at - one.at)))
     .slice(0, NEW_CHAT_RECENT);
   writeHidden(section, rows.length === 0);
+  const head = section.querySelector(".newchat-recent-head");
+  const headKey = listed ? "newChat.waiting" : "newChat.recent";
+  writeAttribute(head, "data-i18n", headKey);
+  writeTextContent(head, listed ? t("newChat.waiting", "나를 기다리는 대화") : t("newChat.recent", "이어서 하기"));
   const host = section.querySelector(".newchat-recent-rows");
-  const drawing = JSON.stringify([locale, rows.map((row) => [row.key, row.title, row.project, row.branch, row.word, row.agent, row.said])]);
+  const drawing = JSON.stringify([locale, listed, rows.map((row) => [row.key, row.title, row.project, row.branch, row.word, row.agent, row.said])]);
   if (host.dataset.drawn === drawing) return;
   host.dataset.drawn = drawing;
   host.replaceChildren(...rows.map((row) => {
@@ -18027,6 +18319,8 @@ async function sendNewChat(host) {
           worker.queue = [message];
           // Its name until the session names it: the first line it was asked (the sidebar's row, `chatListGroups`).
           worker.firstLine = (text || message).split("\n", 1)[0];
+          // Those words stand at the top of its page, the answer under them (`takeFirstAsk`).
+          worker.pinFirst = true;
         },
         refused: (error) => {
           throw error;
@@ -18042,6 +18336,8 @@ async function sendNewChat(host) {
       }
     } else {
       const term = await launchAgentTab({ agent: spec.id, prompt: message, rows: 24, cols: 96, model, effort });
+      // The first words stand at the top of the pane's conversation, the answer under them (`takeFirstAsk`).
+      noteFirstAsk(term);
       mountTermTab(term, { agent: spec.name, worktree: where ?? activeWorktreePath }, { focus: true });
     }
     newChatChoice.draft = "";

@@ -2612,43 +2612,23 @@ mod tests {
         );
     }
 
-    /// Every floating surface is one titanium glass material.
+    /// Every floating surface is one solid material.
     ///
-    /// Orca supplied the shared-material rule. ZeroCode keeps that discipline
-    /// while deepening the dark veil, edge and falloff for its tighter cool
-    /// graphite room.
-    ///
-    /// Ours was near it in three separate ways, each individually defensible:
-    /// a veil that was lighter AND more transparent (38/88% against 23/96%),
-    /// a blur at half strength (22px against `backdrop-blur-2xl`'s 40), and an
-    /// edge at the window's own 7% rule rather than the 14% a thing hovering
-    /// over the window needs to have a silhouette at all. The sum is a dialog
-    /// that read as a grey card instead of as the panel surface with a
-    /// thickness.
+    /// It was one titanium glass — Orca's shared-material rule, a 97% veil
+    /// under a 40px backdrop blur. On 2026-11-10 the person passed the Geist
+    /// draft for the right column and the popups (p-39057edd7d8a28d6, G):
+    /// Geist's menus and modals are opaque, the veil was 97% opaque anyway so
+    /// its blur bought decoration for a backdrop pass per surface, and
+    /// WKWebView now and then dropped a blurred top-layer box altogether. What
+    /// stays from the glass rule is its discipline: ONE rule paints every
+    /// floating surface, so none of them drifts to a ground of its own, and
+    /// its boundary is the floating edge, twice the window's rule.
     #[test]
-    fn a_floating_surface_uses_the_titanium_material() {
+    fn a_floating_surface_is_one_solid_material() {
         let tokens = include_str!("../../../../ui/tokens.css");
         let styles = strip_comments(include_str!("../../../../ui/shell.css"));
         let dark = block_after(tokens, ":root {");
-        let light = block_after(tokens, ":root[data-theme=\"light\"] {");
 
-        // The material, both treatments. Dark is Geist's background-100 at 97%
-        // (t-67607 — the titanium tint is gone with the atelier) while light
-        // keeps the proven 96% paper treatment.
-        assert!(
-            dark.contains("--glass-veil-raised: rgb(10 10 10 / 97%);")
-                && light.contains("--glass-veil-raised: rgb(255 255 255 / 96%);"),
-            "a floating surface's veil drifted off its treatment"
-        );
-        // `backdrop-blur-2xl` = 40px, and no `saturate()`: that utility is not
-        // in Orca's bundle at all, and under a 40px blur it tints every
-        // floating surface a step warmer than the opaque panel beside it.
-        for (treatment, block) in [("dark", &dark), ("light", &light)] {
-            assert!(
-                block.contains("--glass-blur: blur(40px);"),
-                "the {treatment} treatment's glass is not Orca's 40px blur"
-            );
-        }
         // Twice the window's own rule, and it must actually be twice — a
         // floating edge at the panel-divider's weight is the failure this
         // pins, not the literal.
@@ -2658,27 +2638,30 @@ mod tests {
         );
 
         // Worn by every floating surface, from ONE rule — six surfaces each
-        // declaring their own veil is how three of them ended up opaque. The
-        // selector list is the anchor, so a surface dropping out of it fails
-        // here rather than quietly going flat.
+        // declaring their own ground is how three of them ended up different.
+        // The selector list is the anchor, so a surface dropping out of it
+        // fails here rather than quietly drawing its own.
         let list = ".qo,\n.sidebar-menu,\n.ports-pop,\n.note-pop,\n.usage-pop,\n.permission,\n.term-float {";
         assert!(
             styles.contains(list),
-            "the shared glass rule's selector list changed — a floating \
-             surface has left it and is drawing itself opaque"
+            "the shared floating rule's selector list changed — a floating \
+             surface has left it and is drawing its own ground"
         );
-        let glass = &styles[styles.find(list).expect("the glass rule") + list.len()..];
-        let glass = &glass[..glass.find('}').expect("an unterminated glass rule")];
+        let shared = &styles[styles.find(list).expect("the floating rule") + list.len()..];
+        let shared = &shared[..shared.find('}').expect("an unterminated floating rule")];
         for part in [
-            "background-color: var(--glass-veil-raised)",
-            "backdrop-filter: var(--glass-blur)",
+            "background-color: var(--surface-deck)",
             "border-color: var(--glass-edge)",
         ] {
             assert!(
-                glass.contains(part),
-                "the shared glass rule stopped carrying `{part}`:\n{glass}"
+                shared.contains(part),
+                "the shared floating rule stopped carrying `{part}`:\n{shared}"
             );
         }
+        assert!(
+            !shared.contains("backdrop-filter"),
+            "the floating surfaces are blurring what is behind them again:\n{shared}"
+        );
 
         // Depth says what KIND of floating a surface is doing. A dialog is
         // floated over the room and a menu is dropped near its trigger, and
@@ -2697,10 +2680,23 @@ mod tests {
                 && dark.contains("inset 0 1px 0 rgb(255 255 255 / 6%)"),
             "the dropdown shadow lost the titanium drop or lit edge"
         );
+        // A dialog and a menu draw their edge as Geist does, a ring riding on
+        // the shadow, so a row and the corner it sits in line up to the pixel.
+        let ring = "0 0 0 var(--rule-width) var(--glass-edge)";
+        let dialog = block_after_css(&styles, ".qo {\n  box-shadow:");
+        assert!(
+            dialog.contains(&format!("{ring}, var(--shadow-float)")),
+            "a dialog lost its ring or its float:\n{dialog}"
+        );
+        let menus = block_after_css(&styles, ".sidebar-menu,\n.note-pop {");
+        assert!(
+            menus.contains(&format!("{ring}, var(--shadow-drop)")),
+            "a menu lost its ring or its drop:\n{menus}"
+        );
         assert!(
             styles.contains("box-shadow: var(--shadow-drop);"),
-            "nothing wears the dropdown shadow, so the menus are back on the \
-             dialog's float or on a control shadow"
+            "nothing wears the bare dropdown shadow, so the popovers are back \
+             on the dialog's float or on a control shadow"
         );
     }
 
@@ -7860,6 +7856,91 @@ mod tests {
             dressing.contains(r#"if (indicator === "working") wakeWorktreeSpin();"#),
             "nothing wakes the spinner when a workspace starts working:\n{dressing}"
         );
+        // A dot that starts working — or one a rebuild has just made — wears the step the
+        // others stand on at once (t-102869), instead of standing at 0° until the loop's next
+        // step: under several working agents a rebuild made every ring hop to the top together.
+        assert!(
+            dressing.contains(r#"dot.className = turningDotClass("wt-dot", indicator);"#),
+            "a new working dot stands at 0° until the loop's next step:\n{dressing}"
+        );
+        let stepping = block_after(window, "function turningDotClass(base, state) {");
+        assert!(
+            stepping.contains("performance.now()")
+                && stepping.contains("WORKTREE_SPIN_PERIOD_MS")
+                && stepping.contains("is-working wt-spin-${step}"),
+            "a new working dot's step is not the loop's step on the document's clock:\n{stepping}"
+        );
+    }
+
+    /// A rebuild does not send the stylesheet's turning rings back to the top (t-102869).
+    ///
+    /// A CSS animation starts at its node's birth, so every rebuild that remains —
+    /// a pane opening or closing rebuilds the sidebar, an agent row that changes
+    /// shape rebuilds its card's rows — started the card's flowing ring
+    /// (`wt-activity-turn`) and the agent rows' ring (`wt-agent-spin`) again from
+    /// the top: the hop the person saw as the sidebar blinking (「네비바의 판이
+    /// 한번씩 깜박거려」, 2026-11-08). Every such turn is pinned to the document
+    /// timeline's origin, so a ring of one period stands at one angle on any
+    /// node: the rebuilds pin what they just built before a frame is drawn, and
+    /// a turn that starts on a standing node is pinned when it says it started.
+    #[test]
+    fn a_rebuild_keeps_the_turning_rings_where_they_stood() {
+        let window = window_source();
+        let keeping = block_after(window, "function keepTurnsInStep(root) {");
+        assert!(
+            keeping.contains("root.getAnimations({ subtree: true })")
+                && keeping.contains("SHARED_TURNS.has(turn.animationName)")
+                && keeping.contains("turn.startTime = 0"),
+            "the turns are no longer pinned to the document's clock, so a rebuilt \
+             ring starts again from the top:\n{keeping}"
+        );
+        assert!(
+            window.contains(
+                r#"const SHARED_TURNS = new Set(["wt-activity-turn", "wt-agent-spin"]);"#
+            ),
+            "the turns pinned to one clock no longer name the card's ring and the agent rows' ring"
+        );
+        assert!(
+            window.contains(r#"document.addEventListener("animationstart", (event) => {"#),
+            "a turn that starts on a standing node is never pinned, so the next rebuild moves it"
+        );
+        let refreshing = block_after(window, "async function refreshWorktrees() {");
+        let rebuilt = refreshing
+            .find("worktreeList.replaceChildren(...nextNodes);")
+            .expect("the sidebar rebuild no longer swaps its nodes in one call");
+        assert!(
+            refreshing[rebuilt..].contains("keepTurnsInStep(worktreeList);"),
+            "the sidebar rebuild draws its new rings from the top:\n{refreshing}"
+        );
+        // A card's changed rows are pinned once, after the last card (review t-102958 #1): pinned
+        // card by card, every card's ask brought the style forward again.
+        let painting = block_after(window, "function paintWorktreeAgents() {");
+        assert!(
+            painting.contains("stirred.push(host);")
+                && painting.contains(
+                    "for (const host of stirred) keepTurnsInStep(host.closest(\".wt-node\") ?? host);"
+                )
+                && !block_after(window, "function swapAgentRows(host, rows, leaving) {")
+                    .contains("keepTurnsInStep("),
+            "a card's rebuilt agent rows draw their rings from the top, or every \
+             changed card brings the style forward on its own:\n{painting}"
+        );
+        // The rows a scroll builds and a row that starts working on a standing node are pinned
+        // before their first frame, not one frame at the top (review t-102958 #2).
+        let windowing = block_after(window, "function renderSidebarWindows() {");
+        let built = windowing
+            .find("if (built) {")
+            .expect("the sidebar window no longer knows when the scroll built a row");
+        assert!(
+            windowing[built..].contains("keepTurnsInStep(worktreeList);"),
+            "a row the scroll builds draws its rings from the top for a frame:\n{windowing}"
+        );
+        let dots = block_after(window, "function paintWorktreeDots() {");
+        assert!(
+            dots.contains("if (dressWorktreeDot(row, worktreeDotState(path, owned.get(path) ?? []))) started.push(row);")
+                && dots.contains("for (const row of started) keepTurnsInStep(row.closest(\".wt-node\") ?? row);"),
+            "a card ring that starts on a standing row draws from the top for a frame:\n{dots}"
+        );
     }
 
     /// The dot moves without the sidebar being rebuilt around it.
@@ -7908,6 +7989,15 @@ mod tests {
              or without waiting for the list to settle:\n{freezing}"
         );
 
+        // Landing — what git says of a checkout's work against main — is painted in place too
+        // (1fcfd6c52). In the shape, every five-second stamp poll and every `worktree:landing`
+        // notice that moved one number (a commit behind, an unsaved file) rebuilt the whole
+        // sidebar: the blink the person saw (「네비바의 판이 한번씩 깜박거려」, 2026-11-08).
+        assert!(
+            !shape.contains("landingShape(") && !shape.contains(".landing"),
+            "the shape guard counts a checkout's landing as its shape, so every \
+             stamp poll that moved a number rebuilds the sidebar:\n{shape}"
+        );
         let painting = block_after(window, "function paintWorktreeDots() {");
         assert!(
             painting.contains("worktreeList.querySelectorAll(\".wt-row[data-worktree-path]\")")
@@ -7932,6 +8022,12 @@ mod tests {
                 && dressing.contains("worktreeStateLabel(said, phase)"),
             "the dot's mark and its words no longer come off one state and one \
              reading of the ledger:\n{dressing}"
+        );
+        // The landing chip rides the dot's door, so both roads that paint a dot paint the chip.
+        assert!(
+            dressing.contains("dressWorktreeLanding(row, state, phase);"),
+            "the landing chip left the dot's door, so the in-place road no longer \
+             repaints it:\n{dressing}"
         );
         let marking = block_after(window, "function worktreeMark(path, state) {");
         assert!(
@@ -14867,6 +14963,15 @@ mod tests {
             "the landing after a removal stopped being this project's own \
              main:\n{finishing}"
         );
+        // The main is looked up in the catalog the window holds, not in the refresh's answer: a
+        // refresh a newer one overtook answers `[]` (review t-102958 #6).
+        assert!(
+            finishing.contains(
+                "const worktrees = projects.flatMap((project) => project.worktrees ?? []);"
+            ) && !finishing.contains("= await refreshWorktrees();"),
+            "the landing after a removal reads the refresh's answer, which an \
+             overtaken refresh leaves empty:\n{finishing}"
+        );
         let unlisting = block_after(window, "async function removeProjectFromList(");
         assert!(
             unlisting
@@ -17385,7 +17490,9 @@ mod tests {
         // The guard is only sound if the signature covers what a row is BUILT
         // from. The active row, the selection, the dot's state and the agent
         // rows are deliberately outside it — all four are marked in place —
-        // and everything else has to be inside. (See
+        // and so is the landing chip, the fifth (t-102869): what git says of a
+        // checkout's work is painted in place through the dot's door. Everything
+        // else has to be inside. (See
         // `a_workspace_dot_repaints_without_rebuilding_the_list` for the other
         // half: what left the shape has to have arrived on the paint road.)
         let shape = block_after(window, "function worktreeListShape(held, resting) {");
@@ -17703,11 +17810,30 @@ mod tests {
         assert!(
             redressing.contains("if (held.length !== rows.length) return false;")
                 && redressing.contains("const fit = fittedAgentRowWords(held[at], row);")
-                && redressing.contains("writeTextContent(fit.name, fit.primary);")
+                && block_after(window, "function dressFittedAgentRow(fit) {")
+                    .contains("writeTextContent(fit.name, fit.primary);")
+                && redressing.contains("for (const fit of fitted) dressFittedAgentRow(fit);")
                 && fitting.contains("fit.secondary = agentRowSecondary(row, state, fit.primary);")
                 && block_after(window, "function paintWorktreeAgents() {")
                     .contains("if (!redressAgentRows(host, rows)) {"),
             "a card whose words moved is built again instead of re-dressed:\n{redressing}"
+        );
+        // And a card that cannot be re-dressed whole keeps every row that still fits (t-102869):
+        // one agent changing shape no longer rebuilds the other agents of its card.
+        let keyed = block_after(window, "function fittedOrMadeAgentSlots(host, rows) {");
+        assert!(
+            keyed.contains("const fit = fittedAgentRowWords(node, row);")
+                && keyed.contains("dressFittedAgentRow(fit);")
+                && keyed.contains("return makeAgentRow(row, true);")
+                && block_after(window, "function paintWorktreeAgents() {")
+                    .contains("swapAgentRows(host, fittedOrMadeAgentSlots(host, rows), leaving);"),
+            "one row changing shape rebuilds every row of its card:\n{keyed}"
+        );
+        let swapping = block_after(window, "function swapAgentRows(host, rows, leaving) {");
+        assert!(
+            swapping.contains("if (cursor === row) cursor = cursor.nextSibling;")
+                && !swapping.contains("host.append(...rows)"),
+            "a kept agent row is taken out and put back, restarting its ring:\n{swapping}"
         );
         assert!(
             styles.contains(".wt-agent-said::before {\n  content: \" - \";\n}"),
