@@ -5211,111 +5211,187 @@ pub(super) async fn answer_emulator_command(
     cwd: Option<&Path>,
     pane: Option<&str>,
 ) -> zerocode_hookd::TeamAnswer {
+    let command = match answer_emulator_off_window(argv, cwd).await {
+        std::ops::ControlFlow::Break(answer) => return answer,
+        std::ops::ControlFlow::Continue(open) => open,
+    };
+    let platform = command.platform.expect("parser requires a platform");
+    let device = command.device.clone();
+    // Seated where it was asked for, not where the person is looking
+    // (t-6379), the way the browser door's `open` is.
+    let payload = crate::emulator::AgentOpen::asked(platform, device, pane);
+    let opened = app
+        .emit_to("main", "emulator:agent-open", payload)
+        .map(|()| {
+            json!({
+                "surface": "zerocode-built-in",
+                "opening": true,
+                "platform": platform.as_str(),
+            })
+        })
+        .map_err(|error| error.to_string());
+    emulator_answer(
+        command.method,
+        command.json,
+        opened.map_err(crate::emulator::marks::backend_error),
+    )
+}
+
+/// A command that left `--device` out, put on the one simulator or emulator
+/// of its platform this window has open, with that device — or the refusal
+/// that names what to choose from. Anything else passes as it came.
+fn on_the_open_device(
+    argv: &[String],
+) -> Result<
+    (
+        std::borrow::Cow<'_, [String]>,
+        Option<zerocode_core::computer_use::EmulatorOpenDevice>,
+    ),
+    zerocode_hookd::TeamAnswer,
+> {
     use zerocode_core::computer_use::{
-        EmulatorMethod, EmulatorPlatform, emulator_usage, parse_emulator_command,
+        emulator_argv_on_device, emulator_device_choice, emulator_device_left_out,
+    };
+    let Some(platform) = emulator_device_left_out(argv) else {
+        return Ok((std::borrow::Cow::Borrowed(argv), None));
+    };
+    emulator_device_choice(platform, &crate::emulator::open_devices(platform))
+        .map(|device| {
+            let on = emulator_argv_on_device(argv, &device.id);
+            (std::borrow::Cow::Owned(on), Some(device))
+        })
+        .map_err(|why| {
+            let wants_json = argv.iter().any(|word| word == "--json");
+            emulator_cli_error(wants_json, "invalid_argument", &why)
+        })
+}
+
+/// Every emulator verb but `open`, which crosses into the window's frontend
+/// (its tab, splitter and frame channel): answered here (`Break`), or the
+/// parsed `open` handed back for the window to seat (`Continue`). A bench
+/// with no window answers the same verbs through this.
+pub(crate) async fn answer_emulator_off_window(
+    argv: &[String],
+    cwd: Option<&Path>,
+) -> std::ops::ControlFlow<zerocode_hookd::TeamAnswer, zerocode_core::computer_use::EmulatorCommand>
+{
+    use std::ops::ControlFlow::{self, Break, Continue};
+    use zerocode_core::computer_use::{
+        EmulatorCommand, EmulatorMethod, EmulatorPlatform, emulator_answer_went_to, emulator_usage,
+        parse_emulator_command,
     };
 
     if argv
         .first()
         .is_some_and(|word| matches!(word.as_str(), "help" | "-h" | "--help"))
     {
-        return computer_said(format!("{}\n", emulator_usage()));
+        return Break(computer_said(format!("{}\n", emulator_usage())));
     }
+    let (argv, went_to) = match on_the_open_device(argv) {
+        Ok(chosen) => chosen,
+        Err(refusal) => return Break(refusal),
+    };
     let wants_json = argv.iter().any(|word| word == "--json");
-    let command = match parse_emulator_command(argv) {
-        Ok(command) => command,
-        Err(error) => return emulator_cli_error(wants_json, "invalid_argument", &error),
-    };
-    let platform = command.platform;
-    let device = command.device.clone();
-    if command.method == EmulatorMethod::Batch {
-        return answer_emulator_batch(command).await;
-    }
-    if command.method.is_phone_setup()
-        || device
-            .as_deref()
-            .is_some_and(zerocode_core::agent_emulator::real_phone::is_real_phone)
-    {
-        return answer_real_phone(command, cwd).await;
-    }
-    if let (Some(platform), Some(device)) = (platform, device.as_deref()) {
-        crate::emulator::used_through_the_door(platform, device);
-    }
-    let result: Result<serde_json::Value, String> = match command.method {
-        EmulatorMethod::Marks
-        | EmulatorMethod::Click
-        | EmulatorMethod::Find
-        | EmulatorMethod::Foreground
-        | EmulatorMethod::WaitFor
-        | EmulatorMethod::Press
-        | EmulatorMethod::Scroll
-        | EmulatorMethod::ScrollUntil
-        | EmulatorMethod::Collect => {
-            return answer_emulator_observation(command).await;
+    // A command that left `--device` out is answered with the device it
+    // went to, whatever its verb answered.
+    let answered: ControlFlow<zerocode_hookd::TeamAnswer, EmulatorCommand> = async {
+        let command = match parse_emulator_command(&argv) {
+            Ok(command) => command,
+            Err(error) => return Break(emulator_cli_error(wants_json, "invalid_argument", &error)),
+        };
+        let platform = command.platform;
+        let device = command.device.clone();
+        if command.method == EmulatorMethod::Batch {
+            return Break(answer_emulator_batch(command).await);
         }
-        EmulatorMethod::Tap
-        | EmulatorMethod::Swipe
-        | EmulatorMethod::Text
-        | EmulatorMethod::Button => {
-            let method = command.method;
-            let json = command.json;
-            return emulator_answer(method, json, gesture_result(&command).await);
+        if command.method.is_phone_setup()
+            || device
+                .as_deref()
+                .is_some_and(zerocode_core::agent_emulator::real_phone::is_real_phone)
+        {
+            return Break(answer_real_phone(command, cwd).await);
         }
-        EmulatorMethod::List => crate::emulator::list_answer_now().await,
-        EmulatorMethod::Open => {
-            let platform = platform.expect("parser requires a platform");
-            // Seated where it was asked for, not where the person is looking
-            // (t-6379), the way the browser door's `open` is.
-            let payload = crate::emulator::AgentOpen::asked(platform, device, pane);
-            app.emit_to("main", "emulator:agent-open", payload)
-                .map(|()| {
-                    json!({
-                        "surface": "zerocode-built-in",
-                        "opening": true,
-                        "platform": platform.as_str(),
-                    })
-                })
-                .map_err(|error| error.to_string())
+        if command.method == EmulatorMethod::Open {
+            return Continue(command);
         }
-        EmulatorMethod::Tree => {
-            let device = device.expect("parser requires a device");
-            match platform.expect("parser requires a platform") {
-                EmulatorPlatform::Ios => ios_accessibility_tree_direct(device).await,
-                EmulatorPlatform::Android => match active_android_serial(&device).await {
-                    Ok(serial) => android_accessibility_tree_direct(serial).await,
-                    Err(error) => Err(error),
-                },
+        if let (Some(platform), Some(device)) = (platform, device.as_deref()) {
+            crate::emulator::used_through_the_door(platform, device);
+        }
+        let result: Result<serde_json::Value, String> = match command.method {
+            EmulatorMethod::Marks
+            | EmulatorMethod::Click
+            | EmulatorMethod::Find
+            | EmulatorMethod::Foreground
+            | EmulatorMethod::WaitFor
+            | EmulatorMethod::Press
+            | EmulatorMethod::Scroll
+            | EmulatorMethod::ScrollUntil
+            | EmulatorMethod::Collect => {
+                return Break(answer_emulator_observation(command).await);
             }
-        }
-        EmulatorMethod::Rotate => {
-            let device = device.expect("parser requires a device");
-            let rotation = command.rotation.expect("parser requires rotation");
-            let done = match platform.expect("parser requires a platform") {
-                EmulatorPlatform::Ios => ios_rotate_direct(device, rotation).await,
-                EmulatorPlatform::Android => match active_android_serial(&device).await {
-                    Ok(serial) => android_rotate_direct(serial, rotation).await,
-                    Err(error) => Err(error),
-                },
-            };
-            done.map(|()| json!({ "performed": true }))
-        }
-        EmulatorMethod::Screenshot => {
-            let device = device.expect("parser requires a device");
-            let platform = platform.expect("parser requires a platform");
-            capture_emulator_screenshot(platform, device, command.out.as_deref(), cwd).await
-        }
-        // The door above took these.
-        EmulatorMethod::PhoneInstall | EmulatorMethod::PhoneRemove | EmulatorMethod::PhoneCheck => {
-            Err("this verb takes a real phone's id".to_string())
-        }
-        EmulatorMethod::Batch => Err("a batch is answered above".to_string()),
-    };
+            EmulatorMethod::Tap
+            | EmulatorMethod::Swipe
+            | EmulatorMethod::Text
+            | EmulatorMethod::Button => {
+                let method = command.method;
+                let json = command.json;
+                return Break(emulator_answer(
+                    method,
+                    json,
+                    gesture_result(&command).await,
+                ));
+            }
+            EmulatorMethod::List => crate::emulator::list_answer_now().await,
+            EmulatorMethod::Tree => {
+                let device = device.expect("parser requires a device");
+                match platform.expect("parser requires a platform") {
+                    EmulatorPlatform::Ios => ios_accessibility_tree_direct(device).await,
+                    EmulatorPlatform::Android => match active_android_serial(&device).await {
+                        Ok(serial) => android_accessibility_tree_direct(serial).await,
+                        Err(error) => Err(error),
+                    },
+                }
+            }
+            EmulatorMethod::Rotate => {
+                let device = device.expect("parser requires a device");
+                let rotation = command.rotation.expect("parser requires rotation");
+                let done = match platform.expect("parser requires a platform") {
+                    EmulatorPlatform::Ios => ios_rotate_direct(device, rotation).await,
+                    EmulatorPlatform::Android => match active_android_serial(&device).await {
+                        Ok(serial) => android_rotate_direct(serial, rotation).await,
+                        Err(error) => Err(error),
+                    },
+                };
+                done.map(|()| json!({ "performed": true }))
+            }
+            EmulatorMethod::Screenshot => {
+                let device = device.expect("parser requires a device");
+                let platform = platform.expect("parser requires a platform");
+                capture_emulator_screenshot(platform, device, command.out.as_deref(), cwd).await
+            }
+            // The door above took these.
+            EmulatorMethod::PhoneInstall
+            | EmulatorMethod::PhoneRemove
+            | EmulatorMethod::PhoneCheck => Err("this verb takes a real phone's id".to_string()),
+            EmulatorMethod::Batch | EmulatorMethod::Open => {
+                Err("a batch and an open are answered above".to_string())
+            }
+        };
 
-    emulator_answer(
-        command.method,
-        command.json,
-        result.map_err(crate::emulator::marks::backend_error),
-    )
+        Break(emulator_answer(
+            command.method,
+            command.json,
+            result.map_err(crate::emulator::marks::backend_error),
+        ))
+    }
+    .await;
+    match (answered, went_to) {
+        (Break(answer), Some(device)) => Break(zerocode_hookd::TeamAnswer {
+            stdout: emulator_answer_went_to(&answer.stdout, wants_json, &device),
+            ..answer
+        }),
+        (answered, _) => answered,
+    }
 }
 
 /// The four gestures a lone command and a batch's step share — tap, swipe,
@@ -5433,6 +5509,7 @@ fn batch_step_stops(
 async fn answer_emulator_batch(
     command: zerocode_core::computer_use::EmulatorCommand,
 ) -> zerocode_hookd::TeamAnswer {
+    use crate::emulator::checks::VISIBLE_KEY;
     use zerocode_core::agent_emulator::EMULATOR_BATCH_BUDGET_MS;
     use zerocode_core::computer_use::EmulatorMethod;
 
@@ -5445,12 +5522,16 @@ async fn answer_emulator_batch(
     {
         crate::emulator::used_through_the_door(platform, device);
     }
+    let on = command.platform.zip(command.device.clone());
     let started = std::time::Instant::now();
     let budget = std::time::Duration::from_millis(EMULATOR_BATCH_BUDGET_MS);
     let of = command.steps.len();
     let mut ran = Vec::with_capacity(of);
     let mut completed = 0_usize;
     let mut stopped: Option<(usize, String)> = None;
+    // The screen the step before read, for a press to choose on: only ever
+    // the step just before, and gone after any step that may change it.
+    let mut seen = None;
     for (at, step) in command.steps.into_iter().enumerate() {
         let n = at + 1;
         let verb = step.method.verb_name();
@@ -5469,8 +5550,16 @@ async fn answer_emulator_batch(
             EmulatorMethod::Tap
             | EmulatorMethod::Swipe
             | EmulatorMethod::Text
-            | EmulatorMethod::Button => gesture_result(&step).await,
-            _ => observation_result(step).await,
+            | EmulatorMethod::Button => {
+                seen = None;
+                gesture_result(&step).await
+            }
+            _ => observation_seen(step, seen.take())
+                .await
+                .map(|(result, read)| {
+                    seen = read;
+                    result
+                }),
         };
         match result {
             Ok(result) => {
@@ -5490,7 +5579,17 @@ async fn answer_emulator_batch(
             }
         }
     }
-    let answer = json!({
+    let screen = match ran
+        .last()
+        .and_then(|step| step.pointer(&format!("/result/{VISIBLE_KEY}")))
+    {
+        Some(shown) => Some(shown.clone()),
+        None => match on {
+            Some((platform, device)) => batch_screen(platform, device).await,
+            None => None,
+        },
+    };
+    let mut answer = json!({
         "steps": ran,
         "completed": completed,
         "of": of,
@@ -5498,7 +5597,30 @@ async fn answer_emulator_batch(
         "stoppedBecause": stopped.map(|(_, why)| why),
         "elapsedMs": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     });
+    if let Some(screen) = screen {
+        answer[BATCH_SCREEN_KEY] = screen;
+    }
     emulator_answer(EmulatorMethod::Batch, json, Ok(answer))
+}
+
+/// The key a batch answers its last screen's words under, so the result the
+/// steps led to is read in the same answer — a look or a screenshot after a
+/// batch was two more model round trips on every errand (Phone Harness P2,
+/// 2026-11-09: 9–10 round trips, 2 of them a screenshot and its picture).
+const BATCH_SCREEN_KEY: &str = "screen";
+
+/// The words the screen a batch ended on shows (`checks::visible`), or none
+/// when it cannot be read — a locked phone's refusal stays the step's own
+/// answer, and a batch is never failed by its last look.
+async fn batch_screen(
+    platform: zerocode_core::computer_use::EmulatorPlatform,
+    device: String,
+) -> Option<serde_json::Value> {
+    let device = read_target(platform, device).await.ok()?;
+    crate::emulator::checks::screen_words(platform, &device)
+        .await
+        .ok()
+        .map(|words| json!(words))
 }
 
 /// A real phone answers on its own platform only: an iPhone's road is `--platform
@@ -5699,17 +5821,32 @@ pub(super) async fn answer_emulator_observation(
 
 /// What the verbs that read the screen first answer — a look, a check, a wait,
 /// a press by number or by words, a scroll and a list walk — on one device
-/// whichever road it takes: the result a lone command says and a batch's step
-/// keeps.
+/// whichever road it takes: the result a lone command says.
 async fn observation_result(
     command: zerocode_core::computer_use::EmulatorCommand,
 ) -> Result<serde_json::Value, zerocode_core::computer_use_protocol::ProviderError> {
+    observation_seen(command, None)
+        .await
+        .map(|(answer, _)| answer)
+}
+
+/// [`observation_result`] as a batch's step takes it: a `press` chooses on
+/// `seen`, the screen the step before it just read, and a read that changes
+/// nothing (a look, a check, a wait) hands its own screen to the step after
+/// it. Every other verb hands none on, since it may change the screen.
+async fn observation_seen(
+    command: zerocode_core::computer_use::EmulatorCommand,
+    seen: Option<crate::emulator::marks::Seen>,
+) -> Result<
+    (serde_json::Value, Option<crate::emulator::marks::Seen>),
+    zerocode_core::computer_use_protocol::ProviderError,
+> {
     use crate::emulator::{checks, lists, marks};
     use zerocode_core::agent_emulator::{
-        EMULATOR_COLLECT_DEFAULT, EMULATOR_SCROLL_UNTIL_DEFAULT, EMULATOR_WAIT_MS_DEFAULT,
-        real_android::is_android_phone, real_phone::is_real_phone,
+        EMULATOR_COLLECT_DEFAULT, EMULATOR_SCROLL_UNTIL_DEFAULT, real_android::is_android_phone,
+        real_phone::is_real_phone,
     };
-    use zerocode_core::computer_use::{EmulatorDirection, EmulatorMethod, EmulatorPlatform};
+    use zerocode_core::computer_use::{EmulatorDirection, EmulatorMethod};
     use zerocode_core::computer_use_protocol::ProviderError;
 
     let platform = command
@@ -5728,9 +5865,94 @@ async fn observation_result(
             &device,
             command.app.as_deref().unwrap_or_default(),
         )
-        .await;
+        .await
+        .map(|answer| (answer, None));
     }
-    let device = match platform {
+    let device = read_target(platform, device).await?;
+    let text = command.text.as_deref().unwrap_or_default();
+    let direction = command.direction.unwrap_or(EmulatorDirection::Down);
+    let handed_on = |(answer, seen)| (answer, Some(seen));
+    let alone = |answer| (answer, None);
+    match command.method {
+        EmulatorMethod::Marks => marks::observe_seen(platform, device, command.text.as_deref())
+            .await
+            .map(handed_on),
+        EmulatorMethod::Find => checks::observe_seen(platform, device, command.method, text)
+            .await
+            .map(handed_on),
+        EmulatorMethod::Foreground => checks::observe_seen(
+            platform,
+            device,
+            command.method,
+            command.app.as_deref().unwrap_or_default(),
+        )
+        .await
+        .map(handed_on),
+        EmulatorMethod::WaitFor => {
+            checks::wait_for(platform, device, text, command.absent, command.timeout_ms)
+                .await
+                .map(handed_on)
+        }
+        EmulatorMethod::Press => {
+            marks::press(platform, device, text, command.nth, command.preview, seen)
+                .await
+                .map(alone)
+        }
+        EmulatorMethod::Scroll => lists::scroll(
+            platform,
+            &device,
+            direction,
+            command.amount,
+            command.x.zip(command.y),
+        )
+        .await
+        .map(alone),
+        EmulatorMethod::ScrollUntil => lists::scroll_until(
+            platform,
+            device,
+            text,
+            direction,
+            command.amount,
+            command.max.unwrap_or(EMULATOR_SCROLL_UNTIL_DEFAULT),
+        )
+        .await
+        .map(alone),
+        EmulatorMethod::Collect => lists::collect(
+            platform,
+            device,
+            direction,
+            command.amount,
+            command.max.unwrap_or(EMULATOR_COLLECT_DEFAULT),
+        )
+        .await
+        .map(alone),
+        EmulatorMethod::Click => marks::click(
+            platform,
+            device,
+            command.mark.unwrap_or_default(),
+            command.look.as_deref().unwrap_or_default(),
+            command.text.as_deref(),
+            command.preview,
+        )
+        .await
+        .map(alone),
+        method => Err(ProviderError::invalid_argument(format!(
+            "`{}` does not read the screen first",
+            method.verb_name()
+        ))),
+    }
+}
+
+/// The device a read goes to, by the id a command named: an Android
+/// emulator's serial and the AVD it is now, anything else its own id.
+async fn read_target(
+    platform: zerocode_core::computer_use::EmulatorPlatform,
+    device: String,
+) -> Result<crate::emulator::marks::Device, zerocode_core::computer_use_protocol::ProviderError> {
+    use crate::emulator::marks;
+    use zerocode_core::agent_emulator::real_phone::is_real_phone;
+    use zerocode_core::computer_use::EmulatorPlatform;
+    Ok(match platform {
         // A real phone's id is its own identity and address (t-93824).
         EmulatorPlatform::Android if !is_real_phone(&device) => active_android_mark_target(&device)
             .await
@@ -5739,81 +5961,7 @@ async fn observation_result(
             identity: device.clone(),
             address: device,
         },
-    };
-    let text = command.text.as_deref().unwrap_or_default();
-    let direction = command.direction.unwrap_or(EmulatorDirection::Down);
-    match command.method {
-        EmulatorMethod::Marks => marks::observe(platform, device, command.text.as_deref()).await,
-        EmulatorMethod::Find => checks::observe(platform, device, command.method, text).await,
-        EmulatorMethod::Foreground => {
-            checks::observe(
-                platform,
-                device,
-                command.method,
-                command.app.as_deref().unwrap_or_default(),
-            )
-            .await
-        }
-        EmulatorMethod::WaitFor => {
-            checks::wait_for(
-                platform,
-                device,
-                text,
-                command.absent,
-                command.timeout_ms.unwrap_or(EMULATOR_WAIT_MS_DEFAULT),
-            )
-            .await
-        }
-        EmulatorMethod::Press => {
-            marks::press(platform, device, text, command.nth, command.preview).await
-        }
-        EmulatorMethod::Scroll => {
-            lists::scroll(
-                platform,
-                &device,
-                direction,
-                command.amount,
-                command.x.zip(command.y),
-            )
-            .await
-        }
-        EmulatorMethod::ScrollUntil => {
-            lists::scroll_until(
-                platform,
-                device,
-                text,
-                direction,
-                command.amount,
-                command.max.unwrap_or(EMULATOR_SCROLL_UNTIL_DEFAULT),
-            )
-            .await
-        }
-        EmulatorMethod::Collect => {
-            lists::collect(
-                platform,
-                device,
-                direction,
-                command.amount,
-                command.max.unwrap_or(EMULATOR_COLLECT_DEFAULT),
-            )
-            .await
-        }
-        EmulatorMethod::Click => {
-            marks::click(
-                platform,
-                device,
-                command.mark.unwrap_or_default(),
-                command.look.as_deref().unwrap_or_default(),
-                command.text.as_deref(),
-                command.preview,
-            )
-            .await
-        }
-        method => Err(ProviderError::invalid_argument(format!(
-            "`{}` does not read the screen first",
-            method.verb_name()
-        ))),
-    }
+    })
 }
 
 pub(super) fn emulator_answer(
@@ -7181,6 +7329,13 @@ pub(super) fn answer_computer_command_with(
                 answer
             },
         )
+    } else if matches!(
+        command.method,
+        ComputerMethod::SheetWrite | ComputerMethod::SheetRead
+    ) {
+        // A table is the window's too: its file, or its app's own script —
+        // never the helper's keys or pointer (t-102013).
+        computer_use::sheet::answer(&command, workspace)
     } else if command.method == ComputerMethod::Run {
         // A run is the window's to answer too: a program, no pane, its head of
         // output as the result — the terminal a person would have opened.

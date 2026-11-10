@@ -41,20 +41,15 @@ pub const CWD_HEADER: &str = "x-zerocode-cwd";
 
 /// The Computer Use verbs whose request says where its caller stands
 /// ([`CWD_HEADER`]): the ones the window judges by that folder. A recipe walk
-/// that stops is judged for the workspace it was asked from; no other verb
+/// that stops is judged for the workspace it was asked from, and a sheet
+/// file's relative `--path` starts there, as a person's would; no other verb
 /// reads the folder, so no other call spends two processes spelling it.
 pub const CWD_VERBS: &[&str] = &[
     ComputerMethod::RecipeRun.verb_name(),
     ComputerMethod::Walk.verb_name(),
+    ComputerMethod::SheetWrite.verb_name(),
+    ComputerMethod::SheetRead.verb_name(),
 ];
-
-/// The Computer Use verbs whose request names the pane that asked
-/// ([`crate::agent_browser::PANE_HEADER`]): the walks, whose browser steps the
-/// window takes for that pane — a work browser answers its owner alone, and a
-/// walk that named no pane had its every look refused (10-22,
-/// `workspace_actor_required`, t-70425). No other verb names one: the door
-/// opens nothing the person sees.
-pub const PANE_VERBS: &[&str] = CWD_VERBS;
 
 /// [`CWD_HEADER`]'s value for `cwd` — its UTF-8 bytes as lowercase hex, the
 /// spelling the door's `od` writes.
@@ -1871,6 +1866,10 @@ pub fn walked_result_unfinished(method: ComputerMethod, result: &Value) -> Optio
         ComputerMethod::TypeText => {
             crate::computer_use_protocol::typed_check::stop_sentence(result)
         }
+        ComputerMethod::SheetWrite if says("verified", false) => Some(format!(
+            "cells did not read back as written: {}",
+            result.get("mismatched").unwrap_or(&Value::Null)
+        )),
         _ => None,
     }
 }
@@ -2405,6 +2404,13 @@ pub enum ComputerMethod {
     /// the next plan. Answers once the first plan runs; the run holds the
     /// hand until its deadline, a stop or the decision ends it.
     ReflexAuto,
+    /// A table's cells without the pointer, the keys or the front app
+    /// (t-102013) — the window's: a `.xlsx` or `.csv` file written and read
+    /// directly, or an open Numbers or Excel document through the app's own
+    /// script (`computer_sheet`). Background keys wrote 0 of 12 cells in
+    /// Calc and 6 of 12 in Numbers; these roads wrote 12 of 12.
+    SheetWrite,
+    SheetRead,
 }
 
 /// The provider methods the Windows provider answers today
@@ -2533,6 +2539,8 @@ impl ComputerMethod {
         Self::ReflexStatus,
         Self::ReflexStop,
         Self::ReflexAuto,
+        Self::SheetWrite,
+        Self::SheetRead,
     ];
 
     /// Where the verb stands on Windows, by the two tables.
@@ -2598,6 +2606,7 @@ impl ComputerMethod {
             Self::SoundRead => Some("soundRead"),
             Self::SoundWait | Self::Watch | Self::Batch | Self::Parallel | Self::Walk => None,
             Self::ReflexStart | Self::ReflexStatus | Self::ReflexStop | Self::ReflexAuto => None,
+            Self::SheetWrite | Self::SheetRead => None,
         }
     }
 
@@ -2672,6 +2681,8 @@ impl ComputerMethod {
             Self::ReflexStatus => "reflex-status",
             Self::ReflexStop => "reflex-stop",
             Self::ReflexAuto => "reflex-auto",
+            Self::SheetWrite => "sheet-write",
+            Self::SheetRead => "sheet-read",
         }
     }
 
@@ -2788,6 +2799,7 @@ impl ComputerMethod {
                 | Self::Walk
                 | Self::ReflexStart
                 | Self::ReflexAuto
+                | Self::SheetWrite
         )
     }
 
@@ -2903,7 +2915,8 @@ impl ComputerMethod {
         }
     }
 
-    /// A verb that works on the whole desktop names no app.
+    /// A verb that works on the whole desktop names no app — and a sheet
+    /// verb, whose `--app` names the script it goes through, not a window.
     #[must_use]
     pub const fn is_desktop(self) -> bool {
         matches!(
@@ -2956,6 +2969,8 @@ impl ComputerMethod {
                 | Self::ReflexStart
                 | Self::ReflexStatus
                 | Self::ReflexStop
+                | Self::SheetWrite
+                | Self::SheetRead
         )
     }
 }
@@ -3513,6 +3528,105 @@ pub fn parse_emulator_command(argv: &[String]) -> Result<EmulatorCommand, String
     })
 }
 
+/// The platform a command asked for when it acts on one device and left
+/// `--device` out — `None` when it named one, needs none (`list`, `open`), is
+/// a real phone's setup (which always names the phone) or is no command. The
+/// door then answers on the one simulator or emulator of that platform its
+/// window has open ([`emulator_argv_on_device`]), or refuses with the choice
+/// ([`emulator_device_choice`]); a real phone is never taken for granted.
+#[must_use]
+pub fn emulator_device_left_out(argv: &[String]) -> Option<EmulatorPlatform> {
+    let verb = argv.first()?;
+    let method = EmulatorMethod::ALL
+        .into_iter()
+        .find(|method| method.verb_name() == verb)?;
+    if matches!(method, EmulatorMethod::List | EmulatorMethod::Open) || method.is_phone_setup() {
+        return None;
+    }
+    if argv
+        .iter()
+        .any(|word| word == "--device" || word.starts_with("--device="))
+    {
+        return None;
+    }
+    let at = argv.iter().position(|word| word == "--platform")?;
+    argv.get(at + 1)?.parse().ok()
+}
+
+/// A command that left `--device` out, put on `device`.
+#[must_use]
+pub fn emulator_argv_on_device(argv: &[String], device: &str) -> Vec<String> {
+    let mut on = argv.to_vec();
+    on.extend(["--device".to_owned(), device.to_owned()]);
+    on
+}
+
+/// A simulator or emulator this window has a pane open on: its id, which a
+/// command names with `--device`, and the name the person gave it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EmulatorOpenDevice {
+    pub id: String,
+    pub name: String,
+}
+
+impl std::fmt::Display for EmulatorOpenDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.name, self.id)
+    }
+}
+
+/// The key an answer to a command that left `--device` out names the device
+/// it went to under, so the model reads which one without a `list` (Phone
+/// Harness P2, 2026-11-10: 4 of 6 errands began with `list` to make sure of
+/// the simulator's name).
+pub const EMULATOR_WENT_TO_KEY: &str = "device";
+
+/// Which device a command that left `--device` out goes to: the one this
+/// window has open for its platform. None, or several, is refused with the
+/// sentence that says what to name instead — the names and ids when there are
+/// several, so the refusal is the choice and costs no `list`.
+pub fn emulator_device_choice(
+    platform: EmulatorPlatform,
+    open: &[EmulatorOpenDevice],
+) -> Result<EmulatorOpenDevice, String> {
+    let what = match platform {
+        EmulatorPlatform::Ios => "iOS simulator",
+        EmulatorPlatform::Android => "Android emulator",
+    };
+    match open {
+        [one] => Ok(one.clone()),
+        [] => Err(format!(
+            "no {what} is open in this window, so --device cannot be left out: name one from `zerocode-emulator list`, or `open` one"
+        )),
+        several => Err(format!(
+            "{} {what}s are open in this window ({}): name one with --device",
+            several.len(),
+            several
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// An answer to a command that left `--device` out, naming the device it
+/// went to: a JSON answer under [`EMULATOR_WENT_TO_KEY`], a plain one on a
+/// first line of its own. Said on a refusal too, which is about that device.
+#[must_use]
+pub fn emulator_answer_went_to(said: &str, json: bool, device: &EmulatorOpenDevice) -> String {
+    if json {
+        if let Ok(Value::Object(mut answer)) = serde_json::from_str::<Value>(said.trim_end()) {
+            answer.insert(EMULATOR_WENT_TO_KEY.to_owned(), json!(device));
+            return format!("{}\n", Value::Object(answer));
+        }
+        return said.to_owned();
+    }
+    // The name is one line, whatever the person typed into it.
+    let name: String = device.name.chars().filter(|c| !c.is_control()).collect();
+    format!("{EMULATOR_WENT_TO_KEY}: {name} ({})\n{said}", device.id)
+}
+
 /// `batch --steps`: a JSON array of command lines, each one this parser accepts
 /// as a step on the batch's own device — checked whole before the first step
 /// runs, so a batch that could never finish is refused before it touches the
@@ -3848,6 +3962,8 @@ pub fn verb_method(verb: &str) -> Option<ComputerMethod> {
         "reflex-status" => ComputerMethod::ReflexStatus,
         "reflex-stop" => ComputerMethod::ReflexStop,
         "reflex-auto" => ComputerMethod::ReflexAuto,
+        "sheet-write" => ComputerMethod::SheetWrite,
+        "sheet-read" => ComputerMethod::SheetRead,
         "batch" => ComputerMethod::Batch,
         "parallel" => ComputerMethod::Parallel,
         _ => return None,
@@ -4097,6 +4213,10 @@ fn parse_flags(
         ("l1", "l1"),
         ("after-text", "afterText"),
         ("flow-check", "flowCheck"),
+        ("document", "document"),
+        ("sheet", "sheet"),
+        ("table", "table"),
+        ("range", "range"),
     ] {
         if let Some(value) = optional_string_allowing_empty(&flags, flag)? {
             params.insert(key.into(), Value::String(value));
@@ -4165,6 +4285,14 @@ fn parse_flags(
     // The ears hear by the window's table: the helper keeps no numbers of its own.
     if method == ComputerMethod::ListenStart {
         params.extend(sound_table());
+    }
+    // A table's cells, its app and its names are checked whole before any
+    // file or app is touched; the app is named as the share knows it.
+    if matches!(
+        method,
+        ComputerMethod::SheetWrite | ComputerMethod::SheetRead
+    ) {
+        sheet_params(&flags, &mut params)?;
     }
     // A recipe's values are checked before anything is walked.
     if method == ComputerMethod::RecipeRun
@@ -4606,6 +4734,12 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
         ],
         ComputerMethod::ReflexStart => &["json", "flow", "display", "seconds", "renew"],
         ComputerMethod::ReflexStatus | ComputerMethod::ReflexStop => &["json", "run"],
+        ComputerMethod::SheetWrite => {
+            &["json", "path", "app", "document", "sheet", "table", "cells"]
+        }
+        ComputerMethod::SheetRead => {
+            &["json", "path", "app", "document", "sheet", "table", "range"]
+        }
         ComputerMethod::ReflexAuto => &["json", "goal", "app", "display", "seconds", "renew", "l1"],
     }
 }
@@ -4862,6 +4996,25 @@ fn validate(
             Some(ms) if ms > 0 => {}
             _ => return Err("wait needs a positive --ms".into()),
         },
+        ComputerMethod::SheetWrite | ComputerMethod::SheetRead => {
+            if has("path") == has("app") {
+                return Err(format!(
+                    "{} needs exactly one of --path <file.xlsx|file.csv> or --app Numbers|Excel --document <name>",
+                    method.verb_name()
+                ));
+            }
+            if has("app") != has("document") {
+                return Err(
+                    "--app and --document go together: the app and its open document".into(),
+                );
+            }
+            if has("path") && has("table") {
+                return Err("--table names a Numbers table; a file's sheet is --sheet".into());
+            }
+            if method == ComputerMethod::SheetWrite && !has("cells") {
+                return Err("missing required --cells '{\"A1\":\"item\",\"B2\":3}'".into());
+            }
+        }
         ComputerMethod::Open => {
             if has("path") == has("url") {
                 return Err("open needs exactly one of --path or --url".into());
@@ -5351,6 +5504,42 @@ fn validate_element_or_coordinates(element: bool, x: bool, y: bool) -> Result<()
     Ok(())
 }
 
+/// A sheet verb's own words, read whole: the cells as canonical addresses,
+/// the app as the share knows it, the sheet name a workbook keeps and the
+/// range as its two corners.
+fn sheet_params(
+    flags: &BTreeMap<String, Option<String>>,
+    params: &mut Map<String, Value>,
+) -> Result<(), String> {
+    use crate::computer_sheet::{
+        CellRange, SheetApp, cells_to_value, check_sheet_name, parse_cells,
+    };
+    if let Some(raw) = optional_string(flags, "cells")? {
+        params.insert("cells".into(), cells_to_value(&parse_cells(&raw)?));
+    }
+    if let Some(app) = params.get("app").and_then(Value::as_str) {
+        let app = SheetApp::parse(app)?;
+        params.insert("app".into(), json!(app.name()));
+    }
+    if let Some(sheet) = params.get("sheet").and_then(Value::as_str) {
+        check_sheet_name(sheet)?;
+    }
+    if let Some(range) = params.get("range").and_then(Value::as_str) {
+        let range = CellRange::parse(range)?;
+        params.insert("range".into(), json!(range.name()));
+    }
+    for key in ["document", "table", "path"] {
+        if params
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|word| word.trim().is_empty())
+        {
+            return Err(format!("--{key} may not be empty"));
+        }
+    }
+    Ok(())
+}
+
 fn require(params: &Map<String, Value>, key: &str, flag: &str) -> Result<(), String> {
     params
         .contains_key(key)
@@ -5525,6 +5714,13 @@ pub fn usage() -> String {
         "  zerocode-computer clipboard-read [--json]",
         "  zerocode-computer clipboard-write --text <text> [--json]",
         "",
+        "  tables — a spreadsheet's cells by its file or the app's own script, never by keys or the pointer (the front app stays):",
+        "  zerocode-computer sheet-write (--path <file.xlsx|file.csv> | --app Numbers|Excel --document <open document> [--table <name>]) [--sheet <name>] --cells '{\"A1\":\"item\",\"B2\":3,\"C4\":\"=SUM(C2:C3)\"}' [--json]",
+        "      (a missing file is made; an existing xlsx keeps its other cells, sheets and formats; \"=...\" is a formula, \"'=...\" keeps it text,",
+        "       null empties a cell; answers the cells written, each read back (verified), the ms it took and, through an app, whether the front app stayed)",
+        "  zerocode-computer sheet-read (--path <file> | --app Numbers|Excel --document <open document> [--table <name>]) [--sheet <name>] [--range A1:C4] [--json]",
+        "      (a path is in your home folder; through an app the document is already open there — the app is never started or brought forward; Excel and Numbers are macOS only)",
+        "",
         "  the meaning layer — find, wait for, read (--ocr reads pixels when the tree is empty):",
         "  zerocode-computer find (--app <app> | --ocr [--display N] [--region x,y,w,h]) (--text <t> | --role <r> [--label <l>]) [--json]",
         "  zerocode-computer wait-for (--text <t> | --role <r> [--label <l>]) (--app <app> | --ocr) [--timeout-ms N] [--absent] [--json]",
@@ -5619,8 +5815,11 @@ pub fn shim_script(port_var: &str, computer_token_var: &str, hook_token_var: &st
 /// window judges by that folder ([`CWD_VERBS`]): a recipe walk is asked
 /// through it, and a stopped walk is judged only for a workspace the person
 /// consented to. The emulator and terminal doors have no use for the folder.
-/// For the same walks it names the pane that asked ([`PANE_VERBS`]), whose
-/// browser steps are that pane's own.
+/// Every verb names the pane that asked, in the browser door's own header: a
+/// walk's browser steps are that pane's own (t-70425), and every act in an app
+/// draws that pane's own pointer there. A door that named the pane for walks
+/// alone sent every lone act as nobody's, so all the agents at work shared one
+/// pointer that jumped from app to app (11-10, t-101957).
 fn computer_door<'a>(
     manual: &'a str,
     port_var: &'a str,
@@ -5629,7 +5828,7 @@ fn computer_door<'a>(
 ) -> PowerShellBridgeShim<'a> {
     PowerShellBridgeShim {
         cwd_verbs: CWD_VERBS,
-        pane_verbs: PANE_VERBS,
+        pane_header: Some(crate::agent_browser::PANE_HEADER),
         ..computer_route_shim(
             COMPUTER_CLI,
             manual,
@@ -5644,6 +5843,14 @@ fn computer_door<'a>(
 #[must_use]
 pub fn emulator_usage() -> String {
     use crate::agent_emulator::physical::{PHYSICAL_KEY, UNCHECKED_KEY};
+    let wait_note = format!(
+        "    at most {}); answers met, count and waitedMs, and visible when it was not met. Left at its default,\n\
+         \x20   a wait whose words are not there ends once the screen has stood still {} ms ({}); give\n\
+         \x20   --timeout-ms to wait the whole time for words a still screen will show late.",
+        crate::agent_emulator::EMULATOR_WAIT_MS_MAX,
+        crate::agent_emulator::EMULATOR_WAIT_STILL_MS,
+        crate::agent_emulator::EMULATOR_STOOD_STILL_KEY,
+    );
     let list_note = format!(
         "    Answers the simulators and emulators this window drives (ios, android), the real phones it\n\
          \x20   sees ({PHYSICAL_KEY}, each with drivable, its device id and a reason), and a tool that\n\
@@ -5654,6 +5861,9 @@ pub fn emulator_usage() -> String {
         "",
         "  zerocode-emulator list [--json]",
         list_note.as_str(),
+        "  --device may be left out when this window has exactly one simulator or emulator of that",
+        "  platform open, and its answer names the device it went to (device: name and id), so no list is",
+        "  needed to make sure of it; a real phone is always named.",
         "  zerocode-emulator open --platform ios|android [--device <id>] [--json]",
         "  zerocode-emulator tree --platform ios|android --device <id> [--json]",
         "  zerocode-emulator marks --platform ios|android --device <id> [--text <fragment>] [--json]",
@@ -5665,7 +5875,7 @@ pub fn emulator_usage() -> String {
         "    A find that counts 0 also answers visible: the words the screen does show, so the next step is not a guess.",
         "  zerocode-emulator wait-for --platform ios|android --device <id> --text <fragment> [--absent] [--timeout-ms N] [--json]",
         "    Reads the screen until the words are there (gone, with --absent), up to --timeout-ms (default 5000,",
-        "    at most 20000); answers met, count and waitedMs, and visible when it was not met.",
+        wait_note.as_str(),
         "  zerocode-emulator click --platform ios|android --device <id> --mark <n> --look <id> [--text <fragment>] [--preview] [--json]",
         "    On iOS a click answers once the screen it led to stops changing; --text counts what find would",
         "    in the tree it stopped on (count; 0 is not proof of absence — look with marks --text); --preview",
@@ -5693,7 +5903,8 @@ pub fn emulator_usage() -> String {
         "    Several steps on one device in one call, e.g. '[[\"press\",\"--text\",\"Settings\"],[\"wait-for\",\"--text\",\"General\"]]'.",
         "    A step is marks, find, foreground, wait-for, press, tap, swipe, scroll, scroll-until, collect, text or",
         "    button, without --platform and --device. A check that fails (find or foreground counting 0, a wait or",
-        "    a scroll-until not met) or a step refused stops the batch; the answer says each step's result and where it stopped.",
+        "    a scroll-until not met) or a step refused stops the batch; the answer says each step's result and where it stopped,",
+        "    and screen: the words its last screen shows, top to bottom, so reading the result needs no look or screenshot.",
         "  zerocode-emulator phone-check --device <phone-id> [--json]",
         "    A real phone: everything unattended use needs, in one answer; what cannot be read is said as unknown.",
         "  zerocode-emulator phone-install --device <phone-id> [--team <team-id>] [--json]",
@@ -5813,7 +6024,6 @@ fn computer_route_shim<'a>(
         deadline_seconds: COMPUTER_LONGEST_DEADLINE_MS.div_ceil(1_000),
         stdin_flags: true,
         pane_header: None,
-        pane_verbs: &[],
         cwd_verbs: &[],
         cwd_flag: None,
         pane_flag: None,
@@ -5860,11 +6070,6 @@ pub(crate) struct PowerShellBridgeShim<'a> {
     /// emulator doors seat an agent-opened tab in the asking pane's
     /// checkout).
     pub pane_header: Option<&'a str>,
-    /// The verbs whose request names the pane in the browser door's own
-    /// header, at a door that names none for the rest — the Computer Use
-    /// door's walks, whose browser steps are the asking pane's own
-    /// ([`PANE_VERBS`]). Empty for every other door.
-    pub pane_verbs: &'a [&'a str],
     /// The verbs whose request carries the shell's working directory as a
     /// header ([`CWD_HEADER`], spelled in hex) — for a window that must know
     /// which workspace such a command was asked from. Empty for a door whose
@@ -5917,27 +6122,14 @@ impl PowerShellBridgeShim<'_> {
                 pane = crate::hook::PANE_KEY_ENV
             )
         });
-        // The pane key rides as a header where the door seats a pane (the
-        // browser's), through the same guarded file as the tokens — at a door
-        // that seats none, for the verbs that walk for its caller alone.
-        let pane_line = |header: &str, indent: &str| {
+        // The pane key rides as a header where the door names the pane that
+        // asked, through the same guarded file as the tokens.
+        let pane_lines = self.pane_header.map_or(String::new(), |header| {
             format!(
-                "{indent}if [ -n \"${{{pane}:-}}\" ]; then\n{indent}  printf 'header = \"{header}: %s\"\\n' \"${pane}\" >> \"$headers\"\n{indent}fi\n",
+                "if [ -n \"${{{pane}:-}}\" ]; then\n  printf 'header = \"{header}: %s\"\\n' \"${pane}\" >> \"$headers\"\nfi\n",
                 pane = crate::hook::PANE_KEY_ENV
             )
-        };
-        let pane_lines = self
-            .pane_header
-            .map_or(String::new(), |header| pane_line(header, ""));
-        let pane_verb_lines = if self.pane_verbs.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "case \"${{1:-}}\" in\n  {verbs})\n{named}    ;;\nesac\n",
-                verbs = self.pane_verbs.join("|"),
-                named = pane_line(crate::agent_browser::PANE_HEADER, "    ")
-            )
-        };
+        });
         // Where the caller stands rides the same file, for the verbs the
         // window judges by it, as hex digits only: `od -v` spells every byte
         // (never a `*` for a repeated line) and `tr` joins its lines. A
@@ -6009,7 +6201,7 @@ chmod 600 "$headers"
 if [ -n "${{{RUN_EVIDENCE_DIR_ENV}:-}}" ]; then
   printf 'header = "{RUN_EVIDENCE_HEADER}: %s"\n' "${RUN_EVIDENCE_DIR_ENV}" >> "$headers"
 fi
-{pane_lines}{pane_verb_lines}{cwd_lines}{revision_header}{execution_header}out=$(printf '%s' "$body" | curl -q -sS --noproxy '*' --proto =http \
+{pane_lines}{cwd_lines}{revision_header}{execution_header}out=$(printf '%s' "$body" | curl -q -sS --noproxy '*' --proto =http \
   {execution_capture}--max-time {deadline_seconds} -w '\n%{{http_code}}' \
   -K "$headers" -H "content-type: application/octet-stream" --data-binary @- \
   "http://127.0.0.1:$port{route}" 2>/dev/null) || {{
@@ -6043,7 +6235,6 @@ fi
             deadline_seconds,
             stdin_flags,
             pane_header,
-            pane_verbs,
             cwd_verbs,
             cwd_flag,
             pane_flag,
@@ -6073,29 +6264,14 @@ fi
         } else {
             ""
         };
-        let pane_line = |header: &str, indent: &str| {
+        let pane_lines = pane_header.map_or(String::new(), |header| {
             format!(
-                "{indent}$pane = $env:{PANE_KEY_ENV}\n{indent}if ($pane) {{ $request.Headers.Add('{header}', $pane) }}\n",
+                "  $pane = $env:{PANE_KEY_ENV}\n  if ($pane) {{ $request.Headers.Add('{header}', $pane) }}\n",
                 PANE_KEY_ENV = crate::hook::PANE_KEY_ENV
             )
-        };
-        let pane_lines = pane_header.map_or(String::new(), |header| pane_line(header, "  "));
-        // A walk's verbs name the pane at a door that names none for the
-        // rest, matched as `case` matches them (with case).
-        let pane_verb_lines = if pane_verbs.is_empty() {
-            String::new()
-        } else {
-            let verbs = pane_verbs
-                .iter()
-                .map(|verb| format!("'{verb}'"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "  if (@({verbs}) -ccontains [string]$args[0]) {{\n{named}  }}\n",
-                named = pane_line(crate::agent_browser::PANE_HEADER, "    ")
-            )
-        };
-        // The same verbs, matched as `case` matches them (with case), and the
+        });
+        // The verbs the window judges by the folder, matched as `case`
+        // matches them (with case), and the
         // filesystem's spelling of the location (a mapped drive's root, not
         // its name) as hex digits in capitals.
         let cwd_lines = if cwd_verbs.is_empty() {
@@ -6166,7 +6342,7 @@ try {{
   $request.Headers.Add('{capability_header}', $capability)
   $evidence = $env:{RUN_EVIDENCE_DIR_ENV}
   if ($evidence) {{ $request.Headers.Add('{RUN_EVIDENCE_HEADER}', $evidence) }}
-{pane_lines}{pane_verb_lines}{cwd_lines}{revision_header}{execution_header}  $asking = $request.GetRequestStream()
+{pane_lines}{cwd_lines}{revision_header}{execution_header}  $asking = $request.GetRequestStream()
   $asking.Write($bytes, 0, $bytes.Length)
   $asking.Close()
   $response = $request.GetResponse()
@@ -6283,7 +6459,7 @@ mod windows_shim_tests {
             "could not reach the window",
             "$env:ZEROCODE_RUN_EVIDENCE_DIR",
             "'x-zerocode-run-evidence', $evidence",
-            "if (@('recipe-run', 'walk') -ccontains [string]$args[0]) {",
+            "if (@('recipe-run', 'walk', 'sheet-write', 'sheet-read') -ccontains [string]$args[0]) {",
             "(Get-Location).ProviderPath",
             "'x-zerocode-cwd', [BitConverter]::ToString([System.Text.Encoding]::UTF8.GetBytes($cwd)).Replace('-', '')",
             "zerocode-computer — inspect and operate local desktop apps",
@@ -6297,19 +6473,19 @@ mod windows_shim_tests {
             !computer.contains("curl"),
             "the PowerShell door posts in-process"
         );
-        // The Computer Use door opens nothing the person sees: it names the
-        // asking pane for a walk alone, whose browser steps the window takes
-        // for that pane (t-70425), inside the walk verbs' own test.
+        // The Computer Use door names the asking pane for every verb, behind
+        // no verb's test: a walk's browser steps are that pane's (t-70425),
+        // and every act draws that pane's own pointer (t-101957).
         assert!(
             computer.contains(
-                "  if (@('recipe-run', 'walk') -ccontains [string]$args[0]) {\n    $pane = $env:ZEROCODE_PANE_KEY\n    if ($pane) { $request.Headers.Add('x-zerocode-pane', $pane) }\n  }\n"
+                "\n  $pane = $env:ZEROCODE_PANE_KEY\n  if ($pane) { $request.Headers.Add('x-zerocode-pane', $pane) }\n"
             ),
-            "the Computer Use door does not name the pane for a walk:\n{computer}"
+            "the Computer Use door does not name the pane for every verb:\n{computer}"
         );
         assert_eq!(
             computer.matches("x-zerocode-pane").count(),
             1,
-            "the Computer Use door names the pane outside a walk:\n{computer}"
+            "the Computer Use door names the pane more than once:\n{computer}"
         );
         assert!(computer.contains("$body = ''"));
 
@@ -8619,6 +8795,99 @@ mod tests {
         }
     }
 
+    /// A command that acts on one device may leave `--device` out; the door
+    /// puts it on the one device of its platform the window has open, and a
+    /// batch's steps follow it there. `list`, `open`, a real phone's setup and
+    /// a command that named its device are left as they are.
+    #[test]
+    fn a_left_out_device_is_the_one_the_window_has_open() {
+        let marks = words(&["marks", "--platform", "ios", "--json"]);
+        assert_eq!(
+            emulator_device_left_out(&marks),
+            Some(EmulatorPlatform::Ios)
+        );
+        let on = emulator_argv_on_device(&marks, "SIM-1");
+        assert_eq!(
+            parse_emulator_command(&on).unwrap().device.as_deref(),
+            Some("SIM-1")
+        );
+        let batch = words(&[
+            "batch",
+            "--platform",
+            "android",
+            "--steps",
+            r#"[["press","--text","Settings"],["find","--text","General"]]"#,
+        ]);
+        assert_eq!(
+            emulator_device_left_out(&batch),
+            Some(EmulatorPlatform::Android)
+        );
+        let parsed = parse_emulator_command(&emulator_argv_on_device(&batch, "emu-1")).unwrap();
+        assert!(
+            parsed
+                .steps
+                .iter()
+                .all(|step| step.device.as_deref() == Some("emu-1"))
+        );
+        for named in [
+            words(&["marks", "--platform", "ios", "--device", "X"]),
+            words(&["list", "--json"]),
+            words(&["open", "--platform", "ios"]),
+            words(&["phone-check", "--json"]),
+            words(&["marks", "--json"]),
+            words(&["marks", "--platform", "windows"]),
+            words(&["nonsense", "--platform", "ios"]),
+        ] {
+            assert_eq!(emulator_device_left_out(&named), None, "{named:?}");
+        }
+
+        let open = |id: &str, name: &str| EmulatorOpenDevice {
+            id: id.to_owned(),
+            name: name.to_owned(),
+        };
+        assert_eq!(
+            emulator_device_choice(EmulatorPlatform::Ios, &[open("SIM-1", "zc")]),
+            Ok(open("SIM-1", "zc"))
+        );
+        let none = emulator_device_choice(EmulatorPlatform::Ios, &[]).unwrap_err();
+        assert!(none.contains("zerocode-emulator list"), "{none}");
+        let several = emulator_device_choice(
+            EmulatorPlatform::Android,
+            &[open("emu-1", "Pixel"), open("emu-2", "Tablet")],
+        )
+        .unwrap_err();
+        assert!(
+            several.contains("Pixel (emu-1), Tablet (emu-2)"),
+            "{several}"
+        );
+        assert!(emulator_usage().contains("--device may be left out"));
+    }
+
+    /// The answer to a command that left `--device` out names the device it
+    /// went to — by name and id, the two things a `list` was called for —
+    /// in a JSON answer, a refusal and a plain answer alike.
+    #[test]
+    fn an_answer_on_a_left_out_device_names_the_device() {
+        let device = EmulatorOpenDevice {
+            id: "SIM-1".to_owned(),
+            name: "zc-p0p2\nok".to_owned(),
+        };
+        let said = emulator_answer_went_to("{\"ok\":true,\"result\":{\"x\":1}}\n", true, &device);
+        let answer: Value = serde_json::from_str(&said).unwrap();
+        assert_eq!(answer[EMULATOR_WENT_TO_KEY]["id"], "SIM-1");
+        assert_eq!(answer[EMULATOR_WENT_TO_KEY]["name"], "zc-p0p2\nok");
+        assert_eq!(answer["result"]["x"], 1);
+        assert!(said.ends_with('\n'));
+        let refused = emulator_answer_went_to("{\"ok\":false,\"error\":{}}", true, &device);
+        assert!(refused.contains("\"SIM-1\""), "{refused}");
+        assert_eq!(
+            emulator_answer_went_to("not json", true, &device),
+            "not json"
+        );
+        let plain = emulator_answer_went_to("press: done\n", false, &device);
+        assert_eq!(plain, "device: zc-p0p2ok (SIM-1)\npress: done\n");
+    }
+
     /// `down` is the content further down, so the finger travels up; the
     /// finger never starts on an edge, where a drag opens the system's sheets.
     #[test]
@@ -8865,14 +9134,15 @@ mod tests {
     /// pane's checkout instead of beside whatever the person is looking at
     /// (09-23 14:14·14:34·14:49, three mirrors on another project's stage).
     /// The name rides the guarded header file like the tokens, only when the
-    /// shell has one. The Computer Use door opens nothing the person sees and
-    /// names no pane — but for a walk (`walk`, `recipe-run`), whose browser
-    /// steps the window takes for the pane that asked: a work browser answers
-    /// its owner alone, and a walk that named no pane had its every look
-    /// refused (10-22 10:47·11:27, `workspace_actor_required`, t-70425).
+    /// shell has one. The Computer Use door names it for every verb: a walk's
+    /// browser steps are the asking pane's (a walk that named no pane had its
+    /// every look refused, 10-22 10:47·11:27, t-70425), and every act draws
+    /// that pane's own pointer — a door that named it for walks alone sent the
+    /// lone acts of every agent at work as nobody's, under one pointer that
+    /// jumped between their apps (11-10, t-101957).
     #[cfg(unix)]
     #[test]
-    fn the_emulator_door_names_the_pane_that_asked_and_the_computer_door_only_for_a_walk() {
+    fn the_emulator_and_computer_doors_name_the_pane_that_asked() {
         use crate::agent_browser::PANE_HEADER;
         let rig = DoorRig::new();
         let emulator = rig.install(
@@ -8896,13 +9166,61 @@ mod tests {
         );
         let nameless = rig.headers(&emulator, rig.path(), &open, &[]);
         assert!(!nameless.contains(PANE_HEADER), "{nameless}");
-        let desktop = rig.headers(
-            &computer,
-            rig.path(),
+        let acts: [&[&str]; 6] = [
             &[ComputerMethod::ListApps.verb_name(), "--json"],
-            &asked,
-        );
-        assert!(!desktop.contains(PANE_HEADER), "{desktop}");
+            &[
+                ComputerMethod::Click.verb_name(),
+                "--app",
+                "Calculator",
+                "--element-index",
+                "5",
+                "--json",
+            ],
+            &[
+                ComputerMethod::PressKey.verb_name(),
+                "--app",
+                "Calculator",
+                "--key",
+                "5",
+                "--json",
+            ],
+            &[
+                ComputerMethod::Scroll.verb_name(),
+                "--app",
+                "Calculator",
+                "--x",
+                "1",
+                "--y",
+                "1",
+                "--direction",
+                "down",
+            ],
+            &[
+                ComputerMethod::SetValue.verb_name(),
+                "--app",
+                "Calculator",
+                "--element-index",
+                "5",
+                "--value",
+                "v",
+            ],
+            &[ComputerMethod::Batch.verb_name(), "--commands", "[]"],
+        ];
+        for act in acts {
+            let acted = rig.headers(&computer, rig.path(), act, &asked);
+            let said: Vec<&str> = acted
+                .lines()
+                .filter(|line| line.contains(PANE_HEADER))
+                .collect();
+            assert_eq!(
+                said,
+                [named.as_str()],
+                "the computer door did not name the pane that asked, once, for `{}`:\n{acted}",
+                act[0]
+            );
+            let nameless = rig.headers(&computer, rig.path(), act, &[]);
+            assert!(!nameless.contains(PANE_HEADER), "{nameless}");
+        }
         let walks: [&[&str]; 2] = [
             &[
                 ComputerMethod::Walk.verb_name(),

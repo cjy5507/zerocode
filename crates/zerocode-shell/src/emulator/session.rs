@@ -615,6 +615,27 @@ impl SessionRegistry {
             .count()
     }
 
+    /// The devices this platform has a live pane on, each once, in order:
+    /// what a command that left `--device` out may mean
+    /// (`zerocode_core::computer_use::emulator_device_choice`).
+    pub fn open_devices(
+        &self,
+        platform: EmulatorPlatform,
+    ) -> Vec<zerocode_core::computer_use::EmulatorOpenDevice> {
+        let mut devices: Vec<_> = held(&self.state)
+            .sessions
+            .values()
+            .filter(|entry| entry.descriptor.platform == platform && entry.control.is_alive())
+            .map(|entry| zerocode_core::computer_use::EmulatorOpenDevice {
+                id: entry.descriptor.udid.clone(),
+                name: entry.descriptor.name.clone(),
+            })
+            .collect();
+        devices.sort_by(|a, b| a.id.cmp(&b.id));
+        devices.dedup_by(|a, b| a.id == b.id);
+        devices
+    }
+
     pub fn stop(&self, stream: &str) -> bool {
         let (entry, first) = {
             let mut state = held(&self.state);
@@ -1079,6 +1100,49 @@ mod tests {
 
         assert!(registry.stop("stream-1"));
         assert_eq!(registry.counts(), (0, 0, 0));
+    }
+
+    /// The devices a left-out `--device` may mean are the live panes of that
+    /// platform, each once though it streams in two modes; a stopped pane
+    /// and another platform's are not among them.
+    #[test]
+    fn the_open_devices_are_one_platforms_live_panes_each_once() {
+        let registry = Box::leak(Box::<SessionRegistry>::default());
+        let open = |key: SessionKey, stream: &str, udid: &str, platform| {
+            let StartClaim::Acquired(lease) = registry.claim(key).expect("new stream") else {
+                panic!("unexpected existing stream");
+            };
+            let descriptor = EmulatorStream {
+                udid: udid.to_string(),
+                platform,
+                ..descriptor(stream)
+            };
+            let control = registry.new_control(&descriptor);
+            lease.activate(descriptor, control);
+        };
+        let android = EmulatorPlatform::Android;
+        let ids = |platform| -> Vec<String> {
+            registry
+                .open_devices(platform)
+                .into_iter()
+                .map(|device| device.id)
+                .collect()
+        };
+        assert!(ids(android).is_empty());
+        open(SessionKey::frames(android, "emu-2"), "a", "emu-2", android);
+        open(SessionKey::video(android, "emu-2"), "b", "emu-2", android);
+        open(
+            SessionKey::frames(EmulatorPlatform::Ios, "SIM"),
+            "c",
+            "SIM",
+            EmulatorPlatform::Ios,
+        );
+        assert_eq!(ids(android), ["emu-2"]);
+        open(SessionKey::frames(android, "emu-1"), "d", "emu-1", android);
+        assert_eq!(ids(android), ["emu-1", "emu-2"]);
+        assert!(registry.stop("d"));
+        assert_eq!(ids(android), ["emu-2"]);
+        assert_eq!(ids(EmulatorPlatform::Ios), ["SIM"]);
     }
 
     fn registered_control(

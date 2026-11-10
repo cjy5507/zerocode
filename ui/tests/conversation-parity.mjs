@@ -2096,15 +2096,20 @@ export async function testConversationCopies(browser, origin, ok) {
         seen.codeWritten = written.at(-1);
         seen.checked = copies[0].textContent;
         seen.nameKept = copies[0].getAttribute("aria-label") === seen.want;
-        // The answer's copy: the words the answer shows, then the check.
+        // The answer's copy is a mark (2026-11-10): the words the answer shows
+        // are written, the mark turns to a check, and its name stays — said
+        // twice, by its tooltip and to a screen reader.
         const copy = answer.querySelector(".helper-actions .helper-copy");
+        const markOf = (button) => button.querySelector("use")?.getAttribute("href") ?? "";
+        seen.answerName = t("worker.copyAnswer", "답 복사");
+        seen.answerAtRest = { mark: markOf(copy), words: copy.textContent, tip: copy.dataset.tip, label: copy.getAttribute("aria-label") };
         copy.click();
         await window.__PAINTED__();
         seen.answerWritten = written.at(-1);
-        seen.answerChecked = copy.textContent;
-        // Back to the copy's word, and the answer's icon, after the panel's 2 s.
+        seen.answerChecked = { mark: markOf(copy), tip: copy.dataset.tip, label: copy.getAttribute("aria-label") };
+        // Back to the copy's word, and the answer's mark, after the panel's 2 s.
         await new Promise((done) => setTimeout(done, CHAT_COPIED_MS + 150));
-        seen.backAfter = [copies[0].textContent, copy.textContent];
+        seen.backAfter = [copies[0].textContent, markOf(copy)];
       }
       return seen;
     });
@@ -2116,9 +2121,12 @@ export async function testConversationCopies(browser, origin, ok) {
       JSON.stringify(seen),
     );
     ok(
-      "A9: the answer's copy writes the words the answer shows — without the CLI's own plumbing — says copied, and both copies turn back after the panel's 2 s",
+      "A9: the answer's copy is a mark named 「답 복사」 twice; a press writes the words the answer shows — without the CLI's own plumbing — and turns the mark to a check with its name kept, and both copies turn back after the panel's 2 s",
       typeof seen.answerWritten === "string" && seen.answerWritten.startsWith("고쳤습니다.") && !seen.answerWritten.includes("system-reminder") &&
-        seen.answerChecked === seen.copiedWord && JSON.stringify(seen.backAfter) === JSON.stringify([seen.word, seen.word]),
+        seen.answerAtRest.mark === "#i-copy" && seen.answerAtRest.words === "" &&
+        seen.answerAtRest.tip === seen.answerName && seen.answerAtRest.label === seen.answerName &&
+        seen.answerChecked.mark === "#i-check" && seen.answerChecked.tip === seen.answerName && seen.answerChecked.label === seen.answerName &&
+        JSON.stringify(seen.backAfter) === JSON.stringify([seen.word, "#i-copy"]),
       JSON.stringify(seen),
     );
     ok("A9: the copies raised no page errors", faults.length === 0, faults.join("\n"));
@@ -5546,6 +5554,39 @@ export async function testConversationCodeColours(browser, origin, ok) {
       };
       timed("colourCodeSlice");
       timed("colourCodeIn");
+      // Every change of a fence's words where they stand — a text node cut (`splitText`) or its words
+      // rewritten — named as it happens, while the node is still in its fence; and the fences whose words
+      // run on past the end of a unit's spans (a closing brace, a line's end), the words a unit leaves plain.
+      window.__FENCE_WORDS_CHANGED__ = [];
+      window.__FENCE_LEFT_OVER__ = 0;
+      const inFence = (node) => node?.nodeType === Node.TEXT_NODE && Boolean(node.parentElement?.closest("pre.md-block"));
+      for (const [owner, method] of [[Text.prototype, "splitText"], [CharacterData.prototype, "appendData"], [CharacterData.prototype, "insertData"],
+        [CharacterData.prototype, "deleteData"], [CharacterData.prototype, "replaceData"]]) {
+        const real = owner[method];
+        owner[method] = function changedInPlace(...args) {
+          if (inFence(this)) window.__FENCE_WORDS_CHANGED__.push(method);
+          return real.apply(this, args);
+        };
+      }
+      for (const [owner, key] of [[CharacterData.prototype, "data"], [Node.prototype, "nodeValue"], [Node.prototype, "textContent"]]) {
+        const real = Object.getOwnPropertyDescriptor(owner, key);
+        Object.defineProperty(owner, key, {
+          configurable: true,
+          get: real.get,
+          set(value) {
+            if (inFence(this)) window.__FENCE_WORDS_CHANGED__.push(key);
+            real.set.call(this, value);
+          },
+        });
+      }
+      const draw = window.drawCodeSpans;
+      window.drawCodeSpans = function countedLeftOver(job, ...rest) {
+        if (job.laid === 0 && job.spans.length > 0) {
+          const end = Math.min(job.spans.length, 3 * CODE_COLOUR.unitSpans);
+          if (job.spans[end - 2] - job.at < job.words.data.length) window.__FENCE_LEFT_OVER__ += 1;
+        }
+        return draw.call(this, job, ...rest);
+      };
     });
     await openFixtureConversation(long.page, conversationFixture());
     const seen = await long.page.evaluate(async () => {
@@ -5579,8 +5620,16 @@ export async function testConversationCodeColours(browser, origin, ok) {
       seen.sliceMax = Math.max(0, ...slices);
       seen.inlineMax = Math.max(0, ...inline);
       seen.line = typeof CODE_COLOUR === "undefined" ? null : CODE_COLOUR.sliceMs;
+      seen.wordsChanged = window.__FENCE_WORDS_CHANGED__.length;
+      seen.changedBy = [...new Set(window.__FENCE_WORDS_CHANGED__)];
+      seen.leftOver = window.__FENCE_LEFT_OVER__;
       return seen;
     });
+    ok(
+      "P1: a fence takes its colours by nodes put in place of its words, never by its words cut or rewritten where they stand — WebKit, the installed window's engine, moves the list around a text node changed in place, and a reader at the foot was taken for one who had scrolled up",
+      seen.leftOver > 0 && seen.wordsChanged === 0,
+      JSON.stringify({ leftOver: seen.leftOver, wordsChanged: seen.wordsChanged, changedBy: seen.changedBy }),
+    );
     ok(
       "P1: on a 400-turn page the answers that stand their bodies wear their colours and the shelved ones hold none; scrolled to the top, the rows that came back are coloured again and the foot's shelved rows gave theirs back",
       [seen.atFoot, seen.atTop].every((at) => at.standing > 0 && at.standingPlain === 0 && at.shelvedWorn === 0),

@@ -4841,6 +4841,10 @@ async function verifyClaudeAccounts() {
   if (accountReport !== asked) return;
   accountReport = refreshed ?? asked;
   const dead = new Map(verdicts);
+  // The days a login has left, where the CLI named a near day (the third
+  // word of a verdict; Claude Code says when a stored sign-in ends since
+  // 2.1.318, and the backend keeps to its ten-day window).
+  const ending = new Map(verdicts.map(([id, , days]) => [id, Number.isInteger(days) ? days : null]));
   let moved = accountReport !== asked;
   for (const row of accountReport.accounts ?? []) {
     // `false` is the CLI saying the login is gone. `null` is the probe not
@@ -4851,6 +4855,11 @@ async function verifyClaudeAccounts() {
     const expired = row.signed_in && dead.get(row.id) === false;
     if (Boolean(row.login_expired) !== expired) {
       row.login_expired = expired;
+      moved = true;
+    }
+    const left = row.signed_in && !expired ? ending.get(row.id) ?? null : null;
+    if ((row.login_days_left ?? null) !== left) {
+      row.login_days_left = left;
       moved = true;
     }
   }
@@ -5301,7 +5310,23 @@ function accountUnder(row) {
   if (row.login_expired) {
     return t("settings.accounts.expired", "로그인이 만료되었습니다 — 다시 로그인하세요");
   }
-  return claudeOrganizationLabel(row);
+  return [claudeOrganizationLabel(row), accountEnding(row)].filter(Boolean).join(" · ");
+}
+
+/* A login's last days, said before they run out. An account nobody is using
+ * lapses unseen otherwise, and the switch that lands on it finds it dead. The
+ * row keeps its calm colour — the login still works — and 「다시 로그인」 is
+ * already on it. Three sentences rather than one with a number: 「1일 뒤」 and
+ * "1 days" read wrong in every language. */
+function accountEnding(row) {
+  const left = row.login_days_left;
+  if (!Number.isInteger(left)) return "";
+  // Whole days of time left, not calendar days: with 23 hours to go the
+  // login may end tomorrow morning, so the words are "within a day" and "in
+  // a day" and never "today" and "tomorrow".
+  if (left <= 0) return t("settings.accounts.endsWithinADay", "로그인이 하루 안에 만료됩니다 — 다시 로그인하세요");
+  if (left === 1) return t("settings.accounts.endsInADay", "로그인이 하루 뒤 만료됩니다 — 다시 로그인하면 연장됩니다");
+  return t("settings.accounts.endsIn", "로그인이 {{n}}일 뒤 만료됩니다 — 다시 로그인하면 연장됩니다", { n: left });
 }
 
 /* Log in again into the account's own directory — the repair keeps the row,
@@ -5895,6 +5920,9 @@ function harnessFromFields() {
     launches: read(HARNESS_LAUNCH_FIELDS),
     // Only an explicit 「끔」 turns the ledger's alerts off (t-34501).
     alerts: { landing: el("harness-alerts-landing").value !== "off" },
+    // And only an explicit 「거절하고 계속」 has a summoned worker refuse a
+    // permission prompt nobody is watching: a prompt is the person's to answer.
+    workers: { refuse_prompts: el("harness-workers-prompts").value === "refuse" },
   };
 }
 
@@ -5906,9 +5934,10 @@ function setHarnessField(id, value) {
 
 function paintHarnessSettings() {
   if (!harnessSettings) return;
-  const { gate, launches, alerts } = harnessSettings;
+  const { gate, launches, alerts, workers } = harnessSettings;
   setHarnessField("harness-gate-mode", gate.mode);
   setHarnessField("harness-alerts-landing", alerts?.landing === false ? "off" : "on");
+  setHarnessField("harness-workers-prompts", workers?.refuse_prompts === true ? "refuse" : "ask");
   for (const [key, id] of Object.entries(HARNESS_GATE_FIELDS)) setHarnessField(id, gate[key]);
   for (const [key, id] of Object.entries(HARNESS_LAUNCH_FIELDS)) setHarnessField(id, launches[key]);
 }
@@ -5957,6 +5986,7 @@ function commitHarnessSettings() {
 for (const id of [
   "harness-gate-mode",
   "harness-alerts-landing",
+  "harness-workers-prompts",
   ...Object.values(HARNESS_GATE_FIELDS),
   ...Object.values(HARNESS_LAUNCH_FIELDS),
 ]) {
@@ -9904,6 +9934,7 @@ function paintTerminalThemeControls() {
   paintTerminalThemeSelect(el("term-theme-light"), termPrefs.theme_light);
   el("term-separate-light-theme").checked = termPrefs.use_separate_light_theme === true;
   el("term-theme-light-field").hidden = termPrefs.use_separate_light_theme !== true;
+  el("term-match-claude-theme").checked = termPrefs.match_claude_theme === true;
   paintTerminalCustomThemes();
 }
 
@@ -10489,6 +10520,12 @@ el("term-separate-light-theme").addEventListener("change", (event) => {
 });
 el("term-theme-light").addEventListener("change", (event) => {
   setTermPrefs({ theme_light: event.target.value });
+});
+/* Claude Code's own colours, made of this palette (`claude_theme_sync`). The
+ * window only keeps the switch: the backend writes the theme when the palette
+ * is reported, which `applyTerminalPalette` already does on every change. */
+el("term-match-claude-theme").addEventListener("change", (event) => {
+  setTermPrefs({ match_claude_theme: event.target.checked });
 });
 el("term-theme-import-auto").addEventListener("click", () => {
   void openTerminalThemeImport("auto");

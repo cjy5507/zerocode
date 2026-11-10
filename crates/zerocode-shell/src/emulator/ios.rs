@@ -299,6 +299,16 @@ pub(super) fn list_ios_simulators() -> Vec<SimulatorDevice> {
         .collect()
 }
 
+/// The name the person gave the simulator `udid`, off the same `simctl list`.
+/// The walk bench is its one reader, and that bench is a Mac's.
+#[cfg(all(test, target_os = "macos"))]
+pub(super) fn simulator_name(udid: &str) -> Option<String> {
+    list_ios_simulators()
+        .into_iter()
+        .find(|simulator| simulator.udid == udid)
+        .map(|simulator| simulator.name)
+}
+
 /// How many of this machine's simulators are booted, whoever booted them —
 /// the task board's machine strip (t-6588), off the same `simctl list` the
 /// picker reads.

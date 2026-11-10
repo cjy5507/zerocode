@@ -93,6 +93,7 @@ mod browser_workspace;
 mod checks_runtime;
 #[cfg(all(target_os = "macos", feature = "chromium-browser"))]
 mod chromium_browser;
+mod claude_theme_sync;
 mod claude_tokens;
 mod cli_login;
 mod cmd;
@@ -442,13 +443,14 @@ use cmd::{
 };
 use cmd::{adopt_legacy_judgment_key, select_coding_model, zo_model_list};
 use cmd::{
-    artifact_bundle, artifact_copy_path, artifact_counts, artifact_delete, artifact_document,
-    artifact_export, artifact_feedback_record, artifact_flow, artifact_import_transcripts,
-    artifact_open, artifact_open_record, artifact_page_at, artifact_preference_revoke,
-    artifact_preference_save, artifact_preferences, artifact_preview, artifact_register,
-    artifact_reveal, artifact_search, artifact_tasks, artifact_thumbnail, artifact_versions,
-    artifacts_list, explain_cancel, explain_preview, explain_roads, explain_start,
-    set_artifacts_auto_open_beside, set_artifacts_retention_days, set_vault_session_limit,
+    artifact_bundle, artifact_citations, artifact_copy_path, artifact_counts, artifact_delete,
+    artifact_document, artifact_export, artifact_feedback_record, artifact_flow,
+    artifact_import_transcripts, artifact_open, artifact_open_record, artifact_page_at,
+    artifact_preference_revoke, artifact_preference_save, artifact_preferences, artifact_preview,
+    artifact_register, artifact_reveal, artifact_search, artifact_tasks, artifact_thumbnail,
+    artifact_versions, artifacts_list, explain_cancel, explain_preview, explain_roads,
+    explain_start, set_artifacts_auto_open_beside, set_artifacts_retention_days,
+    set_vault_session_limit,
 };
 use cmd::{artifact_export_formats, artifact_export_reveal};
 use cmd::{
@@ -3331,6 +3333,7 @@ fn main() -> ExitCode {
             flow_register,
             artifacts_list,
             artifact_search,
+            artifact_citations,
             artifact_preview,
             artifact_document,
             artifact_counts,
@@ -3649,6 +3652,9 @@ fn main() -> ExitCode {
             launch_budget_door::open(managed.config_root(), boot_settings.harness.launches);
             orchestration::gate_book::open(managed.config_root(), boot_settings.harness.gate);
             landing_watch_sweep::set_enabled(boot_settings.harness.alerts.landing);
+            orchestration::set_workers_refuse_prompts(
+                boot_settings.harness.workers.refuse_prompts,
+            );
             // The readiness probe reads the account stores under this root
             // and no other; until it is named, every door answers unknown.
             readiness_runtime::configure_root(managed.config_root());

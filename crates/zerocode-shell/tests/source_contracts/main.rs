@@ -5384,12 +5384,23 @@ mod tests {
         // The scan claims records across the WHOLE walk: a fork copies earlier
         // `token_count` records byte for byte, and a per-file claim set would
         // bill that work once for the original and again for every fork.
+        // The walk itself is `codex_scan_of` — the roots handed in, so it can
+        // be read apart from where a machine keeps its rollouts — and the door
+        // above reaches it through `codex_start`, with the digests of rollouts
+        // at rest (`token_scan::Digests`).
         let scan = include_str!("../../src/usage_stats_scan.rs");
-        let walking = block_after(scan, "pub fn codex_scan(");
+        let walking = block_after(scan, "fn codex_scan_of(");
         assert!(
             walking.contains("let mut claimed: HashSet<String> = HashSet::new();")
                 && walking.contains("found.sort();"),
             "the Codex scan lost its shared claim set or its stable order:\n{walking}"
+        );
+        // One claim set for the scan whichever way a rollout is read: whole,
+        // or through its kept digest.
+        assert!(
+            walking.contains("RolloutReader::new(stem, &mut claimed)")
+                && walking.contains("for_each_rollout_line(&path, digests,"),
+            "a rollout read through its digest no longer shares the scan's claim set:\n{walking}"
         );
 
         // The window switches BOTH the numbers and the labels together. A
@@ -9845,7 +9856,9 @@ mod tests {
                 ),
             "an agent whose session ends keeps the devices it borrowed"
         );
-        let door = block_after(shell, "async fn answer_emulator_command(");
+        // The door is two functions since t-101963: every verb off the
+        // window, and `open`, which the window seats.
+        let door = block_after(shell, "async fn answer_emulator_off_window(");
         assert!(
             door.contains("crate::emulator::used_through_the_door("),
             "the door's verbs no longer move a loan's last use:\n{door}"
@@ -9930,7 +9943,16 @@ mod tests {
                 && step.contains("evidence_runtime::leave_emulator_evidence("),
             "the emulator step no longer answers through the door and its writer:\n{step}"
         );
-        let mobile = block_after(shell, "async fn answer_emulator_command(");
+        let mobile = format!(
+            "{}{}",
+            block_after(shell, "async fn answer_emulator_command("),
+            block_after(shell, "async fn answer_emulator_off_window(")
+        );
+        assert!(
+            block_after(shell, "async fn answer_emulator_command(")
+                .contains("answer_emulator_off_window(argv, cwd)"),
+            "the window's door no longer answers its verbs through the one road a bench shares"
+        );
         for owned in [
             // The list is one function of the emulator module (t-36920); the
             // door only calls it.
@@ -9958,7 +9980,7 @@ mod tests {
                 "built-in emulator gestures lost {owned}"
             );
         }
-        for route in [mobile, gestures] {
+        for route in [mobile.as_str(), gestures] {
             assert!(
                 !route.contains("Command::new") && !route.contains("open_mobile_emulator_direct"),
                 "the agent route opens or drives an external emulator instead of ZeroCode's pane"
@@ -16654,6 +16676,7 @@ mod tests {
             "term-theme-dark",
             "term-separate-light-theme",
             "term-theme-light",
+            "term-match-claude-theme",
             "term-theme-import-auto",
             "term-theme-import-files",
             "term-theme-import-folder",
@@ -21779,7 +21802,9 @@ mod tests {
         // carries its one exception INSIDE the same clause: a worktree this
         // window did not make stays listed while an agent runs in one of its
         // panes (2026-09-13, "네비바에 안 보여서": the person could not reach
-        // the zo that held their session because its place was hidden) — and
+        // the zo that held their session because its place was hidden); the
+        // agent-scratch hide carries the same exception, because a pane
+        // follows its agent into the scratch checkout it works in — and
         // last a task's other checkouts folded under its row (t-45336, "네비바에
         // … 너무 많아"), with the same exception, and the row the window stands
         // in, inside its clause too.
@@ -21792,7 +21817,7 @@ mod tests {
             "    !(hideAutomationWorkspaces && automationBornPaths.has(worktree.path))",
             "    && !(hideDefaultBranchWorkspaces && worktree.is_main)",
             "    && !(hideDetachedHeadWorkspaces && !worktree.is_folder && !worktree.branch)",
-            "    && !(hideAgentScratchWorkspaces && worktree.ownership === \"agent-scratch\")",
+            "    && !(hideAgentScratchWorkspaces && worktree.ownership === \"agent-scratch\" && worktreeAgentRows(worktree.path).length === 0)",
             "    && !(sleepingPaths.has(worktree.path) && !worktree.active",
             "      && !(keepDefaultBranchAwake && worktree.is_main))",
             "    && !(worktree.external_hidden && worktreeAgentRows(worktree.path).length === 0)",
@@ -39241,6 +39266,7 @@ mod tests {
         for name in [
             "pub(crate) fn artifacts_list(",
             "pub(crate) fn artifact_search(",
+            "pub(crate) fn artifact_citations(",
             "pub(crate) fn artifact_preview(",
             "pub(crate) fn artifact_document(",
             "pub(crate) fn artifact_counts(",

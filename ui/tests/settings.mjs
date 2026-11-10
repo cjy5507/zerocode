@@ -348,6 +348,7 @@ const RUST_DEFAULT_DOCUMENT_JSON = String.raw`{
     "theme_light": "Builtin Tango Light",
     "custom_themes": [],
     "color_overrides": {},
+    "match_claude_theme": false,
     "leading": 1.15,
     "weight": 500,
     "cursor_blink": true,
@@ -425,7 +426,8 @@ const RUST_DEFAULT_DOCUMENT_JSON = String.raw`{
   "harness": {
     "gate": { "mode": "notify", "task_usd": null, "day_usd": null },
     "launches": { "concurrent": 4, "per_hour": 300, "per_day": 2000 },
-    "alerts": { "landing": true }
+    "alerts": { "landing": true },
+    "workers": { "refuse_prompts": false }
   },
   "worktree_prefs": { "branch_prefix": "git-username" },
   "notifications": { "enabled": true, "agent_attention": true, "agent_completion": "long" },
@@ -1798,6 +1800,8 @@ class StatefulBackend {
           launches,
           // The Rust contract: only a plain `false` turns the ledger's alerts off.
           alerts: { landing: asked.alerts?.landing !== false },
+          // And only a plain `true` has a summoned worker refuse an unwatched prompt.
+          workers: { refuse_prompts: asked.workers?.refuse_prompts === true },
         };
         keys = ["harness"];
         break;
@@ -11390,6 +11394,16 @@ await test("non-default writes become canonical state before the second window b
   await gestureAndWait(pageA, "A", "patch_terminal_prefs", () =>
     pageA.uncheck("#term-separate-light-theme"));
   await waitForSettingsIdle(pageA);
+  // Claude Code's colours from this palette: off until asked for, and one
+  // patch when it is — the backend writes the theme, the window keeps a switch.
+  assertEqual(
+    await pageA.$eval("#term-match-claude-theme", (box) => box.checked),
+    false,
+    "Claude Code's theme was taken before anybody asked",
+  );
+  await gestureAndWait(pageA, "A", "patch_terminal_prefs", () =>
+    pageA.check("#term-match-claude-theme"));
+  await waitForSettingsIdle(pageA);
   await pageA.$eval("#term-color-overrides", (details) => { details.open = true; });
   await gestureAndWait(pageA, "A", "patch_terminal_prefs", async () => {
     await changeField(pageA, '[data-terminal-color-text="background"]', "#102030");
@@ -11483,6 +11497,7 @@ await test("non-default writes become canonical state before the second window b
     "theme_dark",
     "theme_light",
     "use_separate_light_theme",
+    "match_claude_theme",
     "divider_thickness_px",
     "divider_color_dark",
     "divider_color_light",
@@ -11529,6 +11544,7 @@ await test("non-default writes become canonical state before the second window b
       theme_dark: backend.settings.terminal_prefs.theme_dark,
       theme_light: backend.settings.terminal_prefs.theme_light,
       use_separate_light_theme: backend.settings.terminal_prefs.use_separate_light_theme,
+      match_claude_theme: backend.settings.terminal_prefs.match_claude_theme,
       color_overrides: backend.settings.terminal_prefs.color_overrides,
     },
     {
@@ -11539,6 +11555,7 @@ await test("non-default writes become canonical state before the second window b
       theme_dark: "Dracula",
       theme_light: "Solarized Light",
       use_separate_light_theme: false,
+      match_claude_theme: true,
       color_overrides: { background: "#102030", brightBlue: "#abcdef" },
     },
     "terminal prefs did not persist canonically",
@@ -11668,6 +11685,7 @@ await test("the second boot paints every non-default before opening settings", a
     themeLight: document.getElementById("term-theme-light")?.value,
     separateLightTheme: document.getElementById("term-separate-light-theme")?.checked,
     lightThemeHidden: document.getElementById("term-theme-light-field")?.hidden,
+    matchClaudeTheme: document.getElementById("term-match-claude-theme")?.checked,
     themeCount: document.getElementById("term-theme-dark")?.options.length,
     terminalBackground: getComputedStyle(document.documentElement)
       .getPropertyValue("--term-screen-bg").trim(),
@@ -11798,6 +11816,7 @@ await test("the second boot paints every non-default before opening settings", a
     themeLight: "Solarized Light",
     separateLightTheme: false,
     lightThemeHidden: true,
+    matchClaudeTheme: true,
     themeCount: 30,
     terminalBackground: "#102030",
     terminalBrightBlue: "#abcdef",
@@ -12028,6 +12047,8 @@ await test("the harness card shows what a person set and what the window counted
       perDay: field("harness-per-day")?.value ?? null,
       alerts: field("harness-alerts-landing")?.value ?? null,
       alertsHint: field("harness-alerts-landing-hint")?.textContent ?? null,
+      prompts: field("harness-workers-prompts")?.value ?? null,
+      promptsHint: field("harness-workers-prompts-hint")?.textContent ?? null,
       status: field("harness-status")?.textContent ?? null,
     };
   });
@@ -12042,7 +12063,7 @@ await test("the harness card shows what a person set and what the window counted
   assert(
     shown.mode === "notify" && shown.task === "" && shown.day === "" &&
       shown.concurrent === "4" && shown.perHour === "300" && shown.perDay === "2000" &&
-      shown.alerts === "on",
+      shown.alerts === "on" && shown.prompts === "ask",
     "the card does not show the document's gate and ceilings", shown,
   );
   assert(
@@ -12065,6 +12086,7 @@ await test("the harness card shows what a person set and what the window counted
         gate: { mode: "notify", task_usd: 12.5, day_usd: null },
         launches: { concurrent: 4, per_hour: 300, per_day: 2000 },
         alerts: { landing: true },
+        workers: { refuse_prompts: false },
       },
     },
     "a budget was sent as something other than the whole record with the number typed",
@@ -12078,6 +12100,7 @@ await test("the harness card shows what a person set and what the window counted
       gate: { mode: "notify", task_usd: 12.5, day_usd: null },
       launches: { concurrent: 4, per_hour: 300, per_day: null },
       alerts: { landing: true },
+      workers: { refuse_prompts: false },
     },
     "a blank ceiling is no ceiling, and the budget saved before it stays",
   );
@@ -12105,6 +12128,29 @@ await test("the harness card shows what a person set and what the window counted
   );
   await waitForSettingsIdle(pageB);
   assertEqual(backend.settings.harness.alerts, { landing: false }, "the stored document does not hold the alerts off");
+  // A summoned worker asks until a person says otherwise; what the other choice costs is said beside it,
+  // and choosing it is one saved word that moves nothing else.
+  assert(
+    /거절/.test(shown.promptsHint ?? "") && /직접 연 판/.test(shown.promptsHint ?? "") &&
+      /2\.1\.319/.test(shown.promptsHint ?? ""),
+    "the choice does not say what refusing does, whose panes it leaves alone and which Claude Code it needs", shown.promptsHint,
+  );
+  const refusing = await gestureAndWait(pageB, "B", "set_harness_settings", () =>
+    pageB.selectOption("#harness-workers-prompts", "refuse"));
+  assertEqual(
+    refusing.args.harness.workers,
+    { refuse_prompts: true },
+    "the choice did not send the workers as refusing",
+  );
+  assertEqual(refusing.args.harness.alerts, { landing: false }, "the choice moved the alerts beside it");
+  await waitForSettingsIdle(pageB);
+  assertEqual(
+    backend.settings.harness.workers,
+    { refuse_prompts: true },
+    "the stored document does not hold the workers as refusing",
+  );
+  await reopenSettings(pageB, "B", "provider-accounts");
+  assertEqual((await card()).prompts, "refuse", "the card does not show the stored choice when it is opened again");
   await backend.externalPatch({ locale: previousLocale }, ["locale"]);
   await renderSettled(pageB);
 });

@@ -54,6 +54,7 @@ import { testMarkdownDiagrams } from "./markdown-diagrams.mjs";
 import { testArtifactStage2 } from "./artifact-stage2.mjs";
 import { testArtifactFlow } from "./artifact-flow.mjs";
 import { testArtifactGeist } from "./artifact-geist.mjs";
+import { testArtifactSeams } from "./artifact-seams.mjs";
 import { testAgentSupport } from "./agent-support.mjs";
 import { testCoordinatorDesk } from "./coordinator-desk.mjs";
 import { testQuotaWallChip } from "./quota-wall-chip.mjs";
@@ -84,6 +85,7 @@ import { testFlowConsole } from "./flow-console.mjs";
 import { testWorktreeEvidence } from "./worktree-evidence.mjs";
 import { testAgentConversation } from "./agent-conversation.mjs";
 import { testConversationAfter, testConversationArchive, testConversationComposerNext, testConversationRecovery, testConversationReviewTests, testConversationReviewUndo, testConversationT3, testConversationBehindTab } from "./conversation-after.mjs";
+import { testConversationPin, testConversationResult, testConversationViewMenu } from "./conversation-result.mjs";
 import { testHelperDoors } from "./helper-doors.mjs";
 import { testBrowserRecovery } from "./browser-recovery.mjs";
 import { testBrowserPanesSurvive } from "./browser-panes-survive.mjs";
@@ -177,7 +179,7 @@ import { testConversationAlign, testConversationColumn } from "./conversation-al
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { readdir, readFile } from "node:fs/promises";
+import { readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -231,7 +233,7 @@ const addReportedPlatform = (page, platform) => page.addInitScript(reportedPlatf
 /* The window asks the backend for everything it draws, so the backend is
  * stubbed down to the answers a first frame needs. Anything missing here does
  * not fail politely: `boot()` throws and the page comes up half-drawn. */
-const { suite, ok, run, report, reportWhenCut } = createRunner();
+const { suite, ok, run, report, times, reportWhenCut } = createRunner();
 reportWhenCut();
 /* Renderer faults from every page the shared flow boots — its own window and
  * the rigs it opens beside it (terminal selection folds its faults in here) —
@@ -280,6 +282,31 @@ suite("window-harness", async ({ browser, origin, ok }) => {
   } finally {
     await page.close();
   }
+  /* The harness's own road to the window's files (`OWN_FILES_TURNS`, window-boot.mjs): a page that did not reach one
+   * of them is opened again with nothing of the lost turn left behind, and a file lost on every turn still ends the
+   * suite under its own name. The losses are the two the hosted Windows runner made — the connection for the words'
+   * file not made (v1.1.138: every script that speaks through `t` failed after it) and the one for the secret
+   * prompt's (v1.1.137: the window stood without it). */
+  const lose = (file) => (opened) => opened.route(`**/${file}`, (route) => route.abort("connectionfailed"));
+  const once = { turns: 0, saidOnTheLostTurn: 0, faults: [] };
+  const again = await openWindowTestPage(browser, origin, { faults: once.faults, before: async (opened) => {
+    once.turns += 1;
+    if (once.turns > 1) return;
+    opened.on("pageerror", () => { once.saidOnTheLostTurn += 1; });
+    await lose("shell-i18n.js")(opened);
+  } });
+  once.speaks = await again.page.evaluate(() => typeof t === "function");
+  await again.page.close();
+  ok("a page that did not reach one of the window's own files is opened again, and what the lost turn said is gone with it",
+    once.turns === 2 && once.speaks && once.saidOnTheLostTurn > 0 && once.faults.length === 0, JSON.stringify(once));
+  const every = { turns: 0 };
+  every.end = await openWindowTestPage(browser, origin, { before: async (opened) => {
+    every.turns += 1;
+    await lose("shell-secret.js")(opened);
+  } }).then((opened) => opened.page.close().then(() => "the page stood"), (failure) => String(failure));
+  ok("a file of the window's own that is lost on every turn ends the suite, and the failure names the file",
+    every.turns === 3 && every.end.includes("shell-secret.js failed: net::ERR_CONNECTION_FAILED"),
+    JSON.stringify({ turns: every.turns, end: every.end.slice(0, 300) }));
 });
 
 suite("explorer", async ({ browser, origin, ok }) => {
@@ -359,6 +386,8 @@ suite("artifact-stage2", ({ browser, origin, ok }) => testArtifactStage2(browser
 suite("artifact-flow", ({ browser, origin, ok }) => testArtifactFlow(browser, origin, ok));
 /* The tab on a 27-inch screen, in Geist (2026-11-06): the reader's share, the grip, wide reading, every tab's rows. */
 suite("artifact-geist", ({ browser, origin, ok }) => testArtifactGeist(browser, origin, ok));
+// 아티팩트의 이음매(2026-11-10): 접힌 사이드바의 「새 N」, 프로젝트의 띠, 카드의 「새」 · 프로젝트 · 지식, 읽는 칸의 지식 페이지.
+suite("artifact-seams", ({ browser, origin, ok }) => testArtifactSeams(browser, origin, ok));
 suite("agent-support", ({ browser, origin, ok }) => testAgentSupport(browser, origin, ok));
 // The coordinator's desk above the task list (t-6588, docs/design/agent-board-round4.md).
 suite("coordinator-desk", ({ browser, origin, ok }) => testCoordinatorDesk(browser, origin, ok));
@@ -571,6 +600,11 @@ suite("conversation-after", ({ browser, origin, ok }) => testConversationAfter(b
 suite("conversation-t3", ({ browser, origin, ok }) => testConversationT3(browser, origin, ok));
 // A conversation that went behind another tab before its first frame, and one left and brought back: its composer and its foot (2026-11-08).
 suite("conversation-behind-tab", ({ browser, origin, ok }) => testConversationBehindTab(browser, origin, ok));
+// 2026-11-10 (window artifact p-1c1bbf75726ff227): an answer's card of what its turn changed, on the
+// reading column; the head's one named 「보기」; a new answer starting under its question.
+suite("conversation-result", ({ browser, origin, ok }) => testConversationResult(browser, origin, ok));
+suite("conversation-view-menu", ({ browser, origin, ok }) => testConversationViewMenu(browser, origin, ok));
+suite("conversation-pin", ({ browser, origin, ok }) => testConversationPin(browser, origin, ok));
 suite("conversation-archive", ({ browser, origin, ok }) => testConversationArchive(browser, origin, ok));
 suite("conversation-recovery", ({ browser, origin, ok }) => testConversationRecovery(browser, origin, ok));
 /* 검토 패널의 테스트 줄·「이 변경 되돌리기」, 실행 중 입력창의 보낼 시점 안내 (t-95969). */
@@ -36775,10 +36809,12 @@ const chatFace = await page.evaluate(async () => {
   const chatDock = composer?.closest(".chat-dock") ?? null;
   seen.dockMax = chatDock ? getComputedStyle(chatDock).maxWidth : "";
   seen.wantDockMax = `${window.__READING_MEASURE__(chatDock?.closest(".worker-view")?.getBoundingClientRect().width ?? 0)}px`;
-  // The composer's focus edge is the agent's accent.
+  // The composer's focus edge is the window's own mark — neutral (2026-11-10, window artifact
+  // p-1c1bbf75726ff227, decision 3): the agent's accent stays on its mark and its send.
   box?.focus();
   await new Promise((done) => setTimeout(done, 450));
-  seen.focusEdge = getComputedStyle(composer).borderColor === probe("--agent-accent-claude");
+  seen.focusEdge = getComputedStyle(composer).borderColor === probe("--edge-mark", "borderTopColor", composer.parentElement) &&
+    getComputedStyle(composer).borderColor !== probe("--agent-accent-claude");
   // The agent chip: the agent's mark and the catalog's name — only when the
   // catalog knows the agent.
   const model = composer?.querySelector(".worker-composer-agent");
@@ -57148,8 +57184,8 @@ suite("pane-conversation-view", async ({ browser, origin, ok }) => {
 /* 알약(t-81525 B1·B2, 사람이 고른 대화 시안 B): 두 답 사이의 도구 일이 알약 한
  * 줄로 접히는 것이 모두의 기본이다. 알약은 제 턴들을 들고 마지막 구성원의
  * 열쇠(`data-turn`)를 쓰며, 구성원의 행은 펼칠 때 짓고 접을 때 버린다. 머리의
- * 토글 「걸음 모두 펼치기」가 전역 설정 `conversation_timeline_view`를 쓰고,
- * 켜면 걸음이 모두 펼쳐진 타임라인이 그 자리에서 선다. */
+ * 「보기」에서 「전체」를 고르면(2026-11-10 — 이름 없는 토글이 있던 자리) 전역 설정
+ * `conversation_timeline_view`를 쓰고, 걸음이 모두 펼쳐진 타임라인이 그 자리에서 선다. */
 suite("focus-view", async ({ browser, origin, ok }) => {
   const { page } = await openWindowTestPage(browser, origin);
   try {
@@ -57213,10 +57249,12 @@ suite("focus-view", async ({ browser, origin, ok }) => {
       const failed = (n) => t("worker.tallyFailed", "실패 {{n}}", { n });
 
       // (a) 기본은 알약: 한 턴의 도구 일이 한 줄이고, 걸음의 행은 하나도 없다.
-      const button = face.querySelector(".worker-head .worker-focus");
-      seen.buttonNamed = button?.dataset.tip === t("worker.timelineView", "걸음 모두 펼치기") &&
-        button?.getAttribute("aria-label") === t("worker.timelineView", "걸음 모두 펼치기");
-      seen.pressed = button?.getAttribute("aria-pressed");
+      const button = face.querySelector(".worker-head .chat-view");
+      const readingOf = (id) => chatViewModes().find((row) => row.id === id).word;
+      seen.buttonNamed = button?.dataset.tip === t("worker.viewTip", "보기 방식 고르기") &&
+        button?.getAttribute("aria-label") === `${t("worker.viewTip", "보기 방식 고르기")} — ${readingOf("normal")}`;
+      seen.reading = button?.querySelector(".chat-view-mode")?.textContent;
+      seen.wantReading = readingOf("normal");
       const standing = pills();
       seen.pills = standing.length;
       seen.rowsFolded = stepRows();
@@ -57356,15 +57394,21 @@ suite("focus-view", async ({ browser, origin, ok }) => {
       };
       capOf(floodPill).click();
 
-      // (f) 토글을 켜면 걸음을 모두 펼친 타임라인이 그 자리에서 서고 — 끝난 같은 종류는
-      // 한 줄로 접힌다 — 끄면 알약으로 돌아온다.
-      button.click();
-      await new Promise((done) => setTimeout(done, 80));
-      seen.timelinePressed = button.getAttribute("aria-pressed");
+      // (f) 「보기」에서 「전체」를 고르면 걸음을 모두 펼친 타임라인이 그 자리에서 서고 —
+      // 끝난 같은 종류는 한 줄로 접힌다 — 「기본」을 고르면 알약으로 돌아온다.
+      const pickView = async (id) => {
+        button.click();
+        [...document.querySelectorAll(".composer-menu .composer-menu-item")]
+          .find((row) => row.querySelector(".composer-menu-name").textContent === readingOf(id)).click();
+        await new Promise((done) => setTimeout(done, 80));
+      };
+      await pickView("all");
+      seen.timelineReading = button.querySelector(".chat-view-mode").textContent;
+      seen.wantTimelineReading = readingOf("all");
       seen.timelinePills = pills().length;
       seen.timelineRuns = list.querySelectorAll(":scope > .helper-turn.is-run").length;
-      button.click();
-      await new Promise((done) => setTimeout(done, 80));
+      await pickView("normal");
+      seen.menuGone = document.querySelectorAll(".composer-menu").length === 0;
       seen.saved = JSON.stringify(saved);
       seen.backPills = pills().length;
       seen.backRows = stepRows();
@@ -57379,7 +57423,7 @@ suite("focus-view", async ({ browser, origin, ok }) => {
     });
     ok(
       "the tool work between two answers is one pill by default — 「도구 2개 · 실패 1」 with its state's dot, the call out named beside it — and no step has a row until its pill opens (t-81525 B1·B2)",
-      seen.buttonNamed && seen.pressed === "false" && seen.pills === 2 && seen.rowsFolded === 0 &&
+      seen.buttonNamed && seen.reading === seen.wantReading && seen.pills === 2 && seen.rowsFolded === 0 &&
         seen.firstWords === seen.wantFirstWords && seen.firstFailed && seen.firstDot &&
         seen.secondWords === seen.wantSecondWords && seen.secondLive && seen.secondDot &&
         seen.secondLiveWords === seen.wantSecondLiveWords && seen.keys === seen.wantKeys,
@@ -57410,9 +57454,9 @@ suite("focus-view", async ({ browser, origin, ok }) => {
       JSON.stringify(seen.trimmedOpen),
     );
     ok(
-      "the head's 「걸음 모두 펼치기」 writes the one global setting: on, every step stands on the timeline (settled steps of one kind folded into one line); off, the pills are back",
-      seen.timelinePressed === "true" && seen.timelinePills === 0 && seen.timelineRuns >= 1 &&
-        seen.saved === JSON.stringify([{ on: true }, { on: false }]) && seen.backPills >= 1 && seen.backRows === 0,
+      "the head's 「보기」 writes the one global setting: 「전체」 stands every step on the timeline (settled steps of one kind folded into one line) and the control says so; 「기본」 brings the pills back",
+      seen.timelineReading === seen.wantTimelineReading && seen.timelinePills === 0 && seen.timelineRuns >= 1 &&
+        seen.saved === JSON.stringify([{ on: true }, { on: false }]) && seen.backPills >= 1 && seen.backRows === 0 && seen.menuGone,
       JSON.stringify(seen),
     );
   } finally {
@@ -59654,6 +59698,9 @@ suite("wire-live-stream", async ({ browser, origin, ok }) => {
 });
 
 await run({ browser, origin, faults });
+/* `WINDOW_SUITE_TIMES=<file>`: each suite's wall time and checks as JSON, in the order the run took them — the report
+ * carries no time (window-runner.mjs `times`). */
+if (process.env.WINDOW_SUITE_TIMES) await writeFile(process.env.WINDOW_SUITE_TIMES, `${JSON.stringify(times, null, 1)}\n`);
 await browser.close();
 files.close();
 endRun(report() ? 1 : 0);

@@ -1374,6 +1374,9 @@ const stubBackend = ({ boot, pollers }) => {
     /* 흐름(t-68458): 이 픽스처의 런타임은 흐름을 답하지 않는다 — 탭은 흐름이 생기기 전처럼 행이
        있는 첫 탭으로 선다. 흐름을 보는 스위트(artifact-flow)가 제 답을 갖다 놓는다. */
     artifact_flow: () => null,
+    /* 세컨드 브레인의 인용(2026-11-10): 이 픽스처에는 볼트가 없다 — 어느 아티팩트도 지식 페이지에 적혀 있지
+       않다. 그 이음을 보는 스위트가 제 답을 갖다 놓는다. */
+    artifact_citations: () => ({}),
     commit_landings: () => ({}),
     artifact_counts: () => {
       const rows = window.__buildArtifacts__(window.__ARTIFACTS__ ?? { count: 0 });
@@ -2545,6 +2548,33 @@ export async function waitBootSettled(page) {
  *   rails  — the two rails on from the first script, as a person's narrow
  *            window boots; off by default (`railsOff`). */
 export async function openWindowTestPage(browser, origin, { faults = [], before = null, context: shape = {}, rails = false } = {}) {
+  for (let turn = 1; ; turn += 1) {
+    const opened = await openWindowTestPageOnce(browser, origin,
+      { faults, before, shape, rails, last: turn === OWN_FILES_TURNS });
+    if (opened.page) return { page: opened.page, faults };
+    process.stderr.write(`window-boot: ${opened.unreached.join(" | ")} — this harness's own file server was not reached; `
+      + `the page is opened again (turn ${turn + 1} of ${OWN_FILES_TURNS})\n`);
+  }
+}
+
+/* How many times a page is opened before a file of the window's own that never reached it ends the suite. A page asks
+ * this harness's server on 127.0.0.1 for some fifty files, and on the hosted Windows runner one connection in a run is
+ * not made: `shell-secret.js failed: net::ERR_CONNECTION_FAILED` ended chrome-geist in v1.1.137's run, and
+ * `shell-i18n.js`, the same way, jev-dashboard in v1.1.138's — a different suite each time, one file each, every other
+ * file of that page arrived. That is the harness's road to its own files, not the window: the page is closed with
+ * everything it said and opened again, and stderr names the file. A file that is truly not served is lost on every
+ * turn, and the last turn's failure is the suite's, as before. */
+const OWN_FILES_TURNS = 3;
+
+/* The window's own files a page asked this harness's server for and never got because no connection was made. */
+const unreachedOwnFiles = (requests, origin) => requests.filter((line) => line.startsWith(`${origin}/`)
+  && /\.(?:html|js|css)(?:\?\S*)? failed: net::ERR_CONNECTION_\w+$/.test(line));
+
+/* One turn of `openWindowTestPage`. `{ page }` when the window stands; `{ unreached }`, the page closed, when its own
+ * files were not reached and this is not the `last` turn; every other failure is thrown. The caller's `faults` takes
+ * this page's renderer errors once the page is kept or its failure is final — a turn that is thrown away leaves the
+ * list as it was. */
+async function openWindowTestPageOnce(browser, origin, { faults, before, shape, rails, last }) {
   // A context of its own, not `browser.newPage()`: a context a page owns
   // refuses `context.newPage()`, and the axe check opens its blank page that
   // way ("Please use browser.newContext()"). The context leaves with the page.
@@ -2553,7 +2583,14 @@ export async function openWindowTestPage(browser, origin, { faults = [], before 
     ...shape });
   const page = await context.newPage();
   page.on("close", () => context.close().catch(() => {}));
-  page.on("pageerror", (error) => faults.push(error?.stack ?? String(error)));
+  // This turn's renderer errors: its own list until the turn is final, the caller's from then on.
+  let heard = [];
+  const settle = () => {
+    if (heard === faults) return;
+    faults.push(...heard);
+    heard = faults;
+  };
+  page.on("pageerror", (error) => heard.push(error?.stack ?? String(error)));
   // What the page asked for and what failed, kept for the one message that says why a page never finished loading:
   // a request that failed or answered an error, and the console's errors. Read only on that failure.
   const requests = [];
@@ -2581,8 +2618,12 @@ export async function openWindowTestPage(browser, origin, { faults = [], before 
   const throttle = Number(process.env.WINDOW_CPU_THROTTLE ?? 0);
   if (throttle > 1) await (await context.newCDPSession(page)).send("Emulation.setCPUThrottlingRate", { rate: throttle });
   if (before) await before(page);
-  await page.goto(`${origin}/index.html`);
   try {
+    await page.goto(`${origin}/index.html`);
+    // `goto` returns at the page's load: every script it names has run or failed by then, so a file that was not
+    // reached is known now. A turn that will be thrown away is not waited out — a window without its words' file
+    // never binds, and waiting for it to was thirty seconds a turn.
+    if (!last && unreachedOwnFiles(requests, origin).length > 0) throw new Error("a file of the window's own was not reached");
     await page.waitForFunction(() => typeof BOUND !== "undefined" && BOUND.size > 0);
     // A page that stood up although one of the window's own scripts or styles never arrived is not the window: the
     // first use of what that file declares fails far from here, under a name that says nothing of the load. PR #17's
@@ -2592,6 +2633,12 @@ export async function openWindowTestPage(browser, origin, { faults = [], before 
       && !line.endsWith("net::ERR_ABORTED"));
     if (lost.length > 0) throw new Error(`the window's own files did not arrive: ${lost.join(" | ")}`);
   } catch (error) {
+    const unreached = unreachedOwnFiles(requests, origin);
+    if (unreached.length > 0 && !last) {
+      await page.close().catch(() => {});
+      return { unreached };
+    }
+    settle();
     // The boot globals and the script resources that did arrive: which scripts the page actually ran.
     const boot = await page.evaluate(() => ({
       readyState: document.readyState,
@@ -2602,12 +2649,15 @@ export async function openWindowTestPage(browser, origin, { faults = [], before 
       scriptsArrived: performance.getEntriesByType("resource")
         .filter((entry) => entry.name.endsWith(".js")).map((entry) => entry.name.split("/").pop()),
     })).catch((failure) => ({ unreadable: String(failure).slice(0, 200) }));
+    // Nobody is handed a page that never stood, so nobody could close it.
+    await page.close().catch(() => {});
     throw new Error(`window did not finish loading: ${faults.join(" | ") || error}`
       + ` | failed requests: ${requests.join(" | ") || "none"}`
       + ` | console errors: ${consoleErrors.join(" | ") || "none"}`
       + ` | boot: ${JSON.stringify(boot)}`);
   }
-  return { page, faults };
+  settle();
+  return { page };
 }
 
 export async function createWindowServer({ bootstrapSource = null } = {}) {
