@@ -244,6 +244,7 @@ const ORCA_SETTINGS_CONTRACT = Object.freeze(JSON.parse(
 ));
 
 let chromium;
+let webkit;
 let AxeBuilder;
 try {
   const require = createRequire(import.meta.url);
@@ -261,7 +262,7 @@ try {
     if (!root) throw new Error("no global npm root");
     entry = require.resolve(resolve(root, "playwright"));
   }
-  ({ chromium } = require(entry));
+  ({ chromium, webkit } = require(entry));
   const axeEntry = require.resolve("@axe-core/playwright");
   const axeModule = require(axeEntry);
   AxeBuilder = axeModule.default ?? axeModule;
@@ -3950,7 +3951,10 @@ const origin = `http://127.0.0.1:${files.address().port}`;
 
 let browser;
 try {
-  browser = await chromium.launch();
+  // The gate runs on Chromium. `SETTINGS_ENGINE=webkit` runs the scenes that
+  // ask about the app's own engine (a filtered run: the gate's budgets and
+  // axe passes are Chromium's).
+  browser = await (process.env.SETTINGS_ENGINE === "webkit" ? webkit : chromium).launch();
 } catch (error) {
   console.error("FAIL  Chromium is required for the settings browser gate.");
   console.error("      Install it with: npx playwright install chromium");
@@ -4994,7 +4998,7 @@ await test("a_flows_schedules_are_listed_switched_and_added_on_the_flow_side", a
   }];
   backend.flows.recipes = [];
   backend.automations = [
-    job("job-on", "Morning wallet QA", { flow: "wallet-qa", runs: 14 }),
+    job("job-on", "Morning wallet QA", { flow: "wallet-qa", runs: 14, last_verdict: false }),
     job("job-off", "Night wallet QA", {
       flow: "wallet-qa",
       enabled: false,
@@ -5002,6 +5006,27 @@ await test("a_flows_schedules_are_listed_switched_and_added_on_the_flow_side", a
     }),
     job("job-plain", "Repo audit", {}),
   ];
+  // The newest run of the morning job: its folder holds a failed verdict and
+  // the report rendered from it.
+  backend.automationRuns = [{
+    id: "1756800000000-7",
+    automation_id: "job-on",
+    scheduled_for_epoch_minutes: 29_000_000,
+    at_epoch_ms: 1_756_800_000_000,
+    root: BOOT_BASE.project_root,
+    term: 7,
+    made_worktree: null,
+    skipped: null,
+    failure: null,
+    ended_at_epoch_ms: 1_756_800_900_000,
+    exit_code: 0,
+    completed_at_epoch_ms: 1_756_800_800_000,
+    result: null,
+    evidence_dir: "/data/automations/job-on/runs/1756800000000",
+    evidence_files: 4,
+    verdict: { pass: false, reason: "the balance was not shown" },
+    report: "/data/automations/job-on/runs/1756800000000/report.html",
+  }];
   try {
     let from = backend.calls.length;
     await openFlowSide(pageA);
@@ -5032,6 +5057,8 @@ await test("a_flows_schedules_are_listed_switched_and_added_on_the_flow_side", a
     assert(rows[0].label.includes("Morning wallet QA"), "a schedule's switch is not named by its job", rows);
     const offWord = await pageA.evaluate(() => t("auto.off", ""));
     assert(offWord && rows[1].words.includes(offWord), "a paused schedule did not say it is off", rows);
+    const failWord = await pageA.evaluate(() => t("flow.fail", ""));
+    assert(failWord && rows[0].words.includes(failWord), "a schedule did not say how its newest run went", rows);
     assert(await pageA.locator("#flow-schedules-none").isHidden(), "a Flow with schedules still said it has none");
     assertEqual(await pageA.locator("#auto-page-count-flows").textContent(), "1", "the Flow tab miscounted the Flows");
     assertEqual(await pageA.locator("#auto-page-count-schedules").textContent(), "3", "the schedule tab miscounted the automations");
@@ -5079,17 +5106,33 @@ await test("a_flows_schedules_are_listed_switched_and_added_on_the_flow_side", a
         flowHidden: document.getElementById("auto-flow-field").hidden,
         promptHidden: document.getElementById("auto-prompt-field").hidden,
         name: document.getElementById("auto-name").value,
+        // A Flow's run keeps its folder and starts its own session: the two
+        // controls that would say otherwise are not offered.
+        evidenceShown: getComputedStyle(document.getElementById("auto-evidence-field")).display !== "none",
+        reuseShown: getComputedStyle(document.getElementById("auto-reuse-field")).display !== "none",
+        // No agent is named: the window walks the Flow itself, the note says so,
+        // and what only a shell has — where it runs, its terminal — is not asked.
+        agent: document.getElementById("auto-agent").value,
+        agentRequired: document.getElementById("auto-agent").required,
+        noAgent: document.getElementById("auto-agent").options[0].textContent === t("auto.agentNone", ""),
+        note: document.getElementById("auto-flow-note").textContent === t("auto.flowNoteDirect", ""),
+        modeShown: getComputedStyle(document.getElementById("auto-mode-field")).display !== "none",
+        closeShown: getComputedStyle(document.getElementById("auto-close-done-field")).display !== "none",
       })),
-      { kind: "flow", pressed: "true", flow: "wallet-qa", flowHidden: false, promptHidden: true, name: "Wallet QA" },
+      {
+        kind: "flow", pressed: "true", flow: "wallet-qa", flowHidden: false, promptHidden: true, name: "Wallet QA",
+        evidenceShown: false, reuseShown: false,
+        agent: "", agentRequired: false, noAgent: true, note: true, modeShown: false, closeShown: false,
+      },
       "the form did not open on this Flow",
     );
     from = backend.calls.length;
     await pageA.click("#auto-save");
     const saved = await backend.waitForCall("A", "save_automation", from);
     assertEqual(
-      [saved.args.automation.flow, saved.args.automation.prompt],
-      ["wallet-qa", ""],
-      "the form sent a command of its own instead of the link",
+      [saved.args.automation.flow, saved.args.automation.prompt, saved.args.automation.agent],
+      ["wallet-qa", "", null],
+      "the form sent a command of its own instead of the link, or named an agent nobody chose",
     );
     await pageA.waitForFunction(
       () => document.querySelectorAll("#flow-schedule-list .flow-schedule").length === 3,
@@ -5102,16 +5145,59 @@ await test("a_flows_schedules_are_listed_switched_and_added_on_the_flow_side", a
     await pageA.click('.flow-schedule[data-id="job-on"] [data-flow-schedule="edit"]');
     await pageA.waitForSelector("#auto-editor-scrim:not([hidden])");
     assertEqual(await pageA.locator("#auto-flow").inputValue(), "wallet-qa", "editing a Flow job lost its Flow");
+    assert(await pageA.locator("#auto-template-field").isHidden(), "a stored job was offered a template to start from");
+    // This job names an agent: it is handed the command, and the note says that.
+    assertEqual(
+      await pageA.evaluate(() => [
+        document.getElementById("auto-agent").value,
+        document.getElementById("auto-form").dataset.direct,
+        document.getElementById("auto-flow-note").textContent === t("auto.flowNote", ""),
+        getComputedStyle(document.getElementById("auto-mode-field")).display !== "none",
+      ]),
+      ["codex", "false", true, true],
+      "a Flow job that names an agent was drawn as the window's own walk",
+    );
     await pageA.click('[data-auto-kind="agent"]');
     assertEqual(
       await pageA.evaluate(() => [
         document.getElementById("auto-flow-field").hidden,
         document.getElementById("auto-prompt-field").hidden,
         document.getElementById("auto-prompt").required,
+        getComputedStyle(document.getElementById("auto-evidence-field")).display !== "none",
       ]),
-      [true, false, true],
-      "the agent kind did not bring the prompt back",
+      [true, false, true, true],
+      "the agent kind did not bring the prompt and the evidence choice back",
     );
+    await pageA.click("#auto-cancel");
+
+    // A new automation can start from a template at any time, not only on the
+    // empty page: choosing one fills the form, and the folded rest says what it
+    // set without being opened.
+    await pageA.click("#auto-new");
+    await pageA.waitForSelector("#auto-editor-scrim:not([hidden])");
+    assertEqual(await pageA.locator("#auto-template-pick option").count(), 7, "the editor did not offer the six templates");
+    await pageA.selectOption("#auto-template-pick", "emulator-qa");
+    const started = await pageA.evaluate(() => ({
+      name: document.getElementById("auto-name").value,
+      want: t("auto.templateQaTitle", ""),
+      closes: document.getElementById("auto-close-done").checked,
+      kind: document.getElementById("auto-form").dataset.kind,
+      picked: document.getElementById("auto-template-pick").value,
+      folded: !document.getElementById("auto-details").open,
+      summary: document.getElementById("auto-details-summary").textContent,
+      closeWord: t("auto.closeWhenDone", ""),
+    }));
+    assert(started.want && started.name === started.want && started.closes, "the template did not fill the form", started);
+    assertEqual([started.kind, started.picked, started.folded], ["agent", "", true], "the template left the form on another kind, or the picker on its choice");
+    assert(started.closeWord && started.summary.includes(started.closeWord), "the folded details did not say what the template set", started);
+    for (const theme of SETTINGS_QUALITY_SPEC.themes) {
+      await setQualityTheme(pageA, theme);
+      assertEqual(await axeViolations(pageA, AxeBuilder, "#auto-form"), [], `en/${theme} automation editor accessibility`);
+    }
+    await setQualityTheme(pageA, "dark");
+    // A theme change reads the stored settings again, the language with them:
+    // back to English, whose catalog the sentences below are read from.
+    await setQualityLocale(pageA, "en");
     await pageA.click("#auto-cancel");
 
     // The 예약 side names the Flow a job runs, and the agent of one that runs none.
@@ -5126,6 +5212,65 @@ await test("a_flows_schedules_are_listed_switched_and_added_on_the_flow_side", a
       [["Morning wallet QA", "Wallet QA"], ["Repo audit", null]],
       "the schedule list did not say what each job runs",
     );
+
+    // A walk the window started itself has no terminal: the notice of its start
+    // mounts no tab.
+    const tabsBefore = await pageA.evaluate(() => tabs.length);
+    await pageA.evaluate((root) => window.__SETTINGS_TEST_EMIT__("automation:started", {
+      term: 4294967295, name: "Wallet QA", root, worktree: null, flow: "wallet-qa",
+    }), BOOT_BASE.project_root);
+    await renderSettled(pageA);
+    assertEqual(await pageA.evaluate(() => tabs.length), tabsBefore, "a walk with no shell was given a terminal tab");
+
+    // How the newest run went stands before its time in the list, and the run's
+    // own row says it with the reason and offers the report its folder holds.
+    assertEqual(
+      await pageA.locator("#auto-list .auto-row .auto-row-verdict.is-fail").count(),
+      1,
+      "the list did not say that the morning job's newest run failed",
+    );
+    from = backend.calls.length;
+    await pageA.locator("#auto-list .auto-row", { hasText: "Morning wallet QA" }).click();
+    await backend.waitForCall("A", "list_automation_runs", from);
+    await pageA.click("#auto-runs-tab");
+    await pageA.waitForSelector("#auto-runs-list .auto-run-row .auto-run-failed");
+    const ran = await pageA.evaluate(() => ({
+      state: document.querySelector("#auto-runs-list .auto-run-row .auto-run-failed").textContent,
+      failed: t("flow.fail", ""),
+      why: document.querySelector("#auto-runs-list .auto-run-why")?.textContent ?? "",
+      report: document.querySelector("#auto-runs-list .auto-run-report")?.textContent ?? "",
+      want: "the balance was not shown",
+      open: t("flow.report", ""),
+      evidence: document.getElementById("auto-detail-evidence").textContent,
+      keeps: t("auto.evidenceFlow", ""),
+    }));
+    assert(ran.failed && ran.state === ran.failed, "the run's row did not say its verdict", ran);
+    assert(ran.want && ran.why === ran.want, "the run's row did not say why it failed, under the row", ran);
+    assert(ran.open && ran.report === ran.open, "the run's row did not offer its report", ran);
+    assert(ran.keeps && ran.evidence === ran.keeps, "the overview did not say a Flow's run keeps its verdict", ran);
+    await pageA.click("#auto-detail-back");
+
+    // In a pane narrower than the row, the row folds instead of scrolling: the
+    // table has nothing to scroll sideways and the edit button is inside it.
+    const viewport = pageA.viewportSize();
+    await pageA.setViewportSize({ width: 820, height: viewport.height });
+    await renderSettled(pageA);
+    const narrow = await pageA.evaluate(() => {
+      const table = document.getElementById("auto-table");
+      const row = document.querySelector("#auto-list .auto-row");
+      const edit = row.querySelector(".auto-row-actions").lastElementChild.getBoundingClientRect();
+      const name = row.querySelector(".auto-row-name").getBoundingClientRect();
+      const schedule = row.querySelector(".auto-row-schedule").getBoundingClientRect();
+      return {
+        sideways: table.scrollWidth - table.clientWidth,
+        editInside: edit.right <= table.getBoundingClientRect().right && edit.width > 0,
+        folded: schedule.top >= name.bottom,
+        sorts: [...document.querySelectorAll(".auto-table-head button")].filter((one) => one.getBoundingClientRect().width > 0).length,
+      };
+    });
+    await pageA.setViewportSize(viewport);
+    await renderSettled(pageA);
+    assertEqual(narrow, { sideways: 0, editInside: true, folded: true, sorts: 2 }, "a narrow table still scrolled its row, or lost a way to sort");
     await closeFlowSide(pageA);
 
     // Settings keeps the count and the door to the Flow side.
@@ -5157,6 +5302,7 @@ await test("a_flows_schedules_are_listed_switched_and_added_on_the_flow_side", a
     backend.flows.flows = [];
     backend.flows.recipes = [];
     backend.automations = [];
+    backend.automationRuns = [];
     await pageA.evaluate(() => {
       closeAutoForm();
       setSettingsOpen(false);
@@ -16198,6 +16344,54 @@ await test("모델 받기: 주소나 ID는 바로 파일 목록으로 가고, �
   }
 }));
 
+await test("모델: 위쪽에 줄이 생기고 사라져도 보고 있던 자리가 밀리지 않는다 (WebKit에서 팅기던 것, 2026-11-11)", async () => withJudgmentStatus(async (page) => {
+  try {
+    await openModelReceive(page);
+    await page.setViewportSize({ width: 1280, height: 640 });
+    await renderSettled(page);
+    // The person is working in 「모델 받기」: its field stands a little under
+    // the top of the viewport, with the group's rows scrolled out above.
+    const look = () => page.evaluate(() => {
+      const frame = document.querySelector(".settings-frame");
+      return { field: Math.round(document.getElementById("judgment-source-repository").getBoundingClientRect().top), top: Math.round(frame.scrollTop) };
+    });
+    await page.evaluate(() => {
+      const frame = document.querySelector(".settings-frame");
+      const field = document.getElementById("judgment-source-repository");
+      frame.scrollTop += field.getBoundingClientRect().top - frame.getBoundingClientRect().top - 90;
+    });
+    const before = await look();
+    assert(before.top > 100, "the page did not scroll down to the receive panel", before);
+    const rows = () => page.locator('[data-connection-group="local"] [data-group-lines] > .model-line').count();
+    const rowsBefore = await rows();
+    // A model is received: its row appears among the group's rows, above
+    // the panel — and, received, leaves again. Chromium anchors the scroller
+    // by itself; WebKit, the app's engine, pushed the panel down and up.
+    const seen = [];
+    const step = async (change) => {
+      const held = backend.managedModelState;
+      change(held);
+      held.revision += 1;
+      await backend.emitManaged(backend.managedJudgmentSettings());
+      await renderSettled(page);
+      seen.push((await look()).field);
+    };
+    await step((held) => { held.models.push({ ...clone(held.models[0]), id: "fixture-second", label: "Fixture Second", installed: true }); });
+    assertEqual(await rows(), rowsBefore + 1, "the received model has no row above the panel");
+    await step((held) => { held.operation = { id: "fixture-progress", kind: "download", modelId: "fixture-second", state: "running", receivedBytes: 31 * 1024 * 1024, totalBytes: 183 * 1024 * 1024, error: null }; });
+    await step((held) => { held.operation = null; held.models.pop(); });
+    assertEqual(await rows(), rowsBefore);
+    assertEqual(seen.filter((at) => Math.abs(at - before.field) > 1), [], `the field moved from ${before.field}px as rows above it came and went`);
+    return `field held at ${before.field}px over ${seen.length} repaints (scrolled ${before.top}px)`;
+  } finally {
+    const held = backend.managedModelState;
+    held.operation = null;
+    held.models = held.models.filter((model) => model.id !== "fixture-second");
+    await page.setViewportSize({ width: 1280, height: 860 });
+    forgetReceiveFixtures();
+  }
+}));
+
 await test("모델 받기: 원본 가중치만 있는 저장소는 같은 모델의 GGUF 저장소를 찾아 보이고, 파일이 대부분 한도를 넘으면 까닭과 「로컬 서버 연결」을 내놓으며, 머리말이 판단용임을 말한다 (2026-11-11)", async () => withJudgmentStatus(async (page) => {
   try {
     await openModelReceive(page);
@@ -16247,6 +16441,11 @@ await test("모델 받기: 원본 가중치만 있는 저장소는 같은 모델
     // The one file under the limit would run at the memory limit: it is
     // marked, and left for the person to pick rather than picked for them.
     assertEqual(await page.locator("#judgment-source-file-list [data-file-heavy]").count(), 1, "the file at the memory limit is not marked");
+    // Sizes of a gigabyte and more are said in gigabytes: 「4096.0 MB를 넘어」
+    // beside 「3733.6 MB」 was two numbers to divide before they could be compared.
+    const sizes = await page.locator("#judgment-source-file-list .model-file").evaluateAll((rows) => rows.map((row) => `${row.querySelector(".model-file-size").textContent} | ${row.querySelector(".model-file-why")?.textContent ?? ""}`));
+    assertEqual(sizes[0].split(" | ")[0], "3.6 GB", "a file of gigabytes is sized in megabytes");
+    assert(sizes[1].includes("4.0 GB") && !sizes.some((line) => /\d{4}\.\d MB/.test(line)), "the limit a file is over is said in megabytes", sizes);
     assert(!backend.calls.slice(largeAt).some((entry) => entry.command === "managed_judgment_inspect_source"), "a file at the memory limit was picked for the person");
     assertEqual(await page.evaluate(() => judgmentModelSourceController.picked), null);
     const big = page.locator("#judgment-source-files-big");
@@ -16324,7 +16523,7 @@ await test("모델 받기: 「받기만」은 파일만 받아 두고 판단 모
 
 await test("이 컴퓨터: 실행 엔진 줄은 이 앱이 고정한 판과 상태를 말하고, 옛 판이 깔려 있으면 「업데이트」를 달며, 공개된 새 판이 있으면 그 이름을 보인다", async () => withJudgmentStatus(async (page, provider) => {
   try {
-    const runtime = { id: "macos-aarch64-llama-cpp-cpu", engine: "llama_cpp", version: "b11669", home: "https://example.invalid/acme/engine", state: "outdated", downloadBytes: 37_351_536 };
+    const runtime = { id: "macos-aarch64-llama-cpp-cpu", engine: "llama_cpp", version: "b11669", installedVersion: null, home: "https://example.invalid/acme/engine", state: "outdated", downloadBytes: 37_351_536 };
     const paint = async (change) => {
       change(backend.managedModelState);
       backend.managedModelState.revision += 1;
@@ -16343,7 +16542,13 @@ await test("이 컴퓨터: 실행 엔진 줄은 이 앱이 고정한 판과 상�
     await paint((held) => { held.runtimes = [clone(runtime)]; held.models[0].engine = "llama_cpp"; });
     const line = page.locator(`#model-runtimes [data-runtime="${runtime.id}"]`);
     assert(await page.locator("#model-runtimes").isVisible() && await line.count() === 1, "the engine has no line");
-    assertEqual(await line.locator(".model-line-name").textContent(), "llama.cpp · b11669", "the line does not name the engine and the build this app pins");
+    // The name is the engine's; the versions are said apart under it — what
+    // is on this computer, and what this app would receive (the person,
+    // 2026-11-11: 「다운받은 버전도 보여줘야」; the pinned build beside the name
+    // read as the installed one while nothing was installed).
+    assertEqual(await line.locator(".model-line-name").textContent(), "llama.cpp", "the engine's name carries a version of its own");
+    const versions = () => line.locator("[data-runtime-versions]").textContent();
+    assertEqual(await versions(), "설치된 버전: 이전 버전 · 앱이 받을 버전: b11669", "an earlier pin's runtime does not say both versions");
     assertEqual(await line.locator("[data-runtime-state]").getAttribute("data-runtime-state"), "outdated");
     assertEqual(await line.locator("[data-runtime-state]").textContent(), await page.evaluate(() => t("settings.models.runtime.outdated", "업데이트 있음")));
     assertEqual(await line.locator("[data-runtime-newer]").getAttribute("data-runtime-newer"), "v0.9.0", "the newest public release is not said");
@@ -16352,29 +16557,53 @@ await test("이 컴퓨터: 실행 엔진 줄은 이 앱이 고정한 판과 상�
     assert((await line.locator("[data-runtime-newer]").textContent()).includes("v0.9.0"));
     const updatedAt = backend.calls.length;
     await line.locator("[data-runtime-update]").click();
-    const updated = await backend.waitForCall("judgment-status", "managed_judgment_prepare_model_runtime", updatedAt);
-    assertEqual(updated.args, { modelId: provider.model, revision: "fixture-revision" }, "the update did not prepare the runtime through the model it runs");
-    // An earlier pin's runtime with no model of its engine on this computer:
-    // nothing here can be pressed, so the line says when the new one comes
-    // rather than naming an update it does not offer.
-    await paint((held) => { held.models[0].installed = false; });
+    const updated = await backend.waitForCall("judgment-status", "managed_judgment_prepare_runtime", updatedAt);
+    assertEqual(updated.args, { runtimeId: runtime.id }, "the update did not name the engine its line stands for");
+    // The engine's own button needs no model: an earlier pin's runtime with
+    // no model of its engine on this computer is updated all the same.
+    await paint((held) => { held.models[0].installed = false; held.runtimes = [clone(runtime)]; });
     assertEqual(await line.locator("[data-runtime-state]").getAttribute("data-runtime-state"), "outdated");
-    assertEqual(await line.locator("[data-runtime-update]").count(), 0, "an update is offered with no model to prepare the runtime through");
-    const later = await page.evaluate(() => [t("settings.models.runtimeOutdatedLater", "이 앱이 확인한 새 판이 있습니다. 이 엔진의 모델을 다음에 쓸 때 새 판으로 바꿉니다({{size}}).", { size: bytesLabel(37_351_536) }), t("settings.models.runtimeOutdated", "이 앱이 확인한 새 판이 있습니다. 업데이트하면 다음 실행부터 씁니다({{size}}).", { size: bytesLabel(37_351_536) })]);
-    const said = await line.innerText();
-    assert(said.includes(later[0]) && !said.includes(later[1]), "the line names an update it does not offer", said);
+    assertEqual(await line.locator("[data-runtime-update]").count(), 1, "the update needs a model to stand");
     await paint((held) => { held.models[0].installed = true; });
-    assertEqual(await line.locator("[data-runtime-update]").count(), 1, "the update did not come back with the model");
+    // The newest release named with its build: the home's release name is
+    // not the build this app pins, and both are said.
+    backend.managedRuntimeNews = [{ id: runtime.id, engine: "llama_cpp", pinned: "b11669", latest: "v0.9.0", build: "b12110", newer: true }];
+    await paint((held) => { held.runtimes = [clone(runtime)]; });
+    assert((await line.locator("[data-runtime-newer]").textContent()).includes("v0.9.0 (b12110)"), "the newest release is not said with its build");
+    // The pinned build is the newest release's: nothing newer is said, and
+    // the installed version wears the release's name.
+    backend.managedRuntimeNews = [{ id: runtime.id, engine: "llama_cpp", pinned: "b11669", latest: "v0.9.0", build: "b11669", newer: false }];
+    await paint((held) => { held.runtimes = [{ ...clone(runtime), state: "ready", installedVersion: "b11669" }]; });
+    assertEqual(await line.locator("[data-runtime-newer]").count(), 0, "the pinned build of the newest release is said to be behind it");
+    assertEqual(await versions(), "설치된 버전: v0.9.0 (b11669)", "the installed build does not wear its release's name");
     // The pinned runtime, installed, with nothing newer published.
     backend.managedRuntimeNews = [{ id: runtime.id, engine: "llama_cpp", pinned: "b11669", latest: "b11669", newer: false }];
-    await paint((held) => { held.runtimes = [{ ...clone(runtime), state: "ready" }]; });
+    await paint((held) => { held.runtimes = [{ ...clone(runtime), state: "ready", installedVersion: "b11669" }]; });
     assertEqual(await line.locator("[data-runtime-state]").getAttribute("data-runtime-state"), "ready");
+    assertEqual(await versions(), "설치된 버전: b11669", "an installed runtime does not say which build is installed");
     assertEqual(await line.locator("[data-runtime-update]").count(), 0, "an installed runtime still offers an update");
     assertEqual(await line.locator("[data-runtime-newer]").count(), 0, "the pinned build is said to be behind itself");
     // Not installed yet: said as coming with the first model, with no button.
     await paint((held) => { held.runtimes = [{ ...clone(runtime), state: "missing" }]; });
     assertEqual(await line.locator("[data-runtime-state]").getAttribute("data-runtime-state"), "missing");
-    assertEqual(await line.locator("button").count(), 0, "a runtime not installed offers a button of its own");
+    assertEqual(await versions(), "설치된 버전: 없음 · 앱이 받을 버전: b11669", "a runtime not installed reads as if the pinned build were on this computer");
+    await receivePictures(page, "engine-missing");
+    // Nothing installed: the line carries 「설치」, which names the engine —
+    // no model has to be received first (the person, 2026-11-11: 「없으면
+    // 최신 다운로드 받을수있는 버튼」).
+    assertEqual(await line.locator("button").count(), 1, "a runtime not installed has no button, or more than one");
+    const installAt = backend.calls.length;
+    await line.locator("[data-runtime-install]").click();
+    const installed = await backend.waitForCall("judgment-status", "managed_judgment_prepare_runtime", installAt);
+    assertEqual(installed.args, { runtimeId: runtime.id }, "the install did not name the engine its line stands for");
+    // While it is received the line says how far, and 「취소」 stands in the button's place.
+    await paint((held) => {
+      held.runtimes = [{ ...clone(runtime), state: "missing" }];
+      held.operation = { id: "fixture-runtime-install", kind: "runtime", modelId: null, state: "running", receivedBytes: 31.3 * 1024 * 1024, totalBytes: 183.2 * 1024 * 1024, error: null };
+    });
+    assertEqual(await line.locator("[data-runtime-progress]").textContent(), "설치 중 · 31.3 MB / 183.2 MB", "an install under way does not say how far it is");
+    assertEqual(await line.locator("button").evaluateAll((all) => all.map((button) => Object.keys(button.dataset).join())), ["runtimeCancel"], "an install under way keeps its install button, or has no way to stop");
+    await paint((held) => { held.operation = null; });
     const lines = new Set();
     for (const locale of SETTINGS_QUALITY_SPEC.locales) {
       await setQualityLocale(page, locale);

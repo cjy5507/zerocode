@@ -507,14 +507,21 @@ function rowsHeld(taken, from, to) {
     // where the tick put them by taking the rest as debt (`oweSidebarDrift`), and the rows move the whole tick, as on
     // every other tick; at rest it pays the debt with one write, which moves nothing. That debt is the person's
     // scroll the browser cut, not a move of the rows: counted as one here, it read as a 79 px jump on WebKit only
-    // (t-103178). Only a tick cut short: a wheel came in that frame or just before it, the scroll stands at its end, and the scroll and
-    // the debt together are no more than the ticks asked for.
+    // (t-103178). Only one tick cut short (review t-103290 N6): a wheel came in this frame or the one before it, the
+    // scroll stands at its end and did not go back, and the scroll and the debt together are exactly one tick —
+    // however many wheels came, so a tick counted for one frame is not forgiven again in the next. The frame before
+    // counts because WebKit's clock gives whole ms and the cut tick's wheel came 1-2 ms after the frame before: counted
+    // only between the two frames, one WebKit run in seven missed the cut tick (a 79 px residual). Exactly, because the
+    // cut tick's scroll and debt fill it to the pixel (21 px + 79 px): a bound of "no more than one tick" also forgave a
+    // debt that left the tick short, and a jump of up to one row (44 px) could hide in that gap (review t-103588 M3).
+    const before = frames[at - 2]?.at ?? was.at - WRITE_WINDOW_MS;
     const wheeled = taken.events
-      .filter((event) => event.type === "wheel" && event.at > Math.min(was.at, now.at - WRITE_WINDOW_MS) && event.at <= now.at)
+      .filter((event) => event.type === "wheel" && event.at > before && event.at <= now.at)
       .length;
     const rose = (now.debt ?? 0) - (was.debt ?? 0);
+    const went = now.top - was.top;
     const cut = wrote === 0 && wheeled > 0 && rose > 0 && Math.abs(now.top - now.max) <= 0.5 &&
-      now.top - was.top + rose <= wheeled * STEP + 0.5
+      went >= -0.5 && Math.abs(went + rose - STEP) <= 0.5
       ? rose
       : 0;
     const scrolled = now.top - was.top - wrote + cut;
@@ -779,6 +786,32 @@ async function pointerHeaderHolds(browser, origin, faults) {
  * saw them; on WebKit (`--engine webkit`) the engine does it itself. Four repositories, the first one's main card
  * holding five agents, a different repository's checkout active; the view cut to 100 px less than the list; the card's
  * head row hidden under the header; the person presses an agent row in that card. */
+/* ⑭ A row the scroll builds wears its rings where every other ring stands from the frame that first shows it (review
+ * t-103290 N8). A CSS animation starts at its node's birth, so a ring on a row built mid-scroll would turn from the top
+ * for a frame until it said it started. The scene's rows hold agents at work; the scroll jumps to the middle of the
+ * list, where nothing has been built, and the window's own render runs at once — the rings of every row it built
+ * are read before any frame, when an unpinned ring has no start time yet. */
+async function scrollBuiltRingsHold(browser, origin, faults) {
+  const { page } = await openWindowTestPage(browser, origin, { faults });
+  try {
+    await standScrollScene(page);
+    return await page.evaluate(() => {
+      const TURNS = new Set(["wt-activity-turn", "wt-agent-spin"]);
+      const scroller = el("sidebar-scroll");
+      const standing = new Set(worktreeList.querySelectorAll(".wt-node"));
+      scroller.scrollTop = Math.round(scroller.scrollHeight / 2);
+      renderSidebarWindows();
+      const built = [...worktreeList.querySelectorAll(".wt-node")].filter((node) => !standing.has(node));
+      const rings = built.flatMap((node) => node.getAnimations({ subtree: true })
+        .filter((one) => TURNS.has(one.animationName)).map((one) => one.startTime));
+      return { built: built.length, rings: rings.length, unpinned: rings.filter((at) => at !== 0).length,
+        sample: rings.slice(0, 4) };
+    });
+  } finally {
+    await page.close();
+  }
+}
+
 async function agentRowsRedrawHoldAShortList(browser, origin, faults, engine) {
   const { page } = await openWindowTestPage(browser, origin, { faults, context: { viewport: { width: 1280, height: 700 } } });
   try {
@@ -1231,6 +1264,12 @@ export async function testSidebarScroll({ browser, origin, ok, engine = "chromiu
     "the header under the pointer holds while a row above it in view grows and while a rebuild puts a repository right above it — the anchor is the row under the pointer, not the first row in view",
     aimed.grownRow && Math.abs(aimed.grown) <= 1 && Math.abs(aimed.rebuilt) <= 1 && aimed.under === aimed.path,
     JSON.stringify({ engine, ...aimed }),
+  );
+  const scrolled = await scrollBuiltRingsHold(browser, origin, faults);
+  ok(
+    "⑭ the rows a scroll builds wear their turning rings where every other ring stands from the frame that first shows them, not from the top",
+    scrolled.built > 0 && scrolled.rings > 0 && scrolled.unpinned === 0,
+    JSON.stringify({ engine, ...scrolled }),
   );
   const short = await agentRowsRedrawHoldAShortList(browser, origin, faults, engine);
   ok(

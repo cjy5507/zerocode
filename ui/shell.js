@@ -12846,7 +12846,6 @@ function paintWorktreeAgents() {
       + `|review:${waiting}`;
     if (host.dataset.said === signature) continue;
     host.dataset.said = signature;
-    stirred.push(host);
     dressWorktreeReviewFoot(host, waiting);
     dressWorktreeTwist(host.previousElementSibling, path, hidden);
     dressWorktreeTitle(host.previousElementSibling);
@@ -12858,8 +12857,10 @@ function paintWorktreeAgents() {
       // children replace the quiet seat with the real chevron in place.
       if (!redressAgentRows(host, rows)) {
         swapAgentRows(host, fittedOrMadeAgentSlots(host, rows), leaving);
+        stirred.push(host);
       }
     } else {
+      stirred.push(host);
       swapAgentRows(host, [
         ...deadSummary.rows.map(({ kind, row }) => kind === "finished"
           ? makeFinishedWorkRow(path, row)
@@ -12872,7 +12873,12 @@ function paintWorktreeAgents() {
     // Visibility uses the full, pre-slice totals. A collapsed card still has
     // content and must keep its handle; only a genuinely empty card hides the
     // host (a restore-waiting row also keeps it visible).
-    host.hidden = all.length + deadSummary.total === 0 && !restoring;
+    const hide = all.length + deadSummary.total === 0 && !restoring;
+    // Words written in place start no ring: a row's state is in its classes, so a row whose state moved is built
+    // (`fittedAgentRowWords`). Only a card whose rows were swapped, or whose rows came or went from view — that
+    // uncovers or covers its own ring — is pinned (review t-103290 N2).
+    if (host.hidden !== hide && stirred.at(-1) !== host) stirred.push(host);
+    host.hidden = hide;
     // The branch line's standing is one decision (`dressWorktreeTitle`): a name the title already said and a base chip.
     // 「에이전트 창 없음」 is no longer one of its parts: it stands once on the project's head (t-84799 A1).
     dressWorktreeTitle(host.previousElementSibling);
@@ -12883,16 +12889,18 @@ function paintWorktreeAgents() {
     // only dresses it.
     host.closest(".wt-node")?.classList.toggle("has-agents", !host.hidden);
   }
-  // Every ring a changed card holds turns from where the old one stood, not from the top — its new rows' rings, and
-  // the card's own ring that a row going quiet or hidden just uncovered. Pinned once, after the last card: asking
-  // the animations brings the style forward, and asked card by card it was one style pass for each card changed
-  // (review t-102958 #1). The first ask settles the style; the asks after it find nothing left to compute.
-  for (const host of stirred) keepTurnsInStep(host.closest(".wt-node") ?? host);
   if (leaving.length > 0) {
     // One layout with the new rows beside the old — the read is what lays them out — then the old ones go.
     void sidebarScroller.scrollHeight;
     for (const node of leaving) node.remove();
   }
+  // Every ring a changed card holds turns from where the old one stood, not from the top — its new rows' rings, and
+  // the card's own ring that a row going quiet or hidden just uncovered. Pinned after the old rows are out: while a
+  // working row still stands the stylesheet hides the card's ring, so pinned before, that ring had no turn yet and
+  // drew one frame at the top (review t-103290 N1). Asking the animations computes style, not layout, so the
+  // new-first swap above keeps its one layout. Pinned once, after the last card: asked card by card it was one style
+  // pass for each card changed (review t-102958 #1); the first ask settles the style, the asks after it find nothing.
+  for (const host of stirred) keepTurnsInStep(host.closest(".wt-node") ?? host);
   // The project heads count the cards that hold nothing — read off the cards themselves, so a card that held (a
   // restore-waiting row, a finished work's row) is not counted as empty (r2 P3-7).
   const seatless = new Set();

@@ -158,6 +158,10 @@ pub(super) struct StartedRun {
     /// The checkout a `NewPerRun` job cut for itself, so the sidebar can show
     /// it and the person can jump. Absent for a run in an existing workspace.
     pub(super) worktree: Option<String>,
+    /// The Flow the window is walking itself, for a run that has no terminal:
+    /// the window shows such a run on the Flow console instead of a tab.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) flow: Option<String>,
 }
 
 /// A scheduled job that could not start at all.
@@ -198,6 +202,11 @@ pub(super) struct AutomationRow {
     /// next-run time alone, and the difference is the first thing anybody
     /// checks when a job seems not to be working.
     pub(super) runs: usize,
+    /// How the newest run went, when its folder holds a verdict — a Flow's
+    /// walk, or a QA scenario's. Absent for a run that left none: the list
+    /// then says only when it last ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) last_verdict: Option<bool>,
 }
 
 /// A prompt that finished its journey into a shell, either way — or that is

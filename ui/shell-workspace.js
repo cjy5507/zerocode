@@ -5105,14 +5105,23 @@ function turningDotClass(base, state) {
  * period stands at the same angle on any node, old or just built, and a
  * rebuild draws the ring where it already was. The rebuilds call this on what
  * they just built, before a frame is drawn — the sidebar's rebuild, the cards
- * whose agent rows changed (once, after the last card), the rows a scroll
- * builds — and so does the dot painter for a row that just began working,
- * whose card ring starts on a node that stands (review t-102958 #2). Any turn
+ * whose agent rows changed or a scroll built (once, after the last card) —
+ * and so do the dot painter for a row that just began working, whose card
+ * ring starts on a node that stands (review t-102958 #2), and the two card
+ * settings that uncover the card rings (review t-103290 N3). Any turn
  * none of them reached is pinned when it says it started, a frame late.
- * Reduced motion names no animation, so there is nothing here to pin. */
+ * Reduced motion stills both of the sidebar's rings (`animation: none`), so the
+ * sidebar's roads return at once: asked anyway, every paint brought the style
+ * forward to find nothing to pin (review t-103290 N4). */
 const SHARED_TURNS = new Set(["wt-activity-turn", "wt-agent-spin"]);
+const SIDEBAR_TURNS_STILL = window.matchMedia("(prefers-reduced-motion: reduce)");
 
 function keepTurnsInStep(root) {
+  if (SIDEBAR_TURNS_STILL.matches) return;
+  pinSharedTurns(root);
+}
+
+function pinSharedTurns(root) {
   if (typeof root?.getAnimations !== "function") return;
   for (const turn of root.getAnimations({ subtree: true })) {
     if (SHARED_TURNS.has(turn.animationName) && turn.startTime !== 0) turn.startTime = 0;
@@ -5125,9 +5134,11 @@ function keepTurnsInStep(root) {
  * spinner pinned to the same clock ticks in step with its row instead of a beat apart; a board repaint does not
  * send its spinners back to the top either. It costs a name looked up in a set for every other animation, and one
  * `getAnimations` on the node for a turn that is pinned. The sidebar's own rebuilds still pin what they build
- * before a frame is drawn — this listener is the late road, a frame after the turn has started. */
+ * before a frame is drawn — this listener is the late road, a frame after the turn has started. It pins whatever
+ * says it started, reduced motion or not: the board's spinner keeps turning there, and a turn that started is one
+ * there is to pin. */
 document.addEventListener("animationstart", (event) => {
-  if (SHARED_TURNS.has(event.animationName)) keepTurnsInStep(event.target);
+  if (SHARED_TURNS.has(event.animationName)) pinSharedTurns(event.target);
 });
 
 /* Waking forgets the step it slept on, so the first frame back always writes:
@@ -5937,12 +5948,12 @@ function renderSidebarWindows() {
   // 에이전트 줄과 포트 핀만 워커의 것이므로 그 둘을 마저 부른다. 서명 가드가
   // 이미 입은 호스트를 그냥 지나가니 재호출은 값이 없다.
   if (built) {
+    // A row the scroll just built wears its rings from the frame that first shows it, where every other ring
+    // stands — not one frame at the top until it says it started (review t-102958 #2). Its card's agent host is
+    // new, so the card painter fills it and pins that card; a second pin of the whole list here found nothing
+    // left (review t-103290 N8).
     paintWorktreeAgents();
     paintWorktreePortPins();
-    // A row the scroll just built wears its rings from the frame that first shows it, where every other ring
-    // stands — not one frame at the top until it says it started (review t-102958 #2). The measure below lays
-    // the list out anyway, so the style this brings forward is not a pass of its own.
-    keepTurnsInStep(worktreeList);
   }
   measureSidebarRows();
   const top = anchor ? sidebarAnchorTop(anchor) : null;
@@ -14001,13 +14012,22 @@ async function finishWorktreeRemoval(worktree, hand) {
     // left the stage on the checkout just removed (review t-102958 #6). Which
     // refresh drew the list does not move a project's main.
     const worktrees = projects.flatMap((project) => project.worktrees ?? []);
-    // This project's OWN main, not the first main of the flat cross-project
+    // This project's OWN main, never the first main of the flat cross-project
     // list — with two projects open those are different rows, and landing in
-    // a stranger's repository is worse than the ghost this replaces.
+    // a stranger's repository is worse than the ghost this replaces. A project
+    // whose main is no longer held (it left the list) lands nowhere: the
+    // refresh above already cleared the stage of the checkout just removed
+    // (review t-103290 N5).
+    //
+    // When another refresh took the removed row out before `home` was read,
+    // the project is unknown, not gone. The backend has already made the
+    // removed checkout's own main active, so the row the catalog calls active
+    // is that main — landing nowhere there left the stage without a tab under
+    // a sidebar painting the main as active (review t-103588 M1).
     const main =
       worktrees.find(
         (held) => held.is_main && projectOfWorktree(held.path)?.path === home,
-      ) ?? worktrees.find((held) => held.is_main);
+      ) ?? (home === null ? worktrees.find((held) => held.active) : undefined);
     if (main) await activateWorktree(main);
   }
 }

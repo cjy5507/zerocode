@@ -2641,7 +2641,9 @@ mod tests {
         // declaring their own ground is how three of them ended up different.
         // The selector list is the anchor, so a surface dropping out of it
         // fails here rather than quietly drawing its own.
-        let list = ".qo,\n.sidebar-menu,\n.ports-pop,\n.note-pop,\n.usage-pop,\n.permission,\n.term-float {";
+        let list = ".qo,\n.sidebar-menu,\n.ports-pop,\n.note-pop,\n.usage-pop,\n.permission,\n.term-float,\n\
+                    .auto-form,\n.your-turn-list,\n.workspace-board-settings-pop,\n.jev-custom-drawer,\n\
+                    .onboard,\n.tour-panel {";
         assert!(
             styles.contains(list),
             "the shared floating rule's selector list changed — a floating \
@@ -2662,6 +2664,47 @@ mod tests {
             !shared.contains("backdrop-filter"),
             "the floating surfaces are blurring what is behind them again:\n{shared}"
         );
+        // The window-wide dialog glass (`body [role="dialog"]`, a more specific
+        // selector than any surface's own class) stays off every one of them —
+        // six were still glass under it on 2026-11-11 although their own rules
+        // said `--surface-deck`.
+        let glass = block_after_css(&styles, "body [role=\"dialog\"]:not(:where(");
+        let glass = &glass[..glass.find('{').expect("the dialog glass rule's body")];
+        let surfaces = list.trim_end_matches(" {").split(",\n").collect::<Vec<_>>();
+        for surface in &surfaces {
+            assert!(
+                glass.matches(&format!("{surface},")).count()
+                    + glass.matches(&format!("{surface})")).count()
+                    == 2,
+                "`{surface}` is not left out of both halves of the window-wide dialog \
+                 glass, so that rule paints over the shared material:\n{glass}"
+            );
+        }
+        // And the six that joined drew their own ground, border and depth in
+        // rules of their own; those rules keep their shape and give the material
+        // back to the shared one.
+        // A surface's own rule is the one its selector opens alone: the same
+        // selector also ends the shared lists above, and those are not it.
+        fn own_rule<'a>(styles: &'a str, surface: &str) -> &'a str {
+            let opens = format!("\n{surface} {{");
+            let at = styles
+                .match_indices(&opens)
+                .map(|(at, _)| at)
+                .find(|at| !styles[..*at].trim_end().ends_with(','))
+                .unwrap_or_else(|| panic!("`{surface}` has no rule of its own in ui/shell.css"));
+            let rest = &styles[at + 1..];
+            &rest[..rest.find("\n}").unwrap_or(rest.len())]
+        }
+        for surface in &surfaces[7..] {
+            let own = own_rule(&styles, surface);
+            for part in ["background", "backdrop-filter", "box-shadow", "border:"] {
+                assert!(
+                    !own.contains(part),
+                    "`{surface}` draws its own `{part}` again instead of the floating \
+                     surfaces' one material:\n{own}"
+                );
+            }
+        }
 
         // Depth says what KIND of floating a surface is doing. A dialog is
         // floated over the room and a menu is dropped near its trigger, and
@@ -2683,12 +2726,18 @@ mod tests {
         // A dialog and a menu draw their edge as Geist does, a ring riding on
         // the shadow, so a row and the corner it sits in line up to the pixel.
         let ring = "0 0 0 var(--rule-width) var(--glass-edge)";
-        let dialog = block_after_css(&styles, ".qo {\n  box-shadow:");
+        let dialog = block_after_css(
+            &styles,
+            ".qo,\n.auto-form,\n.jev-custom-drawer,\n.onboard,\n.tour-panel {",
+        );
         assert!(
             dialog.contains(&format!("{ring}, var(--shadow-float)")),
             "a dialog lost its ring or its float:\n{dialog}"
         );
-        let menus = block_after_css(&styles, ".sidebar-menu,\n.note-pop {");
+        let menus = block_after_css(
+            &styles,
+            ".sidebar-menu,\n.note-pop,\n.your-turn-list,\n.workspace-board-settings-pop {",
+        );
         assert!(
             menus.contains(&format!("{ring}, var(--shadow-drop)")),
             "a menu lost its ring or its drop:\n{menus}"
@@ -7886,13 +7935,23 @@ mod tests {
     #[test]
     fn a_rebuild_keeps_the_turning_rings_where_they_stood() {
         let window = window_source();
+        let pinning = block_after(window, "function pinSharedTurns(root) {");
+        assert!(
+            pinning.contains("root.getAnimations({ subtree: true })")
+                && pinning.contains("SHARED_TURNS.has(turn.animationName)")
+                && pinning.contains("turn.startTime = 0"),
+            "the turns are no longer pinned to the document's clock, so a rebuilt \
+             ring starts again from the top:\n{pinning}"
+        );
+        // Reduced motion stills the sidebar's rings, so its roads do not ask the animations for
+        // nothing (review t-103290 N4); the late road still pins what says it started.
         let keeping = block_after(window, "function keepTurnsInStep(root) {");
         assert!(
-            keeping.contains("root.getAnimations({ subtree: true })")
-                && keeping.contains("SHARED_TURNS.has(turn.animationName)")
-                && keeping.contains("turn.startTime = 0"),
-            "the turns are no longer pinned to the document's clock, so a rebuilt \
-             ring starts again from the top:\n{keeping}"
+            window.contains(
+                r#"const SIDEBAR_TURNS_STILL = window.matchMedia("(prefers-reduced-motion: reduce)");"#
+            ) && keeping.contains("if (SIDEBAR_TURNS_STILL.matches) return;")
+                && keeping.contains("pinSharedTurns(root);"),
+            "the sidebar's roads ask the animations under reduced motion, or no longer pin:\n{keeping}"
         );
         assert!(
             window.contains(
@@ -7901,7 +7960,10 @@ mod tests {
             "the turns pinned to one clock no longer name the card's ring and the agent rows' ring"
         );
         assert!(
-            window.contains(r#"document.addEventListener("animationstart", (event) => {"#),
+            window.contains(r#"document.addEventListener("animationstart", (event) => {"#)
+                && window.contains(
+                    "if (SHARED_TURNS.has(event.animationName)) pinSharedTurns(event.target);"
+                ),
             "a turn that starts on a standing node is never pinned, so the next rebuild moves it"
         );
         let refreshing = block_after(window, "async function refreshWorktrees() {");
@@ -7925,14 +7987,29 @@ mod tests {
             "a card's rebuilt agent rows draw their rings from the top, or every \
              changed card brings the style forward on its own:\n{painting}"
         );
+        // Pinned after the old rows are out (review t-103290 N1): a working row that still stands hides the
+        // card's ring, so a pin before it goes finds no turn to pin and the uncovered ring draws at the top.
+        let gone = painting
+            .find("for (const node of leaving) node.remove();")
+            .expect("the card painter no longer takes the old rows out after the new ones stand");
+        let pinned = painting
+            .find("for (const host of stirred) keepTurnsInStep(")
+            .expect("the card painter no longer pins the rings of the cards it changed");
+        assert!(
+            gone < pinned,
+            "the changed cards are pinned while the old rows still stand, so a card ring a \
+             leaving working row uncovers draws one frame at the top:\n{painting}"
+        );
         // The rows a scroll builds and a row that starts working on a standing node are pinned
         // before their first frame, not one frame at the top (review t-102958 #2).
         let windowing = block_after(window, "function renderSidebarWindows() {");
         let built = windowing
             .find("if (built) {")
             .expect("the sidebar window no longer knows when the scroll built a row");
+        // The card painter pins every card the scroll built: their agent hosts are new, so it fills each
+        // (review t-103290 N8 — the sidebar-scroll suite reads those rings before a frame).
         assert!(
-            windowing[built..].contains("keepTurnsInStep(worktreeList);"),
+            windowing[built..].contains("paintWorktreeAgents();"),
             "a row the scroll builds draws its rings from the top for a frame:\n{windowing}"
         );
         let dots = block_after(window, "function paintWorktreeDots() {");
@@ -7940,6 +8017,14 @@ mod tests {
             dots.contains("if (dressWorktreeDot(row, worktreeDotState(path, owned.get(path) ?? []))) started.push(row);")
                 && dots.contains("for (const row of started) keepTurnsInStep(row.closest(\".wt-node\") ?? row);"),
             "a card ring that starts on a standing row draws from the top for a frame:\n{dots}"
+        );
+        // The two card settings that uncover a standing card's ring pin it as they change it (review t-103290 N3).
+        let off = block_after(window, "function paintWorktreeCardProperties() {");
+        let layout = block_after(window, "function paintWorktreeCardLayout() {");
+        assert!(
+            off.contains("keepTurnsInStep(worktreeList);")
+                && layout.contains("if (moved) keepTurnsInStep(worktreeList);"),
+            "a card setting that uncovers the card rings draws them from the top for a frame:\n{off}\n{layout}"
         );
     }
 
@@ -14742,12 +14827,14 @@ mod tests {
         );
 
         // Each control is wired exactly where it belongs and nowhere spurious:
-        // grace and reuse in save + edit (2), the timeout also in its own
-        // enable/disable painter (3). Counted over the window, so the gate's
-        // own string literals here do not inflate the tally.
+        // grace and reuse in save + edit, and read once more by the line that
+        // says what the folded 「세부 설정」 holds (3); the timeout in save +
+        // edit and its own enable/disable painter (3). Counted over the
+        // window, so the gate's own string literals here do not inflate the
+        // tally.
         assert_eq!(
             window.matches(r#"el("auto-grace")"#).count(),
-            2,
+            3,
             "auto-grace is wired in the wrong number of places"
         );
         assert_eq!(
@@ -14757,8 +14844,13 @@ mod tests {
         );
         assert_eq!(
             window.matches(r#"el("auto-reuse")"#).count(),
-            2,
+            3,
             "auto-reuse is wired in the wrong number of places"
+        );
+        let folded = block_after(window, "function autoDetailsWords() {");
+        assert!(
+            folded.contains(r#"el("auto-grace")"#) && folded.contains(r#"el("auto-reuse")"#),
+            "the third reader of grace and reuse is not the fold's summary:\n{folded}"
         );
 
         // The controls exist in the form, with the exact value contract the
@@ -14959,9 +15051,19 @@ mod tests {
             "the one sweep no longer ends the shells it drops:\n{sweeping}"
         );
         assert!(
-            finishing.contains("projectOfWorktree(held.path)?.path === home,"),
+            finishing.contains("projectOfWorktree(held.path)?.path === home,")
+                && !finishing.contains("?? worktrees.find((held) => held.is_main)"),
             "the landing after a removal stopped being this project's own \
-             main:\n{finishing}"
+             main, or falls back to another project's:\n{finishing}"
+        );
+        // A removed row another refresh already took out leaves `home` unknown, not gone: the backend has made
+        // that checkout's own main active, and landing nowhere left the stage without a tab (review t-103588 M1).
+        assert!(
+            finishing.contains(
+                ") ?? (home === null ? worktrees.find((held) => held.active) : undefined);"
+            ),
+            "a removal whose row a refresh took out before its project was read \
+             lands nowhere again, leaving the stage empty:\n{finishing}"
         );
         // The main is looked up in the catalog the window holds, not in the refresh's answer: a
         // refresh a newer one overtook answers `[]` (review t-102958 #6).

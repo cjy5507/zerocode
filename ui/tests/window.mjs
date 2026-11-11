@@ -137,6 +137,7 @@ import { testPassTwoBFit } from "./pass2-b-fit.mjs";
 import { testPaneFirstView, testPaneHead, testPaneHeadReach } from "./pane-head.mjs";
 import { testStackedWork } from "./stacked-work.mjs";
 import { testRightColumnGeist } from "./right-column-geist.mjs";
+import { testDialogShellsGeist } from "./dialog-shells-geist.mjs";
 import { testPhoneAwake } from "./phone-awake.mjs";
 import { testChatList, testChatListKeyed, testNewChat, testNewChatStart } from "./chat-list.mjs";
 import { testSelfAct } from "./self-act.mjs";
@@ -371,6 +372,7 @@ suite("pane-head-reach", ({ browser, origin, ok }) => testPaneHeadReach(browser,
 suite("pane-first-view", ({ browser, origin, ok }) => testPaneFirstView(browser, origin, ok, join(UI, "..", "output/playwright")));
 suite("stacked-work", ({ browser, origin, ok }) => testStackedWork(browser, origin, ok));
 suite("right-column-geist", ({ browser, origin, ok }) => testRightColumnGeist(browser, origin, ok));
+suite("dialog-shells-geist", ({ browser, origin, ok }) => testDialogShellsGeist(browser, origin, ok));
 // Keeping an Android phone awake (T7, 2026-11-09): the settings card's rows and the status bar's chip.
 suite("phone-awake", ({ browser, origin, ok }) => testPhoneAwake(browser, origin, ok));
 // The T3 Code chat view, stages 2 and 3 (2026-11-08): the sidebar's conversation list, and the 「새 대화」 start page.
@@ -15556,8 +15558,7 @@ const editing = await page.evaluate(async () => {
   document.getElementById("auto-detail-edit").click();
   await new Promise((done) => setTimeout(done, 120));
   const editorBox = document.getElementById("auto-form").getBoundingClientRect();
-  const mainBox = document.querySelector(".auto-editor-main").getBoundingClientRect();
-  const sideBox = document.querySelector(".auto-editor-settings").getBoundingClientRect();
+  const topOf = (id) => document.getElementById(id).getBoundingClientRect().top;
   const mode = document.getElementById("auto-mode");
   document.getElementById("auto-reuse").checked = true;
   mode.value = "new_per_run";
@@ -15574,7 +15575,15 @@ const editing = await page.evaluate(async () => {
     editor: {
       shown: !document.getElementById("auto-editor-scrim").hidden,
       width: Math.round(editorBox.width),
-      twoColumns: mainBox.right <= sideBox.left,
+      // One column, in the order it is read: what runs, when, where, and then
+      // the rest, folded under a line that says what it holds.
+      inOrder: topOf("auto-kind") < topOf("auto-cadence") &&
+        topOf("auto-cadence") < topOf("auto-workspace") &&
+        topOf("auto-workspace") < topOf("auto-details"),
+      folded: !document.getElementById("auto-details").open,
+      summary: document.getElementById("auto-details-summary").textContent,
+      // A template is a way to start a job, not to rewrite a stored one.
+      templateOffered: !document.getElementById("auto-template-field").hidden,
     },
     name: document.getElementById("auto-name").value,
     cadence: document.getElementById("auto-cadence").value,
@@ -15605,11 +15614,12 @@ const editing = await page.evaluate(async () => {
   };
 });
 ok(
-  "a stored row opens its detail, and Edit raises the wide two-column editor",
+  "a stored row opens its detail, and Edit raises the one-column editor with the rest folded",
   editing.detail.shown && editing.detail.listHidden && editing.detail.name === "주간 정리" &&
     editing.detail.overview === "true" && editing.detail.editorClosed &&
-    editing.editor.shown && editing.editor.width > 800 && editing.editor.width <= 1080 &&
-    editing.editor.twoColumns &&
+    editing.editor.shown && editing.editor.width > 400 && editing.editor.width <= 640 &&
+    editing.editor.inOrder && editing.editor.folded && editing.editor.summary.length > 0 &&
+    !editing.editor.templateOffered &&
     editing.name === "주간 정리" &&
     editing.cadences === 5 && editing.cadence === "weekly" &&
     editing.days === 7 && editing.day === "5" &&
