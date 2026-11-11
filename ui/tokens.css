@@ -1471,12 +1471,27 @@
    * Measured, not reasoned: `the_row_box_contains_its_own_glyphs`. */
   --term-font-size: 14px;
   --term-leading: 1.15;
+  /* How far under the baseline a terminal link's underline is drawn. Named
+   * because a double-width run draws its glyphs at another size on a line of
+   * its own and must still put a link's underline beside its neighbour's
+   * (shell.css `.term-wide.term-link`). */
+  --term-underline-offset: 2px;
+  /* The gap an engine leaves under the baseline for an underline whose offset
+   * is `auto`: WebKit's and Chromium's alike at a terminal's font sizes (one
+   * pixel, until half the line's thickness is more). No stylesheet can ask
+   * for it, and a double-width run needs it to stand an SGR 4 underline beside
+   * a narrow run's — which keeps the engine's own and is never given this. */
+  --term-underline-auto-gap: 1px;
   /* Body weight, as a variable rather than a rule, because it is one of the
    * terminal settings a person can change (1-en) and the settings screen
    * writes them onto the root. The defaults are Orca's
    * `terminalFontWeight: 500` and its derived bold floor of 700. */
   --term-weight: 500;
   --term-bold-weight: 700;
+  /* SGR 2 — how much of its colour dim ink keeps. The share is the ink's
+   * alone: the ground under a dim word is the ground its neighbours stand on
+   * (shell.css, `.term .dim`). */
+  --term-dim-ink: 60%;
 
   /* The board card's own screen — the tail of what an agent is printing.
    *

@@ -167,10 +167,25 @@ pub(crate) const PERSON_ONLY_COMMANDS: &[&str] = &[
     "reset_agent_launch",
     "delete_quick_command",
     "delete_automation",
+    // A job that runs with nobody watching, stood up, switched on or off,
+    // or run now (2026-11-11). The automation page is no settings pane and
+    // its form holds no secret, so an agent pressing in the window could
+    // fill the form and save a job carrying a command of its own. It may
+    // still look and fill; the three presses that make a job run are the
+    // person's, as taking one away already was.
+    "save_automation",
+    "enable_automation",
+    "run_automation",
+    // The vault's weekly review, which the window writes among those jobs
+    // or takes away again.
+    "set_second_brain_weekly_review",
     // A recipe or Flow taken from the card, with its last verdict and the
     // automations that walk it; and a plain recipe stood up as a Flow (t-93871).
     "flow_delete",
     "flow_register",
+    // A Flow's policy and what its runs keep (2026-11-11): a policy turned
+    // from rehearsing a money step to pressing it is the person's to turn.
+    "flow_set",
     "artifact_delete",
     "delete_diff_note",
     "clear_diff_notes",

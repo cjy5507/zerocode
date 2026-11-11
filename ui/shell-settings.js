@@ -4445,6 +4445,8 @@ function flowScheduleRow(job) {
   const toggle = document.createElement("button");
   toggle.type = "button";
   toggle.className = "auto-row-toggle";
+  // Switching a job on or off is the person's (`enable_automation`).
+  toggle.dataset.personOnly = "";
   toggle.setAttribute("role", "switch");
   toggle.setAttribute("aria-checked", job.enabled ? "true" : "false");
   toggle.setAttribute("aria-label", job.enabled
@@ -4498,7 +4500,7 @@ function flowScheduleRow(job) {
 async function toggleFlowSchedule(job, toggle) {
   toggle.disabled = true;
   try {
-    automations = await invoke("enable_automation", { id: job.id, enabled: !job.enabled });
+    automations = await invoke("enable_automation", { id: job.id, enabled: !job.enabled }, { hand: handNow() });
     await refreshFlows();
   } catch (error) {
     showFlowError(error);
@@ -4566,6 +4568,8 @@ function buildFlowSegment(seg, values, chosen, field, slug) {
     button.setAttribute("aria-pressed", value === chosen ? "true" : "false");
     // A grammar word (dry, full, …): a technical token, shown as it is written.
     button.textContent = value;
+    // A Flow's policy and what its runs keep are the person's to set (`flow_set`).
+    button.dataset.personOnly = "";
     button.addEventListener("click", () => { if (value !== chosen) void flowSet(slug, { [field]: value }); });
     seg.append(button);
   }
@@ -4594,7 +4598,7 @@ async function flowSet(slug, change) {
       slug,
       policy: change.policy ?? null,
       evidence: change.evidence ?? null,
-    });
+    }, { hand: handNow() });
     flowSelected = slug;
     paintFlows();
   } catch (error) {
@@ -11454,14 +11458,17 @@ async function turnOnSecondBrainIngest() {
   const vault = secondBrainReport?.savedPath ?? "";
   if (ingest === null || !vault) return;
   const button = el("second-brain-ingest-on");
+  // The press's hand, taken before anything is awaited: both commands are the
+  // person's, and the agent list may be read first.
+  const hand = handNow();
   button.disabled = true;
   try {
     if (ingest.automationId) {
-      automations = await invoke("enable_automation", { id: ingest.automationId, enabled: true });
+      automations = await invoke("enable_automation", { id: ingest.automationId, enabled: true }, { hand });
     } else {
       if (agentRows.length === 0) await refreshAgents();
       const automation = newAutomationDraft({ ...AUTO_TEMPLATES["raw-ingest"](), workspace: vault });
-      automations = await invoke("save_automation", { automation });
+      automations = await invoke("save_automation", { automation }, { hand });
     }
     paintAutomations();
   } catch (error) {
@@ -11536,6 +11543,7 @@ el("second-brain-weekly-review").addEventListener("change", (event) => {
     "second_brain_weekly_review",
     "set_second_brain_weekly_review",
     { enabled },
+    { hand: handNow() },
   ).then((snapshot) => {
     if (snapshot !== undefined) void refreshSecondBrain();
   });
@@ -11937,7 +11945,7 @@ function paintAutomations() {
       '<span class="auto-row-when" role="cell"></span>' +
       '<span class="auto-row-last" role="cell"></span>' +
       '</span>' +
-      '<button class="auto-row-toggle" type="button" role="switch"></button>' +
+      '<button class="auto-row-toggle" type="button" role="switch" data-person-only></button>' +
       '<span class="auto-row-actions" role="cell"></span>';
     item.querySelector(".auto-row-name").textContent = row.name || t("auto.untitled", "이름 없음");
     item.querySelector(".auto-row-schedule").textContent = automationScheduleText(row);
@@ -11985,7 +11993,7 @@ function paintAutomations() {
     toggle.addEventListener("click", (event) => {
       event.stopPropagation();
       toggle.disabled = true;
-      invoke("enable_automation", { id: row.id, enabled: !row.enabled })
+      invoke("enable_automation", { id: row.id, enabled: !row.enabled }, { hand: handNow() })
         .then((rows) => {
           automations = rows;
           paintAutomations();
@@ -11998,6 +12006,8 @@ function paintAutomations() {
     const run = document.createElement("button");
     run.className = "auto-row-action";
     run.type = "button";
+    // Running a job now is the person's (`run_automation`).
+    run.dataset.personOnly = "";
     run.dataset.tip = t("auto.runNow", "지금 실행");
     run.setAttribute("aria-label", run.dataset.tip);
     run.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#i-play"></use></svg>';
@@ -12940,7 +12950,10 @@ function autoDetailsWords() {
   words.push(`${t("auto.grace", "놓친 실행 유예")} ${graceLabel(Number(el("auto-grace").value))}`);
   const precheck = el("auto-precheck").value.trim();
   words.push(`${t("auto.precheck", "사전 점검")} ${precheck || t("auto.none", "없음")}`);
-  if (el("auto-command").value.trim()) words.push(t("auto.customCommand", "사용자 명령"));
+  // The command itself, as the precheck above: what a save stores is read off
+  // this line even when the fold is closed.
+  const command = el("auto-command").value.trim();
+  if (command) words.push(`${t("auto.customCommand", "사용자 명령")} ${command}`);
   return words;
 }
 
@@ -13040,10 +13053,11 @@ function editAutomation(row, template = null) {
   // A template is a way to start: it is offered only while the job is new.
   paintAutoTemplatePick();
   el("auto-template-field").hidden = stored;
-  // The fold opens on the one detail that decides what runs — a command of the
-  // person's own; everything else in it is read from its summary line.
-  const advanced = document.querySelector(".auto-advanced");
-  if (advanced) advanced.open = autoDraft.command.trim() !== "";
+  // The fold opens on what the job runs besides its prompt — a command of its
+  // own, a check before it starts; everything else in it is read from its
+  // summary line.
+  el("auto-details").open = false;
+  showAutoOwnCommands();
   paintAutoDetailsSummary();
   showModal(el("auto-editor-scrim"));
 }
@@ -13054,8 +13068,7 @@ function closeAutoForm() {
   el("auto-form").hidden = true;
 }
 
-async function saveAutomation(event) {
-  event.preventDefault();
+async function saveAutomation(hand) {
   if (!autoDraft) return;
   const automation = {
     ...autoDraft,
@@ -13109,7 +13122,7 @@ async function saveAutomation(event) {
     return;
   }
   try {
-    automations = await invoke("save_automation", { automation });
+    automations = await invoke("save_automation", { automation }, { hand });
   } catch (error) {
     // Shown on the form rather than as a window-wide error: what is wrong is
     // a field the person is looking at — the schedule it cannot read, or an
@@ -13237,8 +13250,21 @@ function paintPrecheckTimeout() {
   el("auto-precheck-timeout").disabled = el("auto-precheck").value.trim() === "";
 }
 
+/* A command of the job's own and the check run before it are what the job
+ * runs besides its prompt, so the fold that holds them stands open whenever
+ * either has words, whoever wrote them. An agent may fill this form and only
+ * the person saves it (`save_automation`): what the person's press saves is on
+ * screen, and the fold's summary is theirs alone to close. */
+function showAutoOwnCommands() {
+  if (el("auto-command").value.trim() || el("auto-precheck").value.trim()) el("auto-details").open = true;
+}
+
 el("auto-mode").addEventListener("change", paintAutoMode);
 el("auto-precheck").addEventListener("input", paintPrecheckTimeout);
+for (const id of ["auto-precheck", "auto-command"]) {
+  el(id).addEventListener("input", showAutoOwnCommands);
+  el(id).addEventListener("change", showAutoOwnCommands);
+}
 for (const id of ["auto-mode", "auto-reuse", "auto-close-done", "auto-grace", "auto-precheck", "auto-command"]) {
   el(id).addEventListener("input", paintAutoDetailsSummary);
   el(id).addEventListener("change", paintAutoDetailsSummary);
@@ -13256,7 +13282,7 @@ for (const button of document.querySelectorAll("[data-auto-template]")) {
     editAutomation(null, make ? make() : null);
   });
 }
-el("auto-form").addEventListener("submit", saveAutomation);
+submitByPress(el("auto-form"), el("auto-save"), (hand) => void saveAutomation(hand));
 el("auto-cancel").addEventListener("click", closeAutoForm);
 el("auto-editor-close").addEventListener("click", closeAutoForm);
 el("auto-editor-scrim").addEventListener("click", (event) => {
@@ -13345,7 +13371,7 @@ function mountRunTab(run) {
 async function runAutomationNow(automation) {
   if (!automation) return;
   try {
-    const started = await invoke("run_automation", { id: automation.id });
+    const started = await invoke("run_automation", { id: automation.id }, { hand: handNow() });
     setAutoOpen(false);
     refreshAutomations();
     if (started?.worktree) void refreshWorktrees();
@@ -13357,7 +13383,7 @@ async function runAutomationNow(automation) {
 
 el("auto-run").addEventListener("click", () => {
   if (!autoDraft) return;
-  invoke("run_automation", { id: autoDraft.id })
+  invoke("run_automation", { id: autoDraft.id }, { hand: handNow() })
     .then((started) => {
       setAutoOpen(false);
       refreshAutomations();
@@ -13382,7 +13408,7 @@ el("auto-detail-toggle").addEventListener("click", async () => {
   const button = el("auto-detail-toggle");
   button.disabled = true;
   try {
-    automations = await invoke("enable_automation", { id: row.id, enabled: !row.enabled });
+    automations = await invoke("enable_automation", { id: row.id, enabled: !row.enabled }, { hand: handNow() });
     paintAutomations();
     paintAutomationDetail();
   } catch (error) {
@@ -16538,10 +16564,8 @@ function gitlabHostRow(host) {
   said.hidden = true;
   said.setAttribute("role", "status");
   paste.append(field, send);
-  paste.addEventListener("submit", (event) => {
-    event.preventDefault();
-    void connectGitlabHost(host, field, said, send, handNow());
-  });
+  // 손은 누름에서 읽는다 — `submit` 안에서 읽으면 아무의 손도 아니다(`submitByPress`).
+  submitByPress(paste, send, (hand) => void connectGitlabHost(host, field, said, send, hand));
   row.append(acts, paste, said, older);
   return row;
 }

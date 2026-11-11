@@ -15907,7 +15907,20 @@ body.is-dragging-pane {
 }
 
 .term .bold { font-weight: var(--term-bold-weight); }
-.term .dim { opacity: 0.6; }
+/* SGR 2 dims the INK. `opacity` dimmed the whole run, its ground with it, so
+ * a dim word on a painted band stood on a darker box than the band — zo's
+ * placeholder on #2d2e35 inside a composer of #38393f (2026-11-11). The fill
+ * of the glyphs is the run's own colour at the token's share, whichever class
+ * or inline style gave it — and so is the line an underline or a strike
+ * draws (below) — while the ground, and a selection painted over the run,
+ * stay whole. No layer is opened for it, where `opacity` opened one for every
+ * dim run.
+ *
+ * Reverse video is the other way round: there the foreground IS the cell's
+ * ground, so the colour that dims is the block, and such a run keeps
+ * `opacity` (`dim-reverse`, shell-term.js `runsOf`). */
+.term .dim { -webkit-text-fill-color: color-mix(in srgb, currentColor var(--term-dim-ink), transparent); }
+.term .dim-reverse { opacity: var(--term-dim-ink); }
 .term .italic { font-style: italic; }
 .term .underline { text-decoration: underline; }
 /* SGR 9 and SGR 5, which the grid had no fields for at all until now. A diff
@@ -15921,18 +15934,68 @@ body.is-dragging-pane {
  * would silently lose its underline. */
 .term .strike { text-decoration: line-through; }
 .term .underline.strike { text-decoration: underline line-through; }
+/* The line dims with the ink it is drawn under or through (`.term .dim`).
+ * After the rules above, and as specific as the longest of them: each of
+ * those sets `text-decoration` whole, its colour included. */
+.term .dim.underline,
+.term .dim.strike {
+  text-decoration-color: color-mix(in srgb, currentColor var(--term-dim-ink), transparent);
+}
 /* A run of double-width glyphs the fallback face draws short (shell-term.js
- * `measure`): grown toward its two columns as far as the row allows, the rest
- * of the shortfall as tracking with half of it leading the run, so each glyph
- * sits centered in its columns. The negative tail gives back the lead, so the
- * next run starts on the column the grid says. line-height 0: a grown glyph
- * must never grow the row's line box. */
+ * `measure`, `glyphPitch`; the numbers are the dress `wideDressVars` writes).
+ *
+ * The font-size is the glyph grown AND widened, so the layout gives each one
+ * the advance it is drawn at and nothing depends on how many a run holds; the
+ * widening is then pressed back out of the HEIGHT alone, which is the one way
+ * a glyph is made wider than its face draws it. A transform needs a box, so
+ * the run is an inline-block — and that box is the band a narrow run's
+ * background paints (`--term-band-*`, measured), made taller by the stretch
+ * so that pressed it is that band again: a selection or a background colour
+ * across Korean and Latin is one even strip, on the run's own columns.
+ *
+ * Its margins give all of that height back, so the run takes no part in the
+ * row's line box — a grown glyph must never grow the row. Inside it the line
+ * has no height either, and `--term-wide-rise` lets the baseline down to
+ * where the glyph's ink stands in the middle of the row.
+ *
+ * What is still short of two columns after both is tracking, half of it
+ * leading the run so each glyph sits centered in its columns; the negative
+ * tail gives the lead back, so the next run starts on the column the grid
+ * says. A blank between two words of the run rides in it — a box a word
+ * would be a layer a word to paint — and `--term-wide-blank` gives the blank,
+ * shaped at the run's size, back to one cell. */
 .term .term-wide {
-  letter-spacing: var(--term-cell-spread, 0px);
+  display: inline-block;
+  box-sizing: border-box;
+  vertical-align: top;
+  height: calc(var(--term-band-height, 1em) * var(--term-wide-stretch, 1));
+  margin-top: var(--term-band-top, 0px);
+  margin-bottom: calc(-1 * (var(--term-band-top, 0px) + var(--term-band-height, 1em) * var(--term-wide-stretch, 1)));
+  padding-top: var(--term-wide-rise, 0px);
   font-size: var(--term-wide-scale, 1em);
   line-height: 0;
+  letter-spacing: var(--term-cell-spread, 0px);
+  word-spacing: var(--term-wide-blank, 0px);
   margin-left: var(--term-wide-lead, 0px);
   margin-right: calc(-1 * var(--term-wide-lead, 0px));
+  transform: var(--term-wide-squash, none);
+  transform-origin: 0 0;
+}
+/* Its underline goes where a narrow run's does: up by what the baseline was
+ * let down, and written before the height is pressed. A link's gap is the
+ * terminal's own number (`--term-underline-offset`). An SGR 4 underline's is
+ * the engine's, which a stylesheet cannot ask for, so the wide run is told
+ * what the engines leave (`--term-underline-auto-gap`) — and the narrow rule
+ * stays the engine's: a Latin screen draws its underlines where it always
+ * did. Left to the engine under its own, lower baseline, a wide run's
+ * underline stood a pixel under its neighbour's and every blank in an
+ * underlined Korean line read as a notch. The link's rule is the later one:
+ * an underlined link is a link. */
+.term .term-wide.underline {
+  text-underline-offset: calc((var(--term-underline-auto-gap) - var(--term-wide-drop, 0px)) * var(--term-wide-stretch, 1));
+}
+.term .term-wide.term-link {
+  text-underline-offset: calc((var(--term-underline-offset) - var(--term-wide-drop, 0px)) * var(--term-wide-stretch, 1));
 }
 .term .term-fg-default { color: var(--term-fg); }
 .term .term-fg-reverse-default { color: var(--term-bg-solid); }
@@ -16474,7 +16537,7 @@ body.is-dragging-pane {
 .term-link {
   cursor: text;
   text-decoration: underline;
-  text-underline-offset: 2px;
+  text-underline-offset: var(--term-underline-offset);
   text-decoration-color: transparent;
   transition: text-decoration-color var(--motion-fast) var(--ease-standard);
 }
@@ -25376,17 +25439,6 @@ button.integration-context-action:hover {
   margin-inline: 0;
 }
 
-.managed-judgment-model {
-  padding: var(--space-4) 0;
-  border-bottom: var(--rule-width) solid var(--edge-rule);
-  overflow-wrap: anywhere;
-}
-
-.managed-judgment-model h4 {
-  margin: 0;
-  font: var(--type-heading-14);
-}
-
 .settings-pane[data-pane="judgment-models"] > .settings-card,
 .model-catalog > .settings-card {
   max-width: 72rem;
@@ -25719,8 +25771,8 @@ button.integration-context-action:hover {
   text-decoration: line-through;
 }
 
-/* The manager of received files waits folded under the receive area; it
- * holds cards and forms, so it is not measured as prose. */
+/* What is left of the old manager waits folded under the receive area: a
+ * list file's form and the models it added, so it is not measured as prose. */
 .model-library-fold > :not(summary) {
   max-width: none;
 }
@@ -25731,45 +25783,8 @@ button.integration-context-action:hover {
   padding-block: var(--space-1);
 }
 
-.managed-judgment-library-tools {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-3);
-}
-
-.managed-judgment-library-tools > .settings-field {
-  flex: 1 1 260px;
-  min-width: 0;
-  margin-inline: 0;
-}
-
-.managed-judgment-model-heading {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-}
-
-.managed-judgment-route {
-  color: var(--ink-mist);
-  font-size: var(--text-2xs);
-}
-
-.managed-judgment-model .settings-fold {
-  margin-inline: 0;
-}
-
-/* The catalog models this computer has not received (t-69998), folded under
- * the library: one ruled line each, the name and size, then the ways to have
- * it. The list takes the panel's width, unlike a fold's prose. */
-.settings-fold > .managed-judgment-candidates {
-  max-width: none;
-}
-
-.managed-judgment-candidates > .settings-notice {
-  margin-inline: 0;
-}
+/* The models a list file added that this computer has not received: one
+ * ruled line each, the name and size, then the ways to have it. */
 
 #managed-judgment-candidate-list {
   margin: var(--space-2) 0 0;
@@ -25806,6 +25821,27 @@ button.integration-context-action:hover {
   margin: 0;
   padding: 0;
   border: 0;
+}
+
+/* A received model's 「자세히」: a fold inside its row, quiet until opened. */
+.model-line-more {
+  margin: var(--space-1) 0 0;
+}
+
+.model-line-more > summary {
+  color: var(--ink-mist);
+  font: var(--type-label-12);
+  padding-block: var(--space-1);
+}
+
+/* What an operation on this computer ended as, under the group's rows. */
+.model-local-status:empty {
+  display: none;
+}
+
+.model-local-status {
+  margin: 0;
+  padding: var(--space-2) var(--space-4);
 }
 
 #typesafe-card .settings-fold > summary {
@@ -46989,6 +47025,10 @@ button.board-build-failure-part:focus-visible {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* The list keeps the person's place itself when a card above the view
+   * takes its real height (`vaultDockNear`); an engine that also anchors
+   * would move it twice, and the window's own engine does not anchor at all. */
+  overflow-anchor: none;
 }
 
 .vdock-group-head {
@@ -47048,6 +47088,15 @@ button.board-build-failure-part:focus-visible {
 
 .vdock-card:hover {
   background: var(--row-hover);
+}
+
+/* A session the list has not drawn yet (t-103659): an empty box as tall as a
+ * card, so the scroll bar says how long the list is while only the cards near
+ * the view are built. The height is the first card's, measured
+ * (`fillVaultDockView`); the fallback stands only until then, unseen. */
+.vdock-slot {
+  min-height: var(--vdock-slot-height, var(--control-height-sm));
+  border-bottom: var(--rule-width) solid var(--edge-rule);
 }
 
 .vdock-card-top {

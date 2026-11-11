@@ -377,7 +377,7 @@ fn codex_turn_edge(line: &str) -> Option<TurnEdge> {
 ///
 /// A closed list rather than "anything in angle brackets": somebody pasting
 /// `<div>` into a prompt meant to paste `<div>`.
-const MACHINE_ENVELOPES: [&str; 9] = [
+const MACHINE_ENVELOPES: [&str; 13] = [
     "task-notification",
     "system-reminder",
     "local-command-caveat",
@@ -390,6 +390,15 @@ const MACHINE_ENVELOPES: [&str; 9] = [
     // names an agent after it would be reading the same machinery aloud.
     "local-command-stdout",
     "user-prompt-submit-hook",
+    // What Codex writes into a rollout under the user's role, in its own
+    // voice (measured on 2026-11-11, the user-role records of 60 rollouts on
+    // one machine: the folder and date of the turn in 56 of them, the plugins
+    // it suggests in 20, a turn it cut short and a page it opened in one
+    // each). A session card previewed them as what the person said.
+    "environment_context",
+    "recommended_plugins",
+    "turn_aborted",
+    "external_codex_apps_open_page",
 ];
 
 /// The envelope that carries a slash command's arguments: the one a person
@@ -470,7 +479,7 @@ pub fn prompt_in_payload(payload: &str) -> Option<String> {
 /// [`prompt_in_payload`], for a caller that already paid the parse.
 #[must_use]
 pub fn prompt_in_parsed(payload: &crate::payload::HookPayload<'_>) -> Option<String> {
-    prompt_words_in_parsed(payload).map(|words| clamp(&words))
+    prompt_line(payload.tree()?.get("prompt")?.as_str()?).map(|line| clamp(&line))
 }
 
 /// What a person typed in a `UserPromptSubmit`-family payload, whole: past
@@ -491,16 +500,113 @@ pub fn prompt_words(prompt: &str) -> Option<String> {
     (!words.is_empty()).then(|| words.to_string())
 }
 
+/// The frame a CLI writes around a letter from another of its sessions:
+/// `<cross-session-message from="…" from-name="…">` before it and
+/// `</cross-session-message>` after.
+///
+/// Not one of [`MACHINE_ENVELOPES`]: its opening carries attributes, as a
+/// pasted block's does ([`PASTED_FRAMES`]), and it does not lead the prompt —
+/// the CLI stands sentences of its own before and after it.
+const PEER_LETTER_FRAMES: [&str; 2] = ["<cross-session-message", "</cross-session-message>"];
+
+/// Whether `text` holds a letter another session sent: the frame a CLI opens
+/// before one and closes after it (`PEER_LETTER_FRAMES`).
+///
+/// The frame is the whole test. The sentences a CLI writes beside a letter
+/// change with its version, and it also hands a letter over bare. A person
+/// who writes the tag's name closed nothing around anything, so a frame that
+/// never opens or never closes is theirs — as an envelope that never closes
+/// is ([`searchable_words`]).
+#[must_use]
+pub fn holds_a_peer_letter(text: &str) -> bool {
+    peer_letter(text).is_some()
+}
+
+/// The attribute of a letter's opening that names the session it came from,
+/// as that session is called on the sender's side (`from-name="zerocode-41"`).
+const PEER_LETTER_SENDER: &str = "from-name";
+
+/// A letter another session sent, as the frame around it says it.
+struct PeerLetter<'a> {
+    /// The sending session's name, when the frame says one.
+    from: Option<&'a str>,
+    /// What the letter says, the frame taken off.
+    body: &'a str,
+}
+
+impl PeerLetter<'_> {
+    /// `said` of this letter with who sent it: `zerocode-41: 레인이 끝났다`.
+    fn told(&self, said: &str) -> String {
+        match self.from {
+            Some(from) => format!("{from}: {said}"),
+            None => said.to_string(),
+        }
+    }
+
+    /// The letter on one line, for a name: its sender and the line it opens
+    /// with. `None` for a letter that says nothing.
+    fn name(&self) -> Option<String> {
+        let opens = self
+            .body
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())?;
+        Some(self.told(opens))
+    }
+}
+
+/// The letter in `text`: the first frame a CLI opened before one and closed
+/// after it ([`PEER_LETTER_FRAMES`]). The one reading of that frame — the
+/// test that a prompt is a letter ([`holds_a_peer_letter`]) and the line a
+/// letter is shown and named by both ask here.
+fn peer_letter(text: &str) -> Option<PeerLetter<'_>> {
+    let [opens, closes] = PEER_LETTER_FRAMES;
+    let at = text.find(opens)?;
+    let opened = at + text[at..].find('>')?;
+    let closed = opened + text[opened..].find(closes)?;
+    let from = text[at + opens.len()..opened]
+        .split_once(&format!("{PEER_LETTER_SENDER}=\""))
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(name, _)| name.trim())
+        .filter(|name| !name.is_empty());
+    Some(PeerLetter {
+        from,
+        body: text[opened + 1..closed].trim(),
+    })
+}
+
+/// A prompt as a card says it on one line and a pane is named by it: a letter
+/// another session sent by who sent it and the line it opens with, anything
+/// else by its words ([`prompt_words`]).
+///
+/// A pane a letter opened was named `<cross-session-mes…` on the tab strip,
+/// the sidebar and the session list (2026-11-11, t-103659): the frame was
+/// the first thing in the prompt and nothing read it. The hook's prompt, a
+/// restart's remembered prompt and a stored session's card all ask here, so
+/// the three surfaces name a letter alike.
+#[must_use]
+pub fn prompt_line(prompt: &str) -> Option<String> {
+    let unframed = without_pasted_frames(prompt);
+    match peer_letter(&unframed) {
+        Some(letter) => letter.name(),
+        None => prompt_words(prompt),
+    }
+}
+
 /// What a prompt asks with, for a reader that searches rather than names.
 ///
 /// A name can lose an odd prompt; a question must not. So where
 /// [`prompt_words`] drops everything after an envelope that never closes,
 /// this keeps it, because a person typed that tag; and a slash command's
 /// arguments stay, in both shapes a CLI hands them over, while the command's
-/// own name goes.
+/// own name goes. A letter from another session asks nothing, whatever
+/// stands beside it ([`holds_a_peer_letter`]).
 #[must_use]
 pub fn searchable_words(prompt: &str) -> Option<String> {
     let unframed = without_pasted_frames(prompt);
+    if holds_a_peer_letter(&unframed) {
+        return None;
+    }
     let mut rest = unframed.trim_start();
     let mut arguments = "";
     for _ in 0..8 {
@@ -535,6 +641,102 @@ fn past_a_slash_command(words: &str) -> &str {
         return words;
     }
     &named[name_ends..]
+}
+
+/// `text` without the machine envelopes that stand closed inside it, wherever
+/// they stand. An envelope that never closes stays: past the head of a turn
+/// ([`past_the_envelopes`]) a tag with no end is somebody's own word.
+fn without_envelopes_inside(text: &str) -> std::borrow::Cow<'_, str> {
+    let mut kept: Option<String> = None;
+    let mut rest = text;
+    loop {
+        // The first envelope in what is left that opens and closes.
+        let found = MACHINE_ENVELOPES
+            .iter()
+            .filter_map(|tag| {
+                let at = rest.find(&format!("<{tag}>"))?;
+                let close = format!("</{tag}>");
+                let end = at + rest[at..].find(&close)? + close.len();
+                Some((at, end))
+            })
+            .min();
+        let Some((at, end)) = found else {
+            break;
+        };
+        kept.get_or_insert_with(|| String::with_capacity(text.len()))
+            .push_str(&rest[..at]);
+        rest = &rest[end..];
+    }
+    match kept {
+        None => std::borrow::Cow::Borrowed(text),
+        Some(mut kept) => {
+            kept.push_str(rest);
+            std::borrow::Cow::Owned(kept)
+        }
+    }
+}
+
+/// What a card SHOWS of one thing the user side of a conversation said: the
+/// words, without the frames around what was pasted
+/// ([`without_pasted_frames`]) and without the machine envelopes — the ones
+/// that lead it, as a prompt is read ([`prompt_words`]), and the ones a CLI
+/// tucked in after the words. `None` when the whole turn was machinery.
+///
+/// The one reading of a stored turn for a list: a session card's title and
+/// its preview lines both ask here ([`crate::vault`]), so the window draws
+/// what it is handed and strips nothing itself.
+#[must_use]
+pub fn shown_words(said: &str) -> Option<String> {
+    let unframed = without_pasted_frames(said);
+    // A letter is shown as who sent it and what it says; the sentences a CLI
+    // stands beside its frame are the CLI's.
+    if let Some(letter) = peer_letter(&unframed) {
+        return (!letter.body.is_empty()).then(|| letter.told(letter.body));
+    }
+    let words = without_envelopes_inside(past_the_envelopes(&unframed));
+    let words = words.trim();
+    (!words.is_empty()).then(|| words.to_string())
+}
+
+/// The words a card may be NAMED by, out of one thing the user side said:
+/// what it shows ([`shown_words`]), with any wrapper tag a CLI still dressed
+/// it in peeled off the front and its closing half off the tail —
+/// `<teammate-message from=…>` and whatever the next CLI invents. `None`
+/// when nothing readable is left, so the caller tries the next turn.
+///
+/// Only a name is peeled this far. A preview keeps a tag no table knows: it
+/// may be the person's own, and a name is the one line that must not read as
+/// plumbing ("세션 내용도 orca처럼 나와야하는데 태그가 붙어서 보임", 1-g101).
+#[must_use]
+pub fn naming_words(said: &str) -> Option<String> {
+    // A letter names by its sender and the line it opens with — the line a
+    // pane a letter opened is named by ([`prompt_line`]).
+    if let Some(letter) = peer_letter(&without_pasted_frames(said)) {
+        return letter.name();
+    }
+    let shown = shown_words(said)?;
+    let mut rest = shown.trim_start();
+    while rest.starts_with('<') {
+        let Some(end) = rest.find('>') else { break };
+        rest = rest[end + 1..].trim_start();
+    }
+    // And the closing halves off the tail, so a message that is one whole
+    // envelope names itself by its inside alone. Only `</…>` groups at the
+    // very end — a `<` standing MID-sentence is often the person's own
+    // ("a < b", `Vec<String>`), and mangling real words to hide a tag would
+    // be the worse trade.
+    let mut tail = rest.trim_end();
+    while tail.ends_with('>') {
+        let Some(open) = tail.rfind("</") else { break };
+        if tail[open..].find('>') != Some(tail[open..].len() - 1) {
+            break;
+        }
+        tail = tail[..open].trim_end();
+    }
+    // Still `<`-headed after the peel — an unclosed wrapper — is not a name;
+    // the caller moves to the next user line, the retained scanner's own
+    // stance on `<`-headed content.
+    (!tail.is_empty() && !tail.starts_with('<')).then(|| tail.to_string())
 }
 
 /// The words that only tell an agent to go on — in the five languages the
@@ -683,10 +885,8 @@ pub fn last_naming_prompt(path: &Path) -> Option<String> {
 pub fn last_naming_prompt_words(path: &Path) -> Option<String> {
     let tail = Tail::read_within(path, NAMING_PROMPT_SEARCH_BYTES)?;
     tail.lines().rev().find_map(|line| {
-        let typed = typed_prompt(line.trim())?;
-        let unframed = without_pasted_frames(&typed);
-        let prompt = past_the_envelopes(&unframed).trim();
-        names_the_turn(prompt).then(|| prompt.to_string())
+        let prompt = prompt_line(&typed_prompt(line.trim())?)?;
+        names_the_turn(&prompt).then_some(prompt)
     })
 }
 
@@ -773,10 +973,17 @@ fn typed_prompt(line: &str) -> Option<String> {
     let content = message
         .and_then(|held| held.get("content"))
         .or_else(|| record.get("content"))?;
+    typed_words(content)
+}
+
+/// The words in a user turn's `content`: the string, or its `text` parts.
+/// Typed words are `text` parts; a tool's result rides the same role, and is
+/// nothing a person said.
+#[must_use]
+pub fn typed_words(content: &serde_json::Value) -> Option<String> {
     if let Some(text) = content.as_str() {
         return Some(text.to_string());
     }
-    // Typed words are `text` parts; a tool's result rides the same role.
     let words: Vec<&str> = content
         .as_array()?
         .iter()
@@ -3494,6 +3701,36 @@ mod tests {
         );
     }
 
+    /// A letter from another session is nobody's question. It is known by the
+    /// frame the CLI closes around it and by nothing the CLI says beside it:
+    /// those sentences change with the CLI, and it hands the letter over bare
+    /// as well. A person who writes the tag's name closed nothing around
+    /// anything, and still asks with every word.
+    #[test]
+    fn a_letter_from_another_session_is_not_searched_with() {
+        let letter = "<cross-session-message from=\"uds:/tmp/cc-socks/0000.sock\" \
+                      from-name=\"zerocode-00\" from-mode=\"bypass\">\n\
+                      레인이 초록으로 끝났고 창 시험이 모두 통과했다.\n\
+                      </cross-session-message>";
+        for said in [
+            letter.to_string(),
+            format!(
+                "Another Claude session sent a message:\n{letter}\n\n\
+                 This came from another Claude session."
+            ),
+            format!("다른 세션이 보낸 편지:\n{letter}\n받는 쪽 권한 안에서 처리한다."),
+        ] {
+            assert_eq!(searchable_words(&said), None, "{said:?}");
+        }
+        for said in [
+            "<cross-session-message> 태그가 붙은 프롬프트는 누가 보낸 거야",
+            "편지는 <cross-session-message from= 으로 시작한다는데 맞아?",
+            "</cross-session-message> 로 끝나는 글은 어떻게 걸러",
+        ] {
+            assert_eq!(searchable_words(said).as_deref(), Some(said), "{said:?}");
+        }
+    }
+
     /// How full a pane's context is, recovered from the file it already
     /// reads. A pane with neither a wire nor a channel has no other source:
     /// hooks carry no token counts, so without this the composer's meter
@@ -4513,5 +4750,184 @@ mod tests {
         writeln!(writing, "{COMPLETE}\n{SETTINGS}").expect("close");
         drop(writing);
         assert_eq!(codex_turn_open(&file), Some(false));
+    }
+
+    /* ---- what a card shows and is named by (t-103659) ---- */
+
+    /// What a card shows of a stored user turn is the words: no frame around
+    /// what was pasted, no machine envelope before the words or after them.
+    #[test]
+    fn a_card_shows_the_words_without_the_frames_a_cli_wrote() {
+        for (said, shown) in [
+            (
+                "<pasted_content id=\"8a76\">\nfix the sidebar\n</pasted_content id=\"8a76\">",
+                "fix the sidebar",
+            ),
+            (
+                "<command-name>/review</command-name>\n<command-args>the diff</command-args>\nand say why",
+                "and say why",
+            ),
+            // A reminder the CLI tucked in after the words, and one between.
+            (
+                "fix it\n<system-reminder>\nremember the rules\n</system-reminder>",
+                "fix it",
+            ),
+            (
+                "before<task-notification>done</task-notification>after",
+                "beforeafter",
+            ),
+            // An envelope's name a person wrote, never closed: their word.
+            (
+                "why does <system-reminder> show up in my prompt",
+                "why does <system-reminder> show up in my prompt",
+            ),
+            // A tag no table knows stays in what is shown.
+            ("<div>keep me</div>", "<div>keep me</div>"),
+        ] {
+            assert_eq!(shown_words(said).as_deref(), Some(shown), "{said:?}");
+        }
+    }
+
+    /// A turn that was all machinery shows nothing: a slash command's
+    /// records, a background task's notice, and what Codex writes about the
+    /// turn's folder under the user's role.
+    #[test]
+    fn a_turn_that_was_all_machinery_shows_nothing() {
+        for said in [
+            "<local-command-caveat>Caveat: generated by the user</local-command-caveat>",
+            "<command-name>/clear</command-name>\n<command-message>clear</command-message>",
+            "<task-notification>\n<task-id>7</task-id>\n</task-notification>",
+            "<environment_context>\n  <cwd>/Users/dev/acme</cwd>\n</environment_context>",
+            "<recommended_plugins>\nnone\n</recommended_plugins>",
+            "<system-reminder>never closed",
+            "   ",
+        ] {
+            assert_eq!(shown_words(said), None, "{said:?}");
+        }
+    }
+
+    /// A card's NAME is what the person said, never the wrapper a CLI put in
+    /// front of it — and a message that is nothing but wrapper yields the
+    /// words inside, or no name at all.
+    #[test]
+    fn a_name_sheds_the_tags_a_cli_dressed_the_words_in() {
+        for (said, named) in [
+            ("fix the tests", "fix the tests"),
+            // A `<` inside the person's own sentence is the person's — untouched.
+            (
+                "compare a < b in Vec<String>",
+                "compare a < b in Vec<String>",
+            ),
+            (
+                "<teammate-message from=\"lead\"><attachment>1 # Orca 소스 지도",
+                "1 # Orca 소스 지도",
+            ),
+            ("<div>keep me</div>", "keep me"),
+        ] {
+            assert_eq!(naming_words(said).as_deref(), Some(named), "{said:?}");
+        }
+        for nothing in [
+            "  <a><b>  ",
+            "<unclosed",
+            "",
+            "<local-command-caveat>Caveat: generated by the user</local-command-caveat>",
+        ] {
+            assert_eq!(naming_words(nothing), None, "{nothing:?}");
+        }
+    }
+
+    /// Typed words are a string or `text` parts. A tool's result rides the
+    /// user's role and is nothing a person typed.
+    #[test]
+    fn a_tools_result_is_nothing_a_person_typed() {
+        let typed = serde_json::json!([
+            {"type": "text", "text": "look at"},
+            {"type": "text", "text": "this"},
+        ]);
+        let result = serde_json::json!([
+            {"type": "tool_result", "tool_use_id": "t1", "content": "total 8"},
+        ]);
+        assert_eq!(
+            [
+                typed_words(&serde_json::json!("hello")),
+                typed_words(&typed),
+                typed_words(&result),
+            ],
+            [Some("hello".into()), Some("look at this".into()), None]
+        );
+    }
+
+    /* ---- a letter from another session, shown and named (t-103659) ---- */
+
+    const LETTER: &str = "<cross-session-message from=\"uds:/tmp/cc-socks/0000.sock\" \
+                          from-name=\"zerocode-00\" from-mode=\"bypass\">\n\
+                          레인이 초록으로 끝났다.\n창 시험이 모두 통과했다.\n\
+                          </cross-session-message>";
+
+    /// A letter is named by who sent it and the line it opens with, whatever
+    /// a CLI stands beside its frame — on a card's line, in a pane's name
+    /// and on a session card alike.
+    #[test]
+    fn a_letter_is_named_by_its_sender_and_its_first_line() {
+        let named = "zerocode-00: 레인이 초록으로 끝났다.";
+        for said in [
+            LETTER.to_string(),
+            format!(
+                "Another Claude session sent a message:\n{LETTER}\n\n\
+                 This came from another Claude session."
+            ),
+        ] {
+            assert_eq!(
+                [prompt_line(&said), naming_words(&said)],
+                [Some(named.to_string()), Some(named.to_string())],
+                "{said:?}"
+            );
+            let payload = serde_json::json!({ "prompt": said }).to_string();
+            assert_eq!(prompt_in_payload(&payload).as_deref(), Some(named));
+        }
+    }
+
+    /// A session card shows a letter as who sent it and what it says, the
+    /// frame and the CLI's own sentences gone.
+    #[test]
+    fn a_card_shows_a_letter_as_its_sender_and_what_it_says() {
+        let said = format!("Another Claude session sent a message:\n{LETTER}");
+        assert_eq!(
+            shown_words(&said).as_deref(),
+            Some("zerocode-00: 레인이 초록으로 끝났다.\n창 시험이 모두 통과했다.")
+        );
+    }
+
+    /// A frame that names no sender gives the letter alone, and one that says
+    /// nothing gives no line at all.
+    #[test]
+    fn a_letter_with_no_sender_or_no_words_is_said_as_it_is() {
+        let unsigned = "<cross-session-message>\n배포가 끝났다\n</cross-session-message>";
+        let blank =
+            "<cross-session-message from-name=\"zerocode-00\">\n \n</cross-session-message>";
+        assert_eq!(
+            [
+                prompt_line(unsigned),
+                prompt_line(blank),
+                shown_words(blank)
+            ],
+            [Some("배포가 끝났다".to_string()), None, None]
+        );
+    }
+
+    /// A person who writes the tag's name closed nothing around anything:
+    /// the prompt is theirs, word for word.
+    #[test]
+    fn a_tag_a_person_wrote_is_not_a_letter() {
+        for said in [
+            "<cross-session-message> 태그가 붙은 프롬프트는 누가 보낸 거야",
+            "편지는 <cross-session-message from= 으로 시작한다는데 맞아?",
+        ] {
+            assert_eq!(shown_words(said).as_deref(), Some(said), "{said:?}");
+        }
+        assert_eq!(
+            prompt_line("편지는 <cross-session-message from= 으로 시작한다는데 맞아?").as_deref(),
+            Some("편지는 <cross-session-message from= 으로 시작한다는데 맞아?")
+        );
     }
 }

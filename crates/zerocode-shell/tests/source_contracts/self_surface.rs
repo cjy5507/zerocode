@@ -428,6 +428,287 @@ fn deleting_and_registering_a_flow_from_the_card_are_the_persons_alone() {
     );
 }
 
+/// A job that runs with nobody watching is the person's to save, to switch on
+/// or off and to run now (2026-11-11): the three commands stand on the second
+/// wall's list and are registered, and the controls that reach them wear the
+/// person-only mark (the first wall) — the form's save and run, the detail's
+/// run and switch, a row's switch and run, a Flow's schedule switch and the
+/// vault's own switch-on. An agent may look at the page and fill the form; it
+/// is told the window keeps these for the person, by the words every marked
+/// control answers with. The call that awaits before it invokes takes its
+/// press's hand first; that every call names a hand at all is the rule of
+/// `the_second_wall_reads_the_hand_the_page_says_and_no_clock`.
+#[test]
+fn saving_switching_and_running_an_automation_are_the_persons_alone() {
+    let person = person_only_commands();
+    let registered = registered_commands();
+    for name in [
+        "save_automation",
+        "enable_automation",
+        "run_automation",
+        // The vault's weekly review is written among those jobs, and a Flow's
+        // policy decides whether its money step is pressed.
+        "set_second_brain_weekly_review",
+        "flow_set",
+    ] {
+        assert!(person.contains(&name.to_string()), "{name} is the person's");
+        assert!(
+            registered.contains(&name.to_string()),
+            "{name} is on the person-only list but not registered"
+        );
+    }
+    let index = ui_file("index.html");
+    for id in [
+        "auto-save",
+        "auto-run",
+        "auto-detail-run",
+        "auto-detail-toggle",
+        "second-brain-ingest-on",
+        "second-brain-weekly-review",
+    ] {
+        let at = index
+            .find(&format!("id=\"{id}\""))
+            .unwrap_or_else(|| panic!("#{id} is on the page"));
+        let tag_start = index[..at].rfind('<').unwrap_or(at);
+        let tag_end = at + index[at..].find('>').unwrap_or(0);
+        assert!(
+            index[tag_start..tag_end].contains("data-person-only"),
+            "#{id} carries data-person-only"
+        );
+    }
+    let settings = ui_file("shell-settings.js");
+    let rows = block_after(&settings, "function paintAutomations() {");
+    assert!(
+        rows.contains("role=\"switch\" data-person-only></button>")
+            && rows.contains("run.dataset.personOnly = \"\""),
+        "a row's switch and its run button carry the person-only mark"
+    );
+    assert!(
+        block_after(&settings, "function flowScheduleRow(job) {")
+            .contains("toggle.dataset.personOnly = \"\""),
+        "a Flow's schedule switch carries the person-only mark"
+    );
+    assert!(
+        block_after(&settings, "function buildFlowSegment(")
+            .contains("button.dataset.personOnly = \"\""),
+        "a Flow's policy and evidence buttons carry the person-only mark"
+    );
+    let ingest = block_after(&settings, "async function turnOnSecondBrainIngest() {");
+    let taken = ingest
+        .find("const hand = handNow();")
+        .expect("the vault's switch-on takes its press's hand");
+    let awaited = ingest.find("await ").expect("it awaits");
+    assert!(
+        taken < awaited && ingest.matches("{ hand });").count() == 2,
+        "the hand is taken before anything is awaited and both commands carry it"
+    );
+    // The press that saves has what it saves in view: a command of the job's
+    // own and the check before it sit in a fold, which opens as either gains
+    // words and whose summary an agent cannot close.
+    let fold = index
+        .find("id=\"auto-details\"")
+        .expect("the form folds its details");
+    let summary = &index[fold..];
+    let summary = &summary[summary.find("<summary").expect("the fold has a summary")..];
+    assert!(
+        summary[..summary.find('>').unwrap_or(0)].contains("data-person-only"),
+        "the fold's summary carries data-person-only"
+    );
+    let shown = block_after(&settings, "function showAutoOwnCommands() {");
+    assert!(
+        shown.contains("el(\"auto-command\").value.trim() || el(\"auto-precheck\").value.trim()")
+            && shown.contains("el(\"auto-details\").open = true"),
+        "the fold opens while the command or the precheck has words"
+    );
+    let wired = "for (const id of [\"auto-precheck\", \"auto-command\"]) {\n  el(id).addEventListener(\"input\", showAutoOwnCommands);\n  el(id).addEventListener(\"change\", showAutoOwnCommands);\n}";
+    assert!(
+        settings.contains(wired),
+        "words put into either field open the fold, whoever wrote them"
+    );
+}
+
+/// A hand is read at the person's press, never in a form's `submit`
+/// (2026-11-11). The browser submits as the press's default action, after the
+/// press has been dispatched, and `handNow` answers `none` there — so a
+/// person-only command called from `submit` is refused for the person's own
+/// press. It was: a GitLab token's sign-in and a question closed without an
+/// answer, both since they were written, and the automation's save the day it
+/// became person-only.
+///
+/// Every handler the browser's own submission reaches is read — a
+/// `addEventListener("submit", …)` and a `.onsubmit = …` alike — with the
+/// functions it calls by name, one step down: none reads a hand, none names a
+/// person-only command. A form whose submission does run one reads the hand
+/// at its button's click and at Enter in a one-line field (`submitByPress`),
+/// or submits inside its press, as the worker composer's button and key do.
+///
+/// A handler that is handed its work as a closure cannot be followed by
+/// words: the question-closing form was that shape, and passed. So the
+/// handlers are also counted, file by file. A new one is read by whoever adds
+/// it before the count is moved: where does what it calls read its hand?
+#[test]
+fn a_forms_submit_never_reads_the_hand_of_a_person_only_command() {
+    let person_only = person_only_commands();
+    let scripts = ui_scripts();
+    let mut counted = std::collections::BTreeMap::new();
+    for (name, text) in &scripts {
+        let listened = text
+            .match_indices("addEventListener(\"submit\"")
+            .map(|(at, _)| enclosing_call(text, at + "addEventListener(".len()));
+        let assigned = text
+            .match_indices(".onsubmit = ")
+            .map(|(at, opens)| statement_at(text, at + opens.len()));
+        for handler in listened.chain(assigned) {
+            *counted.entry(name.as_str()).or_insert(0usize) += 1;
+            let called = called_names(handler)
+                .into_iter()
+                .filter_map(|function| function_block(&scripts, function));
+            for read in std::iter::once(handler).chain(called) {
+                assert!(
+                    !read.contains("handNow("),
+                    "{name}: a form's submit reads a hand — in itself or one call down: {read}"
+                );
+                for command in &person_only {
+                    assert!(
+                        !read.contains(&format!("\"{command}\"")),
+                        "{name}: a form's submit runs {command} — in itself or one call down: {read}"
+                    );
+                }
+            }
+        }
+    }
+    // Read 2026-11-11, each to the end of what it calls. One reaches a
+    // person-only command further down than one call: the worker composer
+    // (`shell.js`), whose button and key both submit inside the press, so its
+    // hand is that press's. The new-chat form (`shell-workspace.js`) calls
+    // `closeTab`, which ends a lane or a shell only for a lane's or a
+    // terminal's tab: the tab it closes is neither, so nothing there is the
+    // person's alone.
+    let expected: std::collections::BTreeMap<&str, usize> = [
+        ("shell-board-now.js", 1),
+        ("shell-board.js", 1),
+        ("shell-boot.js", 1),
+        ("shell-composer.js", 1),
+        ("shell-doc.js", 2),
+        ("shell-flow.js", 1),
+        ("shell-jev.js", 3),
+        ("shell-knowledge.js", 1),
+        ("shell-remote.js", 2),
+        ("shell-settings.js", 1),
+        ("shell-sftp.js", 2),
+        ("shell-workspace.js", 1),
+        ("shell.js", 1),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        counted, expected,
+        "a form's submit handler was added or taken away: read where what it calls takes its hand, then move the count"
+    );
+
+    let boot = ui_file("shell-boot.js");
+    let by_press = block_after(&boot, "function submitByPress(form, button, send) {");
+    assert!(
+        by_press.contains("form.addEventListener(\"submit\", (event) => event.preventDefault());")
+            && by_press.contains("button.addEventListener(\"click\", press);")
+            && by_press.contains("if (!button.disabled && form.reportValidity()) send(handNow());")
+            && by_press.contains("event.isComposing")
+            && by_press.contains("event.keyCode === 229"),
+        "the press reads the hand, and submit only keeps the page where it is"
+    );
+    let settings = ui_file("shell-settings.js");
+    let inbox = ui_file("shell-inbox.js");
+    for (script, wired) in [
+        (
+            &settings,
+            "submitByPress(el(\"auto-form\"), el(\"auto-save\"), (hand) => void saveAutomation(hand));",
+        ),
+        (
+            &settings,
+            "submitByPress(paste, send, (hand) => void connectGitlabHost(host, field, said, send, hand));",
+        ),
+        (&inbox, "submitByPress(form, go, (hand) => send(hand));"),
+    ] {
+        assert!(script.contains(wired), "a form sends by its press: {wired}");
+    }
+    // The question's close takes the hand it is handed, or reads it where the
+    // caller is the press itself — before anything is awaited.
+    let closing = block_after(&inbox, "async function closeQuestionWithoutAnswer(");
+    let taken = closing
+        .find("hand = handNow() },")
+        .expect("closing a question takes its press's hand");
+    let awaited = closing.find("await ").expect("it awaits");
+    assert!(
+        taken < awaited && closing.contains("retryRequest: closing.retry.id }, { hand });"),
+        "the close is sent with the hand of its press"
+    );
+    let shell = ui_file("shell.js");
+    let send_button = block_after(
+        &shell,
+        "send.addEventListener(\"click\", async (event) => {",
+    );
+    assert!(
+        send_button.contains("event.preventDefault();\n    form.requestSubmit();"),
+        "the worker composer's button submits inside its press"
+    );
+}
+
+/// Every script the page loads from `ui/`, by file name, in name order.
+fn ui_scripts() -> Vec<(String, String)> {
+    let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui");
+    let mut scripts: Vec<(String, String)> = std::fs::read_dir(&ui)
+        .expect("ui reads")
+        .filter_map(|entry| {
+            let path = entry.expect("ui entry").path();
+            let name = path.file_name()?.to_string_lossy().to_string();
+            name.ends_with(".js")
+                .then(|| (name, std::fs::read_to_string(&path).unwrap_or_default()))
+        })
+        .collect();
+    scripts.sort();
+    scripts
+}
+
+/// From `at` to the `;` that ends the statement, brackets balanced.
+fn statement_at(text: &str, at: usize) -> &str {
+    let mut depth = 0usize;
+    for (offset, letter) in text[at..].char_indices() {
+        match letter {
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => depth = depth.saturating_sub(1),
+            ';' if depth == 0 => return &text[at..at + offset],
+            _ => {}
+        }
+    }
+    &text[at..]
+}
+
+/// The names a piece of script calls: every word that stands before a `(`.
+fn called_names(script: &str) -> std::collections::BTreeSet<&str> {
+    script
+        .match_indices('(')
+        .filter_map(|(at, _)| {
+            let start = script[..at]
+                .char_indices()
+                .rev()
+                .find(|(_, letter)| {
+                    !(letter.is_ascii_alphanumeric() || matches!(letter, '_' | '$'))
+                })
+                .map_or(0, |(before, letter)| before + letter.len_utf8());
+            (start < at).then(|| &script[start..at])
+        })
+        .collect()
+}
+
+/// A function the page declares by that name, as its whole block.
+fn function_block<'a>(scripts: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    let opens = format!("function {name}(");
+    scripts
+        .iter()
+        .find(|(_, text)| text.contains(&opens))
+        .map(|(_, text)| block_after(text, &opens))
+}
+
 #[test]
 fn requiring_a_share_is_a_persisted_person_only_setting() {
     let person = person_only_commands();

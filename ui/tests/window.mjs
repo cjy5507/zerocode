@@ -110,6 +110,7 @@ import { testTerminalRaster } from "./terminal-raster.mjs";
 import { testTerminalThroughput } from "./terminal-throughput.mjs";
 import { testTerminalPacing } from "./terminal-pacing.mjs";
 import { testTerminalCadence } from "./terminal-cadence.mjs";
+import { testDimInk } from "./terminal-dim-ink.mjs";
 import { installHarnessWaits } from "./harness-waits.mjs";
 import { installBoardWaits, testBoardWaits } from "./board-waits.mjs";
 
@@ -525,6 +526,9 @@ suite("vault", async ({ browser, origin }) => {
     await page.close();
   }
 });
+// The docked session history, held to counts: what it asks, how many cards it builds, what it says while a
+// walk looks at the disk (t-103659).
+suite("vault-dock", async ({ browser, origin, ok }) => (await import("./vault-dock.mjs")).testVaultDock(browser, origin, ok));
 suite("workers", testWorkers);
 // A pane on a release the catalog superseded says so, in one word (t-46882).
 suite("superseded-model", testSupersededModel);
@@ -688,6 +692,18 @@ suite("terminal-cadence", async ({ browser, origin, ok }) => {
   const { page } = await openWindowTestPage(browser, origin);
   try {
     await testTerminalCadence(page, ok);
+  } finally {
+    await page.close();
+  }
+});
+
+/* SGR 2 dims the ink of a run and leaves its ground whole (terminal-dim-ink.mjs):
+ * a dim word on a painted band stands on the band's own colour. Computed
+ * style on one frame — a page of its own, so it runs alone in seconds. */
+suite("terminal-dim", async ({ browser, origin, ok }) => {
+  const { page } = await openWindowTestPage(browser, origin);
+  try {
+    await testDimInk(page, ok);
   } finally {
     await page.close();
   }
@@ -15672,10 +15688,12 @@ ok(
 );
 
 /* And the record that leaves is the one the form was showing — id and all, so
- * a save is an edit of that job rather than a second copy of it. */
+ * a save is an edit of that job rather than a second copy of it. The save is
+ * its button's press here and below: a `submit` nobody pressed carries
+ * nobody's hand, and the form sends nothing on one (`submitByPress`). */
 const saved = await page.evaluate(async () => {
   document.getElementById("auto-name").value = "  주간 정리본  ";
-  document.getElementById("auto-form").dispatchEvent(new Event("submit"));
+  document.getElementById("auto-save").click();
   await new Promise((done) => setTimeout(done, 150));
   return {
     sent: window.__SAVED__,
@@ -15723,7 +15741,7 @@ const pickedAgent = await page.evaluate(async () => {
   const held = field.value;
   const options = [...field.options].map((one) => `${one.value}:${one.textContent}`);
   field.value = "claude";
-  document.getElementById("auto-form").dispatchEvent(new Event("submit"));
+  document.getElementById("auto-save").click();
   await new Promise((done) => setTimeout(done, 150));
   const chosen = window.__SAVED__?.agent;
   // And back to the first option, which is absence rather than a word the
@@ -15735,7 +15753,11 @@ const pickedAgent = await page.evaluate(async () => {
   // fixture with neither agent nor command describes a job the backend now
   // correctly refuses.
   document.getElementById("auto-command").value = "./scripts/nightly-check";
-  document.getElementById("auto-form").dispatchEvent(new Event("submit"));
+  // No press saves this record: the form holds the picker required for a job
+  // that sends a prompt, and its button's press asks the browser whether the
+  // form is valid before it sends. What an empty picker sends is read off the
+  // save itself, as the press would call it.
+  void saveAutomation(handNow());
   await new Promise((done) => setTimeout(done, 150));
   return {
     held,
@@ -28081,7 +28103,10 @@ ok(
     // defaults — not a filter it applied itself.
     vaultPane.asked.query.sort === "updated" &&
     vaultPane.asked.query.group === "project" &&
-    vaultPane.asked.query.hide_empty === false,
+    // Sessions nobody spoke in are hidden unless asked for (t-103659): the
+    // original's default shows them, and a machine's zo store filled the
+    // list with ids over 「대화 미리보기를 사용할 수 없습니다」.
+    vaultPane.asked.query.hide_empty === true,
   JSON.stringify(vaultPane),
 );
 
@@ -45370,7 +45395,9 @@ const taskSourcesGitlab = await page.evaluate(async () => {
   seen.tokenPage = opened.at(-1);
   const first = rows()[0];
   first.querySelector(".task-host-token").value = "bad";
-  first.querySelector(".task-host-paste").requestSubmit();
+  // 「연결」 is its button's press: the paste form sends nothing on a `submit`
+  // nobody pressed (`submitByPress`).
+  first.querySelector('.task-host-paste button[type="submit"]').click();
   await wait(120);
   seen.bad = {
     said: first.querySelector(".task-host-said").textContent,
@@ -45380,7 +45407,7 @@ const taskSourcesGitlab = await page.evaluate(async () => {
   glab = { installed: true, authenticated: false, hosts: ["192.0.2.14"] };
   hosts[0].signed_in = true;
   rows()[0].querySelector(".task-host-token").value = "glpat-example";
-  rows()[0].querySelector(".task-host-paste").requestSubmit();
+  rows()[0].querySelector('.task-host-paste button[type="submit"]').click();
   await wait(400);
   seen.list = {
     login: logins.at(-1),
@@ -46530,6 +46557,10 @@ const vaultDock = await page.evaluate(async () => {
   // reach the backend as this checkout's path — a filter applied only to the
   // paint would lie the moment the ledger grows.
   seen.askedScope = window.__ASKED_VAULT__?.query?.scope_paths;
+  // And it comes as the panel being come to — the ask that looks at the disk
+  // again — with sessions nobody spoke in hidden unless asked for (t-103659).
+  seen.arrivalForce = window.__ASKED_VAULT__?.force;
+  seen.arrivalHidesEmpty = window.__ASKED_VAULT__?.query?.hide_empty;
   seen.activePath = activeWorktreePath;
   seen.sub = document.getElementById("vdock-sub").textContent;
   const cards = [...document.querySelectorAll(".vdock-card")];
@@ -46605,7 +46636,7 @@ const vaultDock = await page.evaluate(async () => {
     .map((one) => one.textContent);
   const viewRow = (said) => [...menu.querySelectorAll(".sidebar-menu-item")]
     .find((one) => one.querySelector(".sidebar-menu-label")?.textContent === said);
-  viewRow("빈 세션 숨기기").click();
+  viewRow("대화 아닌 세션 숨기기").click();
   await settle();
   seen.askedHideEmpty = window.__ASKED_VAULT__?.query?.hide_empty;
   viewRow("Claude (2)").click();
@@ -46634,7 +46665,7 @@ const vaultDock = await page.evaluate(async () => {
   vaultDockShut.clear();
   vaultDockOpen.clear();
   vaultDockOff.clear();
-  vaultDockHideEmpty = false;
+  vaultDockHideEmpty = VAULT_HIDE_EMPTY_DEFAULT;
   document.getElementById("activity-files-tab").click();
   return seen;
 });
@@ -46657,9 +46688,10 @@ ok(
     JSON.stringify(vaultDock.moreRows) ===
       JSON.stringify(["다시 열기", "명령 복사", "파일 보기"]) &&
     vaultDock.viewRows.includes("모두") && vaultDock.viewRows.includes("Claude (2)") &&
-    vaultDock.viewRows.includes("빈 세션 숨기기") &&
+    vaultDock.viewRows.includes("대화 아닌 세션 숨기기") &&
     vaultDock.viewRows.includes("보기 초기화") &&
-    vaultDock.askedHideEmpty === true &&
+    vaultDock.arrivalForce === true && vaultDock.arrivalHidesEmpty === true &&
+    vaultDock.askedHideEmpty === false &&
     JSON.stringify(vaultDock.askedOff) === JSON.stringify(["claude"]) &&
     Array.isArray(vaultDock.askedAll) && vaultDock.askedAll.length === 0 && vaultDock.allLit &&
     vaultDock.askedQuery === "needle" &&

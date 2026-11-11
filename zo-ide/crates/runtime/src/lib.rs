@@ -41,6 +41,7 @@ pub mod mcp_http_common;
 pub mod mcp_lifecycle_hardened;
 mod mcp_limits;
 pub mod mcp_oauth;
+pub mod mcp_tool_listings;
 pub mod mcp_sse;
 mod mcp_stdio;
 pub mod mcp_ws;
@@ -98,7 +99,7 @@ pub use core_types::usage;
 
 pub use bash::{
     execute_bash, execute_bash_with_tasks, interrupt_foreground_bash, replace_bash_transport_output, timeout_stderr,
-    timeout_stderr_with_background_advice, BashCommandInput, BashCommandOutput, BASH_TRANSPORT_MAX_BYTES,
+    timeout_stderr_with_background_advice, BashCommandInput, BashCommandOutput, CommandEnding, BASH_TRANSPORT_MAX_BYTES,
 };
 #[cfg(windows)]
 pub use bash::end_process_tree_command;
@@ -262,7 +263,7 @@ pub use mcp_stdio::{
     McpPromptMessage, McpReadResourceParams, McpReadResourceResult, McpResource,
     McpResourceContents, McpServerManager, McpServerManagerError, McpStdioProcess, McpTool,
     McpToolCallContent, McpToolCallParams, McpToolCallResult, McpToolDiscoveryReport,
-    UnsupportedMcpServer,
+    RelistedServer, UnsupportedMcpServer,
 };
 pub use mcp_ws::{connect_mcp_ws, McpWsProcess};
 pub use model_inventory::{

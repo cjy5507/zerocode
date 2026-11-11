@@ -7153,9 +7153,12 @@ fn no_label_reaches_the_window_hardcoded() {
 
     // The Hangul that is not a label, each entry for a stated reason.
     let allowed = [
-        // A font probe. `가` is measured to size the terminal's wide-glyph
-        // cell, so translating it would change the measurement.
-        "wide.textContent = \"가\".repeat(20);",
+        // Font probes. `가` is measured to size the terminal's wide-glyph
+        // cell, and the two syllables after it are the tallest and deepest
+        // ink a Hangul face draws (`WIDE_INK_PROBE`), so translating them
+        // would change the measurement. They are drawn off the screen.
+        "const WIDE_PROBE_GLYPH = \"가\";",
+        "const WIDE_INK_PROBE = `${WIDE_PROBE_GLYPH}홁퉜`;",
         // An endonym: Korean is `한국어` in every language's picker, which
         // is what Orca's own list does (`UI_LANGUAGE_CHOICE_FALLBACKS`).
         "{ code: \"ko\", name: \"한국어\" },",
@@ -21730,10 +21733,14 @@ fn vault_session_limit_uses_the_canonical_settings_document_and_kept_walk() {
         "vault.sessionLimit",
         "vaultSessionLimit = snapshot[\"vault.sessionLimit\"];",
     );
+    // The saved limit cuts the VIEW. The walk is the one that is held, read
+    // to the table's own cap whatever the view asks for.
     let scanning = block_after(shipped_backend(), "fn vault_sessions(");
-    assert!(scanning.contains("vault_walk::kept(force)"));
-    assert!(scanning.contains("Limits::DEFAULT.absolute_max"));
-    assert!(!scanning.contains("scan(&home, query"));
+    assert!(scanning.contains("vault_walk::answer(force, sources,"));
+    assert!(!scanning.contains("vault::scan"));
+    let walking = include_str!("vault_walk.rs");
+    assert!(walking.contains("let limit = Limits::DEFAULT.absolute_max;"));
+    assert!(!walking.contains("VaultQuery"));
 }
 
 /* ---- zo PushNotification over the channel (t-2943) ---- */
