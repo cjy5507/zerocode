@@ -2132,19 +2132,21 @@ fn live_zo_pids(pids: impl Iterator<Item = u32>) -> std::collections::HashSet<u3
     else {
         return unique; // probe failed — presume alive, reap nothing
     };
-    let mut alive = std::collections::HashSet::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let mut parts = line.split_whitespace();
-        let (Some(pid), Some(comm)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        if let Ok(pid) = pid.parse::<u32>() {
-            if is_zo_process_comm(comm) {
-                alive.insert(pid);
-            }
-        }
-    }
-    alive
+    zo_pids_in_ps_listing(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The pids of zo processes in `ps -o pid=,comm=` output. `comm` is the rest
+/// of the line after the pid — on macOS the executable's full path, which may
+/// hold spaces (`…/Application Support/…/zo`), so it is never split further.
+fn zo_pids_in_ps_listing(listing: &str) -> std::collections::HashSet<u32> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let (pid, comm) = line.trim_start().split_once(char::is_whitespace)?;
+            let pid = pid.parse::<u32>().ok()?;
+            is_zo_process_comm(comm.trim()).then_some(pid)
+        })
+        .collect()
 }
 
 #[must_use]
@@ -4557,19 +4559,12 @@ fn structured_schema_is_supported(schema: &serde_json::Value) -> bool {
             return false;
         }
     }
-    for key in [
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "multipleOf",
-    ] {
-        if schema.get(key).is_some_and(|value| exact_json_number(value).is_none()) {
-            return false;
-        }
+    let mut number_keys = STRUCTURED_NUMBER_BOUNDS.iter().map(|(key, _)| *key).chain([STRUCTURED_MULTIPLE_OF]);
+    if number_keys.any(|key| schema.get(key).is_some_and(|value| exact_json_number(value).is_none())) {
+        return false;
     }
     if schema
-        .get("multipleOf")
+        .get(STRUCTURED_MULTIPLE_OF)
         .and_then(exact_json_number)
         .is_some_and(|value| value <= 0)
     {
@@ -4613,6 +4608,19 @@ fn usize_as_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+/// The schema keywords that bound a number, each with the orderings of the
+/// value against the bound that it refuses.
+const STRUCTURED_NUMBER_BOUNDS: [(&str, &[std::cmp::Ordering]); 4] = [
+    ("minimum", &[std::cmp::Ordering::Less]),
+    ("exclusiveMinimum", &[std::cmp::Ordering::Less, std::cmp::Ordering::Equal]),
+    ("maximum", &[std::cmp::Ordering::Greater]),
+    ("exclusiveMaximum", &[std::cmp::Ordering::Greater, std::cmp::Ordering::Equal]),
+];
+
+/// The schema keyword asking for a multiple, checked only on integers read
+/// exactly.
+const STRUCTURED_MULTIPLE_OF: &str = "multipleOf";
+
 fn exact_json_number(value: &serde_json::Value) -> Option<i128> {
     let number = value.as_number()?;
     number
@@ -4627,6 +4635,17 @@ fn exact_decimal_cmp(left: &i128, right: &i128) -> std::cmp::Ordering {
 
 fn exact_multiple_of(value: &i128, divisor: &i128) -> bool {
     *divisor > 0 && value % divisor == 0
+}
+
+/// `value` against `bound`: exactly when both are integers, else as `f64`.
+/// `serde_json` has already read a fraction as `f64`; that rounding keeps
+/// order, so only two numbers landing on one `f64` can compare equal wrongly.
+/// `None` when either is not a number.
+fn json_number_cmp(value: &serde_json::Value, bound: &serde_json::Value) -> Option<std::cmp::Ordering> {
+    match (exact_json_number(value), exact_json_number(bound)) {
+        (Some(value), Some(bound)) => Some(exact_decimal_cmp(&value, &bound)),
+        _ => value.as_f64()?.partial_cmp(&bound.as_f64()?),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4749,25 +4768,20 @@ fn structured_schema_valid(schema: &serde_json::Value, value: &serde_json::Value
             }
         }
         serde_json::Value::Number(_) => {
-            let Some(number) = exact_json_number(value) else {
-                // serde_json has already reduced non-integer JSON numbers to
-                // f64, so their original decimal/exponent precision cannot be
-                // recovered. Numeric constraints therefore fail closed.
-                return false;
-            };
-            if schema.get("minimum").is_some_and(|bound| {
-                exact_json_number(bound).is_none_or(|bound| number < bound)
-            }) || schema.get("exclusiveMinimum").is_some_and(|bound| {
-                exact_json_number(bound).is_none_or(|bound| number <= bound)
-            }) || schema.get("maximum").is_some_and(|bound| {
-                exact_json_number(bound).is_none_or(|bound| number > bound)
-            }) || schema.get("exclusiveMaximum").is_some_and(|bound| {
-                exact_json_number(bound).is_none_or(|bound| number >= bound)
+            if STRUCTURED_NUMBER_BOUNDS.iter().any(|(key, refused)| {
+                schema.get(*key).is_some_and(|bound| {
+                    json_number_cmp(value, bound).is_none_or(|order| refused.contains(&order))
+                })
             }) {
                 return false;
             }
-            if schema.get("multipleOf").is_some_and(|bound| {
-                exact_json_number(bound).is_none_or(|bound| !exact_multiple_of(&number, &bound))
+            // A fraction's decimal digits are gone once it is an f64, so a
+            // multiple is judged on integers only; a fraction fails closed.
+            if schema.get(STRUCTURED_MULTIPLE_OF).is_some_and(|divisor| {
+                match (exact_json_number(value), exact_json_number(divisor)) {
+                    (Some(value), Some(divisor)) => !exact_multiple_of(&value, &divisor),
+                    _ => true,
+                }
             }) {
                 return false;
             }

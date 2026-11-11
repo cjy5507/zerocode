@@ -375,16 +375,16 @@ fn validate_credential(contents: &str) -> std::io::Result<()> {
 }
 
 /// A credential file written the way credential files are written: same-dir
-/// temp + rename so no reader sees half a token, 0600 before the bytes land.
+/// temp + rename so no reader sees half a token, owner-only from the temp's
+/// birth, and a temp that does not land is removed rather than left holding
+/// a token.
 fn write_credential(path: &Path, contents: &str) -> std::io::Result<()> {
     validate_credential(contents)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let stage = path.with_extension("zerocode-stage");
-    std::fs::write(&stage, contents)?;
-    crate::private_file::make_private(&stage)?;
-    std::fs::rename(&stage, path)
+    crate::private_file::write_atomically(
+        path,
+        contents.as_bytes(),
+        Some(crate::private_file::PRIVATE_FILE_MODE),
+    )
 }
 
 fn provenance_path(mirror: &Home) -> PathBuf {
@@ -569,6 +569,26 @@ mod tests {
             assert_ne!(system, inherited);
         }
         (dir, mirror, system)
+    }
+
+    /// A credential that cannot land takes its stage file with it: a token
+    /// left beside the credential is a second copy nobody will clean.
+    #[test]
+    fn a_credential_that_cannot_land_leaves_no_stage_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(AUTH_FILE);
+        // A folder with something in it where the file goes: the rename fails.
+        std::fs::create_dir_all(path.join("occupied")).expect("mkdir");
+        assert!(write_credential(&path, &auth(ACCOUNT_ONE, 100)).is_err());
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from(AUTH_FILE)],
+            "a token was left behind beside the credential"
+        );
     }
 
     /// The bug this module answers: a signed-in system home reaches the

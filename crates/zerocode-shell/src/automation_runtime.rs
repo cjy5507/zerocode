@@ -937,11 +937,21 @@ pub(super) fn start_automation(
 }
 
 /// The words a scheduled Flow is walked with: the command the Flow page's
-/// 「지금 걷기」 submits, answered as JSON.
-pub(super) fn flow_run_argv(slug: &str) -> Vec<String> {
-    ["recipe-run", "--name", slug, "--json"]
+/// 「지금 걷기」 submits, answered as JSON — and, for a job an agent asked for,
+/// the SHA-256 of the document the person allowed (`held_to`), which the walk
+/// judges the text it reads against.
+pub(super) fn flow_run_argv(slug: &str, held_to: Option<&str>) -> Vec<String> {
+    let mut argv = ["recipe-run", "--name", slug, "--json"]
         .map(str::to_string)
-        .to_vec()
+        .to_vec();
+    if let Some(sha256) = held_to {
+        argv.push(format!(
+            "--{}",
+            zerocode_core::computer_use::FLOW_SHA256_FLAG
+        ));
+        argv.push(sha256.to_string());
+    }
+    argv
 }
 
 /// Start a Flow job that names no agent: the window walks the recipe itself.
@@ -974,6 +984,27 @@ fn start_flow_run(
             claim,
             at,
             AutomationFailureInput::new(AutomationFailureStage::Workspace, error, root.clone()),
+        ));
+    }
+    // A job an agent asked for walks the Flow the person allowed, and no other
+    // (`computer_use::recipes::schedule`): once the document reads differently
+    // the job waits for the person, and its row says why.
+    // This look is the early word — the row says why before a walk is asked
+    // for. What holds the walk to the document is the walk itself: it carries
+    // the approved hash (`held_to` below) and judges the text it reads.
+    if automation.flow_changed_since_approval(
+        computer_use::recipes::schedule::document_sha256(state.local_data_root(), slug).as_deref(),
+    ) {
+        return Err(remember_automation_failure(
+            state,
+            automation,
+            claim,
+            at,
+            AutomationFailureInput::new(
+                AutomationFailureStage::LaunchPlan,
+                computer_use::recipes::schedule::FLOW_CHANGED.to_string(),
+                root.clone(),
+            ),
         ));
     }
     let Some(sender) = crate::flow_console::computer_sender() else {
@@ -1019,8 +1050,12 @@ fn start_flow_run(
         },
     );
     let (answer, waiting) = tokio::sync::oneshot::channel();
+    let held_to = automation
+        .asked
+        .as_ref()
+        .map(|asked| asked.flow_sha256.as_str());
     let sent = sender.send(zerocode_hookd::ComputerRequest {
-        argv: flow_run_argv(slug),
+        argv: flow_run_argv(slug, held_to),
         cwd: Some(root.display().to_string()),
         evidence,
         pane: None,
@@ -1608,6 +1643,32 @@ pub(super) fn set_automation_enabled_in(
         held.armed_at = Some(local_minute_now().epoch_minutes);
     }
     held.enabled = enabled;
+    write_automations(config_root, &rows)?;
+    domain.current_or_mint(id);
+    Ok(())
+}
+
+/// Allow again the Flow of a job an agent asked for, as its document stands
+/// now (`stands`, its hash): the approval moves to this document and this
+/// moment, and the job is armed — the firings it waited through are not ones
+/// it missed. A job the person wrote has no approval to move.
+pub(super) fn approve_automation_flow_in(
+    config_root: &Path,
+    id: &str,
+    stands: &str,
+    approved_at_ms: u64,
+) -> Result<(), String> {
+    let mut domain = automation_store_domain();
+    let mut rows = stored_automations(config_root);
+    let Some(held) = rows.iter_mut().find(|held| held.id == id) else {
+        return Err(format!("자동화 {id}을(를) 찾지 못했습니다"));
+    };
+    let Some(asked) = held.asked.as_mut() else {
+        return Err("직접 만든 자동화에는 다시 승인할 것이 없습니다".to_string());
+    };
+    asked.flow_sha256 = stands.to_string();
+    asked.approved_at_ms = approved_at_ms;
+    held.armed_at = Some(local_minute_now().epoch_minutes);
     write_automations(config_root, &rows)?;
     domain.current_or_mint(id);
     Ok(())

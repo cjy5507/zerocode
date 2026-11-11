@@ -42,12 +42,20 @@ use super::{
     TOOL_REPETITION_THRESHOLD, TRUNCATION_CONTINUATION_REMINDER,
 };
 
+/// Where a streaming turn was stopped stays on its record in the turn trace:
+/// the person's own stop is a cancelled turn, a host that stopped reading is a
+/// failed one. Neither writes a self-improvement candidate: nothing read that
+/// store, and a stop paid a lock and an fsync to add to it.
 #[test]
-#[cfg_attr(windows, ignore = "self-improve candidate storage is Unix-only: record_self_improve_candidate needs retained directory handles and returns Unsupported on Windows (runtime/src/memory/dreamer.rs:1052), so a turn there records no candidate")]
-fn explicit_streaming_cancel_boundaries_preserve_typed_dreamer_origin() {
+fn explicit_streaming_cancel_boundaries_keep_their_origin_in_the_turn_trace() {
     let _lock = crate::test_env_lock();
     let cwd = temp_workspace("typed-streaming-cancel");
     fs::create_dir_all(&cwd).expect("cwd");
+    let outcome_of = |session_id: &str| {
+        crate::turn_trace::read_session(&cwd, session_id)
+            .last()
+            .map(|record| record.outcome)
+    };
 
     let user_session = Session::new();
     let user_session_id = user_session.session_id.clone();
@@ -63,18 +71,10 @@ fn explicit_streaming_cancel_boundaries_preserve_typed_dreamer_origin() {
         user_runtime.cancel_streaming_turn_by_user("explicit user cancel"),
         super::StreamingTurnError::Cancelled
     ));
-
-    let after_user = crate::memory::read_self_improve_candidates(&cwd);
-    assert_eq!(after_user.len(), 1);
     assert_eq!(
-        after_user[0].kind,
-        decision_core::dreamer::CandidateKind::UserCancelled
+        outcome_of(&user_session_id),
+        Some(crate::turn_trace::TurnOutcome::Cancelled)
     );
-    assert!(after_user[0]
-        .evidence
-        .iter()
-        .any(|evidence| evidence.session_id == user_session_id
-            && evidence.detail == "explicit user cancel"));
 
     let host_session = Session::new();
     let host_session_id = host_session.session_id.clone();
@@ -90,15 +90,15 @@ fn explicit_streaming_cancel_boundaries_preserve_typed_dreamer_origin() {
         host_runtime.cancel_streaming_turn_by_host("render host failed"),
         super::StreamingTurnError::Cancelled
     ));
+    assert_eq!(
+        outcome_of(&host_session_id),
+        Some(crate::turn_trace::TurnOutcome::Failed)
+    );
 
-    let after_host = crate::memory::read_self_improve_candidates(&cwd);
-    assert!(after_host.iter().any(|candidate| {
-        candidate.kind == decision_core::dreamer::CandidateKind::TurnFailure
-            && candidate.evidence.iter().any(|evidence| {
-                evidence.session_id == host_session_id
-                    && evidence.detail == "render host failed"
-            })
-    }));
+    assert!(
+        !cwd.join(".zo").join("dream").join("candidates").exists(),
+        "a stopped turn writes no self-improvement candidate"
+    );
     let _ = fs::remove_dir_all(cwd);
 }
 
@@ -12028,7 +12028,9 @@ fn read_file_distinct_windows_do_not_escalate_repetition_guard() {
         vec!["system".to_string()],
     );
 
-    for i in 0..(super::TOOL_REPETITION_HARD_STOP * 2) {
+    // A window a line: `offset` is the line read, counted from 1 (0 and 1
+    // are both the first line, so they would be one window).
+    for i in 1..=(super::TOOL_REPETITION_HARD_STOP * 2) {
         let input = format!("{{\"path\":\"x.rs\",\"offset\":{i},\"limit\":1}}");
         assert!(
             matches!(
@@ -16665,9 +16667,11 @@ fn run_turn_records_fallback_when_empty_recovery_also_exhausts() {
     );
 }
 
+/// A turn the provider failed is on record in the turn trace and nowhere
+/// else: it writes no self-improvement candidate, with dreaming on as much as
+/// with it off. Nothing read that store.
 #[test]
-#[cfg_attr(windows, ignore = "self-improve candidate storage is Unix-only: record_self_improve_candidate needs retained directory handles and returns Unsupported on Windows (runtime/src/memory/dreamer.rs:1052), so a turn there records no candidate")]
-fn run_turn_failure_candidates_respect_runtime_auto_dream_gate() {
+fn a_failed_turn_is_traced_and_writes_no_self_improvement_candidate() {
     struct FailingApi;
 
     impl ApiClient for FailingApi {
@@ -16676,56 +16680,32 @@ fn run_turn_failure_candidates_respect_runtime_auto_dream_gate() {
         }
     }
 
-    let disabled_dir = tempfile::tempdir().expect("tempdir");
-    let disabled_features = RuntimeFeatureConfig::default().with_auto_dream_enabled(false);
-    let mut disabled_runtime = ConversationRuntime::new_with_features(
-        Session::new(),
-        FailingApi,
-        StaticToolExecutor::new(),
-        PermissionPolicy::new(PermissionMode::DangerFullAccess),
-        vec!["system".to_string()],
-        &disabled_features,
-    );
-    disabled_runtime.set_workspace_cwd(disabled_dir.path().to_path_buf());
-
-    let error = disabled_runtime
-        .run_turn("hello", None)
-        .expect_err("API failures should propagate");
-    assert_eq!(error.to_string(), "upstream failed");
-    assert!(
-        crate::memory::read_self_improve_candidates(disabled_dir.path()).is_empty(),
-        "per-runtime autoDreamEnabled=false must suppress runtime-level candidate producers"
-    );
-    assert!(
-        !disabled_dir
-            .path()
-            .join(".zo")
-            .join("dream")
-            .join("candidates")
-            .exists(),
-        "disabled runtime candidate producer must not create a candidates directory"
-    );
-
-    let enabled_dir = tempfile::tempdir().expect("tempdir");
-    let mut enabled_runtime = ConversationRuntime::new_with_features(
-        Session::new(),
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session = Session::new();
+    let session_id = session.session_id.clone();
+    let mut runtime = ConversationRuntime::new_with_features(
+        session,
         FailingApi,
         StaticToolExecutor::new(),
         PermissionPolicy::new(PermissionMode::DangerFullAccess),
         vec!["system".to_string()],
         &RuntimeFeatureConfig::default(),
     );
-    enabled_runtime.set_workspace_cwd(enabled_dir.path().to_path_buf());
+    runtime.set_workspace_cwd(dir.path().to_path_buf());
 
-    let error = enabled_runtime
+    let error = runtime
         .run_turn("hello", None)
         .expect_err("API failures should propagate");
     assert_eq!(error.to_string(), "upstream failed");
-    let candidates = crate::memory::read_self_improve_candidates(enabled_dir.path());
-    assert_eq!(candidates.len(), 1);
     assert_eq!(
-        candidates[0].kind,
-        decision_core::dreamer::CandidateKind::TurnFailure
+        crate::turn_trace::read_session(dir.path(), &session_id)
+            .last()
+            .map(|record| record.outcome),
+        Some(crate::turn_trace::TurnOutcome::Failed)
+    );
+    assert!(
+        !dir.path().join(".zo").join("dream").join("candidates").exists(),
+        "a failed turn writes no self-improvement candidate"
     );
 }
 
@@ -21875,4 +21855,196 @@ mod wire_prefix_stability {
             summary.messages
         );
     }
+}
+
+/// An executor whose registry holds tools the policy never heard of — MCP
+/// tools whose server was discovered after the policy was built — and what
+/// they declare: one reads, one destroys, one says nothing.
+struct FoundLater(Arc<Mutex<Vec<String>>>);
+
+impl ToolExecutor for FoundLater {
+    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        self.0.lock().expect("calls").push(format!("{tool_name} {input}"));
+        Ok("ran".to_string())
+    }
+
+    fn declared_mode(&self, tool_name: &str) -> Option<PermissionMode> {
+        match tool_name {
+            "mcp__docs__search" => Some(PermissionMode::ReadOnly),
+            "mcp__docs__purge" => Some(PermissionMode::DangerFullAccess),
+            _ => None,
+        }
+    }
+}
+
+/// The model's one batch of calls to them, then its answer.
+struct CallsToolsFoundLater(bool);
+
+impl ApiClient for CallsToolsFoundLater {
+    fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        if std::mem::replace(&mut self.0, true) {
+            return Ok(vec![AssistantEvent::TextDelta("done".into()), AssistantEvent::MessageStop]);
+        }
+        let through = |id: &str, name: &str| AssistantEvent::ToolUse {
+            id: id.to_string(),
+            name: core_types::tool_names::CAPABILITY_INVOKE.to_string(),
+            input: serde_json::json!({ "name": name, "input": { "query": "x" } }).to_string(),
+        };
+        Ok(vec![
+            through("call-1", "mcp__docs__search"),
+            through("call-2", "mcp__docs__purge"),
+            through("call-3", "mcp__docs__undeclared"),
+            AssistantEvent::ToolUse {
+                id: "call-4".to_string(),
+                name: "mcp__docs__search".to_string(),
+                input: r#"{"query":"y"}"#.to_string(),
+            },
+            AssistantEvent::MessageStop,
+        ])
+    }
+}
+
+/// A read-only session whose policy was built before those tools were found.
+fn a_read_only_session_that_finds_tools_later(ran: &Arc<Mutex<Vec<String>>>) -> ConversationRuntime<CallsToolsFoundLater, FoundLater> {
+    let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+        .with_tool_requirement(core_types::tool_names::CAPABILITY_INVOKE, PermissionMode::ReadOnly);
+    assert!(!policy.has_tool_requirement("mcp__docs__search"), "the policy was built before the tool was found");
+    let mut runtime = ConversationRuntime::new(
+        Session::new(),
+        CallsToolsFoundLater(false),
+        FoundLater(Arc::clone(ran)),
+        policy,
+        vec!["system".into()],
+    );
+    let cwd = temp_workspace("tools-found-later");
+    fs::create_dir_all(&cwd).expect("workspace");
+    runtime.set_workspace_cwd(cwd);
+    runtime
+}
+
+/// The read-only tool ran through the wrapper and by its name, and nothing
+/// else did: not the one that destroys, not the one that declares nothing.
+fn assert_only_the_read_only_tool_ran(ran: &Arc<Mutex<Vec<String>>>) {
+    let ran = ran.lock().expect("calls");
+    assert_eq!(ran.len(), 2, "{ran:?}");
+    assert!(ran[0].starts_with("CapabilityInvoke ") && ran[0].contains("mcp__docs__search"), "{ran:?}");
+    assert!(ran[1].starts_with("mcp__docs__search "), "{ran:?}");
+}
+
+/// A tool that joined the registry after the policy was built is judged at
+/// the grade the executor's registry declares for it, through the wrapper it
+/// is called by and by its name: a read-only one runs in a read-only session,
+/// a destructive one does not, and one that declares nothing stays at the
+/// highest grade.
+#[test]
+fn a_tool_found_after_the_policy_was_built_is_judged_at_the_grade_it_declares() {
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = a_read_only_session_that_finds_tools_later(&ran);
+    runtime.run_turn("search the docs", None).expect("the turn");
+    assert_only_the_read_only_tool_ran(&ran);
+}
+
+/// The same on the streaming turn, which is the one every front runs: the
+/// grade is learned there before the call is judged too.
+#[test]
+fn a_tool_found_later_is_judged_at_its_grade_on_the_streaming_turn_too() {
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = a_read_only_session_that_finds_tools_later(&ran);
+    let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    tokio_runtime.block_on(async {
+        let (render_tx, _render_rx) = tokio::sync::mpsc::channel(256);
+        let prompter: Arc<dyn crate::permission::PermissionPrompter> = Arc::new(AllowAsyncPrompterForOverflow);
+        runtime
+            .run_turn_streaming_with_images("search the docs", Vec::new(), render_tx, prompter)
+            .await
+            .expect("the turn");
+    });
+    assert_only_the_read_only_tool_ran(&ran);
+}
+
+/// A prompt only a person may answer leaves no allow rule, whatever a front
+/// answers it with: a schedule's question answered with the lasting allow —
+/// which the question does not offer, and the IDE channel takes anyway —
+/// registers that one schedule and grants nothing. An ordinary prompt
+/// answered the same way still leaves its rule.
+#[test]
+fn a_lasting_allow_sent_to_a_person_only_prompt_allows_the_one_call_and_leaves_no_rule() {
+    struct Ran(Arc<Mutex<Vec<String>>>);
+    impl ToolExecutor for Ran {
+        fn execute(&mut self, tool_name: &str, _input: &str) -> Result<String, ToolError> {
+            self.0.lock().expect("calls").push(tool_name.to_string());
+            Ok("ran".to_string())
+        }
+    }
+    struct OneCall {
+        name: &'static str,
+        input: String,
+        called: bool,
+    }
+    impl ApiClient for OneCall {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            if std::mem::replace(&mut self.called, true) {
+                return Ok(vec![AssistantEvent::TextDelta("done".into()), AssistantEvent::MessageStop]);
+            }
+            Ok(vec![
+                AssistantEvent::ToolUse {
+                    id: "call-1".to_string(),
+                    name: self.name.to_string(),
+                    input: self.input.clone(),
+                },
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+    // What the prompter is asked does not depend on the pane the suite runs
+    // in: a pane the ledger summoned as a worker puts no question at all.
+    let _env = crate::test_env_lock();
+    let _pane = EnvVarGuard::unset(zerocode_core::agent_teams::TEAM_PANE_VAR);
+    let _leader = EnvVarGuard::unset(zerocode_core::agent_teams::TEAM_LEADER_VAR);
+
+    // The calls that ran and the rules left behind, when the front answers
+    // the one prompt with the lasting allow.
+    let answered_with_a_lasting_allow = |name: &'static str, input: &str, mode: PermissionMode| {
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let policy = PermissionPolicy::new(mode).with_tool_requirement(name, PermissionMode::DangerFullAccess);
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            OneCall { name, input: input.to_string(), called: false },
+            Ran(Arc::clone(&ran)),
+            policy,
+            vec!["system".into()],
+        );
+        let cwd = temp_workspace("lasting-allow");
+        fs::create_dir_all(&cwd).expect("workspace");
+        runtime.set_workspace_cwd(cwd);
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        tokio_runtime.block_on(async {
+            let (render_tx, _render_rx) = tokio::sync::mpsc::channel(256);
+            let prompter: Arc<dyn crate::permission::PermissionPrompter> = Arc::new(AllowAsyncPrompterForOverflow);
+            runtime
+                .run_turn_streaming_with_images("do it", Vec::new(), render_tx, prompter)
+                .await
+                .expect("the turn");
+        });
+        let ran = ran.lock().expect("calls").clone();
+        (ran, runtime.take_granted_permission_rules())
+    };
+
+    let (ran, rules) = answered_with_a_lasting_allow(
+        crate::schedule_guard::TOOL,
+        r#"{"schedule":"0 9 * * 1-5","prompt":"check"}"#,
+        PermissionMode::DangerFullAccess,
+    );
+    assert_eq!(ran, [crate::schedule_guard::TOOL], "the schedule the person was asked about is registered");
+    assert!(rules.is_empty(), "and no rule is left for the next one: {rules:?}");
+
+    let (ran, rules) = answered_with_a_lasting_allow("browser", "{}", PermissionMode::WorkspaceWrite);
+    assert_eq!(ran, ["browser"]);
+    assert_eq!(rules.len(), 1, "an ordinary prompt's lasting allow still leaves its rule: {rules:?}");
 }

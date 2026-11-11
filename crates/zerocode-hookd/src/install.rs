@@ -221,14 +221,25 @@ pub fn script_path_for(home: &Path, agent: AgentKind, host: ScriptHost) -> PathB
 /// extension left open the way Orca leaves it (a `.cmd` written by a Windows
 /// install of this app is still ours to clean from a synced config).
 fn managed_needle(agent: AgentKind) -> String {
-    format!(".zerocode/agent-hooks/{}-hook.", agent.slug())
+    our_script_needle(&format!("{}-hook", agent.slug()))
 }
 
-/// A Windows install spells the same path with backslashes; one spelling
-/// before the needle looks, so an entry written on either host is
-/// recognized on both.
+/// The needle for the script with this file stem in our
+/// `.zerocode/agent-hooks/` folder, extension left open.
+pub(crate) fn our_script_needle(stem: &str) -> String {
+    format!(".zerocode/agent-hooks/{stem}.")
+}
+
+/// Does `command` carry `needle`? A Windows install spells the same path
+/// with backslashes; one spelling before the needle looks, so an entry
+/// written on either host is recognized on both — for every agent's
+/// settings and for Codex's `hooks.json` alike.
+pub(crate) fn command_has_needle(command: &str, needle: &str) -> bool {
+    command.replace('\\', "/").contains(needle)
+}
+
 fn is_managed_command(command: &str, agent: AgentKind) -> bool {
-    command.replace('\\', "/").contains(&managed_needle(agent))
+    command_has_needle(command, &managed_needle(agent))
 }
 
 /// `'…'`-quote for /bin/sh, the only quoting a path in a command gets.
@@ -315,9 +326,18 @@ fn read_config(path: &Path) -> Option<Map<String, Value>> {
     }
 }
 
-fn write_config(path: &Path, config: &Map<String, Value>) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Write `config` over the file `read` came from — unless it says what the
+/// file already said. The window reconciles at every start and the agents
+/// watch these files: a file that already says this (in whatever formatting
+/// the user keeps) is not written again, and it is not read a second time to
+/// find that out.
+fn write_config(
+    path: &Path,
+    read: &Map<String, Value>,
+    config: &Map<String, Value>,
+) -> std::io::Result<()> {
+    if read == config {
+        return Ok(());
     }
     let mut text = serde_json::to_string_pretty(&Value::Object(config.clone()))
         .expect("a JSON map serializes");
@@ -325,11 +345,7 @@ fn write_config(path: &Path, config: &Map<String, Value>) -> std::io::Result<()>
     // Through a sibling temp and a rename: the agent may read its settings at
     // any moment, and half a settings file is a parse error that turns off
     // every hook the user wrote too.
-    let tmp = path.with_extension("json.zerocode-tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    crate::private_file::replace_keeping_mode(path, &text)
 }
 
 /// Does this hook definition (in any of the vendor shapes) run one of our
@@ -723,11 +739,12 @@ pub fn install_agent(paths: &InstallPaths, agent: AgentKind) -> HookStatus {
         // home file AND one per account directory, because a launched claude
         // reads only the `CLAUDE_CONFIG_DIR` it was handed.
         for file in paths.config_paths(agent) {
-            let Some(mut config) = read_config(&file) else {
+            let Some(read) = read_config(&file) else {
                 return unreadable(agent, &file);
             };
+            let mut config = read.clone();
             install_nested(&mut config, agent, events, &script, host, timeout);
-            if write_config(&file, &config).is_err() {
+            if write_config(&file, &read, &config).is_err() {
                 return unreadable(agent, &file);
             }
         }
@@ -760,13 +777,14 @@ pub fn remove_agent(paths: &InstallPaths, agent: AgentKind) -> HookStatus {
     // Taken out of every file it was put into — the account files too, or
     // "off" leaves a hook running in each launched claude.
     for file in paths.config_paths(agent) {
-        let Some(mut config) = read_config(&file) else {
+        let Some(read) = read_config(&file) else {
             // A file that never existed has nothing of ours in it.
             if !file.exists() {
                 continue;
             }
             return unreadable(agent, &file);
         };
+        let mut config = read.clone();
         if agent == AgentKind::Antigravity {
             remove_antigravity_bundle(&mut config, agent);
         } else if let Some(hooks) = config.get("hooks").and_then(Value::as_object) {
@@ -774,7 +792,7 @@ pub fn remove_agent(paths: &InstallPaths, agent: AgentKind) -> HookStatus {
             clean_hooks_object(&mut hooks, agent);
             config.insert("hooks".to_string(), Value::Object(hooks));
         }
-        if file.exists() && write_config(&file, &config).is_err() {
+        if file.exists() && write_config(&file, &read, &config).is_err() {
             return unreadable(agent, &file);
         }
     }
@@ -863,9 +881,10 @@ fn nested_or_flat_present(config: &Map<String, Value>, agent: AgentKind, events:
 
 fn install_cursor(paths: &InstallPaths, config_path: &Path, command: &str) -> HookStatus {
     let agent = AgentKind::Cursor;
-    let Some(mut config) = read_config(config_path) else {
+    let Some(read) = read_config(config_path) else {
         return unreadable(agent, config_path);
     };
+    let mut config = read.clone();
     let mut hooks = config
         .get("hooks")
         .and_then(Value::as_object)
@@ -887,7 +906,7 @@ fn install_cursor(paths: &InstallPaths, config_path: &Path, command: &str) -> Ho
     if !config.contains_key("version") {
         config.insert("version".to_string(), json!(1));
     }
-    if write_config(config_path, &config).is_err() {
+    if write_config(config_path, &read, &config).is_err() {
         return unreadable(agent, config_path);
     }
     status_of(paths, agent)
@@ -921,9 +940,10 @@ const COPILOT_EVENTS: &[&str] = &[
 /// because Copilot's payload does not say which event fired.
 fn install_copilot(paths: &InstallPaths, config_path: &Path) -> HookStatus {
     let agent = AgentKind::Copilot;
-    let Some(mut config) = read_config(config_path) else {
+    let Some(read) = read_config(config_path) else {
         return unreadable(agent, config_path);
     };
+    let mut config = read.clone();
     let mut hooks = config
         .get("hooks")
         .and_then(Value::as_object)
@@ -948,7 +968,7 @@ fn install_copilot(paths: &InstallPaths, config_path: &Path) -> HookStatus {
         hooks.insert((*event).to_string(), Value::Array(definitions));
     }
     config.insert("hooks".to_string(), Value::Object(hooks));
-    if write_config(config_path, &config).is_err() {
+    if write_config(config_path, &read, &config).is_err() {
         return unreadable(agent, config_path);
     }
     status_of(paths, agent)
@@ -974,9 +994,10 @@ const ANTIGRAVITY_BUNDLE: &str = "zerocode-status";
 
 fn install_antigravity(paths: &InstallPaths, config_path: &Path, host: ScriptHost) -> HookStatus {
     let agent = AgentKind::Antigravity;
-    let Some(mut config) = read_config(config_path) else {
+    let Some(read) = read_config(config_path) else {
         return unreadable(agent, config_path);
     };
+    let mut config = read.clone();
     let script = script_path_for(&paths.home, agent, host);
     // Clean every old managed event, including ones we no longer install.
     remove_antigravity_bundle(&mut config, agent);
@@ -1001,7 +1022,7 @@ fn install_antigravity(paths: &InstallPaths, config_path: &Path, host: ScriptHos
         bundle.insert((*event).to_string(), Value::Array(definitions));
     }
     config.insert(ANTIGRAVITY_BUNDLE.to_string(), Value::Object(bundle));
-    if write_config(config_path, &config).is_err() {
+    if write_config(config_path, &read, &config).is_err() {
         return unreadable(agent, config_path);
     }
     status_of(paths, agent)
@@ -1131,18 +1152,18 @@ fn install_kimi(paths: &InstallPaths, config_path: &Path, command: &str) -> Hook
 /// Atomic, and with a `.bak` of what was there — measured off Orca's own kimi
 /// writer, and warranted here more than anywhere: this file is the user's
 /// whole kimi configuration and we are editing it as TEXT.
+///
+/// A file that already reads `text` is not written, and so not backed up:
+/// a second start would otherwise replace the user's own file in `.bak` with
+/// our first write.
 fn write_kimi(config_path: &Path, text: &str) -> std::io::Result<()> {
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    if std::fs::read_to_string(config_path).is_ok_and(|current| current == text) {
+        return Ok(());
     }
     if config_path.exists() {
         let _ = std::fs::copy(config_path, config_path.with_extension("toml.bak"));
     }
-    let tmp = config_path.with_extension("toml.zerocode-tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, config_path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    crate::private_file::replace_keeping_mode(config_path, text)
 }
 
 fn remove_kimi(paths: &InstallPaths, config_path: &Path) -> HookStatus {
@@ -1755,6 +1776,153 @@ mod tests {
             config_path.with_extension("toml.bak").exists(),
             "no backup was kept"
         );
+    }
+
+    /// A rewrite keeps the mode the user gave the file: a 0600 settings file
+    /// (its `env` may hold a key) is not 0644 after our install or remove,
+    /// and neither is a 0600 kimi config.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewritten_config_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |path: &Path| std::fs::metadata(path).expect("stat").permissions().mode() & 0o777;
+        // A mode no common umask makes, so a write that forgot the file's
+        // mode cannot pass by luck.
+        const KEPT_MODE: u32 = 0o640;
+        let (_home, paths) = paths();
+        for agent in [AgentKind::Claude, AgentKind::Kimi] {
+            let config_path = paths.config_path(agent);
+            std::fs::create_dir_all(config_path.parent().expect("parent")).expect("dir");
+            let seed = if agent == AgentKind::Kimi {
+                "model = \"k2\"\n"
+            } else {
+                "{\"env\":{\"EXAMPLE_KEY\":\"example-token\"}}"
+            };
+            std::fs::write(&config_path, seed).expect("seed");
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(KEPT_MODE))
+                .expect("chmod");
+
+            let installed = install_agent(&paths, agent);
+            assert_eq!(
+                installed.state,
+                HookInstallState::Installed,
+                "{installed:?}"
+            );
+            assert_eq!(
+                mode(&config_path),
+                KEPT_MODE,
+                "{agent:?} install widened the file"
+            );
+
+            remove_agent(&paths, agent);
+            assert_eq!(
+                mode(&config_path),
+                KEPT_MODE,
+                "{agent:?} remove widened the file"
+            );
+        }
+    }
+
+    /// A settings file kept as a link (shared between homes, kept in a
+    /// dotfiles folder) stays a link: install and remove write through it,
+    /// keeping the mode of the file it points at.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_config_stays_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let (home, paths) = paths();
+        for agent in [AgentKind::Claude, AgentKind::Kimi] {
+            let config_path = paths.config_path(agent);
+            std::fs::create_dir_all(config_path.parent().expect("parent")).expect("dir");
+            let real = home
+                .path()
+                .join("dotfiles")
+                .join(config_path.file_name().expect("name"));
+            std::fs::create_dir_all(real.parent().expect("parent")).expect("dir");
+            let seed = if agent == AgentKind::Kimi {
+                "model = \"k2\"\n"
+            } else {
+                "{\"env\":{\"EXAMPLE_KEY\":\"example-token\"}}"
+            };
+            std::fs::write(&real, seed).expect("seed");
+            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+            std::os::unix::fs::symlink(&real, &config_path).expect("link");
+
+            let installed = install_agent(&paths, agent);
+            assert_eq!(
+                installed.state,
+                HookInstallState::Installed,
+                "{installed:?}"
+            );
+            remove_agent(&paths, agent);
+
+            let meta = std::fs::symlink_metadata(&config_path).expect("lstat");
+            assert!(
+                meta.file_type().is_symlink(),
+                "{agent:?} replaced the link with a plain file"
+            );
+            let mode = std::fs::metadata(&real).expect("stat").permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o640,
+                "{agent:?} changed the linked file's mode"
+            );
+        }
+    }
+
+    /// A reconcile that changes nothing writes nothing: the window reconciles
+    /// at every start, the agents watch these files, and kimi's `.bak` must
+    /// still hold the user's own file after the second start, not our output.
+    #[test]
+    fn an_unchanged_config_is_not_written_again() {
+        let (_home, paths) = paths();
+        let kimi = paths.config_path(AgentKind::Kimi);
+        std::fs::create_dir_all(kimi.parent().expect("parent")).expect("dir");
+        let seed = "model = \"k2\"\n";
+        std::fs::write(&kimi, seed).expect("seed");
+        let backup = kimi.with_extension("toml.bak");
+
+        install_agent(&paths, AgentKind::Kimi);
+        assert_eq!(std::fs::read_to_string(&backup).expect("bak"), seed);
+        install_agent(&paths, AgentKind::Kimi);
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("bak"),
+            seed,
+            "a second start replaced the user's backup with our own output"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let inode = |path: &Path| std::fs::metadata(path).expect("stat").ino();
+            for agent in [AgentKind::Claude, AgentKind::Cursor, AgentKind::Kimi] {
+                install_agent(&paths, agent);
+                let file = paths.config_path(agent);
+                let before = inode(&file);
+                install_agent(&paths, agent);
+                assert_eq!(
+                    inode(&file),
+                    before,
+                    "{agent:?}: an unchanged config was rewritten"
+                );
+            }
+            // A user file with nothing of ours is not reformatted by a remove.
+            let droid = paths.config_path(AgentKind::Droid);
+            std::fs::create_dir_all(droid.parent().expect("parent")).expect("dir");
+            std::fs::write(&droid, "{ \"theme\": \"dark\" }").expect("seed");
+            let before = inode(&droid);
+            remove_agent(&paths, AgentKind::Droid);
+            assert_eq!(
+                inode(&droid),
+                before,
+                "a remove rewrote a file it had nothing in"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&droid).expect("read"),
+                "{ \"theme\": \"dark\" }"
+            );
+        }
     }
 
     /// Half-present entries answer `partial`, so the settings screen can say

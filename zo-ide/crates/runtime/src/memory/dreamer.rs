@@ -47,7 +47,7 @@ use decision_core::dreamer::{
     AdvisorRole, ApplyGateDecision, ApplyGateInput, AutomationDigest, CandidateEvidence,
     CandidateKind, CandidateStatus, CurationPlan, DreamFusionReport, LessonKind,
     LessonObservation, PatchCheckResult, PatchRisk, PromotionPolicy, QuarantinePatchRun,
-    SelfImproveCandidate,
+    SelfImproveCandidate, SkipReason,
 };
 
 /// Directory under `.zo/` where sessions drop candidate-lesson logs and the
@@ -229,29 +229,64 @@ impl DreamReport {
         self.applied.is_empty()
     }
 
-    /// One-line human summary for logs/notifications.
+    /// One line for the person: what the pass kept, and what it holds until a
+    /// second session shows the same thing.
+    ///
+    /// It says nothing of what a person can do nothing with — a lesson
+    /// already in memory, an entry that needed no write, a second lesson with
+    /// the same sentence. Counted aloud, those read as work that failed:
+    /// "promoted 0, skipped 21" was a pass with nothing left to learn, and it
+    /// was taken for a dreamer that does not work. [`Self::audit_line`] keeps
+    /// every count, for a log.
     #[must_use]
     pub fn summary_line(&self) -> String {
-        let unchanged = self
-            .applied
-            .iter()
-            .filter(|applied| applied.outcome == WriteOutcome::Unchanged)
-            .count();
-        let promoted = self.applied.len() - unchanged;
-        if unchanged == 0 {
-            format!(
-                "dreamer: promoted {promoted}, skipped {}",
-                self.plan.skipped.len()
-            )
-        } else {
-            // A lesson that needed no write is its own count — "promoted 5"
-            // for five untouched entries reads as churn that did not happen.
-            format!(
-                "dreamer: promoted {promoted}, {unchanged} already current, skipped {}",
-                self.plan.skipped.len()
-            )
+        let kept = self.written();
+        let waiting = self.skipped_for(|reason| matches!(reason, SkipReason::NotRepeatedEnough { .. }));
+        match (kept, waiting) {
+            (0, 0) => "dreamer: nothing new".to_string(),
+            (0, _) => format!("dreamer: {} waiting for a second session", lessons(waiting)),
+            (_, 0) => format!("dreamer: kept {}", lessons(kept)),
+            _ => format!("dreamer: kept {}, {waiting} more waiting for a second session", lessons(kept)),
         }
     }
+
+    /// The pass in counts, for a log: what it wrote, what needed no write, and
+    /// every candidate it left with the reason it was left.
+    #[must_use]
+    pub fn audit_line(&self) -> String {
+        format!(
+            "dreamer: wrote {}, unchanged {}, skipped {} (known {}, same sentence {}, one session {}, \
+             unverified {}, low confidence {}, over budget {})",
+            self.written(),
+            self.applied.len() - self.written(),
+            self.plan.skipped.len(),
+            self.skipped_for(|reason| matches!(reason, SkipReason::AlreadyKnown)),
+            self.skipped_for(|reason| matches!(reason, SkipReason::SameSummaryTemplate { .. })),
+            self.skipped_for(|reason| matches!(reason, SkipReason::NotRepeatedEnough { .. })),
+            self.skipped_for(|reason| matches!(reason, SkipReason::Unverified)),
+            self.skipped_for(|reason| matches!(reason, SkipReason::BelowConfidenceFloor { .. })),
+            self.skipped_for(|reason| matches!(reason, SkipReason::BudgetExhausted)),
+        )
+    }
+
+    /// How many lessons the pass wrote: an entry that needed no write is not
+    /// one — "kept 5" for five untouched entries reads as churn that did not
+    /// happen.
+    fn written(&self) -> usize {
+        self.applied
+            .iter()
+            .filter(|applied| applied.outcome != WriteOutcome::Unchanged)
+            .count()
+    }
+
+    fn skipped_for(&self, is: impl Fn(&SkipReason) -> bool) -> usize {
+        self.plan.skipped.iter().filter(|skipped| is(&skipped.reason)).count()
+    }
+}
+
+/// `count` lessons, in words: "1 lesson", "3 lessons".
+fn lessons(count: usize) -> String {
+    if count == 1 { "1 lesson".to_string() } else { format!("{count} lessons") }
 }
 
 /// The Dreamer orchestrator: binds a [`LessonSource`], a [`MemoryStore`], and a
@@ -520,6 +555,25 @@ fn entry_is_expired(fields: EntryDecayFields, now_secs: u64) -> bool {
     now_secs > deadline
 }
 
+/// What the slug of a lesson the dreamer no longer writes opens with: the one
+/// sentence per failed tool name the turn trace was mined for, and the fixed
+/// sentences about zo's own `/goal` and `/loop` ([`dream_at_cwd`] says why
+/// neither is read now). An entry of these kinds that a pass wrote is
+/// archived by the next pass whatever its age — it would otherwise be
+/// recalled into requests for the rest of its ninety days.
+#[cfg(unix)]
+const RETIRED_SLUG_PREFIXES: [&str; 4] = [
+    "gotcha-recurring-tool-failure-",
+    "gotcha-goal-automation-",
+    "workflow-goal-automation-",
+    "workflow-loop-automation-",
+];
+
+#[cfg(unix)]
+fn slug_is_of_a_retired_lesson(slug: &str) -> bool {
+    RETIRED_SLUG_PREFIXES.iter().any(|prefix| slug.starts_with(prefix))
+}
+
 #[cfg(unix)]
 fn entry_is_decay_archive_candidate(
     memory: &crate::secure_fs::RetainedDir,
@@ -530,7 +584,9 @@ fn entry_is_decay_archive_candidate(
     if !has_matching_dreamer_owned_marker(memory, slug, body) {
         return false;
     }
-    if !entry_is_expired(parse_entry_decay_fields(body), now_secs) {
+    if !slug_is_of_a_retired_lesson(slug)
+        && !entry_is_expired(parse_entry_decay_fields(body), now_secs)
+    {
         return false;
     }
     if !memory_body_has_classification_metadata(body) {
@@ -2277,10 +2333,10 @@ impl LessonSource for JsonlLessonSource {
 
 /// Reads candidate observations from the externalized turn trace under
 /// `.zo/turns/` (written by `crate::turn_trace`), distilling recurring
-/// tool-failure gotchas via the pure [`lessons_from_turns`] brain. This is the
-/// second producer the doc's §12-2 calls for ("a coding agent remembers
-/// recurring failures"): it complements [`JsonlLessonSource`]'s green-accept
-/// workflow lessons, so the Dreamer mines friction *and* success signals.
+/// tool-failure gotchas via the pure [`lessons_from_turns`] brain.
+///
+/// No pass reads this source ([`dream_at_cwd`] says why): what it made was one
+/// sentence per failed tool name. It stays until its removal lands.
 ///
 /// [`lessons_from_turns`]: decision_core::dreamer::lessons_from_turns
 pub struct TurnLogLessonSource {
@@ -2331,6 +2387,10 @@ impl LessonSource for UserPatternLessonSource {
 }
 
 /// Reads goal/loop automation events and distills them into Dreamer observations.
+///
+/// No pass reads this source ([`dream_at_cwd`] says why): nothing writes the
+/// events, and their sentences are about zo's own automation. It stays until
+/// its removal lands.
 pub struct AutomationLessonSource {
     cwd: PathBuf,
 }
@@ -3574,17 +3634,21 @@ fn memory_index_summaries(memory_dir: &Path) -> Vec<(String, String)> {
 /// production [`PromotionPolicy::default`] gate. The one-call entry point a
 /// scheduler (cron) or `/dream` command invokes.
 ///
-/// Mines *both* externalized signal streams through a [`CompositeLessonSource`]:
-/// the `.zo/dream/` candidate logs (green-accept workflow lessons) and the
-/// `.zo/turns/` turn trace (recurring tool-failure gotchas). The curation
-/// gate dedups and ranks the merged pool, so adding a producer never changes
-/// the promotion contract.
+/// Mines two signal streams through a [`CompositeLessonSource`]: the
+/// `.zo/dream/` candidate logs (a project gate that ran green after edits)
+/// and the person's verified patterns. The curation gate dedups and ranks the
+/// merged pool, so adding a producer never changes the promotion contract.
+///
+/// Two streams it once mined are not read. The turn trace's failed tools made
+/// one sentence per tool name — "`bash` is error-prone here" — which is how a
+/// tool behaves, the thing the memory protocol tells a model never to record,
+/// and it was 243 of the 277 lessons one machine's passes had written
+/// (2026-11-11). Automation events had no writer, and their sentences were
+/// about zo's own `/goal` and `/loop`, not about the project.
 pub fn dream_at_cwd(cwd: &Path, active_model: Option<&str>) -> Result<DreamReport, DreamError> {
     let source = CompositeLessonSource::new(vec![
         Box::new(JsonlLessonSource::at_cwd(cwd)),
-        Box::new(TurnLogLessonSource::at_cwd(cwd)),
         Box::new(UserPatternLessonSource::at_cwd(cwd)),
-        Box::new(AutomationLessonSource::at_cwd(cwd)),
     ]);
     let dreamer = Dreamer::new(
         source,
@@ -3958,19 +4022,28 @@ pub fn maybe_auto_dream_on_compaction(
     maybe_auto_dream(cwd, min_interval, active_model)
 }
 
-/// The folders whose logs an automatic pass reads, each beside its read cursor.
-fn automatic_curation_dirs(cwd: &Path) -> [PathBuf; 4] {
-    let dream = dream_dir(cwd);
-    [dream.clone(), trace_base(cwd).join(ZO_DIR_NAME).join("turns"),
-        dream.join(AUTOMATION_DIR), user_pattern_dir(cwd)]
+/// The folders whose logs an automatic pass reads, each beside its read
+/// cursor: the ones [`dream_at_cwd`] mines, so a turn trace alone starts no
+/// pass.
+fn automatic_curation_dirs(cwd: &Path) -> [PathBuf; 2] {
+    [dream_dir(cwd), user_pattern_dir(cwd)]
+}
+
+/// The folders a pass read until it stopped mining the turn trace and the
+/// automation events, each with the read cursor that pass kept there. No
+/// pass writes in them now, so a pass stopped mid-write by an earlier zo
+/// left a temporary file there that nothing else would ever take away.
+fn retired_cursor_dirs(cwd: &Path) -> [PathBuf; 2] {
+    [trace_base(cwd).join(ZO_DIR_NAME).join("turns"), dream_dir(cwd).join(AUTOMATION_DIR)]
 }
 
 /// Cheap file-presence prefilter for automatic curation. The actual
 /// promotion gate still rejects one-off noise, unsupported hypotheses, and
 /// transient tool output; this merely avoids opening every candidate/index
-/// file when neither producer has written any evidence at all.
+/// file when neither producer has written any evidence at all and the store
+/// holds nothing a pass would age off.
 fn has_automatic_curation_evidence(cwd: &Path) -> bool {
-    automatic_curation_dirs(cwd)
+    let a_log_has_lines = automatic_curation_dirs(cwd)
         .into_iter().any(|dir| {
             if !fs::symlink_metadata(&dir).is_ok_and(|metadata| metadata.file_type().is_dir()) {
                 return false;
@@ -3980,22 +4053,41 @@ fn has_automatic_curation_evidence(cwd: &Path) -> bool {
                     && entry.file_type().is_ok_and(|kind| kind.is_file())
                     && entry.metadata().is_ok_and(|metadata| metadata.len() > 0)
             }))
-        })
+        });
+    // Entries are aged off where the store's folder can be held open, which
+    // is where a pass has that second thing to do.
+    a_log_has_lines || (cfg!(unix) && owns_an_entry_to_age(cwd))
+}
+
+/// Whether the local store holds an entry a pass wrote. A pass is what ages
+/// those off and retires the kinds it no longer writes, so such a store is
+/// work for a pass though no log has a line. While the turn trace counted as
+/// evidence every project with a turn ran its passes; without this, one whose
+/// only lessons came from that trace would keep them for good.
+fn owns_an_entry_to_age(cwd: &Path) -> bool {
+    let markers = crate::memory::paths::memory_write_dir(cwd, true).join(DREAMER_OWNED_DIR);
+    fs::read_dir(markers).ok().is_some_and(|entries| {
+        entries.flatten().any(|entry| entry.path().extension().is_some_and(|extension| extension == "marker"))
+    })
 }
 
 /// Remove what an automatic pass stopped at its deadline left half-written:
-/// the temporary files of the read cursors, the marker and the error file
-/// that were last written more than [`AUTO_DREAM_PASS_DEADLINE`] before `now`.
-/// Only a pass that holds the lock calls it, and a writer still at work wrote
-/// its temporary file within the deadline, so that one stays.
+/// the temporary files of the read cursors — in the folders a pass reads and
+/// in the ones it used to ([`retired_cursor_dirs`]) — the marker and the
+/// error file that were last written more than [`AUTO_DREAM_PASS_DEADLINE`]
+/// before `now`. Only a pass that holds the lock calls it, and a writer still
+/// at work wrote its temporary file within the deadline, so that one stays.
 fn remove_abandoned_pass_writes(cwd: &Path, now: SystemTime) {
     let Some(cutoff) = now.checked_sub(AUTO_DREAM_PASS_DEADLINE) else {
         return;
     };
     let dream = dream_dir(cwd);
-    let cursors = automatic_curation_dirs(cwd).map(|dir| (dir, READ_CURSOR_FILE));
+    let cursors = automatic_curation_dirs(cwd)
+        .into_iter()
+        .chain(retired_cursor_dirs(cwd))
+        .map(|dir| (dir, READ_CURSOR_FILE));
     let pass_files = [(dream.clone(), THROTTLE_MARKER), (dream, AUTO_DREAM_ERROR_FILE)];
-    for (dir, file) in cursors.into_iter().chain(pass_files) {
+    for (dir, file) in cursors.chain(pass_files) {
         crate::secure_fs::remove_abandoned_temp_files(&dir, Path::new(file), cutoff);
     }
 }
@@ -4235,6 +4327,55 @@ mod retention_tests {
         let index = fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
         assert!(!index.contains("](stale-lesson.md)"));
         assert!(index.contains("](fresh-lesson.md)"));
+    }
+
+    /// A lesson of a kind the dreamer no longer writes — a tool's failures,
+    /// zo's own automation — is archived by the next pass though it was
+    /// written today. A kind it still writes waits out its window, and a
+    /// person's own note under such a name is never the dreamer's to retire.
+    #[test]
+    #[cfg_attr(windows, ignore = "memory decay is Unix-only: decay_expired archives through retained directory handles and archives nothing on Windows (runtime/src/memory/dreamer.rs:2582)")]
+    fn decay_retires_the_kinds_of_lesson_the_dreamer_no_longer_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        let store = FsMemoryStore {
+            memory_dir: memory_dir.clone(),
+        };
+        let now = 200 * 86_400;
+        let kept = "workflow-verified-check-command-cargo-test";
+        let retired = [
+            "gotcha-recurring-tool-failure-bash",
+            "workflow-goal-automation-repaired-then-succeeded",
+        ];
+        for slug in retired.into_iter().chain([kept]) {
+            store
+                .write_entry(&MemoryWriteRequest {
+                    slug: slug.to_string(),
+                    summary: format!("summary for {slug}"),
+                    body: render_entry_body(&promoted(slug), now, None),
+                })
+                .unwrap();
+        }
+        let own = "gotcha-recurring-tool-failure-mine";
+        fs::write(memory_dir.join(format!("{own}.md")), "my own note\n").unwrap();
+        upsert_index(&memory_dir.join("MEMORY.md"), own, "my own note").unwrap();
+
+        let mut archived = store.decay_expired(now).unwrap();
+        archived.sort_unstable();
+        assert_eq!(archived, retired);
+        for slug in retired {
+            assert!(!memory_dir.join(format!("{slug}.md")).exists(), "{slug}");
+            assert!(
+                memory_dir.join(DECAY_ARCHIVE_DIR).join(format!("{slug}.md")).exists(),
+                "{slug}"
+            );
+        }
+        assert!(memory_dir.join(format!("{kept}.md")).exists());
+        assert!(memory_dir.join(format!("{own}.md")).exists());
+        let index = fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+        assert!(!index.contains("](gotcha-recurring-tool-failure-bash.md)"));
+        assert!(index.contains(&format!("]({kept}.md)")));
+        assert!(index.contains(&format!("]({own}.md)")));
     }
 
     #[test]

@@ -998,6 +998,18 @@ class StatefulBackend {
     this.nextRemoteWorkspace = 1;
     this.remoteServers = [];
     this.nextRemoteServer = 1;
+    /* The phone link as `phone_link_status` answers it: Tailscale running
+     * with HTTPS ready, the link off, one phone already paired. */
+    this.phoneLink = {
+      enabled: false,
+      listening: false,
+      tailscale: { installed: true, running: true, dnsName: "host.example.test", httpsReady: true },
+      exposure: "absent",
+      pushReady: false,
+      devices: [
+        { id: "phone-1", name: "Fixture phone", pairedMs: 1, lastSeenMs: 1, push: true },
+      ],
+    };
     this.nextRemoteTerm = 900;
     this.keyboardLayout = { category: "us" };
     this.pwshAvailable = true;
@@ -2532,7 +2544,35 @@ class StatefulBackend {
         this.remoteServers = this.remoteServers.filter((server) => server.id !== args.id);
       });
       case "test_remote_server": return null;
-      case "open_remote_server_session": return ++this.nextRemoteTerm;
+      case "phone_link_status": return clone(this.phoneLink);
+      case "phone_link_enable":
+        this.phoneLink = {
+          ...this.phoneLink,
+          enabled: true,
+          listening: true,
+          exposure: "ours",
+          pushReady: true,
+          url: "https://host.example.test:10443/",
+        };
+        return clone(this.phoneLink);
+      case "phone_link_disable": {
+        const { url: _url, ...rest } = this.phoneLink;
+        this.phoneLink = { ...rest, enabled: false, listening: false, exposure: "absent" };
+        return clone(this.phoneLink);
+      }
+      case "phone_link_new_code": return {
+        code: "ABCD2345",
+        url: "https://host.example.test:10443/pair#ABCD2345",
+        expiresMs: Date.now() + 10 * 60 * 1000,
+        qrSvg: '<?xml version="1.0" standalone="yes"?><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4"><path fill="currentColor" d="M0 0h1v1H0z"/></svg>',
+      };
+      case "phone_link_revoke":
+        this.phoneLink = {
+          ...this.phoneLink,
+          devices: this.phoneLink.devices.filter((device) => device.id !== args.id),
+        };
+        return clone(this.phoneLink);
+      case "phone_link_test_push": return { sent: 1, gone: 0, failed: 0 };
       case "developer_permission_statuses": return clone(DEVELOPER_PERMISSION_STATES);
       case "request_developer_permission": return {
         id: args.id,
@@ -2798,6 +2838,12 @@ class StatefulBackend {
         if (ingest?.automation_id === args.id) {
           this.secondBrain.daily_ingest = { ...ingest, enabled: args.enabled, overdue_since: null };
         }
+        return clone(this.automations);
+      }
+      // 「다시 승인」: the Flow reads as allowed again, and the list is answered.
+      case "approve_automation_flow": {
+        const row = this.automations.find((held) => held.id === args.id);
+        if (row) row.flow_changed = false;
         return clone(this.automations);
       }
       // 「지금 실행」: the run it started. It names no terminal and no Flow, so the
@@ -5551,7 +5597,7 @@ await test("a_job_is_saved_switched_and_run_by_the_persons_own_press", async () 
       tokenByClick: "person",
       tokenByEnter: "person",
     }, "a press of the person's own did not say so, and the window would refuse it");
-    return "thirteen presses, each the person's and each sent once";
+    return "eleven presses, each the person's, and a save sent once by Enter and once by the button";
   } finally {
     await pageA.evaluate(() => {
       document.getElementById("hand-gitlab-stand")?.remove();
@@ -5561,6 +5607,209 @@ await test("a_job_is_saved_switched_and_run_by_the_persons_own_press", async () 
     backend.automations = held.automations;
     backend.flows.flows = held.flows;
     backend.flows.recipes = held.recipes;
+  }
+});
+
+// A job an agent asked for (`recipe-schedule`) says so on its page, with when
+// the person allowed it. Once its Flow's document changed it waits: the list
+// and the page say so, and 「다시 승인」 — the person's alone — asks what would
+// run before it allows the document as it stands.
+await test("an_asked_job_says_who_asked_and_waits_for_the_person_once_its_flow_changed", async () => {
+  const held = {
+    automations: backend.automations,
+    flows: backend.flows.flows,
+    recipes: backend.flows.recipes,
+  };
+  backend.flows.flows = [{
+    slug: "wallet-qa",
+    name: "Wallet QA",
+    policy: "dry",
+    evidence: "full",
+    fingerprint: { apps: [], hosts: ["shop.example.com"] },
+    checks: { n: 3, required: 2 },
+    last: null,
+    file: "/r/wallet-qa.md",
+  }];
+  backend.flows.recipes = [];
+  backend.automations = [{
+    id: "asked-1",
+    name: "Asked wallet QA",
+    enabled: true,
+    workspace: BOOT_BASE.project_root,
+    workspace_mode: "existing",
+    base_branch: null,
+    agent: null,
+    prompt: "zerocode-computer recipe-run --name wallet-qa",
+    command: "",
+    reuse_session: false,
+    close_when_done: false,
+    evidence: "prompt",
+    leaves_evidence: false,
+    flow: "wallet-qa",
+    schedule: { cadence: "daily", time: "09:30", day_of_week: 1, custom: "" },
+    precheck: "",
+    precheck_timeout_seconds: 60,
+    missed_run_grace_minutes: 60,
+    last_run_at: null,
+    next_run_at: 29_001_440,
+    runs: 0,
+    asked: { pane: "term:7", approved_at_ms: 1_794_000_000_000, flow_sha256: "aa" },
+    flow_changed: true,
+  }];
+  try {
+    await pageA.evaluate(() => {
+      setAutoOpen(true);
+      setAutoPage("schedules");
+    });
+    await pageA.waitForFunction(
+      () => automations.some((one) => one.id === "asked-1"),
+      undefined,
+      { timeout: UI_TIMEOUT },
+    );
+    await pageA.evaluate(() => {
+      autoSelectedId = null;
+      autoRuns = [];
+      paintAutomations();
+      paintAutomationDetail();
+    });
+    const listed = await pageA.evaluate(() => ({
+      when: document.querySelector("#auto-list .auto-row .auto-row-when")?.textContent ?? "",
+      want: t("auto.needsApproval", "다시 승인 필요"),
+    }));
+    assert(listed.want && listed.when === listed.want, "the list did not say the job waits for the person", listed);
+
+    await pageA.evaluate(() => selectAutomation("asked-1"));
+    await pageA.waitForSelector("#auto-detail-approve", { timeout: UI_TIMEOUT });
+    const waiting = await pageA.evaluate(() => ({
+      note: document.getElementById("auto-detail-asked").textContent,
+      want: t("auto.flowChanged", "승인한 뒤 Flow 문서가 바뀌어 이 예약은 돌지 않습니다. 문서를 확인하고 다시 승인해 주세요."),
+      mark: "personOnly" in document.getElementById("auto-detail-approve").dataset,
+    }));
+    assert(
+      waiting.want && waiting.note === waiting.want && waiting.mark,
+      "the page did not say the Flow changed since it was allowed, or 「다시 승인」 lacks the person-only mark",
+      waiting,
+    );
+
+    // The press asks first, naming what would run; nothing is allowed before the yes.
+    const before = backend.count("A", "approve_automation_flow");
+    const from = backend.calls.length;
+    await pageA.click("#auto-detail-approve");
+    await pageA.waitForSelector("#ask-scrim:not([hidden])");
+    const question = await pageA.evaluate(() => document.getElementById("ask-body").textContent);
+    assert(question.includes("Wallet QA"), "the question did not name the Flow that would run", question);
+    assertEqual(backend.count("A", "approve_automation_flow"), before, "the Flow was allowed again before the person said yes");
+    await pageA.click("#ask-yes");
+    const approved = await backend.waitForCall("A", "approve_automation_flow", from);
+    assertEqual(
+      [approved.args, approved.hand],
+      [{ id: "asked-1" }, "person"],
+      "allowing again named another job, or did not say the person pressed it",
+    );
+    await pageA.waitForFunction(
+      () => document.getElementById("auto-detail-approve").hidden,
+      undefined,
+      { timeout: UI_TIMEOUT },
+    );
+    const allowed = await pageA.evaluate(() => document.getElementById("auto-detail-asked").textContent);
+    assert(allowed.includes("term:7"), "the page did not say which pane asked and when it was allowed", allowed);
+    return "an asked job said it waits, asked before allowing again, and the yes was the person's";
+  } finally {
+    await pageA.evaluate(() => closeAutoForm());
+    await closeFlowSide(pageA);
+    backend.automations = held.automations;
+    backend.flows.flows = held.flows;
+    backend.flows.recipes = held.recipes;
+  }
+});
+
+// The card an agent's request for a schedule raises (`recipe-schedule`): the
+// window's sentence in the page's language, filled from the job that would be
+// saved — and, when the backend left letters that draw nothing out of the
+// names, how many it left out.
+await test("the_card_for_an_asked_schedule_says_the_job_and_what_was_left_out", async () => {
+  const said = await pageA.evaluate(() => {
+    const args = {
+      flow: "Wallet QA",
+      name: "Morning wallet",
+      policy: "dry",
+      schedule: { cadence: "daily", time: "09:30", day_of_week: 1, custom: "" },
+      cron: "30 9 * * *",
+      next: [29_906_490, 29_907_930],
+      workspace: "/Users/dev/app",
+      pane: "term:7",
+      hidden: 0,
+    };
+    const words = COMPUTER_HANDOFF_WORDS["auto.asked.card"];
+    return {
+      plain: words(args),
+      counted: words({ ...args, hidden: 3 }),
+      note: t("auto.asked.hidden", "받은 이름에서 보이지 않는 글자 {{count}}개를 뺐습니다.", { count: 3 }),
+      spending: words({ ...args, policy: "guarded", money: true }),
+      moneyNote: t("auto.asked.money", "이 Flow는 돈이 오가는 걸음을 누를 수 있습니다 — 지켜보는 사람 없이 돕니다."),
+      runs: args.next.map(localMinuteText),
+    };
+  });
+  for (const shown of ["Wallet QA", "Morning wallet", "dry", "30 9 * * *", "/Users/dev/app", "term:7", ...said.runs]) {
+    assert(said.plain.includes(shown), "the card left out what the job would be", { shown, card: said.plain });
+  }
+  assert(
+    said.note.includes("3") && !said.plain.includes(said.note) && said.counted === `${said.plain} ${said.note}`,
+    "the card did not say, once, how many letters were left out of the names",
+    said,
+  );
+  assert(
+    said.moneyNote !== "" && !said.plain.includes(said.moneyNote) && said.spending.endsWith(said.moneyNote),
+    "a Flow that may spend money was not said so on its card, or a dry one was",
+    said,
+  );
+  return "the card named the Flow, the job, when and where it runs and who asked; three hidden letters were said once, and a Flow that may spend was said so";
+});
+
+// The folded 「세부 설정」 line is where a save's command is read before the
+// press. A character that draws nothing or turns the reading direction could
+// make that line read as another command than the field holds: the line names
+// it by its code point, and the field keeps what it holds.
+await test("the_folded_details_line_names_a_mark_hidden_in_a_command", async () => {
+  try {
+    await pageA.evaluate(() => {
+      setAutoOpen(true);
+      setAutoPage("schedules");
+      editAutomation(null);
+    });
+    await pageA.waitForSelector("#auto-editor-scrim:not([hidden])");
+    const shown = await pageA.evaluate(() => {
+      const set = (id, value) => {
+        const field = document.getElementById(id);
+        field.value = value;
+        field.dispatchEvent(new Event("input", { bubbles: true }));
+      };
+      // The command's input is what paints the line: the precheck goes in first.
+      set("auto-precheck", "test -f a\u200bb");
+      set("auto-command", "echo ok \u202egnp.exe");
+      return {
+        line: document.getElementById("auto-details-summary").textContent,
+        command: document.getElementById("auto-command").value,
+        named: withMarksNamed("a\u202eb\u0007c"),
+        wide: withMarksNamed("x\u00ady\u{e0041}z\ufe0f"),
+      };
+    });
+    assert(
+      shown.line.includes("echo ok ⟦U+202E⟧gnp.exe") && shown.line.includes("test -f a⟦U+200B⟧b"),
+      "the folded line drew a hidden mark instead of naming it",
+      shown,
+    );
+    assert(!/[\u202e\u200b]/.test(shown.line), "a hidden mark is still in the line", shown);
+    assertEqual(shown.command, "echo ok \u202egnp.exe", "the field lost what it holds");
+    assertEqual(shown.named, "a⟦U+202E⟧b⟦U+0007⟧c", "a mark was not named by its code point");
+    assertEqual(shown.wide, "x⟦U+00AD⟧y⟦U+E0041⟧z⟦U+FE0F⟧",
+      "a soft hyphen, a tag character or a variation selector was not named by its code point");
+    return "a direction mark and a zero-width space were named in the line; the field kept them";
+  } finally {
+    await pageA.evaluate(() => {
+      closeAutoForm();
+      setAutoOpen(false);
+    });
   }
 });
 
@@ -10619,7 +10868,7 @@ await test("SSH Hosts verifies the server key and drives one native-backed remot
   return "host pin/vault + SFTP canonical workspace + two real remote PTY roots";
 });
 
-await test("Remote Servers pairs a tunnel, hides its bearer, and opens one persistent session", async () => {
+await test("Remote Servers pairs a tunnel, hides its bearer, and offers no dead persistent-session button", async () => {
   const accessLink = "zerocode://pair?endpoint=127.0.0.1%3A43123&token=fixture-bearer-never-rendered";
   const openedAt = backend.calls.length;
   await openSettings(pageA, "remote-servers");
@@ -10663,25 +10912,16 @@ await test("Remote Servers pairs a tunnel, hides its bearer, and opens one persi
   await pageA.waitForFunction(() =>
     document.querySelector("#remote-server-list")?.textContent.includes("연결됨"));
 
-  const sessionAt = backend.calls.length;
-  await pageA.locator("#remote-server-list .remote-server-open").click();
-  const session = await backend.waitForCall("A", "open_remote_server_session", sessionAt);
+  // zo has no `attach` any more, so the button that called it is gone
+  // (stage-1 phone link decision 3); the list, pairing and token stay.
   assertEqual(
-    session.args,
-    { id: "20000000-0000-4000-8000-000000000001", rows: 24, cols: 96 },
-    "the persistent session did not open by its saved server identity",
-  );
-  await pageA.waitForFunction(() =>
-    currentTab()?.remoteServer === "20000000-0000-4000-8000-000000000001");
-  assertEqual(
-    await pageA.evaluate(() => currentTab()?.worktree),
-    "zerocode://127.0.0.1:43123",
-    "the tunneled server session was labelled as a local workspace",
+    await pageA.locator("#remote-server-list .remote-server-open").count(),
+    0,
+    "the dead persistent-session button came back",
   );
 
-  const reopenedAt = backend.calls.length;
-  await openSettings(pageA, "remote-servers");
-  await backend.waitForCall("A", "remote_servers", reopenedAt);
+  // Settings never closed (no session tab opened), so the list is still the
+  // one on screen: the removal starts from it.
   backend.loseAcknowledgementOnce("remove_remote_server");
   const removedAt = backend.calls.length;
   await pageA.locator("#remote-server-list .remote-server-remove").click();
@@ -10690,7 +10930,74 @@ await test("Remote Servers pairs a tunnel, hides its bearer, and opens one persi
   await pageA.waitForFunction(() =>
     document.querySelectorAll("#remote-server-list [data-server-id]").length === 0);
   assert(await pageA.locator("#remote-servers-error").isHidden(), "a recovered removal reported a false failure");
-  return "native bearer isolation + exact loopback identity + persistent zo attach";
+  return "native bearer isolation + exact loopback identity + no dead attach button";
+});
+
+await test("Remote link turns the phone link on, shows a one-time QR, and revokes a phone", async () => {
+  const openedAt = backend.calls.length;
+  await openSettings(pageA, "remote-link");
+  await backend.waitForCall("A", "phone_link_status", openedAt);
+  await pageA.waitForFunction(() =>
+    document.querySelector("#remote-link-summary")?.dataset.state === "disconnected");
+  assert(await pageA.locator("#remote-link-new-code").isDisabled(), "a code was offered while the link is off");
+  assert(await pageA.locator("#remote-link-pair").isHidden(), "a QR stood while the link is off");
+  assertEqual(
+    await pageA.locator("#remote-link-devices [data-device-id]").count(),
+    1,
+    "the paired phone was not listed",
+  );
+
+  const enabledAt = backend.calls.length;
+  await pageA.locator("#remote-link-toggle").click();
+  const enabled = await backend.waitForCall("A", "phone_link_enable", enabledAt);
+  assertEqual(enabled.args, {}, "turning on carried arguments the native side never takes");
+  await pageA.waitForFunction(() =>
+    document.querySelector("#remote-link-summary")?.dataset.state === "connected");
+  assert(
+    (await pageA.locator("#remote-link-road-desc").innerText()).includes("https://host.example.test:10443/"),
+    "the tailnet address was not shown once the link was on",
+  );
+
+  const codeAt = backend.calls.length;
+  await pageA.locator("#remote-link-new-code").click();
+  await backend.waitForCall("A", "phone_link_new_code", codeAt);
+  await pageA.locator("#remote-link-pair").waitFor({ state: "visible" });
+  assertEqual(await pageA.locator("#remote-link-code").innerText(), "ABCD2345", "the code was not shown");
+  assertEqual(await pageA.locator("#remote-link-qr svg").count(), 1, "the QR was not drawn");
+
+  const testAt = backend.calls.length;
+  await pageA.locator("#remote-link-test").click();
+  await backend.waitForCall("A", "phone_link_test_push", testAt);
+  await pageA.locator("#remote-link-test-result").waitFor({ state: "visible" });
+
+  const revokedAt = backend.calls.length;
+  await pageA.locator("#remote-link-devices .remote-link-revoke").click();
+  const revoked = await backend.waitForCall("A", "phone_link_revoke", revokedAt);
+  assertEqual(revoked.args, { id: "phone-1" }, "revoke did not name the phone by its id");
+  await pageA.waitForFunction(() =>
+    document.querySelectorAll("#remote-link-devices [data-device-id]").length === 0);
+
+  // A phone pairing is told to the person, by its name, until they look —
+  // anything on this machine can reach the listener from loopback.
+  const pairedAt = backend.calls.length;
+  await pageA.evaluate(() => window.__SETTINGS_TEST_EMIT__("phone-link:paired", {
+    name: "Fixture phone",
+    atMs: Date.now(),
+  }));
+  const notice = pageA.locator(".toast", { hasText: "Fixture phone" });
+  await notice.waitFor({ state: "visible" });
+  await backend.waitForCall("A", "phone_link_status", pairedAt);
+  await notice.locator(".toast-action").click();
+  await pageA.waitForFunction(() => settingsPane === "remote-link" && !settingsView.hidden);
+  await notice.waitFor({ state: "detached" });
+
+  const offAt = backend.calls.length;
+  await pageA.locator("#remote-link-toggle").click();
+  await backend.waitForCall("A", "phone_link_disable", offAt);
+  await pageA.waitForFunction(() =>
+    document.querySelector("#remote-link-summary")?.dataset.state === "disconnected");
+  assert(await pageA.locator("#remote-link-pair").isHidden(), "the QR outlived the link");
+  return "tailnet-only status + one-time QR + revoke + pairing notice + off";
 });
 
 await test("macOS Permissions exposes one closed native inventory and a private-LAN-only test", async () => {

@@ -2556,55 +2556,42 @@ fn record_observation_feeds_the_dreamer_end_to_end() {
     });
 }
 
+/// A tool that failed in two sessions is no lesson: a pass does not read the
+/// turn trace for one, and a trace alone is no reason for a pass to run. The
+/// sentence it made — "`bash` is error-prone here" — said how a tool behaves,
+/// which the memory protocol tells a model never to record.
 #[test]
-fn turn_trace_failures_promote_into_memory_through_dream_at_cwd() {
+fn a_tool_that_failed_in_two_sessions_is_no_lesson() {
     // Hermetic: `dream_at_cwd`/`at_cwd` resolve the store through the real
     // global config home when `ZO_CONFIG_HOME` is unset — i.e. under plain
-    // `cargo test` — so this test used to deposit a slug in the developer's
+    // `cargo test` — so this test would deposit a slug in the developer's
     // actual `~/.zo/projects` on every run.
     let config_home = tempfile::tempdir().unwrap();
     let env_lock = crate::test_env_lock();
     with_config_home(&env_lock, config_home.path(), || {
         use crate::turn_trace::{append, TurnRecord};
-        // The plan-3 closed loop end-to-end: the externalized turn trace records
-        // tool failures, and a dreaming pass mines them (alongside the dream/
-        // producer) into a promoted gotcha — no deep-gate green accept involved.
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
 
-        // `bash` errors in two distinct sessions; `grep` only in one.
-        let mut rec1 = TurnRecord::terminal(
-            "sess-1",
-            1,
-            crate::turn_trace::TurnOutcome::Completed,
-            0,
-            None,
-        );
-        rec1.error_tools = vec!["bash".to_string(), "grep".to_string()];
-        append(cwd, &rec1).unwrap();
-        let mut rec2 = TurnRecord::terminal(
-            "sess-2",
-            1,
-            crate::turn_trace::TurnOutcome::Completed,
-            0,
-            None,
-        );
-        rec2.error_tools = vec!["bash".to_string()];
-        append(cwd, &rec2).unwrap();
+        for session in ["sess-1", "sess-2"] {
+            let mut record = TurnRecord::terminal(
+                session,
+                1,
+                crate::turn_trace::TurnOutcome::Completed,
+                0,
+                None,
+            );
+            record.error_tools = vec!["bash".to_string(), "grep".to_string()];
+            append(cwd, &record).unwrap();
+        }
 
+        assert!(!super::has_automatic_curation_evidence(cwd));
         let report = dream_at_cwd(cwd, None).unwrap();
-        let promoted: Vec<&str> = report.applied.iter().map(|a| a.slug.as_str()).collect();
-        // `bash` repeated across two sessions → promoted; `grep` (one session)
-        // stays below the repetition bar.
-        assert_eq!(promoted, vec!["gotcha-recurring-tool-failure-bash"]);
-
-        // The promoted entry is a real memory file describing the recurring tool.
-        let entry = fs::read_to_string(
-            crate::memory::paths::memory_write_dir(cwd, true)
-                .join("gotcha-recurring-tool-failure-bash.md"),
-        )
-        .unwrap();
-        assert!(entry.contains("bash"));
+        assert!(report.applied.is_empty(), "{:?}", report.applied);
+        assert!(report.plan.skipped.is_empty(), "nothing was even a candidate: {:?}", report.plan.skipped);
+        assert!(!crate::memory::paths::memory_write_dir(cwd, true)
+            .join("gotcha-recurring-tool-failure-bash.md")
+            .exists());
     });
 }
 
@@ -2617,9 +2604,8 @@ fn composite_source_merges_both_producers() {
     let config_home = tempfile::tempdir().unwrap();
     let env_lock = crate::test_env_lock();
     with_config_home(&env_lock, config_home.path(), || {
-        use crate::turn_trace::{append, TurnRecord};
-        // Both signal streams reach one dreaming pass: a green-accept workflow
-        // lesson (dream/) and a recurring tool failure (turns/) promote together.
+        // Both signal streams reach one dreaming pass: a project gate that
+        // ran green (dream/) and a pattern of the person's promote together.
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
 
@@ -2627,29 +2613,17 @@ fn composite_source_merges_both_producers() {
         assert!(super::record_verified_check(cwd, "s1", Some("cargo test")));
         assert!(super::record_verified_check(cwd, "s2", Some("cargo test")));
 
-        // Producer 2: a tool failing in two sessions.
-        for (i, sess) in ["s1", "s2"].iter().enumerate() {
-            let mut rec = TurnRecord::terminal(
-                sess,
-                i as u64,
-                crate::turn_trace::TurnOutcome::Completed,
-                0,
-                None,
-            );
-            rec.error_tools = vec!["read_file".to_string()];
-            append(cwd, &rec).unwrap();
+        // Producer 2: the same verified pattern in two sessions.
+        for session in ["s1", "s2"] {
+            assert!(super::record_user_pattern_observation(cwd, session, "pattern-7a", true));
         }
 
         let report = dream_at_cwd(cwd, None).unwrap();
         let mut promoted: Vec<&str> = report.applied.iter().map(|a| a.slug.as_str()).collect();
         promoted.sort_unstable();
-        assert_eq!(
-            promoted,
-            vec![
-                "gotcha-recurring-tool-failure-read-file",
-                "workflow-verified-check-command-cargo-test"
-            ]
-        );
+        assert_eq!(promoted.len(), 2, "{promoted:?}");
+        assert!(promoted[0].starts_with("preference-user-pattern-"), "{promoted:?}");
+        assert_eq!(promoted[1], "workflow-verified-check-command-cargo-test");
     });
 }
 
@@ -2765,24 +2739,40 @@ fn automatic_dreaming_sees_each_source_including_global_user_patterns() {
     let home = tempfile::tempdir().unwrap();
     let lock = crate::test_env_lock();
     with_automatic_home(&lock, home.path(), || {
-        for source in 0..4 {
+        for source in 0..2 {
             let workspace = tempfile::tempdir().unwrap();
             let cwd = workspace.path();
-            match source {
-                0 => super::record_observation(cwd, &obs("observed once", "s1", true)).unwrap(),
-                1 => {
-                    let mut record = crate::turn_trace::TurnRecord::terminal("s1", 0, crate::turn_trace::TurnOutcome::Completed, 0, None);
-                    record.error_tools = vec!["bash".to_string()];
-                    crate::turn_trace::append(cwd, &record).unwrap();
-                }
-                2 => super::record_automation_event(cwd, "s1", "goal", "repair_queued", false).unwrap(),
-                _ => {
-                    assert!(super::record_user_pattern_observation(cwd, "s1", "Prefer concise verification summaries", true));
-                    assert!(!super::dream_dir(cwd).exists(), "preferences are stored outside the trace directory");
-                }
+            if source == 0 {
+                super::record_observation(cwd, &obs("observed once", "s1", true)).unwrap();
+            } else {
+                assert!(super::record_user_pattern_observation(cwd, "s1", "Prefer concise verification summaries", true));
+                assert!(!super::dream_dir(cwd).exists(), "preferences are stored outside the trace directory");
             }
             assert!(super::has_automatic_curation_evidence(cwd), "missed source {source}");
             assert!(super::maybe_auto_dream(cwd, std::time::Duration::ZERO, None).unwrap().is_some(), "missed source {source}");
+        }
+    });
+}
+
+/// What a pass no longer reads is no reason for one to run: a turn trace with
+/// a failed tool, an automation event.
+#[test]
+fn a_turn_trace_or_an_automation_event_alone_starts_no_automatic_pass() {
+    let home = tempfile::tempdir().unwrap();
+    let lock = crate::test_env_lock();
+    with_automatic_home(&lock, home.path(), || {
+        for source in 0..2 {
+            let workspace = tempfile::tempdir().unwrap();
+            let cwd = workspace.path();
+            if source == 0 {
+                let mut record = crate::turn_trace::TurnRecord::terminal("s1", 0, crate::turn_trace::TurnOutcome::Completed, 0, None);
+                record.error_tools = vec!["bash".to_string()];
+                crate::turn_trace::append(cwd, &record).unwrap();
+            } else {
+                super::record_automation_event(cwd, "s1", "goal", "repair_queued", false).unwrap();
+            }
+            assert!(!super::has_automatic_curation_evidence(cwd), "source {source} counted");
+            assert!(super::maybe_auto_dream(cwd, std::time::Duration::ZERO, None).unwrap().is_none(), "source {source} ran a pass");
         }
     });
 }
@@ -3141,8 +3131,14 @@ fn a_pass_removes_what_a_pass_killed_mid_write_left_and_nothing_else() {
             super::record_observation(cwd, &obs("a lesson a killed pass read", session, true)).unwrap();
         }
         let dream = super::dream_dir(cwd);
+        // The turn trace and the automation events are folders a pass read
+        // until zo 1.1.144: a pass an earlier zo stopped left its cursor's
+        // temporary file there, and a pass still takes it away.
         let turns = super::trace_base(cwd).join(core_types::paths::ZO_DIR_NAME).join("turns");
-        fs::create_dir_all(&turns).unwrap();
+        let automation = dream.join(super::AUTOMATION_DIR);
+        for retired in [&turns, &automation] {
+            fs::create_dir_all(retired).unwrap();
+        }
         // The killed pass ran in a process of its own, so its files carry another pid.
         let killed = std::process::id() + 1;
         let long_ago = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
@@ -3154,6 +3150,7 @@ fn a_pass_removes_what_a_pass_killed_mid_write_left_and_nothing_else() {
         let abandoned = [
             leave(&dream, format!(".zo-state-.read-cursor.json-{killed}-1.tmp")),
             leave(&turns, format!(".zo-state-.read-cursor.json-{killed}-2.tmp")),
+            leave(&automation, format!(".zo-state-.read-cursor.json-{killed}-7.tmp")),
             leave(&dream, format!(".zo-state-{}-{killed}-3.tmp", super::THROTTLE_MARKER)),
             leave(&dream, format!(".zo-state-{}-{killed}-4.tmp", super::AUTO_DREAM_ERROR_FILE)),
         ];
@@ -3204,11 +3201,13 @@ fn automatic_decay_archives_only_the_local_store_it_promotes_into() {
     });
 }
 
+/// Automation events are not read by a pass: nothing writes them, and what
+/// they made were fixed sentences about zo's own `/goal` and `/loop`.
 #[test]
-fn automation_events_promote_through_dream_at_cwd_without_goal_text() {
+fn automation_events_are_no_lesson() {
     // Hermetic: `dream_at_cwd`/`at_cwd` resolve the store through the real
     // global config home when `ZO_CONFIG_HOME` is unset — i.e. under plain
-    // `cargo test` — so this test used to deposit a slug in the developer's
+    // `cargo test` — so this test would deposit a slug in the developer's
     // actual `~/.zo/projects` on every run.
     let config_home = tempfile::tempdir().unwrap();
     let env_lock = crate::test_env_lock();
@@ -3222,18 +3221,10 @@ fn automation_events_promote_through_dream_at_cwd_without_goal_text() {
         super::record_automation_event(cwd, "sess-2", "goal", "succeeded", true).unwrap();
 
         let report = dream_at_cwd(cwd, None).unwrap();
-        let promoted: Vec<&str> = report.applied.iter().map(|a| a.slug.as_str()).collect();
-        assert_eq!(
-            promoted,
-            vec!["workflow-goal-automation-repaired-then-succeeded"]
-        );
-        let entry = fs::read_to_string(
-            crate::memory::paths::memory_write_dir(cwd, true)
-                .join("workflow-goal-automation-repaired-then-succeeded.md"),
-        )
-        .unwrap();
-        assert!(entry.contains("/goal"));
-        assert!(!entry.contains("secret goal text"));
+        assert!(report.applied.is_empty(), "{:?}", report.applied);
+        assert!(!crate::memory::paths::memory_write_dir(cwd, true)
+            .join("workflow-goal-automation-repaired-then-succeeded.md")
+            .exists());
     });
 }
 
@@ -3400,3 +3391,59 @@ fn an_identical_dreamer_promotion_is_unchanged_at_the_store() {
         WriteOutcome::Unchanged
     );
 }
+
+/// The person's line says what a pass kept and what waits for a second
+/// session, and nothing of what was known already; the log's line counts
+/// everything. A pass with nothing left to learn used to read "promoted 0,
+/// skipped 21" and was taken for a dreamer that does not work.
+#[test]
+fn a_pass_reads_as_what_it_kept_and_what_waits_for_a_second_session() {
+    use super::{AppliedPromotion, DreamReport};
+    use decision_core::dreamer::{CurationPlan, SkipReason, SkippedLesson};
+
+    let wrote = |slug: &str, outcome| AppliedPromotion { slug: slug.to_string(), outcome };
+    let left = |reason| SkippedLesson { slug: "left".to_string(), summary: "left".to_string(), reason };
+    let known = || left(SkipReason::AlreadyKnown);
+    let once = || left(SkipReason::NotRepeatedEnough { distinct_sessions: 1, required: 2 });
+    let report = |applied: Vec<AppliedPromotion>, skipped: Vec<SkippedLesson>| DreamReport {
+        applied,
+        plan: CurationPlan { promote: Vec::new(), skipped },
+    };
+
+    let learned_out = report(Vec::new(), (0..21).map(|_| known()).collect());
+    assert_eq!(learned_out.summary_line(), "dreamer: nothing new");
+    assert_eq!(
+        learned_out.audit_line(),
+        "dreamer: wrote 0, unchanged 0, skipped 21 (known 21, same sentence 0, one session 0, \
+         unverified 0, low confidence 0, over budget 0)"
+    );
+
+    assert_eq!(
+        report(Vec::new(), vec![once(), once(), known()]).summary_line(),
+        "dreamer: 2 lessons waiting for a second session"
+    );
+    assert_eq!(
+        report(vec![wrote("a", WriteOutcome::Created)], Vec::new()).summary_line(),
+        "dreamer: kept 1 lesson"
+    );
+    let mixed = report(
+        vec![
+            wrote("a", WriteOutcome::Created),
+            wrote("b", WriteOutcome::Updated),
+            wrote("c", WriteOutcome::Unchanged),
+        ],
+        vec![once()],
+    );
+    assert_eq!(mixed.summary_line(), "dreamer: kept 2 lessons, 1 more waiting for a second session");
+    assert_eq!(
+        mixed.audit_line(),
+        "dreamer: wrote 2, unchanged 1, skipped 1 (known 0, same sentence 0, one session 1, \
+         unverified 0, low confidence 0, over budget 0)"
+    );
+    assert_eq!(
+        report(vec![wrote("c", WriteOutcome::Unchanged)], Vec::new()).summary_line(),
+        "dreamer: nothing new",
+        "an entry that needed no write is nothing kept"
+    );
+}
+

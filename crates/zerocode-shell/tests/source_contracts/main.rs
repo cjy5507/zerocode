@@ -19928,7 +19928,13 @@ mod tests {
             // resumes above — it must not divide the pane somebody is reading
             // — and it says `tab` to `spawnGrid` and to `mountTermTab`, then
             // takes the wire tab's own seat on the strip.
-            ("{ placement: \"tab\"", 16),
+            //
+            // Fifteen since the Remote Server row's 「영구 세션 열기」 went
+            // (2026-11-11): zo has no `attach`, so the tab it mounted opened
+            // nothing, and the row, its JS and `open_remote_server_session`
+            // left together. The remote rows that mount a terminal are SSH
+            // Host, Remote Workspace and the SSH-target actions.
+            ("{ placement: \"tab\"", 15),
         ] {
             assert_eq!(
                 window.matches(needle).count(),
@@ -35730,11 +35736,15 @@ mod tests {
         let installing = block_after(installer, "pub fn install_agent(");
         // Per FILE now, not per agent: Claude's hook lives in the home file
         // and one settings.json per account directory (`config_paths`), and
-        // the bail-out must hold at every one of them.
+        // the bail-out must hold at every one of them. What was read is kept
+        // beside the merge so an unchanged file is not written again — and
+        // the merge only ever starts from what was read.
         assert!(
-            installing.contains("let Some(mut config) = read_config(&file) else {")
+            installing.contains("let Some(read) = read_config(&file) else {")
                 && installing.contains("return unreadable(agent, &file)")
-                && installing.contains("for file in paths.config_paths(agent)"),
+                && installing.contains("for file in paths.config_paths(agent)")
+                && installing.contains("let mut config = read.clone();")
+                && installing.contains("write_config(&file, &read, &config)"),
             "the install path no longer bails on a config it could not read:\n{installing}"
         );
 

@@ -158,6 +158,16 @@ pub(super) fn permission_prompt_timeout() -> Option<std::time::Duration> {
     (seconds > 0).then(|| std::time::Duration::from_secs(seconds))
 }
 
+/// Whether an answered prompt leaves an allow rule behind: only a lasting
+/// allow does, and never on a prompt only a person may answer. Such a prompt
+/// offers no lasting allow, but a front that takes any decision — the IDE
+/// channel does not check an answer against the choices — can send one; it
+/// allows the one call and writes no rule, so the next call is asked about
+/// again and nothing lasting reaches the person's settings (t-105031).
+fn leaves_a_rule(decision: AsyncPermissionDecision, person_only: bool) -> bool {
+    decision == AsyncPermissionDecision::Allow && !person_only
+}
+
 /// Model-facing reason for a prompt that expired unanswered. Phrased as a
 /// *transient* outcome on purpose: a mode-based denial is deterministic and
 /// tells the model never to retry, but an unanswered prompt only means nobody
@@ -944,8 +954,8 @@ where
     }
 
     /// Abort a streaming turn because its host failed independently of the
-    /// user. Keeping this distinct prevents transport/render failures from being
-    /// filtered as non-actionable user cancellations by Dreamer.
+    /// user. Keeping this distinct leaves a transport/render failure in the
+    /// turn trace as a failed turn, not as a turn the person cancelled.
     pub fn cancel_streaming_turn_by_host(&mut self, reason: &str) -> StreamingTurnError {
         self.hook_abort_signal.abort_host();
         self.settle_streaming_abort(0, reason)
@@ -2562,6 +2572,7 @@ where
                     pre_hook_result.permission_reason().map(ToOwned::to_owned),
                 );
 
+                self.learn_declared_mode(tool_name, &effective_input);
                 let mut kill_judgment = None;
                 let permission_outcome = if let Some(outcome) =
                     pre_hook_denial_outcome(&pre_hook_result, tool_name)
@@ -2578,8 +2589,15 @@ where
                     // release lane's load, and this task renders and hears an
                     // Esc meanwhile. The policy and the call's dispatch then
                     // use this one reading.
+                    // A shell command the wrapper carries is read here as one
+                    // called by name, as the policy judges it.
+                    let carried = crate::permissions::carried_call(tool_name, &effective_input);
+                    let (judged_tool, judged_input) = carried.as_ref().map_or(
+                        (tool_name.as_str(), effective_input.as_str()),
+                        |(name, arguments)| (name.as_str(), arguments.as_str()),
+                    );
                     if let Some((shell, command)) =
-                        crate::permissions::shell_command(tool_name, &effective_input)
+                        crate::permissions::shell_command(judged_tool, judged_input)
                             .filter(|(shell, command)| crate::kill_guard::reads_the_table(*shell, command))
                     {
                         kill_judgment = tokio::task::spawn_blocking(move || {
@@ -2609,15 +2627,19 @@ where
                                 .deny_reason
                                 .clone()
                                 .or_else(|| sync_request.reason.clone());
-                            let tool_label = tool_name.to_owned();
+                            // What the person is asked about is the call
+                            // the policy judged — the one a wrapper carried,
+                            // when the model called through it — so the hook,
+                            // the notification and a refusal name that call.
+                            let tool_label = sync_request.tool_name.clone();
                             // The user is about to see a permission prompt:
                             // fire PermissionRequest plus Notification (the
                             // event Claude Code uses for OS-level pings).
                             self.fire_lifecycle_hook(
                                 HookEvent::PermissionRequest,
                                 &serde_json::json!({
-                                    "tool_name": tool_name,
-                                    "input": effective_input.as_str(),
+                                    "tool_name": sync_request.tool_name,
+                                    "input": sync_request.input,
                                     "reason": sync_request.reason,
                                 }),
                             );
@@ -2626,9 +2648,9 @@ where
                                 &serde_json::json!({
                                     "message": format!(
                                         "Zo needs permission to run `{}`",
-                                        core_types::tool_names::wire_tool_name(tool_name)
+                                        core_types::tool_names::wire_tool_name(&sync_request.tool_name)
                                     ),
-                                    "tool_name": tool_name,
+                                    "tool_name": sync_request.tool_name,
                                 }),
                             );
                             // `None` = the prompt ceiling expired with nobody
@@ -2668,12 +2690,19 @@ where
                                 // "Always allow" grants a durable rule: it takes
                                 // effect for the rest of this session and is
                                 // queued for the host to persist to settings.
-                                Some(AsyncPermissionDecision::Allow) => {
+                                Some(AsyncPermissionDecision::Allow)
+                                    if leaves_a_rule(AsyncPermissionDecision::Allow, sync_request.person_only) =>
+                                {
+                                    // The rule is for the call the person was
+                                    // asked about: the one a wrapper carried,
+                                    // when the model called through it.
                                     self.permission_policy
-                                        .grant_always(tool_name, &effective_input);
+                                        .grant_always(&sync_request.tool_name, &sync_request.input);
                                     PermissionOutcome::Allow
                                 }
-                                Some(AsyncPermissionDecision::AllowOnce) => PermissionOutcome::Allow,
+                                Some(AsyncPermissionDecision::Allow | AsyncPermissionDecision::AllowOnce) => {
+                                    PermissionOutcome::Allow
+                                }
                                 Some(AsyncPermissionDecision::Deny) => PermissionOutcome::Deny {
                                     reason: reason_for_deny.unwrap_or_else(|| {
                                         format!("user denied tool '{tool_label}'")
@@ -3617,5 +3646,22 @@ mod wire_name_tests {
         );
         assert!(reason.contains(&format!("'{}'", CoreTool::Bash.wire())), "{reason}");
         assert!(!reason.contains(&format!("'{}'", CoreTool::Bash.handler())), "{reason}");
+    }
+}
+
+#[cfg(test)]
+mod lasting_allow_tests {
+    use super::{leaves_a_rule, AsyncPermissionDecision};
+
+    /// Only a lasting allow leaves a rule, and never on a prompt only a
+    /// person may answer: a front that sends one there allows the one call.
+    #[test]
+    fn a_prompt_only_a_person_may_answer_leaves_no_rule_whatever_was_answered() {
+        assert!(leaves_a_rule(AsyncPermissionDecision::Allow, false));
+        assert!(!leaves_a_rule(AsyncPermissionDecision::Allow, true));
+        for person_only in [false, true] {
+            assert!(!leaves_a_rule(AsyncPermissionDecision::AllowOnce, person_only));
+            assert!(!leaves_a_rule(AsyncPermissionDecision::Deny, person_only));
+        }
     }
 }

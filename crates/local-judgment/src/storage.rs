@@ -189,7 +189,8 @@ impl Store {
             &self.root,
             &format!("external-partial/{}.json", location.nonce),
         )?;
-        write_new(
+        // Whole or not at all: a stop mid-write leaves no half tracker.
+        replace(
             &tracker,
             &serde_json::to_vec(&location).map_err(|_| Error::Storage)?,
         )?;
@@ -233,22 +234,36 @@ impl Store {
                 return Err(Error::TooLarge);
             }
             let tracker = io(entry)?.path();
-            let location: Location = serde_json::from_slice(&bounded_read(&tracker, 16 * 1024)?)
-                .map_err(|_| Error::Integrity)?;
-            let partial = location_path(&location, true)?;
-            if partial.exists() {
-                owned_location(&partial, &location)?;
-                io(fs::remove_dir_all(&partial))?;
-            }
-            let destination = location_path(&location, false)?;
-            let registered = child(&self.root, &format!("locations/{}", location.model_id))?;
-            if destination.exists() && !registered.exists() {
-                owned_location(&destination, &location)?;
-                io(fs::remove_dir_all(destination))?;
-            }
-            io(fs::remove_file(tracker))?;
+            // A tracker that cannot be cleaned now stays for a later open:
+            // the folder it points into is not here (the external disk the
+            // person chose, unplugged), or it is not plainly ours to remove
+            // (a changed ownership record, a link, an oversized file). One
+            // such tracker does not stop the store, and every
+            // local-judgment command with it.
+            let _ = self.clean_one_external(&tracker);
         }
         Ok(())
+    }
+
+    fn clean_one_external(&self, tracker: &Path) -> Result<()> {
+        let Ok(location) = serde_json::from_slice::<Location>(&bounded_read(tracker, 16 * 1024)?)
+        else {
+            // Half a tracker, from a stop in the middle of writing it: it
+            // names no folder, so there is nothing it could ever clean.
+            return io(fs::remove_file(tracker));
+        };
+        let partial = location_path(&location, true)?;
+        if partial.exists() {
+            owned_location(&partial, &location)?;
+            io(fs::remove_dir_all(&partial))?;
+        }
+        let destination = location_path(&location, false)?;
+        let registered = child(&self.root, &format!("locations/{}", location.model_id))?;
+        if destination.exists() && !registered.exists() {
+            owned_location(&destination, &location)?;
+            io(fs::remove_dir_all(destination))?;
+        }
+        io(fs::remove_file(tracker))
     }
 
     pub fn registered_catalogs(&self) -> Result<Vec<Catalog>> {

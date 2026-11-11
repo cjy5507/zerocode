@@ -50,6 +50,76 @@ fn checkpoint_durable_loads_from_merged_settings_and_defaults_off() {
     assert!(error.to_string().contains("checkpoint.durable"));
 }
 
+/// t-104888: the desk guard is on unless a person's own settings say
+/// `deskGuard: false`; a repository's `.zo/settings.json` cannot lift it.
+#[test]
+fn desk_guard_defaults_on_and_only_a_persons_settings_turn_it_off() {
+    let _stable = overrides_stable();
+    let root = temp_dir();
+    let cwd = root.join("project");
+    let home = root.join("home").join(".zo");
+    fs::create_dir_all(cwd.join(".zo")).expect("project dir");
+    fs::create_dir_all(&home).expect("home dir");
+
+    let default = ConfigLoader::new(&cwd, &home).load().expect("default config");
+    assert!(default.desk_guard());
+
+    fs::write(cwd.join(".zo").join("settings.json"), r#"{"deskGuard":false}"#)
+        .expect("project settings");
+    let from_repo = ConfigLoader::new(&cwd, &home).load().expect("project config");
+    assert!(from_repo.desk_guard(), "a repository cannot turn the desk guard off");
+
+    fs::write(home.join("settings.json"), r#"{"deskGuard":false}"#).expect("own settings");
+    let off = ConfigLoader::new(&cwd, &home).load().expect("own config");
+    assert!(!off.desk_guard());
+
+    fs::write(home.join("settings.json"), r#"{"deskGuard":"no"}"#).expect("bad settings");
+    let error = ConfigLoader::new(&cwd, &home)
+        .load()
+        .expect_err("a non-boolean deskGuard must fail");
+    assert!(error.to_string().contains("deskGuard"));
+}
+
+/// t-104888, review t-104945: only the person's user settings file turns the
+/// desk guard off. The workspace's `.zo/settings.local.json` is a file the
+/// model's writes reach without a question; it does not lift it.
+#[test]
+fn desk_guard_is_not_turned_off_by_a_workspaces_local_settings() {
+    let _stable = overrides_stable();
+    let root = temp_dir();
+    let cwd = root.join("project");
+    let home = root.join("home").join(".zo");
+    fs::create_dir_all(cwd.join(".zo")).expect("project dir");
+    fs::create_dir_all(&home).expect("home dir");
+    fs::write(cwd.join(".zo").join("settings.local.json"), r#"{"deskGuard":false}"#)
+        .expect("local settings");
+    let config = ConfigLoader::new(&cwd, &home).load().expect("local config");
+    assert!(config.desk_guard(), "a workspace's local settings cannot turn the desk guard off");
+}
+
+/// A `--settings <file>` may be a file inside the workspace too; it does not
+/// lift the desk guard either.
+#[test]
+fn desk_guard_is_not_turned_off_by_a_cli_settings_file() {
+    let _serial = CLI_OVERRIDE_LOCK
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _reset = CliOverrideGuard;
+    let root = temp_dir();
+    let cwd = root.join("project");
+    let home = root.join("home").join(".zo");
+    fs::create_dir_all(&cwd).expect("project dir");
+    fs::create_dir_all(&home).expect("home dir");
+    let extra = cwd.join("extra-settings.json");
+    fs::write(&extra, r#"{"deskGuard":false}"#).expect("extra settings");
+    ConfigLoader::set_cli_overrides(super::CliConfigOverrides {
+        settings_file: Some(extra),
+        strict_mcp_config: false,
+    });
+    let config = ConfigLoader::new(&cwd, &home).load().expect("cli config");
+    assert!(config.desk_guard(), "a --settings file cannot turn the desk guard off");
+}
+
 #[test]
 fn tui_inline_mode_loads_from_merged_settings_and_defaults_unset() {
     let _stable = overrides_stable();

@@ -14,7 +14,6 @@ use std::io;
 use std::path::Path;
 
 /// Owner read/write only.
-#[cfg(unix)]
 pub(crate) const PRIVATE_FILE_MODE: u32 = 0o600;
 
 /// Whether a unix mode asks for a private file (no group or other bits).
@@ -22,6 +21,24 @@ pub(crate) const PRIVATE_FILE_MODE: u32 = 0o600;
 #[must_use]
 pub(crate) fn mode_is_private(mode: u32) -> bool {
     mode & 0o077 == 0
+}
+
+/// The permission bits `path` has now, so a rewrite can put them back.
+/// `None` off unix, where a mode is not this file's vocabulary, and when the
+/// file is not there.
+pub(crate) fn mode_of(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .ok()
+            .map(|meta| meta.permissions().mode())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 /// Give `path` the unix `mode` a caller recorded or asked for.
@@ -44,6 +61,27 @@ pub(crate) fn apply_mode(path: &Path, mode: u32) -> io::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Replace `path` whole with `body`, keeping the permissions it has: a
+/// settings file the person keeps at 0600 (its `env` may hold a key) stays
+/// 0600. A symlinked file is written through and stays a link
+/// ([`crate::codex_install::write_path`]); a missing file gets the default.
+pub(crate) fn replace_keeping_mode(path: &Path, body: &str) -> io::Result<()> {
+    let target = crate::codex_install::write_path(path);
+    write_atomically(&target, body.as_bytes(), mode_of(&target))
+}
+
+/// Through a sibling temp and a rename, so no reader ever sees half a file.
+/// The temp is born with `mode` on unix and gets it exactly (or, elsewhere,
+/// its owner-only ACL) before the rename; it is removed whatever step fails.
+pub(crate) fn write_atomically(path: &Path, body: &[u8], mode: Option<u32>) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    zerocode_core::atomic_file::write_atomically_sealed(path, body, mode, |temp| {
+        mode.map_or(Ok(()), |mode| apply_mode(temp, mode))
+    })
 }
 
 /// Make `path` readable and writable by its owner alone.

@@ -3,7 +3,8 @@
 //! 렌더러는 `PermissionPrompt`/`UserQuestionPrompt` 블록을 화면에 찍고 **파킹만**
 //! 한다(responder 를 drop 하면 hard deny). 답은 다음 stdin 줄에서 온다:
 //! 권한은 프롬프트가 준 선택지의 키 글자 그대로(키마다 어떤 결정인지는
-//! 선택지가 정한다 — 같은 `y` 가 지속 허락일 수도 있다; Enter = deny), 질문은
+//! 선택지가 정한다 — 같은 `y` 가 지속 허락일 수도 있다; Enter = deny, 사람만
+//! 답할 수 있는 물음에서는 Enter 가 답이 아니다), 질문은
 //! 번호(쉼표 다중)·라벨·자유 텍스트(`tui/modals/user_question.rs` 규칙 준용).
 
 use runtime::message_stream::{
@@ -37,6 +38,14 @@ impl PendingPrompt {
         }
     }
 
+    /// Whether this is a permission prompt only a person may answer: a run
+    /// with nobody at it decides such a prompt at once, where it takes any
+    /// other from the lines still to come ([`crate::ide::run_loop`]).
+    #[must_use]
+    pub fn only_a_person_may_answer(&self) -> bool {
+        matches!(self, PendingPrompt::Permission(prompt) if prompt.person_only)
+    }
+
     /// 프롬프트를 답 없이 닫는다 — 권한은 명시적 Deny, 질문은 responder drop.
     pub fn dismiss(self) {
         match self {
@@ -58,7 +67,12 @@ impl PendingPrompt {
                     .map(|choice| format!("[{}] {}", choice.key, choice.label))
                     .collect::<Vec<_>>()
                     .join("  ");
-                format!("{keys}  (Enter = deny)")
+                if prompt.person_only {
+                    // An empty line is no answer here, so none is promised.
+                    keys
+                } else {
+                    format!("{keys}  (Enter = deny)")
+                }
             }
             // 파킹 줄과 **같은 어휘**여야 한다 — 다시 안내하는 자리에서 답하는
             // 법이 달라지면 그 자체가 거짓말이다(`ide::render::question_keys`).
@@ -76,7 +90,10 @@ impl PendingPrompt {
     }
 }
 
-/// 권한 답 해석. 빈 줄은 Deny(zo TUI 의 기본 커서와 동일). 키 글자는
+/// 권한 답 해석. 빈 줄은 Deny 다 — TUI 의 대화상자는 「이번만 허용」 줄에서
+/// 열리므로(`tui::view` 의 `ENTER_ANSWERS`, t-48216) 두 화면의 빈 Enter 는 서로
+/// 다르다. 사람만 답할 수 있는 물음(`person_only`)에서는 빈 줄이 어느 화면에서도
+/// 답이 아니다: 물음이 그대로 남는다(사람의 결정, 2026-11-11). 키 글자는
 /// 대소문자 무시로 선택지의 `key` 와 맞춘다; 모르는 글자는 `None`.
 #[must_use]
 pub fn parse_permission_answer(
@@ -85,7 +102,7 @@ pub fn parse_permission_answer(
 ) -> Option<RenderPermissionDecision> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
-        return Some(RenderPermissionDecision::Deny);
+        return (!prompt.person_only).then_some(RenderPermissionDecision::Deny);
     }
     let mut chars = trimmed.chars();
     let key = chars.next()?.to_ascii_lowercase();
@@ -132,7 +149,7 @@ pub fn parse_question_answer(line: &str, prompt: &UserQuestionPrompt) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_permission_answer, parse_question_answer};
+    use super::{parse_permission_answer, parse_question_answer, PendingPrompt};
     use runtime::message_stream::{
         BlockId, PermissionChoice, PermissionDecision, PermissionPrompt, QuestionOption,
         ToolCallId, UserQuestionPrompt,
@@ -165,6 +182,7 @@ mod tests {
                     decision: PermissionDecision::Deny,
                 },
             ],
+            person_only: false,
             question: None,
             responder: tx,
         }
@@ -202,6 +220,29 @@ mod tests {
         assert_eq!(parse_permission_answer("", &prompt), Some(PermissionDecision::Deny));
         assert_eq!(parse_permission_answer("yes", &prompt), None);
         assert_eq!(parse_permission_answer("q", &prompt), None);
+    }
+
+    /// On a prompt only a person may answer an empty line is no answer — it
+    /// neither allows nor denies, and the prompt stays — and the hint does not
+    /// promise that Enter denies. Its keys answer as on any prompt.
+    #[test]
+    fn an_empty_line_is_no_answer_to_a_prompt_only_a_person_may_answer() {
+        let mut prompt = permission_prompt();
+        prompt.person_only = true;
+        assert_eq!(parse_permission_answer("", &prompt), None);
+        assert_eq!(parse_permission_answer("  ", &prompt), None);
+        assert_eq!(parse_permission_answer("y", &prompt), Some(PermissionDecision::AllowOnce));
+        assert_eq!(parse_permission_answer("n", &prompt), Some(PermissionDecision::Deny));
+
+        let pending = PendingPrompt::Permission(prompt);
+        assert!(pending.only_a_person_may_answer());
+        assert!(!PendingPrompt::Permission(permission_prompt()).only_a_person_may_answer());
+        assert!(!PendingPrompt::Question(question_prompt(false)).only_a_person_may_answer());
+        assert!(!pending.hint().contains("Enter"), "{}", pending.hint());
+        let Some(still) = pending.answer("") else {
+            panic!("an empty line resolved the prompt");
+        };
+        assert!(matches!(still, PendingPrompt::Permission(_)));
     }
 
     #[test]

@@ -659,6 +659,17 @@ struct Ui {
     /// A finished thinking block stands as one row
     /// ([`thinking::one_line`]) — the marks look's first step of `/thinking`.
     thinking_line: bool,
+    /// The thinking block being written shows its newest words under the
+    /// working row ([`Ui::absorb_thinking_tail`]), and a wait on the model is
+    /// named from its second second — the marks look's.
+    thinking_tail: bool,
+    /// The newest words of the turn's thinking so far, bounded
+    /// ([`thinking::TAIL_KEEP_BYTES`]); empty once the answer or a call began.
+    thinking_said: String,
+    /// An answer's line shows as far as it has come while it is written
+    /// ([`MarkdownStream::showing_unfinished`]), with the working row kept
+    /// under it — the marks look's.
+    unfinished_lines: bool,
     /// When the thinking block that is open began.
     reasoning_started: Option<Instant>,
     /// What the working row said the open thinking block was about — its
@@ -1641,6 +1652,9 @@ impl Ui {
             self.last_commit = None;
             return;
         };
+        // The line still being written is rendered here, once a frame, for
+        // the frame painted next ([`MarkdownStream::refresh_unfinished`]).
+        stream.refresh_unfinished();
         if !stream.is_draining() {
             self.last_commit = Some(now);
             return;
@@ -1710,6 +1724,15 @@ impl Ui {
                 self.reasoning_about = None;
             }
         }
+        // Until the block has a heading of its own the row says the one thing
+        // known of it, where it said `Working` as for any other wait.
+        if self.thinking_tail {
+            if let Some(status) = self.status.as_mut() {
+                if status.header == Status::DEFAULT_HEADER {
+                    status.set_header(Some(super::strings::THINKING));
+                }
+            }
+        }
         let Some((_, Some(buffer))) = &self.reasoning_scan else {
             return;
         };
@@ -1729,6 +1752,43 @@ impl Ui {
                 status.set_header(Some(&heading));
             }
         }
+    }
+
+    /// The newest words of the thinking being written, onto the rows under
+    /// the working row ([`thinking::live_tail`]).
+    ///
+    /// A model that reasons for half a minute before its first word left the
+    /// screen on one row whose clock was the only thing that moved, and it
+    /// read as a turn that had stopped (zo 1.1.143, a model at high effort:
+    /// sixteen to fifty-eight seconds, 2026-11-12). The words are only shown
+    /// here: the block is said as it always was when it ends. They stay
+    /// between one block and the next — a summary that comes in parts is one
+    /// train of thought — and go when the answer or a call begins. Hidden
+    /// thinking (`/thinking`) shows none.
+    fn absorb_thinking_tail(&mut self, text: &str, done: bool) {
+        if !self.thinking_tail || !self.flags.show_thinking {
+            return;
+        }
+        self.thinking_said.push_str(text);
+        // A block's end is a break between words: the next block's first word
+        // does not run into this one's last.
+        if done && !self.thinking_said.is_empty() {
+            self.thinking_said.push('\n');
+        }
+        thinking::bound_scan(&mut self.thinking_said, thinking::TAIL_KEEP_BYTES);
+        if !text.is_empty() {
+            self.refresh_status_details();
+        }
+    }
+
+    /// The thinking's words leave the rows under the working row: the answer
+    /// or a call began.
+    fn end_thinking_tail(&mut self) {
+        if self.thinking_said.is_empty() {
+            return;
+        }
+        self.thinking_said.clear();
+        self.refresh_status_details();
     }
 
     /// `/thinking`: show or hide thinking cells from here on. Screen-only,
@@ -1922,6 +1982,12 @@ impl Ui {
             // on two rows.
             details.extend(self.tool_status_detail.iter().cloned());
         }
+        if details.is_empty() && !self.thinking_said.is_empty() {
+            // Four fifths of the rows' room: a row wraps at a word, so words
+            // that fill two rows to the column can take a third.
+            let columns = super::view::status_detail_columns(self.width()) * thinking::TAIL_ROWS * 4 / 5;
+            details.extend(thinking::live_tail(&self.thinking_said, columns));
+        }
         if let Some(status) = self.status.as_mut() {
             status.set_details_max_lines(details.len().max(STATUS_DETAILS_DEFAULT_MAX_LINES));
             status.set_details(details, StatusDetailsCapitalization::Preserve);
@@ -2068,9 +2134,12 @@ impl Ui {
         if !self.fold.is_pending() {
             return (cell, tail_owns_slot);
         }
-        // The `turns` view: the newest finished steps and the text it holds
-        // stand above whatever is live, so the work shows while it runs.
-        let mut rows = self.fold.live_rows(super::style::current().reading_width(width));
+        // The `turns` view: the finished steps, the texts that led into them
+        // and the text it holds stand above whatever is live, one under
+        // another, so the work shows while it runs and no row of it goes
+        // away before the fold is said.
+        let room = turns::live_room(usize::from(self.painter.max_height()));
+        let mut rows = self.fold.live_rows(super::style::current().reading_width(width), room);
         let held = self.fold.held();
         if !held.is_empty() {
             rows.extend(held.iter().cloned());
@@ -2200,7 +2269,12 @@ impl Ui {
             status: self.status.as_ref(),
             pending_input: (!pending_input.is_empty()).then_some(pending_input.as_slice()),
             active: (!active.is_empty()).then_some(active.as_slice()),
-            tail_owns_slot,
+            // Where an answer shows as it is written the working row stays
+            // under it: what the turn is doing is on screen at all times.
+            tail_owns_slot: tail_owns_slot && !self.unfinished_lines,
+            // So do the rows of a turn's work: the call that runs now is
+            // the last of them, and a short pane must not cut it off.
+            active_keeps_newest: (tail_owns_slot && self.unfinished_lines) || self.fold.is_pending(),
             dialog,
             question,
             picker: self.overlay(),
@@ -2228,7 +2302,7 @@ impl Ui {
             max_height: usize::from(self.painter.max_height()),
         };
         let built = view::build_parts(&frame);
-        let dense = self.work_opens_dense(tail_owns_slot);
+        let dense = self.work_opens_dense(tail_owns_slot) || self.tail_continues_its_answer(tail_owns_slot);
         self.place(built, whole, dense);
     }
 
@@ -2244,6 +2318,17 @@ impl Ui {
             HistoryTail::ToolCell => !tail_owns_slot && !self.fold.is_pending() && self.tool_cell.is_some(),
             HistoryTail::Other => false,
         }
+    }
+
+    /// Whether the live rows are the next rows of an answer whose earlier
+    /// rows are in the transcript already: they stand right under those, with
+    /// no gap row, as they will once the line ends — a gap would put the line
+    /// a row lower than it lands.
+    fn tail_continues_its_answer(&self, tail_owns_slot: bool) -> bool {
+        tail_owns_slot
+            && self.unfinished_lines
+            && !self.fold.is_pending()
+            && matches!(&self.segment, Segment::Text(_, stream) if !stream.is_empty())
     }
 
     /// Put the built rows on the screen: the head sized for them — as a popup
@@ -3986,19 +4071,19 @@ impl Ui {
             ParkedScreen::Question(_) => None,
         }) {
             match key.code {
-                KeyCode::Up => dialog.selected = dialog.selected.saturating_sub(1),
-                KeyCode::Down => {
-                    dialog.selected =
-                        (dialog.selected + 1).min(dialog.options.len().saturating_sub(1));
-                }
+                KeyCode::Up => dialog.step(false),
+                KeyCode::Down => dialog.step(true),
                 KeyCode::Char(ch) if ch.is_ascii_digit() => {
                     let index = ch.to_digit(10).unwrap_or(0) as usize;
                     if index >= 1 && index <= dialog.options.len() {
-                        dialog.selected = index - 1;
+                        dialog.selected = Some(index - 1);
                         confirm = true;
                     }
                 }
-                KeyCode::Enter => confirm = true,
+                // Enter answers with the chosen row. With none chosen — how a
+                // prompt only a person may answer opens — it answers nothing,
+                // and the prompt stays up.
+                KeyCode::Enter => confirm = dialog.selected.is_some(),
                 _ => {}
             }
         }
@@ -4012,20 +4097,22 @@ impl Ui {
     }
 
     fn answer_dialog(&mut self) {
+        let chosen = match self.parked.as_ref().map(|parked| &parked.screen) {
+            Some(ParkedScreen::Dialog(dialog)) => dialog.selected,
+            Some(ParkedScreen::Question(_)) => Some(0),
+            None => None,
+        };
+        // A dialog with no row chosen has no answer to give: it stays parked.
+        let Some(selected) = chosen else {
+            return;
+        };
         let Some(parked) = self.parked.take() else {
             return;
         };
         events::retire_prompt(parked.prompt_id, ResolvedBy::Pane);
-        let (selected, label) = match &parked.screen {
-            ParkedScreen::Dialog(dialog) => (
-                dialog.selected,
-                dialog
-                    .options
-                    .get(dialog.selected)
-                    .cloned()
-                    .unwrap_or_default(),
-            ),
-            ParkedScreen::Question(_) => (0, String::new()),
+        let label = match &parked.screen {
+            ParkedScreen::Dialog(dialog) => dialog.options.get(selected).cloned().unwrap_or_default(),
+            ParkedScreen::Question(_) => String::new(),
         };
         match parked.prompt {
             PendingPrompt::Permission(prompt) => {
@@ -4759,7 +4846,8 @@ impl Ui {
 
     /// The `turns` view's working row says how many steps the open fold has
     /// taken: the ones it holds and the calls of the cell still live. The
-    /// rows above it show only the newest.
+    /// rows above it show them one under another, as many as the pane has
+    /// room for.
     fn count_steps(&mut self) {
         let steps = if self.folding() {
             self.fold.step_count() + self.tool_cell.as_ref().map_or(0, ToolGroup::call_count)
@@ -4782,6 +4870,7 @@ impl Ui {
             }
             RenderBlock::TextDelta { id, text, done } => {
                 self.note_stream_content();
+                self.end_thinking_tail();
                 self.open_text(id.0);
                 let text = self.absorb_passport_label(&text, done);
                 self.transcript_answer.push_str(&text);
@@ -4806,6 +4895,7 @@ impl Ui {
                 // heading is the answer to "what is it doing", and hiding the
                 // thinking body must not also hide that.
                 self.absorb_reasoning_heading(id.0, &text, done);
+                self.absorb_thinking_tail(&text, done);
                 // The `turns` view folds thinking with the rest of the work:
                 // its heading is on the working row, the block in Ctrl+T.
                 if !self.flags.show_thinking || self.folding() {
@@ -4828,6 +4918,7 @@ impl Ui {
                 ..
             } => {
                 self.note_stream_content();
+                self.end_thinking_tail();
                 if status == ToolCallStatus::Pending || self.tools.contains_key(&tool_call_id.0) {
                     return;
                 }
@@ -4853,8 +4944,9 @@ impl Ui {
                 // ExecCell 을 앉힌다. 칸은 하나다.
                 self.close_segment();
                 // A short text the `turns` view was holding said what this
-                // call is for: it goes with the fold, not into history.
-                self.fold.drop_preamble();
+                // call is for: it stays in the viewport with the steps, and
+                // does not go into history.
+                self.fold.preamble_joins_the_work();
                 if self.may_take_the_live_slot(LiveSlotRequest::Tool(&kind)) {
                     self.open_tool(tool_call_id.0.clone(), kind.clone());
                 } else {
@@ -5173,7 +5265,8 @@ impl Ui {
         // 이므로 답변 행이 그 앞을 지나가면 순서가 뒤집힌다. 아직 도는 셀은
         // 그대로 둔다(codex 도 활성 칸은 하나지만 도는 exec 을 버리지 않는다).
         self.flush_tool_cell();
-        self.segment = Segment::Text(id, MarkdownStream::answer(self.width()));
+        self.segment =
+            Segment::Text(id, MarkdownStream::answer(self.width()).showing_unfinished(self.unfinished_lines));
         self.last_commit = None;
     }
 
@@ -5653,6 +5746,9 @@ impl App {
                 work_under_transcript: super::style::current().work_under_transcript,
                 fold: turns::TurnFold::default(),
                 thinking_line: super::style::current().thinking_line,
+                thinking_tail: super::style::current().style == super::style::TuiStyle::Marks,
+                thinking_said: String::new(),
+                unfinished_lines: super::style::current().style == super::style::TuiStyle::Marks,
                 reasoning_started: None,
                 reasoning_about: None,
                 start_notes: Vec::new(),
@@ -5746,6 +5842,12 @@ impl App {
 
     async fn run_initial_prompt(&mut self, events: &mut TerminalEvents) {
         if let Some(prompt) = self.session_mut().take_initial_prompt() {
+            // The request given on the command line is the person's first
+            // words, said on screen as a typed one is. It went to the model
+            // unsaid: the screen showed the working row over nothing while
+            // the model was awaited, and the transcript opened on an answer
+            // to a request it did not hold (zo 1.1.142 and 1.1.143).
+            self.ui.user_cell(prompt.trim());
             let submission = Submission { text: prompt, image_paths: Vec::new() };
             Box::pin(self.run_turn_chain(Work::Turn(submission), events, None)).await;
         }
@@ -7262,7 +7364,12 @@ impl App {
         ui.published_activity = PublishedActivity::Never;
         ui.set_subagent_progress(Vec::new());
         ui.set_route_fact(None);
-        ui.status = Some(Status::working(Duration::ZERO));
+        let mut status = Status::working(Duration::ZERO);
+        if ui.thinking_tail {
+            status.name_the_wait_after(super::view::WAIT_NAMED_AFTER);
+        }
+        ui.status = Some(status);
+        ui.thinking_said.clear();
         ui.publish_working_activity(turn_scaffold.ide);
         ui.draw_with_queue(|| block_rx.len());
 
@@ -7934,6 +8041,9 @@ fn test_ui() -> Ui {
         work_under_transcript: false,
         fold: turns::TurnFold::default(),
         thinking_line: false,
+        thinking_tail: false,
+        thinking_said: String::new(),
+        unfinished_lines: false,
         reasoning_started: None,
         reasoning_about: None,
         start_notes: Vec::new(),
@@ -8253,6 +8363,7 @@ mod tests {
                     decision: PermissionDecision::Deny,
                 },
             ],
+            person_only: false,
             question: None,
             responder,
         });
@@ -9001,6 +9112,10 @@ mod tests {
         let live: Vec<String> = ui.active_cell(80).0.iter().map(Line::plain).collect();
         assert!(live.iter().any(|row| row.contains("Read src/parser.rs")), "{live:#?}");
         assert!(live.iter().any(|row| row.contains("Fixed.")), "{live:#?}");
+        // And the words that led into it stay above it until the fold is said.
+        let preamble = live.iter().position(|row| row.contains("I will read the parser first."));
+        let read = live.iter().position(|row| row.contains("Read src/parser.rs"));
+        assert!(preamble.is_some() && preamble < read, "{live:#?}");
 
         // The turn's end.
         ui.close_segment();
@@ -9066,6 +9181,175 @@ mod tests {
             took: None,
         }]);
         assert!(!ui.work_opens_dense(false), "held work becomes a fold, which keeps its gap row here");
+    }
+
+    /// While the model thinks, the rows under the working row show the
+    /// thinking's newest words and the row says `Thinking`: fragments join as
+    /// they were written, one block's words lead into the next block's, and
+    /// all of it goes when the answer begins. A look that does not ask for
+    /// it shows neither, as before.
+    #[test]
+    fn thinking_shows_under_the_working_row_as_it_comes_and_goes_when_the_answer_begins() {
+        use runtime::message_stream::BlockId;
+
+        fn reason(ui: &mut super::Ui, id: BlockId, text: &str, done: bool) {
+            ui.block(RenderBlock::Reasoning { id, text: text.to_string(), signature: None, done });
+        }
+        fn shown(ui: &super::Ui) -> String {
+            let rows = ui.status.as_ref().map(|status| status.detail_lines(100)).unwrap_or_default();
+            rows.iter().map(Line::plain).collect::<Vec<_>>().join(" ")
+        }
+        fn header(ui: &super::Ui) -> String {
+            ui.status.as_ref().map(|status| status.header.clone()).unwrap_or_default()
+        }
+
+        let ids = BlockIdGen::default();
+        let mut ui = test_ui();
+        ui.thinking_tail = true;
+        ui.status = Some(crate::tui::view::Status::working(Duration::from_secs(3)));
+        assert!(shown(&ui).is_empty());
+
+        let first = ids.next();
+        reason(&mut ui, first, "I should read the par", false);
+        assert_eq!(header(&ui), "Thinking", "a block with no heading yet says it is thinking");
+        assert!(shown(&ui).contains("I should read the par"), "{}", shown(&ui));
+        reason(&mut ui, first, "ser before I change it", false);
+        assert!(shown(&ui).contains("read the parser before I change it"), "{}", shown(&ui));
+
+        reason(&mut ui, first, "", true);
+        let second = ids.next();
+        reason(&mut ui, second, "Then the checker", false);
+        assert!(shown(&ui).contains("change it Then the checker"), "{}", shown(&ui));
+
+        ui.block(RenderBlock::TextDelta { id: ids.next(), text: "Here is what I found\n".to_string(), done: false });
+        assert!(shown(&ui).is_empty(), "the answer began: {}", shown(&ui));
+
+        let mut as_before = test_ui();
+        as_before.status = Some(crate::tui::view::Status::working(Duration::from_secs(3)));
+        reason(&mut as_before, ids.next(), "I should read the parser", false);
+        assert!(shown(&as_before).is_empty(), "{}", shown(&as_before));
+        assert_eq!(header(&as_before), crate::tui::view::Status::DEFAULT_HEADER);
+    }
+
+    /// An answer's line shows in the live rows from its first word, and its
+    /// newline moves it into the transcript without a frame in which a row
+    /// of it is missing or stands twice — a short line and one that wraps
+    /// over ten rows. The live rows of an answer already in the transcript
+    /// open with no gap row, so the line lands on the rows it stood on.
+    #[test]
+    fn an_answers_unfinished_line_stands_live_and_lands_once() {
+        /// One frame: the stream's due rows go to the transcript, and what
+        /// the screen then shows is the transcript and the live rows.
+        fn frame(ui: &mut super::Ui) -> Vec<String> {
+            ui.commit_stream(std::time::Instant::now());
+            let mut rows = history(ui);
+            rows.extend(ui.active_cell(80).0.iter().map(Line::plain));
+            rows
+        }
+        fn times(rows: &[String], word: &str) -> usize {
+            rows.iter().map(|row| row.matches(word).count()).sum()
+        }
+
+        for words in [8usize, 200] {
+            let mut ui = test_ui();
+            ui.unfinished_lines = true;
+            ui.status = Some(crate::tui::view::Status::working(Duration::from_secs(3)));
+            let ids = BlockIdGen::default();
+            let id = ids.next();
+            let say = |ui: &mut super::Ui, text: String| ui.block(RenderBlock::TextDelta { id, text, done: false });
+
+            // A first line, finished: it is in the transcript.
+            say(&mut ui, "The first line.\n".to_string());
+            let rows = frame(&mut ui);
+            assert_eq!(times(&rows, "The first line."), 1, "{rows:#?}");
+
+            // The second line arrives a word at a time.
+            let mut shown = Vec::new();
+            for n in 0..words {
+                say(&mut ui, format!("w{n:03} "));
+                shown = frame(&mut ui);
+                assert_eq!(times(&shown, &format!("w{n:03}")), 1, "word {n} of {words}: {shown:#?}");
+            }
+            assert_eq!(times(&history(&ui), "w000"), 0, "nothing of the line is in the transcript yet");
+            assert!(!ui.work_opens_dense(true), "the transcript's last cell is no band and no tool cell");
+            assert!(ui.tail_continues_its_answer(true), "the live rows are the answer's next rows: no gap row");
+
+            // The newline: every word once, in the frame before any tick and
+            // in the frame after, and the rows are the rows that stood.
+            say(&mut ui, "\n".to_string());
+            let before_tick: Vec<String> =
+                history(&ui).into_iter().chain(ui.active_cell(80).0.iter().map(Line::plain)).collect();
+            let landed = frame(&mut ui);
+            for rows in [&before_tick, &landed] {
+                for n in 0..words {
+                    assert_eq!(times(rows, &format!("w{n:03}")), 1, "word {n} of {words}: {rows:#?}");
+                }
+            }
+            assert_eq!(landed, shown, "{words} words: the newline moved a row");
+            assert_eq!(times(&history(&ui), &format!("w{:03}", words - 1)), 1, "the line is in the transcript");
+        }
+    }
+
+    /// The `turns` view stacks a turn's work in the viewport: every finished
+    /// call adds a row under the one before it and takes none away, a short
+    /// text a call followed stays above that call, and the working row counts
+    /// them. It showed the newest three, so a turn of six calls showed rows
+    /// that came and went ("보였다 사라졌다", 2026-11-12: `5 steps` over three
+    /// rows). The turn over, one cell says the work and nothing of it is left
+    /// in the viewport.
+    #[test]
+    fn the_turns_view_stacks_every_step_under_the_one_before_it() {
+        use runtime::message_stream::types::ToolResultBody;
+        let read = |ui: &mut super::Ui, ids: &BlockIdGen, n: usize| {
+            let call = format!("toolu_read_{n}");
+            ui.block(tool_call(ids, &call, "read_file", &json!({ "path": format!("src/f{n}.rs") })));
+            ui.block(RenderBlock::ToolResult {
+                id: ids.next(),
+                tool_call_id: ToolCallId(call),
+                is_error: false,
+                body: ToolResultBody::Text { content: "fn main() {}\n".to_string(), truncated: false },
+            });
+        };
+        let live = |ui: &super::Ui| ui.active_cell(80).0.iter().map(Line::plain).collect::<Vec<_>>();
+        let at = |rows: &[String], words: &str| {
+            rows.iter().position(|row| row.contains(words)).unwrap_or_else(|| panic!("no row says {words}: {rows:#?}"))
+        };
+
+        let mut ui = test_ui();
+        ui.view = super::super::style::ConversationView::Turns;
+        ui.status = Some(crate::tui::view::Status::working(Duration::from_secs(3)));
+        let ids = BlockIdGen::default();
+        says(&mut ui, &ids, "I will read the sources.");
+        let mut before: Vec<String> = Vec::new();
+        for n in 0..6 {
+            read(&mut ui, &ids, n);
+            let rows = live(&ui);
+            assert!(rows.len() > before.len(), "call {n} added a row: {rows:#?}");
+            assert_eq!(rows[..before.len()], before[..], "and moved none of the rows above it");
+            before = rows;
+        }
+        for n in 0..6 {
+            assert_eq!(
+                before.iter().filter(|row| row.contains(&format!("src/f{n}.rs"))).count(),
+                1,
+                "call {n} has its row: {before:#?}"
+            );
+        }
+        assert!(at(&before, "I will read the sources.") < at(&before, "src/f0.rs"), "{before:#?}");
+        assert!(at(&before, "src/f0.rs") < at(&before, "src/f5.rs"), "{before:#?}");
+        let working = ui.status.as_ref().map(|status| status.line(80).plain()).unwrap_or_default();
+        assert!(working.contains("6 steps"), "{working}");
+        assert!(history(&ui).is_empty(), "nothing is said while the work runs: {:#?}", history(&ui));
+
+        // The turn's end: one cell says the six, and the viewport holds none.
+        ui.close_segment();
+        ui.retire_tool_cell();
+        ui.flush_fold();
+        let said = history(&ui);
+        assert_eq!(said.iter().filter(|row| row.contains("Worked")).count(), 1, "{said:#?}");
+        assert!(said.iter().any(|row| row.contains("6 steps")), "{said:#?}");
+        assert!(!said.iter().any(|row| row.contains("src/f3.rs")), "no row a step: {said:#?}");
+        assert!(live(&ui).is_empty() && !ui.fold.is_pending(), "{:#?}", live(&ui));
     }
 
     /// The `turns` view folds each call as it finishes: commands that come
@@ -10994,6 +11278,7 @@ mod tests {
             pending_input: None,
             active: None,
             tail_owns_slot: false,
+            active_keeps_newest: false,
             dialog: None,
             question: None,
             picker: None,
@@ -11297,6 +11582,7 @@ mod tests {
                 },
             ],
             risk_level: RiskLevel::High,
+            person_only: false,
             question: None,
         };
         let (responder, _answer) = tokio::sync::oneshot::channel();
@@ -11314,6 +11600,69 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains(long), "the whole command is on the card:\n{text}");
+    }
+
+    /// A prompt only a person may answer takes no answer from a bare Enter:
+    /// the dialog opens with no row chosen, Enter leaves it up and sends
+    /// nothing, and the row's number answers it in one key as before. With a
+    /// row chosen by an arrow, Enter answers with that row.
+    #[test]
+    fn enter_answers_nothing_on_a_prompt_only_a_person_may_answer() {
+        use crossterm::event::KeyCode as Pressed;
+        use runtime::message_stream::PermissionDecision as Answered;
+        use runtime::permission::{
+            PermissionChoice, PermissionDecision, PermissionRequest, RiskLevel,
+        };
+
+        let ids = BlockIdGen::default();
+        let asked = |ui: &mut super::Ui| {
+            let request = PermissionRequest {
+                tool: "bash".to_string(),
+                input_summary: "kill 4242".to_string(),
+                input_hash: String::new(),
+                reasoning: "a person should say yes first".to_string(),
+                choices: vec![
+                    PermissionChoice {
+                        key: 'o',
+                        label: "Allow once".to_string(),
+                        decision: PermissionDecision::AllowOnce,
+                    },
+                    PermissionChoice {
+                        key: 'n',
+                        label: "Deny".to_string(),
+                        decision: PermissionDecision::Deny,
+                    },
+                ],
+                risk_level: RiskLevel::High,
+                person_only: true,
+                question: None,
+            };
+            let (responder, answer) = tokio::sync::oneshot::channel();
+            ui.block(RenderBlock::PermissionPrompt(
+                crate::session::permission_bridge::build_render_prompt(&request, responder, ids.next()),
+            ));
+            answer
+        };
+
+        // Enter, and Enter again: the prompt is still up and nothing was sent.
+        let mut ui = test_ui();
+        let mut answer = asked(&mut ui);
+        key(&mut ui, Pressed::Enter);
+        key(&mut ui, Pressed::Enter);
+        assert!(ui.parked.is_some(), "a bare Enter leaves the prompt up");
+        assert!(answer.try_recv().is_err(), "and answers nothing");
+        // The row's number answers it, in one key.
+        key(&mut ui, Pressed::Char('1'));
+        assert!(ui.parked.is_none());
+        assert_eq!(answer.try_recv().expect("answered"), Answered::AllowOnce);
+
+        // An arrow chooses a row, and then Enter answers with it.
+        let mut ui = test_ui();
+        let mut answer = asked(&mut ui);
+        key(&mut ui, Pressed::Up);
+        key(&mut ui, Pressed::Enter);
+        assert!(ui.parked.is_none());
+        assert_eq!(answer.try_recv().expect("answered"), Answered::Deny);
     }
 
     /// The parser names a call the way the model made it (`Bash`), the
@@ -11347,6 +11696,7 @@ mod tests {
                 decision: PermissionDecision::AllowOnce,
             }],
             risk_level: RiskLevel::High,
+            person_only: false,
             question: None,
         };
         let (responder, _answer) = tokio::sync::oneshot::channel();

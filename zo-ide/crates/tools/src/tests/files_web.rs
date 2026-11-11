@@ -1513,6 +1513,39 @@ fn notebook_edit_rejects_invalid_inputs() {
     let _ = fs::remove_file(empty_notebook);
 }
 
+/// A read from line 1 is a read from the top, and so is one from 0: the
+/// file's first line is in both. Read as lines to skip, `offset: 1` lost it
+/// in every file a model read that way (zo 1.1.143). The page after lines
+/// 1-2 is asked for by the next line's number, and a model that counts lines
+/// skipped reads one line twice, never one fewer.
+#[test]
+fn a_read_from_line_one_keeps_the_files_first_line() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = temp_path("read-offset");
+    fs::create_dir_all(&root).expect("create root");
+    let original_dir = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&root).expect("set cwd");
+    fs::write(root.join("demo.txt"), "alpha\nbeta\ngamma\n").expect("write the file");
+    let read = |offset: usize| {
+        let read = run_tool("read_file", &json!({ "path": "demo.txt", "offset": offset, "limit": 2 }));
+        read.map(|read| serde_json::from_str::<serde_json::Value>(&read).expect("json"))
+    };
+    let reads: Vec<_> = (0..=3).map(read).collect();
+    std::env::set_current_dir(&original_dir).expect("restore cwd");
+    let _ = fs::remove_dir_all(&root);
+
+    let page = |offset: usize| {
+        let read = reads[offset].as_ref().expect("the read should succeed");
+        (read["file"]["content"].as_str().expect("content"), read["file"]["startLine"].as_u64())
+    };
+    assert_eq!(page(0), ("alpha\nbeta", Some(1)));
+    assert_eq!(page(1), ("alpha\nbeta", Some(1)));
+    assert_eq!(page(2), ("beta\ngamma", Some(2)));
+    assert_eq!(page(3), ("gamma", Some(3)));
+}
+
 #[test]
 fn file_tools_cover_read_write_and_edit_behaviors() {
     let _guard = env_lock()
@@ -1554,9 +1587,11 @@ fn file_tools_cover_read_write_and_edit_behaviors() {
     assert_eq!(read_full_output["file"]["content"], "alpha\nbeta\ngamma");
     assert_eq!(read_full_output["file"]["startLine"], 1);
 
+    // `offset` is the line the read starts at, and the line the result says
+    // it started at: line 2 is the second line.
     let read_slice = run_tool(
         "read_file",
-        &json!({ "path": "nested/demo.txt", "offset": 1, "limit": 1 }),
+        &json!({ "path": "nested/demo.txt", "offset": 2, "limit": 1 }),
     )
     .expect("read slice should succeed");
     let read_slice_output: serde_json::Value = serde_json::from_str(&read_slice).expect("json");

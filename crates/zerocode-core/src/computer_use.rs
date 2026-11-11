@@ -19,6 +19,16 @@ pub const COMPUTER_USE_SKILL_NAME: &str = "computer-use";
 /// The program every Computer Use caller runs — the pane's shim, the name a
 /// recipe line starts with, and zo's road to the window.
 pub const COMPUTER_CLI: &str = "zerocode-computer";
+
+/// Where [`COMPUTER_CLI`] is on the search path `path`, the way a shell looks
+/// it up: the window puts it on every pane's `PATH`, so a session that finds
+/// it can reach Computer Use and one that does not cannot. `windows` looks
+/// it up by Windows' rule, where the window's launcher is the `.cmd`
+/// ([`crate::agent::resolve_on_path`]).
+#[must_use]
+pub fn computer_cli_on_path(path: &std::ffi::OsStr, windows: bool) -> Option<std::path::PathBuf> {
+    crate::agent::resolve_on_path_by(Some(path), COMPUTER_CLI, windows)
+}
 // Protocol 2 requires the window-supplied guard table and its budget shape.
 pub const COMPUTER_USE_PROTOCOL_VERSION: u64 = 2;
 pub const COMPUTER_USE_DEADLINE_SECONDS: u64 = 65;
@@ -41,11 +51,13 @@ pub const CWD_HEADER: &str = "x-zerocode-cwd";
 
 /// The Computer Use verbs whose request says where its caller stands
 /// ([`CWD_HEADER`]): the ones the window judges by that folder. A recipe walk
-/// that stops is judged for the workspace it was asked from, and a sheet
-/// file's relative `--path` starts there, as a person's would; no other verb
-/// reads the folder, so no other call spends two processes spelling it.
+/// that stops is judged for the workspace it was asked from, a schedule that
+/// is asked for runs in it, and a sheet file's relative `--path` starts there,
+/// as a person's would; no other verb reads the folder, so no other call
+/// spends two processes spelling it.
 pub const CWD_VERBS: &[&str] = &[
     ComputerMethod::RecipeRun.verb_name(),
+    ComputerMethod::RecipeSchedule.verb_name(),
     ComputerMethod::Walk.verb_name(),
     ComputerMethod::SheetWrite.verb_name(),
     ComputerMethod::SheetRead.verb_name(),
@@ -431,6 +443,19 @@ pub const OBSERVE_DIFF_RECTS: usize = 20;
 pub const OBSERVE_FRAMES_MAX: usize = 8;
 /// The person's turn (§7.4): how long a handoff waits for them.
 pub const COMPUTER_HANDOFF_TIMEOUT_MS: u64 = 600_000;
+/// How long the card for a schedule an agent asks for (`recipe-schedule`)
+/// stands. Silence past it is a no: nothing is written.
+pub const RECIPE_SCHEDULE_ASK_MS: u64 = 180_000;
+
+/// The flag a walk carries when the window starts it for a schedule an agent
+/// asked for, and its key in the command's parameters: the SHA-256, in hex, of
+/// the Flow document the person allowed. The walk judges the very text it read
+/// against it and refuses another — so what is walked is what was allowed, with
+/// no moment between a check and the walk for the document to change in. It
+/// only ever adds a refusal: anyone may say it, and gains nothing by it.
+pub const FLOW_SHA256_FLAG: &str = "flow-sha256";
+/// See [`FLOW_SHA256_FLAG`].
+pub const FLOW_SHA256_PARAM: &str = "flowSha256";
 /// How long a hand whose place is covered waits before it lists the windows
 /// again, when what stands in front looks like it is passing — a
 /// notification sliding in or out, a window being dragged (t-12979): a
@@ -1134,6 +1159,8 @@ pub fn computer_deadline_ms(argv: &[String]) -> u64 {
         ComputerMethod::RecipeRun if command.params.get("repeat") == Some(&Value::Bool(true)) => {
             COMPUTER_LONGEST_DEADLINE_MS
         }
+        // The person reads a card and answers it: as long as the card stands.
+        ComputerMethod::RecipeSchedule => RECIPE_SCHEDULE_ASK_MS + COMPUTER_BRIDGE_GRACE_MS,
         method if method.presses() => {
             base.max(COMPUTER_CONFIRM_TIMEOUT_MS + COMPUTER_BRIDGE_GRACE_MS)
         }
@@ -2360,6 +2387,10 @@ pub enum ComputerMethod {
     RecipeShow,
     /// Walk a saved recipe in one call (§7.2) — the window's, like a batch.
     RecipeRun,
+    /// Ask the person to let a saved Flow run on a schedule with nobody
+    /// watching — the window's: it shows the card, and only the person's
+    /// press on it writes the job.
+    RecipeSchedule,
     /// The ears (§7.1): listen to the machine's sound through the Screen &
     /// System Audio Recording permission the eyes already hold, read what the
     /// system's sound classifier heard, and wait for a sound — the window
@@ -2527,6 +2558,7 @@ impl ComputerMethod {
         Self::RecipeList,
         Self::RecipeShow,
         Self::RecipeRun,
+        Self::RecipeSchedule,
         Self::ListenStart,
         Self::ListenStop,
         Self::SoundRead,
@@ -2600,7 +2632,11 @@ impl ComputerMethod {
             Self::Read => Some("readText"),
             Self::Stop | Self::Resume | Self::Status | Self::Evidence => None,
             Self::Verdict | Self::Compare | Self::Observe | Self::Handoff => None,
-            Self::RecipeSave | Self::RecipeList | Self::RecipeShow | Self::RecipeRun => None,
+            Self::RecipeSave
+            | Self::RecipeList
+            | Self::RecipeShow
+            | Self::RecipeRun
+            | Self::RecipeSchedule => None,
             Self::ListenStart => Some("listenStart"),
             Self::ListenStop => Some("listenStop"),
             Self::SoundRead => Some("soundRead"),
@@ -2669,6 +2705,7 @@ impl ComputerMethod {
             Self::RecipeList => "recipe-list",
             Self::RecipeShow => "recipe-show",
             Self::RecipeRun => "recipe-run",
+            Self::RecipeSchedule => "recipe-schedule",
             Self::ListenStart => "listen-start",
             Self::ListenStop => "listen-stop",
             Self::SoundRead => "sound-read",
@@ -2959,6 +2996,7 @@ impl ComputerMethod {
                 | Self::RecipeList
                 | Self::RecipeShow
                 | Self::RecipeRun
+                | Self::RecipeSchedule
                 | Self::ListenStart
                 | Self::ListenStop
                 | Self::SoundRead
@@ -3952,6 +3990,7 @@ pub fn verb_method(verb: &str) -> Option<ComputerMethod> {
         "recipe-list" => ComputerMethod::RecipeList,
         "recipe-show" => ComputerMethod::RecipeShow,
         "recipe-run" => ComputerMethod::RecipeRun,
+        "recipe-schedule" => ComputerMethod::RecipeSchedule,
         "listen-start" => ComputerMethod::ListenStart,
         "listen-stop" => ComputerMethod::ListenStop,
         "sound-read" => ComputerMethod::SoundRead,
@@ -4213,6 +4252,11 @@ fn parse_flags(
         ("l1", "l1"),
         ("after-text", "afterText"),
         ("flow-check", "flowCheck"),
+        (FLOW_SHA256_FLAG, FLOW_SHA256_PARAM),
+        ("every", "every"),
+        ("at", "at"),
+        ("day", "day"),
+        ("cron", "cron"),
         ("document", "document"),
         ("sheet", "sheet"),
         ("table", "table"),
@@ -4696,9 +4740,11 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
         ComputerMethod::RecipeSave => &["json", "name", "from", "last", "note", "flow-check"],
         ComputerMethod::RecipeList => BASIC,
         ComputerMethod::RecipeShow => &["json", "name"],
+        ComputerMethod::RecipeSchedule => &["json", "name", "every", "at", "day", "cron", "label"],
         ComputerMethod::RecipeRun => &[
             "json",
             "name",
+            FLOW_SHA256_FLAG,
             "params",
             "tab",
             "start",
@@ -5251,6 +5297,17 @@ fn validate(
             if recipe_slug(name).is_empty() {
                 return Err("--name needs at least one letter or digit".into());
             }
+            if params
+                .get(FLOW_SHA256_PARAM)
+                .and_then(Value::as_str)
+                .is_some_and(|held| {
+                    held.len() != 64 || !held.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+            {
+                return Err(format!(
+                    "--{FLOW_SHA256_FLAG} is a SHA-256 in hex: the document a scheduled walk is held to"
+                ));
+            }
             // The words that stand a saved recipe up as a Flow are the screen's
             // own: an empty condition would be a check nothing can fail.
             if params
@@ -5275,6 +5332,26 @@ fn validate(
                 .is_some_and(|dir| dir.trim().is_empty())
             {
                 return Err("--arena needs the recorded evidence folder".into());
+            }
+        }
+        ComputerMethod::RecipeSchedule => {
+            let word = |key: &str| params.get(key).and_then(Value::as_str);
+            let name = word("name").ok_or("a schedule needs --name: the Flow to run")?;
+            if recipe_slug(name).is_empty() {
+                return Err("--name needs at least one letter or digit".into());
+            }
+            // Read as the window will read it, so a schedule that says nothing
+            // is refused before a card is shown for it.
+            crate::automation::Schedule::from_words(
+                word("every"),
+                word("at"),
+                word("day"),
+                word("cron"),
+            )?;
+            if word("label")
+                .is_some_and(|label| label.trim().is_empty() || label.chars().any(char::is_control))
+            {
+                return Err("--label is one line: the name the schedule is listed under".into());
             }
         }
         ComputerMethod::Handoff => {
@@ -5753,6 +5830,11 @@ pub fn usage() -> String {
         "       --flow-check also stands it up as a Flow: the text becomes its required check, bound to the app or page the steps ended in)",
         "  zerocode-computer recipe-list [--json]",
         "  zerocode-computer recipe-show --name <name> [--json]",
+        "  zerocode-computer recipe-schedule --name <flow> (--every hourly|daily|weekdays|weekly [--at HH:MM] [--day mon..sun] | --cron '<minute hour day-of-month month day-of-week>') [--label <name>] [--json]",
+        "      (asks the person to let the window walk that Flow on the schedule with nobody watching: a card names the Flow,",
+        "       when it runs and where, and only the person's answer on it writes the job — a no or silence writes nothing.",
+        "       A job whose Flow document is changed afterwards waits for the person again. The window cannot tell a job",
+        "       somebody wrote straight into its saved file from one it was asked for)",
         "  zerocode-computer recipe-run --name <name> [--params '{\"name\":\"value\"}'] [--tab <browser-label>] [--start N] [--end N] [--confirm <txn>] [--repeat [--until <HH:MM|N>]] [--arena <evidence dir>] [--rescue] [--json]",
         "  zerocode-computer walk --goal <what to reach> (--app <app> | --pane <browser pane> | --platform <ios|android> --device <id>) [--until <text on screen when it worked>] [--steps N] [--overlap] [--rescue] [--replay] [--json]",
         "      (--replay: this walk repeats one walked before, so a question it asked then is answered from the judgment memo)",
@@ -6459,7 +6541,7 @@ mod windows_shim_tests {
             "could not reach the window",
             "$env:ZEROCODE_RUN_EVIDENCE_DIR",
             "'x-zerocode-run-evidence', $evidence",
-            "if (@('recipe-run', 'walk', 'sheet-write', 'sheet-read') -ccontains [string]$args[0]) {",
+            "if (@('recipe-run', 'recipe-schedule', 'walk', 'sheet-write', 'sheet-read') -ccontains [string]$args[0]) {",
             "(Get-Location).ProviderPath",
             "'x-zerocode-cwd', [BitConverter]::ToString([System.Text.Encoding]::UTF8.GetBytes($cwd)).Replace('-', '')",
             "zerocode-computer — inspect and operate local desktop apps",
@@ -9960,6 +10042,163 @@ mod tests {
             .collect();
         let command = batch(&json!(clicks)).expect("twenty-one actions in one judgement");
         assert_eq!(batch_steps(&command).len(), 21);
+    }
+
+    /// A walk may be held to a document: the window says the SHA-256 of the
+    /// Flow the person allowed with the walk it starts for a schedule an agent
+    /// asked for, and what is not a SHA-256 in hex is refused.
+    #[test]
+    fn a_walk_may_be_held_to_the_sha256_of_a_document() {
+        let held = "ab".repeat(32);
+        let flag = format!("--{FLOW_SHA256_FLAG}");
+        let walk = parse_command(&words(&[
+            "recipe-run",
+            "--name",
+            "wallet-qa",
+            &flag,
+            &held,
+            "--json",
+        ]))
+        .expect("a held walk");
+        assert_eq!(walk.method, ComputerMethod::RecipeRun);
+        assert_eq!(walk.params[FLOW_SHA256_PARAM], json!(held));
+        let plain = parse_command(&words(&["recipe-run", "--name", "wallet-qa"])).expect("a walk");
+        assert!(plain.params.get(FLOW_SHA256_PARAM).is_none());
+        for refused in ["abc", &"zz".repeat(32), &"ab".repeat(33)] {
+            let error = parse_command(&words(&[
+                "recipe-run",
+                "--name",
+                "wallet-qa",
+                &flag,
+                refused,
+            ]))
+            .expect_err("not a SHA-256");
+            assert!(error.contains("SHA-256 in hex"), "{refused}: {error}");
+        }
+    }
+
+    /// `recipe-schedule` asks for a Flow by name and says when in one of two
+    /// ways. It is the window's: it names no app, presses nothing, says where
+    /// its caller stands — the job runs there — and waits as long as its card
+    /// may stand.
+    #[test]
+    fn a_schedule_is_asked_for_by_name_and_says_when_one_way() {
+        let asked = parse_command(&words(&[
+            "recipe-schedule",
+            "--name",
+            "Wallet QA",
+            "--every",
+            "weekly",
+            "--at",
+            "18:30",
+            "--day",
+            "fri",
+            "--label",
+            "Friday wallet check",
+            "--json",
+        ]))
+        .expect("asked");
+        assert_eq!(asked.method, ComputerMethod::RecipeSchedule);
+        for (key, said) in [
+            ("name", "Wallet QA"),
+            ("every", "weekly"),
+            ("at", "18:30"),
+            ("day", "fri"),
+            ("label", "Friday wallet check"),
+        ] {
+            assert_eq!(asked.params[key], json!(said), "{key}");
+        }
+        let by_cron = parse_command(&words(&[
+            "recipe-schedule",
+            "--name",
+            "x",
+            "--cron",
+            "*/20 9-17 * * 1-5",
+        ]))
+        .expect("by cron");
+        assert_eq!(by_cron.params["cron"], json!("*/20 9-17 * * 1-5"));
+        for refused in [
+            &["recipe-schedule"][..],
+            &["recipe-schedule", "--name", "x"],
+            &["recipe-schedule", "--name", "---", "--every", "daily"],
+            &[
+                "recipe-schedule",
+                "--name",
+                "x",
+                "--every",
+                "daily",
+                "--cron",
+                "0 9 * * *",
+            ],
+            &[
+                "recipe-schedule",
+                "--name",
+                "x",
+                "--every",
+                "daily",
+                "--at",
+                "25:00",
+            ],
+            &[
+                "recipe-schedule",
+                "--name",
+                "x",
+                "--every",
+                "daily",
+                "--day",
+                "mon",
+            ],
+            &["recipe-schedule", "--name", "x", "--cron", "@hourly"],
+            &[
+                "recipe-schedule",
+                "--name",
+                "x",
+                "--every",
+                "daily",
+                "--label",
+                " ",
+            ],
+            &[
+                "recipe-schedule",
+                "--name",
+                "x",
+                "--every",
+                "daily",
+                "--app",
+                "Mail",
+            ],
+            &[
+                "recipe-schedule",
+                "--name",
+                "x",
+                "--every",
+                "daily",
+                "--confirming",
+                "pay",
+            ],
+        ] {
+            assert!(parse_command(&words(refused)).is_err(), "{refused:?}");
+        }
+        let method = ComputerMethod::RecipeSchedule;
+        assert!(!method.acts() && !method.presses() && !method.batches() && method.is_desktop());
+        assert_eq!(method.provider_name(), None);
+        assert!(CWD_VERBS.contains(&method.verb_name()));
+        assert!(crate::computer_recipe::RECIPE_HOUSEKEEPING.contains(&method));
+        assert_eq!(
+            computer_deadline_ms(&words(&[
+                "recipe-schedule",
+                "--name",
+                "x",
+                "--every",
+                "daily"
+            ])),
+            RECIPE_SCHEDULE_ASK_MS + COMPUTER_BRIDGE_GRACE_MS
+        );
+        const {
+            assert!(
+                RECIPE_SCHEDULE_ASK_MS + COMPUTER_BRIDGE_GRACE_MS <= COMPUTER_LONGEST_DEADLINE_MS
+            );
+        }
     }
 
     #[test]

@@ -4986,6 +4986,10 @@ function paintAsk() {
           error: ask.failure,
         }),
   );
+  // A reason is one paragraph: line breaks in it are drawn as spaces, so what
+  // an asker wrote cannot stretch the card. Only a kind that says its reason
+  // is written in lines (`view.lines`) has them kept.
+  el("ask-why").toggleAttribute("data-lines", ask.failure === undefined && view.lines === true);
   paintAskPart("ask-fallback", ask.failure === undefined ? null : kind.refused?.(ask) ?? null);
   paintAskPart("ask-clock", kind.clock?.(ask) ?? null);
   const choices = view.choices ?? null;
@@ -5296,9 +5300,23 @@ registerAskKind("tool", {
       agentClass: who.className,
       title: t("perm.title", "이 도구를 실행할까요?"),
       mono: frame.tool_name ? String(frame.tool_name) : null,
-      why: [frame.reasoning, frame.audit_hint].filter(Boolean).join(" — ") || null,
+      // The risk note follows the reason in its paragraph; under a reason
+      // written in lines (`lines` below) it stands on a line of its own, so it
+      // does not run on from the reason's last line.
+      why: [frame.reasoning, frame.audit_hint].filter(Boolean).join(frame.person_only === true ? "\n" : " — ") || null,
       choices,
-      initial: 0,
+      // A question only the person may answer — zo says so on the frame
+      // (`person_only`: a kill of the window's own processes, a schedule of
+      // zo's own) — hands Enter nothing: the keyboard starts on the frame, a
+      // stray Enter neither allows nor refuses, and the person picks the
+      // answer they mean with a click or a Tab (their choice, 2026-11-11).
+      // A frame without the field, every older zo's, opens on its first choice.
+      initial: frame.person_only === true ? null : 0,
+      // Such a question's reason is zo's own writing, a line for each thing it
+      // says — what a schedule is called, what runs, when and where — with
+      // every value it shows cleaned to one line: its lines are kept. Any
+      // other prompt's reason holds what the model wrote, and stays a paragraph.
+      lines: frame.person_only === true,
       safe: choices.findIndex((choice) => choice.decision === "deny"),
     };
   },

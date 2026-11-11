@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use core_types::tool_names::{tool_key, wire_tool_name, CoreTool};
+use core_types::tool_names::{handler_call, tool_key, wire_tool_name, CoreTool, CAPABILITY_INVOKE};
 use serde_json::Value;
 use zerocode_core::shell_rule::kill::KillVerdict;
 
@@ -112,6 +112,9 @@ pub struct PermissionPolicy {
     /// Allow rules granted live this session via [`Self::grant_always`] that
     /// have not yet been persisted to a settings file. Drained by the host.
     newly_granted: Vec<String>,
+    /// The folder the session's schedules are kept for
+    /// ([`Self::with_schedule_workspace`]), which a schedule's card names.
+    schedule_workspace: Option<std::path::PathBuf>,
 }
 
 impl PermissionPolicy {
@@ -127,6 +130,7 @@ impl PermissionPolicy {
             ask_rules: Vec::new(),
             ordered_rules: Vec::new(),
             newly_granted: Vec::new(),
+            schedule_workspace: None,
         }
     }
 
@@ -138,7 +142,7 @@ impl PermissionPolicy {
     pub fn grant_always(&mut self, tool_name: &str, input: &str) {
         let rule_str = match extract_permission_subject(input) {
             Some(subject) if !subject.trim().is_empty() => {
-                format!("{tool_name}({})", escape_rule_subject(subject.trim()))
+                format!("{tool_name}({})", escape_rule_subject(&literal_rule_content(subject.trim())))
             }
             _ => tool_name.to_string(),
         };
@@ -213,6 +217,34 @@ impl PermissionPolicy {
         for (tool_name, required_mode) in requirements {
             self.tool_requirements.insert(tool_name, required_mode);
         }
+    }
+
+    /// The folder the session's schedules are kept for — the one whose
+    /// sessions will open a schedule registered here — so the card a person
+    /// approves names where the schedule runs, and not where this process
+    /// happens to stand when it asks (a worktree it entered since).
+    #[must_use]
+    pub fn with_schedule_workspace(mut self, workspace: Option<std::path::PathBuf>) -> Self {
+        self.schedule_workspace = workspace;
+        self
+    }
+
+    /// The refusal for a schedule zo asks for — a call only a person may
+    /// answer ([`crate::schedule_guard`]) — where the caller has nobody to
+    /// ask at all: the enforcer a sub-agent's and a scheduled workflow's
+    /// tools go through. `None` for every other call. A kill only a person
+    /// may allow is refused on the shell tools' own road
+    /// ([`crate::kill_guard::refused_where_nobody_can_ask`]).
+    #[must_use]
+    pub fn refused_with_nobody_to_ask(&self, tool_name: &str, input: &str) -> Option<String> {
+        crate::schedule_guard::asks(tool_name, input).then(crate::schedule_guard::nobody_to_ask)
+    }
+
+    /// Whether a grade was ever set for `tool_name`: one that has none is
+    /// judged at the highest ([`Self::required_mode_for`]).
+    #[must_use]
+    pub fn has_tool_requirement(&self, tool_name: &str) -> bool {
+        self.tool_requirements.contains_key(tool_name)
     }
 
     #[must_use]
@@ -403,7 +435,12 @@ impl PermissionPolicy {
         self.authorize_by_mode_and_rules("bash", &input, &PermissionContext::default(), prompter)
     }
 
-    /// The decision for one call. A bash command that would send a signal is
+    /// The decision for one call. A call through the wrapper is judged as the
+    /// call it carries — `CapabilityInvoke` is an address and grants nothing —
+    /// and a schedule zo asks for is a person's to approve in every mode
+    /// ([`crate::schedule_guard`]).
+    ///
+    /// A bash command that would send a signal is
     /// judged by the kill guard first (t-80732): a signal to the window is
     /// refused whatever the mode, the rules or a hook say, and nobody is
     /// asked; one that needs a person's yes is put to the person, once and
@@ -416,7 +453,9 @@ impl PermissionPolicy {
     /// call without asking — full access, an allow rule — the question is
     /// refused unasked too, with what to do instead, as the window's hook
     /// answers it (t-82420): nobody is expected at a question there, and one
-    /// left unanswered stalls the turn.
+    /// left unanswered stalls the turn. Right after the kill guard, the desk
+    /// guard refuses a command that moves the person's screen, in every mode
+    /// and unasked ([`crate::desk_guard`], t-104888).
     #[must_use]
     pub fn authorize_with_context(
         &self,
@@ -425,8 +464,18 @@ impl PermissionPolicy {
         context: &PermissionContext,
         prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
-        let verdict = shell_command(tool_name, input)
-            .and_then(|(shell, command)| crate::kill_guard::judged(shell, &command));
+        let shell = shell_command(tool_name, input);
+        let verdict = shell
+            .as_ref()
+            .and_then(|(shell, command)| crate::kill_guard::judged(*shell, command));
+        if !matches!(verdict, Some(KillVerdict::Deny { .. })) {
+            if let Some(reason) = shell
+                .as_ref()
+                .and_then(|(shell, command)| crate::desk_guard::refused(*shell, command))
+            {
+                return PermissionOutcome::Deny { reason };
+            }
+        }
         match verdict {
             Some(KillVerdict::Deny { reason }) => PermissionOutcome::Deny {
                 reason: crate::kill_guard::refusal(&reason),
@@ -438,39 +487,101 @@ impl PermissionPolicy {
                     reason: crate::kill_guard::unanswered(&reason),
                 }
             }
-            Some(KillVerdict::Ask { reason }) => {
-                let mut would_ask = WouldAsk::default();
-                match self.authorize_by_mode_and_rules(
+            Some(KillVerdict::Ask { reason }) => match self.alone(tool_name, input, context) {
+                Alone::Refuses(reason) => PermissionOutcome::Deny { reason },
+                Alone::Runs => PermissionOutcome::Deny {
+                    reason: crate::kill_guard::unasked(&reason),
+                },
+                Alone::Asks => self.ask_a_person(
                     tool_name,
                     input,
-                    context,
-                    Some(&mut would_ask),
-                ) {
-                    PermissionOutcome::Deny { reason } if !would_ask.asked => {
-                        PermissionOutcome::Deny { reason }
-                    }
-                    PermissionOutcome::Allow => PermissionOutcome::Deny {
-                        reason: crate::kill_guard::unasked(&reason),
-                    },
-                    PermissionOutcome::Deny { .. } => Self::prompt_or_deny(
-                        tool_name,
-                        input,
-                        ModeAudit {
-                            current_mode: self.active_mode(),
-                            required_mode: self.required_mode_for_input(tool_name, input),
-                            phase_clamp_base: self.phase_clamp_base,
-                        },
-                        Some(reason.clone()),
-                        Some(crate::kill_guard::unanswered(&reason)),
-                        true,
-                        prompter,
-                    ),
+                    reason.clone(),
+                    crate::kill_guard::unanswered(&reason),
+                    prompter,
+                ),
+            },
+            Some(KillVerdict::Allow) | None => {
+                // The wrapper is an address and grants nothing: the call it
+                // carries is the one judged, by every line of this function,
+                // as if the model had named it.
+                if let Some((carried, arguments)) = carried_call(tool_name, input) {
+                    return self.authorize_with_context(&carried, &arguments, context, prompter);
+                }
+                match crate::schedule_guard::asked(tool_name, input, self.schedule_workspace.as_deref()) {
+                    Some(card) => self.authorize_asked_schedule(tool_name, input, context, card, prompter),
+                    None => self.authorize_by_mode_and_rules(tool_name, input, context, prompter),
                 }
             }
-            Some(KillVerdict::Allow) | None => {
-                self.authorize_by_mode_and_rules(tool_name, input, context, prompter)
-            }
         }
+    }
+
+    /// A schedule zo asks for is a person's to approve, whatever the mode and
+    /// the rules would do with the call ([`crate::schedule_guard`]). What they
+    /// refuse without asking — a deny rule, a mode that never asks — stays
+    /// refused. Everything else, a call they would run unasked included, is
+    /// put to a person, with no lasting allow; and where nobody can be asked —
+    /// no prompter, or a pane the ledger summoned as a worker, which nobody
+    /// watches — it is refused with where to ask instead.
+    fn authorize_asked_schedule(
+        &self,
+        tool_name: &str,
+        input: &str,
+        context: &PermissionContext,
+        card: String,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> PermissionOutcome {
+        if let Alone::Refuses(reason) = self.alone(tool_name, input, context) {
+            return PermissionOutcome::Deny { reason };
+        }
+        if prompter.is_none() || crate::kill_guard::in_a_summoned_worker_pane() {
+            return PermissionOutcome::Deny {
+                reason: crate::schedule_guard::nobody_to_ask(),
+            };
+        }
+        self.ask_a_person(
+            tool_name,
+            input,
+            card,
+            crate::schedule_guard::unanswered(),
+            prompter,
+        )
+    }
+
+    /// What the mode, the rules and the hooks would do with a call by
+    /// themselves.
+    fn alone(&self, tool_name: &str, input: &str, context: &PermissionContext) -> Alone {
+        let mut would_ask = WouldAsk::default();
+        match self.authorize_by_mode_and_rules(tool_name, input, context, Some(&mut would_ask)) {
+            PermissionOutcome::Deny { reason } if !would_ask.asked => Alone::Refuses(reason),
+            PermissionOutcome::Allow => Alone::Runs,
+            PermissionOutcome::Deny { .. } => Alone::Asks,
+        }
+    }
+
+    /// Puts a call to a person and to nobody else: the question says `says`
+    /// and offers no lasting allow, and a no — or nobody to ask — reads
+    /// `unanswered`.
+    fn ask_a_person(
+        &self,
+        tool_name: &str,
+        input: &str,
+        says: String,
+        unanswered: String,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> PermissionOutcome {
+        Self::prompt_or_deny(
+            tool_name,
+            input,
+            ModeAudit {
+                current_mode: self.active_mode(),
+                required_mode: self.required_mode_for_input(tool_name, input),
+                phase_clamp_base: self.phase_clamp_base,
+            },
+            Some(says),
+            Some(unanswered),
+            true,
+            prompter,
+        )
     }
 
     /// [`Self::authorize_with_context`] as the mode, the rules and the hooks
@@ -736,6 +847,18 @@ impl PermissionPolicy {
             allow: Self::find_matching_rule(&self.allow_rules, &tool, input).is_some(),
         }
     }
+}
+
+/// What the mode, the rules and the hooks would do with a call by themselves
+/// ([`PermissionPolicy::alone`]): what a guard that asks a person of its own
+/// accord — the kill guard, the schedule guard — reads before it asks.
+enum Alone {
+    /// Refuse it without asking anyone, for this reason.
+    Refuses(String),
+    /// Run it without asking anyone.
+    Runs,
+    /// Put it to a person.
+    Asks,
 }
 
 /// Says no, and remembers whether it was asked: whether the mode, the rules
@@ -1023,6 +1146,26 @@ pub(crate) fn shell_command(
 /// The `PowerShell` tool's name, as [`normalize_tool_name`] writes it.
 const POWERSHELL_TOOL: &str = "powershell";
 
+/// The call a call through the wrapper carries
+/// ([`core_types::tool_names::CAPABILITY_INVOKE`]), as a direct call of the
+/// same tool is stored: a core tool under its handler's name and fields.
+/// `None` for any other tool, and for a wrapper that carries nothing — the
+/// executor answers that one with what to send and runs nothing. The input is
+/// read as the executor reads it (`parse_tool_arguments`, a mended slip
+/// included), so what is judged is what runs.
+pub(crate) fn carried_call(tool_name: &str, input: &str) -> Option<(String, String)> {
+    if tool_name != CAPABILITY_INVOKE {
+        return None;
+    }
+    let wrapper = core_types::tool_input::parse_tool_arguments(input).ok()?;
+    let (name, arguments) = core_types::tool_names::carried_call(&wrapper).ok()?;
+    let arguments = arguments.to_string();
+    Some(match handler_call(&name, &arguments) {
+        Some((handler, respelled)) => (handler.to_string(), respelled.unwrap_or(arguments)),
+        None => (name, arguments),
+    })
+}
+
 // The spelling rule and the alias table live with the core tools' names in
 // `core_types::tool_names`, where the session's history reconciler reads them
 // too; re-exported here, where rules are judged.
@@ -1099,6 +1242,31 @@ fn unescape_rule_content(content: &str) -> String {
         .replace(r"\(", "(")
         .replace(r"\)", ")")
         .replace(r"\\", r"\")
+}
+
+/// The rule content that matches exactly `subject`, as the person approved it.
+/// Rule grammar reads `*`, `?` or `[` as a glob and a trailing `:*` as a
+/// prefix, either of which allows more than the one command or path asked
+/// about (`rm -rf build/*` would allow `rm -rf build/x; curl …`). Such a
+/// subject is written as a glob whose every metacharacter sits in its own
+/// one-character class (`[*]`, `[?]`, `[[]`), which matches only itself.
+/// A subject with none of them stays the plain exact text it always was.
+fn literal_rule_content(subject: &str) -> String {
+    if !contains_glob_meta(subject) {
+        return subject.to_string();
+    }
+    let mut out = String::with_capacity(subject.len() + 8);
+    for ch in subject.chars() {
+        match ch {
+            '*' | '?' | '[' => {
+                out.push('[');
+                out.push(ch);
+                out.push(']');
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Inverse of [`unescape_rule_content`] — escape a subject so it survives a
@@ -1956,6 +2124,43 @@ mod tests {
         assert_eq!(whole.take_newly_granted(), vec!["some_tool".to_string()]);
     }
 
+    /// "Always allow" on a command that carries a glob character allows that
+    /// command and nothing else: the stored rule is no wider than the approval.
+    #[test]
+    fn grant_always_on_a_command_with_glob_characters_allows_only_that_command() {
+        for (command, wider) in [
+            // None of these is read-only, so only a rule can let them through.
+            ("cargo test build/*", "cargo test build/x && cargo publish"),
+            ("cargo test ?", "cargo test x"),
+            ("cargo test [ab]", "cargo test a"),
+            ("cargo test:*", "cargo test: && cargo publish"),
+            ("*", "cargo publish"),
+        ] {
+            let mut policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+                .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+            let input = serde_json::json!({ "command": command }).to_string();
+            policy.grant_always("bash", &input);
+            assert_eq!(
+                policy.authorize("bash", &input, None),
+                PermissionOutcome::Allow,
+                "the approved command {command:?} is allowed"
+            );
+            let wider_input = serde_json::json!({ "command": wider }).to_string();
+            assert!(
+                matches!(policy.authorize("bash", &wider_input, None), PermissionOutcome::Deny { .. }),
+                "approving {command:?} must not allow {wider:?}"
+            );
+            // The persisted rule reads back to the same narrow scope.
+            let saved = policy.take_newly_granted();
+            let rules = RuntimePermissionRuleConfig::new(saved, Vec::new(), Vec::new());
+            let reloaded = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+                .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+                .with_permission_rules(&rules);
+            assert_eq!(reloaded.authorize("bash", &input, None), PermissionOutcome::Allow);
+            assert!(matches!(reloaded.authorize("bash", &wider_input, None), PermissionOutcome::Deny { .. }));
+        }
+    }
+
     #[test]
     fn glob_deny_rules_match_wildcard_subjects() {
         // `edit_file(*.env)` would parse as an `Exact` literal and silently
@@ -2372,5 +2577,145 @@ mod tests {
                 action: "maybe".to_string()
             })
         );
+    }
+
+    /// A call through the wrapper, as a model sends it.
+    fn through_the_wrapper(name: &str, arguments: &serde_json::Value) -> String {
+        serde_json::json!({ "name": name, "input": arguments }).to_string()
+    }
+
+    /// The wrapper is an address and grants nothing: a call through it is
+    /// judged as the call it carries, to the letter of what a call by name
+    /// gets. It used to be judged as the wrapper itself — a tool any mode may
+    /// run and no rule names — so a write passed a read-only session and a
+    /// denied command passed its deny rule, since the foreground registry
+    /// carries no enforcer to judge the carried call a second time.
+    #[test]
+    fn a_call_through_the_wrapper_is_judged_as_the_call_it_carries() {
+        use core_types::tool_names::CAPABILITY_INVOKE;
+        use serde_json::json;
+
+        let rules = RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            vec!["bash(rm -rf:*)".to_string(), "WebFetch".to_string()],
+            Vec::new(),
+        );
+        for mode in [
+            PermissionMode::ReadOnly,
+            PermissionMode::WorkspaceWrite,
+            PermissionMode::DangerFullAccess,
+            PermissionMode::Prompt,
+            PermissionMode::Allow,
+        ] {
+            let policy = PermissionPolicy::new(mode)
+                .with_tool_requirement(CAPABILITY_INVOKE, PermissionMode::ReadOnly)
+                .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+                .with_tool_requirement("read_file", PermissionMode::ReadOnly)
+                .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite)
+                .with_tool_requirement("browser", PermissionMode::DangerFullAccess)
+                .with_tool_requirement("WebFetch", PermissionMode::ReadOnly)
+                .with_permission_rules(&rules);
+            // The name and input a model sends, and the call zo stores for
+            // them: a core tool's under its handler's name and fields.
+            let calls = [
+                ("read_file", json!({"path": "notes.txt"}), "read_file", json!({"path": "notes.txt"})),
+                ("Read", json!({"file_path": "notes.txt"}), "read_file", json!({"path": "notes.txt"})),
+                ("Write", json!({"file_path": "notes.txt"}), "write_file", json!({"path": "notes.txt"})),
+                ("Bash", json!({"command": "git status --short"}), "bash", json!({"command": "git status --short"})),
+                ("bash", json!({"command": "rm -rf build"}), "bash", json!({"command": "rm -rf build"})),
+                ("browser", json!({}), "browser", json!({})),
+                ("WebFetch", json!({"url": "https://example.com"}), "WebFetch", json!({"url": "https://example.com"})),
+                ("NoSuchTool", json!({}), "NoSuchTool", json!({})),
+            ];
+            for (sent, arguments, stored, stored_arguments) in calls {
+                assert_eq!(
+                    policy.authorize(CAPABILITY_INVOKE, &through_the_wrapper(sent, &arguments), None),
+                    policy.authorize(stored, &stored_arguments.to_string(), None),
+                    "{mode:?}: `{sent}` through the wrapper, with nobody to ask"
+                );
+                let mut through = RecordingPrompter { seen: Vec::new(), allow: true };
+                let mut by_name = RecordingPrompter { seen: Vec::new(), allow: true };
+                assert_eq!(
+                    policy.authorize(CAPABILITY_INVOKE, &through_the_wrapper(sent, &arguments), Some(&mut through)),
+                    policy.authorize(stored, &stored_arguments.to_string(), Some(&mut by_name)),
+                    "{mode:?}: `{sent}` through the wrapper, with a person to ask"
+                );
+                assert_eq!(
+                    through.seen, by_name.seen,
+                    "{mode:?}: `{sent}`: the question is about the call that runs"
+                );
+            }
+        }
+
+        // The two the old judgment let through, said outright.
+        let read_only = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement(CAPABILITY_INVOKE, PermissionMode::ReadOnly)
+            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite);
+        assert!(
+            matches!(
+                read_only.authorize(
+                    CAPABILITY_INVOKE,
+                    &through_the_wrapper("write_file", &json!({"path": "notes.txt", "content": "x"})),
+                    None
+                ),
+                PermissionOutcome::Deny { .. }
+            ),
+            "a read-only session writes nothing through the wrapper"
+        );
+        let denied = PermissionPolicy::new(PermissionMode::DangerFullAccess)
+            .with_tool_requirement(CAPABILITY_INVOKE, PermissionMode::ReadOnly)
+            .with_permission_rules(&rules);
+        let PermissionOutcome::Deny { reason } = denied.authorize(
+            CAPABILITY_INVOKE,
+            &through_the_wrapper("bash", &json!({"command": "rm -rf build"})),
+            None,
+        ) else {
+            panic!("a deny rule did not meet the command the wrapper carried");
+        };
+        assert!(reason.contains("rm -rf"), "the rule is named: {reason}");
+    }
+
+    /// A wrapper that carries nothing is judged as the wrapper: the executor
+    /// answers it with what to send and runs nothing. The input is read as the
+    /// executor reads it, so a slip the executor mends does not hide the call
+    /// inside.
+    #[test]
+    fn a_wrapper_that_carries_nothing_is_the_wrapper_and_a_mended_one_is_read() {
+        use core_types::tool_names::CAPABILITY_INVOKE;
+
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement(CAPABILITY_INVOKE, PermissionMode::ReadOnly)
+            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite);
+        for nothing in [
+            "{}",
+            "",
+            r#"{"name":"  "}"#,
+            r#"{"name":"CapabilityInvoke","input":{"name":"write_file","input":{"path":"a"}}}"#,
+            r#"{"name":"write_file","input":"path=a"}"#,
+        ] {
+            assert_eq!(super::carried_call(CAPABILITY_INVOKE, nothing), None, "{nothing}");
+            assert_eq!(
+                policy.authorize(CAPABILITY_INVOKE, nothing, None),
+                PermissionOutcome::Allow,
+                "{nothing}"
+            );
+        }
+        assert_eq!(super::carried_call("write_file", r#"{"name":"bash"}"#), None, "no other tool is a wrapper");
+
+        for mended in [
+            r#"{"name":"write_file","input":{"path":"a","content":"x"},}"#.to_string(),
+            "```json\n{\"name\":\"write_file\",\"input\":{\"path\":\"a\"}}\n```".to_string(),
+            serde_json::Value::String(r#"{"name":"write_file","input":{"path":"a"}}"#.to_string()).to_string(),
+        ] {
+            assert_eq!(
+                super::carried_call(CAPABILITY_INVOKE, &mended).map(|(name, _)| name).as_deref(),
+                Some("write_file"),
+                "{mended}"
+            );
+            assert!(
+                matches!(policy.authorize(CAPABILITY_INVOKE, &mended, None), PermissionOutcome::Deny { .. }),
+                "{mended}"
+            );
+        }
     }
 }

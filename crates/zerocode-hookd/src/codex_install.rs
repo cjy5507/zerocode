@@ -132,21 +132,6 @@ pub fn write_path(config_path: &Path) -> PathBuf {
     }
 }
 
-fn mode_of(path: &Path) -> Option<u32> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .ok()
-            .map(|meta| meta.permissions().mode())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        None
-    }
-}
-
 /// Read `hooks.json`, refusing anything we could not put back.
 pub fn read(config_path: &Path) -> Result<Found, Refusal> {
     let target = write_path(config_path);
@@ -176,7 +161,7 @@ pub fn read(config_path: &Path) -> Result<Found, Refusal> {
     }
     Ok(Found {
         raw: Some(raw),
-        mode: mode_of(&target),
+        mode: crate::private_file::mode_of(&target),
         config,
     })
 }
@@ -198,8 +183,8 @@ pub fn managed_matcher(script_file_name: &str) -> impl Fn(&str) -> bool + '_ {
         .trim_end_matches(".cmd")
         .trim_end_matches(".ps1")
         .to_string();
-    let needle = format!(".zerocode/agent-hooks/{stem}.");
-    move |command: &str| command.contains(needle.as_str())
+    let needle = crate::install::our_script_needle(&stem);
+    move |command: &str| crate::install::command_has_needle(command, &needle)
 }
 
 /// The handler object our hooks are (`buildManagedCommandHook`, :730-736).
@@ -472,26 +457,12 @@ pub fn backup_once(state_dir: &Path, previous_raw: Option<&str>) -> Result<(), R
         return Ok(());
     }
     std::fs::create_dir_all(state_dir).map_err(|error| Refusal::Failed(error.to_string()))?;
-    write_atomically(&backup, raw, Some(0o600)).map_err(|error| Refusal::Failed(error.to_string()))
-}
-
-pub(crate) fn write_atomically(path: &Path, body: &str, mode: Option<u32>) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    // The temp name carries our own prefix so a sweep can tell its leftovers from
-    // another writer's.
-    let temp = dir.join(format!(".zerocode-hooks-{}.tmp", std::process::id()));
-    std::fs::write(&temp, body)?;
-    // Unix gets the exact mode back (the undo restores "the bytes and the
-    // mode"); elsewhere only an owner-only mode has a road.
-    if let Some(mode) = mode {
-        crate::private_file::apply_mode(&temp, mode)?;
-    }
-    let renamed = std::fs::rename(&temp, path);
-    if renamed.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    renamed
+    crate::private_file::write_atomically(
+        &backup,
+        raw.as_bytes(),
+        Some(crate::private_file::PRIVATE_FILE_MODE),
+    )
+    .map_err(|error| Refusal::Failed(error.to_string()))
 }
 
 /// Remove our groups from one hooks file, as it stands NOW.
@@ -593,7 +564,7 @@ pub fn write(
         return Ok(false);
     }
     assert_unchanged(config_path, found.raw.as_deref())?;
-    write_atomically(&target, &body, found.mode)
+    crate::private_file::write_atomically(&target, body.as_bytes(), found.mode)
         .map(|()| true)
         .map_err(|error| Refusal::Failed(error.to_string()))
 }
@@ -613,7 +584,7 @@ pub fn restore(config_path: &Path, found: &Found) -> Result<(), Refusal> {
             }
             Ok(())
         }
-        Some(raw) => write_atomically(&target, raw, found.mode)
+        Some(raw) => crate::private_file::write_atomically(&target, raw.as_bytes(), found.mode)
             .map_err(|error| Refusal::Failed(error.to_string())),
     }
 }
@@ -1449,6 +1420,25 @@ mod tests {
         assert!(!ours("/h/scripts/codex-hook.sh"));
         assert!(!ours("/usr/local/bin/codex-hook"));
         assert!(!ours("/h/.other/agent-hooks/their-hook.sh"));
+    }
+
+    /// A Windows install writes the command through `cmd_wrapper`, with the
+    /// path in backslashes. Unrecognized, every install appended one more
+    /// handler and an uninstall removed none.
+    #[test]
+    fn a_windows_spelled_command_is_ours_too() {
+        let ours = ours();
+        assert!(ours(
+            r#"cmd.exe /d /c "if exist "C:\Users\x\.zerocode\agent-hooks\codex-hook.cmd" (call "C:\Users\x\.zerocode\agent-hooks\codex-hook.cmd") else (more >nul)""#
+        ));
+        let windows = crate::install::cmd_wrapper(
+            Path::new("C:/Users/x/.zerocode/agent-hooks/codex-hook.cmd"),
+            &[],
+        );
+        assert!(ours(&windows), "not recognized as ours: {windows}");
+        assert!(!ours(
+            r#"cmd.exe /d /c "C:\Users\x\.orca\agent-hooks\codex-hook.cmd""#
+        ));
     }
 
     /// The whole plan, against the file this machine actually had: Orca's

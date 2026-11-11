@@ -1639,7 +1639,7 @@ const MAX_RESTART_WALLCLOCK: std::time::Duration = std::time::Duration::from_sec
 /// opening a connection and sending the whole conversation again.
 type HeldSlot = std::sync::Arc<std::sync::Mutex<Option<websocket::HeldConnection>>>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ChatGptBackendClient {
     http: reqwest::Client,
     access_token: String,
@@ -1683,6 +1683,35 @@ pub struct ChatGptBackendClient {
     /// [`CHATGPT_QUIET_REASONING_NOTICE_AFTER`]). A field so the scenario tests
     /// can reach the notice in milliseconds instead of seconds.
     quiet_notice_after: std::time::Duration,
+}
+
+/// A client's debug line names where it speaks and how, never with what: the
+/// access token is a login, and a `{client:?}` in a panic, a log or the
+/// stream's own debug line must not carry it.
+impl std::fmt::Debug for ChatGptBackendClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatGptBackendClient")
+            .field("access_token", &"<redacted>")
+            .field("has_account_id", &self.account_id.is_some())
+            .field("user_agent", &self.user_agent)
+            .field("cache_scope", &self.cache_scope)
+            .field("base_url", &self.base_url)
+            .field("max_retries", &self.max_retries)
+            .field("initial_backoff", &self.initial_backoff)
+            .field("max_backoff", &self.max_backoff)
+            .field("transport", &self.transport)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Whether a client sends exactly `bearer` — the answer a test needs from a
+/// client whose debug line names no token.
+#[cfg(test)]
+impl ChatGptBackendClient {
+    #[must_use]
+    pub(crate) fn speaks_with_bearer(&self, bearer: &str) -> bool {
+        self.access_token == bearer
+    }
 }
 
 impl ChatGptBackendClient {

@@ -23479,6 +23479,48 @@ button.integration-context-action:hover {
   color: var(--ink-mist);
 }
 
+/* Settings › Remote link: the pairing QR beside its code. */
+.remote-link-pair {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.remote-link-qr {
+  flex: none;
+  width: var(--qr-size);
+  height: var(--qr-size);
+  padding: var(--space-2);
+  border-radius: var(--radius-md);
+  background: var(--qr-tile);
+  color: var(--qr-module);
+  box-shadow: var(--shadow-border);
+}
+
+.remote-link-qr svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.remote-link-pair-text {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.remote-link-pair-label {
+  margin: 0;
+  font: var(--type-label-13);
+  font-weight: 600;
+}
+
+.remote-link-code {
+  font-family: var(--font-mono);
+  letter-spacing: var(--tracking-label);
+}
+
 .integration-error,
 .integration-empty {
   margin: var(--space-3) 0 0 var(--integration-indent);
@@ -32285,6 +32327,16 @@ select {
   margin: 0 0 var(--space-4);
   font-size: var(--text-xs);
   color: var(--ink-mist);
+}
+
+/* A reason written in lines is read line by line: zo's question for a
+ * schedule of its own says what it is called, what runs, when and where, a
+ * line each. Only where the card's kind says so (`view.lines`, shell-term.js)
+ * — any other reason holds an asker's words, whose line breaks could stretch
+ * the card — and only on the question card: the other dialogs' notes share
+ * the class and are written across source lines. */
+#ask-why[data-lines] {
+  white-space: pre-line;
 }
 
 /* 뒤에 서 있는 질문의 수. 답을 재촉하는 경고가 아니라 사실이므로 — 한 번에

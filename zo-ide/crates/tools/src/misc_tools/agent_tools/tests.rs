@@ -1645,6 +1645,77 @@ fn zo_process_comm_requires_exact_basename() {
     assert!(!is_zo_process_comm("/usr/local/bin/forge"));
 }
 
+/// A fractional number is a number: a schema that asks for one without a
+/// bound accepts `0.8`, so the agent's `StructuredOutput` is kept.
+#[test]
+fn structured_output_accepts_a_fraction_where_no_bound_applies() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "required": ["confidence"],
+        "properties": { "confidence": { "type": "number" } },
+        "additionalProperties": false
+    });
+    assert!(structured_schema_valid(&schema, &serde_json::json!({"confidence": 0.8})));
+    assert!(structured_schema_valid(&schema, &serde_json::json!({"confidence": -2.5e3})));
+    assert!(!structured_schema_valid(&schema, &serde_json::json!({"confidence": "0.8"})));
+    let integer = serde_json::json!({ "type": "integer" });
+    assert!(!structured_schema_valid(&integer, &serde_json::json!(0.8)));
+}
+
+/// A confidence bounded to `[0, 1]` — the commonest numeric schema — takes
+/// `0.8`: a fraction compares with integer bounds as `f64`, integers compare
+/// exactly as before, and `multipleOf` still refuses a fraction.
+#[test]
+fn structured_output_compares_a_fraction_with_its_bounds() {
+    let valid = |schema: serde_json::Value, value: serde_json::Value| structured_schema_valid(&schema, &value);
+    let unit = || serde_json::json!({ "type": "number", "minimum": 0, "maximum": 1 });
+    assert!(valid(unit(), serde_json::json!(0.8)));
+    assert!(valid(unit(), serde_json::json!(5e-1)), "exponent form");
+    assert!(valid(unit(), serde_json::json!(0.0)) && valid(unit(), serde_json::json!(1.0)), "the bounds themselves");
+    assert!(!valid(unit(), serde_json::json!(1.2)));
+    assert!(!valid(unit(), serde_json::json!(-0.1)));
+    let open = || serde_json::json!({ "type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1 });
+    assert!(valid(open(), serde_json::json!(0.5)));
+    assert!(!valid(open(), serde_json::json!(0.0)) && !valid(open(), serde_json::json!(1.0)), "an open bound refuses itself");
+    let big = || serde_json::json!({ "type": "integer", "maximum": 9_007_199_254_740_993_u64 });
+    assert!(valid(big(), serde_json::json!(9_007_199_254_740_993_u64)), "integers past f64 compare exactly");
+    assert!(!valid(big(), serde_json::json!(9_007_199_254_740_994_u64)));
+    assert!(!valid(serde_json::json!({ "type": "number", "multipleOf": 1 }), serde_json::json!(0.8)));
+    assert!(valid(serde_json::json!({ "type": "integer", "multipleOf": 3 }), serde_json::json!(9)));
+}
+
+/// `comm` is the rest of the `ps` line: a zo installed under a folder with a
+/// space in its name (`Application Support`) is still a zo.
+#[test]
+fn a_ps_listing_keeps_a_zo_whose_path_holds_spaces() {
+    let listing = "  4242 /Users/dev/Library/Application Support/dev.example/bin/zo\n\
+                   77 /usr/local/bin/zoxide\n\
+                   5150 zo\n\
+                   9 /Users/dev/My Tools/zo helper\n";
+    assert_eq!(
+        zo_pids_in_ps_listing(listing),
+        std::collections::HashSet::from([4242, 5150]),
+    );
+}
+
+/// The probe itself, against a real process: an executable named `zo` in a
+/// folder whose name holds a space is alive while it runs, so the agents it
+/// owns are not overwritten as stopped.
+#[cfg(unix)]
+#[test]
+fn a_live_zo_under_a_path_with_spaces_is_alive() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let folder = dir.path().join("Application Support");
+    std::fs::create_dir_all(&folder).expect("folder");
+    let zo = folder.join("zo");
+    std::fs::copy("/bin/sleep", &zo).expect("copy sleep as zo");
+    let mut child = std::process::Command::new(&zo).arg("30").spawn().expect("spawn zo");
+    let alive = live_zo_pids(std::iter::once(child.id()));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(alive.contains(&child.id()), "a running zo is alive: {alive:?}");
+}
+
 #[test]
 fn orphan_reap_settles_dead_owner_pids_and_spares_live_and_terminal() {
     fn manifest(dir: &std::path::Path, id: &str, status: &str, owner_pid: Option<u32>) -> AgentOutput {

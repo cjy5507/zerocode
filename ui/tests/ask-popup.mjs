@@ -291,6 +291,77 @@ async function tool(browser, origin, ok) {
         && explicit.buttons.join() === "허용,거부" && explicit.why === null,
       JSON.stringify(explicit),
     );
+    // The prompt above still stands: refused here, so the next one opens alone
+    // instead of waiting behind it.
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(90);
+    // A question only the person may answer (zo's `person_only` on the frame):
+    // Enter is no answer — neither an allow nor a refusal — and the person
+    // picks one. The frame is the shape zo sends: two choices, the field last.
+    // Its words are the ones zo's schedule guard writes for a schedule of its
+    // own (five lines), and its risk note is the one every tool prompt carries.
+    const personOnly = await page.evaluate(async () => {
+      const T = window.__ASK_T__;
+      T.reset();
+      T.frame("s-a", {
+        type: "permission_prompt",
+        prompt_id: 14,
+        tool_name: "CronCreate",
+        reasoning: "A schedule runs by itself: each time it comes due, zo opens a turn here on this prompt, with nobody watching.\nCalled: Morning check\nRuns: \"Run the wallet check and report\"\nWhen: 0 9 * * 1-5 (Asia/Seoul time). Next: Thu 2026-11-12 09:00 · Fri 2026-11-13 09:00 · Mon 2026-11-16 09:00\nWhere: /Users/dev/project",
+        audit_hint: "risk: high; explicitly unblock with [o] Allow once",
+        risk_level: "high",
+        choices: [
+          { key: "o", label: "Allow once", decision: "allow_once" },
+          { key: "n", label: "Deny", decision: "deny" },
+        ],
+        person_only: true,
+      });
+      await T.settle();
+      const opened = T.look();
+      // The terminal's key sink focused behind the popup: the keyboard comes
+      // back to the frame, not to a choice.
+      keySink.focus();
+      const why = document.getElementById("ask-why");
+      return {
+        opened,
+        returned: T.look().focus,
+        // What the person reads: a reason of several lines, line by line.
+        lines: why.innerText.split("\n").map((line) => line.trim()).filter(Boolean),
+        space: getComputedStyle(why).whiteSpace,
+      };
+    });
+    ok(
+      "a reason of several lines is read line by line",
+      personOnly.space === "pre-line" && personOnly.lines.length === 6
+        && personOnly.lines[1] === "Called: Morning check" && personOnly.lines[4] === "Where: /Users/dev/project"
+        && personOnly.lines[5].startsWith("risk: high"),
+      JSON.stringify({ lines: personOnly.lines, space: personOnly.space }),
+    );
+    ok(
+      "a question only the person may answer opens on none of its choices, and a focus that left comes back to the frame",
+      personOnly.opened.shown && personOnly.opened.kind === "tool" && personOnly.opened.mono === "CronCreate"
+        && personOnly.opened.buttons.join() === "Allow once,Deny" && personOnly.opened.focus === "(dialog)"
+        && personOnly.returned === "(dialog)",
+      JSON.stringify(personOnly),
+    );
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(90);
+    const unanswered = await page.evaluate(() => ({ sent: window.__ASK_T__.sent.slice(), shown: window.__ASK_T__.look().shown }));
+    ok(
+      "Enter answers such a question nothing: no decision goes back and the question stands",
+      unanswered.sent.length === 0 && unanswered.shown === true,
+      JSON.stringify(unanswered),
+    );
+    await page.keyboard.press("Tab");
+    const walked = await page.evaluate(() => window.__ASK_T__.look().focus);
+    await page.locator("#ask-scrim").getByRole("button", { name: "Allow once", exact: true }).click();
+    await page.waitForTimeout(90);
+    const picked = await page.evaluate(() => window.__ASK_T__.sent.slice());
+    ok(
+      "Tab reaches its first choice, and the person's click on a choice answers it for that very prompt",
+      walked === "Allow once" && picked.length === 1 && picked[0].promptId === 14 && picked[0].decision === "allow_once",
+      JSON.stringify({ walked, picked }),
+    );
     ok("the tool permission scenario raised no renderer errors", faults.length === 0, faults.join("\n"));
   });
 }
@@ -594,6 +665,47 @@ async function computerHandoff(browser, origin, ok) {
       "a covered press is said in the window's words, with the app that covers it",
       covered.why.includes("Safari") && covered.why.includes("다 했어요"),
       JSON.stringify(covered),
+    );
+    // A schedule an agent asks for comes down the same road, and its card is
+    // an approval, not a thing done elsewhere: its own title, 「허락」 for the
+    // yes — never the 「다 했어요」 a hand presses by habit — and the job in the
+    // window's words.
+    const asked = await page.evaluate(async () => {
+      const T = window.__ASK_T__;
+      T.fire("computer:handoff", {
+        id: "handoff-3",
+        reason: "",
+        reasonKey: "auto.asked.card",
+        reasonArgs: {
+          flow: "Wallet QA",
+          name: "Morning wallet",
+          policy: "dry",
+          schedule: { cadence: "daily", time: "09:30", day_of_week: 1, custom: "" },
+          cron: "30 9 * * *",
+          next: [29_906_490],
+          workspace: "/Users/dev/app",
+          pane: "term:7",
+          hidden: 0,
+        },
+        timeoutMs: 180000,
+      });
+      await T.settle(260);
+      // This card's words hold what an asker named: its reason is a paragraph.
+      return { ...T.look(), space: getComputedStyle(document.getElementById("ask-why")).whiteSpace };
+    });
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(90);
+    const unallowed = await page.evaluate(() => window.__ASK_T__.answered.length);
+    await page.evaluate(() => [...document.querySelectorAll("#ask-choices button")].find((one) => one.textContent.trim() === "허락").click());
+    await page.waitForTimeout(90);
+    const allowed = await page.evaluate(() => window.__ASK_T__.answered.slice(-1)[0]);
+    ok(
+      "a schedule an agent asks for is an approval card: its own title, 「허락」 for the yes and the job in the window's words; Enter allows nothing and the click does",
+      asked.title === "예약을 허락할까요?" && asked.buttons.join() === "취소,허락"
+        && ["Wallet QA", "Morning wallet", "30 9 * * *", "「/Users/dev/app」", "term:7"].every((shown) => asked.why.includes(shown))
+        && asked.space !== "pre-line"
+        && unallowed === 2 && allowed?.id === "handoff-3" && allowed?.allow === true,
+      JSON.stringify({ asked, unallowed, allowed }),
     );
     ok("the hand-over scenario raised no renderer errors", faults.length === 0, faults.join("\n"));
   });

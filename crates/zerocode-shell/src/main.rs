@@ -166,6 +166,7 @@ mod pane_layout;
 mod pane_leftovers;
 mod pane_runtime;
 mod pane_transcript;
+mod phone_link;
 mod pick_runtime;
 mod plain_read;
 mod preference_runtime;
@@ -275,6 +276,7 @@ use browser_diagnose::*;
 use browser_guest_runtime::*;
 use browser_nav_state::*;
 use browser_runtime::*;
+use cmd::approve_automation_flow;
 use cmd::judgment_latest_request;
 use cmd::note_term_detached;
 use cmd::{
@@ -350,45 +352,45 @@ use cmd::{
     note_worker_room_seen, notification_probe, open_board_popout, open_browser_pane,
     open_commit_remote, open_computer_use_permission, open_developer_permission_settings,
     open_download, open_lane, open_mirror_term, open_path_in_application, open_project,
-    open_remote_server_session, open_remote_workspace_terminal, open_ssh_terminal, open_term_tab,
-    open_term_tab_in, open_terminal, open_url, open_workspace_in_application, opencode_usage,
-    opencode_usage_stats, orchestration_accuracy, orchestration_report,
-    orchestration_runtime_state, pane_activities, pane_agents, pane_effort, pane_effort_press,
-    pane_image, pane_layouts, pane_log, pane_sessions, pane_subagents, paste_input,
-    patch_browser_link_routing, patch_browser_user_agents, patch_editing_prefs,
-    patch_floating_workspace, patch_left_sidebar_appearance, patch_open_in_applications,
-    patch_terminal_prefs, patch_update_prefs, patch_workspace_board_items,
-    patch_workspace_board_status, patch_workspace_creation_prefs, path_kinds, paths_exist,
-    plan_project_folder, plan_worktree, pr_check_details, pr_checks, preflight_judgment_provider,
-    preview_ghostty_import, preview_warp_terminal_themes, probe_remote_workspace, probe_ssh_host,
-    process_memory, project_catalog, project_kind, project_scripts, pull_request_seed,
-    quota_wall_handover, quota_wall_retry, read_image_file, read_primary_selection, read_text_file,
-    recall_folder_panel, record_archive_trust, record_repo_trust, refresh_summon_lineup,
-    release_status, release_untitled_markdown, relogin_claude_account, relogin_codex_account,
-    relogin_codex_login, remember_judgment_applied, remember_model_connection_check,
-    remember_model_judgment_check, remembered_model_connection_checks, remote_servers,
-    remote_workspaces, remove_api_router, remove_claude_account, remove_codex_account,
-    remove_project, remove_remote_server, remove_remote_workspace, remove_ssh_host,
-    remove_type_value_key, remove_typesafe_key, remove_worktree, render_mermaid, reopen_onboarding,
-    reorder_projects, repo_trust_standing, report_terminal_colors, request_developer_permission,
-    reset_agent_launch, reset_computer_use_permissions, resize_lane,
-    resolve_claude_account_identity, resolve_mr_base, resolve_pr_base, resource_snapshot,
-    respond_permission, resume_line, resume_session, resume_vault_session, reveal_board_agent,
-    reveal_run_evidence, reveal_skill, reveal_vault_session, run_automation, save_agent_launch,
-    save_agent_launch_env, save_api_router, save_automation, save_clipboard_image, save_diff_note,
-    save_launch_recipe, save_onboarding_step, save_pane_layouts, save_quick_command,
-    save_remote_server, save_remote_workspace, save_ssh_host, save_stage_layouts,
-    save_type_value_key, save_typesafe_key, save_worktree_prefs, schedule_timeline, scm_fetch,
-    scm_numstat, scm_observer_dismiss, scm_observer_health, scm_observer_retry, scm_observer_shown,
-    scm_pull, scm_push, scm_status, scm_tree_rows, search_files, search_text,
-    second_brain_export_html, second_brain_graph, second_brain_link, second_brain_open,
-    second_brain_page, second_brain_paths, second_brain_relate, second_brain_seat_recalls,
-    second_brain_setup, second_brain_status, select_claude_account, select_codex_account,
-    select_model_connection, send_prompt, session_info, session_scratch_document,
-    set_active_worktree, set_agent_activity_display, set_agent_pane_first_view,
-    set_agent_permission_mode, set_agent_teams_mode, set_app_font_family,
-    set_browser_default_profile, set_browser_default_zoom, set_browser_home_page,
-    set_browser_open_tabs, set_browser_restore_tabs, set_browser_search_engine, set_browser_visits,
+    open_remote_workspace_terminal, open_ssh_terminal, open_term_tab, open_term_tab_in,
+    open_terminal, open_url, open_workspace_in_application, opencode_usage, opencode_usage_stats,
+    orchestration_accuracy, orchestration_report, orchestration_runtime_state, pane_activities,
+    pane_agents, pane_effort, pane_effort_press, pane_image, pane_layouts, pane_log, pane_sessions,
+    pane_subagents, paste_input, patch_browser_link_routing, patch_browser_user_agents,
+    patch_editing_prefs, patch_floating_workspace, patch_left_sidebar_appearance,
+    patch_open_in_applications, patch_terminal_prefs, patch_update_prefs,
+    patch_workspace_board_items, patch_workspace_board_status, patch_workspace_creation_prefs,
+    path_kinds, paths_exist, plan_project_folder, plan_worktree, pr_check_details, pr_checks,
+    preflight_judgment_provider, preview_ghostty_import, preview_warp_terminal_themes,
+    probe_remote_workspace, probe_ssh_host, process_memory, project_catalog, project_kind,
+    project_scripts, pull_request_seed, quota_wall_handover, quota_wall_retry, read_image_file,
+    read_primary_selection, read_text_file, recall_folder_panel, record_archive_trust,
+    record_repo_trust, refresh_summon_lineup, release_status, release_untitled_markdown,
+    relogin_claude_account, relogin_codex_account, relogin_codex_login, remember_judgment_applied,
+    remember_model_connection_check, remember_model_judgment_check,
+    remembered_model_connection_checks, remote_servers, remote_workspaces, remove_api_router,
+    remove_claude_account, remove_codex_account, remove_project, remove_remote_server,
+    remove_remote_workspace, remove_ssh_host, remove_type_value_key, remove_typesafe_key,
+    remove_worktree, render_mermaid, reopen_onboarding, reorder_projects, repo_trust_standing,
+    report_terminal_colors, request_developer_permission, reset_agent_launch,
+    reset_computer_use_permissions, resize_lane, resolve_claude_account_identity, resolve_mr_base,
+    resolve_pr_base, resource_snapshot, respond_permission, resume_line, resume_session,
+    resume_vault_session, reveal_board_agent, reveal_run_evidence, reveal_skill,
+    reveal_vault_session, run_automation, save_agent_launch, save_agent_launch_env,
+    save_api_router, save_automation, save_clipboard_image, save_diff_note, save_launch_recipe,
+    save_onboarding_step, save_pane_layouts, save_quick_command, save_remote_server,
+    save_remote_workspace, save_ssh_host, save_stage_layouts, save_type_value_key,
+    save_typesafe_key, save_worktree_prefs, schedule_timeline, scm_fetch, scm_numstat,
+    scm_observer_dismiss, scm_observer_health, scm_observer_retry, scm_observer_shown, scm_pull,
+    scm_push, scm_status, scm_tree_rows, search_files, search_text, second_brain_export_html,
+    second_brain_graph, second_brain_link, second_brain_open, second_brain_page,
+    second_brain_paths, second_brain_relate, second_brain_seat_recalls, second_brain_setup,
+    second_brain_status, select_claude_account, select_codex_account, select_model_connection,
+    send_prompt, session_info, session_scratch_document, set_active_worktree,
+    set_agent_activity_display, set_agent_pane_first_view, set_agent_permission_mode,
+    set_agent_teams_mode, set_app_font_family, set_browser_default_profile,
+    set_browser_default_zoom, set_browser_home_page, set_browser_open_tabs,
+    set_browser_restore_tabs, set_browser_search_engine, set_browser_visits,
     set_browser_workspace_mode, set_chat_font_size, set_chat_list_sidebar, set_chat_wide_blocks,
     set_claude_autoswitch_mode, set_claude_remote_control, set_clipboard_image,
     set_compact_worktree_cards, set_computer_awake_mode, set_computer_confirm,
@@ -2813,7 +2815,12 @@ fn main() -> ExitCode {
             save_remote_server,
             remove_remote_server,
             test_remote_server,
-            open_remote_server_session,
+            phone_link::phone_link_status,
+            phone_link::phone_link_enable,
+            phone_link::phone_link_disable,
+            phone_link::phone_link_new_code,
+            phone_link::phone_link_revoke,
+            phone_link::phone_link_test_push,
             developer_permission_statuses,
             request_developer_permission,
             open_developer_permission_settings,
@@ -3325,6 +3332,7 @@ fn main() -> ExitCode {
             save_automation,
             delete_automation,
             enable_automation,
+            approve_automation_flow,
             run_automation,
             list_automation_runs,
             list_run_evidence,
@@ -3648,6 +3656,9 @@ fn main() -> ExitCode {
             }
             // The stats head's counters, read from disk once and kept.
             stats_events_store::open(managed.config_root());
+            // The phone link (stage 1): read its book, and bring it back up off
+            // this thread only when a person had turned it on.
+            phone_link::boot(&handle, managed.local_data_root());
             managed.native_tray().install_handler(&handle);
             let boot_settings = load_settings_for_boot(managed.settings()).document;
             hang_watchdog::configure(crash::Limits::overlay(&boot_settings.crash));
@@ -4048,6 +4059,9 @@ fn main() -> ExitCode {
                 // 원장의 마지막 플러시 — 디바운스가 아직 자고 있어도 여기서
                 // 적힌다(Orca quit의 flushStatusPersistSync와 같은 자리).
                 write_last_statuses_now(handle);
+                // After both saves: taking the phone link's mapping down may
+                // wait on the Tailscale CLI, up to its own close limit.
+                phone_link::shutdown();
             }
             tauri::RunEvent::Exit => {
                 // Again, idempotently: a restart from the main thread skips
@@ -4166,6 +4180,8 @@ impl exit_runtime::Terminating for ExitSteps<'_> {
 
     fn end_panes(&self) {
         cmd::managed_judgment::shutdown();
+        // The tailnet mapping the phone link made goes with the window.
+        phone_link::shutdown();
         // Out of the pool, one by one: the last hold on each lets go and
         // the lane ends its child (`PtyLane`'s own drop). Their seats are
         // asleep by now, so the ledger settles nothing as they go.

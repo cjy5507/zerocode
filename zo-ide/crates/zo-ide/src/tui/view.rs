@@ -47,6 +47,19 @@ fn details_prefix() -> &'static str {
     super::style::glyphs().result_first
 }
 
+/// The display columns a detail row under the working row has for its words
+/// on a pane `width` wide ([`Status::detail_lines`]).
+#[must_use]
+pub fn status_detail_columns(width: usize) -> usize {
+    width.saturating_sub(details_prefix().chars().count()).max(1)
+}
+
+/// How long after a request leaves the marks look names the wait
+/// ([`Status::name_the_wait_after`]): long enough that a model which answers
+/// at once never shows the phrase, short enough that a turn waiting on one
+/// says so before it reads as stopped.
+pub const WAIT_NAMED_AFTER: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusDetailsCapitalization {
     CapitalizeFirst,
@@ -373,6 +386,14 @@ impl Status {
         self.last_event_at = self.elapsed;
     }
 
+    /// Name what the turn waits on from `after` of a request's leaving, where
+    /// the limits table would wait longer: the row then says `waiting for the
+    /// model` beside its clock, not the clock alone. Never later than the
+    /// table says.
+    pub fn name_the_wait_after(&mut self, after: Duration) {
+        self.stream_phase_after = self.stream_phase_after.min(after);
+    }
+
     /// Lower the quiet threshold so a test can reach `quiet` in seconds
     /// without depending on the developer machine's settings overlay.
     #[cfg(test)]
@@ -595,8 +616,41 @@ pub struct Dialog {
     pub subject: String,
     pub body: String,
     pub options: Vec<String>,
-    pub selected: usize,
+    /// The row drawn as chosen, which a bare Enter answers with. `None` while
+    /// no row is chosen: Enter answers nothing then, and the dialog says how
+    /// to choose (`CHOOSE_FOOTER`).
+    pub selected: Option<usize>,
     pub footer: String,
+}
+
+/// What the dialog says under its rows while none is chosen, in the footer's
+/// place: Enter is not an answer yet.
+const CHOOSE_FOOTER: &str = "Press a number, or ↑↓ then enter";
+
+/// What a bare Enter answers on a tool prompt: this one call. The
+/// session-wide allow is a choice the person makes, never the row the dialog
+/// opens on (t-48216).
+const ENTER_ANSWERS: runtime::message_stream::PermissionDecision =
+    runtime::message_stream::PermissionDecision::AllowOnce;
+
+/// What a bare Enter answers on a prompt only a person may answer
+/// ([`runtime::message_stream::PermissionPrompt::person_only`]) — a kill a
+/// person should allow, a schedule a person should approve: nothing.
+///
+/// The person chose this (2026-11-11) over a deny and over the allow-once
+/// every other tool prompt opens on: a stray Enter — a line something else
+/// typed into the pane — neither allows nor denies, and the question stays.
+/// Allowing is one key as it was, the row's number. The window's card follows
+/// the same answer.
+const ENTER_ANSWERS_PERSON_ONLY: Option<runtime::message_stream::PermissionDecision> = None;
+
+/// The row a tool prompt's dialog opens on, which is the row a bare Enter
+/// answers with: the first choice that decides what Enter is to answer for
+/// this kind of prompt (the first row when no choice does), or no row when
+/// Enter is to answer nothing.
+fn row_enter_answers(prompt: &runtime::message_stream::PermissionPrompt) -> Option<usize> {
+    let answer = if prompt.person_only { ENTER_ANSWERS_PERSON_ONLY } else { Some(ENTER_ANSWERS) }?;
+    Some(prompt.choices.iter().position(|choice| choice.decision == answer).unwrap_or(0))
 }
 
 impl Dialog {
@@ -615,7 +669,7 @@ impl Dialog {
                 subject: crate::util::ansi::sanitize_inline(&question.title),
                 body: prompt.reasoning.clone(),
                 options,
-                selected: 0,
+                selected: Some(0),
                 footer,
             },
             None => Self {
@@ -625,15 +679,7 @@ impl Dialog {
                 )),
                 body: permission_body(prompt),
                 options,
-                // Enter allows this one call; the session-wide allow is a
-                // choice the person makes, never the default (t-48216).
-                selected: prompt
-                    .choices
-                    .iter()
-                    .position(|choice| {
-                        matches!(choice.decision, runtime::message_stream::PermissionDecision::AllowOnce)
-                    })
-                    .unwrap_or(0),
+                selected: row_enter_answers(prompt),
                 footer,
             },
         }
@@ -672,7 +718,7 @@ impl Dialog {
         }
         out.push(Line::empty());
         for (index, option) in self.options.iter().enumerate() {
-            let selected = index == self.selected;
+            let selected = Some(index) == self.selected;
             let label = format!("{}. {option}", index + 1);
             let line = if selected {
                 let style = Style::new().bold().fg(focus);
@@ -686,10 +732,23 @@ impl Dialog {
             out.push(line.truncated(width));
         }
         if !self.footer.is_empty() {
+            let footer = if self.selected.is_some() { self.footer.as_str() } else { CHOOSE_FOOTER };
             out.push(Line::empty());
-            out.push(Line::new(vec![Span::dim(self.footer.clone())]).truncated(width));
+            out.push(Line::new(vec![Span::dim(footer.to_string())]).truncated(width));
         }
         out
+    }
+
+    /// Move the choice one row down, or up: what ↓ and ↑ do. From no row
+    /// chosen, down takes the first row and up the last.
+    pub fn step(&mut self, down: bool) {
+        let last = self.options.len().saturating_sub(1);
+        self.selected = Some(match (self.selected, down) {
+            (None, true) => 0,
+            (None, false) => last,
+            (Some(row), true) => (row + 1).min(last),
+            (Some(row), false) => row.saturating_sub(1),
+        });
     }
 }
 
@@ -1649,6 +1708,10 @@ pub struct Frame<'a> {
     /// indicator while leaving task-running state untouched" — esc 는 그대로
     /// 턴을 끊는다).
     pub tail_owns_slot: bool,
+    /// The active cell is an answer being written: when it is taller than
+    /// the rows it may take, its newest rows are the ones kept
+    /// (`clip_newest`) — the words arriving now, not the ones read already.
+    pub active_keeps_newest: bool,
     pub dialog: Option<&'a Dialog>,
     /// 떠 있는 `AskUserQuestion` 오버레이. 보기가 있으면 뷰포트를 통째로 쓰고,
     /// 자유 서술 또는 활성 Other 행이면 컴포저가 답을 받는다.
@@ -1955,11 +2018,8 @@ fn build_bottom_pane(frame: &Frame<'_>, focus: Color) -> (Vec<Line>, Option<(u16
     let budget = frame.max_rows.saturating_sub(rows.len() + 1);
     let mut head: Vec<Line> = Vec::with_capacity(budget + 1);
     head.push(Line::empty());
-    head.extend(
-        clip_active(active, budget)
-            .into_iter()
-            .map(|line| line.truncated(frame.width)),
-    );
+    let clipped = if frame.active_keeps_newest { clip_newest(active, budget) } else { clip_active(active, budget) };
+    head.extend(clipped.into_iter().map(|line| line.truncated(frame.width)));
     let composer_row = composer_row + u16::try_from(head.len()).unwrap_or(u16::MAX);
     let work_rows = head.len() + status_rows;
     head.extend(rows);
@@ -2088,6 +2148,21 @@ fn clip_active(active: &[Line], budget: usize) -> Vec<Line> {
     lines
 }
 
+/// [`clip_active`] for a cell whose newest rows matter most — an answer being
+/// written: the count of the rows not shown stands first, then the last rows.
+fn clip_newest(active: &[Line], budget: usize) -> Vec<Line> {
+    if active.len() <= budget {
+        return active.to_vec();
+    }
+    let shown = budget.saturating_sub(1);
+    let mut lines: Vec<Line> = Vec::with_capacity(budget);
+    if budget > 0 {
+        lines.push(Line::new(vec![Span::dim(strings::more_lines(active.len() - shown))]));
+    }
+    lines.extend(active[active.len() - shown..].iter().cloned());
+    lines
+}
+
 /// The keep-list of slash commands — the `?` card's last section
 /// ([`super::shortcuts::card`]), where codex prints `/keymap customize`.
 #[must_use]
@@ -2154,6 +2229,7 @@ mod tests {
             pending_input: None,
             active: None,
             tail_owns_slot: false,
+            active_keeps_newest: false,
             dialog: None,
             question: None,
             picker: None,
@@ -2511,7 +2587,7 @@ mod tests {
             subject: "/tmp/x".to_string(),
             body: "Do you trust the contents of this directory?".to_string(),
             options: vec!["Yes, continue".to_string(), "No, quit".to_string()],
-            selected: 0,
+            selected: Some(0),
             footer: "Press enter to continue".to_string(),
         };
         let mut frame = frame(&composer, None);
@@ -2580,6 +2656,7 @@ mod tests {
                 choice('n', "Stay on claude-sonnet-5-5", PermissionDecision::Deny),
             ],
             risk_level: RiskLevel::Low,
+            person_only: false,
             question: Some(PromptQuestion {
                 topic: core_types::retry_signal::REFUSAL_SWITCH_TOPIC.to_string(),
                 title: core_types::retry_signal::REFUSAL_SWITCH_TITLE.to_string(),
@@ -2610,6 +2687,7 @@ mod tests {
                 choice('n', "Deny", PermissionDecision::Deny),
             ],
             risk_level: RiskLevel::High,
+            person_only: false,
             question: None,
         };
         let plain: Vec<String> = Dialog::for_permission(&prompt_block(&tool))
@@ -2694,9 +2772,9 @@ mod tests {
 
     #[test]
     fn the_dreamer_turn_footer_is_one_dim_bounded_line() {
-        let dream = "dreamer: promoted 2, skipped 0 (now): gate-order, pty-lane-flush";
+        let dream = "dreamer: kept 2 lessons (now): gate-order, pty-lane-flush";
         let line = dreamer_footer(dream, 44);
-        assert!(line.plain().starts_with("  dreamer: promoted 2"));
+        assert!(line.plain().starts_with("  dreamer: kept 2 lessons"));
         assert!(line.width() <= 44, "footer must stay within the pane");
         assert!(
             line.spans.iter().all(|span| span.style.dim),
@@ -3165,6 +3243,29 @@ mod tests {
         assert!(!line.contains("waiting") && !line.contains("reconnecting"), "{line}");
     }
 
+    /// A wait named early says so from the request's second second, where
+    /// the limits table waits fifteen: a turn waiting on the model says what
+    /// it waits on before it reads as stopped. The bar is only ever lowered.
+    #[test]
+    fn a_wait_named_early_is_said_from_its_second_second() {
+        use runtime::message_stream::types::StreamPhase;
+
+        let mut status = Status::working(Duration::ZERO);
+        status.name_the_wait_after(super::WAIT_NAMED_AFTER);
+        status.note_stream_phase(StreamPhase::RequestSent { attempt: 1 });
+        status.elapsed = Duration::from_secs(1);
+        let line = status.line(120).plain();
+        assert!(!line.contains("waiting"), "a request out one second is not yet a wait: {line}");
+        status.elapsed = super::WAIT_NAMED_AFTER;
+        let line = status.line(120).plain();
+        assert!(line.contains("waiting for the model 2s"), "{line}");
+
+        status.name_the_wait_after(Duration::from_secs(600));
+        let line = status.line(120).plain();
+        assert!(line.contains("waiting for the model 2s"), "the bar is never raised: {line}");
+        assert_eq!(super::status_detail_columns(80) + super::details_prefix().chars().count(), 80);
+    }
+
     /// A live cell taller than the rows above the bottom pane keeps its first
     /// rows and says how many it hides; the composer and the footer stay,
     /// and the head never exceeds `max_rows` (t-3063, the 24-row pane whose
@@ -3254,6 +3355,7 @@ mod card_tests {
                 choice('n', "Deny", PermissionDecision::Deny),
             ],
             risk_level: RiskLevel::High,
+            person_only: false,
             question: None,
         }
     }
@@ -3271,7 +3373,69 @@ mod card_tests {
     #[test]
     fn the_card_starts_on_allow_once_never_on_the_session_wide_allow() {
         let dialog = card();
-        assert_eq!(dialog.options[dialog.selected], "Allow once");
+        assert_eq!(dialog.selected.map(|row| dialog.options[row].as_str()), Some("Allow once"));
+    }
+
+    /// The dialog of a prompt only a person may answer, as the bridge hands
+    /// the pane its block: allow once, or deny.
+    fn person_only_card() -> Dialog {
+        let choice = |key, label: &str, decision| PermissionChoice {
+            key,
+            label: label.to_string(),
+            decision,
+        };
+        let request = PermissionRequest {
+            choices: vec![
+                choice('o', "Allow once", PermissionDecision::AllowOnce),
+                choice('n', "Deny", PermissionDecision::Deny),
+            ],
+            person_only: true,
+            ..bash_request()
+        };
+        let (responder, _answer) = tokio::sync::oneshot::channel();
+        let prompt = crate::session::permission_bridge::build_render_prompt(
+            &request,
+            responder,
+            runtime::message_stream::BlockId(1),
+        );
+        assert!(prompt.person_only, "the bridge carries it to the block the pane parks");
+        Dialog::for_permission(&prompt)
+    }
+
+    /// A prompt only a person may answer opens with no row chosen: none is
+    /// drawn as chosen, and the line under the rows says how to choose in the
+    /// place of "enter to continue" — Enter answers nothing there.
+    #[test]
+    fn a_person_only_card_opens_with_no_row_chosen_and_says_how_to_choose() {
+        let dialog = person_only_card();
+        assert_eq!(dialog.selected, None);
+        let plain: Vec<String> = dialog.lines(100).iter().map(Line::plain).collect();
+        assert!(plain.contains(&"  1. Allow once".to_string()), "{plain:#?}");
+        assert!(plain.contains(&"  2. Deny".to_string()), "{plain:#?}");
+        assert!(!plain.iter().any(|row| row.starts_with('›')), "no row is chosen: {plain:#?}");
+        assert_eq!(plain.last().map(String::as_str), Some(super::CHOOSE_FOOTER));
+    }
+
+    /// ↓ from no row takes the first and ↑ the last; from a row they move one
+    /// and stop at the ends. Once a row is chosen the card says Enter goes on.
+    #[test]
+    fn the_arrows_choose_a_row_from_none_and_stop_at_the_ends() {
+        let mut down = person_only_card();
+        down.step(true);
+        assert_eq!(down.selected, Some(0));
+        down.step(true);
+        down.step(true);
+        assert_eq!(down.selected, Some(1), "the last row holds");
+        let plain: Vec<String> = down.lines(100).iter().map(Line::plain).collect();
+        assert!(plain.contains(&"› 2. Deny".to_string()), "{plain:#?}");
+        assert_eq!(plain.last().map(String::as_str), Some("Press enter to continue"));
+
+        let mut up = person_only_card();
+        up.step(false);
+        assert_eq!(up.selected, Some(1), "up from none is the last row");
+        up.step(false);
+        up.step(false);
+        assert_eq!(up.selected, Some(0), "the first row holds");
     }
 
     #[test]
@@ -3373,5 +3537,23 @@ mod footer_mark_tests {
             None,
         );
         assert_eq!(line.plain(), "  claude-opus-5-5 high · /tmp");
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    /// A cell taller than its rows keeps its newest when asked to: the count
+    /// of the rows above stands first, then the last rows — the call that
+    /// runs now, under a turn's stacked work, is never the row cut off.
+    #[test]
+    fn a_cell_that_keeps_its_newest_rows_counts_the_ones_above() {
+        use crate::tui::ansi::Line;
+        use crate::tui::strings::more_lines;
+
+        let rows: Vec<Line> = (0..10).map(|n| Line::from_text(format!("row {n}"))).collect();
+        let plain = |lines: Vec<Line>| lines.iter().map(Line::plain).collect::<Vec<_>>();
+        assert_eq!(plain(super::clip_newest(&rows, 10)).len(), 10, "a cell that fits is whole");
+        assert_eq!(plain(super::clip_newest(&rows, 4)), [more_lines(7).as_str(), "row 7", "row 8", "row 9"]);
+        assert_eq!(plain(super::clip_active(&rows, 4)), ["row 0", "row 1", "row 2", more_lines(7).as_str()]);
     }
 }
