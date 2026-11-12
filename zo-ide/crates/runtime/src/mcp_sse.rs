@@ -16,8 +16,8 @@ use tokio::sync::Mutex;
 
 use crate::mcp_client::McpRemoteTransport;
 use crate::mcp_http_common::{
-    InboundBuffer, apply_headers_with_auth, build_http_client, resolve_headers_helper,
-    select_jsonrpc_response_frame,
+    InboundBuffer, apply_headers_with_auth, build_http_client, read_bounded_body,
+    resolve_headers_helper, select_jsonrpc_response_frame,
 };
 use crate::mcp_limits::guard_mcp_read_growth;
 use crate::mcp_stdio::{
@@ -68,6 +68,9 @@ pub struct McpSseProcess {
 struct SseStream {
     response: reqwest::Response,
     buffer: String,
+    /// The head of a multi-byte character cut by the last chunk, kept until
+    /// the next chunk finishes it ([`push_utf8_lossy`]).
+    pending: Vec<u8>,
 }
 
 impl McpSseProcess {
@@ -114,6 +117,7 @@ impl McpSseProcess {
         // The leftover `buffer` (bytes after the endpoint event) and the live
         // `response` are kept so later responses can be read off the stream.
         let mut buffer = String::new();
+        let mut pending = Vec::new();
         let message_endpoint = 'discover: loop {
             while let Some(event) = take_next_event(&mut buffer) {
                 match parse_endpoint_event(&event, &transport.url) {
@@ -134,7 +138,7 @@ impl McpSseProcess {
             {
                 Some(chunk) => {
                     guard_mcp_read_growth(buffer.len(), chunk.len(), "SSE endpoint discovery")?;
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    push_utf8_lossy(&mut buffer, &mut pending, &chunk);
                 }
                 None => {
                     return Err(io::Error::new(
@@ -153,7 +157,11 @@ impl McpSseProcess {
             message_endpoint,
             client,
             headers: merged_headers,
-            stream: Arc::new(Mutex::new(SseStream { response, buffer })),
+            stream: Arc::new(Mutex::new(SseStream {
+                response,
+                buffer,
+                pending,
+            })),
             inbound: InboundBuffer::default(),
             auth_server_name,
         })
@@ -194,10 +202,7 @@ impl McpSseProcess {
         // the response as a `message` event on the GET stream. A Streamable-style
         // server may instead inline the response in the POST reply. Prefer an
         // inline response when present and valid; otherwise read the stream.
-        let response_body = response
-            .text()
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let response_body = read_bounded_body(response).await?;
 
         if let Some(json_text) = select_jsonrpc_response_frame(&response_body, &id) {
             if let Ok(rpc_response) = serde_json::from_str::<JsonRpcResponse<TResult>>(json_text) {
@@ -221,7 +226,11 @@ impl McpSseProcess {
         let expected = serde_json::to_value(expected_id)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut guard = self.stream.lock().await;
-        let SseStream { response, buffer } = &mut *guard;
+        let SseStream {
+            response,
+            buffer,
+            pending,
+        } = &mut *guard;
         loop {
             while let Some(event) = take_next_event(buffer) {
                 let Some(data) = event_data_payload(&event) else {
@@ -273,7 +282,7 @@ impl McpSseProcess {
             {
                 Some(chunk) => {
                     guard_mcp_read_growth(buffer.len(), chunk.len(), "SSE event")?;
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    push_utf8_lossy(buffer, pending, &chunk);
                 }
                 None => {
                     return Err(io::Error::new(
@@ -391,6 +400,41 @@ impl McpSseProcess {
     pub fn poll_inbound(&mut self) -> Vec<InboundEvent> {
         self.inbound.drain()
     }
+}
+
+/// Append a network `chunk` to the text `buffer`, decoding UTF-8 across chunk
+/// boundaries. A character of several bytes (a Hangul syllable is three) can be
+/// cut between two chunks; decoding each chunk alone would turn both halves into
+/// U+FFFD. The cut head waits in `pending` until the next chunk finishes it.
+/// Bytes that are not UTF-8 at all still become U+FFFD, as
+/// [`String::from_utf8_lossy`] makes them, so a bad byte never stops the stream.
+fn push_utf8_lossy(buffer: &mut String, pending: &mut Vec<u8>, chunk: &[u8]) {
+    pending.extend_from_slice(chunk);
+    let mut consumed = 0;
+    loop {
+        let rest = &pending[consumed..];
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                buffer.push_str(text);
+                consumed = pending.len();
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                buffer.push_str(&String::from_utf8_lossy(&rest[..valid]));
+                consumed += valid;
+                match error.error_len() {
+                    Some(bad) => {
+                        buffer.push(char::REPLACEMENT_CHARACTER);
+                        consumed += bad;
+                    }
+                    // The bytes end inside a character: wait for the next chunk.
+                    None => break,
+                }
+            }
+        }
+    }
+    pending.drain(..consumed);
 }
 
 /// Pop the next complete SSE event (terminated by a blank line) from `buffer`,
@@ -670,6 +714,269 @@ mod tests {
             Some("line1\nline2")
         );
         assert_eq!(event_data_payload("event: ping\n: keep-alive"), None);
+    }
+
+    #[test]
+    fn push_utf8_lossy_keeps_a_character_cut_between_chunks() {
+        // Hangul is three bytes and the pictograph four: cut every which way,
+        // the text must come out as it went in.
+        let text = "data: 안녕 🙂 끝\n\n";
+        let bytes = text.as_bytes();
+        for first in 0..=bytes.len() {
+            for second in first..=bytes.len() {
+                let mut buffer = String::new();
+                let mut pending = Vec::new();
+                for chunk in [&bytes[..first], &bytes[first..second], &bytes[second..]] {
+                    push_utf8_lossy(&mut buffer, &mut pending, chunk);
+                }
+                assert_eq!(buffer, text, "cut at {first} and {second}");
+                assert!(pending.is_empty(), "cut at {first} and {second}");
+            }
+        }
+    }
+
+    #[test]
+    fn push_utf8_lossy_turns_a_byte_that_is_no_utf8_into_one_replacement_char() {
+        // A truly bad byte still becomes U+FFFD and the stream goes on, however
+        // the chunks are cut: the result is what `from_utf8_lossy` gives the
+        // whole input.
+        let bytes: &[u8] = b"data: a\xFFb \xEC\x95\x88 c\xF0\x9F\n\n";
+        let whole = String::from_utf8_lossy(bytes).into_owned();
+        assert!(whole.contains('\u{FFFD}'));
+        for cut in 0..=bytes.len() {
+            let mut buffer = String::new();
+            let mut pending = Vec::new();
+            push_utf8_lossy(&mut buffer, &mut pending, &bytes[..cut]);
+            push_utf8_lossy(&mut buffer, &mut pending, &bytes[cut..]);
+            assert_eq!(buffer, whole, "cut at {cut}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hangul_response_cut_between_network_chunks_comes_out_whole() {
+        // The GET stream delivers the response event in three writes, cutting
+        // a Hangul syllable and a pictograph in the middle. Decoding each chunk
+        // alone would put U+FFFD into the tool's answer.
+        use tokio::io::AsyncWriteExt;
+
+        let answer = "안녕하세요 🙂 끝";
+        let Some((addr, server)) =
+            serve_sse_post_reply(move |mut get_stream, mut post_stream, id| async move {
+                post_stream
+                    .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .expect("write 202");
+                post_stream.flush().await.expect("flush post");
+
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "content": [{ "type": "text", "text": answer }], "isError": false }
+                });
+                let event = format!("event: message\ndata: {response}\n\n").into_bytes();
+                let hangul = event
+                    .windows(3)
+                    .position(|window| window == "안".as_bytes())
+                    .expect("the answer starts with a Hangul syllable");
+                let pictograph = event
+                    .windows(4)
+                    .position(|window| window == "🙂".as_bytes())
+                    .expect("the answer holds a pictograph");
+                // One byte into the syllable, two bytes into the pictograph.
+                let cuts = [0, hangul + 1, pictograph + 2, event.len()];
+                for pair in cuts.windows(2) {
+                    get_stream
+                        .write_all(&event[pair[0]..pair[1]])
+                        .await
+                        .expect("write piece");
+                    get_stream.flush().await.expect("flush piece");
+                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            })
+            .await
+        else {
+            return;
+        };
+        let process = connect_to(addr).await;
+
+        let call = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            process.call_tool(JsonRpcId::Number(7), echo_params()),
+        )
+        .await
+        .expect("call must read the stream, not hang")
+        .expect("call should succeed");
+
+        assert_eq!(
+            call.result.expect("call result").content[0].data["text"],
+            serde_json::json!(answer),
+            "a character cut between two chunks must not turn into U+FFFD"
+        );
+
+        server.abort();
+    }
+
+    /// A mock SSE server: it opens the GET stream with an `endpoint` event, then
+    /// hands `on_post` the GET stream, the first POST connection and the
+    /// request's id. The GET stream closes when `on_post` returns. `None` when
+    /// this sandbox does not let a test listen.
+    async fn serve_sse_post_reply<F, Fut>(
+        on_post: F,
+    ) -> Option<(std::net::SocketAddr, tokio::task::JoinHandle<()>)>
+    where
+        F: FnOnce(tokio::net::TcpStream, tokio::net::TcpStream, serde_json::Value) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping SSE test: listener bind not permitted here");
+                return None;
+            }
+            Err(error) => panic!("bind: {error}"),
+        };
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut get_stream, _) = listener.accept().await.expect("accept get");
+            let mut buf = [0u8; 1024];
+            let _ = get_stream.read(&mut buf).await;
+            get_stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n\
+                      event: endpoint\ndata: /message\n\n",
+                )
+                .await
+                .expect("write endpoint");
+            get_stream.flush().await.expect("flush get");
+
+            let (mut post_stream, _) = listener.accept().await.expect("accept post");
+            let mut pbuf = vec![0u8; 4096];
+            let n = post_stream.read(&mut pbuf).await.expect("read post");
+            let req = String::from_utf8_lossy(&pbuf[..n]);
+            let body_start = req.find("\r\n\r\n").map_or(0, |i| i + 4);
+            let request: serde_json::Value =
+                serde_json::from_str(req[body_start..].trim()).expect("post json");
+            on_post(get_stream, post_stream, request["id"].clone()).await;
+        });
+        Some((addr, server))
+    }
+
+    async fn connect_to(addr: std::net::SocketAddr) -> McpSseProcess {
+        let transport = McpRemoteTransport {
+            url: format!("http://{addr}/sse"),
+            headers: BTreeMap::new(),
+            headers_helper: None,
+            auth: crate::mcp_client::McpClientAuth::None,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            McpSseProcess::connect(&transport, None),
+        )
+        .await
+        .expect("connect should not block")
+        .expect("connect should succeed")
+    }
+
+    fn echo_params() -> McpToolCallParams {
+        McpToolCallParams {
+            name: "echo".to_string(),
+            arguments: Some(serde_json::json!({})),
+            meta: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_post_reply_past_the_message_cap_is_rejected_like_the_http_transport_does() {
+        // `response.text()` has no limit: a server could stream any body into
+        // memory. The POST reply is read through the same bounded reader the
+        // Streamable HTTP transport uses, so one past the cap is refused.
+        use tokio::io::AsyncWriteExt;
+
+        let Some((addr, server)) = serve_sse_post_reply(|_get, mut post_stream, _id| async move {
+            let length = crate::mcp_limits::MAX_MCP_MESSAGE_BYTES + 1;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {length}\r\n\r\n"
+            );
+            post_stream.write_all(head.as_bytes()).await.expect("head");
+            let piece = vec![b' '; 1024 * 1024];
+            let mut sent = 0;
+            while sent < length {
+                let take = piece.len().min(length - sent);
+                // The client hangs up once it has refused the body.
+                if post_stream.write_all(&piece[..take]).await.is_err() {
+                    break;
+                }
+                sent += take;
+            }
+        })
+        .await
+        else {
+            return;
+        };
+        let process = connect_to(addr).await;
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            process.call_tool(JsonRpcId::Number(3), echo_params()),
+        )
+        .await
+        .expect("a body past the cap must be refused, not read to the end and then wait on the stream")
+        .expect_err("a body past the cap must be an error");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("HTTP response body")
+                && error.to_string().contains("limit"),
+            "the same error the HTTP transport gives: {error}"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_post_reply_inside_the_cap_still_carries_the_response() {
+        // A Streamable-style server inlines the response in the POST reply: the
+        // bounded read changes nothing for a body inside the cap.
+        use tokio::io::AsyncWriteExt;
+
+        let Some((addr, server)) = serve_sse_post_reply(|_get, mut post_stream, id| async move {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "content": [{ "type": "text", "text": "inline" }], "isError": false }
+            })
+            .to_string();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            post_stream.write_all(head.as_bytes()).await.expect("head");
+            post_stream.write_all(body.as_bytes()).await.expect("body");
+            post_stream.flush().await.expect("flush");
+        })
+        .await
+        else {
+            return;
+        };
+        let process = connect_to(addr).await;
+
+        let call = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            process.call_tool(JsonRpcId::Number(4), echo_params()),
+        )
+        .await
+        .expect("an inline reply must answer without the stream")
+        .expect("call should succeed");
+        assert_eq!(
+            call.result.expect("call result").content[0].data["text"],
+            serde_json::json!("inline")
+        );
+
+        server.abort();
     }
 
     #[tokio::test]
