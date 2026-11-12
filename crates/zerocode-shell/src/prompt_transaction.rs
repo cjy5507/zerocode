@@ -358,6 +358,27 @@ pub(super) fn human_write<E>(
     Ok(words || (theirs_before && text.is_some_and(zerocode_core::ask::is_submit_enter)))
 }
 
+/// Whether a write renews what a project's room may wake its pane for
+/// (`orchestration::peer_room`): words or an Enter, made by the person's own
+/// hand as the call's `zerocode-hand` header says — never an agent's press
+/// of a window button that pastes into a pane, never a call that names no
+/// hand (review t-105562, 2).
+pub(crate) fn renews_the_room(hand: Option<&str>, bytes: &[u8]) -> bool {
+    hand == Some(crate::computer_use::self_surface::PERSON_HAND)
+        && (puts_words(bytes)
+            || std::str::from_utf8(bytes).is_ok_and(zerocode_core::ask::is_potential_submit_input))
+}
+
+/// The one door the person's input commands renew a project's room through
+/// (`term_key`, `term_text`, `term_paste`): the call's own hand, read off its
+/// headers, and the bytes it wrote.
+pub(crate) fn renew_the_room(headers: &tauri::http::HeaderMap, term: TermId, bytes: &[u8]) {
+    let hand = crate::computer_use::self_surface::hand_said(headers);
+    if renews_the_room(hand, bytes) {
+        crate::orchestration::peer_room::person_at(term);
+    }
+}
+
 /// Whether these bytes put words on the line (t-57712): printable text with
 /// no escape in it — a printable key, committed IME text, a paste inside or
 /// outside its brackets (a paste's own escapes are already inert,
@@ -3038,6 +3059,28 @@ done
             "a queued delivery was pressed more than once again, or not called delivered: \
              {two_queued:?}"
         );
+    }
+
+    /// Only the person's own hand renews what a room may wake a pane for:
+    /// their words or an Enter. An agent's press of a window button that
+    /// pastes into a pane, a call that names no hand, and a key that adds no
+    /// words renew nothing (review t-105562, 2).
+    #[test]
+    fn only_the_persons_words_or_enter_renew_the_room() {
+        let person = Some(crate::computer_use::self_surface::PERSON_HAND);
+        assert!(super::renews_the_room(person, "고쳐 줘".as_bytes()));
+        assert!(super::renews_the_room(person, b"\r"));
+        assert!(super::renews_the_room(person, b"\x1b[200~pasted\x1b[201~"));
+        assert!(
+            !super::renews_the_room(person, b"\x1b[B"),
+            "an arrow adds no words"
+        );
+        assert!(!super::renews_the_room(
+            Some("agent"),
+            b"pasted by an agent"
+        ));
+        assert!(!super::renews_the_room(Some("none"), b"no flow's hand"));
+        assert!(!super::renews_the_room(None, b"no header at all"));
     }
 }
 

@@ -35,6 +35,7 @@ mod gate_snapshot;
 pub(crate) mod hand_in_keep;
 pub(crate) mod inbox;
 mod mail_triage;
+pub(crate) mod peer_room;
 mod project_scope;
 pub(crate) mod release_reap;
 pub(crate) mod restart_census;
@@ -4447,6 +4448,19 @@ impl Launcher for LiveCatalog {
     /// requires of everything the actor asks under the ledger.
     fn workers_refuse_unwatched_prompts(&self) -> bool {
         workers_refuse_prompts()
+    }
+
+    /// The person's 「에이전트 판끼리 편지」 switch, read off its cell.
+    fn peer_mail_on(&self) -> bool {
+        peer_room::peer_mail()
+    }
+
+    /// The agent panes of `project` as the mail pass last read them.
+    fn live_panes(
+        &self,
+        project: Option<&str>,
+    ) -> Option<Vec<zerocode_core::orchestration::room::PeerPane>> {
+        peer_room::live_panes(project)
     }
 
     fn command_for_resume(
@@ -9223,6 +9237,13 @@ fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
         .unwrap_or_else(|held| held.into_inner())
         .clone();
     let on_their_way = host.prompts_on_their_way();
+    // The agent panes `peers` lists, from the facts just copied out.
+    peer_room::note_panes(host, &turns, &attention);
+    // Asked once a pass: with no room open the wake budget reads nothing.
+    let rooms_open = rows
+        .runs()
+        .iter()
+        .any(zerocode_core::orchestration::Run::is_room);
     /// Advice one pass decided to type: the pane, and the line.
     struct Pointing {
         run: String,
@@ -9742,6 +9763,14 @@ fn point_at_waiting_mail(host: &dyn Host, now_ms: i64) {
                  * (t-52566): a zo's `SessionStart` reads as rest a breath
                  * before that continuation begins its turn. */
                 if host.wake_words_pending(term) || owed.contains(&term) {
+                    continue;
+                }
+                /* A letter written in a project's room wakes a pane within the
+                 * person's budget, and a room reply wakes nobody
+                 * ([`peer_room::held_back`]). Nothing is marked: the letter
+                 * stays filed for the pane's next `check`, and the person's
+                 * next input there lets the pointer go on the next beat. */
+                if peer_room::held_back(run, &address, term, rooms_open).is_some() {
                     continue;
                 }
                 /* The first two conditions, and the line between them: a door
@@ -10658,6 +10687,21 @@ fn walk_handovers(host: &dyn Host, overrides: &[(String, LaunchOverride)], now_m
     walk_handover(&held.actor, &door, &plan, &capability, now_ms)
 }
 
+/// Where a handed-over worker left off: the recap its transcript's tail makes
+/// and, beside it, the kept sections of the newest compaction summary its CLI
+/// wrote ([`zerocode_core::transcript::latest_compact_summary`]) — the
+/// decisions and the approaches already ruled out, which last words cannot
+/// carry. Read while the pane still stands, by both roads that hand work over
+/// (the beat's walk and the person's press on the wall chip).
+pub(crate) fn predecessor_recap(
+    transcript: &str,
+    tail: &[String],
+) -> Option<zerocode_core::orchestration::HandoverRecap> {
+    let summary =
+        zerocode_core::transcript::latest_compact_summary(std::path::Path::new(transcript));
+    zerocode_core::orchestration::handover_recap_with_summary(transcript, tail, summary)
+}
+
 /// Walk one handover: reserve → ① WIP commit → ② `worker-stop` → ③
 /// `worker-start --retry-of … --inherit-checkout` → settle (§2.3).
 ///
@@ -10677,9 +10721,7 @@ pub(crate) fn walk_handover(
     capability: &str,
     now_ms: i64,
 ) -> Walked {
-    use zerocode_core::orchestration::{
-        HANDOVER_STEPS, HandoverStep, Text, handover_paragraph, handover_recap,
-    };
+    use zerocode_core::orchestration::{HANDOVER_STEPS, HandoverStep, Text, handover_paragraph};
     let began = std::time::Instant::now();
     let current_time =
         || now_ms.saturating_add(i64::try_from(began.elapsed().as_millis()).unwrap_or(i64::MAX));
@@ -10787,7 +10829,7 @@ pub(crate) fn walk_handover(
     // and, with it, the window's record of which transcript was its own.
     let recap = door
         .predecessor_tail(plan)
-        .and_then(|(transcript, tail)| handover_recap(&transcript, &tail));
+        .and_then(|(transcript, tail)| predecessor_recap(&transcript, &tail));
     if !authorized() {
         return revoked(stop);
     }

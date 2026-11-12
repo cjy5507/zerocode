@@ -29,6 +29,7 @@ mod has_reach;
 mod jev_pane_seats;
 mod keys_tauri_reads;
 mod land_batch;
+mod peer_room;
 mod plain_words;
 mod pre_handin;
 mod quiet_children;
@@ -2817,15 +2818,16 @@ mod tests {
                 && nodes.contains("gap: var(--agent-graph-team-gap)"),
             "the graph stopped spending its team geometry:\n{nodes}"
         );
-        // The active tab is a lit panel, not just brighter text. Titanium uses
-        // a 5% lift and a 42% marker: enough to navigate, quieter than state.
-        // The whole rule, not a block lookup: `.tab.is-active` also appears
-        // inside the `:hover` group above it, and a prefix search finds that
-        // one first.
+        // The active tab is a lit panel, not just brighter text, under a 42%
+        // marker: enough to navigate, quieter than state. The fill is the
+        // row-selected veil rather than a colour mixed into the deck — under
+        // blur mode the bar is glass a step lighter than the deck, and the
+        // deck mix made the tab in front darker than its neighbours
+        // (2026-11-12). The whole rule, not a block lookup: `.tab.is-active`
+        // also appears inside the `:hover` group above it, and a prefix
+        // search finds that one first.
         assert!(
-            styles.contains(
-                ".tab.is-active {\n  background: color-mix(in srgb, var(--ink-chalk) 5%, var(--surface-deck));\n}"
-            ),
+            styles.contains(".tab.is-active {\n  background: var(--row-selected);\n}"),
             "the active tab has no fill of its own again"
         );
         let mark = block_after_css(&styles, ".tab.is-active::after {");
@@ -3584,14 +3586,15 @@ mod tests {
             "a wide link's underline is drawn off its neighbour's again, or \
              an SGR underline no longer stands where the engine puts it"
         );
-        // The two numbers the fit turns on: lowered, the gap between two
-        // syllables comes back while every check that reads the window's own
-        // ceiling stays green.
+        // The two numbers the fit turns on, as the person chose them of four
+        // drawn side by side (2026-11-12): raised, Korean reads as packed and
+        // as another face again; lowered, as spaced-out letters — while every
+        // check that reads the window's own ceiling stays green.
         assert!(
-            source.contains("\nconst WIDE_GLYPH_ROW_FILL = 0.9;\n")
-                && source.contains("\nconst WIDE_GLYPH_STRETCH_LIMIT = 1.3;\n"),
+            source.contains("\nconst WIDE_GLYPH_ROW_FILL = 0.86;\n")
+                && source.contains("\nconst WIDE_GLYPH_STRETCH_LIMIT = 1.15;\n"),
             "the row's share of a wide glyph's ink, or how far it may be \
-             widened, is another number than the one measured"
+             widened, is another number than the one the person chose"
         );
     }
 
@@ -17108,7 +17111,7 @@ mod tests {
         );
         let routing = block_after(window, "function routeText(text) {");
         let keying = block_after(window, "function routeKeyPress(target, press) {");
-        let paste = block_after(window, "async function pasteTextAt(target, text) {");
+        let paste = block_after(window, "async function pasteTextAt(target, text, hand) {");
         assert!(
             routing.contains("hideTerminalPointerForInput(target);")
                 && keying.contains("hideTerminalPointerForInput(target);")
@@ -17218,8 +17221,9 @@ mod tests {
             .expect("paste no longer goes through the one background read");
         assert!(
             capture_at < via_at
-                && at.contains("text: (text) => pasteTextAt(captured, text)")
-                && at.contains("image: (path) => pasteTextAt(captured, path)"),
+                && at.contains("const started = handNow();")
+                && at.contains("text: (text) => pasteTextAt(captured, text, started)")
+                && at.contains("image: (path) => pasteTextAt(captured, path, started)"),
             "the paste target is read after the async clipboard gap:\n{at}"
         );
         let reading = block_after(window, "async function pasteClipboardVia(to) {");
@@ -17273,7 +17277,7 @@ mod tests {
                 "{name} reads clipboardData in code: a slow pasteboard owner would hold the main thread"
             );
         }
-        let routing = block_after(window, "async function pasteTextAt(target, text) {");
+        let routing = block_after(window, "async function pasteTextAt(target, text, hand) {");
         assert!(
             routing.contains(r#"invoke("term_paste"#)
                 && routing.contains(r#"invoke("paste_input"#)
@@ -23859,8 +23863,16 @@ mod tests {
         let saving = block_after(backend, "fn save_automation_in(");
 
         assert!(
-            block_after(backend, "fn save_automation(")
-                .contains("    save_automation_in(state.config_root(), automation)?;"),
+            block_after(backend, "fn save_automation(").contains(
+                &[
+                    "    save_automation_in(",
+                    "        state.config_root(),",
+                    "        automation,",
+                    "        Approval::FromForm(&standing),",
+                    "    )?;",
+                ]
+                .join("\n")
+            ),
             "the editor's save no longer goes through the door these lines pin"
         );
 
@@ -24112,7 +24124,11 @@ mod tests {
         );
         let routing = block_after(window, "function routeText(text) {");
         assert!(
-            routing.contains("invoke(\"term_text\", { term: target.term, text, human: true })"),
+            // And it says whose hand it is, past a composition's or a
+            // timer's gap (the room's wake budget, review t-105587).
+            routing.contains(
+                "invoke(\"term_text\", { term: target.term, text, human: true }, { hand: flowHand(typingHand) })"
+            ),
             "keyboard text does not identify itself at the shared terminal road:\n{routing}"
         );
     }

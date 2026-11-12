@@ -438,7 +438,8 @@ impl PermissionPolicy {
     /// The decision for one call. A call through the wrapper is judged as the
     /// call it carries — `CapabilityInvoke` is an address and grants nothing —
     /// and a schedule zo asks for is a person's to approve in every mode
-    /// ([`crate::schedule_guard`]).
+    /// ([`crate::schedule_guard`]) — one that would register nothing is
+    /// refused with why, and nobody is asked.
     ///
     /// A bash command that would send a signal is
     /// judged by the kill guard first (t-80732): a signal to the window is
@@ -455,7 +456,9 @@ impl PermissionPolicy {
     /// answers it (t-82420): nobody is expected at a question there, and one
     /// left unanswered stalls the turn. Right after the kill guard, the desk
     /// guard refuses a command that moves the person's screen, in every mode
-    /// and unasked ([`crate::desk_guard`], t-104888).
+    /// and unasked ([`crate::desk_guard`], t-104888), and the schedule guard
+    /// one that registers a schedule from the shell, past the question
+    /// ([`crate::schedule_guard::refused_in_a_shell`]).
     #[must_use]
     pub fn authorize_with_context(
         &self,
@@ -469,10 +472,10 @@ impl PermissionPolicy {
             .as_ref()
             .and_then(|(shell, command)| crate::kill_guard::judged(*shell, command));
         if !matches!(verdict, Some(KillVerdict::Deny { .. })) {
-            if let Some(reason) = shell
-                .as_ref()
-                .and_then(|(shell, command)| crate::desk_guard::refused(*shell, command))
-            {
+            if let Some(reason) = shell.as_ref().and_then(|(shell, command)| {
+                crate::desk_guard::refused(*shell, command)
+                    .or_else(|| crate::schedule_guard::refused_in_a_shell(command))
+            }) {
                 return PermissionOutcome::Deny { reason };
             }
         }
@@ -509,7 +512,13 @@ impl PermissionPolicy {
                 }
                 match crate::schedule_guard::asked(tool_name, input, self.schedule_workspace.as_deref()) {
                     Some(card) => self.authorize_asked_schedule(tool_name, input, context, card, prompter),
-                    None => self.authorize_by_mode_and_rules(tool_name, input, context, prompter),
+                    None => match crate::schedule_guard::registers_nothing(tool_name, input) {
+                        // A yes to it would register nothing, so nobody is
+                        // asked in any mode: the model is told why, in the
+                        // words the tool would refuse the call with.
+                        Some(reason) => PermissionOutcome::Deny { reason },
+                        None => self.authorize_by_mode_and_rules(tool_name, input, context, prompter),
+                    },
                 }
             }
         }

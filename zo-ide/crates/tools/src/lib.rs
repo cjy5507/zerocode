@@ -37,6 +37,8 @@ mod dispatch;
 pub mod capability;
 pub mod error;
 mod fanout;
+pub mod fast_model;
+pub mod said_lessons;
 mod file_tools;
 mod image_tools;
 mod file_write_lease;

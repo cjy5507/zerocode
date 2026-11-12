@@ -11,6 +11,11 @@
 //!   that draw nothing the rule left out of them;
 //! - the job is built before the card and the card is drawn from it
 //!   ([`Request`]), so what the person allowed is what is saved;
+//! - the card says which document it is about, beyond the title the document
+//!   gives itself ([`About`]): the file's own name, how many steps it walks,
+//!   the apps and hosts it names and when it was last written — a Flow an
+//!   agent saved a minute ago under a familiar title does not read as the one
+//!   the person knows;
 //! - the one job this road writes is a Flow the window walks itself: no
 //!   agent, no command and no precheck (`Automation::asked_flow`), which a
 //!   request has no word for;
@@ -22,18 +27,26 @@
 //!   cleaned and still be that folder, so a path the card's rule would show
 //!   differently is refused before any card;
 //! - a no and a silence write nothing, and a Flow document that changed while
-//!   the card stood is not the one that was allowed ([`settle`]).
+//!   the card stood is not the one that was allowed ([`settle`]);
+//! - after two answers in a row that were not a yes, requests rest: for
+//!   [`ASKED_REST_MINUTES`] every one is refused before any card ([`Rest`]),
+//!   so a card that keeps coming back does not get pressed to make it stop.
 //!
 //! The window cannot tell a job somebody wrote straight into its saved file
 //! from one it was asked for; this road closes the asking, not the file.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use zerocode_core::automation::{ASKED_SCHEDULE_FLOOR_MINUTES, Asked, flow_document_sha256};
 use zerocode_core::card_words::{self, WORD_MAX_CHARS};
-use zerocode_core::computer_flow::{Policy, parse_flow};
+use zerocode_core::computer_flow::{FlowSpec, Policy, parse_flow};
+use zerocode_core::computer_recipe::recipe_lines;
 use zerocode_core::computer_use::{COMPUTER_CLI, recipe_slug};
 use zerocode_core::computer_use_protocol::error_code;
 use zerocode_core::{Automation, Cron, LocalMinute, Schedule};
@@ -46,6 +59,105 @@ use super::{recipe_title, show};
 pub(crate) const ASK_KEY: &str = "auto.asked.card";
 /// How many of the coming runs the card names.
 const CARD_RUNS: usize = 3;
+/// How many of the sites, and how many of the apps, a document names the card
+/// repeats before it only counts the rest.
+const ABOUT_NAMES: usize = 3;
+
+/// One kind of name a document's fingerprint holds — its sites, or its apps:
+/// the first [`ABOUT_NAMES`] as the card's rule shows them, and how many it
+/// names in all, so what is not shown is still counted, each kind apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct Named {
+    pub shown: Vec<String>,
+    pub count: usize,
+}
+
+/// Which document a card or a question is about, beyond the title the document
+/// gives itself — all of it off the one text the hash is of. What a document
+/// says of itself is data an agent may have written: its names are shown by
+/// the card's rule (`card_words`), `hidden` counts the letters that rule left
+/// out, and the page says they are the document's own words.
+///
+/// When the file was last written is not here: a process of the same user sets
+/// that time to what it likes, and a card must not offer it as a ground.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct About {
+    /// The file's own name without `.md`: what the recipe store calls it, as
+    /// the card's rule shows it.
+    pub slug: String,
+    /// How many steps it walks.
+    pub steps: usize,
+    /// The sites its fingerprint names — said first: a walk is refused a page
+    /// action on any other.
+    pub hosts: Named,
+    /// The apps its fingerprint names.
+    pub apps: Named,
+    /// Letters that draw nothing, left out of the slug and the names.
+    pub hidden: usize,
+}
+
+impl About {
+    /// What `spec` and `text` — one reading of the document kept under `slug`
+    /// — say it is.
+    ///
+    /// # Errors
+    ///
+    /// When the steps do not read: a document that cannot be walked is not
+    /// one to ask about.
+    fn read(slug: &str, text: &str, spec: &FlowSpec) -> Result<Self, String> {
+        let steps = recipe_lines(text)?.len();
+        let mut hidden = 0;
+        let mut named = |names: &BTreeSet<String>| Named {
+            shown: names
+                .iter()
+                .take(ABOUT_NAMES)
+                .map(|name| {
+                    let shown = card_words::shown_counting(name, WORD_MAX_CHARS);
+                    hidden += shown.hidden;
+                    shown.text
+                })
+                .collect(),
+            count: names.len(),
+        };
+        let hosts = named(&spec.fingerprint.hosts);
+        let apps = named(&spec.fingerprint.apps);
+        let slug = card_words::shown_counting(slug, WORD_MAX_CHARS);
+        Ok(Self {
+            slug: slug.text,
+            steps,
+            hosts,
+            apps,
+            hidden: hidden + slug.hidden,
+        })
+    }
+
+    /// The window's own words for it, for a page that does not know the card.
+    fn said(&self) -> String {
+        let named = |what: &str, names: &Named| {
+            if names.count == 0 {
+                return String::new();
+            }
+            let more = names.count.saturating_sub(names.shown.len());
+            let rest = if more == 0 {
+                String::new()
+            } else {
+                format!(" and {more} more")
+            };
+            format!(
+                " It names {} {what}: {}{rest}.",
+                names.count,
+                names.shown.join(", ")
+            )
+        };
+        format!(
+            " The document is {}.md: {} step(s).{}{}",
+            self.slug,
+            self.steps,
+            named("site(s)", &self.hosts),
+            named("app(s)", &self.apps)
+        )
+    }
+}
 
 /// The turn to ask: held while a schedule's card stands, so a second request
 /// is refused instead of queued behind it — the person answers one such
@@ -72,6 +184,106 @@ impl Drop for Turn {
     }
 }
 
+/// How many answers in a row that were not a yes — a no, or a silence — it
+/// takes before requests rest. One is let pass: a no pressed by mistake is
+/// mended by asking once more.
+pub(crate) const ASKED_NOS_BEFORE_REST: u32 = 2;
+/// How long requests rest after that many (the person's answer, 2026-11-12).
+pub(crate) const ASKED_REST_MINUTES: i64 = 10;
+
+/// The answers that were not a yes, in a row, and the rest they bring. Kept
+/// for the whole window and not per pane: the pane a request names is the
+/// caller's own word (`run_evidence::actor_pane`), and a rest kept by that
+/// name is stepped around by naming another.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Rest {
+    /// Nos and silences since the last yes or the last rest.
+    nos: u32,
+    /// Until when requests are refused before any card, by the clock the
+    /// rest is kept by ([`rest_clock_ms`]).
+    until_ms: i64,
+}
+
+impl Rest {
+    /// How long a request made at `now_ms` still has to wait, when requests
+    /// rest: it is refused before any card.
+    #[must_use]
+    pub(crate) fn left_ms(self, now_ms: i64) -> Option<i64> {
+        (now_ms < self.until_ms).then_some(self.until_ms - now_ms)
+    }
+
+    /// What an answer given at `now_ms` makes of it: a yes forgets every no;
+    /// the no or the silence that makes [`ASKED_NOS_BEFORE_REST`] in a row
+    /// starts the rest, and the count starts over after it.
+    #[must_use]
+    pub(crate) fn after(self, decision: Decision, now_ms: i64) -> Self {
+        match decision {
+            Decision::Allowed => Self::default(),
+            Decision::Refused | Decision::TimedOut => {
+                let nos = self.nos + 1;
+                if nos >= ASKED_NOS_BEFORE_REST {
+                    Self {
+                        nos: 0,
+                        until_ms: now_ms + ASKED_REST_MINUTES * 60_000,
+                    }
+                } else {
+                    Self { nos, ..self }
+                }
+            }
+        }
+    }
+}
+
+static REST: Mutex<Rest> = Mutex::new(Rest {
+    nos: 0,
+    until_ms: 0,
+});
+
+/// The clock the rest is kept by: the milliseconds this window has run, off a
+/// clock that only runs forward. Kept by the wall clock, a rest grew by
+/// however far that clock was set back while it stood.
+fn rest_clock_ms() -> i64 {
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+    i64::try_from(STARTED.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Refuse a request made while requests rest ([`Rest`]) — before the request
+/// is read, so nothing is shown and nothing about it is answered.
+///
+/// # Errors
+///
+/// When the person's last two answers were not a yes and the rest they
+/// brought is not over.
+pub(crate) fn rested() -> Result<(), ComputerUseError> {
+    let rest = *REST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match rest.left_ms(rest_clock_ms()) {
+        None => Ok(()),
+        Some(left_ms) => Err(ComputerUseError::new(
+            error_code::CONFIRMATION_REFUSED,
+            resting_said(left_ms),
+        )),
+    }
+}
+
+/// What a request refused for the rest is told: how long is left, and what to
+/// do instead of asking again.
+fn resting_said(left_ms: i64) -> String {
+    let minutes = (left_ms + 59_999) / 60_000;
+    format!(
+        "the person's last {ASKED_NOS_BEFORE_REST} answers to a schedule request were a no or a silence, so no schedule is asked for during the next {minutes} minute(s). Do not ask again: tell the person what you wanted to schedule and why — they can add it themselves in the automation form"
+    )
+}
+
+/// Keep the person's answer to a request's card ([`Rest::after`]).
+pub(crate) fn answered(decision: Decision) {
+    let mut rest = REST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *rest = rest.after(decision, rest_clock_ms());
+}
+
 /// A request read and checked: the job as it will be saved — which is what the
 /// card is drawn from — and what the card says beside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,9 +298,12 @@ pub(crate) struct Request {
     pub money: bool,
     /// The coming runs the card names, soonest first.
     pub next: Vec<LocalMinute>,
-    /// How many letters that draw nothing were left out of the label and the
-    /// Flow's title (`card_words::shown_counting`): the card says so.
+    /// How many letters that draw nothing were left out of the label, the
+    /// Flow's title and the names its document gives
+    /// (`card_words::shown_counting`): the card says so.
     pub hidden: usize,
+    /// Which document this is, beyond its title.
+    pub about: About,
     /// The Flow's document, read again once the person has answered.
     document: PathBuf,
 }
@@ -161,12 +376,15 @@ pub(crate) fn read(
         ));
     }
     let slug = recipe_slug(named);
+    let about = About::read(&slug, &text, &spec).map_err(|why| {
+        ComputerUseError::invalid_argument(format!("the steps of '{named}' do not read: {why}"))
+    })?;
     let title = card_words::shown_counting(
         &recipe_title(&text).unwrap_or_else(|| slug.clone()),
         WORD_MAX_CHARS,
     );
     let label = word("label").map(|label| card_words::shown_counting(label, WORD_MAX_CHARS));
-    let hidden = title.hidden + label.as_ref().map_or(0, |label| label.hidden);
+    let hidden = title.hidden + label.as_ref().map_or(0, |label| label.hidden) + about.hidden;
     let flow_name = title.text;
     let name = label
         .map(|label| label.text)
@@ -198,6 +416,7 @@ pub(crate) fn read(
         money: spends(spec.policy),
         next,
         hidden,
+        about,
         document,
     })
 }
@@ -221,6 +440,65 @@ pub(crate) fn document_sha256(recipes_root: &Path, slug: &str) -> Option<String>
     show(recipes_root, slug)
         .ok()
         .map(|(_, text)| flow_document_sha256(&text))
+}
+
+/// A Flow's document as one reading of it stands: the hash an approval is held
+/// against, and what a question about allowing it has to say — both off the
+/// same text, so the person is not asked about one document and answered for
+/// another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Standing {
+    /// The hash of the text that was read (`flow_document_sha256`).
+    pub sha256: String,
+    /// Whether walking it may spend money ([`spends`]): the question says so.
+    pub money: bool,
+    /// Which document it is, beyond its title: the question says that too.
+    pub about: About,
+}
+
+/// The document of `slug` under `recipes_root` as it stands, read once.
+/// `None` when it cannot be read or no longer reads as a Flow with steps that
+/// read: there is then nothing to allow — a walk would refuse it too.
+#[must_use]
+pub(crate) fn standing(recipes_root: &Path, slug: &str) -> Option<Standing> {
+    let (_, text) = show(recipes_root, slug).ok()?;
+    let spec = parse_flow(&text).ok().flatten()?;
+    let about = About::read(&recipe_slug(slug), &text, &spec).ok()?;
+    Some(Standing {
+        sha256: flow_document_sha256(&text),
+        money: spends(spec.policy),
+        about,
+    })
+}
+
+/// What 「다시 승인」 is refused with when the document is no longer the one
+/// the question was asked about ([`allowed_again`]).
+pub(crate) const FLOW_CHANGED_UNDER_QUESTION: &str =
+    "묻는 동안 Flow 문서가 다시 바뀌었습니다 — 문서를 확인한 뒤 다시 승인해 주세요";
+
+/// What 「다시 승인」 is refused with when there is no Flow to allow.
+pub(crate) const FLOW_NOT_A_FLOW: &str =
+    "Flow 문서를 읽을 수 없거나 더는 Flow가 아닙니다 — Flow 탭에서 문서를 확인해 주세요";
+
+/// The person's yes to allowing a job's Flow again, held to the document the
+/// question was asked about: `seen` is the hash the list read and the question
+/// was drawn from, `stands` the document as it reads at the press. The hash an
+/// approval may move to is answered only when the two are one document — the
+/// one that was compared is the one that is stored.
+///
+/// # Errors
+///
+/// When there is no Flow to allow, or the document changed under the question.
+pub(crate) fn allowed_again<'a>(
+    stands: Option<&'a Standing>,
+    seen: &str,
+) -> Result<&'a str, &'static str> {
+    let stands = stands.ok_or(FLOW_NOT_A_FLOW)?;
+    if stands.sha256 == seen {
+        Ok(stands.sha256.as_str())
+    } else {
+        Err(FLOW_CHANGED_UNDER_QUESTION)
+    }
 }
 
 /// What a job says when the Flow it was allowed for reads differently: it
@@ -282,9 +560,11 @@ pub(crate) fn card(request: &Request) -> (String, Value) {
         "pane": pane,
         "hidden": request.hidden,
         "money": request.money,
+        "about": request.about,
     });
     let sentence = format!(
-        "An agent in {pane} asks to schedule the Flow \"{flow}\" (policy {policy}) as \"{name}\": cron `{cron}`, in \"{workspace}\". The window would walk it by itself, with nobody watching. Allow it only if that is what you want; cancel it, or leave it, and nothing is scheduled.{spending}{left_out}",
+        "An agent in {pane} asks to schedule the Flow \"{flow}\" (policy {policy}) as \"{name}\": cron `{cron}`, in \"{workspace}\". The window would walk it by itself, with nobody watching. Allow it only if that is what you want; cancel it, or leave it, and nothing is scheduled.{spending}{about}{left_out}",
+        about = request.about.said(),
         flow = request.flow_name,
         policy = request.policy,
         name = job.name,
@@ -369,8 +649,13 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    use zerocode_core::computer_flow::{FLOW_HEADING, FLOW_HEADING_CHECKS};
-    use zerocode_core::computer_recipe::RECIPE_HEADING_STEPS;
+    use zerocode_core::computer_flow::{
+        FLOW_HEADING, FLOW_HEADING_CHECKS, FLOW_KEY_MONEY, FLOW_MONEY_AMOUNT, FLOW_MONEY_ID,
+        FLOW_MONEY_RECIPIENT,
+    };
+    use zerocode_core::computer_recipe::{
+        RECIPE_HEADING_STEPS, RECIPE_MARK_MONEY, RECIPE_MARK_SEPARATOR,
+    };
     use zerocode_core::computer_use::COMPUTER_USE_PROTOCOL_VERSION;
 
     /// 2026-11-11 00:00, local: a Wednesday.
@@ -391,6 +676,39 @@ mod tests {
              {FLOW_HEADING_CHECKS}\n\n\
              1. `zerocode-computer wait-for --app \"Sample Wallet\" --text Balance` — event, required\n"
         )
+    }
+
+    /// A Flow that may spend: policy `guarded`, a money line, and the one step
+    /// that carries the money mark.
+    fn spending_document() -> String {
+        format!(
+            "# Wallet top-up\n\n{RECIPE_HEADING_STEPS}\n\n\
+             1. `zerocode-browser type browser-1 #recipient {{{{recipient}}}}`\n\
+             2. `zerocode-browser type browser-1 #amount {{{{amount}}}}`\n\
+             3. `zerocode-browser click browser-1 #send`{RECIPE_MARK_SEPARATOR}{RECIPE_MARK_MONEY}\n\n\
+             {FLOW_HEADING}\n\n\
+             - policy: guarded\n\
+             - evidence: full\n\
+             - fingerprint: hosts=shop.example.com protocol={COMPUTER_USE_PROTOCOL_VERSION}\n\
+             - {FLOW_KEY_MONEY}: {FLOW_MONEY_ID}=txn {FLOW_MONEY_AMOUNT}=amount {FLOW_MONEY_RECIPIENT}=recipient\n\n\
+             {FLOW_HEADING_CHECKS}\n\n\
+             1. `zerocode-browser find browser-1 \"Sent\"` — event, required\n"
+        )
+    }
+
+    /// What a card says a document is: its sites, then its apps, every one shown.
+    fn about(slug: &str, steps: usize, hosts: &[&str], apps: &[&str]) -> About {
+        let named = |names: &[&str]| Named {
+            shown: names.iter().map(ToString::to_string).collect(),
+            count: names.len(),
+        };
+        About {
+            slug: slug.to_string(),
+            steps,
+            hosts: named(hosts),
+            apps: named(apps),
+            hidden: 0,
+        }
     }
 
     /// A recipe that was never stood up as a Flow.
@@ -450,6 +768,236 @@ mod tests {
             parse_flow(&plain)
         );
         assert_eq!(recipe_title(&flow).as_deref(), Some("Wallet QA"));
+        let spending = spending_document();
+        assert!(
+            matches!(parse_flow(&spending), Ok(Some(ref spec)) if spec.policy == Policy::Guarded),
+            "{:?}",
+            parse_flow(&spending)
+        );
+    }
+
+    /// One no is let pass — a no pressed by mistake is mended by asking once
+    /// more. The second answer in a row that is not a yes starts the rest:
+    /// for ten minutes a request is refused before any card, and told how long
+    /// is left. A yes in between forgets the no before it.
+    #[test]
+    fn requests_rest_after_two_answers_in_a_row_that_were_not_a_yes() {
+        let start = 1_794_000_000_000_i64;
+        let rest = Rest::default();
+        assert_eq!(rest.left_ms(start), None);
+
+        let once = rest.after(Decision::Refused, start);
+        assert_eq!(once.left_ms(start), None, "one no already rested requests");
+
+        // A silence counts as a no does.
+        let twice = once.after(Decision::TimedOut, start + 1_000);
+        let whole = ASKED_REST_MINUTES * 60_000;
+        assert_eq!(twice.left_ms(start + 1_000), Some(whole));
+        assert_eq!(twice.left_ms(start + 1_000 + whole - 1), Some(1));
+        assert_eq!(twice.left_ms(start + 1_000 + whole), None);
+        // After the rest the count starts over: one more no does not rest again.
+        let later = start + 1_000 + whole;
+        assert_eq!(twice.after(Decision::Refused, later).left_ms(later), None);
+
+        // A yes forgets the no before it.
+        let mended = once.after(Decision::Allowed, start + 2_000);
+        assert_eq!(mended, Rest::default());
+        assert_eq!(
+            mended
+                .after(Decision::Refused, start + 3_000)
+                .left_ms(start + 3_000),
+            None
+        );
+
+        // What a rested request is told: the minutes left, rounded up, and
+        // what to do instead.
+        let said = resting_said(whole - 30_000);
+        assert!(
+            said.contains("next 10 minute(s)") && said.contains("Do not ask again"),
+            "{said}"
+        );
+        assert!(resting_said(1).contains("next 1 minute(s)"));
+    }
+
+    /// One reading of a Flow's document gives the hash an approval is held
+    /// against and what a question about it says. A document that cannot be
+    /// read, or is no Flow, stands as nothing: there is nothing to allow.
+    #[test]
+    fn a_flows_document_stands_as_its_hash_and_whether_it_may_spend() {
+        let (flow, spending, plain) = (flow_document(), spending_document(), plain_document());
+        let (root, _) = stand(&[
+            ("wallet-qa", &flow),
+            ("wallet-top-up", &spending),
+            ("plain-steps", &plain),
+        ]);
+        assert_eq!(
+            standing(root.path(), "wallet-qa"),
+            Some(Standing {
+                sha256: flow_document_sha256(&flow),
+                money: false,
+                about: about(
+                    "wallet-qa",
+                    1,
+                    &["shop.example.com"],
+                    &["com.example.wallet"]
+                ),
+            })
+        );
+        assert_eq!(
+            standing(root.path(), "wallet-top-up"),
+            Some(Standing {
+                sha256: flow_document_sha256(&spending),
+                money: true,
+                about: about("wallet-top-up", 3, &["shop.example.com"], &[]),
+            })
+        );
+        assert_eq!(standing(root.path(), "plain-steps"), None);
+        assert_eq!(standing(root.path(), "nothing"), None);
+    }
+
+    /// Which document a card is about is read off the document itself: its
+    /// file's name, its steps, and the sites and the apps it names — sites
+    /// first, each kind counted apart, the first few by name — shown by the
+    /// card's rule. When the file was written is not said: a process of the
+    /// same user sets that. And what may spend is said before any of it: the
+    /// document's own words, however long it makes them, do not push that
+    /// sentence down (t-105495, 막는 문제 1).
+    #[test]
+    fn a_card_says_which_document_it_is_about() {
+        let crowded = flow_document().replace(
+            "apps=com.example.wallet hosts=shop.example.com",
+            "apps=com.example.a,com.example.b,com.example.c,com.example.d hosts=one.example.com,two.example.com,three.example.com,four.example.com,five.example.com",
+        );
+        let (root, workspace) = stand(&[("wallet-qa", &flow_document()), ("crowded", &crowded)]);
+        let plain = asked(
+            root.path(),
+            Some(&workspace),
+            &[("name", "wallet-qa"), ("every", "daily")],
+        )
+        .expect("read");
+        assert_eq!(
+            plain.about,
+            about(
+                "wallet-qa",
+                1,
+                &["shop.example.com"],
+                &["com.example.wallet"]
+            )
+        );
+        let (sentence, args) = card(&plain);
+        assert!(
+            sentence.contains(
+                "The document is wallet-qa.md: 1 step(s). It names 1 site(s): shop.example.com. It names 1 app(s): com.example.wallet."
+            ),
+            "{sentence}"
+        );
+        assert_eq!(
+            args["about"],
+            json!({
+                "slug": "wallet-qa",
+                "steps": 1,
+                "hosts": { "shown": ["shop.example.com"], "count": 1 },
+                "apps": { "shown": ["com.example.wallet"], "count": 1 },
+                "hidden": 0,
+            }),
+            "the card is told a file time again, or the names in another shape"
+        );
+
+        // More than the card repeats: the first few of each kind, in the
+        // document's own order, and each kind's count — apps do not crowd the
+        // sites out.
+        let many = asked(
+            root.path(),
+            Some(&workspace),
+            &[("name", "crowded"), ("every", "daily")],
+        )
+        .expect("read");
+        assert_eq!(
+            many.about.hosts,
+            Named {
+                shown: vec![
+                    "five.example.com".to_string(),
+                    "four.example.com".to_string(),
+                    "one.example.com".to_string(),
+                ],
+                count: 5,
+            }
+        );
+        assert_eq!(
+            (many.about.apps.shown.len(), many.about.apps.count),
+            (ABOUT_NAMES, 4)
+        );
+        let (sentence, _) = card(&many);
+        assert!(
+            sentence.contains("It names 5 site(s): five.example.com, four.example.com, one.example.com and 2 more.")
+                && sentence.contains("It names 4 app(s): com.example.a, com.example.b, com.example.c and 1 more."),
+            "{sentence}"
+        );
+
+        // What may spend comes before what the document says of itself.
+        let spending = Request {
+            money: spends(Policy::Guarded),
+            policy: Policy::Guarded.as_str(),
+            ..many.clone()
+        };
+        let (sentence, _) = card(&spending);
+        let money = sentence
+            .find("may spend money")
+            .expect("the money sentence");
+        let document = sentence.find("The document is").expect("the document");
+        assert!(
+            money < document,
+            "the document's own words stand before the sentence that says it may spend: {sentence}"
+        );
+
+        // The file's name is shown by the card's rule too: a letter that draws
+        // nothing is left out of it and counted with the others.
+        let spec = parse_flow(&flow_document())
+            .expect("reads")
+            .expect("a Flow");
+        let named = About::read("wallet\u{3164}qa", &flow_document(), &spec).expect("reads");
+        assert_eq!((named.slug.as_str(), named.hidden), ("walletqa", 1));
+    }
+
+    /// 「다시 승인」 is the person's yes to the document the question was drawn
+    /// from: the approval may move only to that one. A document that changed
+    /// again while the question stood is refused — what the person read about
+    /// is not what is there — and so is one that is no longer a Flow.
+    #[test]
+    fn allowing_again_is_held_to_the_document_the_question_was_asked_about() {
+        let asked_about = Standing {
+            sha256: flow_document_sha256(&flow_document()),
+            money: false,
+            about: about(
+                "wallet-qa",
+                1,
+                &["shop.example.com"],
+                &["com.example.wallet"],
+            ),
+        };
+        let changed_again = Standing {
+            sha256: flow_document_sha256(&spending_document()),
+            money: true,
+            about: about("wallet-qa", 3, &["shop.example.com"], &[]),
+        };
+        assert_eq!(
+            allowed_again(Some(&asked_about), &asked_about.sha256),
+            Ok(asked_about.sha256.as_str())
+        );
+        assert_eq!(
+            allowed_again(Some(&changed_again), &asked_about.sha256),
+            Err(FLOW_CHANGED_UNDER_QUESTION),
+            "a document that changed under the question was allowed as if it had been read"
+        );
+        assert_eq!(
+            allowed_again(None, &asked_about.sha256),
+            Err(FLOW_NOT_A_FLOW)
+        );
+        // A page that sent no hash — an older one — allows nothing.
+        assert_eq!(
+            allowed_again(Some(&asked_about), ""),
+            Err(FLOW_CHANGED_UNDER_QUESTION)
+        );
     }
 
     /// The job is built before the card, and the card is drawn from it: a Flow

@@ -212,6 +212,22 @@ pub(super) struct AutomationRow {
     /// Absent on a job that does not wait — every job the person wrote.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(super) flow_changed: bool,
+    /// On a job that waits: the hash of its Flow's document as this list read
+    /// it — what 「다시 승인」 asks about and hands back, so the yes is held to
+    /// the document the question was drawn from. Absent when the job does not
+    /// wait, and when the document cannot be read or is no Flow: there is then
+    /// nothing to allow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) flow_stands: Option<String>,
+    /// On a job that waits: whether that document may spend money when it is
+    /// walked — the question says so, as the card of a request does.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(super) flow_money: bool,
+    /// On a job that waits: which document that is, beyond its title — its
+    /// file's name, its steps, what it names and when it was last written
+    /// (`schedule::About`), said in the question as on the card of a request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) flow_about: Option<computer_use::recipes::schedule::About>,
 }
 
 /// A prompt that finished its journey into a shell, either way — or that is
@@ -7852,7 +7868,8 @@ fn recipe_seen_by(window: Option<&tauri::AppHandle>) -> computer_use::recipes::S
 /// only on the person's yes — the job, through the door every writer of a job
 /// uses (`computer_use::recipes::schedule` holds every rule of it). Nothing is
 /// asked while the operator is stopped, while the person is answering another
-/// question, or while another schedule's card stands.
+/// question, while another schedule's card stands, or while requests rest
+/// after two answers in a row that were not a yes.
 fn desktop_schedule(
     command: &zerocode_core::computer_use::ComputerCommand,
     window: Option<&tauri::AppHandle>,
@@ -7873,6 +7890,9 @@ fn desktop_schedule(
         return Err(person_asked());
     }
     let _turn = schedule::Turn::take().ok_or_else(person_asked)?;
+    // Two answers in a row that were not a yes: requests rest, and this one is
+    // refused before it is read or shown.
+    schedule::rested()?;
     let (Some(root), Some(window)) = (computer_use::evidence::root(), window) else {
         return Err(computer_use::ComputerUseError::new(
             error_code::ACCESSIBILITY_ERROR,
@@ -7894,8 +7914,13 @@ fn desktop_schedule(
         args,
         zerocode_core::computer_use::RECIPE_SCHEDULE_ASK_MS,
     );
+    schedule::answered(decision);
     schedule::settle(request, decision, now_epoch_ms(), |job| {
-        crate::cmd::review::save_automation_in(window.state::<AppState>().config_root(), job)
+        crate::cmd::review::save_automation_in(
+            window.state::<AppState>().config_root(),
+            job,
+            crate::cmd::review::Approval::AsWritten,
+        )
     })
 }
 

@@ -303,15 +303,18 @@ pub(crate) fn list_automations(state: State<'_, AppState>) -> Vec<AutomationRow>
                 .and_then(|dir| computer_use::evidence::read_verdict(Path::new(dir)))
                 .map(|(pass, _)| pass);
             // A job an agent asked for waits once its Flow reads differently
-            // from the one the person allowed.
-            let flow_changed = automation.asked.is_some()
-                && automation.flow_changed_since_approval(
-                    automation
-                        .flow
-                        .as_deref()
-                        .and_then(|slug| flow_document_stands(state.local_data_root(), slug))
-                        .as_deref(),
-                );
+            // from the one the person allowed. One reading answers that and
+            // what 「다시 승인」 will ask about: the row carries the hash of
+            // the very text it judged, whether that text may spend, and which
+            // document it is.
+            let standing = automation
+                .asked
+                .as_ref()
+                .and(automation.flow.as_deref())
+                .and_then(|slug| flow_standing(state.local_data_root(), slug));
+            let flow_changed = automation
+                .flow_changed_since_approval(standing.as_ref().map(|one| one.sha256.as_str()));
+            let waits_on = standing.filter(|_| flow_changed);
             AutomationRow {
                 cron: automation.schedule.to_cron(),
                 leaves_evidence: zerocode_core::leaves_evidence(&automation),
@@ -319,6 +322,9 @@ pub(crate) fn list_automations(state: State<'_, AppState>) -> Vec<AutomationRow>
                 runs,
                 last_verdict,
                 flow_changed,
+                flow_money: waits_on.as_ref().is_some_and(|one| one.money),
+                flow_about: waits_on.as_ref().map(|one| one.about.clone()),
+                flow_stands: waits_on.map(|one| one.sha256),
                 automation,
             }
         })
@@ -336,59 +342,136 @@ pub(crate) fn list_automations(state: State<'_, AppState>) -> Vec<AutomationRow>
 #[tauri::command(async)]
 pub(crate) fn save_automation(
     state: State<'_, AppState>,
-    mut automation: Automation,
+    automation: Automation,
 ) -> Result<Vec<AutomationRow>, String> {
-    // A job saved from the form is the person's own, whatever it was before:
-    // only the window's card writes who asked (`recipes::schedule`).
-    automation.asked = None;
-    save_automation_in(state.config_root(), automation)?;
-    Ok(list_automations(state))
-}
-
-/// 「다시 승인」: allow the Flow of a job an agent asked for as its document
-/// stands now. The person's alone (`PERSON_ONLY_COMMANDS`): it is the yes the
-/// card took, said again for a document that has changed since.
-///
-/// # Errors
-///
-/// When the job is gone, was written by the person, or its Flow's document
-/// cannot be read.
-#[tauri::command(async)]
-pub(crate) fn approve_automation_flow(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<Vec<AutomationRow>, String> {
-    let flow = stored_automations(state.config_root())
-        .into_iter()
-        .find(|held| held.id == id)
-        .and_then(|held| held.flow)
-        .ok_or_else(|| format!("자동화 {id}을(를) 찾지 못했습니다"))?;
-    let stands = flow_document_stands(state.local_data_root(), &flow)
-        .ok_or_else(|| format!("Flow 문서를 읽을 수 없습니다: {flow}"))?;
-    approve_automation_flow_in(
+    // What the page says of an approval is never read: the door decides what
+    // of the stored job's approval this save keeps (`Approval::FromForm`).
+    let root = state.local_data_root();
+    let standing = |slug: &str| flow_standing(root, slug);
+    save_automation_in(
         state.config_root(),
-        &id,
-        &stands,
-        u64::try_from(now_epoch_ms()).unwrap_or_default(),
+        automation,
+        Approval::FromForm(&standing),
     )?;
     Ok(list_automations(state))
 }
 
-/// The hash of a Flow's document as it stands under the window's data root,
-/// or `None` when it cannot be read: what an approval is held against
-/// (`recipes::schedule`). The root is the window's own (`AppState`), not the
-/// one the Computer Use door remembers from its first request: a window just
-/// opened has answered none, and every asked job read as changed until it did.
-pub(crate) fn flow_document_stands(local_data_root: &Path, slug: &str) -> Option<String> {
-    computer_use::recipes::schedule::document_sha256(local_data_root, slug)
+/// What a save does with the approval a job carries (`Automation::asked`).
+pub(crate) enum Approval<'a> {
+    /// The approval is what the writer wrote: the window's card writing the
+    /// job the person allowed, or a job the window keeps for itself.
+    AsWritten,
+    /// A save from the form. What the page says of an approval is never read:
+    /// [`approval_a_form_save_keeps`] answers from the stored job, reading
+    /// its Flow's document through this (`flow_standing`).
+    FromForm(&'a dyn Fn(&str) -> Option<computer_use::recipes::schedule::Standing>),
+}
+
+/// What a waiting job's save is refused with when it would stop being a job
+/// that walks a Flow ([`approval_a_form_save_keeps`]).
+pub(crate) const WAITING_JOB_STAYS_A_FLOW: &str = "다시 승인을 기다리는 예약은 Flow를 걷는 예약으로만 저장할 수 있습니다 — 먼저 「다시 승인」을 누르거나, 지우고 새로 만들어 주세요";
+
+/// What of the stored job's approval a save from the form keeps.
+///
+/// An approval binds a job to the document the person allowed: once that
+/// document reads differently the job waits, and 「다시 승인」 asks. A save
+/// that dropped the approval took the binding off without a word — a job
+/// that waited walked its changed Flow at the next minute, and one that did
+/// not wait walked whatever the document was rewritten to afterwards
+/// (t-105044 알아 둘 것 3, t-105495 막지 않는 1). So:
+///
+/// - a job that WAITS keeps its approval through a save — its name, its
+///   schedule, its switch and the Flow it names may change, and it still
+///   waits; 「다시 승인」 alone releases it. Saved as another kind of job — an
+///   agent, a command, no Flow — there would be nothing left to allow, and it
+///   would wait for ever: that save is refused;
+/// - a job that does not wait keeps its approval while it stays the job that
+///   was allowed — the window walking that same Flow. Pointed at another
+///   Flow, or made another kind of job, it is the person's own from then on:
+///   they chose that in the form;
+/// - a job the person wrote, and one the store does not hold, carry none.
+///
+/// `held` is the stored job and `saved` the job as the form sent it, its Flow
+/// already in the store's spelling (`bind_flow`); what `saved` says of an
+/// approval is never read. `standing` reads a Flow's document. Called under
+/// the store's lock ([`save_automation_in`]), as 「다시 승인」 judges: between
+/// a look outside it and the write, the document could change.
+///
+/// # Errors
+///
+/// When a waiting job would be saved as another kind of job.
+pub(crate) fn approval_a_form_save_keeps(
+    held: Option<&Automation>,
+    saved: &Automation,
+    standing: &dyn Fn(&str) -> Option<computer_use::recipes::schedule::Standing>,
+) -> Result<Option<zerocode_core::automation::Asked>, String> {
+    let Some((held, asked)) = held.and_then(|held| Some((held, held.asked.clone()?))) else {
+        return Ok(None);
+    };
+    let stands = held.flow.as_deref().and_then(standing);
+    let waits = held.flow_changed_since_approval(stands.as_ref().map(|one| one.sha256.as_str()));
+    let walks_a_flow = saved.runs_flow_directly();
+    if waits {
+        return if walks_a_flow {
+            Ok(Some(asked))
+        } else {
+            Err(WAITING_JOB_STAYS_A_FLOW.to_string())
+        };
+    }
+    Ok((walks_a_flow && saved.flow == held.flow).then_some(asked))
+}
+
+/// 「다시 승인」: allow the Flow of a job an agent asked for, as the document
+/// the person was asked about. The person's alone (`PERSON_ONLY_COMMANDS`): it
+/// is the yes the card took, said again for a document that has changed since.
+///
+/// `seen` is the hash the list read for the row (`flow_stands`) and the
+/// question was drawn from. A document that changed again while the question
+/// stood is refused — as the card's own road refuses one that changed under
+/// the card (`schedule::settle`) — and the page reads the list again.
+///
+/// # Errors
+///
+/// When the job is gone or was written by the person, when its Flow's document
+/// cannot be read or is no Flow, or when it is not the document that was seen.
+#[tauri::command(async)]
+pub(crate) fn approve_automation_flow(
+    state: State<'_, AppState>,
+    id: String,
+    seen: String,
+) -> Result<Vec<AutomationRow>, String> {
+    let root = state.local_data_root();
+    approve_automation_flow_in(
+        state.config_root(),
+        &id,
+        &seen,
+        u64::try_from(now_epoch_ms()).unwrap_or_default(),
+        |slug| flow_standing(root, slug),
+    )?;
+    Ok(list_automations(state))
+}
+
+/// A Flow's document as it stands under the window's data root — its hash and
+/// what a question about it says — or `None` when it cannot be read or is no
+/// Flow: what an approval is held against (`recipes::schedule`). The root is
+/// the window's own (`AppState`), not the one the Computer Use door remembers
+/// from its first request: a window just opened has answered none, and every
+/// asked job read as changed until it did.
+pub(crate) fn flow_standing(
+    local_data_root: &Path,
+    slug: &str,
+) -> Option<computer_use::recipes::schedule::Standing> {
+    computer_use::recipes::schedule::standing(local_data_root, slug)
 }
 
 /// The save behind [`save_automation`], for every writer of a job: the second
 /// brain's weekly review is written through it too (t-77377), so it is
-/// checked, armed and locked like one the person typed.
+/// checked, armed and locked like one the person typed. `approval` says what
+/// becomes of the approval the job carries ([`Approval`]).
 pub(crate) fn save_automation_in(
     config_root: &Path,
     mut automation: Automation,
+    approval: Approval<'_>,
 ) -> Result<(), String> {
     let cron = automation.schedule.to_cron();
     if Cron::parse(&cron).is_none() {
@@ -411,6 +494,12 @@ pub(crate) fn save_automation_in(
     let automation_id = automation.id.clone();
     let mut domain = automation_store_domain();
     let mut rows = stored_automations(config_root);
+    // What a form's save keeps of the stored job's approval is judged here,
+    // under the store's lock, against the job as it is stored.
+    if let Approval::FromForm(standing) = approval {
+        let stored = rows.iter().find(|row| row.id == automation.id);
+        automation.asked = approval_a_form_save_keeps(stored, &automation, standing)?;
+    }
     // And which agent, on the same terms the editor offers: a first save may
     // only name one this build knows, while an edit keeps the unrecognised id
     // it was already carrying. The rule and its reasoning live in

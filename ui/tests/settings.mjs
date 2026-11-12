@@ -428,7 +428,8 @@ const RUST_DEFAULT_DOCUMENT_JSON = String.raw`{
     "gate": { "mode": "notify", "task_usd": null, "day_usd": null },
     "launches": { "concurrent": 4, "per_hour": 300, "per_day": 2000 },
     "alerts": { "landing": true },
-    "workers": { "refuse_prompts": false }
+    "workers": { "refuse_prompts": false },
+    "mail": { "peers": true }
   },
   "worktree_prefs": { "branch_prefix": "git-username" },
   "notifications": { "enabled": true, "agent_attention": true, "agent_completion": "long" },
@@ -1818,6 +1819,8 @@ class StatefulBackend {
           alerts: { landing: asked.alerts?.landing !== false },
           // And only a plain `true` has a summoned worker refuse an unwatched prompt.
           workers: { refuse_prompts: asked.workers?.refuse_prompts === true },
+          // And only a plain `false` turns the panes' mail off.
+          mail: { peers: asked.mail?.peers !== false },
         };
         keys = ["harness"];
         break;
@@ -2840,10 +2843,21 @@ class StatefulBackend {
         }
         return clone(this.automations);
       }
-      // 「다시 승인」: the Flow reads as allowed again, and the list is answered.
+      // 「다시 승인」: the yes is held to the document the question was drawn
+      // from — `seen`, the hash the list read for the row. The window refuses
+      // any other, and allows that one: the row stops waiting.
       case "approve_automation_flow": {
         const row = this.automations.find((held) => held.id === args.id);
-        if (row) row.flow_changed = false;
+        if (row && args.seen !== row.flow_stands) {
+          throw new Error("묻는 동안 Flow 문서가 다시 바뀌었습니다 — 문서를 확인한 뒤 다시 승인해 주세요");
+        }
+        if (row) {
+          row.flow_changed = false;
+          row.asked = { ...row.asked, flow_sha256: args.seen };
+          delete row.flow_stands;
+          delete row.flow_money;
+          delete row.flow_about;
+        }
         return clone(this.automations);
       }
       // 「지금 실행」: the run it started. It names no terminal and no Flow, so the
@@ -5613,7 +5627,12 @@ await test("a_job_is_saved_switched_and_run_by_the_persons_own_press", async () 
 // A job an agent asked for (`recipe-schedule`) says so on its page, with when
 // the person allowed it. Once its Flow's document changed it waits: the list
 // and the page say so, and 「다시 승인」 — the person's alone — asks what would
-// run before it allows the document as it stands.
+// run before it allows the document as it stands. The yes goes back with the
+// hash of the document the question was drawn from (`flow_stands`): one that
+// was rewritten while the question stood is refused, the list is read again,
+// and the next question is about what stands then. A document that may spend
+// money is said so in the question; one that is no Flow any more has nothing
+// to allow, and no button.
 await test("an_asked_job_says_who_asked_and_waits_for_the_person_once_its_flow_changed", async () => {
   const held = {
     automations: backend.automations,
@@ -5655,7 +5674,9 @@ await test("an_asked_job_says_who_asked_and_waits_for_the_person_once_its_flow_c
     runs: 0,
     asked: { pane: "term:7", approved_at_ms: 1_794_000_000_000, flow_sha256: "aa" },
     flow_changed: true,
+    flow_stands: "bb",
   }];
+  const said = [];
   try {
     await pageA.evaluate(() => {
       setAutoOpen(true);
@@ -5692,19 +5713,113 @@ await test("an_asked_job_says_who_asked_and_waits_for_the_person_once_its_flow_c
     );
 
     // The press asks first, naming what would run; nothing is allowed before the yes.
+    const money = await pageA.evaluate(() => t("auto.asked.money", "이 Flow는 돈이 오가는 걸음을 누를 수 있습니다 — 지켜보는 사람 없이 돕니다."));
     const before = backend.count("A", "approve_automation_flow");
     const from = backend.calls.length;
     await pageA.click("#auto-detail-approve");
     await pageA.waitForSelector("#ask-scrim:not([hidden])");
     const question = await pageA.evaluate(() => document.getElementById("ask-body").textContent);
     assert(question.includes("Wallet QA"), "the question did not name the Flow that would run", question);
+    assert(money && !question.includes(money), "a Flow that spends nothing was asked about as one that may spend", question);
     assertEqual(backend.count("A", "approve_automation_flow"), before, "the Flow was allowed again before the person said yes");
+
+    // An approval is not given by a stray Enter: the keyboard starts on the
+    // question's frame, not on its yes, and Enter leaves the question standing.
+    const opened = await pageA.evaluate(() => ({
+        onYes: document.activeElement === document.getElementById("ask-yes"),
+        inQuestion: document.getElementById("ask-scrim").contains(document.activeElement),
+    }));
+    await pageA.keyboard.press("Enter");
+    await pageA.waitForTimeout(150);
+    const afterEnter = await pageA.evaluate(() => !document.getElementById("ask-scrim").hidden);
+    assert(
+      !opened.onYes && opened.inQuestion && afterEnter && backend.count("A", "approve_automation_flow") === before,
+      "Enter answered 「다시 승인」, or the question opened with the keyboard on its yes",
+      { opened, afterEnter, calls: backend.count("A", "approve_automation_flow") - before },
+    );
+
+    // The document is rewritten while the question stands — and now may spend.
+    // The yes carries the hash the question was drawn from; the window refuses
+    // it, says why, and the page reads the list again.
+    backend.automations[0].flow_stands = "cc";
+    backend.automations[0].flow_money = true;
+    // It names as much as a document may: three sites and three apps shown,
+    // each as long as the card's rule lets a name be, and more of each counted.
+    const longName = (word) => `${word}.`.repeat(20).slice(0, 80);
+    backend.automations[0].flow_about = {
+      slug: "wallet-qa",
+      steps: 4,
+      hosts: { shown: ["a", "b", "c"].map((word) => longName(`${word}-shop.example.com`)), count: 5 },
+      apps: { shown: ["x", "y", "z"].map((word) => longName(`com.example.${word}`)), count: 4 },
+      hidden: 2,
+    };
+    await pageA.evaluate(() => {
+      window.__askedSaid = [];
+      window.__realShowError = window.showError;
+      window.showError = (message) => window.__askedSaid.push(String(message));
+    });
+    const reread = backend.count("A", "list_automations");
     await pageA.click("#ask-yes");
-    const approved = await backend.waitForCall("A", "approve_automation_flow", from);
+    const refused = await backend.waitForCall("A", "approve_automation_flow", from);
+    assertEqual(
+      [refused.args, refused.hand],
+      [{ id: "asked-1", seen: "bb" }, "person"],
+      "the yes did not carry the document the question was drawn from, or named another job or hand",
+    );
+    await pageA.waitForFunction(
+      () => automations.find((one) => one.id === "asked-1")?.flow_stands === "cc",
+      undefined,
+      { timeout: UI_TIMEOUT },
+    );
+    said.push(...await pageA.evaluate(() => window.__askedSaid));
+    assert(
+      said.length === 1 && said[0].includes("다시 바뀌었습니다"),
+      "a yes to a document rewritten under the question was not refused out loud",
+      said,
+    );
+    assert(backend.count("A", "list_automations") > reread, "the list was not read again after the refusal");
+    const still = await pageA.evaluate(() => ({
+      hidden: document.getElementById("auto-detail-approve").hidden,
+      waits: automations.find((one) => one.id === "asked-1")?.flow_changed,
+    }));
+    assertEqual(still, { hidden: false, waits: true }, "the job stopped waiting though nothing was allowed");
+
+    // Asked again, about what stands now: the question says it may spend, and
+    // the yes carries this document's hash.
+    const again = backend.calls.length;
+    await pageA.click("#auto-detail-approve");
+    await pageA.waitForSelector("#ask-scrim:not([hidden])");
+    const second = await pageA.evaluate(() => document.getElementById("ask-body").textContent);
+    assert(second.includes("Wallet QA") && second.includes(money), "the question did not say this document may spend money", second);
+    const words = await pageA.evaluate(() => ({
+      hosts: t("auto.asked.aboutHosts", "문서가 적은 사이트 {{count}}곳: {{names}}", { count: 5, names: "" }).split(":")[0],
+      apps: t("auto.asked.aboutApps", "문서가 적은 앱 {{count}}개: {{names}}", { count: 4, names: "" }).split(":")[0],
+      hidden: t("auto.asked.hidden", "받은 이름에서 보이지 않는 글자 {{count}}개를 뺐습니다.", { count: 2 }),
+    }));
+    assert(
+      second.includes("wallet-qa.md") && second.includes("a-shop.example.com") && !question.includes("wallet-qa.md"),
+      "the question did not say which document it is about, or said it of a row that carried none",
+      { second, question },
+    );
+    // What may spend is said BEFORE anything the document says of itself:
+    // those words are as long as the document makes them, and the box this
+    // is read in shows a few lines (t-105495, 막는 문제 1). Sites come before
+    // apps, each counted apart and named as the document's own words; letters
+    // left out of them are counted.
+    const at = (words_) => second.indexOf(words_);
+    assert(
+      at(money) > 0 && at(money) < at("wallet-qa.md")
+        && at(words.hosts) > 0 && at(words.hosts) < at(words.apps)
+        && second.includes("+2") && second.includes("+1") && second.includes(words.hidden),
+      "the money sentence stands behind the document's own words, or the sites and apps are not said apart and in that order",
+      { second, words },
+    );
+    await pageA.click("#ask-yes");
+    const approved = await backend.waitForCall("A", "approve_automation_flow", again);
     assertEqual(
       [approved.args, approved.hand],
-      [{ id: "asked-1" }, "person"],
-      "allowing again named another job, or did not say the person pressed it",
+      [{ id: "asked-1", seen: "cc" }, "person"],
+      "allowing again named another job or document, or did not say the person pressed it",
     );
     await pageA.waitForFunction(
       () => document.getElementById("auto-detail-approve").hidden,
@@ -5713,8 +5828,38 @@ await test("an_asked_job_says_who_asked_and_waits_for_the_person_once_its_flow_c
     );
     const allowed = await pageA.evaluate(() => document.getElementById("auto-detail-asked").textContent);
     assert(allowed.includes("term:7"), "the page did not say which pane asked and when it was allowed", allowed);
-    return "an asked job said it waits, asked before allowing again, and the yes was the person's";
+
+    // A document that cannot be read, or is no Flow any more: nothing to
+    // allow. The list and the page say the document needs a look, and there
+    // is no button to press.
+    backend.automations[0].flow_changed = true;
+    await pageA.evaluate(() => refreshAutomations());
+    await pageA.waitForFunction(
+      () => automations.find((one) => one.id === "asked-1")?.flow_changed === true,
+      undefined,
+      { timeout: UI_TIMEOUT },
+    );
+    const gone = await pageA.evaluate(() => ({
+      when: document.querySelector("#auto-list .auto-row .auto-row-when")?.textContent ?? "",
+      wantWhen: t("auto.needsFlow", "Flow 문서 확인 필요"),
+      note: document.getElementById("auto-detail-asked").textContent,
+      wantNote: t("auto.flowGone", "이 예약의 Flow 문서를 읽을 수 없거나 더는 Flow가 아니어서 돌지 않습니다. Flow 탭에서 문서를 확인해 주세요."),
+      hidden: document.getElementById("auto-detail-approve").hidden,
+    }));
+    assert(
+      gone.wantWhen && gone.when === gone.wantWhen && gone.wantNote && gone.note === gone.wantNote && gone.hidden,
+      "a job whose Flow is gone offered 「다시 승인」, or did not say the document needs a look",
+      gone,
+    );
+    return "an asked job said it waits, asked before allowing again, was held to the document it asked about, and the yes was the person's";
   } finally {
+    await pageA.evaluate(() => {
+      if (window.__realShowError) {
+        window.showError = window.__realShowError;
+        delete window.__realShowError;
+      }
+      delete window.__askedSaid;
+    });
     await pageA.evaluate(() => closeAutoForm());
     await closeFlowSide(pageA);
     backend.automations = held.automations;
@@ -5741,6 +5886,21 @@ await test("the_card_for_an_asked_schedule_says_the_job_and_what_was_left_out", 
       hidden: 0,
     };
     const words = COMPUTER_HANDOFF_WORDS["auto.asked.card"];
+    const about = {
+      slug: "wallet-qa",
+      steps: 3,
+      hosts: { shown: ["a.example.com", "shop.example.com"], count: 4 },
+      apps: { shown: ["com.example.wallet"], count: 1 },
+      hidden: 0,
+      // A backend that still sent a file time would not be repeated.
+      modified_ms: 1_794_000_000_000,
+    };
+    const longName = (word) => `${word}.`.repeat(20).slice(0, 80);
+    const crowded = {
+      ...about,
+      hosts: { shown: ["a", "b", "c"].map((word) => longName(`${word}-shop.example.com`)), count: 5 },
+      apps: { shown: ["x", "y", "z"].map((word) => longName(`com.example.${word}`)), count: 4 },
+    };
     return {
       plain: words(args),
       counted: words({ ...args, hidden: 3 }),
@@ -5748,6 +5908,14 @@ await test("the_card_for_an_asked_schedule_says_the_job_and_what_was_left_out", 
       spending: words({ ...args, policy: "guarded", money: true }),
       moneyNote: t("auto.asked.money", "이 Flow는 돈이 오가는 걸음을 누를 수 있습니다 — 지켜보는 사람 없이 돕니다."),
       runs: args.next.map(localMinuteText),
+      // Which document: its file's name, its steps, the sites and the apps it names — each counted apart.
+      about: words({ ...args, about }),
+      // And of one that may spend, naming as much as a document may.
+      spendingAbout: words({ ...args, policy: "guarded", money: true, about: crowded }),
+      aboutSteps: t("auto.asked.aboutSteps", "걸음 {{count}}개", { count: 3 }),
+      aboutHosts: t("auto.asked.aboutHosts", "문서가 적은 사이트 {{count}}곳: {{names}}", { count: 4, names: "a.example.com, shop.example.com +2" }),
+      aboutApps: t("auto.asked.aboutApps", "문서가 적은 앱 {{count}}개: {{names}}", { count: 1, names: "com.example.wallet" }),
+      fileTime: new Date(1_794_000_000_000).toLocaleString(),
     };
   });
   for (const shown of ["Wallet QA", "Morning wallet", "dry", "30 9 * * *", "/Users/dev/app", "term:7", ...said.runs]) {
@@ -5763,7 +5931,26 @@ await test("the_card_for_an_asked_schedule_says_the_job_and_what_was_left_out", 
     "a Flow that may spend money was not said so on its card, or a dry one was",
     said,
   );
-  return "the card named the Flow, the job, when and where it runs and who asked; three hidden letters were said once, and a Flow that may spend was said so";
+  assert(
+    said.aboutSteps.includes("3")
+      && ["wallet-qa.md", said.aboutSteps, said.aboutHosts, said.aboutApps].every((shown) => said.about.includes(shown))
+      && said.about.indexOf(said.aboutHosts) < said.about.indexOf(said.aboutApps)
+      && said.about.startsWith(`${said.plain} `)
+      && !said.plain.includes("wallet-qa.md")
+      && !said.about.includes(said.fileTime),
+    "the card did not say which document it is about — its file, its steps, its sites and then its apps, each counted — or said a file time, or said it with none sent",
+    said,
+  );
+  // What may spend is said before anything the document says of itself, however
+  // long the document makes its names (t-105495, 막는 문제 1).
+  assert(
+    said.spendingAbout.indexOf(said.moneyNote) > 0
+      && said.spendingAbout.indexOf(said.moneyNote) < said.spendingAbout.indexOf("wallet-qa.md")
+      && said.spendingAbout.includes("a-shop.example.com"),
+    "the money sentence stands behind the document's own words on the card",
+    said,
+  );
+  return "the card named the Flow, the job, when and where it runs and who asked; three hidden letters were said once, a Flow that may spend was said so before the document's own words, and the document was named by its file, steps, sites and apps";
 });
 
 // The folded 「세부 설정」 line is where a save's command is read before the
@@ -12781,6 +12968,8 @@ await test("the harness card shows what a person set and what the window counted
       alertsHint: field("harness-alerts-landing-hint")?.textContent ?? null,
       prompts: field("harness-workers-prompts")?.value ?? null,
       promptsHint: field("harness-workers-prompts-hint")?.textContent ?? null,
+      peers: field("harness-mail-peers")?.value ?? null,
+      peersHint: field("harness-mail-peers-hint")?.textContent ?? null,
       status: field("harness-status")?.textContent ?? null,
     };
   });
@@ -12795,7 +12984,7 @@ await test("the harness card shows what a person set and what the window counted
   assert(
     shown.mode === "notify" && shown.task === "" && shown.day === "" &&
       shown.concurrent === "4" && shown.perHour === "300" && shown.perDay === "2000" &&
-      shown.alerts === "on" && shown.prompts === "ask",
+      shown.alerts === "on" && shown.prompts === "ask" && shown.peers === "on",
     "the card does not show the document's gate and ceilings", shown,
   );
   assert(
@@ -12819,6 +13008,7 @@ await test("the harness card shows what a person set and what the window counted
         launches: { concurrent: 4, per_hour: 300, per_day: 2000 },
         alerts: { landing: true },
         workers: { refuse_prompts: false },
+        mail: { peers: true },
       },
     },
     "a budget was sent as something other than the whole record with the number typed",
@@ -12833,6 +13023,7 @@ await test("the harness card shows what a person set and what the window counted
       launches: { concurrent: 4, per_hour: 300, per_day: null },
       alerts: { landing: true },
       workers: { refuse_prompts: false },
+      mail: { peers: true },
     },
     "a blank ceiling is no ceiling, and the budget saved before it stays",
   );
@@ -12883,6 +13074,22 @@ await test("the harness card shows what a person set and what the window counted
   );
   await reopenSettings(pageB, "B", "provider-accounts");
   assertEqual((await card()).prompts, "refuse", "the card does not show the stored choice when it is opened again");
+  // Agent panes write to each other until the person says otherwise (사람 결정 2026-11-12): what the
+  // switch lets through, how often a letter may wake a pane and what stays out are said beside it,
+  // and turning it off is one saved word that moves nothing else.
+  assert(
+    /같은 프로젝트/.test(shown.peersHint ?? "") && /세 번/.test(shown.peersHint ?? "") &&
+      /다른 프로젝트/.test(shown.peersHint ?? "") && /코디네이터/.test(shown.peersHint ?? ""),
+    "the switch does not say whom it reaches, how often it wakes and what it keeps out", shown.peersHint,
+  );
+  const quiet = await gestureAndWait(pageB, "B", "set_harness_settings", () =>
+    pageB.selectOption("#harness-mail-peers", "off"));
+  assertEqual(quiet.args.harness.mail, { peers: false }, "the switch did not send the panes' mail as off");
+  assertEqual(quiet.args.harness.workers, { refuse_prompts: true }, "the switch moved the workers beside it");
+  await waitForSettingsIdle(pageB);
+  assertEqual(backend.settings.harness.mail, { peers: false }, "the stored document does not hold the panes' mail off");
+  await reopenSettings(pageB, "B", "provider-accounts");
+  assertEqual((await card()).peers, "off", "the card does not show the switch off when it is opened again");
   await backend.externalPatch({ locale: previousLocale }, ["locale"]);
   await renderSettled(pageB);
 });

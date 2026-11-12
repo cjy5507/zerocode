@@ -115,6 +115,11 @@ zo 세션이 켜져 있으면 기본 60초 유휴 뒤 실행 기록을 확인하
 `autoDreamEnabled: false` 또는 `ZO_DREAM=0`으로 자동 dreaming을 끈다.
 유휴 지연은 `autonomy.idleDreamDelaySecs` 또는 `ZO_AUTONOMY_IDLE_DREAM_DELAY_SECS`로 설정한다.
 
+교훈 뽑기는 기본으로 꺼져 있다. 자기 설정 파일(`~/.zo/settings.json`)에 `"dreamLessons": true`를 넣으면 켜진다. 저장소의 `.zo/settings.json`, 작업 폴더의 `.zo/settings.local.json`, `--settings` 파일로는 켜지지 않는다.
+켜면 유휴 dreaming이 돌 차례에, 그 세션에서 사람이 새로 한 말(말마다 앞 1,200자)과 그 직전 어시스턴트 말의 끝(400자)을 세션이 쓰던 공급자의 빠른 모델에 한 번 보내 다음 세션에도 통할 선호·제약·작업 방식을 묻는다. 새로 한 말이 3개 이상이고 마지막으로 물은 지 30분이 지났을 때만 묻고, 보낸 말은 다시 보내지 않는다. 원장이 소환한 워커 판과 파이프로 띄운 실행(`-p`)은 묻지 않고, 공급자에 제 빠른 모델이 없거나 사용자 지정 공급자면 아무것도 보내지 않는다.
+이 버전에서 뽑힌 교훈은 **후보로만** 적힌다(`user-patterns/said-lessons/candidates.jsonl`, 몇 세션에서 나왔는지와 함께). dreaming 패스는 이 파일을 읽지 않으므로 메모리에는 올라가지 않는다 — 모델이 쓴 문장을 사람의 말과 대조해 확인하는 방법을 정한 뒤에 올린다.
+켜기 전에 `zo dream-lessons preview <세션> [--dry-run]`으로 한 세션에서 무엇이 뽑힐지 볼 수 있다. 이 명령은 아무것도 저장하지 않고, `--dry-run`은 아무것도 보내지 않는다. 터미널에서 사람이 직접 돌릴 때만 보내고, 프로그램이 부르면 `--send`를 붙여야 보낸다.
+
 그래프를 반복하려면 `WorkflowLibrary`에 저장한 뒤 `CronCreate`에 한 번 등록한다.
 예를 들어 저장된 `repair-check` 그래프를 30분마다 실행하는 등록 입력은 다음과 같다.
 
@@ -158,6 +163,13 @@ zo-ide/
 `~/.zo/model-catalog.json`(모델 카탈로그 오버레이 — settings 의 `modelCatalog` 키는 파일이 없을 때만 읽는 레거시),
 `~/.zo/projects/<slug>/sessions/*.jsonl`(턴마다 영속), `~/.zo/projects/<slug>/state/agents/`(헬퍼 명부 — 세션 소유 registry + 채택 미러, t-2511 착지),
 `~/.zo/cache/`(모델 카탈로그·프롬프트 캐시 원장), `~/.zo/logs/zo-ide.log`.
+
+zo가 값싼 모델에 맡기는 일 가운데 셋은 세션이 쓰는 공급자 안에 머문다: 한도를 넘긴 도구 출력 접기(`toolDigest`, 기본 켜짐), 병렬 과업 나누기, 교훈 뽑기(`dreamLessons`, 기본 꺼짐).
+접기와 교훈 뽑기는 그 공급자에 제 빠른 모델이 있을 때만 그 모델에 묻는다.
+사용자 지정 공급자(`providers`, 내장 DeepSeek 포함), 로컬 모델, 카탈로그가 모르는 이름의 세션에는 제 빠른 모델이 없다. 그런 세션은 접지 않고 넘친 출력의 앞뒤를 자르며, 교훈을 묻지 않는다.
+과업 나누기는 그런 세션에서 세션의 제 모델로 묻는다.
+접기는 `"toolDigest": "off"` 또는 `ZO_TOOL_DIGEST=off`로 끈다.
+스마트 라우터의 판정은 이 규칙 밖이다. 도우미를 띄울 때의 난이도 판정(`smart.autoClassifier`, 기본 `probed`)은 도우미의 과업 글을 연결된 공급자 전체에서 고른 빠른 모델에 보내며, 세션의 공급자가 아닐 수 있다. `"smart": {"autoClassifier": "off"}`로 끈다.
 
 ## 검증과 배포
 ```bash

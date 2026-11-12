@@ -12111,6 +12111,7 @@ mod tests {
             handover: None,
             project: None,
             folded: None,
+            room: None,
         });
         projection.messages.push(MessageRow {
             run: "run-1".to_string(),
@@ -12127,6 +12128,7 @@ mod tests {
             dispatch: None,
             author_seat: None,
             from_run: None,
+            room: None,
             created_ms: 2,
         });
         projection.inboxes.push(InboxRow {

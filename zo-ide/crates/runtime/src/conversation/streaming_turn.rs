@@ -45,6 +45,7 @@ use super::{
     REFUSAL_CONTEXT_CLEANED_WARN, STEERING_ECHO_PREFIX,
     TRUNCATION_CONTINUATION_REMINDER,
 };
+use super::tool::ToldCall;
 use crate::message_stream::types::WireModel;
 use crate::conversation::error::ToolTextKind;
 use crate::message_stream::ToolResultBody;
@@ -2573,12 +2574,15 @@ where
                 );
 
                 self.learn_declared_mode(tool_name, &effective_input);
+                // What the gates ahead of the policy and a refusal name is the
+                // call a wrapper carries, as the policy judges it.
+                let told_name = ToldCall::of(tool_name, &effective_input).name.into_owned();
                 let mut kill_judgment = None;
                 let permission_outcome = if let Some(outcome) =
-                    pre_hook_denial_outcome(&pre_hook_result, tool_name)
+                    pre_hook_denial_outcome(&pre_hook_result, &told_name)
                 {
                     outcome
-                } else if let Some(reason) = self.architect_edit_gate_denial(tool_name) {
+                } else if let Some(reason) = self.architect_edit_gate_denial(&told_name) {
                     // Architect contract backstop: a reserved foreground model
                     // editing directly is redirected to delegation before the
                     // ordinary permission policy runs.
@@ -2724,7 +2728,7 @@ where
                 if let PermissionOutcome::Deny { reason } = &permission_outcome {
                     self.fire_lifecycle_hook(
                         HookEvent::PermissionDenied,
-                        &serde_json::json!({ "tool_name": tool_name, "reason": reason }),
+                        &serde_json::json!({ "tool_name": told_name, "reason": reason }),
                     );
                 }
 
@@ -3033,8 +3037,10 @@ where
                         // a quiet hint and fold later mode denials out of the
                         // transcript; exceptional denials stay warnings.
                         let mode_denial_seen = !self.mode_denial_counts.is_empty();
+                        // The banner names the call that was refused, not
+                        // the wrapper it came through.
                         if let Some((level, text)) = permission_denial_notice(
-                            &p.tool_name,
+                            &ToldCall::of(&p.tool_name, &p.effective_input).name,
                             reason,
                             mode_denial_seen,
                         ) {
@@ -3055,8 +3061,10 @@ where
                                 ));
                             }
                         }
+                        // Folded under the call that was refused: two
+                        // tools refused through the wrapper are two rows.
                         let body = self.fold_repeated_mode_denial(
-                            &p.tool_name,
+                            &ToldCall::of(&p.tool_name, &p.effective_input).name,
                             super::denial_result_body(reason),
                         );
                         ConversationMessage::tool_result(
@@ -3463,12 +3471,15 @@ where
         let (execution, kind) = result;
         let ToolExecutionResult { text: mut output, surface } = execution;
         let mut is_error = kind.is_error();
+        // The seats beside a result know a call by the tool that ran: the one
+        // a wrapper carried, when the model called through it.
+        let told_name = ToldCall::of(&p.tool_name, &p.effective_input).name.into_owned();
         // The patch review seat reads the tool's own envelope, so it is kept
         // before any hook merges text into it (t-6203).
-        let reviewed = (!is_error && self.reviews_edits_of(&p.tool_name)).then(|| output.clone());
+        let reviewed = (!is_error && self.reviews_edits_of(&told_name)).then(|| output.clone());
         // So does the text guard, for a block a file read, a web tool, the
         // window's browser or an MCP tool handed back (t-6348).
-        let text_asked = self.text_guard_ask(&p.tool_use_id, &p.tool_name, &output, is_error);
+        let text_asked = self.text_guard_ask(&p.tool_use_id, &told_name, &output, is_error);
         if options.notify_slow {
             crate::notifications::notify_if_slow(
                 &p.tool_name,
@@ -3544,7 +3555,7 @@ where
         // Enforcer-layer denials surface as tool errors here; fold same-class
         // repeats on the model-facing result like the policy-layer deny arm.
         if is_error {
-            output = self.fold_repeated_mode_denial(&p.tool_name, output);
+            output = self.fold_repeated_mode_denial(&told_name, output);
         }
         // Append (after rendering, so the user-facing body stays clean) only to
         // the model-facing result, nudging the agent out of a tight
@@ -3566,12 +3577,12 @@ where
         // The patch review seat's line, model-facing only and last: a hook
         // that failed the result took the patch with it.
         if let Some(pristine) = reviewed.filter(|_| !is_error) {
-            let note = self.reviewed_edit_note(&p.tool_use_id, &p.tool_name, &pristine).await;
+            let note = self.reviewed_edit_note(&p.tool_use_id, &told_name, &pristine).await;
             output = super::reviewed_edit::with_review_note(output, note);
         }
         // The tool guards' fence and lines, model-facing only (t-6348).
         output = self
-            .guarded_result(&p.tool_use_id, &p.tool_name, text_asked, output, is_error)
+            .guarded_result(&p.tool_use_id, &told_name, text_asked, output, is_error)
             .await;
 
         // Drain images the tool staged. The real live dispatcher shares the

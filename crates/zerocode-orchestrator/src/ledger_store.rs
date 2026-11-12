@@ -32,6 +32,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
+use zerocode_core::orchestration::room::RoomMark;
 use zerocode_core::orchestration::{
     AckedRow, AttachmentRow, Auto, BoundRow, CHECK_RENDERER, CheckV1, Closure, CoordinatorSeat,
     Delivery, DispatchRow, FoldedMail, GateRow, HandoverPolicy, InboxRow, LedgerProjectionV1,
@@ -102,6 +103,7 @@ pub const LEDGER_TABLES_SQL: &str = "
         handover TEXT,
         project TEXT,
         folded TEXT,
+        room TEXT,
         PRIMARY KEY (ledger_id, ordinal),
         UNIQUE (ledger_id, id),
         FOREIGN KEY (ledger_id) REFERENCES orchestration_ledger_heads(ledger_id)
@@ -258,6 +260,7 @@ pub const LEDGER_TABLES_SQL: &str = "
         dispatch TEXT,
         author_seat TEXT,
         from_run TEXT,
+        room TEXT,
         created_ms INTEGER NOT NULL,
         PRIMARY KEY (ledger_id, ordinal),
         UNIQUE (ledger_id, run, id),
@@ -429,6 +432,9 @@ pub fn ensure_ledger_columns(connection: &Connection) -> Result<(), EffectJourna
          * for every row written before it, which reads the chairs back as
          * those rows always did. */
         ("ledger_messages", "from_run", "TEXT"),
+        /* The room a letter was written in (2026-11-12): NULL for every row
+         * written before rooms existed — no letter of a room. */
+        ("ledger_messages", "room", "TEXT"),
         /* Who wrote a task's result, as one JSON document like the seat —
          * and NULL for every row written before authorship was recorded,
          * which the review reads as a claim by nobody known (t-6815). */
@@ -529,6 +535,9 @@ pub fn ensure_ledger_columns(connection: &Connection) -> Result<(), EffectJourna
          * one JSON document of counts and stamps like the summary, NULL for
          * every run that never folded any. */
         ("ledger_runs", "folded", "TEXT"),
+        /* A project's room (2026-11-12): absent from every run written before
+         * rooms existed, which reads back as an ordinary run. */
+        ("ledger_runs", "room", "TEXT"),
         /* Whether a worker's checkout is its own tree (t-78914): a flag like
          * `taken_over`, and false for every row written before it — a
          * checkout nobody said was the worker's own is not counted as one. */
@@ -2402,8 +2411,8 @@ fn insert_row(
                 connection,
                 "INSERT INTO ledger_runs (
                     ledger_id, ordinal, id, name, created_ms, summary, coordinator, handover,
-                    project, folded
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    project, folded, room
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     ledger_id,
                     place,
@@ -2415,6 +2424,7 @@ fn insert_row(
                     document(row.handover.as_ref())?,
                     document(row.project.as_ref())?,
                     document(row.folded.as_ref())?,
+                    document(row.room.as_ref())?,
                 ],
             )?;
             let Some(auto) = &row.auto else {
@@ -2601,9 +2611,9 @@ fn insert_row(
                 "INSERT INTO ledger_messages (
                     ledger_id, ordinal, run, id, sender, recipient, kind, body,
                     subject, priority, payload, thread, task, dispatch,
-                    author_seat, from_run, created_ms
+                    author_seat, from_run, room, created_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                           ?15, ?16, ?17)",
+                           ?15, ?16, ?17, ?18)",
                 params![
                     ledger_id,
                     place,
@@ -2621,6 +2631,7 @@ fn insert_row(
                     row.dispatch,
                     row.author_seat,
                     row.from_run,
+                    row.room,
                     row.created_ms,
                 ],
             )?;
@@ -3189,7 +3200,8 @@ fn read_repairable_from_head(
     let mut runs = Vec::new();
     each(
         connection,
-        "SELECT ordinal, id, name, created_ms, summary, coordinator, handover, project, folded
+        "SELECT ordinal, id, name, created_ms, summary, coordinator, handover, project, folded,
+                room
            FROM ledger_runs WHERE ledger_id = ?1 ORDER BY ordinal",
         ledger_id,
         |row| {
@@ -3236,6 +3248,14 @@ fn read_repairable_from_head(
                 .map(|held| serde_json::from_str::<FoldedMail>(&held))
                 .transpose()
                 .map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
+            // A room mark that will not parse is a corrupt row for the seat's
+            // reason: read as `None` it would turn a room into an ordinary
+            // run, where a leader-shaped pane signs as the operator.
+            let room = row
+                .get::<_, Option<String>>(9)?
+                .map(|held| serde_json::from_str::<RoomMark>(&held))
+                .transpose()
+                .map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
             runs.push(RunRow {
                 id: row.get(1)?,
                 name: Text::from(row.get::<_, String>(2)?),
@@ -3246,6 +3266,7 @@ fn read_repairable_from_head(
                 handover,
                 project,
                 folded,
+                room,
             });
             Ok(())
         },
@@ -3594,7 +3615,7 @@ fn read_repairable_from_head(
     each(
         connection,
         "SELECT run, id, sender, recipient, kind, body, subject, priority, payload,
-                thread, task, dispatch, author_seat, from_run, created_ms
+                thread, task, dispatch, author_seat, from_run, created_ms, room
            FROM ledger_messages WHERE ledger_id = ?1 ORDER BY ordinal",
         ledger_id,
         |row| {
@@ -3612,6 +3633,7 @@ fn read_repairable_from_head(
                 (
                     row.get::<_, Option<String>>(12)?,
                     row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(15)?,
                 ),
                 row.get::<_, i64>(14)?,
             ));
@@ -3633,7 +3655,7 @@ fn read_repairable_from_head(
                     thread,
                     task,
                     dispatch,
-                    (author_seat, from_run),
+                    (author_seat, from_run, room),
                     created_ms,
                 ),
                 (kind, priority),
@@ -3653,6 +3675,7 @@ fn read_repairable_from_head(
                     dispatch,
                     author_seat,
                     from_run,
+                    room,
                     created_ms,
                 })
             },
@@ -3891,6 +3914,7 @@ pub(crate) fn a_ledger_with_mail_of(
             dispatch: None,
             author_seat: None,
             from_run: None,
+            room: None,
             created_ms: 2,
         });
         batch.push(id);
@@ -4044,6 +4068,7 @@ pub(crate) fn a_ledger_with_every_table(
         dispatch: None,
         author_seat: None,
         from_run: None,
+        room: None,
         created_ms: 5,
     });
     rows.bound.push(BoundRow {
@@ -4343,6 +4368,7 @@ mod tests {
                     handover: None,
                     project: None,
                     folded: None,
+                    room: None,
                 },
                 RunRow {
                     id: "run-1".to_string(),
@@ -4374,6 +4400,7 @@ mod tests {
                     handover: None,
                     project: None,
                     folded: None,
+                    room: None,
                 },
             ],
             tasks: vec![TaskRow {
@@ -4493,6 +4520,7 @@ mod tests {
                     dispatch: None,
                     author_seat: None,
                     from_run: None,
+                    room: None,
                     created_ms: 9,
                 },
                 MessageRow {
@@ -4510,6 +4538,7 @@ mod tests {
                     dispatch: None,
                     author_seat: None,
                     from_run: None,
+                    room: None,
                     created_ms: 8,
                 },
             ],
@@ -5394,6 +5423,7 @@ mod tests {
                  ALTER TABLE ledger_runs DROP COLUMN project;
                  ALTER TABLE ledger_workers DROP COLUMN in_worktree;
                  ALTER TABLE ledger_runs DROP COLUMN folded;
+                 ALTER TABLE ledger_runs DROP COLUMN room;
                  UPDATE orchestration_ledger_heads SET bytes_held = {};",
                 bytes_held(&expected)
             ))

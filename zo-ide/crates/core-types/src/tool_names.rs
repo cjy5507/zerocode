@@ -64,6 +64,12 @@ pub const APPLY_PATCH: &str = "apply_patch";
 /// permission policy — judges the call it carries ([`carried_call`]).
 pub const CAPABILITY_INVOKE: &str = "CapabilityInvoke";
 
+/// The field of a [`CAPABILITY_INVOKE`] input that names the tool it carries.
+const CARRIED_NAME: &str = "name";
+
+/// The field that holds that tool's arguments.
+const CARRIED_INPUT: &str = "input";
+
 /// Why a [`CAPABILITY_INVOKE`] input carries no call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoCarriedCall {
@@ -85,7 +91,7 @@ pub enum NoCarriedCall {
 /// that are not an object: nothing runs for such a call.
 pub fn carried_call(input: &Value) -> Result<(String, Value), NoCarriedCall> {
     let name = input
-        .get("name")
+        .get(CARRIED_NAME)
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|name| !name.is_empty())
@@ -93,7 +99,7 @@ pub fn carried_call(input: &Value) -> Result<(String, Value), NoCarriedCall> {
     if name == CAPABILITY_INVOKE {
         return Err(NoCarriedCall::Itself);
     }
-    let arguments = match input.get("input") {
+    let arguments = match input.get(CARRIED_INPUT) {
         None | Some(Value::Null) => Value::Object(Map::new()),
         Some(value @ Value::Object(_)) => value.clone(),
         Some(other) => {
@@ -107,6 +113,17 @@ pub fn carried_call(input: &Value) -> Result<(String, Value), NoCarriedCall> {
         }
     };
     Ok((name.to_string(), arguments))
+}
+
+/// The [`CAPABILITY_INVOKE`] input that carries a call of `name` with
+/// `arguments`: what [`carried_call`] reads back. Written beside its reading,
+/// so a call taken out of the wrapper and put back is the same wrapper.
+#[must_use]
+pub fn carrying(name: &str, arguments: Value) -> Value {
+    let mut wrapper = Map::new();
+    wrapper.insert(CARRIED_NAME.to_string(), Value::String(name.to_string()));
+    wrapper.insert(CARRIED_INPUT.to_string(), arguments);
+    Value::Object(wrapper)
 }
 
 /// Alias keys that are zo's own shorthand rather than another agent's name for
@@ -521,6 +538,11 @@ mod tests {
         for no_name in [json!({}), json!({"name": "  "}), json!({"name": 7}), json!("bash")] {
             assert_eq!(carried_call(&no_name), Err(NoCarriedCall::NoName), "{no_name}");
         }
+        assert_eq!(
+            carried_call(&carrying("bash", json!({"command": "ls"}))),
+            Ok(("bash".to_string(), json!({"command": "ls"}))),
+            "a call put into the wrapper is the call read out of it"
+        );
         assert_eq!(
             carried_call(&json!({"name": CAPABILITY_INVOKE, "input": {"name": "bash"}})),
             Err(NoCarriedCall::Itself)

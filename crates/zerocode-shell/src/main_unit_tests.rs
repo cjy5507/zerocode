@@ -21950,6 +21950,9 @@ fn the_helper_page_speaks_from_its_catalogs_and_paints_from_its_tokens() {
         "worker.resultReview",
         "worker.resultFile",
         "worker.resultMore",
+        // The same card beside the conversation (2026-11-12): what its
+        // 「검토」 says while the panel shows it.
+        "worker.resultBeside",
         "worker.statusKey",
         "chatPanel.title",
         "chatPanel.conversation",
@@ -22121,7 +22124,7 @@ fn the_helper_page_speaks_from_its_catalogs_and_paints_from_its_tokens() {
         ),
         // An answer's card of what its turn changed (2026-11-10).
         (
-            "function answerResultNode(list, row) {",
+            "function answerResultNode(list, row, { head: headed = true } = {}) {",
             vec![
                 "worker.resultCard",
                 "worker.resultFiles",
@@ -22129,6 +22132,16 @@ fn the_helper_page_speaks_from_its_catalogs_and_paints_from_its_tokens() {
                 "worker.resultFile",
                 "worker.resultMore",
             ],
+        ),
+        // The card beside the conversation (2026-11-12): the inline card's
+        // door says where its changes stand, the panel is named and closes.
+        (
+            "function paintResultAll(card) {",
+            vec!["worker.resultBeside", "worker.showLess", "worker.resultReview"],
+        ),
+        (
+            "function chatBesideNode(page) {",
+            vec!["worker.resultCard", "worker.reviewClose"],
         ),
         (
             "function updateHelperStatus(line, run) {",
@@ -34759,20 +34772,370 @@ fn a_flows_document_is_hashed_under_the_root_it_is_handed() {
     let root = tempfile::tempdir().expect("a root");
     let recipes = root.path().join(crate::computer_use::recipes::RECIPES_DIR);
     std::fs::create_dir_all(&recipes).expect("the recipes folder");
-    std::fs::write(recipes.join("wallet-qa.md"), "# Wallet QA\n").expect("a document");
+    let flow = asked_flow_document("dry");
+    std::fs::write(recipes.join("wallet-qa.md"), &flow).expect("a document");
     assert_eq!(
-        crate::cmd::review::flow_document_stands(root.path(), "wallet-qa"),
-        Some(zerocode_core::automation::flow_document_sha256(
-            "# Wallet QA\n"
-        ))
+        crate::cmd::review::flow_standing(root.path(), "wallet-qa").map(|one| one.sha256),
+        Some(zerocode_core::automation::flow_document_sha256(&flow))
     );
     assert_eq!(
-        crate::cmd::review::flow_document_stands(root.path(), "nothing"),
+        crate::cmd::review::flow_standing(root.path(), "nothing"),
         None
     );
-    let reading = block_after(shipped_backend(), "fn flow_document_stands(");
+    let reading = block_after(shipped_backend(), "fn flow_standing(");
     assert!(
         !reading.contains("evidence::root()"),
         "the document is looked for where a new window has no word of it:\n{reading}"
+    );
+}
+
+/// An approval binds a job to the document the person allowed, and a save
+/// from the form does not take that binding off without a word (t-105044
+/// 알아 둘 것 3, t-105495 막지 않는 1 · 2). The roads a person's hand reaches
+/// a stored job by, as a table:
+///
+/// - a job that WAITS — its Flow reads differently from the one allowed —
+///   keeps its approval and its wait through every save and the switch;
+///   「다시 승인」 alone releases it, and a save that would make it another
+///   kind of job is refused;
+/// - a job that does not wait keeps its approval while it stays the window's
+///   walk of that same Flow, so a document rewritten afterwards still stops
+///   it; pointed at another Flow, or made another kind of job, it is the
+///   person's own from then on;
+/// - a job the person wrote, and a new one, carry none — whatever the page
+///   sent.
+#[test]
+fn a_form_save_keeps_the_approval_of_the_job_that_was_allowed() {
+    use crate::cmd::review::{Approval, WAITING_JOB_STAYS_A_FLOW, save_automation_in};
+    use crate::computer_use::recipes::schedule::standing;
+    let config = tempfile::tempdir().expect("config");
+    let root = tempfile::tempdir().expect("a root");
+    let recipes = root.path().join(crate::computer_use::recipes::RECIPES_DIR);
+    std::fs::create_dir_all(&recipes).expect("the recipes folder");
+    let allowed = asked_flow_document("dry");
+    let rewritten = allowed.replace("com.example.wallet", "com.example.other");
+    std::fs::write(recipes.join("other-flow.md"), allowed.replace("Wallet QA", "Other"))
+        .expect("another Flow");
+    let approval = zerocode_core::automation::Asked {
+        pane: "term:7".to_string(),
+        agent: None,
+        approved_at_ms: 1,
+        flow_sha256: zerocode_core::automation::flow_document_sha256(&allowed),
+    };
+    // As the card's road stores one: bound to its Flow, its prompt the
+    // command that walks it (`schedule::read`).
+    let mut job = zerocode_core::Automation::asked_flow(
+        "asked-1".to_string(),
+        "Asked wallet QA".to_string(),
+        "/Users/dev/app".to_string(),
+        "wallet-qa".to_string(),
+        zerocode_core::Schedule::from_words(Some("daily"), Some("09:30"), None, None)
+            .expect("a schedule"),
+        approval.clone(),
+    );
+    job.bind_flow().expect("the job binds to its Flow");
+    assert!(job.validate_for_save().is_ok(), "the fixture is no job the door would save");
+    let job = job;
+    let stored = || {
+        stored_automations(config.path())
+            .into_iter()
+            .find(|held| held.id == "asked-1")
+            .expect("the job")
+    };
+    let waits = || {
+        let held = stored();
+        held.flow_changed_since_approval(
+            held.flow
+                .as_deref()
+                .and_then(|slug| standing(root.path(), slug))
+                .as_ref()
+                .map(|one| one.sha256.as_str()),
+        )
+    };
+    // The job as it was allowed, the document as it was allowed or rewritten.
+    let stand = |document: &str| {
+        std::fs::write(recipes.join("wallet-qa.md"), document).expect("the document");
+        write_automations(config.path(), std::slice::from_ref(&job)).expect("definition");
+    };
+    // The form's save, as the command makes it. The page sends the row back,
+    // approval and all: what it says of one is never read — here it claims a
+    // newer approval than the store holds.
+    let form_saves = |edit: &dyn Fn(&mut zerocode_core::Automation)| -> Result<(), String> {
+        let mut sent = stored();
+        if let Some(claimed) = sent.asked.as_mut() {
+            claimed.approved_at_ms = 99;
+            claimed.flow_sha256 = "claimed-by-the-page".to_string();
+        }
+        edit(&mut sent);
+        save_automation_in(
+            config.path(),
+            sent,
+            Approval::FromForm(&|slug| standing(root.path(), slug)),
+        )
+    };
+    type Edit = Box<dyn Fn(&mut zerocode_core::Automation)>;
+    fn edit(change: impl Fn(&mut zerocode_core::Automation) + 'static) -> Edit {
+        Box::new(change)
+    }
+    let same_job: Vec<(&str, Edit)> = vec![
+        ("a save that changes nothing", edit(|_| {})),
+        ("a save that renames it", edit(|sent| sent.name = "Renamed".to_string())),
+        (
+            "a save that changes its schedule",
+            edit(|sent| {
+                sent.schedule = zerocode_core::Schedule::from_words(Some("hourly"), None, None, None)
+                    .expect("hourly");
+            }),
+        ),
+        ("a save that switches it off", edit(|sent| sent.enabled = false)),
+    ];
+    let another_flow: Vec<(&str, Edit)> = vec![(
+        "a save that points it at another Flow",
+        edit(|sent| sent.flow = Some("other-flow".to_string())),
+    )];
+    // The first two leave a job the door saves; an agent is asked of the catalog first.
+    let another_kind: Vec<(&str, Edit)> = vec![
+        ("a command", edit(|sent| sent.command = "echo hi".to_string())),
+        ("no Flow", edit(|sent| sent.flow = None)),
+        ("an agent", edit(|sent| sent.agent = Some("claude".to_string()))),
+    ];
+
+    // ---- A job that does not wait.
+    for (road, edit) in &same_job {
+        stand(&allowed);
+        assert!(!waits());
+        form_saves(edit.as_ref()).unwrap_or_else(|why| panic!("{road} was refused: {why}"));
+        assert_eq!(
+            stored().asked,
+            Some(approval.clone()),
+            "{road} dropped the approval of a job that still walks the Flow it was allowed for"
+        );
+        // So a document rewritten afterwards still stops it.
+        std::fs::write(recipes.join("wallet-qa.md"), &rewritten).expect("rewritten later");
+        assert!(waits(), "{road}: a document rewritten after the save would be walked unasked");
+    }
+    // Pointed at another Flow, or made another kind of job: the person's own.
+    stand(&allowed);
+    form_saves(another_flow[0].1.as_ref()).expect("saved");
+    assert_eq!(stored().asked, None, "a job the person pointed at another Flow kept the old approval");
+    for (kind, edit) in &another_kind[..2] {
+        stand(&allowed);
+        form_saves(edit.as_ref()).unwrap_or_else(|why| panic!("{kind} was refused: {why}"));
+        assert_eq!(stored().asked, None, "{kind}: the person's own job kept an approval");
+    }
+
+    // ---- A job that waits: every road but 「다시 승인」 leaves it waiting.
+    for (road, edit) in same_job.iter().chain(&another_flow) {
+        stand(&rewritten);
+        assert!(waits());
+        form_saves(edit.as_ref()).unwrap_or_else(|why| panic!("{road} was refused: {why}"));
+        assert_eq!(stored().asked, Some(approval.clone()), "{road} moved or dropped the approval");
+        assert!(waits(), "{road} released a job that waits to be allowed again");
+    }
+    stand(&rewritten);
+    for enabled in [false, true] {
+        set_automation_enabled_in(config.path(), "asked-1", enabled).expect("the switch");
+        assert_eq!(stored().asked, Some(approval.clone()), "the switch moved or dropped the approval");
+        assert!(waits(), "the switch released a job that waits to be allowed again");
+    }
+    // Made another kind of job, there would be nothing left to allow: refused, and nothing is written.
+    for (kind, edit) in &another_kind {
+        stand(&rewritten);
+        assert_eq!(form_saves(edit.as_ref()), Err(WAITING_JOB_STAYS_A_FLOW.to_string()), "{kind}");
+        assert_eq!(stored(), job, "{kind}: a refused save wrote something");
+    }
+
+    // ---- A job the person wrote, and a new one: none, whatever the page sent.
+    let mut own = job.clone();
+    own.asked = None;
+    std::fs::write(recipes.join("wallet-qa.md"), &allowed).expect("the document");
+    write_automations(config.path(), std::slice::from_ref(&own)).expect("the person's own");
+    let claims = |id: &str| {
+        let mut sent = job.clone();
+        sent.id = id.to_string();
+        save_automation_in(
+            config.path(),
+            sent,
+            Approval::FromForm(&|slug| standing(root.path(), slug)),
+        )
+        .expect("saved");
+        stored_automations(config.path())
+            .into_iter()
+            .find(|held| held.id == id)
+            .expect("the saved job")
+            .asked
+    };
+    assert_eq!(claims("asked-1"), None, "the page's word made the person's own job an asked one");
+    assert_eq!(claims("brand-new"), None, "the page's word made a new job an asked one");
+    // The card's road writes the approval it was given.
+    let mut carded = job.clone();
+    carded.id = "from-the-card".to_string();
+    save_automation_in(config.path(), carded, Approval::AsWritten).expect("saved");
+    assert!(
+        stored_automations(config.path())
+            .iter()
+            .any(|held| held.id == "from-the-card" && held.asked == Some(approval.clone())),
+        "the card's own save lost the approval it wrote"
+    );
+
+    // The command goes through the door as the form, and the door judges
+    // under the store's lock — as 「다시 승인」 does.
+    let saving = block_after(shipped_backend(), "fn save_automation(");
+    assert!(
+        saving.contains("Approval::FromForm(&standing),") && !saving.contains("automation.asked = None;"),
+        "the form's save drops the approval again, or no longer says it is the form's:\n{saving}"
+    );
+    let door = block_after(shipped_backend(), "fn save_automation_in(");
+    let locked = door.find("automation_store_domain()").expect("the lock");
+    let judged = door
+        .find("approval_a_form_save_keeps(stored, &automation, standing)?;")
+        .expect("the judgment");
+    let written = door.find("write_automations(config_root, &rows)?;").expect("the write");
+    assert!(
+        locked < judged && judged < written,
+        "what a form's save keeps is judged outside the store's lock, or after the write:\n{door}"
+    );
+}
+
+/// A request for a schedule is refused for the rest before it is read or
+/// shown, and every answer on its card is kept for the next request: the rest
+/// is asked about once the turn is held and before the request is read, and
+/// the answer is kept before it is settled — whatever settling makes of it.
+#[test]
+fn a_schedule_request_asks_about_the_rest_before_it_is_read_and_keeps_every_answer() {
+    let asking = block_after(shipped_backend(), "fn desktop_schedule(");
+    let at = |what: &str| {
+        asking
+            .find(what)
+            .unwrap_or_else(|| panic!("`{what}` is gone from desktop_schedule:\n{asking}"))
+    };
+    let turn = at("schedule::Turn::take()");
+    let rested = at("schedule::rested()?;");
+    let read = at("schedule::read(");
+    let card = at("computer_use::confirm::handoff_said(");
+    let answered = at("schedule::answered(decision);");
+    let settled = at("schedule::settle(");
+    assert!(
+        turn < rested && rested < read && read < card && card < answered && answered < settled,
+        "a request is read or shown before the rest is asked about, or an answer is settled before it is kept:\n{asking}"
+    );
+}
+
+/// A Flow as `recipe-save --flow-check` leaves one, under the policy named.
+fn asked_flow_document(policy: &str) -> String {
+    format!(
+        "# Wallet QA\n\n## Steps\n\n\
+         1. `zerocode-computer launch --app \"Sample Wallet\"`\n\n\
+         ## Flow\n\n\
+         - policy: {policy}\n\
+         - evidence: full\n\
+         - fingerprint: apps=com.example.wallet hosts=shop.example.com protocol={}\n\n\
+         ## Checks\n\n\
+         1. `zerocode-computer wait-for --app \"Sample Wallet\" --text Balance` — event, required\n",
+        zerocode_core::computer_use::COMPUTER_USE_PROTOCOL_VERSION
+    )
+}
+
+/// 「다시 승인」 moves an approval only to the document the person was asked
+/// about (t-105044, question 7). The list reads the document and the question
+/// is drawn from that reading; the press hands its hash back. A document
+/// rewritten while the question stood is not the one that was read: nothing
+/// is allowed, the stored approval stays where it was, and the job keeps
+/// waiting. Before, the press allowed whatever stood there at that moment.
+#[test]
+fn allowing_a_flow_again_moves_the_approval_only_to_the_document_that_was_seen() {
+    use crate::computer_use::recipes::schedule::{
+        FLOW_CHANGED_UNDER_QUESTION, FLOW_NOT_A_FLOW, standing,
+    };
+    let config = tempfile::tempdir().expect("config");
+    let root = tempfile::tempdir().expect("a root");
+    let recipes = root.path().join(crate::computer_use::recipes::RECIPES_DIR);
+    std::fs::create_dir_all(&recipes).expect("the recipes folder");
+    let document = recipes.join("wallet-qa.md");
+    let allowed_first = asked_flow_document("dry");
+    let job = zerocode_core::Automation::asked_flow(
+        "asked-1".to_string(),
+        "Asked wallet QA".to_string(),
+        "/Users/dev/app".to_string(),
+        "wallet-qa".to_string(),
+        zerocode_core::Schedule::from_words(Some("daily"), Some("09:30"), None, None)
+            .expect("a schedule"),
+        zerocode_core::automation::Asked {
+            pane: "term:7".to_string(),
+            agent: None,
+            approved_at_ms: 1,
+            flow_sha256: zerocode_core::automation::flow_document_sha256(&allowed_first),
+        },
+    );
+    write_automations(config.path(), std::slice::from_ref(&job)).expect("definition");
+    let stored = || {
+        stored_automations(config.path())
+            .into_iter()
+            .find(|held| held.id == "asked-1")
+            .and_then(|held| held.asked)
+            .expect("the asked job")
+    };
+    let allow = |seen: &str| {
+        approve_automation_flow_in(config.path(), "asked-1", seen, 2, |slug| {
+            standing(root.path(), slug)
+        })
+    };
+
+    // The document changed after the approval; the list read it and the
+    // question was drawn from that reading.
+    let seen_text = allowed_first.replace("com.example.wallet", "com.example.other");
+    std::fs::write(&document, &seen_text).expect("the document the person is asked about");
+    let seen = zerocode_core::automation::flow_document_sha256(&seen_text);
+
+    // It is rewritten again while the question stands: the yes is refused,
+    // and the approval has not moved.
+    let rewritten = seen_text.replace("com.example.other", "com.example.third");
+    std::fs::write(&document, &rewritten).expect("rewritten under the question");
+    assert_eq!(
+        allow(&seen),
+        Err(FLOW_CHANGED_UNDER_QUESTION.to_string()),
+        "a document rewritten under the question was allowed as if the person had read it"
+    );
+    assert_eq!(stored().flow_sha256, job.asked.as_ref().expect("asked").flow_sha256);
+    assert_eq!(stored().approved_at_ms, 1);
+
+    // No longer a Flow, or gone: nothing to allow.
+    std::fs::write(&document, "# Wallet QA\n").expect("a plain recipe now");
+    assert_eq!(allow(&seen), Err(FLOW_NOT_A_FLOW.to_string()));
+    std::fs::remove_file(&document).expect("gone");
+    assert_eq!(allow(&seen), Err(FLOW_NOT_A_FLOW.to_string()));
+    assert_eq!(stored().approved_at_ms, 1);
+
+    // The document the person was asked about, still standing: the approval
+    // moves to it and to this moment, and the job is armed.
+    std::fs::write(&document, &seen_text).expect("as it was seen");
+    assert_eq!(allow(&seen), Ok(()));
+    assert_eq!(stored().flow_sha256, seen);
+    assert_eq!(stored().approved_at_ms, 2);
+    assert!(
+        stored_automations(config.path())[0].armed_at.is_some(),
+        "allowing again did not arm the job"
+    );
+
+    // A job the person wrote has no approval to move.
+    let mut own = job.clone();
+    own.id = "own-1".to_string();
+    own.asked = None;
+    write_automations(config.path(), std::slice::from_ref(&own)).expect("the person's own");
+    assert!(
+        approve_automation_flow_in(config.path(), "own-1", &seen, 3, |slug| standing(
+            root.path(),
+            slug
+        ))
+        .is_err()
+    );
+
+    // The command is handed what the page saw and reads under the window's own root.
+    let command = block_after(shipped_backend(), "fn approve_automation_flow(");
+    assert!(
+        command.contains("seen: String,")
+            && command.contains("&seen,")
+            && command.contains("|slug| flow_standing(root, slug),"),
+        "the command does not hold the yes to the document the page saw:\n{command}"
     );
 }

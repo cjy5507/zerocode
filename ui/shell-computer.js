@@ -652,10 +652,13 @@ const COMPUTER_HANDOFF_WORDS = Object.freeze({
         next: (args.next ?? []).map(localMinuteText).join(" · "),
       },
     ),
-    // A Flow whose walk may spend money (policy guarded): the card says it in plain words, not by the policy's name alone.
+    // A Flow whose walk may spend money (policy guarded): the card says it in plain words, not by the policy's name alone —
+    // and before anything the document says of itself, which is as long as the document makes it.
     args.money === true
       ? t("auto.asked.money", "이 Flow는 돈이 오가는 걸음을 누를 수 있습니다 — 지켜보는 사람 없이 돕니다.")
       : "",
+    // Which document this is, beyond the title it gives itself.
+    flowAboutText(args.about),
     // Letters that draw nothing, left out of those names by the backend: the card says how many there were.
     args.hidden > 0
       ? t("auto.asked.hidden", "받은 이름에서 보이지 않는 글자 {{count}}개를 뺐습니다.", { count: args.hidden })
@@ -663,6 +666,37 @@ const COMPUTER_HANDOFF_WORDS = Object.freeze({
   ].filter(Boolean).join(" "),
   "computer.cover.gone": (args) => t("computer.cover.gone", "누르려던 창이 화면에 없습니다(최소화했거나 다른 데스크톱에 있음). 창이 보이게 한 뒤 「다 했어요」를 눌러 주세요.", args),
 });
+
+/* Which document a schedule's card, or 「다시 승인」, is about — beyond the
+ * title the document gives itself, which an agent may have written: the file's
+ * own name, how many steps it walks, and the sites and the apps its
+ * fingerprint names — sites first, each kind counted apart, the first few by
+ * name. Those names are the document's own words and the page says so
+ * (「문서가 적은」): they are what the document claims, not what the window
+ * found. When the file was last written is not said — a process of the same
+ * user sets that time to what it likes. The backend read all of it off the
+ * text the approval is held to (`schedule::About`); an older backend sends
+ * none, and nothing is said. */
+function flowAboutText(about) {
+  if (!about?.slug) return "";
+  // One kind of name, as the sentence takes it: how many the document names
+  // in all, and the first few with the rest counted.
+  const named = (names) => {
+    const count = names?.count ?? 0;
+    if (count === 0) return null;
+    const shown = names.shown ?? [];
+    const more = count - shown.length;
+    return { count, names: more > 0 ? `${shown.join(", ")} +${more}` : shown.join(", ") };
+  };
+  const hosts = named(about.hosts);
+  const apps = named(about.apps);
+  return [
+    t("auto.asked.aboutFile", "문서 {{slug}}.md", { slug: about.slug }),
+    t("auto.asked.aboutSteps", "걸음 {{count}}개", { count: about.steps ?? 0 }),
+    hosts ? t("auto.asked.aboutHosts", "문서가 적은 사이트 {{count}}곳: {{names}}", hosts) : "",
+    apps ? t("auto.asked.aboutApps", "문서가 적은 앱 {{count}}개: {{names}}", apps) : "",
+  ].filter(Boolean).join(" · ") + ".";
+}
 
 function computerHandoffText(handoff) {
   const say = COMPUTER_HANDOFF_WORDS[handoff.reasonKey];

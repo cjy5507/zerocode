@@ -397,11 +397,15 @@ document.addEventListener("keydown", (event) => {
  * existing backend paste commands. Those commands own bracketed-paste and
  * control-sequence sanitizing; JavaScript never writes clipboard text to a PTY
  * directly. */
-async function pasteTextAt(target, text) {
+async function pasteTextAt(target, text, hand) {
   if (!target || text === "") return false;
   hideTerminalPointerForInput(target);
   try {
-    if (target.kind === "term") await invoke("term_paste", { term: target.term, text });
+    // A paste that awaited the clipboard says the hand it started with: the
+    // backend renews a room's wake budget for the person's alone (review
+    // t-105587).
+    const options = hand === undefined ? undefined : { hand: flowHand(hand) };
+    if (target.kind === "term") await invoke("term_paste", { term: target.term, text }, options);
     else await invoke("paste_input", { id: target.id, text });
     return true;
   } catch {
@@ -582,12 +586,15 @@ async function pasteClipboardVia(to) {
 
 async function pasteClipboardAt(target) {
   // Held before the read: focus/tab changes while the native clipboard call is
-  // pending must not redirect text into the terminal that became active later.
+  // pending must not redirect text into the terminal that became active later
+  // — and so is the hand that asked for the paste, which the read's await
+  // would otherwise leave behind.
   const captured = target ? { ...target } : null;
   if (!captured) return false;
+  const started = handNow();
   return pasteClipboardVia({
-    text: (text) => pasteTextAt(captured, text),
-    image: (path) => pasteTextAt(captured, path),
+    text: (text) => pasteTextAt(captured, text, started),
+    image: (path) => pasteTextAt(captured, path, started),
   });
 }
 
@@ -1403,19 +1410,23 @@ const CONTINUATION = "\u0000";
 /* How far a double-width glyph may grow toward its two columns: its INK may
  * take this fraction of the row height and no more, standing in the middle
  * of the row. The row is the one box a glyph must never push — a Hangul
- * syllable drawn taller than the row would sit on the row below — and the
- * tenth left over is the air between two Korean lines. The ceiling used to
- * be the font-size against the row (0.95), which stopped at 1.09× while the
- * ink still had room: at 14px/1.15 the ink allows 1.14×. */
-const WIDE_GLYPH_ROW_FILL = 0.9;
+ * syllable drawn taller than the row would sit on the row below — and what
+ * is left over is the air between two Korean lines. At 14px/1.15 this is
+ * 1.09×, the size Korean had before it was widened at all. For a day the ink
+ * took 0.9 of the row (1.14×): with the widening below it read as another,
+ * larger face, and line stood on line ("너무 글들이 붙어서 따닥따닥",
+ * "글꼴도 뭔가 바뀐거같은데", the person, 2026-11-12). */
+const WIDE_GLYPH_ROW_FILL = 0.86;
 /* How much wider than its face draws it a double-width glyph may be made,
  * once the row stops it growing. Growing alone cannot reach two columns: a
  * fallback Hangul is about as wide as it is tall (0.865em in Apple SD Gothic
  * Neo), and two cells of a mono face are wider than a row is high. Widened
- * by a quarter a syllable reads as the wide cut of the same face; past a
- * third it reads as another face, so what is still short after this stays as
- * tracking, split around the glyph. At 14px/1.15 two columns ask for 1.25×. */
-const WIDE_GLYPH_STRETCH_LIMIT = 1.3;
+ * by a sixth a syllable is still the face's own shape; what is still short
+ * after this stays as tracking, split around the glyph — at 14px/1.15 about
+ * 2px between two syllables, half of what growing alone left (4.08px, "사 이
+ * 드 바") and not the none that widening by a quarter left. The person chose
+ * this of four drawn side by side (2026-11-12). */
+const WIDE_GLYPH_STRETCH_LIMIT = 1.15;
 /* The glyph a double-width cell is measured with (`measure`): which face
  * draws Hangul is the OS's answer to a stack with no Hangul in it. */
 const WIDE_PROBE_GLYPH = "가";
@@ -1971,7 +1982,9 @@ function makeTermView(host, pre, caret, owner = { address: () => null }) {
    *
    * Growing alone left 4.08px of tracking between two syllables at 14px, and
    * Korean in every pane still read as spaced-out letters (2026-09-10 자 체
-   * 는, 2026-11-11 사 이 드 바); grown and widened the same line leaves none.
+   * 는, 2026-11-11 사 이 드 바); widened until none was left it read as
+   * packed, in another face (2026-11-12). Grown as before and widened by a
+   * sixth the same line leaves about 2px.
    *
    * What `measure` learns about the face that draws `WIDE_PROBE_GLYPH`:
    * `advance` its advance at the screen's font size, `grow` the largest size
@@ -4997,7 +5010,10 @@ function paintAsk() {
   el("ask-confirm-actions").hidden = choices !== null;
   if (choices === null) {
     el("ask-choices").replaceChildren();
-    askFocus = el("ask-yes");
+    // The window's own confirm opens on its yes, so Enter says it — unless the
+    // question asked for the frame (`initial: null`): an approval a stray
+    // Enter must not give.
+    askFocus = view.initial === null ? askFrame : el("ask-yes");
     askSafe = null;
   } else {
     const buttons = choices.map(askButton);
@@ -10062,6 +10078,20 @@ const TAB_GLYPH = {
  * sidebar row, not before its name (t-78107, 시안 「또렷한 Geist」 2: the strip
  * says the work and its state; 「코디 · …」 had taken a third of every
  * tab). `termTabTip` names the seats a tab holds (t-45938, t-67936). */
+/* A conversation that began with a letter from another session is titled by
+ * its first prompt — Claude names the session after it and says so as the
+ * terminal's title — and that prompt is the letter's envelope. The strip
+ * showed the raw tag (2026-11-12 capture: 「<cross-session-message from…」);
+ * it says what the tab holds instead: a letter, and who sent it. */
+const LETTER_ENVELOPE = /^<cross-session-message\b/;
+const LETTER_SENDER = /\bfrom="?([^"\s>]+)/;
+
+function readableTitle(text) {
+  if (!LETTER_ENVELOPE.test(text)) return text;
+  const from = LETTER_SENDER.exec(text)?.[1];
+  return from ? t("tab.letterFrom", "세션 편지 · {{from}}", { from }) : t("tab.letter", "세션 편지");
+}
+
 function tabLabel(tab) {
   // 표와 노트북은 그 파일 자체이지 파생된 판이 아니다 — 이름만 단다(1-g39·1-g40).
   if (
@@ -10155,9 +10185,9 @@ function tabLabel(tab) {
       // terminal that is doing something. A person's name for the pane still
       // wins above; the number below is only for a shell that says nothing.
       const spoken = spokenTitleOf(leaves[0]);
-      if (spoken) return spoken;
+      if (spoken) return readableTitle(spoken);
       const prompt = panePrompts.get(leaves[0])?.trim();
-      if (prompt) return prompt;
+      if (prompt) return readableTitle(prompt);
     }
     // A pane that runs an agent, with nothing above to say, is named for its folder: the folder is the
     // work's own name, where "터미널 N" says only where the tab sits (t-44016). A tab that carries its

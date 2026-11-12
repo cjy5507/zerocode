@@ -12,7 +12,13 @@
 //! their locations, summaries and counts, the matches that answer the call —
 //! with `⋯ N lines omitted` markers between non-adjacent runs.
 //!
-//! Three rules keep it honest:
+//! Four rules keep it honest:
+//! - **Only a fast tier that is the session's own.** The fold is worth its
+//!   request because a cheaper model of the same provider reads what the main
+//!   one then need not. A session whose provider has none — a person's own
+//!   endpoint, a local model, a name the catalog does not know — takes the
+//!   head+tail cut: its "fast model" would be a built-in provider's, and a
+//!   tool's whole output is not handed to an account the session is not on.
 //! - **Verbatim or nothing.** Every kept line is checked against the source; a
 //!   line the source does not contain is dropped, and a reply with more than
 //!   [`MAX_UNVERIFIED_PERCENT`] of such lines is rejected wholesale.
@@ -167,57 +173,27 @@ pub(crate) trait Digester {
     fn reply(&self, system: &[String], user: &str, max_tokens: u32) -> Result<String, String>;
 }
 
-/// The session provider's fast-tier model, dialled the way sub-agents are.
-struct ProviderDigester {
-    model: String,
-    client: api::ProviderClient,
-}
+/// The session provider's fast-tier model ([`crate::fast_model::FastModel`]),
+/// held to the digest's wall clock.
+struct ProviderDigester(crate::fast_model::FastModel);
 
 impl ProviderDigester {
-    fn for_parent(parent_model: Option<&str>) -> Result<Self, String> {
-        // The cheap-model choice is a family alias (`haiku`); the wire wants
-        // the release id, the same way the sub-agent client resolves it.
-        let model = api::resolve_model_alias(&crate::fanout::decompose_model(parent_model));
-        let client = crate::misc_tools::build_provider_client_for_agent(&model)?;
-        Ok(Self { model, client })
+    /// The digester for a session on `session_model`: `None` where its
+    /// provider has no fast tier of its own (the fold is not for it, and
+    /// nothing has failed), `Some(Err)` where the fast model cannot be dialled.
+    fn for_session(session_model: Option<&str>) -> Option<Result<Self, String>> {
+        let model = crate::fast_model::FastModel::fast_tier_named_for(session_model)?;
+        Some(crate::fast_model::FastModel::dialling(model).map(Self))
     }
 }
 
 impl Digester for ProviderDigester {
     fn model(&self) -> &str {
-        &self.model
+        self.0.model()
     }
 
     fn reply(&self, system: &[String], user: &str, max_tokens: u32) -> Result<String, String> {
-        let request = api::MessageRequest {
-            model: self.model.clone(),
-            max_tokens: max_tokens.min(api::max_tokens_for_model(&self.model)),
-            messages: vec![api::InputMessage::user_text(user)],
-            // The identity-first split the sub-agent path uses: the Claude Max
-            // OAuth route rejects any other first system block.
-            system: Some(runtime::split_system_with_identity(&system.join("\n\n"))),
-            tools: None,
-            tool_choice: None,
-            stream: false,
-            thinking: None,
-            output_config: None,
-            effort: None,
-            effort_band_ceiling: None,
-        };
-        let response = api::sync_bridge::run_blocking(async {
-            tokio::time::timeout(DIGEST_TIMEOUT, self.client.send_message(&request)).await
-        })
-        .map_err(|_| format!("digest timed out after {}s", DIGEST_TIMEOUT.as_secs()))?
-        .map_err(|error| error.to_string())?;
-        Ok(response
-            .content
-            .into_iter()
-            .filter_map(|block| match block {
-                api::OutputContentBlock::Text { text } => Some(text),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"))
+        self.0.reply(system, user, max_tokens, DIGEST_TIMEOUT)
     }
 }
 
@@ -234,7 +210,7 @@ pub(crate) fn digest_over_cap(
     if mode() == ToolDigestMode::Off || !is_digestible(tool) || HEALTH.given_up() {
         return None;
     }
-    let Ok(digester) = ProviderDigester::for_parent(ctx.active_model().as_deref()) else {
+    let Ok(digester) = ProviderDigester::for_session(ctx.active_model().as_deref())? else {
         HEALTH.note_failure();
         return None;
     };
@@ -497,6 +473,16 @@ mod tests {
         assert!(!health.given_up());
     }
 
+    /// A session whose provider has no fast tier of its own is not folded
+    /// for, and that is not a failure: no model is named, so none is dialled
+    /// — on that provider or on any other.
+    #[test]
+    fn a_session_with_no_fast_tier_of_its_own_has_no_digester() {
+        for own in ["zq-model-nobody-lists", "zq-relay/some-model"] {
+            assert!(super::ProviderDigester::for_session(Some(own)).is_none(), "{own}");
+        }
+    }
+
     /// Live probe, ignored by default: dials the real fast model for the
     /// session provider and prints what came back, so a silent fallback in
     /// production can be reproduced by hand:
@@ -506,9 +492,10 @@ mod tests {
     fn live_digest_probe() {
         let health = DigestHealth::new();
         let parent = std::env::var("ZO_DIGEST_PROBE_PARENT").ok();
-        let digester = match super::ProviderDigester::for_parent(parent.as_deref()) {
-            Ok(digester) => digester,
-            Err(error) => panic!("no digester: {error}"),
+        let digester = match super::ProviderDigester::for_session(parent.as_deref()) {
+            Some(Ok(digester)) => digester,
+            Some(Err(error)) => panic!("no digester: {error}"),
+            None => panic!("no digester: {}", crate::fast_model::NO_FAST_TIER),
         };
         eprintln!("digester model: {}", digester.model());
         // A test log with the one failure buried mid-stream: the shape the
