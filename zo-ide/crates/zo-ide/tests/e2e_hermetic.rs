@@ -9789,6 +9789,120 @@ async fn e2e_an_unattended_approval_is_for_one_call_and_writes_no_lasting_allow(
     assert!(layout.cwd.join("approved-once.txt").exists(), "both calls were approved and ran");
 }
 
+/// t-105662: up to v1.1.143 "always allow" saved `printf narrowed-*` as a
+/// glob, which also let `printf narrowed-x && touch widened.txt` run unasked.
+/// The first session after the update narrows it before it reads its rules,
+/// so that very run asks for the wider call; the file is rewritten, the
+/// original is kept in the project's zo state, and the notice waits there for
+/// a session a person watches rather than being said to a pipe.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_a_broad_allow_saved_by_an_older_zo_is_narrowed_before_the_first_session_reads_it() {
+    let layout = Layout::new();
+    let git = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&layout.cwd)
+        .status()
+        .expect("git runs");
+    assert!(git.success(), "the workspace is a git repository");
+    let settings = layout.cwd.join(".zo").join("settings.local.json");
+    fs::create_dir_all(settings.parent().expect("the .zo folder")).expect("make .zo");
+    let before = "{\"permissions\":{\"allow\":[\"bash(printf narrowed-*)\"]}}\n";
+    fs::write(&settings, before).expect("the person's local settings");
+    let call = serde_json::json!({ "command": "printf narrowed-x && touch widened.txt" });
+    let service = ScriptedAnthropicService::tool_calls(&[("bash", call)], "narrowed-done")
+        .await
+        .unwrap();
+    let output = run_pipe(&layout.cwd, &layout.home, &layout.sessions, &layout.state, service.base_url(),
+        &["--plain", "--permission-mode", "workspace-write"], b"Run it.\n/exit\n").unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let screen = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        screen
+            .matches(&format!("unattended: {} approved once", core_types::tool_names::CoreTool::Bash.wire()))
+            .count(),
+        1,
+        "the wider call was asked, not let through by the old glob: {screen}"
+    );
+    assert!(!screen.contains("zo narrowed"), "a pipe is not told: {screen}");
+    let after = fs::read_to_string(&settings).expect("the local settings are still there");
+    assert!(after.contains("\"bash(printf narrowed-[*])\""), "{after}");
+    assert!(!after.contains("\"bash(printf narrowed-*)\""), "{after}");
+
+    let folder = fs::read_dir(layout.state.join("projects"))
+        .expect("the project's zo state")
+        .filter_map(Result::ok)
+        .map(|project| project.path().join("state").join("allow-always-narrow"))
+        .find(|folder| folder.is_dir())
+        .expect("the narrowing's folder");
+    assert!(folder.join("done").exists(), "the project is marked");
+    assert!(folder.join("notice.json").exists(), "the notice waits for a watched session");
+    let kept = fs::read_dir(&folder)
+        .expect("the folder")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("settings.local.json.before-narrowing-")))
+        .expect("the original is kept");
+    assert_eq!(fs::read_to_string(kept).expect("kept"), before);
+}
+
+/// t-105746: the notice of the narrowing reaches the person in the TUI. The
+/// first TUI start narrows the broad rule and says so once at start — the rule
+/// as it was and the name of the kept copy — and the second start says
+/// nothing. Without `App::boot` taking the notice, the first start is silent
+/// and this goes red.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_the_narrowing_notice_is_said_once_at_the_next_tui_start() {
+    let layout = Layout::new();
+    let git = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&layout.cwd)
+        .status()
+        .expect("git runs");
+    assert!(git.success(), "the workspace is a git repository");
+    let settings = layout.cwd.join(".zo").join("settings.local.json");
+    fs::create_dir_all(settings.parent().expect("the .zo folder")).expect("make .zo");
+    fs::write(&settings, "{\"permissions\":{\"allow\":[\"bash(printf narrowed-*)\"]}}")
+        .expect("the person's local settings");
+    let service = MockAnthropicService::spawn()
+        .await
+        .expect("start mock service");
+    // The line wraps at the PTY's width, with its style codes between the
+    // pieces; read the screen without them and with no spaces.
+    let squashed = |text: &str| strip_ansi(text).split_whitespace().collect::<String>();
+
+    let mut run = pty(&layout, &service.base_url(), &interactive_args());
+    run.wait_for("directory:", TEST_TIMEOUT);
+    run.wait_for("zo narrowed", TEST_TIMEOUT);
+    let first = squashed(&history_text(&run.finish()));
+    let folder = fs::read_dir(layout.state.join("projects"))
+        .expect("the project's zo state")
+        .filter_map(Result::ok)
+        .map(|project| project.path().join("state").join("allow-always-narrow"))
+        .find(|folder| folder.is_dir())
+        .expect("the narrowing's folder");
+    let kept = fs::read_dir(&folder)
+        .expect("the folder")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|name| name.starts_with("settings.local.json.before-narrowing-"))
+        .expect("the original is kept");
+    assert_eq!(first.matches("zonarrowed1\"alwaysallow\"rule").count(), 1, "said once:\n{first}");
+    assert!(first.contains("`bash(printfnarrowed-*)`"), "the rule as it was:\n{first}");
+    assert!(first.contains(&kept), "where the original is kept ({kept}):\n{first}");
+    assert!(!folder.join("notice.json").exists(), "the notice is taken once said");
+
+    let mut run = pty(&layout, &service.base_url(), &interactive_args());
+    run.wait_for("directory:", TEST_TIMEOUT);
+    let second = squashed(&history_text(&run.finish()));
+    assert!(!second.contains("zonarrowed"), "the second start says nothing:\n{second}");
+}
+
 /// t-68408: two zo sessions in one folder never hand each other their plans.
 /// The first writes a plan and leaves it in progress; the second, opened in the
 /// same folder, runs a tool and writes a plan of its own, and is handed none

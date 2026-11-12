@@ -2,7 +2,7 @@
 //! other through the ledger, whatever CLI each one runs ([`room`]).
 
 use super::*;
-use crate::orchestration::room::{self, MAIL_OFF, PeerPane, ROOM_NAME};
+use crate::orchestration::room::{self, MAIL_OFF, PeerPane, PeerState, ROOM_NAME};
 
 const A: &str = "/Users/dev/a/.git";
 const B: &str = "/Users/dev/b/.git";
@@ -16,6 +16,8 @@ const OTHER: &str = "%8";
 /// has open.
 struct RoomOn {
     panes: Vec<PeerPane>,
+    /// When the person last typed, in every pane — `None` is never.
+    person_ms: Option<i64>,
 }
 
 impl Launcher for RoomOn {
@@ -35,24 +37,29 @@ impl Launcher for RoomOn {
     fn live_panes(&self, _project: Option<&str>) -> Option<Vec<PeerPane>> {
         Some(self.panes.clone())
     }
+
+    fn person_input_ms(&self, _seat: &str) -> Option<i64> {
+        self.person_ms
+    }
 }
 
 fn on() -> RoomOn {
     RoomOn {
+        person_ms: None,
         panes: vec![
             PeerPane {
                 seat: format!("team-1/{LONE}"),
                 agent: Some("codex".to_string()),
                 title: Some("codex".to_string()),
                 folder: Some("/Users/dev/a".to_string()),
-                state: "idle",
+                state: PeerState::Idle,
             },
             PeerPane {
                 seat: format!("team-1/{OTHER}"),
                 agent: Some("agy".to_string()),
                 title: None,
                 folder: None,
-                state: "working",
+                state: PeerState::Working,
             },
         ],
     }
@@ -1000,4 +1007,155 @@ fn a_room_replys_copy_in_the_writers_run_carries_the_room() {
         .expect("the copy");
     assert_eq!(held.room.as_deref(), Some(room.as_str()));
     assert_eq!(held.from, to_other, "the copy keeps the room's signature");
+}
+
+/// Two panes asking each other in a room are each told of the ring at their
+/// own address — nobody reads the room's `run:` address (review t-105450,
+/// held for v1.1.146).
+#[test]
+fn a_ring_of_waiting_in_a_room_is_told_to_the_panes_holding_each_other() {
+    let mut bench = Bench::new();
+    let launcher = on();
+    let lone = format!("pane:team-1/{LONE}");
+    let other = format!("pane:team-1/{OTHER}");
+    typed(
+        &mut bench,
+        &launcher,
+        LONE,
+        Some(A),
+        &[
+            "ask",
+            "--to",
+            &other,
+            "--body",
+            "yours?",
+            "--timeout-ms",
+            "1000",
+        ],
+    );
+    typed(
+        &mut bench,
+        &launcher,
+        OTHER,
+        Some(A),
+        &[
+            "ask",
+            "--to",
+            &lone,
+            "--body",
+            "yours?",
+            "--timeout-ms",
+            "1000",
+        ],
+    );
+    let room = the_room(&bench);
+    let told: Vec<&str> = room
+        .messages()
+        .iter()
+        .filter(|held| held.kind == MessageKind::Deadlocked)
+        .map(|held| held.to.as_str())
+        .collect();
+    assert!(
+        told.contains(&lone.as_str()) && told.contains(&other.as_str()),
+        "{told:?}"
+    );
+    assert!(!told.contains(&room.address().as_str()), "{told:?}");
+}
+
+/// Two panes write each other at most [`room::PAIR_LETTERS`] room letters,
+/// both ways together, between two of the person's inputs in either pane —
+/// an `ask` answered and asked back does not go on with nobody watching. A
+/// third pane is not held by the pair's count, and the person's next input
+/// lets the two go on (review t-105450, held for v1.1.146).
+#[test]
+fn two_panes_write_each_other_at_most_the_pair_limit_between_the_persons_inputs() {
+    let mut bench = Bench::new();
+    let launcher = on();
+    let lone = format!("pane:team-1/{LONE}");
+    let other = format!("pane:team-1/{OTHER}");
+    for at in 0..room::PAIR_LETTERS {
+        let (from, to) = match at % 2 {
+            0 => (LONE, other.as_str()),
+            _ => (OTHER, lone.as_str()),
+        };
+        answered(&send(&mut bench, &launcher, from, to, "back and forth"));
+    }
+    let why = refused(&send(&mut bench, &launcher, LONE, &other, "one more"));
+    assert!(why.contains("since the person last typed"), "{why}");
+    answered(&send(
+        &mut bench,
+        &launcher,
+        LONE,
+        "pane:team-1/%7",
+        "someone else",
+    ));
+    let after = RoomOn {
+        person_ms: Some(bench.clock),
+        ..on()
+    };
+    answered(&send(&mut bench, &after, LONE, &other, "after the person"));
+}
+
+/// The tenth letter between two panes may be a question, and its answer is
+/// not refused — an asker waiting on it would wait on nobody (review
+/// t-105808). An answer to that answer is a new letter, and refused, as is the
+/// pair's next new letter (review t-105844, 2).
+#[test]
+fn the_answer_to_a_question_at_the_pairs_limit_is_not_refused() {
+    let mut bench = Bench::new();
+    let launcher = on();
+    let lone = format!("pane:team-1/{LONE}");
+    let other = format!("pane:team-1/{OTHER}");
+    for at in 0..room::PAIR_LETTERS - 1 {
+        let (from, to) = match at % 2 {
+            0 => (LONE, other.as_str()),
+            _ => (OTHER, lone.as_str()),
+        };
+        answered(&send(&mut bench, &launcher, from, to, "back and forth"));
+    }
+    let asked = answered(&typed(
+        &mut bench,
+        &launcher,
+        LONE,
+        Some(A),
+        &[
+            "send",
+            "--to",
+            other.as_str(),
+            "--type",
+            "question",
+            "--body",
+            "the tenth: which?",
+        ],
+    ));
+    let question = asked["messageId"].as_str().expect("a question").to_string();
+    let answer = answered(&typed(
+        &mut bench,
+        &launcher,
+        OTHER,
+        Some(A),
+        &[
+            "reply",
+            "--to-message",
+            question.as_str(),
+            "--body",
+            "this one",
+        ],
+    ));
+    let answer = answer["messageId"].as_str().expect("an answer").to_string();
+    let why = refused(&typed(
+        &mut bench,
+        &launcher,
+        LONE,
+        Some(A),
+        &[
+            "reply",
+            "--to-message",
+            answer.as_str(),
+            "--body",
+            "and back",
+        ],
+    ));
+    assert!(why.contains("since the person last typed"), "{why}");
+    refused(&send(&mut bench, &launcher, OTHER, &lone, "one more"));
 }

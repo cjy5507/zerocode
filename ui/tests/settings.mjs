@@ -2849,7 +2849,9 @@ class StatefulBackend {
       case "approve_automation_flow": {
         const row = this.automations.find((held) => held.id === args.id);
         if (row && args.seen !== row.flow_stands) {
-          throw new Error("묻는 동안 Flow 문서가 다시 바뀌었습니다 — 문서를 확인한 뒤 다시 승인해 주세요");
+          // As the window answers a refused press (`AutomationRefusal`): its
+          // sentence, and the code the screen says it by.
+          throw { said: "the window's own sentence", code: "flow_changed_under_question" };
         }
         if (row) {
           row.flow_changed = false;
@@ -2857,6 +2859,8 @@ class StatefulBackend {
           delete row.flow_stands;
           delete row.flow_money;
           delete row.flow_about;
+          delete row.flow_title;
+          delete row.flow_hidden;
         }
         return clone(this.automations);
       }
@@ -3693,6 +3697,18 @@ class StatefulBackend {
       // (t-76698). These scenes' zo writes no secret as plain text, so the
       // line stays hidden; the line's own suite is settings-secrets.mjs.
       case "settings_secret_literals": return null;
+      // zo's desk guard (v1.1.146): what the person's zo settings file says
+      // (`cmd/desk_guard.rs`), and the write only the person's hand reaches —
+      // refused here by the rule the window's invoke handler keeps
+      // (`PERSON_ONLY_COMMANDS`).
+      case "desk_guard_setting":
+        if (this.deskGuardUnread) throw new Error("the zo settings file does not read");
+        return clone(this.deskGuard ?? { on: true, why: null });
+      case "set_desk_guard":
+        if (hand !== "person") throw new Error(`set_desk_guard is the person's alone: refused for the hand ${hand}`);
+        if (this.deskGuardRefuses) throw new Error(this.deskGuardRefuses);
+        this.deskGuard = { on: args.on === true, why: null };
+        return clone(this.deskGuard);
       // The real phone switches paint what the seals say (t-90894); nothing is
       // allowed in these scenes.
       case "emulator_real_phone_said": return clone(this.realPhoneSaid ?? { allowedPhones: 0, unattended: false });
@@ -5743,6 +5759,13 @@ await test("an_asked_job_says_who_asked_and_waits_for_the_person_once_its_flow_c
     // it, says why, and the page reads the list again.
     backend.automations[0].flow_stands = "cc";
     backend.automations[0].flow_money = true;
+    // The rewritten document gives itself another title. The Flow side's
+    // list, read earlier, still says 「Wallet QA」: the question is to name
+    // the Flow by the reading the yes is held to.
+    backend.automations[0].flow_title = "Wallet QA rewritten";
+    // Two letters left out in all — one of them from that title, which
+    // `flow_about` does not count.
+    backend.automations[0].flow_hidden = 2;
     // It names as much as a document may: three sites and three apps shown,
     // each as long as the card's rule lets a name be, and more of each counted.
     const longName = (word) => `${word}.`.repeat(20).slice(0, 80);
@@ -5751,7 +5774,7 @@ await test("an_asked_job_says_who_asked_and_waits_for_the_person_once_its_flow_c
       steps: 4,
       hosts: { shown: ["a", "b", "c"].map((word) => longName(`${word}-shop.example.com`)), count: 5 },
       apps: { shown: ["x", "y", "z"].map((word) => longName(`com.example.${word}`)), count: 4 },
-      hidden: 2,
+      hidden: 1,
     };
     await pageA.evaluate(() => {
       window.__askedSaid = [];
@@ -5772,10 +5795,14 @@ await test("an_asked_job_says_who_asked_and_waits_for_the_person_once_its_flow_c
       { timeout: UI_TIMEOUT },
     );
     said.push(...await pageA.evaluate(() => window.__askedSaid));
+    // Said in the screen's own words for the code the window answered with —
+    // the catalog's, in the language the person chose — not in the window's
+    // sentence.
+    const refusedWords = await pageA.evaluate(() => t("auto.refused.flowChangedUnderQuestion", "묻는 동안 Flow 문서가 다시 바뀌었습니다 — 문서를 확인한 뒤 다시 승인해 주세요"));
     assert(
-      said.length === 1 && said[0].includes("다시 바뀌었습니다"),
-      "a yes to a document rewritten under the question was not refused out loud",
-      said,
+      said.length === 1 && said[0] === refusedWords,
+      "a yes to a document rewritten under the question was not refused out loud, or not in the screen's own words",
+      { said, refusedWords },
     );
     assert(backend.count("A", "list_automations") > reread, "the list was not read again after the refusal");
     const still = await pageA.evaluate(() => ({
@@ -5791,6 +5818,11 @@ await test("an_asked_job_says_who_asked_and_waits_for_the_person_once_its_flow_c
     await pageA.waitForSelector("#ask-scrim:not([hidden])");
     const second = await pageA.evaluate(() => document.getElementById("ask-body").textContent);
     assert(second.includes("Wallet QA") && second.includes(money), "the question did not say this document may spend money", second);
+    assert(
+      second.includes("「Wallet QA rewritten」") && !question.includes("Wallet QA rewritten"),
+      "the question named the Flow by the Flow side's list, not by the title read with the hash its yes hands back",
+      { second, question },
+    );
     const words = await pageA.evaluate(() => ({
       hosts: t("auto.asked.aboutHosts", "문서가 적은 사이트 {{count}}곳: {{names}}", { count: 5, names: "" }).split(":")[0],
       apps: t("auto.asked.aboutApps", "문서가 적은 앱 {{count}}개: {{names}}", { count: 4, names: "" }).split(":")[0],
@@ -6329,6 +6361,201 @@ await test("Computer Use 공유 의무는 기본 꺼짐이며 저장과 다른 �
     backend.settings.computer_share_required = false;
     await backend.broadcast(null, ["computer_share_required"]);
     await pageA.evaluate(() => setSettingsOpen(false));
+  }
+});
+
+// zo's desk guard (v1.1.146): the answer is the person's zo settings file's,
+// so the row paints what the window read from it and never a guess, and the
+// write is the person's own press — the hand the call carries is what the
+// window's second wall reads (`PERSON_ONLY_COMMANDS`, mirrored by this
+// backend's `set_desk_guard`).
+await test("zo 화면 조작 막기 줄은 zo 설정 파일이 말하는 대로 그리고 사람의 손으로만 바뀐다", async () => {
+  const words = {
+    label: { key: "computerUse.deskGuard", word: "zo가 셸 명령으로 화면을 움직이는 것을 막기" },
+    unreadable: { key: "computerUse.deskGuardUnreadable", word: "zo 설정 파일을 읽지 못해 켜져 있는지 알 수 없습니다. 파일을 고친 뒤 이 화면을 다시 열어 주세요." },
+    notBoolean: { key: "computerUse.deskGuardNotBoolean", word: "zo 설정 파일의 deskGuard 값이 true도 false도 아니어서 켜져 있는지 알 수 없습니다. 파일에서 그 줄을 고치거나 지워 주세요." },
+  };
+  const said = (name) => pageA.evaluate(({ key, word }) => t(key, word), words[name]);
+  const read = () => pageA.evaluate(() => {
+    const control = document.getElementById("computer-desk-guard");
+    const state = document.getElementById("computer-desk-guard-state");
+    return {
+      stateHidden: state.hidden,
+      state: state.textContent,
+      label: control.closest("label").querySelector(".settings-label").textContent,
+      personOnly: control.closest("label").matches("label.settings-check[data-person-only]"),
+      describedBy: control.getAttribute("aria-describedby"),
+    };
+  });
+  const stands = (want) => pageA.waitForFunction(({ checked, neither, locked }) => {
+    const control = document.getElementById("computer-desk-guard");
+    if (control.checked !== checked || control.indeterminate !== neither || control.disabled !== locked) return false;
+    // The thumb has stopped where this answer puts it along the track, in px:
+    // 2 off, 16 on, 9 for neither.
+    const thumb = getComputedStyle(control, "::before").transform;
+    const at = thumb === "none" ? null : new DOMMatrixReadOnly(thumb).m41;
+    return at === (neither ? 9 : checked ? 16 : 2);
+  }, want, { timeout: UI_TIMEOUT });
+  const comeBack = () => pageA.evaluate(() => { window.dispatchEvent(new Event("focus")); });
+  const on = { checked: true, neither: false, locked: false };
+  const off = { checked: false, neither: false, locked: false };
+  const untold = { checked: false, neither: true, locked: true };
+  const errors = [];
+  try {
+    await pageA.evaluate(() => {
+      window.__deskGuardShowError = window.showError;
+      window.__deskGuardErrors = [];
+      window.showError = (message) => window.__deskGuardErrors.push(String(message));
+    });
+    // Before the first answer the switch is neither on nor off: a window that
+    // has not opened these settings yet has asked nothing.
+    const fresh = await context.newPage();
+    const freshId = "desk-guard-fresh";
+    try {
+      if (PLATFORM_OVERRIDE) await addReportedPlatform(fresh, PLATFORM_OVERRIDE);
+      await installTauri(fresh, freshId);
+      attachFaultRecorder(fresh, freshId);
+      await bootPage(fresh, freshId);
+      assertEqual(backend.last(freshId, "desk_guard_setting"), null, "a window read the desk guard before its settings were opened");
+      assertEqual(await fresh.evaluate(() => {
+        const control = document.getElementById("computer-desk-guard");
+        return { checked: control.checked, neither: control.indeterminate, locked: control.disabled };
+      }), untold, "an unread switch is drawn as an answer");
+    } finally {
+      await fresh.close();
+    }
+    backend.deskGuard = { on: true, why: null };
+    const asked = backend.calls.length;
+    await openSettings(pageA, "computer-use");
+    await backend.waitForCall("A", "desk_guard_setting", asked);
+    await stands(on);
+    const first = await read();
+    assertEqual(first.label, await said("label"));
+    assert(first.personOnly, "the switch's label does not carry the person's mark");
+    assertEqual(first.describedBy, "computer-desk-guard-about computer-desk-guard-state");
+    assertEqual(first.stateHidden, true);
+    assertEqual(first.state, "");
+
+    // The person turns it off: one write, the answer and nothing else, their own hand.
+    const control = pageA.locator("#computer-desk-guard");
+    let before = backend.calls.length;
+    await control.uncheck();
+    const turnedOff = await backend.waitForCall("A", "set_desk_guard", before);
+    assertEqual(turnedOff.args, { on: false });
+    assertEqual(turnedOff.hand, "person", "the write did not say the person pressed it");
+    await stands(off);
+    assertEqual(backend.deskGuard, { on: false, why: null });
+
+    // And on again, by a press on the row's words — the label forwards it.
+    before = backend.calls.length;
+    await pageA.locator("label.settings-check:has(#computer-desk-guard) .settings-label").click();
+    const turnedOn = await backend.waitForCall("A", "set_desk_guard", before);
+    assertEqual(turnedOn.args, { on: true });
+    assertEqual(turnedOn.hand, "person", "a press on the row's words did not say the person pressed it");
+    await stands(on);
+
+    // A press no person made — a script's click — reaches the write as nobody's
+    // hand: refused, said, and the switch goes back to what the file says.
+    before = backend.calls.length;
+    await pageA.evaluate(() => { document.getElementById("computer-desk-guard").click(); });
+    const scripted = await backend.waitForCall("A", "set_desk_guard", before);
+    assert(scripted.hand !== "person", "a script's click was said as the person's hand", scripted.hand);
+    await backend.waitForCall("A", "desk_guard_setting", scripted.at);
+    await stands(on);
+    assertEqual(backend.deskGuard, { on: true, why: null }, "a refused write changed the file");
+    errors.push(...await pageA.evaluate(() => window.__deskGuardErrors.splice(0)));
+    assertEqual(errors.length, 1, "the refusal was not said once");
+    assert(errors[0].includes("set_desk_guard"), "the refusal does not name the command", errors[0]);
+
+    // The file changed behind the window — a hand edit: coming back reads it again.
+    backend.deskGuard = { on: false, why: null };
+    await comeBack();
+    await stands(off);
+
+    // A value that is neither on nor off: locked, drawn as neither, and the line says why.
+    backend.deskGuard = { on: null, why: "not_boolean" };
+    await comeBack();
+    await stands(untold);
+    let now = await read();
+    assertEqual(now.stateHidden, false);
+    assertEqual(now.state, await said("notBoolean"));
+
+    // A file that does not read, said by the window or by a read that fails: the same.
+    backend.deskGuard = { on: null, why: "unreadable" };
+    await comeBack();
+    await pageA.waitForFunction((want) => document.getElementById("computer-desk-guard-state").textContent === want,
+      await said("unreadable"), { timeout: UI_TIMEOUT });
+    await stands(untold);
+    backend.deskGuard = { on: true, why: null };
+    await comeBack();
+    await stands(on);
+    backend.deskGuardUnread = true;
+    await comeBack();
+    await stands(untold);
+    now = await read();
+    assertEqual(now.state, await said("unreadable"));
+    assertEqual(now.stateHidden, false);
+    backend.deskGuardUnread = false;
+
+    // The row in every language and both themes, standing as neither — the
+    // answer with the most words: it speaks the language and passes axe.
+    await comeBack();
+    await stands(on);
+    backend.deskGuard = { on: null, why: "not_boolean" };
+    await comeBack();
+    await stands(untold);
+    const spoken = {};
+    for (const locale of SETTINGS_QUALITY_SPEC.locales) {
+      await setQualityLocale(pageA, locale);
+      const row = await pageA.evaluate(() => ({
+        label: document.querySelector("label.settings-check:has(#computer-desk-guard) .settings-label").textContent,
+        about: document.getElementById("computer-desk-guard-about").textContent,
+        state: document.getElementById("computer-desk-guard-state").textContent,
+      }));
+      for (const [key, text] of Object.entries(row)) assert(text && text.trim(), `${locale}: ${key} is empty`, row);
+      if (locale !== "ko") {
+        for (const [key, text] of Object.entries(row)) assert(!/[가-힣]/.test(text), `${locale}: ${key} still speaks Korean: ${text}`, row);
+      }
+      // The words that keep the promise small: zo's panes only, and the next session.
+      assert(row.about.includes("Claude Code") && row.about.includes("Codex") && row.about.includes("cliclick"),
+        `${locale}: the hint no longer says which panes and which commands`, row.about);
+      spoken[locale] = `${row.label}\n${row.about}\n${row.state}`;
+      for (const theme of SETTINGS_QUALITY_SPEC.themes) {
+        await setQualityTheme(pageA, theme);
+        assertEqual(await axeViolations(pageA, AxeBuilder, "#computer-input-policy-card"), [], `${locale}/${theme} desk guard row accessibility`);
+      }
+    }
+    assertEqual(new Set(Object.values(spoken)).size, SETTINGS_QUALITY_SPEC.locales.length, "a locale repeats another's words");
+    await setQualityLocale(pageA, "ko");
+    await setQualityTheme(pageA, "dark");
+    assertEqual((await read()).state, words.notBoolean.word);
+
+    // A write the file refuses is said, and the switch shows what the file still says.
+    backend.deskGuard = { on: true, why: null };
+    await comeBack();
+    await stands(on);
+    backend.deskGuardRefuses = "파일 쓰기 실패: read-only";
+    before = backend.calls.length;
+    // A plain click: `uncheck()` would wait for a state the refusal takes back.
+    await control.click();
+    const refused = await backend.waitForCall("A", "set_desk_guard", before);
+    await backend.waitForCall("A", "desk_guard_setting", refused.at);
+    await stands(on);
+    errors.push(...await pageA.evaluate(() => window.__deskGuardErrors.splice(0)));
+    assertEqual(errors.length, 2, "the refused write was not said");
+    assert(errors[1].includes("파일 쓰기 실패"), "the refused write's reason was not said", errors[1]);
+  } finally {
+    backend.deskGuard = { on: true, why: null };
+    backend.deskGuardUnread = false;
+    backend.deskGuardRefuses = null;
+    await setQualityLocale(pageA, "ko");
+    await setQualityTheme(pageA, "dark");
+    await pageA.evaluate(() => {
+      if (window.__deskGuardShowError) window.showError = window.__deskGuardShowError;
+      delete window.__deskGuardShowError;
+      delete window.__deskGuardErrors;
+      setSettingsOpen(false);
+    });
   }
 });
 

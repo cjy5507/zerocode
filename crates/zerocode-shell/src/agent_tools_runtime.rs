@@ -224,10 +224,20 @@ pub(super) struct AutomationRow {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(super) flow_money: bool,
     /// On a job that waits: which document that is, beyond its title — its
-    /// file's name, its steps, what it names and when it was last written
-    /// (`schedule::About`), said in the question as on the card of a request.
+    /// file's name, its steps and what it names (`schedule::About`), said in
+    /// the question as on the card of a request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) flow_about: Option<computer_use::recipes::schedule::About>,
+    /// On a job that waits: the title that document gives itself, as the
+    /// card's rule shows it — the name 「다시 승인」 asks by. It comes off the
+    /// reading the yes is held to (`flow_stands`), not off a Flow list the
+    /// page read at another time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) flow_title: Option<String>,
+    /// On a job that waits: how many letters that draw nothing were left out
+    /// of that title and of what `flow_about` shows; the question says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) flow_hidden: Option<usize>,
 }
 
 /// A prompt that finished its journey into a shell, either way — or that is
@@ -3485,6 +3495,14 @@ pub(super) async fn computer_loop(
                             run_evidence::fenced_dir(&root, evidence.as_deref())
                                 .or_else(session_folder_adopted)
                         });
+                        // A walk the window started for a job says nobody is
+                        // watching it (`WALK_UNWATCHED_FLAG`): its guarded
+                        // presses are handed back whatever the settings ask.
+                        let unwatched = command
+                            .params
+                            .get(zerocode_core::computer_use::WALK_UNWATCHED_PARAM)
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
                         // One set of roads for both walks: a recipe's steps
                         // and a goal walk's presses reach a screen the same
                         // way, so neither can acquire a road of its own.
@@ -3497,18 +3515,33 @@ pub(super) async fn computer_loop(
                                         evidence.as_deref(),
                                         step,
                                         logged,
-                                        Asking::HandBack,
+                                        if unwatched {
+                                            Asking::Unwatched
+                                        } else {
+                                            Asking::HandBack
+                                        },
                                         cwd.as_deref().map(Path::new),
                                     )
                                 }
                                 zerocode_core::computer_recipe::RecipeTool::Browser => {
-                                    tauri::async_runtime::block_on(browser_step(
+                                    let stepping = browser_step(
                                         &app,
                                         pane.as_deref(),
                                         dir.as_deref(),
                                         step,
                                         logged,
-                                    ))
+                                    );
+                                    // The browser's presses have no helper
+                                    // to hand one back: on a walk nobody is
+                                    // watching the page reads the control
+                                    // before it presses (`confirm::unwatched`).
+                                    if unwatched {
+                                        tauri::async_runtime::block_on(
+                                            computer_use::confirm::unwatched(stepping),
+                                        )
+                                    } else {
+                                        tauri::async_runtime::block_on(stepping)
+                                    }
                                 }
                                 zerocode_core::computer_recipe::RecipeTool::Emulator => {
                                     tauri::async_runtime::block_on(emulator_step(
@@ -7769,7 +7802,9 @@ pub(super) fn call_with_confirmation_asker(
     };
     let verb = command.method;
     let mut params = command.params.clone();
-    let policy = confirm::policy();
+    // The person's settings say which kinds are guarded — except on a walk
+    // nobody is watching, where every kind is (`Asking::guards`).
+    let policy = asking.guards(confirm::policy());
     let refusal = |decision: Decision, kind: ConfirmKind, label: &str| {
         let (code, why) = match decision {
             Decision::TimedOut => (error_code::CONFIRMATION_TIMEOUT, "nobody answered in time"),
@@ -7797,7 +7832,7 @@ pub(super) fn call_with_confirmation_asker(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("(declared)")
                 .to_string();
-            if asking == Asking::HandBack {
+            if asking.hands_back() {
                 // Handed back unpressed, in the helper's own words, so the
                 // caller reads it as the press it found (parse_confirmation_required).
                 return Err(computer_use::ComputerUseError::new(

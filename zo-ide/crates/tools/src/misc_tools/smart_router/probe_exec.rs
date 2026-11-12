@@ -13,10 +13,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use api::{InputMessage, MessageRequest, OutputContentBlock};
-use runtime::{
-    parse_probe_response, probe_prompt, route_model, ModelInventory, ProbeAssessment,
-    RouteRequest, RouteRole, RoutingTarget,
-};
+use runtime::{parse_probe_response, probe_prompt, ProbeAssessment};
 
 use crate::misc_tools::agent_tools::{build_provider_client_for_agent, shared_agent_runtime};
 
@@ -56,6 +53,11 @@ const FAIL_JOIN_FAILURE: &str = "join_failure";
 const FAIL_MALFORMED: &str = "malformed";
 const FAIL_CACHED_MALFORMED: &str = "cached_malformed";
 const FAIL_CLIENT_UNAVAILABLE: &str = "client_unavailable";
+/// Why a slot holds no verdict where the provider the session is on has no
+/// fast tier of its own ([`probe_model`]): nobody was asked. Not a failure —
+/// a session on a person's own provider is how that person works — so it is
+/// attested as a decline, never as a defect.
+const SKIP_NO_FAST_TIER: &str = "no_fast_tier";
 const FAIL_CACHE_UNAVAILABLE: &str = "cache_unavailable";
 /// The probe's provider is parked behind its own wall — this process's 429,
 /// or a neighbour's through the shared cool-down — so no call is made: it
@@ -332,9 +334,6 @@ fn probe_cache() -> &'static Mutex<HashMap<u64, Option<ProbeAssessment>>> {
 /// pane's calls the way zo names its own.
 pub use zerocode_core::jev::task_fingerprint;
 
-/// Resolve the model the probe itself runs on: the router's own Fast-role
-/// pick from the already-loaded inventory — the probe reuses the engine it
-/// serves instead of hand-rolling a second "cheap model" table.
 /// Every task that lost its probe fails with `reason`, one row each — the
 /// one shape both a missing client and a parked provider answer in.
 fn fail_misses(
@@ -366,19 +365,72 @@ fn parked_ms_for(kind: api::ProviderKind) -> u64 {
     api::quota::rate_limit_cooldown_remaining_ms(kind)
 }
 
-fn probe_model(inventory: &ModelInventory, parent_model: &str) -> String {
-    let request = RouteRequest::for_target(
-        RoutingTarget::RoleFallback(RouteRole::Fast),
-        RouteRole::Fast,
-        parent_model,
-    );
-    route_model(&request, inventory).resolved_model
+/// The model the probe itself runs on: the fast tier of the provider the
+/// session is on ([`crate::fanout::fast_tier_model`], the pick the fold and
+/// the lessons make), or `None` where that provider has none of its own — a
+/// person's own provider, a name the catalog does not know, a provider whose
+/// catalog lists no fast tier.
+///
+/// The probe carries the person's words (a turn's) or a helper's task (a
+/// spawn's). Until v1.1.146 its model was the router's Fast-role pick over
+/// every connected provider, so on a machine that also held another
+/// provider's login those words left for that provider's account. Measured on
+/// v1.1.144 and v1.1.145: a turn of a `fable` session, and a helper's task in
+/// a `sonnet` session and in one on a person's own provider, went to OpenAI's
+/// fast model first. What is connected beside the session's provider is not
+/// read at all: the callers build no model list for the probe.
+///
+/// A session spelled `<provider key>/<id>` with one of the model catalog's
+/// own keys is on the provider that key names, whatever the id reads as
+/// (`ModelCatalog::provider_for_model`, asked first where the session's
+/// client is built). The pick reads the id after the slash, so where the two
+/// part — `openai/gemini-…`, or `google/<an id a person's own provider
+/// declares>` — the probe would be another provider's model than the
+/// session's: nobody is asked. Nor under a key the catalog does not have.
+/// Read from the letters alone: no catalog file, no discovery cache.
+fn probe_model(parent_model: &str) -> Option<String> {
+    if let Some((key, _)) = parent_model.trim().split_once('/') {
+        let keyed = runtime::model_catalog::CatalogProvider::from_key(key)?.kind();
+        if keyed != api::detect_provider_kind(parent_model) {
+            return None;
+        }
+    }
+    crate::fanout::fast_tier_model(Some(parent_model))
+}
+
+/// Whether the probe has a model to ask for a session on `parent_model`
+/// ([`probe_model`]): the turn's gate asks before it admits the probe, so a
+/// session with none is told as a decline and builds nothing.
+pub(super) fn probe_has_a_model(parent_model: &str) -> bool {
+    probe_model(parent_model).is_some()
+}
+
+/// Every task that lost its probe to a session with no fast tier of its own:
+/// one slot each saying so. Unlike [`fail_misses`] it attests a decline — the
+/// turn's gate has usually said so already and no task reaches here; a
+/// spawn's has no gate of its own.
+fn skip_misses(slots: &mut [Option<ProbeSlot>], misses: &[(usize, u64)], road: ProbeUse) {
+    for (index, fingerprint) in misses {
+        if road == ProbeUse::Routing {
+            telemetry::attest_declined(telemetry::HarnessFeature::RoutingProbe, SKIP_NO_FAST_TIER);
+        }
+        if route_debug_enabled() {
+            eprintln!(
+                "[ROUTE_PROBE] task={fingerprint:016x} road={} result={SKIP_NO_FAST_TIER}",
+                road.word()
+            );
+        }
+        slots[*index] = Some(ProbeSlot {
+            fingerprint: *fingerprint,
+            verdict: Err(SKIP_NO_FAST_TIER),
+            spent: None,
+        });
+    }
 }
 
 /// Run (or recall) the routing readers for one task. Returns `None` on any
 /// failure — the caller stays on the deterministic classification.
 pub(super) fn route_probe_assessment(
-    inventory: &ModelInventory,
     parent_model: &str,
     description: &str,
     prompt: &str,
@@ -386,7 +438,7 @@ pub(super) fn route_probe_assessment(
     attempt: &str,
     admitted: Admitted,
 ) -> Option<ProbeAssessment> {
-    route_probe_assessment_judged(inventory, parent_model, description, prompt, facts, attempt, admitted)
+    route_probe_assessment_judged(parent_model, description, prompt, facts, attempt, admitted)
         .map(|probed| probed.assessment)
 }
 
@@ -402,7 +454,6 @@ pub(super) struct ProbedTask {
 /// [`route_probe_assessment`] with the seat that answered kept beside the
 /// verdict — the status row's word for a judged turn (t-5872).
 pub(super) fn route_probe_assessment_judged(
-    inventory: &ModelInventory,
     parent_model: &str,
     description: &str,
     prompt: &str,
@@ -411,7 +462,6 @@ pub(super) fn route_probe_assessment_judged(
     admitted: Admitted,
 ) -> Option<ProbedTask> {
     probe_and_shadow_judged(
-        inventory,
         parent_model,
         &[(description, prompt)],
         &[facts],
@@ -435,14 +485,12 @@ pub(super) fn route_probe_assessment_judged(
 /// Record-only mode fires after the chat probe, detached, and never changes the
 /// returned assessments.
 pub(super) fn route_probe_assessments(
-    inventory: &ModelInventory,
     parent_model: &str,
     tasks: &[(&str, &str)],
     attempt: &str,
     admitted: Admitted,
 ) -> Vec<Option<ProbeAssessment>> {
     probe_and_shadow(
-        inventory,
         parent_model,
         tasks,
         &[],
@@ -458,7 +506,6 @@ pub(super) fn route_probe_assessments(
 /// fired, and to give it a shorter wall. On the active road the batch handed
 /// back is the control sample's, when the batch drew one.
 pub(super) fn probe_and_shadow(
-    inventory: &ModelInventory,
     parent_model: &str,
     tasks: &[(&str, &str)],
     facts: &[runtime::RoutingFacts],
@@ -467,7 +514,7 @@ pub(super) fn probe_and_shadow(
     admitted: Admitted,
 ) -> (Vec<Option<ProbeAssessment>>, Option<tokio::task::JoinHandle<()>>) {
     let (probed, shadow) =
-        probe_and_shadow_judged(inventory, parent_model, tasks, facts, attempt, shadow_deadline, admitted);
+        probe_and_shadow_judged(parent_model, tasks, facts, attempt, shadow_deadline, admitted);
     (
         probed
             .into_iter()
@@ -486,7 +533,6 @@ pub(super) fn probe_and_shadow(
 /// allows and the judgment records, detached — asked about every task the
 /// batch names, the ones the probe was not asked about included.
 fn probe_and_shadow_judged(
-    inventory: &ModelInventory,
     parent_model: &str,
     tasks: &[(&str, &str)],
     facts: &[runtime::RoutingFacts],
@@ -515,7 +561,7 @@ fn probe_and_shadow_judged(
             .zip(&active.assessments)
             .map(|(task, assessment)| if assessment.is_some() || !admitted.probe { ("", "") } else { *task })
             .collect();
-        let fallback = probe_slots(inventory, parent_model, &fallback_tasks, attempt, ProbeUse::Routing);
+        let fallback = probe_slots(parent_model, &fallback_tasks, attempt, ProbeUse::Routing);
         let results = active
             .assessments
             .into_iter()
@@ -533,12 +579,12 @@ fn probe_and_shadow_judged(
         // clock, for the rows the judge compares.
         let control = active
             .control
-            .map(|batch| super::decision_shadow::fire_control(batch, inventory, parent_model));
+            .map(|batch| super::decision_shadow::fire_control(batch, parent_model));
         return (results, control);
     }
     let probed_tasks: Vec<(&str, &str)> =
         tasks.iter().map(|task| if admitted.probe { *task } else { ("", "") }).collect();
-    let slots = probe_slots(inventory, parent_model, &probed_tasks, attempt, ProbeUse::Routing);
+    let slots = probe_slots(parent_model, &probed_tasks, attempt, ProbeUse::Routing);
     let shadow = super::decision_shadow::fire(tasks, facts, &slots, attempt, shadow_deadline);
     let results = slots
         .iter()
@@ -557,7 +603,6 @@ fn probe_and_shadow_judged(
 /// shadow's control sample, which makes the same call for a row rather than
 /// a route.
 pub(super) fn probe_slots(
-    inventory: &ModelInventory,
     parent_model: &str,
     tasks: &[(&str, &str)],
     attempt: &str,
@@ -621,7 +666,12 @@ pub(super) fn probe_slots(
     if misses.is_empty() {
         return slots;
     }
-    let model = probe_model(inventory, parent_model);
+    let Some(model) = probe_model(parent_model) else {
+        // No fast tier that is the session's own: nobody is asked, and the
+        // words stay where the session's own requests go.
+        skip_misses(&mut slots, &misses, road);
+        return slots;
+    };
     // Alias-normalized like every sibling `build_provider_client_for_agent`
     // caller (`provider_client.rs`), so a pinned/aliased Fast-role model id
     // cannot misroute provider detection or the wire model.
@@ -738,6 +788,125 @@ mod tests {
         assert_ne!(task_fingerprint("ab", "c"), task_fingerprint("a", "bc"));
         assert_eq!(task_fingerprint("a", "b"), task_fingerprint("a", "b"));
     }
+
+    /// The probe asks the fast model of the provider the session is on, read
+    /// from the session's model alone: what else the machine has connected
+    /// does not move it. A `fable` session's turn went to OpenAI's fast model
+    /// on a machine that held an OpenAI login as well (v1.1.145).
+    ///
+    /// The session ids are made up — a family's opening word and nothing a
+    /// catalog, a discovery cache or a developer's own provider could list —
+    /// and the crate's environment lock is held, which has taken the
+    /// developer's providers away.
+    #[test]
+    fn the_probe_asks_the_fast_model_of_the_sessions_own_provider() {
+        let _held = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let asked = |parent: &str| probe_model(parent).map(|model| api::resolve_model_alias(&model));
+        let haiku = api::resolve_model_alias("haiku");
+        assert_eq!(asked("claude-zq-probe-session"), Some(haiku), "an Anthropic session");
+        assert_eq!(asked("gpt-zq-probe-session").as_deref(), Some("gpt-5.6-luna"), "an OpenAI session");
+        let google = asked("gemini-zq-probe-session");
+        assert!(
+            google.as_deref().is_some_and(|model| model.starts_with("gemini")),
+            "a Gemini session asks a Gemini model: {google:?}"
+        );
+    }
+
+    /// A person's own providers declared for as long as it lives, on a config
+    /// home of its own, and what stood there put back when it goes. Declared
+    /// after the environment lock's guard, so it goes first.
+    struct OwnProvidersDeclared {
+        providers: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+        dir: std::path::PathBuf,
+    }
+
+    impl OwnProvidersDeclared {
+        fn new(providers: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("zo-tools-probe-own-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a config home");
+            let home = std::env::var_os(core_types::paths::ZO_CONFIG_HOME_ENV);
+            std::env::set_var(core_types::paths::ZO_CONFIG_HOME_ENV, &dir);
+            let before = std::env::var_os(api::CUSTOM_PROVIDERS_ENV);
+            std::env::set_var(api::CUSTOM_PROVIDERS_ENV, providers);
+            api::refresh_custom_providers_from_env();
+            Self { providers: before, home, dir }
+        }
+    }
+
+    impl Drop for OwnProvidersDeclared {
+        fn drop(&mut self) {
+            match self.providers.take() {
+                Some(before) => std::env::set_var(api::CUSTOM_PROVIDERS_ENV, before),
+                None => std::env::remove_var(api::CUSTOM_PROVIDERS_ENV),
+            }
+            api::refresh_custom_providers_from_env();
+            match self.home.take() {
+                Some(home) => std::env::set_var(core_types::paths::ZO_CONFIG_HOME_ENV, home),
+                None => std::env::remove_var(core_types::paths::ZO_CONFIG_HOME_ENV),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A session spelled `<provider key>/<id>` is on the provider its key
+    /// names. Where the id after the slash reads as another provider's — a
+    /// Google id under OpenAI's key, an id a person's own provider declares
+    /// under Google's — the probe would go where the session does not, so
+    /// nobody is asked. Where key and id agree, and for a bare id, the probe
+    /// asks that provider's fast model as before.
+    #[test]
+    fn a_session_keyed_to_another_provider_than_its_id_reads_as_asks_nobody() {
+        let _held = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _own = OwnProvidersDeclared::new(
+            r#"[{"name":"zqrelay","base_url":"https://relay.invalid/v1","models":["gemini-zq-own"],"requires_auth":false}]"#,
+        );
+        assert_eq!(probe_model("google/gemini-zq-own"), None, "Google's by its key, the relay's by its id");
+        assert_eq!(probe_model("openai/gemini-3.5-flash"), None, "OpenAI's by its key, Google's by its id");
+        assert_eq!(probe_model("zqnobody/gpt-zq-probe-session"), None, "a key the catalog does not have");
+        assert!(!probe_has_a_model("google/gemini-zq-own"));
+
+        let asked = |parent: &str| probe_model(parent).map(|model| api::resolve_model_alias(&model));
+        let haiku = api::resolve_model_alias("haiku");
+        assert_eq!(asked("anthropic/claude-zq-probe-session"), Some(haiku.clone()));
+        assert_eq!(asked("claude/claude-zq-probe-session"), Some(haiku));
+        assert_eq!(asked("openai/gpt-zq-probe-session").as_deref(), Some("gpt-5.6-luna"));
+        let google = asked("google/gemini-zq-probe-session");
+        assert!(
+            google.as_deref().is_some_and(|model| model.starts_with("gemini")),
+            "Google's key over a Google id: {google:?}"
+        );
+        assert_eq!(asked("gpt-zq-probe-session").as_deref(), Some("gpt-5.6-luna"), "a bare id");
+    }
+
+    /// A session whose provider has no fast model of its own has nobody to
+    /// ask, and a batch for it asks nobody: each task's slot says why.
+    #[test]
+    fn a_session_with_no_fast_model_of_its_own_asks_nobody() {
+        let _held = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for own in ["zq-model-nobody-lists", "zq-relay/some-model"] {
+            assert_eq!(probe_model(own), None, "{own}");
+            assert!(!probe_has_a_model(own), "{own}");
+        }
+        let prompt = format!("zq a task nobody is asked about {}", std::process::id());
+        let slots = probe_slots(
+            "zq-model-nobody-lists",
+            &[("zq", prompt.as_str())],
+            "turn-zq@1",
+            ProbeUse::Routing,
+        );
+        assert_eq!(slots.len(), 1);
+        let slot = slots[0].expect("the task has a slot");
+        assert_eq!(slot.verdict, Err(SKIP_NO_FAST_TIER));
+        assert_eq!(slot.spent, None, "nothing was spent on a question nobody was asked");
+    }
 }
 
 /// End-to-end coverage of the probe's LIVE request path, over a real socket.
@@ -761,13 +930,11 @@ mod live_path_tests {
     /// tax row is skipped (an attempt nobody declared writes none), and the
     /// probe path under test is otherwise identical.
     fn route_probe_assessment_for_tests(
-        inventory: &super::ModelInventory,
         parent_model: &str,
         description: &str,
         prompt: &str,
     ) -> Option<super::ProbeAssessment> {
         super::route_probe_assessment(
-            inventory,
             parent_model,
             description,
             prompt,
@@ -782,9 +949,7 @@ mod live_path_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
 
-    use runtime::{
-        ModelInventory, RouteConfidence, RouteTaskComplexity, RouteTaskIntent, RouteTaskRisk,
-    };
+    use runtime::{RouteConfidence, RouteTaskComplexity, RouteTaskIntent, RouteTaskRisk};
 
     use super::PROBE_BASE_URL_ENV;
 
@@ -1002,10 +1167,6 @@ mod live_path_tests {
         format!("data: {delta}\n\ndata: {completed}\n\ndata: [DONE]\n\n")
     }
 
-    fn inventory() -> ModelInventory {
-        ModelInventory::new("gpt-5.5-codex", Vec::new())
-    }
-
     #[test]
     fn live_probe_fuses_a_four_field_assessment_including_intent() {
         let mock = MockCodex::sse(responses_sse(
@@ -1014,7 +1175,6 @@ mod live_path_tests {
         let _env = ProbeEnv::pointing_at(mock.addr);
 
         let assessment = route_probe_assessment_for_tests(
-            &inventory(),
             "gpt-5.5-codex",
             "e2e-intent",
             "redesign the settings screen",
@@ -1053,7 +1213,6 @@ mod live_path_tests {
         let _env = ProbeEnv::pointing_at(mock.addr);
 
         let assessment = route_probe_assessment_for_tests(
-            &inventory(),
             "gpt-5.5-codex",
             "e2e-legacy",
             "rename one config key",
@@ -1081,7 +1240,6 @@ mod live_path_tests {
         let _env = ProbeEnv::pointing_at(mock.addr);
 
         let assessment = route_probe_assessment_for_tests(
-            &inventory(),
             "gpt-5.5-codex",
             "e2e-rejected",
             "anything at all",
@@ -1119,7 +1277,7 @@ mod live_path_tests {
             PROBE_CONTROL_EVERY,
         };
         use super::super::{probe_and_shadow, task_fingerprint, ProbeSlot};
-        use super::{inventory, responses_sse, MockCodex, ProbeEnv, PROBE_BILLED_INPUT_TOKENS};
+        use super::{responses_sse, MockCodex, ProbeEnv, PROBE_BILLED_INPUT_TOKENS};
 
         /// A wall far past any scripted delay, for the cases not about time.
         const UNHURRIED: Duration = Duration::from_secs(8);
@@ -1356,7 +1514,6 @@ mod live_path_tests {
         fn funnel(tasks: &[(&str, &str)], deadline: Duration) -> (Vec<Option<ProbeAssessment>>, Duration) {
             let started = Instant::now();
             let (results, shadow) = probe_and_shadow(
-                &inventory(),
                 "gpt-5.5-codex",
                 tasks,
                 &[],
@@ -2067,7 +2224,6 @@ mod live_path_tests {
                 let before = env.rows().len();
                 let started = Instant::now();
                 let (_, shadow) = probe_and_shadow(
-                    &inventory(),
                     "gpt-5.5-codex",
                     &[("", task.as_str())],
                     &[],

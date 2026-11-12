@@ -90,11 +90,71 @@ pub fn policy() -> Policy {
 
 /// Who answers a guarded press: the person, asked now — or the caller the
 /// press is handed back to unpressed (a recipe's walk has nobody to wait on
-/// a question for; it stops there and says the step is the person's).
+/// a question for; it stops there and says the step is the person's) — or,
+/// on a walk the window started for a job, nobody: the press is handed back
+/// the same way, and which kinds are guarded is not the person's settings'
+/// to say ([`Asking::guards`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Asking {
     Person,
     HandBack,
+    Unwatched,
+}
+
+impl Asking {
+    /// Whether a guarded press goes back to the caller unpressed, instead of
+    /// to the person as a question.
+    #[must_use]
+    pub const fn hands_back(self) -> bool {
+        matches!(self, Self::HandBack | Self::Unwatched)
+    }
+
+    /// The kinds guarded for this press: the person's own choice, except on
+    /// a walk nobody is watching — there a payment, a transfer and a deletion
+    /// are all guarded whatever they chose. A question switched off in the
+    /// settings was switched off for presses made while the person is at the
+    /// desk; a job's walk runs when they are not.
+    #[must_use]
+    pub const fn guards(self, persons: Policy) -> Policy {
+        match self {
+            Self::Person | Self::HandBack => persons,
+            Self::Unwatched => Policy {
+                payment: true,
+                transfer: true,
+                delete: true,
+            },
+        }
+    }
+}
+
+tokio::task_local! {
+    /// Stands around a browser step of a walk nobody is watching
+    /// ([`unwatched`]).
+    static NOBODY_WATCHES: ();
+}
+
+/// Run `step` — a browser step of a walk the window started for a job — as
+/// one nobody is watching: a press it makes is told the words a payment, a
+/// transfer and a deletion are held by ([`held_by_an_unwatched_walk`]). The
+/// browser's presses have no helper to match a label for them and nobody to
+/// ask, so the page itself reads what the control says before it presses.
+pub async fn unwatched<T>(step: impl std::future::Future<Output = T>) -> T {
+    NOBODY_WATCHES.scope((), step).await
+}
+
+/// What a browser press is told on a walk nobody is watching: every kind the
+/// confirmation gate knows, with its words — whatever the person's settings
+/// ask about, as on that walk's desktop presses ([`Asking::guards`]). `None`
+/// for every other press.
+#[must_use]
+pub fn held_by_an_unwatched_walk() -> Option<Value> {
+    NOBODY_WATCHES.try_with(|_| ()).ok()?;
+    Some(Value::Array(
+        ConfirmKind::ALL
+            .into_iter()
+            .map(|kind| serde_json::json!({ "kind": kind.as_str(), "words": kind.words() }))
+            .collect(),
+    ))
 }
 
 /// What the person said, or did not.
@@ -492,6 +552,21 @@ mod tests {
             delete: false,
         };
         assert_eq!(none.guard_words(), None, "nothing guarded, nothing sent");
+        // A walk nobody is watching guards every kind whatever the person
+        // chose, and hands the press back as any walk does; the person's
+        // choice stands for a press they are asked about and for a walk they
+        // started themselves.
+        assert_eq!(
+            Asking::Unwatched
+                .guards(none)
+                .guard_words()
+                .and_then(|words| words.as_object().map(serde_json::Map::len)),
+            Some(ConfirmKind::ALL.len()),
+        );
+        assert_eq!(Asking::HandBack.guards(none), none);
+        assert_eq!(Asking::Person.guards(none), none);
+        assert!(Asking::Unwatched.hands_back() && Asking::HandBack.hands_back());
+        assert!(!Asking::Person.hands_back());
         let only_transfer = Policy {
             payment: false,
             transfer: true,

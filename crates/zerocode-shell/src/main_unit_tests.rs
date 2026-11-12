@@ -8995,9 +8995,10 @@ fn the_terminal_wears_the_options_orca_ships() {
         "bold no longer follows Orca's floor, offset, and cap:\n{bold_weight}"
     );
 
-    // A block caret, one cell wide, blinking on a hard-edged second — and
-    // the width is written from the MEASURED cell, never guessed from the
-    // font size, which is wrong for every fallback face.
+    // A block caret, one cell wide (two over a double-width glyph), blinking
+    // on a hard-edged second — and the width is written from the MEASURED
+    // cell, never guessed from the font size, which is wrong for every
+    // fallback face.
     let caret = block_after(&styles, ".term-caret {");
     let caret_paint = block_after(&styles, ".term-caret::after {");
     assert!(
@@ -9008,7 +9009,7 @@ fn the_terminal_wears_the_options_orca_ships() {
         "the caret stopped being a blinking block:\n{caret}"
     );
     assert!(
-        window.contains("caret.style.width = `${cell.width}px`;"),
+        window.contains("caret.style.width = `${(cursorWide ? 2 : 1) * cell.width}px`;"),
         "the caret went back to a width nobody measured"
     );
     assert!(
@@ -34677,8 +34678,8 @@ fn a_scheduled_flow_with_no_agent_is_walked_through_the_windows_own_door() {
 
     assert_eq!(
         flow_run_argv("wallet-qa", None),
-        ["recipe-run", "--name", "wallet-qa", "--json"],
-        "the words 「지금 걷기」 submits"
+        ["recipe-run", "--name", "wallet-qa", "--json", "--unwatched"],
+        "the words 「지금 걷기」 submits, and that nobody is watching this walk"
     );
     // A job an agent asked for: the walk carries the hash of the document
     // the person allowed, and judges the text it reads against it.
@@ -34690,9 +34691,50 @@ fn a_scheduled_flow_with_no_agent_is_walked_through_the_windows_own_door() {
             "--name",
             "wallet-qa",
             "--json",
+            "--unwatched",
             "--flow-sha256",
             allowed.as_str()
         ],
+    );
+    // Every walk the window starts for a job says so, and that is what the
+    // walk's road reads: its desktop presses are handed back with every kind
+    // guarded, whatever the person's settings ask about (t-105495's follow-up,
+    // 2026-11-12 — a question switched off in the settings left a schedule's
+    // walk free to press a payment or a deletion with nobody there).
+    let said = zerocode_core::computer_use::parse_command(&flow_run_argv("wallet-qa", None))
+        .expect("the words read");
+    assert_eq!(
+        said.params[zerocode_core::computer_use::WALK_UNWATCHED_PARAM],
+        serde_json::json!(true)
+    );
+    let looped = block_after(shipped_backend(), "async fn computer_loop(");
+    let roads = &looped[looped.find("RecipeRoads::new(").expect("the walk's roads")..];
+    assert!(
+        looped.contains(".get(zerocode_core::computer_use::WALK_UNWATCHED_PARAM)")
+            && roads.contains("if unwatched {\n")
+            && roads.contains("Asking::Unwatched\n"),
+        "the walk's road does not read that nobody is watching it"
+    );
+    // The browser's presses have no helper to hand one back: the walk's road
+    // runs each browser step as one nobody is watching, and both press roads
+    // tell the page the words that hold a press back.
+    assert!(
+        roads.contains("computer_use::confirm::unwatched(stepping),"),
+        "a browser step of a job's walk is run as any other"
+    );
+    let door = include_str!("cmd/browser.rs");
+    assert_eq!(
+        door.matches("crate::computer_use::confirm::held_by_an_unwatched_walk()")
+            .count(),
+        2,
+        "a press by selector and a press by point both ask whether nobody is watching"
+    );
+    let pressing = block_after(shipped_backend(), "fn call_with_confirmation_asker(");
+    assert!(
+        pressing.contains("let policy = asking.guards(confirm::policy());")
+            && pressing.contains("if asking.hands_back() {")
+            && !pressing.contains("let policy = confirm::policy();"),
+        "a press reads the person's settings alone, on a walk nobody is watching too"
     );
 
     let backend = shipped_backend();
@@ -35034,6 +35076,145 @@ fn asked_flow_document(policy: &str) -> String {
          1. `zerocode-computer wait-for --app \"Sample Wallet\" --text Balance` — event, required\n",
         zerocode_core::computer_use::COMPUTER_USE_PROTOCOL_VERSION
     )
+}
+
+/// A browser press of a walk nobody is watching is told the words every
+/// kind is held by — a payment, a transfer, a deletion, whatever the person's
+/// settings ask about — and any other press is told nothing. What the page
+/// answers for a control that said one of them is said to the person with
+/// the kind and the control's own words, shown by the card's rule.
+#[tokio::test]
+async fn a_browser_press_nobody_watches_is_told_the_words_that_hold_it() {
+    use crate::computer_use::confirm::{held_by_an_unwatched_walk, unwatched};
+
+    assert_eq!(held_by_an_unwatched_walk(), None, "a press somebody asked for");
+    let held = unwatched(async { held_by_an_unwatched_walk() })
+        .await
+        .expect("nobody is watching");
+    let kinds: Vec<&str> = held
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["kind"].as_str().expect("a kind"))
+        .collect();
+    assert_eq!(kinds, ["payment", "transfer", "delete"]);
+    assert!(
+        held[0]["words"]
+            .as_array()
+            .is_some_and(|words| words.contains(&serde_json::json!("결제"))),
+        "{held}"
+    );
+    assert_eq!(held_by_an_unwatched_walk(), None, "the step is over");
+
+    let said = cmd::browser::page_failure(&serde_json::json!({
+        "ok": false, "code": cmd::browser::HELD_PRESS, "kind": "delete", "said": "계정\u{202E} 삭제",
+    }));
+    assert!(
+        said.contains("「계정 삭제」") && said.contains("삭제 누름") && said.contains("다음 걸음부터"),
+        "{said}"
+    );
+    assert!(cmd::browser::UNSENT_PAGE_CODES.contains(&cmd::browser::HELD_PRESS));
+}
+
+/// A refused save, and a refused 「다시 승인」, are answered with the
+/// window's sentence and — for the three refusals the automation screen says
+/// in the language the person chose — the code that screen finds its words
+/// by. They were one Korean sentence under every language (t-105495, 알아 둘
+/// 것 8). Any other refusal is said as the window wrote it. The screen holds
+/// words for every code, its own Korean is the window's sentence, and each
+/// key stands in the catalog's four other languages.
+#[test]
+fn a_refused_press_on_the_automation_screen_is_said_in_the_persons_language() {
+    use crate::cmd::review::{AutomationRefusal, REFUSALS_THE_SCREEN_SAYS};
+
+    let table = block_after(
+        window_source(),
+        "const AUTOMATION_REFUSALS = Object.freeze({",
+    );
+    for (sentence, code) in REFUSALS_THE_SCREEN_SAYS {
+        let refused = AutomationRefusal::from(sentence.to_string());
+        assert_eq!(
+            serde_json::to_value(&refused).expect("an answer"),
+            serde_json::json!({ "said": sentence, "code": code }),
+        );
+        let opens = format!("{code}: () => t(\"auto.refused.");
+        let row = table
+            .lines()
+            .find(|line| line.trim_start().starts_with(&opens))
+            .unwrap_or_else(|| panic!("the screen has no words for {code}:\n{table}"));
+        assert!(
+            row.trim_end()
+                .ends_with(&format!(", \"{sentence}\"),")),
+            "the screen's Korean for {code} is not the window's sentence:\n{row}"
+        );
+        let key = row.split('"').nth(1).expect("the catalog key");
+        assert_eq!(
+            window_source()
+                .matches(&format!("\n    \"{key}\": \""))
+                .count(),
+            4,
+            "{key} does not stand in each of the catalog's four other languages"
+        );
+    }
+    let other = AutomationRefusal::from("프롬프트를 입력해 주세요".to_string());
+    assert_eq!(
+        serde_json::to_value(&other).expect("an answer"),
+        serde_json::json!({ "said": "프롬프트를 입력해 주세요" }),
+        "a refusal the screen has no words for was given a code"
+    );
+
+    // Both presses answer with it, and the screen asks its catalog at each of
+    // the three places it says such a refusal.
+    for command in ["fn save_automation(", "fn approve_automation_flow("] {
+        assert!(
+            block_after(shipped_backend(), command)
+                .contains(") -> Result<Vec<AutomationRow>, AutomationRefusal> {"),
+            "{command} answers a refusal as a bare sentence"
+        );
+    }
+    let page = window_source();
+    assert!(
+        page.contains("showError(automationRefusalText(error));")
+            && page.contains("say(el(\"auto-error\"), () => automationRefusalText(error));")
+            && page.contains("secondBrainError = automationRefusalText(error);"),
+        "a press on the automation screen says a refusal without asking the catalog"
+    );
+}
+
+/// 「다시 승인」 names the Flow by the title the list read together with the
+/// hash the yes hands back — not by the Flow side's own list, which the page
+/// reads at another time (t-105495, 막지 않는 문제 5). And what a card and
+/// that question both say — that the Flow may spend, how many letters were
+/// left out — is written in the window once.
+#[test]
+fn the_question_names_the_flow_by_the_reading_its_yes_is_held_to() {
+    let listing = block_after(
+        shipped_backend(),
+        "fn list_automations(state: State<'_, AppState>)",
+    );
+    assert!(
+        listing.contains("flow_title: waits_on.as_ref().map(|one| one.title.clone()),")
+            && listing.contains("flow_hidden: waits_on.as_ref().map(|one| one.hidden),")
+            && listing.contains("flow_stands: waits_on.map(|one| one.sha256),"),
+        "the list does not hand the question the title of the reading it hashed:\n{listing}"
+    );
+    let asking = block_after(
+        window_source(),
+        "async function approveAutomationFlowAgain(row) {",
+    );
+    assert!(
+        asking.contains("flow: row.flow_title ?? automationFlowName(row) ?? row.flow,")
+            && asking.contains("flowMoneyText(row.flow_money),")
+            && asking.contains("flowHiddenText(row.flow_hidden),"),
+        "「다시 승인」 names the Flow by another reading, or says a sentence of its own:\n{asking}"
+    );
+    for key in ["auto.asked.money", "auto.asked.hidden"] {
+        assert_eq!(
+            window_source().matches(&format!("t(\"{key}\", ")).count(),
+            1,
+            "{key} is written in the window more than once"
+        );
+    }
 }
 
 /// 「다시 승인」 moves an approval only to the document the person was asked

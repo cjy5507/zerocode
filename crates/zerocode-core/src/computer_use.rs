@@ -456,6 +456,34 @@ pub const RECIPE_SCHEDULE_ASK_MS: u64 = 180_000;
 pub const FLOW_SHA256_FLAG: &str = "flow-sha256";
 /// See [`FLOW_SHA256_FLAG`].
 pub const FLOW_SHA256_PARAM: &str = "flowSha256";
+/// The flag a walk carries when the window itself starts it for a job — at
+/// the job's time or by 「지금 실행」, with nobody watching — and its key in
+/// the command's parameters. On such a walk a desktop press the helper reads
+/// as a payment, a transfer or a deletion is handed back unpressed, whatever
+/// the person's settings ask about, and the walk stops there. It only ever
+/// adds a refusal: anyone may say it, and gains nothing by it.
+///
+/// What it does not reach: a job that names an agent or a command is walked
+/// by that agent in its pane, without this flag and by the person's settings;
+/// a step on the emulator reads the person's settings too; and a key is not a
+/// press this guard reads.
+///
+/// In the browser the same walk's `click` — by selector, by number or by
+/// point — leaves a control that says of itself that it pays, moves money or
+/// deletes unpressed ([`WALK_HELD_PRESS_SAID`]). That is a net of words: a
+/// form sent by Enter, a script the walk evaluates, and a control that says
+/// nothing of itself pass through it.
+pub const WALK_UNWATCHED_FLAG: &str = "unwatched";
+/// See [`WALK_UNWATCHED_FLAG`].
+pub const WALK_UNWATCHED_PARAM: &str = "unwatched";
+/// The clause the browser door's refusal of such a press carries, word for
+/// word. The door refuses in sentences, with no code of its own, so the walk
+/// knows a press left to the person by this clause and stops at it as it does
+/// at a desktop press handed back: the step is the person's last step, and
+/// the walk goes on after it — never from it, which would press the control
+/// the next time round with nobody's guard on.
+pub const WALK_HELD_PRESS_SAID: &str =
+    "지켜보는 사람 없이 도는 걸음은 결제 · 이체 · 삭제를 누르지 않습니다";
 /// How long a hand whose place is covered waits before it lists the windows
 /// again, when what stands in front looks like it is passing — a
 /// notification sliding in or out, a window being dragged (t-12979): a
@@ -4300,6 +4328,7 @@ fn parse_flags(
         (WALK_OVERLAP_FLAG, WALK_OVERLAP_PARAM),
         (WALK_RESCUE_FLAG, WALK_RESCUE_PARAM),
         (WALK_REPLAY_FLAG, WALK_REPLAY_PARAM),
+        (WALK_UNWATCHED_FLAG, WALK_UNWATCHED_PARAM),
         ("renew", "renew"),
         ("ask-code", "askCode"),
     ] {
@@ -4460,6 +4489,7 @@ fn takes_no_value(name: &str) -> bool {
             | WALK_OVERLAP_FLAG
             | WALK_RESCUE_FLAG
             | WALK_REPLAY_FLAG
+            | WALK_UNWATCHED_FLAG
             | EMULATOR_PREVIEW_FLAG
     )
 }
@@ -4745,6 +4775,7 @@ pub(crate) fn allowed(method: ComputerMethod) -> &'static [&'static str] {
             "json",
             "name",
             FLOW_SHA256_FLAG,
+            WALK_UNWATCHED_FLAG,
             "params",
             "tab",
             "start",
@@ -10064,6 +10095,17 @@ mod tests {
         assert_eq!(walk.params[FLOW_SHA256_PARAM], json!(held));
         let plain = parse_command(&words(&["recipe-run", "--name", "wallet-qa"])).expect("a walk");
         assert!(plain.params.get(FLOW_SHA256_PARAM).is_none());
+        // A walk the window starts for a job says nobody is watching it; a
+        // walk that does not say so is not one, and only a walk can say it.
+        assert!(plain.params.get(WALK_UNWATCHED_PARAM).is_none());
+        let unwatched = format!("--{WALK_UNWATCHED_FLAG}");
+        let job = parse_command(&words(&["recipe-run", "--name", "wallet-qa", &unwatched]))
+            .expect("a job's walk");
+        assert_eq!(job.params[WALK_UNWATCHED_PARAM], json!(true));
+        assert!(
+            parse_command(&words(&["recipe-show", "--name", "wallet-qa", &unwatched])).is_err(),
+            "a verb that walks nothing took the walk's flag"
+        );
         for refused in ["abc", &"zz".repeat(32), &"ab".repeat(33)] {
             let error = parse_command(&words(&[
                 "recipe-run",

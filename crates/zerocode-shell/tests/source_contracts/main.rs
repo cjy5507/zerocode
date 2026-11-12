@@ -19,6 +19,7 @@ mod continue_gate;
 mod cookie_import_card;
 mod coordinator_desk;
 mod crash_report;
+mod desk_guard;
 mod effort_chip;
 mod fixture_cases;
 mod git_doors;
@@ -520,6 +521,12 @@ mod tests {
                             // a person allowed and a runner's hold are judged on a
                             // checkout the test made, beside the command.
                             | "cmd/build_buttons.rs"
+                            // 2026-11-12 (v1.1.146): zo's desk guard switch.
+                            // Its read and its write are judged on a zo
+                            // settings file the test made, and the hands the
+                            // write refuses on the window's own wall — beside
+                            // the two commands.
+                            | "cmd/desk_guard.rs"
                             // t-21017: a provider's done report reaches the
                             // human-input line through the one door
                             // `note_pane_state` calls, tested beside that door.
@@ -3474,7 +3481,7 @@ mod tests {
         );
         assert!(
             fitted.contains(
-                "for (const [property, value] of wideDressVars(...dress)) pre.style.setProperty(property, value);"
+                "for (const [property, value] of wideDressVars(...dress)) host.style.setProperty(property, value);"
             ) && !source.contains("span.style.letterSpacing"),
             "the measured dress never reaches the terminal as its own custom \
              properties — or is left on a span a narrow run later reuses:\n{fitted}"
@@ -3548,7 +3555,7 @@ mod tests {
         // run takes no part in the row's line box, so a grown glyph never
         // grows the row.
         let styles = include_str!("../../../../ui/shell.css");
-        let wide = block_after(styles, ".term .term-wide {");
+        let wide = block_after(styles, ":is(.term, .term-caret) .term-wide {");
         for rule in [
             "display: inline-block;",
             "vertical-align: top;",
