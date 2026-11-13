@@ -43,6 +43,7 @@ use zerocode_core::screen_action::GIVE_UP;
 use zerocode_core::computer_use_protocol::error_code;
 use zerocode_core::computer_use_protocol::execution::{FOREGROUND, REQUIRES_FOREGROUND};
 use zerocode_core::computer_use_protocol::frame::ShotFrame;
+use zerocode_core::computer_use_protocol::identity::{is_known_browser, AppQuery};
 use zerocode_core::computer_use_protocol::marks::{legend_line, ITEMS_KEY, LEGEND_KEY, LOOK_ID_KEY, TOOL_ONLY_KEYS};
 
 use super::{
@@ -170,6 +171,13 @@ pub(crate) const ACTIONS: &[(&str, ComputerMethod)] = &[
     (BATCH_ACTION, ComputerMethod::Batch),
     (WALK_ACTION, ComputerMethod::Walk),
 ];
+/// Other spellings models send for an action and for a field, each meaning one
+/// name the tool already has and nothing else (t-106321): read as that name
+/// before anything else looks at the call, so every check, the command line,
+/// the background judgment and the person's confirmation see only the tool's
+/// own name. Never in the schema — the model is taught one name.
+const ACTION_ALIASES: &[(&str, &str)] = &[("click", "left_click")];
+const FIELD_ALIASES: &[(&str, &str)] = &[("direction", "scroll_direction")];
 /// The fields a batch step's actions read — the rest of the tool's fields
 /// belong to actions no step may be (a test probes every step action for it).
 const STEP_FIELDS: &[&str] = &[
@@ -220,6 +228,140 @@ fn methods(action: &str) -> impl Iterator<Item = ComputerMethod> {
 /// The action names, in the table's order.
 fn action_names(keep: impl Fn(&str) -> bool) -> Vec<&'static str> {
     ACTIONS.iter().map(|(name, _)| *name).filter(|name| keep(name)).collect()
+}
+
+/// The action an alias stands for, or the action itself, trimmed.
+pub(crate) fn action_named(action: &str) -> &str {
+    let action = action.trim();
+    ACTION_ALIASES.iter().find(|(alias, _)| *alias == action).map_or(action, |(_, name)| *name)
+}
+
+/// The one action a misspelled name is plainly near: within a quarter of
+/// that name's length (one edit at least), and nearer than any other — a tie
+/// or a short guess (`tap`, `type`) names nothing.
+fn nearest_action(action: &str) -> Option<&'static str> {
+    let query = action.to_ascii_lowercase();
+    let mut near: Vec<(usize, &'static str)> = action_names(|name| name != action)
+        .into_iter()
+        .map(|name| (core_types::text::levenshtein_distance(&query, name), name))
+        .filter(|(distance, name)| *distance <= (name.chars().count() / 4).max(1))
+        .collect();
+    near.sort_unstable();
+    match near.as_slice() {
+        [(_, only)] => Some(*only),
+        [(first, name), (second, _), ..] if first < second => Some(*name),
+        _ => None,
+    }
+}
+
+/// An action the tool has no name for, refused by its own name before any
+/// other check can blame a field for it (t-106321), with the near name when
+/// one is plain.
+fn known_action(action: &str) -> Result<(), ToolError> {
+    if ACTIONS.iter().any(|(name, _)| *name == action) {
+        return Ok(());
+    }
+    Err(unknown_action(action))
+}
+
+fn unknown_action(action: &str) -> ToolError {
+    let near = nearest_action(action).map_or_else(|| "; one of".to_string(), |name| format!("; did you mean `{name}`? one of"));
+    ToolError::InvalidInput(format!("unknown Computer action {action:?}{near} {}", action_names(|_| true).join(", ")))
+}
+
+/// The call in the tool's own names, at the top and in each batch step: an
+/// alias read as the name it stands for, an action with no name refused by
+/// that name first, and a field sent under both its names refused.
+fn in_the_tools_names(input: &Value) -> Result<Value, ToolError> {
+    let mut input = input.clone();
+    rename(&mut input, None)?;
+    Ok(input)
+}
+
+fn rename(call: &mut Value, step: Option<usize>) -> Result<(), ToolError> {
+    let Some(fields) = call.as_object_mut() else {
+        return Ok(());
+    };
+    let mut action = None;
+    if let Some(Value::String(named)) = fields.get_mut("action") {
+        *named = action_named(named).to_string();
+        action = Some(named.clone());
+    }
+    let at = |error: ToolError| match (step, &action) {
+        (Some(at), Some(action)) => ToolError::InvalidInput(format!("step {at} ({action}): {error}")),
+        _ => error,
+    };
+    if let Some(action) = &action {
+        known_action(action).map_err(at)?;
+    }
+    for (alias, name) in FIELD_ALIASES {
+        let Some(value) = fields.remove(*alias) else { continue };
+        if fields.contains_key(*name) {
+            return Err(at(ToolError::InvalidInput(format!("`{alias}` and `{name}` are one field; send `{name}` alone"))));
+        }
+        fields.insert((*name).to_string(), value);
+    }
+    if step.is_none() {
+        if let Some(Value::Array(steps)) = fields.get_mut("steps") {
+            for (at, step) in steps.iter_mut().enumerate() {
+                rename(step, Some(at + 1))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The app a call names that is the person's own web browser — at the top or
+/// in a step — by the core's one browser table; a `pid:N` is not judged.
+fn persons_browser(input: &ComputerInput) -> Option<&str> {
+    std::iter::once(input)
+        .chain(input.steps.iter().flatten())
+        .filter_map(|call| call.app.as_deref())
+        .find(|app| match AppQuery::parse(app) {
+            Ok(AppQuery::Named(name)) => is_known_browser(&name, Some(&name), None),
+            _ => false,
+        })
+}
+
+/// The first call of a session that names the person's own browser runs
+/// nothing and says where web pages go (t-106321): a weak model drove the
+/// person's Chrome 24 times and the work browser never, and input there
+/// stops whenever the person uses it. Sent again, the same call runs as it
+/// always has — once a session, never a refusal. A call the tool would
+/// refuse anyway is refused first, as it always was.
+fn work_browser_first(input: &Value, ctx: &ToolContext) -> Option<Result<ToolExecutionResult, ToolError>> {
+    let input = read_input(input).ok()?;
+    let well_formed = match input.action.trim() {
+        BATCH_ACTION => input.steps.as_ref().is_some_and(|steps| check_batch_len(steps.len()).is_ok()),
+        WALK_ACTION => input.steps.is_none(),
+        _ => input.steps.is_none() && argv_for(&input).is_ok(),
+    };
+    if !well_formed {
+        return None;
+    }
+    let app = persons_browser(&input)?;
+    if !ctx.computer_says_work_browser_once() {
+        return None;
+    }
+    Some(
+        to_pretty_json(json!({
+            "ok": false,
+            "action": input.action.trim(),
+            "ran": false,
+            "app": app,
+            "next": format!(
+                "{app} is the person's own browser: input there pauses whenever they use it. \
+                 For a web page use your own tab, which never meets theirs: {BROWSER_CLI} open <url>, then read, marks, click, type and fill. \
+                 If the person told you to do this in their own browser, send this same request again and it runs there."
+            ),
+        }))
+        .map(ToolExecutionResult::from),
+    )
+}
+
+/// The input as the tool reads it: in its own names, then its own fields.
+fn read_input(input: &Value) -> Result<ComputerInput, ToolError> {
+    from_value(&in_the_tools_names(input)?)
 }
 
 /// The window kinds, as the core names them, that `keep` admits.
@@ -517,7 +659,7 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
         description: "Drive desktop apps inside a ZeroCode pane: screenshots/zoom, mouse moves/clicks/drags/scroll, \
             keys/text/waits, app/window management, element/OCR reads, clipboard and programs. \
             For web pages use zerocode-browser open <url>, then read, marks, click, type and fill; \
-            the person's own browser is an app when they ask for it. \
+            the person's own browser is an app when they ask for it; input there pauses while they use it. \
             Windows without trees (mirrored phones): one batch, not a call per click: \
             left_click {label, ocr: true, foreground: true, after_text: line above} only when the person told you to do that step on their own screen, otherwise hand it to them; \
             type, key Return, wait_for {ocr: true, text}. \
@@ -592,8 +734,10 @@ pub(crate) fn dispatch_result(
     input: &Value,
 ) -> Option<Result<ToolExecutionResult, ToolError>> {
     match name {
+        // The person's rules read the call in the tool's own names, as the
+        // run does; a call with no such names is checked as it was sent.
         "Computer" => Some(
-            maybe_enforce_permission_check(enforcer, name, input).and_then(|()| {
+            maybe_enforce_permission_check(enforcer, name, &in_the_tools_names(input).unwrap_or_else(|_| input.clone())).and_then(|()| {
                 let road = ComputerRoad::from_path()?;
                 run_computer_execution(input, ctx, &road)
             }),
@@ -603,7 +747,7 @@ pub(crate) fn dispatch_result(
 }
 
 pub(crate) fn canonical_call(input: &Value) -> Result<runtime::ResolvedToolCall, ToolError> {
-    let parsed: ComputerInput = from_value(input)?;
+    let parsed = read_input(input)?;
     let argv = argv_for(&parsed)?;
     Ok(runtime::ResolvedToolCall {
         name: "Computer".to_string(),
@@ -792,8 +936,13 @@ fn validate_scope(input: &ComputerInput) -> Result<(), ToolError> {
         return Err(ToolError::InvalidInput("a mark already pins its app and window; do not combine it with another app/window selector".into()));
     }
     if let Some(window_id) = input.window_id {
-        if window_id == 0 || (action != "window" && ((!app_scoped_action(action) && !timer) || input.app.as_deref().is_none_or(|app| app.trim().is_empty()))) {
+        if window_id == 0 || (action != "window" && !app_scoped_action(action) && !timer) {
             return Err(ToolError::InvalidInput("window_id needs a supported app-scoped action and a positive window ID; this selector cannot be ignored".into()));
+        }
+        if action != "window" && input.app.as_deref().is_none_or(|app| app.trim().is_empty()) {
+            return Err(ToolError::InvalidInput(format!(
+                "window_id goes with the app whose window it is: add `app`, e.g. {{\"action\":\"{action}\",\"app\":\"Notes\",\"window_id\":41}}; this selector cannot be ignored"
+            )));
         }
     }
     if input.app.is_some() && !app_scoped_action(action) && !timer
@@ -883,6 +1032,7 @@ fn unverified_action_receipt(action: &str, window_id: Option<u64>, scope_error: 
 /// families — looking and input, apps and the system, the meaning layer.
 pub(crate) fn argv_for(input: &ComputerInput) -> Result<Vec<String>, ToolError> {
     let action = input.action.trim();
+    known_action(action)?;
     validate_scope(input)?;
     if input.mark.is_some() && !MARK_CLICKS.contains(&action) {
         return Err(ToolError::InvalidInput(format!("`mark` belongs to the clicks ({}), not `{action}`", MARK_CLICKS.join(", "))));
@@ -900,10 +1050,7 @@ pub(crate) fn argv_for(input: &ComputerInput) -> Result<Vec<String>, ToolError> 
         || argv_persons_turn(action, input, &mut argv)?
         || argv_walk(action, input, &mut argv);
     if !handled {
-        return Err(ToolError::InvalidInput(format!(
-            "unknown Computer action {action:?}; one of {}",
-            action_names(|_| true).join(", ")
-        )));
+        return Err(unknown_action(action));
     }
     if let Some(window_id) = input.window_id.filter(|_| !timed_wait(action)) {
         if !matches!(action, "window" | "observe" | "find" | "read" | "wait_for") {
@@ -2451,7 +2598,7 @@ pub(crate) fn run_computer(input: &Value, ctx: &ToolContext, road: &ComputerRoad
 }
 
 pub(crate) fn run_computer_execution(input: &Value, ctx: &ToolContext, road: &ComputerRoad) -> Result<ToolExecutionResult, ToolError> {
-    super::computer_tally::run(input, ctx, || run_computer_inner(input, ctx, road))
+    super::computer_tally::run(input, ctx, || work_browser_first(input, ctx).unwrap_or_else(|| run_computer_inner(input, ctx, road)))
 }
 
 fn run_computer_inner(input: &Value, ctx: &ToolContext, road: &ComputerRoad) -> Result<ToolExecutionResult, ToolError> {
@@ -2460,7 +2607,7 @@ fn run_computer_inner(input: &Value, ctx: &ToolContext, road: &ComputerRoad) -> 
             check_batch_len(steps.len())?;
         }
     }
-    let input: ComputerInput = from_value(input)?;
+    let input = read_input(input)?;
     if input.background == Some(true) && input.action.trim() != BATCH_ACTION {
         argv_for(&input)?;
     }
@@ -6252,6 +6399,187 @@ printf '%s
         }
     }
 
+    /// The person's own browser, named first in a session, is answered with
+    /// where web pages go and nothing runs; the same call sent again runs as
+    /// it always has; another app, or a pid, runs from the first call.
+    #[cfg(unix)]
+    #[test]
+    fn the_first_call_on_the_persons_browser_says_where_web_pages_go_and_the_same_call_again_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (road, _) = fake_shim(dir.path());
+        let ctx = crate::tests::tool_context_outside_cwd_windows();
+        let call = json!({"action":"find","app":"Google Chrome","window_id":41,"label":"Save"});
+        let said: Value = serde_json::from_str(&run_computer(&call, &ctx, &road).unwrap()).unwrap();
+        assert_eq!(said["ok"], false, "{said}");
+        assert_eq!(said["ran"], false, "{said}");
+        let next = said["next"].as_str().unwrap();
+        assert!(next.contains("Google Chrome is the person's own browser: input there pauses whenever they use it."), "{next}");
+        assert!(next.contains(&format!("{BROWSER_CLI} open <url>")) && next.contains("send this same request again"), "{next}");
+        assert!(calls(dir.path()).is_empty(), "the first call runs nothing");
+        let ran: Value = serde_json::from_str(&run_computer(&call, &ctx, &road).unwrap()).unwrap();
+        assert_eq!(ran["ok"], true, "{ran}");
+        assert_eq!(calls(dir.path()).iter().filter(|verb| *verb == "find").count(), 1, "the same call again runs once");
+        let words = std::fs::read_to_string(dir.path().join("argv-find.1")).unwrap();
+        let expected = argv_for(&read_input(&call).unwrap()).unwrap();
+        for word in expected.iter().filter(|word| *word != "--json") {
+            assert!(words.lines().any(|line| line == word), "{word} in {words}");
+        }
+        let later: Value = serde_json::from_str(&run_computer(&json!({"action":"find","app":"Safari","label":"Save"}), &ctx, &road).unwrap()).unwrap();
+        assert_eq!(later["ok"], true, "once a session: {later}");
+
+        for first in [json!({"action":"find","app":"Notes","window_id":41,"label":"Save"}), json!({"action":"find","app":"pid:41","label":"Save"})] {
+            let dir = tempfile::tempdir().unwrap();
+            let (road, _) = fake_shim(dir.path());
+            let ctx = crate::tests::tool_context_outside_cwd_windows();
+            let ran: Value = serde_json::from_str(&run_computer(&first, &ctx, &road).unwrap()).unwrap();
+            assert_eq!(ran["ok"], true, "{first}: {ran}");
+            assert_eq!(calls(dir.path()).iter().filter(|verb| *verb == "find").count(), 1, "{first} runs from the first call");
+        }
+    }
+
+    #[test]
+    fn the_persons_browser_is_judged_by_the_cores_one_table() {
+        let named = |app: &str, steps: Value| {
+            let call = read_input(&json!({"action":"batch","steps":steps}));
+            let top = read_input(&json!({"action":"find","app":app,"label":"Save"})).unwrap();
+            (persons_browser(&top).map(str::to_string), call.ok().and_then(|call| persons_browser(&call).map(str::to_string)))
+        };
+        for browser in ["Google Chrome", "google chrome", "Safari", "Arc", "Microsoft Edge", "Brave Browser", "Firefox", "com.google.Chrome"] {
+            let (top, step) = named(browser, json!([{"action":"find","app":browser,"label":"Save"}]));
+            assert_eq!(top.as_deref(), Some(browser));
+            assert_eq!(step.as_deref(), Some(browser), "a step's app counts too");
+        }
+        for app in ["Notes", "pid:41", "Finder"] {
+            let (top, step) = named(app, json!([{"action":"find","app":app,"label":"Save"}]));
+            assert_eq!((top, step), (None, None), "{app}");
+        }
+    }
+
+    /// What one call resolves to — its command line, or the words it is refused in.
+    fn resolved(fields: &Value) -> Result<String, String> {
+        canonical_call(fields).map(|call| call.input).map_err(|error| error.to_string())
+    }
+
+    /// The six calls a weak model sent in one session (t-106321), window and
+    /// app swapped for fixtures: each answered for the reason it is wrong, or
+    /// taken under the one name it means.
+    #[test]
+    fn the_six_reported_calls_get_answers_that_name_what_is_wrong() {
+        let click = json!({"action":"click","app":"Notes","coordinate":[100,20],"window_id":41});
+        let left_click = json!({"action":"left_click","app":"Notes","coordinate":[100,20],"window_id":41});
+        assert_eq!(resolved(&click), resolved(&left_click));
+        assert!(resolved(&left_click).unwrap().contains("\"action\":\"left_click\""));
+
+        let scroll = resolved(&json!({"action":"scroll","app":"Notes","direction":"down","scroll_amount":5,"window_id":41})).unwrap_err();
+        assert_eq!(scroll, format!("invalid input: scroll_amount belongs to desktop scrolling: {SCROLL_SHAPES}"));
+
+        let screenshot = resolved(&json!({"action":"screenshot","window_id":41})).unwrap_err();
+        assert!(screenshot.contains("window_id goes with the app whose window it is: add `app`"), "{screenshot}");
+        assert!(screenshot.contains(r#"{"action":"screenshot","app":"Notes","window_id":41}"#), "{screenshot}");
+        assert!(screenshot.contains("this selector cannot be ignored"), "{screenshot}");
+        let example = json!({"action":"screenshot","app":"Notes","window_id":41});
+        assert!(resolved(&example).is_ok(), "the example is taken as it stands");
+
+        let pages = resolved(&json!({"action":"scroll","app":"Notes","coordinate":[600,400],"scroll_amount":500,"scroll_direction":"down","window_id":41})).unwrap_err();
+        assert_eq!(pages, format!("invalid input: scroll_amount belongs to desktop scrolling: {SCROLL_SHAPES}"));
+
+        let empty = resolved(&json!({})).unwrap_err();
+        assert_eq!(empty, "invalid input: missing field `action`");
+
+        let unknown = resolved(&json!({"action":"invalid_action_name"})).unwrap_err();
+        assert_eq!(unknown, format!("invalid input: unknown Computer action \"invalid_action_name\"; one of {}", action_names(|_| true).join(", ")));
+    }
+
+    #[test]
+    fn an_action_with_no_name_is_refused_by_its_name_before_any_selector() {
+        let typo = resolved(&json!({"action":"left_clik","app":"Notes","coordinate":[100,20],"window_id":41})).unwrap_err();
+        assert!(typo.starts_with("invalid input: unknown Computer action \"left_clik\"; did you mean `left_click`? one of "), "{typo}");
+        for fields in [
+            json!({"action":"tap","window_id":41}),
+            json!({"action":"press","app":"Notes","background":true}),
+            json!({"action":"tap","foreground":true}),
+            json!({"action":"tap","mark":3}),
+            json!({"action":"tap","window":"Draft"}),
+        ] {
+            let refused = resolved(&fields).unwrap_err();
+            assert!(refused.starts_with("invalid input: unknown Computer action"), "{fields}: {refused}");
+            assert!(!refused.contains("did you mean"), "no guess for {fields}: {refused}");
+            let direct = argv_for(&input(fields.clone())).unwrap_err().to_string();
+            assert!(direct.starts_with("invalid input: unknown Computer action"), "{fields}: {direct}");
+        }
+        let unknown_field = resolved(&json!({"action":"tap","sideways":true})).unwrap_err();
+        assert!(unknown_field.contains("unknown Computer action \"tap\""), "{unknown_field}");
+        let step = resolved(&json!({"action":"batch","steps":[{"action":"tap","window_id":41}]})).unwrap_err();
+        assert!(step.starts_with("invalid input: step 1 (tap): invalid input: unknown Computer action \"tap\""), "{step}");
+    }
+
+    #[test]
+    fn a_near_name_is_named_only_when_it_is_plain() {
+        for (typo, near) in [("left_clik", "left_click"), ("scrol", "scroll"), ("screenshoot", "screenshot"), ("Left_Click", "left_click"), ("doubleclick", "double_click")] {
+            assert_eq!(nearest_action(typo), Some(near), "{typo}");
+        }
+        for far in ["tap", "press", "invalid_action_name", "click_here", "go"] {
+            assert_eq!(nearest_action(far), None, "{far}");
+        }
+    }
+
+    /// An alias moves a call to a name the tool has and nowhere else: the same
+    /// command line, the same background judgment, the same confirmation.
+    #[test]
+    fn an_alias_reads_exactly_as_the_name_it_stands_for() {
+        for fields in [
+            json!({"coordinate":[20,40]}),
+            json!({"app":"Notes","window_id":41,"label":"Save","background":true}),
+            json!({"coordinate":[20,40],"foreground":true}),
+            json!({"coordinate":[20,40],"confirming":"delete"}),
+            json!({"app":"Notes","window_id":41,"label":"Delete","confirming":"delete","background":true}),
+            json!({"coordinate":[20,40],"background":true}),
+            json!({"app":"Notes","coordinate":[20,40]}),
+        ] {
+            let with = |action: &str| {
+                let mut call = fields.clone();
+                call["action"] = json!(action);
+                call
+            };
+            assert_eq!(resolved(&with(" click ")), resolved(&with("left_click")), "{fields}");
+        }
+        let scroll = |field: &str| json!({"action":"scroll","coordinate":[790,450],field:"down","scroll_amount":3});
+        assert_eq!(resolved(&scroll("direction")), resolved(&scroll("scroll_direction")));
+        assert!(resolved(&scroll("direction")).is_ok());
+        let both = resolved(&json!({"action":"scroll","coordinate":[790,450],"direction":"down","scroll_direction":"down","scroll_amount":3})).unwrap_err();
+        assert!(both.contains("`direction` and `scroll_direction` are one field"), "{both}");
+        let batch = |action: &str, field: &str| {
+            let call = read_input(&json!({"action":"batch","steps":[
+                {"action":action,"app":"Notes","window_id":41,"label":"Save"},
+                {"action":"scroll","coordinate":[790,450],field:"down","scroll_amount":3}
+            ]})).unwrap();
+            batch_argv(call.steps.as_deref().unwrap(), ShotFrame::UNIT).map_err(|error| error.to_string())
+        };
+        assert_eq!(batch("click", "direction"), batch("left_click", "scroll_direction"));
+        assert!(batch("click", "direction").is_ok());
+        assert_eq!(acts(action_named(" click ")), acts("left_click"));
+        assert_eq!(presses(action_named("click")), presses("left_click"));
+    }
+
+    /// The model is taught one name: the aliases lead to names the tool and
+    /// its schema already have, and the schema never shows an alias.
+    #[test]
+    fn the_aliases_lead_to_names_the_schema_has_and_never_show_in_it() {
+        let schema = tool_specs().pop().expect("one spec").input_schema;
+        let properties = &schema["properties"];
+        let actions: Vec<&str> = properties["action"]["enum"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        let steps = &properties["steps"]["items"]["properties"];
+        for (alias, name) in ACTION_ALIASES {
+            assert!(ACTIONS.iter().any(|(action, _)| action == name) && actions.contains(name), "{alias} -> {name}");
+            assert!(!actions.contains(alias), "{alias} is not taught");
+            assert!(!ACTIONS.iter().any(|(action, _)| action == alias), "{alias} is not an action of its own");
+        }
+        for (alias, name) in FIELD_ALIASES {
+            assert!(properties.get(*name).is_some() && steps.get(*name).is_some(), "{alias} -> {name}");
+            assert!(properties.get(*alias).is_none() && steps.get(*alias).is_none(), "{alias} is not taught");
+        }
+    }
+
     /// The tool's seat in a conversation once it is looked up, measured the
     /// way the harness measures every schema (the serialized definition,
     /// `chars/4 + 1`), and pinned from above so a batch's step items cannot
@@ -6271,10 +6599,11 @@ printf '%s
     /// clause; t-70459) ~29, and the desktop taken only for a step the person
     /// told it to do (foreground in the tool and a step, its sentences, a phone's
     /// borrowing; t-90094) ~206, and a phone's borrowing said only for its mirroring
-    /// window, three sentences shortened to pay for it (t-78118) ~+3.
+    /// window, three sentences shortened to pay for it (t-78118) ~+3, and the
+    /// person's own browser pausing input while they use it (t-106321) ~+10.
     #[test]
     fn the_computer_schema_is_measured() {
-        const CEILING_TOKENS: usize = 2_270;
+        const CEILING_TOKENS: usize = 2_280;
         let spec = tool_specs().pop().expect("one spec");
         let definition = json!({ "name": spec.name, "description": spec.description, "input_schema": spec.input_schema });
         let compact = serde_json::to_string(&definition).unwrap().chars().count();

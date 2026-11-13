@@ -1403,12 +1403,15 @@ function buildKnowledgeView() {
   underlay.setAttribute("aria-hidden", "true");
   const ties = document.createElementNS(SVG_NS, "g");
   ties.setAttribute("class", "knowledge-ties");
+  /* 묶음마다의 그라데이션(11-12) — 한 줄은 제가 잇는 두 군집의 색으로 물든다. */
+  const tieInks = document.createElementNS(SVG_NS, "defs");
+  tieInks.setAttribute("class", "knowledge-tie-inks");
   /* 놀라운 연결(t-12029)의 곡선과 번호, 그리고 곡선마다의 그라데이션. */
   const bridgeInks = document.createElementNS(SVG_NS, "defs");
   bridgeInks.setAttribute("class", "knowledge-bridge-inks");
   const bridges = document.createElementNS(SVG_NS, "g");
   bridges.setAttribute("class", "knowledge-bridges");
-  underlay.append(bridgeInks, ties, bridges);
+  underlay.append(bridgeInks, tieInks, ties, bridges);
   canvas.append(underlay, picture);
 
   /* 배율의 세 단추. 낱말은 에이전트 그래프의 것을 그대로 쓴다 — 같은 동작에
@@ -5309,6 +5312,16 @@ function paintKnowledgeFrame(view, layout, { cameraOnly = false } = {}) {
    * 원반을 잰 뒤에 긋는다(`clusterReach`는 그 손의 프레임이 채운다). */
   knowledgeTies(layout);
   const camera = knowledgeCamera(view, layout);
+  /* 우주가 평면 지도를 덮고 있는 동안에는 평면의 손이 쉰다(11-12) — 가려진 그림을 올림 · 고름 · 찾기 · 앉기마다 다시
+   * 그릴 까닭이 없고, GL 손이 쥔 그리기 버퍼(판 1,365 × 1,137 · dpr 2에서 약 25 MB)도 그동안 돌려준다. 카메라와 세로
+   * 눌림은 그대로 잰다 — 우주가 떠오르고 내려앉는 자세가 그 수를 읽는다. 우주가 떠나면 그 문
+   * (`leaveKnowledgeUniverse`)이 이 프레임을 다시 불러 평면이 제 크기로 선다. */
+  if (knowledgeUniverseCovers(view)) {
+    knowledgeSeatDrawY(layout, camera);
+    knowledgePainters.get(view)?.park?.();
+    dressKnowledgeUniverse(view);
+    return;
+  }
   knowledgePainterFor(view).paintFrame(layout, camera, { cameraOnly });
   paintKnowledgeTies(view, layout, camera);
   paintKnowledgeBridges(view, layout, camera);
@@ -5327,12 +5340,18 @@ function paintKnowledgeFrame(view, layout, { cameraOnly = false } = {}) {
  * 곡선 하나이고 휨은 틈의 `tieBend`, 배율 1에서 `tieBendMax` px까지라 확대해도 모양이 같다. 두 원반이 화면에서
  * `tieRoom` px보다 가까우면 긋지 않는다(그 틈에 선 줄은 원반의 테두리와 구별되지 않는다). 굵기는 쌍의 수에서
  * (`tieWidth` + √n × `tieGrow`), 옅기는 가장 굵은 쌍에 대한 몫에서 나오고 확대할수록 물러선다. 이름판에 올라
- * 섰거나 고른 군집에 닿는 줄은 그 군집의 잉크(`is-mine`), 목록에서 짚은 줄은 밝은 잉크(`is-hot`)이고, 그 밖에
+ * 섰거나 고른 군집에 닿는 줄은 그 군집의 잉크(`is-mine`), 목록에서 짚은 줄은 밝은 잉크(`is-hot`)이고, 쉬는 줄은 제가
+ * 잇는 두 군집의 색 사이를 흐른다(줄마다의 그라데이션 — 우주의 다발과 같은 빛깔, 색 칸이 없는 군집 쪽은 묶음의 잉크). 그 밖에
  * 사람이 무엇을 묻고 있으면(짚기·고르기·찾기·경로) 모든 줄이 물러선다 — 묶음은 지도의 바탕이지 답이 아니다.
  * 주변 탐색에는 줄이 없다. 줄은 수십이라 프레임마다 쓰고, 값이 같은 속성은 다시 쓰지 않는다. */
 function paintKnowledgeTies(view, layout, camera) {
   const host = view.querySelector(".knowledge-ties");
   if (host === null) return;
+  const inks = view.querySelector(".knowledge-tie-inks");
+  const hueInk = (rank) => {
+    const hue = layout.communityHue[rank];
+    return hue >= 0 ? `var(--knowledge-hue-${hue})` : "var(--knowledge-tie-ink)";
+  };
   writeAttribute(host.ownerSVGElement, "viewBox", `${camera.x} ${camera.y} ${camera.wide} ${camera.tall}`);
   const ties = layout.ring === null ? layout.ties : [];
   const tuning = layout.tuning;
@@ -5388,12 +5407,34 @@ function paintKnowledgeTies(view, layout, camera) {
     writeAttribute(line, "stroke-width", width.toFixed(2));
     writeAttribute(line, "stroke-opacity", alpha.toFixed(3));
     writeAttribute(line, "data-tie", String(at));
+    /* 줄의 잉크 — 왼쪽 군집의 색에서 오른쪽 군집의 색으로. 올리거나 고른 줄 · 짚은 줄은 스타일시트의 잉크를 입는다. */
+    let ink = inks.children[drawn];
+    if (!ink) {
+      ink = document.createElementNS(SVG_NS, "linearGradient");
+      ink.setAttribute("gradientUnits", "userSpaceOnUse");
+      ink.id = `knowledge-tie-ink-${drawn}`;
+      ink.append(document.createElementNS(SVG_NS, "stop"), document.createElementNS(SVG_NS, "stop"));
+      writeAttribute(ink.lastElementChild, "offset", "1");
+      inks.appendChild(ink);
+    }
+    writeAttribute(ink, "x1", startX.toFixed(digits));
+    writeAttribute(ink, "y1", startY.toFixed(digits));
+    writeAttribute(ink, "x2", endX.toFixed(digits));
+    writeAttribute(ink, "y2", endY.toFixed(digits));
+    writeAttribute(ink.firstElementChild, "style", `stop-color: ${hueInk(tie.left)}`);
+    writeAttribute(ink.lastElementChild, "style", `stop-color: ${hueInk(tie.right)}`);
+    if (mine || hot) {
+      if (line.hasAttribute("style")) line.removeAttribute("style");
+    } else {
+      writeAttribute(line, "style", `stroke: url(#${ink.id})`);
+    }
     const hue = mine ? layout.communityHue[spot] : -1;
     if (hue >= 0) writeAttribute(line, "data-hue", String(hue));
     else if (line.hasAttribute("data-hue")) line.removeAttribute("data-hue");
     drawn += 1;
   }
   while (host.children.length > drawn) host.lastElementChild.remove();
+  while (inks.children.length > drawn) inks.lastElementChild.remove();
   layout.tiesDrawn = drawn;
 }
 
@@ -5567,6 +5608,18 @@ function paintKnowledgeRingLabel(layout, at, node) {
  * 그림의 크기가 아니다. `mentions`는 본문의 대괄호일 뿐 이름이 아니므로 낱말을
  * 얻지 못한다.
  *
+ * 낱말은 **읽힐 틈이 있을 때만** 선다. 낱말은 제 선의 가운데에 서므로, 허브 하나를 고르면 가까운 이웃으로 가는
+ * 짧은 선들의 낱말이 한곳에 겹쳐 얼룩이 되고 고른 쪽과 그 이웃을 덮었다(실제 볼트 모양의 좁은 판에서
+ * `depends_on` 다섯이 한 덩어리). 그래서 긴 선부터 서고, 낱말의 상자가
+ *   · 먼저 선 낱말에 닿거나,
+ *   · 지금 밝은 점(짚거나 고른 쪽과 그 이웃, 경로의 점)을 덮거나,
+ *   · 제 선보다 긴 낱말인데 그려진 점을 하나라도 덮으면
+ * 서지 않는다 — 어느 것이든 제 선의 두 끝은 뺀다. 제 선보다 짧은 낱말은 물러선 점 위에 서도 된다(먼 군집으로
+ * 가는 긴 선의 가운데는 흔히 남의 군집 위이고, 낱말은 바탕색 테두리로 읽힌다). 제 선보다 긴 낱말은 선을 덮어
+ * 어느 선의 이름인지 말하지 못하므로 빈 땅에서만 선다 — 작은 볼트의 짧은 선 하나에 홀로 서는 낱말이 그것이다.
+ * 서지 못한 관계는 카드의 관계 줄이 말하고, 다가가면 점 사이가 벌어져 낱말이 선다. 점을 훑는 것은 낱말끼리의
+ * 물음을 넘긴 후보뿐이고, 덮인 점 하나를 찾으면 멈춘다.
+ *
  * 클래스는 **붙이기 전에** 쓴다. 이 층은 호버가 세는 그림(`.knowledge-picture`)
  * 안에 살고, 붙인 뒤에 class를 쓰면 그 쓰기가 호버 한 번의 값에 얹힌다 —
  * 하네스가 이웃 + 선 + 1을 재고 있는 바로 그 수다. */
@@ -5580,6 +5633,15 @@ function paintKnowledgeEdgeLabels(view, layout) {
   const held = layout.edgeLabels;
   const wanted = [];
   const drawnEdge = layout.drawnEdge;
+  const tuning = layout.tuning;
+  /* 화면 1px이 그래프 좌표로 얼마인가 — 첫 프레임 전에는 밝은 선이 없으니 1이어도 닿지 않는다. */
+  const inverse = layout.inverse > 0 ? layout.inverse : 1;
+  const tall = tuning.edgeLabelPx * inverse;
+  /* 낱말의 상자는 이름표의 상자와 같은 여백을 두른다(`--knowledge-label-pad-*`) — 글자가 닿을 듯 선 두 낱말도 얼룩이다. */
+  const padX = tuning.labelPadX * inverse;
+  const padY = tuning.labelPadY * inverse;
+  const drawn = layout.drawn;
+  const asked = [];
   for (let at = 0; at < model.edgeCount; at += 1) {
     /* 낱말을 얻는 것은 **방향이 있는** 관계뿐이다(3차). `related`는 색이 이미
      * 말하고 방향이 없어 낱말이 더하는 것이 없다 — 실제 볼트에서 허브 하나를
@@ -5589,6 +5651,42 @@ function paintKnowledgeEdgeLabels(view, layout) {
       && model.kind[at] !== KNOWLEDGE_EDGE_CODE.mentions
       && model.kind[at] !== KNOWLEDGE_EDGE_CODE.related;
     if (!shown) continue;
+    const wide = knowledgeLabelEm(knowledgeEdgeWord(model.kind[at]), tuning) * tall;
+    const long = Math.hypot(
+      layout.x[model.to[at]] - layout.x[model.from[at]],
+      layout.drawY[model.to[at]] - layout.drawY[model.from[at]],
+    );
+    asked.push({ at, long, wide, short: long < wide });
+  }
+  /* 긴 선부터 — 길이가 같으면 선의 번호로, 같은 그림은 언제나 같은 낱말을 세운다. */
+  asked.sort((one, other) => other.long - one.long || one.at - other.at);
+  const stood = [];
+  const pathNode = layout.focusEdgeCount > 0 ? layout.pathNode : null;
+  for (const { at, wide, short } of asked) {
+    const midX = (layout.x[model.from[at]] + layout.x[model.to[at]]) / 2;
+    const midY = (layout.drawY[model.from[at]] + layout.drawY[model.to[at]]) / 2;
+    let clear = true;
+    for (const other of stood) {
+      if (Math.abs(midX - other.midX) * 2 < wide + other.wide + padX * 4
+        && Math.abs(midY - other.midY) < tall + padY * 2) {
+        clear = false;
+        break;
+      }
+    }
+    if (!clear) continue;
+    const halfX = wide / 2 + padX;
+    const halfY = tall / 2 + padY;
+    const from = model.from[at];
+    const to = model.to[at];
+    for (let point = 0; point < model.count; point += 1) {
+      if (Math.abs(layout.x[point] - midX) >= halfX || Math.abs(layout.drawY[point] - midY) >= halfY) continue;
+      if (point === from || point === to || (drawn !== null && drawn[point] === 0)) continue;
+      if (!short && !layout.litNodes.has(point) && (pathNode === null || pathNode[point] !== 1)) continue;
+      clear = false;
+      break;
+    }
+    if (!clear) continue;
+    stood.push({ midX, midY, wide });
     let word = held.get(at);
     if (word === undefined) {
       word = document.createElementNS(SVG_NS, "text");
@@ -5607,8 +5705,6 @@ function paintKnowledgeEdgeLabels(view, layout) {
     }
     /* 점의 제목과 같은 손: 자리는 그래프 좌표로, 크기는 배율의 역수로. 이것이
      * 없으면 낱말이 그림과 함께 커져 배율 두 배에서 판을 뒤덮는다. */
-    const midX = (layout.x[model.from[at]] + layout.x[model.to[at]]) / 2;
-    const midY = (layout.drawY[model.from[at]] + layout.drawY[model.to[at]]) / 2;
     writeAttribute(
       word,
       "transform",

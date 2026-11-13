@@ -14,7 +14,7 @@ import { seedKnowledgeWindow } from "./knowledge-fixture.mjs";
 import { measureKnowledgeSupplyParity, measureKnowledgeSupplyScene, testKnowledgeSupply } from "./knowledge-supply.mjs";
 import { testKnowledgeUniverse, testKnowledgeUniverseBodies, testKnowledgeUniverseColour, testKnowledgeUniverseFilaments,
   testKnowledgeUniverseFocus, testKnowledgeUniverseGalaxies, testKnowledgeUniverseInspector, testKnowledgeUniverseLabels,
-  testKnowledgeUniverseMotion, testKnowledgeUniverseUnable } from "./knowledge-universe.mjs";
+  testKnowledgeUniverseMotion, testKnowledgeUniverseNav, testKnowledgeUniverseUnable } from "./knowledge-universe.mjs";
 import { seedUniverseVault } from "./knowledge-universe-fixture.mjs";
 
 const UI = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -2400,6 +2400,179 @@ ok("provenance: three toggles default on, a hidden road drops its lines and keep
     && provenanceLens.health?.note === "0" && provenanceLens.health?.disabled === true
     && JSON.stringify(provenanceLens.overview) === JSON.stringify(["measured=0", "declared=2", "inferred=2"]),
   JSON.stringify(provenanceLens));
+
+/* Test 11d-2: 관계의 낱말은 읽힐 틈이 있을 때만 선다(`paintKnowledgeEdgeLabels`).
+ *
+ * 허브 하나에 `depends_on` 잎 열넷. 낱말은 제 선의 가운데에 서므로, 멀리서 보면 낱말 열넷이 허브 둘레 한곳에
+ * 겹쳐 얼룩이 됐다(실제 볼트 모양의 좁은 판에서 본 흠). 배율 셋에서 같은 것을 다시 센다: 선 낱말끼리 상자가
+ * 겹치지 않고, 선 낱말은 제 선의 두 끝이 아닌 밝은 점을 덮지 않으며(제 선보다 긴 낱말은 어떤 점도), 서는
+ * 낱말의 수는 그 규칙을 따로 센 수와 같다. 멀리서는 몇만 서고, 다가가면 전부 선다. */
+const wordRoom = await page.evaluate(async () => {
+  const wait = (ms) => new Promise((done) => setTimeout(done, ms));
+  knowledgeSelectedKey = null;
+  knowledgeQuery = "";
+  knowledgeProvenanceHidden.clear();
+  const leaves = 14;
+  window.__VAULT__ = {
+    pages: leaves + 1,
+    customEdges: Array.from({ length: leaves }, (_, at) => ({ from: 0, to: at + 1, kind: "depends_on" })),
+  };
+  dropTab("knowledge");
+  document.getElementById("nav-knowledge").click();
+  await wait(400);
+  const view = document.querySelector(".knowledge-view:not([hidden])");
+  const layout = knowledgeLayouts.get(view);
+  const model = layout.model;
+  const tuning = layout.tuning;
+  const fit = layout.zoom;
+  const at = (zoom) => {
+    layout.zoom = zoom;
+    layout.zoomTaken = true;
+    paintKnowledgeFrame(view, layout);
+    litKnowledge(view, layout, "wiki/Page-0000.md");
+    const words = [...view.querySelectorAll(".knowledge-edge-label")];
+    const boxes = words.map((one) => one.getBoundingClientRect());
+    let overlaps = 0;
+    for (let one = 0; one < boxes.length; one += 1) {
+      for (let other = one + 1; other < boxes.length; other += 1) {
+        const a = boxes[one];
+        const b = boxes[other];
+        if (a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom) overlaps += 1;
+      }
+    }
+    /* 따로 세기: 긴 선부터, 먼저 선 상자에 닿지 않고, 제 끝이 아닌 밝은 점(제 선보다 긴 낱말은 어떤 점)을 덮지
+     * 않는 것만. */
+    const tall = tuning.edgeLabelPx * layout.inverse;
+    const wide = knowledgeLabelEm("depends_on", tuning) * tall;
+    const padX = tuning.labelPadX * layout.inverse;
+    const padY = tuning.labelPadY * layout.inverse;
+    const lines = [];
+    for (let edge = 0; edge < model.edgeCount; edge += 1) {
+      if (!layout.lit.has(edge)) continue;
+      lines.push({ edge,
+        long: Math.hypot(layout.x[model.to[edge]] - layout.x[model.from[edge]],
+          layout.drawY[model.to[edge]] - layout.drawY[model.from[edge]]),
+        midX: (layout.x[model.from[edge]] + layout.x[model.to[edge]]) / 2,
+        midY: (layout.drawY[model.from[edge]] + layout.drawY[model.to[edge]]) / 2 });
+    }
+    lines.sort((one, other) => other.long - one.long || one.edge - other.edge);
+    const stood = [];
+    let covering = 0;
+    for (const line of lines) {
+      if (stood.some((other) => Math.abs(line.midX - other.midX) < wide + padX * 2
+        && Math.abs(line.midY - other.midY) < tall + padY * 2)) continue;
+      let covers = false;
+      for (let point = 0; point < model.count && !covers; point += 1) {
+        covers = point !== model.from[line.edge] && point !== model.to[line.edge]
+          && (line.long < wide || layout.litNodes.has(point))
+          && Math.abs(layout.x[point] - line.midX) < wide / 2 + padX
+          && Math.abs(layout.drawY[point] - line.midY) < tall / 2 + padY;
+      }
+      if (covers) { covering += 1; continue; }
+      stood.push(line);
+    }
+    const seen = { zoom: Number(zoom.toFixed(3)), lit: layout.lit.size, points: layout.litNodes.size,
+      words: words.length, recount: stood.length, covering, overlaps };
+    litKnowledge(view, layout, null);
+    return seen;
+  };
+  const far = at(fit * 0.12);
+  const rest = at(fit);
+  const near = at(fit * 6);
+  layout.zoom = fit;
+  layout.zoomTaken = false;
+  paintKnowledgeFrame(view, layout);
+  return { leaves, far, rest, near };
+});
+ok("a relation's word stands only where it can be read — never two in one place, never over a lit page that is not its own line's end, a word longer than its line only on free ground, few from afar and all of them close up",
+  [wordRoom.far, wordRoom.rest, wordRoom.near].every((seen) => seen.lit === wordRoom.leaves
+    && seen.points === wordRoom.leaves + 1 && seen.words === seen.recount && seen.overlaps === 0)
+    && wordRoom.far.words < wordRoom.leaves / 2
+    && wordRoom.near.words === wordRoom.leaves && wordRoom.near.covering === 0
+    && wordRoom.rest.words >= wordRoom.far.words,
+  JSON.stringify(wordRoom));
+
+/* Test 11d-3: 전체 지도에서 색 없는 군집의 잎은 물러선다(`--knowledge-quiet-weight`, shell.css).
+ *
+ * 선이 없는 여섯 쪽 — 군집이 없으니 모두 색 없는 잎이다. 전체 지도에서 그 점의 채움은 안개색을 토큰의 몫만큼만
+ * 든 잉크(나머지는 바탕)이고 바탕과 3:1을 지킨다. 주변 탐색(`is-local`)의 옷에서는 그 잉크가 걸리지 않는다
+ * (그 판의 채움은 그라데이션이라 색으로 견주지 않고, 규칙이 거는 `--knowledge-tint`가 비었는지를 본다). 대표
+ * 지식과 중심의 단에는 어느 판에서도 걸리지 않는다. GL 손이 읽는 견본도 같은 답을 낸다. */
+const quietInk = await page.evaluate(async () => {
+  const wait = (ms) => new Promise((done) => setTimeout(done, ms));
+  knowledgeSelectedKey = null;
+  knowledgeQuery = "";
+  window.__VAULT__ = { pages: 6, customEdges: [] };
+  dropTab("knowledge");
+  document.getElementById("nav-knowledge").click();
+  await wait(300);
+  const view = document.querySelector(".knowledge-view:not([hidden])");
+  const picture = view.querySelector(".knowledge-picture:not(.knowledge-gl-swatch)");
+  const bytes = (word) => {
+    const into = new Float32Array(4);
+    knowledgeGlColor(word, into, 0);
+    return [into[0], into[1], into[2]].map((one) => Math.round(one * 255));
+  };
+  const probe = document.createElement("div");
+  view.appendChild(probe);
+  const inkOf = (name) => {
+    probe.style.color = `var(${name})`;
+    return bytes(getComputedStyle(probe).color);
+  };
+  const mist = inkOf("--ink-mist");
+  const ground = inkOf("--knowledge-ground");
+  probe.remove();
+  const weight = Number.parseFloat(getComputedStyle(view).getPropertyValue("--knowledge-quiet-weight")) / 100;
+  const want = mist.map((one, at) => Math.round(one * weight + ground[at] * (1 - weight)));
+  const quiet = "g.knowledge-node.is-page:not([data-hue])[data-tier=\"leaf\"] .knowledge-dot";
+  const dot = picture.querySelector(quiet);
+  const node = dot?.parentNode ?? null;
+  const tintOf = () => (node === null ? null : getComputedStyle(node).getPropertyValue("--knowledge-tint").trim());
+  const wasLocal = picture.classList.contains("is-local");
+  const global = dot === null ? null : bytes(getComputedStyle(dot).fill);
+  const tintGlobal = tintOf();
+  /* 같은 점을 다른 단으로 입혀 본다 — 규칙은 잎에만 걸린다. */
+  const tiers = {};
+  for (const tier of ["major", "core"]) {
+    node.dataset.tier = tier;
+    tiers[tier] = tintOf();
+  }
+  node.dataset.tier = "leaf";
+  picture.classList.add("is-local");
+  const tintLocal = tintOf();
+  picture.classList.toggle("is-local", wasLocal);
+  /* GL 손의 견본 — 판이 서 있을 때만 있다(작은 볼트는 SVG 손이 그린다). */
+  const swatchOf = (host) => {
+    const one = host?.querySelector(quiet) ?? null;
+    return one === null ? null : bytes(getComputedStyle(one).fill);
+  };
+  const swatchGlobal = swatchOf(document.querySelector("svg.knowledge-gl-swatch:not(.is-local):not(.is-tracing)"));
+  const swatchLocal = swatchOf(document.querySelector("svg.knowledge-gl-swatch.is-local:not(.is-focused)"));
+  const light = (rgb) => {
+    const [r, g, b] = rgb.map((one) => {
+      const part = one / 255;
+      return part <= 0.04045 ? part / 12.92 : ((part + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const contrast = (one, other) => {
+    const [high, low] = [light(one), light(other)].sort((a, b) => b - a);
+    return (high + 0.05) / (low + 0.05);
+  };
+  return { weight, mist, ground, want, global, tintGlobal, tintLocal, tiers, swatchGlobal, swatchLocal,
+    contrast: global === null ? null : Number(contrast(global, ground).toFixed(2)) };
+});
+{
+  const near = (one, other) => one !== null && other !== null && one.every((part, at) => Math.abs(part - other[at]) <= 2);
+  ok("on the whole map a leaf of a cluster without a colour steps back — its ink is the token's share of the mist ink over the ground and keeps 3:1 against it; the rule reaches no other tier and not the neighbourhood, and the GL hand's swatch answers the same",
+    quietInk.weight > 0 && quietInk.weight <= 1
+      && near(quietInk.global, quietInk.want) && (quietInk.weight === 1 || !near(quietInk.global, quietInk.mist))
+      && quietInk.tintGlobal !== "" && quietInk.tintLocal === ""
+      && quietInk.tiers.major === "" && quietInk.tiers.core === ""
+      && (quietInk.swatchGlobal === null || near(quietInk.swatchGlobal, quietInk.want))
+      && quietInk.contrast >= 3,
+    JSON.stringify(quietInk));
+}
 
 /* Test 11e(t-5966 G4): HTML로 내보내기. 단추 하나가 지금 렌즈의 부분그래프 — 점의 자리·쉬는 옷·
  * 선의 관계·근거·잉크 — 를 백엔드의 한 문(`second_brain_export_html`)에 건네고, 영수증을 토스트로
@@ -5434,7 +5607,7 @@ const fourteenTopics = topicVault({ sizes: [40, 36, 32, 30, 28, 26, 24, 22, 20, 
 /* 군집 사이 선은 묶어서(t-12029, 승인된 시안 v2 「bundle」). 다섯 주제(30·24·20·16·12쪽)에 주제 사이 선
  * 12·9·3·2·1·1가닥과 고아 넷. 쉬는 전체 지도에서 두 손 모두: 그려진 선은 한 군집 안의 선뿐이고(군집을 건너는
  * 낱낱의 선은 가운데를 덮지 않는다), 묶음은 선이 8가닥 이상인 쌍에만 한 줄씩이며 굵기가 그 수를 말한다
- * (0.9 + √n × 0.55 px). 「강한 묶음」 목록은 선이 많은 순. 한 군집을 고르거나 그 이름판에 포인터를 올리면 그
+ * (1 + √n × 0.26 px — 11-12에 가늘게), 쉬는 줄은 제가 잇는 두 군집의 색 사이를 흐른다. 「강한 묶음」 목록은 선이 많은 순. 한 군집을 고르거나 그 이름판에 포인터를 올리면 그
  * 군집을 건너는 낱낱의 선이 돌아오고 그 군집에 닿는 묶음은 제 잉크를 입는다. 짚은 점의 선은 군집을 건너도
  * 선다. 주변 탐색에는 묶음이 없고 선은 그대로다. */
 const bundleVault = topicVault({ sizes: [30, 24, 20, 16, 12],
@@ -5485,8 +5658,17 @@ const bundles = await glPage.evaluate(async ({ spec, starts }) => {
       const wanted = [...pairs].filter(([, count]) => count >= 8).map(([pair, count]) => `${pair}:${count}`).sort();
       const readTies = () => [...view.querySelectorAll(".knowledge-underlay .knowledge-tie")]
         .filter((line) => getComputedStyle(line).display !== "none")
-        .map((line) => ({ at: Number(line.dataset.tie), width: Number(line.getAttribute("stroke-width")),
-          mine: line.classList.contains("is-mine"), curved: /Q/u.test(line.getAttribute("d") ?? "") }));
+        .map((line) => {
+          /* 쉬는 줄은 제가 잇는 두 군집의 색 사이를 흐르는 그라데이션을 입는다(11-12) — 그 두 끝의 색을 함께 읽는다. */
+          const inkId = /url\(#(knowledge-tie-ink-\d+)\)/u.exec(line.getAttribute("style") ?? "")?.[1] ?? null;
+          const ink = inkId === null ? null : view.querySelector(`#${inkId}`);
+          return { at: Number(line.dataset.tie), width: Number(line.getAttribute("stroke-width")),
+            mine: line.classList.contains("is-mine"), curved: /Q/u.test(line.getAttribute("d") ?? ""),
+            inks: ink === null ? null : [...ink.querySelectorAll("stop")].map((stop) => stop.getAttribute("style") ?? "") };
+        });
+      /* 군집의 색 칸 — 줄의 두 끝이 입어야 할 잉크(색 칸이 없는 군집은 묶음의 잉크). */
+      const inkOf = (rank) => (layout.communityHue[rank] >= 0 ? `stop-color: var(--knowledge-hue-${layout.communityHue[rank]})`
+        : "stop-color: var(--knowledge-tie-ink)");
       const rest = drawnLines();
       const tiesAtRest = readTies();
       const listed = [...view.querySelectorAll(".knowledge-overview-ties .knowledge-inspector-row")]
@@ -5536,6 +5718,9 @@ const bundles = await glPage.evaluate(async ({ spec, starts }) => {
         widthsOk: tiesAtRest.every((one) => Math.abs(one.width
           - (layout.tuning.tieWidth + Math.sqrt(layout.ties[one.at].count) * layout.tuning.tieGrow)) < 0.01),
         curved: tiesAtRest.every((one) => one.curved),
+        restInked: tiesAtRest.every((one) => one.inks !== null && one.inks.length === 2
+          && one.inks[0] === inkOf(layout.ties[one.at].left) && one.inks[1] === inkOf(layout.ties[one.at].right)),
+        mineBare: tiesPicked.filter((one) => one.mine).every((one) => one.inks === null),
         least: layout.tuning.tieLeast, widthBase: layout.tuning.tieWidth, grow: layout.tuning.tieGrow,
         listed: listed.map((row) => layout.ties[row.tie]?.count ?? -1),
         listedWords: listed.every((row) => row.words.includes("↔")),
@@ -5568,12 +5753,12 @@ const bundles = await glPage.evaluate(async ({ spec, starts }) => {
     knowledgePainterKind = null;
   }
 }, { spec: bundleVault.spec, starts: bundleVault.starts });
-ok("the overview bundles the lines between clusters: at rest only a cluster's own lines stand, one tie per pair of eight lines or more speaks the count in its width, the strong ties list them, and picking or pointing at a cluster brings its lines back — on both hands",
+ok("the overview bundles the lines between clusters: at rest only a cluster's own lines stand, one tie per pair of eight lines or more speaks the count in its width and runs between its two clusters' colours, the strong ties list them, and picking or pointing at a cluster brings its lines back in that cluster's ink — on both hands",
   () => !bundles.thrown && bundles.rows.length === 2 && bundles.rows.every((row) => row.topics === 5 && row.named >= 5
-    && row.least === 8 && row.widthBase === 0.9 && row.grow === 0.55
+    && row.least === 8 && row.widthBase === 1 && row.grow === 0.26
     && row.restBetween === 0 && row.restDrawn === row.intra
     && row.wanted.length === 2 && JSON.stringify(row.drawnTies) === JSON.stringify(row.wanted)
-    && row.widthsOk && row.curved
+    && row.widthsOk && row.curved && row.restInked && row.mineBare
     && row.listed.length === row.wanted.length && row.listed.every((count, at, all) => at === 0 || all[at - 1] >= count)
     && row.listedWords
     && row.pickedDrawn === row.pickedWanted && row.pickedMine.length >= 1 && row.pickedMine.every(Boolean)
@@ -5745,7 +5930,9 @@ await step(5359, () => glPage.setViewportSize(spreadSeat));
 }
 
 /* 색이 다시 주제를 가른다(t-12029, 승인된 시안 v2 「colour」). 열넷의 주제에서 두 손 모두: 가장 큰 여덟만 여덟 칸을
- * 하나씩 입고 나머지는 색이 없다. 잎은 제 군집의 색 그대로(안개색을 섞지 않는다), 색 없는 군집의 쪽은 안개색이다
+ * 하나씩 입고 나머지는 색이 없다. 잎은 제 군집의 색 그대로(안개색을 섞지 않는다), 색 없는 군집의 잎은 안개색을
+ * `--knowledge-quiet-weight`의 몫만큼 든다(나머지는 바탕 — 시안 v2에서는 안개색 그대로였고, 실제 볼트 모양의
+ * 좁은 판에서 회색 군집이 색 군집보다 먼저 읽혀 2026-11-13에 낮췄다; 토큰이 100%면 시안 그대로다)
  * (SVG의 칠을 픽셀로). 모든 이름 있는 군집이 원반을 갖고(색 없는 군집은 안개색 원반 — GL은 예전에 그 원반을 아예
  * 그리지 않았다), 쉬는 원반에는 테두리가 없으며 밝힌 군집의 원반에만 선다(두 손). 범례는 색 여덟과 「작은 주제
  * n」 한 줄. */
@@ -5771,15 +5958,19 @@ const colours = await glPage.evaluate(async ({ spec }) => {
       const root = getComputedStyle(view);
       let leafChecked = 0;
       let leafMiss = 0;
+      const mist = rgb(root.getPropertyValue("--ink-mist").trim());
+      const ground = rgb(root.getPropertyValue("--knowledge-ground").trim());
+      const share = Number.parseFloat(root.getPropertyValue("--knowledge-quiet-weight")) / 100;
+      const quietLeaf = mist.map((one, part) => Math.round(one * share + ground[part] * (1 - share)));
       if (hand === "svg") {
         for (let at = 0; at < layout.count; at += 1) {
           if (layout.model.kinds[at] !== "page" || layout.tier[at] !== 0 || layout.community[at] >= named) continue;
           const dot = layout.nodeEls[at]?.querySelector(".knowledge-dot");
           if (!dot) continue;
           const own = hue[layout.community[at]];
-          const want = own >= 0 ? root.getPropertyValue(`--knowledge-hue-${own}`) : root.getPropertyValue("--ink-mist");
+          const want = own >= 0 ? rgb(root.getPropertyValue(`--knowledge-hue-${own}`).trim()) : quietLeaf;
           leafChecked += 1;
-          if (!near(rgb(getComputedStyle(dot).fill), rgb(want.trim()))) leafMiss += 1;
+          if (!near(rgb(getComputedStyle(dot).fill), want)) leafMiss += 1;
         }
       }
       /* 원반: 이름 있는 군집마다 하나, 쉬는 테두리 없음, 밝힌 군집에만 테두리. */
@@ -5817,7 +6008,7 @@ const colours = await glPage.evaluate(async ({ spec }) => {
     knowledgePainterKind = null;
   }
 }, { spec: fourteenTopics.spec });
-ok("colour sorts the topics again: the eight largest clusters wear the eight hues and the rest are quiet grey, leaves wear their cluster's full ink, every cluster has a flat disc whose edge stands only when lit, and the legend says eight colours and the smaller topics — on both hands",
+ok("colour sorts the topics again: the eight largest clusters wear the eight hues and the rest are quiet grey, leaves wear their cluster's full ink and a quiet cluster's leaves the token's share of the mist ink, every cluster has a flat disc whose edge stands only when lit, and the legend says eight colours and the smaller topics — on both hands",
   () => !colours.thrown && colours.rows.length === 2 && colours.rows.every((row) => row.named > 8 && row.huesOk
     && row.discs === row.named && row.restRims === 0 && row.pickedRims === 1
     && JSON.stringify(row.keys) === JSON.stringify([0, 1, 2, 3, 4, 5, 6, 7])
@@ -6500,6 +6691,7 @@ await step(6124, () => testKnowledgeUniverse(glPage, ok));
 await step(6125, () => testKnowledgeUniverseGalaxies(glPage, ok));
 await step(6126, () => testKnowledgeUniverseColour(glPage, ok));
 await step(6127, () => testKnowledgeUniverseBodies(glPage, ok));
+await step(6133, () => testKnowledgeUniverseNav(glPage, ok));
 await step(6128, () => testKnowledgeUniverseFilaments(glPage, ok));
 await step(6129, () => testKnowledgeUniverseFocus(glPage, ok));
 await step(6130, () => testKnowledgeUniverseInspector(glPage, ok));
