@@ -527,6 +527,141 @@ fn the_longest_line_the_limits_allow_fits_the_cap() {
     assert!(check(&definition).contains(&Refusal::NameLength));
 }
 
+/// A yes or a no is said as what it means in the person's words, on one
+/// line — never as the bare word, which under a name asked as a question
+/// reads as that question's answer. A choice's option and a score's level
+/// are said as they are shown.
+#[test]
+fn a_yes_or_no_is_said_as_what_it_means() {
+    let mut definition = yes_no("d-0000000a", "Checked before done");
+    definition.answer = Answer::YesNo {
+        yes: "Done was said\n  with no check run.".to_string(),
+        no: "A check ran, or nothing was changed.".to_string(),
+    };
+    let [yes, no] = AGENT_TOOL_ASK_OPTIONS;
+    assert_eq!(said(&definition, yes), "Done was said with no check run.");
+    assert_eq!(
+        said(&definition, no),
+        "A check ran, or nothing was changed."
+    );
+    assert_eq!(
+        line(&definition.name, &said(&definition, no), 0.99),
+        "「Checked before done」 판단: A check ran, or nothing was changed. (확신 99%)"
+    );
+    definition.answer = choice(&[("ship", "Ship it."), ("hold", "Hold it.")]);
+    assert_eq!(said(&definition, "ship"), "ship");
+    definition.answer = Answer::Score(vec!["Low.".to_string(), "High.".to_string()]);
+    assert_eq!(said(&definition, &shown_level(1, 2)), "2/2");
+}
+
+/// The longest meaning the check lets through is cut where its line would
+/// pass the cap, and wears the mark of a cut; under the longest name, at the
+/// surest answer, the line still fits. A meaning that fits is said whole.
+#[test]
+fn the_longest_meaning_is_cut_to_fit_the_line() {
+    let mut definition = yes_no("d-0000000a", &"가".repeat(NAME_MAX_CHARS));
+    definition.answer = Answer::YesNo {
+        yes: "나".repeat(MEANING_MAX_CHARS),
+        no: "다".repeat(SAID_MAX_CHARS),
+    };
+    assert_eq!(check(&definition), Vec::new());
+    let [yes, no] = AGENT_TOOL_ASK_OPTIONS;
+    let cut = said(&definition, yes);
+    assert_eq!(cut.chars().count(), SAID_MAX_CHARS);
+    assert!(cut.ends_with('…') && cut.starts_with('나'), "{cut}");
+    let handed = line(&definition.name, &cut, 1.0);
+    assert_eq!(handed.chars().count(), LINE_MAX_CHARS, "{handed}");
+    assert_eq!(said(&definition, no), "다".repeat(SAID_MAX_CHARS));
+}
+
+/// At a point no agent asked at, a yes-or-no decision speaks only of its
+/// yes: its no is the answer that nothing is worth a line. An agent that
+/// asked is told either. A choice's option and a score's level are always
+/// answers.
+#[test]
+fn unasked_a_yes_or_no_speaks_only_of_its_yes() {
+    let [yes, no] = AGENT_TOOL_ASK_OPTIONS;
+    let mut definition = yes_no("d-0000000a", "Visible");
+    for unasked in [Point::TurnStart, Point::BeforeCommand, Point::TurnEnd] {
+        definition.at = unasked;
+        assert!(speaks(&definition, yes), "{}", unasked.key());
+        assert!(!speaks(&definition, no), "{}", unasked.key());
+    }
+    definition.at = Point::AgentAsks;
+    assert!(speaks(&definition, yes) && speaks(&definition, no));
+    definition.at = Point::TurnEnd;
+    definition.answer = choice(&[("ship", "Ship it."), ("no", "Hold it.")]);
+    assert!(speaks(&definition, "no"), "a choice's own option named no");
+    definition.answer = Answer::Score(vec!["Low.".to_string(), "High.".to_string()]);
+    assert!(speaks(&definition, &shown_level(0, 2)));
+}
+
+/// What stands before the lines handed unasked says what they are in one
+/// line — nothing a model can take for a request — and keeps what a line
+/// tells the agent to do; it stands once, before every line, and not at all
+/// before none.
+#[test]
+fn the_intro_is_one_line_and_stands_once_before_the_lines() {
+    assert!(
+        !LINES_INTRO.contains('\n') && !LINES_INTRO.contains("  "),
+        "{LINES_INTRO}"
+    );
+    assert!(LINES_INTRO.contains("not a new request"), "{LINES_INTRO}");
+    assert!(LINES_INTRO.contains("do that too"), "{LINES_INTRO}");
+    assert_eq!(introduced(&[]), None);
+    let lines = ["one".to_string(), "two".to_string()];
+    assert_eq!(introduced(&lines), Some(format!("{LINES_INTRO}\none\ntwo")));
+}
+
+/// Within a room, two lines stand under one opening; the lines that do not
+/// fit after it are left out, in order; and a room the opening fills alone
+/// gives nothing at all, so a caller leaves its lines waiting (t-106308).
+#[test]
+fn the_lines_within_a_room_open_once_and_none_go_without_the_opening() {
+    let lines = ["one".to_string(), "two".to_string(), "three".to_string()];
+    let whole = introduced(&lines).expect("lines");
+    assert_eq!(
+        introduced_within(&lines, whole.chars().count()),
+        (Some(whole.clone()), 3)
+    );
+    assert_eq!(
+        introduced_within(&lines, whole.chars().count() - 1),
+        (Some(format!("{LINES_INTRO}\none\ntwo")), 2)
+    );
+    assert_eq!(
+        introduced_within(&lines[..2], usize::MAX)
+            .0
+            .map(|text| text.matches(LINES_INTRO).count()),
+        Some(1)
+    );
+    let opening = LINES_INTRO.chars().count();
+    assert_eq!(introduced_within(&lines, opening + 3), (None, 0));
+    assert_eq!(introduced_within(&lines, opening), (None, 0));
+    assert_eq!(introduced_within::<String>(&[], usize::MAX), (None, 0));
+}
+
+/// A meaning is read for a credential line by line when it is stored, and
+/// once more as the one line it is said on: digits that are a card's number
+/// only once two lines meet are never said, and neither is a control
+/// character. The bare word stands in for a meaning withheld.
+#[test]
+fn a_meaning_that_joins_into_a_credential_is_said_as_the_bare_word() {
+    let [yes, no] = AGENT_TOOL_ASK_OPTIONS;
+    let half = "42".repeat(4);
+    let mut definition = yes_no("d-0000000a", "Paid");
+    definition.answer = Answer::YesNo {
+        yes: format!("{half}\n{half}"),
+        no: "Nothing\u{1b}[31m was\u{7}paid.".to_string(),
+    };
+    assert_eq!(
+        check(&definition),
+        Vec::new(),
+        "each line alone passes the store's check"
+    );
+    assert_eq!(said(&definition, yes), yes);
+    assert_eq!(said(&definition, no), "Nothing [31m was paid.");
+}
+
 /// A score's level is shown counted from one over its levels, the way a
 /// person numbers them; the most levels a score offers still read whole.
 #[test]

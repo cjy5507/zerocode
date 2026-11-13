@@ -55,12 +55,7 @@ pub(crate) struct TeamDeleteInput {
     pub team_id: String,
 }
 
-pub(crate) use runtime::team_cron_registry::CronCreateInput;
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct CronDeleteInput {
-    pub cron_id: String,
-}
+pub(crate) use runtime::team_cron_registry::{CronCreateInput, CronDeleteInput};
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct CronRunDueInput {
@@ -300,8 +295,8 @@ fn cron_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
-            name: "CronDelete",
-            description: "Permanently remove a registered cron task record by ID.",
+            name: runtime::schedule_guard::DELETE_TOOL,
+            description: "Permanently remove a registered cron task record by ID (CronList names the IDs). A person at the session approves each deletion before it runs; where nobody can be asked it is refused.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -313,7 +308,7 @@ fn cron_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
-            name: "CronList",
+            name: runtime::schedule_guard::LIST_TOOL,
             description: "List all registered cron task records, their next due time, the time zone their schedules are read in, and the scheduler status.",
             input_schema: json!({
                 "type": "object",
@@ -398,13 +393,13 @@ pub(crate) fn dispatch(
                     .and_then(|parsed| run_cron_create(&ctx.crons, &parsed))
             }),
         ),
-        "CronDelete" => Some(
+        runtime::schedule_guard::DELETE_TOOL => Some(
             maybe_enforce_permission_check(enforcer, name, input).and_then(|()| {
                 from_value::<CronDeleteInput>(input)
                     .and_then(|parsed| run_cron_delete(&ctx.crons, &parsed))
             }),
         ),
-        "CronList" => Some(
+        runtime::schedule_guard::LIST_TOOL => Some(
             maybe_enforce_permission_check(enforcer, name, input)
                 .and_then(|()| run_cron_list(&ctx.crons)),
         ),

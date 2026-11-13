@@ -436,6 +436,54 @@ impl Refused {
             .into_iter()
             .find(|refused| refused.token() == token)
     }
+
+    /// Whether the door would give this refusal again to the same request
+    /// until something outside the asking program changes — and, when it
+    /// would, the clock span past which it may answer otherwise (t-106308).
+    /// A program that asks far more often than the door lets through (a
+    /// pane's agent runs thousands of commands a week) writes such a refusal
+    /// once per span, not once per ask. A settings file read again may lift
+    /// any of them sooner; the span is only the latest. `None` for a refusal
+    /// a moment's race or a server's own wait decides, which the next ask may
+    /// not meet.
+    #[must_use]
+    pub const fn repeats(self) -> Option<Span> {
+        match self {
+            // A key put in, consent given or the switch turned on shows in
+            // the settings file; with no new reading, an hour bounds it.
+            Self::NoKey | Self::Off | Self::NotConsented | Self::HourlyBudget => Some(Span::Hour),
+            Self::Budget => Some(Span::Day),
+            Self::SettingsChanged | Self::Resting => None,
+        }
+    }
+
+    /// Whether this refusal is the asking folder's own: the door refuses the
+    /// words of that folder and may let another folder's through in the same
+    /// span. A program that quiets a refusal that repeats ([`Self::repeats`])
+    /// quiets it for that folder alone; every other one holds for the
+    /// machine — the key, the switch, the day and the hours are the
+    /// machine's.
+    #[must_use]
+    pub const fn of_the_folder(self) -> bool {
+        match self {
+            Self::NotConsented => true,
+            Self::NoKey
+            | Self::Off
+            | Self::Budget
+            | Self::HourlyBudget
+            | Self::SettingsChanged
+            | Self::Resting => false,
+        }
+    }
+}
+
+/// The local clock span a refused request is refused for at the longest
+/// ([`Refused::repeats`]): the hour or the day the door counts it in
+/// ([`count::hour_of`], [`count::day_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Span {
+    Hour,
+    Day,
 }
 
 /// What the door is told about one request.
@@ -771,7 +819,7 @@ pub fn pass_within_the_hour(
         count::sent_in_the_hour(hour.decision).map_err(|_| Refused::HourlyBudget)?,
         count::sent_in_the_hour(hour.every).map_err(|_| Refused::HourlyBudget)?,
     );
-    if before.0 >= hour.decision_most || before.1 >= hour.every_most {
+    if hour.full_at(before) {
         return Err(Refused::HourlyBudget);
     }
     if let Err(refused) = take_an_hours_place(hour.decision, hour.decision_most)
@@ -782,6 +830,29 @@ pub fn pass_within_the_hour(
         return Err(refused);
     }
     Ok(cleared)
+}
+
+impl Hour<'_> {
+    /// Whether either hour is full at the counts `(decision, every)` — the
+    /// one comparison the door refuses on.
+    const fn full_at(self, (decision, every): (u64, u64)) -> bool {
+        decision >= self.decision_most || every >= self.every_most
+    }
+
+    /// Whether either hour is full now: what tells a [`Refused::HourlyBudget`]
+    /// that repeats until the hour ends from one a busy lock or a count that
+    /// did not read gave a moment's ask, which reads as not full. Read without
+    /// the lock, after the door let it go (t-106308).
+    #[must_use]
+    pub fn is_full(self) -> bool {
+        match (
+            count::sent_in_the_hour(self.decision),
+            count::sent_in_the_hour(self.every),
+        ) {
+            (Ok(decision), Ok(every)) => self.full_at((decision, every)),
+            _ => false,
+        }
+    }
 }
 
 fn return_hours(hour: Hour<'_>, before: (u64, u64)) -> Result<(), Refused> {

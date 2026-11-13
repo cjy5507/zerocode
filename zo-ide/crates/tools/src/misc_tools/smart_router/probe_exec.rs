@@ -15,7 +15,9 @@ use std::time::Duration;
 use api::{InputMessage, MessageRequest, OutputContentBlock};
 use runtime::{parse_probe_response, probe_prompt, ProbeAssessment};
 
-use crate::misc_tools::agent_tools::{build_provider_client_for_agent, shared_agent_runtime};
+use crate::misc_tools::agent_tools::{
+    build_provider_client_for_the_sessions_fast_model, shared_agent_runtime,
+};
 
 /// Hard wall for one probe call. A Fast-tier model answers the ~200-token
 /// classification prompt well inside this; anything slower forfeits the
@@ -112,13 +114,20 @@ pub(super) struct Admitted {
     /// seat records instead — a verdict nobody reads is not worth holding
     /// the first request for.
     pub(super) read: bool,
+    /// The person's classifier word is the one under which the chat probe is
+    /// called (`probed`). Not the same as `probe`: under that word a turn's
+    /// gate may still decline this task, and the control sample of an acting
+    /// seat runs the probe for it all the same — that row is what the seat's
+    /// judgment is compared with. Under any other word nobody is asked the
+    /// chat probe's question, for a route or for a row.
+    pub(super) word_probes: bool,
 }
 
 impl Admitted {
     /// A spawn's: its model reads the verdict; the probe runs under the
     /// person's probing classifier word alone.
     pub(super) const fn spawn(probe: bool) -> Self {
-        Self { probe, read: true }
+        Self { probe, read: true, word_probes: probe }
     }
 }
 
@@ -298,7 +307,7 @@ fn record_route_tax(attempt: &str, model: &str, status: &str, elapsed_ms: u64, o
 /// design below turned each one into silence rather than an error. Only an
 /// end-to-end test against a real HTTP endpoint can catch that class of bug,
 /// and the single thing preventing one was credential resolution inside
-/// [`build_provider_client_for_agent`].
+/// [`build_provider_client_for_the_sessions_fast_model`].
 ///
 /// When set, the probe — and only the probe — talks to this endpoint through a
 /// ChatGPT-backend (Codex Responses) client with a placeholder bearer. Every
@@ -308,8 +317,9 @@ const PROBE_BASE_URL_ENV: &str = "ZO_PROBE_BASE_URL";
 
 /// The client one probe batch sends on: the override endpoint when
 /// [`PROBE_BASE_URL_ENV`] names one, else the normally-resolved provider client
-/// for `model`.
-fn probe_client(model: &str) -> Option<api::ProviderClient> {
+/// for `model` — the fast model of the provider the session on
+/// `parent_model` runs on, on the login that session is on.
+fn probe_client(model: &str, parent_model: &str) -> Option<api::ProviderClient> {
     if let Some(base_url) = std::env::var(PROBE_BASE_URL_ENV)
         .ok()
         .map(|url| url.trim().to_string())
@@ -320,7 +330,7 @@ fn probe_client(model: &str) -> Option<api::ProviderClient> {
             "zo-probe-diagnostic-token",
         ));
     }
-    build_provider_client_for_agent(model).ok()
+    build_provider_client_for_the_sessions_fast_model(model, parent_model).ok()
 }
 
 fn probe_cache() -> &'static Mutex<HashMap<u64, Option<ProbeAssessment>>> {
@@ -366,10 +376,10 @@ fn parked_ms_for(kind: api::ProviderKind) -> u64 {
 }
 
 /// The model the probe itself runs on: the fast tier of the provider the
-/// session is on ([`crate::fanout::fast_tier_model`], the pick the fold and
-/// the lessons make), or `None` where that provider has none of its own — a
-/// person's own provider, a name the catalog does not know, a provider whose
-/// catalog lists no fast tier.
+/// session is on ([`crate::fanout::fast_tier_model`], the pick the fold
+/// makes), or `None` where that provider has none of its own — a person's
+/// own provider whose `providers` row names no `fast_model`, a name the
+/// catalog does not know, a provider whose catalog lists no fast tier.
 ///
 /// The probe carries the person's words (a turn's) or a helper's task (a
 /// spawn's). Until v1.1.146 its model was the router's Fast-role pick over
@@ -381,20 +391,13 @@ fn parked_ms_for(kind: api::ProviderKind) -> u64 {
 /// read at all: the callers build no model list for the probe.
 ///
 /// A session spelled `<provider key>/<id>` with one of the model catalog's
-/// own keys is on the provider that key names, whatever the id reads as
-/// (`ModelCatalog::provider_for_model`, asked first where the session's
-/// client is built). The pick reads the id after the slash, so where the two
-/// part — `openai/gemini-…`, or `google/<an id a person's own provider
-/// declares>` — the probe would be another provider's model than the
-/// session's: nobody is asked. Nor under a key the catalog does not have.
-/// Read from the letters alone: no catalog file, no discovery cache.
+/// own keys is on the provider that key names, whatever the id reads as, and
+/// so is a row the person wrote into the catalog: the probe asks that
+/// provider's fast model ([`crate::fanout::fast_tier_model`], which reads
+/// where the session's requests go in the order its client is built). In
+/// v1.1.146 and v1.1.147 the pick still read the id after the slash, so
+/// where key and id parted — `openai/gemini-…` — nobody was asked.
 fn probe_model(parent_model: &str) -> Option<String> {
-    if let Some((key, _)) = parent_model.trim().split_once('/') {
-        let keyed = runtime::model_catalog::CatalogProvider::from_key(key)?.kind();
-        if keyed != api::detect_provider_kind(parent_model) {
-            return None;
-        }
-    }
     crate::fanout::fast_tier_model(Some(parent_model))
 }
 
@@ -579,10 +582,13 @@ fn probe_and_shadow_judged(
         // clock, for the rows the judge compares. Only where the probe has a
         // model to ask: a session with no fast tier of its own has no probe
         // the judgment stood in for, and its control row would hold a cell
-        // that compares nothing.
+        // that compares nothing. And only under the word that calls the
+        // probe: a person on `deterministic` or `assisted` was told no
+        // provider is asked, and until v1.1.148 one task in five an acting
+        // seat routed went to the fast model for this row.
         let control = active
             .control
-            .filter(|_| probe_has_a_model(parent_model))
+            .filter(|_| admitted.word_probes && probe_has_a_model(parent_model))
             .map(|batch| super::decision_shadow::fire_control(batch, parent_model));
         return (results, control);
     }
@@ -684,7 +690,7 @@ pub(super) fn probe_slots(
         fail_misses(&mut slots, &misses, road, &model, FAIL_PROVIDER_PARKED);
         return slots;
     }
-    let Some(client) = probe_client(&model) else {
+    let Some(client) = probe_client(&model, parent_model) else {
         // One failure per task that lost its probe, not one per batch — a
         // credential-less environment should read as "every probe gave up",
         // which is what the count then says.
@@ -756,7 +762,9 @@ async fn timed_probe_call(
 
 fn probe_request(model: &str, description: &str, prompt: &str) -> MessageRequest {
     MessageRequest {
-        model: model.to_string(),
+        // The id the endpoint knows the model by: a provider of the person's
+        // is named `<provider>/<id>` here, and is asked for `<id>`.
+        model: api::wire_model_id(model),
         max_tokens: PROBE_MAX_TOKENS,
         messages: vec![InputMessage::user_text(probe_prompt(description, prompt))],
         system: None,
@@ -818,74 +826,46 @@ mod tests {
         );
     }
 
-    /// A person's own providers declared for as long as it lives, on a config
-    /// home of its own, and what stood there put back when it goes. Declared
-    /// after the environment lock's guard, so it goes first.
-    struct OwnProvidersDeclared {
-        providers: Option<std::ffi::OsString>,
-        home: Option<std::ffi::OsString>,
-        dir: std::path::PathBuf,
-    }
-
-    impl OwnProvidersDeclared {
-        fn new(providers: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("zo-tools-probe-own-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("a config home");
-            let home = std::env::var_os(core_types::paths::ZO_CONFIG_HOME_ENV);
-            std::env::set_var(core_types::paths::ZO_CONFIG_HOME_ENV, &dir);
-            let before = std::env::var_os(api::CUSTOM_PROVIDERS_ENV);
-            std::env::set_var(api::CUSTOM_PROVIDERS_ENV, providers);
-            api::refresh_custom_providers_from_env();
-            Self { providers: before, home, dir }
-        }
-    }
-
-    impl Drop for OwnProvidersDeclared {
-        fn drop(&mut self) {
-            match self.providers.take() {
-                Some(before) => std::env::set_var(api::CUSTOM_PROVIDERS_ENV, before),
-                None => std::env::remove_var(api::CUSTOM_PROVIDERS_ENV),
-            }
-            api::refresh_custom_providers_from_env();
-            match self.home.take() {
-                Some(home) => std::env::set_var(core_types::paths::ZO_CONFIG_HOME_ENV, home),
-                None => std::env::remove_var(core_types::paths::ZO_CONFIG_HOME_ENV),
-            }
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-
     /// A session spelled `<provider key>/<id>` is on the provider its key
-    /// names. Where the id after the slash reads as another provider's — a
-    /// Google id under OpenAI's key, an id a person's own provider declares
-    /// under Google's — the probe would go where the session does not, so
-    /// nobody is asked. Where key and id agree, and for a bare id, the probe
-    /// asks that provider's fast model as before.
+    /// names, and the probe asks that provider's fast model whatever the id
+    /// after the slash reads as: a Google id under OpenAI's key is asked on
+    /// OpenAI, an id a person's own provider declares under Google's key on
+    /// Google. Those are the accounts such a session's own requests go on.
+    /// A word before the slash that names nobody leaves the id to be read.
     #[test]
-    fn a_session_keyed_to_another_provider_than_its_id_reads_as_asks_nobody() {
-        let _held = crate::tests::env_lock()
+    fn a_session_keyed_to_a_provider_asks_that_providers_fast_model() {
+        let held = crate::tests::env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _own = OwnProvidersDeclared::new(
+        let _home = crate::tests::ConfigHome::empty(&held);
+        let _own = crate::tests::OwnProviders::declared(
+            &held,
             r#"[{"name":"zqrelay","base_url":"https://relay.invalid/v1","models":["gemini-zq-own"],"requires_auth":false}]"#,
         );
-        assert_eq!(probe_model("google/gemini-zq-own"), None, "Google's by its key, the relay's by its id");
-        assert_eq!(probe_model("openai/gemini-3.5-flash"), None, "OpenAI's by its key, Google's by its id");
-        assert_eq!(probe_model("zqnobody/gpt-zq-probe-session"), None, "a key the catalog does not have");
-        assert!(!probe_has_a_model("google/gemini-zq-own"));
-
         let asked = |parent: &str| probe_model(parent).map(|model| api::resolve_model_alias(&model));
         let haiku = api::resolve_model_alias("haiku");
+        let google = asked("gemini-zq-probe-session");
+        assert!(
+            google.as_deref().is_some_and(|model| model.starts_with("gemini")),
+            "a Gemini session asks a Gemini model: {google:?}"
+        );
+
+        // The key's provider, where key and id part.
+        assert_eq!(asked("google/gemini-zq-own"), google, "Google's by its key, the relay's by its id");
+        assert_eq!(asked("openai/gemini-3.5-flash").as_deref(), Some("gpt-5.6-luna"), "OpenAI's by its key");
+        assert!(probe_has_a_model("google/gemini-zq-own"));
+        // Bare, the relay's id is the relay's session, and the relay has no
+        // fast model of its own.
+        assert_eq!(asked("gemini-zq-own"), None);
+        // And where they agree, as before.
         assert_eq!(asked("anthropic/claude-zq-probe-session"), Some(haiku.clone()));
         assert_eq!(asked("claude/claude-zq-probe-session"), Some(haiku));
         assert_eq!(asked("openai/gpt-zq-probe-session").as_deref(), Some("gpt-5.6-luna"));
-        let google = asked("google/gemini-zq-probe-session");
-        assert!(
-            google.as_deref().is_some_and(|model| model.starts_with("gemini")),
-            "Google's key over a Google id: {google:?}"
-        );
+        assert_eq!(asked("google/gemini-zq-probe-session"), google);
         assert_eq!(asked("gpt-zq-probe-session").as_deref(), Some("gpt-5.6-luna"), "a bare id");
+        // A key the catalog does not have names nobody: the id is read.
+        assert_eq!(asked("zqnobody/gpt-zq-probe-session").as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(asked("zqnobody/zq-some-model"), None);
     }
 
     /// A session whose provider has no fast model of its own has nobody to
@@ -944,7 +924,7 @@ mod live_path_tests {
             prompt,
             runtime::RoutingFacts::default(),
             "",
-            super::Admitted { probe: true, read: true },
+            super::Admitted { probe: true, read: true, word_probes: true },
         )
     }
 
@@ -1261,6 +1241,45 @@ mod live_path_tests {
     /// sides: a Codex-shaped probe endpoint and a System One endpoint speaking
     /// its documented contract (`docs/design/jev-decision-shadow-20260917.md`
     /// §4 — tools).
+    /// A person's own endpoint is asked for its fast model by the id the
+    /// endpoint knows it by. Here the model is named `<provider>/<id>`, so
+    /// that it is that provider's and no other's; sent as it is named, the
+    /// endpoint knew no such model and refused — the probe fell back to the
+    /// tables and the fold to the cut, after the turn's words and a tool's
+    /// whole output had left in requests that could not be answered.
+    #[test]
+    fn a_persons_own_endpoint_is_asked_for_its_fast_model_by_its_own_id() {
+        const REPLY: &str = r#"{"id":"zq","object":"chat.completion","model":"zq-wire-small","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+        let held = env_lock();
+        let _home = crate::tests::ConfigHome::empty(&held);
+        let _no_override = crate::tests::Var::unset(&held, PROBE_BASE_URL_ENV);
+        let endpoint = MockCodex::serving("HTTP/1.1 200 OK", "application/json", REPLY.to_string());
+        let _own = crate::tests::OwnProviders::declared(
+            &held,
+            &format!(
+                r#"[{{"name":"zqwire","base_url":"http://{}/v1","requires_auth":false,
+                     "models":["zq-wire-big","zq-wire-small"],"fast_model":"zq-wire-small"}}]"#,
+                endpoint.addr
+            ),
+        );
+        let named = super::probe_model("zq-wire-big").expect("the provider names its fast model");
+        assert_eq!(named, "zqwire/zq-wire-small");
+
+        // The probe of a task, and the one request a fold makes.
+        let task = format!("zq wire probe {}", std::process::id());
+        let _ = super::probe_slots("zq-wire-big", &[("", task.as_str())], "", super::ProbeUse::Routing);
+        let fold = crate::fast_model::FastModel::dialling(named, Some("zq-wire-big"))
+            .expect("a client for the person's endpoint");
+        let _ = fold.reply(&["zq wire system".to_string()], "zq wire fold", 64, std::time::Duration::from_secs(10));
+
+        let asked = endpoint.requests();
+        assert!(asked.len() >= 2, "the probe and the fold both reached the endpoint: {asked:?}");
+        for body in &asked {
+            let body: serde_json::Value = serde_json::from_str(body).expect("a JSON request");
+            assert_eq!(body["model"], "zq-wire-small", "{body}");
+        }
+    }
+
     mod decision_shadow {
         use std::ffi::OsString;
         use std::io::Write;
@@ -1523,7 +1542,7 @@ mod live_path_tests {
                 &[],
                 "turn-7@1",
                 deadline,
-                super::super::Admitted { probe: true, read: true },
+                super::super::Admitted { probe: true, read: true, word_probes: true },
             );
             let returned = started.elapsed();
             if let Some(shadow) = shadow {
@@ -2162,7 +2181,7 @@ mod live_path_tests {
                 &[],
                 "turn-7@1",
                 UNHURRIED,
-                super::super::Admitted { probe: true, read: true },
+                super::super::Admitted { probe: true, read: true, word_probes: true },
             );
 
             assert_eq!(results[0].expect("the judgment routed").complexity, RouteTaskComplexity::Large);
@@ -2171,6 +2190,39 @@ mod live_path_tests {
             let rows = env.rows();
             assert_eq!(rows.len(), 1, "the active row and no control row beside it: {rows:?}");
             assert_eq!(rows[0].route_use, DecisionRouteUse::Applied);
+        }
+
+        /// Under a classifier word that does not probe, a sampled task an
+        /// acting seat routed draws no control: `deterministic` and
+        /// `assisted` ask no provider, for a route or for a row. Under the
+        /// probing word the control runs even where the probe itself was
+        /// declined for the task — a turn's gate refused it — because that
+        /// row is all the seat's judgment of such a task is compared with.
+        #[test]
+        fn a_task_sampled_under_a_word_that_does_not_probe_draws_no_control_row() {
+            let probe = MockCodex::sse(responses_sse(PROBE_ANSWER));
+            let judgment = judging(judgment_answer());
+            let env = ShadowEnv::new(probe.addr, judgment.addr, Some("test-key"));
+            env.set_mode(Some("on"));
+            let routed = |label: &str, admitted: super::super::Admitted| {
+                let picked = sampled_for("", label);
+                let (results, control) =
+                    probe_and_shadow("gpt-5.5-codex", &[("", picked.as_str())], &[], "turn-7@1", UNHURRIED, admitted);
+                assert_eq!(results[0].expect("the judgment routed").complexity, RouteTaskComplexity::Large);
+                control.map(|control| api::sync_bridge::run_blocking(control).expect("the control ran to its end"))
+            };
+
+            // A spawn under `deterministic` or `assisted`.
+            let before = env.rows().len();
+            assert!(routed("control-word-off", super::super::Admitted::spawn(false)).is_none(), "a control was fired");
+            assert!(probe.requests().is_empty(), "the chat probe was asked under a word that asks no provider");
+            assert_eq!(env.rows().len() - before, 1, "the active row and no control row beside it");
+
+            // A turn the gate declined, under `probed`: the control is the probe's only run.
+            let declined = super::super::Admitted { probe: false, read: true, word_probes: true };
+            assert!(routed("control-word-on", declined).is_some(), "no control was fired");
+            assert_eq!(probe.requests().len(), 1, "the control's probe");
+            assert!(env.rows().last().is_some_and(|row| row.route_use == DecisionRouteUse::Control));
         }
 
         #[test]
@@ -2262,7 +2314,7 @@ mod live_path_tests {
                     &[],
                     "turn-7@1",
                     WALL,
-                    super::super::Admitted { probe: true, read: true },
+                    super::super::Admitted { probe: true, read: true, word_probes: true },
                 );
                 let returned = started.elapsed();
                 let written = env.rows().len() - before;

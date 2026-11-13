@@ -289,7 +289,27 @@ pub fn memo_path(wire: &Wire) -> Option<PathBuf> {
 /// been left at `auto` with nothing deciding (2026-09-20, "전부 자동 기록하며
 /// 실제 적용되어야").
 pub fn record_rows(seat: &JevUse, ledger: &Path, rows: &[Value], now_ms: i64) {
-    append_rows(ledger, rows);
+    record(seat, ledger, rows, now_ms, None);
+}
+
+/// [`record_rows`] into a ledger zo appends to as well, kept within the one
+/// bound zo keeps on it ([`zerocode_core::jev::journal::LEDGER_MAX_BYTES`]):
+/// past it, the ledger keeps its newer half before the rows go in — whoever
+/// writes, the ledger is cut the same.
+pub(crate) fn record_bounded_rows(seat: &JevUse, ledger: &Path, rows: &[Value], now_ms: i64) {
+    record(
+        seat,
+        ledger,
+        rows,
+        now_ms,
+        Some(zerocode_core::jev::journal::LEDGER_MAX_BYTES),
+    );
+}
+
+fn record(seat: &JevUse, ledger: &Path, rows: &[Value], now_ms: i64, bound: Option<u64>) {
+    if let Err(why) = append_rows_inner(ledger, rows, false, bound) {
+        said_unwritten(ledger, &why);
+    }
     if !seat.promotes {
         return;
     }
@@ -437,13 +457,18 @@ fn standing_at(
 /// named by the ledger file's own stem, so the sentence cannot name one use
 /// while the bytes go to another.
 pub fn append_rows(ledger: &Path, rows: &[Value]) {
-    if let Err(why) = append_rows_inner(ledger, rows, false) {
-        let what = ledger.file_stem().map_or_else(
-            || ledger.to_string_lossy(),
-            std::ffi::OsStr::to_string_lossy,
-        );
-        eprintln!("orchestration: the {what} record was not written: {why}");
+    if let Err(why) = append_rows_inner(ledger, rows, false, None) {
+        said_unwritten(ledger, &why);
     }
+}
+
+/// Say once on stderr that `ledger` would not take its rows.
+fn said_unwritten(ledger: &Path, why: &std::io::Error) {
+    let what = ledger.file_stem().map_or_else(
+        || ledger.to_string_lossy(),
+        std::ffi::OsStr::to_string_lossy,
+    );
+    eprintln!("orchestration: the {what} record was not written: {why}");
 }
 
 /// Append a receipt whose successful write is part of acknowledging an effect.
@@ -451,10 +476,17 @@ pub fn append_rows(ledger: &Path, rows: &[Value]) {
 /// # Errors
 /// The ledger could not be created or written.
 pub fn append_rows_checked(ledger: &Path, rows: &[Value]) -> std::io::Result<()> {
-    append_rows_inner(ledger, rows, true)
+    append_rows_inner(ledger, rows, true, None)
 }
 
-fn append_rows_inner(ledger: &Path, rows: &[Value], durable: bool) -> std::io::Result<()> {
+/// Append `rows` under the ledger's lock — past `bound`, when one is kept,
+/// cutting it to its newer half first.
+fn append_rows_inner(
+    ledger: &Path,
+    rows: &[Value],
+    durable: bool,
+    bound: Option<u64>,
+) -> std::io::Result<()> {
     if rows.is_empty() || !zerocode_core::jev::erase::may_write(ledger) {
         return Ok(());
     }
@@ -465,6 +497,9 @@ fn append_rows_inner(ledger: &Path, rows: &[Value], durable: bool) -> std::io::R
     let rows = zerocode_core::jev::erase::rows_may_write(ledger, rows);
     if rows.is_empty() {
         return Ok(());
+    }
+    if let Some(bound) = bound {
+        zerocode_core::jev::journal::keep_within(ledger, bound)?;
     }
     let mut said = String::new();
     for row in rows {
@@ -716,6 +751,33 @@ pub struct Wire {
     review_origin: Option<(String, String)>,
 }
 
+/// A person's decision's hour files, as the wire hands them to the door
+/// ([`door::Hour`]): the bound every decision shares is read from the
+/// settings the door reads, as zo's door reads it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DecisionHour<'a> {
+    /// The decision's own hour file ([`count::hour_path`] under its id).
+    pub(crate) decision: &'a Path,
+    /// The most it sends in an hour.
+    pub(crate) decision_most: u64,
+    /// The hour file every decision shares
+    /// ([`zerocode_core::jev::custom::EVERY_DECISION`]).
+    pub(crate) every: &'a Path,
+}
+
+impl<'a> DecisionHour<'a> {
+    /// The hours as the door counts them, with the bound every decision
+    /// shares read from `root`, the settings the door reads.
+    fn of_the_door(self, root: &Value) -> door::Hour<'a> {
+        door::Hour {
+            decision: self.decision,
+            decision_most: self.decision_most,
+            every: self.every,
+            every_most: door::custom_hourly_requests(root),
+        }
+    }
+}
+
 /// A key as the wire keeps it: trimmed, and empty is none.
 fn trimmed(key: Option<String>) -> Option<String> {
     key.map(|key| key.trim().to_string())
@@ -935,9 +997,14 @@ impl Wire {
     /// Whether current global settings still authorize effects in this workspace.
     #[must_use]
     pub(crate) fn permits_workspace_now(&self, workspace: Option<&Path>) -> bool {
+        workspace.is_some_and(self.permits_workspaces_now())
+    }
+
+    /// [`Self::permits_workspace_now`] for any number of folders, the settings
+    /// read once now.
+    pub(crate) fn permits_workspaces_now(&self) -> impl Fn(&Path) -> bool {
         let settings = JevSettings::from_root(&self.settings_root()).resolved();
-        settings.enabled
-            && workspace.is_some_and(|path| settings.consents(&door::resolved_path(path)))
+        move |path| settings.enabled && settings.consents(&door::resolved_path(path))
     }
 
     fn response_is_current(
@@ -964,7 +1031,10 @@ impl Wire {
     }
 
     /// Ask the door about one request of `row`'s, its facts read now: the
-    /// person's settings, the workspace, the day's count.
+    /// person's settings, the workspace, the day's count — and, for a
+    /// person's decision, its two hours ([`door::pass_within_the_hour`]),
+    /// which keep no memo: a decision's every answer is a request its hours
+    /// count.
     fn pass(
         &self,
         row: &JevUse,
@@ -972,6 +1042,7 @@ impl Wire {
         workspace: Option<&Path>,
         body: Value,
         memo: Option<Memo<'_>>,
+        hour: Option<DecisionHour<'_>>,
     ) -> Result<(Passed, JevSettings, zerocode_core::jev::JevMode), Refused> {
         let root = self.settings_root();
         let settings = JevSettings::from_root(&root).resolved();
@@ -980,21 +1051,31 @@ impl Wire {
             .config_home()
             .map(|home| count::requests_path(home, &today()))
             .unwrap_or_default();
-        door::pass_remembering(
-            |asking| {
-                let cleared = door::may_send(row, asking, body)?;
-                if row.word_in(&root).is_none() || row.mode_in(&root).asks() {
-                    Ok(cleared)
-                } else {
-                    Err(Refused::Off)
-                }
-            },
-            key,
-            &settings,
-            workspace.as_deref(),
-            &requests,
-            memo,
-        )
+        let ask = |asking: &door::Asking<'_>| {
+            let cleared = door::may_send(row, asking, body)?;
+            if row.word_in(&root).is_none() || row.mode_in(&root).asks() {
+                Ok(cleared)
+            } else {
+                Err(Refused::Off)
+            }
+        };
+        match hour {
+            None => {
+                door::pass_remembering(ask, key, &settings, workspace.as_deref(), &requests, memo)
+            }
+            Some(hour) => door::pass_within_the_hour(
+                ask,
+                key,
+                &settings,
+                workspace.as_deref(),
+                &requests,
+                hour.of_the_door(&root),
+            )
+            .map(|cleared| Passed {
+                cleared,
+                memo: None,
+            }),
+        }
         .map(|mut passed| {
             if zerocode_core::jev::promote::label_drafts_wanted(&root)
                 && let (Some(home), Some(workspace)) = (self.config_home(), workspace.as_deref())
@@ -1158,6 +1239,42 @@ impl Wire {
         deadline: Duration,
         memo: Option<Memo<'_>>,
     ) -> Asked {
+        self.ask_through_the_door(row, workspace, body, deadline, memo, None)
+    }
+
+    /// One request of a person's decision (t-106308): [`Self::ask`] through
+    /// the door zo's decisions pass ([`door::pass_within_the_hour`]) — the
+    /// decision's own hour and the hour every decision shares counted in the
+    /// files zo counts them in, beside the day. Blocks like [`Self::ask`].
+    #[must_use]
+    pub(crate) fn ask_within_the_hour(
+        &self,
+        row: &JevUse,
+        workspace: Option<&Path>,
+        body: Value,
+        deadline: Duration,
+        hour: DecisionHour<'_>,
+    ) -> Asked {
+        self.ask_through_the_door(row, workspace, body, deadline, None, Some(hour))
+    }
+
+    /// Whether `hour` is full now, by the door's own rule
+    /// ([`door::Hour::is_full`]) with the bound the settings hold: a refusal
+    /// of an hour that repeats until it ends, not a busy lock's.
+    #[must_use]
+    pub(crate) fn hour_is_full(&self, hour: DecisionHour<'_>) -> bool {
+        hour.of_the_door(&self.settings_root()).is_full()
+    }
+
+    fn ask_through_the_door(
+        &self,
+        row: &JevUse,
+        workspace: Option<&Path>,
+        body: Value,
+        deadline: Duration,
+        memo: Option<Memo<'_>>,
+        hour: Option<DecisionHour<'_>>,
+    ) -> Asked {
         let began = Instant::now();
         let deadline = began + deadline;
         let refused = |refusal: Refused| Asked {
@@ -1187,6 +1304,7 @@ impl Wire {
             workspace,
             body,
             memo,
+            hour,
         ) {
             Ok(passed) => passed,
             Err(refusal) => return refused(refusal),
@@ -1603,6 +1721,29 @@ fn failure(err: &reqwest::Error) -> String {
 /// The local day, on this machine's clock, a request is counted in — the
 /// door's, and the dashboard's count of it (`typesafe_settings::read_day`).
 pub(crate) fn today() -> String {
+    let (now_ms, offset_minutes) = local_now();
+    count::day_of(now_ms, offset_minutes)
+}
+
+/// The local day a request at `now_ms` is counted in, on the clock [`today`]
+/// reads.
+pub(crate) fn day_at(now_ms: i64) -> String {
+    let offset_minutes =
+        i32::try_from(crate::automation_runtime::local_offset_secs() / 60).unwrap_or(0);
+    count::day_of(now_ms, offset_minutes)
+}
+
+/// The local hour a person's decision's request is counted in at `now_ms`
+/// ([`count::hour_of`]), on the clock [`today`] reads.
+pub(crate) fn hour_at(now_ms: i64) -> String {
+    let offset_minutes =
+        i32::try_from(crate::automation_runtime::local_offset_secs() / 60).unwrap_or(0);
+    count::hour_of(now_ms, offset_minutes)
+}
+
+/// Now, in Unix milliseconds, and the local clock's offset from UTC in
+/// minutes.
+fn local_now() -> (i64, i32) {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| {
@@ -1610,7 +1751,7 @@ pub(crate) fn today() -> String {
         });
     let offset_minutes =
         i32::try_from(crate::automation_runtime::local_offset_secs() / 60).unwrap_or(0);
-    count::day_of(now_ms, offset_minutes)
+    (now_ms, offset_minutes)
 }
 
 pub(crate) mod latest;

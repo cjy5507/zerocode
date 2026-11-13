@@ -1,7 +1,8 @@
 //! Decisions a person makes (t-62170): the definition the window writes, the
 //! rules a definition keeps before anything stores it, and the question it
-//! asks System One. Nothing asks one yet — zo's four points come next, and
-//! the window's editor after them.
+//! asks System One. zo asks one at its four points, the window asks the
+//! ones at a shell command and a turn's end for the agents in its panes, and
+//! both read the answer and keep its row as [`answered`] does.
 //!
 //! A definition is one version, never rewritten. Its version is the SHA-256
 //! of the bytes [`Definition::to_bytes`] writes, so a word changed anywhere is
@@ -25,9 +26,15 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use super::JevMode;
+use super::{AGENT_TOOL_ASK_OPTIONS, JevMode};
 
+pub mod answered;
 pub mod store;
+
+pub use answered::{
+    DecisionRow, Lent, Reading, body_of, deadline_at, earns_its_line, lent_at_turn_end,
+    lent_before_command, nearest_level, read, standing,
+};
 
 /// The shape a definition ([`Definition::to_bytes`]) and the store's own files are written in; a file of another is not read.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -97,7 +104,9 @@ const KIND_SCORE: &str = "score";
 /// What a definition's `folders` holds for every folder the person consented to.
 const CONSENTED: &str = "consented";
 
-/// Whose turns a decision asks in: zo's own; a Claude Code or Codex pane is a later stage's.
+/// The word a definition's `targets` holds. Written when zo alone asked, and
+/// kept as it is: it is part of every version's hash, and the window asks the
+/// same definitions for its panes' agents too (t-106308).
 const TARGETS: [&str; 1] = ["zo"];
 
 /// Who answers: the judgment model the person set (System One), never a subscription login.
@@ -363,22 +372,154 @@ impl Refusal {
 }
 
 /// The most characters the one line a decision hands an agent holds
-/// (DESIGN 2.4). [`line()`] holds it by construction: a name and an option are
-/// each [`NAME_MAX_CHARS`] at most, so no line is ever cut.
+/// (DESIGN 2.4). [`line()`] holds it by construction: a name is
+/// [`NAME_MAX_CHARS`] at most and what the line says of the answer
+/// ([`said`]) [`SAID_MAX_CHARS`], so no line is ever cut when it is handed.
 pub const LINE_MAX_CHARS: usize = 200;
 
-/// The one line a decision that is on hands the agent when its answer is as
-/// sure as its act-from line (DESIGN 2.4): `「name」 판단: option (확신 85%)`,
-/// the confidence a whole percent. Every place a decision is asked builds it
-/// here, so the line an agent reads is the same wherever it was asked.
+/// The characters of a line that are neither its decision's name nor what it
+/// says of the answer, at the widest confidence: `「」 판단: ` and
+/// ` (확신 100%)`.
+const LINE_FRAME_CHARS: usize = 17;
+
+/// The most characters a line says of its answer ([`said`]): what is left of
+/// [`LINE_MAX_CHARS`] beside the longest name — room for a choice's longest
+/// option whole, and where a longer meaning of a yes or a no is cut.
+pub const SAID_MAX_CHARS: usize = LINE_MAX_CHARS - NAME_MAX_CHARS - LINE_FRAME_CHARS;
+
+/// What marks a meaning cut to fit its line ([`said`]).
+const CUT_MARK: char = '…';
+
+/// What stands once before the lines decisions hand where no agent asked
+/// for them — at a turn's start, under a command's result, from a turn's end
+/// to the next turn ([`introduced`]): what they are, and what to do with
+/// them. Without it a line stood in the next turn as a remark out of
+/// nowhere, and a model took it for the subject of the person's next
+/// question and went looking for where it was written (2026-11-13). It asks
+/// for the person's request first and keeps what a line tells the agent to
+/// do: a decision's yes is often the person's own instruction, and a line
+/// that only "applies where it applies" would be skipped.
+pub const LINES_INTRO: &str = "These lines come from checks the person set up. They are observations, not \
+     a new request, not new permission, and nothing to look up. Answer what the person asks now first; \
+     where a line says what to do next and it holds for this turn, do that too, briefly.";
+
+/// The lines decisions hand unasked, as an agent reads them: [`LINES_INTRO`]
+/// once, then each on a line of its own — nothing for no line. Every place
+/// that hands such lines whole builds them here.
 #[must_use]
-pub fn line(name: &str, option: &str, confidence: f64) -> String {
+pub fn introduced(lines: &[String]) -> Option<String> {
+    (!lines.is_empty()).then(|| format!("{LINES_INTRO}\n{}", lines.join("\n")))
+}
+
+/// [`introduced`] within `room` characters: [`LINES_INTRO`] and as many of
+/// `lines`, in order, as fit whole after it — and how many that was. `None`
+/// and none when not one line fits beside the opening, so a caller leaves
+/// every line where it was. Every place that hands such lines into a bounded
+/// room builds them here, so none counts the opening's shape again.
+#[must_use]
+pub fn introduced_within<S: AsRef<str>>(lines: &[S], room: usize) -> (Option<String>, usize) {
+    let mut held = LINES_INTRO.chars().count();
+    let mut used = 0;
+    for line in lines {
+        let longer = held + 1 + line.as_ref().chars().count();
+        if longer > room {
+            break;
+        }
+        (held, used) = (longer, used + 1);
+    }
+    let text = (used > 0).then(|| {
+        let mut text = String::with_capacity(LINES_INTRO.len() + held);
+        text.push_str(LINES_INTRO);
+        for line in &lines[..used] {
+            text.push('\n');
+            text.push_str(line.as_ref());
+        }
+        text
+    });
+    (text, used)
+}
+
+/// The one line a decision that is on hands the agent when its answer is as
+/// sure as its act-from line (DESIGN 2.4): `「name」 판단: said (확신 85%)`,
+/// the confidence a whole percent and `said` what the line says of the
+/// answer ([`said`]). Every place a decision is asked builds it here, so the
+/// line an agent reads is the same wherever it was asked.
+#[must_use]
+pub fn line(name: &str, said: &str, confidence: f64) -> String {
     let percent = if confidence.is_nan() {
         0.0
     } else {
         (confidence.clamp(0.0, 1.0) * 100.0).round()
     };
-    format!("「{name}」 판단: {option} (확신 {percent:.0}%)")
+    format!("「{name}」 판단: {said} (확신 {percent:.0}%)")
+}
+
+/// What a decision's line says of the answer shown as `shown`. A yes or a no
+/// is said in the person's own words for it — what that answer means
+/// ([`Answer::YesNo`]) — on one line, cut to [`SAID_MAX_CHARS`]: the bare
+/// word, under a name that is itself a question, reads as that question's
+/// answer (`「…확인했는가」 판단: no` told a model the work was unchecked when
+/// its no meant nothing was left to check, 2026-11-13). A choice's option and
+/// a score's level are said as they are shown: the person's own word, and a
+/// level over its count.
+///
+/// The meaning's lines are joined by one space each, control characters
+/// read as spaces. The store checks a meaning for a credential line by line
+/// ([`check`]), so the joined line is read once more by the same detector —
+/// digits that are a card's number only once two lines meet — and a meaning
+/// it would withhold, or an empty one, is said as the bare word.
+#[must_use]
+pub fn said(definition: &Definition, shown: &str) -> String {
+    let Answer::YesNo { yes, no } = &definition.answer else {
+        return shown.to_string();
+    };
+    let meaning = if shown == AGENT_TOOL_ASK_OPTIONS[0] {
+        yes
+    } else {
+        no
+    };
+    let mut one_line = String::with_capacity(meaning.len());
+    for word in meaning
+        .split(|read: char| read.is_whitespace() || read.is_control())
+        .filter(|word| !word.is_empty())
+    {
+        if !one_line.is_empty() {
+            one_line.push(' ');
+        }
+        one_line.push_str(word);
+    }
+    if one_line.is_empty() || crate::credential::may_carry_a_credential(&one_line) {
+        return shown.to_string();
+    }
+    // One character past the cap is all that says the meaning is too long:
+    // the line is never counted whole.
+    if one_line.char_indices().nth(SAID_MAX_CHARS).is_some() {
+        let kept = one_line
+            .char_indices()
+            .nth(SAID_MAX_CHARS - 1)
+            .map_or(one_line.len(), |(at, _)| at);
+        one_line.truncate(kept);
+        one_line.push(CUT_MARK);
+    }
+    one_line
+}
+
+/// Whether the answer shown as `shown` is one a decision speaks of at all,
+/// however sure it is. A yes-or-no decision at a point no agent asked at — a
+/// turn's start, before a command, a turn's end — speaks only of its yes:
+/// its question names what is worth a line, and its no is the answer that
+/// nothing is. Handed all the same, a no stood in every turn as a remark
+/// about nothing (2026-11-13). An agent that asked ([`Point::AgentAsks`]) is
+/// told either answer, and a choice's option or a score's level is always
+/// one — a choice has [`NOT_APPLICABLE`] for nothing to say.
+#[must_use]
+pub fn speaks(definition: &Definition, shown: &str) -> bool {
+    match &definition.answer {
+        Answer::YesNo { .. } => {
+            definition.at == Point::AgentAsks || shown == AGENT_TOOL_ASK_OPTIONS[0]
+        }
+        Answer::Choice(_) | Answer::Score(_) => true,
+    }
 }
 
 /// How a score's level is shown to a person and to the agent it is handed

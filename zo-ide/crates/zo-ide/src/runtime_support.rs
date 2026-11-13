@@ -9,6 +9,7 @@ use api::{
     ProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
     resolve_startup_auth_source,
 };
+use runtime::model_home::{Held, ModelHome};
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ConfigLoader, ConversationRuntime,
     PermissionMode, ProviderStateBlob, RuntimeError, Session, TokenUsage,
@@ -1259,7 +1260,7 @@ async fn rebuild_oauth_client(client: &mut AnthropicRuntimeClient) {
     .ok()
     .flatten();
     if let Some(rebuilt) = rebuilt {
-        client.client = rebuilt;
+        client.put_in(rebuilt);
     }
 }
 
@@ -1400,13 +1401,39 @@ fn contains_family_alias_of(lower: &str, provider: ProviderKind) -> bool {
         .any(|entry| lower.contains(&entry.alias.to_ascii_lowercase()))
 }
 
+/// The session's client for `model`, and what it was built by
+/// ([`Held`]: where it sends, what the catalog named, the login) — both off
+/// one reading of the catalog. The record is what the judgments about this
+/// session's provider are held to until the client is built again
+/// ([`AnthropicRuntimeClient::put_in`]); it is not told to them here,
+/// because a client built is not yet a client the session runs on.
 fn build_provider_client(
     session_id: &str,
     model: &str,
     auth_route: AuthRoute,
     anthropic_auth: Option<AuthSource>,
-) -> Result<ProviderClient, Box<dyn std::error::Error>> {
-    let client = if let Some(provider_kind) = catalog_provider_for_model(model) {
+) -> Result<(ProviderClient, Held), Box<dyn std::error::Error>> {
+    let catalog = runtime::model_catalog::ModelCatalog::load().ok();
+    let catalog_provider = catalog.as_ref().and_then(|catalog| catalog.provider_for_model(model.trim()));
+    let built = Held { home: ModelHome::read(catalog.as_ref(), model), catalog_provider, auth_route };
+    // A name nothing knows is built for whichever login the machine holds —
+    // but not while the person's own providers cannot be read. One slip in
+    // `providers` costs every provider the array declares, and the model one
+    // of them serves then reads as such a name: the session's words would
+    // leave for a built-in provider the person did not choose (which refuses
+    // the model, after it has them).
+    if built.home == ModelHome::Unknown {
+        if let Some(why) = api::custom_providers_unreadable() {
+            return Err(format!(
+                "The `providers` in settings could not be read ({why}), and nothing else says whose model `{}` is. \
+                 The session is not opened on whichever login this machine holds: fix `providers`, or start zo on a model \
+                 the catalog knows (`--model <name>`; in a session, /model).",
+                model.trim()
+            )
+            .into());
+        }
+    }
+    let client = if let Some(provider_kind) = catalog_provider {
         ProviderClient::from_provider_kind_with_auth_route_and_anthropic_auth(
             provider_kind,
             auth_route,
@@ -1442,7 +1469,7 @@ fn build_provider_client(
             client = client.with_session_tracer(tracer);
         }
 
-        return Ok(ProviderClient::Anthropic(client));
+        return Ok((ProviderClient::Anthropic(client), built));
     }
 
     // Pin the ChatGPT prompt-cache scope to the zo session id (Anthropic gets
@@ -1450,7 +1477,7 @@ fn build_provider_client(
     // defaults to a random per-client id, and every provider-route model swap
     // or OAuth rotation rebuilds the client — rolling the provider cache key
     // mid-session.
-    Ok(client.with_cache_scope(session_id))
+    Ok((client.with_cache_scope(session_id), built))
 }
 
 /// Load `cwd`'s settings and publish its `providers` table, for a process
@@ -2102,10 +2129,22 @@ impl AnthropicRuntimeClient {
             let session = self.session_id.clone(); let model = self.model.clone(); let route = self.auth_route;
             let rebuilt = tokio::task::spawn_blocking(move || build_provider_client(&session, &model, route, None).map_err(|error| error.to_string()))
                 .await.map_err(|error| error.to_string())??;
-            self.client = rebuilt;
+            self.put_in(rebuilt);
         }
         self.connections_generation = generation;
         Ok(None)
+    }
+
+    /// Put a client built again for this session's model in the place of the
+    /// one it ran on, and say what the new one was built by
+    /// ([`runtime::model_home::hold`]) — the two together, here and in
+    /// [`Self::new`] and nowhere else. The catalog may have been edited since
+    /// the session began: its requests follow the edit from this client on,
+    /// and so do the judgments that keep to "the session's provider". A
+    /// rebuild that failed never reaches this, and leaves both as they were.
+    fn put_in(&mut self, (client, built): (ProviderClient, Held)) {
+        self.client = client;
+        runtime::model_home::hold(&self.model, built);
     }
 
     pub(crate) fn client(&self) -> ProviderClient {
@@ -2208,8 +2247,12 @@ impl AnthropicRuntimeClient {
         } else {
             None
         };
-        let client = build_provider_client(session_id, &model, auth_route, auth)
+        let (client, built) = build_provider_client(session_id, &model, auth_route, auth)
             .map_err(|error| format!("startup stage build-provider-client: {error:?}"))?;
+        // This process's session runs on this client from here: the judgments
+        // about "the session's provider" are held to where it sends, not to
+        // what the catalog file says when they ask (see `put_in`).
+        runtime::model_home::hold_session(&model, built);
 
         Ok(Self {
             client,
@@ -3415,7 +3458,7 @@ mod oauth_refresh_tests {
         .expect("custom providers");
         let built = |model: &str, auth: Option<api::AuthSource>| {
             super::build_provider_client("router-test", model, AuthRoute::Auto, auth)
-                .map(|client| client.provider_kind())
+                .map(|(client, _)| client.provider_kind())
                 .map_err(|error| error.to_string())
         };
 
@@ -3434,6 +3477,319 @@ mod oauth_refresh_tests {
         std::fs::remove_dir_all(config_home).ok();
     }
 
+
+    /// The client a session is built on and [`runtime::model_home::ModelHome`]
+    /// are one reading. However a model is named — a row the person wrote
+    /// into the catalog, a `<catalog key>/<id>` selection, an id a provider
+    /// of the person's declares, a name read by its spelling — the home says
+    /// the provider the client is built for, and `/status` reads the same.
+    /// What asks whose account a session spends asks the home: were the two
+    /// to part, a session's probe, helper or verifier would be picked for an
+    /// account the session is not on.
+    #[test]
+    fn the_session_client_is_built_where_the_models_home_says() {
+        use runtime::model_catalog::{CatalogProvider, ModelCatalog};
+        use runtime::model_home::ModelHome;
+
+        const OWN_ENDPOINT: &str = "https://own.invalid/v1";
+        let _env_lock = crate::test_env_lock();
+        let config_home = crate::support::temp_dir("model-home-differential");
+        let _config_home = crate::support::EnvVarGuard::set(
+            "ZO_CONFIG_HOME",
+            Some(config_home.to_str().expect("utf8 config home")),
+        );
+        let _zo_home = crate::support::EnvVarGuard::set("ZO_HOME", None);
+        let _custom = crate::support::EnvVarGuard::set(api::CUSTOM_PROVIDERS_ENV, None);
+        // A key for each built-in provider, so its client can be built on a
+        // machine with no login, at that provider's own address.
+        let _adapters = crate::support::EnvVarGuard::set(api::NON_CLAUDE_ADAPTERS_ENV, Some("1"));
+        let _openai = crate::support::EnvVarGuard::set("OPENAI_API_KEY", Some("test-key"));
+        let _google = crate::support::EnvVarGuard::set("GOOGLE_API_KEY", Some("test-key"));
+        let _xai = crate::support::EnvVarGuard::set("XAI_API_KEY", Some("test-key"));
+        let _openai_url = crate::support::EnvVarGuard::set("OPENAI_BASE_URL", None);
+        let _google_url = crate::support::EnvVarGuard::set("GOOGLE_BASE_URL", None);
+        let _xai_url = crate::support::EnvVarGuard::set("XAI_BASE_URL", None);
+        let _ollama = crate::support::EnvVarGuard::set("OLLAMA_BASE_URL", None);
+
+        // Rows the person wrote by hand, one per built-in provider and none
+        // spelled as that provider's models are; the last is also listed by
+        // the person's own provider below.
+        let mut catalog = ModelCatalog::load_from_home(&config_home).expect("an empty home loads");
+        for (provider, id) in [
+            (CatalogProvider::Google, "zq-row-on-google"),
+            (CatalogProvider::Anthropic, "zq-row-on-anthropic"),
+            (CatalogProvider::Openai, "zq-row-on-openai"),
+            (CatalogProvider::Google, "zq-both-list"),
+        ] {
+            catalog.add(provider, id, id).expect("the row is added");
+        }
+        let shipped = api::provider_catalog()
+            .iter()
+            .find(|entry| entry.provider == ProviderKind::Anthropic)
+            .expect("an Anthropic catalog row")
+            .canonical_model_id;
+        api::refresh_custom_providers_from_json(&format!(
+            r#"[{{"name":"zqown","base_url":"{OWN_ENDPOINT}","requires_auth":false,
+                 "models":["gpt-zq-oss","claude-zq-gateway","gemini-zq-relay","zq-own-model",
+                           "zq-both-list","anthropic/zq-slash-id","{shipped}"]}}]"#
+        ))
+        .expect("custom providers");
+
+        let built_in = ModelHome::BuiltIn;
+        let own = || ModelHome::Own("zqown".to_string());
+        let cases: Vec<(String, ModelHome)> = [
+            ("zq-row-on-google", built_in(ProviderKind::Google)),
+            ("zq-row-on-anthropic", built_in(ProviderKind::Anthropic)),
+            ("zq-row-on-openai", built_in(ProviderKind::OpenAi)),
+            ("zq-both-list", built_in(ProviderKind::Google)),
+            ("openai/gemini-zq-9", built_in(ProviderKind::OpenAi)),
+            ("google/zq-own-model", built_in(ProviderKind::Google)),
+            ("claude/gpt-zq-9", built_in(ProviderKind::Anthropic)),
+            ("gpt-zq-oss", own()),
+            ("claude-zq-gateway", own()),
+            ("gemini-zq-relay", own()),
+            ("zq-own-model", own()),
+            ("zqown/zq-own-model", own()),
+            ("anthropic/zq-slash-id", own()),
+            ("gpt-zq-9", built_in(ProviderKind::OpenAi)),
+            ("claude-zq-9", built_in(ProviderKind::Anthropic)),
+            ("gemini-zq-9", built_in(ProviderKind::Google)),
+            ("grok-zq-9", built_in(ProviderKind::Xai)),
+            ("zqrelay/gpt-zq-9", built_in(ProviderKind::OpenAi)),
+            (shipped, built_in(ProviderKind::Anthropic)),
+        ]
+        .into_iter()
+        .map(|(model, home)| (model.to_string(), home))
+        .chain([(api::format_provider_model_ref("zqown", shipped), own())])
+        .collect();
+
+        // The provider the client is built for, and whether it is dialled at
+        // the person's own endpoint.
+        let built = |model: &str| {
+            super::build_provider_client(
+                "model-home-test",
+                model,
+                AuthRoute::Auto,
+                Some(api::AuthSource::ApiKey("test-key".to_string())),
+            )
+            .map(|(client, built)| (client.provider_kind(), format!("{client:?}").contains(OWN_ENDPOINT), built.home))
+            .map_err(|error| error.to_string())
+        };
+        for (model, expected) in &cases {
+            let home = ModelHome::of(model);
+            assert_eq!(&home, expected, "{model}: the home");
+            let client = match home {
+                ModelHome::BuiltIn(kind) => (kind, false),
+                ModelHome::Own(_) => (ProviderKind::OpenAi, true),
+                ModelHome::Unknown => unreachable!("no case expects an unknown home"),
+            };
+            // The client, and the home handed out beside it for the session to
+            // be held to: the same reading.
+            assert_eq!(built(model), Ok((client.0, client.1, home.clone())), "{model}: the client");
+            assert_eq!(provider_kind_for_model(model), client.0, "{model}: what `/status` reads");
+        }
+        // A name nothing knows has no home; its client is built for whichever
+        // login the machine holds, which no judgment may read as a provider.
+        assert_eq!(ModelHome::of("zq-model-nobody-lists"), ModelHome::Unknown);
+
+        api::refresh_custom_providers_from_json("[]").expect("clear");
+        std::fs::remove_dir_all(config_home).ok();
+    }
+
+    /// Nothing held for the process's session when a test that built a
+    /// session's client ends, however it ends.
+    struct NoHeldSession;
+
+    impl Drop for NoHeldSession {
+        fn drop(&mut self) {
+            runtime::model_home::forget_session();
+        }
+    }
+
+    /// A session is held to where its client was built. The catalog is a file
+    /// another pane may edit while the session runs: the edit moves neither
+    /// the session's requests nor what the judgments about "the session's
+    /// provider" are told ([`runtime::model_home::held`]), and the client
+    /// built again moves both at once. Read from the file each time, as the
+    /// first cut of [`runtime::model_home`] did, a session on a name nothing
+    /// knew folded its tool output for Google the moment a row put that name
+    /// there — while its own requests went on where they had gone.
+    #[test]
+    fn a_session_is_held_to_where_its_client_was_built_until_it_is_built_again() {
+        use runtime::model_catalog::{CATALOG_FILE, CatalogProvider, ModelCatalog};
+        use runtime::model_home::{ModelHome, forget_session, held};
+
+        const UNLISTED: &str = "zq-held-unlisted";
+        const LISTED: &str = "zq-held-listed";
+
+        let _env_lock = crate::test_env_lock();
+        let _clean = NoHeldSession;
+        let config_home = crate::support::temp_dir("model-home-held");
+        let _config_home = crate::support::EnvVarGuard::set(
+            "ZO_CONFIG_HOME",
+            Some(config_home.to_str().expect("utf8 config home")),
+        );
+        let _zo_home = crate::support::EnvVarGuard::set("ZO_HOME", None);
+        let _custom = crate::support::EnvVarGuard::set(api::CUSTOM_PROVIDERS_ENV, None);
+        api::refresh_custom_providers_from_json("[]").expect("no provider of the person's");
+        let _adapters = crate::support::EnvVarGuard::set(api::NON_CLAUDE_ADAPTERS_ENV, Some("1"));
+        let _openai = crate::support::EnvVarGuard::set("OPENAI_API_KEY", Some("test-key"));
+        let _google = crate::support::EnvVarGuard::set("GOOGLE_API_KEY", Some("test-key"));
+        let _openai_url = crate::support::EnvVarGuard::set("OPENAI_BASE_URL", None);
+        let _google_url = crate::support::EnvVarGuard::set("GOOGLE_BASE_URL", None);
+        let _ollama = crate::support::EnvVarGuard::set("OLLAMA_BASE_URL", None);
+        // The catalog holding exactly `rows`, as an edit from elsewhere leaves it.
+        let catalog_says = |rows: &[(CatalogProvider, &str)]| {
+            std::fs::remove_file(config_home.join(CATALOG_FILE)).ok();
+            let mut catalog = ModelCatalog::load_from_home(&config_home).expect("the home loads");
+            for (provider, id) in rows {
+                catalog
+                    .add_with_auth_route(*provider, id, id, AuthRoute::ApiKey)
+                    .expect("the row is added");
+            }
+        };
+        // The session's own client, built as a session builds it: the model
+        // is given with the spaces a setting may carry.
+        let session_on = |model: &str| {
+            AnthropicRuntimeClient::new_with_auth_resolver(
+                "model-home-held-test",
+                model.to_string(),
+                false,
+                false,
+                None,
+                GlobalToolRegistry::builtin(),
+                PermissionMode::ReadOnly,
+                None,
+                None,
+                None,
+                || Ok(api::AuthSource::ApiKey("test-key".to_string())),
+            )
+            .expect("the session's client builds")
+        };
+        let again = |client: &mut AnthropicRuntimeClient| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime")
+                .block_on(super::rebuild_oauth_client(client));
+        };
+        let held_home = |model: &str| held(model).map(|held| held.home);
+        let google = ModelHome::BuiltIn(ProviderKind::Google);
+        let openai = ModelHome::BuiltIn(ProviderKind::OpenAi);
+
+        // A name nothing knows: built for whichever login the machine holds,
+        // and held as that — a record, not the lack of one.
+        catalog_says(&[]);
+        forget_session();
+        let mut client = session_on(UNLISTED);
+        assert_eq!(held_home(client.model()), Some(ModelHome::Unknown));
+        let before = client.provider_kind();
+        // A row written while the session runs puts the name on Google.
+        catalog_says(&[(CatalogProvider::Google, UNLISTED)]);
+        assert_eq!(ModelHome::of(UNLISTED), google, "the file says Google now");
+        assert_eq!(held_home(client.model()), Some(ModelHome::Unknown), "the session is where it was built");
+        assert_eq!(client.provider_kind(), before);
+        // Its client built again reads the file, and the record goes with it.
+        again(&mut client);
+        assert_eq!(client.provider_kind(), ProviderKind::Google);
+        assert_eq!(held_home(client.model()), Some(google.clone()));
+
+        // A session built on a row, and the row moved to another provider.
+        catalog_says(&[(CatalogProvider::Google, LISTED)]);
+        let mut client = session_on(&format!(" {LISTED} "));
+        assert_eq!(client.provider_kind(), ProviderKind::Google);
+        assert_eq!(held_home(LISTED), Some(google.clone()));
+        assert_eq!(held_home(UNLISTED), None, "the model the session left is held no longer");
+        catalog_says(&[(CatalogProvider::Openai, LISTED)]);
+        assert_eq!(ModelHome::of(LISTED), openai, "the file says OpenAI now");
+        assert_eq!(held_home(LISTED), Some(google.clone()), "the session is where it was built");
+        assert_eq!(client.provider_kind(), ProviderKind::Google);
+        // A turn's legs, while the file and the session part ways: the leg on
+        // the session's own model goes through the session's client; a model
+        // on the session's provider shares it; any other is built as the file
+        // reads now — and each is held to what it was built by.
+        catalog_says(&[
+            (CatalogProvider::Openai, LISTED),
+            (CatalogProvider::Google, "zq-held-turn-google"),
+            (CatalogProvider::Openai, "zq-held-turn-openai"),
+        ]);
+        let leg = |client: &AnthropicRuntimeClient, model: &str| {
+            crate::session::runtime_builder::turn_client(client, model).map(|(built, _)| built.provider_kind())
+        };
+        assert_eq!(leg(&client, LISTED), Some(ProviderKind::Google), "the session's own model");
+        assert_eq!(held_home(LISTED), Some(google.clone()), "and no leg rewrites the session's record");
+        assert_eq!(leg(&client, "zq-held-turn-google"), Some(ProviderKind::Google));
+        assert_eq!(held_home("zq-held-turn-google"), Some(google.clone()));
+        assert_eq!(leg(&client, "zq-held-turn-openai"), Some(ProviderKind::OpenAi));
+        assert_eq!(held_home("zq-held-turn-openai"), Some(openai.clone()));
+
+        again(&mut client);
+        assert_eq!(client.provider_kind(), ProviderKind::OpenAi);
+        assert_eq!(held_home(LISTED), Some(openai));
+        assert_eq!(held(LISTED).map(|held| held.auth_route), Some(AuthRoute::ApiKey), "on the login its row was pinned to when it began");
+
+        std::fs::remove_dir_all(config_home).ok();
+    }
+
+    /// A session is not opened on a guess while the person's own providers
+    /// cannot be read. One slip in `providers` costs every provider the array
+    /// declares; the model one of them serves then reads as a name nothing
+    /// knows, and such a name is built for whichever login the machine holds
+    /// — the session's words left for a provider the person did not choose.
+    /// A model the catalog or the name does say is opened as before, and so
+    /// is the unknown name once `providers` reads again.
+    #[test]
+    fn a_name_nothing_knows_is_not_opened_while_the_persons_providers_cannot_be_read() {
+        const UNSEEN: &str = "zq-unread-big";
+        let _env_lock = crate::test_env_lock();
+        let _clean = NoHeldSession;
+        let config_home = crate::support::temp_dir("providers-unread");
+        let _config_home = crate::support::EnvVarGuard::set(
+            "ZO_CONFIG_HOME",
+            Some(config_home.to_str().expect("utf8 config home")),
+        );
+        let _zo_home = crate::support::EnvVarGuard::set("ZO_HOME", None);
+        let _custom = crate::support::EnvVarGuard::set(api::CUSTOM_PROVIDERS_ENV, None);
+        let _adapters = crate::support::EnvVarGuard::set(api::NON_CLAUDE_ADAPTERS_ENV, Some("1"));
+        let _openai = crate::support::EnvVarGuard::set("OPENAI_API_KEY", Some("test-key"));
+        let _openai_url = crate::support::EnvVarGuard::set("OPENAI_BASE_URL", None);
+        let _ollama = crate::support::EnvVarGuard::set("OLLAMA_BASE_URL", None);
+        let open = |model: &str| {
+            AnthropicRuntimeClient::new_with_auth_resolver(
+                "providers-unread-test",
+                model.to_string(),
+                false,
+                false,
+                None,
+                GlobalToolRegistry::builtin(),
+                PermissionMode::ReadOnly,
+                None,
+                None,
+                None,
+                || Ok(api::AuthSource::ApiKey("test-key".to_string())),
+            )
+            .map(|client| client.provider_kind())
+            .map_err(|error| error.to_string())
+        };
+
+        api::refresh_custom_providers_from_json("[]").expect("no provider of the person's");
+        assert!(open(UNSEEN).is_ok(), "premise: with readable providers the name opens on the machine's login");
+
+        // The array as a slip leaves it: one row's `models` is not a list.
+        let slipped = format!(r#"[{{"name":"zqhost","base_url":"https://zqhost.invalid/v1","models":"{UNSEEN}"}}]"#);
+        assert!(api::refresh_custom_providers_from_json(&slipped).is_err());
+        let refused = open(UNSEEN).expect_err("opened on a guess");
+        assert!(refused.contains("providers") && refused.contains(UNSEEN), "{refused}");
+        assert_eq!(open("gpt-zq-9"), Ok(ProviderKind::OpenAi), "a model the name says");
+        // One provider written as an object where the list belongs.
+        let not_a_list = format!(r#"{{"name":"zqhost","base_url":"https://zqhost.invalid/v1","models":["{UNSEEN}"]}}"#);
+        assert!(api::refresh_custom_providers_from_json(&not_a_list).is_err());
+        assert!(open(UNSEEN).is_err(), "opened on a guess under a `providers` that is not a list");
+
+        api::refresh_custom_providers_from_json("[]").expect("readable again");
+        assert!(open(UNSEEN).is_ok(), "the providers read again");
+        std::fs::remove_dir_all(config_home).ok();
+    }
 
     #[test]
     fn boot_does_not_resolve_anthropic_auth_for_non_anthropic_main() {

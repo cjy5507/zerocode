@@ -1805,6 +1805,91 @@
         assert!(super::settings::smart_setting_defaults().verify_cross_provider);
     }
 
+    /// The session's provider, for the verifier that stays on it, is where
+    /// the session's client was built to send — not what the catalog file
+    /// says of the session's model when the turn begins. A row written while
+    /// the session ran moved its verifier to the provider the row named.
+    #[test]
+    fn a_running_sessions_verifier_stays_where_its_client_was_built() {
+        use runtime::model_catalog::CatalogProvider;
+
+        const SESSION: &str = "zq-held-verified";
+        let env = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ollama = crate::tests::Var::unset(&env, "OLLAMA_BASE_URL");
+        let home = crate::tests::ConfigHome::empty(&env);
+        let pick = |candidates: &[&str]| {
+            super::settings::preferred_verify_model(SESSION, candidates.iter().map(ToString::to_string), false)
+        };
+        let candidates = ["gpt-zq-verifier", "gemini-zq-verifier"];
+
+        // Built on a name nothing knows: no provider to keep a verifier on.
+        let session = crate::tests::RunningSession::built_now(&env, SESSION);
+        assert_eq!(pick(&candidates), None);
+        home.catalog_now(&[(CatalogProvider::Google, SESSION)]);
+        assert_eq!(pick(&candidates), None, "the file says Google now; the session's client does not");
+        // Its client built again: on Google, and held there as the row moves on.
+        session.client_built_now(SESSION);
+        assert_eq!(pick(&candidates), Some("gemini-zq-verifier".to_string()));
+        home.catalog_now(&[(CatalogProvider::Openai, SESSION)]);
+        assert_eq!(pick(&candidates), Some("gemini-zq-verifier".to_string()));
+    }
+
+    /// With `smart.verifyCrossProvider` off the verifier stays on the
+    /// session's provider, and that is the provider the session's requests
+    /// go to — not the one its model is spelled like. A session on a
+    /// person's own provider is given that provider's other model or no
+    /// verifier at all, never `OpenAI`'s; with crossing on, `OpenAI`'s is
+    /// another provider to it, as it is. The catalog says which built-in
+    /// provider a row the person wrote is on.
+    #[test]
+    fn a_verifier_kept_to_the_sessions_provider_is_on_the_provider_the_session_is_on() {
+        use runtime::model_catalog::CatalogProvider;
+
+        let env = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ollama = crate::tests::Var::unset(&env, "OLLAMA_BASE_URL");
+        let _home = crate::tests::ConfigHome::empty(&env).catalog_row(CatalogProvider::Google, "zq-row-on-google");
+        let _own = crate::tests::OwnProviders::declared(
+            &env,
+            r#"[{"name":"zqown","base_url":"https://own.invalid/v1","models":["gpt-zq-main","zq-own-verifier"],"requires_auth":false}]"#,
+        );
+        let pick = |main: &str, candidates: &[&str], cross: bool| {
+            super::settings::preferred_verify_model(main, candidates.iter().map(ToString::to_string), cross)
+        };
+        let some = |model: &str| Some(model.to_string());
+
+        // On the person's own provider, crossing off.
+        assert_eq!(pick("gpt-zq-main", &["gpt-zq-verifier", "claude-zq-verifier"], false), None);
+        assert_eq!(
+            pick("gpt-zq-main", &["gpt-zq-verifier", "zq-own-verifier"], false),
+            some("zq-own-verifier")
+        );
+        // Crossing on: OpenAI is another provider than the person's own.
+        assert_eq!(
+            pick("gpt-zq-main", &["zq-own-verifier", "gpt-zq-verifier"], true),
+            some("gpt-zq-verifier")
+        );
+        // A row the person wrote under Google is on Google.
+        assert_eq!(
+            pick("zq-row-on-google", &["gpt-zq-verifier", "gemini-zq-verifier"], false),
+            some("gemini-zq-verifier")
+        );
+        assert_eq!(
+            pick("zq-row-on-google", &["gemini-zq-verifier", "gpt-zq-verifier"], true),
+            some("gpt-zq-verifier")
+        );
+        // A built-in session reads as before.
+        assert_eq!(
+            pick("claude-zq-main", &["gpt-zq-verifier", "claude-zq-verifier"], false),
+            some("claude-zq-verifier")
+        );
+        assert_eq!(
+            pick("claude-zq-main", &["claude-zq-verifier", "gpt-zq-verifier"], true),
+            some("gpt-zq-verifier")
+        );
+        // Nothing else to cross to: the first candidate stands.
+        assert_eq!(pick("claude-zq-main", &["claude-zq-verifier"], true), some("claude-zq-verifier"));
+    }
+
     #[test]
     fn smart_router_auto_classifier_settings_are_conservative_and_auditable() {
         // Unset → probed: a spawn's difficulty is the model's reading of the

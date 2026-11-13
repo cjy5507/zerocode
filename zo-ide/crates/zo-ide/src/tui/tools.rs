@@ -19,7 +19,8 @@
 //! | Edit·Write | `✓ Edit <path>      +A -B` 과 그 아래 diff |
 //! | 웹 검색 | `✓ Search <q> on the web` |
 //! | 스폰 | `✓ Spawn <label> [role] (request)` 과 그 아래 진행·결과 한 줄 |
-//! | 그 외(MCP 등) | `✓ Call <name>(<args>)` 과 그 아래 결과 |
+//! | 받아 오기 | `✓ Fetch <address>` (scheme 없이) |
+//! | 그 외(MCP 등) | `✓ <server> · <tool> <args>` 과 그 아래 결과 |
 //!
 //! # 트랜스크립트 힌트를 뺀 이유
 //!
@@ -93,6 +94,10 @@ pub enum ToolKind {
     /// Web search/fetch activity: a `Search` row whose target is the query
     /// on the web.
     WebSearch { detail: String },
+    /// Web fetch: a `Fetch` row whose target is the address. The runtime
+    /// gives both web tools one preview, so the tool's own name — which the
+    /// call announced — says which this is.
+    WebFetch { url: String },
     /// Agent-family spawn: a `Spawn` row. A running one shows the helper's
     /// live row under it.
     Spawn {
@@ -141,7 +146,7 @@ impl ToolKind {
 
     /// 도구 호출 preview 를 셀 종류로 옮긴다.
     #[must_use]
-    pub fn from_preview(_name: &str, preview: &ToolPreview, summary: &str) -> Self {
+    pub fn from_preview(name: &str, preview: &ToolPreview, summary: &str) -> Self {
         match preview {
             ToolPreview::Bash { command } => Self::Command {
                 command: sanitize_lines(command, summary),
@@ -169,6 +174,9 @@ impl ToolKind {
             ToolPreview::Write { path, .. } | ToolPreview::Edit { path, .. } => Self::Edit {
                 path: sanitize(path, summary),
             },
+            ToolPreview::Search { query } if core_types::tool_names::canonical_tool_name(name) == "WebFetch" => {
+                Self::WebFetch { url: sanitize(query, summary) }
+            }
             ToolPreview::Search { query } => Self::WebSearch {
                 detail: sanitize(query, summary),
             },
@@ -234,6 +242,7 @@ impl ToolKind {
             },
             Self::Edit { .. } => "Edit",
             Self::WebSearch { .. } => "WebSearch",
+            Self::WebFetch { .. } => "WebFetch",
             Self::Spawn { .. } => "Agent",
             Self::Call { name, .. } => name,
             Self::Plan(_) | Self::AgentResult { .. } => announced_name,
@@ -560,7 +569,7 @@ impl ToolGroup {
     /// ([`super::turns`]): what each did, to what, and how it ended.
     #[must_use]
     pub(super) fn steps(&self) -> Vec<super::turns::Step> {
-        use super::strings::{TOOL_CREATE, TOOL_DELETE, TOOL_EDIT, TOOL_LIST, TOOL_READ, TOOL_RUN, TOOL_SEARCH, TOOL_SPAWN};
+        use super::strings::{TOOL_CREATE, TOOL_DELETE, TOOL_EDIT, TOOL_FETCH, TOOL_RUN, TOOL_SEARCH, TOOL_SPAWN};
         use super::turns::{Step, StepKind};
         let mut out = Vec::new();
         for call in &self.calls {
@@ -569,6 +578,11 @@ impl ToolGroup {
             };
             let failure = (!done.ok)
                 .then(|| failure_result(done).iter().map(|span| span.text.as_str()).collect::<String>());
+            // What a failed call said first, for the row under its step.
+            let error = (!done.ok && !done.declined)
+                .then(|| done.output.lines().map(str::trim).find(|line| !line.is_empty()))
+                .flatten()
+                .map(crate::util::ansi::sanitize_inline);
             let step = |kind: StepKind, verb: &str, target: String| Step {
                 kind,
                 verb: verb.to_string(),
@@ -577,24 +591,32 @@ impl ToolGroup {
                 ok: done.ok,
                 declined: done.declined,
                 failure: failure.clone(),
+                error: error.clone(),
+                result: None,
                 started: call.started,
                 took: call.took,
             };
+            let with_result = |mut step: Step, result: Vec<Span>| {
+                step.result = (done.ok && !result.is_empty()).then(|| plain_text(&result));
+                step
+            };
             match &call.kind {
                 ToolKind::Command { command, .. } => {
-                    out.push(step(StepKind::Run, TOOL_RUN, command.lines().next().unwrap_or_default().to_string()));
+                    let run = step(StepKind::Run, TOOL_RUN, command.lines().next().unwrap_or_default().to_string());
+                    out.push(with_result(run, command_result(done)));
                 }
                 ToolKind::Explore(items) => {
                     for item in items {
-                        out.push(match item {
-                            Explored::Read { name } => step(StepKind::Read, TOOL_READ, shown_path(name)),
-                            Explored::List { path } => step(StepKind::List, TOOL_LIST, shown_path(path)),
-                            Explored::Search { query, path } => step(
-                                StepKind::Search,
-                                TOOL_SEARCH,
-                                path.as_ref().map_or_else(|| query.clone(), |path| format!("{query} in {}", shown_path(path))),
-                            ),
-                        });
+                        // The words the running row says, so the call reads the
+                        // same while it runs and after it ends.
+                        let (verb, target) = explored_target(item);
+                        let kind = match item {
+                            Explored::Read { .. } => StepKind::Read,
+                            Explored::List { .. } => StepKind::List,
+                            Explored::Search { .. } => StepKind::Search,
+                        };
+                        let row = step(kind, verb, plain_text(&target));
+                        out.push(with_result(row, explored_result(item, done)));
                     }
                 }
                 ToolKind::Edit { path } => {
@@ -609,12 +631,21 @@ impl ToolGroup {
                     out.push(edit);
                 }
                 ToolKind::Plan(_) => out.push(step(StepKind::Other, super::strings::STEP_PLAN, String::new())),
-                ToolKind::WebSearch { detail } => out.push(step(StepKind::Search, TOOL_SEARCH, detail.clone())),
+                ToolKind::WebSearch { detail } => {
+                    let search = step(StepKind::Search, TOOL_SEARCH, plain_text(&web_search_target(detail)));
+                    out.push(with_result(search, web_result(done)));
+                }
+                ToolKind::WebFetch { url } => {
+                    let fetch = step(StepKind::Fetch, TOOL_FETCH, super::strings::address_shown(url).to_string());
+                    out.push(with_result(fetch, web_result(done)));
+                }
                 ToolKind::Spawn { label, .. } => out.push(step(StepKind::Other, TOOL_SPAWN, label.clone())),
                 ToolKind::AgentResult { label, .. } => {
                     out.push(step(StepKind::Other, super::strings::STEP_AGENT, label.clone()));
                 }
-                ToolKind::Call { name, .. } => out.push(step(StepKind::Other, name, String::new())),
+                ToolKind::Call { name, detail } => {
+                    out.push(step(StepKind::Other, &super::strings::mcp_name_shown(name), detail.clone()));
+                }
             }
         }
         out
@@ -870,6 +901,7 @@ impl ToolGroup {
             ToolKind::WebSearch { detail } => {
                 self.web_search_lines(call, detail, width, elapsed)
             }
+            ToolKind::WebFetch { url } => self.web_fetch_lines(call, url, width, elapsed),
             ToolKind::Spawn {
                 label,
                 role,
@@ -1043,7 +1075,7 @@ impl ToolGroup {
         }
     }
 
-    /// `✓ Call <name>(<args>)` and what the call returned under it; an
+    /// `✓ <server> · <tool>(<args>)` and what the call returned under it; an
     /// empty result adds no row.
     fn mcp_lines(
         &self,
@@ -1053,18 +1085,12 @@ impl ToolGroup {
         width: usize,
         elapsed: Duration,
     ) -> Vec<Line> {
-        let mut invocation = vec![Span::new(
-            name.to_string(),
-            Style::new().fg(palette::TOOL_LABEL),
-        )];
-        if !detail.is_empty() {
-            invocation.push(Span::raw("("));
-            invocation.push(Span::dim(detail.to_string()));
-            invocation.push(Span::raw(")"));
-        }
+        // The tool is the row's verb (`almanac · read_webpage`), its argument
+        // the target; a call with no argument is its verb alone.
+        let target = if detail.is_empty() { Vec::new() } else { vec![Span::dim(detail.to_string())] };
         let result = call.done.as_ref().filter(|done| !done.ok).map(failure_result).unwrap_or_default();
-        let mut out =
-            self.uncut_row(call, super::strings::TOOL_CALL, invocation, result, width, elapsed);
+        let shown = super::strings::mcp_name_shown(name);
+        let mut out = self.uncut_row(call, &shown, target, result, width, elapsed);
         if let Some(done) = call.done.as_ref() {
             let said = mcp_envelope_text(&done.output);
             let output = said.as_deref().unwrap_or(&done.output);
@@ -1084,14 +1110,16 @@ impl ToolGroup {
         width: usize,
         elapsed: Duration,
     ) -> Vec<Line> {
-        let mut target = Vec::new();
-        if !detail.is_empty() {
-            target.push(Span::raw(detail.to_string()));
-            target.push(Span::dim(" on "));
-        }
-        target.push(Span::dim(super::strings::THE_WEB));
+        let target = web_search_target(detail);
         let result = call.done.as_ref().filter(|done| !done.ok).map(failure_result).unwrap_or_default();
         self.uncut_row(call, super::strings::TOOL_SEARCH, target, result, width, elapsed)
+    }
+
+    /// `✓ Fetch <address>` — the address without its scheme.
+    fn web_fetch_lines(&self, call: &ToolCall, url: &str, width: usize, elapsed: Duration) -> Vec<Line> {
+        let target = vec![Span::raw(super::strings::address_shown(url).to_string())];
+        let result = call.done.as_ref().filter(|done| !done.ok).map(failure_result).unwrap_or_default();
+        self.uncut_row(call, super::strings::TOOL_FETCH, target, result, width, elapsed)
     }
 
     /// Collab spawn — codex `multi_agents.rs::spawn_end`, plus Claude Code's
@@ -1309,13 +1337,15 @@ fn tool_row(glyph: Span, verb: &str, target: Vec<Span>, result: Vec<Span>, width
     let wanted: usize = target.iter().map(Span::width).sum();
     let short = wanted.saturating_sub(target_budget(verb, &result, column).saturating_sub(closing));
     let width = width.min(column + short);
-    let opened = if marks { format!("{verb}(") } else { format!("{verb} ") };
+    // A call with nothing to say about its argument is its verb alone.
+    let bare = wanted == 0;
+    let opened = if bare { verb.to_string() } else { call_opening(verb) };
     let mut spans = vec![glyph, Span::raw(" "), Span::bold(opened)];
     let result_width: usize = result.iter().map(Span::width).sum();
     let target = Line::new(target).truncated(target_budget(verb, &result, width).saturating_sub(closing));
     spans.extend(target.spans);
-    if marks {
-        spans.push(Span::bold(")"));
+    if marks && !bare {
+        spans.push(Span::bold(call_closing()));
     }
     let used: usize = spans.iter().map(Span::width).sum();
     if result_width > 0 {
@@ -1460,12 +1490,49 @@ fn closed_json(printed: &str) -> String {
     closed
 }
 
+/// `"rust async" on the web` — a web search's argument: the question the
+/// model asked, quoted, and the web where a file search names its path.
+fn web_search_target(detail: &str) -> Vec<Span> {
+    let mut target = Vec::new();
+    if !detail.is_empty() {
+        target.push(Span::raw(super::strings::quoted(detail)));
+        target.push(Span::dim(" on "));
+    }
+    target.push(Span::dim(super::strings::THE_WEB));
+    target
+}
+
+/// What a row's target spans say, without their styles.
+fn plain_text(spans: &[Span]) -> String {
+    spans.iter().map(|span| span.text.as_str()).collect()
+}
+
+/// How a call's name and argument stand together on a row: the marks look
+/// writes a call (`Search(…)`), the codex look a phrase (`Search …`). The
+/// running row ([`tool_row`]) and the finished step the `turns` view shows
+/// ([`super::turns`]) both take it from here, so one call reads the same
+/// while it runs and after.
+#[must_use]
+pub(super) fn call_opening(verb: &str) -> String {
+    if super::style::current().style == super::style::TuiStyle::Marks {
+        format!("{verb}(")
+    } else {
+        format!("{verb} ")
+    }
+}
+
+/// What closes a call written by [`call_opening`].
+#[must_use]
+pub(super) fn call_closing() -> &'static str {
+    if super::style::current().style == super::style::TuiStyle::Marks { ")" } else { "" }
+}
+
 fn explored_target(item: &Explored) -> (&'static str, Vec<Span>) {
     match item {
         Explored::Read { name } => (super::strings::TOOL_READ, vec![path_span(shown_path(name), name)]),
         Explored::List { path } => (super::strings::TOOL_LIST, vec![Span::raw(shown_path(path))]),
         Explored::Search { query, path } => {
-            let mut target = vec![Span::raw(query.clone())];
+            let mut target = vec![Span::raw(super::strings::quoted(query))];
             if let Some(path) = path {
                 target.push(Span::dim(" in "));
                 target.push(path_span(shown_path(path), path));
@@ -1517,6 +1584,15 @@ fn explored_result(item: &Explored, done: &Outcome) -> Vec<Span> {
         Explored::Search { .. } => super::strings::match_count(rows),
     };
     vec![Span::dim(text)]
+}
+
+/// What a web call brought back, as far as zo knows it: the size of the text
+/// (the tool gives no status code and no count). Nothing when it said nothing.
+fn web_result(done: &Outcome) -> Vec<Span> {
+    if !done.ok || done.output.trim().is_empty() {
+        return Vec::new();
+    }
+    vec![Span::dim(super::strings::size_shown(done.output.len()))]
 }
 
 /// How many lines a command printed — nothing when it printed nothing, since
@@ -2367,7 +2443,7 @@ mod tests {
         // the invocation as its target while it runs and once it is done.
         assert_eq!(
             plain(&group.lines(60, Duration::ZERO))[0],
-            "⠋ Call TodoWrite(3 items)"
+            "⠋ TodoWrite 3 items"
         );
         assert!(group.complete(
             "a",
@@ -2383,7 +2459,7 @@ mod tests {
         assert_eq!(
             plain(&group.lines(60, Duration::ZERO)),
             vec![
-                "✓ Call TodoWrite(3 items)".to_string(),
+                "✓ TodoWrite 3 items".to_string(),
                 "  └ done".to_string()
             ]
         );
@@ -2407,7 +2483,7 @@ mod tests {
 
         assert_eq!(
             plain(&group.lines(60, Duration::ZERO))[0],
-            "⠋ Call TodoWrite"
+            "⠋ TodoWrite"
         );
     }
 
@@ -2485,7 +2561,7 @@ mod tests {
 
         assert_eq!(
             plain(&group.lines(60, Duration::ZERO)),
-            vec!["✓ Call Sleep".to_string()]
+            vec!["✓ Sleep".to_string()]
         );
     }
 
@@ -2517,14 +2593,14 @@ mod tests {
         assert!(group.complete("a", Outcome::from_result(false, &body, "")));
         let rows = plain(&group.lines(24, Duration::ZERO));
 
-        assert!(rows[0].starts_with("✓ Call Lookup("), "rows were {rows:?}");
+        assert!(rows[0].starts_with("✓ Lookup "), "rows were {rows:?}");
         assert!(rows.len() >= 3, "rows were {rows:?}");
         assert!(
             rows[1..rows.len() - 1].iter().all(|row| row.starts_with("    ")),
             "rows were {rows:?}"
         );
         assert!(rows.iter().all(|row| !row.contains('…')), "rows were {rows:?}");
-        assert!(rows.iter().any(|row| row.contains("epsilon)")), "rows were {rows:?}");
+        assert!(rows.iter().any(|row| row.contains("epsilon")), "rows were {rows:?}");
         assert_eq!(rows.last().expect("output row"), "  └ ok");
     }
 
@@ -2537,13 +2613,13 @@ mod tests {
 
         assert_eq!(
             plain(&group.lines(60, Duration::ZERO)),
-            vec!["⠋ Search rust async on the web".to_string()]
+            vec!["⠋ Search \"rust async\" on the web".to_string()]
         );
 
         let body = format_tool_result_from_raw("WebSearch", "raw search result", false);
         assert!(group.complete("a", Outcome::from_result(false, &body, "")));
         let lines = group.lines(60, Duration::ZERO);
-        assert_eq!(plain(&lines), vec!["✓ Search rust async on the web".to_string()]);
+        assert_eq!(plain(&lines), vec!["✓ Search \"rust async\" on the web".to_string()]);
         assert_eq!(lines[0].spans[0].style.fg, Some(super::palette::TOOL_OK));
     }
 
@@ -3234,8 +3310,8 @@ mod tests {
                 detail: "alpha beta gamma delta".to_string(),
             }),
             vec![
-                "✓ Call Lookup(alpha beta".to_string(),
-                "    gamma delta)".to_string(),
+                "✓ Lookup alpha beta".to_string(),
+                "    gamma delta".to_string(),
             ]
         );
     }
@@ -3301,7 +3377,7 @@ mod tests {
                 r####"{"content":[{"type":"text","text":"### Result\nTook the viewport screenshot and saved it as page-1.png"},{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}],"structuredContent":null}"####,
             ),
             vec![
-                "✓ Call mcp__playwright__browser_take_screenshot".to_string(),
+                "✓ playwright · browser_take_screenshot".to_string(),
                 "  └ ### Result".to_string(),
                 "    Took the viewport screenshot and saved it as page-1.png".to_string(),
                 "    [image]".to_string(),
@@ -3309,7 +3385,7 @@ mod tests {
         );
         assert_eq!(
             call("mcp__playwright__browser_resize", r#"{"content":[],"structuredContent":null}"#),
-            vec!["✓ Call mcp__playwright__browser_resize".to_string()]
+            vec!["✓ playwright · browser_resize".to_string()]
         );
         let snapshot = (1..=300)
             .map(|n| format!("- generic [ref=e{n}]: row {n}"))
@@ -3341,7 +3417,7 @@ mod tests {
         assert_eq!(
             plain(&group.lines(80, Duration::ZERO)),
             vec![
-                "✓ Call mcp__playwright__browser_navigate".to_string(),
+                "✓ playwright · browser_navigate".to_string(),
                 "  └ ### Page state".to_string(),
                 "    - generic [ref=e1]: row 1".to_string(),
                 "    - generic [ref=e2]: ro".to_string(),
@@ -3677,7 +3753,7 @@ mod row_tests {
             plain(&group.lines(WIDTH, Duration::ZERO)),
             vec![
                 edge("✓ Read src/app.py", "12 lines", WIDTH),
-                edge("✓ Search do_(GET|POST) in src", "1 match", WIDTH),
+                edge("✓ Search \"do_(GET|POST)\" in src", "1 match", WIDTH),
             ]
         );
     }

@@ -69,6 +69,37 @@ pub struct CronCreateInput {
     pub description: Option<String>,
 }
 
+/// The arguments of a `CronDelete` call: the tool deletes by them, and the
+/// schedule guard puts the deletion to a person by them
+/// ([`crate::schedule_guard`]), so a call the tool would run is never one the
+/// guard did not see.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CronDeleteInput {
+    pub cron_id: String,
+}
+
+/// What a look at a store found under one id
+/// ([`CronRegistry::peek_in_workspace`]).
+#[derive(Debug, Clone)]
+pub enum CronPeek {
+    /// The schedule the store holds under that id.
+    Stands(Box<CronEntry>),
+    /// The store read, and holds no schedule by that id — or there is no
+    /// store file.
+    NotHere,
+    /// The store's file is there and did not read, so the look says nothing
+    /// of what it holds.
+    DidNotRead,
+}
+
+impl CronPeek {
+    /// Whether the look found a schedule by that id.
+    #[must_use]
+    pub fn stands(&self) -> bool {
+        matches!(self, Self::Stands(_))
+    }
+}
+
 /// What a `CronCreate` call registers.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CronWork<'a> {
@@ -1214,6 +1245,31 @@ impl CronRegistry {
     #[must_use]
     pub fn for_workspace(cwd: &Path) -> Self {
         Self::with_persistence_path(Some(registry_io::registry_path_in(cwd, CRON_REGISTRY_FILE)))
+    }
+
+    /// What the store a session started in `cwd` reads
+    /// ([`Self::for_workspace`]) holds under `cron_id`, read and nothing
+    /// more: opening the registry puts away an entry that does not read and
+    /// saves the file ([`Self::with_persistence_path`]), and a look taken to
+    /// ask a person writes nothing. A file that is not there holds no
+    /// schedule; one that is there and does not read — broken JSON, a link,
+    /// no right to read it — says nothing of what it holds.
+    #[must_use]
+    pub fn peek_in_workspace(cwd: &Path, cron_id: &str) -> CronPeek {
+        let path = registry_io::registry_path_in(cwd, CRON_REGISTRY_FILE);
+        match registry_io::load_registry_inner::<CronInner>(&path) {
+            Some(mut inner) => inner
+                .entries
+                .remove(cron_id)
+                .map_or(CronPeek::NotHere, |entry| CronPeek::Stands(Box::new(entry))),
+            None if path
+                .symlink_metadata()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                CronPeek::NotHere
+            }
+            None => CronPeek::DidNotRead,
+        }
     }
 
     /// Where this registry persists, if anywhere.

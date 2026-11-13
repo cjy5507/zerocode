@@ -1804,7 +1804,9 @@ function paintWorktreeSelection() {
     row.classList.toggle("is-selected", selected);
     const node = row.closest(".wt-node");
     node?.classList.toggle("is-selected", selected);
-    node?.setAttribute("aria-selected", selected ? "true" : "false");
+    // Written only when it moved: this runs on every refresh of the list, and an attribute set to the value it
+    // holds is still a mutation the sidebar pays for on every row (v1.1.149, 「왼쪽 네비 판이 계속 깜박」).
+    if (node) writeAttribute(node, "aria-selected", selected ? "true" : "false");
   }
 }
 
@@ -1829,7 +1831,8 @@ function paintWorktreeActive() {
     const node = row.closest(".wt-node");
     node?.classList.toggle("is-active", here);
     // The item carries "current", as it carries the name and the selection: the row inside it is a plain box.
-    node?.setAttribute("aria-current", here ? "location" : "false");
+    // Written only when it moved, as the selection is.
+    if (node) writeAttribute(node, "aria-current", here ? "location" : "false");
   }
   // The list's focus stays on the list; this says which item the keys act on (t-88672).
   const current = worktreeList.querySelector(".wt-node[aria-current=location]");
@@ -3989,8 +3992,10 @@ function paintSidebarFilterBadge() {
   const badge = el("project-collapse").querySelector(".sidebar-filter-count");
   if (!badge) return;
   const count = sidebarActiveFilterCount();
-  badge.hidden = count === 0;
-  badge.textContent = count > 9 ? "9+" : String(count);
+  // Painted by every refresh of the list: written only when the count moved (v1.1.149, 「왼쪽 네비 판이 계속 깜박」).
+  if (badge.hidden !== (count === 0)) badge.hidden = count === 0;
+  const said = count > 9 ? "9+" : String(count);
+  if (badge.textContent !== said) badge.textContent = said;
   paintWorkspaceBoardFilterBadge();
 }
 el("worktree-new").addEventListener("click", () => {
@@ -6494,7 +6499,7 @@ function dressWorktreeFold(chip, path) {
   if (chip.hidden !== (words === "")) chip.hidden = words === "";
   if ((chip.dataset.tip ?? "") !== tip) chip.dataset.tip = tip;
   if ((chip.dataset.foldKey ?? "") !== (held?.key ?? "")) chip.dataset.foldKey = held?.key ?? "";
-  chip.setAttribute("aria-expanded", opened ? "true" : "false");
+  if (chip.getAttribute("aria-expanded") !== (opened ? "true" : "false")) chip.setAttribute("aria-expanded", opened ? "true" : "false");
 }
 
 /* What a workspace row is CALLED — the branch, or the folder's own name.
@@ -6756,17 +6761,19 @@ async function refreshWorktrees() {
   paintStagePlaceholder();
   const canCreateWorktree = activeProject?.worktrees.some((worktree) => !worktree.is_folder) ?? false;
   // Live on a folder project too — the dialog offers to make it git.
-  el("worktree-new").disabled = !activeProject;
+  if (el("worktree-new").disabled !== !activeProject) el("worktree-new").disabled = !activeProject;
   paintWorktreeNewTitle();
   // 작업 is reachable only where there is something to browse, which is Orca's
   // own rule for this row: `canBrowseTasks = repos.some(isGitRepoKind)`
   // (`App-BaqTRjaA.js:8737`). It holds here for the same reason it holds
   // there — a folder project has no worktrees, so the finder this row opens
   // would come up empty and the row would have led nowhere.
-  el("nav-tasks").disabled = !canCreateWorktree;
-  el("nav-tasks").dataset.tip = canCreateWorktree
+  // Every refresh says these again, and most say what they already said: written only when they moved.
+  if (el("nav-tasks").disabled !== !canCreateWorktree) el("nav-tasks").disabled = !canCreateWorktree;
+  const tasksTip = canCreateWorktree
     ? t("view.tasksTitle", "작업")
     : t("worktree.gitOnly", "Git 프로젝트에서만 워크트리를 만들 수 있습니다");
+  if (el("nav-tasks").dataset.tip !== tasksTip) el("nav-tasks").dataset.tip = tasksTip;
   if (activeProject) paintProjectName(activeProject.name);
 
   // The repositories the 표시 menu left checked. Ungrouped rows cannot hide
@@ -9606,9 +9613,13 @@ function paintWorkspaceBoardStage() {
  * neighbours do (`renderTabs`): pressed, and 「여기」 like the 작업 row. */
 function paintWorkspaceBoardDoor() {
   workspaceBoardOpen = activeTabId === WORKSPACE_BOARD_TAB.id;
-  el("nav-board").setAttribute("aria-pressed", String(workspaceBoardOpen));
-  if (workspaceBoardOpen) el("nav-board").setAttribute("aria-current", "page");
-  else el("nav-board").removeAttribute("aria-current");
+  // Painted on every pass over the tabs: each attribute is written only when it moved (v1.1.149).
+  if (el("nav-board").getAttribute("aria-pressed") !== String(workspaceBoardOpen)) {
+    el("nav-board").setAttribute("aria-pressed", String(workspaceBoardOpen));
+  }
+  if (workspaceBoardOpen) {
+    if (el("nav-board").getAttribute("aria-current") !== "page") el("nav-board").setAttribute("aria-current", "page");
+  } else if (el("nav-board").hasAttribute("aria-current")) el("nav-board").removeAttribute("aria-current");
 }
 
 /* Open the board's tab, or close it. Closing is the tab's — its ×, ⌘W or the
@@ -17515,6 +17526,7 @@ function paintChatList() {
   const shown = chatListShown();
   writeHidden(host, !shown);
   if (!shown) {
+    releaseChatListHeld();
     if (chatListDrawn !== "") {
       el("chat-list-groups").replaceChildren();
       chatListNodes.clear();
@@ -17541,15 +17553,72 @@ function paintChatList() {
     parts.push(standChatGroup(group, rows));
   }
   reconcileElementOrder(el("chat-list-groups"), parts);
+  holdChatListHeight(host, [...groups.values()].reduce((sum, rows) => sum + rows.length, 0));
 }
 
-/* What a row is built from, but for its time words and whether its pane is
+/* The conversation list keeps the height it reached while agents come and go (v1.1.149, 「왼쪽 네비 판이 계속
+ * 깜박」). It heads the column above the branch list's scroller, so a row leaving the open 「작업 중」 for the folded
+ * 「오늘 끝남」 at a turn's end — and coming back at the next — moved the whole branch list 43px up and down on
+ * every turn of every agent. A turn hides a row; it does not end a conversation. So the list does not shrink under a
+ * turn: the room a hidden row leaves stays, empty, at the list's end, and the row takes it again when its agent works
+ * again. A conversation that leaves the list (put away, closed, a worker the ledger names) takes its room with it:
+ * only a row hidden in a folded group, the conversations counted the same, is held. It grows at once for a new
+ * conversation (the person opened it). The room is given back on the person's
+ * hand — a press anywhere in the list, a group folded or opened — or once the list has been still for the team's
+ * clock with the pointer off the sidebar: one move when the person is not working the column, not one per turn.
+ * The room never outgrows the branch list it keeps still. */
+let chatListHeld = 0;
+// The list's own height at the last paint: a change is a row that came or went, which starts the still clock again.
+let chatListNatural = 0;
+// How many conversations the list counted at the last paint, the folded groups' with the open ones'.
+let chatListCount = 0;
+
+function holdChatListHeight(host, count) {
+  const top = host.getBoundingClientRect().top;
+  // The list's own height without the room it holds: its children stand from its top (`align-content: start`).
+  const last = host.lastElementChild;
+  const natural = last ? last.getBoundingClientRect().bottom - top : 0;
+  const moved = natural !== chatListNatural;
+  const left = count < chatListCount;
+  chatListNatural = natural;
+  chatListCount = count;
+  if (left || natural >= chatListHeld || chatListHeld - natural > sidebarScroller.clientHeight) chatListHeld = natural;
+  const room = chatListHeld > natural ? `${Math.ceil(chatListHeld)}px` : "";
+  if (host.style.minHeight !== room) host.style.minHeight = room;
+  // Words moving (a title, an elapsed time) are not the list moving: only a row coming or going holds the room longer.
+  if (room !== "" && moved) settle("chat-list-held", TEAM_CLOCK_MS, releaseChatListHeldAway);
+}
+
+/* Give the room back now: the person's hand, or a hidden list. */
+function releaseChatListHeld() {
+  chatListHeld = 0;
+  const host = document.getElementById("chat-list");
+  if (host && host.style.minHeight !== "") host.style.minHeight = "";
+}
+
+/* The still list's release waits for the pointer to leave the sidebar: a column the person is reading does not move
+ * under them. */
+function releaseChatListHeldAway() {
+  const column = document.querySelector("aside.threads");
+  if (column?.matches(":hover")) {
+    column.addEventListener("pointerleave", () => releaseChatListHeldAway(), { once: true });
+    return;
+  }
+  releaseChatListHeld();
+  paintChatList();
+}
+
+// The person's hand in the list gives the room back before what it does lays the list out again.
+document.getElementById("chat-list")?.addEventListener("click", releaseChatListHeld, true);
+
+/* What a row is built from, but for its time words, its title and whether its pane is
  * the one in front, which it writes in place (`standChatRow`). A permission's
- * row carries what its last answer refused. */
+ * row carries what its last answer refused. The title is a word: an agent names its terminal again every few seconds,
+ * and built, the row's hover and transition began again each time (v1.1.149, 「왼쪽 네비 판이 계속 깜박」). */
 function chatRowShape(row) {
   const permission = row.card && yourTurnKind(row.card) === "permission";
   return JSON.stringify([
-    locale, row.term, row.key, row.said, row.title, row.agent, row.project, row.mark, row.branch,
+    locale, row.term, row.key, row.said, row.agent, row.project, row.mark, row.branch,
     chatListNotes.pinned.has(row.key), row.card ? yourTurnKey(row.card) : "",
     permission ? yourTurnDraft(row.card).refusal ?? "" : "",
   ]);
@@ -17596,6 +17665,7 @@ function standChatRow(held, row) {
     held.set(row.key, node);
   }
   writeTextContent(node.__word, row.word);
+  writeTextContent(node.__title, row.title);
   const tip = chatRowTip(row);
   if (node.__open.dataset.tip !== tip) {
     node.__open.dataset.tip = tip;
@@ -17682,6 +17752,7 @@ function chatRowNode(row) {
   open.setAttribute("aria-label", open.dataset.tip);
   // What a paint writes in place (`standChatRow`).
   node.__word = word;
+  node.__title = title;
   node.__open = open;
   open.addEventListener("click", () => {
     if (row.open) row.open();

@@ -2418,6 +2418,10 @@ pub struct CustomProviderUsability {
 pub struct ResolvedCustomProvider {
     pub connection: Option<judgment_provider::connections::Metadata>,
     pub models: Vec<String>,
+    /// The fast model the person named for this provider
+    /// (`fast_model`), in the casing [`Self::models`] declares it — `None`
+    /// when none is named, or the name is not one of this provider's models.
+    pub fast_model: Option<String>,
     pub requires_auth: bool,
     pub config: openai_compat::OpenAiCompatConfig,
     /// Optional operator-provided context window for every declared model
@@ -2448,6 +2452,9 @@ impl From<openai_compat::CustomProviderConfig> for ResolvedCustomProvider {
             }
             models.push(model.id.clone());
         }
+        let fast_model = custom.fast_model.as_deref().map(str::trim).and_then(|named| {
+            models.iter().find(|declared| declared.eq_ignore_ascii_case(named)).cloned()
+        });
         Self {
             context_window: custom.context_window.filter(|&value| value > 0),
             max_output_tokens: custom.max_output_tokens.filter(|&value| value > 0),
@@ -2456,6 +2463,7 @@ impl From<openai_compat::CustomProviderConfig> for ResolvedCustomProvider {
             config: custom.to_static_config(),
             connection: custom.connection,
             models,
+            fast_model,
             requires_auth: custom.requires_auth,
         }
     }
@@ -2550,9 +2558,11 @@ fn load_custom_providers_from_env() -> Vec<ResolvedCustomProvider> {
         .ok()
         .filter(|value| !value.trim().is_empty())
     else {
+        // None exported is nothing that could not be read.
+        let _ = noting_readable(ProvidersRead::Environment, Ok(()));
         return Vec::new();
     };
-    match parse_resolved_custom_providers(&raw) {
+    match noting_readable(ProvidersRead::Environment, parse_resolved_custom_providers(&raw)) {
         Ok(providers) => providers,
         Err(error) => {
             eprintln!("[zo] {CUSTOM_PROVIDERS_ENV} is not a valid provider JSON array: {error}");
@@ -2617,6 +2627,10 @@ fn builtin_seed_providers() -> Vec<ResolvedCustomProvider> {
                 "deepseek-v4-pro".to_string(),
                 "deepseek-v4-flash".to_string(),
             ],
+            // Not named here: what a `DeepSeek` session is asked on its flash
+            // model would change every such session at once, unmeasured. A
+            // person names it in their own `providers` row.
+            fast_model: None,
             requires_auth: true,
             config: deepseek_seed_config(),
             context_window: None,
@@ -2682,10 +2696,65 @@ fn last_custom_providers_json() -> &'static std::sync::Mutex<Option<String>> {
     LAST.get_or_init(Default::default)
 }
 
+/// The two readings of the providers a person declared: the array handed in
+/// (their settings, with an operator's export merged in), and the
+/// environment variable read by itself — which is also how the catalog is
+/// first filled, lazily, by whoever asks it first.
+#[derive(Clone, Copy)]
+enum ProvidersRead {
+    Declared,
+    Environment,
+}
+
+/// Why each reading failed the last time it was made — the parse error — or
+/// `None` while it reads. One slot to a reading: the second one succeeding,
+/// or finding nothing to read, says nothing of the first.
+fn providers_unreadable() -> &'static std::sync::Mutex<[Option<String>; 2]> {
+    static UNREADABLE: OnceLock<std::sync::Mutex<[Option<String>; 2]>> = OnceLock::new();
+    UNREADABLE.get_or_init(Default::default)
+}
+
+/// `parsed`, with whether `read` could make it out noted for
+/// [`custom_providers_unreadable`].
+fn noting_readable<T>(read: ProvidersRead, parsed: Result<T, serde_json::Error>) -> Result<T, serde_json::Error> {
+    providers_unreadable().lock().unwrap_or_else(std::sync::PoisonError::into_inner)[read as usize] =
+        parsed.as_ref().err().map(ToString::to_string);
+    parsed
+}
+
+/// Why the providers the person declared (`providers` in settings, or
+/// `ZO_CUSTOM_PROVIDERS`) could not be read, when either reading of them
+/// could not. One slip in the array costs every provider it declares, and a
+/// model one of them serves then reads as a name nothing knows: a caller
+/// that would build a client for such a name on whichever login the machine
+/// holds asks this first — the name may be a provider's of the person's that
+/// it cannot see.
+#[must_use]
+pub fn custom_providers_unreadable() -> Option<String> {
+    providers_unreadable()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .flatten()
+        .next()
+        .cloned()
+}
+
 pub fn refresh_custom_providers_from_json(raw: &str) -> Result<(), serde_json::Error> {
     let mut last = last_custom_providers_json().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if last.as_deref() == Some(raw) { return Ok(()); }
-    let providers = shared_providers(with_builtin_seed(parse_resolved_custom_providers(raw)?));
+    // The array the catalog was last filled from, handed in again: it read
+    // then, so it reads — whatever was handed in between and did not.
+    if last.as_deref() == Some(raw) { return noting_readable(ProvidersRead::Declared, Ok(())); }
+    let providers = shared_providers(with_builtin_seed(noting_readable(
+        ProvidersRead::Declared,
+        parse_resolved_custom_providers(raw),
+    )?));
+    // The environment variable holding this very array is zo's own copy of
+    // it (the settings, mirrored for whoever reads the variable): what the
+    // variable failed on when the catalog was first filled is mended with it.
+    if std::env::var(CUSTOM_PROVIDERS_ENV).is_ok_and(|exported| exported == raw) {
+        let _ = noting_readable(ProvidersRead::Environment, Ok(()));
+    }
     let mut guard = custom_provider_store()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2797,6 +2866,26 @@ fn named_provider_ref(model: &str) -> Option<(Arc<ResolvedCustomProvider>, Strin
 #[must_use]
 pub fn format_provider_model_ref(provider: &str, model: &str) -> String {
     format!("{}/{}", provider.trim(), model.trim())
+}
+
+/// The fast model of the provider of the person's that serves
+/// `session_model` (`fast_model` in that provider's settings), by the name
+/// that is that provider's and no other's: `<provider>/<id>`.
+///
+/// `None` when no provider of the person's serves `session_model`, when that
+/// provider names no fast model, when the model it names is not one of its
+/// own — and when the name would not read back as that same provider entry:
+/// a like-named provider declared before this one that serves the id too
+/// would take it. The bare id is never the name: one the shipped registry
+/// names stays first-party, and one the person also wrote into the model
+/// catalog is the catalog's.
+#[must_use]
+pub fn own_fast_model_ref(session_model: &str) -> Option<String> {
+    let provider = custom_provider_for_model(&resolve_model_alias(session_model))?;
+    let named = format_provider_model_ref(provider.config.provider_name, provider.fast_model.as_deref()?);
+    custom_provider_for_model(&resolve_model_alias(&named))
+        .is_some_and(|back| Arc::ptr_eq(&back, &provider))
+        .then_some(named)
 }
 
 /// Wire model id to send to the remote API for `model`.
@@ -7445,6 +7534,118 @@ mod tests {
         assert_eq!(max_tokens_for_model("grok-4.5"), 32_000);
 
         super::refresh_custom_providers_from_json("[]").expect("restore empty custom providers");
+    }
+
+    /// A provider's fast model goes by the one name that is that provider's
+    /// — `<provider>/<id>`, in the casing its `models` lists — whatever the id
+    /// is spelled like, and by none where the entry names no fast model,
+    /// names one it does not list, or shares both its name and that id with
+    /// an entry declared before it.
+    #[test]
+    fn a_providers_fast_model_goes_by_the_name_that_is_that_providers() {
+        let _lock = crate::test_env_lock();
+        let shipped = super::builtin_provider_catalog()
+            .iter()
+            .find(|entry| entry.provider == ProviderKind::Anthropic)
+            .expect("an Anthropic row ships")
+            .canonical_model_id;
+        let entry = |name: &str, models: &str, fast: &str| {
+            format!(r#"{{"name":"{name}","base_url":"https://{name}.invalid/v1","requires_auth":false,"models":[{models}]{fast}}}"#)
+        };
+        super::refresh_custom_providers_from_json(&format!(
+            "[{}]",
+            [
+                entry("zqplain", r#""zq-plain-big","zq-small""#, r#","fast_model":" ZQ-Small ""#),
+                entry("zqshipped", &format!(r#""zq-shipped-big","{shipped}""#), &format!(r#","fast_model":"{shipped}""#)),
+                entry("zqstray", r#""zq-stray-big""#, r#","fast_model":"zq-not-listed""#),
+                entry("zqnone", r#""zq-none-big""#, ""),
+                entry("zqtwin", r#""zq-twin-small""#, ""),
+                entry("zqtwin", r#""zq-twin-big","zq-twin-small""#, r#","fast_model":"zq-twin-small""#),
+            ]
+            .join(",")
+        ))
+        .expect("custom providers");
+
+        let named = |session: &str| super::own_fast_model_ref(session);
+        assert_eq!(named("zq-plain-big").as_deref(), Some("zqplain/zq-small"));
+        assert_eq!(named("zqplain/zq-plain-big").as_deref(), Some("zqplain/zq-small"));
+        assert_eq!(named("zq-shipped-big"), Some(format!("zqshipped/{shipped}")));
+        assert_eq!(named("zq-stray-big"), None, "a model the entry does not list");
+        assert_eq!(named("zq-none-big"), None, "no fast model named");
+        assert_eq!(named("zq-twin-big"), None, "the name is the like-named entry's declared first");
+        assert_eq!(named("zq-model-nobody-serves"), None);
+        assert_eq!(named(shipped), None, "a first-party id is served by no provider of the person's");
+
+        // A `fast_model` that is not a model id names none, and costs the
+        // person nothing else the array declares.
+        for not_an_id in ["7", "true", r#"["zq-small"]"#, r#"{"id":"zq-small"}"#, "null"] {
+            super::refresh_custom_providers_from_json(&format!(
+                "[{},{}]",
+                entry("zqplain", r#""zq-plain-big","zq-small""#, &format!(r#","fast_model":{not_an_id}"#)),
+                entry("zqbeside", r#""zq-beside-big","zq-beside-small""#, r#","fast_model":"zq-beside-small""#),
+            ))
+            .unwrap_or_else(|error| panic!("`{not_an_id}` cost the whole array: {error}"));
+            assert!(super::custom_provider_for_model("zq-plain-big").is_some(), "`{not_an_id}`: the provider stands");
+            assert_eq!(named("zq-plain-big"), None, "`{not_an_id}`");
+            assert_eq!(named("zq-beside-big").as_deref(), Some("zqbeside/zq-beside-small"), "`{not_an_id}`");
+        }
+
+        super::refresh_custom_providers_from_json("[]").expect("clear custom providers");
+    }
+
+    /// The providers could not be read while either reading of them could
+    /// not. The settings' array fails on a row of the wrong shape and leaves
+    /// the catalog as it was; the environment variable is then read by
+    /// itself — it is how the catalog is first filled, by whoever asks it
+    /// first — and reads well, or is not there. That second reading says
+    /// nothing of the first: held in one flag, it took the first one's
+    /// failure down, and a session opened on a guess a moment later.
+    #[test]
+    fn the_providers_are_unread_while_either_reading_of_them_fails() {
+        let _lock = crate::test_env_lock();
+        let _env = EnvVarGuard::set(super::CUSTOM_PROVIDERS_ENV, None);
+        super::refresh_custom_providers_from_json("[]").expect("readable");
+        assert_eq!(super::custom_providers_unreadable(), None);
+
+        let slipped = r#"[{"name":"zqhost","base_url":"https://zqhost.invalid/v1","models":"zq-unread-big"}]"#;
+        assert!(super::refresh_custom_providers_from_json(slipped).is_err());
+        assert!(super::custom_providers_unreadable().is_some());
+        // The environment read by itself, with nothing exported, and then
+        // with an operator's own array that reads well.
+        let _ = super::load_custom_providers_from_env();
+        assert!(super::custom_providers_unreadable().is_some(), "an absent export took the settings' failure down");
+        let exported = EnvVarGuard::set(
+            super::CUSTOM_PROVIDERS_ENV,
+            Some(r#"[{"name":"zqpinned","base_url":"https://zqpinned.invalid/v1","models":["zq-pinned"]}]"#),
+        );
+        let _ = super::load_custom_providers_from_env();
+        assert!(super::custom_providers_unreadable().is_some(), "a readable export took the settings' failure down");
+        // And the other way round: an export that cannot be read stands
+        // though the settings' array reads.
+        drop(exported);
+        let broken = EnvVarGuard::set(super::CUSTOM_PROVIDERS_ENV, Some("{not an array"));
+        super::refresh_custom_providers_from_json("[]").expect("readable");
+        let _ = super::load_custom_providers_from_env();
+        assert!(super::custom_providers_unreadable().is_some(), "the settings reading well took the export's failure down");
+
+        // The variable is zo's own copy of the settings, and failed with
+        // them when the catalog was first filled; the settings mended and
+        // copied into it again, both readings are mended — the variable is
+        // not read a second time by itself.
+        let mended = r#"[{"name":"zqmended","base_url":"https://zqmended.invalid/v1","models":["zq-mended"]}]"#;
+        std::env::set_var(super::CUSTOM_PROVIDERS_ENV, mended);
+        super::refresh_custom_providers_from_json(mended).expect("readable");
+        assert_eq!(super::custom_providers_unreadable(), None, "the copy of the mended settings");
+
+        drop(broken);
+        super::refresh_custom_providers_from_env();
+        super::refresh_custom_providers_from_json("[]").expect("readable");
+        assert_eq!(super::custom_providers_unreadable(), None, "both read again");
+        // Mended back to the very array the catalog was last filled from:
+        // it is not parsed again, and it reads.
+        assert!(super::refresh_custom_providers_from_json(slipped).is_err());
+        super::refresh_custom_providers_from_json("[]").expect("readable");
+        assert_eq!(super::custom_providers_unreadable(), None, "the array it was last filled from");
     }
 
     #[test]

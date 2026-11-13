@@ -30,6 +30,7 @@ use crate::error::ToolError;
 use crate::misc_tools::council::{
     execute_council, CouncilCandidateInput, CouncilInput, VERDICT_MARKER,
 };
+use crate::model_home::ModelHome;
 use crate::misc_tools::{
     execute_agent_with_parent_model_and_hooks, run_spawn_multi_agent_with_timeout_and_hooks,
     wait_for_agent_completions, AgentInput, SpawnMultiAgentInput, AGENT_MODEL_ENV,
@@ -433,22 +434,54 @@ fn session_model(parent_model: Option<&str>) -> &str {
 /// model — one that hands over more than a short question, or was promised
 /// the session's provider's fast model and no other — asks this.
 ///
-/// `None` as well for a model a person's own provider serves
-/// (`<provider>/<model>`, or an id it declares) and for a name the catalog
-/// does not know. Both are *read* as a built-in provider — the first by the
-/// wire it speaks, the second by whichever login the machine holds — and the
-/// pick would be that provider's catalog model, dialled on that provider's
-/// account: not where the session's words went. The person's own provider is
-/// asked first, before any reading of the name: an id it declares may be
-/// spelled like a built-in family's (`gpt-…`, `claude-…`).
+/// The provider is where the session's requests go ([`crate::model_home`]),
+/// read in the order the session's client is built. The catalog comes first:
+/// a row the person wrote, or a `<catalog key>/<id>` selection, is on the
+/// provider it names whatever the id reads as. Until v1.1.147 the id was
+/// read, so a session spelled `openai/gemini-…` folded and split on Google's
+/// fast model, and one on a row written under Google had no fast model.
+///
+/// A model a person's own provider serves (`<provider>/<model>`, or an id it
+/// declares — which may be spelled like a built-in family's, `gpt-…` or
+/// `claude-…`) has the fast model that provider's row names for it
+/// (`fast_model`), and `None` where the row names none: the provider speaks
+/// the wire a built-in provider speaks, and a pick off the catalog would be
+/// that built-in provider's model, dialled on that provider's account — not
+/// where the session's words went. `None` for a name nothing knows, which is
+/// built for whichever login the machine holds.
+///
+/// "Where the session's requests go" is what its client was built by, not
+/// what the catalog file says when this is asked
+/// ([`crate::model_home::of_the_session`]): read from the file each time, a
+/// row written while the session ran moved its folds to the provider the row
+/// named, and left its own requests where they were.
 pub(crate) fn fast_tier_model(parent_model: Option<&str>) -> Option<String> {
     let parent = session_model(parent_model);
-    if api::custom_provider_for_model(parent).is_some()
-        || api::metadata_for_model(&api::resolve_model_alias(parent)).is_none()
-    {
-        return None;
+    fast_tier_model_where(parent, &crate::model_home::of_the_session(parent))
+}
+
+/// [`fast_tier_model`] for a session whose home the caller holds itself: a
+/// helper's context, told where the helper's own client was built to send.
+pub(crate) fn fast_tier_model_where(parent: &str, home: &ModelHome) -> Option<String> {
+    match home {
+        ModelHome::BuiltIn(provider) => fast_tier_triage_model(parent, *provider),
+        ModelHome::Own(_) => own_fast_model(parent, home),
+        ModelHome::Unknown => None,
     }
-    fast_tier_triage_model(parent, api::detect_provider_kind(parent))
+}
+
+/// The fast model the person named for the provider of theirs that serves
+/// `parent` (`fast_model` in its `providers` row), by that provider's own
+/// name for it ([`api::own_fast_model_ref`]: `<provider>/<id>`) — where that
+/// name sends where `parent`'s requests go (`home`), read as a client for it
+/// is built ([`crate::model_home::of_the_session`]).
+///
+/// The two part where the session is held to a provider that is no longer
+/// the one serving its model: the row was replaced by another while the
+/// session ran, and the session's own client still sends to the first. The
+/// row's fast model is then the other provider's, and nobody is asked.
+fn own_fast_model(parent: &str, home: &ModelHome) -> Option<String> {
+    api::own_fast_model_ref(parent).filter(|named| crate::model_home::of_the_session(named) == *home)
 }
 
 /// Decomposition/triage's model, derived from the connected catalog instead
@@ -1387,29 +1420,6 @@ mod tests {
         }
     }
 
-    /// The custom-provider catalog as the test found it, put back on drop.
-    struct OwnProviders(Option<std::ffi::OsString>);
-
-    impl OwnProviders {
-        /// Declare `providers` (the `ZO_CUSTOM_PROVIDERS` JSON) for this process.
-        fn declared(providers: &str) -> Self {
-            let before = std::env::var_os(api::CUSTOM_PROVIDERS_ENV);
-            std::env::set_var(api::CUSTOM_PROVIDERS_ENV, providers);
-            api::refresh_custom_providers_from_env();
-            Self(before)
-        }
-    }
-
-    impl Drop for OwnProviders {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(before) => std::env::set_var(api::CUSTOM_PROVIDERS_ENV, before),
-                None => std::env::remove_var(api::CUSTOM_PROVIDERS_ENV),
-            }
-            api::refresh_custom_providers_from_env();
-        }
-    }
-
     /// A session on a person's own provider is never handed a built-in
     /// provider's fast model, however its model is spelled. The ids are
     /// chosen to read as OpenAI's and Anthropic's own when nobody declares
@@ -1418,7 +1428,7 @@ mod tests {
     /// v1.1.144: 1,500 of 1,500 rows of a `bash` result).
     #[test]
     fn a_model_a_persons_own_provider_serves_keeps_to_that_provider() {
-        let _env = crate::tests::env_lock()
+        let env = crate::tests::env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let openai_fast = decompose_model(Some("gpt-5.5"));
@@ -1426,12 +1436,13 @@ mod tests {
 
         // Undeclared, the names are built-in families' by their spelling.
         {
-            let _none = OwnProviders::declared("[]");
+            let _none = crate::tests::OwnProviders::declared(&env, "[]");
             assert_eq!(decompose_model(Some("gpt-oss-120b")), openai_fast);
             assert_eq!(decompose_model(Some("claude-zq-gateway")), anthropic_fast);
         }
 
-        let _own = OwnProviders::declared(
+        let _own = crate::tests::OwnProviders::declared(
+            &env,
             r#"[{"name":"zqown","base_url":"https://own.invalid/v1","models":["gpt-oss-120b","claude-zq-gateway","zq-own-model"],"requires_auth":false}]"#,
         );
         for served in [
@@ -1447,6 +1458,128 @@ mod tests {
         // A built-in model keeps its provider's fast tier beside it.
         assert_eq!(decompose_model(Some("gpt-5.5")), openai_fast);
         assert_eq!(decompose_model(Some("opus")), anthropic_fast);
+    }
+
+    /// The fast tier is the session's provider's, and the catalog says which
+    /// provider that is before the name does: a row the person wrote under
+    /// Google is on Google though nothing in its name says so, and a
+    /// `<catalog key>/<id>` selection is on the key's provider though its id
+    /// reads as another's. Read by the id, such a session's over-cap tool
+    /// output and the request it was asked to split went to the id's
+    /// provider — not the account the session is on.
+    #[test]
+    fn the_fast_tier_is_of_the_provider_the_catalog_puts_the_session_on() {
+        use runtime::model_catalog::CatalogProvider;
+
+        let env = crate::tests::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ollama = crate::tests::Var::unset(&env, "OLLAMA_BASE_URL");
+        let _home = crate::tests::ConfigHome::empty(&env)
+            .catalog_row(CatalogProvider::Google, "zq-row-on-google")
+            .catalog_row(CatalogProvider::Anthropic, "zq-row-on-anthropic")
+            .catalog_row(CatalogProvider::Google, "zq-both-list");
+        let _own = crate::tests::OwnProviders::declared(
+            &env,
+            r#"[{"name":"zqown","base_url":"https://own.invalid/v1","models":["zq-both-list","zq-own-model"],"requires_auth":false}]"#,
+        );
+        let fast = |parent: &str| super::fast_tier_model(Some(parent));
+        let google = fast("gemini-zq-9").expect("Google ships a fast tier");
+        let openai = fast("gpt-zq-9").expect("OpenAI ships a fast tier");
+        let anthropic = fast("claude-zq-9").expect("Anthropic ships a fast tier");
+        assert_ne!(google, openai);
+
+        assert_eq!(fast("zq-row-on-google"), Some(google.clone()));
+        assert_eq!(fast("zq-row-on-anthropic"), Some(anthropic));
+        // A row a provider of the person's lists too is still the catalog's.
+        assert_eq!(fast("zq-both-list"), Some(google.clone()));
+        assert_eq!(fast("openai/gemini-zq-9"), Some(openai.clone()));
+        assert_eq!(fast("google/gpt-zq-9"), Some(google.clone()));
+        // An id the person's provider declares, under Google's key, is
+        // Google's session; bare, it is the provider's and has no fast tier.
+        assert_eq!(fast("google/zq-own-model"), Some(google));
+        assert_eq!(fast("zq-own-model"), None);
+        // A word before the slash that names nobody: the id is read.
+        assert_eq!(fast("zqnobody/gpt-zq-9"), Some(openai));
+        assert_eq!(fast("zqnobody/zq-some-model"), None);
+    }
+
+    /// A session on a provider of the person's own is asked on the fast model
+    /// that provider's row names (`fast_model`), by the provider's own name
+    /// for it, and on nothing where the row names none. However the id is
+    /// spelled — like a built-in family's, like a row the person also wrote
+    /// into the catalog under another provider — and whatever the provider
+    /// is named, the name sends to that provider; a model the row does not
+    /// list is nobody's. And a session held to a provider whose row another
+    /// took the place of is not asked on the other's.
+    #[test]
+    fn a_persons_own_provider_is_asked_on_the_fast_model_its_row_names() {
+        use crate::tests::{ConfigHome, OwnProviders, RunningSession, Var};
+        use runtime::model_catalog::CatalogProvider;
+
+        let env = crate::tests::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ollama = Var::unset(&env, "OLLAMA_BASE_URL");
+        let _home = ConfigHome::empty(&env).catalog_row(CatalogProvider::Google, "zq-fast-also-a-row");
+        let shipped = api::builtin_provider_catalog()
+            .iter()
+            .find(|entry| entry.provider == api::ProviderKind::Anthropic)
+            .expect("an Anthropic row ships")
+            .canonical_model_id;
+        let provider = |name: &str, fast: &str, models: &str| {
+            format!(r#"{{"name":"{name}","base_url":"https://{name}.invalid/v1","requires_auth":false,{fast}"models":[{models}]}}"#)
+        };
+        let rows = [
+            provider("zqplain", r#""fast_model":"ZQ-Small","#, r#""zq-plain-big","zq-small""#),
+            provider("zqnone", "", r#""zq-none-big","zq-none-small""#),
+            provider("zqalias", r#""fast_model":"haiku","#, r#""zq-alias-big","haiku""#),
+            provider("zqshipped", &format!(r#""fast_model":"{shipped}","#), &format!(r#""zq-shipped-big","{shipped}""#)),
+            provider("openai", r#""fast_model":"zq-keyed-small","#, r#""zq-keyed-big","zq-keyed-small""#),
+            provider("zqstray", r#""fast_model":"zq-not-listed","#, r#""zq-stray-big""#),
+            provider("zqrow", r#""fast_model":"zq-fast-also-a-row","#, r#""zq-row-big","zq-fast-also-a-row""#),
+        ];
+        let own_rows = OwnProviders::declared(&env, &format!("[{}]", rows.join(",")));
+        let fast = |session: &str| super::fast_tier_model(Some(session));
+        let own = |name: &str| ModelHome::Own(name.to_string());
+        let home = |model: &str| crate::model_home::of_the_session(model);
+
+        // Named, in the casing the row lists it; however the session is spelled.
+        for session in ["zq-plain-big", "zqplain/zq-plain-big", "zq-small"] {
+            assert_eq!(fast(session).as_deref(), Some("zqplain/zq-small"), "{session}");
+        }
+        // Not named, or not one of the row's models: asked nothing, as before.
+        assert_eq!(fast("zq-none-big"), None);
+        assert_eq!(fast("zq-stray-big"), None);
+        // Whatever the id is spelled like and whatever the provider is named,
+        // the name sends where the session's requests go.
+        for (session, provider, id) in [
+            ("zq-alias-big", "zqalias", "haiku"),
+            ("zq-shipped-big", "zqshipped", shipped),
+            ("zq-keyed-big", "openai", "zq-keyed-small"),
+            ("zq-row-big", "zqrow", "zq-fast-also-a-row"),
+        ] {
+            let named = format!("{provider}/{id}");
+            assert_eq!(fast(session), Some(named.clone()), "{session}");
+            assert_eq!(home(&named), own(provider), "{named}");
+            assert_eq!(home(session), own(provider), "{session}");
+        }
+        // The bare id the catalog holds under Google is Google's; it is never the name.
+        assert_eq!(home("zq-fast-also-a-row"), ModelHome::BuiltIn(api::ProviderKind::Google));
+        // The split falls back to the session's own model where none is named.
+        assert_eq!(decompose_model(Some("zq-none-big")), "zq-none-big");
+        assert_eq!(decompose_model(Some("zq-plain-big")), "zqplain/zq-small");
+
+        // A session held to a provider whose row another took the place of
+        // while it ran: its client still sends to the first, and the fast
+        // model the new row names is the new provider's.
+        let _session = RunningSession::built_now(&env, "zq-plain-big");
+        drop(own_rows);
+        let _replaced = OwnProviders::declared(
+            &env,
+            &format!("[{}]", provider("zqother", r#""fast_model":"zq-small","#, r#""zq-plain-big","zq-small""#)),
+        );
+        assert_eq!(api::own_fast_model_ref("zq-plain-big").as_deref(), Some("zqother/zq-small"));
+        assert_eq!(home("zq-plain-big"), own("zqplain"), "the session is where its client was built");
+        assert_eq!(fast("zq-plain-big"), None);
     }
 
     #[test]

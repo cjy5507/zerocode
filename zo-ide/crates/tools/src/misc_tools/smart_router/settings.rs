@@ -1181,12 +1181,25 @@ fn route_deep_verify_model(
     )
 }
 
-fn preferred_verify_model(
+/// The verifier among `candidates`: with crossing allowed, the first on
+/// another provider than the session's (else the first); with crossing off,
+/// the first on the session's own provider and nothing otherwise.
+///
+/// "The session's provider" is where the session's requests go
+/// ([`crate::model_home`]), read once here for all the candidates. Until
+/// v1.1.147 it was the name's reading, which for a model a person's own
+/// provider serves is `OpenAI`: with crossing switched off, such a session's
+/// verifier was `OpenAI`'s model — on another account than the session's.
+pub(super) fn preferred_verify_model(
     main_model: &str,
     candidates: impl Iterator<Item = String>,
     allow_cross_provider: bool,
 ) -> Option<String> {
-    let main_provider = api::detect_provider_kind(main_model);
+    // The session's side is what its client was built by; the candidates
+    // have no client yet and are read from the catalog as it is, once.
+    let main_home = crate::model_home::of_the_session(main_model);
+    let homes = crate::model_home::Homes::load();
+    let on_the_sessions_provider = |candidate: &String| main_home.is_where(&homes.of(candidate));
     let candidates = candidates
         .filter(|candidate| !same_smart_generation(candidate, main_model))
         .fold(Vec::<String>::new(), |mut unique, candidate| {
@@ -1201,13 +1214,11 @@ fn preferred_verify_model(
     if allow_cross_provider {
         candidates
             .iter()
-            .find(|candidate| api::detect_provider_kind(candidate) != main_provider)
+            .find(|candidate| !on_the_sessions_provider(candidate))
             .cloned()
             .or_else(|| candidates.into_iter().next())
     } else {
-        candidates
-            .into_iter()
-            .find(|candidate| api::detect_provider_kind(candidate) == main_provider)
+        candidates.into_iter().find(on_the_sessions_provider)
     }
 }
 

@@ -363,7 +363,7 @@ pub(crate) struct LogLine {
     pub at_ms: i64,
     /// `taken-in`, `edited`, `removed`, `asked`, `added`, `deleted`,
     /// `switched-off`, `switched-on`, `agent-off`, `agent-on`, `chosen`,
-    /// `shared`, `linked`, `first-merge`, `failed`, `undone`.
+    /// `aligned`, `shared`, `linked`, `first-merge`, `failed`, `undone`.
     pub kind: String,
     /// `mcp` or `skill` (or `both` for the first merge).
     pub item: String,
@@ -585,6 +585,66 @@ fn skill_digest(dir: &Path, skill_md: &[u8]) -> String {
         .collect()
 }
 
+/// The files under `dir`, by path below it, to the digest's bounds.
+fn digest_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((at, depth)) = pending.pop() {
+        let Ok(read) = std::fs::read_dir(&at) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            if files.len() >= DIGEST_ENTRIES {
+                break;
+            }
+            let path = entry.path();
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.is_dir() && depth < 4 => pending.push((path, depth + 1)),
+                Ok(meta) if meta.is_file() => {
+                    if let Ok(relative) = path.strip_prefix(dir) {
+                        files.push(relative.to_path_buf());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Whether every file under `copy` is byte for byte the one at its place in
+/// `held` — asked only of two folders whose digests already agree, so the
+/// two hold the same names at the same sizes.
+fn same_bytes(held: &Path, copy: &Path) -> bool {
+    digest_files(copy).iter().all(|relative| {
+        match (
+            std::fs::read(copy.join(relative)),
+            std::fs::read(held.join(relative)),
+        ) {
+            (Ok(mine), Ok(theirs)) => mine == theirs,
+            _ => false,
+        }
+    })
+}
+
+/// A digest of every file's path and text under `dir`, for a copy whose
+/// sizes agree with the store's but whose text does not.
+fn content_digest(dir: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"bytes");
+    for relative in digest_files(dir) {
+        hasher.update(relative.to_string_lossy().as_bytes());
+        hasher.update(std::fs::read(dir.join(&relative)).unwrap_or_default());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// A skill folder's digest as [`skill_folders`] reads it; `None` without its
 /// `SKILL.md`.
 fn folder_digest(dir: &Path) -> Option<String> {
@@ -629,9 +689,23 @@ fn skill_folders(dir: &Path, store: Option<&Path>, home: &Path) -> Vec<SkillFold
             .as_ref()
             .zip(real.as_ref())
             .is_some_and(|(store, real)| real.starts_with(store));
+        let mut digest = skill_digest(&path, &bytes);
+        // A digest reads sizes, not texts: a copy that agrees with the
+        // store's by it is read byte for byte once, and one a person changed
+        // a letter of — same size — is told apart, so it is asked about and
+        // never taken for the store's (review t-106726, fourth).
+        let held = store.as_ref().map(|store| store.join(&name));
+        if let Some(held) = held.filter(|held| {
+            !into_store
+                && canonical(&path) != canonical(held)
+                && folder_digest(held).as_deref() == Some(digest.as_str())
+        }) && !same_bytes(&held, &path)
+        {
+            digest = content_digest(&path);
+        }
         folders.push(SkillFolder {
-            ours: zerocode_core::skill_install::ships_this_text(&name, &bytes),
-            digest: skill_digest(&path, &bytes),
+            ours: zerocode_core::skill_install::ships_this_folder(&name, &path),
+            digest,
             name,
             path,
             into_store,
@@ -1241,8 +1315,9 @@ fn copy_into_store(ctx: &Context, from: &Path, name: &str) -> Result<Option<Remo
 }
 
 /// Whether `path` holds what the store's `held` folder holds: the same text,
-/// or an earlier release of a skill this build ships, whose store copy is the
-/// one kept.
+/// byte for byte, or, whole, a copy this build or an earlier release ships,
+/// whose store copy is the one kept — not one a person added a file to or
+/// changed a letter of.
 fn duplicates(held: &Path, path: &Path, name: &str) -> bool {
     let Some(store_text) = folder_digest(held) else {
         return false;
@@ -1250,8 +1325,8 @@ fn duplicates(held: &Path, path: &Path, name: &str) -> bool {
     let Ok(bytes) = std::fs::read(path.join(zerocode_core::skill::SKILL_FILE)) else {
         return false;
     };
-    skill_digest(path, &bytes) == store_text
-        || zerocode_core::skill_install::ships_this_text(name, &bytes)
+    (skill_digest(path, &bytes) == store_text && same_bytes(held, path))
+        || zerocode_core::skill_install::ships_this_folder(name, path)
 }
 
 /// Where a folder's own entry stands, by its whole path: a link is an entry
@@ -1534,7 +1609,7 @@ fn link_claude_home(ctx: &Context, ledger: &mut Ledger, log: &mut Vec<LogLine>) 
                             std::fs::read(target.join(zerocode_core::skill::SKILL_FILE))
                                 .unwrap_or_default();
                         let same = skill_digest(&target, &store_bytes) == theirs;
-                        if same || zerocode_core::skill_install::ships_this_text(&name, bytes) {
+                        if same || zerocode_core::skill_install::ships_this_folder(&name, &path) {
                             put_away(&path).is_ok()
                         } else {
                             let keep = held.join(&name);
@@ -2855,6 +2930,75 @@ pub(crate) fn choose_skill(
             }
         }
         Ok(vec![line("chosen", "skill", name, "person")])
+    })
+}
+
+/// The folder under the keeper's own where a copy the person set to the
+/// store's text is kept before it goes ([`align_skill`]): outside the store
+/// and every agent's home.
+const ALIGNED: &str = "aligned";
+
+/// The person set an agent's copy of a skill to the store's text (「저장소
+/// 것으로 맞추기」): the agent reads the store by itself, so the copy in its
+/// own folder is the same name read twice, in another text. Each such copy
+/// the record asks about is kept whole under the keeper's folder
+/// ([`ALIGNED`]), then goes to the Trash (「되돌리기」 brings it back), and
+/// the question about it is closed. The folder is the record's own and must
+/// stand in one of the agent's own skills folders; the page names the skill
+/// and the agent, never a path.
+pub(crate) fn align_skill(ctx: &Context, name: &str, agent: &str) -> Result<Report, String> {
+    if !library::is_skill_name(name) {
+        return Err("library.invalidName".to_string());
+    }
+    let reads_store = AGENTS
+        .iter()
+        .find(|known| known.id == agent)
+        .filter(|known| known.skills.reads_the_store_everywhere())
+        .ok_or("library.notFound")?;
+    if std::fs::symlink_metadata(ctx.store_skills().join(name)).is_err() {
+        return Err("library.notFound".to_string());
+    }
+    let own: Vec<PathBuf> = ctx
+        .own_skill_dirs(reads_store)
+        .into_iter()
+        .map(|dir| dir.join(name))
+        .collect();
+    act(ctx, |ledger| {
+        let record = ledger.skills.get_mut(name).ok_or("library.notFound")?;
+        let (copies, rest): (Vec<SkillCandidate>, Vec<SkillCandidate>) =
+            std::mem::take(&mut record.pick)
+                .into_iter()
+                .partition(|candidate| {
+                    candidate.agent == agent
+                        && own.iter().any(|path| Path::new(&candidate.path) == path)
+                });
+        record.pick = rest;
+        if copies.is_empty() {
+            return Err("library.notFound".to_string());
+        }
+        let kept = ctx
+            .folder()
+            .join(ALIGNED)
+            .join(format!("{}-{agent}", now()));
+        let mut receipts = Vec::new();
+        for (at, copy) in copies.iter().enumerate() {
+            let from = Path::new(&copy.path);
+            if std::fs::symlink_metadata(from).is_err() {
+                continue;
+            }
+            let into = kept.join(at.to_string()).join(name);
+            copy_skill_folder(from, &into)?;
+            receipts.push(put_away(from)?);
+        }
+        let said = line("aligned", "skill", name, agent);
+        remember(
+            said.id,
+            Undo::Trashed {
+                name: name.to_string(),
+                receipts,
+            },
+        );
+        Ok(vec![said])
     })
 }
 
@@ -4421,6 +4565,168 @@ mod tests {
             Some("library.invalidName")
         );
         assert!(!read_ledger(&ctx).skills.contains_key("../x"));
+    }
+
+    /// A copy of a shipped skill in a Native agent's own folder goes to the
+    /// Trash only when the whole folder is ours (review t-106726, fourth): a
+    /// shipped `SKILL.md` beside a file the person added stays where it is,
+    /// and is asked about; the same text alone goes.
+    #[test]
+    fn a_native_agents_copy_with_a_file_of_the_persons_stays_and_is_asked() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let shipped = |name: &str| zerocode_core::skill_install::bundled_skill(name).unwrap();
+        for name in ["computer-use", "dataviz"] {
+            for root in [".agents/skills", ".gemini/skills"] {
+                let dir = home.path().join(root).join(name);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join(zerocode_core::skill::SKILL_FILE),
+                    shipped(name).content,
+                )
+                .unwrap();
+            }
+        }
+        let added = home.path().join(".gemini/skills/computer-use");
+        std::fs::write(added.join("notes.md"), "mine").unwrap();
+        let ctx = context_of(home.path(), data.path(), &["gemini"]);
+        look(&ctx).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(added.join("notes.md")).unwrap(),
+            "mine",
+            "a folder with the person's file went"
+        );
+        let asked = &read_ledger(&ctx).skills["computer-use"].pick;
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(asked[0].agent, "gemini");
+        assert!(
+            std::fs::symlink_metadata(home.path().join(".gemini/skills/dataviz")).is_err(),
+            "a copy of ours alone stayed"
+        );
+    }
+
+    /// A copy whose reference file a person changed a letter of — the same
+    /// size, so the digest agrees with the store's — stays and is asked
+    /// about; a copy the same byte for byte still goes (review t-106726,
+    /// fourth, the rest).
+    #[test]
+    fn a_native_agents_copy_changed_at_the_same_size_stays_and_is_asked() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        for name in ["notes-a", "notes-b"] {
+            for root in [".agents/skills", ".gemini/skills"] {
+                let dir = home.path().join(root).join(name);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join(zerocode_core::skill::SKILL_FILE),
+                    format!("---\nname: {name}\n---\nbody\n"),
+                )
+                .unwrap();
+                std::fs::write(dir.join("verbs.md"), "verbs: ask, tell\n").unwrap();
+            }
+        }
+        let changed = home.path().join(".gemini/skills/notes-a");
+        std::fs::write(changed.join("verbs.md"), "verbs: ask, sell\n").unwrap();
+        let ctx = context_of(home.path(), data.path(), &["gemini"]);
+        look(&ctx).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(changed.join("verbs.md")).unwrap(),
+            "verbs: ask, sell\n",
+            "a copy changed at the same size went"
+        );
+        let asked = &read_ledger(&ctx).skills["notes-a"].pick;
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(asked[0].agent, "gemini");
+        assert!(
+            std::fs::symlink_metadata(home.path().join(".gemini/skills/notes-b")).is_err(),
+            "a copy the same byte for byte stayed"
+        );
+    }
+
+    /// 「저장소 것으로 맞추기」 (2026-11-13): Gemini CLI reads the store by
+    /// itself, and an old text of a shipped skill in its own folder is a
+    /// question. The person's press keeps that copy under the keeper's own
+    /// folder, sends it to the Trash and closes the question; 「되돌리기」
+    /// brings it back. An agent that does not read the store, and a name
+    /// with no question, are refused with nothing moved.
+    #[test]
+    fn setting_a_native_agents_copy_to_the_stores_keeps_it_and_takes_it_out() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let store = home.path().join(".agents/skills/computer-use");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(
+            store.join(zerocode_core::skill::SKILL_FILE),
+            "---\nname: computer-use\n---\nstore\n",
+        )
+        .unwrap();
+        let copy = home.path().join(".gemini/skills/computer-use");
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(
+            copy.join(zerocode_core::skill::SKILL_FILE),
+            "---\nname: computer-use\n---\nmine\n",
+        )
+        .unwrap();
+        let ctx = context_of(home.path(), data.path(), &["gemini", "kiro"]);
+        look(&ctx).unwrap();
+        let asked = &read_ledger(&ctx).skills["computer-use"].pick;
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(asked[0].agent, "gemini");
+
+        assert_eq!(
+            align_skill(&ctx, "computer-use", "kiro").err().as_deref(),
+            Some("library.notFound")
+        );
+        assert_eq!(
+            align_skill(&ctx, "other", "gemini").err().as_deref(),
+            Some("library.notFound")
+        );
+        assert!(
+            copy.join(zerocode_core::skill::SKILL_FILE).is_file(),
+            "a refusal moved the copy"
+        );
+
+        let answered = align_skill(&ctx, "computer-use", "gemini").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&copy).is_err(),
+            "the copy is still there"
+        );
+        let kept: Vec<PathBuf> = std::fs::read_dir(data.path().join("library").join(ALIGNED))
+            .unwrap()
+            .flatten()
+            .map(|entry| {
+                entry
+                    .path()
+                    .join("0/computer-use")
+                    .join(zerocode_core::skill::SKILL_FILE)
+            })
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&kept[0]).unwrap(),
+            "---\nname: computer-use\n---\nmine\n"
+        );
+        assert!(read_ledger(&ctx).skills["computer-use"].pick.is_empty());
+        assert!(
+            answered.skills.iter().all(|row| row.pick.is_empty()),
+            "the question is still asked"
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.join(zerocode_core::skill::SKILL_FILE)).unwrap(),
+            "---\nname: computer-use\n---\nstore\n",
+            "the store's text moved"
+        );
+        let aligned = answered
+            .log
+            .iter()
+            .find(|row| row.line.kind == "aligned")
+            .expect("the log says what was done");
+        assert_eq!(aligned.line.who, "gemini");
+        undo(&ctx, aligned.line.id).unwrap();
+        assert!(
+            copy.join(zerocode_core::skill::SKILL_FILE).is_file(),
+            "「되돌리기」 brings it back"
+        );
     }
 
     /// A skill Kiro installs is copied (Kiro reads only its own folder); the

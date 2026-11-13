@@ -374,6 +374,7 @@ mod tests {
             worktree: root,
             worker: false,
             prompt_key: None,
+            launch: String::new(),
         };
         (home, workspace, wire, endpoint, pane)
     }
@@ -426,6 +427,7 @@ mod tests {
                     ..PaneBook::default()
                 },
             )]),
+            ..Guards::default()
         });
         assert!(brief_in(&guards, &wire, &ask, 1).is_none());
         let expired = zerocode_hookd::TurnBriefAsk {
