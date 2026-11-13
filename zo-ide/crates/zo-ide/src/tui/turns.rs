@@ -64,7 +64,8 @@ pub enum StepKind {
     /// An edit, a created file or a deleted one — `verb` says which.
     Edit,
     Run,
-    /// A web fetch — counted by its word in the fold, like any other call.
+    /// A web fetch — looking around, as a read is: the fold counts the pages
+    /// in the row that counts the files read.
     Fetch,
     /// Any other call: a helper spawned, an MCP tool, a plan update.
     Other,
@@ -126,6 +127,14 @@ impl TurnFold {
     #[must_use]
     pub fn has_steps(&self) -> bool {
         !self.steps.is_empty()
+    }
+
+    /// Whether the last shown entry is a step (so a following live step from
+    /// an open tool cell hangs with continuation indent rather than opening a
+    /// new hung mark).
+    #[must_use]
+    pub fn ends_hanging(&self) -> bool {
+        matches!(self.live.last(), Some(Shown::Step(_)))
     }
 
     /// Finished calls join the fold.
@@ -196,6 +205,12 @@ impl TurnFold {
     #[must_use]
     pub fn step_count(&self) -> usize {
         self.steps.len()
+    }
+
+    /// How many of the fold's steps failed — what its head row says.
+    #[must_use]
+    pub fn failures(&self) -> usize {
+        failures(&self.steps)
     }
 
     /// Whether a blank row stands above the row at `at`: it opens a text that
@@ -296,38 +311,83 @@ impl TurnFold {
 }
 
 /// A step's row in the viewport: its hung mark, the call as the running row
-/// said it, and what it came to. The tail is kept before the target is: a
-/// target that does not fit gives up its own end (an address its middle) so
-/// the result stays on the row.
-fn step_row(step: &Step, lead: &str, width: usize) -> Line {
+/// said it, and what it came to.
+pub(super) fn step_row(step: &Step, lead: &str, width: usize) -> Line {
     let tail = step_tail(step, true, true);
-    if step.target.is_empty() {
-        let mut spans = vec![Span::dim(lead), Span::dim(step.verb.clone())];
+    call_row(vec![Span::dim(lead)], &step.verb, &step.target, step.kind == StepKind::Fetch, Style::new().dim(), tail, width)
+}
+
+/// A running call's row in the `turns` viewport: the spinner where a
+/// finished step's hung mark stands, and the call as [`step_row`] will say
+/// it, at the same column and cut the same way — the row does not move or
+/// change its words when the call ends. `note` is what the call says beside
+/// its target while it runs (`+2 lines` of a command's script).
+pub(super) fn running_step_row(spinner: Span, verb: &str, target: &str, address: bool, note: Option<&str>, width: usize) -> Line {
+    let mark = super::style::glyphs().result_first;
+    let indent = mark.len() - mark.trim_start().len();
+    let lead = vec![Span::raw(" ".repeat(indent)), spinner, Span::raw(" ")];
+    let tail = note.map(|note| vec![Span::dim(format!("{RESULT_GAP}{note}"))]).unwrap_or_default();
+    call_row(lead, verb, target, address, Style::new(), tail, width)
+}
+
+/// What stands between a call and what it came to, on every row that says
+/// both — a step that names a target and one that does not alike.
+const RESULT_GAP: &str = "  ";
+
+/// A call's row: `lead`, the call — `Verb(target)`, or the verb alone — and
+/// `tail`. The tail is kept before the target is: a target that does not fit
+/// gives up its own end (an address its middle) so the result stays on the
+/// row.
+fn call_row(lead: Vec<Span>, verb: &str, target: &str, address: bool, style: Style, tail: Vec<Span>, width: usize) -> Line {
+    let mut spans = lead;
+    if target.is_empty() {
+        spans.push(Span::new(verb.to_string(), style));
         spans.extend(tail);
         return Line::new(spans).truncated(width);
     }
-    let opening = super::tools::call_opening(&step.verb);
+    let opening = super::tools::call_opening(verb);
     let closing = super::tools::call_closing();
-    let fixed = [lead, opening.as_str(), closing].iter().map(|text| super::ansi::str_width(text)).sum::<usize>()
-        + tail.iter().map(Span::width).sum::<usize>();
+    let fixed = spans.iter().chain(tail.iter()).map(Span::width).sum::<usize>()
+        + super::ansi::str_width(&opening)
+        + super::ansi::str_width(closing);
     let budget = width.saturating_sub(fixed).max(1);
-    let target = if super::ansi::str_width(&step.target) <= budget {
-        step.target.clone()
-    } else if step.kind == StepKind::Fetch {
-        super::paths::center_truncate_path(&step.target, budget)
+    let target = if super::ansi::str_width(target) <= budget {
+        target.to_string()
+    } else if address {
+        super::paths::center_truncate_path(target, budget)
     } else {
-        Line::new(vec![Span::raw(step.target.clone())]).truncated(budget).plain()
+        Line::new(vec![Span::raw(target.to_string())]).truncated(budget).plain()
     };
-    let mut spans = vec![Span::dim(lead), Span::dim(format!("{opening}{target}{closing}"))];
+    spans.push(Span::new(format!("{opening}{target}{closing}"), style));
     spans.extend(tail);
     Line::new(spans).truncated(width)
 }
 
+/// A failed step's call in the fold, in the words its row said while the turn
+/// ran — `Run(cat a.txt)`, the verb alone for a call with no target — so the
+/// call reads the same once it is said (`Run cat a.txt` before, and
+/// `almanac · whoami   failed` with a space for the target it did not have).
+fn call_words(step: &Step) -> Vec<Span> {
+    if step.target.is_empty() {
+        return vec![Span::dim(step.verb.clone())];
+    }
+    vec![
+        Span::dim(super::tools::call_opening(&step.verb)),
+        Span::raw(step.target.clone()),
+        Span::dim(super::tools::call_closing()),
+    ]
+}
+
+/// How much deeper than its step the row that says why it failed stands —
+/// under the call's words, not beside them, in the viewport as in the fold.
+const WHY_INDENT: &str = "  ";
+
 /// The row under a failed step: what it said first.
-fn why_row(step: &Step, width: usize) -> Option<Line> {
+pub(super) fn why_row(step: &Step, width: usize) -> Option<Line> {
     let why = step.error.as_ref()?;
     let glyphs = super::style::glyphs();
-    Some(Line::new(vec![Span::raw(glyphs.result_rest), Span::new(why.clone(), Style::new().fg(palette::TOOL_FAIL).dim())]).truncated(width))
+    let lead = format!("{}{WHY_INDENT}", glyphs.result_rest);
+    Some(Line::new(vec![Span::raw(lead), Span::new(why.clone(), Style::new().fg(palette::TOOL_FAIL).dim())]).truncated(width))
 }
 
 /// `1 step`, `7 steps` — a fold's count, in its cell and on the working row,
@@ -347,11 +407,11 @@ fn step_tail(step: &Step, quiet: bool, per_call: bool) -> Vec<Span> {
     if !step.ok {
         let word = step.failure.clone().unwrap_or_else(|| strings::TOOL_FAILED_RESULT.to_string());
         let style = if step.declined { Style::new().dim() } else { tint(palette::TOOL_FAIL) };
-        return vec![Span::raw("  "), Span::new(word, style)];
+        return vec![Span::raw(RESULT_GAP), Span::new(word, style)];
     }
     if let Some((added, removed)) = step.change {
         return vec![
-            Span::raw("  "),
+            Span::raw(RESULT_GAP),
             Span::new(format!("+{added}"), tint(Color::GREEN)),
             Span::raw(" "),
             Span::new(format!("-{removed}"), tint(Color::RED)),
@@ -359,10 +419,10 @@ fn step_tail(step: &Step, quiet: bool, per_call: bool) -> Vec<Span> {
     }
     let mut tail = Vec::new();
     if let Some(result) = step.result.as_ref().filter(|_| per_call) {
-        tail.push(Span::dim(format!("  {result}")));
+        tail.push(Span::dim(format!("{RESULT_GAP}{result}")));
     }
     if let Some(took) = step.took.filter(|took| step.kind == StepKind::Run && took.as_secs() > 0) {
-        tail.push(Span::dim(format!("  {:.1}s", took.as_secs_f32())));
+        tail.push(Span::dim(format!("{RESULT_GAP}{:.1}s", took.as_secs_f32())));
     }
     tail
 }
@@ -391,11 +451,11 @@ pub fn cell(steps: &[Step], width: usize, now: Instant) -> Vec<Line> {
     body.extend(other_row(steps));
     // What did not go through is never folded away.
     for step in steps.iter().filter(|step| !step.ok) {
-        let mut row = vec![Span::dim(format!("{} ", step.verb)), Span::raw(step.target.clone())];
+        let mut row = call_words(step);
         row.extend(step_tail(step, false, false));
         body.push(row);
         if let Some(why) = step.error.as_ref() {
-            body.push(vec![Span::raw("  "), Span::new(why.clone(), Style::new().fg(palette::TOOL_FAIL).dim())]);
+            body.push(vec![Span::raw(WHY_INDENT), Span::new(why.clone(), Style::new().fg(palette::TOOL_FAIL).dim())]);
         }
     }
 
@@ -408,11 +468,46 @@ pub fn cell(steps: &[Step], width: usize, now: Instant) -> Vec<Line> {
     out
 }
 
+/// The row the work stands under while the turn runs — `⏺ Working · 3 steps`,
+/// with ` · 1 failed` once one has: the words and the order of the row the
+/// fold's cell opens with when the turn is said ([`cell`]), on the screen
+/// row it will be said on, so nothing moves then but the words. `steps` are
+/// the calls made so far, the running ones too. No clock and no spinner of
+/// its own: the working row counts the time, and the running call's row
+/// turns. Its mark is the look's cell mark (`⏺`, `•`): the done mark (`✓`)
+/// is the fold's to put there.
+#[must_use]
+pub fn working_head(steps: usize, failed: usize, width: usize) -> Line {
+    let column = super::style::current().reading_width(width);
+    let mark = super::style::glyphs().answer.trim_end();
+    Line::new(head_spans(mark, Style::new().dim(), strings::WORKING.to_string(), steps, failed)).truncated(column)
+}
+
+/// A head row's words: its mark, what was done, how many steps, how many of
+/// them failed.
+fn head_spans(mark: &str, style: Style, done: String, steps: usize, failed: usize) -> Vec<Span> {
+    let mut head = vec![
+        Span::new(mark.to_string(), style),
+        Span::raw(" "),
+        Span::bold(done),
+        Span::dim(format!(" · {}", steps_word(steps))),
+    ];
+    if failed > 0 {
+        head.push(Span::new(format!(" · {failed} failed"), Style::new().fg(palette::TOOL_FAIL)));
+    }
+    head
+}
+
+/// How many steps failed: a declined one did not fail, it was not run.
+fn failures(steps: &[Step]) -> usize {
+    steps.iter().filter(|step| !step.ok && !step.declined).count()
+}
+
 /// The cell's first row: how long the steps took and how many there were,
 /// and, where it fits, the key that shows them all.
 fn head_row(steps: &[Step], width: usize, now: Instant) -> Vec<Span> {
-    let failed = steps.iter().any(|step| !step.ok && !step.declined);
-    let glyph_style = Style::new().fg(if failed { palette::TOOL_FAIL } else { palette::TOOL_OK }).bold();
+    let failed = failures(steps);
+    let glyph_style = Style::new().fg(if failed > 0 { palette::TOOL_FAIL } else { palette::TOOL_OK }).bold();
     let seconds = steps
         .iter()
         .map(|step| step.started)
@@ -423,16 +518,7 @@ fn head_row(steps: &[Step], width: usize, now: Instant) -> Vec<Span> {
     } else {
         strings::WORKED.to_string()
     };
-    let mut head = vec![
-        Span::new(super::style::glyphs().tool_done.to_string(), glyph_style),
-        Span::raw(" "),
-        Span::bold(worked),
-        Span::dim(format!(" · {}", steps_word(steps.len()))),
-    ];
-    let failures = steps.iter().filter(|step| !step.ok && !step.declined).count();
-    if failures > 0 {
-        head.push(Span::new(format!(" · {failures} failed"), Style::new().fg(palette::TOOL_FAIL)));
-    }
+    let mut head = head_spans(super::style::glyphs().tool_done, glyph_style, worked, steps.len(), failed);
     let hint = [Span::bold(strings::KEY_VIEW), Span::dim(strings::TO_EXPAND)];
     let used: usize = head.iter().map(Span::width).sum();
     let hint_width: usize = hint.iter().map(Span::width).sum();
@@ -451,6 +537,7 @@ fn looked_row(steps: &[Step]) -> Option<Vec<Span>> {
         (StepKind::Read, "read", "file", "files"),
         (StepKind::Search, "searched", "pattern", "patterns"),
         (StepKind::List, "listed", "folder", "folders"),
+        (StepKind::Fetch, "fetched", "page", "pages"),
     ] {
         let seen = count(kind);
         if seen > 0 {
@@ -528,7 +615,7 @@ fn run_rows(steps: &[Step]) -> Vec<Vec<Span>> {
 /// Everything else that went through, counted by its word.
 fn other_row(steps: &[Step]) -> Option<Vec<Span>> {
     let mut others: Vec<(&str, usize)> = Vec::new();
-    for step in steps.iter().filter(|step| step.ok && matches!(step.kind, StepKind::Other | StepKind::Fetch)) {
+    for step in steps.iter().filter(|step| step.ok && step.kind == StepKind::Other) {
         match others.iter_mut().find(|(verb, _)| *verb == step.verb) {
             Some(other) => other.1 += 1,
             None => others.push((step.verb.as_str(), 1)),
@@ -579,6 +666,30 @@ mod tests {
 
     fn plain(rows: &[Line]) -> Vec<String> {
         rows.iter().map(Line::plain).collect()
+    }
+
+    /// A fetch is looking around, as a read is: the fold counts the pages
+    /// in the row that counts the files read. It stood alone as `Fetch`
+    /// beside the plan updates — every fetch zo's models make, since a
+    /// fetch through `CapabilityInvoke` is a fetch (v1.1.150). A failed one
+    /// keeps its row.
+    #[test]
+    fn the_fold_counts_fetched_pages_beside_the_files_read() {
+        let now = Instant::now();
+        let fetch = |target: &str| step(StepKind::Fetch, "Fetch", target);
+        let one = plain(&cell(&[step(StepKind::Read, "Read", "a.rs"), fetch("example.com/a")], 100, now));
+        assert!(one.iter().any(|row| row.ends_with("Read 1 file · fetched 1 page")), "{one:#?}");
+        assert!(!one.iter().any(|row| row.trim_end().ends_with("Fetch")), "{one:#?}");
+        let two = plain(&cell(&[fetch("example.com/a"), fetch("example.com/b")], 100, now));
+        assert!(two.iter().any(|row| row.ends_with("Fetched 2 pages")), "{two:#?}");
+        let mut gone = fetch("example.com/gone");
+        gone.ok = false;
+        gone.failure = Some("failed".to_string());
+        let kept = plain(&cell(&[fetch("example.com/a"), gone], 100, now));
+        assert!(kept.iter().any(|row| row.ends_with("Fetched 1 page")), "{kept:#?}");
+        assert!(kept.iter().any(|row| row.contains("example.com/gone") && row.contains("failed")), "{kept:#?}");
+        let plans = plain(&cell(&[step(StepKind::Other, "Plan", ""), step(StepKind::Other, "Plan", ""), fetch("example.com/a")], 100, now));
+        assert!(plans.iter().any(|row| row.ends_with("Plan ×2")), "{plans:#?}");
     }
 
     #[test]

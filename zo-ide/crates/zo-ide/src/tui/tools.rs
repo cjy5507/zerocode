@@ -144,9 +144,11 @@ impl ToolKind {
         matches!(self, Self::Spawn { .. })
     }
 
-    /// 도구 호출 preview 를 셀 종류로 옮긴다.
+    /// 도구 호출 preview 를 셀 종류로 옮긴다. 도구의 이름은 읽지 않는다 —
+    /// `CapabilityInvoke` 로 감싼 호출의 블록은 감싼 쪽 이름만 들고 오므로,
+    /// 무엇을 불렀는지는 런타임이 안쪽 이름으로 지은 preview 가 말한다.
     #[must_use]
-    pub fn from_preview(name: &str, preview: &ToolPreview, summary: &str) -> Self {
+    pub fn from_preview(preview: &ToolPreview, summary: &str) -> Self {
         match preview {
             ToolPreview::Bash { command } => Self::Command {
                 command: sanitize_lines(command, summary),
@@ -174,10 +176,8 @@ impl ToolKind {
             ToolPreview::Write { path, .. } | ToolPreview::Edit { path, .. } => Self::Edit {
                 path: sanitize(path, summary),
             },
-            ToolPreview::Search { query } if core_types::tool_names::canonical_tool_name(name) == "WebFetch" => {
-                Self::WebFetch { url: sanitize(query, summary) }
-            }
-            ToolPreview::Search { query } => Self::WebSearch {
+            ToolPreview::Search { query, fetch: true } => Self::WebFetch { url: sanitize(query, summary) },
+            ToolPreview::Search { query, fetch: false } => Self::WebSearch {
                 detail: sanitize(query, summary),
             },
             ToolPreview::Generic {
@@ -380,6 +380,64 @@ impl Change {
     }
 }
 
+/// Strip redundant `invalid input: <tool>: ` framing from a failed step's first
+/// error line while leaving real command stderr (`ERROR: ...`, `HTTP 404 ...`)
+/// intact.
+fn clean_step_error(first_line: &str, kind: &ToolKind) -> String {
+    if let ToolKind::Edit { path } = kind {
+        return failure_reason(first_line, path);
+    }
+    let mut rest = first_line.trim();
+    if let Some(after) = rest.strip_prefix("invalid input: ") {
+        rest = after;
+        if let Some((tool, tail)) = rest.split_once(": ") {
+            if !tool.is_empty() && !tool.contains(' ') && !tool.contains('/') {
+                rest = tail;
+            }
+        }
+    }
+    rest.to_string()
+}
+
+/// Whether the first line of a multi-line shell command ends mid-quote or with
+/// a line-continuation token (so showing line 1 alone looks syntactically cut).
+fn has_unclosed_shell_line(line: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for ch in line.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if !in_single && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if !in_double && ch == '\'' {
+            in_single = !in_single;
+        } else if !in_single && ch == '"' {
+            in_double = !in_double;
+        }
+    }
+    in_single || in_double || escaped || line.trim_end().ends_with('|')
+}
+
+/// First-line target and optional `+N lines` note for a command in `turns` view.
+fn turns_command_target(command: &str) -> (String, Option<String>) {
+    let first = command.lines().next().unwrap_or_default().trim_end();
+    let extra = command.lines().skip(1).filter(|line| !line.trim().is_empty()).count();
+    if extra == 0 {
+        return (first.to_string(), None);
+    }
+    let target = if has_unclosed_shell_line(first) {
+        format!("{first}{}", super::strings::COMMAND_CONTINUES)
+    } else {
+        first.to_string()
+    };
+    (target, Some(super::strings::command_more_lines(extra)))
+}
+
 /// The reason a write or edit was refused, without the words the row already
 /// carries: the runtime's `invalid input: write_file: /abs/path …` prefix
 /// repeats the tool and the path, and pushed the sentence that matters
@@ -569,83 +627,197 @@ impl ToolGroup {
     /// ([`super::turns`]): what each did, to what, and how it ended.
     #[must_use]
     pub(super) fn steps(&self) -> Vec<super::turns::Step> {
-        use super::strings::{TOOL_CREATE, TOOL_DELETE, TOOL_EDIT, TOOL_FETCH, TOOL_RUN, TOOL_SEARCH, TOOL_SPAWN};
-        use super::turns::{Step, StepKind};
-        let mut out = Vec::new();
+        self.calls.iter().flat_map(Self::call_steps).collect()
+    }
+
+    /// Whether this group should share the `turns` view's indented step
+    /// layout while live instead of switching to full-width `tool_row` grammar.
+    #[must_use]
+    pub(super) fn uses_turns_live_rows(&self) -> bool {
+        !self.calls.is_empty()
+            && !self.is_spawning()
+            && !self
+                .calls
+                .iter()
+                .any(|call| matches!(call.kind, ToolKind::Plan(_) | ToolKind::AgentResult { .. }))
+    }
+
+    /// Render every call in this group (finished and still running) in the
+    /// `turns` view's unified indented step grammar so calls never jump or
+    /// split across two formats mid-turn.
+    #[must_use]
+    pub(super) fn turns_live_rows(
+        &self,
+        width: usize,
+        elapsed: Duration,
+        mut hangs: bool,
+    ) -> Vec<Line> {
+        let glyphs = super::style::glyphs();
+        let mut rows = Vec::new();
         for call in &self.calls {
-            let Some(done) = call.done.as_ref() else {
+            if call.done.is_some() {
+                for step in Self::call_steps(call) {
+                    let lead = if hangs { glyphs.result_rest } else { glyphs.result_first };
+                    rows.push(super::turns::step_row(&step, lead, width));
+                    if let Some(why) = super::turns::why_row(&step, width) {
+                        rows.push(why);
+                    }
+                    hangs = true;
+                }
                 continue;
-            };
-            let failure = (!done.ok)
-                .then(|| failure_result(done).iter().map(|span| span.text.as_str()).collect::<String>());
-            // What a failed call said first, for the row under its step.
-            let error = (!done.ok && !done.declined)
-                .then(|| done.output.lines().map(str::trim).find(|line| !line.is_empty()))
-                .flatten()
-                .map(crate::util::ansi::sanitize_inline);
-            let step = |kind: StepKind, verb: &str, target: String| Step {
-                kind,
-                verb: verb.to_string(),
-                target,
-                change: None,
-                ok: done.ok,
-                declined: done.declined,
-                failure: failure.clone(),
-                error: error.clone(),
-                result: None,
-                started: call.started,
-                took: call.took,
-            };
-            let with_result = |mut step: Step, result: Vec<Span>| {
-                step.result = (done.ok && !result.is_empty()).then(|| plain_text(&result));
-                step
-            };
+            }
+            let glyph = self.row_glyph(call, elapsed);
             match &call.kind {
                 ToolKind::Command { command, .. } => {
-                    let run = step(StepKind::Run, TOOL_RUN, command.lines().next().unwrap_or_default().to_string());
-                    out.push(with_result(run, command_result(done)));
+                    let (target, note) = turns_command_target(command);
+                    rows.push(super::turns::running_step_row(
+                        glyph,
+                        super::strings::TOOL_RUN,
+                        &target,
+                        false,
+                        note.as_deref(),
+                        width,
+                    ));
+                    let under = format!("{}{LIVE_TAIL_BAR}", super::style::glyphs().result_rest);
+                    rows.extend(live_tail_with_prefix(&call.id, &under, width));
                 }
                 ToolKind::Explore(items) => {
                     for item in items {
-                        // The words the running row says, so the call reads the
-                        // same while it runs and after it ends.
                         let (verb, target) = explored_target(item);
-                        let kind = match item {
-                            Explored::Read { .. } => StepKind::Read,
-                            Explored::List { .. } => StepKind::List,
-                            Explored::Search { .. } => StepKind::Search,
-                        };
-                        let row = step(kind, verb, plain_text(&target));
-                        out.push(with_result(row, explored_result(item, done)));
+                        rows.push(super::turns::running_step_row(
+                            glyph.clone(),
+                            verb,
+                            &plain_text(&target),
+                            false,
+                            None,
+                            width,
+                        ));
                     }
                 }
                 ToolKind::Edit { path } => {
-                    let change = done.change.as_ref().filter(|_| done.ok);
-                    let verb = change.map_or(TOOL_EDIT, |change| match change.verb {
-                        "Added" => TOOL_CREATE,
-                        "Deleted" => TOOL_DELETE,
-                        _ => TOOL_EDIT,
-                    });
-                    let mut edit = step(StepKind::Edit, verb, change.map_or_else(|| shown_path(path), Change::display_path));
-                    edit.change = change.map(|change| (change.added, change.removed));
-                    out.push(edit);
+                    rows.push(super::turns::running_step_row(
+                        glyph,
+                        super::strings::TOOL_EDIT,
+                        &shown_path(path),
+                        false,
+                        None,
+                        width,
+                    ));
                 }
-                ToolKind::Plan(_) => out.push(step(StepKind::Other, super::strings::STEP_PLAN, String::new())),
                 ToolKind::WebSearch { detail } => {
-                    let search = step(StepKind::Search, TOOL_SEARCH, plain_text(&web_search_target(detail)));
-                    out.push(with_result(search, web_result(done)));
+                    rows.push(super::turns::running_step_row(
+                        glyph,
+                        super::strings::TOOL_SEARCH,
+                        &plain_text(&web_search_target(detail)),
+                        false,
+                        None,
+                        width,
+                    ));
                 }
                 ToolKind::WebFetch { url } => {
-                    let fetch = step(StepKind::Fetch, TOOL_FETCH, super::strings::address_shown(url).to_string());
-                    out.push(with_result(fetch, web_result(done)));
-                }
-                ToolKind::Spawn { label, .. } => out.push(step(StepKind::Other, TOOL_SPAWN, label.clone())),
-                ToolKind::AgentResult { label, .. } => {
-                    out.push(step(StepKind::Other, super::strings::STEP_AGENT, label.clone()));
+                    rows.push(super::turns::running_step_row(
+                        glyph,
+                        super::strings::TOOL_FETCH,
+                        super::strings::address_shown(url),
+                        true,
+                        None,
+                        width,
+                    ));
                 }
                 ToolKind::Call { name, detail } => {
-                    out.push(step(StepKind::Other, &super::strings::mcp_name_shown(name), detail.clone()));
+                    rows.push(super::turns::running_step_row(
+                        glyph,
+                        &super::strings::mcp_name_shown(name),
+                        detail,
+                        false,
+                        None,
+                        width,
+                    ));
                 }
+                ToolKind::Spawn { .. } | ToolKind::Plan(_) | ToolKind::AgentResult { .. } => {}
+            }
+            hangs = true;
+        }
+        rows
+    }
+
+    fn call_steps(call: &ToolCall) -> Vec<super::turns::Step> {
+        use super::strings::{TOOL_CREATE, TOOL_DELETE, TOOL_EDIT, TOOL_FETCH, TOOL_RUN, TOOL_SEARCH, TOOL_SPAWN};
+        use super::turns::{Step, StepKind};
+        let Some(done) = call.done.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let failure = (!done.ok)
+            .then(|| failure_result(done).iter().map(|span| span.text.as_str()).collect::<String>());
+        // What a failed call said first, for the row under its step.
+        let error = (!done.ok && !done.declined)
+            .then(|| done.output.lines().map(str::trim).find(|line| !line.is_empty()))
+            .flatten()
+            .map(|line| crate::util::ansi::sanitize_inline(&clean_step_error(line, &call.kind)));
+        let step = |kind: StepKind, verb: &str, target: String| Step {
+            kind,
+            verb: verb.to_string(),
+            target,
+            change: None,
+            ok: done.ok,
+            declined: done.declined,
+            failure: failure.clone(),
+            error: error.clone(),
+            result: None,
+            started: call.started,
+            took: call.took,
+        };
+        let with_result = |mut step: Step, result: Vec<Span>| {
+            step.result = (done.ok && !result.is_empty()).then(|| plain_text(&result));
+            step
+        };
+        match &call.kind {
+            ToolKind::Command { command, .. } => {
+                let (target, _) = turns_command_target(command);
+                let run = step(StepKind::Run, TOOL_RUN, target);
+                out.push(with_result(run, command_result(done)));
+            }
+            ToolKind::Explore(items) => {
+                for item in items {
+                    // The words the running row says, so the call reads the
+                    // same while it runs and after it ends.
+                    let (verb, target) = explored_target(item);
+                    let kind = match item {
+                        Explored::Read { .. } => StepKind::Read,
+                        Explored::List { .. } => StepKind::List,
+                        Explored::Search { .. } => StepKind::Search,
+                    };
+                    let row = step(kind, verb, plain_text(&target));
+                    out.push(with_result(row, explored_result(item, done)));
+                }
+            }
+            ToolKind::Edit { path } => {
+                let change = done.change.as_ref().filter(|_| done.ok);
+                let verb = change.map_or(TOOL_EDIT, |change| match change.verb {
+                    "Added" => TOOL_CREATE,
+                    "Deleted" => TOOL_DELETE,
+                    _ => TOOL_EDIT,
+                });
+                let mut edit = step(StepKind::Edit, verb, change.map_or_else(|| shown_path(path), Change::display_path));
+                edit.change = change.map(|change| (change.added, change.removed));
+                out.push(edit);
+            }
+            ToolKind::Plan(_) => out.push(step(StepKind::Other, super::strings::STEP_PLAN, String::new())),
+            ToolKind::WebSearch { detail } => {
+                let search = step(StepKind::Search, TOOL_SEARCH, plain_text(&web_search_target(detail)));
+                out.push(with_result(search, web_result(done)));
+            }
+            ToolKind::WebFetch { url } => {
+                let fetch = step(StepKind::Fetch, TOOL_FETCH, super::strings::address_shown(url).to_string());
+                out.push(with_result(fetch, web_result(done)));
+            }
+            ToolKind::Spawn { label, .. } => out.push(step(StepKind::Other, TOOL_SPAWN, label.clone())),
+            ToolKind::AgentResult { label, .. } => {
+                out.push(step(StepKind::Other, super::strings::STEP_AGENT, label.clone()));
+            }
+            ToolKind::Call { name, detail } => {
+                out.push(step(StepKind::Other, &super::strings::mcp_name_shown(name), detail.clone()));
             }
         }
         out
@@ -1627,8 +1799,15 @@ fn failure_result(done: &Outcome) -> Vec<Span> {
     vec![Span::new(text, Style::new().fg(palette::TOOL_FAIL))]
 }
 
+/// The bar a running command's last printed lines stand behind.
+const LIVE_TAIL_BAR: &str = "│ ";
+
 /// The last lines a running command has printed, `  │ ` under its row.
 fn live_tail(id: &str, width: usize) -> Vec<Line> {
+    live_tail_with_prefix(id, &format!("  {LIVE_TAIL_BAR}"), width)
+}
+
+fn live_tail_with_prefix(id: &str, prefix: &str, width: usize) -> Vec<Line> {
     let Some(tail) = runtime::live_output::snapshot(id, LIVE_TAIL_BYTES) else {
         return Vec::new();
     };
@@ -1637,7 +1816,7 @@ fn live_tail(id: &str, width: usize) -> Vec<Line> {
     let rows: Vec<&str> = printed.lines().filter(|line| !line.trim().is_empty()).collect();
     rows[rows.len().saturating_sub(LIVE_TAIL_ROWS)..]
         .iter()
-        .map(|row| Line::new(vec![Span::dim("  │ "), Span::dim((*row).to_string())]).truncated(width))
+        .map(|row| Line::new(vec![Span::dim(prefix), Span::dim((*row).to_string())]).truncated(width))
         .collect()
 }
 
@@ -2478,7 +2657,7 @@ mod tests {
             }),
         );
         let summary = preview_summary(&preview);
-        let kind = ToolKind::from_preview("TodoWrite", &preview, &summary);
+        let kind = ToolKind::from_preview(&preview, &summary);
         let group = ToolGroup::new(ToolCall::new("a".to_string(), kind));
 
         assert_eq!(
@@ -2497,7 +2676,7 @@ mod tests {
             }),
         );
         let summary = preview_summary(&preview);
-        let kind = ToolKind::from_preview("CapabilityInvoke", &preview, &summary);
+        let kind = ToolKind::from_preview(&preview, &summary);
         let group = ToolGroup::new(ToolCall::new("a".to_string(), kind));
 
         assert_eq!(
@@ -2521,7 +2700,7 @@ mod tests {
         });
         let preview = preview_tool_input("TodoWrite", &input);
         let summary = preview_summary(&preview);
-        let kind = ToolKind::from_preview("TodoWrite", &preview, &summary);
+        let kind = ToolKind::from_preview(&preview, &summary);
         let mut group = ToolGroup::new(ToolCall::new("a".to_string(), kind));
         let body = format_tool_result_from_raw(
             "TodoWrite",
@@ -2554,7 +2733,7 @@ mod tests {
     fn an_empty_mcp_result_does_not_add_a_no_output_row() {
         let preview = preview_tool_input("Sleep", &json!({}));
         let summary = preview_summary(&preview);
-        let kind = ToolKind::from_preview("Sleep", &preview, &summary);
+        let kind = ToolKind::from_preview(&preview, &summary);
         let mut group = ToolGroup::new(ToolCall::new("a".to_string(), kind));
         let body = format_tool_result_from_raw("Sleep", "", false);
         assert!(group.complete("a", Outcome::from_result(false, &body, "")));
@@ -2569,7 +2748,7 @@ mod tests {
     fn a_successful_mcp_result_uses_the_success_status_color() {
         let preview = preview_tool_input("Sleep", &json!({}));
         let summary = preview_summary(&preview);
-        let kind = ToolKind::from_preview("Sleep", &preview, &summary);
+        let kind = ToolKind::from_preview(&preview, &summary);
         let mut group = ToolGroup::new(ToolCall::new("a".to_string(), kind));
         let body = format_tool_result_from_raw("Sleep", "", false);
         assert!(group.complete("a", Outcome::from_result(false, &body, "")));
@@ -2587,7 +2766,7 @@ mod tests {
             &json!({ "query": "alpha beta gamma delta epsilon" }),
         );
         let summary = preview_summary(&preview);
-        let kind = ToolKind::from_preview("Lookup", &preview, &summary);
+        let kind = ToolKind::from_preview(&preview, &summary);
         let mut group = ToolGroup::new(ToolCall::new("a".to_string(), kind));
         let body = format_tool_result_from_raw("Lookup", "ok", false);
         assert!(group.complete("a", Outcome::from_result(false, &body, "")));
@@ -2604,11 +2783,39 @@ mod tests {
         assert_eq!(rows.last().expect("output row"), "  └ ok");
     }
 
+    /// zo offers the web tools through `CapabilityInvoke`, whose block names
+    /// only the wrapper: a fetch made that way drew as a search of its
+    /// address (`Search("http://…" on the web)`, v1.1.149's screen). It draws
+    /// as the fetch made directly, running and done; a wrapped search is a
+    /// search.
+    #[test]
+    fn a_wrapped_fetch_draws_as_the_fetch_made_directly() {
+        let page = json!({ "url": "https://example.com/models/zq", "prompt": "What does it say?" });
+        let wrapped = json!({ "name": "WebFetch", "input": page.clone() });
+        let rows = |name: &str, input: &serde_json::Value| {
+            let preview = preview_tool_input(name, input);
+            let kind = ToolKind::from_preview(&preview, &preview_summary(&preview));
+            let mut group = ToolGroup::new(ToolCall::new("a".to_string(), kind));
+            let running = plain(&group.lines(60, Duration::ZERO));
+            let body = format_tool_result_from_raw("WebFetch", "URL: https://example.com/models/zq\n\n# zq\n", false);
+            assert!(group.complete("a", Outcome::from_result(false, &body, "")));
+            (running, plain(&group.lines(60, Duration::ZERO)))
+        };
+        let direct = rows("WebFetch", &page);
+        assert_eq!(direct.0, vec!["⠋ Fetch example.com/models/zq".to_string()]);
+        assert_eq!(rows("CapabilityInvoke", &wrapped), direct);
+        let search = json!({ "name": "WebSearch", "input": { "query": "rust async" } });
+        let preview = preview_tool_input("CapabilityInvoke", &search);
+        let kind = ToolKind::from_preview(&preview, &preview_summary(&preview));
+        let group = ToolGroup::new(ToolCall::new("a".to_string(), kind));
+        assert_eq!(plain(&group.lines(60, Duration::ZERO)), vec!["⠋ Search \"rust async\" on the web".to_string()]);
+    }
+
     #[test]
     fn web_search_wears_the_search_row() {
         let preview = preview_tool_input("WebSearch", &json!({ "query": "rust async" }));
         let summary = preview_summary(&preview);
-        let kind = ToolKind::from_preview("WebSearch", &preview, &summary);
+        let kind = ToolKind::from_preview(&preview, &summary);
         let mut group = ToolGroup::new(ToolCall::new("a".to_string(), kind));
 
         assert_eq!(
@@ -2626,7 +2833,7 @@ mod tests {
     #[test]
     fn failed_spawn_shows_the_refusal_instead_of_the_delegated_prompt() {
         let preview = preview_tool_input("Agent", &json!({"description":"look up remote", "prompt":"delegated prompt"}));
-        let kind = ToolKind::from_preview("Agent", &preview, &preview_summary(&preview));
+        let kind = ToolKind::from_preview(&preview, &preview_summary(&preview));
         let mut group = ToolGroup::new(ToolCall::new("a".to_string(), kind));
         let reason = "Small delegated task: do it inline. Do not retry this spawn.";
         let body = ToolResultBody::Declined { reason: reason.to_owned() };
@@ -2641,7 +2848,7 @@ mod tests {
         assert!(!text.contains("failed"), "a verdict is not a failure:\n{text}");
         assert!(lines[0].spans[0].style.dim && lines[0].spans[0].style.fg.is_none(), "{:?}", lines[0].spans[0]);
         // A spawn that really failed still says so.
-        let kind = ToolKind::from_preview("Agent", &preview, &preview_summary(&preview));
+        let kind = ToolKind::from_preview(&preview, &preview_summary(&preview));
         let mut failed = ToolGroup::new(ToolCall::new("b".to_string(), kind));
         let body = format_tool_result_from_raw("Agent", "execution error: child died", true);
         failed.complete("b", Outcome::from_result(true, &body, "child died"));
@@ -2662,7 +2869,7 @@ mod tests {
             }),
         );
         let summary = preview_summary(&preview);
-        let kind = ToolKind::from_preview("Agent", &preview, &summary);
+        let kind = ToolKind::from_preview(&preview, &summary);
         let mut group = ToolGroup::new(ToolCall::new("a".to_string(), kind));
 
         // While the helper works, the cell is what the person watches — it
@@ -2747,7 +2954,7 @@ mod tests {
                 &json!({ "name": label, "description": "look into it" }),
             );
             let summary = preview_summary(&preview);
-            ToolKind::from_preview("Agent", &preview, &summary)
+            ToolKind::from_preview(&preview, &summary)
         };
         let mut group = ToolGroup::new(ToolCall::new("a".to_string(), spawn("scout")));
         let second = spawn("verifier");
@@ -2797,7 +3004,7 @@ mod tests {
             }),
         );
         let summary = preview_summary(&preview);
-        let kind = ToolKind::from_preview("Workflow", &preview, &summary);
+        let kind = ToolKind::from_preview(&preview, &summary);
         let mut group = ToolGroup::new(ToolCall::new("workflow-1".to_string(), kind));
 
         assert!(group.set_spawn_progress(&[
@@ -2835,7 +3042,7 @@ mod tests {
         let preview =
             preview_tool_input("Agent", &json!({ "name": "scout", "description": "look" }));
         let summary = preview_summary(&preview);
-        let spawn = ToolKind::from_preview("Agent", &preview, &summary);
+        let spawn = ToolKind::from_preview(&preview, &summary);
         assert!(!group.accepts(&spawn));
         assert!(group.is_active());
     }
@@ -2965,7 +3172,7 @@ mod tests {
                 &json!({"path": path, "old_string": "a", "new_string": "b"}),
             );
             let summary = preview_summary(&preview);
-            ToolCall::new(id.to_string(), ToolKind::from_preview("edit_file", &preview, &summary))
+            ToolCall::new(id.to_string(), ToolKind::from_preview(&preview, &summary))
         };
         let mut group = ToolGroup::new(announce("e1", "src/a.rs"));
         group.push(announce("e2", "src/b.rs"));
@@ -2996,7 +3203,7 @@ mod tests {
         let announce = |id: &str, path: &str| {
             let preview = preview_tool_input("write_file", &json!({"path": path, "content": "a\nb\n"}));
             let summary = preview_summary(&preview);
-            ToolCall::new(id.to_string(), ToolKind::from_preview("write_file", &preview, &summary))
+            ToolCall::new(id.to_string(), ToolKind::from_preview(&preview, &summary))
         };
         let mut group = ToolGroup::new(announce("w1", "src/a.ts"));
         group.push(announce("w2", "src/b.ts"));
@@ -3036,7 +3243,7 @@ mod tests {
         let summary = preview_summary(&preview);
         let mut group = ToolGroup::new(ToolCall::new(
             "w1".to_string(),
-            ToolKind::from_preview("write_file", &preview, &summary),
+            ToolKind::from_preview(&preview, &summary),
         ));
         let body: Vec<String> = (1..=60).map(|n| format!("+line {n}")).collect();
         let created = json!({
@@ -3071,7 +3278,7 @@ mod tests {
             let summary = preview_summary(&preview);
             ToolCall::new(
                 id.to_string(),
-                ToolKind::from_preview("MultiEdit", &preview, &summary),
+                ToolKind::from_preview(&preview, &summary),
             )
         };
         let mut group = ToolGroup::new(announce("m1", "ui/tokens.css"));
@@ -3116,7 +3323,7 @@ mod tests {
             }),
         );
         let summary = preview_summary(&preview);
-        let kind = ToolKind::from_preview("Edit", &preview, &summary);
+        let kind = ToolKind::from_preview(&preview, &summary);
         let mut group = ToolGroup::new(ToolCall::new("edit".to_string(), kind));
         let body = format_tool_result_from_raw("Edit", "context mismatch\ntry again", true);
         assert!(group.complete("edit", Outcome::from_result(true, &body, "src/lib.rs")));
@@ -3134,10 +3341,10 @@ mod tests {
     fn consecutive_edits_are_one_row_each_in_call_order() {
         let b_preview = preview_tool_input("Edit", &json!({ "file_path": "b.rs" }));
         let b_summary = preview_summary(&b_preview);
-        let b_kind = ToolKind::from_preview("Edit", &b_preview, &b_summary);
+        let b_kind = ToolKind::from_preview(&b_preview, &b_summary);
         let a_preview = preview_tool_input("Edit", &json!({ "file_path": "a.rs" }));
         let a_summary = preview_summary(&a_preview);
-        let a_kind = ToolKind::from_preview("Edit", &a_preview, &a_summary);
+        let a_kind = ToolKind::from_preview(&a_preview, &a_summary);
         let mut group = ToolGroup::new(ToolCall::new("b".to_string(), b_kind));
 
         assert!(group.accepts(&a_kind));
@@ -3168,7 +3375,7 @@ mod tests {
 
         let preview = preview_tool_input("Edit", &json!({ "file_path": "old.rs" }));
         let summary = preview_summary(&preview);
-        let kind = ToolKind::from_preview("Edit", &preview, &summary);
+        let kind = ToolKind::from_preview(&preview, &summary);
         let mut group = ToolGroup::new(ToolCall::new("rename".to_string(), kind));
         let body = ToolResultBody::Diff(DiffView {
             old_path: Some("old.rs".to_string()),
@@ -3194,7 +3401,7 @@ mod tests {
             &json!({ "command": "echo \"hello\" && cargo test --lib" }),
         );
         let summary = preview_summary(&preview);
-        let kind = ToolKind::from_preview("Bash", &preview, &summary);
+        let kind = ToolKind::from_preview(&preview, &summary);
         let group = ToolGroup::new(ToolCall::new("bash".to_string(), kind));
         let lines = group.lines(100, Duration::ZERO);
 
@@ -3254,7 +3461,7 @@ mod tests {
         let script = "python3 - <<'EOF'\nimport sys\r\n\tprint(sys.version)\nEOF\n";
         let preview = preview_tool_input("Bash", &json!({ "command": script }));
         let summary = preview_summary(&preview);
-        let kind = ToolKind::from_preview("Bash", &preview, &summary);
+        let kind = ToolKind::from_preview(&preview, &summary);
         let ToolKind::Command { command, .. } = &kind else {
             panic!("a command, not {kind:?}");
         };

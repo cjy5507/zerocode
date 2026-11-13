@@ -364,7 +364,7 @@ fn a_run_of_fetches_reads_as_calls_with_their_results() {
         [
             "  ⎿ Fetch(huggingface.co/api/models/acme/alpha)  3.1 KB",
             "    Fetch(huggingface.co/api/models/acme/beta)  failed",
-            "    HTTP 404 Not Found",
+            "      HTTP 404 Not Found",
             "    Search(\"https://example.test/a\" on the web)  812 B",
             "    almanac · read_webpage(https://example.test/page)",
             "    almanac · whoami",
@@ -423,7 +423,7 @@ fn a_failed_step_stays_when_the_rest_fold_away() {
         [
             "  ⎿ … 6 earlier",
             "    Read(gone.rs)  failed",
-            "    No such file: gone.rs",
+            "      No such file: gone.rs",
             "    Read(f7.rs)  1 line",
             "    Read(f8.rs)  1 line",
             "    Read(f9.rs)  1 line",
@@ -432,6 +432,8 @@ fn a_failed_step_stays_when_the_rest_fold_away() {
     let head = plain(&super::turns::cell(&steps, 100, std::time::Instant::now()));
     assert!(head[1].starts_with("⏺ Worked · 10 steps · 1 failed"), "{head:?}");
     assert!(head.iter().any(|row| row.trim() == "No such file: gone.rs"), "{head:?}");
+    // The failed call reads in the fold as its row read while the turn ran.
+    assert!(head.iter().any(|row| row.ends_with("Read(gone.rs)  failed")), "{head:?}");
 }
 
 /// Calls made together stand in the order they were made, not in the order
@@ -451,4 +453,123 @@ fn calls_made_together_stand_in_the_order_they_were_made() {
     }
     let targets: Vec<String> = group.steps().into_iter().map(|step| step.target).collect();
     assert_eq!(targets, ["a.rs", "b.rs", "c.rs"]);
+}
+
+#[test]
+fn turns_live_rows_aligns_finished_and_running_calls_and_marks_multiline_commands() {
+    if !style::in_fresh_run(&path("turns_live_rows_aligns_finished_and_running_calls_and_marks_multiline_commands")) {
+        return;
+    }
+    style::init(&Preferences::default());
+    let twelve = "line\n".repeat(12);
+    let mut group = ToolGroup::new(ToolCall::new(
+        "r1".to_string(),
+        ToolKind::Explore(vec![Explored::Read { name: "controlled/types.go:420-579".to_string() }]),
+    ));
+    assert!(group.complete("r1", finished(&twelve)));
+    group.push(ToolCall::new(
+        "r2".to_string(),
+        ToolKind::Explore(vec![Explored::Read { name: "server/controlled.go:550-699".to_string() }]),
+    ));
+    assert!(group.complete("r2", finished(&twelve)));
+    group.push(ToolCall::new(
+        "cmd".to_string(),
+        ToolKind::Command {
+            command: "docker compose exec -T exploit-runner sh -c 'python3 -c \"\nimport sys\nprint(1)\n\"'".to_string(),
+            background: false,
+        },
+    ));
+    let rows = plain(&group.turns_live_rows(98, Duration::ZERO, false));
+    assert_eq!(
+        rows,
+        [
+            "  ⎿ Read(controlled/types.go:420-579)  12 lines",
+            "    Read(server/controlled.go:550-699)  12 lines",
+            "  ⠋ Run(docker compose exec -T exploit-runner sh -c 'python3 -c \" …)  +3 lines",
+        ]
+    );
+    let continued = plain(&group.turns_live_rows(98, Duration::ZERO, true));
+    assert!(continued[0].starts_with("    Read("), "{continued:?}");
+}
+
+#[test]
+fn a_failed_bare_tool_strips_redundant_prefix_and_keeps_its_result_two_columns_off() {
+    if !style::in_fresh_run(&path("a_failed_bare_tool_strips_redundant_prefix_and_keeps_its_result_two_columns_off")) {
+        return;
+    }
+    style::init(&Preferences::default());
+    let steps = steps_of(vec![
+        (
+            ToolKind::Call { name: "session_recall".to_string(), detail: String::new() },
+            failed("invalid input: session_recall: provide `query` to search across sessions, or `session_id`"),
+        ),
+        (
+            ToolKind::Command { command: "psql -c 'select 1'".to_string(), background: false },
+            Outcome {
+                ok: false,
+                declined: false,
+                output: "ERROR:  function left(jsonb, integer) does not exist".to_string(),
+                change: None,
+                exit_code: Some(1),
+            },
+        ),
+    ]);
+    let mut fold = super::turns::TurnFold::default();
+    fold.take_steps(steps);
+    assert_eq!(
+        plain(&fold.live_rows(98, 16)),
+        [
+            "  ⎿ session_recall  failed",
+            "      provide `query` to search across sessions, or `session_id`",
+            "    Run(psql -c 'select 1')  exit 1",
+            "      ERROR:  function left(jsonb, integer) does not exist",
+        ]
+    );
+}
+
+#[test]
+fn marks_prose_keeps_a_right_gutter_on_medium_panes() {
+    if !style::in_fresh_run(&path("marks_prose_keeps_a_right_gutter_on_medium_panes")) {
+        return;
+    }
+    style::init(&Preferences::default());
+    let prose = Line::from_text("word ".repeat(30).trim_end().to_string());
+    let rows = super::cells::prefixed_prose(&[prose], 98, &Prefix::hang(), true);
+    assert!(rows.len() >= 2, "{rows:?}");
+    assert!(rows.iter().all(|row| row.width() <= 95), "{rows:?}");
+}
+
+/// A call reads the same while it runs and once it ends, and is cut the same
+/// way: an address too long for its row gives up its middle on both rows,
+/// keeping its host and its last part. The running row cut it at its end
+/// (f81e7c8a4), so the row changed its words the moment the call ended.
+#[test]
+fn a_long_address_gives_up_its_middle_while_it_runs_and_after() {
+    if !style::in_fresh_run(&path("a_long_address_gives_up_its_middle_while_it_runs_and_after")) {
+        return;
+    }
+    style::init(&Preferences::default());
+    let url = "https://huggingface.co/api/models/acme-research/zq-coder-7b-instruct-preview/tree/main/config.json";
+    let mut group = ToolGroup::new(ToolCall::new("a".to_string(), ToolKind::WebFetch { url: url.to_string() }));
+    let running = plain(&group.turns_live_rows(60, Duration::ZERO, false));
+    assert!(group.complete("a", finished(&"x".repeat(3100))));
+    let done = plain(&group.turns_live_rows(60, Duration::ZERO, false));
+    // The call's words on each row: from its verb to its closing parenthesis.
+    let call = |row: &str| -> String {
+        let from = row.find("Fetch(").unwrap_or_else(|| panic!("{row:?}"));
+        let to = row.rfind(')').unwrap_or_else(|| panic!("{row:?}"));
+        row[from..=to].to_string()
+    };
+    let (shown, said) = (call(&running[0]), call(&done[0]));
+    for words in [&shown, &said] {
+        assert!(words.starts_with("Fetch(huggingface.co/"), "{running:?} {done:?}");
+        assert!(words.ends_with("config.json)"), "{running:?} {done:?}");
+        assert_eq!(words.matches('…').count(), 1, "{running:?} {done:?}");
+    }
+    // The finished row gives its result room from the same middle.
+    let (head, tail) = said.split_once('…').expect("cut");
+    assert!(shown.starts_with(head) && shown.ends_with(tail), "{shown:?} / {said:?}");
+    for row in running.iter().chain(&done) {
+        assert!(super::ansi::str_width(row) <= 60, "{row:?}");
+    }
 }
