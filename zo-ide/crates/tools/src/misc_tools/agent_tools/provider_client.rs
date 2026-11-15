@@ -319,12 +319,15 @@ impl ProviderRuntimeClient {
         api_concurrency: Option<usize>,
         rate_limit_fallback_models: Vec<String>,
         cancel_signal: Option<runtime::HookAbortSignal>,
+        the_sessions_own_call: bool,
     ) -> Result<Self, String> {
         let (selection, model) = agent_model_route(model);
-        let client = build_provider_client_for_agent_with_rate_limit_failover(
-            &selection,
-            !rate_limit_fallback_models.is_empty(),
-        )?;
+        let fail_fast_on_rate_limit = !rate_limit_fallback_models.is_empty();
+        let client = if the_sessions_own_call {
+            build_provider_client_for_the_sessions_own_call(&selection, fail_fast_on_rate_limit)
+        } else {
+            build_provider_client_for_agent_with_rate_limit_failover(&selection, fail_fast_on_rate_limit)
+        }?;
         Ok(Self {
             handle: shared_agent_runtime().handle().clone(),
             client,
@@ -861,7 +864,7 @@ fn build_provider_client_for_agent_with_rate_limit_failover(
     model: &str,
     fail_fast_on_rate_limit: bool,
 ) -> Result<ProviderClient, String> {
-    build_as(model, built_by(model), fail_fast_on_rate_limit)
+    build_as(model, &built_by(model), fail_fast_on_rate_limit)
 }
 
 /// The client for `fast_model`, the fast model of the provider the session
@@ -875,7 +878,7 @@ pub(crate) fn build_provider_client_for_the_sessions_fast_model(
     fast_model: &str,
     session_model: &str,
 ) -> Result<ProviderClient, String> {
-    build_as(fast_model, on_the_sessions_login(built_by(fast_model), session_model), false)
+    build_as(fast_model, &on_the_sessions_login(built_by(fast_model), session_model), false)
 }
 
 /// `built` on the login the session's own client for `session_model` is
@@ -892,6 +895,32 @@ pub(super) fn on_the_sessions_login(built: Held, session_model: &str) -> Held {
         {
             Held { auth_route: session.auth_route, ..built }
         }
+        _ => built,
+    }
+}
+
+/// The client for `model` where the session itself is the one asking: the
+/// router's own call — the split of a request into lanes — which is no
+/// helper's work. It goes on the login the session is on at that provider,
+/// as its fold and its probe do
+/// ([`build_provider_client_for_the_sessions_fast_model`]). Built by the
+/// model's own row alone, a session pinned to its API key had the person's
+/// words split on whichever login the machine holds for that provider: the
+/// same provider, another account.
+fn build_provider_client_for_the_sessions_own_call(
+    model: &str,
+    fail_fast_on_rate_limit: bool,
+) -> Result<ProviderClient, String> {
+    build_as(model, &on_the_login_the_session_is_on(built_by(model)), fail_fast_on_rate_limit)
+}
+
+/// `built` on the login the session is on at the provider `built` sends to
+/// ([`runtime::model_home::held_login_at`]), where `built` pins none of its
+/// own. The router's own call is handed the model it runs on and not the
+/// session's, so the session is found by where its clients send.
+pub(super) fn on_the_login_the_session_is_on(built: Held) -> Held {
+    match runtime::model_home::held_login_at(&built.home) {
+        Some(auth_route) if built.auth_route == AuthRoute::Auto => Held { auth_route, ..built },
         _ => built,
     }
 }
@@ -920,7 +949,7 @@ fn built_by(model: &str) -> Held {
 
 fn build_as(
     model: &str,
-    Held { home, catalog_provider, auth_route }: Held,
+    built: &Held,
     fail_fast_on_rate_limit: bool,
 ) -> Result<ProviderClient, String> {
     // The provider is the model's home, read in the order the session's own
@@ -930,18 +959,15 @@ fn build_as(
     // below: on a session that provider served, the helper's task went to
     // Anthropic. A name nothing knows is built for whichever login the
     // machine holds, as the session's client is.
-    let provider_kind = match home {
+    let provider_kind = match built.home {
         ModelHome::BuiltIn(kind) => kind,
         ModelHome::Own(_) => ProviderKind::OpenAi,
         ModelHome::Unknown => detect_provider_kind(model),
     };
     if provider_kind != ProviderKind::Anthropic {
-        let client = if let Some(provider_kind) = catalog_provider {
-            ProviderClient::from_provider_kind_with_auth_route(provider_kind, auth_route)
-        } else {
-            ProviderClient::from_model_with_auth_route(model, auth_route)
-        };
-        return client.map_err(|error| error.to_string());
+        // A model held to a provider of the person's own is built there or
+        // not at all (`Held::client`).
+        return built.client(model, None).map_err(|error| error.to_string());
     }
 
     // Inherit the parent runtime's credential when one is cached; otherwise run
@@ -953,7 +979,7 @@ fn build_as(
     // Under a cloud gateway (Bedrock/Vertex) the gateway credential replaces
     // the first-party chain at send time, so sub-agents must not fail here
     // just because no Anthropic credential exists on the machine.
-    let auth = match auth_route {
+    let auth = match built.auth_route {
         AuthRoute::Auto => {
             match api::AuthSource::cached().or_else(api::resolve_claude_auth_fresh) {
                 Some(auth) => auth,

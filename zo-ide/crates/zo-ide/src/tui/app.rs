@@ -2170,9 +2170,31 @@ impl Ui {
     /// 두 번째 값은 "꼬리가 칸을 쥐었는가" — 그때 codex 는 Working 줄을
     /// 감춘다(`sync_active_stream_tail` → `hide_status_indicator`).
     fn active_cell(&self, width: usize) -> (Vec<Line>, bool) {
-        let (cell, tail_owns_slot) = self.live_cell(width);
         let head_row = self.work_head(width);
+        let room = turns::live_room(usize::from(self.painter.max_height())).saturating_sub(usize::from(head_row.is_some()));
+        let elapsed = self.status.as_ref().map_or(Duration::ZERO, |status| status.elapsed);
+        let active_turns_tool = self.tool_cell.as_ref().filter(|cell| {
+            self.folding() && cell.is_active() && cell.uses_turns_live_rows()
+        });
+        let (cell, tail_owns_slot, turns_entries) = if let Some(tool_cell) = active_turns_tool {
+            (Vec::new(), false, Some(tool_cell.turns_live_entries(width, elapsed)))
+        } else {
+            let (cell, tail_owns_slot) = self.live_cell(width);
+            let entries = (!tail_owns_slot && self.folding())
+                .then(|| {
+                    self.tool_cell
+                        .as_ref()
+                        .filter(|tool_cell| tool_cell.uses_turns_live_rows())
+                        .map(|tool_cell| tool_cell.turns_live_entries(width, elapsed))
+                })
+                .flatten();
+            (cell, tail_owns_slot, entries)
+        };
         if !self.fold.is_pending() {
+            let cell = match turns_entries.as_deref() {
+                Some(entries) => turns::render_live_entries(entries, width, false, Some(room)),
+                None => cell,
+            };
             return (head_row.into_iter().chain(cell).collect(), tail_owns_slot);
         }
         // The `turns` view: the finished steps, the texts that led into them
@@ -2180,19 +2202,32 @@ impl Ui {
         // another, so the work shows while it runs and no row of it goes
         // away before the fold is said — under the head row the fold's cell
         // will open with.
-        let room = turns::live_room(usize::from(self.painter.max_height())).saturating_sub(usize::from(head_row.is_some()));
-        let fold_room = if cell.is_empty() {
-            room
+        let held = self.fold.held();
+        let fold_budget = room.saturating_sub(held.len());
+        let needed_cell_rows = turns_entries
+            .as_deref()
+            .map_or(cell.len(), |entries| entries.iter().map(turns::LiveEntry::total_cost).sum());
+        let fold_room = if needed_cell_rows == 0 {
+            fold_budget.max(1)
         } else {
-            room.saturating_sub(cell.len()).max(turns::LIVE_ROWS_MIN)
+            let reserve = needed_cell_rows.min(fold_budget.saturating_sub(turns::LIVE_ROWS_MIN).max(1));
+            fold_budget.saturating_sub(reserve).max(turns::LIVE_ROWS_MIN.min(fold_budget).max(1))
         };
         let mut rows: Vec<Line> = head_row.into_iter().collect();
-        rows.extend(self.fold.live_rows(width, fold_room));
-        let held = self.fold.held();
+        let fold_rows = self.fold.live_rows(width, fold_room);
+        let used_by_fold = fold_rows.len() + held.len();
+        rows.extend(fold_rows);
         if !held.is_empty() {
             rows.extend(held.iter().cloned());
         }
-        if !cell.is_empty() {
+        if needed_cell_rows > 0 {
+            let cell = match turns_entries.as_deref() {
+                Some(entries) => {
+                    let cell_budget = room.saturating_sub(used_by_fold).max(1);
+                    turns::render_live_entries(entries, width, self.fold.ends_hanging(), Some(cell_budget))
+                }
+                None => cell,
+            };
             rows.extend(cell);
         }
         (rows, tail_owns_slot)
@@ -2211,28 +2246,26 @@ impl Ui {
         let running = self.tool_cell.as_ref().is_some_and(|cell| {
             cell.call_ids().any(|id| self.tools.get(id).is_none_or(PendingTool::stays_a_step))
         });
-        (self.fold.has_steps() || running).then(|| turns::working_head(self.work_steps(), self.fold.failures(), width))
+        let failed = self.fold.failures() + self.tool_cell.as_ref().map_or(0, ToolGroup::failures);
+        (self.fold.has_steps() || running || failed > 0)
+            .then(|| turns::working_head(self.work_steps(), failed, width))
     }
 
     /// The steps the open fold has taken: the ones it holds and the calls of
     /// the cell still live.
     fn work_steps(&self) -> usize {
-        self.fold.step_count() + self.tool_cell.as_ref().map_or(0, ToolGroup::call_count)
+        self.fold.step_count()
+            + self.tool_cell.as_ref().map_or(0, |cell| {
+                cell.step_count_with(|id| self.tools.get(id).is_none_or(PendingTool::stays_a_step))
+            })
     }
 
     /// The one live cell: the running tool cell, the stream's unsettled tail,
     /// a finished cell still open for its next call, or a quiet loop's row.
     fn live_cell(&self, width: usize) -> (Vec<Line>, bool) {
         let elapsed = self.status.as_ref().map_or(Duration::ZERO, |status| status.elapsed);
-        let draw_tool = |cell: &ToolGroup| {
-            if self.folding() && cell.uses_turns_live_rows() {
-                cell.turns_live_rows(width, elapsed, self.fold.ends_hanging())
-            } else {
-                cell.lines(width, elapsed)
-            }
-        };
         if let Some(cell) = self.tool_cell.as_ref().filter(|cell| cell.is_active()) {
-            return (draw_tool(cell), false);
+            return (cell.lines(width, elapsed), false);
         }
         let tail = match &self.segment {
             Segment::None => Vec::new(),
@@ -2242,7 +2275,7 @@ impl Ui {
             return (tail, true);
         }
         match self.tool_cell.as_ref() {
-            Some(cell) => (draw_tool(cell), false),
+            Some(cell) => (cell.lines(width, elapsed), false),
             None => (
                 self.quiet_loop_cell
                     .as_ref()
@@ -9510,6 +9543,118 @@ mod tests {
         assert!(
             !live.iter().any(|row| row.starts_with("⏺ Read(")),
             "0-col tool marker collision must not appear in turns view: {live:#?}"
+        );
+    }
+
+    #[test]
+    fn work_head_counts_active_tool_cell_failures_and_skips_transient_calls() {
+        use runtime::message_stream::types::ToolResultBody;
+        let mut ui = test_ui();
+        ui.view = super::super::style::ConversationView::Turns;
+        ui.status = Some(crate::tui::view::Status::working(Duration::from_secs(3)));
+        let ids = BlockIdGen::default();
+
+        // Parallel Explore batch: r1 fails while r2 is still running in the same tool_cell.
+        ui.block(tool_call(&ids, "r1", "read_file", &json!({ "path": "missing.rs" })));
+        ui.block(tool_call(&ids, "r2", "read_file", &json!({ "path": "present.rs" })));
+        ui.block(RenderBlock::ToolResult {
+            id: ids.next(),
+            tool_call_id: ToolCallId("r1".to_string()),
+            is_error: true,
+            body: ToolResultBody::Text { content: "No such file\n".to_string(), truncated: false },
+        });
+
+        let head = ui.active_cell(98).0.first().map(Line::plain).unwrap_or_default();
+        assert!(
+            head.contains("Working · 2 steps · 1 failed"),
+            "head must show failure inside live tool_cell while sibling is running: {head:?}"
+        );
+    }
+
+    #[test]
+    fn active_cell_caps_large_parallel_tool_cell_within_live_room() {
+        let mut ui = test_ui();
+        ui.view = super::super::style::ConversationView::Turns;
+        ui.status = Some(crate::tui::view::Status::working(Duration::from_secs(3)));
+        let ids = BlockIdGen::default();
+        let room = super::super::turns::live_room(usize::from(ui.painter.max_height()));
+        for i in 0..24 {
+            ui.block(tool_call(&ids, &format!("r{i}"), "read_file", &json!({ "path": format!("src/f{i}.rs") })));
+        }
+        let rows: Vec<String> = ui.active_cell(98).0.iter().map(Line::plain).collect();
+        assert!(rows.len() <= room, "active_cell exceeded live_room ({room}): {} rows: {rows:#?}", rows.len());
+        assert!(rows.iter().any(|row| row.contains("earlier")), "missing earlier summary: {rows:#?}");
+    }
+
+    #[test]
+    fn active_cell_keeps_running_command_row_on_eighteen_row_pane_with_tail() {
+        use runtime::message_stream::types::ToolResultBody;
+        let mut ui = test_ui();
+        ui.painter = super::super::painter::Painter::new(std::io::stdout(), 80, 18, 1, false);
+        ui.view = super::super::style::ConversationView::Turns;
+        ui.status = Some(crate::tui::view::Status::working(Duration::from_secs(3)));
+        let ids = BlockIdGen::default();
+
+        for i in 0..3 {
+            let call_id = format!("r{i}");
+            ui.block(tool_call(&ids, &call_id, "read_file", &json!({ "path": format!("src/f{i}.rs") })));
+            ui.block(RenderBlock::ToolResult {
+                id: ids.next(),
+                tool_call_id: ToolCallId(call_id),
+                is_error: false,
+                body: ToolResultBody::Text { content: "ok\n".to_string(), truncated: false },
+            });
+        }
+        says(&mut ui, &ids, "Running tests.");
+        let handle = runtime::live_output::register(Some("cmd_tail_18"));
+        handle
+            .writer()
+            .append_stdout(b"t1\nt2\nt3\nt4\n");
+        ui.block(tool_call(&ids, "cmd_tail_18", "bash", &json!({ "command": "cargo test" })));
+
+        let rows: Vec<String> = ui.active_cell(80).0.iter().map(Line::plain).collect();
+        drop(handle);
+        assert!(
+            rows.iter().any(|row| row.contains("Run cargo test")),
+            "running command call row must remain visible on 18-row pane: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.ends_with("│ t4")),
+            "live command tail must remain visible on 18-row pane: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn active_cell_pins_failed_call_and_reason_when_parallel_batch_overflows_room() {
+        use runtime::message_stream::types::ToolResultBody;
+        let mut ui = test_ui();
+        ui.view = super::super::style::ConversationView::Turns;
+        ui.status = Some(crate::tui::view::Status::working(Duration::from_secs(3)));
+        let ids = BlockIdGen::default();
+
+        ui.block(tool_call(&ids, "r0", "read_file", &json!({ "path": "missing.rs" })));
+        for i in 1..=9 {
+            ui.block(tool_call(&ids, &format!("r{i}"), "read_file", &json!({ "path": format!("src/f{i}.rs") })));
+        }
+        ui.block(RenderBlock::ToolResult {
+            id: ids.next(),
+            tool_call_id: ToolCallId("r0".to_string()),
+            is_error: true,
+            body: ToolResultBody::Text { content: "No such file\n".to_string(), truncated: false },
+        });
+
+        let rows: Vec<String> = ui.active_cell(98).0.iter().map(Line::plain).collect();
+        assert!(
+            rows.iter().any(|row| row.contains("Read missing.rs") && row.contains("failed")),
+            "failed step row must stay pinned above earlier collapse: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("No such file")),
+            "failed step reason row must stay pinned under its call: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("2 earlier")),
+            "hidden call count must reflect the 2 hidden running calls, not raw lines: {rows:#?}"
         );
     }
 

@@ -310,6 +310,222 @@ impl TurnFold {
     }
 }
 
+/// One live entry from an open `ToolGroup` rendered in the `turns` view.
+pub(super) enum LiveEntry {
+    Step(Step),
+    Running {
+        spinner: Span,
+        verb: String,
+        target: String,
+        address: bool,
+        note: Option<String>,
+        tail: Vec<Line>,
+    },
+}
+
+impl LiveEntry {
+    fn is_failed(&self) -> bool {
+        matches!(self, Self::Step(step) if !step.ok && !step.declined)
+    }
+
+    fn is_running(&self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
+
+    fn base_cost(&self) -> usize {
+        match self {
+            Self::Step(step) => 1 + usize::from(step.error.is_some()),
+            Self::Running { .. } => 1,
+        }
+    }
+
+    pub(super) fn total_cost(&self) -> usize {
+        match self {
+            Self::Step(_) => self.base_cost(),
+            Self::Running { tail, .. } => 1 + tail.len(),
+        }
+    }
+}
+
+/// Render an open `ToolGroup`'s live entries within an optional row `budget`.
+/// When `entries` exceed `budget`, the newest running call header and failed
+/// calls (newest first, up to half the budget) stay visible, a floor of live
+/// output tail lines is reserved for the newest running command with output,
+/// and remaining space goes to the newest calls under a single `… N earlier`
+/// count of hidden entries.
+pub(super) fn render_live_entries(
+    entries: &[LiveEntry],
+    width: usize,
+    mut hangs: bool,
+    budget: Option<usize>,
+) -> Vec<Line> {
+    let glyphs = super::style::glyphs();
+    let total_rows: usize = entries.iter().map(LiveEntry::total_cost).sum();
+    let Some(budget) = budget.filter(|budget| total_rows > *budget) else {
+        let mut rows = Vec::with_capacity(total_rows);
+        for entry in entries {
+            push_live_entry(&mut rows, entry, &mut hangs, usize::MAX, width);
+        }
+        return rows;
+    };
+    let budget = budget.max(1);
+    let (keep, tail_alloc, used, hidden) = select_live_entries(entries, budget);
+    let mut rows = Vec::with_capacity(budget);
+    if hidden > 0 && used < budget {
+        let lead = if hangs { glyphs.result_rest } else { glyphs.result_first };
+        rows.push(Line::new(vec![Span::dim(lead), Span::dim(strings::earlier_rows(hidden))]).truncated(width));
+        hangs = true;
+    }
+    for (idx, entry) in entries.iter().enumerate() {
+        if keep[idx] {
+            push_live_entry(&mut rows, entry, &mut hangs, tail_alloc[idx], width);
+        }
+    }
+    rows
+}
+
+fn select_live_entries(entries: &[LiveEntry], budget: usize) -> (Vec<bool>, Vec<usize>, usize, usize) {
+    let mut keep = vec![false; entries.len()];
+    let mut kept_count = 0usize;
+    let mut used = 0usize;
+
+    // 1. Guarantee the newest running call's header row first so an active
+    //    spinner/command never disappears even in a 1-row budget.
+    if let Some((idx, entry)) = entries.iter().enumerate().rev().find(|(_, entry)| entry.is_running()) {
+        let cost = entry.base_cost();
+        if cost <= budget {
+            keep[idx] = true;
+            kept_count += 1;
+            used += cost;
+        }
+    }
+
+    // 2. Pin failed calls (newest first) within half the budget (at least 2
+    //    rows when affordable so a 1-step failure + reason fits), stopping at
+    //    the first failure that does not fit, as TurnFold::live_rows does.
+    let fail_cap = (budget / 2).max(2).min(budget);
+    let mut fail_used = 0usize;
+    for (idx, entry) in entries.iter().enumerate().rev().filter(|(_, entry)| entry.is_failed()) {
+        if keep[idx] {
+            continue;
+        }
+        let cost = entry.base_cost();
+        let earlier_row = usize::from(kept_count + 1 < entries.len());
+        if fail_used + cost <= fail_cap && used + cost + earlier_row <= budget {
+            keep[idx] = true;
+            kept_count += 1;
+            used += cost;
+            fail_used += cost;
+        } else {
+            break;
+        }
+    }
+
+    // 3a. Keep any remaining running call headers (newest first).
+    for idx in (0..entries.len()).rev() {
+        if keep[idx] || !entries[idx].is_running() {
+            continue;
+        }
+        let cost = entries[idx].base_cost();
+        let earlier_row = usize::from(kept_count + 1 < entries.len());
+        if used + cost + earlier_row <= budget {
+            keep[idx] = true;
+            kept_count += 1;
+            used += cost;
+        } else {
+            break;
+        }
+    }
+
+    // 3b. Reserve a floor of live tail lines for the newest kept running
+    //     command that actually has output, so finished sibling calls and
+    //     queued quiet calls behind it cannot starve its output to zero.
+    let tail_reserve = entries
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, entry)| match entry {
+            LiveEntry::Running { tail, .. } if keep[idx] && !tail.is_empty() => Some(tail.len()),
+            _ => None,
+        })
+        .map_or(0, |tail_len| {
+            let avail = budget.saturating_sub(used + usize::from(kept_count < entries.len()));
+            if avail == 0 {
+                0
+            } else {
+                tail_len.min((avail / 2).max(1))
+            }
+        });
+
+    // 3c. Fill remaining budget from newest unkept entries backwards, stopping
+    //     at the first entry that does not fit (matching TurnFold::live_rows) so
+    //     an older success never jumps ahead of a newer hidden failure.
+    for idx in (0..entries.len()).rev() {
+        if keep[idx] {
+            continue;
+        }
+        let cost = entries[idx].base_cost();
+        let earlier_row = usize::from(kept_count + 1 < entries.len());
+        if used + tail_reserve + cost + earlier_row <= budget {
+            keep[idx] = true;
+            kept_count += 1;
+            used += cost;
+        } else {
+            break;
+        }
+    }
+
+    let hidden = entries.len() - kept_count;
+    let tail_budget = budget.saturating_sub(used + usize::from(hidden > 0));
+    let mut tail_alloc = vec![0usize; entries.len()];
+    let mut tail_left = tail_budget;
+    for (idx, entry) in entries.iter().enumerate().rev() {
+        if !keep[idx] {
+            continue;
+        }
+        if let LiveEntry::Running { tail, .. } = entry {
+            let take = tail.len().min(tail_left);
+            tail_alloc[idx] = take;
+            tail_left -= take;
+        }
+    }
+    (keep, tail_alloc, used, hidden)
+}
+
+fn push_live_entry(
+    rows: &mut Vec<Line>,
+    entry: &LiveEntry,
+    hangs: &mut bool,
+    max_tail: usize,
+    width: usize,
+) {
+    let glyphs = super::style::glyphs();
+    match entry {
+        LiveEntry::Step(step) => {
+            let lead = if *hangs { glyphs.result_rest } else { glyphs.result_first };
+            rows.push(step_row(step, lead, width));
+            if let Some(why) = why_row(step, width) {
+                rows.push(why);
+            }
+            *hangs = true;
+        }
+        LiveEntry::Running { spinner, verb, target, address, note, tail } => {
+            rows.push(running_step_row(
+                spinner.clone(),
+                verb,
+                target,
+                *address,
+                note.as_deref(),
+                width,
+            ));
+            let take = tail.len().min(max_tail);
+            let skip = tail.len() - take;
+            rows.extend(tail.iter().skip(skip).cloned());
+            *hangs = true;
+        }
+    }
+}
+
 /// A step's row in the viewport: its hung mark, the call as the running row
 /// said it, and what it came to.
 pub(super) fn step_row(step: &Step, lead: &str, width: usize) -> Line {
@@ -871,5 +1087,140 @@ mod tests {
         assert_eq!(live_room(4), LIVE_ROWS_MIN);
         assert_eq!(live_room(16), 8);
         assert_eq!(live_room(60), LIVE_ROWS_MAX);
+    }
+
+    #[test]
+    fn render_live_entries_keeps_running_command_row_and_trims_oldest_tail_first() {
+        use super::{render_live_entries, LiveEntry};
+        use crate::tui::ansi::Span;
+        let running = LiveEntry::Running {
+            spinner: Span::raw("⠋"),
+            verb: "Run".to_string(),
+            target: "cargo test".to_string(),
+            address: false,
+            note: None,
+            tail: ["t1", "t2", "t3", "t4"]
+                .into_iter()
+                .map(|line| Line::from_text(format!("    │ {line}")))
+                .collect(),
+        };
+        let rows_4 = plain(&render_live_entries(&[running], 98, false, Some(4)));
+        assert_eq!(rows_4.len(), 4, "{rows_4:#?}");
+        assert!(rows_4[0].contains("Run cargo test"), "{rows_4:#?}");
+        assert!(rows_4[1].ends_with("│ t2") && rows_4[3].ends_with("│ t4"), "{rows_4:#?}");
+
+        let running_1 = LiveEntry::Running {
+            spinner: Span::raw("⠋"),
+            verb: "Run".to_string(),
+            target: "cargo test".to_string(),
+            address: false,
+            note: None,
+            tail: ["t1", "t2", "t3", "t4"]
+                .into_iter()
+                .map(|line| Line::from_text(format!("    │ {line}")))
+                .collect(),
+        };
+        let rows_1 = plain(&render_live_entries(&[running_1], 98, false, Some(1)));
+        assert_eq!(rows_1.len(), 1, "{rows_1:#?}");
+        assert!(rows_1[0].contains("Run cargo test"), "{rows_1:#?}");
+    }
+
+    #[test]
+    fn render_live_entries_reserves_command_tail_before_older_finished_siblings() {
+        use super::{render_live_entries, LiveEntry};
+        use crate::tui::ansi::Span;
+        let mut entries: Vec<LiveEntry> = (0..6)
+            .map(|i| LiveEntry::Step(step(StepKind::Read, "Read", &format!("src/f{i}.rs"))))
+            .collect();
+        entries.push(LiveEntry::Running {
+            spinner: Span::raw("⠋"),
+            verb: "Run".to_string(),
+            target: "cargo test".to_string(),
+            address: false,
+            note: None,
+            tail: ["t1", "t2", "t3", "t4"]
+                .into_iter()
+                .map(|line| Line::from_text(format!("    │ {line}")))
+                .collect(),
+        });
+        let rows = plain(&render_live_entries(&entries, 98, false, Some(7)));
+        assert_eq!(rows.len(), 7, "{rows:#?}");
+        assert!(rows.iter().any(|row| row.contains("Run cargo test")), "{rows:#?}");
+        assert!(rows.iter().any(|row| row.ends_with("│ t4")), "newest tail line starved by finished reads: {rows:#?}");
+    }
+
+    #[test]
+    fn render_live_entries_stops_backfill_at_first_unfit_entry_to_preserve_recency() {
+        use super::{render_live_entries, LiveEntry};
+        use crate::tui::ansi::Span;
+        let fail = |target: &str| {
+            let mut s = step(StepKind::Read, "Read", target);
+            s.ok = false;
+            s.error = Some("No such file".to_string());
+            LiveEntry::Step(s)
+        };
+        let running = |target: &str| LiveEntry::Running {
+            spinner: Span::raw("⠋"),
+            verb: "Read".to_string(),
+            target: target.to_string(),
+            address: false,
+            note: None,
+            tail: Vec::new(),
+        };
+        let entries = vec![
+            LiveEntry::Step(step(StepKind::Read, "Read", "old_ok.rs")),
+            fail("newer_fail.rs"),
+            fail("kept_fail_1.rs"),
+            fail("kept_fail_2.rs"),
+            running("r1.rs"),
+            running("r2.rs"),
+            running("r3.rs"),
+            running("r4.rs"),
+        ];
+        let rows = plain(&render_live_entries(&entries, 98, false, Some(10)));
+        assert!(rows.len() <= 10, "{rows:#?}");
+        assert!(rows.iter().any(|row| row.contains("2 earlier")), "{rows:#?}");
+        assert!(rows.iter().any(|row| row.contains("kept_fail_1.rs")), "{rows:#?}");
+        assert!(rows.iter().any(|row| row.contains("kept_fail_2.rs")), "{rows:#?}");
+        assert!(
+            !rows.iter().any(|row| row.contains("old_ok.rs")),
+            "older ok step must not jump ahead of newer hidden failure: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn render_live_entries_reserves_tail_even_when_quiet_call_is_queued_behind_command() {
+        use super::{render_live_entries, LiveEntry};
+        use crate::tui::ansi::Span;
+        let mut entries: Vec<LiveEntry> = (0..5)
+            .map(|i| LiveEntry::Step(step(StepKind::Read, "Read", &format!("src/f{i}.rs"))))
+            .collect();
+        entries.push(LiveEntry::Running {
+            spinner: Span::raw("⠋"),
+            verb: "Run".to_string(),
+            target: "cargo test".to_string(),
+            address: false,
+            note: None,
+            tail: ["t1", "t2", "t3", "t4"]
+                .into_iter()
+                .map(|line| Line::from_text(format!("    │ {line}")))
+                .collect(),
+        });
+        entries.push(LiveEntry::Running {
+            spinner: Span::raw("⠋"),
+            verb: "Run".to_string(),
+            target: "git status".to_string(),
+            address: false,
+            note: None,
+            tail: Vec::new(),
+        });
+        let rows = plain(&render_live_entries(&entries, 98, false, Some(7)));
+        assert_eq!(rows.len(), 7, "{rows:#?}");
+        assert!(rows.iter().any(|row| row.contains("Run cargo test")), "{rows:#?}");
+        assert!(rows.iter().any(|row| row.contains("Run git status")), "{rows:#?}");
+        assert!(
+            rows.iter().any(|row| row.ends_with("│ t4")),
+            "quiet queued call behind command must not starve command tail: {rows:#?}"
+        );
     }
 }

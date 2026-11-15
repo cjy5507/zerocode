@@ -2,6 +2,7 @@ mod allow_always_narrow;
 mod mcp_edit;
 mod mcp_secrets;
 mod parsers;
+mod repository_narrows;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
@@ -74,6 +75,7 @@ pub struct ConfigEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
     merged: BTreeMap<String, JsonValue>,
+    persons_own: BTreeMap<String, JsonValue>,
     loaded_entries: Vec<ConfigEntry>,
     feature_config: RuntimeFeatureConfig,
 }
@@ -965,6 +967,9 @@ impl ConfigLoader {
                 if !project_lsp_opt_in {
                     value.remove("lspServers");
                 }
+                // How much the session asks outside itself is the person's
+                // to widen; what their repository committed may narrow it.
+                repository_narrows::only_narrows(&mut value, &trusted_settings);
             }
             // The desk guard is a person's to turn off (t-104888), in their
             // user settings file only: a repository cannot lift it for
@@ -1108,6 +1113,7 @@ impl ConfigLoader {
 
         Ok(RuntimeConfig {
             merged,
+            persons_own: trusted_settings,
             loaded_entries,
             feature_config,
         })
@@ -2520,6 +2526,7 @@ impl RuntimeConfig {
     pub fn empty() -> Self {
         Self {
             merged: BTreeMap::new(),
+            persons_own: BTreeMap::new(),
             loaded_entries: Vec::new(),
             feature_config: RuntimeFeatureConfig::default(),
         }
@@ -2528,6 +2535,17 @@ impl RuntimeConfig {
     #[must_use]
     pub fn merged(&self) -> &BTreeMap<String, JsonValue> {
         &self.merged
+    }
+
+    /// The person's own documents, merged as they are: the user settings, a
+    /// `.zo/settings.local.json` git does not track, and a `--settings` file
+    /// — the documents the `enableAllProject…` opt-ins are read from, and
+    /// nothing a repository committed. A reader that takes a setting for the
+    /// person's own selection asks here whether the person said it;
+    /// [`Self::as_json`] says the same of a value the repository wrote.
+    #[must_use]
+    pub fn persons_own_json(&self) -> JsonValue {
+        JsonValue::Object(self.persons_own.clone())
     }
 
     #[must_use]
