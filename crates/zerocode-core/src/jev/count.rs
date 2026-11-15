@@ -33,9 +33,18 @@ const HOUR_FILE_PREFIX: &str = "hour-";
 /// The lock beside every hour file, shared across decisions and hours.
 pub(super) const HOURS_LOCK_FILE: &str = ".hours.lock";
 
-/// The maximum wait and retry interval for an hour writer, as in the decisions store.
-const HOURS_LOCK_WAIT: Duration = Duration::from_millis(25);
+/// The longest an hour writer waits for the lock, and the first and longest
+/// pause between its tries; each pause doubles up to the longest. A holder
+/// keeps the lock for well under a millisecond, but on a loaded machine it
+/// can be put off the processor for tens of milliseconds while it holds it,
+/// and a launch that forks on another thread keeps a copy until it execs:
+/// 25 ms gave up on three decisions asked together at a load of 33
+/// (t-107869). 300 ms leaves a 1,500 ms request four fifths of its wall when
+/// the whole wait is spent, and a wait that runs out is
+/// [`super::door::Refused::Uncounted`], not a full hour.
+const HOURS_LOCK_WAIT: Duration = Duration::from_millis(300);
 const HOURS_LOCK_POLL: Duration = Duration::from_millis(1);
+const HOURS_LOCK_POLL_MOST: Duration = Duration::from_millis(10);
 
 /// The hour lock is readable and writable by its owner alone.
 #[cfg(unix)]
@@ -138,11 +147,13 @@ pub(super) fn lock_hours(every: &Path) -> io::Result<HeldFileLock> {
     }
     let file = options.open(path)?;
     let until = Instant::now() + HOURS_LOCK_WAIT;
+    let mut pause = HOURS_LOCK_POLL;
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(HeldFileLock::locked(file)),
             Err(TryLockError::WouldBlock) if Instant::now() < until => {
-                thread::sleep(HOURS_LOCK_POLL);
+                thread::sleep(pause.min(until.saturating_duration_since(Instant::now())));
+                pause = (pause * 2).min(HOURS_LOCK_POLL_MOST);
             }
             Err(TryLockError::WouldBlock) => {
                 return Err(io::Error::new(
@@ -203,6 +214,77 @@ fn append_one(path: &Path) -> io::Result<(u64, bool)> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(ONE_REQUEST)?;
     Ok((file.stream_position()?, first))
+}
+
+/// What a decision's left-out file's name starts with, before its id.
+const LEFT_OUT_PREFIX: &str = "left-out-";
+
+/// The local days a decision's left-out counts are kept: the day and the six
+/// before it — the week a summary reads.
+pub const LEFT_OUT_DAYS: usize = 7;
+
+/// The file the decision `id` counts in, for `day` (`YYYY-MM-DD`, local), the
+/// moments its words left out ([`super::custom::ask_when`]): asks that sent
+/// no request and wrote no row.
+#[must_use]
+pub fn left_out_path(config_home: &Path, id: &str, day: &str) -> PathBuf {
+    config_home
+        .join(REQUESTS_DIR)
+        .join(format!("{LEFT_OUT_PREFIX}{id}-{day}{DAY_FILE_SUFFIX}"))
+}
+
+/// Count one moment the decision `id`'s words left out in `day`; the day's
+/// first clears that decision's files older than [`LEFT_OUT_DAYS`].
+///
+/// # Errors
+/// A file that cannot be created or written.
+pub fn count_left_out(config_home: &Path, id: &str, day: &str) -> io::Result<u64> {
+    let path = left_out_path(config_home, id, day);
+    let (place, first_of_the_day) = append_one(&path)?;
+    if first_of_the_day {
+        let oldest_kept = (1..LEFT_OUT_DAYS).try_fold(day.to_string(), |at, _| day_before(&at));
+        if let Some(oldest_kept) = oldest_kept {
+            forget_earlier_days(
+                &path,
+                &format!("{LEFT_OUT_PREFIX}{id}-"),
+                DAY_FILE_SUFFIX,
+                |kept, _| kept >= oldest_kept.as_str(),
+            );
+        }
+    }
+    Ok(place)
+}
+
+/// The moments the decision `id`'s words left out over the `days` local days
+/// ending with `day`: one entry per day, `day` first.
+#[must_use]
+pub fn left_out_over(config_home: &Path, id: &str, day: &str, days: usize) -> Vec<u64> {
+    let mut counts = Vec::with_capacity(days);
+    let mut at = Some(day.to_string());
+    for _ in 0..days {
+        let Some(this) = at else {
+            break;
+        };
+        counts.push(sent(&left_out_path(config_home, id, &this)));
+        at = day_before(&this);
+    }
+    counts
+}
+
+/// Remove every day file of the decision `id`'s left-out moments — what a
+/// deleted decision leaves behind, since nothing counts it again to clear
+/// them (t-107869). Best effort, as [`forget_earlier_days`].
+pub fn forget_left_out(config_home: &Path, id: &str) {
+    let prefix = format!("{LEFT_OUT_PREFIX}{id}-");
+    let Ok(entries) = fs::read_dir(config_home.join(REQUESTS_DIR)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if day_named(&path, &prefix, DAY_FILE_SUFFIX).is_some() {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 /// The day before `day` (`YYYY-MM-DD`), or `None` for a word that is not a
@@ -299,7 +381,9 @@ fn hour_named(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::lock_hours;
+    use super::{
+        LEFT_OUT_DAYS, count_left_out, forget_left_out, left_out_over, left_out_path, lock_hours,
+    };
 
     /// A process launch on another thread that forks before it execs holds a
     /// copy of the hour lock until the exec; the duplicate here is that copy,
@@ -318,5 +402,54 @@ mod tests {
             next.is_ok(),
             "a lock its holder let go is still held by a copy: {next:?}"
         );
+    }
+
+    #[test]
+    fn a_decisions_left_out_moments_are_counted_by_day_and_kept_a_week() {
+        let home = tempfile::tempdir().unwrap();
+        let id = "d-0000000a";
+        assert_eq!(
+            left_out_over(home.path(), id, "2026-11-14", LEFT_OUT_DAYS),
+            vec![0; LEFT_OUT_DAYS]
+        );
+        for day in ["2026-11-01", "2026-11-07", "2026-11-08"] {
+            count_left_out(home.path(), id, day).unwrap();
+        }
+        count_left_out(home.path(), "d-0000000b", "2026-11-01").unwrap();
+        assert_eq!(count_left_out(home.path(), id, "2026-11-14").unwrap(), 1);
+        assert_eq!(count_left_out(home.path(), id, "2026-11-14").unwrap(), 2);
+        assert!(
+            !left_out_path(home.path(), id, "2026-11-01").exists()
+                && !left_out_path(home.path(), id, "2026-11-07").exists(),
+            "a day before the week is cleared by the day's first count"
+        );
+        assert!(
+            left_out_path(home.path(), id, "2026-11-08").exists(),
+            "the week's first day stays"
+        );
+        assert!(
+            left_out_path(home.path(), "d-0000000b", "2026-11-01").exists(),
+            "another decision's days are its own"
+        );
+        assert_eq!(
+            left_out_over(home.path(), id, "2026-11-14", LEFT_OUT_DAYS),
+            vec![2, 0, 0, 0, 0, 0, 1]
+        );
+    }
+    /// A deleted decision's left-out days go with it, and only its own.
+    #[test]
+    fn a_deleted_decisions_left_out_days_are_forgotten_and_no_others() {
+        let home = tempfile::tempdir().unwrap();
+        let (gone, kept) = ("d-0000000a", "d-0000000b");
+        for day in ["2026-11-13", "2026-11-14"] {
+            count_left_out(home.path(), gone, day).unwrap();
+            count_left_out(home.path(), kept, day).unwrap();
+        }
+        forget_left_out(home.path(), gone);
+        for day in ["2026-11-13", "2026-11-14"] {
+            assert!(!left_out_path(home.path(), gone, day).exists(), "{day}");
+            assert!(left_out_path(home.path(), kept, day).exists(), "{day}");
+        }
+        forget_left_out(home.path(), "d-0000000c");
     }
 }

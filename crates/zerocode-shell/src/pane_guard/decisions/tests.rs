@@ -1511,3 +1511,239 @@ fn a_room_too_small_for_the_opening_takes_nothing_and_the_line_waits() {
         Some(briefed(custom::line("Visible", YES_MEANS, 0.9)))
     );
 }
+
+/// A decision told the words it asks about (`custom::ask_when`) leaves out a
+/// command none of them names: no request, no row, one count in its day —
+/// and asks about a command that names one as it always did.
+#[test]
+fn a_command_none_of_its_words_names_sends_nothing_and_is_counted_left_out() {
+    let endpoint = replying(|_| a_noul(0.95));
+    let project = tempfile::tempdir().expect("a project");
+    let decision = yes_no("Deleting", Point::BeforeCommand);
+    let home = Home::new(
+        &endpoint,
+        project.path(),
+        JevMode::On,
+        &[(&decision, JevMode::On)],
+    );
+    let words = AskWhen {
+        words: vec!["rm".to_string()],
+        edited: false,
+    };
+    store::set_ask_when(home.home.path(), &decision.id, &words).expect("when it asks is kept");
+    let standing = home.standing();
+    let guards = fresh_guards();
+    noted(
+        guards,
+        &home,
+        &standing,
+        vec![about(
+            Some("call-1"),
+            "cargo build --release",
+            project.path(),
+        )],
+    );
+    assert!(
+        endpoint.asked().is_empty(),
+        "a command no word names was asked about"
+    );
+    assert!(home.rows().is_empty(), "a moment left out wrote a row");
+    let day = systemone::day_at(crate::usage_runtime::epoch_ms_now());
+    assert_eq!(
+        count::left_out_over(home.home.path(), &decision.id, &day, 1),
+        [1]
+    );
+
+    noted(
+        guards,
+        &home,
+        &standing,
+        vec![about(Some("call-2"), "rm -rf build", project.path())],
+    );
+    assert_eq!(
+        endpoint.asked().len(),
+        1,
+        "a command a word names was not asked about"
+    );
+    assert_eq!(home.rows().len(), 1);
+    assert_eq!(
+        count::left_out_over(home.home.path(), &decision.id, &day, 1),
+        [1]
+    );
+}
+
+/// A turn's-end decision told to ask after edits leaves out a turn that
+/// edited nothing, and asks after one that edited a file.
+#[test]
+fn a_turn_that_edited_nothing_is_left_out_by_a_decision_that_asks_after_edits() {
+    let endpoint = replying(|_| a_noul(0.9));
+    let project = tempfile::tempdir().expect("a project");
+    let decision = yes_no("Checked", Point::TurnEnd);
+    let home = Home::new(
+        &endpoint,
+        project.path(),
+        JevMode::On,
+        &[(&decision, JevMode::On)],
+    );
+    let after_edits = AskWhen {
+        words: Vec::new(),
+        edited: true,
+    };
+    store::set_ask_when(home.home.path(), &decision.id, &after_edits)
+        .expect("when it asks is kept");
+    let standing = home.standing();
+    let guards = fresh_guards();
+    noted(guards, &home, &standing, vec![turn_ended(false)]);
+    assert!(
+        endpoint.asked().is_empty(),
+        "a turn that edited nothing was asked about"
+    );
+    // The project's own spelling of the path: a temporary folder's unresolved
+    // one (`/var` for `/private/var`) is outside the project.
+    let notes = home.root.join("notes.md");
+    std::fs::write(&notes, "edited\n").expect("the edited file");
+    let edit = Moment::Started {
+        call_id: Some("edit-1".to_string()),
+        tool: "Edit".to_string(),
+        words: None,
+        paths: vec![notes.to_string_lossy().into_owned()],
+    };
+    noted(guards, &home, &standing, vec![edit, turn_ended(false)]);
+    assert_eq!(
+        endpoint.asked().len(),
+        1,
+        "a turn that edited a file was not asked about"
+    );
+}
+
+/// What `zo jev decisions ask-when` writes reaches a running window
+/// (t-107869): the file beside the index rides the window's watcher with
+/// zo's settings and the index ([`watched_files`]), so a decision told when
+/// to ask — and told to ask every time again — is read within a tick of the
+/// watcher, though neither the settings nor the index moved.
+#[test]
+fn when_a_decision_asks_reaches_the_running_window_within_a_tick() {
+    use std::time::{Duration, Instant};
+
+    let endpoint = replying(|_| a_noul(0.9));
+    let project = tempfile::tempdir().expect("a project");
+    let decision = yes_no("Deletes", Point::BeforeCommand);
+    let home = Home::new(
+        &endpoint,
+        project.path(),
+        JevMode::On,
+        &[(&decision, JevMode::On)],
+    );
+    let standing: &'static Standing = Box::leak(Box::new(home.standing()));
+    let told = |standing: &Standing| -> Vec<AskWhen> {
+        standing
+            .decided()
+            .decisions
+            .kept
+            .iter()
+            .map(|kept| kept.ask_when.clone())
+            .collect()
+    };
+    assert_eq!(told(standing), [AskWhen::default()]);
+    // The window's own watcher, on a short tick of its own, reading on a
+    // change of anything the window watches for the standing.
+    let watched: &'static crate::file_watch::WatchSet =
+        Box::leak(Box::new(crate::file_watch::WatchSet::default()));
+    watched.replace_lane(
+        WATCH_LANE,
+        watched_files(&home.home.path().join("settings.json")),
+        false,
+    );
+    let reading = home.wire.clone();
+    std::thread::spawn(move || {
+        watched.run(Duration::from_millis(40), |events| {
+            if events.iter().any(|change| change.lane == WATCH_LANE) {
+                standing.read(&reading);
+            }
+        });
+    });
+    // Waited for up to a bound only a watcher that never reads reaches: a
+    // loaded runner does not schedule the thread for long stretches.
+    const WATCHER_HEARD_BY: Duration = Duration::from_secs(10);
+    let within_a_tick = |wanted: &[AskWhen]| {
+        let began = Instant::now();
+        while began.elapsed() < WATCHER_HEARD_BY {
+            if told(standing) == wanted {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        false
+    };
+    let words = AskWhen {
+        words: vec!["rm".to_string()],
+        edited: false,
+    };
+    let (_, now) =
+        store::set_ask_when(home.home.path(), &decision.id, &words).expect("its words are kept");
+    assert!(
+        within_a_tick(std::slice::from_ref(&now)),
+        "the words never reached the running window: {:?}",
+        told(standing)
+    );
+    store::set_ask_when(home.home.path(), &decision.id, &AskWhen::default())
+        .expect("its words are taken out");
+    assert!(
+        within_a_tick(&[AskWhen::default()]),
+        "asking every time again never reached the running window: {:?}",
+        told(standing)
+    );
+}
+
+/// A decision's words are read as its point keeps them (t-107869): a line
+/// its point does not take — "after edits" on a command, as no writer of the
+/// store writes it — asks every time, and so does a decision an edit moved
+/// to another point: a command's words are never looked for in a turn's last
+/// answer.
+#[test]
+fn a_decision_whose_point_does_not_take_its_words_asks_every_time() {
+    let endpoint = replying(|_| a_noul(0.9));
+    let project = tempfile::tempdir().expect("a project");
+    let command = yes_no("Deletes", Point::BeforeCommand);
+    let home = Home::new(
+        &endpoint,
+        project.path(),
+        JevMode::On,
+        &[(&command, JevMode::On)],
+    );
+    let told = |home: &Home| -> Vec<AskWhen> {
+        home.standing()
+            .decided()
+            .decisions
+            .kept
+            .iter()
+            .map(|kept| kept.ask_when.clone())
+            .collect()
+    };
+    let side = store::ask_when_path(home.home.path());
+    let id = command.id.clone();
+    std::fs::write(
+        &side,
+        json!({ "schemaVersion": custom::SCHEMA_VERSION, "decisions": { id: { "edited": true } } })
+            .to_string(),
+    )
+    .expect("a line by hand");
+    assert_eq!(told(&home), [AskWhen::default()]);
+
+    std::fs::remove_file(&side).expect("the hand's line goes");
+    let words = AskWhen {
+        words: vec!["rm".to_string()],
+        edited: false,
+    };
+    store::set_ask_when(home.home.path(), &command.id, &words).expect("its words are kept");
+    assert_eq!(told(&home), [words]);
+    let mut moved = command.clone();
+    moved.at = Point::TurnEnd;
+    moved.reads = Point::TurnEnd.inputs().iter().copied().collect();
+    store::edit(home.home.path(), &moved, 2).expect("moved to a turn's end");
+    assert_eq!(
+        told(&home),
+        [AskWhen::default()],
+        "a command's words are looked for in a turn's last answer"
+    );
+}
