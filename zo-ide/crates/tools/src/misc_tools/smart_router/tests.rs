@@ -137,6 +137,77 @@
         let _ = fs::remove_dir_all(&repository);
     }
 
+    /// The window draws the classifier card from `zerocode_core::jev::ClassifierMode`
+    /// and zo routes on `RouteAutoClassifierMode`: one word read two ways is a
+    /// card that names one mode while zo runs another. `"Probed"` drew
+    /// 「키워드 + 빠른 모델 확인」 while zo routed it as `deterministic` and asked
+    /// no model. Every value a settings file can hold reads as the same mode on
+    /// both sides; what is not said at all is read through zo's own settings
+    /// reader, where only its absence means probed.
+    #[test]
+    fn the_windows_card_reads_the_classifier_word_as_zo_routes_on_it() {
+        use zerocode_core::jev::ClassifierMode;
+        let zo_word = |mode: RouteAutoClassifierMode| match mode {
+            RouteAutoClassifierMode::Off => "off",
+            RouteAutoClassifierMode::Deterministic => "deterministic",
+            RouteAutoClassifierMode::Assisted => "assisted",
+            RouteAutoClassifierMode::Probed => "probed",
+        };
+        let written = [
+            json!("off"),
+            json!("deterministic"),
+            json!("assisted"),
+            json!("probed"),
+            json!(" probed "),
+            json!("\tprobed\n"),
+            json!("Probed"),
+            json!("PROBED"),
+            json!("Off"),
+            json!(" OFF "),
+            json!("Assisted"),
+            json!("Deterministic"),
+            json!(""),
+            json!("   "),
+            json!("x"),
+            json!("probed!"),
+            json!(3),
+            json!(1.5),
+            json!(true),
+            Value::Null,
+            json!(["probed"]),
+            json!({ "mode": "probed" }),
+        ];
+        for value in &written {
+            assert_eq!(
+                ClassifierMode::of(Some(value)).key(),
+                zo_word(RouteAutoClassifierMode::from_settings_value(Some(value))),
+                "the card and zo read `autoClassifier: {value}` as different modes",
+            );
+        }
+
+        let config_home = temp_config_home("classifier-card-unsaid");
+        let repository = temp_config_home("classifier-card-unsaid-cwd");
+        fs::create_dir_all(&repository).expect("repository dir");
+        for document in [
+            json!({}),
+            json!({ "smart": {} }),
+            json!({ "smart": "x" }),
+            json!({ "smart": ["probed"] }),
+        ] {
+            write_settings(&config_home, &document);
+            let zo = with_config_home(&config_home, || {
+                super::settings::read_smart_runtime_settings_for(&repository).expect("settings")
+            });
+            assert_eq!(
+                ClassifierMode::in_settings(&document).key(),
+                zo_word(zo.auto_classifier),
+                "the card and zo read {document} as different modes",
+            );
+        }
+        let _ = fs::remove_dir_all(&config_home);
+        let _ = fs::remove_dir_all(&repository);
+    }
+
     /// Nor does the router put the verify leg on another provider, carry a
     /// turn out of quota on at one, or have the checking roles prefer one,
     /// because a repository said so: a person's `false` stands against its
@@ -231,6 +302,89 @@
         json!({ "modelRouter": { "roles": { role: { "mode": "pinned", "model": model } } } })
     }
 
+    /// A person's own pin stands as they wrote it: a repository's document
+    /// can neither change it nor take it away (152, review t-107693 D). The
+    /// merge goes key by key, so `{"mode": "auto"}` over a pin read as none,
+    /// and a `modelRouter` or `roles` that is no object wiped the person's.
+    #[test]
+    fn a_repository_neither_changes_nor_takes_away_a_persons_pin() {
+        let persons = pinned("verifier", "Verifier/Model-X");
+        let theirs = Some(runtime::RoleOverride::Pin("Verifier/Model-X".to_string()));
+        for (at, repository) in [
+            json!({ "modelRouter": { "roles": { "verifier": { "mode": "auto" } } } }),
+            json!({ "modelRouter": { "roles": { "verifier": { "mode": "deleted" } } } }),
+            json!({ "modelRouter": { "roles": { "verifier": { "mode": "sideways" } } } }),
+            json!({ "modelRouter": { "roles": { "verifier": "x" } } }),
+            json!({ "modelRouter": { "roles": [] } }),
+            json!({ "modelRouter": "x" }),
+            json!({ "modelRouter": { "roles": { "verifier": { "mode": "pinned", "model": "Other/Model" } } } }),
+            json!({ "modelRouter": { "roles": { "Verifier": { "mode": "pinned", "model": "Other/Model" } } } }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            in_a_repository(&format!("persons-pin-stands-{at}"), &persons, &repository, |settings| {
+                assert_eq!(settings.roles.get("verifier"), theirs.as_ref(), "{repository}");
+                assert!(settings.repository_roles.is_empty(), "{repository}");
+            });
+        }
+    }
+
+    /// A pin the person wrote stands over one a repository wrote for the same
+    /// helper, whichever table each sits in: a repository's pin on a kind of
+    /// helper (`modelRouter.subagents`) does not undo the person's on the
+    /// role that kind works in (152, review t-107910).
+    #[test]
+    fn a_persons_role_pin_stands_over_a_repositorys_pin_on_the_kind_of_helper() {
+        const MAIN: &str = "claude-sonnet-5";
+        const PERSONS: &str = "claude-haiku-4-5-20251001";
+        const REPOSITORYS: &str = "gpt-5.6-terra";
+        let inventory = inventory_of(MAIN, &[MAIN, PERSONS, REPOSITORYS]);
+        for (kind, role) in [("Verification", "verifier"), ("code-reviewer", "reviewer"), ("Explore", "fast")] {
+            let repository = json!({ "modelRouter": { "subagents": { kind: { "mode": "pinned", "model": REPOSITORYS } } } });
+            let routed = |label: &str, persons: &Value| {
+                in_a_repository(label, persons, &repository, |settings| {
+                    let profile = runtime::SubagentProfileId::parse(kind).expect("a built-in kind");
+                    let works_as = profile.route_role_hint().expect("the kind's role");
+                    let mut request =
+                        runtime::RouteRequest::for_target(runtime::RoutingTarget::Subagent(profile), works_as, MAIN);
+                    super::apply::route_spawn(&mut request, &settings, &inventory, false)
+                })
+            };
+            let theirs = routed(&format!("kind-over-role-{role}"), &pinned(role, PERSONS));
+            assert_eq!(theirs.resolved_model, PERSONS, "{kind} on {role}: {}", theirs.reason);
+            assert_eq!(theirs.source, runtime::RouteDecisionSource::Pinned, "{kind}");
+            // With nothing of the person's, the repository's pin on the kind routes it.
+            let alone = routed(&format!("kind-alone-{role}"), &json!({}));
+            assert_eq!(alone.resolved_model, REPOSITORYS, "{kind}: {}", alone.reason);
+        }
+    }
+
+    /// A route a repository's committed pin decided is written down with its
+    /// own word, not `pin`, which the spawn reads as the person's selection;
+    /// the challenger arm still leaves it alone, as a model chosen by hand.
+    #[test]
+    fn a_repositorys_pin_is_not_written_down_as_the_persons() {
+        const MAIN: &str = "claude-sonnet-5";
+        const SAME: &str = "claude-haiku-4-5-20251001";
+        let inventory = inventory_of(MAIN, &[MAIN, SAME]);
+        let label = |name: &str, persons: &Value, repository: &Value| {
+            in_a_repository(name, persons, repository, |settings| {
+                let mut request = runtime::RouteRequest::new(RouteRole::Coding, MAIN);
+                let decision = super::apply::route_spawn(&mut request, &settings, &inventory, false);
+                super::apply::route_source_label_for(decision.source, &request)
+            })
+        };
+        assert_eq!(label("label-repository", &json!({}), &pinned("coding", SAME)), "repository-pin");
+        assert_eq!(label("label-persons", &pinned("coding", SAME), &json!({})), "pin");
+        assert_eq!(label("label-both", &pinned("coding", SAME), &pinned("coding", SAME)), "pin");
+        assert!(!super::route_source_is_a_persons("repository-pin"));
+        for chosen in ["pin", "repository-pin", "explicit"] {
+            assert!(super::route_source_was_chosen_by_hand(chosen), "{chosen}");
+        }
+        assert!(!super::route_source_was_chosen_by_hand("auto"));
+    }
+
     /// A pin, and a `deepTierModels` list, are the person's selection only
     /// where the person's own documents say them: what a repository's
     /// committed settings added or changed is told apart, and what both say
@@ -262,8 +416,12 @@
         });
         let keys = |keys: &[&str]| keys.iter().map(ToString::to_string).collect::<std::collections::BTreeSet<_>>();
         in_a_repository("pins-told-apart", &persons, &repository, |settings| {
-            assert_eq!(settings.repository_roles, keys(&["coding", "writing"]));
-            assert_eq!(settings.repository_subagents, keys(&[explore.as_str()]));
+            // The repository's own pin is its; where it changed one of the
+            // person's, the person's stands (152).
+            assert_eq!(settings.repository_roles, keys(&["coding"]));
+            assert!(settings.repository_subagents.is_empty());
+            assert_eq!(settings.roles.get("writing"), Some(&runtime::RoleOverride::Pin("Role/Model-Y".to_string())));
+            assert_eq!(settings.subagents.get(&explore), Some(&runtime::RoleOverride::Pin("Subagent/Model-Z".to_string())));
             assert!(settings.roles.contains_key("verifier"), "said alike: the person's, and routed by");
             assert_eq!(settings.persons_deep_tier_models, [api::resolve_catalog_alias("claude-opus-5")]);
             assert_eq!(settings.deep_tier_models, [api::resolve_catalog_alias("gpt-5.6-sol")], "the pool is the merged list");
@@ -346,6 +504,39 @@
         let mut listed_and_pins = listed.clone();
         listed_and_pins["modelRouter"] = on_explore["modelRouter"].clone();
         assert_eq!(explore("family-explore-persons", &listed_and_pins, &nothing), OTHER, "the person's own pin");
+    }
+
+    /// Where a repository's committed pin is named and not applied, the
+    /// route says so on the line the person sees, and why — a team that
+    /// relied on it finds its helpers on automatic routing otherwise in
+    /// silence (152, review t-107693).
+    #[test]
+    fn a_repositorys_pin_that_was_not_applied_is_named_on_the_route() {
+        const MAIN: &str = "claude-sonnet-5";
+        const OTHER: &str = "gpt-5.6-terra";
+        let inventory = inventory_of(MAIN, &[MAIN, OTHER]);
+        let why = |label: &str, persons: &Value, repository: &Value, edits_files: bool| {
+            in_a_repository(label, persons, repository, |settings| {
+                let context = runtime::RoutePolicyContext {
+                    provider_allowlist: settings.provider_allowlist.clone(),
+                    ..runtime::RoutePolicyContext::default()
+                };
+                let mut request = runtime::RouteRequest::new(RouteRole::Coding, MAIN).with_context(context);
+                let decision = super::apply::route_spawn(&mut request, &settings, &inventory, edits_files);
+                super::apply::repository_pin_not_applied(&decision)
+            })
+        };
+        let listed = json!({ "smart": { "providerAllowlist": ["anthropic"] } });
+        assert_eq!(
+            why("not-applied-allowlist", &listed, &pinned("coding", OTHER), false),
+            Some("outside your smart.providerAllowlist")
+        );
+        assert_eq!(
+            why("not-applied-family", &json!({}), &pinned("coding", OTHER), true),
+            Some("outside the session's provider family")
+        );
+        assert_eq!(why("applied", &json!({}), &pinned("coding", OTHER), false), None);
+        assert_eq!(why("persons-pin", &pinned("coding", OTHER), &json!({}), true), None);
     }
 
     /// The verify leg and the Architect implementer are pinned by a role too,
@@ -1522,6 +1713,35 @@
         let _ = fs::remove_dir_all(config_home);
     }
 
+    /// The person's allowlist bounds the Architect verify leg and plan stage
+    /// too, which pick from the connected top tier: a top-tier model of a
+    /// provider they left out is not picked, and where the list leaves none,
+    /// the session's own provider's are (152, review t-107910 · 7).
+    #[test]
+    fn the_persons_allowlist_bounds_the_architect_verify_leg_and_plan_stage() {
+        let config_home = temp_config_home("architect-allowlist");
+        let listing = |providers: &[&str], main: &str| {
+            architect_routing(
+                &config_home,
+                &json!({ "enabled": true, "policy": "architect", "providerAllowlist": providers }),
+                main,
+            )
+        };
+        // Crossing is on by default: with nothing to keep it, the verify leg
+        // goes to another provider's top tier.
+        let anthropic = listing(&["anthropic"], "claude-sonnet-5");
+        assert_eq!(anthropic.deep_verify_model.as_deref(), Some("claude-fable-5-1"));
+        assert_eq!(anthropic.deep_plan_model.as_deref(), Some("claude-fable-5-1"));
+        let openai = listing(&["openai"], "gpt-5.6-terra");
+        assert_eq!(openai.deep_plan_model.as_deref(), Some("gpt-6-astra"), "the pool's first is anthropic's");
+        assert_eq!(openai.deep_verify_model.as_deref(), Some("gpt-6-astra"));
+        // A list that leaves no top-tier model: the session's own provider's.
+        let nothing_listed = listing(&["google"], "claude-sonnet-5");
+        assert_eq!(nothing_listed.deep_verify_model.as_deref(), Some("claude-fable-5-1"));
+        assert_eq!(nothing_listed.deep_plan_model.as_deref(), Some("claude-fable-5-1"));
+        let _ = fs::remove_dir_all(config_home);
+    }
+
     #[test]
     fn a_configured_pool_naming_no_connected_top_tier_model_falls_back_to_the_dynamic_pool() {
         let config_home = temp_config_home("foreground-pool-fallback");
@@ -1759,6 +1979,33 @@
                 .is_some_and(|model| !model.contains("fable") && !model.contains("5.6-sol")));
         });
         let _ = fs::remove_dir_all(config_home);
+    }
+
+    /// The route a spawn takes under a repository's committed pin is written
+    /// down as the repository's, on the road a spawn takes (`apply.rs`, the
+    /// route's `decision_meta`), and the person's own pin as `pin` (152,
+    /// review t-107910).
+    #[test]
+    fn a_spawn_routed_by_a_repositorys_pin_is_written_down_as_the_repositorys() {
+        let deterministic = json!({ "smart": { "enabled": true, "autoClassifier": "deterministic" } });
+        let mut persons_pin = deterministic.clone();
+        persons_pin["modelRouter"] = pinned("coding", "claude-fable-5")["modelRouter"].clone();
+        let source = |label: &str, persons: &Value, repository: &Value| {
+            in_a_repository(label, persons, repository, |settings| {
+                let mut input = agent_input(Some("general-purpose"));
+                input.description = "implement a scoped fix".to_string();
+                input.prompt = "Implement the change and run its focused test.".to_string();
+                super::apply::smart_parent_model_for_agent_under(settings, "claude-fable-5", &input)
+                    .expect("a coding route carries its metadata")
+                    .decision_meta
+                    .route_source
+            })
+        };
+        assert_eq!(
+            source("route-source-repository", &deterministic, &pinned("coding", "claude-fable-5")),
+            "repository-pin"
+        );
+        assert_eq!(source("route-source-persons", &persons_pin, &json!({})), "pin");
     }
 
     #[test]

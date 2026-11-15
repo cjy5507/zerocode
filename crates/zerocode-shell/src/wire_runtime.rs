@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use zerocode_core::ProviderSession;
 use zerocode_core::transcript::{TranscriptEdit, TranscriptTool, TranscriptTurn};
 
 pub(crate) type WireId = u32;
@@ -261,6 +262,10 @@ pub(crate) struct WireState {
     /// What the session's tool calls said since the session last told its
     /// window (`take_activities`).
     activity: Vec<zerocode_core::hook::Activity>,
+    /// The pane that took this conversation up while the wire held it (152):
+    /// the wire ended for it (`WireRuntime::supersede`), and its page says
+    /// where the conversation goes on.
+    pub(crate) continued_in: Option<crate::TermId>,
 }
 
 /// The most activities a session holds untold. The session tells its window
@@ -379,6 +384,16 @@ pub(crate) enum Outgoing {
 }
 
 impl WireState {
+    /// Move the session to `status` — never out of `ended` (152). A wire
+    /// whose CLI is gone stays ended, whatever comes after: the handshake's
+    /// `idle` (the session is in the map, and so can be ended, before its
+    /// handshake is done), a line the reader still held, a send.
+    fn becomes(&mut self, status: &'static str) {
+        if self.status != "ended" {
+            self.status = status;
+        }
+    }
+
     fn push(&mut self, turn: TranscriptTurn) {
         self.note_activity(&turn);
         let seq = self.next_seq;
@@ -777,7 +792,7 @@ fn codex_take(state: &mut WireState, message: &serde_json::Value) -> Vec<Outgoin
                     questions: Vec::new(),
                     grant: None,
                 });
-                state.status = "asking";
+                state.becomes("asking");
             }
             "item/fileChange/requestApproval" => {
                 let item = text_of(params.get("itemId"));
@@ -797,7 +812,7 @@ fn codex_take(state: &mut WireState, message: &serde_json::Value) -> Vec<Outgoin
                     questions: Vec::new(),
                     grant: None,
                 });
-                state.status = "asking";
+                state.becomes("asking");
             }
             "item/permissions/requestApproval" => {
                 let reason = text_of(params.get("reason"));
@@ -837,7 +852,7 @@ fn codex_take(state: &mut WireState, message: &serde_json::Value) -> Vec<Outgoin
                     questions: Vec::new(),
                     grant: permissions,
                 });
-                state.status = "asking";
+                state.becomes("asking");
             }
             "item/tool/requestUserInput" => {
                 let questions = params
@@ -877,7 +892,7 @@ fn codex_take(state: &mut WireState, message: &serde_json::Value) -> Vec<Outgoin
                     questions,
                     grant: None,
                 });
-                state.status = "asking";
+                state.becomes("asking");
             }
             "mcpServer/elicitation/request" => out.push(Outgoing::Reply {
                 id: id.clone(),
@@ -913,7 +928,7 @@ fn codex_take(state: &mut WireState, message: &serde_json::Value) -> Vec<Outgoin
                 .and_then(|turn| turn.get("id"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
-            state.status = "working";
+            state.becomes("working");
         }
         "turn/completed" => {
             let turn = params.get("turn").unwrap_or(&serde_json::Value::Null);
@@ -927,7 +942,7 @@ fn codex_take(state: &mut WireState, message: &serde_json::Value) -> Vec<Outgoin
             }
             state.turn = None;
             state.live.clear();
-            state.status = if failed { "failed" } else { "idle" };
+            state.becomes(if failed { "failed" } else { "idle" });
         }
         "thread/tokenUsage/updated" => {
             // Codex's app-server announces the thread's token usage on its
@@ -960,19 +975,20 @@ fn codex_take(state: &mut WireState, message: &serde_json::Value) -> Vec<Outgoin
             let flags = status
                 .get("activeFlags")
                 .and_then(serde_json::Value::as_array);
-            state.status = match status.get("type").and_then(serde_json::Value::as_str) {
+            let next = match status.get("type").and_then(serde_json::Value::as_str) {
                 Some("active") if flags.is_some_and(|flags| !flags.is_empty()) => "asking",
                 Some("active") => "working",
                 Some("systemError") => "failed",
                 Some("idle") if state.turn.is_none() => "idle",
                 _ => state.status,
             };
+            state.becomes(next);
         }
         "error" => {
             let error = params.get("error").unwrap_or(&serde_json::Value::Null);
             state.say("system", text_of(error.get("message")));
             if params.get("willRetry").and_then(serde_json::Value::as_bool) != Some(true) {
-                state.status = "failed";
+                state.becomes("failed");
             }
         }
         "item/started" => {
@@ -1152,7 +1168,7 @@ fn acp_take(state: &mut WireState, message: &serde_json::Value) -> Vec<Outgoing>
                     questions: Vec::new(),
                     grant: None,
                 });
-                state.status = "asking";
+                state.becomes("asking");
             }
             other => out.push(Outgoing::Refuse {
                 id: id.clone(),
@@ -1487,7 +1503,7 @@ fn claude_take(state: &mut WireState, message: &serde_json::Value) -> Vec<Outgoi
                     {
                         state.model = Some(model.to_string());
                     }
-                    state.status = "working";
+                    state.becomes("working");
                 }
                 Some("content_block_delta") => {
                     let delta = event.get("delta").unwrap_or(&serde_json::Value::Null);
@@ -1531,7 +1547,7 @@ fn claude_take(state: &mut WireState, message: &serde_json::Value) -> Vec<Outgoi
                 Some("can_use_tool") => {
                     state.flush_live();
                     state.asks.push(claude_ask(id, request, state.plan_tool));
-                    state.status = "asking";
+                    state.becomes("asking");
                 }
                 Some(other) => out.push(Outgoing::Refuse {
                     id,
@@ -1554,7 +1570,7 @@ fn claude_take(state: &mut WireState, message: &serde_json::Value) -> Vec<Outgoi
                     .map_or_else(|| text_of(message.get("subtype")), str::to_string);
                 state.say("system", words);
             }
-            state.status = if failed { "failed" } else { "idle" };
+            state.becomes(if failed { "failed" } else { "idle" });
         }
         _ => {}
     }
@@ -1886,7 +1902,7 @@ fn take_response(protocol: Protocol, state: &mut WireState, message: &serde_json
         state.prompt_request = None;
         state.flush_live();
         state.open.clear();
-        state.status = match message.get("error") {
+        let next = match message.get("error") {
             Some(error) if !error.is_null() => {
                 let words = text_of(error.get("message"));
                 state.say("system", words);
@@ -1894,6 +1910,7 @@ fn take_response(protocol: Protocol, state: &mut WireState, message: &serde_json
             }
             _ => "idle",
         };
+        state.becomes(next);
     }
 }
 
@@ -1911,6 +1928,14 @@ pub(crate) struct WireSession {
     pub(crate) id: WireId,
     pub(crate) agent: String,
     pub(crate) protocol: Protocol,
+    /// The session id the wire was started to continue (`--resume`): the
+    /// conversation it holds until its CLI names one (`system/init` — the
+    /// same id, measured on Claude Code 2.1.325, 152).
+    resumed: Option<String>,
+    /// The pane whose conversation this wire took over, when it did: that
+    /// pane reporting the conversation is the hand-over itself, not a second
+    /// process on it (152).
+    from_pane: Option<crate::TermId>,
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
     next_request: AtomicI64,
@@ -2121,7 +2146,7 @@ impl WireSession {
                     .lock()
                     .map_err(|_| "wire state lock".to_string())?;
                 state.say("user", text);
-                state.status = "working";
+                state.becomes("working");
                 drop(state);
                 self.settled();
                 let turn = self
@@ -2142,7 +2167,7 @@ impl WireSession {
                     .lock()
                     .map_err(|_| "wire state lock".to_string())?;
                 state.say("user", text);
-                state.status = "working";
+                state.becomes("working");
                 drop(state);
                 self.settled();
                 let id = self.send_request(
@@ -2161,7 +2186,7 @@ impl WireSession {
                     .lock()
                     .map_err(|_| "wire state lock".to_string())?;
                 state.say("user", text);
-                state.status = "working";
+                state.becomes("working");
                 state.live.clear();
                 drop(state);
                 self.settled();
@@ -2256,7 +2281,7 @@ impl WireSession {
                 .ok_or("that question is no longer open")?;
             let ask = state.asks.remove(at);
             if state.asks.is_empty() && state.status == "asking" {
-                state.status = "working";
+                state.becomes("working");
             }
             ask
         };
@@ -2418,10 +2443,105 @@ impl WireSession {
 
     fn kill(&self) {
         if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+            end_wire_child(&mut child);
         }
     }
+
+    /// The conversation this wire holds, keyed the way panes report theirs:
+    /// the session its CLI named, or the one it was started to continue.
+    fn conversation(&self) -> Option<zerocode_core::ConversationKey> {
+        let named = self.state.lock().ok()?.thread.clone();
+        let id = named.or_else(|| self.resumed.clone())?;
+        let record = crate::conversation_wake::vault_record(&self.agent, &id)?;
+        zerocode_core::conversation_key(&self.agent, &record)
+    }
+
+    /// End this wire for the pane that took its conversation up
+    /// (`WireRuntime::supersede`), and say so: the wire is ended once its CLI
+    /// is gone, as a page's close says it (`WireRuntime::stop`) — not only
+    /// when its reader sees the output close, which may have come before the
+    /// handshake said `idle` over it.
+    fn end_for_a_pane(&self) {
+        self.kill();
+        if let Ok(mut state) = self.state.lock() {
+            state.status = "ended";
+            state.tasks.clear();
+        }
+        self.settled();
+    }
+
+    /// Whether a pane took this wire's conversation up (`continued_in`).
+    fn superseded(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .is_ok_and(|state| state.continued_in.is_none())
+    }
+
+    /// The CLI's pid while it still runs — the head of its tree — or `None`
+    /// once it has gone, or while somebody else holds it: a wire being ended
+    /// right now (`supersede`'s thread) is not waited for on the way out
+    /// (`WireRuntime::hang_up_all`).
+    fn running_pid(&self) -> Option<u32> {
+        let mut child = self.child.try_lock().ok()?;
+        matches!(child.try_wait(), Ok(None)).then_some(child.id())
+    }
+
+    /// A CLI that left by itself is collected as its output closes (152): left
+    /// to a stop that may never come, it stood `<defunct>` under the window.
+    /// Its output can close a moment before it is gone, so it is looked at for
+    /// a little while, the lock let go between looks.
+    fn collect_if_left(&self) {
+        let deadline = Instant::now() + WIRE_END_GRACE;
+        loop {
+            let runs = match self.child.lock() {
+                Ok(mut child) => matches!(child.try_wait(), Ok(None)),
+                Err(_) => false,
+            };
+            if !runs || Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(WIRE_END_POLL);
+        }
+    }
+}
+
+/// How long a wire's CLI is given to leave after a TERM before what is left
+/// of its group is killed (152). Claude Code 2.1.325 was gone 1.3–1.4 s after
+/// a TERM — mid-answer, and while it waited on an approval — with its record's
+/// last line whole and its MCP servers ended with it.
+const WIRE_END_GRACE: Duration = Duration::from_secs(3);
+
+/// How often the end looks whether the CLI has gone.
+const WIRE_END_POLL: Duration = Duration::from_millis(25);
+
+/// End a wire's CLI and every process it started, then collect it (152). The
+/// CLI leads a process group of its own (`lead_own_tree` where it starts), so
+/// the group hears a TERM — the CLI writes its record's last line and ends its
+/// MCP servers — and a KILL for whatever of it is still there after
+/// [`WIRE_END_GRACE`]. Only while the CLI itself still runs: once it is
+/// collected its id may be another process's, and its children have their own
+/// way out (each one measured ends as the CLI's pipe closes). On Windows
+/// `taskkill /T` ends the tree.
+fn end_wire_child(child: &mut Child) {
+    #[cfg(unix)]
+    if matches!(child.try_wait(), Ok(None)) {
+        use crate::codex_queue::{process_group_exists, signal_process_group};
+        let group = child.id();
+        let _ = signal_process_group(group, libc::SIGTERM);
+        let deadline = Instant::now() + WIRE_END_GRACE;
+        while process_group_exists(group) && Instant::now() < deadline {
+            let _ = child.try_wait();
+            std::thread::sleep(WIRE_END_POLL);
+        }
+        if process_group_exists(group) {
+            let _ = signal_process_group(group, libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    zerocode_core::process_tree::end_tree(child);
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 impl Drop for WireSession {
@@ -2467,6 +2587,10 @@ pub(crate) struct WireLog {
     /// a session a pane can take.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) session: Option<String>,
+    /// The pane that took this conversation up, which the wire ended for
+    /// (152) — the page's 「터미널 N에서 이어집니다」 and its way there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) continued_in: Option<crate::TermId>,
 }
 
 #[derive(Default)]
@@ -2501,10 +2625,101 @@ impl WireRuntime {
         Ok(())
     }
 
+    /// Every session the window holds, let go of the map's lock: what is asked
+    /// of each one takes its own locks, and a stop holds its child's for up
+    /// to [`WIRE_END_GRACE`].
+    fn held(&self) -> Vec<Arc<WireSession>> {
+        self.sessions
+            .lock()
+            .map(|sessions| sessions.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The live wire holding `agent`'s conversation `session`, if one does
+    /// (152): one conversation, one process, wires included (t-68069 kept it
+    /// for panes alone). Not a wire a pane already took the conversation up
+    /// from, nor the one `except` handed its own conversation to — that pane
+    /// reporting it is the hand-over itself. The lowest, when several do.
+    pub(crate) fn holding(
+        &self,
+        agent: &str,
+        session: &ProviderSession,
+        except: Option<crate::TermId>,
+    ) -> Option<WireId> {
+        let wanted = zerocode_core::conversation_key(agent, session)?;
+        self.held()
+            .into_iter()
+            .filter(|wire| except.is_none() || wire.from_pane != except)
+            .filter(|wire| wire.conversation().as_ref() == Some(&wanted))
+            .filter(|wire| !wire.superseded() && wire.running())
+            .map(|wire| wire.id)
+            .min()
+    }
+
+    /// A pane reported `agent`'s conversation `session` while a wire of this
+    /// window holds it (152): two processes on one transcript, and each line
+    /// either writes forks the record. The pane's CLI already runs — opened in
+    /// a shell, by a picker inside it, or by a door that did not ask — and
+    /// cannot be refused; the wire is this window's own child. So the wire
+    /// ends, even mid-turn (the pane has read the record already: everything
+    /// the wire writes after is the fork), on a thread of its own rather than
+    /// on the hook's road, and its page says where the conversation goes on.
+    /// The wire `term` handed its conversation to is not one of them.
+    pub(crate) fn supersede(
+        &self,
+        agent: &str,
+        session: &ProviderSession,
+        term: crate::TermId,
+    ) -> Option<WireId> {
+        let id = self.holding(agent, session, Some(term))?;
+        let wire = self.get(id).ok()?;
+        {
+            let mut state = wire.state.lock().ok()?;
+            if state.continued_in.is_some() {
+                return None;
+            }
+            state.continued_in = Some(term);
+        }
+        let ending = Arc::clone(&wire);
+        let spawned = std::thread::Builder::new()
+            .name(format!("wire-{id}-end"))
+            .spawn(move || ending.end_for_a_pane());
+        if spawned.is_err() {
+            wire.end_for_a_pane();
+        }
+        Some(id)
+    }
+
+    /// The window is going (152): every wire's CLI hears a TERM to its group,
+    /// and nobody waits. Its input closes with the window in any case —
+    /// Claude Code measured gone 1.5–3.6 s after that, mid-answer and while it
+    /// waited on an approval — but the TERM says it at once, to every wire
+    /// protocol alike.
+    ///
+    /// On Windows each tree's `taskkill` is started and nobody waits for it
+    /// either. Called where every way out passes — the quit's and the
+    /// restart's (`ExitSteps::hang_up_panes`).
+    pub(crate) fn hang_up_all(&self) {
+        let running: Vec<u32> = self
+            .held()
+            .iter()
+            .filter_map(|wire| wire.running_pid())
+            .collect();
+        #[cfg(unix)]
+        for pid in running {
+            let _ = crate::codex_queue::signal_process_group(pid, libc::SIGTERM);
+        }
+        #[cfg(windows)]
+        zerocode_core::process_tree::start_ending_trees(&running);
+        #[cfg(not(any(unix, windows)))]
+        let _ = running;
+    }
+
     /// Start `agent` on its wire in `cwd`, walk the handshake, and hold the
     /// session. `binary` is the agent's executable as this machine found it;
     /// `resume` continues the conversation with that session id where the
-    /// road has a flag for it; `env` is the launch's own environment (which
+    /// road has a flag for it; `from_pane` is the pane handing that
+    /// conversation over, if one is; `env` is the launch's own environment (which
     /// account it runs as — an empty value removes the variable); `news` is
     /// told the session's id each time the page should look, and what its tool
     /// calls said.
@@ -2516,6 +2731,7 @@ impl WireRuntime {
         cwd: &Path,
         version: &str,
         resume: Option<&str>,
+        from_pane: Option<crate::TermId>,
         tuning: &[String],
         env: &[(String, String)],
         news: WireNews,
@@ -2533,6 +2749,10 @@ impl WireRuntime {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        // The head of a tree of its own (152): its MCP servers and whatever
+        // else it starts end with it (`end_wire_child`), and a signal to its
+        // group never reaches the window, whose group it stood in before.
+        zerocode_core::process_tree::lead_own_tree(&mut command);
         // A wire child is not a pane: the hook environment that names panes
         // must not name it, or its own hooks would report as somebody's pane.
         for (key, _) in std::env::vars_os() {
@@ -2558,6 +2778,8 @@ impl WireRuntime {
             id,
             agent: agent.to_string(),
             protocol,
+            resumed: resume.map(str::to_string),
+            from_pane,
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
             next_request: AtomicI64::new(1),
@@ -2597,6 +2819,7 @@ impl WireRuntime {
                         );
                     }
                 }
+                reader.collect_if_left();
                 reader.settled();
             })
             .map_err(|error| error.to_string())?;
@@ -2671,7 +2894,7 @@ fn handshake(
                 })
                 .collect();
             state.version = announced;
-            state.status = "idle";
+            state.becomes("idle");
             Ok(())
         }
         Protocol::AppServer => {
@@ -2708,7 +2931,7 @@ fn handshake(
                 .get("approvalPolicy")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
-            state.status = "idle";
+            state.becomes("idle");
             Ok(())
         }
         Protocol::Acp => {
@@ -2759,7 +2982,7 @@ fn handshake(
                 .lock()
                 .map_err(|_| "wire state lock".to_string())?;
             acp_session_opened(&mut state, &result);
-            state.status = "idle";
+            state.becomes("idle");
             Ok(())
         }
     }
@@ -2794,6 +3017,7 @@ pub(crate) fn log_of(session: &WireSession, after: u64) -> Result<WireLog, Strin
         session: (session.protocol.name() == "claude-stream")
             .then(|| state.thread.clone())
             .flatten(),
+        continued_in: state.continued_in,
     })
 }
 
@@ -2934,6 +3158,21 @@ pub(crate) fn refusal_line(
         .take(SESSION_LOG_PREFIX_CHARS)
         .collect();
     format!("term {term} kept {agent} {session} on its screen, no wire started: {reason}")
+}
+
+/// The window log's line for a wire a pane took its conversation up from
+/// (152): two processes on one transcript, and the wire ended for the pane.
+pub(crate) fn superseded_line(
+    term: crate::TermId,
+    agent: &str,
+    session: &str,
+    wire: WireId,
+) -> String {
+    let session: String = session.chars().take(SESSION_LOG_PREFIX_CHARS).collect();
+    format!(
+        "term {term} reported {agent} {session}, which wire {wire} held: two processes on one \
+         transcript, wire {wire} ended"
+    )
 }
 
 /// How much of a session id the log line carries — enough to tell sessions
@@ -4405,5 +4644,285 @@ mod tests {
             ),
             "term 4 kept claude b7695d1e on its screen, no wire started: a worker's pane stays a pane"
         );
+    }
+
+    /// A stand-in for a wire's CLI (152): it answers the handshake's `--help`
+    /// and `--version` probes as Claude Code does, then runs `body` with the
+    /// folder it was written to as `$HERE`.
+    #[cfg(unix)]
+    fn fake_wire_cli(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let here = tempfile::tempdir().expect("a folder for the stand-in CLI");
+        let cli = here.path().join("claude");
+        std::fs::write(
+            &cli,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  --help) echo '  --permission-mode <mode>  (choices: \"default\", \"plan\")'; exit 0;;\n  --version) echo '9.9.9 (Claude Code)'; exit 0;;\nesac\nHERE='{}'\n{body}\n",
+                here.path().display()
+            ),
+        )
+        .expect("the stand-in CLI");
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in CLI runs");
+        (here, cli)
+    }
+
+    #[cfg(unix)]
+    fn quiet_news() -> WireNews {
+        WireNews {
+            changed: Box::new(|_| {}),
+            acted: Box::new(|_, _| {}),
+        }
+    }
+
+    /// What `ps` says of `pid` now: its state letters (`Z` for a zombie), or
+    /// `None` once no process has that id.
+    #[cfg(unix)]
+    fn process_state(pid: u32) -> Option<String> {
+        let out = crate::proc::quiet_command("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps runs");
+        let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!state.is_empty()).then_some(state)
+    }
+
+    #[cfg(unix)]
+    fn runs(pid: u32) -> bool {
+        process_state(pid).is_some_and(|state| !state.starts_with('Z'))
+    }
+
+    /// A stopped wire ends every process its CLI started, not the CLI alone
+    /// (152). Claude Code starts an MCP server for each one configured; one
+    /// that does not end when its parent's pipe closes outlived
+    /// `Child::kill` of the CLI — and the CLI stood in the window's own
+    /// process group, where no group signal could reach it without reaching
+    /// the window. The stand-in leaves a grandchild whose input is not the
+    /// CLI's pipe, so only the wire's own group ending takes it.
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_wire_ends_every_process_its_cli_started() {
+        let (here, cli) = fake_wire_cli(
+            "sleep 600 </dev/null >/dev/null 2>&1 &\necho $! > \"$HERE/grandchild\"\nexec cat >/dev/null",
+        );
+        let wires = WireRuntime::default();
+        let session = wires
+            .start(
+                "claude",
+                &cli,
+                here.path(),
+                "test",
+                None,
+                None,
+                &[],
+                &[],
+                quiet_news(),
+            )
+            .expect("the wire stands");
+        let written = here.path().join("grandchild");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&written).is_ok_and(|pid| !pid.trim().is_empty())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let grandchild: u32 = std::fs::read_to_string(&written)
+            .expect("the grandchild's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        wires.stop(session.id).expect("the wire stops");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runs(grandchild) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let survived = runs(grandchild);
+        if survived {
+            let _ = crate::proc::quiet_command("kill")
+                .args(["-9", &grandchild.to_string()])
+                .status();
+        }
+        assert!(
+            !survived,
+            "the wire was stopped and a process its CLI started still runs"
+        );
+    }
+
+    /// A wire whose CLI left by itself is collected as its output closes, not
+    /// kept as a zombie until somebody stops it (152: pid 83478 stood
+    /// `<defunct>` under the window after its CLI had gone, its tab or no tab).
+    #[cfg(unix)]
+    #[test]
+    fn a_wire_whose_cli_left_is_collected_not_kept_a_zombie() {
+        let (here, cli) = fake_wire_cli("sleep 1\nexit 0");
+        let wires = WireRuntime::default();
+        let session = wires
+            .start(
+                "claude",
+                &cli,
+                here.path(),
+                "test",
+                None,
+                None,
+                &[],
+                &[],
+                quiet_news(),
+            )
+            .expect("the wire stands");
+        let pid = session
+            .child
+            .lock()
+            .map(|child| child.id())
+            .expect("its child");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !session
+            .state
+            .lock()
+            .is_ok_and(|state| state.status == "ended")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_state(pid).is_some_and(|state| state.starts_with('Z'))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let left = process_state(pid);
+        wires.stop(session.id).expect("the wire stops");
+        assert!(
+            !left.as_deref().is_some_and(|state| state.starts_with('Z')),
+            "the wire's CLI left and stays a zombie under the window: {left:?}"
+        );
+    }
+
+    /// One conversation, one process, wires included (152): a wire holding a
+    /// conversation is found by it — not from the pane that handed it over —
+    /// and a pane that reports it ends the wire once, whose page then says
+    /// where the conversation goes on and which no longer holds it.
+    #[cfg(unix)]
+    #[test]
+    fn a_pane_reporting_a_wires_conversation_ends_the_wire_and_its_page_says_where() {
+        const HELD: &str = "419c2fa8-45fc-4b81-9f71-92d4d7702477";
+        let (here, cli) = fake_wire_cli("exec cat >/dev/null");
+        let wires = WireRuntime::default();
+        let wire = wires
+            .start(
+                "claude",
+                &cli,
+                here.path(),
+                "test",
+                Some(HELD),
+                Some(7),
+                &[],
+                &[],
+                quiet_news(),
+            )
+            .expect("the wire stands");
+        let record =
+            crate::conversation_wake::vault_record("claude", HELD).expect("a Claude record");
+        let elsewhere = crate::conversation_wake::vault_record(
+            "claude",
+            "0c4c8a28-8161-4569-bfb3-6cca18ae0bbc",
+        )
+        .expect("a Claude record");
+        assert_eq!(wires.holding("claude", &record, None), Some(wire.id));
+        assert_eq!(
+            wires.holding("claude", &record, Some(7)),
+            None,
+            "the pane that handed the conversation over is not a second process on it"
+        );
+        assert_eq!(wires.holding("claude", &elsewhere, None), None);
+        assert_eq!(wires.supersede("claude", &record, 7), None);
+        assert_eq!(wires.supersede("claude", &record, 21), Some(wire.id));
+        assert_eq!(
+            wires.supersede("claude", &record, 22),
+            None,
+            "a wire ends for the first pane that took its conversation up, once"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !wire.state.lock().is_ok_and(|state| state.status == "ended")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let log = log_of(&wire, 0).expect("its log");
+        assert_eq!((log.status, log.continued_in), ("ended", Some(21)));
+        assert_eq!(wires.holding("claude", &record, None), None);
+        wires.stop(wire.id).expect("its page closes");
+    }
+
+    /// The window going tells every wire to end, and waits for none (152).
+    #[cfg(unix)]
+    #[test]
+    fn the_window_going_tells_every_wire_to_end() {
+        let (here, cli) = fake_wire_cli("exec cat >/dev/null");
+        let wires = WireRuntime::default();
+        let stand = || {
+            wires
+                .start(
+                    "claude",
+                    &cli,
+                    here.path(),
+                    "test",
+                    None,
+                    None,
+                    &[],
+                    &[],
+                    quiet_news(),
+                )
+                .expect("the wire stands")
+        };
+        let (first, second) = (stand(), stand());
+        wires.hang_up_all();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (first.running() || second.running()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !first.running() && !second.running(),
+            "a wire still runs after the window said goodbye"
+        );
+    }
+
+    #[test]
+    fn a_wire_a_pane_took_up_logs_two_processes_and_its_end() {
+        assert_eq!(
+            superseded_line(21, "claude", "419c2fa8-45fc-4b81-9f71-92d4d7702477", 1),
+            "term 21 reported claude 419c2fa8, which wire 1 held: two processes on one transcript, \
+             wire 1 ended"
+        );
+    }
+
+    /// A wire whose CLI is gone stays ended (152): a line its reader still
+    /// held when it was ended, and the handshake's `idle` — the session is in
+    /// the map, so it can be ended, before its handshake is done — stand it up
+    /// again no more. The gate's run of the supersede test read `idle` under
+    /// 「터미널 N에서 이어집니다」 (11-15 00:34).
+    #[test]
+    fn an_ended_wire_stays_ended_whatever_comes_after() {
+        let mut state = WireState {
+            status: "ended",
+            ..WireState::default()
+        };
+        for line in [
+            serde_json::json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"m1","model":"m"}},"session_id":"s1","parent_tool_use_id":null}),
+            serde_json::json!({"type":"result","subtype":"success","is_error":false,"session_id":"s1"}),
+        ] {
+            take(Protocol::ClaudeStream, &mut state, &line);
+        }
+        state.becomes("idle");
+        assert_eq!(state.status, "ended");
+        let mut live = WireState {
+            status: "working",
+            ..WireState::default()
+        };
+        take(
+            Protocol::ClaudeStream,
+            &mut live,
+            &serde_json::json!({"type":"result","subtype":"success","is_error":false,"session_id":"s1"}),
+        );
+        assert_eq!(live.status, "idle", "a live wire still moves");
     }
 }

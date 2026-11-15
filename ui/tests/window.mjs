@@ -59819,6 +59819,229 @@ suite("plan-card", async ({ browser, origin, ok }) => {
   }
 });
 
+/* The order the window log of 2026-11-14 shows (`term 7 ended` at .833,
+ * `handed … to wire 1` at .910): the pane's CLI leaves while the hand-over is
+ * still out, so `term:exited` comes before `wire_start` answers. The pane
+ * stays until the wire's page stands, then goes — `pane-hands-over-to-wire`
+ * tells the exit only after the answer. (That day the pane stood 82 minutes
+ * longer; this order alone does not do it — 152, not reproduced here.) */
+suite("pane-leaves-while-its-hand-over-is-out", async ({ browser, origin, ok }) => {
+  const { page } = await openWindowTestPage(browser, origin);
+  try {
+    const seen = await page.evaluate(async () => {
+      const tell = (name, payload) => {
+        for (const handler of window.__LISTENERS__[name] ?? []) handler({ payload });
+      };
+      const settle = () => new Promise((done) => setTimeout(done, 60));
+      const until = async (test) => {
+        for (let n = 0; n < 40 && !test(); n += 1) await settle();
+        return test();
+      };
+      const seen = {};
+      window.__ANSWER__.pane_log = () => ({
+        found: true, next: 2, skipped: false,
+        turns: [{ role: "user", text: "probe" }, { role: "assistant", text: "done" }],
+      });
+      let release = null;
+      window.__ANSWER__.wire_start = (args) => new Promise((done) => {
+        release = () => done({ id: 61, agent: args.agent, protocol: "claude-stream", version: "2.1.325", model: null, session: args.resume ?? null });
+      });
+      window.__ANSWER__.wire_log = () => ({
+        found: true, skipped: false, next: 0, turns: [], status: "idle", asks: [], live: [], agent: "claude",
+        protocol: "claude-stream", models: [], modes: [], commands: [], version: "2.1.325",
+      });
+      window.__ANSWER__.wire_stop = () => null;
+      const term = await openTermTab({ placement: "tab" });
+      await window.__PAINTED__();
+      const paneTab = tabOfTerm(term);
+      tell("hook:agent", { term, state: "working", agent: "claude", session: { key: "session_id", id: "s-exit" }, resumable: true });
+      tell("hook:agent", { term, state: "done", agent: "claude", session: { key: "session_id", id: "s-exit" }, resumable: true });
+      await window.__PAINTED__();
+      el("view-toggle-chat").click();
+      seen.asked = await until(() => release !== null);
+      tell("term:exited", { term });
+      await settle();
+      seen.paneWhileHanding = tabs.some((tab) => tab.id === paneTab.id);
+      release?.();
+      seen.wireStood = await until(() => tabs.some((tab) => tab.worker?.wire === 61));
+      seen.paneGone = await until(() => !tabs.some((tab) => tab.id === paneTab.id));
+      for (const name of ["pane_log", "wire_start", "wire_log", "wire_stop"]) delete window.__ANSWER__[name];
+      for (const held of [...tabs]) dropTab(held.id);
+      return seen;
+    });
+    ok(
+      "a pane whose CLI leaves while its hand-over is out stays until the wire's page stands, then goes",
+      seen.asked && seen.paneWhileHanding && seen.wireStood && seen.paneGone,
+      JSON.stringify(seen),
+    );
+  } finally {
+    await page.close();
+  }
+});
+
+/* 152: a wire's child ends with its page, whichever road the page leaves by,
+ * and one conversation stays one process. A tab dropped by a road that is not
+ * its close (a removed worktree's or project's sweep, `dropTab`) stops its wire;
+ * 「터미널」 stops the wire BEFORE the pane on the same session is launched, and
+ * is refused while the wire is working; a vault row whose conversation a wire
+ * holds brings that tab forward rather than resuming it a second time (a wire
+ * with no tab is stopped first, and the row asks again); and a wire whose
+ * conversation a pane took up says where it goes on, with the way there.
+ * 2026-11-14: pid 83478 held a conversation two hours after its pane's tab
+ * closed, and the same conversation was opened again in a shell beside it. */
+suite("wire-ends-with-its-page", async ({ browser, origin, ok }) => {
+  const { page } = await openWindowTestPage(browser, origin);
+  try {
+    const seen = await page.evaluate(async () => {
+      const settle = () => new Promise((done) => setTimeout(done, 60));
+      const until = async (test) => {
+        for (let n = 0; n < 40 && !test(); n += 1) await settle();
+        return test();
+      };
+      const seen = {};
+      const calls = [];
+      const status = new Map();
+      const continued = new Map();
+      let nextWire = 41;
+      window.__ANSWER__.wire_start = (args) => {
+        calls.push(["start", args]);
+        return { id: nextWire++, agent: args.agent, protocol: "claude-stream", version: "2.1.325", model: null, session: args.resume ?? null };
+      };
+      window.__ANSWER__.wire_log = (args) => ({
+        found: true, skipped: false, next: 0, turns: [], status: status.get(args.id) ?? "idle", asks: [], live: [],
+        agent: "claude", protocol: "claude-stream", models: [], modes: [], commands: [], version: "2.1.325",
+        ...(continued.has(args.id) && { continued_in: continued.get(args.id) }),
+      });
+      window.__ANSWER__.wire_stop = (args) => { calls.push(["stop", args]); return null; };
+      // The boot's own answer, with the order of the asks written down.
+      const launchBefore = window.__ANSWER__.launch_agent_tab;
+      window.__ANSWER__.launch_agent_tab = (args) => {
+        calls.push(["launch", { agent: args.agent, resume: args.resume }]);
+        window.__LAUNCHED__ = args;
+        window.__LAUNCHES__ = (window.__LAUNCHES__ ?? 0) + 1;
+        return (window.__NEXT_TERM__ = (window.__NEXT_TERM__ ?? 0) + 1);
+      };
+      const stopped = (id) => calls.some(([kind, args]) => kind === "stop" && args?.id === id);
+      const at = (kind, test) => calls.findIndex(([one, args]) => one === kind && test(args));
+      for (let tries = 0; tries < 200 && !installedAgents().some((row) => row.id === "claude"); tries += 1) {
+        await new Promise((done) => setTimeout(done, 25));
+      }
+      const cwd = "/tmp/zerocode-window-test";
+
+      // 1. Dropped, not closed — the sweep a removed worktree or project runs.
+      const dropped = await openWirePage("claude", cwd, { resume: "s-dropped" });
+      await window.__PAINTED__();
+      dropTab(dropped);
+      await settle();
+      seen.droppedStops = stopped(41);
+
+      // 2. 「터미널」: the wire goes first, then the pane resumes the session.
+      const screen = await openWirePage("claude", cwd, { resume: "s-screen" });
+      await pollHelperPages();
+      await window.__PAINTED__();
+      el("view-toggle-term").click();
+      seen.screenLaunched = await until(() => at("launch", (args) => args?.resume === "s-screen") >= 0);
+      seen.stopBeforeLaunch = at("stop", (args) => args?.id === 42) >= 0 &&
+        at("stop", (args) => args?.id === 42) < at("launch", (args) => args?.resume === "s-screen");
+      seen.screenTabGone = await until(() => !tabs.some((tab) => tab.id === screen));
+      // ... and not while the wire is working: nothing stops, nothing launches.
+      const busy = await openWirePage("claude", cwd, { resume: "s-busy" });
+      status.set(43, "working");
+      await pollHelperPages();
+      await window.__PAINTED__();
+      await settle();
+      const launchesBusy = calls.filter(([kind]) => kind === "launch").length;
+      el("view-toggle-term").click();
+      await settle();
+      await settle();
+      seen.busyKept = !stopped(43) && calls.filter(([kind]) => kind === "launch").length === launchesBusy &&
+        tabs.some((tab) => tab.id === busy);
+      seen.busySaid = [...document.querySelectorAll(".toast")].some((note) =>
+        note.textContent.includes(t("worker.wireToScreenBusy", "대화가 아직 일하는 중입니다(차례·질문·승인이 열려 있음) — 끝나면 다시 누르세요")));
+      dropTab(busy);
+
+      // 3. A vault row whose conversation a wire holds: that tab, not a second process.
+      const held = await openWirePage("claude", cwd, { resume: "s-vault" });
+      const other = await openTermTab({ placement: "tab" });
+      await window.__PAINTED__();
+      const asked = [];
+      window.__ANSWER__.resume_vault_session = (args) => {
+        asked.push(args.session.session_id);
+        return asked.length === 1 ? { term: 0, standing: true, wire: 44 } : { term: 97, standing: false };
+      };
+      const termsBefore = tabs.filter((tab) => tab.kind === "term").length;
+      await resumeVaultSession({ id: "v1", agent: "claude", session_id: "s-vault", title: "s-vault" });
+      await settle();
+      seen.vaultFront = activeTabId === held && tabs.filter((tab) => tab.kind === "term").length === termsBefore && asked.length === 1;
+      // A wire the window holds with no tab of its own is stopped, and the row asks again.
+      asked.length = 0;
+      window.__ANSWER__.resume_vault_session = (args) => {
+        asked.push(args.session.session_id);
+        return asked.length === 1 ? { term: 0, standing: true, wire: 99 } : { term: 97, standing: false };
+      };
+      await resumeVaultSession({ id: "v2", agent: "claude", session_id: "s-orphan", title: "s-orphan" });
+      await settle();
+      seen.orphanStopped = stopped(99) && asked.length === 2;
+      delete window.__ANSWER__.resume_vault_session;
+
+      // 4. A pane took the conversation up: the page says where, with the way there.
+      setActiveTab(held);
+      continued.set(44, other);
+      status.set(44, "ended");
+      await pollHelperPages();
+      await window.__PAINTED__();
+      await settle();
+      const notice = document.querySelector('#worker-view .pane-chat-notice[data-says="worker.wireContinuedIn"]');
+      seen.continuedSaid = (notice?.textContent ?? "").includes(
+        t("worker.wireContinuedIn", "이 대화는 터미널 {{term}}번에서 이어집니다 — 이 화면은 끝났습니다", { term: other }));
+      notice?.querySelector(".pane-chat-notice-go")?.click();
+      seen.wentThere = await until(() => activeTabId === tabOfTerm(other)?.id);
+
+      // 5. A tab's 「이 대화 다시 열기」 the backend answers with a wire: that page.
+      window.__ANSWER__.resume_session = () => ({ term: 0, standing: true, wire: 44 });
+      const mountedBefore = tabs.filter((tab) => tab.kind === "term").length;
+      await resumeSession({ agent: "claude", session: { key: "session_id", id: "s-vault" } });
+      await settle();
+      seen.reopenFront = activeTabId === held && tabs.filter((tab) => tab.kind === "term").length === mountedBefore;
+
+      // 6. A stored pane woken on a conversation a wire holds (a sleeping tab
+      // put on the stage, a first visit): a plain shell that says where the
+      // conversation is, and no CLI.
+      const plain = [];
+      window.__ANSWER__.open_term_tab = (args) => { plain.push(args); return 9300 + plain.length; };
+      window.__ANSWER__.pane_layouts = () => [{
+        id: 31, root: { type: "leaf" }, agents: { 0: { agent: "claude", key: "session_id", id: "s-vault" } },
+        running: { 0: "claude" }, active: 0,
+      }];
+      const launchesBefore = calls.filter(([kind]) => kind === "launch").length;
+      const before = tabs.filter((tab) => tab.kind === "term").length;
+      await restoreWorktreeLayouts(activeWorktreePath);
+      await settle();
+      await settle();
+      const wakeSays = t("session.wakeOnWire", "{{agent}} 대화는 이미 대화 화면에서 열려 있어, 이 판은 빈 셸로 섭니다", { agent: agentName("claude") });
+      seen.wokeAsPlainShell = plain.some((args) => args.plain === true && String(args.notice ?? "").includes(wakeSays)) &&
+        calls.filter(([kind]) => kind === "launch").length === launchesBefore &&
+        tabs.filter((tab) => tab.kind === "term").length > before;
+      for (const name of ["resume_session", "open_term_tab", "pane_layouts"]) delete window.__ANSWER__[name];
+
+      for (const name of ["wire_start", "wire_log", "wire_stop"]) delete window.__ANSWER__[name];
+      if (launchBefore) window.__ANSWER__.launch_agent_tab = launchBefore;
+      else delete window.__ANSWER__.launch_agent_tab;
+      for (const one of [...tabs]) dropTab(one.id);
+      return seen;
+    });
+    ok(
+      "a wire ends with its page and one conversation stays one process — a tab dropped by a sweep stops its wire, 「터미널」 stops the wire before the pane resumes the session and not while it works, a vault row or a tab's reopen a wire holds brings that tab forward (a tabless wire is stopped and the row asks again), a stored pane woken on a wire's conversation stands as a plain shell saying so, and a wire a pane took up says where it goes on with the way there",
+      seen.droppedStops && seen.screenLaunched && seen.stopBeforeLaunch && seen.screenTabGone &&
+        seen.busyKept && seen.busySaid && seen.vaultFront && seen.orphanStopped && seen.continuedSaid && seen.wentThere &&
+        seen.reopenFront && seen.wokeAsPlainShell,
+      JSON.stringify(seen),
+    );
+  } finally {
+    await page.close();
+  }
+});
+
 /* The reveal's pace, measured on the path the person sees (Paseo's two numbers:
  * the coefficient of variation of characters painted per frame is the
  * smoothness, the longest the text sits still mid-stream is the stall). Deltas

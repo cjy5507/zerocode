@@ -39,11 +39,34 @@ pub(crate) fn build_system_prompt_for_mode(
     // Deferred-tool manifest: the model cannot ToolSearch for names it has
     // never seen. Session-stable, so it never disturbs the prompt cache — the
     // tools it names are what this process's `PATH` reaches, and that does not
-    // change under a session (`tools::ToolReach`). Appended here rather than
-    // in the runtime builder because the deferred set is owned by the tools
-    // crate, which depends on runtime — not vice versa.
-    sections.push(tools::deferred_tool_manifest_section(tools::ToolReach::here()));
+    // change under a session (`tools::ToolReach`), less the tools the person's
+    // rules refuse every call of, read once here (`rules_as_read`). Appended
+    // here rather than in the runtime builder because the deferred set is
+    // owned by the tools crate, which depends on runtime — not vice versa.
+    let denied_by = rules_as_read(cwd);
+    sections.push(tools::deferred_tool_manifest_section_for(
+        tools::ToolReach::here(),
+        denied_by.as_ref(),
+    ));
     Ok(sections)
+}
+
+/// The permission rules a session under `cwd` reads, as a policy — what the
+/// prompt asks [`PermissionPolicy::denies_every_call`] of. The same settings
+/// documents and the same rule intake ([`rules_policy`]) the session's own
+/// policy is built from ([`permission_policy`]); the mode does not enter that
+/// answer. `None` when the settings do not load: then every tool is offered,
+/// and every call is judged as it always is.
+fn rules_as_read(cwd: &Path) -> Option<PermissionPolicy> {
+    let config = runtime::ConfigLoader::default_for(cwd).load().ok()?;
+    Some(rules_policy(PermissionMode::ReadOnly, config.feature_config()))
+}
+
+/// A policy in `mode` holding the configured permission rules and nothing
+/// else — the one rule intake of [`permission_policy`] and of what the prompt
+/// offers ([`rules_as_read`]).
+fn rules_policy(mode: PermissionMode, feature_config: &runtime::RuntimeFeatureConfig) -> PermissionPolicy {
+    PermissionPolicy::new(mode).with_permission_rules(feature_config.permission_rules())
 }
 
 /// Whether this session can delegate at all.
@@ -73,9 +96,7 @@ pub(crate) fn permission_policy(
         .map_err(|e| e.to_string())?
         .into_iter()
         .fold(
-            PermissionPolicy::new(mode)
-                .with_permission_rules(feature_config.permission_rules())
-                .with_schedule_workspace(tool_registry.schedule_workspace()),
+            rules_policy(mode, feature_config).with_schedule_workspace(tool_registry.schedule_workspace()),
             |policy, (name, required_permission)| {
                 policy.with_tool_requirement(name, required_permission)
             },
@@ -101,6 +122,40 @@ pub(crate) fn queue_unknown_rule_warnings(
             crate::runtime_support::push_startup_warning(line);
         }
     }
+}
+
+/// The local settings lines this process has queued, for the same reason as
+/// [`WARNED_RULES`].
+static WARNED_LOCAL_SETTINGS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Queue a start-up warning when the workspace's `.zo/settings.local.json`
+/// said something that went unused because no git repository governs the
+/// folder (152), once in this process.
+pub(crate) fn queue_unowned_local_settings_warning(feature_config: &runtime::RuntimeFeatureConfig) {
+    let Some(line) = unowned_local_settings_warning(feature_config.unowned_local_settings()) else {
+        return;
+    };
+    let fresh = WARNED_LOCAL_SETTINGS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(line.clone());
+    if fresh {
+        crate::runtime_support::push_startup_warning(line);
+    }
+}
+
+/// The line that says which settings of a folder's local file went unused,
+/// why, and what a person who wrote that file can do — or none when nothing
+/// went unused. The names are the loader's own; nothing of the file's text is
+/// put on the screen.
+fn unowned_local_settings_warning(unused: &[&str]) -> Option<String> {
+    if unused.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "zo did not use {} from .zo/settings.local.json: this folder is in no git repository, so zo cannot tell that you wrote that file (a downloaded folder can bring one). \"Always allow\" here lasts for this session only. If you wrote the file, read it over: in a git repository, zo reads a local file git does not track as yours.",
+        unused.join(", ")
+    ))
 }
 
 /// One line for each configured permission rule whose tool name no tool zo
@@ -176,6 +231,54 @@ mod system_prompt_tests {
                 .join("\n\n");
 
         assert!(prompt.contains("SUPPLIED_CWD_RULE"), "{prompt}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A tool the settings deny outright (`WebSearch`) is not named in the
+    /// deferred line, while one denied only for some subjects
+    /// (`WebFetch(https://docs.rs/*)`) still is; and the policy the session is
+    /// built with refuses a call to the hidden one in today's words. A
+    /// benchmark run on 2026-11-14 found `WebSearch` through the line, loaded
+    /// it and was refused five times by the bench's own deny rule.
+    #[test]
+    fn a_tool_the_settings_deny_outright_is_not_named_and_its_call_is_refused() {
+        // The settings come from the config home the env names: no other test
+        // may move it, or delete the folder it names, while this one reads it.
+        let _lock = crate::test_env_lock();
+        let root = crate::support::temp_dir("denied-outright");
+        fs::create_dir_all(root.join(".zo")).expect("settings folder");
+        fs::write(
+            root.join(".zo").join("settings.json"),
+            r#"{"permissions":{"deny":["WebSearch","WebFetch(https://docs.rs/*)"]}}"#,
+        )
+        .expect("write settings");
+
+        let prompt =
+            build_system_prompt_for_mode(&root, runtime::PromptMode::Interactive, "claude-opus-5")
+                .expect("system prompt should load")
+                .join("\n\n");
+        let line = prompt
+            .lines()
+            .find(|line| line.starts_with("Hidden but callable:"))
+            .expect("the deferred line");
+        assert!(!line.contains("WebSearch"), "denied outright, so not offered: {line}");
+        assert!(line.contains("WebFetch"), "denied for one subject only, so still offered: {line}");
+
+        let config = runtime::ConfigLoader::default_for(&root).load().expect("settings load");
+        let policy = super::permission_policy(
+            runtime::PermissionMode::DangerFullAccess,
+            config.feature_config(),
+            &tools::GlobalToolRegistry::builtin(),
+        )
+        .expect("the session's policy");
+        assert!(
+            matches!(
+                policy.authorize("WebSearch", r#"{"query":"rust"}"#, None),
+                runtime::PermissionOutcome::Deny { reason }
+                    if reason.contains("Permission to use WebSearch has been denied by rule 'WebSearch'")
+            ),
+            "a call by name meets the refusal it always met"
+        );
         fs::remove_dir_all(root).ok();
     }
 
@@ -795,3 +898,59 @@ mod unknown_rule_warning_tests {
     }
 }
 
+
+#[cfg(test)]
+mod unowned_local_settings_warning_tests {
+    use std::fs;
+
+    use super::unowned_local_settings_warning;
+
+    /// Nothing went unused, nothing is said.
+    #[test]
+    fn a_folder_whose_local_file_lost_nothing_is_not_warned_of() {
+        assert_eq!(unowned_local_settings_warning(&[]), None);
+    }
+
+    /// The line names what went unused by the loader's words, says why, says
+    /// that "always allow" lasts for the session there, and tells a person
+    /// who wrote the file what to do (152).
+    #[test]
+    fn the_line_names_what_went_unused_why_and_what_a_person_can_do() {
+        let line = unowned_local_settings_warning(&["hooks", "permissions.allow"]).expect("a line");
+        assert!(
+            line.starts_with("zo did not use hooks, permissions.allow from .zo/settings.local.json:"),
+            "{line}"
+        );
+        for said in [
+            "in no git repository",
+            "\"Always allow\" here lasts for this session only.",
+            "in a git repository, zo reads a local file git does not track as yours",
+        ] {
+            assert!(line.contains(said), "{said:?} is missing from: {line}");
+        }
+    }
+
+    /// From the loader to the line: a folder no git repository governs whose
+    /// local file carries a hook is warned of by that name.
+    #[test]
+    #[cfg_attr(windows, ignore = "a folder's local file is never the person's on Windows, so the loader names nothing there")]
+    fn a_hook_in_the_local_file_of_a_folder_without_git_is_named() {
+        let root = tempfile::tempdir().expect("a scratch folder");
+        let home = root.path().join("home");
+        let cwd = root.path().join("work");
+        fs::create_dir_all(&home).expect("home");
+        fs::create_dir_all(cwd.join(".zo")).expect(".zo");
+        fs::write(
+            cwd.join(".zo").join("settings.local.json"),
+            r#"{"hooks":{"SessionStart":["echo came-with-the-folder"]},"model":"opus"}"#,
+        )
+        .expect("local settings");
+
+        let config = runtime::ConfigLoader::new(&cwd, &home).load().expect("settings load");
+        let line = unowned_local_settings_warning(config.feature_config().unowned_local_settings())
+            .expect("a line");
+
+        assert!(line.starts_with("zo did not use hooks from"), "{line}");
+        assert!(!line.contains("came-with-the-folder"), "text of the file reached the screen: {line}");
+    }
+}

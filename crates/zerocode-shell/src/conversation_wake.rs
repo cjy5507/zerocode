@@ -45,6 +45,11 @@ pub(crate) struct ConversationWake {
     /// stands a plain shell in its place without carrying the conversation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) finished: Option<String>,
+    /// The wire already holding the conversation (152), with nothing spawned
+    /// — `standing`, and no pane: `term` is 0 then. The page brings that
+    /// wire's tab forward, or stops a wire it has no tab for and asks again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) wire: Option<crate::wire_runtime::WireId>,
 }
 
 impl ConversationWake {
@@ -54,6 +59,7 @@ impl ConversationWake {
             standing: false,
             model: None,
             finished: None,
+            wire: None,
         }
     }
 
@@ -63,6 +69,18 @@ impl ConversationWake {
             standing: true,
             model: None,
             finished: None,
+            wire: None,
+        }
+    }
+
+    /// Nothing opened: wire `wire` holds the conversation (152).
+    pub(crate) const fn on_wire(wire: crate::wire_runtime::WireId) -> Self {
+        Self {
+            term: 0,
+            standing: true,
+            model: None,
+            finished: None,
+            wire: Some(wire),
         }
     }
 
@@ -73,6 +91,7 @@ impl ConversationWake {
             standing: false,
             model: None,
             finished: Some(worker),
+            wire: None,
         }
     }
 
@@ -677,6 +696,16 @@ pub(crate) fn vault_record(agent: &str, session_id: &str) -> Option<ProviderSess
 /// whose agent still holds the terminal. The one reading both roads ask —
 /// a resume door here, and the ledger's reseat through its host (t-7812).
 pub(crate) fn holding_pane(state: &AppState, wanted: &ConversationKey) -> Option<TermId> {
+    holding_pane_but(state, wanted, None)
+}
+
+/// [`holding_pane`], passing over `except` — the pane handing its own
+/// conversation to a wire (152): a second pane behind it still holds it.
+pub(crate) fn holding_pane_but(
+    state: &AppState,
+    wanted: &ConversationKey,
+    except: Option<TermId>,
+) -> Option<TermId> {
     let naming = {
         let sessions = state.pane_sessions();
         let agents = state.agent_terms();
@@ -684,6 +713,7 @@ pub(crate) fn holding_pane(state: &AppState, wanted: &ConversationKey) -> Option
     };
     naming
         .into_iter()
+        .filter(|held| Some(*held) != except)
         .find(|held| !crate::agent_tools_runtime::shell_in_front_of(state, *held))
 }
 

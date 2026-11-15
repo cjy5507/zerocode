@@ -99,7 +99,11 @@ impl SmartRouteContext {
     /// `None` when Smart routing is off (or settings are unreadable) — the
     /// caller leaves the spawn on its default model.
     fn load(parent_model: &str) -> Option<Self> {
-        let settings = read_smart_runtime_settings()?;
+        Self::load_with(read_smart_runtime_settings()?, parent_model)
+    }
+
+    /// [`Self::load`] over settings already read.
+    fn load_with(settings: SmartRuntimeSettings, parent_model: &str) -> Option<Self> {
         if !settings.enabled {
             return None;
         }
@@ -406,8 +410,9 @@ fn route_role_label(role: RouteRole) -> String {
 }
 
 /// Projects `RouteDecisionSource` (already computed by `route_model`) onto
-/// the v2 schema's `routeSource` vocabulary (`"auto"|"pin"|"explicit"|
-/// "fallback"|"exploration"`). `Pinned` and `ManualSelector` both project to
+/// the v2 schema's `routeSource` vocabulary (`"auto"|"pin"|"repository-pin"|
+/// "explicit"|"fallback"|"exploration"`; `repository-pin` is
+/// [`route_source_label_for`]'s). `Pinned` and `ManualSelector` both project to
 /// `"pin"`: both are a `smart.roles`/`smart.subagents` CONFIG override (an
 /// availability signal), not the unconstrained AUTO ranking — the same
 /// distinction Phase 6's pin-zero-weight learning filter relies on.
@@ -428,14 +433,38 @@ pub(crate) fn route_source_label(source: RouteDecisionSource) -> &'static str {
     }
 }
 
+/// The `routeSource` word of a route a repository's committed pin or
+/// selector decided (`RouteRequest::repository_override`). Not `pin`: that
+/// word is read as the person's selection, which steps past the
+/// implementation gate and keeps no quota fallback (152).
+pub(crate) const REPOSITORY_PIN_SOURCE: &str = "repository-pin";
+
+/// [`route_source_label`] for the route `request` was decided by: a pin or
+/// selector a repository's committed settings named carries
+/// [`REPOSITORY_PIN_SOURCE`].
+pub(super) fn route_source_label_for(source: RouteDecisionSource, request: &RouteRequest) -> &'static str {
+    match source {
+        RouteDecisionSource::Pinned | RouteDecisionSource::ManualSelector if request.repository_override => {
+            REPOSITORY_PIN_SOURCE
+        }
+        source => route_source_label(source),
+    }
+}
+
 /// Whether a persisted `routeSource` word says a PERSON chose the model —
-/// a settings pin or an explicit `model:` — rather than the router
-/// ([`route_source_label`]'s `pin` and `explicit`). The one predicate for
-/// the two words, asked by the spawn (a person's pin is honored verbatim)
-/// and by the challenger arm (a person's pick is not the route it measures),
-/// so neither spells the pair for itself.
+/// a pin in their own settings or an explicit `model:` — rather than the
+/// router or a repository ([`route_source_label`]'s `pin` and `explicit`).
+/// Asked by the spawn: a person's pin is honored verbatim.
 pub(crate) fn route_source_is_a_persons(source: &str) -> bool {
     matches!(source, "pin" | "explicit")
+}
+
+/// Whether a persisted `routeSource` word says somebody named the model by
+/// hand — the person, or a repository's committed pin — rather than the
+/// router picking it. Asked by the challenger arm: a model chosen by hand is
+/// not the route it measures.
+pub(crate) fn route_source_was_chosen_by_hand(source: &str) -> bool {
+    route_source_is_a_persons(source) || source == REPOSITORY_PIN_SOURCE
 }
 
 /// Smuggle key carrying the route reason inside a fan-out member's JSON object;
@@ -622,6 +651,31 @@ pub(crate) fn smart_parent_model_for_agent_with_auto_type(
         input.prior_failures,
         None,
         probe.as_ref(),
+    )
+}
+
+/// [`smart_parent_model_for_agent`] over settings already read — what a
+/// test reads from a workspace of its own, where the spawn reads the process's
+/// working folder — and with no routing probe.
+#[cfg(test)]
+pub(super) fn smart_parent_model_for_agent_under(
+    settings: SmartRuntimeSettings,
+    parent_model: &str,
+    input: &AgentInput,
+) -> Option<SmartRouteChoice> {
+    let context = SmartRouteContext::load_with(settings, parent_model)?;
+    smart_model_for_fields(
+        &context,
+        parent_model,
+        routing_subagent_type(input.subagent_type.as_deref(), None),
+        input.name.as_deref(),
+        &input.description,
+        &input.prompt,
+        input.schema.is_some(),
+        input.workflow_member,
+        input.prior_failures,
+        None,
+        None,
     )
 }
 
@@ -901,22 +955,38 @@ pub(super) fn route_spawn(
     }
 }
 
+/// The override the settings name for `request`, and whether a repository's
+/// committed settings named it: the pin on the helper's kind
+/// (`modelRouter.subagents`) before the one on its role (`roles`), as ever —
+/// except that a pin the person wrote stands over one a repository wrote,
+/// whichever table each sits in. A repository's pin on the `Verification`
+/// kind does not undo the person's on the verifier role (152, review
+/// t-107910).
 fn apply_configured_route_override(
     request: &mut RouteRequest,
     settings: &SmartRuntimeSettings,
 ) {
-    if let RoutingTarget::Subagent(profile) = &request.target {
-        if let Some(override_rule) = settings.subagents.get(profile.key()) {
-            request.override_rule = Some(override_rule.clone());
-            request.repository_override = settings.repository_subagents.contains(profile.key());
-        }
-    }
-    if request.override_rule.is_none() {
-        let role = role_key(request.effective_role());
-        if let Some(override_rule) = settings.roles.get(role) {
-            request.override_rule = Some(override_rule.clone());
-            request.repository_override = settings.repository_roles.contains(role);
-        }
+    let on_the_kind = match &request.target {
+        RoutingTarget::Subagent(profile) => settings
+            .subagents
+            .get(profile.key())
+            .map(|rule| (rule, settings.repository_subagents.contains(profile.key()))),
+        _ => None,
+    };
+    let role = role_key(request.effective_role());
+    let on_the_role = settings
+        .roles
+        .get(role)
+        .map(|rule| (rule, settings.repository_roles.contains(role)));
+    let named = match (on_the_kind, on_the_role) {
+        (Some((_, true)), Some(persons @ (_, false))) => Some(persons),
+        (Some(on_the_kind), _) => Some(on_the_kind),
+        (None, on_the_role) if request.override_rule.is_none() => on_the_role,
+        (None, _) => None,
+    };
+    if let Some((override_rule, repositorys)) = named {
+        request.override_rule = Some(override_rule.clone());
+        request.repository_override = repositorys;
     }
 }
 
@@ -1077,6 +1147,7 @@ fn smart_model_for_fields(
         && fallback_models.is_empty()
         && effort.is_none()
         && !matches!(effective_role, RouteRole::Coding | RouteRole::Debugging)
+        && repository_pin_not_applied(&decision).is_none()
     {
         return None;
     }
@@ -1103,7 +1174,7 @@ fn smart_model_for_fields(
             ) {
             format!("{}+probe", route_source_label(decision.source))
         } else {
-            route_source_label(decision.source).to_string()
+            route_source_label_for(decision.source, &request).to_string()
         },
     };
     Some(SmartRouteChoice {
@@ -1184,7 +1255,26 @@ fn compose_route_reason(
         use std::fmt::Write as _;
         let _ = write!(reason, " · learned-shadow-differs:{model}");
     }
+    if let Some(why) = repository_pin_not_applied(decision) {
+        use std::fmt::Write as _;
+        let _ = write!(reason, " · repository pin not applied: {why}");
+    }
     reason
+}
+
+/// Why a repository's committed pin or selector named for this route was
+/// not applied, in the words of the reason line — `None` where none was
+/// named or it was applied (`runtime::REPOSITORY_PIN_NOT_APPLIED`). A team
+/// that relied on it is told, rather than finding its helpers moved to
+/// automatic routing in silence (152, review t-107693).
+pub(super) fn repository_pin_not_applied(decision: &RouteDecision) -> Option<&'static str> {
+    decision.audit.guardrails.iter().find_map(|line| {
+        match line.strip_prefix(runtime::REPOSITORY_PIN_NOT_APPLIED)? {
+            "allowlist" => Some("outside your smart.providerAllowlist"),
+            "family" => Some("outside the session's provider family"),
+            _ => None,
+        }
+    })
 }
 
 /// Phase 6 shadow-mode wiring: `request` already carries whatever
@@ -1254,6 +1344,7 @@ fn route_reason_is_worth_reporting(model_override: Option<&String>, decision: &R
             .guardrails
             .iter()
             .any(|line| line.starts_with("learned-shadow-differs:"))
+        || repository_pin_not_applied(decision).is_some()
 }
 
 fn route_audit_notes(

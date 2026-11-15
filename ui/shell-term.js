@@ -1462,11 +1462,25 @@ const PITCH_QUANTUM_PX = 1 / 64;
 /* One 2D context for every view's glyph advances. `measureText` shapes a
  * string through the same font cascade a run's text takes — including the
  * fallback face that draws what the mono stack lacks — and reads no layout,
- * which the paint path may not do. */
+ * which the paint path may not do.
+ *
+ * The canvas stands in the document, hidden: a fallback face is chosen by
+ * language, and a canvas outside the document shapes in the language of the
+ * system, not the page's. On a Mac whose language is not the page's (`ko`),
+ * a Han character, kana or a full-width letter was measured in one face and
+ * drawn in another, and every column after it moved (a CI runner in English,
+ * 2026-11-13; this Mac with the page in Japanese). `ctx.lang` would say the
+ * same, but WebKit — the window's own engine on macOS — has none. */
 let glyphMeterContext = null;
 
 function glyphMeter() {
-  if (glyphMeterContext === null) glyphMeterContext = document.createElement("canvas").getContext("2d");
+  if (glyphMeterContext === null) {
+    const canvas = document.createElement("canvas");
+    canvas.hidden = true;
+    canvas.setAttribute("aria-hidden", "true");
+    (document.body ?? document.documentElement).appendChild(canvas);
+    glyphMeterContext = canvas.getContext("2d");
+  }
   return glyphMeterContext;
 }
 
@@ -8492,10 +8506,15 @@ async function spawnStoredLeaf(wake, launched, grid = null, restore = null, work
         // a record that named it twice is what put two resumes on one transcript
         // to begin with.
         duplicate = true;
-        notice = t("session.wakeStanding", "{{agent}} 대화는 이미 다른 판에서 열려 있어, 이 판은 빈 셸로 섭니다", {
-          agent: agentName(wake.agent),
-        });
-        console.warn(`[restore] ${wake.agent} ${wake.id} is already standing in term ${woke.term}; this leaf opens as a plain shell`);
+        // Held on a wire (152): the conversation is on that wire's page.
+        notice = woke.wire != null
+          ? t("session.wakeOnWire", "{{agent}} 대화는 이미 대화 화면에서 열려 있어, 이 판은 빈 셸로 섭니다", {
+            agent: agentName(wake.agent),
+          })
+          : t("session.wakeStanding", "{{agent}} 대화는 이미 다른 판에서 열려 있어, 이 판은 빈 셸로 섭니다", {
+            agent: agentName(wake.agent),
+          });
+        console.warn(`[restore] ${wake.agent} ${wake.id} is already standing ${woke.wire != null ? `on wire ${woke.wire}` : `in term ${woke.term}`}; this leaf opens as a plain shell`);
       }
     } catch (error) {
       // The agent left the PATH, or the vendor dropped the session. The layout

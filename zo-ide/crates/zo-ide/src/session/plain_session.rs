@@ -733,6 +733,7 @@ fn selection_record(
         matches!(model_selection, super::plan_execution::ModelSelection::Pinned).then_some(model),
         effort,
     )
+    .at_the_provider_serving_it()
 }
 
 /// The model the conversation's last answer came from: what a conversation
@@ -903,6 +904,11 @@ impl PlainSession {
             last_answer_model: if resumed { last_answer_model(&session) } else { None },
             preferences: &persisted_preferences,
         });
+        // A conversation that ran at a provider of the person's own reopens
+        // there or not at all — before its record is written again.
+        if let Some(why) = recorded_selection.as_ref().and_then(|recorded| recorded.reopen_refusal(&opening.model)) {
+            return Err(why.into());
+        }
         // What this conversation opens on is its own from here: a `/model` in
         // another session rewrites the default for NEW sessions, not this one.
         // Best-effort like the `.cwd` sidecar — a failed write only leaves the
@@ -3825,6 +3831,32 @@ mod opening_selection_tests {
             .expect("push");
         assert_eq!(last_answer_model(&session), Some(PANE_TWO_FLASH));
         assert_eq!(last_answer_model(&runtime::Session::new()), None);
+    }
+
+    /// The record of a conversation pinned to a model a provider of the
+    /// person's own serves names that provider, and holds a later reopen of
+    /// it there (152).
+    #[test]
+    fn a_pinned_conversations_record_names_the_persons_provider_it_runs_at() {
+        let _env_lock = crate::test_env_lock();
+        let config_home = crate::support::temp_dir("selection-record-provider");
+        let _config_home = crate::support::EnvVarGuard::set(
+            "ZO_CONFIG_HOME",
+            Some(config_home.to_str().expect("utf8 config home")),
+        );
+        let _zo_home = crate::support::EnvVarGuard::set("ZO_HOME", None);
+        let _custom = crate::support::EnvVarGuard::set(api::CUSTOM_PROVIDERS_ENV, None);
+        api::refresh_custom_providers_from_json(
+            r#"[{"name":"zqown","base_url":"https://zqown.invalid/v1","requires_auth":false,"models":["gpt-zq-oss"]}]"#,
+        )
+        .expect("custom providers");
+        let record = selection_record(ModelSelection::Pinned, "gpt-zq-oss", Some(Effort::High));
+        assert_eq!(record.reopen_refusal("gpt-zq-oss"), None);
+        api::refresh_custom_providers_from_json("[]").expect("the row goes");
+        assert!(record.reopen_refusal("gpt-zq-oss").is_some(), "the record holds the reopen to zqown");
+        // A router-chosen conversation records no model, and holds nothing.
+        let automatic = selection_record(ModelSelection::Automatic, "gpt-zq-oss", None);
+        assert_eq!(automatic.reopen_refusal("gpt-zq-oss"), None);
     }
 }
 

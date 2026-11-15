@@ -805,6 +805,14 @@ fn rate_limit_fallback_models(
     fallbacks
 }
 
+/// The model a custom agent's definition names, where the definition is the
+/// person's own: a `.zo/agents/<name>.md` in the workspace or a folder above
+/// it — committed or not — is the repository's, and its `model:` is not their
+/// selection (152, review t-107693).
+fn persons_custom_agent_model(agent: Option<&CustomAgent>) -> Option<&str> {
+    agent.filter(|agent| agent.persons).and_then(|agent| agent.model.as_deref())
+}
+
 /// One gate for primary implementation picks and their quota fallbacks.
 fn implementation_model_refusal(model: &str, parent: Option<&str>, person_pin: bool) -> Option<String> {
     if person_pin { return None; }
@@ -817,7 +825,7 @@ fn implementation_model_refusal(model: &str, parent: Option<&str>, person_pin: b
     } else if runtime::is_reserved_orchestrator_model(&identity) {
         "reserved for orchestration"
     } else { return None; };
-    Some(format!("Implementation model `{model}` is {problem}. Do this work inline. Only the person's launch or settings selection authorizes this exception; do not retry this spawn with a model pin."))
+    Some(format!("Implementation model `{model}` is {problem}. Do this work inline. Only the person's launch or settings selection authorizes this exception — an agent definition counts only from the person's own `~/.zo/agents`; do not retry this spawn with a model pin."))
 }
 
 fn route_complexity_for_gate(value: Option<&str>) -> runtime::RouteTaskComplexity {
@@ -1301,7 +1309,7 @@ where
         && (matches!(input.route_role.as_deref(), Some("coding" | "debugging"))
             || implementation_task(implementation_kind, &implementation_description, &input.prompt));
     let person_model_pin = input.launch.selected || route_is_person_pin || person_selected(&model)
-        || custom_agent.as_ref().and_then(|agent| agent.model.as_deref())
+        || persons_custom_agent_model(custom_agent.as_ref())
             .is_some_and(|pin| same_model(pin, &model))
         || std::env::var(AGENT_MODEL_ENV).ok().is_some_and(|pin| !pin.trim().is_empty());
     if implementation_route && !input.launch.selected {

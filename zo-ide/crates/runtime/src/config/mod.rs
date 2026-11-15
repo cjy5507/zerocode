@@ -223,6 +223,11 @@ pub struct RuntimeFeatureConfig {
     tui_inline_mode: Option<bool>,
     /// Settings `secondBrain`: the knowledge vault zo consults and adds to.
     second_brain: RuntimeSecondBrainConfig,
+    /// What the workspace's `.zo/settings.local.json` said that went unused
+    /// because no git repository governs the folder, so the file is read as
+    /// one the folder came with (152). Names from the loader's own list —
+    /// never text from the file.
+    unowned_local_settings: Vec<&'static str>,
 }
 
 impl Default for RuntimeFeatureConfig {
@@ -253,6 +258,7 @@ impl Default for RuntimeFeatureConfig {
             checkpoint_durable: false,
             tui_inline_mode: None,
             second_brain: RuntimeSecondBrainConfig::default(),
+            unowned_local_settings: Vec::new(),
         }
     }
 }
@@ -804,6 +810,15 @@ impl ConfigLoader {
         } else {
             ConfigSource::Project
         };
+        // A real local file the gate did not take, in a folder no git
+        // repository governs, came with the folder (152): what it says that
+        // the repository strips take out below goes unused, and the person
+        // is told so by name.
+        let local_settings_without_git = local_settings_contents.is_none()
+            && can_tell_persons_own_settings_file()
+            && is_real_file(&local_settings_path)
+            && governed_by_no_repository(&self.cwd);
+        let mut unowned_local_settings = Vec::new();
         let trusted_local_settings_snapshot = local_settings_contents
             .as_deref()
             .map(|contents| parse_json_object_contents(&local_settings_path, contents))
@@ -929,6 +944,10 @@ impl ConfigLoader {
             let Some(mut value) = value else {
                 continue;
             };
+            let unowned_before = (local_settings_without_git
+                && entry.source == ConfigSource::Project
+                && entry.path == local_settings_path)
+                .then(|| (value.clone(), untrusted_project_mcp.len()));
             // Repo-committed Project documents are attacker-controllable on clone,
             // so their code-execution / security-downgrade surfaces are stripped
             // before validation or merge unless an operator opts each in (honored
@@ -1037,6 +1056,13 @@ impl ConfigLoader {
             if entry.source == ConfigSource::Project && !project_env_opt_in {
                 value.remove("env");
             }
+            if let Some((said, gated_before)) = unowned_before {
+                unowned_local_settings = settings_left_unused(
+                    &said,
+                    &value,
+                    untrusted_project_mcp.len() > gated_before,
+                );
+            }
             // Fold this scope's (post-strip) deny/ask into the cumulative unions
             // so the final policy is a superset of every scope's restrictions,
             // regardless of merge order.
@@ -1109,6 +1135,7 @@ impl ConfigLoader {
             checkpoint_durable: parse_checkpoint_durable(&merged_value)?,
             tui_inline_mode: parse_tui_inline_mode(&merged_value)?,
             second_brain: parse_second_brain_config(&merged_value)?,
+            unowned_local_settings,
         };
 
         Ok(RuntimeConfig {
@@ -1173,6 +1200,78 @@ fn enable_all_project_flag(settings: &BTreeMap<String, JsonValue>, flag: &str) -
         .get(flag)
         .and_then(JsonValue::as_bool)
         .unwrap_or(false)
+}
+
+/// The opt-ins [`ConfigLoader::load`] reads from the person's own documents
+/// only. Written in a document the loader reads as the project's, none of
+/// them takes a gate off.
+const PROJECT_OPT_INS: [&str; 11] = [
+    "enableAllProjectMcpServers",
+    "enableAllProjectPlugins",
+    "enableAllProjectPermissions",
+    "enableAllProjectEnv",
+    "enableAllProjectHooks",
+    "enableAllProjectShip",
+    "enableAllProjectSandbox",
+    "enableAllProjectProviders",
+    "enableAllProjectOauth",
+    "enableAllProjectStatusLine",
+    "enableAllProjectLsp",
+];
+
+/// What a project document said that the repository strips took out or cut
+/// down, named by the loader's own words: read off the document as it was
+/// written (`said`) and as it merges (`kept`), so no text of the file is
+/// carried along. `mcp_servers_gated` is whether the trust gate held back
+/// one of its `mcpServers`.
+fn settings_left_unused(
+    said: &BTreeMap<String, JsonValue>,
+    kept: &BTreeMap<String, JsonValue>,
+    mcp_servers_gated: bool,
+) -> Vec<&'static str> {
+    const SECTIONS: [&str; 11] = [
+        "hooks",
+        "env",
+        "statusLine",
+        "lspServers",
+        "providers",
+        "oauth",
+        "sandbox",
+        "ship",
+        "plugins",
+        "smart",
+        "permissionMode",
+    ];
+    const PERMISSIONS: [(&str, &str); 5] = [
+        ("allow", "permissions.allow"),
+        ("rules", "permissions.rules"),
+        ("defaultMode", "permissions.defaultMode"),
+        ("deny", "permissions.deny"),
+        ("ask", "permissions.ask"),
+    ];
+    let mut unused: Vec<&'static str> = SECTIONS
+        .into_iter()
+        .filter(|key| said.get(*key) != kept.get(*key))
+        .collect();
+    match (said.get("permissions"), kept.get("permissions")) {
+        (Some(JsonValue::Object(said_rules)), Some(JsonValue::Object(kept_rules))) => unused.extend(
+            PERMISSIONS
+                .into_iter()
+                .filter(|(key, _)| said_rules.get(*key) != kept_rules.get(*key))
+                .map(|(_, name)| name),
+        ),
+        (Some(_), None) => unused.push("permissions"),
+        _ => {}
+    }
+    if mcp_servers_gated {
+        unused.push("mcpServers");
+    }
+    unused.extend(
+        PROJECT_OPT_INS
+            .into_iter()
+            .filter(|flag| enable_all_project_flag(said, flag)),
+    );
+    unused
 }
 
 /// The documents under `<workspace>/.zo` the loader reads as the project's.
@@ -1463,6 +1562,9 @@ fn local_settings_scope(cwd: &Path, path: &Path) -> ConfigSource {
 /// * a `.zo` submodule / nested repo (`.zo/.git`) whose file lands on a
 ///   recursive clone yet is a gitlink (untracked) in the outer repo;
 /// * a git-tracked (committed) path;
+/// * a folder no git repository governs: a downloaded copy of a repository
+///   brings its committed file along with nothing to tell it from the
+///   person's own;
 /// * an absent file (moot — nothing loads).
 fn is_trusted_local_settings(cwd: &Path, path: &Path) -> bool {
     is_trusted_uncommitted_zo_file(cwd, path, "settings.local.json")
@@ -1637,7 +1739,8 @@ fn merge_allow_always_rules(
 /// Trust a project-local Zo control file only when it is the operator's real,
 /// uncommitted file at the exact expected path. This shared gate prevents a
 /// repository from self-authorizing through tracked files, symlinks, aliases,
-/// or a nested `.zo` repository.
+/// a nested `.zo` repository, or a folder no git repository governs — where
+/// nothing tells a file the person made from one the folder arrived with.
 fn is_trusted_uncommitted_zo_file(cwd: &Path, path: &Path, file_name: &str) -> bool {
     trusted_uncommitted_zo_file_snapshot(cwd, path, file_name).is_some()
 }
@@ -1741,6 +1844,15 @@ fn trusted_uncommitted_zo_file_snapshot_with_git(
         }
         ensure_path_absent(&base.join(".zo").join(".git"))?;
         let repository_before = git_repository_fingerprint(&base)?;
+        // Only a folder a `.git` from here up stands in is asked of git. A
+        // folder can answer git as a repository with no `.git` at all — its
+        // own `HEAD`, `objects/`, `refs/` and a `config` naming itself the
+        // work tree — and a ZIP of a repository brings such a folder as well
+        // as the file in it (review t-107885, G0). Nothing a folder with no
+        // `.git` holds tells a file the person made from one it came with.
+        if repository_before.markers.is_empty() {
+            return Err(untrusted_control_file());
+        }
         let git_path = PathBuf::from(git_program);
         if !git_path.is_absolute() {
             return Err(untrusted_control_file());
@@ -1758,16 +1870,10 @@ fn trusted_uncommitted_zo_file_snapshot_with_git(
                 .path
                 .parent()
                 .is_some_and(|root| git_before.starts_with(root))
-        }) || (repository_before.markers.is_empty() && git_before.starts_with(&base))
-        {
+        }) {
             return Err(untrusted_control_file());
         }
-        let tracking = git_tracking_state_with_program(
-            &base,
-            &real,
-            git_before.as_os_str(),
-            repository_before.markers.is_empty(),
-        );
+        let tracking = git_tracking_state_with_program(&base, &real, git_before.as_os_str());
 
         let (Ok(real_after), Ok(base_after)) = (path.canonicalize(), cwd.canonicalize()) else {
             return Err(untrusted_control_file());
@@ -1787,10 +1893,9 @@ fn trusted_uncommitted_zo_file_snapshot_with_git(
         if git_repository_fingerprint(&base_after)? != repository_before {
             return Err(untrusted_control_file());
         }
-        if !matches!(
-            tracking,
-            GitTrackingState::Untracked | GitTrackingState::NotRepository
-        ) {
+        // Git's word that it does not track the file is the only sign the
+        // person made it here.
+        if tracking != GitTrackingState::Untracked {
             return Err(untrusted_control_file());
         }
         Ok(())
@@ -1869,6 +1974,21 @@ fn filesystem_identity(_metadata: &std::fs::Metadata) -> std::io::Result<Filesys
     ))
 }
 
+/// Whether no folder from `cwd` up holds a `.git` — the folders the control
+/// file gate refuses as governed by no repository, found the way the gate
+/// finds them.
+fn governed_by_no_repository(cwd: &Path) -> bool {
+    cwd.canonicalize()
+        .ok()
+        .and_then(|cwd| git_repository_fingerprint(&cwd).ok())
+        .is_some_and(|fingerprint| fingerprint.markers.is_empty())
+}
+
+/// Whether `path` is a regular file itself, not a link to one.
+fn is_real_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
 fn git_repository_fingerprint(cwd: &Path) -> std::io::Result<GitRepositoryFingerprint> {
     let cwd_identity = filesystem_identity(&std::fs::metadata(cwd)?)?;
     let mut markers = Vec::new();
@@ -1893,19 +2013,18 @@ fn git_repository_fingerprint(cwd: &Path) -> std::io::Result<GitRepositoryFinger
 enum GitTrackingState {
     Tracked,
     Untracked,
-    NotRepository,
     Indeterminate,
 }
 
 /// Determine Git provenance without conflating an untracked file with a Git
 /// failure. Only a successful repository probe followed by a successful index
-/// query can yield `Tracked`/`Untracked`; launch failures, dubious ownership,
-/// repository corruption, and unexpected output fail closed as `Indeterminate`.
+/// query can yield `Tracked`/`Untracked`; launch failures, "not a repository",
+/// dubious ownership, repository corruption, and unexpected output fail
+/// closed as `Indeterminate`.
 fn git_tracking_state_with_program(
     cwd: &Path,
     path: &Path,
     git_program: &std::ffi::OsStr,
-    allow_not_repository: bool,
 ) -> GitTrackingState {
     let configure = |command: &mut std::process::Command| {
         command
@@ -1923,15 +2042,7 @@ fn git_tracking_state_with_program(
         return GitTrackingState::Indeterminate;
     };
     if !probe.status.success() {
-        let stderr = probe.stderr.as_slice().trim_ascii();
-        return if probe.stdout.is_empty()
-            && allow_not_repository
-            && stderr.starts_with(b"fatal: not a git repository")
-        {
-            GitTrackingState::NotRepository
-        } else {
-            GitTrackingState::Indeterminate
-        };
+        return GitTrackingState::Indeterminate;
     }
     if !probe.stderr.as_slice().trim_ascii().is_empty()
         || probe.stdout.as_slice().trim_ascii() != b"true"
@@ -2900,6 +3011,15 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn desk_guard(&self) -> bool {
         self.desk_guard
+    }
+
+    /// The settings of the workspace's `.zo/settings.local.json` that went
+    /// unused because no git repository governs the folder (152), by name;
+    /// empty when the file is the person's, absent, or said nothing that
+    /// went unused.
+    #[must_use]
+    pub fn unowned_local_settings(&self) -> &[&'static str] {
+        &self.unowned_local_settings
     }
 
     #[must_use]

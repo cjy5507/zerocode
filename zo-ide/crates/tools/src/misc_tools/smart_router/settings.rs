@@ -758,8 +758,16 @@ pub(super) fn read_smart_runtime_settings_for(cwd: &Path) -> Option<SmartRuntime
         .and_then(|value| u8::try_from(value).ok())
         .unwrap_or(DEFAULT_HEADROOM_PENALTY_THRESHOLD);
     let plan = PlanShadowSettings::from_settings_value(smart.and_then(|smart| smart.get("plan")));
-    let (subagents, roles) = configured_overrides(&root);
+    let (mut subagents, mut roles) = configured_overrides(&root);
     let (own_subagents, own_roles) = configured_overrides(&persons);
+    // A person's own pin or selector stands as they wrote it. The merge goes
+    // key by key, so a repository's `{"mode": "auto"}` over their pin read as
+    // no pin at all, a pin of its own over theirs as the repository's, and a
+    // `modelRouter` or `roles` that is no object as none of theirs; read off
+    // the person's documents, keyed as the router keys them, theirs is put
+    // back over whatever the merge left.
+    subagents.extend(own_subagents.iter().map(|(key, rule)| (key.clone(), rule.clone())));
+    roles.extend(own_roles.iter().map(|(key, rule)| (key.clone(), rule.clone())));
     let persons_deep_tier =
         deep_tier_models_from_smart(persons.get("smart").and_then(Value::as_object));
     Some(SmartRuntimeSettings {
@@ -824,6 +832,7 @@ pub(super) fn route_within_the_family(request: &mut RouteRequest, inventory: &ru
         request.override_rule = None;
         request.repository_override = false;
         request.context.audit_notes.push(NOT_APPLIED_OUTSIDE_THE_FAMILY.to_string());
+        request.context.audit_notes.push(format!("{}family", runtime::REPOSITORY_PIN_NOT_APPLIED));
         return route_model(request, inventory);
     }
     decision
@@ -1037,9 +1046,14 @@ pub(super) fn smart_turn_routing_with(
         };
     };
 
-    let deep_tier_models = effective_deep_tier_models(
-        &settings.deep_tier_models,
-        settings.deep_tier_models_configured,
+    let deep_tier_models = within_the_persons_allowlist(
+        effective_deep_tier_models(
+            &settings.deep_tier_models,
+            settings.deep_tier_models_configured,
+            main_model,
+            inventory,
+        ),
+        &settings,
         main_model,
         inventory,
     );
@@ -1116,6 +1130,36 @@ pub(super) fn effective_deep_tier_models(
     dynamic
         .into_iter()
         .filter(|model| same_smart_model(model, main_model) || listed(model))
+        .collect()
+}
+
+/// The Architect pool cut to the providers the person's
+/// `smart.providerAllowlist` names. The verify leg and the plan stage pick
+/// from it, and a top-tier model of a provider the person left out is not
+/// one to send their work to (152, review t-107910 · 7). Where the list
+/// leaves no model but the main one, the session's own provider's top-tier
+/// models stay. The main model stays wherever it stood: it is the session,
+/// not a pick.
+fn within_the_persons_allowlist(
+    pool: Vec<String>,
+    settings: &SmartRuntimeSettings,
+    main_model: &str,
+    inventory: &runtime::ModelInventory,
+) -> Vec<String> {
+    if settings.provider_allowlist.is_empty() {
+        return pool;
+    }
+    let is_main = |model: &str| same_smart_model(model, main_model);
+    let allowed: Vec<String> = pool
+        .iter()
+        .filter(|model| is_main(model) || inside_the_allowlist(model, settings, inventory))
+        .cloned()
+        .collect();
+    if allowed.iter().any(|model| !is_main(model)) {
+        return allowed;
+    }
+    pool.into_iter()
+        .filter(|model| is_main(model) || same_provider_family(Some(main_model), model))
         .collect()
 }
 
