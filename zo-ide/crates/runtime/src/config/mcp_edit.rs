@@ -54,6 +54,7 @@ pub enum McpEdit {
 /// edited document does not survive the loader's own parser, or the write
 /// fails.
 pub fn write_mcp_server(
+    home: &Path,
     path: &Path,
     name: &str,
     config: &McpServerConfig,
@@ -71,7 +72,7 @@ pub fn write_mcp_server(
         return Ok(edit);
     }
     servers.insert(name.to_string(), written);
-    commit(path, root, name, Some(config))?;
+    commit(home, path, root, name, Some(config))?;
     Ok(edit)
 }
 
@@ -80,7 +81,7 @@ pub fn write_mcp_server(
 /// # Errors
 ///
 /// As [`write_mcp_server`].
-pub fn remove_mcp_server(path: &Path, name: &str) -> Result<McpEdit, ConfigError> {
+pub fn remove_mcp_server(home: &Path, path: &Path, name: &str) -> Result<McpEdit, ConfigError> {
     let _guard = crate::file_ops::SettingsFileLock::acquire(path).map_err(ConfigError::Io)?;
     let mut root = read_document(path)?;
     let servers = servers_section(&mut root, path)?;
@@ -92,7 +93,7 @@ pub fn remove_mcp_server(path: &Path, name: &str) -> Result<McpEdit, ConfigError
     if servers.is_empty() {
         root.remove(mcp_keys::SERVERS);
     }
-    commit(path, root, name, None)?;
+    commit(home, path, root, name, None)?;
     Ok(McpEdit::Removed)
 }
 
@@ -110,13 +111,13 @@ pub fn remove_mcp_server(path: &Path, name: &str) -> Result<McpEdit, ConfigError
 ///
 /// The record is not a JSON array of server names, it does not survive the
 /// round-trip through the parser a future session uses, or the write fails.
-pub fn trust_mcp_server(path: &Path, name: &str) -> Result<McpEdit, ConfigError> {
+pub fn trust_mcp_server(home: &Path, path: &Path, name: &str) -> Result<McpEdit, ConfigError> {
     let mut names = parse_trusted_mcp_server_names(path, &read_file_or_empty(path)?)?;
     if names.iter().any(|trusted| trusted == name) {
         return Ok(McpEdit::Unchanged);
     }
     names.push(name.to_string());
-    write_trusted_names(path, &names)?;
+    write_trusted_names(home, path, &names)?;
     Ok(McpEdit::Added)
 }
 
@@ -131,7 +132,7 @@ pub fn trust_mcp_server(path: &Path, name: &str) -> Result<McpEdit, ConfigError>
 /// # Errors
 ///
 /// As [`trust_mcp_server`].
-pub fn untrust_mcp_server(path: &Path, name: &str) -> Result<McpEdit, ConfigError> {
+pub fn untrust_mcp_server(home: &Path, path: &Path, name: &str) -> Result<McpEdit, ConfigError> {
     let mut names = parse_trusted_mcp_server_names(path, &read_file_or_empty(path)?)?;
     let before = names.len();
     // A hand-edited record may hold the name twice; consent goes with every copy.
@@ -139,13 +140,13 @@ pub fn untrust_mcp_server(path: &Path, name: &str) -> Result<McpEdit, ConfigErro
     if names.len() == before {
         return Ok(McpEdit::Absent);
     }
-    write_trusted_names(path, &names)?;
+    write_trusted_names(home, path, &names)?;
     Ok(McpEdit::Removed)
 }
 
 /// Render the record, read it back through the parser a future session uses,
 /// and only then write it.
-fn write_trusted_names(path: &Path, names: &[String]) -> Result<(), ConfigError> {
+fn write_trusted_names(home: &Path, path: &Path, names: &[String]) -> Result<(), ConfigError> {
     let rendered =
         JsonValue::Array(names.iter().cloned().map(JsonValue::String).collect()).render_pretty();
     // The read-back `commit` does for a settings document: a record our
@@ -156,9 +157,43 @@ fn write_trusted_names(path: &Path, names: &[String]) -> Result<(), ConfigError>
             path.display()
         )));
     }
-    create_parent_directory(path)?;
+    refuse_a_file_zo_did_not_write(home, path)?;
     // Owner-only like every document this module writes: a name another local
     // account could append is a server this one would run.
+    write_document(path, &rendered)?;
+    super::local_record::wrote(home, path, rendered.as_bytes());
+    Ok(())
+}
+
+/// A project's `.zo/trusted-mcp-servers.json` or `.zo/settings.local.json`
+/// that zo did not write as it stands (the folder came with it, or it changed
+/// since) is not written into: what it says would become the person's (153).
+fn refuse_a_file_zo_did_not_write(home: &Path, path: &Path) -> Result<(), ConfigError> {
+    if super::local_record::may_write(home, path) {
+        return Ok(());
+    }
+    Err(ConfigError::Io(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "{} was not written by zo as it stands (it came with this folder, an older zo \
+             wrote it before zo kept a record, or it changed since zo wrote it), or the \
+             folder's .zo is a link to another folder, so zo does not write into it. If the \
+             file is yours, run `zo settings trust-local` in your own terminal, then try again.",
+            path.display()
+        ),
+    )))
+}
+
+/// Write `rendered` to `path`, owner-only: a folder's local file through its
+/// own `.zo`, following no link ([`super::local_record::write_local_file`]);
+/// any other document (the user settings, a project's `settings.json`) as
+/// before.
+fn write_document(path: &Path, rendered: &str) -> Result<(), ConfigError> {
+    if super::local_record::is_recorded_kind(path) {
+        return super::local_record::write_local_file(path, rendered.as_bytes())
+            .map_err(ConfigError::Io);
+    }
+    create_parent_directory(path)?;
     write_private_file(path, rendered.as_bytes(), &ParentDirPolicy::LeaveParent)
         .map_err(ConfigError::Io)
 }
@@ -215,6 +250,7 @@ fn servers_section<'a>(
 /// A document our renderer mangles, or a server that does not come back as it
 /// went in, fails here — before it becomes the file on disk.
 fn commit(
+    home: &Path,
     path: &Path,
     root: BTreeMap<String, JsonValue>,
     name: &str,
@@ -244,11 +280,12 @@ fn commit(
             )));
         }
     }
-    create_parent_directory(path)?;
+    refuse_a_file_zo_did_not_write(home, path)?;
     // The file is owner-only: an `env` block under `mcpServers` carries the
     // server's tokens.
-    write_private_file(path, rendered.as_bytes(), &ParentDirPolicy::LeaveParent)
-        .map_err(ConfigError::Io)
+    write_document(path, &rendered)?;
+    super::local_record::wrote(home, path, rendered.as_bytes());
+    Ok(())
 }
 
 /// One server, as the settings document spells it.

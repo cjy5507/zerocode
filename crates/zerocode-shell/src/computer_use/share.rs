@@ -10,6 +10,11 @@
 //! required, an app whose card went unanswered waits (t-74826): the band names it
 //! and offers the hand-over (`computer_share_hand_over`), and the card is raised
 //! again only after the quiet.
+//!
+//! A use that is over leaves by itself ([`lapse`], the rule is `Share::lapse`):
+//! every request lets go of what is over before it is judged, and while
+//! anything is in use the window looks every few seconds, so the band closes
+//! with no press when the last app quit or went quiet.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -21,6 +26,8 @@ use serde_json::{Value, json};
 use zerocode_core::computer_use::ComputerMethod;
 #[cfg(test)]
 pub(crate) use zerocode_core::computer_use_protocol::share::SHARE_ASK_AGAIN_MS;
+#[cfg(test)]
+pub(crate) use zerocode_core::computer_use_protocol::share::SHARE_USE_LAPSES_MS;
 use zerocode_core::computer_use_protocol::share::{
     Answer, Gate, Reach, SHARE_ASK_MS, Share, app_key, named_app_key, took_control, unread_name,
 };
@@ -65,6 +72,13 @@ struct Held {
     /// The window each app in use was last named by, by the app's key: its
     /// own "take control" control stands on that window (t-93286).
     panel_windows: BTreeMap<String, Value>,
+    /// The process each app in use was last acted in as, by the app's key: an
+    /// app whose process ended is no longer in use.
+    pids: BTreeMap<String, i64>,
+    /// The words agents named each app in use by, a word's key to its app's
+    /// key: a look that names the app by one of them is a use of it
+    /// ([`in_use_as`]).
+    words: BTreeMap<String, String>,
 }
 
 /// What the helper's controls stand beside: the app the band leads with,
@@ -143,6 +157,9 @@ struct Admitted {
     app: Option<String>,
     acts: bool,
     whole_screen: bool,
+    /// The app in use a free look reads, by the app's own key: each step of
+    /// the look is a use of it ([`in_use_as`]).
+    looks_in: Option<String>,
 }
 
 thread_local! {
@@ -202,6 +219,8 @@ struct Named {
     key: String,
     label: String,
     unread: bool,
+    /// The process the helper said the word means, when it said.
+    pid: Option<i64>,
 }
 
 impl Named {
@@ -210,6 +229,7 @@ impl Named {
             key: app_key(named),
             label: named.to_string(),
             unread,
+            pid: None,
         }
     }
 }
@@ -236,6 +256,7 @@ fn named_by(named: &str) -> Named {
             key,
             label: named.trim().to_string(),
             unread: false,
+            pid: None,
         };
     }
     person_words_for(named.trim())
@@ -269,6 +290,7 @@ fn person_words_for(named: &str) -> Named {
         key: named_app_key(app.get("bundleId").and_then(Value::as_str), name),
         label: name.to_string(),
         unread: false,
+        pid: app.get("pid").and_then(Value::as_i64),
     }
 }
 
@@ -335,11 +357,22 @@ pub(crate) fn admit(method: ComputerMethod, params: &Value) -> Result<Scope, Com
     if acts && let Some(named) = named.as_ref().filter(|named| named.unread) {
         return Err(unread_name(&named.label));
     }
+    // A free look is named by the agent's word alone, and it is a use of the
+    // app it reads all the same.
+    let looks_in = if acts || held_to_the_share {
+        None
+    } else {
+        params
+            .get("app")
+            .and_then(Value::as_str)
+            .and_then(|word| with_held(|held| in_use_as(held, word)))
+    };
     loop {
         refresh_required();
         let before = with_held(|held| presented(held));
         let now = now_ms();
-        let (gate, generation, after) = with_held(|held| {
+        let (left, gate, generation, after) = with_held(|held| {
+            let left = let_go(held, now);
             let gate = held.share.gate(
                 Reach {
                     app: named.as_ref().map(|named| named.key.as_str()),
@@ -355,10 +388,23 @@ pub(crate) fn admit(method: ComputerMethod, params: &Value) -> Result<Scope, Com
                 held.labels
                     .entry(named.key.clone())
                     .or_insert_with(|| named.label.clone());
+                if let Some(pid) = named.pid {
+                    held.pids.insert(named.key.clone(), pid);
+                }
+                if let Some(word) = params.get("app").and_then(Value::as_str) {
+                    held.words.insert(app_key(word), named.key.clone());
+                }
             }
-            (gate, held.share.generation(), presented(held))
+            if matches!(gate, Gate::Go)
+                && let Some(app) = looks_in.as_deref()
+            {
+                held.share.used(app, now);
+            }
+            (left, gate, held.share.generation(), presented(held))
         });
-        if before != after {
+        // What left may be the app that waits for the person, which is none
+        // of the apps in use: the band shows its line too.
+        if left || before != after {
             tell();
         }
         match gate {
@@ -390,6 +436,7 @@ pub(crate) fn admit(method: ComputerMethod, params: &Value) -> Result<Scope, Com
                     app: named.as_ref().map(|named| named.key.clone()),
                     acts,
                     whole_screen: screen,
+                    looks_in,
                 })));
             }
             Gate::Refuse(refused) => return Err(refused),
@@ -443,15 +490,248 @@ pub(crate) fn ensure_current() -> Result<(), ComputerUseError> {
         if held.share.generation() != admitted.generation {
             return Err(took_control());
         }
-        held.share.still_holds(
+        let holds = held.share.still_holds(
             Reach {
                 app: admitted.app.as_deref(),
                 acts: admitted.acts,
                 whole_screen: admitted.whole_screen,
             },
             now,
-        )
+        );
+        if holds.is_ok()
+            && let Some(app) = admitted.looks_in.as_deref().or(admitted.app.as_deref())
+        {
+            held.share.used(app, now);
+        }
+        holds
     })
+}
+
+/// Let go of the apps whose use is over (`Share::lapse`): one whose process
+/// ended, and where sharing is not required one nothing reached for a minute.
+/// What the window kept for an app goes with it. Whether anything the band
+/// shows left.
+///
+/// The minute does not run while the person is being asked something. A press
+/// they are asked about waits for their answer up to two minutes and nothing
+/// reaches its app meanwhile: allowed after the minute, it would go with its
+/// app — and the band's take-control — gone from the band (t-109811). An app
+/// that quit leaves all the same.
+fn let_go(held: &mut Held, now: u64) -> bool {
+    if person_is_asked() {
+        let in_use: Vec<String> = held.share.targets().map(str::to_string).collect();
+        for app in &in_use {
+            held.share.used(app, now);
+        }
+    }
+    let pids = &held.pids;
+    let left = held
+        .share
+        .lapse(now, |app| pids.get(app).is_some_and(|pid| exited(*pid)));
+    if left {
+        let in_use: Vec<String> = held.share.targets().map(str::to_string).collect();
+        let waits = held.share.waiting().map(str::to_string);
+        let kept = |key: &String| in_use.contains(key) || waits.as_ref() == Some(key);
+        held.labels.retain(|key, _| kept(key));
+        held.panel_windows.retain(|key, _| in_use.contains(key));
+        held.pids.retain(|key, _| in_use.contains(key));
+        held.words.retain(|_, key| in_use.contains(key));
+    }
+    left
+}
+
+/// The app in use that `word` means, from what the window already holds of
+/// the apps in use: the words agents named them by, their keys, the names the
+/// helper gave them, their processes. An act holds its app by the bundle
+/// identifier the helper names it by, and a free look — not worth the helper's
+/// round trip — names it by the agent's word alone; without this a look moved
+/// nothing, and an agent that only read for a minute lost its app from the
+/// band (t-109811). Nothing is judged by it: a free look goes whatever it
+/// names, so a word another app has taken since can only keep the first app
+/// on the band a little longer.
+fn in_use_as(held: &Held, word: &str) -> Option<String> {
+    let wanted = app_key(word);
+    let in_use = |key: &str| held.share.targets().any(|target| target == key);
+    if let Some(key) = held.words.get(&wanted).filter(|key| in_use(key)) {
+        return Some(key.clone());
+    }
+    let pid = wanted
+        .strip_prefix("pid:")
+        .and_then(|pid| pid.parse::<i64>().ok());
+    held.share
+        .targets()
+        .find(|key| {
+            *key == wanted
+                || held
+                    .labels
+                    .get(*key)
+                    .is_some_and(|label| app_key(label) == wanted)
+                || pid.is_some_and(|pid| held.pids.get(*key) == Some(&pid))
+        })
+        .map(str::to_string)
+}
+
+/// The app in use that an answer names, by the app's key. A look at an app's
+/// tree answers with the app whole, and its bundle identifier is its key. A
+/// read of its text and a search of its elements answer with the name the
+/// helper gave it and no more: then the one app in use that bears the name,
+/// and none where two do.
+fn in_use_named_by(held: &Held, app: &Value) -> Option<String> {
+    if let Some(name) = app.as_str() {
+        let wanted = app_key(name);
+        let mut bearing = held.share.targets().filter(|key| {
+            held.labels
+                .get(*key)
+                .is_some_and(|label| app_key(label) == wanted)
+        });
+        let key = bearing.next()?;
+        return bearing.next().is_none().then(|| key.to_string());
+    }
+    let name = app.get("name")?.as_str()?;
+    let key = named_app_key(app.get("bundleId").and_then(Value::as_str), name);
+    held.share
+        .targets()
+        .any(|target| target == key)
+        .then_some(key)
+}
+
+/// What a free look's answer says of the app it read. The helper names the
+/// app in every look it answers, so where that app is in use the look is a
+/// use of it under whatever word the agent gave, and the word names the app
+/// from then on ([`in_use_as`]) — at no round trip. A word no act carried and
+/// no name of the app's spells would otherwise never be matched: a mark's
+/// press names no app at all, and `Notes` is `메모` on a Korean Mac
+/// (t-109874). Nothing is judged by it.
+pub(super) fn heard(answer: &Value) {
+    let word = ADMITTED.with(|held| {
+        let held = held.borrow();
+        let admitted = held.as_ref()?;
+        if admitted.acts || admitted.looks_in.is_some() {
+            return None;
+        }
+        admitted.app.clone()
+    });
+    let Some(word) = word else { return };
+    let Some(app) = answer
+        .pointer("/snapshot/app")
+        .or_else(|| answer.get("app"))
+    else {
+        return;
+    };
+    let now = now_ms();
+    let tied = with_held(|held| {
+        let key = in_use_named_by(held, app)?;
+        held.share.used(&key, now);
+        held.words.insert(word, key.clone());
+        Some(key)
+    });
+    if let Some(key) = tied {
+        ADMITTED.with(|held| {
+            if let Some(admitted) = held.borrow_mut().as_mut() {
+                admitted.looks_in = Some(key);
+            }
+        });
+    }
+}
+
+/// Whether the person is being asked something now — a press's question, a
+/// card, their own turn: the window's word, and in a test the test's, so no
+/// test depends on a question another test has open.
+fn person_is_asked() -> bool {
+    #[cfg(test)]
+    {
+        stand_in::ASKING.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        super::confirm::asking()
+    }
+}
+
+/// Whether the process `pid` has ended: the host's word, and in a test the
+/// test's, so no test depends on which numbers this machine has given out.
+fn exited(pid: i64) -> bool {
+    #[cfg(test)]
+    {
+        stand_in::ENDED.with(|ended| ended.borrow().contains(&pid))
+    }
+    #[cfg(not(test))]
+    {
+        host_says_ended(pid)
+    }
+}
+
+/// Whether the host says the process `pid` has ended. Only "no such process"
+/// proves it: anything else is a process the host would not describe. Where
+/// the host has no such question (Windows) nothing is proven, and an app
+/// leaves by its quiet alone.
+#[cfg(any(unix, not(test)))]
+fn host_says_ended(pid: i64) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: probing with signal 0 sends nothing.
+        pid > 0
+            && unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Let go of what is over now, and tell the band when anything left. Whether
+/// anything still stands that could be let go later.
+pub(crate) fn lapse() -> bool {
+    let now = now_ms();
+    let (left, more) = with_held(|held| (let_go(held, now), held.share.may_lapse()));
+    if left {
+        tell();
+    }
+    more
+}
+
+/// How often the window looks for uses that are over, while any stands.
+#[cfg(not(test))]
+const LAPSE_LOOK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether the look for uses that are over is running.
+#[cfg(not(test))]
+static LOOKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Look for uses that are over for as long as any stands: one thread, begun
+/// by the first telling of a use and ended by the look that finds none left.
+#[cfg(not(test))]
+fn look_for_lapses() {
+    use std::sync::atomic::Ordering;
+
+    if !with_held(|held| held.share.may_lapse()) || LOOKING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let looking = std::thread::Builder::new()
+        .name("computer-share-lapse".into())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(LAPSE_LOOK);
+                if lapse() {
+                    continue;
+                }
+                LOOKING.store(false, Ordering::Release);
+                // A use told between that look and the store found the look
+                // running and began none: this thread goes on for it.
+                if !with_held(|held| held.share.may_lapse()) || LOOKING.swap(true, Ordering::AcqRel)
+                {
+                    return;
+                }
+            }
+        });
+    if looking.is_err() {
+        LOOKING.store(false, Ordering::Release);
+    }
 }
 
 /// The person takes control of the shared window.
@@ -474,6 +754,8 @@ pub(crate) fn end(app: &str, generation: u64) -> Value {
         }
         held.labels.clear();
         held.panel_windows.clear();
+        held.pids.clear();
+        held.words.clear();
         true
     });
     if ended {
@@ -642,6 +924,7 @@ fn tell() {
         if let Some((_, notice)) = road {
             notice(&said);
         }
+        look_for_lapses();
     }
     #[cfg(test)]
     {
@@ -666,6 +949,20 @@ pub(crate) mod stand_in {
         pub(super) static ASKED: RefCell<Option<Person>> = const { RefCell::new(None) };
         pub(super) static NOTICES: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
         pub(super) static NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// The processes a test says have ended: none until it says.
+        pub(super) static ENDED: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+        /// Whether a test says the person is being asked something.
+        pub(super) static ASKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// On this thread the person is, or is no longer, being asked something.
+    pub(crate) fn asking(asked: bool) {
+        ASKING.with(|asking| asking.set(asked));
+    }
+
+    /// On this thread the processes in `pids` have ended and every other runs.
+    pub(crate) fn ended(pids: &[i64]) {
+        ENDED.with(|ended| *ended.borrow_mut() = pids.to_vec());
     }
 
     /// Move this thread's share clock on by `ms`.
@@ -682,6 +979,8 @@ pub(crate) mod stand_in {
             ASKED.with(|asked| asked.borrow_mut().take());
             REQUIRED.with(|read| read.borrow_mut().take());
             NOTICES.with(|notices| notices.borrow_mut().clear());
+            ENDED.with(|ended| ended.borrow_mut().clear());
+            ASKING.with(|asking| asking.set(false));
         }
     }
 

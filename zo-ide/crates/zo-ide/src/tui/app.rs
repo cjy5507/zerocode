@@ -1923,6 +1923,9 @@ impl Ui {
     /// whole switch did.
     fn apply_live_permission_mode(&mut self, mode: PermissionMode) -> bool {
         self.permission_mode = mode;
+        // The person set the mode themselves: what plan mode kept to put back
+        // on leaving it is no longer theirs to have restored (153).
+        tools::forget_plan_mode_put_backs();
         write_permission_cell(self.permission_cell.as_deref(), mode)
     }
 
@@ -2026,7 +2029,12 @@ impl Ui {
             // Four fifths of the rows' room: a row wraps at a word, so words
             // that fill two rows to the column can take a third.
             let columns = super::view::status_detail_columns(self.width()) * thinking::TAIL_ROWS * 4 / 5;
-            details.extend(thinking::live_tail(&self.thinking_said, columns));
+            let tail = if super::style::current().style == super::style::TuiStyle::Marks {
+                thinking::live_tail_without_headings(&self.thinking_said, columns)
+            } else {
+                thinking::live_tail(&self.thinking_said, columns)
+            };
+            details.extend(tail);
         }
         if let Some(status) = self.status.as_mut() {
             status.set_details_max_lines(details.len().max(STATUS_DETAILS_DEFAULT_MAX_LINES));
@@ -6372,6 +6380,15 @@ impl App {
         // rules narrowed — here or in a run nobody watched — is said now, once
         // (t-105662).
         if let Some(text) = runtime::take_allow_always_narrow_notice(&self.session().cwd) {
+            crate::runtime_support::push_startup_warning(text);
+        }
+        // … and so is the word that "always allow" given here last time
+        // lasted that session only, for a person whose settings use the
+        // ordered `rules` (153).
+        if let Some(text) = runtime::take_allow_always_session_only_notice(
+            &runtime::default_config_home(),
+            &self.session().cwd,
+        ) {
             crate::runtime_support::push_startup_warning(text);
         }
         // What the runtime build found wrong in the settings — a permission
@@ -10831,6 +10848,117 @@ mod tests {
             inside: true,
         };
         assert!(!guard.swallows(&KeyEvent::from(KeyCode::Char('a')), now + Duration::from_secs(1)));
+    }
+
+    /// Crossterm parses `ESC ]` as `Alt+]` and `ESC \` as `Alt+\` when both
+    /// bytes arrive in one read, and a second colour reply (`OSC 11`) follows
+    /// immediately after `OSC 10`. Both replies must be swallowed and the
+    /// following `h` must reach the composer.
+    #[test]
+    fn a_late_crossterm_osc_pair_with_st_is_swallowed_and_leaves_h_alone() {
+        use super::{KeyCode, KeyEvent, KeyModifiers, LateOscGuard};
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let mut guard = LateOscGuard {
+            until: now + Duration::from_secs(3),
+            saw_escape: false,
+            inside: false,
+        };
+        let alt = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::ALT);
+        let plain = KeyEvent::from;
+
+        for payload in ["10;rgb:e0e0/e0e0/e0e0", "11;rgb:1c1c/1e1e/2626"] {
+            assert!(guard.swallows(&alt(']'), now), "Alt+] must open and be swallowed");
+            for ch in payload.chars() {
+                assert!(guard.swallows(&plain(KeyCode::Char(ch)), now), "{ch} reached the composer");
+            }
+            assert!(guard.swallows(&alt('\\'), now), "Alt+\\ must close and be swallowed");
+        }
+
+        assert!(!guard.swallows(&plain(KeyCode::Char('h')), now), "h after replies must reach the composer");
+    }
+
+    /// Crossterm parses `BEL` (`0x07`) as `Ctrl+g`. Multiple BEL-terminated
+    /// replies inside the window must all be swallowed, leaving `h` intact.
+    #[test]
+    fn a_late_crossterm_osc_pair_with_bel_is_swallowed_and_leaves_h_alone() {
+        use super::{KeyCode, KeyEvent, KeyModifiers, LateOscGuard};
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let mut guard = LateOscGuard {
+            until: now + Duration::from_secs(3),
+            saw_escape: false,
+            inside: false,
+        };
+        let alt = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::ALT);
+        let bel = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        let plain = KeyEvent::from;
+
+        for payload in ["10;rgb:e0e0/e0e0/e0e0", "11;rgb:1c1c/1e1e/2626"] {
+            assert!(guard.swallows(&alt(']'), now), "Alt+] must open and be swallowed");
+            for ch in payload.chars() {
+                assert!(guard.swallows(&plain(KeyCode::Char(ch)), now), "{ch} reached the composer");
+            }
+            assert!(guard.swallows(&bel, now), "Ctrl+g (BEL) must close and be swallowed");
+        }
+
+        assert!(!guard.swallows(&plain(KeyCode::Char('h')), now), "h after replies must reach the composer");
+    }
+
+    /// Past the three-second window, `Alt+]` is the operator's again.
+    #[test]
+    fn a_late_crossterm_osc_reply_past_the_window_is_not_swallowed() {
+        use super::{KeyCode, KeyEvent, KeyModifiers, LateOscGuard};
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let mut guard = LateOscGuard {
+            until: now + Duration::from_secs(3),
+            saw_escape: false,
+            inside: false,
+        };
+        let after = now + Duration::from_secs(4);
+        assert!(!guard.swallows(&KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT), after));
+    }
+
+    /// A marks startup probe sends up to nineteen queries (OSC 10, OSC 11,
+    /// sixteen OSC 4 slots, and the end-sentinel OSC 10). All nineteen late
+    /// replies must be swallowed in sequence, leaving a following `h` intact.
+    #[test]
+    fn nineteen_late_osc_replies_are_all_swallowed_and_leave_h_alone() {
+        use super::{KeyCode, KeyEvent, KeyModifiers, LateOscGuard};
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let mut guard = LateOscGuard {
+            until: now + Duration::from_secs(3),
+            saw_escape: false,
+            inside: false,
+        };
+        let alt = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::ALT);
+        let plain = KeyEvent::from;
+
+        let mut payloads = vec![
+            "10;rgb:6565/7b7b/8383".to_string(),
+            "11;rgb:fdfd/f6f6/e3e3".to_string(),
+        ];
+        for slot in 0..16 {
+            payloads.push(format!("4;{slot};rgb:2a2a/a1a1/9898"));
+        }
+        payloads.push("10;rgb:6565/7b7b/8383".to_string());
+        assert_eq!(payloads.len(), 19);
+
+        for payload in payloads {
+            assert!(guard.swallows(&alt(']'), now), "Alt+] must open and be swallowed");
+            for ch in payload.chars() {
+                assert!(guard.swallows(&plain(KeyCode::Char(ch)), now), "{ch} reached the composer");
+            }
+            assert!(guard.swallows(&alt('\\'), now), "Alt+\\ must close and be swallowed");
+        }
+
+        assert!(!guard.swallows(&plain(KeyCode::Char('h')), now), "h after 19 replies must reach the composer");
     }
     /// A result that missed its cell must still be drawn as what it is. The
     /// old code forced `ToolKind::Call`, so an edit came back as a generic

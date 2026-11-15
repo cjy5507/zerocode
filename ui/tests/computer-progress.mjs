@@ -1181,6 +1181,10 @@ async function testThePanelReadsTheWorkBrowser(browser, origin, ok) {
     const desk = await evaluateCase(page, async ({ subject }) => {
       const hands = window.__COMPUTER_HANDS__;
       hands.recordCommand("computer_progress_frame", () => null);
+      // A window stays shared through these cases: the band stands while
+      // nothing acts, so the panel under it stays open (it closes with the
+      // band, 2026-11-15) and its line says nobody acts.
+      hands.announce("computer:share-state", { target: "safari", label: "Safari", takenBack: false, generation: 1, revision: 1 });
       hands.openPanel(subject);
       await hands.settle();
       const quiet = hands.readControl();
@@ -2074,7 +2078,858 @@ async function testAReloadDuringTheStop(browser, origin, ok) {
   } finally { await page.close(); }
 }
 
+/* The band closes itself (2026-11-15): when the backend says the share ended
+ * (`target: null`) or the operator went quiet for the band's idle time, the
+ * band and the work screen panel both go, with nothing of the last session
+ * left — no picture, no look for the view to open. A stop that stands and a
+ * window the person took back are the person's to lift, so both stay. */
+async function testTheBandClosesItself(browser, origin, ok) {
+  const { page, faults } = await openComputerPage(browser, origin);
+  try {
+    const shareEnds = await evaluateCase(page, async ({ subject }) => {
+      const hands = window.__COMPUTER_HANDS__;
+      hands.announce("computer:share-state", { target: "safari", label: "Safari", takenBack: false, generation: 1, revision: 1 });
+      hands.announce("computer:activity", hands.operatorReport({ revision: 1, active: false }));
+      hands.announce("computer:frame", { ...subject, seq: 3 });
+      await hands.settle();
+      const frames = hands.recordCommand("computer_progress_frame", () => hands.look(subject, 3));
+      hands.pressBand("view");
+      await hands.settle();
+      document.getElementById("computer-progress-close").focus();
+      const open = { band: hands.readBand(), panel: hands.readPanel() };
+      hands.announce("computer:share-state", { target: null, takenBack: false, generation: 2, revision: 2 });
+      await hands.settle();
+      const ended = { band: hands.readBand(), panel: hands.readPanel() };
+      const focusLeftInHidden = document.activeElement !== document.body &&
+        document.activeElement?.closest("[hidden]") != null;
+      // The next session starts clean: no view to a look of the last one.
+      hands.announce("computer:activity", hands.operatorReport({ revision: 3, active: true }));
+      await hands.settle();
+      const next = hands.readBand();
+      hands.announce("computer:activity", hands.operatorReport({ revision: 4, active: false }));
+      await hands.settle();
+      return { open, ended, focusLeftInHidden, next, asked: frames.length };
+    }, { subject: SUBJECT });
+    ok(
+      "when the share ends the band and the open panel close without a press, and nothing of that session is left",
+      shareEnds.open?.band?.shown === true && shareEnds.open?.panel?.shown === true &&
+        shareEnds.ended?.band?.shown === false && shareEnds.ended?.panel?.shown === false &&
+        shareEnds.ended?.panel?.picture === null && shareEnds.focusLeftInHidden === false &&
+        shareEnds.next?.shown === true && shareEnds.next?.offersView === false,
+      JSON.stringify(shareEnds),
+    );
+
+    const quiet = await evaluateCase(page, async ({ subject, idle }) => {
+      const hands = window.__COMPUTER_HANDS__;
+      hands.recordCommand("computer_progress_frame", () => hands.look(subject, 5));
+      hands.announce("computer:activity", hands.operatorReport({ revision: 5, active: true }));
+      hands.announce("computer:frame", { ...subject, seq: 5 });
+      await hands.settle();
+      hands.pressBand("view");
+      await hands.settle();
+      const open = { band: hands.readBand(), panel: hands.readPanel() };
+      await new Promise((done) => hands.census.native.setTimeout(done, idle));
+      await hands.settle();
+      return { open, after: { band: hands.readBand(), panel: hands.readPanel() } };
+    }, { subject: SUBJECT, idle: 8600 });
+    ok(
+      "after the operator's last action the band and the open panel slip away by themselves",
+      quiet.open?.band?.shown === true && quiet.open?.panel?.shown === true &&
+        quiet.after?.band?.shown === false && quiet.after?.panel?.shown === false,
+      JSON.stringify(quiet),
+    );
+
+    const held = await evaluateCase(page, async ({ subject }) => {
+      const hands = window.__COMPUTER_HANDS__;
+      hands.recordCommand("computer_progress_frame", () => hands.look(subject, 7));
+      // The person took the window back: the band and the panel stay.
+      hands.announce("computer:share-state", { target: "safari", label: "Safari", takenBack: true, generation: 3, revision: 3 });
+      hands.announce("computer:activity", hands.operatorReport({ revision: 6, active: false }));
+      hands.announce("computer:frame", { ...subject, seq: 7 });
+      await hands.settle();
+      hands.pressBand("view");
+      await hands.settle();
+      const taken = { band: hands.readBand(), panel: hands.readPanel() };
+      // A stop stands with the share gone: still the person's to lift.
+      hands.announce("computer:activity", hands.operatorReport({ revision: 7, stopped: "window", personsStop: true }));
+      hands.announce("computer:share-state", { target: null, takenBack: false, generation: 4, revision: 4 });
+      await hands.settle();
+      const stopped = { band: hands.readBand(), panel: hands.readPanel() };
+      // Control taken back with no window left (2026-11-16, t-110042): the
+      // backend refuses every action while it holds, window or none, so the
+      // band stays and its give-back is the person's one way to lift it.
+      hands.announce("computer:share-state", { target: null, takenBack: true, generation: 5, revision: 5 });
+      hands.announce("computer:activity", hands.operatorReport({ revision: 8, stopped: null, active: false }));
+      await hands.settle();
+      const give = document.getElementById("computer-band-give");
+      const box = give.getBoundingClientRect();
+      const hit = give.hidden || box.width === 0 ? null
+        : document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+      const gives = hands.recordCommand("computer_give_back", () => null);
+      if (hit === give) hands.pressBand("give");
+      await hands.settle();
+      return {
+        taken, stopped,
+        orphan: {
+          band: hands.readBand(), panel: hands.readPanel(), give: !give.hidden, ownPress: hit === give,
+          end: !document.getElementById("computer-band-end").hidden, sent: gives.length,
+        },
+      };
+    }, { subject: SUBJECT });
+    ok(
+      "a window the person took back and a standing stop keep the band and the panel; control taken back with no window keeps them too, with the give-back shown and taking its own press",
+      held.taken?.band?.shown === true && held.taken?.panel?.shown === true &&
+        held.stopped?.band?.shown === true && held.stopped?.panel?.shown === true &&
+        held.orphan?.band?.shown === true && held.orphan?.panel?.shown === true && held.orphan.give === true &&
+        held.orphan.ownPress === true && held.orphan.end === false && held.orphan.sent === 1,
+      JSON.stringify(held),
+    );
+
+    const typing = await evaluateCase(page, async () => {
+      const hands = window.__COMPUTER_HANDS__;
+      const field = document.createElement("input");
+      field.id = "typing-probe";
+      document.body.append(field);
+      hands.announce("computer:share-state", { target: null, takenBack: false, generation: 6, revision: 6 });
+      hands.announce("computer:activity", hands.operatorReport({ revision: 9, active: true }));
+      await hands.settle();
+      field.focus();
+      hands.announce("computer:activity", hands.operatorReport({ revision: 10, active: false }));
+      await hands.settle();
+      const kept = document.activeElement === field;
+      field.remove();
+      return { kept, band: hands.readBand() };
+    });
+    ok(
+      "closing by itself never takes the keyboard from where the person types",
+      typing.kept === true && typing.band?.shown === false,
+      JSON.stringify(typing),
+    );
+    ok("the closing scenario raised no renderer errors", faults.length === 0, faults.join("\n"));
+  } finally { await page.close(); }
+}
+
+/* Where the band stands (2026-11-15): in the status bar's row at the foot of
+ * the window, not under the header — clear of the tab strip and the title, of
+ * the pane where the person types and of the ask popup — with its stop and its
+ * take-back a press or a key away, and its words readable in both themes. */
+async function testTheBandsPlace(browser, origin, ok) {
+  const states = {
+    working: { activity: { revision: 1, active: true, actions: 12 } },
+    shared: {
+      activity: { revision: 1, active: true, actions: 4 },
+      share: { target: "safari", label: "Safari", takenBack: false, generation: 1, revision: 1 },
+    },
+    taken: {
+      activity: { revision: 1, active: false, actions: 4 },
+      share: { target: "safari", label: "Safari", takenBack: true, generation: 1, revision: 1 },
+    },
+    stopped: { activity: { revision: 1, stopped: "window", personsStop: true } },
+  };
+  for (const width of [900, 1280, 1800]) {
+    for (const [name, state] of Object.entries(states)) {
+      const { page, faults } = await openComputerPage(browser, origin);
+      try {
+        await page.setViewportSize({ width, height: 860 });
+        const seen = await evaluateCase(page, async ({ state }) => {
+          const hands = window.__COMPUTER_HANDS__;
+          if (state.share) hands.announce("computer:share-state", state.share);
+          hands.announce("computer:activity", hands.operatorReport(state.activity));
+          hands.announce("computer:confirm", { id: "place-1", kind: "payment", label: "Place order", verb: "mouse-click", timeoutMs: 120000 });
+          await hands.settle();
+          await new Promise((done) => hands.census.native.setTimeout(done, 300));
+          const rect = (node) => {
+            const box = node?.getBoundingClientRect();
+            return box && box.width > 0 ? { left: box.left, top: box.top, right: box.right, bottom: box.bottom } : null;
+          };
+          const meets = (one, two) => one != null && two != null &&
+            one.left < two.right && two.left < one.right && one.top < two.bottom && two.top < one.bottom;
+          const band = rect(document.getElementById("computer-band"));
+          const ask = rect(document.querySelector("#ask-scrim .permission"));
+          const titlebar = rect(document.querySelector(".titlebar"));
+          const stage = rect(document.querySelector(".stage"));
+          const statusbar = rect(document.querySelector(".statusbar"));
+          return {
+            band, statusbar,
+            onTitle: meets(band, titlebar),
+            onStage: meets(band, stage),
+            onAsk: meets(band, ask),
+            askShown: ask != null,
+            inStatusRow: band != null && statusbar != null && band.top >= statusbar.top - 0.5 &&
+              band.bottom <= statusbar.bottom + 0.5,
+          };
+        }, { state });
+        ok(
+          `at ${width}px wide the ${name} band stands in the status bar's row, clear of the title bar, the pane and the ask popup`,
+          seen.inStatusRow === true && seen.onTitle === false && seen.onStage === false &&
+            seen.askShown === true && seen.onAsk === false,
+          JSON.stringify(seen),
+        );
+        if (faults.length > 0) ok(`the ${name} band at ${width}px raised no renderer errors`, false, faults.join("\n"));
+      } finally { await page.close(); }
+    }
+  }
+
+  const { page, faults } = await openComputerPage(browser, origin);
+  try {
+    const keys = await evaluateCase(page, async () => {
+      const hands = window.__COMPUTER_HANDS__;
+      hands.announce("computer:share-state", { target: "safari", label: "Safari", takenBack: false, generation: 1, revision: 1 });
+      hands.announce("computer:activity", hands.operatorReport({ revision: 1, active: true }));
+      await hands.settle();
+      const stop = document.getElementById("computer-band-stop");
+      const take = document.getElementById("computer-band-take");
+      const reachable = (button) => !button.hidden && button.tabIndex >= 0 && !button.disabled &&
+        button.getClientRects().length > 0;
+      return { stop: reachable(stop), take: reachable(take), role: document.getElementById("computer-band").getAttribute("role") };
+    });
+    const stops = await page.evaluate(() => window.__COMPUTER_HANDS__.recordCommand("computer_stop", () => ({ stopped: true, reason: "window", revision: 2 })).length);
+    await page.focus("#computer-band-stop");
+    await page.keyboard.press("Enter");
+    const stopped = await page.evaluate(async () => {
+      await window.__COMPUTER_HANDS__.settle();
+      return window.__COUNTS__.computer_stop ?? 0;
+    });
+    ok(
+      "the stop and the take-back are in the keyboard's reach, and Enter on the stop stops",
+      keys.stop === true && keys.take === true && keys.role === "status" && stops === 0 && stopped >= 1,
+      JSON.stringify({ keys, stopped }),
+    );
+
+    // The window's focus ring draws on a band button the keyboard holds.
+    const ring = await evaluateCase(page, async () => {
+      const hands = window.__COMPUTER_HANDS__;
+      hands.announce("computer:activity", hands.operatorReport({ revision: 3, active: true, stopped: null }));
+      await hands.settle();
+      const take = document.getElementById("computer-band-take");
+      take.focus();
+      await new Promise((done) => hands.census.native.setTimeout(done, 300));
+      const ringWidth = getComputedStyle(document.documentElement).getPropertyValue("--ring-width").trim();
+      return { visible: take.matches(":focus-visible"), shadow: getComputedStyle(take).boxShadow, ringWidth };
+    });
+    ok(
+      "a band button the keyboard holds wears the window's focus ring",
+      ring.visible === true && Boolean(ring.ringWidth) && ring.shadow.includes(ring.ringWidth),
+      JSON.stringify(ring),
+    );
+
+    // A press with the pointer acts and leaves the keyboard where the person
+    // types; a band that goes lets go of a keyboard left on its buttons.
+    await page.evaluate(() => {
+      window.__COMPUTER_HANDS__.recordCommand("computer_take_control", () => null);
+      document.getElementById("key-sink").focus();
+    });
+    await page.click("#computer-band-take");
+    const pressed = await page.evaluate(async () => {
+      const hands = window.__COMPUTER_HANDS__;
+      await hands.settle();
+      const kept = document.activeElement?.id ?? null;
+      const taken = window.__COUNTS__.computer_take_control ?? 0;
+      document.getElementById("computer-band-end").focus();
+      hands.announce("computer:share-state", { target: null, takenBack: false, generation: 9, revision: 9 });
+      hands.announce("computer:activity", hands.operatorReport({ revision: 4, active: false, stopped: null }));
+      await hands.settle();
+      const band = document.getElementById("computer-band");
+      return { kept, taken, bandShown: !band.hidden, heldByBand: band.contains(document.activeElement) };
+    });
+    ok(
+      "a pointer press on the band acts without taking the keyboard from the terminal, and a band that goes lets go of the keyboard",
+      pressed.kept === "key-sink" && pressed.taken >= 1 && pressed.bandShown === false && pressed.heldByBand === false,
+      JSON.stringify(pressed),
+    );
+
+    const ink = await evaluateCase(page, async () => {
+      const hands = window.__COMPUTER_HANDS__;
+      // A paint as the eye gets it: laid over the ground it stands on.
+      const channels = (paint, under = "#000") => {
+        const probe = document.createElement("canvas").getContext("2d");
+        probe.fillStyle = under;
+        probe.fillRect(0, 0, 1, 1);
+        probe.fillStyle = paint;
+        probe.fillRect(0, 0, 1, 1);
+        return [...probe.getImageData(0, 0, 1, 1).data];
+      };
+      const luminance = ([r, g, b]) => [r, g, b].map((c) => {
+        const v = c / 255;
+        return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+      }).reduce((sum, v, at) => sum + v * [0.2126, 0.7152, 0.0722][at], 0);
+      const ratio = (one, two) => {
+        const [a, b] = [luminance(one), luminance(two)].sort((x, y) => y - x);
+        return (a + 0.05) / (b + 0.05);
+      };
+      const read = () => {
+        const band = document.getElementById("computer-band");
+        const floor = getComputedStyle(document.body).backgroundColor;
+        const groundPaint = getComputedStyle(band).backgroundColor;
+        const ground = channels(groundPaint, floor);
+        const groundCss = `rgb(${ground.slice(0, 3).join(" ")})`;
+        const of = (id) => ratio(channels(getComputedStyle(document.getElementById(id)).color, groundCss), ground);
+        return { word: of("computer-band-word"), stop: of("computer-band-stop"), count: of("computer-band-count") };
+      };
+      hands.announce("computer:activity", hands.operatorReport({ revision: 3, active: true }));
+      await hands.settle();
+      const dark = read();
+      const theme = document.documentElement.dataset.theme;
+      document.documentElement.dataset.theme = "light";
+      // The window eases every colour change: read once the ease is over.
+      await new Promise((done) => hands.census.native.setTimeout(done, 400));
+      const light = read();
+      if (theme == null) delete document.documentElement.dataset.theme;
+      else document.documentElement.dataset.theme = theme;
+      return { dark, light };
+    });
+    const readable = (one) => one != null && one.word >= 4.5 && one.stop >= 4.5 && one.count >= 4.5;
+    ok(
+      "the band's words, count and stop read at 4.5:1 or more on its ground in the dark and the light theme",
+      readable(ink.dark) && readable(ink.light),
+      JSON.stringify(ink),
+    );
+    ok("the band's keys and ink scenario raised no renderer errors", faults.length === 0, faults.join("\n"));
+  } finally { await page.close(); }
+
+  // At 320px wide the band wraps upward and every button stays on screen,
+  // apart from the others, and takes its own press.
+  const narrow = await openComputerPage(browser, origin);
+  try {
+    await narrow.page.setViewportSize({ width: 320, height: 640 });
+    const seen = await evaluateCase(narrow.page, async () => {
+      const hands = window.__COMPUTER_HANDS__;
+      hands.announce("computer:share-state", { target: "safari", label: "Safari", takenBack: false, generation: 1, revision: 1 });
+      hands.announce("computer:activity", hands.operatorReport({ revision: 1, active: true, actions: 12 }));
+      await hands.settle();
+      const buttons = [...document.querySelectorAll("#computer-band button")].filter((one) => !one.hidden);
+      const boxes = buttons.map((one) => one.getBoundingClientRect());
+      const inside = boxes.every((box) => box.left >= 0 && box.top >= 0 &&
+        box.right <= window.innerWidth + 0.5 && box.bottom <= window.innerHeight + 0.5);
+      const apart = boxes.every((one, at) => boxes.every((two, other) => other === at ||
+        one.right <= two.left || two.right <= one.left || one.bottom <= two.top || two.bottom <= one.top));
+      const own = (id) => {
+        const box = document.getElementById(id).getBoundingClientRect();
+        return document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2)?.closest("button")?.id === id;
+      };
+      return { buttons: buttons.length, inside, apart, stop: own("computer-band-stop"), take: own("computer-band-take") };
+    });
+    ok(
+      "on a 320px wide window the band's buttons stay on screen, apart, and the stop and take-back take their own press",
+      seen.buttons >= 3 && seen.inside === true && seen.apart === true && seen.stop === true && seen.take === true,
+      JSON.stringify(seen),
+    );
+    ok("the narrow band scenario raised no renderer errors", narrow.faults.length === 0, narrow.faults.join("\n"));
+  } finally { await narrow.page.close(); }
+}
+
+/* A full status bar (2026-11-16): the person's window shows all six plan
+ * gauges, and the band stood over their left end — the usage button and up to
+ * five gauges at 900, 1280 and 1800px. The band covers nothing the bar shows,
+ * in every state and above all in the two that do not lift by themselves (a
+ * standing stop, a window taken back), and still nothing of the title, the
+ * pane where the person types or the ask popup. */
+const FULL_BAR_GAUGES = ["sb-codex", "sb-antigravity", "sb-kimi", "sb-grok", "sb-opencode-go"];
+
+function fillTheStatusBar(gauges) {
+  window.__HOLD_POLLERS__ = true;
+  for (const id of ["sb-claude", ...gauges]) {
+    const gauge = document.getElementById(id);
+    gauge.hidden = false;
+    for (const part of gauge.querySelectorAll(".sb-usage-bar, .sb-claude-pct")) part.hidden = false;
+    gauge.querySelector(".sb-claude-pct").textContent = "5h 42% · 7d 18%";
+  }
+  document.getElementById("sb-model").textContent = "claude-opus-5-5";
+  document.getElementById("sb-usage").textContent = "ctx 182k / 1M";
+}
+
+async function testTheBandCoversNothingInAFullBar(browser, origin, ok) {
+  const states = {
+    working: { activity: { revision: 1, active: true, actions: 12 } },
+    shared: {
+      activity: { revision: 1, active: true, actions: 4 },
+      share: { target: "safari", label: "Safari", takenBack: false, generation: 1, revision: 1 },
+    },
+    taken: {
+      activity: { revision: 1, active: false, actions: 4 },
+      share: { target: "safari", label: "Safari", takenBack: true, generation: 1, revision: 1 },
+    },
+    waiting: {
+      activity: { revision: 1, active: false, actions: 0 },
+      share: { target: null, waiting: "notes", waitingLabel: "메모", generation: 1, revision: 1 },
+    },
+    stopped: { activity: { revision: 1, stopped: "window", personsStop: true, actions: 7 } },
+  };
+  for (const width of [320, 900, 1280, 1800]) {
+    for (const [name, state] of Object.entries(states)) {
+      const { page, faults } = await openComputerPage(browser, origin);
+      try {
+        await page.setViewportSize({ width, height: 860 });
+        await page.evaluate(fillTheStatusBar, FULL_BAR_GAUGES);
+        const seen = await evaluateCase(page, async ({ state }) => {
+          const hands = window.__COMPUTER_HANDS__;
+          if (state.share) hands.announce("computer:share-state", state.share);
+          hands.announce("computer:activity", hands.operatorReport(state.activity));
+          hands.announce("computer:confirm", { id: "full-1", kind: "payment", label: "Place order", verb: "mouse-click", timeoutMs: 120000 });
+          await hands.settle();
+          await new Promise((done) => hands.census.native.setTimeout(done, 300));
+          const rect = (node) => {
+            if (!node || node.closest("[hidden]") || node.getClientRects().length === 0) return null;
+            const box = node.getBoundingClientRect();
+            return box.width > 0 && box.height > 0
+              ? { left: box.left, top: box.top, right: box.right, bottom: box.bottom } : null;
+          };
+          const meets = (one, two) => one != null && two != null &&
+            one.left < two.right - 0.5 && two.left < one.right - 0.5 && one.top < two.bottom - 0.5 && two.top < one.bottom - 0.5;
+          const band = rect(document.getElementById("computer-band"));
+          // What the bar shows: each item standing in it, each gauge inside the
+          // usage button too, never the empty middle.
+          const shown = [...document.querySelectorAll(".statusbar > *, .statusbar .sb-claude")]
+            .filter((node) => !node.classList.contains("sb-spacer"))
+            .map((node) => ({ name: node.id || node.className, box: rect(node) }))
+            .filter((item) => item.box != null);
+          const gauges = shown.filter((item) => item.name.startsWith("sb-") && document.getElementById(item.name)?.classList.contains("sb-claude"));
+          return {
+            band,
+            gauges: gauges.length,
+            covered: shown.filter((item) => meets(band, item.box)).map((item) => item.name),
+            onTitle: meets(band, rect(document.querySelector(".titlebar"))),
+            onWorkbench: meets(band, rect(document.getElementById("workbench"))),
+            onAsk: meets(band, rect(document.querySelector("#ask-scrim .permission"))),
+            askShown: rect(document.querySelector("#ask-scrim .permission")) != null,
+            onScreen: band != null && band.left >= -0.5 && band.right <= window.innerWidth + 0.5 &&
+              band.bottom <= window.innerHeight + 0.5,
+          };
+        }, { state });
+        ok(
+          `in a full status bar at ${width}px wide the ${name} band covers nothing the bar shows, nor the title, the pane or the ask popup`,
+          seen.band != null && seen.gauges === 6 && seen.covered.length === 0 && seen.onTitle === false &&
+            seen.onWorkbench === false && seen.askShown === true && seen.onAsk === false && seen.onScreen === true,
+          JSON.stringify(seen),
+        );
+        if (faults.length > 0) ok(`the full bar ${name} band at ${width}px raised no renderer errors`, false, faults.join("\n"));
+      } finally { await page.close(); }
+    }
+  }
+
+  // A whole session at 1800px: the working band fits the empty middle, the
+  // share widens it past the middle, the share ends while the operator still
+  // acts, the band goes. The panes give room once and get it back once — the
+  // band does not hop between the middle and its own line as it narrows.
+  const { page, faults } = await openComputerPage(browser, origin);
+  try {
+    await page.setViewportSize({ width: 1800, height: 860 });
+    await page.evaluate(fillTheStatusBar, FULL_BAR_GAUGES);
+    const session = await evaluateCase(page, async () => {
+      const hands = window.__COMPUTER_HANDS__;
+      const wait = (ms) => new Promise((done) => hands.census.native.setTimeout(done, ms));
+      const workbench = document.getElementById("workbench");
+      const heights = [Math.round(workbench.getBoundingClientRect().height)];
+      const watch = new ResizeObserver(() => {
+        const height = Math.round(workbench.getBoundingClientRect().height);
+        if (height !== heights.at(-1)) heights.push(height);
+      });
+      watch.observe(workbench);
+      const place = () => document.querySelector(".computer-dock").dataset.place;
+      const steps = {};
+      hands.announce("computer:activity", hands.operatorReport({ revision: 1, active: true, actions: 2 }));
+      await hands.settle(); await wait(150);
+      steps.working = place();
+      hands.announce("computer:share-state", { target: "safari", label: "Safari", takenBack: false, generation: 1, revision: 1 });
+      await hands.settle(); await wait(150);
+      steps.shared = place();
+      hands.announce("computer:share-state", { target: null, takenBack: false, generation: 1, revision: 2 });
+      hands.announce("computer:activity", hands.operatorReport({ revision: 2, active: true, actions: 5 }));
+      await hands.settle(); await wait(150);
+      steps.narrowed = place();
+      hands.announce("computer:activity", hands.operatorReport({ revision: 3, active: false, actions: 5 }));
+      await hands.settle(); await wait(8600);
+      steps.gone = document.getElementById("computer-band").hidden;
+      await wait(150);
+      watch.disconnect();
+      return { steps, heights, room: getComputedStyle(document.body).getPropertyValue("--computer-band-room") };
+    });
+    ok(
+      "over a session the band stands in the middle while it fits, takes its own line once it does not, keeps it until it goes, and gives the panes their room back",
+      session.steps.working === "row" && session.steps.shared === "raised" && session.steps.narrowed === "raised" &&
+        session.steps.gone === true && session.heights.length === 3 && session.heights[0] === session.heights[2] &&
+        session.heights[1] < session.heights[0] && session.room === "",
+      JSON.stringify(session),
+    );
+    ok("the full bar session raised no renderer errors", faults.length === 0, faults.join("\n"));
+  } finally { await page.close(); }
+}
+
+/* What stands at the window's foot (2026-11-16, t-110042): the band on its own
+ * line stood over the person's-turn card docked in the corner, the toasts, the
+ * floating workspace's door and the SFTP launcher beside it, the SFTP manager,
+ * and the foot of every dialog tall enough to reach the scrim's edge — at 320px
+ * it took the presses of the card's 「다 했어요 · 취소」. And in the board
+ * pop-out, which draws no status bar, it stood 24px up over the board. Each is
+ * read the way a hand meets it: the band's box against the thing's box, and
+ * what a press at each control's middle lands on. */
+const BAND_STATES = {
+  working: { activity: { revision: 1, active: true, actions: 12 } },
+  shared: {
+    activity: { revision: 1, active: true, actions: 4 },
+    share: { target: "safari", label: "Safari", takenBack: false, generation: 1, revision: 1 },
+  },
+  taken: {
+    activity: { revision: 1, active: false, actions: 4 },
+    share: { target: "safari", label: "Safari", takenBack: true, generation: 1, revision: 1 },
+  },
+  waiting: {
+    activity: { revision: 1, active: false, actions: 0 },
+    share: { target: null, waiting: "notes", waitingLabel: "메모", generation: 1, revision: 1 },
+  },
+  stopped: { activity: { revision: 1, stopped: "window", personsStop: true, actions: 7 } },
+};
+
+async function readTheFoot(page, { state, scene, surface = null }) {
+  return evaluateCase(page, async ({ state, scene, surface }) => {
+    const hands = window.__COMPUTER_HANDS__;
+    const wait = (ms) => new Promise((done) => hands.census.native.setTimeout(done, ms));
+    if (surface) document.documentElement.dataset.surface = surface;
+    if (state.share) hands.announce("computer:share-state", state.share);
+    hands.announce("computer:activity", hands.operatorReport(state.activity));
+    if (scene.card) hands.announce("computer:handoff", { id: "foot-1", reason: "휴대폰에서 2단계 인증을 승인해 주세요", timeoutMs: 600000 });
+    if (scene.toast) toast("The foot's toast", "", { sticky: true, action: { label: "Open", run: () => {} } });
+    if (scene.doors) {
+      document.getElementById("float-toggle").hidden = false;
+      document.querySelector(".sftp-launcher").hidden = false;
+    }
+    if (scene.manager) document.getElementById("sftp-manager").hidden = false;
+    await hands.settle();
+    await wait(300);
+    const rect = (node) => {
+      if (!node || node.closest("[hidden]") || node.getClientRects().length === 0) return null;
+      const box = node.getBoundingClientRect();
+      return box.width > 0 && box.height > 0
+        ? { left: box.left, top: box.top, right: box.right, bottom: box.bottom } : null;
+    };
+    const meets = (one, two) => one != null && two != null &&
+      one.left < two.right - 0.5 && two.left < one.right - 0.5 && one.top < two.bottom - 0.5 && two.top < one.bottom - 0.5;
+    const bandNode = document.getElementById("computer-band");
+    const band = rect(bandNode);
+    const name = (node) => node.id || node.textContent.trim().slice(0, 16) || node.className;
+    // A control a press at whose middle lands on the band, or on anything but itself.
+    const lost = (nodes) => nodes.map((node) => ({ node, box: rect(node) }))
+      .filter(({ box }) => box != null && box.top >= 0 && box.bottom <= window.innerHeight)
+      .filter(({ node, box }) => {
+        const hit = document.elementFromPoint((box.left + box.right) / 2, (box.top + box.bottom) / 2);
+        return !(hit === node || node.contains(hit));
+      }).map(({ node }) => name(node));
+    const lostToTheBand = (nodes) => nodes.map(rect).filter(Boolean).filter((box) =>
+      bandNode.contains(document.elementFromPoint((box.left + box.right) / 2, (box.top + box.bottom) / 2))).length;
+    const card = rect(document.querySelector("#ask-scrim[data-docked] .permission"));
+    const toasts = [...document.querySelectorAll(".toasts .toast")].map(rect).filter(Boolean);
+    const doors = [document.getElementById("float-toggle"), document.querySelector(".sftp-launcher")];
+    const manager = rect(document.getElementById("sftp-manager"));
+    // Each control a press must reach: the card's when the card stands, else
+    // the toast's (beside a card at 320px the toast stands over the card's
+    // corner whatever the band does — not the band's to answer).
+    const controls = [
+      ...document.querySelectorAll(scene.card ? "#ask-scrim .permission button" : ".toasts button"),
+      ...(scene.doors ? doors : []),
+    ];
+    return {
+      place: document.querySelector(".computer-dock").dataset.place,
+      band,
+      bandAtFoot: band != null && Math.abs(window.innerHeight - band.bottom) < 0.5,
+      card: scene.card ? { shown: card != null, met: meets(band, card), belowTitle: card != null && card.top >= (rect(document.querySelector(".titlebar"))?.bottom ?? 0) - 0.5 } : null,
+      toasts: scene.toast ? { shown: toasts.length, met: toasts.filter((box) => meets(band, box)).length } : null,
+      doors: scene.doors ? doors.filter((node) => meets(band, rect(node))).map(name) : null,
+      manager: scene.manager ? { shown: manager != null, met: meets(band, manager) } : null,
+      lost: lost(controls),
+      underBand: lostToTheBand([...document.querySelectorAll("#ask-scrim .permission button, .toasts button")]),
+      onBoard: meets(band, rect(document.querySelector(".body"))),
+      onScreen: band != null && band.left >= -0.5 && band.right <= window.innerWidth + 0.5 && band.bottom <= window.innerHeight + 0.5,
+    };
+  }, { state, scene, surface });
+}
+
+async function testTheBandCoversNothingAtTheFoot(browser, origin, ok) {
+  // The docked card, in every state the band takes, at every width.
+  for (const width of [320, 900, 1280, 1800]) {
+    for (const [name, state] of Object.entries(BAND_STATES)) {
+      const { page, faults } = await openComputerPage(browser, origin);
+      try {
+        await page.setViewportSize({ width, height: 640 });
+        await page.evaluate(fillTheStatusBar, FULL_BAR_GAUGES);
+        const seen = await readTheFoot(page, { state, scene: { card: true } });
+        ok(
+          `in a full status bar at ${width}px wide the ${name} band covers nothing of the person's-turn card in the corner, which stays under the title, and its 「다 했어요 · 취소」 take their own press`,
+          seen.band != null && seen.card?.shown === true && seen.card.met === false && seen.card.belowTitle === true &&
+            seen.lost?.length === 0 && seen.onScreen === true,
+          JSON.stringify(seen),
+        );
+        if (faults.length > 0) ok(`the foot ${name} band at ${width}px raised no renderer errors`, false, faults.join("\n"));
+      } finally { await page.close(); }
+    }
+  }
+
+  // A toast alone keeps the right corner, and beside a card the left one (the
+  // toasts step aside while any scrim stands); the doors and the SFTP manager
+  // stand where they stand. The widest band, the share.
+  for (const width of [320, 900]) {
+    const scenes = {
+      toast: { toast: true }, "toast beside the card": { toast: true, card: true },
+      doors: { doors: true }, manager: { manager: true },
+    };
+    for (const [what, scene] of Object.entries(scenes)) {
+      const { page, faults } = await openComputerPage(browser, origin);
+      try {
+        await page.setViewportSize({ width, height: 640 });
+        await page.evaluate(fillTheStatusBar, FULL_BAR_GAUGES);
+        const seen = await readTheFoot(page, { state: BAND_STATES.shared, scene });
+        const clear = scene.toast ? seen.toasts?.shown === 1 && seen.toasts.met === 0 && seen.underBand === 0
+          : what === "doors" ? seen.doors?.length === 0
+            : seen.manager?.shown === true && seen.manager.met === false;
+        ok(
+          `in a full status bar at ${width}px wide the shared band covers nothing of the ${what} and leaves every press there its own`,
+          seen.place === "raised" && clear && (scene.card ? seen.card?.met === false : seen.lost?.length === 0),
+          JSON.stringify(seen),
+        );
+        if (faults.length > 0) ok(`the foot ${what} scene at ${width}px raised no renderer errors`, false, faults.join("\n"));
+      } finally { await page.close(); }
+    }
+  }
+
+  // Every dialog the window opens over a scrim, at its tallest the scrim lets
+  // it be: no part of it or of any control in it lies under the band, raised (a full bar) or in the
+  // bar's own row (an empty bar, where the band still stands over the bar's
+  // 24px and a dialog with a 16px edge reaches into them).
+  for (const [width, full] of [[320, true], [900, true], [1800, false]]) {
+    const { page, faults } = await openComputerPage(browser, origin);
+    try {
+      await page.setViewportSize({ width, height: 640 });
+      if (full) await page.evaluate(fillTheStatusBar, FULL_BAR_GAUGES);
+      else await page.evaluate(() => { window.__HOLD_POLLERS__ = true; });
+      const seen = await evaluateCase(page, async ({ state }) => {
+        const hands = window.__COMPUTER_HANDS__;
+        const wait = (ms) => new Promise((done) => hands.census.native.setTimeout(done, ms));
+        hands.announce("computer:share-state", state.share);
+        hands.announce("computer:activity", hands.operatorReport(state.activity));
+        await hands.settle();
+        await wait(150);
+        const bandNode = document.getElementById("computer-band");
+        const bandBox = bandNode.getBoundingClientRect();
+        const under = [];
+        let opened = 0;
+        for (const scrim of document.querySelectorAll("body > .scrim, body > .sftp-dialog-scrim")) {
+          if (scrim.id === "ask-scrim" || !scrim.hidden) continue;
+          scrim.hidden = false;
+          await wait(30);
+          opened += 1;
+          const dialog = [...scrim.children].find((one) => one.getClientRects().length > 0);
+          const frame = dialog?.getBoundingClientRect();
+          // The dialog itself stays clear of the band: a footer filled in later
+          // (the SFTP editor's close · save) stands at its foot.
+          if (frame && frame.left < bandBox.right - 0.5 && bandBox.left < frame.right - 0.5 &&
+            frame.top < bandBox.bottom - 0.5 && bandBox.top < frame.bottom - 0.5) under.push(scrim.id);
+          for (const node of scrim.querySelectorAll("button, input, select, textarea")) {
+            if (node.closest("[hidden]") || node.getClientRects().length === 0) continue;
+            const box = node.getBoundingClientRect();
+            if (box.width === 0 || box.height === 0 || box.top < 0 || box.bottom > window.innerHeight) continue;
+            // Scrolled out of its own dialog: no hand reaches it there, band or none.
+            const y = box.top + box.height / 2;
+            if (!frame || y < frame.top || y > frame.bottom) continue;
+            // Any of the control under the band, not only its middle — of
+            // what its dialog shows of it: a dialog that scrolls clips the rest.
+            const top = Math.max(box.top, frame.top);
+            const bottom = Math.min(box.bottom, frame.bottom);
+            const met = box.left < bandBox.right - 0.5 && bandBox.left < box.right - 0.5 &&
+              top < bandBox.bottom - 0.5 && bandBox.top < bottom - 0.5;
+            if (met) under.push(`${scrim.id}#${node.id || node.textContent.trim().slice(0, 12)}`);
+          }
+          scrim.hidden = true;
+        }
+        return { place: document.querySelector(".computer-dock").dataset.place, opened, under };
+      }, { state: BAND_STATES.shared });
+      ok(
+        `at ${width}px wide with ${full ? "a full" : "an empty"} status bar no dialog the window opens has a control under the band`,
+        seen.opened >= 20 && seen.place === (full ? "raised" : "row") && seen.under?.length === 0,
+        JSON.stringify(seen),
+      );
+      if (faults.length > 0) ok(`the dialogs at the foot at ${width}px raised no renderer errors`, false, faults.join("\n"));
+    } finally { await page.close(); }
+  }
+
+  // The board pop-out draws no status bar: the band stands at the window's
+  // own foot, on a line the board gives it, over nothing of the board — and
+  // the corner card and the toast still clear it.
+  for (const width of [320, 900, 1280]) {
+    for (const name of ["working", "shared", "stopped"]) {
+      const { page, faults } = await openComputerPage(browser, origin);
+      try {
+        await page.setViewportSize({ width, height: 640 });
+        await page.evaluate(() => { window.__HOLD_POLLERS__ = true; });
+        const seen = await readTheFoot(page, { state: BAND_STATES[name], scene: { card: true }, surface: "popout" });
+        ok(
+          `in the board pop-out at ${width}px wide the ${name} band stands at the window's foot over nothing of the board or the corner card, whose buttons take their own press`,
+          seen.band != null && seen.bandAtFoot === true && seen.onBoard === false && seen.card?.shown === true &&
+            seen.card.met === false && seen.lost?.length === 0 && seen.onScreen === true,
+          JSON.stringify(seen),
+        );
+        if (faults.length > 0) ok(`the pop-out ${name} band at ${width}px raised no renderer errors`, false, faults.join("\n"));
+      } finally { await page.close(); }
+    }
+  }
+}
+
+/* A menu the person opens takes its own presses (2026-11-16): a sidebar menu
+ * opened at a pane's last line stood under the band, and a press meant for its
+ * lowest items landed on the band — on its stop, its take-back or its end.
+ * Every menu, popover and tooltip the window opens draws over the band; the
+ * composer's menus, which live low in the stacking, stop above it; and the
+ * band still draws over every modal, so its stop is one press away while the
+ * Computer Use confirm card stands, the SFTP manager's too. */
+async function testTheBandTakesNoPressFromAMenu(browser, origin, ok) {
+  for (const [width, full] of [[320, true], [900, true], [1800, false]]) {
+    const { page, faults } = await openComputerPage(browser, origin);
+    try {
+      await page.setViewportSize({ width, height: 640 });
+      if (full) await page.evaluate(fillTheStatusBar, FULL_BAR_GAUGES);
+      else await page.evaluate(() => { window.__HOLD_POLLERS__ = true; });
+      const seen = await evaluateCase(page, async ({ state }) => {
+        const hands = window.__COMPUTER_HANDS__;
+        const wait = (ms) => new Promise((done) => hands.census.native.setTimeout(done, ms));
+        const bandNode = document.getElementById("computer-band");
+        const dock = bandNode.parentElement;
+        const items = (menu, rows) => [...menu.querySelectorAll(rows)].filter((one) => one.getClientRects().length > 0);
+        const lostToTheBand = (nodes) => nodes.filter((one) => {
+          const box = one.getBoundingClientRect();
+          return bandNode.contains(document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2));
+        }).length;
+        const five = Array.from({ length: 5 }, (_, at) => ({ label: `Item ${at + 1}`, run: () => {} }));
+        // The band comes while a sidebar menu stands open at the foot.
+        openSidebarMenu(16, window.innerHeight - 30, five);
+        await wait(250);
+        hands.announce("computer:share-state", state.share);
+        hands.announce("computer:activity", hands.operatorReport(state.activity));
+        await hands.settle();
+        await wait(250);
+        const band = bandNode.getBoundingClientRect();
+        const sidebarMenu = document.querySelector(".sidebar-menu");
+        const late = { items: items(sidebarMenu, ".sidebar-menu-item").length, lost: lostToTheBand(items(sidebarMenu, ".sidebar-menu-item")) };
+        closeSidebarMenu();
+        await wait(250);
+        // Opened at a pane's last line, just over the band.
+        openSidebarMenu(band.left + 8, band.top - 4, five);
+        await wait(250);
+        const sidebar = { items: items(sidebarMenu, ".sidebar-menu-item").length, lost: lostToTheBand(items(sidebarMenu, ".sidebar-menu-item")) };
+        closeSidebarMenu();
+        await wait(250);
+        openTermMenu(band.left + 8, band.top - 4, 1);
+        await wait(250);
+        const termMenu = document.getElementById("term-menu");
+        const term = { items: items(termMenu, "button").length, lost: lostToTheBand(items(termMenu, "button")) };
+        closeTermMenu();
+        await wait(250);
+        // Every menu, popover and tooltip of the window, laid over the band:
+        // the press at the overlap lands on it.
+        const menuish = (node) => /(^|[\s-])(pop|menu|tooltip|popover)([\s-]|$)/.test(String(node.className)) ||
+          ["menu", "listbox", "tooltip"].includes(node.getAttribute("role")) || node.matches(".team-close, .team-close-form");
+        const under = [];
+        let laid = 0;
+        for (const node of document.body.querySelectorAll("*")) {
+          if (dock.contains(node) || !menuish(node) || node.matches(".composer-menu, .composer-slash")) continue;
+          const hidden = node.hidden;
+          const style = node.getAttribute("style");
+          node.hidden = false;
+          const look = getComputedStyle(node);
+          // Only what takes a press can lose one: a tooltip lets the pointer through.
+          if (look.position !== "fixed" || look.pointerEvents === "none") { node.hidden = hidden; continue; }
+          laid += 1;
+          for (const [name, value] of [["display", look.display === "none" ? "block" : look.display],
+            ["left", `${band.left + 4}px`], ["top", `${band.top - 4}px`], ["min-width", "48px"], ["min-height", "24px"],
+            ["visibility", "visible"], ["opacity", "1"], ["transform", "none"], ["translate", "none"]]) node.style.setProperty(name, value, "important");
+          const hit = document.elementFromPoint(band.left + 20, band.top + 8);
+          if (!node.contains(hit)) under.push(`${node.id || node.className} (layer ${look.zIndex})`);
+          if (style == null) node.removeAttribute("style"); else node.setAttribute("style", style);
+          node.hidden = hidden;
+        }
+        // The stop under the Computer Use confirm card, and with the SFTP
+        // manager standing (its ask stands one layer higher).
+        const stopTakes = () => {
+          const stop = document.getElementById("computer-band-stop");
+          const box = stop.getBoundingClientRect();
+          return !stop.hidden && document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2) === stop;
+        };
+        hands.announce("computer:confirm", { id: "menu-1", kind: "payment", label: "Place order", verb: "mouse-click", timeoutMs: 120000 });
+        await hands.settle();
+        await wait(250);
+        const underConfirm = stopTakes();
+        document.body.classList.add("sftp-active");
+        await wait(50);
+        const underSftpConfirm = stopTakes();
+        document.body.classList.remove("sftp-active");
+        return { place: dock.dataset.place, late, sidebar, term, laid, under, underConfirm, underSftpConfirm };
+      }, { state: BAND_STATES.shared });
+      ok(
+        `at ${width}px wide with ${full ? "a full" : "an empty"} status bar no item of a menu the person opens loses its press to the band — opened over it, or standing when it comes — and every menu, popover and tooltip draws over it`,
+        seen.place === (full ? "raised" : "row") && seen.late?.items === 5 && seen.late.lost === 0 &&
+          seen.sidebar?.items === 5 && seen.sidebar.lost === 0 && seen.term?.items >= 3 && seen.term.lost === 0 &&
+          seen.laid >= 15 && seen.under?.length === 0,
+        JSON.stringify(seen),
+      );
+      ok(
+        `at ${width}px wide the band's stop takes its own press while the Computer Use confirm card stands, and while it stands over the SFTP manager`,
+        seen.underConfirm === true && seen.underSftpConfirm === true,
+        JSON.stringify({ underConfirm: seen.underConfirm, underSftpConfirm: seen.underSftpConfirm }),
+      );
+      if (faults.length > 0) ok(`the menu scenario at ${width}px raised no renderer errors`, false, faults.join("\n"));
+    } finally { await page.close(); }
+  }
+
+  // The composer's menus live low in the stacking, so they stop above the band
+  // instead: in a short narrow window (a band of three lines), under a chip with too little room above it
+  // (the one case they open downward), the open list ends above the band.
+  const { page, faults } = await openComputerPage(browser, origin);
+  try {
+    await page.setViewportSize({ width: 320, height: 420 });
+    await page.evaluate(fillTheStatusBar, FULL_BAR_GAUGES);
+    const composer = await evaluateCase(page, async ({ state }) => {
+      const hands = window.__COMPUTER_HANDS__;
+      hands.announce("computer:share-state", state.share);
+      hands.announce("computer:activity", hands.operatorReport(state.activity));
+      await hands.settle();
+      await new Promise((done) => hands.census.native.setTimeout(done, 200));
+      const chip = document.createElement("button");
+      chip.style.cssText = "position: fixed; top: 170px; left: 16px; width: 60px; height: 20px;";
+      const menu = document.createElement("div");
+      menu.className = "composer-menu";
+      menu.style.height = "2000px";
+      const holder = document.createElement("div");
+      holder.style.cssText = "position: fixed; top: 0; left: 0; right: 0;";
+      const slash = document.createElement("div");
+      slash.className = "composer-slash";
+      slash.style.height = "2000px";
+      holder.append(slash);
+      document.body.append(chip, menu, holder);
+      standComposerMenu(menu, chip);
+      standComposerSlash(slash, chip);
+      const box = (node) => node.getBoundingClientRect();
+      const seen = {
+        place: document.querySelector(".computer-dock").dataset.place,
+        chip: Math.round(box(chip).bottom),
+        menu: [Math.round(box(menu).top), Math.round(box(menu).bottom)],
+        slash: [Math.round(box(slash).top), Math.round(box(slash).bottom)],
+        bandTop: Math.round(box(document.getElementById("computer-band")).top),
+      };
+      chip.remove(); menu.remove(); holder.remove();
+      return seen;
+    }, { state: BAND_STATES.shared });
+    ok(
+      "in a short narrow window the composer's menus under a chip near the middle end above the band, whichever side they open",
+      composer.place === "raised" && composer.menu?.[1] <= composer.bandTop && composer.slash?.[1] <= composer.bandTop,
+      JSON.stringify(composer),
+    );
+    if (faults.length > 0) ok("the composer menu scenario raised no renderer errors", false, faults.join("\n"));
+  } finally { await page.close(); }
+}
+
 export async function testComputerProgress(browser, origin, ok) {
+  await testTheBandClosesItself(browser, origin, ok);
+  await testTheBandsPlace(browser, origin, ok);
+  await testTheBandCoversNothingInAFullBar(browser, origin, ok);
+  await testTheBandCoversNothingAtTheFoot(browser, origin, ok);
+  await testTheBandTakesNoPressFromAMenu(browser, origin, ok);
   await testTheBand(browser, origin, ok);
   await testTheProgressPanel(browser, origin, ok);
   await testTheBandWithThePanel(browser, origin, ok);

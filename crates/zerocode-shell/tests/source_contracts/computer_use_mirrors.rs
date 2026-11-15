@@ -23,6 +23,12 @@ const MARK_PIN: &str = include_str!(
 const DESKTOP_APPS: &str = include_str!(
     "../../native/computer-use-macos/Sources/ZeroCodeComputerUseMacOSCore/DesktopApps.swift"
 );
+const BACKGROUND_INPUT: &str = include_str!(
+    "../../native/computer-use-macos/Sources/ZeroCodeComputerUseMacOSCore/BackgroundInput.swift"
+);
+const REQUEST_LANE: &str = include_str!(
+    "../../native/computer-use-macos/Sources/ZeroCodeComputerUseMacOSCore/RequestLane.swift"
+);
 const IOS_BRIDGE: &str = include_str!("../../native/ios-emulator-helper/AccessibilityBridge.swift");
 const IOS_HELPER: &str = include_str!("../../native/ios-emulator-helper/main.swift");
 const IOS_HID: &str = include_str!("../../src/emulator/ios_hid.rs");
@@ -56,6 +62,46 @@ fn literals_after<'a>(source: &'a str, marker: &str) -> Vec<&'a str> {
         .skip(1)
         .filter_map(|rest| rest.split('"').next())
         .collect()
+}
+
+/// The verbs that may run in the background are listed once in each language:
+/// the window refuses by its list before the helper refuses by its own, so a
+/// verb in one list alone is either refused twice over or never offered.
+#[test]
+fn the_helpers_background_verbs_are_the_cores() {
+    use zerocode_core::computer_use_protocol::execution::METHODS;
+    let list = BACKGROUND_INPUT
+        .split("public static let methods: Set<String> = [")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .expect("the helper's background verbs");
+    let mut helper: Vec<&str> = list
+        .split(',')
+        .map(|word| word.trim().trim_matches('"'))
+        .filter(|word| !word.is_empty())
+        .collect();
+    let mut core = METHODS.to_vec();
+    helper.sort_unstable();
+    core.sort_unstable();
+    assert_eq!(helper, core);
+}
+
+/// The window names the lane of an app written `pid:N` by the number itself and
+/// asks the helper nothing (`sequence::pid_lane`): the helper names that lane
+/// the same way, and reads the same spellings as a pid.
+#[test]
+fn the_helper_names_the_lane_of_an_app_written_by_its_pid_as_the_window_does() {
+    for held in [
+        r#"if let pid = parsePid(written) { return "pid:\(pid)" }"#,
+        r#"guard query.hasPrefix("pid:") else { return nil }"#,
+        "guard let pid = Int32(query.dropFirst(4)), pid > 0 else { return nil }",
+    ] {
+        assert!(HELPER.contains(held), "the helper lost `{held}`");
+    }
+    assert!(
+        REQUEST_LANE.contains(r#"return resolve(app) ?? "app:\(app.lowercased())""#),
+        "a named app's lane is what `resolve` answers"
+    );
 }
 
 #[test]
@@ -1028,4 +1074,52 @@ fn the_skill_says_a_walk_the_person_took_over_stops_and_is_no_defect() {
             "the skill does not say {said:?} of a walk the person took over: {refused}"
         );
     }
+}
+
+/// The bridge waits one deadline for the whole `parallel`, so a group that
+/// waited for a place is given what is left of the request's time, not that
+/// deadline again (t-109578, t-109675): counted from its own start a late
+/// group runs past the bridge, and every group's answer is lost with it.
+/// `run_parallel` names the request's deadline twice — where it takes it and
+/// where it counts it down — and hands the look and the batch the count. The
+/// count has one beginning, taken before any group waits for a place: one
+/// taken inside a group's own work is that group's start again (t-109717).
+#[test]
+fn a_parallels_groups_are_given_what_is_left_of_the_requests_time() {
+    let runtime =
+        super::quiet_children::code_only(include_str!("../../src/agent_tools_runtime.rs"));
+    let body = super::support::block_after(&runtime, "fn run_parallel(");
+    assert_eq!(
+        body.matches("deadline_ms").count(),
+        2,
+        "a group is handed the request's whole deadline again:\n{body}"
+    );
+    assert_eq!(
+        body.matches("left_ms()").count(),
+        2,
+        "the look and the batch are each handed what is left:\n{body}"
+    );
+    assert!(
+        body.contains("look_group(&steps[0], left_ms(), step)"),
+        "a look group begins with what is left:\n{body}"
+    );
+    let began = body
+        .find("let began = std::time::Instant::now();")
+        .expect("the request's time is counted from one beginning");
+    let pool = body
+        .find("at_most_at_once(")
+        .expect("the groups go through the pool");
+    assert!(
+        began < pool,
+        "the count begins after a group has waited for its place:\n{body}"
+    );
+    assert_eq!(
+        body.matches("Instant::now()").count(),
+        1,
+        "a group counts from a beginning of its own:\n{body}"
+    );
+    assert!(
+        body.contains("deadline_ms.saturating_sub("),
+        "what is left is not counted down from the request's deadline:\n{body}"
+    );
 }

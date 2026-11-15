@@ -696,6 +696,39 @@ fn a_model_that_reads_no_pictures_is_not_sent_a_tools_picture() {
 }
 
 #[test]
+fn a_person_endpoint_that_takes_pictures_still_sends_none_to_a_model_that_reads_none() {
+    // The person says their endpoint takes `image_url` for every model behind
+    // it; this model's catalog row says `no_vision`. A tool's picture is
+    // nobody's choice, so the row still keeps it out.
+    struct ClearProviders;
+    impl Drop for ClearProviders {
+        fn drop(&mut self) {
+            let _ = crate::providers::refresh_custom_providers_from_json("[]");
+        }
+    }
+    let _lock = crate::test_env_lock();
+    let _clear = ClearProviders;
+    crate::providers::refresh_custom_providers_from_json(
+        r#"[{"name":"Fixture","base_url":"https://vlm.example/v1","requires_auth":false,
+             "supports_vision":true,"models":["gpt-5.3-codex-spark"]}]"#,
+    )
+    .unwrap();
+    let config = crate::providers::custom_provider_for_model("Fixture/gpt-5.3-codex-spark")
+        .expect("the person's provider")
+        .config;
+    assert!(config.supports_vision && config.is_declared_by_the_person());
+    assert!(!crate::providers::model_supports_vision("gpt-5.3-codex-spark"));
+    // The runtime sends the model half of `Fixture/gpt-5.3-codex-spark`.
+    let payload = build_chat_completion_request(
+        &chat_request("gpt-5.3-codex-spark", a_step_whose_first_result_is_a_picture()),
+        config,
+    );
+
+    assert_eq!(roles(&payload), ["user", "assistant", "tool", "tool"]);
+    assert!(!payload.to_string().contains("image_url"), "{payload}");
+}
+
+#[test]
 fn zos_own_endpoints_are_not_sent_a_tools_picture() {
     // xAI, OpenAI and Google take `image_url`, but that is said of the endpoint
     // and not of each model behind it (no catalog row describes an xAI model).
@@ -786,8 +819,8 @@ fn a_step_without_reasoning(call: &str) -> Vec<InputMessage> {
 }
 
 /// An endpoint a person declared, under `base_url`. The answers an endpoint
-/// gives about the field are kept per base URL and model for the life of the
-/// process, so a test that sends anything names a base URL of its own.
+/// gives about the field are kept per base URL and model (in a temporary home
+/// under test), so a test that sends anything names a base URL of its own.
 fn a_persons_endpoint(base_url: &'static str) -> OpenAiCompatConfig {
     OpenAiCompatConfig::from_user("Gateway", base_url, None, false)
 }
@@ -1039,6 +1072,7 @@ async fn an_endpoint_that_takes_no_step_without_the_field_takes_a_turn_whose_sec
     history.extend(a_step_without_reasoning("call_2"));
     let request = chat_request("ruled-1", history);
     let (addr, server) = endpoint(the_measured_rule, 1).await;
+    let config = OpenAiCompatConfig { default_base_url: super::leak(&format!("http://{addr}/v1")), ..config };
     let client = OpenAiCompatClient::new("token", config).with_base_url(format!("http://{addr}/v1"));
 
     let _ = client.stream_message(&request).await.expect("the endpoint takes the turn as first sent");
@@ -1059,6 +1093,7 @@ async fn an_endpoint_that_asks_for_the_field_is_sent_the_request_again_with_it()
     history.extend(a_step_without_reasoning("toolu_2"));
     let request = chat_request("asker-1", history);
     let (addr, server) = endpoint(the_measured_rule, 2).await;
+    let config = OpenAiCompatConfig { default_base_url: super::leak(&format!("http://{addr}/v1")), ..config };
     let client = OpenAiCompatClient::new("token", config).with_base_url(format!("http://{addr}/v1"));
 
     let _ = client.stream_message(&request).await.expect("the stream opens on the second send");
@@ -1083,6 +1118,7 @@ async fn an_endpoint_that_refuses_reasoning_content_is_sent_the_request_again_wi
     let config = a_persons_endpoint("http://refuses-reasoning.example/v1");
     let request = chat_request("refuser-1", a_step_with_its_own_reasoning(""));
     let (addr, server) = endpoint(no_field_it_does_not_know, 2).await;
+    let config = OpenAiCompatConfig { default_base_url: super::leak(&format!("http://{addr}/v1")), ..config };
     let client = OpenAiCompatClient::new("token", config).with_base_url(format!("http://{addr}/v1"));
 
     let _ = client.stream_message(&request).await.expect("the stream opens on the second send");
@@ -1118,6 +1154,7 @@ async fn a_refusal_that_is_not_about_the_reasoning_leaves_it_riding() {
     let config = a_persons_endpoint("http://refuses-everything.example/v1");
     let request = chat_request("refuser-2", a_step_with_its_own_reasoning(""));
     let (addr, server) = endpoint(nothing_is_taken, 2).await;
+    let config = OpenAiCompatConfig { default_base_url: super::leak(&format!("http://{addr}/v1")), ..config };
     let client = OpenAiCompatClient::new("token", config).with_base_url(format!("http://{addr}/v1"));
 
     let refused = client.stream_message(&request).await;
@@ -1140,6 +1177,7 @@ async fn a_refusal_that_does_not_name_the_field_is_not_answered_with_one() {
     history.extend(a_step_without_reasoning("call_1"));
     let request = chat_request("refuser-3", history);
     let (addr, server) = endpoint(nothing_is_taken, 1).await;
+    let config = OpenAiCompatConfig { default_base_url: super::leak(&format!("http://{addr}/v1")), ..config };
     let client = OpenAiCompatClient::new("token", config).with_base_url(format!("http://{addr}/v1"));
 
     let refused = client.stream_message(&request).await;
@@ -1147,6 +1185,111 @@ async fn a_refusal_that_does_not_name_the_field_is_not_answered_with_one() {
     assert!(refused.is_err(), "the refusal reaches the caller");
     assert_eq!(server.await.unwrap().len(), 1);
     assert_eq!(reasoning_fields(&build_chat_completion_request(&request, config)), [None]);
+}
+
+#[tokio::test]
+async fn an_answer_kept_from_before_that_the_endpoint_no_longer_gives_is_learnt_again() {
+    // The endpoint once refused the field and now takes no step without it.
+    // The first send goes the kept way and is refused by name; the same
+    // request goes again with the field, and that answer replaces the kept one.
+    let mut history = vec![InputMessage::user_text("count the rows")];
+    history.extend(a_step_without_reasoning("toolu_1"));
+    let request = chat_request("changed-1", history);
+    let (addr, server) = endpoint(the_measured_rule, 2).await;
+    let config = OpenAiCompatConfig {
+        default_base_url: super::leak(&format!("http://{addr}/v1")),
+        ..a_persons_endpoint("http://changed-its-answer.example/v1")
+    };
+    super::note_reasoning_answer(&config, "changed-1", Some(super::ReasoningAnswer::Refused));
+    let client = OpenAiCompatClient::new("token", config).with_base_url(format!("http://{addr}/v1"));
+
+    let _ = client.stream_message(&request).await.expect("the stream opens on the second send");
+
+    let seen = server.await.unwrap();
+    assert_eq!(reasoning_fields(&seen[0]), [None], "the kept answer: no field");
+    assert_eq!(reasoning_fields(&seen[1]), [Some("")], "the other way: the field on every step");
+    assert_eq!(
+        reasoning_fields(&build_chat_completion_request(&request, config)),
+        [Some("")],
+        "and that is the answer kept now"
+    );
+    super::note_reasoning_answer(&config, "changed-1", None);
+}
+
+/// A long conversation at an endpoint that takes no step without the field:
+/// with the field the request is over the context window, without it the
+/// field is missing.
+#[allow(clippy::unnecessary_wraps)] // an `EndpointRule` answers `Option`; this one always refuses
+fn too_long_and_wants_the_field(body: &serde_json::Value) -> Option<&'static str> {
+    let carries = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .any(|message| message.get("reasoning_content").is_some());
+    Some(if carries {
+        "This model's maximum context length is 131072 tokens. However, you requested 140000 tokens."
+    } else {
+        "The `reasoning_content` in the thinking mode must be passed back to the API."
+    })
+}
+
+#[tokio::test]
+async fn a_kept_answer_is_not_revisited_for_a_refusal_that_does_not_name_the_field() {
+    // The endpoint is kept as demanding the field, and the request is over its
+    // context window: one send, and the refusal comes back as it was, so the
+    // turn compacts instead of ending on a field it never asked about.
+    let request = chat_request("kept-1", a_step_with_its_own_reasoning(""));
+    let (addr, server) = endpoint(nothing_is_taken, 1).await;
+    let config = OpenAiCompatConfig {
+        default_base_url: super::leak(&format!("http://{addr}/v1")),
+        ..a_persons_endpoint("http://kept-and-too-long.example/v1")
+    };
+    super::note_reasoning_answer(&config, "kept-1", Some(super::ReasoningAnswer::Demanded));
+    let client = OpenAiCompatClient::new("token", config)
+        .with_base_url(format!("http://{addr}/v1"))
+        .with_retry_policy(0, std::time::Duration::ZERO, std::time::Duration::ZERO);
+
+    let refused = client.stream_message(&request).await.expect_err("the refusal reaches the caller");
+
+    assert_eq!(refused.provider_error_class(), crate::ProviderErrorClass::ContextOverflow, "{refused}");
+    let seen = server.await.unwrap();
+    assert_eq!(seen.len(), 1, "one send");
+    assert_eq!(reasoning_fields(&seen[0]), [Some(OWN_REASONING)], "the kept answer: the field");
+    assert_eq!(
+        reasoning_fields(&build_chat_completion_request(&request, config)),
+        [Some(OWN_REASONING)],
+        "the kept answer stays"
+    );
+    super::note_reasoning_answer(&config, "kept-1", None);
+}
+
+#[tokio::test]
+async fn a_context_too_long_comes_back_as_itself_when_the_other_way_is_refused_for_the_field() {
+    // Nothing kept yet: the request carried its reasoning and was refused, so
+    // it goes once without the field — and that is refused for the missing
+    // field. The first refusal, the context too long, is what comes back.
+    let request = chat_request("long-1", a_step_with_its_own_reasoning(""));
+    let (addr, server) = endpoint(too_long_and_wants_the_field, 2).await;
+    let config = OpenAiCompatConfig {
+        default_base_url: super::leak(&format!("http://{addr}/v1")),
+        ..a_persons_endpoint("http://too-long-and-wants-the-field.example/v1")
+    };
+    let client = OpenAiCompatClient::new("token", config)
+        .with_base_url(format!("http://{addr}/v1"))
+        .with_retry_policy(0, std::time::Duration::ZERO, std::time::Duration::ZERO);
+
+    let refused = client.stream_message(&request).await.expect_err("the refusal reaches the caller");
+
+    assert_eq!(refused.provider_error_class(), crate::ProviderErrorClass::ContextOverflow, "{refused}");
+    assert!(refused.to_string().contains("maximum context length"), "{refused}");
+    let seen = server.await.unwrap();
+    assert_eq!(reasoning_fields(&seen[0]), [Some(OWN_REASONING)], "the first send carried it");
+    assert_eq!(reasoning_fields(&seen[1]), [None], "the other way did not");
+    assert_eq!(
+        reasoning_fields(&build_chat_completion_request(&request, config)),
+        [Some(OWN_REASONING)],
+        "nothing was learnt"
+    );
 }
 
 #[test]

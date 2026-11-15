@@ -19,7 +19,9 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use zerocode_core::computer_use::{COMPUTER_USE_PROTOCOL_VERSION, guard_table};
+use zerocode_core::computer_use::{
+    COMPUTER_USE_PROTOCOL_VERSION, ComputerPermissionReport, ComputerPermissionState, guard_table,
+};
 
 use super::{Launched, Session, peer_pid};
 use crate::computer_use::ComputerUseError;
@@ -98,6 +100,17 @@ struct Shared {
     closing: AtomicBool,
     /// The fault the next `stopWatch` answer carries, once one is set.
     watch_fault: Mutex<Option<WatchFault>>,
+    /// The door: whether the stand-in takes no connection for now, as a helper
+    /// too busy to accept does, and whether its accepting thread stands there
+    /// waiting. What connects meanwhile fills its queue.
+    door: Mutex<Door>,
+    door_moved: Condvar,
+}
+
+#[derive(Default)]
+struct Door {
+    shut: bool,
+    waited_at: bool,
 }
 
 impl Shared {
@@ -111,6 +124,47 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
+
+    fn door(&self) -> std::sync::MutexGuard<'_, Door> {
+        self.door.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The accepting thread waits here for as long as the door is shut, and
+    /// says that it does.
+    fn wait_at_the_door(&self) {
+        let mut door = self.door();
+        while door.shut {
+            door.waited_at = true;
+            self.door_moved.notify_all();
+            door = self
+                .door_moved
+                .wait(door)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        door.waited_at = false;
+    }
+
+    fn move_the_door(&self, shut: bool) {
+        self.door().shut = shut;
+        self.door_moved.notify_all();
+    }
+
+    /// Wait until the accepting thread stands at the shut door: from then on
+    /// it takes nothing out of the queue.
+    fn wait_for_the_doorkeeper(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut door = self.door();
+        while !door.waited_at {
+            let left = deadline
+                .checked_duration_since(Instant::now())
+                .expect("the stand-in's accepting thread never came to the door");
+            door = self
+                .door_moved
+                .wait_timeout(door, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
 }
 
 /// The stand-in: its folder, its socket and what it shares with the threads
@@ -118,6 +172,8 @@ impl Shared {
 pub(crate) struct StandIn {
     directory: PathBuf,
     socket: PathBuf,
+    /// The listening socket, for the length of its queue.
+    listening: std::os::unix::io::RawFd,
     shared: Arc<Shared>,
     accepting: Option<std::thread::JoinHandle<()>>,
 }
@@ -141,6 +197,7 @@ impl StandIn {
             .expect("the stand-in's folder is its own");
         let socket = directory.join("provider.sock");
         let listener = UnixListener::bind(&socket).expect("the stand-in listens");
+        let listening = std::os::unix::io::AsRawFd::as_raw_fd(&listener);
         let shared = Arc::new(Shared {
             token: token.to_string(),
             shape,
@@ -149,15 +206,19 @@ impl StandIn {
             heard: Mutex::new(Vec::new()),
             closing: AtomicBool::new(false),
             watch_fault: Mutex::new(None),
+            door: Mutex::new(Door::default()),
+            door_moved: Condvar::new(),
         });
         let accepting = {
             let shared = Arc::clone(&shared);
             std::thread::spawn(move || {
-                for stream in listener.incoming() {
+                loop {
+                    shared.wait_at_the_door();
+                    let stream = listener.accept();
                     if shared.closing.load(Ordering::Acquire) {
                         return;
                     }
-                    let Ok(stream) = stream else { continue };
+                    let Ok((stream, _)) = stream else { continue };
                     let shared = Arc::clone(&shared);
                     std::thread::spawn(move || serve(&stream, &shared));
                 }
@@ -166,9 +227,49 @@ impl StandIn {
         Self {
             directory,
             socket,
+            listening,
             shared,
             accepting: Some(accepting),
         }
+    }
+
+    /// Take no connection for now, with a queue of one, and fill that queue:
+    /// what comes back keeps it full until it is dropped. The next connection
+    /// is refused at once, as the helper's is when the groups of a `parallel`
+    /// connect faster than it accepts.
+    pub(crate) fn shut_the_door(&self) -> Vec<UnixStream> {
+        self.shared.move_the_door(true);
+        // The accepting thread may be inside an accept already: this
+        // connection takes it out, and then it waits at the door. It is made
+        // while the queue is still its whole length, so it is never the one
+        // refused: under load the queue may already hold a connection of the
+        // window's own — its waiting request's — that the stand-in has not
+        // taken yet, and with the queue cut to one first this connection was
+        // refused (2026-11-16, in the whole suite, once in 4,867 tests).
+        let mut filling = vec![UnixStream::connect(&self.socket).expect("the stand-in listens")];
+        self.shared.wait_for_the_doorkeeper();
+        // From here the accepting thread takes nothing out of the queue.
+        // SAFETY: the stand-in owns this listening socket for its whole life.
+        assert_eq!(
+            unsafe { libc::listen(self.listening, 1) },
+            0,
+            "a queue of one"
+        );
+        loop {
+            match UnixStream::connect(&self.socket) {
+                Ok(stream) => filling.push(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    return filling;
+                }
+                Err(error) => panic!("the stand-in's queue: {error}"),
+            }
+            assert!(filling.len() < 64, "the queue never filled");
+        }
+    }
+
+    /// Take connections again.
+    pub(crate) fn open_the_door(&self) {
+        self.shared.move_the_door(false);
     }
 
     /// What a launch hands the connection, for a window holding `token`: a
@@ -244,6 +345,7 @@ impl Drop for StandIn {
     fn drop(&mut self) {
         self.shared.closing.store(true, Ordering::Release);
         self.shared.changed.notify_all();
+        self.shared.move_the_door(false);
         // The accept loop wakes on a connection of its own and sees it is
         // closing.
         if UnixStream::connect(&self.socket).is_ok()
@@ -392,6 +494,34 @@ fn answer(method: &str, params: &Value, shared: &Shared) -> Result<Value, String
     }
 }
 
+thread_local! {
+    /// The rows this thread's permission probe reads, once a test says them.
+    static PROBE_READS: std::cell::RefCell<Option<Vec<ComputerPermissionState>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// From here on the permission probe of this thread reads `rows`, and starts
+/// no helper app to read them: the probe is the helper app launched to write
+/// what macOS grants it, and a test stands in for that answer too.
+fn probe_reads(rows: &[ComputerPermissionState]) {
+    PROBE_READS.with_borrow_mut(|reads| *reads = Some(rows.to_vec()));
+}
+
+/// The report of a probe that read what a test said, on a thread whose test
+/// said it.
+pub(super) fn probe_report() -> Option<ComputerPermissionReport> {
+    let permissions = PROBE_READS.with_borrow(Clone::clone)?;
+    Some(ComputerPermissionReport {
+        identity: None,
+        platform: "darwin".into(),
+        helper_app_path: None,
+        helper_unavailable_reason: None,
+        permissions,
+        judged_rows: Vec::new(),
+        tcc_rows: Vec::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +578,410 @@ mod tests {
             1,
             "the session's end asks the helper to go"
         );
+    }
+
+    /// The groups of one `parallel` connect in the same instant, and the
+    /// helper's queue holds eight (t-109501). A connection the full queue
+    /// refused sent nothing: it is tried again, every request is answered, and
+    /// the session — the one helper the window's stop reaches — is the one
+    /// that answers them all.
+    #[test]
+    fn requests_past_the_helpers_full_queue_are_all_answered_on_the_one_session() {
+        const AT_ONCE: usize = 16;
+        let helper = StandIn::start(TOKEN, Shape::matching());
+        let window = helper.connect_window(TOKEN).expect("connected");
+        let filling = helper.shut_the_door();
+        let answers: Vec<Result<Value, String>> = std::thread::scope(|scope| {
+            let asking: Vec<_> = (0..AT_ONCE)
+                .map(|_| {
+                    scope.spawn(|| {
+                        window.0.request("status", json!({})).map_err(|failure| {
+                            let (super::super::SessionFailure::Transport(error)
+                            | super::super::SessionFailure::Provider(error)) = failure;
+                            format!("{}: {}", error.code, error.message)
+                        })
+                    })
+                })
+                .collect();
+            // The queue stays full while they try: longer than a few tries.
+            std::thread::sleep(Duration::from_millis(60));
+            helper.open_the_door();
+            asking
+                .into_iter()
+                .map(|asked| asked.join().expect("a request"))
+                .collect()
+        });
+        drop(filling);
+        for answer in &answers {
+            assert!(answer.is_ok(), "the full queue cost a request: {answer:?}");
+        }
+        let heard = helper.heard();
+        assert_eq!(
+            heard
+                .iter()
+                .filter(|heard| heard.method == "status")
+                .count(),
+            AT_ONCE,
+            "every request reached the one helper"
+        );
+        assert_eq!(
+            heard
+                .iter()
+                .filter(|heard| heard.method == "handshake")
+                .count(),
+            1,
+            "and no second session was made for any of them"
+        );
+    }
+
+    /// A helper that lives and takes no connection through the wait refuses
+    /// that request alone — nothing of it was sent — and the session stands:
+    /// no second helper is started beside one that may still be at work, out
+    /// of reach of the window's stop (t-109578).
+    #[test]
+    fn a_living_helper_that_takes_no_connection_refuses_the_request_and_keeps_the_session() {
+        let helper = StandIn::start(TOKEN, Shape::matching());
+        let window = helper.connect_window(TOKEN).expect("connected");
+        // With no idle connection the next request needs a new one.
+        let held = window
+            .0
+            .idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        let filling = helper.shut_the_door();
+        let refused = match window.0.request("status", json!({})) {
+            Err(super::super::SessionFailure::Provider(refused)) => refused,
+            Err(super::super::SessionFailure::Transport(broken)) => {
+                panic!(
+                    "the session is discarded for a helper that lives: {}",
+                    broken.message
+                )
+            }
+            Ok(answer) => panic!("a full queue answered: {answer}"),
+        };
+        assert_eq!(refused.code, error_code::ACTION_TIMEOUT);
+        assert_eq!(
+            refused.delivery.as_deref(),
+            Some(zerocode_core::computer_use_protocol::NOT_DELIVERED),
+            "nothing of the request was sent"
+        );
+        helper.open_the_door();
+        drop((filling, held));
+        window
+            .0
+            .request("status", json!({}))
+            .map_err(|_| "the same session answers once the helper takes connections again")
+            .expect("answered");
+        assert_eq!(
+            helper
+                .heard()
+                .iter()
+                .filter(|heard| heard.method == "handshake")
+                .count(),
+            1,
+            "one session, one helper, from first to last"
+        );
+    }
+
+    /// A session the window discards may still be held by another group's
+    /// request, with a step under way at its helper, and the window's stop is
+    /// aimed at the session that stands. So the helper of a discarded session
+    /// is asked to go at the discard — not when its last request ends
+    /// (t-109578).
+    #[test]
+    fn the_helper_of_a_discarded_session_is_asked_to_go_at_once() {
+        let helper = StandIn::start(TOKEN, Shape::matching());
+        let Connected(session) = helper.connect_window(TOKEN).expect("connected");
+        let session = Arc::new(session);
+        // Another group's request, still under way on the same session.
+        let in_flight = Arc::clone(&session);
+        let broke = ComputerUseError::new(
+            error_code::ACCESSIBILITY_ERROR,
+            "read Computer Use response: the road broke",
+        );
+        let said = crate::computer_use::discard(&session, broke.clone());
+        assert_eq!(said, broke, "the break is the answer");
+        assert_eq!(
+            helper.wait_heard("terminate", 1, Duration::from_secs(2)),
+            1,
+            "the helper was not asked to go while a request still held its session"
+        );
+        drop((session, in_flight));
+    }
+
+    /// `shutdown` ends the session for a fresh one (the permission roads call
+    /// it). A request of another agent may still hold that session, so its
+    /// helper is sent away at the shutdown — not when that request ends
+    /// (t-109578).
+    #[test]
+    fn the_helper_of_a_session_that_is_shut_down_is_asked_to_go_at_once() {
+        // The session that stands is the process's: one test holds it at a time.
+        let _hand = crate::tests::computer_desktop_wait::ONE_HAND
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let helper = StandIn::start(TOKEN, Shape::matching());
+        let Connected(session) = helper.connect_window(TOKEN).expect("connected");
+        let session = Arc::new(session);
+        *crate::computer_use::held_client()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&session));
+        crate::computer_use::shutdown();
+        assert_eq!(
+            helper.wait_heard("terminate", 1, Duration::from_secs(2)),
+            1,
+            "the helper was not asked to go while a request still held its session"
+        );
+        assert!(!crate::computer_use::session_stands());
+        drop(session);
+    }
+
+    /// The window reads the permission rows whenever it is focused. A reading
+    /// that moved no row leaves the session and its helper alone — every act
+    /// under way goes on — and one that moved a row ends the session, its
+    /// helper sent away, so the next call starts one that sees the new row
+    /// (t-109675). The readings are the window's own, `permission_status`,
+    /// the probe answered here: an end written back into that road fails
+    /// this test (t-109717).
+    #[test]
+    fn a_permission_reading_ends_the_session_only_when_a_row_moved() {
+        use zerocode_core::computer_use::ComputerPermissionStatus;
+        let _hand = crate::tests::computer_desktop_wait::ONE_HAND
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let granted = rows_with_screenshots(ComputerPermissionStatus::Granted);
+        let (helper, session) = a_session_standing_after_a_reading_of(&granted);
+
+        assert_eq!(super::super::permission_status().permissions, granted);
+        assert!(
+            crate::computer_use::session_stands(),
+            "a reading that moved no row ended the session"
+        );
+        assert_eq!(
+            helper.wait_heard("terminate", 1, Duration::from_millis(300)),
+            0,
+            "a reading that moved no row sent the helper away"
+        );
+        session
+            .request("status", json!({}))
+            .map_err(|_| "the session no longer answers")
+            .expect("what the session has under way goes on");
+
+        let denied = rows_with_screenshots(ComputerPermissionStatus::NotGranted);
+        probe_reads(&denied);
+        assert_eq!(super::super::permission_status().permissions, denied);
+        assert!(
+            !crate::computer_use::session_stands(),
+            "a row moved and the session still stands"
+        );
+        assert_eq!(
+            helper.wait_heard("terminate", 1, Duration::from_secs(2)),
+            1,
+            "a row moved and the helper was not sent away"
+        );
+        drop(session);
+    }
+
+    /// An agent's plain `permissions` is a reading too — the skill makes it
+    /// the first call of every run. With the rows as they were last read it
+    /// leaves the session, its helper and what other agents have under way
+    /// alone; with a row moved it ends the session, as the window's own
+    /// reading does (t-109717).
+    #[test]
+    fn a_plain_permissions_ask_ends_the_session_only_when_a_row_moved() {
+        use zerocode_core::computer_use::{ComputerPermissionId, ComputerPermissionStatus};
+        let _hand = crate::tests::computer_desktop_wait::ONE_HAND
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let granted = rows_with_screenshots(ComputerPermissionStatus::Granted);
+        let (helper, session) = a_session_standing_after_a_reading_of(&granted);
+
+        let said = super::super::open_permission(None).expect("the rows");
+        assert_eq!(said.permissions.as_deref(), Some(&granted[..]));
+        assert!(
+            crate::computer_use::session_stands(),
+            "a plain ask that moved no row ended the session"
+        );
+        assert_eq!(
+            helper.wait_heard("terminate", 1, Duration::from_millis(300)),
+            0,
+            "a plain ask that moved no row sent the helper away"
+        );
+        session
+            .request("status", json!({}))
+            .map_err(|_| "the session no longer answers")
+            .expect("what the session has under way goes on");
+
+        probe_reads(&rows_with_screenshots(ComputerPermissionStatus::NotGranted));
+        let said = super::super::open_permission(None).expect("the rows");
+        assert_eq!(
+            said.permission_id,
+            Some(ComputerPermissionId::Screenshots),
+            "the ask names the row that is missing"
+        );
+        assert!(
+            !crate::computer_use::session_stands(),
+            "a row moved and the session still stands"
+        );
+        assert_eq!(
+            helper.wait_heard("terminate", 1, Duration::from_secs(2)),
+            1,
+            "a row moved and the helper was not sent away"
+        );
+        drop(session);
+    }
+
+    /// A row that was reset, or a permission the person was sent to System
+    /// Settings for, changed outside a reading, and the last reading is
+    /// forgotten there. The next reading then ends the session though it
+    /// finds the rows as they were: a helper that started in between started
+    /// under the row as it stood then, and sees no grant given since
+    /// (t-109717).
+    #[test]
+    fn a_reading_after_the_last_was_forgotten_ends_the_session() {
+        use zerocode_core::computer_use::ComputerPermissionStatus;
+        let _hand = crate::tests::computer_desktop_wait::ONE_HAND
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let granted = rows_with_screenshots(ComputerPermissionStatus::Granted);
+        let (helper, session) = a_session_standing_after_a_reading_of(&granted);
+
+        super::super::forget_rows_read();
+        assert_eq!(super::super::permission_status().permissions, granted);
+        assert!(
+            !crate::computer_use::session_stands(),
+            "the rows read as before, and a helper started in between still stands"
+        );
+        assert_eq!(
+            helper.wait_heard("terminate", 1, Duration::from_secs(2)),
+            1,
+            "that helper was not sent away"
+        );
+        drop(session);
+    }
+
+    /// The two rows as a probe reads them: Accessibility granted, Screen
+    /// Recording as said.
+    fn rows_with_screenshots(
+        screenshots: zerocode_core::computer_use::ComputerPermissionStatus,
+    ) -> [ComputerPermissionState; 2] {
+        use zerocode_core::computer_use::{ComputerPermissionId, ComputerPermissionStatus};
+        [
+            (
+                ComputerPermissionId::Accessibility,
+                ComputerPermissionStatus::Granted,
+            ),
+            (ComputerPermissionId::Screenshots, screenshots),
+        ]
+        .map(|(id, status)| ComputerPermissionState { id, status })
+    }
+
+    /// A stand-in helper whose session is the one that stands, after a first
+    /// reading of `rows` — the probe's from here on — that had none before it.
+    fn a_session_standing_after_a_reading_of(
+        rows: &[ComputerPermissionState],
+    ) -> (StandIn, Arc<Session>) {
+        super::super::forget_rows_read();
+        probe_reads(rows);
+        assert_eq!(
+            super::super::permission_status().permissions,
+            rows,
+            "the reading is the probe's"
+        );
+        let helper = StandIn::start(TOKEN, Shape::matching());
+        let Connected(session) = helper.connect_window(TOKEN).expect("connected");
+        let session = Arc::new(session);
+        *crate::computer_use::held_client()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&session));
+        (helper, session)
+    }
+
+    /// A reading is compared with the one before it, which it replaces.
+    #[test]
+    fn the_rows_moved_when_they_differ_from_the_last_reading() {
+        use zerocode_core::computer_use::{
+            ComputerPermissionId, ComputerPermissionState, ComputerPermissionStatus,
+        };
+        let rows = |status| {
+            [ComputerPermissionState {
+                id: ComputerPermissionId::Screenshots,
+                status,
+            }]
+        };
+        let mut read = None;
+        let granted = rows(ComputerPermissionStatus::Granted);
+        assert!(
+            super::super::rows_moved(&mut read, &granted),
+            "the first reading has none before it"
+        );
+        assert!(!super::super::rows_moved(&mut read, &granted));
+        assert!(super::super::rows_moved(
+            &mut read,
+            &rows(ComputerPermissionStatus::NotGranted)
+        ));
+        assert!(
+            super::super::rows_moved(&mut read, &granted),
+            "granted again is a row that moved"
+        );
+        assert!(!super::super::rows_moved(&mut read, &granted));
+    }
+
+    /// A living helper that takes no connection is busy for a while and
+    /// broken after that: past the patience the session goes — its helper is
+    /// sent away first — so a helper that stopped accepting is not kept for
+    /// good. One connection it takes, and the count begins again.
+    #[test]
+    fn a_helper_that_takes_no_connection_for_long_enough_is_no_busy_one() {
+        use super::super::Untaken;
+        let patience = Duration::from_secs(10);
+        let began = Instant::now();
+        let at = |seconds: u64| began + Duration::from_secs(seconds);
+        let mut untaken = Untaken::default();
+        assert!(
+            !untaken.refused(at(0), at(2), patience),
+            "two seconds: busy"
+        );
+        assert!(
+            !untaken.refused(at(5), at(7), patience),
+            "inside the patience"
+        );
+        assert!(
+            untaken.refused(at(8), at(10), patience),
+            "ten seconds since the first refusal, whatever asked meanwhile"
+        );
+        untaken.taken();
+        assert!(
+            !untaken.refused(at(11), at(13), patience),
+            "a connection it took begins the count again"
+        );
+    }
+
+    /// Only a queue that is full for a moment is waited out: a refusal from a
+    /// helper that is gone is the answer at once, and one that lives but
+    /// never takes the connection is given up when the wait is over.
+    #[test]
+    fn a_refused_connection_is_tried_again_only_while_the_helper_lives_and_the_wait_lasts() {
+        let helper = StandIn::start(TOKEN, Shape::matching());
+        let filling = helper.shut_the_door();
+        let connect = |wait, lives: bool| {
+            let started = Instant::now();
+            let answer = super::super::connect_past_a_full_queue(&helper.socket, wait, || lives);
+            (
+                answer.map(drop).map_err(|error| error.kind()),
+                started.elapsed(),
+            )
+        };
+        let (gone, took) = connect(Duration::from_secs(5), false);
+        assert_eq!(gone, Err(std::io::ErrorKind::ConnectionRefused));
+        assert!(
+            took < Duration::from_secs(1),
+            "waited {took:?} for a helper that is gone"
+        );
+        let (never_taken, took) = connect(Duration::from_millis(40), true);
+        assert_eq!(never_taken, Err(std::io::ErrorKind::ConnectionRefused));
+        assert!(took >= Duration::from_millis(40), "gave up after {took:?}");
+        drop(filling);
     }
 
     /// A helper of another protocol is refused at the handshake, in the

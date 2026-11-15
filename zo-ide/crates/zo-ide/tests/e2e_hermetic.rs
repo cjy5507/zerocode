@@ -160,6 +160,15 @@ impl Layout {
     }
 }
 
+/// Record a `.zo` control file the test wrote as the person's own, in the
+/// config home the run reads (`ZO_CONFIG_HOME` is the layout's home): what
+/// `zo settings trust-local` does for a file zo did not write (153).
+fn as_the_persons_own(layout: &Layout, path: &std::path::Path) {
+    let real = path.canonicalize().expect("canonical path");
+    let bytes = fs::read(&real).expect("the file");
+    runtime::remember_local_file(&layout.home, &real, &bytes).expect("record");
+}
+
 fn pty(layout: &Layout, base_url: &str, args: &[&str]) -> PtyRun {
     PtyRun::spawn(
         &layout.cwd,
@@ -9809,6 +9818,9 @@ async fn e2e_a_broad_allow_saved_by_an_older_zo_is_narrowed_before_the_first_ses
     fs::create_dir_all(settings.parent().expect("the .zo folder")).expect("make .zo");
     let before = "{\"permissions\":{\"allow\":[\"bash(printf narrowed-*)\"]}}\n";
     fs::write(&settings, before).expect("the person's local settings");
+    // An older zo kept no record of what it wrote; the person records the file
+    // as theirs (`zo settings trust-local`) before it is read as theirs (153).
+    as_the_persons_own(&layout, &settings);
     let call = serde_json::json!({ "command": "printf narrowed-x && touch widened.txt" });
     let service = ScriptedAnthropicService::tool_calls(&[("bash", call)], "narrowed-done")
         .await
@@ -9869,6 +9881,7 @@ async fn e2e_the_narrowing_notice_is_said_once_at_the_next_tui_start() {
     fs::create_dir_all(settings.parent().expect("the .zo folder")).expect("make .zo");
     fs::write(&settings, "{\"permissions\":{\"allow\":[\"bash(printf narrowed-*)\"]}}")
         .expect("the person's local settings");
+    as_the_persons_own(&layout, &settings);
     let service = MockAnthropicService::spawn()
         .await
         .expect("start mock service");
@@ -10553,6 +10566,55 @@ async fn e2e_a_settings_file_named_on_the_command_line_is_read() {
     );
 }
 
+/// A model's plain call of `zo settings trust-local` records nothing: its shell
+/// tool runs the command with no terminal and `ZO_TOOL_CHILD` set, and the
+/// command refuses — even with the folder's name piped in — telling the model
+/// that a person runs it in their own terminal (153). This is a guard against
+/// a mistake or a plain instruction, not a boundary: a shell let run commands
+/// of its choosing can get past it, or write the record itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_a_models_plain_call_of_trust_local_records_nothing() {
+    let layout = Layout::new();
+    fs::create_dir_all(layout.cwd.join(".zo")).expect("project .zo");
+    fs::write(
+        layout.cwd.join(".zo").join("settings.local.json"),
+        r#"{"hooks":{"SessionStart":["echo planted"]}}"#,
+    )
+    .expect("local file");
+    let folder = layout.cwd.file_name().and_then(|name| name.to_str()).expect("folder name");
+    let command = format!(
+        "printf '{folder}\\n' | '{}' settings trust-local",
+        env!("CARGO_BIN_EXE_zo")
+    );
+    let service = ScriptedAnthropicService::tool_calls(
+        &[("bash", serde_json::json!({"command": command}))],
+        "trust-local-finished-marker",
+    )
+    .await
+    .expect("start trust-local script");
+    let output = run_pipe(
+        &layout.cwd,
+        &layout.home,
+        &layout.sessions,
+        &layout.state,
+        service.base_url(),
+        &["--plain", "--permission-mode", "danger-full-access"],
+        b"Record this folder's local settings as mine\n/exit\n",
+    )
+    .expect("run zo in pipe mode");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(output.status.success(), "pipe exited with {:?}:\n{stdout}", output.status);
+    assert!(
+        !layout.home.join(runtime::LOCAL_RECORD_FILE).exists(),
+        "the model's shell recorded the folder's file:\n{stdout}"
+    );
+    let requests = service.request_bodies().await;
+    assert!(
+        requests.get(1).is_some_and(|body| body.contains("yourself in a terminal")),
+        "the model is not told a person runs it: {requests:?}"
+    );
+}
+
 /// The lines of a plain transcript that warn of `rule` as naming no zo tool.
 fn rule_warnings<'a>(stdout: &'a str, rule: &str) -> Vec<&'a str> {
     let quoted = format!("'{rule}'");
@@ -10727,5 +10789,68 @@ async fn e2e_a_full_access_tui_refuses_a_kill_question_without_putting_it() {
             .any(|body| body.contains("no person said yes") && body.contains("its pid as a number")),
         "the model heard why it was refused and what to do instead: {requests:?}"
     );
+}
+
+#[cfg(unix)]
+async fn assert_late_osc_replies_swallowed(payload: &[u8]) {
+    let rows = 30;
+    let cols = 120;
+    let layout = Layout::new();
+    let service = ScriptedAnthropicService::text("unused\n")
+        .await
+        .expect("start provider");
+    let args = interactive_args();
+    let mut run = PtyRun::spawn_controlling_sized(
+        rows,
+        cols,
+        &layout.cwd,
+        &layout.home,
+        &layout.sessions,
+        &layout.state,
+        service.base_url(),
+        &args,
+        &[],
+    )
+    .expect("spawn zo in PTY");
+    run.send(b"\x1b[1;1R").expect("answer cursor position query");
+    run.wait_for("Ask zo to do anything", TEST_TIMEOUT);
+    let painted = std::time::Instant::now();
+    std::thread::sleep(Duration::from_millis(150));
+    run.send(payload).expect("send late OSC colour replies");
+    std::thread::sleep(LATE_OSC_WINDOW.saturating_sub(painted.elapsed()));
+    wait_until_quiet(&run, Duration::from_millis(250), TEST_TIMEOUT);
+
+    let visible = settled_screen(&run.snapshot_output(), rows).visible();
+    let joined = visible.join("\n");
+    assert!(
+        !joined.contains("]10;") && !joined.contains("]11;") && !joined.contains("rgb:"),
+        "late OSC colour reply reached the screen:\n{joined}"
+    );
+    assert!(
+        visible.iter().any(|row| row.contains("Ask zo to do anything")),
+        "composer placeholder must remain empty:\n{joined}"
+    );
+    let _ = run.finish();
+    assert!(
+        service.request_bodies().await.is_empty(),
+        "no late reply bytes may reach the model"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_late_osc_colour_replies_never_reach_composer() {
+    assert_late_osc_replies_swallowed(
+        b"\x1b]10;rgb:e0e0/e0e0/e0e0\x1b\\\x1b]11;rgb:1c1c/1e1e/2626\x1b\\",
+    )
+    .await;
+    assert_late_osc_replies_swallowed(
+        b"\x1b]10;rgb:e0e0/e0e0/e0e0\x07\x1b]11;rgb:1c1c/1e1e/2626\x07",
+    )
+    .await;
+    assert_late_osc_replies_swallowed(
+        b"\x1b]10;rgb:e0e0/e0e0/e0e0\x1b\\\x1b]11;rgb:1c1c/1e1e/2626\x1b\\\x1b]10;rgb:d0d0/d0d0/d0d0\x07\x1b]11;rgb:1010/1212/1818\x07",
+    )
+    .await;
 }
 

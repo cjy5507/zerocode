@@ -7,7 +7,8 @@ use zerocode_core::computer_use_protocol::error_code;
 
 use super::stand_in;
 use super::{
-    Decision, SHARE_ASK_AGAIN_MS, admit, ensure_current, give_back, hand_over, state, take_control,
+    Decision, SHARE_ASK_AGAIN_MS, SHARE_USE_LAPSES_MS, admit, ensure_current, give_back, hand_over,
+    lapse, state, take_control,
 };
 
 fn person(answer: Decision) -> (stand_in::Standing, Rc<Cell<u32>>) {
@@ -986,4 +987,406 @@ fn an_app_entered_while_the_helper_restarts_is_not_entered_again_under_its_other
         );
     }
     assert_eq!(asked.get(), 1, "no card for a name nobody can read");
+}
+
+/// The person, 2026-11-15: "표시가 끝나면 자동 종료되게.. 내가 누르지 않아도
+/// 끊기거나 종료되면". A request lets go of the app whose minute is up before
+/// it is judged, so the band names what is in use now.
+#[test]
+fn a_request_lets_go_of_the_app_nothing_reached_for_a_minute() {
+    let (_person, asked) = person(Decision::Allowed);
+    admit(ComputerMethod::Click, &click("Sample")).expect("goes at once");
+    stand_in::advance(SHARE_USE_LAPSES_MS);
+    admit(ComputerMethod::Click, &click("Other")).expect("goes at once");
+    let now = state();
+    assert_eq!(now["label"], "Other", "{now}");
+    assert_eq!(now["panels"].as_array().map(Vec::len), Some(1), "{now}");
+    assert_eq!(asked.get(), 0, "letting go asks nobody");
+}
+
+/// With no request at all the window's own look lets go: the band closes with
+/// no press, and is told so.
+#[test]
+fn the_windows_look_lets_go_of_a_quiet_app_and_tells_the_band() {
+    let (_person, asked) = person(Decision::Allowed);
+    admit(ComputerMethod::Click, &click("Sample")).expect("goes at once");
+    stand_in::advance(SHARE_USE_LAPSES_MS - 1);
+    assert!(lapse(), "still in use: the look goes on");
+    assert_eq!(state()["target"], "sample");
+    stand_in::advance(1);
+    assert!(!lapse(), "nothing is left to look for");
+    let now = state();
+    assert!(now["target"].is_null(), "{now}");
+    assert!(now["label"].is_null(), "{now}");
+    assert_eq!(now["panels"], json!([]), "{now}");
+    assert_eq!(stand_in::notices().last(), Some(&now), "the band was told");
+    admit(ComputerMethod::Click, &click("Sample")).expect("joins again at once");
+    assert_eq!(state()["target"], "sample");
+    assert_eq!(asked.get(), 0, "a lapse is no answer of the person's");
+}
+
+#[test]
+fn an_app_whose_process_ended_leaves_at_once() {
+    let round_trips = Rc::new(Cell::new(0));
+    let _helper = naming_helper(&round_trips);
+    let (_person, _) = person(Decision::Allowed);
+    admit(ComputerMethod::Click, &click("Sample")).expect("goes at once");
+    admit(ComputerMethod::Click, &click("iPhone 미러링")).expect("goes at once");
+    assert!(lapse());
+    assert_eq!(state()["label"], "iPhone 미러링, Sample", "both run");
+    stand_in::ended(&[4343]);
+    assert!(lapse(), "one is still in use");
+    let now = state();
+    assert_eq!(now["label"], "iPhone 미러링", "{now}");
+    assert_eq!(now["target"], "com.apple.screencontinuity", "{now}");
+    stand_in::ended(&[4343, 4242]);
+    assert!(!lapse());
+    assert!(state()["target"].is_null());
+}
+
+#[test]
+fn a_request_under_way_keeps_its_app_in_use() {
+    let (_person, _) = person(Decision::Allowed);
+    let _request = admit(ComputerMethod::Click, &click("Sample")).unwrap();
+    stand_in::advance(SHARE_USE_LAPSES_MS - 1);
+    ensure_current().expect("its next step");
+    stand_in::advance(SHARE_USE_LAPSES_MS - 1);
+    assert!(lapse());
+    assert_eq!(
+        state()["target"],
+        "sample",
+        "a step reached it inside the minute"
+    );
+    stand_in::advance(1);
+    assert!(!lapse());
+    assert!(state()["target"].is_null());
+    assert!(
+        ensure_current().is_ok(),
+        "the request itself is not refused"
+    );
+}
+
+/// What the person took is theirs to hand back: the band stays under their
+/// hand whatever ended meanwhile.
+#[test]
+fn nothing_leaves_while_the_person_holds_control() {
+    let round_trips = Rc::new(Cell::new(0));
+    let _helper = naming_helper(&round_trips);
+    let (_person, _) = person(Decision::Allowed);
+    admit(ComputerMethod::Click, &click("Sample")).unwrap();
+    take_control();
+    stand_in::advance(10 * SHARE_USE_LAPSES_MS);
+    stand_in::ended(&[4343]);
+    assert!(!lapse(), "nothing to look for under the person's hand");
+    let taken = state();
+    assert_eq!(taken["target"], "com.example.sample", "{taken}");
+    assert_eq!(taken["takenBack"], true);
+    give_back();
+    assert!(!lapse());
+    assert!(
+        state()["target"].is_null(),
+        "handed back, the ended app goes"
+    );
+}
+
+/// Where the person requires sharing, a quiet minute ends nothing: letting the
+/// hand-over go would open every other window to an agent's look mid-task. It
+/// goes with its app, and the person's yes stands for when the app is back.
+#[test]
+fn required_a_hand_over_stands_through_the_quiet_and_goes_with_its_app() {
+    let round_trips = Rc::new(Cell::new(0));
+    let _helper = naming_helper(&round_trips);
+    let (_person, asked) = person_requiring(Decision::Allowed);
+    drop(admit(ComputerMethod::Click, &click("Sample")).expect("handed over"));
+    assert_eq!(asked.get(), 1);
+    stand_in::advance(10 * SHARE_USE_LAPSES_MS);
+    assert!(lapse());
+    assert_eq!(state()["target"], "com.example.sample");
+    assert_eq!(
+        refused(ComputerMethod::Observe, &json!({"app": "iPhone 미러링"})).as_deref(),
+        Some(error_code::SHARE_SCOPE),
+        "a look outside what was handed over is still refused"
+    );
+    stand_in::ended(&[4343]);
+    assert!(!lapse());
+    assert!(state()["target"].is_null());
+    drop(admit(ComputerMethod::Click, &click("Sample")).expect("the yes stands"));
+    assert_eq!(
+        asked.get(),
+        1,
+        "no second card for an app the person handed over"
+    );
+}
+
+/// With sharing required, the app that waits for the person stops waiting
+/// once no request has asked for it through the quiet. When a request for
+/// something else is what finds that, the band is told all the same: its
+/// "waiting" line and the hand-over under it go with the wait (t-109811).
+#[test]
+fn required_a_wait_that_ends_during_another_request_is_told_to_the_band() {
+    let (_person, _asked) = person_requiring(Decision::TimedOut);
+    assert!(admit(ComputerMethod::Click, &click("Notes")).is_err());
+    assert_eq!(state()["waiting"], "notes", "it waits for the person");
+    stand_in::advance(SHARE_ASK_AGAIN_MS);
+    let told = stand_in::notices().len();
+    drop(admit(ComputerMethod::Observe, &json!({})).expect("a look while nothing is handed over"));
+    let now = state();
+    assert!(now["waiting"].is_null(), "{now}");
+    assert!(
+        stand_in::notices().len() > told,
+        "the wait ended and the band heard nothing: {now}"
+    );
+    assert_eq!(
+        stand_in::notices().last(),
+        Some(&now),
+        "the band was told what stands now"
+    );
+}
+
+/// An act holds its app by the bundle identifier the helper names it by, and
+/// a free look names it by the agent's word alone. The look is a use of the
+/// app all the same — under the word the agent acted by, the app's name, its
+/// identifier or its process — so an agent that only reads for more than a
+/// minute keeps its app on the band, and the look still asks the helper
+/// nothing (t-109811).
+#[test]
+fn a_look_by_any_word_of_an_app_in_use_keeps_it_in_use() {
+    for word in [
+        "iPhone Mirroring",
+        "iPhone 미러링",
+        "com.apple.ScreenContinuity",
+        "pid:4242",
+    ] {
+        let round_trips = Rc::new(Cell::new(0));
+        let _helper = naming_helper(&round_trips);
+        let (_person, _) = person(Decision::Allowed);
+        admit(ComputerMethod::Click, &click("iPhone Mirroring")).expect("goes at once");
+        round_trips.set(0);
+        stand_in::advance(SHARE_USE_LAPSES_MS - 1);
+        drop(admit(ComputerMethod::Observe, &json!({ "app": word })).expect("a look"));
+        assert_eq!(
+            round_trips.get(),
+            0,
+            "{word}: a free look asks the helper nothing"
+        );
+        stand_in::advance(SHARE_USE_LAPSES_MS - 1);
+        assert!(lapse(), "{word}: the look reached it inside the minute");
+        assert_eq!(state()["target"], "com.apple.screencontinuity", "{word}");
+        stand_in::advance(1);
+        assert!(
+            !lapse(),
+            "{word}: a minute after the look nothing is in use"
+        );
+        assert!(state()["target"].is_null(), "{word}");
+        // Each pass starts from a share of its own.
+        super::HELD.with(|held| *held.borrow_mut() = super::Held::default());
+    }
+}
+
+/// A look under way — a wait that lasts — is a use of its app at every step.
+#[test]
+fn a_look_under_way_keeps_its_app_in_use() {
+    let round_trips = Rc::new(Cell::new(0));
+    let _helper = naming_helper(&round_trips);
+    let (_person, _) = person(Decision::Allowed);
+    admit(ComputerMethod::Click, &click("Sample")).expect("goes at once");
+    let _look = admit(ComputerMethod::Observe, &json!({ "app": "Sample" })).expect("a look");
+    stand_in::advance(SHARE_USE_LAPSES_MS - 1);
+    ensure_current().expect("its next step");
+    stand_in::advance(SHARE_USE_LAPSES_MS - 1);
+    assert!(lapse(), "a step of the look reached it inside the minute");
+    assert_eq!(state()["target"], "com.example.sample");
+    stand_in::advance(1);
+    assert!(!lapse());
+    assert!(state()["target"].is_null());
+}
+
+/// A word names the app it was acted by only while that app is in use: once
+/// the app left, a look by the word brings nothing back.
+#[test]
+fn a_look_brings_no_app_back_into_use() {
+    let round_trips = Rc::new(Cell::new(0));
+    let _helper = naming_helper(&round_trips);
+    let (_person, _) = person(Decision::Allowed);
+    admit(ComputerMethod::Click, &click("Sample")).expect("goes at once");
+    stand_in::advance(SHARE_USE_LAPSES_MS);
+    drop(admit(ComputerMethod::Observe, &json!({ "app": "Sample" })).expect("a look"));
+    let now = state();
+    assert!(now["target"].is_null(), "{now}");
+    assert_eq!(now["panels"], json!([]), "{now}");
+}
+
+/// A press the person is asked about waits for their answer up to two
+/// minutes, and nothing reaches its app meanwhile. The minute does not run
+/// while they think: allowed after it, the press would otherwise go with its
+/// app — and the band's take-control — gone from the band. The minute begins
+/// when the card closes (t-109811).
+#[test]
+fn nothing_goes_quiet_while_the_person_is_asked() {
+    let (_person, _) = person(Decision::Allowed);
+    let _request = admit(ComputerMethod::Click, &click("Sample")).expect("goes at once");
+    stand_in::asking(true);
+    stand_in::advance(SHARE_USE_LAPSES_MS + SHARE_USE_LAPSES_MS / 2);
+    assert!(lapse(), "the look goes on while the card stands");
+    assert_eq!(state()["target"], "sample", "its app stays on the band");
+    ensure_current().expect("allowed, the press goes with its app on the band");
+    stand_in::asking(false);
+    stand_in::advance(SHARE_USE_LAPSES_MS - 1);
+    assert!(lapse(), "the minute begins when the card closes");
+    stand_in::advance(1);
+    assert!(!lapse());
+    assert!(state()["target"].is_null());
+}
+
+/// An app that quit leaves at once, whatever the person is being asked.
+#[test]
+fn an_app_that_quit_leaves_while_the_person_is_asked() {
+    let round_trips = Rc::new(Cell::new(0));
+    let _helper = naming_helper(&round_trips);
+    let (_person, _) = person(Decision::Allowed);
+    admit(ComputerMethod::Click, &click("Sample")).expect("goes at once");
+    stand_in::asking(true);
+    stand_in::ended(&[4343]);
+    assert!(!lapse(), "nothing is left to look for");
+    assert!(state()["target"].is_null());
+}
+
+/// A look's answer names the app it read. A press by a mark names no app at
+/// all, and the word of a look may be one no name of the app's spells
+/// (`Notes` where the helper says `메모`): the first look answered ties the
+/// word to the app in use, and that look and every later one by the word is a
+/// use of it — with nothing asked of the helper (t-109874).
+#[test]
+fn a_looks_answer_ties_its_word_to_the_app_in_use() {
+    let round_trips = Rc::new(Cell::new(0));
+    let _helper = naming_helper(&round_trips);
+    let (_person, _) = person(Decision::Allowed);
+    // As a mark's press reaches its app: by its process, no word of the agent's.
+    admit(ComputerMethod::Click, &click("pid:4242")).expect("goes at once");
+    round_trips.set(0);
+    let look = json!({ "app": "Mirroring" });
+    let answer = json!({"snapshot": {"app": {
+        "name": "iPhone 미러링", "bundleId": "com.apple.ScreenContinuity", "pid": 4242,
+    }}});
+    stand_in::advance(SHARE_USE_LAPSES_MS - 1);
+    {
+        let _look = admit(ComputerMethod::Observe, &look).expect("a look");
+        super::heard(&answer);
+    }
+    stand_in::advance(SHARE_USE_LAPSES_MS - 1);
+    assert!(lapse(), "the look's answer named the app in use");
+    drop(admit(ComputerMethod::Observe, &look).expect("a look"));
+    stand_in::advance(SHARE_USE_LAPSES_MS - 1);
+    assert!(
+        lapse(),
+        "from then on the word names it as the look comes in"
+    );
+    assert_eq!(state()["target"], "com.apple.screencontinuity");
+    assert_eq!(round_trips.get(), 0, "no look asked the helper anything");
+    stand_in::advance(1);
+    assert!(!lapse());
+    assert!(state()["target"].is_null());
+}
+
+/// A read of an app's text and a search of its elements answer with the name
+/// the helper gave the app and no more (`read`, `find`, `wait-for`): the look
+/// is tied to the one app in use that bears the name (t-109874).
+#[test]
+fn an_answer_that_carries_the_apps_name_alone_ties_the_look_too() {
+    let round_trips = Rc::new(Cell::new(0));
+    let _helper = naming_helper(&round_trips);
+    let (_person, _) = person(Decision::Allowed);
+    admit(ComputerMethod::Click, &click("pid:4242")).expect("goes at once");
+    round_trips.set(0);
+    let look = json!({ "app": "Mirroring" });
+    let read = json!({
+        "source": "accessibility", "snapshotId": "s-1", "app": "iPhone 미러링",
+        "window": {"id": 7, "title": "a window"}, "text": "what it reads",
+    });
+    stand_in::advance(SHARE_USE_LAPSES_MS - 1);
+    {
+        let _look = admit(ComputerMethod::Observe, &look).expect("a look");
+        super::heard(&read);
+    }
+    stand_in::advance(SHARE_USE_LAPSES_MS - 1);
+    assert!(lapse(), "the read named the app in use by its name");
+    assert_eq!(state()["target"], "com.apple.screencontinuity");
+    drop(admit(ComputerMethod::Observe, &look).expect("a look"));
+    stand_in::advance(SHARE_USE_LAPSES_MS - 1);
+    assert!(
+        lapse(),
+        "from then on the word names it as the look comes in"
+    );
+    assert_eq!(round_trips.get(), 0, "no look asked the helper anything");
+    stand_in::advance(1);
+    assert!(!lapse());
+}
+
+/// A name two apps in use bear names neither: the look is tied to none.
+#[test]
+fn a_name_two_apps_in_use_bear_ties_a_look_to_neither() {
+    let (_person, _) = person(Decision::Allowed);
+    let _helper = crate::computer_use::test_helper::stand(|_, params| {
+        let (bundle, pid) = if params["named"] == "one" {
+            ("com.example.one", 1)
+        } else {
+            ("com.example.two", 2)
+        };
+        Ok(json!({"apps": [{
+            "name": "Twin", "bundleId": bundle, "pid": pid, "isRunning": true,
+        }], "named": true}))
+    });
+    admit(ComputerMethod::Click, &click("one")).expect("goes at once");
+    admit(ComputerMethod::Click, &click("two")).expect("goes at once");
+    assert_eq!(state()["label"], "Twin, Twin", "two apps of one name");
+    stand_in::advance(SHARE_USE_LAPSES_MS - 1);
+    {
+        let _look = admit(ComputerMethod::Observe, &json!({ "app": "the twin" })).expect("a look");
+        super::heard(&json!({ "app": "Twin" }));
+    }
+    stand_in::advance(1);
+    assert!(!lapse(), "a look that named neither kept one in use");
+    assert!(state()["target"].is_null());
+}
+
+/// An answer about an app that is not in use ties nothing and keeps nothing
+/// in use.
+#[test]
+fn an_answer_about_an_app_that_is_not_in_use_ties_nothing() {
+    let round_trips = Rc::new(Cell::new(0));
+    let _helper = naming_helper(&round_trips);
+    let (_person, _) = person(Decision::Allowed);
+    admit(ComputerMethod::Click, &click("Sample")).expect("goes at once");
+    let other = json!({"snapshot": {"app": {
+        "name": "iPhone 미러링", "bundleId": "com.apple.ScreenContinuity", "pid": 4242,
+    }}});
+    stand_in::advance(SHARE_USE_LAPSES_MS - 1);
+    {
+        let _look = admit(ComputerMethod::Observe, &json!({ "app": "Mirroring" })).expect("a look");
+        super::heard(&other);
+    }
+    stand_in::advance(1);
+    assert!(!lapse(), "a look at another app kept this one in use");
+    assert!(state()["target"].is_null());
+    assert_eq!(state()["panels"], json!([]), "and brought nothing into use");
+}
+
+/// The host's own answer, not a test's: a child that was waited for is gone,
+/// and this process is not.
+#[cfg(unix)]
+#[test]
+fn a_process_that_was_waited_for_has_ended_and_this_one_has_not() {
+    let mut child = crate::proc::quiet_command("/usr/bin/true")
+        .spawn()
+        .expect("a child");
+    let pid = i64::from(child.id());
+    child.wait().expect("the child ended");
+    assert!(super::host_says_ended(pid));
+    assert!(!super::host_says_ended(i64::from(std::process::id())));
+    assert!(!super::host_says_ended(0), "no process is not an ended one");
+    assert!(!super::host_says_ended(-1));
+    assert!(
+        !super::host_says_ended(i64::MAX),
+        "a number no process can have proves nothing"
+    );
 }

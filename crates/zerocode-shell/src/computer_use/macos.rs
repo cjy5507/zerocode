@@ -67,6 +67,52 @@ const STOP_WATCH_METHOD: &str = "stopWatch";
 /// How many unused connections to keep. More than this at once is a burst, and
 /// the extra ones are closed when it is over.
 const MAX_IDLE_WIRES: usize = 8;
+/// How long a connection the helper's queue refused is tried again, and the
+/// pause between two tries. The helper's queue holds eight connections it has
+/// not taken yet (`listen(socketFd, 8)`), and the groups of one `parallel`
+/// connect in the same instant: past the queue the system refuses at once.
+/// The helper takes a connection within moments, so a refusal while it lives
+/// is a queue that was full for one.
+const QUEUE_FULL_WAIT: Duration = Duration::from_secs(2);
+const QUEUE_FULL_PAUSE: Duration = Duration::from_millis(2);
+/// A living helper that has taken no connection for this long, whatever asked,
+/// is no busy helper: the time a helper is given to listen when it starts.
+/// The session goes then, and its helper is sent away before another starts.
+const UNTAKEN_IS_BROKEN: Duration = CONNECT_TIMEOUT;
+
+/// Since when a living helper has taken no connection, across the requests
+/// that asked for one.
+#[derive(Default)]
+struct Untaken(Option<std::time::Instant>);
+
+impl Untaken {
+    /// A connection asked for at `asked` was refused to the last, at `now`.
+    /// Whether the helper has now taken none for `patience`.
+    fn refused(
+        &mut self,
+        asked: std::time::Instant,
+        now: std::time::Instant,
+        patience: Duration,
+    ) -> bool {
+        now.duration_since(*self.0.get_or_insert(asked)) >= patience
+    }
+
+    /// The helper took a connection.
+    fn taken(&mut self) {
+        self.0 = None;
+    }
+}
+
+/// Why a request got no connection to the helper.
+enum NoWire {
+    /// The helper lives and took no new connection through the wait. Nothing
+    /// was sent, and the session stands: this request alone is refused.
+    Busy,
+    /// The road is broken — the helper is gone, the socket is, or the helper
+    /// has taken no connection for [`UNTAKEN_IS_BROKEN`]. The session is
+    /// discarded, its helper sent away, and the next call starts a new one.
+    Broken(ComputerUseError),
+}
 // Every waiting request is answered inside the limit every answer has.
 const _: () = assert!(STOP_WATCH_WAIT.as_secs() < REQUEST_TIMEOUT.as_secs());
 
@@ -75,6 +121,8 @@ pub(super) struct Session {
     /// one, so requests to different apps run at once and the helper keeps them
     /// in order per app.
     idle: std::sync::Mutex<Vec<Wire>>,
+    /// Since when the helper has taken no new connection, if it has not.
+    untaken: std::sync::Mutex<Untaken>,
     socket: PathBuf,
     token: String,
     /// The window's waiting request (t-66753 B): its own connection, shut
@@ -371,8 +419,18 @@ impl ProviderSession for Session {
         Self::connect(launch()?)
     }
 
+    fn dismiss(&self) {
+        self.dismiss_helper();
+    }
+
     fn request(&self, method: &str, params: Value) -> Result<Value, SessionFailure> {
-        let mut wire = self.take_wire().map_err(SessionFailure::Transport)?;
+        let mut wire = match self.take_wire(QUEUE_FULL_WAIT) {
+            Ok(wire) => wire,
+            // No second helper beside one that lives: it may still carry
+            // another group's steps, and the window's stop reaches one helper.
+            Err(NoWire::Busy) => return Err(SessionFailure::Provider(helper_took_no_connection())),
+            Err(NoWire::Broken(error)) => return Err(SessionFailure::Transport(error)),
+        };
         let answer = wire.request(method, params);
         // A wire that broke, or whose reply no longer lines up, is not reused.
         if !matches!(answer, Err(SessionFailure::Transport(_))) {
@@ -471,7 +529,9 @@ fn launch_at(app: &Path) -> Result<Launched, ComputerUseError> {
 }
 
 impl Session {
-    fn take_wire(&self) -> Result<Wire, ComputerUseError> {
+    /// A connection with no request on it: an idle one, or a new one — tried
+    /// again through `wait` while the helper's queue is full.
+    fn take_wire(&self, wait: Duration) -> Result<Wire, NoWire> {
         if let Some(wire) = self
             .idle
             .lock()
@@ -480,9 +540,80 @@ impl Session {
         {
             return Ok(wire);
         }
-        let stream = std::os::unix::net::UnixStream::connect(&self.socket)
-            .map_err(io_error("connect to the Computer Use helper"))?;
-        Wire::new(stream, self.token.clone())
+        let asked = std::time::Instant::now();
+        let untaken = || {
+            self.untaken
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        match connect_past_a_full_queue(&self.socket, wait, || self.helper_lives()) {
+            Ok(stream) => {
+                untaken().taken();
+                Wire::new(stream, self.token.clone()).map_err(NoWire::Broken)
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ConnectionRefused
+                    && self.helper_lives()
+                    && !untaken().refused(asked, std::time::Instant::now(), UNTAKEN_IS_BROKEN) =>
+            {
+                Err(NoWire::Busy)
+            }
+            Err(error) => Err(NoWire::Broken(io_error(
+                "connect to the Computer Use helper",
+            )(error))),
+        }
+    }
+
+    /// Ask the helper to go, and signal it if it stays: at the session's end,
+    /// and as soon as the window discards the session — a request of another
+    /// group may still hold it, and a helper left running then would go on
+    /// with that group's steps out of reach of the window's stop, which is
+    /// aimed at the session that stands (t-109578). Asked twice it is gone
+    /// the second time, and nothing is sent or signalled.
+    fn dismiss_helper(&self) {
+        // Its waiting request ends with it, on purpose: that is no loss.
+        if let Some(watching) = &self.watching {
+            watching
+                .leaving
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        // A full queue is not waited out for a goodbye.
+        if let Ok(mut wire) = self.take_wire(Duration::ZERO)
+            && let Ok(line) = serde_json::to_vec(&json!({
+                "id": wire.next_id,
+                "method": "terminate",
+                "params": {},
+                "token": self.token,
+            }))
+        {
+            let _ = wire.stream.write_all(&line);
+            let _ = wire.stream.write_all(b"\n");
+            let _ = wire.stream.flush();
+        }
+        // `terminate` is the helper's own exit; the signal is for a helper
+        // that stopped reading. Only ever aimed at the process this socket
+        // answered from, and only while that pid still runs our executable —
+        // a pid is reusable, a path is not.
+        if let Some(pid) = self.helper_pid {
+            let deadline = std::time::Instant::now() + Duration::from_millis(300);
+            while helper_runs_at(pid) {
+                if std::time::Instant::now() >= deadline {
+                    // SAFETY: `kill` with a positive pid and a plain signal
+                    // number has no memory effects on this process.
+                    let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+
+    /// Whether the helper is known to be there still: its pid lives and still
+    /// runs the helper's executable — a pid is reusable, a path is not. A
+    /// helper whose pid was never read is not known to live: its refusal is a
+    /// broken road, as it always was.
+    fn helper_lives(&self) -> bool {
+        self.helper_pid.is_some_and(helper_stands_at)
     }
 
     pub(super) fn panel_watch_ended(&self) -> bool {
@@ -526,6 +657,7 @@ impl Session {
         let wire = Wire::new(stream, token.clone())?;
         let mut client = Self {
             idle: std::sync::Mutex::new(vec![wire]),
+            untaken: std::sync::Mutex::new(Untaken::default()),
             socket: socket.clone(),
             token,
             watching: None,
@@ -562,6 +694,46 @@ impl Session {
     }
 }
 
+/// The refusal of a request for which the living helper took no connection:
+/// nothing of it was sent, and the same helper answers the next one.
+fn helper_took_no_connection() -> ComputerUseError {
+    ComputerUseError::new(
+        error_code::ACTION_TIMEOUT,
+        format!(
+            "the Computer Use helper took no new connection for {} s; nothing was sent. It is the same helper still: try again in a moment",
+            QUEUE_FULL_WAIT.as_secs()
+        ),
+    )
+    .with_delivery(Some(zerocode_core::computer_use_protocol::NOT_DELIVERED))
+}
+
+/// Connect to the helper at `socket`, trying again while its queue is full.
+/// A refused connection sent nothing. Taken for a broken road it discards the
+/// session, and the next step starts a second helper beside one that still
+/// carries the other groups' steps — out of reach of the window's stop, with
+/// an app's turns and the session's count split between the two (t-109501).
+/// Given up at once when `lives` says the helper is gone, and after `wait`
+/// when it never took the connection.
+fn connect_past_a_full_queue(
+    socket: &Path,
+    wait: Duration,
+    lives: impl Fn() -> bool,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    let started = std::time::Instant::now();
+    loop {
+        match std::os::unix::net::UnixStream::connect(socket) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ConnectionRefused
+                    && started.elapsed() < wait
+                    && lives() =>
+            {
+                std::thread::sleep(QUEUE_FULL_PAUSE);
+            }
+            connected => return connected,
+        }
+    }
+}
+
 impl SessionFailure {
     fn into_error_pub(self) -> ComputerUseError {
         match self {
@@ -578,34 +750,7 @@ impl Drop for Session {
         }
         // The session is over, and its watch with it: nothing is lost.
         super::guard::watch_left();
-        if let Ok(mut wire) = self.take_wire()
-            && let Ok(line) = serde_json::to_vec(&json!({
-                "id": wire.next_id,
-                "method": "terminate",
-                "params": {},
-                "token": self.token,
-            }))
-        {
-            let _ = wire.stream.write_all(&line);
-            let _ = wire.stream.write_all(b"\n");
-            let _ = wire.stream.flush();
-        }
-        // `terminate` is the helper's own exit; the signal is for a helper
-        // that stopped reading. Only ever aimed at the process this socket
-        // answered from, and only while that pid still runs our executable —
-        // a pid is reusable, a path is not.
-        if let Some(pid) = self.helper_pid {
-            let deadline = std::time::Instant::now() + Duration::from_millis(300);
-            while helper_runs_at(pid) {
-                if std::time::Instant::now() >= deadline {
-                    // SAFETY: `kill` with a positive pid and a plain signal
-                    // number has no memory effects on this process.
-                    let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-        }
+        self.dismiss_helper();
         cleanup(&self.directory);
     }
 }
@@ -629,6 +774,17 @@ fn peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<libc::pid_t> {
         )
     };
     (rc == 0 && pid > 0).then_some(pid)
+}
+
+/// Whether the helper a session read off its socket is there still. In a
+/// test the helper is a stand-in on a thread of the test's own process, whose
+/// executable is no helper's (`stand_in`): that process stands for it.
+fn helper_stands_at(pid: libc::pid_t) -> bool {
+    #[cfg(test)]
+    if u32::try_from(pid).is_ok_and(|pid| pid == std::process::id()) {
+        return true;
+    }
+    helper_runs_at(pid)
 }
 
 /// Whether `pid` is alive *and* still runs the Computer Use helper executable.
@@ -749,9 +905,7 @@ fn signing_identity(details: &str) -> Option<zerocode_core::computer_use::Comput
 
 #[must_use]
 pub(super) fn permission_status() -> ComputerPermissionReport {
-    // A granted ScreenCapture row is only observed by a new helper process.
-    super::shutdown();
-    match permission_status_macos() {
+    let report = match permission_status_macos() {
         Ok(report) => report,
         Err(error) => ComputerPermissionReport {
             identity: helper_signing_identity(),
@@ -766,10 +920,64 @@ pub(super) fn permission_status() -> ComputerPermissionReport {
                 .map(|helper| tcc_rows(&helper, None))
                 .unwrap_or_default(),
         },
+    };
+    settle_session_for(&report.permissions);
+    report
+}
+
+/// The rows as the window last read them: what a helper started since counts on.
+static ROWS_READ: std::sync::Mutex<Option<Vec<(ComputerPermissionId, ComputerPermissionStatus)>>> =
+    std::sync::Mutex::new(None);
+
+/// A granted ScreenCapture row is only observed by a new helper process, so
+/// a reading that moved a row ends the session, and the next call starts a
+/// helper that sees it. A reading that moved none leaves the session and what
+/// it has under way alone: the window reads the rows whenever it is focused,
+/// and ending a session sends its helper away with every act it carries
+/// (t-109675).
+fn settle_session_for(rows: &[ComputerPermissionState]) {
+    let moved = rows_moved(
+        &mut ROWS_READ
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        rows,
+    );
+    if moved {
+        super::shutdown();
     }
 }
 
+/// Whether `rows` differ from the ones `read` last, which they replace. The
+/// first reading has none to compare with and counts as moved: nothing says
+/// what a helper that already stands started under.
+fn rows_moved(
+    read: &mut Option<Vec<(ComputerPermissionId, ComputerPermissionStatus)>>,
+    rows: &[ComputerPermissionState],
+) -> bool {
+    let rows: Vec<_> = rows.iter().map(|row| (row.id, row.status)).collect();
+    let moved = read.as_ref() != Some(&rows);
+    *read = Some(rows);
+    moved
+}
+
+/// Forget the last reading, so the next one counts as moved whatever it
+/// says. A row changed outside a reading — it was reset, or the person was
+/// sent to System Settings to set it — and a helper that starts before the
+/// row is set again starts under the row as it stands in between: a reading
+/// that then finds the rows as they were last read would leave that helper
+/// standing, blind to a grant given after it started (t-109717).
+fn forget_rows_read() {
+    *ROWS_READ
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
 fn permission_status_macos() -> Result<ComputerPermissionReport, ComputerUseError> {
+    // A test says what its thread's probe reads, and no helper app starts.
+    #[cfg(test)]
+    if let Some(report) = stand_in::probe_report() {
+        return Ok(report);
+    }
     permission_probe(None).map(|(report, _)| report)
 }
 
@@ -1147,8 +1355,20 @@ fn permission_next_step(target: &PermissionTarget, row: &ComputerPermissionRow) 
 pub(super) fn open_permission(
     permission_id: Option<ComputerPermissionId>,
 ) -> Result<ComputerPermissionSetup, ComputerUseError> {
-    super::shutdown();
-    let report = permission_status_macos()?;
+    let report = if permission_id.is_some() {
+        // A named permission is asked of the OS and the person sent to its
+        // list: the session ends here, and the last reading is forgotten.
+        super::shutdown();
+        forget_rows_read();
+        permission_status_macos()?
+    } else {
+        // A plain status ask is a reading like the window's own — an agent
+        // makes one as the first call of every run — and ends the session
+        // only when a row moved (t-109717).
+        let report = permission_status_macos()?;
+        settle_session_for(&report.permissions);
+        report
+    };
     let plan = permission_plan(permission_id, &report.permissions);
     let mut setup = ComputerPermissionSetup {
         identity: report.identity,
@@ -1222,6 +1442,8 @@ fn reset_row(
         .args(reset_args(target, &row.bundle_id)?)
         .output()
         .map_err(io_error("reset Computer Use permission"))?;
+    // The reset ran: the row is no longer what the last reading said.
+    forget_rows_read();
     if !output.status.success() {
         let why = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(ComputerUseError::new(
@@ -1633,6 +1855,11 @@ mod tests {
         super::super::call("handshake", json!({})).unwrap();
         assert!(super::super::session_stands());
         let refreshed = permission_status();
+        assert!(
+            super::super::session_stands(),
+            "a reading that moved no row leaves the session standing"
+        );
+        super::super::shutdown();
         assert!(!super::super::session_stands());
         assert!(
             refreshed

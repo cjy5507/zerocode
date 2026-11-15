@@ -179,10 +179,9 @@ fn ensure_share_panel() -> bool {
         // A provider may already be starting; this is not a failed launch.
         return false;
     };
-    if held
-        .as_ref()
-        .is_some_and(|session| session.panel_watch_ended())
-    {
+    if let Some(session) = held.as_ref().filter(|session| session.panel_watch_ended()) {
+        // Its helper goes before another is started (t-109578).
+        session.dismiss();
         discard_session(&mut held);
     }
     if held.is_none()
@@ -257,7 +256,12 @@ pub fn call(method: &str, params: Value) -> Result<Value, ComputerUseError> {
     input_policy::ensure_current()?;
     let acts = acts_on_something(method);
     match session.request(method, params) {
-        Ok(answer) => Ok(answer),
+        Ok(answer) => {
+            // A look's answer names the app it read: where that app is in
+            // use, the share counts the look as a use of it (t-109874).
+            share::heard(&answer);
+            Ok(answer)
+        }
         Err(SessionFailure::Provider(error)) => {
             Err(said_of_delivery(error, acts, card_held_the_borrow))
         }
@@ -338,6 +342,11 @@ fn said_of_delivery(
 /// break, or a new session may already stand: only the session this request used
 /// goes.
 fn discard(session: &Arc<platform::Session>, error: ComputerUseError) -> ComputerUseError {
+    // Its helper goes first, before a new session can stand: a request of
+    // another group may still hold this session, and the window's stop is
+    // aimed at the session that stands (t-109578). Before the lock: sending a
+    // helper away can take a moment, and other requests wait on that lock.
+    session.dismiss();
     let mut held = held_client()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -433,7 +442,12 @@ pub fn shutdown() {
         let mut held = client
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if held.take().is_some() {
+        if let Some(session) = held.take() {
+            // Its helper goes with it, before the next call can start
+            // another: a request of another agent may still hold this
+            // session, and the window's stop is aimed at the one that stands
+            // (t-109578).
+            session.dismiss();
             SESSION_EPOCH.fetch_add(1, Ordering::AcqRel);
         }
     }

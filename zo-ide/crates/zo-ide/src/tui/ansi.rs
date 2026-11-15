@@ -101,6 +101,9 @@ pub struct Style {
     pub bg: Option<Color>,
     pub bold: bool,
     pub dim: bool,
+    /// Keeps SGR 2 (`\x1b[2m`) even when the marks look resolves dim spans
+    /// to measured RGB ink, so the window can still read `cell.style.dim`.
+    pub sgr_dim: bool,
     pub italic: bool,
     pub underline: bool,
     pub strike: bool,
@@ -114,6 +117,7 @@ impl Style {
             bg: None,
             bold: false,
             dim: false,
+            sgr_dim: false,
             italic: false,
             underline: false,
             strike: false,
@@ -144,6 +148,15 @@ impl Style {
         self
     }
 
+    /// Marks the span as dim while requiring SGR 2 (`\x1b[2m`) instead of
+    /// measured secondary RGB ink.
+    #[must_use]
+    pub const fn sgr_dim(mut self) -> Self {
+        self.dim = true;
+        self.sgr_dim = true;
+        self
+    }
+
     #[must_use]
     pub const fn italic(mut self) -> Self {
         self.italic = true;
@@ -163,7 +176,33 @@ impl Style {
     }
 
     fn resolved_for(mut self, palette: Option<TerminalPalette>) -> Self {
+        let keep_sgr_dim = self.sgr_dim;
+        self.sgr_dim = false;
         if let Some(palette) = palette {
+            let explicit_bg = match self.bg {
+                Some(Color::Rgb(red, green, blue)) => Some((red, green, blue)),
+                _ => None,
+            };
+            let marks_truecolor = !keep_sgr_dim
+                && palette.color_level() != palette::ColorLevel::Ansi16
+                && super::style::current().style == super::style::TuiStyle::Marks;
+            if marks_truecolor {
+                if self.dim && self.fg.is_none() {
+                    let ink = match explicit_bg {
+                        Some(bg) => palette.secondary_foreground(bg),
+                        None => palette::secondary_foreground_cached(palette),
+                    };
+                    self.dim = false;
+                    self.fg = Some(Color::Rgb(ink.0, ink.1, ink.2));
+                } else if let Some(slot) = self.fg.and_then(ansi16_slot) {
+                    if let Some(ink) =
+                        palette::resolved_ansi16_ink(palette, slot, self.dim, explicit_bg)
+                    {
+                        self.dim = false;
+                        self.fg = Some(Color::Rgb(ink.0, ink.1, ink.2));
+                    }
+                }
+            }
             self.fg = self.fg.and_then(|color| palette.resolve(color));
             self.bg = self.bg.and_then(|color| palette.resolve(color));
         }
@@ -194,12 +233,22 @@ impl Style {
         }
         self.bold |= other.bold;
         self.dim |= other.dim;
+        self.sgr_dim |= other.sgr_dim;
         self.italic |= other.italic;
         self.underline |= other.underline;
         self.strike |= other.strike;
         self
     }
 
+}
+
+const fn ansi16_slot(color: Color) -> Option<u8> {
+    match color {
+        Color::Base(index) if index < 8 => Some(index),
+        Color::BrightBase(index) if index < 8 => Some(index + 8),
+        Color::Indexed(index) if index < 16 => Some(index),
+        _ => None,
+    }
 }
 
 /// 창이 여는 주소의 머리. 이 밖의 목적지 — `javascript:`, `data:`, 앱 전용
@@ -955,5 +1004,35 @@ mod background_tests {
         let mut out = String::new();
         write_spans_for_palette(&line, None, &mut out);
         assert_eq!(out, "\u{1b}[32;48;2;48;48;48mx");
+    }
+
+    #[test]
+    fn codex_look_keeps_sgr_dim_even_with_a_palette() {
+        use crate::tui::palette::{ColorLevel, TerminalPalette};
+
+        let horizon = TerminalPalette::new((224, 224, 224), (28, 30, 38), ColorLevel::TrueColor);
+        let line = Line::new(vec![Span::dim("12 lines")]);
+        let mut out = String::new();
+        write_spans_for_palette(&line, Some(horizon), &mut out);
+        assert_eq!(out, "\u{1b}[2m12 lines");
+    }
+
+    #[test]
+    fn codex_look_keeps_ansi_slot_bytes_even_with_sixteen_colours() {
+        use crate::tui::palette::{ColorLevel, TerminalPalette};
+
+        let mut slots = [None; 16];
+        slots[6] = Some((42, 161, 152));
+        let solarized = TerminalPalette::new((101, 123, 131), (253, 246, 227), ColorLevel::TrueColor)
+            .with_ansi16(slots);
+
+        for style in [Style::new().fg(Color::CYAN), Style::new().fg(Color::CYAN).dim()] {
+            let line = Line::new(vec![Span::new("x", style)]);
+            let mut with_palette = String::new();
+            let mut without_palette = String::new();
+            write_spans_for_palette(&line, Some(solarized), &mut with_palette);
+            write_spans_for_palette(&line, None, &mut without_palette);
+            assert_eq!(with_palette, without_palette);
+        }
     }
 }

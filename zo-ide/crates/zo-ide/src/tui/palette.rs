@@ -14,11 +14,23 @@
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::ansi::{Color, Style};
 
-type DefaultColors = ((u8, u8, u8), (u8, u8, u8));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedOscPalette {
+    foreground: (u8, u8, u8),
+    background: (u8, u8, u8),
+    ansi16: [Option<(u8, u8, u8)>; 16],
+}
+
+#[cfg(any(unix, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OscPaletteRead {
+    complete: bool,
+    palette: Option<ParsedOscPalette>,
+}
 
 /// OSC 조회가 기다리는 전체 시간. Codex startup probe와 같은 상한이다.
 #[cfg(unix)]
@@ -28,6 +40,17 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100)
 pub const SHIMMER_BASE: (u8, u8, u8) = (128, 128, 128);
 /// shimmer 밴드의 꼭대기 재료 — 응답이 없을 때의 캡처 값.
 pub const SHIMMER_PEAK: (u8, u8, u8) = (255, 255, 255);
+/// Minimum WCAG contrast ratio against the terminal background for muted
+/// marks elements (table rules and the deepest shimmer trough).
+pub const MIN_MUTED_CONTRAST: f64 = 3.0;
+/// Minimum WCAG contrast ratio for secondary (dim) text in the marks look.
+pub const MIN_SECONDARY_CONTRAST: f64 = 4.5;
+/// Maximum share of the body-text contrast ratio that secondary text may
+/// require on low-contrast themes (e.g. Solarized), so dim text stays softer
+/// than body text.
+pub const SECONDARY_CONTRAST_BODY_SHARE: f64 = 0.75;
+const SECONDARY_INK_START_SHARE: f32 = 0.60;
+const SECONDARY_INK_STEP: f32 = 0.05;
 
 /// Max tier 컴포저 caret `›` 의 캡처 폴백.
 pub const COMPOSER_CARET: Color = Color::Rgb(255, 178, 66);
@@ -66,8 +89,10 @@ pub const TOOL_OK: Color = Color::Indexed(2);
 pub const TOOL_FAIL: Color = Color::Indexed(1);
 /// `Exploring` 목록과 MCP 셀의 도구 이름.
 pub const TOOL_LABEL: Color = Color::Indexed(6);
+/// Accent for marks headings (H1/H2) and table headers.
+pub const HEADING_ACCENT: Color = Color::Rgb(249, 226, 175);
 /// 표 헤더 행의 전경색.
-pub const TABLE_HEADER: Color = Color::Rgb(249, 226, 175);
+pub const TABLE_HEADER: Color = HEADING_ACCENT;
 /// `/resume` 목록에서 고른 행 — 감사에서 확인된 어두운 배경 갈래
 /// (`Color::Yellow`). 행 배경 tint는 측정값에 적응하지만, 밝은 테마의 전경
 /// remap은 #19와 함께 유예되어 이 토큰은 보존한다.
@@ -90,6 +115,7 @@ pub struct TerminalPalette {
     foreground: (u8, u8, u8),
     background: (u8, u8, u8),
     color_level: ColorLevel,
+    ansi16: [Option<(u8, u8, u8)>; 16],
 }
 
 impl TerminalPalette {
@@ -104,6 +130,24 @@ impl TerminalPalette {
             foreground,
             background,
             color_level,
+            ansi16: [None; 16],
+        }
+    }
+
+    /// Attaches measured RGB values for ANSI 16-colour slots `0..=15`.
+    #[must_use]
+    pub const fn with_ansi16(mut self, ansi16: [Option<(u8, u8, u8)>; 16]) -> Self {
+        self.ansi16 = ansi16;
+        self
+    }
+
+    /// Returns the measured RGB for an ANSI 16-colour slot (`0..=15`), if known.
+    #[must_use]
+    pub const fn ansi_color(self, index: u8) -> Option<(u8, u8, u8)> {
+        if index < 16 {
+            self.ansi16[index as usize]
+        } else {
+            None
         }
     }
 
@@ -136,7 +180,86 @@ impl TerminalPalette {
     /// foreground, which reversed that polarity.
     #[must_use]
     pub fn shimmer_colors(self) -> ((u8, u8, u8), (u8, u8, u8)) {
-        (self.foreground, self.background)
+        let peak = if super::style::current().style == super::style::TuiStyle::Marks {
+            self.muted_foreground_for_contrast(MIN_MUTED_CONTRAST)
+        } else {
+            self.background
+        };
+        (self.foreground, peak)
+    }
+
+    /// Lightest blend of `foreground` over `background` (starting at 20 % in
+    /// 5 % steps) that still clears `min_contrast` against `background`.
+    #[must_use]
+    pub fn muted_foreground_for_contrast(self, min_contrast: f64) -> (u8, u8, u8) {
+        for step in 4..=20 {
+            #[allow(clippy::cast_precision_loss)]
+            let alpha = step as f32 * 0.05;
+            let candidate = blend_rgb(self.foreground, self.background, alpha);
+            if contrast_ratio(candidate, self.background) >= min_contrast {
+                return candidate;
+            }
+        }
+        self.foreground
+    }
+
+    fn text_contrast_floor(self, background: (u8, u8, u8)) -> f64 {
+        let body_contrast = contrast_ratio(self.foreground, background);
+        (body_contrast * SECONDARY_CONTRAST_BODY_SHARE).min(MIN_SECONDARY_CONTRAST)
+    }
+
+    /// Measured dimmed ink for `ink` against `background`: blends `ink` over
+    /// `background` starting at 60 % in 5 % steps until it clears the text
+    /// contrast floor, then pulls toward `self.foreground` if `ink` itself
+    /// falls under the floor.
+    #[must_use]
+    pub fn dim_foreground(
+        self,
+        ink: (u8, u8, u8),
+        background: (u8, u8, u8),
+    ) -> (u8, u8, u8) {
+        let floor = self.text_contrast_floor(background);
+        for step in 0..8 {
+            #[allow(clippy::cast_precision_loss)]
+            let alpha = SECONDARY_INK_START_SHARE + step as f32 * SECONDARY_INK_STEP;
+            let candidate = blend_rgb(ink, background, alpha);
+            if contrast_ratio(candidate, background) >= floor {
+                return candidate;
+            }
+        }
+        self.ensure_text_contrast(ink, background)
+    }
+
+    /// Measured secondary-text ink against `background`: blends `foreground`
+    /// over `background` starting at 60 % in 5 % steps until it clears
+    /// `min(4.5, body_contrast * 0.75)`.
+    #[must_use]
+    pub fn secondary_foreground(self, background: (u8, u8, u8)) -> (u8, u8, u8) {
+        self.dim_foreground(self.foreground, background)
+    }
+
+    /// Pull `color` toward `self.foreground` in 5 % steps until its contrast
+    /// against `background` reaches the text contrast floor, returning `color`
+    /// unchanged when it already clears the floor.
+    #[must_use]
+    pub fn ensure_text_contrast(
+        self,
+        color: (u8, u8, u8),
+        background: (u8, u8, u8),
+    ) -> (u8, u8, u8) {
+        let floor = self.text_contrast_floor(background);
+        if contrast_ratio(color, background) >= floor {
+            return color;
+        }
+        for step in 1..20 {
+            #[allow(clippy::cast_precision_loss)]
+            let alpha = step as f32 * SECONDARY_INK_STEP;
+            let candidate = blend_rgb(self.foreground, color, alpha);
+            if contrast_ratio(candidate, background) >= floor {
+                return candidate;
+            }
+        }
+        self.foreground
     }
 
     /// 실제 깊이에서 표현할 수 있는 전경/배경색으로 낮춘다.
@@ -230,13 +353,19 @@ pub(crate) fn band_background(terminal_palette: TerminalPalette, style: super::s
 /// The band a code block stands on: the terminal's background moved a step
 /// toward its opposite — less than the band the person's words stand on.
 #[must_use]
-pub(crate) fn code_background(terminal_palette: TerminalPalette) -> Color {
+pub(crate) fn code_background_rgb(terminal_palette: TerminalPalette) -> (u8, u8, u8) {
     let (overlay, alpha) = if terminal_palette.has_light_background() {
         ((0, 0, 0), 0.03)
     } else {
         ((255, 255, 255), 0.05)
     };
-    let (red, green, blue) = blend_rgb(overlay, terminal_palette.background(), alpha);
+    blend_rgb(overlay, terminal_palette.background(), alpha)
+}
+
+/// The band a code block stands on, wrapped as an RGB [`Color`].
+#[must_use]
+pub(crate) fn code_background(terminal_palette: TerminalPalette) -> Color {
+    let (red, green, blue) = code_background_rgb(terminal_palette);
     Color::Rgb(red, green, blue)
 }
 
@@ -298,11 +427,147 @@ pub fn contrast_ratio(foreground: (u8, u8, u8), background: (u8, u8, u8)) -> f64
 }
 
 static TERMINAL_PALETTE: OnceLock<Option<TerminalPalette>> = OnceLock::new();
+static DEFAULT_SECONDARY_INK: OnceLock<(TerminalPalette, (u8, u8, u8))> = OnceLock::new();
 
 /// startup probe가 성공했을 때만 적응 팔레트를 돌려준다.
 #[must_use]
 pub(crate) fn terminal_palette() -> Option<TerminalPalette> {
     TERMINAL_PALETTE.get().copied().flatten()
+}
+
+/// Returns the cached secondary-text RGB for `palette`'s default background
+/// when `palette` matches the probed terminal palette.
+#[must_use]
+pub(crate) fn secondary_foreground_cached(palette: TerminalPalette) -> (u8, u8, u8) {
+    if let Some(active) = terminal_palette() {
+        if active == palette {
+            return DEFAULT_SECONDARY_INK
+                .get_or_init(|| (active, active.secondary_foreground(active.background())))
+                .1;
+        }
+    }
+    palette.secondary_foreground(palette.background())
+}
+
+struct ContrastCacheEntry {
+    palette: TerminalPalette,
+    color: (u8, u8, u8),
+    background: (u8, u8, u8),
+    adjusted: (u8, u8, u8),
+}
+
+/// Cached [`TerminalPalette::ensure_text_contrast`] keyed by `(palette, color, background)`.
+#[must_use]
+fn ensure_text_contrast_cached(
+    palette: TerminalPalette,
+    color: (u8, u8, u8),
+    background: (u8, u8, u8),
+) -> (u8, u8, u8) {
+    thread_local! {
+        static ADJUSTED_TEXT_COLORS: std::cell::RefCell<Vec<ContrastCacheEntry>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    ADJUSTED_TEXT_COLORS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(entry) = cache.iter().find(|entry| {
+            entry.palette == palette && entry.color == color && entry.background == background
+        }) {
+            return entry.adjusted;
+        }
+        let adjusted = palette.ensure_text_contrast(color, background);
+        cache.push(ContrastCacheEntry {
+            palette,
+            color,
+            background,
+            adjusted,
+        });
+        adjusted
+    })
+}
+
+/// Adjusts an RGB foreground `color` to meet the marks text contrast floor
+/// against `background_of(palette)` when running in marks style on a
+/// non-ANSI-16 palette; leaves all other cases untouched.
+#[must_use]
+pub(crate) fn ensure_marks_fg_contrast(
+    palette: Option<TerminalPalette>,
+    color: Color,
+    background_of: impl FnOnce(TerminalPalette) -> (u8, u8, u8),
+) -> Color {
+    if super::style::current().style != super::style::TuiStyle::Marks {
+        return color;
+    }
+    let (Some(palette), Color::Rgb(red, green, blue)) = (palette, color) else {
+        return color;
+    };
+    if palette.color_level() == ColorLevel::Ansi16 {
+        return color;
+    }
+    let (red, green, blue) =
+        ensure_text_contrast_cached(palette, (red, green, blue), background_of(palette));
+    Color::Rgb(red, green, blue)
+}
+
+struct Ansi16InkCacheEntry {
+    palette: TerminalPalette,
+    slot: u8,
+    dim: bool,
+    resolved: Option<(u8, u8, u8)>,
+}
+
+fn compute_ansi16_ink(
+    palette: TerminalPalette,
+    slot: u8,
+    dim: bool,
+    background: (u8, u8, u8),
+) -> Option<(u8, u8, u8)> {
+    let ink = palette.ansi_color(slot)?;
+    if dim {
+        return Some(palette.dim_foreground(ink, background));
+    }
+    let floor = palette.text_contrast_floor(background);
+    if contrast_ratio(ink, background) >= floor {
+        None
+    } else {
+        Some(palette.ensure_text_contrast(ink, background))
+    }
+}
+
+/// Resolves an ANSI-16 slot's foreground RGB when its colour is known and
+/// either `dim` is set or the slot falls below the text contrast floor.
+/// Returns `None` when the slot should keep its original ANSI index bytes.
+/// Caches `(palette, slot, dim)` for the terminal's default background.
+#[must_use]
+pub(crate) fn resolved_ansi16_ink(
+    palette: TerminalPalette,
+    slot: u8,
+    dim: bool,
+    explicit_background: Option<(u8, u8, u8)>,
+) -> Option<(u8, u8, u8)> {
+    if let Some(background) = explicit_background {
+        return compute_ansi16_ink(palette, slot, dim, background);
+    }
+    thread_local! {
+        static ANSI16_INKS: std::cell::RefCell<Vec<Ansi16InkCacheEntry>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    ANSI16_INKS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(entry) = cache
+            .iter()
+            .find(|entry| entry.palette == palette && entry.slot == slot && entry.dim == dim)
+        {
+            return entry.resolved;
+        }
+        let resolved = compute_ansi16_ink(palette, slot, dim, palette.background());
+        cache.push(Ansi16InkCacheEntry {
+            palette,
+            slot,
+            dim,
+            resolved,
+        });
+        resolved
+    })
 }
 
 /// raw TTY의 이벤트 스트림이 열리기 전에 팔레트를 한 번 초기화한다.
@@ -364,11 +629,16 @@ impl LateOscGuard {
             return false;
         }
         if self.inside {
-            // `ESC \` or BEL closes the string; the terminator's own bytes go
-            // with it.
-            if matches!(key.code, KeyCode::Char('\\')) || matches!(key.code, KeyCode::Char('\u{7}')) {
+            // `ESC \` (parsed as `Alt+\` or `Esc` then `\`) or `BEL` (parsed
+            // as `Ctrl+g` by crossterm) closes this reply. Keep the guard
+            // armed until `self.until` because `query_default_colors` sends
+            // two queries (OSC 10 and 11) and multiple replies can follow.
+            let is_st = matches!(key.code, KeyCode::Char('\\'));
+            let is_bel = matches!(key.code, KeyCode::Char('\u{7}'))
+                || (matches!(key.code, KeyCode::Char('g'))
+                    && key.modifiers.contains(KeyModifiers::CONTROL));
+            if is_st || is_bel {
                 self.inside = false;
-                self.until = now;
             }
             return true;
         }
@@ -382,6 +652,11 @@ impl LateOscGuard {
             // swallowed; disarm so the next one reaches the operator.
             self.until = now;
             return false;
+        }
+        // Crossterm parses `ESC ]` arriving in one read as `Alt+]`.
+        if matches!(key.code, KeyCode::Char(']')) && key.modifiers.contains(KeyModifiers::ALT) {
+            self.inside = true;
+            return true;
         }
         if matches!(key.code, KeyCode::Esc) {
             // The reply begins with ESC, and letting that through fires an
@@ -409,12 +684,15 @@ pub(crate) fn initialize_if_raw_tty() {
 }
 
 fn query_terminal_palette() -> Option<TerminalPalette> {
-    let (foreground, background) = query_default_colors()?;
-    Some(TerminalPalette::new(
-        foreground,
-        background,
-        color_level_from_env(),
-    ))
+    let parsed = query_default_colors()?;
+    Some(
+        TerminalPalette::new(
+            parsed.foreground,
+            parsed.background,
+            color_level_from_env(),
+        )
+        .with_ansi16(parsed.ansi16),
+    )
 }
 
 pub(crate) fn color_level_from_env() -> ColorLevel {
@@ -436,7 +714,20 @@ pub(crate) fn color_level_from_env() -> ColorLevel {
 }
 
 #[cfg(unix)]
-fn query_default_colors() -> Option<DefaultColors> {
+const CODEX_OSC_QUERY: &[u8] = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
+#[cfg(unix)]
+const MARKS_OSC_QUERY: &[u8] = concat!(
+    "\x1b]10;?\x1b\\\x1b]11;?\x1b\\",
+    "\x1b]4;0;?\x1b\\\x1b]4;1;?\x1b\\\x1b]4;2;?\x1b\\\x1b]4;3;?\x1b\\",
+    "\x1b]4;4;?\x1b\\\x1b]4;5;?\x1b\\\x1b]4;6;?\x1b\\\x1b]4;7;?\x1b\\",
+    "\x1b]4;8;?\x1b\\\x1b]4;9;?\x1b\\\x1b]4;10;?\x1b\\\x1b]4;11;?\x1b\\",
+    "\x1b]4;12;?\x1b\\\x1b]4;13;?\x1b\\\x1b]4;14;?\x1b\\\x1b]4;15;?\x1b\\",
+    "\x1b]10;?\x1b\\",
+)
+.as_bytes();
+
+#[cfg(unix)]
+fn query_default_colors() -> Option<ParsedOscPalette> {
     use std::fs::OpenOptions;
     use std::io::{ErrorKind, Read as _, Write as _};
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -448,7 +739,13 @@ fn query_default_colors() -> Option<DefaultColors> {
         .custom_flags(nix::libc::O_NONBLOCK)
         .open("/dev/tty")
         .ok()?;
-    tty.write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\").ok()?;
+    let query_ansi16 = super::style::current().style == super::style::TuiStyle::Marks;
+    let query = if query_ansi16 {
+        MARKS_OSC_QUERY
+    } else {
+        CODEX_OSC_QUERY
+    };
+    tty.write_all(query).ok()?;
     tty.flush().ok()?;
 
     // The reply may still be in flight when the budget runs out — a tmux relay,
@@ -458,18 +755,17 @@ fn query_default_colors() -> Option<DefaultColors> {
     // `]10;rgb:…` sitting in the prompt, one Enter away from being sent.
     PROBE_SENT.store(true, std::sync::atomic::Ordering::Release);
     let deadline = Instant::now() + PROBE_TIMEOUT;
-    let mut response = Vec::with_capacity(128);
+    let mut response = Vec::with_capacity(if query_ansi16 { 512 } else { 128 });
     let mut chunk = [0u8; 256];
     while Instant::now() < deadline {
         match tty.read(&mut chunk) {
             Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
             Ok(read) => {
                 response.extend_from_slice(&chunk[..read]);
-                if let (Some(foreground), Some(background)) =
-                    (parse_osc_color(&response, 10), parse_osc_color(&response, 11))
-                {
+                let status = parse_osc_palette_response(&response, query_ansi16);
+                if status.complete {
                     PROBE_ANSWERED.store(true, std::sync::atomic::Ordering::Release);
-                    return Some((foreground, background));
+                    return status.palette;
                 }
                 if response.len() > 4_096 {
                     response.drain(..response.len() - 4_096);
@@ -481,15 +777,86 @@ fn query_default_colors() -> Option<DefaultColors> {
             Err(_) => return None,
         }
     }
-    None
+    parse_osc_palette_response(&response, query_ansi16).palette
 }
 
 #[cfg(not(unix))]
-const fn query_default_colors() -> Option<DefaultColors> {
+const fn query_default_colors() -> Option<ParsedOscPalette> {
     None
 }
 
 #[cfg(any(unix, test))]
+fn parse_osc_palette_response(
+    response: &[u8],
+    expect_ansi16_sentinel: bool,
+) -> OscPaletteRead {
+    let mut foreground = None;
+    let mut background = None;
+    let mut ansi16 = [None; 16];
+    let mut osc10_count = 0u8;
+    let mut offset = 0usize;
+
+    while let Some(rel_start) = response[offset..]
+        .windows(2)
+        .position(|window| window == b"\x1b]")
+    {
+        let body_start = offset + rel_start + 2;
+        let payload = &response[body_start..];
+        let string_end = payload.windows(2).position(|window| window == b"\x1b\\");
+        let bell = payload.iter().position(|byte| *byte == 0x07);
+        let (end, term_len) = match (string_end, bell) {
+            (Some(st), Some(b)) if st <= b => (st, 2),
+            (Some(st), None) => (st, 2),
+            (Some(_) | None, Some(b)) => (b, 1),
+            (None, None) => break,
+        };
+        if let Ok(text) = std::str::from_utf8(&payload[..end]) {
+            if let Some((code, rest)) = text.split_once(';') {
+                if code == "10" {
+                    if let Some(rgb) = parse_osc_rgb(rest) {
+                        osc10_count = osc10_count.saturating_add(1);
+                        if foreground.is_none() {
+                            foreground = Some(rgb);
+                        }
+                    }
+                } else if code == "11" {
+                    if let Some(rgb) = parse_osc_rgb(rest) {
+                        if background.is_none() {
+                            background = Some(rgb);
+                        }
+                    }
+                } else if code == "4" {
+                    if let Some((slot_str, rgb_str)) = rest.split_once(';') {
+                        if let (Ok(slot), Some(rgb)) =
+                            (slot_str.parse::<usize>(), parse_osc_rgb(rgb_str))
+                        {
+                            if slot < 16 {
+                                ansi16[slot] = Some(rgb);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        offset = body_start + end + term_len;
+    }
+
+    let palette = match (foreground, background) {
+        (Some(foreground), Some(background)) => Some(ParsedOscPalette {
+            foreground,
+            background,
+            ansi16,
+        }),
+        _ => None,
+    };
+    let required_osc10 = if expect_ansi16_sentinel { 2 } else { 1 };
+    OscPaletteRead {
+        complete: palette.is_some() && osc10_count >= required_osc10,
+        palette,
+    }
+}
+
+#[cfg(test)]
 fn parse_osc_color(response: &[u8], slot: u8) -> Option<(u8, u8, u8)> {
     let prefix = format!("\x1b]{slot};");
     let start = response
@@ -630,6 +997,141 @@ mod tests {
             soften_status_line_style(Style::new().fg(Color::Rgb(166, 227, 161))).fg,
             Some(Color::Rgb(171, 223, 167))
         );
+    }
+
+    #[test]
+    fn secondary_foreground_keeps_a_contrast_floor_across_themes() {
+        let horizon = TerminalPalette::new((224, 224, 224), (28, 30, 38), ColorLevel::TrueColor);
+        let horizon_ink = horizon.secondary_foreground(horizon.background());
+        assert_eq!(horizon_ink, super::blend_rgb((224, 224, 224), (28, 30, 38), 0.60));
+        assert!(super::contrast_ratio(horizon_ink, (28, 30, 38)) >= 4.5);
+
+        let light = TerminalPalette::new((46, 52, 52), (255, 255, 255), ColorLevel::TrueColor);
+        let light_ink = light.secondary_foreground(light.background());
+        assert!(super::contrast_ratio(light_ink, (255, 255, 255)) >= 4.5);
+        assert!(
+            super::contrast_ratio(light_ink, (255, 255, 255))
+                < super::contrast_ratio((46, 52, 52), (255, 255, 255))
+        );
+
+        let solarized_light =
+            TerminalPalette::new((101, 123, 131), (253, 246, 227), ColorLevel::TrueColor);
+        let solarized_light_body = super::contrast_ratio((101, 123, 131), (253, 246, 227));
+        let solarized_light_ink = solarized_light.secondary_foreground(solarized_light.background());
+        let solarized_light_contrast =
+            super::contrast_ratio(solarized_light_ink, (253, 246, 227));
+        assert!(solarized_light_contrast >= solarized_light_body * 0.75);
+        assert!(solarized_light_contrast < solarized_light_body);
+
+        let solarized_dark =
+            TerminalPalette::new((131, 148, 150), (0, 43, 54), ColorLevel::TrueColor);
+        let solarized_dark_body = super::contrast_ratio((131, 148, 150), (0, 43, 54));
+        let solarized_dark_ink = solarized_dark.secondary_foreground(solarized_dark.background());
+        let solarized_dark_contrast = super::contrast_ratio(solarized_dark_ink, (0, 43, 54));
+        assert!(solarized_dark_contrast >= solarized_dark_body * 0.75);
+        assert!(solarized_dark_contrast < solarized_dark_body);
+
+        let band = (42, 43, 50);
+        let band_ink = horizon.secondary_foreground(band);
+        assert!(super::contrast_ratio(band_ink, band) >= 4.5);
+    }
+
+    #[test]
+    fn ensure_text_contrast_pulls_low_contrast_colours_and_keeps_compliant_ones() {
+        let light = TerminalPalette::new((46, 52, 52), (255, 255, 255), ColorLevel::TrueColor);
+        let model = light.ensure_text_contrast((213, 144, 48), (255, 255, 255));
+        assert_ne!(model, (213, 144, 48));
+        assert!(super::contrast_ratio(model, (255, 255, 255)) >= 4.5);
+
+        let cyan = light.ensure_text_contrast((23, 146, 153), (247, 247, 247));
+        assert_ne!(cyan, (23, 146, 153));
+        assert!(super::contrast_ratio(cyan, (247, 247, 247)) >= 4.5);
+
+        let dark = TerminalPalette::new((224, 224, 224), (28, 30, 38), ColorLevel::TrueColor);
+        assert_eq!(dark.ensure_text_contrast((147, 153, 178), (39, 41, 48)), (147, 153, 178));
+        assert_eq!(dark.ensure_text_contrast((246, 226, 183), (28, 30, 38)), (246, 226, 183));
+
+        let solarized = TerminalPalette::new((101, 123, 131), (253, 246, 227), ColorLevel::TrueColor);
+        let solarized_bg = (253, 246, 227);
+        let body_contrast = super::contrast_ratio((101, 123, 131), solarized_bg);
+        let adjusted = solarized.ensure_text_contrast((213, 144, 48), solarized_bg);
+        assert!(super::contrast_ratio(adjusted, solarized_bg) >= body_contrast * 0.75);
+    }
+
+    #[test]
+    fn parses_osc_palette_with_sixteen_ansi_slots_and_end_sentinel() {
+        let mut response = b"\x1b]10;rgb:6565/7b7b/8383\x1b\\\x1b]11;rgb:fdfd/f6f6/e3e3\x1b\\".to_vec();
+        for slot in 0u8..16 {
+            response.extend_from_slice(
+                format!("\x1b]4;{slot};rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}\x1b\\", slot * 10, slot * 10 + 1, slot * 10 + 2).as_bytes(),
+            );
+        }
+        response.extend_from_slice(b"\x1b]10;rgb:6565/7b7b/8383\x1b\\");
+
+        let read = super::parse_osc_palette_response(&response, true);
+        assert!(read.complete, "complete 19-reply response should finish");
+        let parsed = read.palette.expect("palette should be present");
+        assert_eq!(parsed.foreground, (0x65, 0x7b, 0x83));
+        assert_eq!(parsed.background, (0xfd, 0xf6, 0xe3));
+        for slot in 0u8..16 {
+            assert_eq!(
+                parsed.ansi16[usize::from(slot)],
+                Some((slot * 10, slot * 10 + 1, slot * 10 + 2))
+            );
+        }
+    }
+
+    #[test]
+    fn completes_at_end_sentinel_when_terminal_ignores_osc_4() {
+        let response = b"\x1b]10;rgb:e0e0/e0e0/e0e0\x1b\\\x1b]11;rgb:1c1c/1e1e/2626\x1b\\\x1b]10;rgb:e0e0/e0e0/e0e0\x1b\\";
+        let read = super::parse_osc_palette_response(response, true);
+        assert!(read.complete, "end sentinel should finish even without OSC 4 replies");
+        let parsed = read.palette.expect("palette should be present");
+        assert_eq!(parsed.foreground, (0xe0, 0xe0, 0xe0));
+        assert_eq!(parsed.background, (0x1c, 0x1e, 0x26));
+        assert_eq!(parsed.ansi16, [None; 16]);
+    }
+
+    #[test]
+    fn waits_for_end_sentinel_while_osc_4_replies_are_still_arriving() {
+        let mut response = b"\x1b]10;rgb:e0e0/e0e0/e0e0\x1b\\\x1b]11;rgb:1c1c/1e1e/2626\x1b\\".to_vec();
+        for slot in 0..5 {
+            response.extend_from_slice(format!("\x1b]4;{slot};rgb:1111/2222/3333\x1b\\").as_bytes());
+        }
+        let read = super::parse_osc_palette_response(&response, true);
+        assert!(!read.complete, "without end sentinel, probe is not complete");
+        let parsed = read
+            .palette
+            .expect("partial response with OSC 10 and 11 should still build a palette");
+        assert_eq!(parsed.foreground, (0xe0, 0xe0, 0xe0));
+        assert_eq!(parsed.background, (0x1c, 0x1e, 0x26));
+        for slot in 0..5 {
+            assert_eq!(parsed.ansi16[slot], Some((0x11, 0x22, 0x33)));
+        }
+        for slot in 5..16 {
+            assert_eq!(parsed.ansi16[slot], None);
+        }
+    }
+
+    #[test]
+    fn returns_no_palette_when_only_osc_4_replies_arrived() {
+        let response = b"\x1b]4;0;rgb:1111/2222/3333\x1b\\\x1b]4;1;rgb:4444/5555/6666\x1b\\\x1b]4;2;rgb:7777/8888/9999\x1b\\";
+        let read = super::parse_osc_palette_response(response, true);
+        assert!(!read.complete);
+        assert_eq!(read.palette, None);
+    }
+
+    #[test]
+    fn parses_osc_4_replies_with_bel_and_8_or_16_bit_components() {
+        let response = b"\x1b]10;rgb:65/7b/83\x07\x1b]11;rgb:fdfd/f6f6/e3e3\x07\x1b]4;1;rgb:dc/32/2f\x07\x1b]4;6;rgb:2a2a/a1a1/9898\x07\x1b]10;rgb:65/7b/83\x07";
+        let read = super::parse_osc_palette_response(response, true);
+        assert!(read.complete, "BEL-terminated replies should finish at second OSC 10");
+        let parsed = read.palette.expect("palette should be present");
+        assert_eq!(parsed.foreground, (0x65, 0x7b, 0x83));
+        assert_eq!(parsed.background, (0xfd, 0xf6, 0xe3));
+        assert_eq!(parsed.ansi16[1], Some((0xdc, 0x32, 0x2f)));
+        assert_eq!(parsed.ansi16[6], Some((0x2a, 0xa1, 0x98)));
+        assert_eq!(parsed.ansi16[0], None);
     }
 
 }

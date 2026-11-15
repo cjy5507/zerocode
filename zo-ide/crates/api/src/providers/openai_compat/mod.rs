@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use serde::Deserialize;
+use super::endpoint_capabilities::{self, ReasoningAnswer};
 use serde_json::{Value, json};
 use super::{crosses_restart_commit_boundary, prompt_cache_key, read_env_non_empty};
 
@@ -342,12 +343,14 @@ pub struct CustomProviderConfig {
     /// [`crate::providers::max_tokens_for_model`].
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
-    /// Whether this endpoint accepts multimodal `image_url` content parts.
-    /// Defaults `false`: a vision-less OpenAI-compatible server (e.g. a
-    /// DeepSeek-style gateway) rejects `image_url` with a hard 400, so images
-    /// are degraded to a text placeholder unless the operator opts in here.
+    /// Optional serialized request-body ceiling, in bytes.
     #[serde(default)]
-    pub supports_vision: bool,
+    pub max_request_bytes: Option<u64>,
+    /// Whether this endpoint accepts multimodal `image_url` content parts.
+    /// An explicit value wins over `/models`; when neither states support,
+    /// images are degraded to a text placeholder.
+    #[serde(default)]
+    pub supports_vision: Option<bool>,
     /// Read-only advisory VRAM estimate for local models. Zo displays this
     /// only when the `model-fit-hints` feature is enabled; it never selects or
     /// serves a model from the estimate.
@@ -414,6 +417,8 @@ where
 pub struct ModelLimits {
     pub context_window: Option<u64>,
     pub max_output_tokens: Option<u64>,
+    pub max_request_bytes: Option<u64>,
+    pub supports_vision: Option<bool>,
 }
 
 impl ModelLimits {
@@ -422,6 +427,8 @@ impl ModelLimits {
     pub fn is_stated(self) -> bool {
         self.context_window.is_some_and(|value| value > 0)
             || self.max_output_tokens.is_some_and(|value| value > 0)
+            || self.max_request_bytes.is_some_and(|value| value > 0)
+            || self.supports_vision.is_some()
     }
 }
 
@@ -451,6 +458,10 @@ enum CustomModelWire {
         context_window: Option<u64>,
         #[serde(default)]
         max_output_tokens: Option<u64>,
+        #[serde(default)]
+        max_request_bytes: Option<u64>,
+        #[serde(default)]
+        supports_vision: Option<bool>,
     },
 }
 
@@ -465,11 +476,15 @@ impl From<CustomModelWire> for CustomModel {
                 id,
                 context_window,
                 max_output_tokens,
+                max_request_bytes,
+                supports_vision,
             } => Self {
                 id,
                 limits: ModelLimits {
                     context_window,
                     max_output_tokens,
+                    max_request_bytes,
+                    supports_vision,
                 },
             },
         }
@@ -512,7 +527,7 @@ impl CustomProviderConfig {
         );
         // Operator opt-in: a vision-capable custom endpoint re-enables `image_url`
         // parts that `from_user` conservatively disabled.
-        config.supports_vision = self.supports_vision;
+        config.supports_vision = self.supports_vision.unwrap_or(false);
         // Same shape of opt-in for the effort field: without it a gateway-served
         // reasoning model gets no `reasoning_effort` at all.
         config.supports_reasoning_effort = self.supports_reasoning_effort;
@@ -775,33 +790,53 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let mut attempts = 0;
-        // Set once a refused request is being sent again with its reasoning
-        // the other way (`reasoning_answer_to_try`).
-        let mut resent_the_other_way = false;
+        // What this endpoint answered about `reasoning_content` before, kept
+        // in zo's home (`endpoint_capabilities`). A refusal that may be about
+        // the field is answered once with the other way to send it — with an
+        // answer kept, only a refusal that names the field — and that other
+        // way is kept only once the same request succeeds with it, never on a
+        // 429 or a server error.
+        let known = endpoint_capabilities::reasoning_answer(&self.base_url, &request.model);
+        let mut candidate = None;
+        // The refusal of the request as first sent, while the other way is
+        // tried: when that way is refused for the field, the first refusal is
+        // the one that says what is wrong (a context too long goes on to
+        // compaction instead of ending the turn on the field).
+        let mut first_refusal: Option<(ApiError, bool)> = None;
         let config = request_config_for_base_url(self.config(), &self.base_url);
 
         let last_error = loop {
             attempts += 1;
-            let retryable_error = match self.send_raw_request(request).await {
+            let answer = candidate.or(known);
+            let retryable_error = match self.send_raw_request(request, answer).await {
                 Ok((response, key_sent)) => match expect_success(response).await {
-                    Ok(response) => return Ok(response),
+                    Ok(response) => {
+                        if candidate.is_some() {
+                            endpoint_capabilities::note_reasoning_answer(
+                                &self.base_url,
+                                &request.model,
+                                candidate,
+                            );
+                        }
+                        return Ok(response);
+                    }
                     Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
                     Err(error) => {
-                        if resent_the_other_way {
-                            // The same request the other way was refused as
-                            // well, so the reasoning was not why: nothing was
-                            // learnt about the endpoint.
-                            if refuses_the_body(&error) {
-                                note_reasoning_answer(&config, &request.model, None);
+                        if candidate.is_none() {
+                            if let Some(other) =
+                                reasoning_answer_to_try(&error, request, &config, answer)
+                            {
+                                // Not a transient failure: no backoff, and the
+                                // attempt is not spent.
+                                candidate = Some(other);
+                                first_refusal = Some((error, key_sent));
+                                attempts -= 1;
+                                continue;
                             }
-                        } else if let Some(answer) = reasoning_answer_to_try(&error, request, &config) {
-                            // Not a transient failure: no backoff, and the
-                            // attempt is not spent. The body is built from the
-                            // answer noted here (`reasoning_wire`).
-                            note_reasoning_answer(&config, &request.model, Some(answer));
-                            resent_the_other_way = true;
-                            attempts -= 1;
-                            continue;
+                        } else if names_the_reasoning_field(&error) {
+                            if let Some((first, first_key_sent)) = first_refusal.take() {
+                                return Err(self.refused_router_key(first, first_key_sent));
+                            }
                         }
                         return Err(self.refused_router_key(error, key_sent));
                     }
@@ -844,17 +879,41 @@ impl OpenAiCompatClient {
     async fn send_raw_request(
         &self,
         request: &MessageRequest,
+        answer: Option<ReasoningAnswer>,
     ) -> Result<(reqwest::Response, bool), ApiError> {
         let request_url = chat_completions_endpoint(&self.base_url);
         let config = request_config_for_base_url(self.config(), &self.base_url);
+        let payload = serde_json::to_vec(&build_chat_completion_request_with_answer(
+            request, config, answer,
+        ))?;
+        let bytes = payload.len();
+        // The exact body is known only here. It stops here when it is over a
+        // declared ceiling or no smaller than a size this endpoint refused —
+        // never for being larger than one it took: a size planned under is a
+        // safe target, not a limit (`endpoint_capabilities::preflight`).
+        let refused = endpoint_capabilities::request_body_bounds(&self.base_url, &request.model);
+        if let Some(error) = endpoint_capabilities::preflight(
+            bytes,
+            super::declared_max_request_bytes_for_model(&request.model),
+            refused,
+        ) {
+            return Err(error);
+        }
         let builder = self
             .http
             .post(&request_url)
             .header("content-type", "application/json")
-            .json(&build_chat_completion_request(request, config));
+            .body(payload);
         let builder = self.apply_client_identity(builder);
         let (builder, key_sent) = self.apply_auth(builder).await?;
         let response = builder.send().await.map_err(ApiError::from)?;
+        endpoint_capabilities::note_http_status(
+            &self.base_url,
+            &request.model,
+            response.status(),
+            bytes,
+            refused,
+        );
         Ok((response, key_sent))
     }
 
@@ -869,6 +928,18 @@ impl OpenAiCompatClient {
             builder = builder.header(*name, *value);
         }
         builder
+    }
+
+    /// Read model metadata with this connection's auth and client headers.
+    pub(super) async fn read_model_capabilities(&self) -> Result<(), ApiError> {
+        let endpoint = super::custom_models::models_endpoint(&self.base_url);
+        let builder = self.http.get(endpoint).timeout(Duration::from_secs(2));
+        let builder = self.apply_client_identity(builder);
+        let (builder, _) = self.apply_auth(builder).await?;
+        let response = expect_success(builder.send().await?).await?;
+        let body = response.json::<ModelsListResponse>().await?;
+        super::custom_models::remember(&self.base_url, &body.data);
+        Ok(())
     }
 
     fn authenticate(&self, builder: reqwest::RequestBuilder, key: &str) -> reqwest::RequestBuilder {
@@ -1681,62 +1752,17 @@ enum ReasoningWire {
     Field { every_step: bool },
 }
 
-/// What an endpoint answered a request about `reasoning_content`, learnt from
-/// a refusal that the same request sent the other way did not get.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReasoningAnswer {
-    /// It refused a request that carried the field (400, or the 422 "extra
-    /// inputs are not permitted") and took it without.
-    Refused,
-    /// It refused a request for lacking the field and took it with one.
-    Demanded,
-}
-
-/// The answers so far, by base URL and lower-cased model id, for the life of
-/// the process: an endpoint that refuses the field would refuse it on every
-/// later step of the conversation, and one that demands it likewise
-/// (`OpenAiCompatClient::send_with_retry`).
-type ReasoningAnswers = std::sync::Mutex<std::collections::BTreeMap<(String, String), ReasoningAnswer>>;
-
-fn reasoning_answers() -> &'static ReasoningAnswers {
-    static ANSWERS: std::sync::OnceLock<ReasoningAnswers> = std::sync::OnceLock::new();
-    ANSWERS.get_or_init(Default::default)
-}
-
-fn reasoning_answer_key(config: &OpenAiCompatConfig, model: &str) -> (String, String) {
-    (config.default_base_url.to_string(), model.trim().to_ascii_lowercase())
-}
-
-fn reasoning_answer(config: &OpenAiCompatConfig, model: &str) -> Option<ReasoningAnswer> {
-    reasoning_answers()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&reasoning_answer_key(config, model))
-        .copied()
-}
-
-/// Remember what `model` behind this endpoint answered, or forget it.
+#[cfg(test)]
 fn note_reasoning_answer(config: &OpenAiCompatConfig, model: &str, answer: Option<ReasoningAnswer>) {
-    let mut answers = reasoning_answers()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let key = reasoning_answer_key(config, model);
-    match answer {
-        Some(answer) => {
-            answers.insert(key, answer);
-        }
-        None => {
-            answers.remove(&key);
-        }
-    }
+    endpoint_capabilities::note_reasoning_answer(config.default_base_url, model, answer);
 }
 
 /// How `request` carries reasoning to this endpoint ([`ReasoningWire`]).
-fn reasoning_wire(request: &MessageRequest, config: &OpenAiCompatConfig) -> ReasoningWire {
+fn reasoning_wire(request: &MessageRequest, config: &OpenAiCompatConfig, answer: Option<ReasoningAnswer>) -> ReasoningWire {
     if !config.takes_its_reasoning_back() {
         return ReasoningWire::Text;
     }
-    match reasoning_answer(config, &request.model) {
+    match answer {
         Some(ReasoningAnswer::Refused) => ReasoningWire::Text,
         Some(ReasoningAnswer::Demanded) => ReasoningWire::Field { every_step: true },
         None => ReasoningWire::Field {
@@ -1762,29 +1788,40 @@ fn holds_reasoning_to_send_back(request: &MessageRequest) -> bool {
 }
 
 /// The other way to send a request this endpoint just refused, when the
-/// refusal may be about `reasoning_content` and nothing is known of the
-/// endpoint yet: without the field when the request carried it, with it when
-/// the refusal names the field and the request carried none.
+/// refusal may be about `reasoning_content`: without the field when the
+/// refused body carried it, with it when the refusal names the field and the
+/// body carried none. `sent_with` is the answer the refused body was built
+/// with ([`reasoning_wire`]). An answer kept from before is revisited only
+/// when the refusal names the field — any other refusal (a context too long,
+/// a bad argument) comes back as it was, after one send, as it did before
+/// answers were kept. The same answer again is no other way, and `None`.
 fn reasoning_answer_to_try(
     error: &ApiError,
     request: &MessageRequest,
     config: &OpenAiCompatConfig,
+    sent_with: Option<ReasoningAnswer>,
 ) -> Option<ReasoningAnswer> {
-    if !config.takes_its_reasoning_back()
-        || !refuses_the_body(error)
-        || reasoning_answer(config, &request.model).is_some()
-    {
+    if !config.takes_its_reasoning_back() || !refuses_the_body(error) {
         return None;
     }
-    if holds_reasoning_to_send_back(request) {
-        Some(ReasoningAnswer::Refused)
-    } else if names_the_reasoning_field(error)
-        && request.messages.iter().any(|message| message.role == "assistant")
-    {
-        Some(ReasoningAnswer::Demanded)
-    } else {
-        None
+    if sent_with.is_some() && !names_the_reasoning_field(error) {
+        return None;
     }
+    let has_a_step = request.messages.iter().any(|message| message.role == "assistant");
+    let carried_the_field = match reasoning_wire(request, config, sent_with) {
+        ReasoningWire::Text => false,
+        ReasoningWire::Field { every_step } => {
+            (every_step && has_a_step) || holds_reasoning_to_send_back(request)
+        }
+    };
+    let other = if carried_the_field {
+        ReasoningAnswer::Refused
+    } else if names_the_reasoning_field(error) && has_a_step {
+        ReasoningAnswer::Demanded
+    } else {
+        return None;
+    };
+    (Some(other) != sent_with).then_some(other)
 }
 
 /// Whether a refusal's own words name `reasoning_content` — the 400 an
@@ -1809,7 +1846,18 @@ fn refuses_the_body(error: &ApiError) -> bool {
     )
 }
 
+#[cfg(test)]
 fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
+    build_chat_completion_request_with_answer(request, config,
+        endpoint_capabilities::reasoning_answer(config.default_base_url, &request.model))
+}
+
+fn build_chat_completion_request_with_answer(request: &MessageRequest, mut config: OpenAiCompatConfig, answer: Option<ReasoningAnswer>) -> Value {
+    // The person's endpoint may take this model's pictures by declaration or
+    // by what its `/models` said; the request is built for that answer.
+    if let Some(vision) = super::custom_models::vision_for_config(&config, &request.model) {
+        config.supports_vision = vision;
+    }
     let mut messages = Vec::new();
     if let Some(blocks) = request.system.as_ref().filter(|v| !v.is_empty()) {
         let text: String = blocks
@@ -1838,7 +1886,7 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     // only): it waits until the step's run of `tool` messages has ended and
     // then goes out in a user message of its own — see `ToolPictures`.
     let mut tool_pictures = ToolPictures::for_request(request, &config);
-    let reasoning = reasoning_wire(request, &config);
+    let reasoning = reasoning_wire(request, &config, answer);
     for message in &request.messages {
         translate_message(
             message,
@@ -2469,8 +2517,10 @@ struct ModelsListResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ModelListEntry {
-    id: String,
+pub(super) struct ModelListEntry {
+    pub(super) id: String,
+    #[serde(flatten)]
+    pub(super) attributes: serde_json::Map<String, Value>,
 }
 
 /// List the model ids a running local OpenAI-compatible server advertises at
@@ -2493,7 +2543,10 @@ pub async fn discover_models(base_url: &str) -> Vec<String> {
         return Vec::new();
     }
     match response.json::<ModelsListResponse>().await {
-        Ok(body) => body.data.into_iter().map(|entry| entry.id).collect(),
+        Ok(body) => {
+            super::custom_models::remember(base_url, &body.data);
+            body.data.into_iter().map(|entry| entry.id).collect()
+        }
         Err(_) => Vec::new(),
     }
 }
@@ -2514,6 +2567,7 @@ pub async fn discover_models_with_bearer(
         .await?;
     let response = expect_success(response).await?;
     let body = response.json::<ModelsListResponse>().await?;
+    super::custom_models::remember(base_url, &body.data);
     Ok(body.data.into_iter().map(|entry| entry.id).collect())
 }
 

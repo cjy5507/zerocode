@@ -23127,6 +23127,186 @@ pub(crate) mod computer_desktop_wait {
     /// never refuses another's run.
     pub(crate) static ONE_HAND: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// A parallel holds as many groups as it is given and works on a bounded
+    /// number at a time (t-109501): each at work holds a thread and a
+    /// connection to the helper. Every group is answered, in the order given.
+    #[test]
+    fn a_parallel_answers_every_group_in_order_with_a_bounded_number_at_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const GROUPS: usize = 200;
+        const AT_ONCE: usize = 8;
+        let groups: Vec<usize> = (0..GROUPS).collect();
+        let at_work = AtomicUsize::new(0);
+        let most = AtomicUsize::new(0);
+        let entered = AtomicUsize::new(0);
+        let answers = crate::agent_tools_runtime::at_most_at_once(
+            &groups,
+            AT_ONCE,
+            || entered.fetch_add(1, Ordering::SeqCst),
+            |group| {
+                let now = at_work.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                at_work.fetch_sub(1, Ordering::SeqCst);
+                group * 2
+            },
+            |why| panic!("no group fails here: {why}"),
+        );
+        let doubled: Vec<usize> = (0..GROUPS).map(|group| group * 2).collect();
+        assert_eq!(answers, doubled);
+        let most = most.load(Ordering::SeqCst);
+        assert!(most <= AT_ONCE, "{most} groups were at work at once");
+        assert!(most > 1, "the groups ran one after another");
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            AT_ONCE,
+            "a worker begins once and takes group after group"
+        );
+    }
+
+    #[test]
+    fn a_parallel_of_fewer_groups_than_its_bound_starts_no_idle_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let entered = AtomicUsize::new(0);
+        let answers = crate::agent_tools_runtime::at_most_at_once(
+            &["a", "b", "c"],
+            64,
+            || entered.fetch_add(1, Ordering::SeqCst),
+            |group| group.to_uppercase(),
+            |why| why,
+        );
+        assert_eq!(answers, ["A", "B", "C"]);
+        assert_eq!(entered.load(Ordering::SeqCst), 3);
+    }
+
+    /// A group that panics is refused by itself: the groups beside it and
+    /// after it are answered, and the request never panics with it.
+    #[test]
+    fn a_group_that_panics_is_its_own_refusal_and_the_rest_are_answered() {
+        let answers = crate::agent_tools_runtime::at_most_at_once(
+            &[1, 2, 3, 4],
+            2,
+            || (),
+            |group| {
+                assert_ne!(*group, 2, "the second group broke");
+                group.to_string()
+            },
+            |why| format!("refused: {why}"),
+        );
+        assert_eq!(answers[0], "1");
+        assert!(
+            answers[1].starts_with("refused: ") && answers[1].contains("the second group broke"),
+            "{answers:?}"
+        );
+        assert_eq!(answers[2..], ["3", "4"]);
+    }
+
+    /// A parallel's look answers in a batch's shape — one step, carrying the
+    /// look's whole result — so every group of a parallel's answer reads alike.
+    #[test]
+    fn a_parallels_look_answers_in_a_batchs_shape_with_its_own_result() {
+        let look: Vec<String> = ["get-app-state", "--app", "Fixture", "--json"]
+            .map(str::to_owned)
+            .to_vec();
+        let mut asked = Vec::new();
+        let answer = crate::agent_tools_runtime::look_group(&look, u64::MAX, |step| {
+            asked.push(step.to_vec());
+            crate::agent_tools_runtime::computer_said(
+                serde_json::json!({ "ok": true, "result": { "snapshot": { "treeText": "0 window" } } })
+                    .to_string(),
+            )
+        });
+        assert_eq!(asked, [look], "the look goes down the lone command's road once");
+        assert_eq!(answer.exit_code, 0);
+        let said = envelope(&answer);
+        assert_eq!(
+            (&said["result"]["ran"], &said["result"]["of"]),
+            (&serde_json::json!(1), &serde_json::json!(1))
+        );
+        assert_eq!(said["result"]["steps"][0]["verb"], "get-app-state");
+        assert_eq!(
+            said["result"]["steps"][0]["result"]["snapshot"]["treeText"],
+            "0 window"
+        );
+    }
+
+    /// A look the door refused is that group's refusal, by the look's own code.
+    #[test]
+    fn a_parallels_refused_look_is_refused_by_the_looks_own_code() {
+        let look: Vec<String> = ["get-app-state", "--app", "Gone", "--json"]
+            .map(str::to_owned)
+            .to_vec();
+        let answer = crate::agent_tools_runtime::look_group(&look, u64::MAX, |_| {
+            crate::agent_tools_runtime::computer_cli_error(true, "app_not_found", "app 'Gone' not found")
+        });
+        assert_eq!(answer.exit_code, 1);
+        let said = envelope(&answer);
+        assert_eq!(said["error"]["code"], "app_not_found");
+        assert_eq!(said["result"]["refusedAt"], 1);
+    }
+
+    /// A group that waited for a place has what is left of the request's
+    /// time (t-109578): the bridge gives up on the whole request, so a look
+    /// that could not end inside what is left is not begun, and its group
+    /// says it is late in a batch's words.
+    #[test]
+    fn a_parallels_look_with_no_time_left_is_not_begun_and_says_it_is_late() {
+        let look: Vec<String> = ["get-app-state", "--app", "Fixture", "--json"]
+            .map(str::to_owned)
+            .to_vec();
+        for left_ms in [0, 1] {
+            let mut asked = 0;
+            let answer = crate::agent_tools_runtime::look_group(&look, left_ms, |_| {
+                asked += 1;
+                crate::agent_tools_runtime::computer_said("{\"ok\":true}".to_string())
+            });
+            assert_eq!(asked, 0, "with {left_ms} ms left the look was begun");
+            assert_ne!(answer.exit_code, 0);
+            let said = envelope(&answer);
+            assert_eq!(
+                said["error"]["code"],
+                zerocode_core::computer_use_protocol::error_code::BATCH_DEADLINE
+            );
+            assert_eq!(
+                (&said["result"]["ran"], &said["result"]["of"]),
+                (&serde_json::json!(0), &serde_json::json!(1))
+            );
+        }
+    }
+
+    /// The same for a group of acts: given no time, it starts no step.
+    #[test]
+    fn a_parallels_batch_with_no_time_left_starts_no_step_and_says_it_is_late() {
+        let _hand = ONE_HAND.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let command = zerocode_core::computer_use::parse_command(&words(&[
+            "batch",
+            "--commands",
+            r#"[["wait","--ms","10"],["wait","--ms","10"]]"#,
+            "--json",
+        ]))
+        .expect("a batch");
+        let mut ran = 0;
+        let answer = crate::agent_tools_runtime::run_batch(
+            &command,
+            0,
+            |_| {
+                ran += 1;
+                crate::agent_tools_runtime::computer_said("{\"ok\":true}".to_string())
+            },
+            |_, _| {},
+            || true,
+            |_| {},
+        );
+        assert_eq!(ran, 0, "a step was begun with no time left");
+        assert_ne!(answer.exit_code, 0);
+        let said = envelope(&answer);
+        assert_eq!(
+            said["error"]["code"],
+            zerocode_core::computer_use_protocol::error_code::BATCH_DEADLINE
+        );
+        assert_eq!(said["result"]["ran"], 0);
+    }
+
     #[cfg(unix)]
     #[test]
     fn an_omitted_background_flag_does_not_allow_a_shared_desktop_process() {

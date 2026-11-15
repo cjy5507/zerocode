@@ -106,6 +106,7 @@ pub use bash::{
 };
 #[cfg(windows)]
 pub use bash::end_process_tree_command;
+pub use bash::TOOL_CHILD_ENV;
 pub use tool_cancel::{
     ToolCancelSignal, ToolCancelWatch, ToolDispatchOutcome, CANCELLED_TOOL_RESULT,
 };
@@ -158,11 +159,15 @@ pub use config::{
     RuntimeSecondBrainConfig, RuntimeShipConfig, ScopedMcpServerConfig, UntrustedMcpServer,
     TRUSTED_MCP_SERVERS_FILE, ZO_SETTINGS_SCHEMA_NAME,
     narrow_broad_allow_always_rules, take_allow_always_narrow_notice, AllowAlwaysNarrowing,
+    take_allow_always_session_only_notice,
     NarrowedRule,
     persist_allow_always_rules, remove_mcp_server, trust_mcp_server, untrust_mcp_server,
     write_mcp_server, mcp_literal_secrets, move_mcp_literal_to_reference,
     slot_holds_literal_secret, persons_own_literal_secrets, can_tell_persons_own_settings_file,
     McpLiteralSecret, persons_own_settings_secrets, PersonsOwnSettingsSecrets, SkippedSettingsFile,
+    forget_local_file, is_recorded_local_file_kind, local_file_recorded, remember_local_file,
+    write_local_settings_for_a_tool, local_settings_record_stamp, LocalSettingsWrite, LOCAL_RECORD_FILE,
+    RECORDED_LOCAL_FILES,
 };
 pub use conversation::{is_fan_out_tool, ModelSwitch, SteeringObserver, SteeringQueue, SwitchObserver};
 pub use conversation::{

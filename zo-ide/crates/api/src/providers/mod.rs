@@ -13,6 +13,8 @@ pub mod anthropic;
 pub(crate) mod aws_sigv4;
 pub mod chatgpt_backend;
 pub mod cli_sessions;
+pub mod endpoint_capabilities;
+pub mod custom_models;
 pub(crate) mod cloud_gateway;
 pub mod gemini_code_assist;
 pub(crate) mod google_auth;
@@ -80,14 +82,48 @@ impl EditToolForm {
 
 /// The harness a model is driven with: what it is shown, as opposed to how a
 /// request reaches it (`wire`, effort, window). Resolved per model by
-/// [`harness_profile_for_model`]: the model's catalog row, then its lineup's
-/// `harness.by_provider` row, then the default — each field on its own, so a
+/// [`harness_profile_for_model`]: the model's catalog row, its name-token
+/// family's exact `harness.by_provider` key, its serving lineup, then the
+/// default — each field on its own, so a
 /// row states only where it differs. An operator overlay
 /// ([`MODEL_CONTEXT_WINDOWS_ENV`]) is read before the shipped catalog, which is
 /// how an experiment arm changes one field without a build.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HarnessProfile {
     pub edit_tool: EditToolForm,
+    /// Where the resolved edit shape came from; never changes the wire form.
+    pub edit_tool_source: HarnessValueSource,
+}
+
+/// Evidence behind one resolved harness value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessValueSource {
+    /// A measurement recorded in the catalog.
+    Measured,
+    /// A value read from the selected endpoint's model list.
+    Read,
+    /// An operator or model declaration.
+    Declared,
+    /// A different lineup's transport default.
+    Inherited,
+    /// The common fallback when no declaration applies.
+    #[default]
+    Default,
+}
+
+impl HarnessValueSource {
+    /// Stable spelling used by `zo --prompt-input`.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Measured => "measured",
+            Self::Read => "read",
+            Self::Declared => "declared",
+            Self::Inherited => "inherited",
+            Self::Default => "default",
+        }
+    }
 }
 
 /// A catalog row's partial harness declaration: absent fields fall through.
@@ -95,10 +131,17 @@ pub struct HarnessProfile {
 #[serde(default)]
 struct HarnessDecl {
     edit_tool: Option<EditToolForm>,
+    edit_tool_source: Option<HarnessValueSource>,
 }
 
-/// The catalog's `harness` section: lineup defaults keyed by the provider
-/// spelling catalog rows use (`openai`, `anthropic`, `google`).
+impl HarnessDecl {
+    fn edit_tool(self) -> Option<(EditToolForm, HarnessValueSource)> {
+        Some((self.edit_tool?, self.edit_tool_source.unwrap_or(HarnessValueSource::Declared)))
+    }
+}
+
+/// The catalog's `harness` section: exact name-token family keys, or lineup
+/// defaults keyed by the provider spelling catalog rows use.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct HarnessSection {
@@ -106,6 +149,10 @@ struct HarnessSection {
 }
 
 impl HarnessSection {
+    fn for_family(&self, family: &str) -> Option<&HarnessDecl> {
+        self.by_provider.iter().find(|(key, _)| key.eq_ignore_ascii_case(family)).map(|(_, decl)| decl)
+    }
+
     fn for_provider(&self, provider: ProviderKind) -> Option<&HarnessDecl> {
         self.by_provider
             .iter()
@@ -801,25 +848,29 @@ impl ModelContextCatalog {
             .filter(|capabilities| !capabilities.is_empty())
     }
 
-    /// The edit shape this catalog declares for a model: its row's own
-    /// `harness`, then its lineup's `harness.by_provider` row. The lineup is
-    /// the row's `provider`, else `named_provider` (the id's own naming), so a
-    /// model no row lists still takes its lineup's default.
+    /// The model row, then its name-token family, then the serving transport.
+    /// A missing family declaration keeps the existing transport behavior.
     fn edit_tool_for(
         &self,
         raw_model: &str,
         canonical_model: &str,
         named_provider: Option<ProviderKind>,
-    ) -> Option<EditToolForm> {
+    ) -> Option<(EditToolForm, HarnessValueSource)> {
         let entry = self.find_entry(raw_model, canonical_model);
-        if let Some(form) = entry.and_then(|row| row.harness).and_then(|decl| decl.edit_tool) {
-            return Some(form);
+        if let Some(value) = entry.and_then(|row| row.harness).and_then(HarnessDecl::edit_tool) {
+            return Some(value);
+        }
+        let family = harness_family_from_name(canonical_model);
+        if let Some(value) = family.and_then(|family| self.harness.for_family(family)).and_then(|decl| decl.edit_tool()) {
+            return Some(value);
         }
         let provider = entry
             .and_then(|row| row.provider.as_deref())
             .and_then(provider_kind_from_key)
             .or(named_provider)?;
-        self.harness.for_provider(provider)?.edit_tool
+        let (form, source) = self.harness.for_provider(provider)?.edit_tool()?;
+        let same_family = family.and_then(first_party_lineup) == Some(provider);
+        Some((form, if same_family { source } else { HarnessValueSource::Inherited }))
     }
 
     fn demotes_to_for(&self, raw_model: &str, canonical_model: &str) -> Option<String> {
@@ -1064,10 +1115,18 @@ pub fn harness_profile_for_model(model: &str) -> HarnessProfile {
     let canonical = resolve_catalog_alias(bare);
     let lower = canonical.to_ascii_lowercase();
     let named_provider = catalog_provider_of(&canonical);
-    HarnessProfile {
-        edit_tool: catalog_fact(|catalog| catalog.edit_tool_for(bare, &lower, named_provider))
-            .unwrap_or_default(),
-    }
+    let (edit_tool, edit_tool_source) = catalog_fact(|catalog| catalog.edit_tool_for(bare, &lower, named_provider))
+        .unwrap_or_default();
+    HarnessProfile { edit_tool, edit_tool_source }
+}
+
+/// A model's name-token family, from the same cold-start table the router uses.
+/// No provider inference is made here: an unknown name has no family.
+fn harness_family_from_name(model: &str) -> Option<&'static str> {
+    let lower = model.to_ascii_lowercase();
+    router_priors().frontier_family_tokens.iter()
+        .find(|token| !token.is_empty() && lower.contains(&token.to_ascii_lowercase()))
+        .map(String::as_str)
 }
 
 /// Whether `model`'s catalog row declares `capability` (`imagegen`,
@@ -1355,19 +1414,51 @@ fn catalog_max_output_tokens(raw_model: &str, canonical_model: &str) -> Option<u
     catalog_fact(|catalog| catalog.max_output_tokens_for(raw_model, canonical_model))
 }
 
-/// The declared maximum serialized request-body size (bytes) for a model, from
-/// the env override catalog first then the built-in — mirrors
-/// `catalog_model_context_window` for the `max_request_bytes` field.
-///
-/// `None` means "undeclared", never "unlimited": callers must skip the check
-/// rather than substitute a guess. A custom provider declares its own ceiling
-/// through the same `ZO_MODEL_CONTEXT_WINDOWS` catalog as every other model
-/// fact, so no code change is needed to teach zo about a new endpoint.
+/// The serialized request-body ceiling a request for `model` is planned under,
+/// in bytes: a declaration first — the person's provider row or model entry,
+/// then the model catalog — else what the model's endpoint taught by refusing
+/// a body, kept in zo's home for seven days (`endpoint_capabilities`). `None`
+/// means unknown, never unlimited: with no declaration and no refusal there is
+/// no ceiling to plan under, as before.
 #[must_use]
 pub fn max_request_bytes_for_model(model: &str) -> Option<u64> {
+    declared_max_request_bytes_for_model(model).or_else(|| {
+        let (endpoint, wire) = endpoint_for_model(model)?;
+        endpoint_capabilities::request_body_bounds(&endpoint, &wire)?.ceiling()
+    })
+}
+
+/// The ceiling a declaration states for `model`: its own entry or its
+/// provider's row among the person's providers (`max_request_bytes`), else
+/// the model catalog's — the catalog read exactly as v1.1.155 read it.
+pub(crate) fn declared_max_request_bytes_for_model(model: &str) -> Option<u64> {
     let canonical = resolve_model_alias(model);
-    let canonical_lower = canonical.to_ascii_lowercase();
-    catalog_fact(|catalog| catalog.max_request_bytes_for(model, &canonical_lower))
+    custom_provider_limit(
+        model,
+        &canonical,
+        ResolvedCustomProvider::max_request_bytes_for,
+    )
+    .or_else(|| {
+        let canonical_lower = canonical.to_ascii_lowercase();
+        catalog_fact(|catalog| catalog.max_request_bytes_for(model, &canonical_lower))
+    })
+}
+
+/// The endpoint URL and model id a client built for `model` sends to: the
+/// pair that client keeps its endpoint record under. Read the way
+/// [`crate::ProviderClient::from_model`] builds the client — the person's
+/// provider serving the model, else the built-in provider its name reads as —
+/// each at the base URL that client reads.
+fn endpoint_for_model(model: &str) -> Option<(String, String)> {
+    let resolved = resolve_model_alias(model);
+    if let Some(provider) = custom_provider_for_model(&resolved) {
+        let served = provider.declared_id(&resolved)?.to_string();
+        return Some((openai_compat::read_base_url(provider.config), served));
+    }
+    let metadata = metadata_for_model(&resolved)?;
+    let endpoint = std::env::var(metadata.base_url_env)
+        .unwrap_or_else(|_| metadata.default_base_url.to_string());
+    Some((endpoint, wire_model_id(model)))
 }
 
 /// Process-wide shared `reqwest::Client` for every provider call.
@@ -1730,7 +1821,11 @@ struct ModelCapability {
     canonical_model_id: String,
     provider: Option<ProviderKind>,
     context_window: Option<u64>,
+    /// Where `context_window` came from, decided by the same walk.
+    context_window_source: HarnessValueSource,
     max_output_tokens: Option<u32>,
+    /// Where `max_output_tokens` came from, decided by the same walk.
+    max_output_tokens_source: HarnessValueSource,
     adaptive_thinking: Option<bool>,
 }
 
@@ -1765,24 +1860,32 @@ impl ModelCapability {
 
         // An explicit `<provider>/<model>` states its limits through the named
         // provider first: the wire id below has the provider stripped, and the
-        // same bare id may be a first-party model with another window.
+        // same bare id may be a first-party model with another window. What the
+        // selected endpoint's `/models` said comes after every declaration and
+        // before the name-shape guesses and the common fallback.
         let named = named_provider_ref(model);
-        let context_window = named
+        let read = custom_models::selected_reading(model);
+        let (context_window, context_window_source) = named
             .as_ref()
             .and_then(|(provider, declared)| provider.context_window_for(declared))
-            .unwrap_or_else(|| context_window_for_canonical(&wire, &canonical_lower));
-        let max_output_tokens = named
+            .map_or_else(
+                || context_window_for_canonical(&wire, &canonical_lower, read.context_window),
+                |window| (window, HarnessValueSource::Declared),
+            );
+        let (max_output_tokens, max_output_tokens_source) = named
             .as_ref()
             .and_then(|(provider, declared)| provider.max_output_tokens_for(declared))
             .map_or_else(
-                || max_output_tokens_for_model_id(&wire, model_id),
-                |value| u32::try_from(value).unwrap_or(u32::MAX),
+                || max_output_tokens_for_model_id(&wire, model_id, read.max_output_tokens),
+                |value| (u32::try_from(value).unwrap_or(u32::MAX), HarnessValueSource::Declared),
             );
 
         Self {
             provider,
             context_window: Some(context_window),
+            context_window_source,
             max_output_tokens: Some(max_output_tokens),
+            max_output_tokens_source,
             adaptive_thinking: Some(adaptive_thinking_for_canonical(&canonical_lower)),
             canonical_model_id,
         }
@@ -2430,6 +2533,12 @@ pub struct ResolvedCustomProvider {
     /// Optional operator-provided max output cap for every declared model
     /// that states none of its own.
     pub max_output_tokens: Option<u64>,
+    /// Operator-declared request-body ceiling in bytes.
+    pub max_request_bytes: Option<u64>,
+    /// Explicit endpoint-wide image-input declaration, including `false`.
+    pub supports_vision: Option<bool>,
+    /// A person supplied this connection, rather than a shipped seed.
+    pub(crate) declared_by_person: bool,
     /// The limits a declared model states for itself, keyed by its id exactly
     /// as declared (the spelling [`Self::canonical_model`] answers with), so
     /// the lookup is one hash. Empty for a provider of plain ids.
@@ -2458,6 +2567,9 @@ impl From<openai_compat::CustomProviderConfig> for ResolvedCustomProvider {
         Self {
             context_window: custom.context_window.filter(|&value| value > 0),
             max_output_tokens: custom.max_output_tokens.filter(|&value| value > 0),
+            max_request_bytes: custom.max_request_bytes.filter(|&value| value > 0),
+            supports_vision: custom.supports_vision,
+            declared_by_person: true,
             model_limits,
             fit_hint: custom.to_fit_hint(),
             config: custom.to_static_config(),
@@ -2502,6 +2614,15 @@ impl ResolvedCustomProvider {
             .unwrap_or_default()
     }
 
+    /// `model`'s request-body ceiling on this provider, in bytes: its own,
+    /// else the provider-wide one.
+    fn max_request_bytes_for(&self, model: &str) -> Option<u64> {
+        self.stated_limits(model)
+            .max_request_bytes
+            .or(self.max_request_bytes)
+            .filter(|&value| value > 0)
+    }
+
     /// `model`'s context window on this provider: its own, else the
     /// provider-wide one.
     fn context_window_for(&self, model: &str) -> Option<u64> {
@@ -2518,6 +2639,23 @@ impl ResolvedCustomProvider {
             .max_output_tokens
             .or(self.max_output_tokens)
             .filter(|&value| value > 0)
+    }
+
+    /// Whether this endpoint takes `model`'s pictures, and on what evidence:
+    /// the model's own declaration (an explicit `false` included), else the
+    /// provider-wide one, else the catalog's `no_vision` row, else what the
+    /// endpoint's `/models` said. `None` when nothing states it, which leaves
+    /// the endpoint's `false` default.
+    fn vision_for(&self, model: &str) -> Option<custom_models::CapabilityValue<bool>> {
+        let declared = |value| custom_models::CapabilityValue { value, source: HarnessValueSource::Declared };
+        self.stated_limits(model).supports_vision
+            .or(self.supports_vision)
+            // A catalog row (shipped or the person's overlay) that says the
+            // model reads no pictures is a declaration: a reading never wins it.
+            .or_else(|| (!model_supports_vision(model)).then_some(false))
+            .map(declared)
+            .or_else(|| custom_models::read_limits(self, model).supports_vision
+                .map(|value| custom_models::CapabilityValue { value, source: HarnessValueSource::Read }))
     }
 
     /// The registered model id matching `model`, used as the canonical id sent
@@ -2635,6 +2773,9 @@ fn builtin_seed_providers() -> Vec<ResolvedCustomProvider> {
             config: deepseek_seed_config(),
             context_window: None,
             max_output_tokens: None,
+            max_request_bytes: None,
+            supports_vision: Some(false),
+            declared_by_person: false,
             model_limits: HashMap::new(),
             fit_hint: None,
         });
@@ -3947,12 +4088,27 @@ const LEGACY_OPUS_MAX_OUTPUT_TOKENS: u32 = 32_000;
 
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
-    model_capability_for_model(model)
-        .max_output_tokens
-        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+    max_tokens_with_source(model).value
 }
 
-fn max_output_tokens_for_model_id(raw_model: &str, model_id: &str) -> u32 {
+/// [`max_tokens_for_model`] with the source the same walk found it in.
+fn max_tokens_with_source(model: &str) -> custom_models::CapabilityValue<u32> {
+    let capability = model_capability_for_model(model);
+    custom_models::CapabilityValue {
+        value: capability.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
+        source: capability.max_output_tokens_source,
+    }
+}
+
+/// The output cap and its source. `read` is what the selected endpoint's
+/// `/models` said; it is used only where nothing declares a cap, and only
+/// when it is below the default.
+fn max_output_tokens_for_model_id(
+    raw_model: &str,
+    model_id: &str,
+    read: Option<u64>,
+) -> (u32, HarnessValueSource) {
+    let declared = |value: u64| (u32::try_from(value).unwrap_or(u32::MAX), HarnessValueSource::Declared);
     // Anthropic's current model table documents 128k synchronous max output for
     // Fable/Mythos 5, Sonnet 5, and Opus 4.6+; the streaming guide explicitly
     // uses `claude-opus-4-8` with `max_tokens: 128000` as the large-output path
@@ -3968,14 +4124,14 @@ fn max_output_tokens_for_model_id(raw_model: &str, model_id: &str) -> u32 {
         || model_id_matches_prefix_segment(model_id, "claude-opus-4-7")
         || model_id_matches_prefix_segment(model_id, "claude-opus-4-6")
     {
-        return EXTENDED_MAX_OUTPUT_TOKENS;
+        return (EXTENDED_MAX_OUTPUT_TOKENS, HarnessValueSource::Declared);
     }
     if model_id_matches_prefix_segment(model_id, "claude-opus-4-1")
         || model_id_matches_prefix_segment(model_id, "claude-opus-4-0")
         || model_id == "claude-opus-4"
         || model_id_matches_prefix_segment(model_id, "claude-opus-4-20250514")
     {
-        return LEGACY_OPUS_MAX_OUTPUT_TOKENS;
+        return (LEGACY_OPUS_MAX_OUTPUT_TOKENS, HarnessValueSource::Declared);
     }
     // Non-Anthropic models: honour the docs-verified catalog cap (GPT-5.5 128k,
     // DeepSeek V4 384k) before the conservative default, so large refactors and
@@ -3983,12 +4139,20 @@ fn max_output_tokens_for_model_id(raw_model: &str, model_id: &str) -> u32 {
     // Anthropic path was widened to 128k to avoid, previously still present for
     // every other provider because the catalog field was never read.
     if let Some(max_out) = custom_provider_max_output_tokens(raw_model, model_id) {
-        return u32::try_from(max_out).unwrap_or(u32::MAX);
+        return declared(max_out);
     }
     if let Some(max_out) = catalog_max_output_tokens(raw_model, model_id) {
-        return u32::try_from(max_out).unwrap_or(u32::MAX);
+        return declared(max_out);
     }
-    DEFAULT_MAX_OUTPUT_TOKENS
+    // Undeclared. What `/models` says is the most the model can write, while
+    // `max_tokens` is what one request asks for: a read cap only lowers the
+    // request below the default and never raises it, since asking for the
+    // ceiling on every request changes how long each answer may run.
+    read.and_then(|max_out| u32::try_from(max_out).ok())
+        .filter(|&max_out| max_out < DEFAULT_MAX_OUTPUT_TOKENS)
+        .map_or((DEFAULT_MAX_OUTPUT_TOKENS, HarnessValueSource::Default), |max_out| {
+            (max_out, HarnessValueSource::Read)
+        })
 }
 
 /// Whether `model` uses Anthropic *adaptive* thinking — the server sizes the
@@ -4630,12 +4794,25 @@ pub fn resolve_effort_band(
 /// correctly.
 #[must_use]
 pub fn context_window_for_model(model: &str) -> u64 {
-    model_capability_for_model(model)
-        .context_window
-        .unwrap_or(200_000)
+    context_window_with_source(model).value
 }
 
-fn context_window_for_canonical(raw_model: &str, canonical_lower: &str) -> u64 {
+/// [`context_window_for_model`] with the source the same walk found it in.
+fn context_window_with_source(model: &str) -> custom_models::CapabilityValue<u64> {
+    let capability = model_capability_for_model(model);
+    custom_models::CapabilityValue {
+        value: capability.context_window.unwrap_or(200_000),
+        source: capability.context_window_source,
+    }
+}
+
+/// The context window and its source. `read` is what the selected endpoint's
+/// `/models` said; it is used only where nothing declares a window.
+fn context_window_for_canonical(
+    raw_model: &str,
+    canonical_lower: &str,
+    read: Option<u64>,
+) -> (u64, HarnessValueSource) {
     // DECLARED FIRST. The operator's own custom-provider declaration, then the
     // catalog (which already honours the `ZO_MODEL_CONTEXT_WINDOWS` override).
     //
@@ -4651,13 +4828,19 @@ fn context_window_for_canonical(raw_model: &str, canonical_lower: &str) -> u64 {
     // sonnet-5 → 1M, haiku → 258k), so this only changes the answer for a model
     // somebody actually declared. `context_window_declaration_beats_the_name_guess`
     // pins both halves of that.
-    if let Some(window) = custom_provider_context_window(raw_model, canonical_lower) {
-        return window;
+    if let Some(window) = custom_provider_context_window(raw_model, canonical_lower)
+        .or_else(|| catalog_model_context_window(raw_model, canonical_lower))
+    {
+        return (window, HarnessValueSource::Declared);
     }
-    if let Some(window) = catalog_model_context_window(raw_model, canonical_lower) {
-        return window;
-    }
+    // Undeclared: the endpoint's own `/models` answer outranks a name guess.
+    read.map_or_else(
+        || (context_window_guess(canonical_lower), HarnessValueSource::Default),
+        |window| (window, HarnessValueSource::Read),
+    )
+}
 
+fn context_window_guess(canonical_lower: &str) -> u64 {
     // Undeclared, from here down: name-shape guesses, last resort.
     //
     // Current flagship Claude models with documented native 1M windows.
@@ -5348,7 +5531,146 @@ mod tests {
 
     mod harness_profile {
         use super::{EnvVarGuard, MODEL_CONTEXT_WINDOWS_ENV};
-        use crate::providers::{harness_profile_for_model, EditToolForm};
+        use crate::providers::{harness_profile_for_model, EditToolForm, HarnessValueSource};
+
+        struct OwnProviders(EnvVarGuard);
+
+        impl OwnProviders {
+            fn new() -> Self {
+                let guard = EnvVarGuard::set(crate::CUSTOM_PROVIDERS_ENV,
+                    Some(r#"[{"name":"acme","base_url":"http://127.0.0.1:1/v1","requires_auth":false,"models":["deepseek-flash","acme-coder-1"]}]"#));
+                crate::refresh_custom_providers_from_env();
+                Self(guard)
+            }
+        }
+
+        impl Drop for OwnProviders {
+            fn drop(&mut self) {
+                match &self.0.original {
+                    Some(value) => std::env::set_var(crate::CUSTOM_PROVIDERS_ENV, value),
+                    None => std::env::remove_var(crate::CUSTOM_PROVIDERS_ENV),
+                }
+                crate::refresh_custom_providers_from_env();
+            }
+        }
+
+        struct ShippedRegistry;
+
+        impl ShippedRegistry {
+            fn new() -> Self {
+                super::super::reset_model_registry_for_tests();
+                Self
+            }
+        }
+
+        impl Drop for ShippedRegistry {
+            fn drop(&mut self) { super::super::reset_model_registry_for_tests(); }
+        }
+
+        // Frozen v1.1.155 resolution: model declaration, serving lineup, default.
+        // Keep this independent of the new name-family lookup.
+        fn v155_edit_tool(model: &str) -> EditToolForm {
+            let catalog = super::super::builtin_model_context_catalog();
+            let canonical = super::super::resolve_catalog_alias(model);
+            let entry = catalog.find_entry(model, &canonical);
+            if let Some(form) = entry.and_then(|row| row.harness).and_then(|decl| decl.edit_tool) {
+                return form;
+            }
+            let provider = entry.and_then(|row| row.provider.as_deref())
+                .and_then(super::super::provider_kind_from_key)
+                .or_else(|| super::super::catalog_provider_of(&canonical));
+            provider.and_then(|provider| catalog.harness.for_provider(provider))
+                .and_then(|decl| decl.edit_tool).unwrap_or_default()
+        }
+
+        #[test]
+        fn shipped_twenty_rows_and_forty_aliases_keep_the_v155_edit_tools() {
+            let _lock = crate::test_env_lock();
+            let _shipped = EnvVarGuard::set(MODEL_CONTEXT_WINDOWS_ENV, None);
+            let _providers = OwnProviders::new();
+            let _ollama = EnvVarGuard::set("OLLAMA_BASE_URL", None);
+            let _registry = ShippedRegistry::new();
+            let catalog = super::super::builtin_model_context_catalog();
+            let expected: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/harness-v155-edit-shapes.json")).expect("frozen v155 edit shapes");
+            let models = expected["models"].as_array().expect("model rows");
+            let aliases = expected["aliases"].as_array().expect("alias rows");
+            assert_eq!(catalog.models.len(), 20);
+            assert_eq!(models.len(), catalog.models.len());
+            assert_eq!(catalog.aliases.len(), 40);
+            assert_eq!(aliases.len(), catalog.aliases.len());
+            for (row, expected) in catalog.models.iter().zip(models) {
+                assert_eq!(serde_json::json!(row.ids), expected["ids"], "the shipped model rows moved");
+                for id in &row.ids {
+                    assert_eq!(v155_edit_tool(id).key(), expected["edit_tool"].as_str().unwrap(), "v155 model {id}");
+                    assert_eq!(harness_profile_for_model(id).edit_tool.key(), expected["edit_tool"].as_str().unwrap(), "model {id}");
+                }
+            }
+            for (row, expected) in catalog.aliases.iter().zip(aliases) {
+                assert_eq!(row.alias, expected["alias"].as_str().unwrap(), "the shipped alias rows moved");
+                assert_eq!(v155_edit_tool(&row.alias).key(), expected["edit_tool"].as_str().unwrap(), "v155 alias {}", row.alias);
+                assert_eq!(harness_profile_for_model(&row.alias).edit_tool.key(), expected["edit_tool"].as_str().unwrap(), "alias {}", row.alias);
+            }
+        }
+
+        #[test]
+        fn a_name_token_without_an_exact_family_bundle_keeps_the_legacy_shape() {
+            let _lock = crate::test_env_lock();
+            let _shipped = EnvVarGuard::set(MODEL_CONTEXT_WINDOWS_ENV, None);
+            let _providers = OwnProviders::new();
+            let _registry = ShippedRegistry::new();
+            for endpoint in [None, Some("http://127.0.0.1:1/v1")] {
+                let _ollama = EnvVarGuard::set("OLLAMA_BASE_URL", endpoint);
+                for id in ["chatgpt-4o-latest", "local-gpt-helper", "local-codex-helper"] {
+                    assert_eq!(v155_edit_tool(id), EditToolForm::Edit, "baseline {id}");
+                    assert_eq!(harness_profile_for_model(id).edit_tool, EditToolForm::Edit,
+                        "a name token must not change the legacy edit shape for {id}");
+                }
+            }
+        }
+
+        #[test]
+        fn reasoning_lineups_without_a_family_token_inherit_the_openai_shape() {
+            let _lock = crate::test_env_lock();
+            let _shipped = EnvVarGuard::set(MODEL_CONTEXT_WINDOWS_ENV, None);
+            let _providers = OwnProviders::new();
+            let _registry = ShippedRegistry::new();
+            for id in ["o1", "o3", "o4"] {
+                let profile = harness_profile_for_model(id);
+                assert_eq!(profile.edit_tool, EditToolForm::ApplyPatch, "{id}");
+                assert_eq!(profile.edit_tool_source, HarnessValueSource::Inherited, "{id}");
+            }
+        }
+
+        #[test]
+        fn names_evidence_for_defaults_declarations_and_inherited_values() {
+            let _lock = crate::test_env_lock();
+            let _shipped = EnvVarGuard::set(MODEL_CONTEXT_WINDOWS_ENV, None);
+            let _providers = OwnProviders::new();
+            for (model, expected) in [
+                ("claude-opus-5-5", HarnessValueSource::Default),
+                ("gemini-3.6-flash", HarnessValueSource::Default),
+                ("gpt-6.1-sol", HarnessValueSource::Measured),
+                ("deepseek-flash", HarnessValueSource::Inherited),
+                ("acme-coder-1", HarnessValueSource::Inherited),
+            ] {
+                assert_eq!(harness_profile_for_model(model).edit_tool_source, expected, "{model}");
+            }
+            let _overlay = EnvVarGuard::set(MODEL_CONTEXT_WINDOWS_ENV,
+                Some(r#"{"models":[{"ids":["deepseek-flash"],"harness":{"edit_tool":"edit"}}]}"#));
+            let profile = harness_profile_for_model("deepseek-flash");
+            assert_eq!(profile.edit_tool, EditToolForm::Edit);
+            assert_eq!(profile.edit_tool_source, HarnessValueSource::Declared);
+        }
+
+        #[test]
+        fn reads_an_unlisted_models_family_before_its_transport() {
+            let _lock = crate::test_env_lock();
+            let _providers = OwnProviders::new();
+            let _overlay = EnvVarGuard::set(MODEL_CONTEXT_WINDOWS_ENV,
+                Some(r#"{"harness":{"by_provider":{"deepseek":{"edit_tool":"edit"},"openai":{"edit_tool":"apply_patch"}}}}"#));
+            assert_eq!(harness_profile_for_model("deepseek-flash").edit_tool, EditToolForm::Edit);
+            assert_eq!(harness_profile_for_model("acme-coder-1").edit_tool, EditToolForm::ApplyPatch);
+        }
 
         #[test]
         fn shows_a_gpt_model_apply_patch() {

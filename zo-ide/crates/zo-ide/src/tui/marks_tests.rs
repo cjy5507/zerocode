@@ -125,6 +125,162 @@ fn the_composer_keeps_the_mark_the_window_reads() {
 }
 
 #[test]
+fn the_composer_placeholder_keeps_sgr_dim_under_a_measured_palette() {
+    use super::ansi::write_spans_for_palette;
+    use super::palette::{ColorLevel, TerminalPalette};
+
+    if !style::in_fresh_run(&path("the_composer_placeholder_keeps_sgr_dim_under_a_measured_palette")) {
+        return;
+    }
+    style::init(&Preferences::default());
+    let horizon = TerminalPalette::new((224, 224, 224), (28, 30, 38), ColorLevel::TrueColor);
+    let (rows, _cursor) = super::composer::Composer::new().render(WIDTH, "Ask zo to do anything");
+    let rendered: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let mut out = String::new();
+            write_spans_for_palette(row, Some(horizon), &mut out);
+            out
+        })
+        .collect();
+    assert!(
+        rendered.iter().any(|row| row.contains("\u{1b}[2mAsk zo to do anything")),
+        "{rendered:?}"
+    );
+}
+
+#[test]
+fn marks_secondary_text_uses_measured_ink_and_respects_fallbacks() {
+    use super::ansi::{write_spans_for_palette, Color, Span, Style};
+    use super::palette::{ColorLevel, TerminalPalette};
+
+    if !style::in_fresh_run(&path("marks_secondary_text_uses_measured_ink_and_respects_fallbacks")) {
+        return;
+    }
+    style::init(&Preferences::default());
+    let horizon = TerminalPalette::new((224, 224, 224), (28, 30, 38), ColorLevel::TrueColor);
+    let ansi16 = TerminalPalette::new((224, 224, 224), (28, 30, 38), ColorLevel::Ansi16);
+
+    let render = |spans: Vec<Span>, palette: Option<TerminalPalette>| {
+        let mut out = String::new();
+        write_spans_for_palette(&Line::new(spans), palette, &mut out);
+        out
+    };
+
+    let dim_horizon = render(vec![Span::dim("12 lines")], Some(horizon));
+    assert!(dim_horizon.contains("38;2;") && !dim_horizon.contains("\u{1b}[2m"), "{dim_horizon:?}");
+
+    let sgr_dim_horizon = render(vec![Span::new("Ask zo to do anything", Style::new().sgr_dim())], Some(horizon));
+    assert!(sgr_dim_horizon.contains("\u{1b}[2m") && !sgr_dim_horizon.contains("38;2;"), "{sgr_dim_horizon:?}");
+
+    let dim_none = render(vec![Span::dim("12 lines")], None);
+    assert!(dim_none.contains("\u{1b}[2m") && !dim_none.contains("38;2;"), "{dim_none:?}");
+
+    let dim_ansi16 = render(vec![Span::dim("12 lines")], Some(ansi16));
+    assert!(dim_ansi16.contains("\u{1b}[2m") && !dim_ansi16.contains("38;2;"), "{dim_ansi16:?}");
+
+    let colored_dim_horizon = render(vec![Span::new("warn", Style::new().fg(Color::CYAN).dim())], Some(horizon));
+    let colored_dim_none = render(vec![Span::new("warn", Style::new().fg(Color::CYAN).dim())], None);
+    assert_eq!(colored_dim_horizon, colored_dim_none);
+
+    let adjacent = render(
+        vec![Span::dim("a"), Span::new("b", Style::new().sgr_dim())],
+        None,
+    );
+    assert_eq!(adjacent, "\u{1b}[2mab");
+}
+
+#[test]
+fn marks_lifts_low_contrast_ansi_inks_and_keeps_compliant_and_fallback_bytes() {
+    use super::ansi::{write_spans_for_palette, Color, Span, Style};
+    use super::palette::{contrast_ratio, ColorLevel, TerminalPalette};
+
+    if !style::in_fresh_run(&path("marks_lifts_low_contrast_ansi_inks_and_keeps_compliant_and_fallback_bytes")) {
+        return;
+    }
+    style::init(&Preferences::default());
+
+    let mut solarized_slots = [None; 16];
+    solarized_slots[1] = Some((220, 50, 47));
+    solarized_slots[2] = Some((133, 153, 0));
+    solarized_slots[3] = Some((181, 137, 0));
+    solarized_slots[6] = Some((42, 161, 152));
+    let solarized_ground = (253, 246, 227);
+    let solarized_ink = (101, 123, 131);
+    let solarized = TerminalPalette::new(solarized_ink, solarized_ground, ColorLevel::TrueColor)
+        .with_ansi16(solarized_slots);
+    let solarized_no_ansi16 =
+        TerminalPalette::new(solarized_ink, solarized_ground, ColorLevel::TrueColor);
+    let solarized_ansi16_level =
+        TerminalPalette::new(solarized_ink, solarized_ground, ColorLevel::Ansi16)
+            .with_ansi16(solarized_slots);
+    let solarized_floor = contrast_ratio(solarized_ink, solarized_ground) * 0.75;
+
+    let mut horizon_slots = [None; 16];
+    horizon_slots[1] = Some((233, 86, 120));
+    horizon_slots[6] = Some((89, 225, 227));
+    let horizon = TerminalPalette::new((224, 224, 224), (28, 30, 38), ColorLevel::TrueColor)
+        .with_ansi16(horizon_slots);
+
+    let render = |style: Style, palette: Option<TerminalPalette>| {
+        let mut out = String::new();
+        write_spans_for_palette(&Line::new(vec![Span::new("x", style)]), palette, &mut out);
+        out
+    };
+    let parse_fg_rgb = |rendered: &str| -> (u8, u8, u8) {
+        let (_, rest) = rendered
+            .split_once("38;2;")
+            .unwrap_or_else(|| panic!("expected 38;2; RGB SGR in {rendered:?}"));
+        let (params, _) = rest.split_once('m').expect("SGR terminator");
+        let mut parts = params.split(';');
+        (
+            parts.next().expect("red").parse().expect("u8"),
+            parts.next().expect("green").parse().expect("u8"),
+            parts.next().expect("blue").parse().expect("u8"),
+        )
+    };
+
+    for color in [Color::CYAN, Color::GREEN, Color::YELLOW] {
+        let rendered = render(Style::new().fg(color), Some(solarized));
+        let rgb = parse_fg_rgb(&rendered);
+        assert!(
+            contrast_ratio(rgb, solarized_ground) >= solarized_floor,
+            "{color:?} lifted to {rgb:?} should clear floor {solarized_floor}: {rendered:?}"
+        );
+    }
+
+    for color in [Color::CYAN, Color::RED] {
+        assert_eq!(
+            render(Style::new().fg(color), Some(horizon)),
+            render(Style::new().fg(color), None),
+            "compliant Horizon Dark {color:?} should keep slot bytes"
+        );
+    }
+
+    let dim_cyan = render(Style::new().fg(Color::CYAN).dim(), Some(solarized));
+    assert!(!dim_cyan.contains("\u{1b}[2m"), "dim should turn off: {dim_cyan:?}");
+    let dim_rgb = parse_fg_rgb(&dim_cyan);
+    assert!(
+        contrast_ratio(dim_rgb, solarized_ground) >= solarized_floor,
+        "dim cyan {dim_rgb:?} should clear floor {solarized_floor}"
+    );
+
+    let cyan = Style::new().fg(Color::CYAN);
+    let baseline = render(cyan, None);
+    assert_eq!(render(cyan, Some(solarized_no_ansi16)), baseline);
+    assert_eq!(render(cyan, Some(solarized_ansi16_level)), baseline);
+
+    assert_eq!(
+        render(Style::new().fg(Color::Indexed(6)), Some(solarized)),
+        render(Style::new().fg(Color::Base(6)), Some(solarized)),
+    );
+    assert_eq!(
+        render(Style::new().fg(Color::Indexed(200)), Some(solarized)),
+        render(Style::new().fg(Color::Indexed(200)), None),
+    );
+}
+
+#[test]
 fn a_flush_code_row_starts_at_column_zero_and_prose_keeps_its_prefix() {
     if !style::in_fresh_run(&path("a_flush_code_row_starts_at_column_zero_and_prose_keeps_its_prefix")) {
         return;
@@ -694,4 +850,319 @@ fn committed_fold_caps_long_failure_runs_while_keeping_total_in_head() {
     assert!(!cell.iter().any(|row| row.contains("probe_5")), "{cell:#?}");
     assert!(cell.iter().any(|row| row.contains("probe_6")), "{cell:#?}");
     assert!(cell.iter().any(|row| row.contains("probe_9")), "{cell:#?}");
+}
+
+#[test]
+fn marks_blockquote_uses_dim_bar_and_body_ink() {
+    if !style::in_fresh_run(&path("marks_blockquote_uses_dim_bar_and_body_ink")) {
+        return;
+    }
+    style::init(&Preferences::default());
+    let lines = super::markdown::render("> 주의");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let prefix = &lines[0].spans[0];
+    assert_eq!(prefix.text, "│ ");
+    assert!(prefix.style.dim);
+    assert_eq!(prefix.style.fg, None);
+    let body = &lines[0].spans[1];
+    assert_eq!(body.text, "주의");
+    assert_eq!(body.style.fg, None);
+
+    let two_lines = super::markdown::render_wrapped("> first line\n> second line", Some(80));
+    assert_eq!(two_lines.len(), 2, "{two_lines:?}");
+    for line in &two_lines {
+        assert_eq!(line.spans[0].text, "│ ");
+        assert!(line.spans[0].style.dim);
+        assert_eq!(line.spans[0].style.fg, None);
+    }
+
+    let quote = super::markdown::render("> one two three four five six seven");
+    let hanging = quote[0]
+        .continuation
+        .as_ref()
+        .expect("blockquote carries hanging bar");
+    assert_eq!(hanging.text, "│ ");
+    assert!(hanging.style.dim);
+    assert_eq!(hanging.style.fg, None);
+    let wrapped = super::wrap::wrap_line(&quote[0], 16, hanging);
+    assert!(wrapped.len() >= 2, "{wrapped:?}");
+    for line in &wrapped {
+        assert_eq!(line.spans[0].text, "│ ");
+        assert!(line.spans[0].style.dim);
+        assert_eq!(line.spans[0].style.fg, None);
+    }
+    let cell_rows = prefixed(&quote, 16, &Prefix::hang(), true);
+    assert!(cell_rows.len() >= 2, "{cell_rows:?}");
+    for row in &cell_rows {
+        assert_eq!(row.spans[1].text, "│ ");
+        assert!(row.spans[1].style.dim);
+        assert_eq!(row.spans[1].style.fg, None);
+    }
+}
+
+#[test]
+fn marks_headings_drop_italic_and_keep_no_colour_without_palette() {
+    if !style::in_fresh_run(&path("marks_headings_drop_italic_and_keep_no_colour_without_palette")) {
+        return;
+    }
+    style::init(&Preferences::default());
+    let lines = super::markdown::render("# One\n\n## Two\n\n### Three\n\n#### Four");
+    let headings: Vec<_> = lines.iter().filter(|line| !line.spans.is_empty()).collect();
+    assert_eq!(headings.len(), 4, "{headings:?}");
+    for (idx, line) in headings.iter().enumerate() {
+        for span in &line.spans {
+            assert!(span.style.bold, "heading {idx} should be bold: {span:?}");
+            assert!(!span.style.italic, "heading {idx} should not be italic: {span:?}");
+            assert_eq!(span.style.underline, idx == 0, "only H1 is underlined: {span:?}");
+            assert_eq!(span.style.fg, None, "no palette means no heading colour: {span:?}");
+        }
+    }
+    let palette = super::palette::TerminalPalette::new(
+        (224, 224, 224),
+        (28, 30, 38),
+        super::palette::ColorLevel::TrueColor,
+    );
+    let h1 = super::markdown::heading_style_for_palette(
+        pulldown_cmark::HeadingLevel::H1,
+        Some(palette),
+    );
+    let h2 = super::markdown::heading_style_for_palette(
+        pulldown_cmark::HeadingLevel::H2,
+        Some(palette),
+    );
+    let h3 = super::markdown::heading_style_for_palette(
+        pulldown_cmark::HeadingLevel::H3,
+        Some(palette),
+    );
+    assert!(h1.bold && h1.underline && !h1.italic);
+    assert_eq!(h1.fg, Some(super::palette::HEADING_ACCENT));
+    assert!(h2.bold && !h2.underline && !h2.italic);
+    assert_eq!(h2.fg, Some(super::palette::HEADING_ACCENT));
+    assert!(h3.bold && !h3.underline && !h3.italic);
+    assert_eq!(h3.fg, None);
+}
+
+#[test]
+fn marks_ordered_marker_has_no_foreground_colour() {
+    if !style::in_fresh_run(&path("marks_ordered_marker_has_no_foreground_colour")) {
+        return;
+    }
+    style::init(&Preferences::default());
+    let lines = super::markdown::render("1. 가");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let marker = &lines[0].spans[0];
+    assert_eq!(marker.text, "1. ");
+    assert_eq!(marker.style.fg, None);
+}
+
+#[test]
+fn marks_table_header_drops_syntect_colour_without_palette() {
+    if !style::in_fresh_run(&path("marks_table_header_drops_syntect_colour_without_palette")) {
+        return;
+    }
+    style::init(&Preferences::default());
+    let lines = super::markdown::render("| a | b |\n| - | - |\n| 1 | 2 |");
+    assert!(lines.len() >= 3, "{lines:?}");
+    assert!(lines[0].style.bold, "header row should be bold: {:?}", lines[0].style);
+    assert_eq!(lines[0].style.fg, None, "no palette means no header colour: {:?}", lines[0].style);
+    for span in &lines[0].spans {
+        assert_eq!(span.style.fg, None, "no palette means no header span colour: {span:?}");
+    }
+    let dark = super::palette::TerminalPalette::new(
+        (224, 224, 224),
+        (28, 30, 38),
+        super::palette::ColorLevel::TrueColor,
+    );
+    let light = super::palette::TerminalPalette::new(
+        (46, 52, 52),
+        (255, 255, 255),
+        super::palette::ColorLevel::TrueColor,
+    );
+    for palette in [dark, light] {
+        let header = super::tables::header_style_for_palette(Some(palette));
+        assert!(header.bold);
+        assert_eq!(header.fg, Some(super::palette::HEADING_ACCENT));
+        let sep = super::tables::separator_style_for_palette(Some(palette));
+        let Some(super::ansi::Color::Rgb(r, g, b)) = sep.fg else {
+            panic!("truecolor separator must emit RGB fg: {sep:?}");
+        };
+        let ratio = super::palette::contrast_ratio((r, g, b), palette.background());
+        assert!(
+            (3.0..4.5).contains(&ratio),
+            "separator contrast {ratio:.2} out of [3.0, 4.5) for {:?}",
+            palette.background()
+        );
+    }
+}
+
+#[test]
+fn marks_quiet_fold_edit_counts_are_not_dimmed() {
+    use runtime::message_stream::{DiffHunk, DiffLine, DiffLineKind, DiffView, ToolResultBody};
+    if !style::in_fresh_run(&path("marks_quiet_fold_edit_counts_are_not_dimmed")) {
+        return;
+    }
+    style::init(&Preferences::default());
+    let view = DiffView {
+        old_path: Some("src/lib.rs".to_string()),
+        new_path: Some("src/lib.rs".to_string()),
+        language: None,
+        hunks: vec![DiffHunk {
+            old_start: 1,
+            old_lines: 1,
+            new_start: 1,
+            new_lines: 1,
+            lines: vec![
+                DiffLine {
+                    kind: DiffLineKind::Removed,
+                    text: "old".to_string(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Added,
+                    text: "new".to_string(),
+                },
+            ],
+        }],
+    };
+    let mut group = ToolGroup::new(ToolCall::new(
+        "a".to_string(),
+        ToolKind::Edit {
+            path: "src/lib.rs".to_string(),
+        },
+    ));
+    assert!(group.complete(
+        "a",
+        Outcome::from_result(false, &ToolResultBody::Diff(view), "src/lib.rs"),
+    ));
+    let mut fold = super::turns::TurnFold::default();
+    fold.take_steps(group.steps());
+    let rows = fold.live_rows(100, 16);
+    let plus = rows[0]
+        .spans
+        .iter()
+        .find(|s| s.text == "+1")
+        .expect("+1 span in quiet fold row");
+    let minus = rows[0]
+        .spans
+        .iter()
+        .find(|s| s.text == "-1")
+        .expect("-1 span in quiet fold row");
+    assert!(!plus.style.dim, "+1 must not be dimmed: {plus:?}");
+    assert_eq!(plus.style.fg, Some(super::ansi::Color::GREEN));
+    assert!(!minus.style.dim, "-1 must not be dimmed: {minus:?}");
+    assert_eq!(minus.style.fg, Some(super::ansi::Color::RED));
+}
+
+#[test]
+fn marks_shimmer_keeps_contrast_at_least_three_to_one() {
+    if !style::in_fresh_run(&path("marks_shimmer_keeps_contrast_at_least_three_to_one")) {
+        return;
+    }
+    style::init(&Preferences::default());
+    let dark = super::palette::TerminalPalette::new(
+        (224, 224, 224),
+        (28, 30, 38),
+        super::palette::ColorLevel::TrueColor,
+    );
+    let light = super::palette::TerminalPalette::new(
+        (46, 52, 52),
+        (255, 255, 255),
+        super::palette::ColorLevel::TrueColor,
+    );
+    for palette in [dark, light] {
+        for ms in (0..=2000).step_by(50) {
+            let spans = super::shimmer::shimmer_spans_for_palette(
+                "Working",
+                Duration::from_millis(ms),
+                Some(palette),
+            );
+            for span in spans {
+                let Some(super::ansi::Color::Rgb(r, g, b)) = span.style.fg else {
+                    panic!("truecolor shimmer must emit RGB fg: {span:?}");
+                };
+                let ratio = super::palette::contrast_ratio((r, g, b), palette.background());
+                assert!(
+                    ratio >= 3.0,
+                    "contrast {ratio:.2} < 3.0 at {ms}ms for {:?}: {span:?}",
+                    palette.background()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn marks_syntax_highlight_keeps_text_contrast_floor_on_light_palette() {
+    use super::ansi::Color;
+    use super::palette::{code_background, contrast_ratio, ColorLevel, TerminalPalette};
+
+    if !style::in_fresh_run(&path("marks_syntax_highlight_keeps_text_contrast_floor_on_light_palette")) {
+        return;
+    }
+    style::init(&Preferences::default());
+    let light = TerminalPalette::new((46, 52, 52), (255, 255, 255), ColorLevel::TrueColor);
+    let Color::Rgb(bg_r, bg_g, bg_b) = code_background(light) else {
+        panic!("code_background must return RGB");
+    };
+    let code = "fn main() {\n    let x = \"hi\"; // note\n    println!(\"{x}\");\n}\n";
+    let lines = super::highlight::highlight_code_to_lines_for_palette(code, "rust", Some(light));
+    for line in &lines {
+        for span in &line.spans {
+            if let Some(Color::Rgb(r, g, b)) = span.style.fg {
+                let ratio = contrast_ratio((r, g, b), (bg_r, bg_g, bg_b));
+                assert!(
+                    ratio >= 4.5,
+                    "syntax span {span:?} has contrast {ratio:.2} < 4.5 on ({bg_r}, {bg_g}, {bg_b})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn marks_footer_colours_keep_contrast_floor_on_light_and_keep_dark_values() {
+    use super::ansi::Color;
+    use super::palette::{self, contrast_ratio, ColorLevel, TerminalPalette};
+
+    if !style::in_fresh_run(&path("marks_footer_colours_keep_contrast_floor_on_light_and_keep_dark_values")) {
+        return;
+    }
+    style::init(&Preferences::default());
+    let light = TerminalPalette::new((46, 52, 52), (255, 255, 255), ColorLevel::TrueColor);
+    let dark = TerminalPalette::new((224, 224, 224), (28, 30, 38), ColorLevel::TrueColor);
+    let model_scopes = &["entity.name.type", "support.type", "variable"];
+    let cwd_scopes = &["string", "markup.underline.link"];
+
+    let light_model = super::view::footer_theme_style_for_palette(
+        model_scopes,
+        palette::FOOTER_MODEL,
+        Some(light),
+    );
+    let Some(Color::Rgb(r, g, b)) = light_model.fg else {
+        panic!("light model must be RGB: {light_model:?}");
+    };
+    assert!(contrast_ratio((r, g, b), light.background()) >= 4.5);
+
+    let light_cwd = super::view::footer_theme_style_for_palette(
+        cwd_scopes,
+        palette::FOOTER_CWD,
+        Some(light),
+    );
+    let Some(Color::Rgb(r, g, b)) = light_cwd.fg else {
+        panic!("light cwd must be RGB: {light_cwd:?}");
+    };
+    assert!(contrast_ratio((r, g, b), light.background()) >= 4.5);
+
+    let dark_model = super::view::footer_theme_style_for_palette(
+        model_scopes,
+        palette::FOOTER_MODEL,
+        Some(dark),
+    );
+    assert_eq!(dark_model.fg, Some(Color::Rgb(246, 226, 183)));
+
+    let dark_cwd = super::view::footer_theme_style_for_palette(
+        cwd_scopes,
+        palette::FOOTER_CWD,
+        Some(dark),
+    );
+    assert_eq!(dark_cwd.fg, Some(Color::Rgb(171, 223, 167)));
 }

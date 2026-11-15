@@ -76,11 +76,13 @@ pub use providers::chatgpt_backend::{
     ChatGptBackendClient, ORIGINATOR as CHATGPT_ORIGINATOR, USER_AGENT as CHATGPT_USER_AGENT,
 };
 pub use providers::cli_sessions;
+pub use providers::custom_models;
 pub use providers::cli_sessions::{
     CliSession, XaiCredential, XaiCredentialSource, grok_session, grok_store_label,
     kimi_code_login_configured, kimi_code_models_url, kimi_code_session, kimi_code_store_label, resolve_xai_credential, xai_credential_configured,
 };
 pub use providers::cloud_gateway::cloud_gateway_active;
+pub use providers::endpoint_capabilities::ceiling_after_refusal;
 pub use providers::gemini_code_assist::{
     FETCH_AVAILABLE_MODELS as GOOGLE_CODE_ASSIST_FETCH_AVAILABLE_MODELS,
     GEMINI_CODE_ASSIST_OAUTH_CLIENT_ID_ENV, GEMINI_CODE_ASSIST_OAUTH_CLIENT_SECRET_ENV,
@@ -118,7 +120,7 @@ pub use providers::{
     BandDifficulty,
     CUSTOM_PROVIDERS_ENV, EXPERIMENTAL_PROVIDERS_ENV, MODEL_CLASSES_ENV,
     MODEL_CONTEXT_WINDOWS_ENV, MODEL_EFFORT_CEILINGS_ENV, ULTRA_BAND_ENV,
-    CustomProviderUsability, EditToolForm, HarnessProfile, KeySource, ModelClass, ModelFitHint,
+    CustomProviderUsability, EditToolForm, HarnessProfile, HarnessValueSource, KeySource, ModelClass, ModelFitHint,
     NON_CLAUDE_ADAPTERS_ENV,
     PlanPriorsTable, ProviderCatalogEntry, ProviderKind, ProviderMetadata, RouterPriors,
     WireRoute, WorkTurnPrior,
@@ -137,7 +139,7 @@ pub use providers::{
     model_family, model_has_capability, parse_effort_level, plan_priors, router_priors,
     shipped_router_priors,
     maker_for_provider, max_request_bytes_for_model, max_supported_effort, max_tokens_for_model,
-    model_supports_xhigh,
+    model_supports_vision, model_supports_xhigh,
     non_claude_adapters_enabled, openai_fast_tier_enabled, openai_fast_variant_pair,
     orchestration_reserved_models, provider_catalog, provider_enabled,
     provider_usable_for_smart_inventory, refresh_custom_providers_from_env,
