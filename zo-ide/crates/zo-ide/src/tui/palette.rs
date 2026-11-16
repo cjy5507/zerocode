@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::ansi::{Color, Style};
+use super::ansi::{Color, Role, Style};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParsedOscPalette {
@@ -53,11 +53,17 @@ const SECONDARY_INK_START_SHARE: f32 = 0.60;
 const SECONDARY_INK_STEP: f32 = 0.05;
 
 /// Max tier 컴포저 caret `›` 의 캡처 폴백.
-pub const COMPOSER_CARET: Color = Color::Rgb(255, 178, 66);
+pub const COMPOSER_CARET: Color = Color::Role(Role::Caret);
 /// 푸터의 `<model> <effort>` 캡처 폴백.
-pub const FOOTER_MODEL: Color = Color::Rgb(246, 226, 183);
+pub const FOOTER_MODEL: Color = Color::Role(Role::Model);
 /// 푸터의 cwd 캡처 폴백.
-pub const FOOTER_CWD: Color = Color::Rgb(171, 223, 167);
+pub const FOOTER_CWD: Color = Color::Role(Role::Cwd);
+
+const DARK_COMPOSER_CARET: Color = Role::Caret.terminal_color();
+const DARK_FOOTER_MODEL: Color = Role::Model.terminal_color();
+const DARK_FOOTER_CWD: Color = Role::Cwd.terminal_color();
+const DARK_TABLE_HEADER: Color = Role::Heading.terminal_color();
+const DARK_WARNING_NOTICE: Color = Role::Warning.terminal_color();
 
 // OSC 11이 밝은 배경을 돌려줄 때의 화면용 색. `None` 팔레트에서는 절대로
 // 이 값으로 바꾸지 않는다. 그래야 응답하지 않는 터미널의 캡처 바이트가
@@ -82,7 +88,7 @@ pub const CARD_EFFORT: Color = Color::Indexed(5);
 pub const NOTICE_WARN: Color = Color::Indexed(3);
 /// The footer badge's `N warnings` — codex `style.rs::warning_notice_style`
 /// amber on a dark background (the light one is `LIGHT_WARNING_NOTICE`).
-pub const WARNING_NOTICE: Color = Color::Rgb(196, 167, 103);
+pub const WARNING_NOTICE: Color = Color::Role(Role::Warning);
 /// 끝난 도구 셀의 성공 불릿.
 pub const TOOL_OK: Color = Color::Indexed(2);
 /// 끝난 도구 셀의 실패 불릿.
@@ -90,7 +96,7 @@ pub const TOOL_FAIL: Color = Color::Indexed(1);
 /// `Exploring` 목록과 MCP 셀의 도구 이름.
 pub const TOOL_LABEL: Color = Color::Indexed(6);
 /// Accent for marks headings (H1/H2) and table headers.
-pub const HEADING_ACCENT: Color = Color::Rgb(249, 226, 175);
+pub const HEADING_ACCENT: Color = Color::Role(Role::Heading);
 /// 표 헤더 행의 전경색.
 pub const TABLE_HEADER: Color = HEADING_ACCENT;
 /// `/resume` 목록에서 고른 행 — 감사에서 확인된 어두운 배경 갈래
@@ -170,8 +176,7 @@ impl TerminalPalette {
     /// pastel foregrounds would lose their contrast.
     #[must_use]
     pub fn has_light_background(self) -> bool {
-        let (red, green, blue) = self.background;
-        u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114 > 128_000
+        is_light_background(self.background)
     }
 
     /// Colours for the moving status band. Codex uses the terminal foreground
@@ -203,7 +208,7 @@ impl TerminalPalette {
         self.foreground
     }
 
-    fn text_contrast_floor(self, background: (u8, u8, u8)) -> f64 {
+    pub(crate) fn text_contrast_floor(self, background: (u8, u8, u8)) -> f64 {
         let body_contrast = contrast_ratio(self.foreground, background);
         (body_contrast * SECONDARY_CONTRAST_BODY_SHARE).min(MIN_SECONDARY_CONTRAST)
     }
@@ -269,7 +274,22 @@ impl TerminalPalette {
     /// 두고, 0~7 인덱스만 동일한 base SGR로 옮긴다.
     #[must_use]
     pub fn resolve(self, color: Color) -> Option<Color> {
+        let color = match color {
+            Color::Role(role) => role.terminal_color(),
+            other => other,
+        };
         let color = self.adapt_for_background(color);
+        self.resolve_depth(color)
+    }
+
+    /// Lowers `color` to `self.color_level` without running `terminal`-theme
+    /// background adaptation.
+    #[must_use]
+    pub(crate) fn resolve_depth(self, color: Color) -> Option<Color> {
+        let color = match color {
+            Color::Role(role) => role.terminal_color(),
+            other => other,
+        };
         match (self.color_level, color) {
             (ColorLevel::Ansi256, Color::Rgb(red, green, blue)) => {
                 Some(Color::Indexed(nearest_xterm_index((red, green, blue))))
@@ -280,6 +300,7 @@ impl TerminalPalette {
                 Some(Color::Base(index))
             }
             (ColorLevel::Ansi16, Color::Indexed(_) | Color::Rgb(..)) => None,
+            (_, Color::Role(_)) => unreachable!("Role was lowered above"),
         }
     }
 
@@ -288,11 +309,11 @@ impl TerminalPalette {
             return color;
         }
         match color {
-            COMPOSER_CARET => LIGHT_COMPOSER_CARET,
-            FOOTER_MODEL => LIGHT_FOOTER_MODEL,
-            FOOTER_CWD => LIGHT_FOOTER_CWD,
-            TABLE_HEADER => LIGHT_TABLE_HEADER,
-            WARNING_NOTICE => LIGHT_WARNING_NOTICE,
+            DARK_COMPOSER_CARET => LIGHT_COMPOSER_CARET,
+            DARK_FOOTER_MODEL => LIGHT_FOOTER_MODEL,
+            DARK_FOOTER_CWD => LIGHT_FOOTER_CWD,
+            DARK_TABLE_HEADER => LIGHT_TABLE_HEADER,
+            DARK_WARNING_NOTICE => LIGHT_WARNING_NOTICE,
             _ => color,
         }
     }
@@ -404,6 +425,15 @@ pub(crate) fn soften_status_line_style(mut style: Style) -> Style {
     style
 }
 
+/// Whether a ground is bright enough that the capture's pastel foregrounds
+/// would lose their contrast on it — the one place this rule is written
+/// (`TerminalPalette::has_light_background` and the theme's lightness fit
+/// both ask it).
+#[must_use]
+pub(crate) fn is_light_background((red, green, blue): (u8, u8, u8)) -> bool {
+    u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114 > 128_000
+}
+
 /// WCAG relative-luminance contrast ratio for a measured RGB foreground and
 /// background. Keeping this here makes the light-palette pins prove their
 /// readability instead of merely asserting a hand-picked RGB triplet.
@@ -450,32 +480,72 @@ pub(crate) fn secondary_foreground_cached(palette: TerminalPalette) -> (u8, u8, 
 }
 
 struct ContrastCacheEntry {
+    revision: u64,
     palette: TerminalPalette,
     color: (u8, u8, u8),
     background: (u8, u8, u8),
     adjusted: (u8, u8, u8),
 }
 
-/// Cached [`TerminalPalette::ensure_text_contrast`] keyed by `(palette, color, background)`.
+#[cfg(test)]
+thread_local! {
+    static CONTRAST_COMPUTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn contrast_computes() -> usize {
+    CONTRAST_COMPUTES.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    static ADJUSTED_TEXT_COLORS: std::cell::RefCell<Vec<ContrastCacheEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static ANSI16_INKS: std::cell::RefCell<Vec<Ansi16InkCacheEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How many entries this thread's contrast cache and ANSI-16 ink cache hold.
+#[cfg(test)]
+pub(crate) fn cached_colour_entries() -> (usize, usize) {
+    (
+        ADJUSTED_TEXT_COLORS.with(|cache| cache.borrow().len()),
+        ANSI16_INKS.with(|cache| cache.borrow().len()),
+    )
+}
+
+/// Cached contrast adjustment keyed by `(revision, palette, color, background)`.
+/// In `terminal` theme it blends toward `palette.foreground`; in a named theme
+/// it shifts HSL lightness while keeping hue and saturation. A miss drops the
+/// entries an earlier theme revision left, so switching themes keeps one
+/// revision's worth.
 #[must_use]
-fn ensure_text_contrast_cached(
+pub(crate) fn ensure_text_contrast_cached(
     palette: TerminalPalette,
     color: (u8, u8, u8),
     background: (u8, u8, u8),
 ) -> (u8, u8, u8) {
-    thread_local! {
-        static ADJUSTED_TEXT_COLORS: std::cell::RefCell<Vec<ContrastCacheEntry>> =
-            const { std::cell::RefCell::new(Vec::new()) };
-    }
+    let revision = super::theme::revision();
+    let named_theme = !super::theme::is_terminal();
     ADJUSTED_TEXT_COLORS.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(entry) = cache.iter().find(|entry| {
-            entry.palette == palette && entry.color == color && entry.background == background
+            entry.revision == revision
+                && entry.palette == palette
+                && entry.color == color
+                && entry.background == background
         }) {
             return entry.adjusted;
         }
-        let adjusted = palette.ensure_text_contrast(color, background);
+        #[cfg(test)]
+        CONTRAST_COMPUTES.with(|count| count.set(count.get() + 1));
+        let adjusted = if named_theme {
+            super::theme::fit_lightness(color, palette, background)
+        } else {
+            palette.ensure_text_contrast(color, background)
+        };
+        cache.retain(|entry| entry.revision == revision);
         cache.push(ContrastCacheEntry {
+            revision,
             palette,
             color,
             background,
@@ -509,6 +579,7 @@ pub(crate) fn ensure_marks_fg_contrast(
 }
 
 struct Ansi16InkCacheEntry {
+    revision: u64,
     palette: TerminalPalette,
     slot: u8,
     dim: bool,
@@ -536,7 +607,8 @@ fn compute_ansi16_ink(
 /// Resolves an ANSI-16 slot's foreground RGB when its colour is known and
 /// either `dim` is set or the slot falls below the text contrast floor.
 /// Returns `None` when the slot should keep its original ANSI index bytes.
-/// Caches `(palette, slot, dim)` for the terminal's default background.
+/// Caches `(palette, slot, dim)` for the terminal's default background, for
+/// one theme revision at a time.
 #[must_use]
 pub(crate) fn resolved_ansi16_ink(
     palette: TerminalPalette,
@@ -547,20 +619,21 @@ pub(crate) fn resolved_ansi16_ink(
     if let Some(background) = explicit_background {
         return compute_ansi16_ink(palette, slot, dim, background);
     }
-    thread_local! {
-        static ANSI16_INKS: std::cell::RefCell<Vec<Ansi16InkCacheEntry>> =
-            const { std::cell::RefCell::new(Vec::new()) };
-    }
+    let revision = super::theme::revision();
     ANSI16_INKS.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(entry) = cache
-            .iter()
-            .find(|entry| entry.palette == palette && entry.slot == slot && entry.dim == dim)
-        {
+        if let Some(entry) = cache.iter().find(|entry| {
+            entry.revision == revision
+                && entry.palette == palette
+                && entry.slot == slot
+                && entry.dim == dim
+        }) {
             return entry.resolved;
         }
         let resolved = compute_ansi16_ink(palette, slot, dim, palette.background());
+        cache.retain(|entry| entry.revision == revision);
         cache.push(Ansi16InkCacheEntry {
+            revision,
             palette,
             slot,
             dim,
@@ -695,19 +768,40 @@ fn query_terminal_palette() -> Option<TerminalPalette> {
     )
 }
 
+/// The colour depth this process's environment names.
+///
+/// A terminal that answered no colour question has no palette, and then every
+/// row the painter writes asks for this depth. The environment does not change
+/// under a running zo, so it is read once.
 pub(crate) fn color_level_from_env() -> ColorLevel {
-    if std::env::var_os("WT_SESSION").is_some() && std::env::var_os("FORCE_COLOR").is_none() {
+    static LEVEL: OnceLock<ColorLevel> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        color_level_for(
+            std::env::var_os("WT_SESSION").is_some(),
+            std::env::var_os("FORCE_COLOR").is_some(),
+            &std::env::var("COLORTERM").unwrap_or_default(),
+            std::env::var("TERM").ok().as_deref(),
+        )
+    })
+}
+
+/// The colour depth these environment values name: Windows Terminal draws
+/// truecolour unless `FORCE_COLOR` is set, then `COLORTERM` (`truecolor`,
+/// `24bit`), then a `TERM` with `256color`; anything else is ANSI-16.
+fn color_level_for(
+    wt_session: bool,
+    force_color: bool,
+    colorterm: &str,
+    term: Option<&str>,
+) -> ColorLevel {
+    if wt_session && !force_color {
         return ColorLevel::TrueColor;
     }
-    let colorterm = std::env::var("COLORTERM")
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let colorterm = colorterm.to_ascii_lowercase();
     if colorterm.contains("truecolor") || colorterm.contains("24bit") {
         return ColorLevel::TrueColor;
     }
-    if std::env::var("TERM")
-        .is_ok_and(|term| term.to_ascii_lowercase().contains("256color"))
-    {
+    if term.is_some_and(|term| term.to_ascii_lowercase().contains("256color")) {
         return ColorLevel::Ansi256;
     }
     ColorLevel::Ansi16
@@ -900,7 +994,7 @@ fn parse_component(component: &str) -> Option<u8> {
     }
 }
 
-fn nearest_xterm_index(target: (u8, u8, u8)) -> u8 {
+pub(crate) fn nearest_xterm_index(target: (u8, u8, u8)) -> u8 {
     (16u8..=255)
         .min_by_key(|index| perceptual_distance(target, xterm_rgb(*index)))
         .unwrap_or(16)
@@ -1134,4 +1228,21 @@ mod tests {
         assert_eq!(parsed.ansi16[0], None);
     }
 
+    /// The depth the environment names, from the values handed in — the
+    /// process reads its own environment once and asks the same rule.
+    #[test]
+    fn the_colour_depth_follows_the_values_the_environment_names() {
+        use super::color_level_for;
+        assert_eq!(color_level_for(true, false, "", None), ColorLevel::TrueColor, "Windows Terminal");
+        assert_eq!(
+            color_level_for(true, true, "", Some("xterm-256color")),
+            ColorLevel::Ansi256,
+            "FORCE_COLOR hands Windows Terminal back to the other names"
+        );
+        assert_eq!(color_level_for(false, false, "TrueColor", None), ColorLevel::TrueColor);
+        assert_eq!(color_level_for(false, false, "24bit", Some("xterm")), ColorLevel::TrueColor);
+        assert_eq!(color_level_for(false, false, "", Some("XTERM-256COLOR")), ColorLevel::Ansi256);
+        assert_eq!(color_level_for(false, false, "yes", Some("xterm")), ColorLevel::Ansi16);
+        assert_eq!(color_level_for(false, true, "", None), ColorLevel::Ansi16);
+    }
 }
