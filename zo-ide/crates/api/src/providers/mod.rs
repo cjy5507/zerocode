@@ -113,15 +113,20 @@ pub enum ToolSet {
     /// The shell, `Read`, `Write` and the model's edit shape: the session an
     /// `--allowed-tools` list naming those four opens.
     Core,
+    /// `core` for a run nobody attends — a root session opened headless, with
+    /// no `--allowed-tools` list and nothing of the person's attached (an MCP
+    /// server, a plugin's tool, a skill) — and `full` for every other session.
+    HeadlessCore,
 }
 
 impl ToolSet {
-    /// The catalog spelling (`full` | `core`).
+    /// The catalog spelling (`full` | `core` | `headless_core`).
     #[must_use]
     pub const fn key(self) -> &'static str {
         match self {
             Self::Full => "full",
             Self::Core => "core",
+            Self::HeadlessCore => "headless_core",
         }
     }
 }
@@ -5952,7 +5957,9 @@ mod tests {
 
         /// The prompt set, tool set and finish rule are defaults wherever they
         /// are not declared: every shipped row id, every shipped alias and the
-        /// unlisted names keep the harness they had before the values existed.
+        /// unlisted names keep the harness they had before the values existed —
+        /// but the deepseek family's tool set, which the catalog declares
+        /// `headless_core` from a measurement, and no other name's.
         #[test]
         fn the_new_values_keep_their_defaults_on_every_shipped_and_unlisted_name() {
             let _lock = crate::test_env_lock();
@@ -5971,12 +5978,20 @@ mod tests {
                 .chain(crowd)
                 .collect();
             assert!(names.len() > catalog.aliases.len() + crowd.len(), "the shipped rows are read");
+            let mut measured = 0;
             for name in names {
                 let profile = harness_profile_for_model(name);
+                let tool_set = if name.to_ascii_lowercase().contains("deepseek") {
+                    measured += 1;
+                    (ToolSet::HeadlessCore, HarnessValueSource::Measured)
+                } else {
+                    (ToolSet::Full, HarnessValueSource::Default)
+                };
                 assert_eq!((profile.prompt_set, profile.prompt_set_source), (PromptSet::Full, HarnessValueSource::Default), "{name}");
-                assert_eq!((profile.tool_set, profile.tool_set_source), (ToolSet::Full, HarnessValueSource::Default), "{name}");
+                assert_eq!((profile.tool_set, profile.tool_set_source), tool_set, "{name}");
                 assert_eq!((profile.finish_rule, profile.finish_rule_source), (FinishRule::Off, HarnessValueSource::Default), "{name}");
             }
+            assert!(measured > 1, "the shipped deepseek rows and the measured model are read");
         }
 
         /// Each new value takes the edit shape's road, field by field: the
@@ -6005,6 +6020,22 @@ mod tests {
 
             let elsewhere = harness_profile_for_model("claude-opus-5-5");
             assert_eq!((elsewhere.tool_set, elsewhere.prompt_set, elsewhere.finish_rule), (ToolSet::Full, PromptSet::Full, FinishRule::Off));
+        }
+
+        /// The third tool set is spelled `headless_core`, and a family key
+        /// declares it for that family alone, as it does the other values.
+        #[test]
+        fn a_headless_core_tool_set_takes_the_same_road() {
+            let _lock = crate::test_env_lock();
+            let _providers = OwnProviders::new();
+            let _overlay = EnvVarGuard::set(MODEL_CONTEXT_WINDOWS_ENV, Some(r#"{"harness":{"by_provider":{
+                "deepseek":{"tool_set":"headless_core","tool_set_source":"measured"}}}}"#));
+
+            let family = harness_profile_for_model("deepseek-flash");
+            assert_eq!((family.tool_set, family.tool_set_source), (ToolSet::HeadlessCore, HarnessValueSource::Measured));
+            assert_eq!(family.tool_set.key(), "headless_core");
+            let elsewhere = harness_profile_for_model("claude-opus-5-5");
+            assert_eq!((elsewhere.tool_set, elsewhere.tool_set_source), (ToolSet::Full, HarnessValueSource::Default));
         }
     }
 
