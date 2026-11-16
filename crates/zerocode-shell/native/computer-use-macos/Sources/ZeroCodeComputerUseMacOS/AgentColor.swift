@@ -179,6 +179,64 @@ struct AgentColorBook {
     }
 }
 
+/// One drawn pointer: an agent has one for each app it works in, so an agent
+/// working in several apps at once is seen in each of them.
+struct PointerKey: Hashable, Sendable {
+    let agent: String
+    let pid: pid_t
+}
+
+/// The pointers in view. An agent wears its colour while any of its pointers
+/// is in view, so the roster says when its last one goes.
+struct PointerRoster {
+    private var inView = Set<PointerKey>()
+
+    var count: Int { inView.count }
+
+    /// The pointer came into view.
+    mutating func shown(_ key: PointerKey) { inView.insert(key) }
+
+    /// The pointer went. True when its agent has none left in view.
+    @discardableResult
+    mutating func gone(_ key: PointerKey) -> Bool {
+        guard inView.remove(key) != nil else { return false }
+        return !inView.contains { $0.agent == key.agent }
+    }
+}
+
+/// The pointers that wait to be drawn. They are drawn one at a time, the
+/// longest waiting first, so none is drawn twice while another waits; one that
+/// waits again before its turn keeps the turn and takes its newest place.
+struct PointerWaiting<Place> {
+    private var places: [PointerKey: Place] = [:]
+    private var order: [PointerKey] = []
+
+    var isEmpty: Bool { order.isEmpty }
+
+    /// `key` waits to be drawn at `place`. True when none waited before it:
+    /// the drawing is to be begun.
+    @discardableResult
+    mutating func enter(_ key: PointerKey, at place: Place) -> Bool {
+        let first = order.isEmpty
+        if places.updateValue(place, forKey: key) == nil { order.append(key) }
+        return first
+    }
+
+    /// The pointer that has waited longest, and where it is to be drawn.
+    mutating func next() -> (key: PointerKey, place: Place)? {
+        guard !order.isEmpty else { return nil }
+        let key = order.removeFirst()
+        guard let place = places.removeValue(forKey: key) else { return nil }
+        return (key, place)
+    }
+
+    /// None waits any more.
+    mutating func forget() {
+        places = [:]
+        order = []
+    }
+}
+
 /// The agent that last acted on each app, as the helper heard it while drawing
 /// that agent's pointer. The newest act wins; the oldest app is forgotten
 /// past `limit`, so a long session does not grow it.

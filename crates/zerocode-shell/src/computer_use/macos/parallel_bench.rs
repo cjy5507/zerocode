@@ -113,6 +113,67 @@ fn call(session: &Session, method: &str, params: &Value) -> (f64, Result<Value, 
     )
 }
 
+/// Opens `wanted` connections to the helper one after another and leaves them
+/// idle, so that as many requests in the same instant each find one. A helper's
+/// listen queue holds eight, and what the window does when it is full — it
+/// tries again — is another measurement's (`parallel_bench_at_once`): here no
+/// request is to wait on it, whichever helper it reaches.
+fn warm(session: &Session, wanted: usize) {
+    let opened: Vec<_> = (0..wanted)
+        .map(|_| {
+            session
+                .take_wire(super::QUEUE_FULL_WAIT)
+                .unwrap_or_else(|_| panic!("a connection to the helper"))
+        })
+        .collect();
+    session
+        .idle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(opened);
+}
+
+/// How long the helper lets a pointer stay after its agent's last act: its own
+/// number, read where the helper has it.
+fn pointer_stays() -> Duration {
+    let seconds = include_str!(
+        "../../../native/computer-use-macos/Sources/ZeroCodeComputerUseMacOS/BackgroundPointerOverlay.swift"
+    )
+    .split("static let staysSeconds = ")
+    .nth(1)
+    .and_then(|rest| rest.lines().next())
+    .and_then(|seconds| seconds.trim().parse().ok())
+    .expect("how long the helper's pointer stays");
+    Duration::from_secs(seconds)
+}
+
+/// Waits until the helper shows no pointer and has none left to draw. A pointer
+/// stays for a while after its agent's last act, whatever became of its app, and
+/// the helper's count is of every agent's pointers in every app: what one
+/// section counts starts here, clear of the section before (2026-11-16: four
+/// apps read five, the fifth the press before them had left). Waited out and
+/// never stopped: what a stop costs is a section's own measure.
+fn none_shown(session: &Session) {
+    /// A timer's turn on a busy machine, past the pointer's own time.
+    const LATE: Duration = Duration::from_secs(5);
+    let bound = pointer_stays() + LATE;
+    let started = Instant::now();
+    loop {
+        let (_, said) = call(session, "status", &json!({}));
+        let status = said.expect("a status");
+        let pointer = &status["backgroundPointer"];
+        // The helper before says nothing of pointers waiting: it draws them at once.
+        if pointer["pointers"].as_u64() == Some(0) && pointer["pending"].as_bool() != Some(true) {
+            return;
+        }
+        assert!(
+            started.elapsed() < bound,
+            "a pointer outstays its time: {pointer}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn stats(mut samples: Vec<f64>) -> Value {
     samples.sort_by(f64::total_cmp);
     let at = |fraction: f64| {
@@ -664,6 +725,367 @@ fn parallel_bench() {
         "new": helper_rss_kib(new.helper_pid()),
     });
     drop(hold);
+
+    let text = serde_json::to_string_pretty(&report).expect("a report");
+    std::fs::write(&out, &text).expect("the report");
+    println!("{text}");
+}
+
+/// What a press costs when the drawn pointer has to travel to it, how many
+/// pointers one agent working in four apps shows, what many apps at once cost
+/// with every pointer drawn, and how soon the helper's main thread hears a
+/// stop while those pointers are drawn — a helper built from the commit
+/// before against the one built here, turn about (2026-11-15: the press
+/// waited for its pointer, 240 of 423 ms, and one agent had one pointer
+/// however many apps). A count of pointers starts with none shown
+/// (`none_shown`), and what each helper holds is read with four apps counted
+/// and after the first and the last stop, so pointers drawn and cleared over
+/// and over show what they leave behind. Build it in a folder named `target`:
+/// a helper admits a test only from `target/debug/deps`, and the build line's
+/// own folder is not one.
+///
+/// ```text
+/// CARGO_TARGET_DIR=<checkout>/target ZEROCODE_PARALLEL_FIXTURE=… \
+/// ZEROCODE_PARALLEL_BASELINE=<the helper built before> ZEROCODE_PARALLEL_BUILT=<the helper built here> \
+/// ZEROCODE_PARALLEL_OUT=… \
+/// cargo test -p zerocode-shell --bin zerocode-shell parallel_bench_pointer -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "drives the signed helper against owned fixtures; run by hand, see the module comment"]
+fn parallel_bench_pointer() {
+    const ROUNDS: usize = 12;
+    const APPS: usize = 4;
+    const MANY: usize = 24;
+    const MANY_ROUNDS: usize = 6;
+    const STOP_ROUNDS: usize = 24;
+    /// How long after the presses set off the stop is sent, round by round.
+    const STOP_AFTER_MS: [u64; 4] = [10, 20, 40, 80];
+    let program = PathBuf::from(std::env::var_os("ZEROCODE_PARALLEL_FIXTURE").expect("fixture"));
+    let baseline = PathBuf::from(std::env::var_os("ZEROCODE_PARALLEL_BASELINE").expect("baseline"));
+    let built = PathBuf::from(std::env::var_os("ZEROCODE_PARALLEL_BUILT").expect("built helper"));
+    let out = PathBuf::from(std::env::var_os("ZEROCODE_PARALLEL_OUT").expect("report path"));
+    let root = out.parent().expect("report folder").join("fixtures");
+    let old = Session::connect(launch_at(&baseline).expect("baseline")).expect("baseline answers");
+    let new = Session::connect(launch_at(&built).expect("built")).expect("built answers");
+    let press_as = |session: &Session, app: &str, number: u64, agent: &str| {
+        let (ms, answer) = call(
+            session,
+            "click",
+            &json!({
+                "app": app, "elementIndex": number, "background": true,
+                "noScreenshot": true, "afterAct": "changes", "agent": agent,
+            }),
+        );
+        answer.expect("a press");
+        ms
+    };
+    // A number belongs to the agent whose look gave it: the look is the presser's.
+    let look_as = |session: &Session, app: &str, agent: &str| {
+        let (_, answer) = call(
+            session,
+            "getAppState",
+            &json!({"app": app, "noScreenshot": true, "background": true, "agent": agent}),
+        );
+        answer.expect("a look")
+    };
+    // The pointers are drawn on the helper's main queue just after the answers:
+    // the most it shows while they stay, and how long until it shows `wanted`.
+    let pointers_shown = |session: &Session, wanted: usize| {
+        let started = Instant::now();
+        let mut most = 0;
+        while most < wanted && started.elapsed() < Duration::from_millis(1_500) {
+            let (_, said) = call(session, "status", &json!({}));
+            let shown = said.expect("a status")["backgroundPointer"]["pointers"]
+                .as_u64()
+                .and_then(|shown| usize::try_from(shown).ok())
+                .expect("a count of pointers");
+            most = most.max(shown);
+            if most < wanted {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let took = (most >= wanted).then(|| started.elapsed().as_secs_f64() * 1000.0);
+        (most, took)
+    };
+    let resident_of = |session: &Session| helper_rss_kib(session.helper_pid());
+    let mut report = json!({});
+
+    // ---- a press whose pointer travels, and one whose pointer is already there
+    // Eight rows keep the last button inside the window, so its pointer is drawn.
+    let travel = Fixture::start(&program, &root, "travel", 8);
+    let app = travel.app();
+    let mut by_helper = serde_json::Map::new();
+    let (mut far, mut same): (Vec<Vec<f64>>, Vec<Vec<f64>>) =
+        (vec![vec![], vec![]], vec![vec![], vec![]]);
+    let targets: Vec<(u64, u64)> = [&old, &new]
+        .iter()
+        .map(|session| {
+            let state = look_as(session, &app, "bench");
+            (
+                number_of(&state, "button Target", 0),
+                number_of(&state, "button Submit", 0),
+            )
+        })
+        .collect();
+    for round in 0..ROUNDS {
+        for (at, session) in [&old, &new].into_iter().enumerate() {
+            let (top, bottom) = targets[at];
+            far[at].push(press_as(
+                session,
+                &app,
+                if round % 2 == 0 { bottom } else { top },
+                "bench",
+            ));
+        }
+    }
+    for _ in 0..ROUNDS {
+        for (at, session) in [&old, &new].into_iter().enumerate() {
+            same[at].push(press_as(session, &app, targets[at].0, "bench"));
+        }
+    }
+    for (at, label) in ["before", "new"].into_iter().enumerate() {
+        by_helper.insert(
+            label.into(),
+            json!({
+                "press_to_a_far_point_ms": stats(std::mem::take(&mut far[at])),
+                "press_on_the_same_point_ms": stats(std::mem::take(&mut same[at])),
+            }),
+        );
+    }
+    report["press_ms"] = Value::Object(by_helper);
+    report["travel_pressed"] = json!({"events": travel.events().len(), "asked": ROUNDS * 4});
+    drop(travel);
+
+    // ---- one agent in four apps at once: how many pointers the helper shows
+    let mut apps: Vec<Fixture> = (0..APPS)
+        .map(|at| Fixture::start(&program, &root, &format!("pointer{at}"), 10))
+        .collect();
+    // Each in a place of its own, so a person sees each pointer apart.
+    for (at, fixture) in apps.iter_mut().enumerate() {
+        fixture.ctl(&format!("place {} 0", at * 150));
+    }
+    let mut pointers = serde_json::Map::new();
+    // What each helper holds, moment by moment: (moment, before, new).
+    let mut resident: Vec<(&str, u64, u64)> = Vec::new();
+    for (label, session) in [("before", &old), ("new", &new)] {
+        none_shown(session);
+        let prepared: Vec<(String, u64)> = apps
+            .iter()
+            .map(|fixture| {
+                let app = fixture.app();
+                let state = look_as(session, &app, "one-agent");
+                (app, number_of(&state, "button Target", 0))
+            })
+            .collect();
+        std::thread::scope(|scope| {
+            for (app, number) in &prepared {
+                let press_as = &press_as;
+                scope.spawn(move || press_as(session, app, *number, "one-agent"));
+            }
+        });
+        pointers.insert(label.into(), json!(pointers_shown(session, APPS).0));
+    }
+    resident.push(("four_apps_counted", resident_of(&old), resident_of(&new)));
+    report["one_agent_in_four_apps_pointers"] = Value::Object(pointers);
+    report["four_apps_pressed"] = json!(
+        apps.iter()
+            .map(|fixture| fixture.events().len())
+            .collect::<Vec<_>>()
+    );
+    drop(apps);
+
+    // ---- one agent in many apps at once: every pointer drawn, every press timed.
+    // Each round presses the other of two far buttons, so every pointer travels.
+    let mut many: Vec<Fixture> = (0..MANY)
+        .map(|at| Fixture::start(&program, &root, &format!("many{at}"), 8))
+        .collect();
+    // Six to a row, each in a place of its own: every pointer has its own way to go.
+    for (at, fixture) in many.iter_mut().enumerate() {
+        fixture.ctl(&format!("place {} {}", (at % 6) * 150, (at / 6) * 100));
+    }
+    let targets: Vec<Vec<(String, u64, u64)>> = [&old, &new]
+        .iter()
+        .map(|session| {
+            many.iter()
+                .map(|fixture| {
+                    let app = fixture.app();
+                    let state = look_as(session, &app, "one-agent");
+                    (
+                        app,
+                        number_of(&state, "button Target", 0),
+                        number_of(&state, "button Submit", 0),
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    let (mut rounds, mut presses): (Vec<Vec<f64>>, Vec<Vec<f64>>) =
+        (vec![vec![], vec![]], vec![vec![], vec![]]);
+    let mut first_shown = [(0, None), (0, None)];
+    for round in 0..MANY_ROUNDS {
+        for (at, session) in [&old, &new].into_iter().enumerate() {
+            if round == 0 {
+                none_shown(session);
+            }
+            warm(session, MANY);
+            let started = Instant::now();
+            let took: Vec<f64> = std::thread::scope(|scope| {
+                let mut pressing = Vec::with_capacity(MANY);
+                for (app, top, bottom) in &targets[at] {
+                    let press_as = &press_as;
+                    let number = if round % 2 == 0 { *bottom } else { *top };
+                    pressing.push(scope.spawn(move || press_as(session, app, number, "one-agent")));
+                }
+                pressing
+                    .into_iter()
+                    .map(|press| press.join().expect("a press"))
+                    .collect()
+            });
+            rounds[at].push(started.elapsed().as_secs_f64() * 1000.0);
+            presses[at].extend(took);
+            if round == 0 {
+                first_shown[at] = pointers_shown(session, MANY);
+            }
+        }
+    }
+    let mut by_helper = serde_json::Map::new();
+    for (at, (label, session)) in [("before", &old), ("new", &new)].into_iter().enumerate() {
+        let (pointers, all_shown_ms) = first_shown[at];
+        by_helper.insert(
+            label.into(),
+            json!({
+                "round_ms": stats(std::mem::take(&mut rounds[at])),
+                "press_ms": stats(std::mem::take(&mut presses[at])),
+                "pointers": pointers,
+                "all_pointers_shown_ms": all_shown_ms.map(f64::round),
+                "helper_resident_kib": session.helper_pid().map(super::background_tests::resident_kib),
+            }),
+        );
+    }
+    report["one_agent_in_many_apps"] = json!({
+        "apps": MANY, "rounds": MANY_ROUNDS, "by_helper": by_helper,
+    });
+    report["many_apps_pressed"] = json!(
+        many.iter()
+            .map(|fixture| fixture.events().len())
+            .collect::<Vec<_>>()
+    );
+
+    // ---- how soon the helper's main thread hears a stop while many pointers
+    // are being drawn (t-109788). The person's stop chord is heard on that
+    // thread, and the chord is theirs to press: the window's own stop is sent
+    // instead. The helper takes it on a queue of its own and then clears the
+    // pointers on the main thread, behind whatever that thread is doing — the
+    // wait the chord would have. Timed from the signal to the first pointer
+    // gone; the stop is lifted after, as the window lifts its own.
+    let stop_heard = |session: &Session, targets: &[(String, u64, u64)], round: usize| {
+        let pid = session.helper_pid().expect("the helper's pid");
+        let pointers = || {
+            let (_, said) = call(session, "status", &json!({}));
+            said.ok()
+                .and_then(|said| said["backgroundPointer"]["pointers"].as_u64())
+                .unwrap_or(0)
+        };
+        warm(session, MANY + 2);
+        let heard = std::thread::scope(|scope| {
+            for (app, top, bottom) in targets {
+                let number = if round.is_multiple_of(2) {
+                    *bottom
+                } else {
+                    *top
+                };
+                // A press the stop catches is refused: its answer is no part of this.
+                scope.spawn(move || {
+                    let _ = call(
+                        session,
+                        "click",
+                        &json!({
+                            "app": app, "elementIndex": number, "background": true,
+                            "noScreenshot": true, "afterAct": "changes", "agent": "one-agent",
+                        }),
+                    );
+                });
+            }
+            std::thread::sleep(Duration::from_millis(
+                STOP_AFTER_MS[round % STOP_AFTER_MS.len()],
+            ));
+            let mut shown = pointers();
+            let waited = Instant::now();
+            while shown == 0 && waited.elapsed() < Duration::from_millis(500) {
+                std::thread::sleep(Duration::from_millis(2));
+                shown = pointers();
+            }
+            if shown == 0 {
+                return None;
+            }
+            let sent = Instant::now();
+            // SAFETY: a signal to the helper this bench started — the one the
+            // window's stop sends it.
+            let signalled = unsafe { libc::kill(pid, libc::SIGUSR1) };
+            assert_eq!(signalled, 0, "the stop signal");
+            loop {
+                let now = pointers();
+                if now < shown {
+                    return Some(sent.elapsed().as_secs_f64() * 1000.0);
+                }
+                shown = now;
+                if sent.elapsed() > Duration::from_secs(5) {
+                    return None;
+                }
+            }
+        });
+        let (_, lifted) = call(session, "resume", &json!({"lifter": "person"}));
+        lifted.expect("the stop is lifted");
+        std::thread::sleep(Duration::from_millis(250));
+        heard
+    };
+    let (mut heard, mut untimed): (Vec<Vec<f64>>, [u32; 2]) = (vec![vec![], vec![]], [0; 2]);
+    for round in 0..STOP_ROUNDS {
+        for (at, session) in [&old, &new].into_iter().enumerate() {
+            match stop_heard(session, &targets[at], round) {
+                Some(ms) => heard[at].push(ms),
+                None => untimed[at] += 1,
+            }
+        }
+        // A stop clears every pointer, and each round after draws them again:
+        // what a helper holds after the first round against after the last is
+        // what the rounds between left behind, with no pointer shown at either.
+        let moment = match round + 1 {
+            1 => "first_stop_lifted",
+            STOP_ROUNDS => "last_stop_lifted",
+            _ => continue,
+        };
+        none_shown(&old);
+        none_shown(&new);
+        resident.push((moment, resident_of(&old), resident_of(&new)));
+    }
+    let mut by_helper = serde_json::Map::new();
+    for (at, label) in ["before", "new"].into_iter().enumerate() {
+        // Every round's, slowest last: twenty-four are too few for a p95 to
+        // show the slowest one.
+        let mut all = std::mem::take(&mut heard[at]);
+        all.sort_by(f64::total_cmp);
+        let all: Vec<f64> = all.iter().map(|ms| (ms * 10.0).round() / 10.0).collect();
+        by_helper.insert(
+            label.into(),
+            json!({
+                "heard_ms": stats(all.clone()),
+                "longest_ms": all.last().copied().unwrap_or_default(),
+                "all_ms": all,
+                "not_timed": untimed[at],
+            }),
+        );
+    }
+    report["a_stop_while_many_pointers_are_drawn"] = json!({
+        "apps": MANY, "rounds": STOP_ROUNDS, "stop_after_ms": STOP_AFTER_MS, "by_helper": by_helper,
+    });
+    report["helper_resident_kib_at"] = Value::Object(
+        resident
+            .into_iter()
+            .map(|(moment, before, new)| (moment.to_owned(), json!({"before": before, "new": new})))
+            .collect(),
+    );
+    drop(many);
 
     let text = serde_json::to_string_pretty(&report).expect("a report");
     std::fs::write(&out, &text).expect("the report");
