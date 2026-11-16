@@ -1,6 +1,6 @@
 use std::ffi::OsString;
-use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::io::{ErrorKind, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -76,23 +76,15 @@ impl Server {
                     std::thread::sleep(Duration::from_millis(2));
                     continue;
                 };
-                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                let mut bytes = Vec::new();
-                let mut chunk = [0; 4096];
-                loop {
-                    let n = stream.read(&mut chunk).unwrap_or(0);
-                    if n == 0 { break; }
-                    bytes.extend_from_slice(&chunk[..n]);
-                    let text = String::from_utf8_lossy(&bytes);
-                    if let Some((head, rest)) = text.split_once("\r\n\r\n") {
-                        let length = head.lines().find_map(|line| {
-                            let (key, value) = line.split_once(':')?;
-                            key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok()).flatten()
-                        }).unwrap_or(0);
-                        if rest.len() >= length { break; }
-                    }
+                // macOS gives an accepted stream the listener's non-blocking
+                // mode: read it blocking, so the timeout waits for a request
+                // still on its way instead of the read taking it for none.
+                if stream.set_nonblocking(false).is_err() || stream.set_read_timeout(Some(Duration::from_secs(2))).is_err() {
+                    continue;
                 }
-                let request = String::from_utf8(bytes).unwrap();
+                // A connection that ends, fails or times out before its
+                // request is whole is closed unanswered and left unrecorded.
+                let Some(request) = read_request(&mut stream) else { continue };
                 let (status, body) = if request.starts_with("POST ") {
                     ("200 OK", r#"{"id":"fixture","model":"vendor/model","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#)
                 } else { (status.as_str(), body.as_str()) };
@@ -118,8 +110,93 @@ impl Drop for Server {
     }
 }
 
+/// One whole request: the head through its blank line and the body its
+/// Content-Length names. `None` when the connection ends, fails or times out
+/// first, so a partial request is never answered.
+fn read_request(stream: &mut TcpStream) -> Option<String> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return None,
+            Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+        let Some(end) = bytes.windows(4).position(|four| four == b"\r\n\r\n") else { continue };
+        let length = String::from_utf8_lossy(&bytes[..end]).lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok()).flatten()
+        }).unwrap_or(0);
+        if bytes.len() >= end + 4 + length { return Some(String::from_utf8_lossy(&bytes).into_owned()); }
+    }
+}
+
 pub fn read(server: &Server) -> Result<Vec<String>, api::ApiError> {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(
         api::discover_models_with_bearer(&server.base, "fixture-key")
     )
+}
+
+/// The fixture's own checks, over bare sockets: it answers a request only once
+/// it has read it whole. They touch neither `provider` nor `read`, so a test
+/// file that shares only the provider guard still leaves those unused.
+mod tests {
+    use super::*;
+    use std::net::Shutdown;
+
+    fn connect(server: &Server) -> TcpStream {
+        let address = server.base.trim_start_matches("http://").trim_end_matches("/v1");
+        let stream = TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream
+    }
+
+    /// Whatever comes back until the fixture closes, or the error that ended it.
+    fn answer(stream: &mut TcpStream) -> String {
+        let mut text = String::new();
+        match stream.read_to_string(&mut text) {
+            Ok(_) => text,
+            Err(error) => format!("{text}<{error}>"),
+        }
+    }
+
+    #[test]
+    fn a_request_sent_a_moment_after_connecting_is_read_before_it_is_answered() {
+        let server = Server::new("200 OK", r#"{"data":[]}"#);
+        let mut client = connect(&server);
+        client.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let mut early = [0; 512];
+        let answered_early = match client.read(&mut early) {
+            Ok(read) => Some(String::from_utf8_lossy(&early[..read]).into_owned()),
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => None,
+            Err(error) => Some(format!("<{error}>")),
+        };
+        assert_eq!(answered_early, None, "the fixture answered before the request came");
+        client.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let body = r#"{"model":"vendor/model","messages":[]}"#;
+        let request = format!("POST /v1/chat/completions HTTP/1.1\r\nHost: fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let reply = match client.write_all(request.as_bytes()) {
+            Ok(()) => answer(&mut client),
+            Err(error) => format!("<{error}>"),
+        };
+        assert!(reply.starts_with("HTTP/1.1 200 OK") && reply.contains(r#""id":"fixture""#), "not the answer to the POST: {reply}");
+        assert_eq!(*server.requests.lock().unwrap(), [request]);
+    }
+
+    #[test]
+    fn a_connection_that_ends_without_a_request_is_closed_unanswered_and_unrecorded() {
+        let server = Server::new("200 OK", r#"{"data":[]}"#);
+        let mut silent = connect(&server);
+        silent.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(answer(&mut silent), "", "the fixture answered a connection that sent nothing");
+        let request = "GET /v1/models HTTP/1.1\r\nHost: fixture\r\n\r\n";
+        let mut client = connect(&server);
+        let reply = match client.write_all(request.as_bytes()) {
+            Ok(()) => answer(&mut client),
+            Err(error) => format!("<{error}>"),
+        };
+        assert!(reply.starts_with("HTTP/1.1 200 OK") && reply.ends_with(r#"{"data":[]}"#), "the next connection: {reply}");
+        assert_eq!(*server.requests.lock().unwrap(), [request]);
+    }
 }

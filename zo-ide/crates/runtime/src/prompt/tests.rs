@@ -639,6 +639,49 @@ fn a_prompt_ablation_arm_drops_what_it_names_and_keeps_what_it_must() {
     );
 }
 
+/// A core prompt set is the `all` arm by another door: whichever says it —
+/// the experiment switch or the model's harness profile — the prompt is one,
+/// byte for byte, and a declared full set is the prompt as it was. The arm is
+/// applied here the way `build` applies the switch, because setting the
+/// switch itself would reach every prompt this binary builds meanwhile.
+#[test]
+fn a_core_prompt_set_builds_the_prompt_the_all_arm_builds() {
+    use super::ablation::PromptAblation;
+
+    let _guard = env_lock();
+    let saved = std::env::var_os(api::MODEL_CONTEXT_WINDOWS_ENV);
+    let overlay = |harness: &str| format!(r#"{{"models":[{{"ids":["acme-coder-1"],"harness":{harness}}}]}}"#);
+    let build = || SystemPromptBuilder::new().with_model("acme-coder-1").build();
+
+    std::env::set_var(api::MODEL_CONTEXT_WINDOWS_ENV, overlay("{}"));
+    let full = build();
+    std::env::set_var(api::MODEL_CONTEXT_WINDOWS_ENV, overlay(r#"{"prompt_set":"core"}"#));
+    let core = build();
+    std::env::set_var(api::MODEL_CONTEXT_WINDOWS_ENV, overlay(r#"{"prompt_set":"full"}"#));
+    let declared_full = build();
+    match saved {
+        Some(value) => std::env::set_var(api::MODEL_CONTEXT_WINDOWS_ENV, value),
+        None => std::env::remove_var(api::MODEL_CONTEXT_WINDOWS_ENV),
+    }
+
+    // The arm reaches the static region only, as `build` applies it.
+    let every = PromptAblation::all();
+    let boundary = full
+        .iter()
+        .position(|section| section == SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+        .expect("dynamic boundary should be present");
+    let (static_region, dynamic_region) = full.split_at(boundary);
+    let all_arm: Vec<String> = static_region
+        .iter()
+        .filter(|section| section.lines().next().is_none_or(|heading| !every.suppresses(heading)))
+        .chain(dynamic_region)
+        .cloned()
+        .collect();
+    assert_ne!(all_arm, full, "the arm must hold sections out");
+    assert_eq!(core, all_arm, "a core prompt set is the `all` arm");
+    assert_eq!(declared_full, full, "a declared full prompt set is the prompt as it was");
+}
+
 /// `# Action scope and permission` must ship, and ship cacheably.
 ///
 /// Found by ablation: each of the twelve static sections was removed in turn
@@ -1057,7 +1100,7 @@ fn the_reworded_manual_keeps_its_system_and_task_rules() {
     }
     assert_eq!(system.lines().filter(|line| line.starts_with(" - ")).count(), 6);
 
-    let tasks = super::get_simple_doing_tasks_section();
+    let tasks = super::get_simple_doing_tasks_section(api::FinishRule::Off);
     assert!(tasks.starts_with("# Task work\n"));
     for term in [
         "Create a file only when completing the request requires it",
@@ -2199,6 +2242,142 @@ fn model_family_line_follows_the_bound_model() {
     // An id the built-in catalog does not carry renders verbatim rather than
     // being mislabeled as some family it does not belong to.
     assert!(render(Some("ollama/llama-4-70b")).contains("Model family: llama-4-70b"));
+}
+
+/// The sandbox line names the limits in force, and says so when there are none
+/// — a sandbox that is asked for but limits nothing here is not claimed.
+#[test]
+fn the_sandbox_line_says_what_a_shell_command_meets() {
+    use crate::sandbox::{FilesystemIsolationMode, SandboxStatus};
+
+    let none = SandboxStatus::default();
+    assert_eq!(
+        super::render_sandbox_line(&none),
+        "Sandbox: none — shell commands run directly on this machine; zo restricts neither their files nor their network."
+    );
+    let container = SandboxStatus { in_container: true, ..SandboxStatus::default() };
+    assert_eq!(
+        super::render_sandbox_line(&container),
+        "Sandbox: none — shell commands run directly on this machine (a container); zo restricts neither their files nor their network."
+    );
+    // Enabled in the settings, nothing this machine can enforce: still none.
+    let asked_only = SandboxStatus { enabled: true, ..SandboxStatus::default() };
+    assert!(super::render_sandbox_line(&asked_only).starts_with("Sandbox: none — "));
+
+    let walled = SandboxStatus {
+        enabled: true,
+        active: true,
+        filesystem_write_blocking_active: true,
+        filesystem_active: true,
+        network_active: true,
+        home_tmp_redirected: true,
+        ..SandboxStatus::default()
+    };
+    assert_eq!(
+        super::render_sandbox_line(&walled),
+        "Sandbox: on — shell commands run on this machine with these limits: writes outside the workspace are blocked; the network is cut off; HOME and TMPDIR point at scratch folders."
+    );
+    let mounts = SandboxStatus {
+        filesystem_mode: FilesystemIsolationMode::AllowList,
+        ..walled.clone()
+    };
+    assert!(super::render_sandbox_line(&mounts).contains("writes outside the allowed mounts are blocked"));
+    let namespaced = SandboxStatus {
+        enabled: true,
+        active: true,
+        namespace_active: true,
+        in_container: true,
+        ..SandboxStatus::default()
+    };
+    assert_eq!(
+        super::render_sandbox_line(&namespaced),
+        "Sandbox: on — shell commands run on this machine (a container) with these limits: processes run in a namespace of their own."
+    );
+}
+
+/// A prompt built from a workspace carries the line in its environment section,
+/// and one built with no settings in hand does not grow it.
+#[test]
+fn the_environment_section_says_what_the_sandbox_is_when_settings_are_in_hand() {
+    let _guard = env_lock();
+    ensure_valid_cwd();
+    let root = temp_dir();
+    fs::create_dir_all(&root).expect("root dir");
+    let sections = super::load_system_prompt_for_main(&root, "2026-03-31", "linux", "6.8", None)
+        .expect("main prompt should load");
+    let environment = sections
+        .iter()
+        .find(|section| section.starts_with("# Environment context"))
+        .expect("environment section");
+    let line = environment
+        .lines()
+        .find(|line| line.starts_with(" - Sandbox: "))
+        .unwrap_or_else(|| panic!("no sandbox line: {environment}"));
+    assert!(
+        line.starts_with(" - Sandbox: none — ") || line.starts_with(" - Sandbox: on — "),
+        "{line}"
+    );
+    assert_eq!(
+        environment.lines().last(),
+        Some(line),
+        "the line closes the section, after the platform"
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+
+    let bare = super::SystemPromptBuilder::new().with_os("linux", "6.8").render();
+    assert!(!bare.contains("Sandbox: "), "no settings, no claim: {bare}");
+}
+
+/// A sandbox the settings ask for that this machine cannot give: the bash tool
+/// refuses a shell command for it, and the line says that and why instead of
+/// "none" or "on". Run alone, with a `PATH` that holds neither `sandbox-exec`
+/// nor `unshare`: the person's own settings (a project's `sandbox` is stripped)
+/// ask for Seatbelt (macOS) and for namespaces (Linux), and neither is there.
+/// Windows refuses nothing for a sandbox.
+#[cfg(unix)]
+#[test]
+fn the_sandbox_line_says_when_a_requested_sandbox_refuses_commands() {
+    let root = own_root().unwrap_or_else(temp_dir);
+    let vars = [
+        ("HOME", root.join("home")),
+        ("ZO_CONFIG_HOME", root.join("zo-global")),
+        ("ZO_HOME", root.join("missing-zo-home")),
+        ("PATH", root.join("no-tools")),
+    ];
+    with_root_exported(
+        "the_sandbox_line_says_when_a_requested_sandbox_refuses_commands",
+        &root,
+        &vars,
+        false,
+        |root| {
+            fs::create_dir_all(root.join("zo-global")).expect("global zo dir");
+            fs::write(
+                root.join("zo-global").join("settings.json"),
+                r#"{"sandbox":{"enabled":true,"macosSeatbelt":true}}"#,
+            )
+            .expect("write the person's settings");
+            let config = ConfigLoader::default_for(root).load().expect("settings should load");
+            let status = crate::sandbox::resolve_sandbox_status(config.sandbox(), root);
+            let reason = crate::sandbox::current_sandbox_unavailability(&status)
+                .unwrap_or_else(|| {
+                    panic!("precondition: the bash tool runs commands here: {status:?}")
+                });
+            let context =
+                ProjectContext::discover(root, "2026-03-31").expect("context should load");
+            let line = SystemPromptBuilder::new()
+                .with_project_context(context)
+                .with_runtime_config(config)
+                .sandbox_line();
+            let expected = format!(
+                "Sandbox: requested but unavailable — shell commands are refused: {reason}."
+            );
+            assert_eq!(
+                line.as_deref(),
+                Some(expected.as_str()),
+                "the line where the bash tool refuses commands"
+            );
+        },
+    );
 }
 
 /// No bound model (diagnostic dump, harness that has not picked one) falls back
