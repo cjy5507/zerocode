@@ -19,6 +19,11 @@ use super::theme::{self, Theme, TERMINAL_THEME_NAME};
 /// The largest theme file read: 256 KiB.
 pub const MAX_THEME_FILE_BYTES: u64 = 256 * 1024;
 
+/// The most theme files read from the themes folder: the first 200 by name.
+/// The folder is read where the screen is drawn, each time `/theme` opens,
+/// so a folder of thousands of files must not hold the screen.
+pub const MAX_THEME_FILES: usize = 200;
+
 /// The folder under the zo home that holds the theme files.
 const THEMES_FOLDER: &str = "themes";
 
@@ -48,34 +53,91 @@ type ColourField = for<'t> fn(&'t mut Theme, &str) -> Option<&'t mut Option<(u8,
 /// Reads every `<slug>.json` directly inside `dir` into a theme, sorted by
 /// name, and says each mistake as one warning line. A name that starts with
 /// `.` is passed over without a word, and a missing folder is no themes and
-/// no warning.
+/// no warning. At most [`MAX_THEME_FILES`] files are read. [`load_folder`]
+/// is the same read, and counts each theme file's mistakes too.
 #[must_use]
 pub fn load_from(dir: &Path) -> (Vec<Theme>, Vec<String>) {
+    let loaded = load_folder(dir);
+    (loaded.themes, loaded.warnings)
+}
+
+/// What one read of the themes folder found.
+#[derive(Debug, Default, PartialEq)]
+pub struct Loaded {
+    /// The themes read, sorted by name.
+    pub themes: Vec<Theme>,
+    /// Each mistake, as one line.
+    pub warnings: Vec<String>,
+    /// How many mistakes the file of a theme held, by the theme's name: the
+    /// lines of `warnings` said while that file was read. A theme whose file
+    /// held none is not listed, and neither is a file that made no theme —
+    /// its one line says why it was skipped.
+    pub problems: BTreeMap<String, usize>,
+}
+
+/// Reads the themes folder `dir` as [`load_from`] does, and counts the
+/// mistakes of each file that made a theme — what the `/theme` picker marks
+/// on that theme's row.
+#[must_use]
+pub fn load_folder(dir: &Path) -> Loaded {
+    load_folder_capped(dir, MAX_THEME_FILES)
+}
+
+/// [`load_folder`], reading at most `cap` theme files: the first `cap` by
+/// name of the folder's theme files — what is left of its entries without
+/// those passed over in silence (a name that starts with `.`, another
+/// extension, a folder). A file past the cap is not opened or measured, and
+/// one warning line says how many theme files the folder holds.
+fn load_folder_capped(dir: &Path, cap: usize) -> Loaded {
     let mut warnings = Vec::new();
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return (Vec::new(), warnings),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Loaded::default(),
         Err(error) => {
             warnings.push(format!(
                 "theme folder {}: cannot be read ({error})",
                 dir.display()
             ));
-            return (Vec::new(), warnings);
+            return Loaded {
+                warnings,
+                ..Loaded::default()
+            };
         }
     };
     let folder = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let mut paths: Vec<PathBuf> = entries
         .filter_map(Result::ok)
+        .filter(is_theme_file_entry)
         .map(|entry| entry.path())
         .collect();
     paths.sort();
+    if paths.len() > cap {
+        warnings.push(format!(
+            "theme folder {}: holds {} theme files; only the first {cap} by name are read",
+            dir.display(),
+            paths.len()
+        ));
+        paths.truncate(cap);
+    }
     let mut themes = BTreeMap::new();
+    let mut problems = BTreeMap::new();
     for path in &paths {
+        let said_before = warnings.len();
         if let Some(theme) = read_theme_file(path, &folder, &mut warnings) {
+            // Every line said while a file that made a theme was read is a
+            // mistake in that file.
+            let mistakes = warnings.len() - said_before;
+            if mistakes > 0 {
+                problems.insert(theme.name.clone(), mistakes);
+            }
             themes.insert(theme.name.clone(), theme);
         }
     }
-    (themes.into_values().collect(), warnings)
+    Loaded {
+        themes: themes.into_values().collect(),
+        warnings,
+        problems,
+    }
 }
 
 /// One theme file's warnings, each naming the file.
@@ -90,19 +152,37 @@ impl Notes<'_> {
     }
 }
 
-/// The theme in `path`, or `None` — said, unless it is no theme file at all
-/// (another extension, a folder, or a name that starts with `.`).
-fn read_theme_file(path: &Path, folder: &Path, warnings: &mut Vec<String>) -> Option<Theme> {
+/// Whether `path` is named as a theme file is: `<name>.json`, and not a name
+/// that starts with `.`.
+fn has_theme_file_name(path: &Path) -> bool {
     // An editor's lock file beside a theme being edited (`.#mine.json`),
     // macOS's `._mine.json` and any other hidden name: no theme file, and
     // nothing to say each time the names are read.
-    if path
+    let hidden = path
         .file_name()
-        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"."))
-    {
-        return None;
+        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"."));
+    !hidden && path.extension().and_then(OsStr::to_str) == Some("json")
+}
+
+/// Whether a folder's entry is one of its theme files — the ones counted
+/// against the cap: named as one (`has_theme_file_name`) and no folder. A
+/// link is followed to tell; nothing is opened.
+fn is_theme_file_entry(entry: &fs::DirEntry) -> bool {
+    let path = entry.path();
+    if !has_theme_file_name(&path) {
+        return false;
     }
-    if path.extension().and_then(OsStr::to_str) != Some("json") {
+    match entry.file_type() {
+        Ok(kind) if kind.is_dir() => false,
+        Ok(kind) if kind.is_symlink() => !fs::metadata(&path).is_ok_and(|target| target.is_dir()),
+        _ => true,
+    }
+}
+
+/// The theme in `path`, or `None` — said, unless it is no theme file at all
+/// (another extension, a folder, or a name that starts with `.`).
+fn read_theme_file(path: &Path, folder: &Path, warnings: &mut Vec<String>) -> Option<Theme> {
+    if !has_theme_file_name(path) {
         return None;
     }
     let mut notes = Notes {
@@ -321,11 +401,13 @@ fn shown(value: &Value) -> String {
     }
 }
 
-/// The person's themes as last read, and the warnings that read said.
+/// The person's themes as last read, the warnings that read said, and how
+/// many mistakes it counted in each theme's file.
 #[derive(Debug, Default)]
 pub(crate) struct Catalog {
     themes: Option<Vec<Theme>>,
     said: BTreeSet<String>,
+    problems: BTreeMap<String, usize>,
 }
 
 impl Catalog {
@@ -333,6 +415,7 @@ impl Catalog {
         Self {
             themes: None,
             said: BTreeSet::new(),
+            problems: BTreeMap::new(),
         }
     }
 
@@ -340,8 +423,13 @@ impl Catalog {
     /// read before did not say, so a picker opened again and again does not
     /// repeat the same line.
     pub(crate) fn read(&mut self, dir: Option<&Path>) -> Vec<String> {
-        let (themes, warnings) = dir.map_or_else(|| (Vec::new(), Vec::new()), load_from);
+        let Loaded {
+            themes,
+            warnings,
+            problems,
+        } = dir.map_or_else(Loaded::default, load_folder);
         self.themes = Some(themes);
+        self.problems = problems;
         let fresh = warnings
             .iter()
             .filter(|warning| !self.said.contains(*warning))
@@ -374,6 +462,14 @@ impl Catalog {
             }
         }
         (list, warnings)
+    }
+
+    /// How many mistakes the file of the theme `slug` held at the last read:
+    /// none for a file without one, for a built-in theme and before any read.
+    /// The warning lines are said once; this is there for as long as the
+    /// file is as it was.
+    pub(crate) fn problems(&self, slug: &str) -> usize {
+        self.problems.get(slug).copied().unwrap_or(0)
     }
 
     /// `terminal`, else the person's theme of that name, else the built-in one.
@@ -431,6 +527,15 @@ pub(crate) fn find(slug: &str) -> Option<Theme> {
     })
 }
 
+/// How many mistakes the file of the person's theme `slug` held when the
+/// themes folder was last read. The folder is not read for this.
+pub(crate) fn problems(slug: &str) -> usize {
+    CATALOG
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .problems(slug)
+}
+
 /// Reads the person's themes folder at start, saying what is wrong in it.
 pub(crate) fn read_at_start() {
     with_catalog(|catalog, dir| ((), catalog.read(dir)));
@@ -438,12 +543,15 @@ pub(crate) fn read_at_start() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
 
     use two_face::theme::EmbeddedThemeName;
 
-    use super::{load_from, Catalog, MAX_THEME_FILE_BYTES};
+    use super::{
+        load_folder, load_folder_capped, load_from, Catalog, MAX_THEME_FILES, MAX_THEME_FILE_BYTES,
+    };
     use crate::tui::ansi::Role;
     use crate::tui::theme::find_builtin;
 
@@ -765,6 +873,131 @@ mod tests {
         let names: Vec<&str> = themes.iter().map(|theme| theme.name.as_str()).collect();
         assert_eq!(names, ["mine"]);
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// More theme files than the cap: the first by name are read, the rest
+    /// are not opened, and one line says how many there are. A dot file,
+    /// another extension and a folder are no theme files and are not
+    /// counted.
+    #[test]
+    fn more_theme_files_than_the_cap_reads_the_first_by_name_and_says_so_in_one_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let theme = r##"{"colors":{"accent":"#112233"}}"##;
+        for name in ["delta.json", "alpha.json", "charlie.json", "bravo.json"] {
+            write_theme(dir.path(), name, theme);
+        }
+        // Past a cap of three or four: never opened, so what is wrong in it
+        // is not said.
+        write_theme(dir.path(), "echo.json", "{ not valid json");
+        write_theme(dir.path(), ".hidden.json", theme);
+        write_theme(dir.path(), "notes.txt", "my themes");
+        fs::create_dir_all(dir.path().join("folder.json")).expect("create a folder named .json");
+        let names_of = |themes: &[crate::tui::theme::Theme]| -> Vec<String> {
+            themes.iter().map(|theme| theme.name.clone()).collect()
+        };
+        let load_from_capped = |dir: &Path, cap: usize| {
+            let loaded = load_folder_capped(dir, cap);
+            (loaded.themes, loaded.warnings)
+        };
+
+        let (themes, warnings) = load_from_capped(dir.path(), 3);
+        assert_eq!(names_of(&themes), ["alpha", "bravo", "charlie"]);
+        assert_eq!(warnings.len(), 1, "the cap's line and no other: {warnings:?}");
+        let line = &warnings[0];
+        assert!(
+            line.contains("holds 5 theme files")
+                && line.contains("only the first 3 by name are read")
+                && line.contains(&dir.path().display().to_string()),
+            "{line}"
+        );
+        assert!(!line.contains('\n'), "a warning is one line: {line:?}");
+
+        let (themes, warnings) = load_from_capped(dir.path(), 4);
+        assert_eq!(names_of(&themes), ["alpha", "bravo", "charlie", "delta"]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("only the first 4 by name are read"), "{warnings:?}");
+
+        // At the cap, and under it: every file is read and no such line.
+        for cap in [5, 6, MAX_THEME_FILES] {
+            let (themes, warnings) = load_from_capped(dir.path(), cap);
+            assert_eq!(names_of(&themes), ["alpha", "bravo", "charlie", "delta"], "cap {cap}");
+            assert_eq!(warnings.len(), 1, "cap {cap}: {warnings:?}");
+            assert!(
+                warnings[0].contains("echo.json") && !warnings[0].contains("holds"),
+                "cap {cap}: {warnings:?}"
+            );
+        }
+        assert_eq!(
+            load_folder(dir.path()),
+            load_folder_capped(dir.path(), MAX_THEME_FILES),
+            "the folder is read with the cap of {MAX_THEME_FILES}"
+        );
+    }
+
+    /// A theme file's mistakes are counted for its theme — two for two, none
+    /// for a file without one — and the count is there each time it is
+    /// asked, though the lines are said once. A file that makes no theme has
+    /// no theme and no count: its one line says why.
+    #[test]
+    fn a_theme_file_with_mistakes_counts_them_and_a_clean_one_counts_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let two_wrong = r##"{
+            "base": "dracula",
+            "colours": {},
+            "ansi": { "red": "not-a-hex", "green": "#69ff94" }
+        }"##;
+        write_theme(dir.path(), "two-wrong.json", two_wrong);
+        write_theme(
+            dir.path(),
+            "clean.json",
+            r##"{ "base": "dracula", "colors": { "accent": "#ff79c6" } }"##,
+        );
+        write_theme(dir.path(), "bad-json.json", "{ not valid json");
+
+        let loaded = load_folder(dir.path());
+        let names: Vec<&str> = loaded.themes.iter().map(|theme| theme.name.as_str()).collect();
+        assert_eq!(names, ["clean", "two-wrong"]);
+        assert_eq!(loaded.warnings.len(), 3, "{:?}", loaded.warnings);
+        assert_eq!(
+            loaded.problems,
+            BTreeMap::from([("two-wrong".to_owned(), 2)]),
+            "only the file with mistakes is counted: {:?}",
+            loaded.warnings
+        );
+        assert_eq!(
+            load_from(dir.path()),
+            (loaded.themes.clone(), loaded.warnings.clone()),
+            "the read without the counts is the same read"
+        );
+
+        let mut catalog = Catalog::new();
+        assert_eq!(catalog.problems("two-wrong"), 0, "nothing is counted before a read");
+        let (_, first) = catalog.names(Some(dir.path()));
+        assert_eq!(first.len(), 3, "{first:?}");
+        assert_eq!(catalog.problems("two-wrong"), 2);
+        assert_eq!(catalog.problems("clean"), 0);
+        assert!(catalog.find("bad-json").is_none());
+        for slug in ["bad-json", "dracula", "terminal", "no-such-theme"] {
+            assert_eq!(catalog.problems(slug), 0, "{slug}");
+        }
+
+        // Asked again: the lines are not said twice, and the count stays.
+        let (_, again) = catalog.names(Some(dir.path()));
+        assert!(again.is_empty(), "{again:?}");
+        assert_eq!(catalog.problems("two-wrong"), 2, "the count is there every time");
+        // The file put right counts none; the mistake made again counts again.
+        write_theme(dir.path(), "two-wrong.json", "{}");
+        let _ = catalog.names(Some(dir.path()));
+        assert_eq!(catalog.problems("two-wrong"), 0);
+        write_theme(dir.path(), "two-wrong.json", two_wrong);
+        let _ = catalog.names(Some(dir.path()));
+        assert_eq!(catalog.problems("two-wrong"), 2);
+        // No folder: nothing is counted any more.
+        let _ = catalog.names(None);
+        assert_eq!(catalog.problems("two-wrong"), 0);
+
+        // The process catalog in a test build reads no folder at all.
+        assert_eq!(super::problems("two-wrong"), 0);
     }
 
     #[test]

@@ -5190,6 +5190,129 @@ fn the_main_turn_attempt_is_the_session_and_a_rising_turn_ordinal() {
     ::api::note_attempt(&session_id, "");
 }
 
+/// What shortens a transcript — a compaction, a rewind, a failed turn taken
+/// back, a session read back from its file — does not hand a later turn a key
+/// an earlier turn was spent under, and every turn runs under the key a host
+/// peeked for it. The ordinal used to be the user messages left in the
+/// transcript plus one, so the turn after a compaction took the key of the
+/// session's second or third turn, and the ledgers that join on the key
+/// joined the two.
+#[test]
+fn a_turn_key_is_not_given_again_after_the_transcript_is_shortened() {
+    fn take_turn(runtime: &mut ConversationRuntime<PlainAnswerClient, StaticToolExecutor>, words: &str) -> String {
+        let peeked = runtime.next_attempt();
+        runtime.run_turn(words, None).expect("turn");
+        assert_eq!(runtime.attempt(), peeked, "a turn runs under the key a host priced it under");
+        peeked
+    }
+
+    let session = Session::new();
+    let session_id = session.session_id.clone();
+    let mut runtime = ConversationRuntime::new(
+        session,
+        PlainAnswerClient,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        vec!["You are a test assistant.".to_string()],
+    );
+    let mut keys = Vec::new();
+    for words in ["one", "two", "three"] {
+        keys.push(take_turn(&mut runtime, words));
+    }
+
+    // A compaction: the continuation it wrote and the last answer are what is
+    // left, and no user message among them.
+    let session = runtime.session_mut();
+    let last = session.messages.last().cloned().expect("the third answer");
+    let folded = session.messages.len() - 1;
+    let continuation = ConversationMessage {
+        role: MessageRole::System,
+        ..ConversationMessage::user_text("what the folded messages said")
+    };
+    session.apply_compaction_atomic(Arc::new(vec![continuation, last]), "summary", folded, None);
+    keys.push(take_turn(&mut runtime, "four"));
+
+    // A rewind takes the fourth turn back; its rows stay under @4.
+    assert!(runtime.rewind_turns(1) > 0, "the fourth turn is taken back");
+    keys.push(take_turn(&mut runtime, "five"));
+
+    // A turn whose messages are taken back as the streaming loop takes a
+    // failed turn's: the transcript is cut to what it held before the turn.
+    let before = runtime.session().messages.len();
+    keys.push(take_turn(&mut runtime, "six, which is taken back"));
+    Arc::make_mut(&mut runtime.session_mut().messages).truncate(before);
+    keys.push(take_turn(&mut runtime, "seven"));
+
+    // A resume: the session as its file gives it back.
+    let resumed = Session::from_json(&runtime.session().to_json().expect("the session renders"))
+        .expect("the session reads back");
+    runtime.replace_session(resumed);
+    keys.push(take_turn(&mut runtime, "eight"));
+
+    let expected: Vec<String> = (1..=8).map(|ordinal| format!("{session_id}@{ordinal}")).collect();
+    assert_eq!(keys, expected);
+    ::api::note_attempt(&session_id, "");
+}
+
+/// A turn that was given its number and whose user message did not reach the
+/// file — the append was refused — leaves a number no message stands for, and
+/// the header that carries such numbers is written only by a full write of
+/// the file. The turn start asks for one. Without it the next turn appends,
+/// its turn-end persist writes nothing, and the session read back gives that
+/// turn's number again — the number its requests were filed under.
+#[test]
+fn a_turn_whose_message_did_not_land_does_not_cost_the_next_turn_its_number() {
+    let dir = temp_workspace("turn-number-lost-message");
+    fs::create_dir_all(&dir).expect("the folder");
+    let path = dir.join("session.jsonl");
+    let session = Session::new().with_persistence_path(path.clone());
+    let session_id = session.session_id.clone();
+    let mut runtime = ConversationRuntime::new(
+        session,
+        PlainAnswerClient,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        vec!["You are a test assistant.".to_string()],
+    );
+    runtime.run_turn("one", None).expect("first turn");
+    assert_eq!(runtime.attempt(), format!("{session_id}@1"));
+
+    // Another writer holds the file's lease for a moment and writes nothing:
+    // the second turn takes its number, and its message is refused.
+    runtime.session().release_writer_lease();
+    let peer = Session::load_from_path(&path).expect("the peer reads the file");
+    peer.persist_appended_state_to_path(&path)
+        .expect("the peer takes the lease and has nothing to write");
+    runtime
+        .run_turn("two", None)
+        .expect_err("the second turn's message is refused");
+    assert_eq!(
+        runtime.attempt(),
+        format!("{session_id}@2"),
+        "the turn took its number before its message was refused"
+    );
+    peer.release_writer_lease();
+    drop(peer);
+
+    runtime.run_turn("three", None).expect("third turn");
+    assert_eq!(runtime.attempt(), format!("{session_id}@3"));
+    // The turn-end persist, as a host makes it.
+    runtime
+        .session()
+        .persist_appended_state_to_path(&path)
+        .expect("turn-end persist");
+    let read_back = Session::load_from_path(&path).expect("the session reads back");
+    assert_eq!(
+        read_back.next_turn_ordinal(),
+        4,
+        "read back, the session would give the third turn's number again"
+    );
+    ::api::note_attempt(&session_id, "");
+    drop(read_back);
+    drop(runtime);
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// A spawned agent's runtime spends on the attempt its PARENT named, under the
 /// agent's own prompt-cache scope — not a turn key of its own, which would
 /// leave its requests joined to nothing.
