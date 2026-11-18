@@ -38,7 +38,7 @@ impl ZoBinary {
     /// surfaces away and the rest of the IDE carries on.
     #[must_use]
     pub fn discover() -> Option<Self> {
-        let fallback_dirs = well_known_fallback_dirs(std::env::var_os("HOME").as_deref());
+        let fallback_dirs = well_known_fallback_dirs(home_var().as_deref(), cfg!(windows));
         Self::discover_in_with_fallbacks(std::env::var_os("PATH").as_deref(), &fallback_dirs)
     }
 
@@ -123,9 +123,17 @@ impl ZoBinary {
     }
 }
 
-#[cfg(unix)]
-fn well_known_fallback_dirs(home: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+/// Where `zo` may stand when `PATH` does not name it, by Windows' rule or by
+/// the others', so both rules are tested wherever tests run.
+fn well_known_fallback_dirs(home: Option<&std::ffi::OsStr>, windows: bool) -> Vec<PathBuf> {
     let home = home.map(PathBuf::from);
+    if windows {
+        // The folder the window installs zo into at boot (`zo_companion`).
+        return home
+            .map(|home| home.join(".local").join("bin"))
+            .into_iter()
+            .collect();
+    }
     let mut dirs = Vec::with_capacity(4);
     if let Some(home) = &home {
         dirs.push(home.join(".local/bin"));
@@ -138,9 +146,17 @@ fn well_known_fallback_dirs(home: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
     dirs
 }
 
-#[cfg(not(unix))]
-fn well_known_fallback_dirs(_home: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
-    Vec::new()
+/// The home the window installs zo under: the profile folder on Windows,
+/// which sets no `HOME`, and `HOME` elsewhere — the window's own
+/// `person_home` rule, read here from the environment alone, as this crate
+/// stands below the window's.
+fn home_var() -> Option<std::ffi::OsString> {
+    let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+    if cfg!(windows) {
+        var("USERPROFILE").or_else(|| var("HOME"))
+    } else {
+        var("HOME")
+    }
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -255,12 +271,26 @@ mod tests {
         assert_eq!(found, None);
     }
 
+    /// Windows names no package-manager folders, but the window installs zo
+    /// into `.local\bin` under the profile folder at boot (`zo_companion`),
+    /// and the PATH a feature that looks zo up by itself reads does not hold
+    /// that folder: there it is the fallback (t-113689).
+    #[test]
+    fn windows_falls_back_to_the_folder_the_window_installs_zo_into() {
+        let profile = Path::new(r"C:\Users\person");
+        assert_eq!(
+            well_known_fallback_dirs(Some(profile.as_os_str()), true),
+            [profile.join(".local").join("bin")]
+        );
+        assert!(well_known_fallback_dirs(None, true).is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn well_known_fallbacks_keep_the_deployment_directory_first() {
         let home = Path::new("/Users/dev");
 
-        let fallback_dirs = well_known_fallback_dirs(Some(home.as_os_str()));
+        let fallback_dirs = well_known_fallback_dirs(Some(home.as_os_str()), false);
 
         assert_eq!(
             fallback_dirs,

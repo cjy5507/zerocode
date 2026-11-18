@@ -347,6 +347,33 @@ pub fn start(local_data_root: &Path) -> Option<HookBridgeReceivers> {
 /// set — and a second spelling would seed a variable nobody checks.
 const P10K_WIZARD_OFF: &str = "POWERLEVEL9K_DISABLE_CONFIGURATION_WIZARD";
 
+/// PowerShell's process-scope execution policy, which every PowerShell a pane
+/// starts reads. Named here because it is read twice — asked about, then set.
+const POWERSHELL_POLICY: &str = "PSExecutionPolicyPreference";
+
+/// The process-scope execution policy a pane's PowerShell starts with:
+/// RemoteSigned on Windows, unless the window's own environment already
+/// names one, which then stands.
+///
+/// A bare `zerocode-orc` typed in PowerShell finds the ledger command's
+/// `.ps1` before its `.cmd`, and client Windows' default policy (Restricted)
+/// refuses that script, so a PowerShell-hosted agent could not reach the
+/// ledger (TR-08). The Process scope outranks the user's and the machine's
+/// own settings and a Group Policy outranks it in turn, which is left alone
+/// (`about_Execution_Policies`, "Execution policy scope and precedence").
+/// RemoteSigned runs a script written on this machine, as the window writes
+/// its own, and still asks a downloaded one for a signature. Going through
+/// the `.cmd` instead would hand every inline text to cmd, which expands
+/// `%NAME%` in it and cannot carry a line break. Nothing off Windows, where
+/// PowerShell enforces no policy.
+pub(crate) fn pane_powershell_policy(
+    windows: bool,
+    inherited: Option<&std::ffi::OsStr>,
+) -> Option<(String, String)> {
+    (windows && inherited.is_none())
+        .then(|| (POWERSHELL_POLICY.to_string(), "RemoteSigned".to_string()))
+}
+
 /// This machine's second-brain vault, as the settings document last said.
 ///
 /// `pty_env` builds a pane's environment from a pane key and a worktree; it
@@ -603,6 +630,12 @@ pub fn pty_env(
     if std::env::var_os(P10K_WIZARD_OFF).is_none() {
         env.push((P10K_WIZARD_OFF.to_string(), "true".to_string()));
     }
+    // A Windows pane's PowerShell may run the scripts this window writes —
+    // the ledger command's above all ([`pane_powershell_policy`]).
+    env.extend(pane_powershell_policy(
+        cfg!(windows),
+        std::env::var_os(POWERSHELL_POLICY).as_deref(),
+    ));
     // Where the second brain is, for every pane and every agent in it. The
     // vault used to be findable only from inside the vault's own project —
     // its `AGENTS.md` was the only thing that named it — so an agent working
@@ -1639,8 +1672,12 @@ fn grant_codex_trust(
 /// Empty unless the mirror lane is the live one, and the answer comes from
 /// reading the mirror rather than from remembering the install: a home whose
 /// hook was removed by hand must stop being used, not keep being pointed at.
-pub fn agent_launch_env(local_data_root: &Path, agent: &str) -> Vec<(String, String)> {
-    agent_launch_env_with_lock(local_data_root, agent).0
+pub fn agent_launch_env(
+    config_root: &Path,
+    local_data_root: &Path,
+    agent: &str,
+) -> Vec<(String, String)> {
+    agent_launch_env_with_lock(config_root, local_data_root, agent).0
 }
 
 /// Prepare a named agent's environment and, for Codex's mirror lane, return
@@ -1649,7 +1686,11 @@ pub fn agent_launch_env(local_data_root: &Path, agent: &str) -> Vec<(String, Str
 /// Most launch roads only need the environment and keep the old helper above.
 /// A teammate is different: its caller is one of several blocking team tasks,
 /// so it carries this guard until `PtyLane::spawn` has created the child.
-pub fn agent_launch_env_with_lock(local_data_root: &Path, agent: &str) -> LaunchEnv {
+pub fn agent_launch_env_with_lock(
+    config_root: &Path,
+    local_data_root: &Path,
+    agent: &str,
+) -> LaunchEnv {
     // What this thread prepared before it took the team table is handed over
     // as it was prepared (t-51380): its lease was waited for where waiting
     // is safe.
@@ -1657,7 +1698,7 @@ pub fn agent_launch_env_with_lock(local_data_root: &Path, agent: &str) -> Launch
         return prepared;
     }
     let home = crate::person_home::person_home();
-    launch_env_for(local_data_root, agent, home.as_deref())
+    launch_env_for(config_root, local_data_root, agent, home.as_deref())
 }
 
 /// A launch's environment and the Codex mirror lease that must live through
@@ -1669,8 +1710,14 @@ pub type LaunchEnv = (
 
 /// The door's own work: the agent's home with its lease, and a zo launch's
 /// router keys.
-fn launch_env_for(local_data_root: &Path, agent: &str, system_home: Option<&Path>) -> LaunchEnv {
-    let (mut env, lock) = agent_launch_env_with_lock_inner(local_data_root, agent, system_home);
+fn launch_env_for(
+    config_root: &Path,
+    local_data_root: &Path,
+    agent: &str,
+    system_home: Option<&Path>,
+) -> LaunchEnv {
+    let (mut env, lock) =
+        agent_launch_env_with_lock_inner(config_root, local_data_root, agent, system_home);
     env.extend(router_env_for(
         agent,
         crate::api_routers::router_launch_env_from_disk,
@@ -1705,18 +1752,23 @@ impl Drop for PreparedLaunch {
 /// team does. So a caller about to take the table prepares here first, where
 /// nothing waits on this thread, and the door hands what was prepared to the
 /// split that asks for the same agent on this thread.
-pub(crate) fn prepare_launch(local_data_root: &Path, agent: &str) -> PreparedLaunch {
+pub(crate) fn prepare_launch(
+    config_root: &Path,
+    local_data_root: &Path,
+    agent: &str,
+) -> PreparedLaunch {
     let home = crate::person_home::person_home();
-    prepare_launch_inner(local_data_root, agent, home.as_deref())
+    prepare_launch_inner(config_root, local_data_root, agent, home.as_deref())
 }
 
 /// [`prepare_launch`] with the machine's home named rather than read.
 fn prepare_launch_inner(
+    config_root: &Path,
     local_data_root: &Path,
     agent: &str,
     system_home: Option<&Path>,
 ) -> PreparedLaunch {
-    let launch = launch_env_for(local_data_root, agent, system_home);
+    let launch = launch_env_for(config_root, local_data_root, agent, system_home);
     PREPARED_LAUNCH.with(|slot| *slot.borrow_mut() = Some((agent.to_string(), launch)));
     PreparedLaunch(())
 }
@@ -1767,6 +1819,7 @@ fn router_env_for(
 /// [`agent_launch_env_with_lock`] with the machine's home named rather than
 /// read, so a test can hand it one that is not the developer's.
 fn agent_launch_env_with_lock_inner(
+    config_root: &Path,
     local_data_root: &Path,
     agent: &str,
     system_home: Option<&Path>,
@@ -1785,10 +1838,10 @@ fn agent_launch_env_with_lock_inner(
     let runtime = crate::codex_accounts::runtime_home(local_data_root);
     let mut record = crate::codex_accounts::read_runtime_record(&runtime);
     if record.account.is_none() {
-        let store = crate::codex_accounts::read_store(local_data_root);
+        let store = crate::codex_accounts::read_store(config_root);
         if zerocode_core::codex_account::active_account(&store.accounts, &store.selection).is_some()
         {
-            let _ = crate::codex_accounts::materialize(local_data_root, local_data_root);
+            let _ = crate::codex_accounts::materialize(config_root, local_data_root);
             record = crate::codex_accounts::read_runtime_record(&runtime);
         }
     }
@@ -1824,14 +1877,16 @@ fn agent_launch_env_with_lock_inner(
 /// Best effort belongs to the caller, matching launch preparation: a failed
 /// auth sync must never keep a terminal from closing.
 pub fn sync_agent_auth(
+    config_root: &Path,
     local_data_root: &Path,
     agent: &str,
 ) -> std::io::Result<Option<zerocode_hookd::codex_runtime_auth::AuthSync>> {
     let home = crate::person_home::person_home();
-    sync_agent_auth_inner(local_data_root, agent, home.as_deref())
+    sync_agent_auth_inner(config_root, local_data_root, agent, home.as_deref())
 }
 
 fn sync_agent_auth_inner(
+    config_root: &Path,
     local_data_root: &Path,
     agent: &str,
     system_home: Option<&Path>,
@@ -1846,7 +1901,7 @@ fn sync_agent_auth_inner(
     };
     let runtime = crate::codex_accounts::runtime_home(local_data_root);
     let record = crate::codex_accounts::read_runtime_record(&runtime);
-    let store = crate::codex_accounts::read_store(local_data_root);
+    let store = crate::codex_accounts::read_store(config_root);
     let active_id = record.account.as_deref().or_else(|| {
         zerocode_core::codex_account::active_account(&store.accounts, &store.selection)
             .map(|a| a.id.as_str())
@@ -3060,6 +3115,31 @@ mod tests {
         .expect("account store");
     }
 
+    /// The account store is the config root's, not the data root's. The two
+    /// are one folder on macOS only: on Windows (Roaming and Local app data)
+    /// and on Linux (`~/.config` and `~/.local/share`) a launch that read the
+    /// store off the data root found none, so the Codex account the person
+    /// picked never reached the pane (TR-16, audit 29-01).
+    #[test]
+    fn a_launch_reads_the_codex_account_store_off_the_config_root_when_the_roots_are_apart() {
+        let config = tempfile::tempdir().expect("config root");
+        let data = tempfile::tempdir().expect("local data root");
+        let system_home = tempfile::tempdir().expect("system home");
+        select_a_managed_codex_account(config.path());
+
+        let (env, lock) = agent_launch_env_with_lock_inner(
+            config.path(),
+            data.path(),
+            "codex",
+            Some(system_home.path()),
+        );
+        drop(lock);
+        assert!(
+            env.iter().any(|(key, _)| key == "CODEX_HOME"),
+            "the picked Codex account did not reach the launch: {env:?}"
+        );
+    }
+
     /// A zo pane is an OpenAI consumer, so it gets the same mirror `CODEX_HOME`
     /// (and the same launch lock) a Codex pane gets. Before the provider table
     /// this door answered `agent == "codex"` and handed zo nothing, which is
@@ -3070,8 +3150,12 @@ mod tests {
         let system_home = tempfile::tempdir().expect("system home");
         select_a_managed_codex_account(root.path());
 
-        let (zo, zo_lock) =
-            agent_launch_env_with_lock_inner(root.path(), "zo", Some(system_home.path()));
+        let (zo, zo_lock) = agent_launch_env_with_lock_inner(
+            root.path(),
+            root.path(),
+            "zo",
+            Some(system_home.path()),
+        );
         assert!(
             zo_lock.is_some(),
             "a zo launch took the mirror without its launch lock"
@@ -3080,8 +3164,12 @@ mod tests {
         // holder at a time, and a launch that kept it would sit on the next
         // one forever.
         drop(zo_lock);
-        let (codex, codex_lock) =
-            agent_launch_env_with_lock_inner(root.path(), "codex", Some(system_home.path()));
+        let (codex, codex_lock) = agent_launch_env_with_lock_inner(
+            root.path(),
+            root.path(),
+            "codex",
+            Some(system_home.path()),
+        );
         drop(codex_lock);
 
         let home_of = |env: &[(String, String)]| {
@@ -3121,7 +3209,7 @@ mod tests {
             let (root, home) = (root.path().to_path_buf(), system_home.path().to_path_buf());
             let (lease, ended) = (std::sync::Arc::clone(&lease), ended.clone());
             std::thread::spawn(move || {
-                let (_, taken) = agent_launch_env_with_lock_inner(&root, "zo", Some(&home));
+                let (_, taken) = agent_launch_env_with_lock_inner(&root, &root, "zo", Some(&home));
                 let took = taken.is_some();
                 *lease.lock().unwrap_or_else(|held| held.into_inner()) = taken;
                 let _ = leased.send(took);
@@ -3143,7 +3231,7 @@ mod tests {
                 let table = crate::agent_teams::teams();
                 let _ = tabled.send(());
                 let _ = crate::agent_teams::under_team_table(|| {
-                    agent_launch_env_with_lock_inner(&root, "zo", Some(&home))
+                    agent_launch_env_with_lock_inner(&root, &root, "zo", Some(&home))
                 });
                 drop(table);
                 let _ = ended.send("split");
@@ -3191,9 +3279,10 @@ mod tests {
             .is_ok()
         };
 
-        let prepared = prepare_launch_inner(root.path(), "codex", Some(system_home.path()));
+        let prepared =
+            prepare_launch_inner(root.path(), root.path(), "codex", Some(system_home.path()));
         let (env, lease) = crate::agent_teams::under_team_table(|| {
-            agent_launch_env_with_lock(root.path(), "codex")
+            agent_launch_env_with_lock(root.path(), root.path(), "codex")
         });
         assert!(
             lease.is_some(),
@@ -3208,7 +3297,8 @@ mod tests {
         drop(prepared);
         assert!(free_now(), "the split's lease outlived the split");
 
-        let untaken = prepare_launch_inner(root.path(), "codex", Some(system_home.path()));
+        let untaken =
+            prepare_launch_inner(root.path(), root.path(), "codex", Some(system_home.path()));
         assert!(!free_now(), "a prepared launch did not hold its lease");
         drop(untaken);
         assert!(free_now(), "a prepared launch nobody took kept the lease");
@@ -3223,8 +3313,12 @@ mod tests {
         let system_home = tempfile::tempdir().expect("system home");
 
         for agent in ["claude", "opencode", ""] {
-            let (env, lock) =
-                agent_launch_env_with_lock_inner(root.path(), agent, Some(system_home.path()));
+            let (env, lock) = agent_launch_env_with_lock_inner(
+                root.path(),
+                root.path(),
+                agent,
+                Some(system_home.path()),
+            );
             assert!(env.is_empty(), "{agent} was handed {env:?}");
             assert!(lock.is_none(), "{agent} took the mirror launch lock");
         }
@@ -3237,7 +3331,7 @@ mod tests {
     fn a_launch_without_a_home_is_handed_nothing() {
         let root = tempfile::tempdir().expect("local data root");
 
-        let (env, lock) = agent_launch_env_with_lock_inner(root.path(), "zo", None);
+        let (env, lock) = agent_launch_env_with_lock_inner(root.path(), root.path(), "zo", None);
 
         assert!(env.is_empty(), "{env:?}");
         assert!(lock.is_none());
@@ -3252,8 +3346,9 @@ mod tests {
         let system_home = tempfile::tempdir().expect("system home");
 
         for agent in ["claude", "opencode"] {
-            let synced = sync_agent_auth_inner(root.path(), agent, Some(system_home.path()))
-                .expect("best-effort sync");
+            let synced =
+                sync_agent_auth_inner(root.path(), root.path(), agent, Some(system_home.path()))
+                    .expect("best-effort sync");
             assert!(synced.is_none(), "{agent} reached the codex auth sync");
         }
     }
@@ -3304,7 +3399,7 @@ mod tests {
         std::fs::write(runtime.join(crate::codex_accounts::AUTH_FILE), &older)
             .expect("a stale runtime copy");
 
-        sync_agent_auth_inner(root.path(), "zo", Some(system_home.path()))
+        sync_agent_auth_inner(root.path(), root.path(), "zo", Some(system_home.path()))
             .expect("best-effort sync");
 
         assert_eq!(
@@ -3356,8 +3451,9 @@ mod tests {
         )
         .expect("rotated runtime auth");
 
-        let synced = sync_agent_auth_inner(root.path(), "zo", Some(system_home.path()))
-            .expect("best-effort sync");
+        let synced =
+            sync_agent_auth_inner(root.path(), root.path(), "zo", Some(system_home.path()))
+                .expect("best-effort sync");
 
         assert!(synced.is_some(), "zo was not treated as an OpenAI consumer");
         assert_eq!(
@@ -3708,6 +3804,46 @@ mod tests {
                 .map(|(_, value)| value.as_str())
                 .collect();
             assert_eq!(told, [std::process::id().to_string()], "{launch:?}");
+        }
+    }
+
+    /// TR-08: on Windows a pane's PowerShell starts under a process-scope
+    /// RemoteSigned, which client Windows' default (Restricted) yields to, so
+    /// a bare `zerocode-orc` there runs the ledger command's `.ps1` the window
+    /// wrote. A policy the window's own environment already names stands, and
+    /// nothing is said off Windows, where PowerShell enforces no policy. Every
+    /// pane carries it: a plain shell, where an agent may be typed by hand,
+    /// and a launched agent's alike.
+    #[test]
+    fn a_windows_panes_powershell_may_run_the_scripts_the_window_writes() {
+        assert_eq!(
+            pane_powershell_policy(true, None),
+            Some((
+                "PSExecutionPolicyPreference".to_string(),
+                "RemoteSigned".to_string()
+            )),
+            "a Windows pane keeps the machine's default, which refuses the window's own scripts"
+        );
+        assert_eq!(
+            pane_powershell_policy(true, Some(std::ffi::OsStr::new("Bypass"))),
+            None,
+            "a policy the person set was overridden"
+        );
+        assert_eq!(pane_powershell_policy(false, None), None);
+        bridge_for_tests();
+        let expected: Vec<(String, String)> = pane_powershell_policy(
+            cfg!(windows),
+            std::env::var_os(POWERSHELL_POLICY).as_deref(),
+        )
+        .into_iter()
+        .collect();
+        for launch in [None, Some("launch-nonce")] {
+            let env = pty_env("term-7", launch, Path::new("/workspace"), None);
+            let carried: Vec<(String, String)> = env
+                .into_iter()
+                .filter(|(name, _)| name == POWERSHELL_POLICY)
+                .collect();
+            assert_eq!(carried, expected, "{launch:?}");
         }
     }
 
@@ -5296,6 +5432,151 @@ mod tests {
         };
         assert_eq!(run("term-24"), "team-abc|%1|pane-secret");
         assert_eq!(run("term-25"), "none|none|none", "another pane's grant");
+    }
+
+    /// A PowerShell this machine runs the generated `.impl.ps1` files with, or
+    /// `None`: Windows PowerShell (or pwsh) on Windows, pwsh elsewhere.
+    fn powershell_here() -> Option<&'static str> {
+        let names: &[&'static str] = if cfg!(windows) {
+            &["powershell.exe", "pwsh.exe"]
+        } else {
+            &["pwsh"]
+        };
+        names.iter().copied().find(|name| {
+            crate::proc::quiet_command(name)
+                .args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"])
+                .output()
+                .is_ok_and(|out| out.status.success())
+        })
+    }
+
+    /// The PowerShell twin of the two tests above (TR-11, t-113721). An agent
+    /// typed into a plain Windows shell reaches its doors and `zerocode-orc`
+    /// through `<door>.cmd` → `<door>.impl.ps1`, whose loader read the
+    /// endpoint and the token files the environment named, but never the
+    /// pane's grant: the browser, Computer Use and the ledger refused it. The
+    /// grant is the window's own writer's, under a folder with a space and
+    /// Hangul in it — a Korean profile folder is where it lives, and Windows
+    /// PowerShell 5.1 reads a file with no byte-order mark in the ANSI code
+    /// page. The conditions are the sh loader's: only a missing token file
+    /// sends it to the grant, and only for the window's own pane-key spelling.
+    #[test]
+    fn a_hand_started_agents_grant_is_read_by_the_powershell_loader_too() {
+        let Some(powershell) = powershell_here() else {
+            eprintln!("skipping: no PowerShell on this machine");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("Application Support").join("사용자 폴더");
+        std::fs::create_dir_all(&root).expect("root");
+        let file = |name: &str, body: &str| {
+            let path = root.join(name);
+            std::fs::write(&path, body).expect("token file");
+            path.to_string_lossy().into_owned()
+        };
+        let computer = file("computer-token", "secret-1234\n");
+        let browser = file("browser-token", "browser-secret\n");
+        let team = file("team.token", "pane-secret\n");
+        write_pane_grant(
+            &root,
+            7,
+            &[
+                (zerocode_hookd::env_var::COMPUTER_TOKEN_FILE, computer),
+                (zerocode_hookd::env_var::BROWSER_TOKEN_FILE, browser),
+                (
+                    zerocode_core::agent_teams::TEAM_ID_VAR,
+                    "team-abc".to_string(),
+                ),
+                (zerocode_core::agent_teams::TEAM_PANE_VAR, "%1".to_string()),
+                (zerocode_hookd::env_var::TEAM_TOKEN_FILE, team),
+            ],
+        )
+        .expect("grant");
+        let endpoint = root.join("endpoint.env");
+        std::fs::write(&endpoint, "ZEROCODE_HOOK_PORT=1\nZEROCODE_HOOK_TOKEN=h\n")
+            .expect("endpoint");
+        let script = root.join("probe.impl.ps1");
+        let probe = "function v($n) { $x = [Environment]::GetEnvironmentVariable($n); if ($x) { $x } else { 'none' } }\r\n\
+             [Console]::Out.Write((v 'ZEROCODE_COMPUTER_TOKEN') + '|' + (v 'ZEROCODE_BROWSER_TOKEN') + '|' + \
+             (v 'ZEROCODE_AGENT_TEAM_ID') + '|' + (v 'ZEROCODE_AGENT_TEAM_PANE') + '|' + (v 'ZEROCODE_AGENT_TEAM_TOKEN'))\r\n";
+        let body = powershell_shim_script_with_private_tokens(
+            probe.to_string(),
+            &[
+                (
+                    zerocode_hookd::env_var::COMPUTER_TOKEN,
+                    zerocode_hookd::env_var::COMPUTER_TOKEN_FILE,
+                ),
+                (
+                    zerocode_hookd::env_var::BROWSER_TOKEN,
+                    zerocode_hookd::env_var::BROWSER_TOKEN_FILE,
+                ),
+                (
+                    zerocode_core::agent_teams::TEAM_TOKEN_VAR,
+                    zerocode_hookd::env_var::TEAM_TOKEN_FILE,
+                ),
+            ],
+        );
+        std::fs::write(&script, format!("{UTF8_BOM}{body}")).expect("script");
+        let run = |pane_key: &str, named: &[(&str, &Path)]| {
+            let mut command = crate::proc::quiet_command(powershell);
+            // This test may run in a ZeroCode pane, whose own capability
+            // paths must not stand in for the grant under test.
+            for (name, _) in std::env::vars_os() {
+                if name.to_string_lossy().starts_with("ZEROCODE_") {
+                    command.env_remove(name);
+                }
+            }
+            command
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                ])
+                .arg(&script)
+                .env("ZEROCODE_HOOK_ENDPOINT", &endpoint)
+                .env("ZEROCODE_PANE_KEY", pane_key);
+            for (name, path) in named {
+                command.env(name, path);
+            }
+            let out = command.output().expect("powershell");
+            assert!(
+                out.status.success(),
+                "{powershell}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        assert_eq!(
+            run("term-7", &[]),
+            "secret-1234|browser-secret|team-abc|%1|pane-secret",
+            "a hand-started agent's PowerShell loader did not read its pane's grant"
+        );
+        assert_eq!(
+            run("term-8", &[]),
+            "none|none|none|none|none",
+            "another pane's grant is not this pane's"
+        );
+        assert_eq!(
+            run("../term-7", &[]),
+            "none|none|none|none|none",
+            "a key that is not the window's spelling"
+        );
+        let own = root.join("own-token");
+        std::fs::write(&own, "launched\n").expect("own token");
+        assert_eq!(
+            run(
+                "term-7",
+                &[
+                    (zerocode_hookd::env_var::COMPUTER_TOKEN_FILE, own.as_path()),
+                    (zerocode_hookd::env_var::BROWSER_TOKEN_FILE, own.as_path()),
+                    (zerocode_hookd::env_var::TEAM_TOKEN_FILE, own.as_path()),
+                ]
+            ),
+            "launched|launched|none|none|launched",
+            "a launch that names every file is not sent to the grant"
+        );
     }
 
     /// The agent mirror shims' Windows companions: for every resolved agent a
