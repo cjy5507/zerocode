@@ -168,6 +168,7 @@ mod pane_layout;
 mod pane_leftovers;
 mod pane_runtime;
 mod pane_transcript;
+mod person_home;
 mod phone_link;
 mod pick_runtime;
 mod plain_read;
@@ -3881,6 +3882,10 @@ fn main() -> ExitCode {
                     scanning
                         .state::<cmd::update::UpdateState>()
                         .note_zo(report);
+                    // A zo installed just now is an agent the keeper's first
+                    // round may have looked for before it stood: it is given
+                    // the skills this build carries at the next (t-113689).
+                    library_runtime::poke();
                 }
                 artifact_runtime::rescan_and_tell(&scanning, now_epoch_ms());
                 // The transcripts' artifacts and pages (t-3233 §2): one

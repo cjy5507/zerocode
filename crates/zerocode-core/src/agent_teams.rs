@@ -1130,7 +1130,14 @@ pub fn teammate_mode_args(argv: &[String], mode: TeamsMode) -> Vec<String> {
 /// Returned as pairs rather than applied here: the launch assembles one
 /// environment from several contributors in a measured order, and this is one
 /// contributor.
+///
+/// `dialect` is the caller's, decided once with the shim folders it puts on
+/// `shim_dirs`: the program's own ([`Dialect::of`]) where a fake `tmux` can
+/// run, and the ledger alone where it cannot — a Windows window, whose claude
+/// runs its teammates in-process. A claude handed the ledger is told nothing
+/// about a multiplexer, here or in the folders.
 pub fn team_launch_env(
+    dialect: Dialect,
     team_id: &str,
     token: &str,
     shim_dirs: &[&str],
@@ -1140,7 +1147,7 @@ pub fn team_launch_env(
 ) -> Vec<(String, String)> {
     let joined = shim_path(shim_dirs, path);
     let mut said: Vec<(String, String)> = Vec::new();
-    if Dialect::of(program) == Dialect::Tmux {
+    if dialect == Dialect::Tmux {
         // Claude's Agent Teams is behind an experimental switch, and the
         // switch is CLAUDE's — not the road's. A zo leader reaches the same
         // panes without it, and setting it in a zo pane would arm Agent Teams
@@ -2319,6 +2326,7 @@ mod tests {
     fn the_shim_is_found_before_a_real_tmux_and_the_leader_knows_its_own_name() {
         let sep = PATH_SEPARATOR;
         let env = team_launch_env(
+            Dialect::Tmux,
             "team-9",
             "s3cret",
             &["/tmp/shim"],
@@ -2348,7 +2356,7 @@ mod tests {
         assert!(held("TMUX").ends_with("team-9,0,1"));
         assert_eq!(held(TEAM_TOKEN_VAR), "s3cret");
         // An inherited COLORTERM is kept rather than overwritten.
-        let inherited = team_launch_env("t", "s", &["/shim"], "", "24bit", "claude");
+        let inherited = team_launch_env(Dialect::Tmux, "t", "s", &["/shim"], "", "24bit", "claude");
         assert!(inherited.contains(&("COLORTERM".into(), "24bit".into())));
         assert!(inherited.contains(&("PATH".into(), "/shim".into())));
     }
@@ -2362,7 +2370,15 @@ mod tests {
     /// claims nothing.
     #[test]
     fn a_leader_that_does_not_speak_tmux_is_not_handed_one() {
-        let ledger = team_launch_env("team-2", "s", &["/orc"], "/usr/bin", "", "codex");
+        let ledger = team_launch_env(
+            Dialect::Ledger,
+            "team-2",
+            "s",
+            &["/orc"],
+            "/usr/bin",
+            "",
+            "codex",
+        );
         let named: Vec<&str> = ledger.iter().map(|(key, _)| key.as_str()).collect();
         for absent in ["TMUX", "TMUX_PANE", "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] {
             assert!(!named.contains(&absent), "a ledger leader carries {absent}");
@@ -2384,6 +2400,38 @@ mod tests {
         assert_eq!(Dialect::of("claude"), Dialect::Tmux);
         assert_eq!(Dialect::of("codex"), Dialect::Ledger);
         assert_eq!(Dialect::of(""), Dialect::Ledger);
+    }
+
+    /// A claude or a zo the caller puts on the ledger road gets the road and
+    /// no multiplexer: a Windows window runs claude's teammates in-process,
+    /// since its fake `tmux` is a POSIX script nothing there can run, and
+    /// still seats every agent it launches in the ledger (t-113721).
+    #[test]
+    fn a_tmux_speaker_on_the_ledger_road_is_not_handed_a_multiplexer() {
+        for program in ["claude", "zo"] {
+            let env = team_launch_env(
+                Dialect::Ledger,
+                "team-w",
+                "s",
+                &["/orc"],
+                "/usr/bin",
+                "",
+                program,
+            );
+            let named: Vec<&str> = env.iter().map(|(key, _)| key.as_str()).collect();
+            for absent in ["TMUX", "TMUX_PANE", "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] {
+                assert!(
+                    !named.contains(&absent),
+                    "{program} on the ledger carries {absent}"
+                );
+            }
+            for present in [TEAM_ID_VAR, TEAM_PANE_VAR, TEAM_TOKEN_VAR, "PATH"] {
+                assert!(
+                    named.contains(&present),
+                    "{program} on the ledger lacks {present}"
+                );
+            }
+        }
     }
 
     /// The argv zo's panes executor actually types, planned end to end.
@@ -2547,7 +2595,15 @@ mod tests {
     /// of a leader that is not claude.
     #[test]
     fn a_zo_leader_gets_the_multiplexer_without_claudes_feature_switch() {
-        let env = team_launch_env("team-zo", "s", &["/shim"], "/usr/bin", "", "zo");
+        let env = team_launch_env(
+            Dialect::Tmux,
+            "team-zo",
+            "s",
+            &["/shim"],
+            "/usr/bin",
+            "",
+            "zo",
+        );
         let held = |name: &str| {
             env.iter()
                 .find(|(key, _)| key == name)
@@ -2563,7 +2619,7 @@ mod tests {
             "a zo leader must not arm another vendor's feature switch"
         );
         // Claude still gets it — this is one program's switch, not a policy.
-        let claude = team_launch_env("team-cc", "s", &["/shim"], "", "", "claude");
+        let claude = team_launch_env(Dialect::Tmux, "team-cc", "s", &["/shim"], "", "", "claude");
         assert!(
             claude
                 .iter()

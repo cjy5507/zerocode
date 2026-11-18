@@ -2378,14 +2378,19 @@ async fn e2e_a_delegation_cell_shows_its_task_not_its_arguments() {
 
 /// Anthropic thinking has no bold heading, so the status row said `Working`
 /// for the whole block and the body never reached the screen (2026-09-22,
-/// "thinking 중에 뭘 하는지 확인이 안 됨"). Now the row says the newest
-/// complete sentence and the block commits as a titled thinking cell; a
-/// `/thinking` keeps the row's word and drops the cell (t-5872).
+/// "thinking 중에 뭘 하는지 확인이 안 됨"). Now the row says a complete
+/// sentence and the block commits as a titled thinking cell; a `/thinking`
+/// keeps the row's word and drops the cell (t-5872).
 ///
-/// The delta-to-screen latency is measured, not assumed: the script writes
-/// one SSE event per sentence with its instant, and the screen is polled
-/// until the sentence's word stands on the row.
+/// The first sentence takes the row at once — its delta-to-screen latency is
+/// measured, not assumed: the script writes one SSE event per sentence with
+/// its instant, and the screen is polled until the word stands on the row.
+/// The two after it end within its dwell
+/// ([`zo_ide::tui::view::HEADER_DWELL`]), so the row keeps it: the word
+/// changed once a sentence and the row jumped as the model wrote (the
+/// person, 2026-11-18: 「working부분이 정신없게 바뀜」).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // one turn read in its order: the row while it thinks, the cell it leaves, then `/thinking` — split, the turn loses its order
 async fn e2e_headerless_thinking_names_the_status_row_and_commits_a_titled_cell() {
     let layout = Layout::new();
     let sentences = [
@@ -2408,11 +2413,11 @@ async fn e2e_headerless_thinking_names_the_status_row_and_commits_a_titled_cell(
     run.wait_for("directory:", TEST_TIMEOUT);
     run.send(b"Summarise the fixture\r").expect("send prompt");
 
-    // Each sentence's word on the status row, and how long after its delta
-    // left the server. The shimmer styles every glyph, so the row is read
-    // through the screen, never as raw bytes.
+    // The first sentence's word on the status row, and how long after its
+    // delta left the server. The shimmer styles every glyph, so the row is
+    // read through the screen, never as raw bytes.
     let mut latencies_ms = Vec::new();
-    for (index, word) in words.iter().enumerate() {
+    for (index, word) in words.iter().enumerate().take(1) {
         let deadline = Instant::now() + timeout;
         let seen_at = loop {
             let mut screen = Screen::new(40);
@@ -2449,6 +2454,24 @@ async fn e2e_headerless_thinking_names_the_status_row_and_commits_a_titled_cell(
         latencies_ms.iter().all(|ms| *ms < 1_000.0),
         "the status word lagged its delta: {latencies_ms:?}"
     );
+    // Until the answer is in: the sentences that ended within the first
+    // word's dwell never take the row (the block's end comes first, and
+    // waits too).
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut screen = Screen::new(40);
+        screen.feed(&run.snapshot_output());
+        for row in screen.visible().iter().filter(|row| row.contains("esc to interrupt")) {
+            for later in &words[1..] {
+                assert!(!row.contains(later), "a sentence took the row inside the first one's dwell: {row}");
+            }
+        }
+        if screen.transcript().iter().any(|row| row.contains("three lines")) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the answer never came");
+        std::thread::sleep(Duration::from_millis(2));
+    }
 
     // The block ends: a titled thinking cell with the sentences under it,
     // then the answer.
@@ -2520,7 +2543,12 @@ async fn e2e_rewind_command_works_in_the_shipped_tui() {
     run.wait_for("directory:", TEST_TIMEOUT);
     run.send(b"remember the ZEBRA-REWIND prompt\r").expect("send prompt");
     run.wait_for_history_row("rewind fixture answer", timeout);
-    wait_until_quiet(&run, Duration::from_millis(300), timeout);
+    // The actions row under the answer is the turn's end: zo draws it after
+    // the turn's status is gone, when keys reach the idle composer. Quiet
+    // after the answer is not that — on a busy machine the turn went on past
+    // 300 ms of quiet, and `/rewind list` met "'/rewind' is disabled while a
+    // task is in progress." (10-01, 11-18).
+    run.wait_for_screen("/find search", 40, timeout);
 
     run.send(b"/rewind list\r").expect("send /rewind list");
     run.wait_for_history_row("Workspace checkpoints", timeout);
@@ -10852,6 +10880,70 @@ async fn e2e_late_osc_colour_replies_never_reach_composer() {
         b"\x1b]10;rgb:e0e0/e0e0/e0e0\x1b\\\x1b]11;rgb:1c1c/1e1e/2626\x1b\\\x1b]10;rgb:d0d0/d0d0/d0d0\x07\x1b]11;rgb:1010/1212/1818\x07",
     )
     .await;
+}
+
+/// `/theme` over a conversation (the person, 2026-11-18: 「theme 색상 글씨가
+/// 바꿔도 다똑같음」): the rows already written are drawn again in the theme
+/// chosen — the answer's code in Dracula's green (#50fa7b) — and the line that
+/// says the theme stands under them. Before, only what came after the choice
+/// took its colours: the screen the person was looking at stayed as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_theme_draws_the_conversation_again_in_the_theme_chosen() {
+    // The foreground of an SGR, whatever stands beside it in the sequence.
+    const DRACULA_GREEN: &[u8] = b"38;2;80;250;123";
+    /// Whether `text` is written right after an SGR that sets `colour`.
+    fn written_in(bytes: &[u8], colour: &[u8], text: &[u8]) -> bool {
+        bytes.windows(colour.len()).enumerate().any(|(index, window)| {
+            window == colour && {
+                let rest = &bytes[index + colour.len()..];
+                rest.iter().position(|byte| *byte == b'm').is_some_and(|end| rest[end + 1..].starts_with(text))
+            }
+        })
+    }
+    let layout = Layout::new();
+    let service = ScriptedAnthropicService::text("Run `cargo test` before you push.")
+        .await
+        .expect("start text script");
+    let args = interactive_args();
+    let mut run = PtyRun::spawn_with_env(
+        &layout.cwd,
+        &layout.home,
+        &layout.sessions,
+        &layout.state,
+        service.base_url(),
+        &args,
+        &[
+            (zo_ide::tui::style::STYLE_ENV, "marks"),
+            ("COLORTERM", "truecolor"),
+        ],
+    )
+    .expect("spawn zo in PTY");
+    run.wait_for("What should we do?", TEST_TIMEOUT);
+    run.send(b"Which command first?\r").expect("send prompt");
+    run.wait_for_history_row("before you push", TEST_TIMEOUT);
+    assert!(
+        !written_in(&run.snapshot_output(), DRACULA_GREEN, b"cargo test"),
+        "the answer's code was in Dracula's green before the theme was chosen"
+    );
+
+    let at = run.output_len();
+    run.send(b"/theme dracula\r").expect("send /theme dracula");
+    run.wait_until(at, TEST_TIMEOUT, |after| {
+        find_bytes(after, b"before you push")
+            .is_some_and(|answer| find_bytes(&after[answer..], "theme → Dracula".as_bytes()).is_some())
+    });
+    let output = run.finish();
+    let after = &output[at..];
+    assert!(
+        written_in(after, DRACULA_GREEN, b"cargo test"),
+        "the answer was not drawn again in Dracula's green: {:?}",
+        String::from_utf8_lossy(after)
+    );
+    let answer = find_bytes(after, b"before you push").expect("the answer drawn again");
+    assert!(
+        find_bytes(&after[answer..], "theme → Dracula".as_bytes()).is_some(),
+        "the line that says the theme stands under the conversation"
+    );
 }
 
 /// `/theme dracula` in a real terminal (T3): the line is zo's own — no

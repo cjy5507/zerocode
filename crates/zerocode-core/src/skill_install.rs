@@ -22,6 +22,7 @@
 //! from a repository not every person can reach, and it needs Node on PATH.
 //! The person asked for the install to happen inside the app ("우리 자체에
 //! 설치 될 수 있게", 2026-09-02). The npx road stays as the typed fallback.
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -363,6 +364,19 @@ pub fn install_bundled_skill(
     launched: &[(String, PathBuf)],
     detected: &[(String, String)],
 ) -> Result<Vec<SkillInstallOutcome>, String> {
+    install_bundled_into(name, home, launched, detected, None)
+}
+
+/// [`install_bundled_skill`], into every root it reads — or, with `only`,
+/// into just the roots whose `SKILL.md` place `only` names. A root left out
+/// is not touched and has no outcome, and neither has an agent with no root.
+fn install_bundled_into(
+    name: &str,
+    home: &Path,
+    launched: &[(String, PathBuf)],
+    detected: &[(String, String)],
+    only: Option<&BTreeSet<PathBuf>>,
+) -> Result<Vec<SkillInstallOutcome>, String> {
     let skill = bundled_skill(name)
         .ok_or_else(|| format!("{name}: 이 빌드가 담고 있는 스킬이 아닙니다"))?;
     let sources = discovery_sources(home, &[]);
@@ -372,7 +386,7 @@ pub fn install_bundled_skill(
     let mut stored: Option<SkillInstallOutcome> = None;
     for (agent, label) in detected {
         let roots = skill_roots(agent, &sources, launched, store.as_deref());
-        if roots.is_empty() {
+        if roots.is_empty() && only.is_none() {
             outcomes.push(SkillInstallOutcome {
                 agent: agent.clone(),
                 label: label.clone(),
@@ -382,6 +396,10 @@ pub fn install_bundled_skill(
             });
         }
         for root in roots {
+            let place = root.dir.join(skill.name).join(SKILL_FILE);
+            if only.is_some_and(|only| !only.contains(&place)) {
+                continue;
+            }
             outcomes.push(match &root.link_to {
                 Some(store) => install_linked(skill, agent, label, &root.dir, store, &mut stored),
                 None => install_one(skill, agent, label, &root.dir),
@@ -389,6 +407,47 @@ pub fn install_bundled_skill(
         }
     }
     Ok(outcomes)
+}
+
+/// Put every skill this build carries where a detected agent reads skills
+/// and nothing stands yet — without a press, once for each place: on the
+/// first run, for an agent found later, and for a skill a later release
+/// adds (t-113689: 「윈도우에서 설치 했는데 동봉스킬도 없고 전부 없던데」).
+///
+/// `seeded` holds every `SKILL.md` place a seed has looked at before, kept
+/// by the caller between runs. A place in it is not written here again, so
+/// a skill the person took out stays out, and every place this seed looks
+/// at goes into it. A copy that stands is left for the person: an earlier
+/// release's text waits for their press of 「고쳐 쓰기」 (t-55424), and a
+/// text that is not ours is never written over. Writes follow
+/// [`install_bundled_skill`]'s roads, the store's links included.
+pub fn seed_bundled_skills(
+    home: &Path,
+    launched: &[(String, PathBuf)],
+    detected: &[(String, String)],
+    seeded: &mut BTreeSet<PathBuf>,
+) -> Vec<SkillInstallOutcome> {
+    let mut outcomes = Vec::new();
+    for skill in BUNDLED_SKILLS {
+        let Ok(copies) = bundled_copies(skill.name, home, launched, detected) else {
+            continue;
+        };
+        let empty: BTreeSet<PathBuf> = copies
+            .iter()
+            .filter(|copy| copy.state == CopyState::Missing && !seeded.contains(&copy.path))
+            .map(|copy| copy.path.clone())
+            .collect();
+        seeded.extend(copies.into_iter().map(|copy| copy.path));
+        if empty.is_empty() {
+            continue;
+        }
+        if let Ok(written) =
+            install_bundled_into(skill.name, home, launched, detected, Some(&empty))
+        {
+            outcomes.extend(written);
+        }
+    }
+    outcomes
 }
 
 /// Put the store's copy of `skill` where `root` should hold it, as a link.
@@ -1715,6 +1774,114 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(stale.join(SKILL_FILE)).unwrap(),
             current
+        );
+    }
+
+    /// A fresh machine: every skill this build carries lands where each
+    /// detected agent reads skills, without a press, and only once. A copy
+    /// the person then takes out stays out (t-113689: 「윈도우에서 설치
+    /// 했는데 동봉스킬도 없고 전부 없던데」).
+    #[test]
+    fn a_fresh_home_is_given_every_bundled_skill_once_for_each_detected_agent() {
+        let home = tempfile::tempdir().unwrap();
+        let agents = detected(&[("claude", "Claude"), ("codex", "Codex"), ("zo", "ZO")]);
+        let mut seeded = BTreeSet::new();
+        let outcomes = seed_bundled_skills(home.path(), &[], &agents, &mut seeded);
+        assert_eq!(outcomes.len(), BUNDLED_SKILLS.len() * 3, "{outcomes:?}");
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.state == InstallState::Written),
+            "{outcomes:?}"
+        );
+        for skill in BUNDLED_SKILLS {
+            for root in [".claude", ".codex", ".zo"] {
+                let file = home
+                    .path()
+                    .join(root)
+                    .join("skills")
+                    .join(skill.name)
+                    .join(SKILL_FILE);
+                assert_eq!(
+                    std::fs::read_to_string(&file).unwrap(),
+                    skill.content,
+                    "{}",
+                    file.display()
+                );
+                assert!(seeded.contains(&file), "{} not recorded", file.display());
+            }
+        }
+        // A look after it finds every place seen: nothing is written.
+        assert!(seed_bundled_skills(home.path(), &[], &agents, &mut seeded).is_empty());
+        // The person takes one out, and it is not put back.
+        let taken_out = claude_skill_dir(home.path());
+        std::fs::remove_dir_all(&taken_out).unwrap();
+        assert!(seed_bundled_skills(home.path(), &[], &agents, &mut seeded).is_empty());
+        assert!(!taken_out.exists());
+    }
+
+    /// The seed writes only where nothing stands: a copy somebody edited is
+    /// kept to the byte, and an earlier release's copy waits for the
+    /// person's press of 「고쳐 쓰기」 (t-55424) — the seed never rewrites. Both
+    /// places count as seen, so a later look does not come back to them.
+    #[test]
+    fn a_seed_writes_only_where_nothing_stands() {
+        let home = tempfile::tempdir().unwrap();
+        let current = bundled_skill("second-brain").unwrap().content;
+        let mine = format!("{current}\n- 내 볼트는 ~/Notes 다.\n");
+        let edited = home.path().join(".claude/skills/second-brain");
+        let stale = home.path().join(".codex/skills/second-brain");
+        for (dir, text) in [(&edited, mine.as_str()), (&stale, SECOND_BRAIN_9F3B7DBCE)] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(SKILL_FILE), text).unwrap();
+        }
+        let agents = detected(&[("claude", "Claude"), ("codex", "Codex"), ("zo", "ZO")]);
+        let mut seeded = BTreeSet::new();
+        let outcomes = seed_bundled_skills(home.path(), &[], &agents, &mut seeded);
+        assert_eq!(
+            std::fs::read_to_string(edited.join(SKILL_FILE)).unwrap(),
+            mine
+        );
+        assert_eq!(
+            std::fs::read_to_string(stale.join(SKILL_FILE)).unwrap(),
+            SECOND_BRAIN_9F3B7DBCE
+        );
+        let second_brain: Vec<(&str, InstallState)> = outcomes
+            .iter()
+            .filter(|outcome| outcome.path.ends_with("second-brain/SKILL.md"))
+            .map(|outcome| (outcome.agent.as_str(), outcome.state))
+            .collect();
+        assert_eq!(second_brain, vec![("zo", InstallState::Written)]);
+        assert!(seeded.contains(&edited.join(SKILL_FILE)));
+        assert!(seeded.contains(&stale.join(SKILL_FILE)));
+    }
+
+    /// An agent the window finds later — installed after the first run — is
+    /// given the skills at the next seed; the agents seeded before are not
+    /// written again.
+    #[test]
+    fn an_agent_detected_later_is_seeded_at_the_next_look() {
+        let home = tempfile::tempdir().unwrap();
+        let mut seeded = BTreeSet::new();
+        let first = seed_bundled_skills(
+            home.path(),
+            &[],
+            &detected(&[("claude", "Claude")]),
+            &mut seeded,
+        );
+        assert_eq!(first.len(), BUNDLED_SKILLS.len());
+        assert!(!home.path().join(".codex").exists());
+        let later = seed_bundled_skills(
+            home.path(),
+            &[],
+            &detected(&[("claude", "Claude"), ("codex", "Codex")]),
+            &mut seeded,
+        );
+        assert_eq!(later.len(), BUNDLED_SKILLS.len(), "{later:?}");
+        assert!(
+            later
+                .iter()
+                .all(|outcome| outcome.agent == "codex" && outcome.state == InstallState::Written)
         );
     }
 

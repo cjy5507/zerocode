@@ -709,7 +709,8 @@ pub fn mark_selection_seeded(env: &mut Vec<(String, String)>, prompt: &str) {
 
 /// The shim and mirror directories, built once for this window's lifetime —
 /// or `None` when the mirror binary is not beside this executable, which is
-/// the graceful absence every launch keeps working through.
+/// the graceful absence every launch keeps working through. On Windows the
+/// folder stands without it, for the doors ([`build_shims_in`]).
 pub fn mirror_shims() -> Option<(PathBuf, PathBuf)> {
     use std::sync::OnceLock;
     static HELD: OnceLock<Option<(PathBuf, PathBuf)>> = OnceLock::new();
@@ -799,19 +800,46 @@ const MIRROR_DIR_PREFIX: &str = "zerocode-mirror-";
 
 fn build_mirror_shims() -> Option<(PathBuf, PathBuf)> {
     let mirror_bin = mirror_bin()?;
-    if !mirror_bin.is_file() {
+    build_shims_in(
+        &std::env::temp_dir(),
+        std::process::id(),
+        &mirror_bin,
+        cfg!(windows),
+        resolvable_agents,
+    )
+}
+
+/// The shim and mirror folders in `temp` for the window numbered `stamp`.
+///
+/// The agent shims need the mirror; the six doors beside them do not. With no
+/// mirror beside the window a macOS one writes no folder, as before, and a
+/// Windows one (`doors_without_mirror`) writes the doors and mirrors no agent.
+/// A source build started with `cargo run --bin zerocode-shell` builds the
+/// window's binary alone, and the person's Windows source build had none of
+/// the six (11-18, t-113721). Its nested runs are not mirrored, which
+/// [`mirror_ready`] still says.
+fn build_shims_in(
+    temp: &Path,
+    stamp: u32,
+    mirror_bin: &Path,
+    doors_without_mirror: bool,
+    agents: impl FnOnce() -> Vec<(String, PathBuf)>,
+) -> Option<(PathBuf, PathBuf)> {
+    let agents = if mirror_bin.is_file() {
+        agents()
+    } else if doors_without_mirror {
+        Vec::new()
+    } else {
         return None;
-    }
-    let stamp = std::process::id();
-    let temp = std::env::temp_dir();
+    };
     sweep_ownerless_shim_dirs(
-        &temp,
+        temp,
         stamp,
         zerocode_core::settings_file_lock::process_alive,
     );
     let shims = temp.join(format!("{SHIM_DIR_PREFIX}{stamp}"));
     let mirrors = temp.join(format!("{MIRROR_DIR_PREFIX}{stamp}"));
-    write_shim_dir(&shims, &mirror_bin, resolvable_agents().as_slice()).ok()?;
+    write_shim_dir(&shims, mirror_bin, agents.as_slice()).ok()?;
     std::fs::create_dir_all(&mirrors).ok()?;
     #[cfg(unix)]
     {
@@ -1514,7 +1542,7 @@ pub fn reconcile(
     local_data_root: &Path,
     installed_slugs: &[String],
 ) -> Vec<HookStatus> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = crate::person_home::person_home() else {
         return Vec::new();
     };
     let paths = InstallPaths::from_environment(home.clone())
@@ -1628,7 +1656,7 @@ pub fn agent_launch_env_with_lock(local_data_root: &Path, agent: &str) -> Launch
     if let Some(prepared) = take_prepared_launch(agent) {
         return prepared;
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = crate::person_home::person_home();
     launch_env_for(local_data_root, agent, home.as_deref())
 }
 
@@ -1678,7 +1706,7 @@ impl Drop for PreparedLaunch {
 /// nothing waits on this thread, and the door hands what was prepared to the
 /// split that asks for the same agent on this thread.
 pub(crate) fn prepare_launch(local_data_root: &Path, agent: &str) -> PreparedLaunch {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = crate::person_home::person_home();
     prepare_launch_inner(local_data_root, agent, home.as_deref())
 }
 
@@ -1799,7 +1827,7 @@ pub fn sync_agent_auth(
     local_data_root: &Path,
     agent: &str,
 ) -> std::io::Result<Option<zerocode_hookd::codex_runtime_auth::AuthSync>> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = crate::person_home::person_home();
     sync_agent_auth_inner(local_data_root, agent, home.as_deref())
 }
 
@@ -1887,7 +1915,7 @@ fn claude_account_settings(config_root: &Path) -> Vec<PathBuf> {
 
 /// What the settings screen shows, read without writing anything.
 pub fn statuses(config_root: &Path, local_data_root: &Path) -> Vec<HookStatus> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = crate::person_home::person_home() else {
         return Vec::new();
     };
     let paths = InstallPaths::from_environment(home.clone())
@@ -4981,6 +5009,39 @@ mod tests {
             .expect("fallback child");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"unset");
+    }
+
+    /// A Windows window with no mirror beside it — a source build started with
+    /// `cargo run --bin zerocode-shell`, which builds the window alone — still
+    /// lays the six doors and mirrors no agent; a macOS one writes no folder,
+    /// as it always has (t-113721).
+    #[test]
+    fn a_windows_window_without_the_mirror_still_lays_the_doors_and_mirrors_no_agent() {
+        let temp = tempfile::tempdir().unwrap();
+        let absent = temp.path().join("zerocode-mirror-not-built");
+        let (shims, _) = build_shims_in(temp.path(), 7, &absent, true, || {
+            panic!("an agent was resolved for a mirror that is not there")
+        })
+        .expect("no shim folder without the mirror, so no door on the pane's PATH");
+        for door in [
+            zerocode_core::artifact_publish::SHIM,
+            zerocode_core::file_find::SHIM,
+            zerocode_core::agent_browser::BROWSER_CLI,
+            zerocode_core::computer_use::COMPUTER_CLI,
+            "zerocode-emulator",
+            "zerocode-ssh",
+        ] {
+            assert!(shims.join(door).is_file(), "{door} is missing");
+            #[cfg(windows)]
+            assert!(
+                shims.join(format!("{door}.cmd")).is_file(),
+                "{door}.cmd is missing"
+            );
+        }
+        assert!(
+            build_shims_in(temp.path(), 8, &absent, false, Vec::new).is_none(),
+            "a macOS window without the mirror wrote a shim folder"
+        );
     }
 
     /// Every door an agent has out of its pane is laid by this one function,

@@ -156,6 +156,36 @@ pub fn merge(current: Option<&str>, segments: &[String]) -> Option<String> {
     Some(merged.join(":"))
 }
 
+/// `path` with each folder of `dirs` it does not hold yet added at its end,
+/// `separator` between them: `;` on Windows, `:` elsewhere. At the end, so a
+/// command the person's own PATH finds first is still the one that runs.
+pub fn with_dirs_at_end(path: &str, dirs: &[String], separator: char) -> String {
+    let mut joined = path.to_string();
+    for dir in dirs {
+        if dir.is_empty() || joined.split(separator).any(|held| held == dir) {
+            continue;
+        }
+        if !joined.is_empty() && !joined.ends_with(separator) {
+            joined.push(separator);
+        }
+        joined.push_str(dir);
+    }
+    joined
+}
+
+/// The folders the window puts commands of its own in, which every pane and
+/// the agent list must find whatever PATH the person's shell builds: the one
+/// the zo the window carries is installed into at boot (`zo_companion`,
+/// `~/.local/bin`). Named whether it stands yet or not — the first boot
+/// reads the PATH before it installs zo there.
+fn own_bins() -> Vec<String> {
+    crate::person_home::person_home()
+        .map(|home| crate::zo_companion::zo_path_under(&home))
+        .and_then(|zo| zo.parent().map(|dir| dir.to_string_lossy().into_owned()))
+        .into_iter()
+        .collect()
+}
+
 /// Ask one shell for its PATH, bounded (`spawnShellAndReadPath`, :7793-7860).
 ///
 /// `-i` and `-l` together, or nvm-installed agents stay invisible; stderr to
@@ -237,6 +267,15 @@ pub fn hydrate(force: bool) -> Option<String> {
         let segments = read_login_shell_path(&shell, SPAWN_TIMEOUT);
         merge(std::env::var("PATH").ok().as_deref(), &segments)
     });
+    // Windows asks no shell: its PATH is the process's own, which a GUI app
+    // there inherits whole. Either way the window's own folders go at its
+    // end, so the zo it installed is found and runs (t-113689).
+    let (merged, separator) = if cfg!(windows) {
+        (std::env::var("PATH").ok(), ';')
+    } else {
+        (merged, ':')
+    };
+    let merged = merged.map(|path| with_dirs_at_end(&path, &own_bins(), separator));
     let mut held = HYDRATED.lock().expect("shell path lock");
     *held = Some(merged.clone());
     merged
@@ -424,6 +463,49 @@ mod tests {
         assert_eq!(
             read_login_shell_path("/nonexistent/shell", Duration::from_millis(300)),
             Vec::<String>::new()
+        );
+    }
+
+    /// The folder the window installs zo into joins a PATH that lacks it, at
+    /// the end and in the platform's separator — Windows asks no shell, and
+    /// nothing else put the folder there, so the zo the window installed was
+    /// never found (t-113689). A PATH that holds it already is left alone.
+    #[test]
+    fn the_folder_zo_is_installed_in_goes_at_the_end_of_a_path_that_lacks_it() {
+        let windows_bin = String::from(r"C:\Users\person\.local\bin");
+        assert_eq!(
+            with_dirs_at_end(
+                r"C:\Windows\system32;C:\Users\person\AppData\Roaming\npm",
+                std::slice::from_ref(&windows_bin),
+                ';'
+            ),
+            r"C:\Windows\system32;C:\Users\person\AppData\Roaming\npm;C:\Users\person\.local\bin"
+        );
+        // A trailing separator is not doubled; an empty PATH is the folder.
+        assert_eq!(
+            with_dirs_at_end(r"C:\Windows;", std::slice::from_ref(&windows_bin), ';'),
+            r"C:\Windows;C:\Users\person\.local\bin"
+        );
+        assert_eq!(
+            with_dirs_at_end("", std::slice::from_ref(&windows_bin), ';'),
+            windows_bin
+        );
+        let unix_bin = String::from("/Users/person/.local/bin");
+        assert_eq!(
+            with_dirs_at_end(
+                "/opt/homebrew/bin:/usr/bin",
+                std::slice::from_ref(&unix_bin),
+                ':'
+            ),
+            "/opt/homebrew/bin:/usr/bin:/Users/person/.local/bin"
+        );
+        assert_eq!(
+            with_dirs_at_end(
+                "/Users/person/.local/bin:/usr/bin",
+                std::slice::from_ref(&unix_bin),
+                ':'
+            ),
+            "/Users/person/.local/bin:/usr/bin"
         );
     }
 }
