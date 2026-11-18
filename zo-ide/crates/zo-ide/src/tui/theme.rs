@@ -362,7 +362,8 @@ pub fn revision() -> u64 {
 }
 
 /// Chooses the startup theme from `env_theme` (`ZO_THEME`) then `preferences.theme`,
-/// returning a warning message if an explicit value was invalid or unknown.
+/// returning a warning message if an explicit value was invalid or unknown —
+/// or names a theme whose file was not read, which the warning says, and why.
 /// An empty value in either place is no value.
 #[must_use]
 pub fn choose(preferences: &Preferences, env_theme: Option<&str>) -> (Theme, Option<String>) {
@@ -385,6 +386,13 @@ pub fn choose(preferences: &Preferences, env_theme: Option<&str>) -> (Theme, Opt
         Err(ThemeResolveError::Unknown) => (
             Theme::terminal(),
             Some(format!("unknown theme {name:?}; using terminal")),
+        ),
+        Err(ThemeResolveError::PastCap { cap }) => (
+            Theme::terminal(),
+            Some(format!(
+                "{}; using terminal",
+                super::strings::theme_past_cap(name, cap)
+            )),
         ),
     }
 }
@@ -482,7 +490,21 @@ pub fn fit_lightness(
     palette: TerminalPalette,
     background: (u8, u8, u8),
 ) -> (u8, u8, u8) {
-    let floor = palette.text_contrast_floor(background);
+    fit_lightness_to_floor(color, background, palette.text_contrast_floor(background))
+}
+
+/// Adjusts `color`'s HSL lightness in 1%p steps away from `background` until
+/// its contrast against `background` clears `floor` — the rule
+/// [`fit_lightness`] follows with the floor a measured body ink gives, and
+/// `ground` with the fixed floor it takes when only the ground's lightness is
+/// known. Hue and saturation stay; a colour that clears `floor` already is
+/// returned as it is.
+#[must_use]
+pub(crate) fn fit_lightness_to_floor(
+    color: (u8, u8, u8),
+    background: (u8, u8, u8),
+    floor: f64,
+) -> (u8, u8, u8) {
     if contrast_ratio(color, background) >= floor {
         return color;
     }
@@ -516,6 +538,13 @@ pub enum ThemeResolveError {
     Invalid,
     /// A name no theme has.
     Unknown,
+    /// The name of a theme the person has a file for, which was not read:
+    /// the themes folder holds more theme files than `cap`, and this one is
+    /// past the first `cap` by name.
+    PastCap {
+        /// The most theme files read from the themes folder.
+        cap: usize,
+    },
 }
 
 /// The theme a person's word names — one reading for the `theme` setting,
@@ -527,7 +556,9 @@ pub enum ThemeResolveError {
 ///
 /// # Errors
 /// [`ThemeResolveError::Invalid`] for an empty or path-shaped name, which is
-/// never looked up; [`ThemeResolveError::Unknown`] for a name no theme has.
+/// never looked up; [`ThemeResolveError::Unknown`] for a name no theme has;
+/// [`ThemeResolveError::PastCap`] for one whose file is in the person's
+/// themes folder, unread past the cap.
 pub fn resolve_name(name: &str) -> Result<Theme, ThemeResolveError> {
     let name = name.trim();
     if name.is_empty() || name.contains(['/', '\\', '.']) {
@@ -552,11 +583,14 @@ pub fn resolve_name(name: &str) -> Result<Theme, ThemeResolveError> {
     if TERMINAL_ALIASES.contains(&slug.as_str()) {
         return Ok(Theme::terminal());
     }
-    Err(if is_valid_slug(&slug) {
-        ThemeResolveError::Unknown
-    } else {
-        ThemeResolveError::Invalid
-    })
+    if !is_valid_slug(&slug) {
+        return Err(ThemeResolveError::Invalid);
+    }
+    // No theme has the name. Whether its file is in the themes folder,
+    // unread past the cap, is asked here alone: a name that is known never
+    // comes this far, so a start that knows its theme pays nothing for it.
+    Err(super::theme_files::past_cap(&slug)
+        .map_or(ThemeResolveError::Unknown, |cap| ThemeResolveError::PastCap { cap }))
 }
 
 /// The name a theme is said by on the screen: its visible name, and for

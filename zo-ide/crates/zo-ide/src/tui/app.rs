@@ -347,6 +347,7 @@ fn thinking_flags(flags: RenderFlags) -> RenderFlags {
     let preferences = crate::preferences::load();
     super::style::init(&preferences);
     super::theme::init(&preferences);
+    super::ground::init(&preferences);
     RenderFlags {
         show_thinking: flags.show_thinking
             || preferences.show_thinking.unwrap_or(thinking::SHOW_BY_DEFAULT),
@@ -448,7 +449,8 @@ struct PermissionPicker {
 
 /// 떠 있는 `/theme` 피커. The theme under the cursor is on while it is up —
 /// a move turns it on at once — so the picker keeps what to go back to.
-/// Letters typed narrow the list to the themes they are found in.
+/// Letters typed narrow the list to the themes they are found in, and once
+/// one is typed a digit narrows it too instead of picking a row.
 struct ThemePicker {
     /// Every theme there was when the picker opened, in the list's order.
     /// Narrowing asks this list: the themes folder is not read again while
@@ -4038,9 +4040,12 @@ impl Ui {
     /// and leaving goes back to the theme the picker opened on — in one esc,
     /// whatever was typed. A letter, `-` or a blank typed narrows the list
     /// to the themes it is found in (`theme_matches`) and backspace takes
-    /// the last one back; a number still picks its row, of the rows left.
-    /// The home, end and page keys move too. A letter held with ctrl or alt
-    /// is a chord and no part of the query.
+    /// the last one back. Once something is typed a digit is one more
+    /// character of it and picks no row, so a name with digits in it
+    /// (`theme-12`) is typed to its end and nothing is saved on the way; a
+    /// number picks its row again when all that was typed is taken back.
+    /// The home, end and page keys move too. A letter or a digit held with
+    /// ctrl or alt is a chord and no part of the query.
     fn theme_picker_key(&mut self, key: KeyEvent) -> bool {
         /// The rows a page key moves by.
         const PAGE: usize = 10;
@@ -4059,14 +4064,16 @@ impl Ui {
             KeyCode::End => picker.view.selected = last,
             KeyCode::PageUp => picker.view.selected = picker.view.selected.saturating_sub(PAGE),
             KeyCode::PageDown => picker.view.selected = (picker.view.selected + PAGE).min(last),
-            KeyCode::Char(ch) if ch.is_ascii_digit() => {
-                let digit = ch.to_digit(10).unwrap_or(0) as usize;
-                confirm = picker.view.select_number(digit);
-            }
-            KeyCode::Char(ch) if !chord && is_theme_query_char(ch) => {
+            KeyCode::Char(ch) if !chord && is_theme_query_char(ch, &picker.query) => {
                 let mut query = picker.query.clone();
                 query.push(ch);
                 picker.narrow(query);
+            }
+            // Nothing typed: a number picks its row and confirms, as in
+            // every numbered picker.
+            KeyCode::Char(ch) if ch.is_ascii_digit() && picker.query.is_empty() => {
+                let digit = ch.to_digit(10).unwrap_or(0) as usize;
+                confirm = picker.view.select_number(digit);
             }
             KeyCode::Backspace if !picker.query.is_empty() => {
                 let mut query = picker.query.clone();
@@ -4141,16 +4148,23 @@ impl Ui {
     /// `/theme <name>`: the theme the word names
     /// ([`super::theme::resolve_name`]) is turned on and saved. A word that
     /// names none — a path-shaped one is never looked up — changes nothing
-    /// and is answered with the names there are.
+    /// and is answered with the names there are. A word that names a theme
+    /// file left unread past the cap changes nothing either, and is answered
+    /// with that: the names there are would not hold it.
     fn apply_typed_theme(&mut self, name: &str) {
-        if let Ok(theme) = super::theme::resolve_name(name) {
-            self.choose_theme(&theme);
-        } else {
-            let text = format!(
-                "no theme is named {name:?} — the themes: {}",
-                super::theme::names_line()
-            );
-            self.note(SystemLevel::Info, &text);
+        use super::theme::ThemeResolveError;
+        match super::theme::resolve_name(name) {
+            Ok(theme) => self.choose_theme(&theme),
+            Err(ThemeResolveError::PastCap { cap }) => {
+                self.note(SystemLevel::Info, &super::strings::theme_past_cap(name, cap));
+            }
+            Err(ThemeResolveError::Invalid | ThemeResolveError::Unknown) => {
+                let text = format!(
+                    "no theme is named {name:?} — the themes: {}",
+                    super::theme::names_line()
+                );
+                self.note(SystemLevel::Info, &text);
+            }
         }
     }
 
@@ -8448,10 +8462,12 @@ fn theme_picker_rows(entries: &[ThemeEntry], current: &str) -> Vec<PickerRow> {
         .collect()
 }
 
-/// Whether a key's character goes into the `/theme` picker's query: a
-/// letter, `-` or a blank. A digit picks a row, as in every numbered picker.
-fn is_theme_query_char(ch: char) -> bool {
-    ch.is_alphabetic() || ch == '-' || ch == ' '
+/// Whether a key's character goes into the `/theme` picker's query, of
+/// which `typed` is there already: a letter, `-` or a blank — and a digit
+/// once something is typed, since a theme's name may hold one. With nothing
+/// typed a digit picks a row, as in every numbered picker.
+fn is_theme_query_char(ch: char, typed: &str) -> bool {
+    ch.is_alphabetic() || ch == '-' || ch == ' ' || (ch.is_ascii_digit() && !typed.is_empty())
 }
 
 /// A theme's name or a typed query as the `/theme` picker compares them: in
@@ -13436,7 +13452,7 @@ mod theme_tests {
         KeyEvent, KeyModifiers, Line, Painter, SystemLevel, ThemeEntry, Ui,
     };
     use crate::preferences::Preferences;
-    use crate::tui::{slash, strings, style, theme};
+    use crate::tui::{slash, strings, style, theme, theme_files};
 
     /// The path of one of this module's tests inside the crate — what a
     /// fresh run of it is asked for by.
@@ -13482,6 +13498,19 @@ mod theme_tests {
 
     fn read(settings: &Path) -> String {
         std::fs::read_to_string(settings).expect("read the settings file")
+    }
+
+    /// A themes folder of the test's own holding each `(file name, body)` of
+    /// `files`, which the process catalog of this run reads from here on —
+    /// at most `cap` theme files of it. For a test in a fresh run alone
+    /// (`style::in_fresh_run`). The folder is returned, to remove afterwards.
+    fn themes_folder(label: &str, files: &[(&str, &str)], cap: usize) -> PathBuf {
+        let folder = crate::support::temp_dir(label);
+        for (name, body) in files {
+            std::fs::write(folder.join(name), body).expect("write a theme file");
+        }
+        theme_files::read_folder_in_this_run(&folder, cap);
+        folder
     }
 
     /// Criteria 1 and 2: `/th` lists `/theme` with its words — after
@@ -13742,9 +13771,9 @@ mod theme_tests {
     /// in the row under the title; backspace brings the rows back with the
     /// cursor on the theme that is on. A word no theme has leaves one faded
     /// line where the list was and the theme the picker opened on, and then
-    /// enter and a number choose nothing. A number picks its row of the rows
-    /// left and saves it. One esc goes back to the first theme and closes,
-    /// whatever was typed.
+    /// enter chooses nothing and a digit is one more character typed. Enter
+    /// saves the row under the cursor of the rows left. One esc goes back to
+    /// the first theme and closes, whatever was typed.
     #[test]
     fn theme_picker_filters_as_letters_are_typed() {
         if !style::in_fresh_run(&test_path("theme_picker_filters_as_letters_are_typed")) {
@@ -13788,7 +13817,8 @@ mod theme_tests {
         assert_eq!(picker.note, strings::THEME_PICKER_NOTE);
 
         // A word no theme has: one faded line where the list was, and the
-        // theme the picker opened on. Enter and a number choose nothing.
+        // theme the picker opened on. Enter and a move choose nothing, and
+        // a digit is one more character of the word no theme has.
         type_word(&mut ui, "zzz");
         let picker = ui.overlay().expect("no match keeps the picker open");
         assert!(picker.rows.is_empty(), "{:?}", labels(&ui));
@@ -13812,12 +13842,14 @@ mod theme_tests {
         assert!(theme::active().is_terminal());
         assert_eq!(read(&settings), initial);
 
-        // A number picks its row of the rows left, and saves it.
+        // Enter saves the row under the cursor of the rows left. (A number
+        // would be one more character of the query here — the digit tests
+        // below.)
         ui.open_theme_picker();
         type_word(&mut ui, "Tokyo N");
         assert_eq!(labels(&ui), ["Tokyo Night", "Tokyo Night Light"], "case and the blank are no matter");
-        let _ = ui.idle_event(&press(KeyCode::Char('1')));
-        assert!(ui.overlay().is_none(), "a number confirms");
+        let _ = ui.idle_event(&press(KeyCode::Enter));
+        assert!(ui.overlay().is_none(), "enter confirms");
         assert_eq!(theme::active().name, "tokyo-night");
         assert_eq!(crate::preferences::load_from_path(&settings).theme.as_deref(), Some("tokyo-night"));
         assert!(said(&ui).contains("theme → Tokyo Night"), "{}", said(&ui));
@@ -13912,6 +13944,108 @@ mod theme_tests {
         assert!(ui.overlay().is_none());
         assert!(theme::active().is_terminal());
         assert_eq!(read(&settings), "{}\n", "nothing was saved");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A digit typed once something is typed is one more character of the
+    /// query, so a name with digits in it — `theme-12` — is typed to its
+    /// end, and no row is picked or saved on the way. A digit no theme has
+    /// leaves no row and the theme the picker opened on. A digit held with
+    /// ctrl or alt is a chord, as a letter is. Enter saves the one theme the
+    /// query came down to.
+    #[test]
+    fn a_digit_typed_while_filtering_joins_the_query_and_saves_nothing() {
+        if !style::in_fresh_run(&test_path("a_digit_typed_while_filtering_joins_the_query_and_saves_nothing")) {
+            return;
+        }
+        style::init(&Preferences::default());
+        let own = r##"{"colors":{"accent":"#112233"}}"##;
+        let files = [("theme-12.json", own), ("theme-13.json", own)];
+        let themes = themes_folder("theme-digit-themes", &files, theme_files::MAX_THEME_FILES);
+        let initial = "{\n    \"z\": 1,\n    \"a\": true\n}\n";
+        let saved = "{\n    \"z\": 1,\n    \"a\": true,\n    \"theme\": \"theme-12\"\n}\n";
+        let (folder, settings) = settings_file("theme-digit", initial);
+        let mut ui = ui_saving_to(&settings);
+        assert!(theme::active().is_terminal());
+
+        ui.open_theme_picker();
+        let total = theme::names().len();
+        assert_eq!(ui.overlay().expect("the picker is open").rows.len(), total);
+        type_word(&mut ui, "theme-");
+        assert_eq!(labels(&ui), ["theme-12", "theme-13"], "the person's two themes");
+        assert_eq!(theme::active().name, "theme-12", "the first row left is turned on");
+
+        // A digit no theme has: no row, and the theme the picker opened on.
+        let _ = ui.idle_event(&press(KeyCode::Char('9')));
+        let picker = ui.overlay().expect("a digit typed keeps the picker open");
+        assert!(picker.rows.is_empty(), "`9` is typed, and picks no row: {:?}", labels(&ui));
+        assert_eq!(picker.note, strings::theme_picker_note("theme-9", 0, total));
+        assert!(theme::active().is_terminal(), "no theme matches: the first one is on again");
+        let _ = ui.idle_event(&press(KeyCode::Enter));
+        assert!(ui.overlay().is_some(), "enter chooses nothing when no theme matches");
+        let _ = ui.idle_event(&press(KeyCode::Backspace));
+        assert_eq!(labels(&ui), ["theme-12", "theme-13"]);
+
+        // `1` is in both names: both rows stay, and no row is picked.
+        let _ = ui.idle_event(&press(KeyCode::Char('1')));
+        let picker = ui.overlay().expect("a digit typed keeps the picker open");
+        assert_eq!(picker.note, strings::theme_picker_note("theme-1", 2, total));
+        assert_eq!(labels(&ui), ["theme-12", "theme-13"]);
+        assert_eq!(std::fs::read(&settings).expect("read"), initial.as_bytes(), "a digit typed saves nothing");
+        assert!(!said(&ui).contains("theme →"), "nothing was chosen: {}", said(&ui));
+
+        // Held with ctrl or alt it is a chord, and no part of the query.
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+            let _ = ui.idle_event(&Event::Key(KeyEvent::new(KeyCode::Char('2'), modifiers)));
+        }
+        let picker = ui.overlay().expect("a chord keeps the picker open");
+        assert_eq!(picker.note, strings::theme_picker_note("theme-1", 2, total));
+        assert_eq!(read(&settings), initial, "a chord saves nothing");
+
+        // `2`: the one theme the query names is on, and enter saves it.
+        let _ = ui.idle_event(&press(KeyCode::Char('2')));
+        assert_eq!(labels(&ui), ["theme-12"]);
+        assert_eq!(theme::active().name, "theme-12");
+        assert_eq!(read(&settings), initial, "typing saves nothing");
+        let _ = ui.idle_event(&press(KeyCode::Enter));
+        assert!(ui.overlay().is_none(), "enter closes the picker");
+        assert_eq!(theme::active().name, "theme-12");
+        assert_eq!(read(&settings), saved, "only the theme member is new");
+        assert!(said(&ui).contains("theme → theme-12"), "{}", said(&ui));
+        let _ = std::fs::remove_dir_all(&folder);
+        let _ = std::fs::remove_dir_all(&themes);
+    }
+
+    /// With nothing typed a number picks its row and saves it, as in every
+    /// numbered picker — and again once what was typed is taken back.
+    #[test]
+    fn a_digit_with_nothing_typed_still_picks_its_row() {
+        if !style::in_fresh_run(&test_path("a_digit_with_nothing_typed_still_picks_its_row")) {
+            return;
+        }
+        style::init(&Preferences::default());
+        let (folder, settings) = settings_file("theme-digit-row", "{}\n");
+        let mut ui = ui_saving_to(&settings);
+        let names = theme::names();
+        let saved_theme = || crate::preferences::load_from_path(&settings).theme;
+
+        ui.open_theme_picker();
+        let _ = ui.idle_event(&press(KeyCode::Char('2')));
+        assert!(ui.overlay().is_none(), "a number confirms");
+        assert_eq!(theme::active().name, names[1], "row two is the second theme");
+        assert_eq!(saved_theme().as_ref(), Some(&names[1]));
+
+        // A letter typed and taken back: nothing is typed again.
+        ui.open_theme_picker();
+        type_word(&mut ui, "d");
+        assert_ne!(ui.overlay().expect("still open").note, strings::THEME_PICKER_NOTE);
+        let _ = ui.idle_event(&press(KeyCode::Backspace));
+        let picker = ui.overlay().expect("still open");
+        assert_eq!((picker.rows.len(), picker.note.as_str()), (names.len(), strings::THEME_PICKER_NOTE));
+        let _ = ui.idle_event(&press(KeyCode::Char('3')));
+        assert!(ui.overlay().is_none(), "a number confirms once nothing is typed again");
+        assert_eq!(theme::active().name, names[2], "row three is the third theme");
+        assert_eq!(saved_theme().as_ref(), Some(&names[2]));
         let _ = std::fs::remove_dir_all(&folder);
     }
 
@@ -14029,6 +14163,106 @@ mod theme_tests {
         assert_eq!(theme::active().name, "dracula");
         assert_eq!(crate::preferences::load_from_path(&settings).theme.as_deref(), Some("dracula"));
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A theme whose file is in the themes folder past the cap is not an
+    /// unknown name: the start warning and `/theme <name>` say that it was
+    /// not read and why, with the cap the folder was read by, and nothing is
+    /// saved. A name no file has, a file the read took that made no theme, a
+    /// folder and a path-shaped name are said in the words there were; a
+    /// theme inside the cap is taken without a word. The unread file is
+    /// never opened: what is wrong in it is not said.
+    #[test]
+    fn a_theme_past_the_cap_says_why_it_was_not_read() {
+        if !style::in_fresh_run(&test_path("a_theme_past_the_cap_says_why_it_was_not_read")) {
+            return;
+        }
+        style::init(&Preferences::default());
+        let (own, broken) = (r##"{"colors":{"accent":"#112233"}}"##, "{ not valid json");
+        let longest = "z".repeat(64);
+        let longest_file = format!("{longest}.json");
+        // By name the first three are `aa-broken`, `alpha` and `bravo`.
+        let files = [
+            ("aa-broken.json", broken),
+            ("alpha.json", own),
+            ("bravo.json", own),
+            ("charlie.json", own),
+            ("zz-mine.json", broken),
+            (longest_file.as_str(), own),
+        ];
+        let themes = themes_folder("theme-cap-themes", &files, 3);
+        std::fs::create_dir_all(themes.join("zz-folder.json")).expect("a folder named as a theme file is");
+        let initial = "{\n  \"z\": 1\n}\n";
+        let (folder, settings) = settings_file("theme-cap", initial);
+        let mut ui = ui_saving_to(&settings);
+        let named = |name: &str| Preferences { theme: Some(name.to_string()), ..Preferences::default() };
+        let past = |name: &str| format!("theme {name:?} was not read: it is past the first 3 theme files by name");
+        assert_eq!(past("zz-mine"), strings::theme_past_cap("zz-mine", 3));
+
+        // At start, by the setting and by `ZO_THEME`, as the name was written.
+        for typed in ["zz-mine", "ZZ Mine", "charlie", longest.as_str()] {
+            let expected = Some(format!("{}; using terminal", past(typed)));
+            let by_setting = theme::choose(&named(typed), None);
+            let by_env = theme::choose(&Preferences::default(), Some(typed));
+            for (chosen, warning) in [by_setting, by_env] {
+                assert!(chosen.is_terminal(), "{typed:?}");
+                assert_eq!(warning, expected, "{typed:?}");
+            }
+        }
+        // A name no file has, a file the read took that made no theme and a
+        // folder named as a theme file is: unknown, in the words there were.
+        for unknown in ["no-such-theme", "aa-broken", "zz-folder"] {
+            let (chosen, warning) = theme::choose(&named(unknown), None);
+            assert!(chosen.is_terminal(), "{unknown:?}");
+            assert_eq!(warning, Some(format!("unknown theme {unknown:?}; using terminal")), "{unknown:?}");
+        }
+        let (_, warning) = theme::choose(&named("../x"), None);
+        assert_eq!(warning.as_deref(), Some("invalid theme name \"../x\"; using terminal"));
+        // A theme inside the cap is taken, and nothing is said.
+        for inside in ["alpha", "bravo"] {
+            let (chosen, warning) = theme::choose(&named(inside), None);
+            assert_eq!((chosen.name.as_str(), warning), (inside, None), "{inside:?}");
+        }
+        // The unread file was never opened: what is wrong in it is not said.
+        let warnings = crate::runtime_support::drain_startup_warnings();
+        assert!(warnings.iter().any(|line| line.contains("aa-broken.json")), "{warnings:?}");
+        assert!(warnings.iter().any(|line| line.contains("only the first 3 by name are read")), "{warnings:?}");
+        assert!(!warnings.iter().any(|line| line.contains("zz-mine.json")), "{warnings:?}");
+
+        // `/theme <name>`: the same reason on one row, in place of the names.
+        for typed in ["zz-mine", "ZZ Mine"] {
+            ui.pending_history.clear();
+            ui.apply_typed_theme(typed);
+            let answer = said(&ui);
+            assert!(answer.contains(&past(typed)), "{typed:?}: {answer}");
+            assert!(!answer.contains("dracula") && !answer.contains("no theme is named"), "{typed:?}: {answer}");
+            assert_eq!(answer.lines().filter(|row| !row.trim().is_empty()).count(), 1, "{typed:?}: {answer}");
+            assert!(theme::active().is_terminal(), "{typed:?} changed the theme");
+            assert_eq!(read(&settings), initial, "{typed:?} changed the settings");
+        }
+        // A name no file has is answered with the names there are, as it was.
+        for unknown in ["no-such-theme", "aa-broken"] {
+            ui.pending_history.clear();
+            ui.apply_typed_theme(unknown);
+            let answer = said(&ui);
+            let opening = format!("no theme is named {unknown:?} — the themes: terminal,");
+            assert!(answer.contains(&opening) && answer.contains("dracula"), "{unknown:?}: {answer}");
+            assert!(!answer.contains("was not read"), "{unknown:?}: {answer}");
+        }
+        assert_eq!(read(&settings), initial, "nothing was saved");
+
+        // The longest name there can be, with the real cap: two rows of an
+        // 80-column terminal at most, for the warning at start and the answer.
+        let reason = strings::theme_past_cap(&longest, theme_files::MAX_THEME_FILES);
+        assert!(reason.contains(&format!("the first {} theme files", theme_files::MAX_THEME_FILES)), "{reason}");
+        for (level, text) in [(SystemLevel::Warn, format!("{reason}; using terminal")), (SystemLevel::Info, reason)] {
+            // A blank row stands above the words.
+            let rows = crate::tui::cells::system_cell(level, &text, 80);
+            assert!(rows.len() <= 3, "{} rows: {text}", rows.len());
+            assert!(rows.iter().all(|row| crate::tui::ansi::str_width(&row.plain()) <= 80), "{text}");
+        }
+        let _ = std::fs::remove_dir_all(&folder);
+        let _ = std::fs::remove_dir_all(&themes);
     }
 
     /// Criterion 7: a key reaches the open picker on both roads — an idle
