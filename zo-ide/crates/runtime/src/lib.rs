@@ -353,7 +353,7 @@ pub use oauth::{
 pub use permissions::{
     normalize_tool_name, rule_tool_names, PermissionContext, PermissionMode, PermissionOutcome,
     PermissionOverride, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
-    PermissionRequest, RuleToolName, TemporaryAllowGrant,
+    PermissionRequest, ReadOnlyHold, RuleToolName, TemporaryAllowGrant,
 };
 pub use prompt::{
     discover_all_skills, discover_skills, load_system_prompt, load_system_prompt_for_main,
@@ -386,6 +386,8 @@ mod tool_output_truncation;
 pub use tool_output_truncation::{
     truncate_tool_output, TruncatedOutput, TruncationConfig, SKILL_RESULT_CHARS, SKILL_TOOL,
 };
+mod skill_range;
+pub use skill_range::SkillRange;
 pub mod commit_ledger;
 pub mod turn_trace;
 pub use turn_trace::{TurnOutcome, TurnRecord};

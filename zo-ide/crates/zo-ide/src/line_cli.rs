@@ -36,9 +36,10 @@ zo line forget <job> · zo line restore <job>
 
   One line for the whole machine: each owner's jobs run in the order they
   were put in and never two at a time; the owner whose last job ended longest
-  ago goes first; --first jobs go before plain ones (two to one) and --last
-  ones only fill a slot nothing else wants. --solo takes the first slot only
-  (a whole suite), --quiet runs alone (a measurement). Nothing starts while
+  ago goes first; --first jobs go before plain ones (two to one, --quiet ones
+  too) and --last ones only fill a slot nothing else wants. --solo takes the
+  first slot only (a whole suite); --quiet runs alone (a measurement): from
+  its turn nothing new starts until the machine is empty. Nothing starts while
   the line is paused or the disk is below its floor; near it, the folders of
   idle slots go first. Cargo builds in the slot's own folder (zo's home,
   build-slots/targets/<slot>), the job's workspace crates removed from it

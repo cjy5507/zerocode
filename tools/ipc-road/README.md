@@ -79,6 +79,16 @@ path, so the copy keeps the two files' places:
 macOS only. Measure on AC power with the machine quiet: the numbers are
 microseconds, and a build running beside them is the largest term.
 
+It never takes the keyboard from the app in front: the tool is never the
+active app (tao activates an app on launch unless told not to) and its windows
+are never key (t-115889). WebKit reports its page hidden in a hidden window. A
+copy that showed its window outside every screen with occlusion detection off
+heard `hidden` in one run and `visible` in another, so page-side figures carry
+the run's `visibilityState`. In the speed check a page of this kind that kept
+asking for 1 to 16 MB answers stood still twice, after 11.4 s and 8.7 s of its
+measured phases, for a reason not found; the scheme road finishes in a few
+seconds.
+
 ## What it reads
 
 | field | meaning |
