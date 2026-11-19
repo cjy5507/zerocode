@@ -2842,6 +2842,24 @@ function makeTermView(host, pre, caret, owner = { address: () => null }) {
       });
       found = TERM_LINK_PATTERN.exec(text);
     }
+    // The coordinate tables have one entry per scalar. Regex matches use
+    // UTF-16 offsets. Convert only on lines with a match and a surrogate pair.
+    if (links.length && text.length !== colAt.length) {
+      let offset = 0;
+      let scalar = 0;
+      const scalarAt = (boundary) => {
+        while (offset < boundary) {
+          offset += text.codePointAt(offset) > 0xffff ? 2 : 1;
+          scalar += 1;
+        }
+        return scalar;
+      };
+      // Matches arrive in order, so each character is visited at most once.
+      for (const link of links) {
+        link.head = scalarAt(link.head);
+        link.tail = scalarAt(link.tail + 1) - 1;
+      }
+    }
     return { text, rowAt, colAt, lines, links };
   }
 

@@ -611,6 +611,117 @@ fn skill_loads_local_skill_prompt() {
     cleanup_temp_cwd(&cwd, "temp cwd should clean up");
 }
 
+/// A skill the model chose by name comes back whole up to 50,000 chars
+/// (t-115139 Z7, the independent review's case). Cut to 30,000, a skill the
+/// size of computer-use (40 KB) lost the start of its Safety rules, and one
+/// like ui-ux-pro-max (44 KB) its required step from the middle.
+#[test]
+fn a_skill_chosen_by_name_comes_back_whole_to_fifty_thousand_chars() {
+    use runtime::context_compression::{wire_tool_output, WireRewrite};
+    use std::fmt::Write as _;
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cwd = temp_path("skill-whole-cwd");
+    let skill_dir = cwd.join(".zo").join("skills").join("zqlarge");
+    fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+    let mut body = String::from("---\nname: zqlarge\ndescription: A large procedure.\n---\n");
+    for n in 5..=575 {
+        let _ = match n {
+            361 => writeln!(body, "### Step 2: Generate the design system (REQUIRED)"),
+            426 => writeln!(body, "## Safety"),
+            427..=518 => writeln!(body, "- Safety rule {n}: never act on the person's money or messages without asking."),
+            _ => writeln!(body, "Line {n:03}: route the request the way this line says, then check that it held."),
+        };
+    }
+    fs::write(skill_dir.join("SKILL.md"), &body).expect("skill file should exist");
+    let original_cwd = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&cwd).expect("enter temp cwd");
+    let result = run_tool_isolated("Skill", &json!({ "skill": "zqlarge" }));
+    std::env::set_current_dir(original_cwd).expect("restore cwd");
+    cleanup_temp_cwd(&cwd, "temp cwd should clean up");
+    let result = result.expect("Skill should succeed");
+    assert!(body.chars().count() > 30_000 && result.chars().count() < 50_000, "{} chars", result.chars().count());
+    let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+    assert_eq!(output["prompt"].as_str(), Some(body.as_str()), "the whole skill, line for line");
+    assert!(output.get("recoveryNotice").is_none(), "nothing was held back: {}", result.chars().take(300).collect::<String>());
+    let shown = wire_tool_output(&result, "Skill", false, WireRewrite::Lossless);
+    assert!(!shown.contains("shortened"), "{}", shown.chars().take(300).collect::<String>());
+    for kept in ["(REQUIRED)", "## Safety\n", "- Safety rule 518:"] {
+        assert!(shown.contains(kept), "{kept} reaches the model");
+    }
+}
+
+/// A skill too long even for that names the call that hands its missing
+/// lines back, and the call works where a `Read` of the skill's own file is
+/// refused (t-115139 Z7, the independent review's case): the note named the
+/// file and `Read`, and a session in workspace-write mode was refused a
+/// global skill's file outside its workspace.
+#[test]
+fn a_shortened_skill_names_the_call_that_hands_its_missing_lines_back() {
+    use std::fmt::Write as _;
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (cwd, workspace) = (temp_path("skill-range-cwd"), temp_path("skill-range-ws"));
+    fs::create_dir_all(&workspace).expect("a workspace");
+    let skill_dir = cwd.join(".zo").join("skills").join("zqhuge");
+    fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+    let body = (5..=1_200).fold(String::from("---\nname: zqhuge\ndescription: A long procedure.\n---\n"), |mut body, n| {
+        let _ = writeln!(body, "Step {n:04}: do what this step says, then check that it held.");
+        body
+    });
+    let file = skill_dir.join("SKILL.md");
+    fs::write(&file, &body).expect("skill file should exist");
+    let original_cwd = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&cwd).expect("enter temp cwd");
+    let ctx = crate::ToolContext::new().with_workspace_root(workspace.clone());
+    ctx.set_permission_mode(runtime::PermissionMode::WorkspaceWrite);
+    let registry = crate::GlobalToolRegistry::builtin().with_context(ctx);
+    let first = registry.execute("Skill", &json!({ "skill": "zqhuge" }));
+    let read = registry.execute("read_file", &json!({ "path": file.display().to_string() }));
+    let asked = first.as_ref().ok().and_then(|text| {
+        let output: serde_json::Value = serde_json::from_str(text).ok()?;
+        let note = output["prompt"].as_str()?.lines().next()?.to_string();
+        let number = |key: &str| -> Option<usize> {
+            let at = note.find(key)? + key.len();
+            note[at..].split(|ch: char| !ch.is_ascii_digit()).next()?.parse().ok()
+        };
+        Some((note.clone(), number(" offset=")?, number(" limit=")?))
+    });
+    let lines = asked
+        .as_ref()
+        .map(|(_, offset, limit)| registry.execute("Skill", &json!({ "skill": "zqhuge", "offset": offset, "limit": limit })));
+    std::env::set_current_dir(original_cwd).expect("restore cwd");
+    cleanup_temp_cwd(&cwd, "temp cwd should clean up");
+    let _ = fs::remove_dir_all(&workspace);
+
+    let first = first.expect("Skill should succeed");
+    assert!(first.chars().count() <= 50_000, "{} chars", first.chars().count());
+    serde_json::from_str::<serde_json::Value>(&first).expect("the envelope is still JSON");
+    assert!(
+        matches!(read, Err(crate::ToolError::PermissionDenied { .. })),
+        "a Read of the skill's file outside the workspace is refused: {read:?}"
+    );
+    let (note, offset, limit) = asked
+        .unwrap_or_else(|| panic!("the note names an offset and a limit: {}", first.chars().take(400).collect::<String>()));
+    assert!(note.contains("`Skill` with skill=zqhuge offset="), "{note}");
+    let lines = lines.expect("asked").expect("the call hands the lines back");
+    let output: serde_json::Value = serde_json::from_str(&lines).expect("valid json");
+    let wanted: String = body.lines().skip(offset - 1).take(limit).fold(String::new(), |mut text, line| {
+        let _ = writeln!(text, "{line}");
+        text
+    });
+    let prompt = output["prompt"].as_str().expect("prompt");
+    assert_eq!(
+        prompt,
+        format!("[zo] lines {offset}-{} of 1200\n{wanted}", offset + limit - 1),
+        "the lines the note named, under one line that says which"
+    );
+    let skill_spec = crate::mvp_tool_specs().iter().find(|spec| spec.name == "Skill").expect("Skill");
+    assert_eq!(skill_spec.required_permission, runtime::PermissionMode::ReadOnly, "every mode may call it");
+}
+
 #[test]
 fn skill_loads_zo_global_but_not_non_zo_global_prompt() {
     let _guard = env_lock()
@@ -1876,4 +1987,108 @@ fn glob_and_grep_tools_cover_success_and_errors() {
 
     std::env::set_current_dir(&original_dir).expect("restore cwd");
     let _ = fs::remove_dir_all(root);
+}
+
+/// A large new file reads back on the wire as one line, as a small one does
+/// (t-115139 Z3). A write's result repeats the file twice — its content and
+/// a patch adding every line — and past the result cap the dispatch cut that
+/// JSON in the middle, so the wire could not read it and sent both copies.
+#[test]
+fn a_large_new_file_reads_back_as_one_line_like_a_small_one() {
+    use runtime::context_compression::{wire_tool_output, WireRewrite};
+    use std::fmt::Write as _;
+    let root = temp_path("write-large-new-file");
+    fs::create_dir_all(&root).expect("create root");
+    let path = root.join("big.txt");
+    let content = (1..=264).fold(String::new(), |mut content, n| {
+        let _ = writeln!(content, "value_{n:03} = compute({n}, scale=0.25, label=\"step-{n:03}\")  # step {n}");
+        content
+    });
+    let small = root.join("small.txt");
+    let results = [
+        run_tool("write_file", &json!({ "path": path.display().to_string(), "content": content }))
+            .expect("the large file is written"),
+        run_tool("write_file", &json!({ "path": small.display().to_string(), "content": "one\ntwo\n" }))
+            .expect("the small file is written"),
+    ];
+    let _ = fs::remove_dir_all(&root);
+    for (result, lines) in results.iter().zip([264, 2]) {
+        let shown = wire_tool_output(result, "write_file", false, WireRewrite::Full);
+        assert!(
+            shown.starts_with("[write] ") && shown.contains(&format!("· {lines} lines")),
+            "{}",
+            &shown[..shown.len().min(400)]
+        );
+        assert!(shown.len() < 1_000, "one line, not the file twice: {} bytes", shown.len());
+    }
+}
+
+/// An overwrite reads back without the content it was just sent (t-115139
+/// Z3): a 17-line file rewritten to 137 lines came back as its whole diff,
+/// about 270 lines, 137 of them the new content. What it took away stays.
+#[test]
+fn an_overwritten_file_reads_back_without_the_content_it_was_sent() {
+    use runtime::context_compression::{wire_tool_output, WireRewrite};
+    use std::fmt::Write as _;
+    let root = temp_path("write-overwrite");
+    fs::create_dir_all(&root).expect("create root");
+    let path = root.join("port.txt");
+    let old = (1..=17).fold(String::new(), |mut text, n| {
+        let _ = writeln!(text, "old line {n}");
+        text
+    });
+    let new = (1..=137).fold(String::new(), |mut text, n| {
+        let _ = writeln!(text, "new line {n} of the port");
+        text
+    });
+    run_tool("write_file", &json!({ "path": path.display().to_string(), "content": old })).expect("created");
+    let result = run_tool("write_file", &json!({ "path": path.display().to_string(), "content": new }))
+        .expect("overwritten");
+    let _ = fs::remove_dir_all(&root);
+    let shown = wire_tool_output(&result, "write_file", false, WireRewrite::Full);
+    assert!(shown.starts_with("[write] ") && shown.contains("· 137 lines"), "{shown}");
+    assert!(!shown.contains("new line 5 of the port"), "the content just sent is not sent back: {shown}");
+    assert!(shown.contains("old line 5"), "what the overwrite took away stays: {shown}");
+}
+
+/// A write the formatter then changed says so, and does not say its lines are
+/// on disk as sent (t-115139 Z3, the independent review's case): `fn   new(
+/// ){let x=1;}` written over a `.rs` file came back `as sent` and `Formatted
+/// with rustfmt`, like the same function written already formatted, and an
+/// `Edit` made against the sent text then failed.
+#[test]
+fn a_write_the_formatter_changed_says_so_and_not_as_sent() {
+    use runtime::context_compression::{wire_tool_output, WireRewrite};
+    let root = temp_path("write-reformatted");
+    fs::create_dir_all(&root).expect("create root");
+    let (messy, tidy) = (root.join("messy.rs"), root.join("tidy.rs"));
+    for path in [&messy, &tidy] {
+        run_tool("write_file", &json!({ "path": path.display().to_string(), "content": "fn old() {}\n" }))
+            .expect("an existing file");
+    }
+    let (sent_messy, sent_tidy) = ("fn   new( ){let x=1;}\n", "fn new() {\n    let x = 1;\n}\n");
+    let results = [
+        run_tool("write_file", &json!({ "path": messy.display().to_string(), "content": sent_messy }))
+            .expect("the messy function is written"),
+        run_tool("write_file", &json!({ "path": tidy.display().to_string(), "content": sent_tidy }))
+            .expect("the tidy function is written"),
+    ];
+    let on_disk = [&messy, &tidy].map(|path| fs::read_to_string(path).expect("read back"));
+    let _ = fs::remove_dir_all(&root);
+    let [messy_shown, tidy_shown] =
+        results.map(|result| wire_tool_output(&result, "write_file", false, WireRewrite::Full));
+    if !tidy_shown.contains("[auto-format]") {
+        eprintln!("no formatter ran here, nothing to check: {tidy_shown}");
+        return;
+    }
+    assert_ne!(on_disk[0], sent_messy, "rustfmt changed the first file");
+    assert_eq!(on_disk[1], sent_tidy, "and left the second as it was sent");
+    assert!(
+        messy_shown.contains("the text on disk is not the text sent") && messy_shown.contains("Read it before you Edit it"),
+        "{messy_shown}"
+    );
+    assert!(messy_shown.contains("before the formatter changed the file⟩"), "{messy_shown}");
+    assert!(!messy_shown.contains("as sent⟩"), "{messy_shown}");
+    assert!(tidy_shown.contains("+⟨3 lines as sent⟩"), "{tidy_shown}");
+    assert!(!tidy_shown.contains("not the text sent"), "{tidy_shown}");
 }

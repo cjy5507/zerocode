@@ -347,7 +347,7 @@ pub fn compress_tool_output_with(
     // through to `unchanged` and forfeit the compression.
     match CoreTool::of(tool_name) {
         Some(CoreTool::Read) => compress_read_file(raw, rewrite, workspace_root),
-        Some(CoreTool::Bash) => compress_bash(raw),
+        Some(CoreTool::Bash) => compress_bash(raw, rewrite),
         Some(CoreTool::Grep) => compress_grep(raw, workspace_root),
         Some(CoreTool::Glob) => compress_glob(raw, workspace_root),
         // `MultiEdit` returns the same envelope as `edit_file` (`filePath` +
@@ -449,6 +449,21 @@ fn skill_envelope_view(raw: &str) -> Option<String> {
         for skill in skills {
             push_skill(&mut view, skill.as_object()?)?;
         }
+        // A search's lesser matches: a line each, name, reading and what the
+        // skill is for (t-115139 Z4).
+        if let Some(described) = object.get("described").and_then(|v| v.as_array()) {
+            for skill in described {
+                let name = skill.get("skill").and_then(|v| v.as_str())?;
+                let _ = write!(view, "[skill, not loaded] {name}");
+                if let Some(reading) = skill.get("reading").and_then(serde_json::Value::as_f64) {
+                    let _ = write!(view, " · reading {reading:.2}");
+                }
+                if let Some(description) = skill.get("description").and_then(|v| v.as_str()) {
+                    let _ = write!(view, " — {description}");
+                }
+                view.push('\n');
+            }
+        }
         if let Some(others) = object.get("others").and_then(|v| v.as_array()) {
             let names = others.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>();
             if !names.is_empty() {
@@ -482,7 +497,7 @@ fn skill_envelope_view(raw: &str) -> Option<String> {
 
 /// Every key a skill list may carry (`SkillSearchOutput`, `SkillLoadOutput`).
 const SKILL_LIST_KEYS: &[&str] = &[
-    "rankedBy", "outcome", "installed", "skills", "others", "unknown", "note",
+    "rankedBy", "outcome", "installed", "skills", "described", "others", "unknown", "note",
 ];
 /// Every key one skill may carry (`SkillOutput`, `LoadedSkill`).
 const SKILL_KEYS: &[&str] = &[
@@ -604,7 +619,7 @@ fn compress_edit_file(raw: &str) -> CompressionOutcome {
         view.push_str(" · user_modified");
     }
     view.push('\n');
-    render_patch_hunks(&mut view, hunks);
+    render_patch_hunks(&mut view, hunks, AddedLines::Shown);
     append_tool_feedback(&mut view, obj);
     CompressionOutcome::pick_smaller(raw, view)
 }
@@ -616,8 +631,10 @@ fn compress_edit_file(raw: &str) -> CompressionOutcome {
 /// A new file's diff is the echo again: every line of it added. Over 14 days
 /// to 2026-11-05 this machine's conversations carried 588 of those, 2.69M
 /// characters the model had just written itself. A created file keeps only
-/// its header; an overwrite keeps its diff, which says what changed against
-/// an old file the model may not hold.
+/// its header; an overwrite keeps what its diff took away and where, which
+/// the model may not hold, and counts what it added, which is the content
+/// just sent — a 17-line file rewritten to 137 lines came back as the whole
+/// diff, about 270 lines (t-115139 Z3).
 fn compress_write_file(raw: &str) -> CompressionOutcome {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return CompressionOutcome::unchanged(raw);
@@ -643,16 +660,37 @@ fn compress_write_file(raw: &str) -> CompressionOutcome {
     view.push('\n');
     if !created {
         if let Some(patch) = obj.get("structuredPatch").and_then(|v| v.as_array()) {
-            render_patch_hunks(&mut view, patch);
+            // A formatter that changed the file after it was written leaves
+            // the patch's added lines as they were sent, not as they are on
+            // disk (t-115139 Z3 review).
+            let added = if obj.get("reformatted").and_then(serde_json::Value::as_bool) == Some(true) {
+                AddedLines::CountedBeforeTheFormatter
+            } else {
+                AddedLines::Counted
+            };
+            render_patch_hunks(&mut view, patch, added);
         }
     }
     append_tool_feedback(&mut view, obj);
     CompressionOutcome::pick_smaller(raw, view)
 }
 
+/// How a diff's added lines reach the wire.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AddedLines {
+    /// Each as it is: an edit's.
+    Shown,
+    /// Each run as one line that counts it: a write's, whose added lines are
+    /// the content the model just sent.
+    Counted,
+    /// [`Self::Counted`], for a write the formatter then changed on disk:
+    /// the line says the lines are the sent ones, before the formatter.
+    CountedBeforeTheFormatter,
+}
+
 /// Render `structuredPatch` hunks (whose `lines` already carry the
 /// ` `/`-`/`+` prefixes) as unified-diff text.
-fn render_patch_hunks(out: &mut String, hunks: &[serde_json::Value]) {
+fn render_patch_hunks(out: &mut String, hunks: &[serde_json::Value], added: AddedLines) {
     for hunk in hunks {
         let Some(obj) = hunk.as_object() else {
             continue;
@@ -678,14 +716,35 @@ fn render_patch_hunks(out: &mut String, hunks: &[serde_json::Value]) {
             "@@ -{old_start},{old_lines} +{new_start},{new_lines} @@"
         );
         if let Some(lines) = obj.get("lines").and_then(|v| v.as_array()) {
-            for line in lines {
-                if let Some(text) = line.as_str() {
-                    out.push_str(text);
-                    out.push('\n');
+            let mut run = 0_usize;
+            for text in lines.iter().filter_map(serde_json::Value::as_str) {
+                if added != AddedLines::Shown && text.starts_with('+') {
+                    run += 1;
+                    continue;
                 }
+                push_added_run(out, &mut run, added);
+                out.push_str(text);
+                out.push('\n');
             }
+            push_added_run(out, &mut run, added);
         }
     }
+}
+
+/// One line for a run of added lines that are the content just sent — and,
+/// when the formatter changed the file after, that they are the lines before
+/// it, so a later edit is not made against them unread (t-115139 Z3 review).
+fn push_added_run(out: &mut String, run: &mut usize, added: AddedLines) {
+    let lines = std::mem::take(run);
+    if lines == 0 {
+        return;
+    }
+    let noun = if lines == 1 { "line" } else { "lines" };
+    let _ = if added == AddedLines::CountedBeforeTheFormatter {
+        writeln!(out, "+⟨{lines} {noun} as sent, before the formatter changed the file⟩")
+    } else {
+        writeln!(out, "+⟨{lines} {noun} as sent⟩")
+    };
 }
 
 /// Preserve the enrichment feedback (`toolFeedback`: auto-format + LSP
@@ -948,7 +1007,7 @@ fn outline_view(file: &crate::file_ops::TextFilePayload) -> Option<String> {
 // bash
 // ---------------------------------------------------------------------------
 
-fn compress_bash(raw: &str) -> CompressionOutcome {
+fn compress_bash(raw: &str, rewrite: WireRewrite) -> CompressionOutcome {
     let Ok(parsed) = serde_json::from_str::<BashCommandOutput>(raw) else {
         return CompressionOutcome::unchanged(raw);
     };
@@ -956,6 +1015,9 @@ fn compress_bash(raw: &str) -> CompressionOutcome {
     // represent — leave those envelopes intact.
     if parsed.structured_content.is_some() || parsed.is_image == Some(true) {
         return CompressionOutcome::unchanged(raw);
+    }
+    if let Some(view) = dedicated_read_view(&parsed, rewrite) {
+        return CompressionOutcome::pick_smaller(raw, view);
     }
 
     let mut header_notes: Vec<String> = Vec::new();
@@ -988,7 +1050,7 @@ fn compress_bash(raw: &str) -> CompressionOutcome {
         header_notes.push(format!("full output: {path}{size}"));
     }
     if let Some(path) = &parsed.raw_output_path {
-        header_notes.push(format!("raw output: {path}"));
+        header_notes.push(crate::bash::cut_output_note(path));
     }
     if let Some(warning) = &parsed.safety_warning {
         header_notes.push(format!("safety: {warning}"));
@@ -1033,6 +1095,21 @@ fn compress_bash(raw: &str) -> CompressionOutcome {
         view.push_str("(no output)");
     }
     CompressionOutcome::pick_smaller(raw, view)
+}
+
+/// A shell read the runtime answered with a dedicated read (`sed -n 1,80p
+/// x.rs` run as `Read`), shown as that read: the note naming the door, then
+/// the dedicated tool's own view of its result — the text a direct call gets
+/// (t-115139 Z2). Left to the shell's view it came as the read tool's JSON
+/// inside the shell's, every newline two characters on one long line.
+fn dedicated_read_view(parsed: &BashCommandOutput, rewrite: WireRewrite) -> Option<String> {
+    let (command, tool, body) = crate::bash::split_dedicated_read(&parsed.stdout)?;
+    let read = compress_tool_output_with(body, tool.handler(), None, rewrite);
+    Some(format!(
+        "[bash]\n{}\n{}",
+        crate::bash::dedicated_read_note(command, tool.handler()),
+        read.content
+    ))
 }
 
 pub(crate) fn compact_bash_stream(text: &str) -> String {
@@ -2218,8 +2295,9 @@ mod tests {
         assert!(out.compressed_chars < out.original_chars / 5);
     }
 
-    /// An overwrite's diff says what changed against the old file, which the
-    /// model may not hold, so it stays.
+    /// An overwrite's diff says what it took away from the old file, which the
+    /// model may not hold, so that stays; what it added is the content just
+    /// sent, so that is counted (t-115139 Z3).
     #[test]
     fn write_file_over_an_existing_file_keeps_its_diff() {
         let raw = serde_json::to_string_pretty(&serde_json::json!({
@@ -2239,7 +2317,7 @@ mod tests {
         assert!(out
             .content
             .starts_with("[write] /ws/gen.rs · written · 180 lines"));
-        assert!(out.content.contains("-    42\n+    43"), "{}", out.content);
+        assert!(out.content.contains("@@ -2,1 +2,1 @@\n-    42\n+⟨1 line as sent⟩\n"), "{}", out.content);
     }
 
     // --- read_file outline (large code files) ---
@@ -2604,6 +2682,40 @@ mod tests {
         assert!(wired.contains("# TUI design\n\nUse box-drawing characters sparingly.\n"));
         assert!(wired.contains("[others, not loaded] frontend-design, ui-ux-pro-max\n"), "{wired}");
         assert!(wired.contains("[note] word match only\n"), "{wired}");
+    }
+
+    /// A search's lesser matches come as a line each — name, reading, what
+    /// the skill is for — between the skills it loaded and the names it only
+    /// ranked (t-115139 Z4); the envelope never falls back to its JSON.
+    #[test]
+    fn a_skill_search_names_its_lesser_matches_with_their_descriptions() {
+        let raw = pretty(&serde_json::json!({
+            "rankedBy": "fallback",
+            "outcome": "off",
+            "installed": 32,
+            "skills": [{
+                "skill": "rust-anything",
+                "path": "/Users/dev/.agents/skills/rust-anything/SKILL.md",
+                "description": "Port code to Rust.",
+                "origin": "global-zo",
+                "reading": 0.941_176,
+                "prompt": "---\nname: rust-anything\ndescription: Port code to Rust.\n---\n\nProfile first.\n",
+            }],
+            "described": [
+                { "skill": "context-md-builder", "description": "Build CONTEXT.md.", "reading": 0.235_294 },
+                { "skill": "mobile-device", "description": null, "reading": 0.176_470 },
+            ],
+            "others": ["computer-use"],
+        }));
+        let wired = wire_tool_output(&raw, "CapabilityInvoke", false, WireRewrite::Lossless);
+        assert!(wired.starts_with("[skills] ranked by fallback · judgment off · 32 installed · 1 loaded\n"), "{wired}");
+        assert!(
+            wired.contains(
+                "Profile first.\n[skill, not loaded] context-md-builder · reading 0.24 — Build CONTEXT.md.\n\
+                 [skill, not loaded] mobile-device · reading 0.18\n[others, not loaded] computer-use\n"
+            ),
+            "{wired}"
+        );
     }
 
     /// The `Skill` tool's own envelope is one skill, with the arguments the

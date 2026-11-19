@@ -20,6 +20,7 @@ import contextlib
 import hashlib
 import importlib.util
 import io
+import itertools
 import json
 import os
 import re
@@ -51,6 +52,10 @@ CASES = (
 
 CAUGHT = {category: caught for category, caught, _allowed in CASES}
 ALLOWED = {category: allowed for category, _caught, allowed in CASES}
+
+# The line breaks `str.splitlines()` knows and a count of "\n" does not
+# (a lone "\r" never reaches the gate: reading a file as text turns it into "\n").
+SPLITLINES_ONLY = "\v\f\x1c\x1d\x1e\x85\u2028\u2029"
 
 
 def run(root, *args):
@@ -276,6 +281,34 @@ class PiiScan(unittest.TestCase):
         self.checkout.write("waived.txt", f"{caught}  # pii-scan: allow email — wrong row\n")
         self.assertEqual(len(found(self.checkout.root)["home-path"]), 1)
 
+    def test_a_waiver_on_the_findings_line_holds_after_a_break_only_splitlines_knows(self):
+        """A finding's line is counted by `\\n`, and its waiver is read off that same
+        line. `str.splitlines()` also breaks at a form feed, a vertical tab, the
+        file, group and record separators, NEL and the two Unicode separators, so
+        one of those earlier in the file put the waiver a line off (t-115074,
+        reports/rust-anything-166 §8): the gate refused a site that waives itself."""
+        caught = CAUGHT["home-path"]
+        for brk in SPLITLINES_ONLY:
+            with self.subTest(brk=hex(ord(brk))):
+                checkout = Checkout()
+                self.addCleanup(checkout.close)
+                checkout.write("same-line.txt", f"a{brk}b\n{caught}  # pii-scan: allow home-path — why\n")
+                self.assertEqual(pii_scan.scan(checkout.root)["home-path"], [])
+
+    def test_a_waiver_two_lines_above_does_not_hold_after_a_break_only_splitlines_knows(self):
+        """The other half of the same slip, and the one that let a value through: a
+        waiver two lines above the finding was read as the line above it."""
+        caught = CAUGHT["home-path"]
+        for brk in SPLITLINES_ONLY:
+            with self.subTest(brk=hex(ord(brk))):
+                checkout = Checkout()
+                self.addCleanup(checkout.close)
+                checkout.write(
+                    "two-below.txt", f"a{brk}b\n# pii-scan: allow home-path — why\nunrelated\n{caught}\n"
+                )
+                hits = pii_scan.scan(checkout.root)["home-path"]
+                self.assertEqual([(h["path"], h["line"]) for h in hits], [("two-below.txt", 4)], hits)
+
     # --- what the recipe sees ----------------------------------------------
 
     def test_a_clean_checkout_is_rc_0_and_a_dirty_one_is_rc_1(self):
@@ -456,6 +489,234 @@ class PiiScan(unittest.TestCase):
         windows = {"USERNAME": "acme", "USERPROFILE": "C:\\Users\\acme-old", "USER": "root", "HOME": "/tmp/gate-home"}
         with mock.patch.object(pii_scan, "pwd", None), mock.patch.dict(os.environ, windows):
             self.assertEqual(pii_scan.machine_accounts(), ("acme", "acme-old"))
+
+
+# --- one corpus over every pattern the gate runs -------------------------------
+#
+# The 2026-11-19 measurement of this gate (t-115074, reports/rust-anything-166)
+# counts thirteen patterns it runs: each row's `find` and `allow` (eight),
+# home-path's `allow` read without case for the account (`account_forgiven`),
+# `TOKEN`, `ACCOUNT_ALLOW`, `account_finder` and `WAIVER`. The corpus gives each
+# one a value it takes and one it passes over, and every alternative of every
+# `find` a value of its own, so a change that leaves a file or a word unread
+# shows here as a finding gone missing, and one that reads too much as a finding
+# too many. Every value is fictional, and the caught ones are assembled where the
+# corpus is written: this file carries none of them whole.
+CORPUS_ACCOUNTS = ("acme", "DEV", "RunnerAdmin", "runner2")  # two looked for; home-path forgives one, ACCOUNT_ALLOW one
+CORPUS_WORDS = ("gizmo", "frobozz")  # a banished word of each length the shipped table hashes
+
+
+def dotted(*octets):
+    """An address written from its parts, so this file never spells it whole."""
+    return ".".join(str(octet) for octet in octets)
+
+
+def corpus():
+    """The corpus's files, and every finding the gate reads off them, in the order it reports them."""
+    home = CAUGHT["home-path"]
+    name = home.rsplit("/", 1)[-1]
+    domain = CAUGHT["email"].split("@", 1)[1]
+    s, b = "/", "\\"
+    body = "Qz7Rk2Wm9Lp4"  # twelve characters that spell no word a row's `allow` forgives
+    keys = (  # one per alternative of the credential row's `find`, in its order
+        "sk-ant-" + "api03-" + body * 2,
+        "sk-proj-" + body * 2,
+        "gh" + "p_" + body * 3,
+        "github_" + "pat_" + body * 5,
+        CAUGHT["credential"],
+        "xox" + "b-" + body * 2,
+        "AI" + "za" + (body * 3)[:35],
+        "GOCSPX" + "-" + body * 2,
+        "ya29" + "." + body * 3,
+    )
+    pem_head = "-----BEGIN " + "RSA PRIVATE KEY-----"
+    pem_body = "\n".join("MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC1" for _ in range(3))
+    files = {
+        "account.txt": (
+            "the account was acme and ACME@h and /srv/acme/x acme-kim acme_home\n"
+            "runner2 ran\n"
+            "misses acmes xacme acme7 9acme runner RunnerAdmin dev DEV runner22\n"
+        ),
+        "home.txt": (
+            f"path {home}{s}x\n"
+            f"win C:{b}Users{b}{name}{b}y\n"
+            f'rust "C:{b}{b}Users{b}{b}{name}"\n'
+            f"quoted `Users{s}{name}{s}Desktop`\n"
+            f"slug -Users-{name}-proj\n"
+            f"placeholders {s}Users{s}dev {b}Users{b}pi Users-you {s}Users{s}dev.local\n"
+            f"near {s}Users{s}devops\n"
+            f"misses AllUsers{s}{name} Users:{name} {s}Users{s} the Users table\n"
+        ),
+        "ip.txt": (
+            f"hosts {dotted(10, 99, 44, 7)} and {dotted(172, 20, 9, 9)} and {dotted(192, 168, 77, 5)}\n"
+            "allowed 10.0.0.5 10.1.2.3 172.16.0.1 192.168.1.20\n"
+            f"near {dotted(172, 16, 0, 2)}\n"
+            "misses 172.15.0.1 110.99.44.7 10.1.2 version 10.4 192.169.1.1\n"
+        ),
+        "keys.txt": "".join(f"{key}\n" for key in keys) + f"{pem_head}\n{pem_body}\n" + (
+            "short AKIA" + "Q7RVBNMLKJHGFDS\n"
+            "header -----BEGIN PRIVATE KEY----- and no body\n"
+            "forgiven AKIAIOSFODNN7EXAMPLE gh" + "p_" + "x" * 36 + "\n"
+        ),
+        "mail.txt": (
+            f"write to chief@{domain}\n"
+            "allowed one@example.com ONE@EXAMPLE.ORG git@github.com icon@2x.png\n"
+            "misses user@localhost a@b @mention name@host.c\n"
+        ),
+        # No shape row's literal stands in this file: the banished and account rows still read it.
+        "plain.txt": "a gizmo by acme\n",
+        "ui/vendor/lib.js": f"/* by chief@{domain}, acme, {dotted(10, 99, 44, 8)} */\n",
+        "waived.txt": (
+            f"{home}  # pii-scan: allow home-path — on its own line\n"
+            "# pii-scan:allow  home-path — the line below\n"
+            f"{home}\n"
+            f"{home}  # pii-scan: allow email — another row\n"
+            "# pii-scan: allow home-path — two lines above\n"
+            "unrelated\n"
+            f"{home}\n"
+            f"{home}  # pii-scan allow home-path — no colon\n"
+        ),
+        "words.txt": (
+            "a gizmo here and GIZMO there\n"
+            "frobozz/x and 7gizmo and gizmo_x\n"
+            + "a" * 32 + "gizmo\n"  # TOKEN takes 32 characters at most: the five after them are a word
+            "misses gizmos xgizmo gizmo7 " + "a" * 31 + "gizmo frobozzz\n"
+        ),
+    }
+    expected = [
+        ("home-path", "home.txt", 1, home),
+        ("home-path", "home.txt", 2, f"{b}Users{b}{name}"),
+        ("home-path", "home.txt", 3, f"{b}{b}Users{b}{b}{name}"),
+        ("home-path", "home.txt", 4, f"Users{s}{name}"),
+        ("home-path", "home.txt", 5, f"Users-{name}"),
+        ("home-path", "home.txt", 7, f"{s}Users{s}devops"),
+        ("home-path", "waived.txt", 4, home),
+        ("home-path", "waived.txt", 7, home),
+        ("home-path", "waived.txt", 8, home),
+        ("private-ip", "ip.txt", 1, dotted(10, 99, 44, 7)),
+        ("private-ip", "ip.txt", 1, dotted(172, 20, 9, 9)),
+        ("private-ip", "ip.txt", 1, dotted(192, 168, 77, 5)),
+        ("private-ip", "ip.txt", 3, dotted(172, 16, 0, 2)),
+        ("private-ip", "ui/vendor/lib.js", 1, dotted(10, 99, 44, 8)),
+        ("email", "mail.txt", 1, f"chief@{domain}"),
+        # A finding is shown in at most 60 characters: 57 and an ellipsis past that.
+        *(("credential", "keys.txt", line, key if len(key) <= 60 else key[:57] + "…") for line, key in enumerate(keys, start=1)),
+        ("credential", "keys.txt", len(keys) + 1, f"{pem_head}\\n{pem_body[:25]}…"),
+        (pii_scan.BANISHED_NAME, "plain.txt", 1, "gizmo"),
+        (pii_scan.BANISHED_NAME, "words.txt", 1, "gizmo"),
+        (pii_scan.BANISHED_NAME, "words.txt", 1, "GIZMO"),
+        (pii_scan.BANISHED_NAME, "words.txt", 2, "frobozz"),
+        (pii_scan.BANISHED_NAME, "words.txt", 2, "gizmo"),
+        (pii_scan.BANISHED_NAME, "words.txt", 2, "gizmo"),
+        (pii_scan.BANISHED_NAME, "words.txt", 3, "gizmo"),
+        *((pii_scan.ACCOUNT_NAME, "account.txt", 1, pii_scan.ACCOUNT_SHOWN),) * 5,
+        (pii_scan.ACCOUNT_NAME, "account.txt", 2, pii_scan.ACCOUNT_SHOWN),
+        (pii_scan.ACCOUNT_NAME, "plain.txt", 1, pii_scan.ACCOUNT_SHOWN),
+    ]
+    return files, expected
+
+
+class Corpus(unittest.TestCase):
+    """The corpus above, read by the gate as it stands."""
+
+    def setUp(self):
+        self.files, self.expected = corpus()
+        self.checkout = Checkout()
+        self.addCleanup(self.checkout.close)
+        for path, text in self.files.items():
+            self.checkout.write(path, text)
+
+    def scan(self):
+        """The gate over the corpus, with its fictional accounts and banished words."""
+        table = tuple((len(word), hashlib.sha256(word.encode()).hexdigest()) for word in CORPUS_WORDS)
+        with account(*CORPUS_ACCOUNTS), mock.patch.object(pii_scan, "BANISHED", table):
+            return pii_scan.scan(self.checkout.root)
+
+    def test_every_pattern_takes_its_value_and_passes_over_its_neighbour(self):
+        """Each finding the corpus holds, in the gate's order, and not one more."""
+        found = self.scan()
+        self.assertEqual(
+            [(category, hit["path"], hit["line"], hit["text"]) for category in pii_scan.categories() for hit in found[category]],
+            self.expected,
+        )
+
+    def test_the_two_shortcuts_find_what_the_plain_loop_finds(self):
+        """`needles` lets a row pass over a text that holds none of them, and
+        `banished_reader` lets a file's words pass the hash once seen. With both
+        off the scan is the loop it was before them — every row over every text,
+        every word hashed — and the corpus reads the same either way, while the
+        banished offsets are looked for only in the two files that hold one."""
+        with mock.patch.object(pii_scan, "banished_words", wraps=pii_scan.banished_words) as read:
+            fast = self.scan()
+        self.assertEqual(read.call_count, 2, "only plain.txt and words.txt hold a banished word")
+        with mock.patch.object(pii_scan, "needles", return_value=None), \
+                mock.patch.object(pii_scan, "banished_reader", return_value=lambda text: True):
+            plain = self.scan()
+        self.assertEqual(fast, plain)
+
+
+# Small patterns over a four-letter alphabet, one for each thing `needles` must
+# read right, with what each exercises. Two of them can be read for nothing.
+NEEDLE_PATTERNS = (
+    (r"ab|ac", "a prefix the parser hoists out of the alternatives"),
+    (r"a(?:bc)?-", "an optional group"),
+    (r"(?:ab){2,3}c", "a bounded repeat"),
+    (r"[ab]c|-[bc]", "a class on either side"),
+    (r"\bab\b", "word boundaries"),
+    (r"a(?=b)|c(?!a)-", "look-aheads"),
+    (r"(?<=a)bc|(?<!a)b-", "look-behinds"),
+    (r"(a|b)\1c", "a back-reference"),
+    (r"(?:ab|)c", "an empty alternative inside a group"),
+    (r"a+?b", "a lazy repeat"),
+    (r"(?:a-|b)+c", "a repeated branch"),
+    (r"-?a{0,2}b", "parts that may match nothing"),
+    (r"a.c", "any character"),
+    (r"(?i:a)b", "a part read without case"),
+    (r"(?:(?:ab|ba)c)+-", "nested groups"),
+    (r"ab|", "an empty alternative: it matches nothing, so nothing is required"),
+    (r"(?i)ab", "a pattern read without case: no needle is safe"),
+)
+NEEDLE_PATTERNS_UNREAD = {r"ab|", r"(?i)ab"}
+
+
+class Needles(unittest.TestCase):
+    """`needles`, held to the regex engine: a wrong needle would leave a value unread."""
+
+    def test_every_match_the_engine_makes_holds_a_needle(self):
+        """Every string over `abc-` up to seven long, every start in it: each match
+        the engine makes holds one of its pattern's needles, or the pattern has none."""
+        texts = ["".join(chars) for length in range(8) for chars in itertools.product("abc-", repeat=length)]
+        for pattern, why in NEEDLE_PATTERNS:
+            find = re.compile(pattern)
+            held = pii_scan.needles(find)
+            with self.subTest(pattern=pattern, why=why):
+                if pattern in NEEDLE_PATTERNS_UNREAD:
+                    self.assertIsNone(held)
+                    continue
+                self.assertTrue(held, "read for nothing: every text would be searched")
+                matched = 0
+                for text in texts:
+                    for start in range(len(text) + 1):
+                        hit = find.match(text, start)
+                        if hit is None:
+                            continue
+                        matched += 1
+                        self.assertTrue(any(needle in hit.group(0) for needle in held), (text, start, hit.group(0), held))
+                self.assertTrue(matched, "the alphabet never matches it, so it proves nothing")
+
+    def test_every_shipped_row_is_read_for_its_needles(self):
+        """Every row of the table gets needles on this interpreter — a row without
+        any is searched in every file, the 12 s of CPU this gate used to take — and
+        every match of a row in the corpus holds one of them."""
+        files, _expected = corpus()
+        for category, _says, find, _allow, _skip in pii_scan.rows():
+            held = pii_scan.needles(find)
+            with self.subTest(category=category):
+                self.assertTrue(held, "read for nothing: every file is searched for this row")
+                matches = [hit.group(0) for text in files.values() for hit in find.finditer(text)]
+                self.assertTrue(matches)
+                for match in matches:
+                    self.assertTrue(any(needle in match for needle in held), (match, held))
 
 
 if __name__ == "__main__":

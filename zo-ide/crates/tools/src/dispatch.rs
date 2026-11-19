@@ -21,7 +21,7 @@ use std::time::Duration;
 use runtime::{
     context_compression::compress_tool_output,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    truncate_tool_output, TruncationConfig,
+    truncate_tool_output, TruncatedOutput, TruncationConfig,
 };
 use runtime::ToolExecutionResult;
 use serde::Deserialize;
@@ -383,7 +383,8 @@ pub(crate) fn finish_successful_tool_output(
     // byte; that — not the capped envelope — is what the artifact keeps and
     // what the fold reads, so the middle the cap dropped is neither lost to
     // `retrieve_tool_output` nor invisible to the digester.
-    let raw_spill = raw_bash_output(canonical_ref, &enriched);
+    let spill = bash_spill_path(canonical_ref, &enriched);
+    let raw_spill = spill.as_deref().and_then(read_spill);
 
     // Compute the model-facing compressed/outline view first: it is what
     // bounds the wire size for JSON-envelope tools (read_file) whose raw
@@ -393,15 +394,24 @@ pub(crate) fn finish_successful_tool_output(
         canonical_ref,
         ctx.workspace_root.as_deref().or(ctx.cwd.as_deref()),
     );
-    let truncated = truncate_tool_output(&enriched, canonical_ref, global_truncation_config());
+    let kept_whole = echoes_what_was_sent(canonical_ref)
+        && compressed.was_compressed
+        && compressed.content.chars().count() <= global_truncation_config().limit_for(canonical_ref);
+    let truncated = if kept_whole {
+        TruncatedOutput { content: enriched.clone(), was_truncated: false, original_len: enriched.chars().count() }
+    } else {
+        truncate_tool_output(&enriched, canonical_ref, global_truncation_config())
+    };
     // A JSON-envelope tool (read_file) is exempt from raw-envelope truncation,
     // so `was_truncated` is always false for it even when the output is huge.
     // We must still preserve the full bytes as an artifact in that case so the
     // model can recover them via `retrieve_tool_output`. Treat any output that
     // exceeds the global ceiling as "oversized" for artifact purposes, even
     // when the structural rewrite did not happen to save enough to flip
-    // `was_compressed`.
-    let oversized = truncated.original_len > global_truncation_config().default_max_chars;
+    // `was_compressed`. An envelope kept whole withholds nothing: its view
+    // drops only what the model sent. The ceiling is the tool's own: a skill
+    // chosen by name fits whole under its 50,000 chars (t-115139 Z7).
+    let oversized = !kept_whole && truncated.original_len > global_truncation_config().limit_for(canonical_ref);
     // Phase-4: transformed output keeps its full pre-transform content as a
     // content-addressed artifact (best-effort) so it stays recoverable without
     // rendering raw bytes without bound into the transcript. The `None`
@@ -427,7 +437,8 @@ pub(crate) fn finish_successful_tool_output(
                 global_truncation_config().limit_for(canonical_ref),
             )
         })
-        .flatten();
+        .flatten()
+        .map(|folded| naming_the_whole_output(folded, spill.as_deref()));
     let mut content = digest.unwrap_or(truncated.content);
     // CCR retrieve half: tell the model how to get the cut bytes back. Only
     // when the artifact actually persisted — a store failure must not
@@ -466,18 +477,48 @@ pub(crate) fn finish_successful_tool_output(
     content
 }
 
-/// The whole output of a `bash` run whose streams outgrew the in-memory cap,
-/// read from the spill file its envelope names (`rawOutputPath`). `None` for
-/// every other tool, for a run that fit, and for a spill that is already gone.
-fn raw_bash_output(canonical_ref: &str, enriched: &str) -> Option<String> {
+/// The file tools whose result echoes what the model sent — a write's content
+/// and a patch adding every line of it, an edit's strings and its patch —
+/// and whose view on the wire is a header and the diff.
+///
+/// Such an envelope is kept whole when that view fits the cap (t-115139 Z3).
+/// Cut at the cap like any text, it lost its JSON shape in the middle, the
+/// wire could not read it, and a 264-line file written once came back to the
+/// model twice — 30,187 chars where a smaller write gets one line (12 of 184
+/// writes and 8 of 1,828 edits in a week of this machine's sessions).
+fn echoes_what_was_sent(canonical_ref: &str) -> bool {
+    use core_types::tool_names::CoreTool;
+    matches!(CoreTool::of(canonical_ref), Some(CoreTool::Write | CoreTool::Edit | CoreTool::MultiEdit))
+}
+
+/// The spill file a `bash` run whose streams outgrew the in-memory cap names
+/// (`rawOutputPath`), holding every byte of it. `None` for every other tool
+/// and for a run that fit.
+fn bash_spill_path(canonical_ref: &str, enriched: &str) -> Option<String> {
     if canonical_ref != "bash" {
         return None;
     }
-    let parsed: runtime::BashCommandOutput = serde_json::from_str(enriched).ok()?;
-    let path = parsed.raw_output_path?;
+    serde_json::from_str::<runtime::BashCommandOutput>(enriched).ok()?.raw_output_path
+}
+
+/// The whole output a spill holds; `None` for one that is already gone.
+fn read_spill(path: &str) -> Option<String> {
     std::fs::read(path)
         .ok()
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// A fold of a run past the in-memory cap, under a line naming the file
+/// that holds every byte of it and the tool that reads it (t-115139 Z1). The
+/// fold says how many lines it kept and not where the rest are, so a `cat`
+/// of seven files folded to one file's twelve lines left the model guessing
+/// what was missing; the cut it stands in for names the file on its first
+/// line.
+fn naming_the_whole_output(folded: String, spill: Option<&str>) -> String {
+    match spill {
+        Some(path) => format!("[bash] {}\n{folded}", runtime::whole_output_pointer(path)),
+        None => folded,
+    }
 }
 
 fn recovery_notice(sha256: &str) -> String {
@@ -560,10 +601,31 @@ fn maybe_enrich_file_tool_result(
         _ => return raw_output,
     };
     let mut enrichments = Vec::new();
+    let mut reformatted = false;
     for path in &paths {
-        enrich_written_file(ctx, &path.to_string_lossy(), &mut enrichments);
+        reformatted |= enrich_written_file(ctx, &path.to_string_lossy(), &mut enrichments);
     }
-    fold_enrichment_into_output(raw_output, &enrichments)
+    let output = fold_enrichment_into_output(raw_output, &enrichments);
+    if reformatted {
+        mark_reformatted(output)
+    } else {
+        output
+    }
+}
+
+/// Mark a write's JSON envelope whose file the formatter changed after it was
+/// written (`reformatted`), so its view does not say the file holds what was
+/// sent (t-115139 Z3 review): `fn   new( ){let x=1;}` written to a `.rs` came
+/// back `as sent` and `Formatted with rustfmt`, like the same function written
+/// already formatted, and an `Edit` made against the sent text failed.
+fn mark_reformatted(output: String) -> String {
+    match serde_json::from_str::<serde_json::Value>(&output) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            map.insert("reformatted".to_string(), serde_json::Value::Bool(true));
+            serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or(output)
+        }
+        _ => output,
+    }
 }
 
 /// The files a successful `apply_patch` left on disk (`files[].filePath`,
@@ -584,7 +646,10 @@ fn patched_file_paths(raw_output: &str) -> Vec<std::path::PathBuf> {
 }
 
 /// Auto-format and LSP diagnostics for one file a write tool just wrote.
-fn enrich_written_file(ctx: &ToolContext, path: &str, enrichments: &mut Vec<String>) {
+/// True when the formatter changed the file's bytes: what is on disk is then
+/// not the text the tool was sent.
+fn enrich_written_file(ctx: &ToolContext, path: &str, enrichments: &mut Vec<String>) -> bool {
+    let mut reformatted = false;
     // Auto-format rewrites the file in place. While an instrumentation probe is
     // staged (debugger debug-mode), skip it: a reformat (e.g. rustfmt re-indenting
     // or line-splitting a column-0 `/*ZO_PROBE*/` line) would shift the probe's
@@ -594,11 +659,21 @@ fn enrich_written_file(ctx: &ToolContext, path: &str, enrichments: &mut Vec<Stri
     // debugger sub-agent can stage probes, so the main session is unaffected. LSP
     // diagnostics below only READ the file, so they still run.
     if !file_has_staged_probe(ctx) {
+        let written = runtime::auto_format::formatter_for_path(Path::new(path)).and_then(|_| std::fs::read(path).ok());
         if let Some(fmt_result) = runtime::auto_format::format_file_with_timeout(
             path,
             Duration::from_millis(AUTO_FORMAT_BUDGET_MS),
         ) {
-            enrichments.push(format!("[auto-format] {fmt_result}"));
+            reformatted = written.is_some() && std::fs::read(path).ok() != written;
+            if reformatted {
+                enrichments.push(format!(
+                    "[auto-format] {fmt_result}: it changed the file, so the text on disk is not the text sent — {} it before you {} it",
+                    core_types::tool_names::CoreTool::Read.wire(),
+                    core_types::tool_names::CoreTool::Edit.wire(),
+                ));
+            } else {
+                enrichments.push(format!("[auto-format] {fmt_result}"));
+            }
             // 포맷터가 방금 파일을 재작성했다 — write/edit 성공 시점에 기록된
             // read-registry 스냅샷이 즉시 stale해지므로 여기서 재기록한다.
             // 이 재기록이 없으면 다음 edit_file마다 거짓 "외부 변경" 거부 →
@@ -636,6 +711,7 @@ fn enrich_written_file(ctx: &ToolContext, path: &str, enrichments: &mut Vec<Stri
             ));
         }
     }
+    reformatted
 }
 
 /// Attach `enrichments` (auto-format / LSP feedback) to a tool's `raw_output`
@@ -1620,5 +1696,30 @@ mod auto_format_guard_tests {
             }
         }
         let _ = std::fs::remove_dir_all(&artifact_dir);
+    }
+}
+
+#[cfg(test)]
+mod whole_output_tests {
+    use super::{bash_spill_path, naming_the_whole_output};
+
+    /// A fold of a cut run opens on the file holding all of it and the tool
+    /// that reads it (t-115139 Z1); a fold of anything else is left as it is.
+    #[test]
+    fn a_fold_of_a_cut_run_names_the_whole_output_first() {
+        let envelope = serde_json::json!({ "stdout": "head", "stderr": "", "rawOutputPath": "/tmp/zo-bash-raw/1-2-3.log", "interrupted": false })
+            .to_string();
+        let folded = "[digest] fast-model read 468 lines (16716 chars) of bash output and kept 12 verbatim; ⋯ marks omitted runs.\n# README";
+        let spill = bash_spill_path("bash", &envelope);
+        let named = naming_the_whole_output(folded.to_string(), spill.as_deref());
+        assert_eq!(
+            named.lines().next(),
+            Some("[bash] whole output: /tmp/zo-bash-raw/1-2-3.log — Read it with offset/limit"),
+            "{named}"
+        );
+        assert!(named.ends_with(folded), "{named}");
+        assert_eq!(bash_spill_path("grep_search", &envelope), None);
+        let fit = serde_json::json!({ "stdout": "short", "stderr": "", "rawOutputPath": null, "interrupted": false }).to_string();
+        assert_eq!(naming_the_whole_output(folded.to_string(), bash_spill_path("bash", &fit).as_deref()), folded);
     }
 }

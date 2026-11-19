@@ -28,7 +28,7 @@ zo line run  [--what <words>] [--task <t-id>] [--first | --last] [--solo] [--qui
              [--owner <name>] -- <command...>
 zo line add  (the same flags) [--notify <address>] -- <command...>
 zo line wait <job>
-zo line list [--all]
+zo line list [--all] [--history]
 zo line log <job>
 zo line retry <job> · zo line withdraw <job> · zo line front <job> · zo line stop <job>
 zo line pause [--until-build <build>] [--why <words>] · zo line resume
@@ -48,7 +48,10 @@ zo line forget <job> · zo line restore <job>
   end is told to --notify through the ledger; `wait` waits for an added job's
   end and exits as its command did. A put whose command outran that cap last
   time is warned; a job the line ends (its cap, a stop) says so as its log's
-  last line. Records live under zo's home (line/).
+  last line. `list` shows this project's waiting and running jobs and the ten
+  that ended last, and counts the older ones; --history lists every job of
+  this project, --all every job of every project. `wait <job>` on a job that
+  has ended exits with its code too. Records live under zo's home (line/).
 ";
 
 /// How often a waiting job looks for its turn, and a running one for a stop.
@@ -88,7 +91,7 @@ enum Verb {
     Run(Put),
     Add(Put),
     Wait(String),
-    List { all: bool },
+    List { all: bool, history: bool },
     Log(String),
     Retry(String),
     Withdraw(String),
@@ -117,11 +120,17 @@ fn parse(args: &[String]) -> Result<Verb, String> {
             if verb == "run" { Verb::Run(put) } else { Verb::Add(put) }
         }
         "wait" => Verb::Wait(one("wait")?),
-        "list" => match rest {
-            [] => Verb::List { all: false },
-            [all] if all == "--all" => Verb::List { all: true },
-            _ => return Err(format!("unknown argument for `zo line list`\n\n{USAGE}")),
-        },
+        "list" => {
+            let (mut all, mut history) = (false, false);
+            for flag in rest {
+                match flag.as_str() {
+                    "--all" => all = true,
+                    "--history" => history = true,
+                    _ => return Err(format!("unknown argument for `zo line list`\n\n{USAGE}")),
+                }
+            }
+            Verb::List { all, history }
+        }
         "log" => Verb::Log(one("log")?),
         "retry" => Verb::Retry(one("retry")?),
         "withdraw" => Verb::Withdraw(one("withdraw")?),
@@ -234,7 +243,7 @@ pub fn run(args: &[String], cwd: &Path) -> Result<Ended, String> {
             put_receipt(&line, &job, json!({ "job": job.id, "place": places.get(&job.id) }))
         }
         Verb::Wait(id) => run_job(&line, &machine, &id, false).map(Ended::Ran),
-        Verb::List { all } => list(&line, cwd, all),
+        Verb::List { all, history } => listing(&line, cwd, all, history),
         Verb::Log(id) => log_tail(&line, &id),
         Verb::Retry(id) => {
             let old = line.job(&id).map_err(|error| error.to_string())?;
@@ -856,18 +865,40 @@ const fn state_word(state: JobState) -> &'static str {
     }
 }
 
-/// `zo line list`: this project's jobs (every project's with `--all`), each
-/// waiting one with its place.
-fn list(line: &Line, cwd: &Path, all: bool) -> Result<Ended, String> {
+/// How many of the jobs that ended a list shows unasked: the last ones, where
+/// a script finds the code of the job it just waited on.
+const LIST_ENDED_SHOWN: usize = 10;
+
+/// `zo line list`: this project's jobs that wait or run, each waiting one
+/// with its place, and the ten that ended last; the older ended ones are
+/// counted (t-115139 Z6). An agent asks the line whether it is busy or how
+/// its job ended, and the project's whole history came back — 399 jobs,
+/// 245 KB of one-line JSON a shell result cut. `--history` lists every job
+/// of this project, and `--all` every job of every project as it always has:
+/// a script finds an old job's code there by its id (the independent review).
+fn listing(line: &Line, cwd: &Path, all: bool, history: bool) -> Result<Ended, String> {
+    let history = history || all;
     let project = project_of(cwd);
     let jobs = line.jobs();
     let places = line::places(&jobs, &|owner| line.last_end(owner), line.turn());
-    let shown: Vec<serde_json::Value> = jobs
+    let ours: Vec<&Job> = jobs.iter().filter(|job| all || job.project == project).collect();
+    let mut ended: Vec<&Job> = ours.iter().copied().filter(|job| job.state.ended()).collect();
+    ended.sort_by_key(|job| std::cmp::Reverse(job.ended_ms.unwrap_or(job.queued_ms)));
+    let older = if history { 0 } else { ended.len().saturating_sub(LIST_ENDED_SHOWN) };
+    let last_ended: Vec<&str> = ended.iter().take(LIST_ENDED_SHOWN).map(|job| job.id.as_str()).collect();
+    let shown: Vec<serde_json::Value> = ours
         .iter()
-        .filter(|job| all || job.project == project)
+        .filter(|job| history || !job.state.ended() || last_ended.contains(&job.id.as_str()))
         .map(|job| json!({ "job": job, "place": places.get(&job.id) }))
         .collect();
-    said(&json!({ "paused": line.pause(), "jobs": shown }))
+    let mut answer = json!({ "paused": line.pause(), "jobs": shown });
+    if older > 0 {
+        answer["olderEndedJobs"] = json!(older);
+        answer["note"] = json!(format!(
+            "{older} older ended jobs are not listed; `zo line list --history` lists every job, `zo line wait <job>` exits with one's code"
+        ));
+    }
+    said(&answer)
 }
 
 /// `zo line log <job>`: the log's last lines.
@@ -1313,5 +1344,90 @@ mod tests {
         assert_eq!(run_job(&line, &machine, &job.id, false), Ok(0));
         let left: Vec<_> = std::fs::read_dir(slots.join("targets")).expect("the folders' folder").collect();
         assert!(left.is_empty(), "both idle slots' folders went: {left:?}");
+    }
+
+    /// `zo line list` answers what an agent asks it — is the line busy, how
+    /// did my job end — and not the project's whole history (t-115139 Z6):
+    /// 399 jobs came back as 245 KB of one-line JSON. The waiting and running
+    /// jobs and the ten that ended last are listed; the older ones are counted.
+    #[cfg(unix)]
+    #[test]
+    fn a_list_shows_the_live_jobs_and_the_last_ended_and_counts_the_rest() {
+        let home = tempfile::tempdir().expect("a zo home");
+        let cwd = tempfile::tempdir().expect("a folder");
+        let line = Line::at(home.path());
+        line.make().expect("folders");
+        let mut ended = Vec::new();
+        for n in 0..14_i64 {
+            let job = put(&line, cwd.path(), &format!("w-{n}"), &["true"]);
+            change(&line, &job.id, |record| {
+                record.state = JobState::Passed;
+                record.rc = Some(0);
+                record.ended_ms = Some(1_000 + n);
+                Ok(())
+            })
+            .expect("ended");
+            ended.push(job.id);
+        }
+        let waiting = put(&line, cwd.path(), "w-live", &["true"]);
+        let Ok(Ended::Said(text)) = listing(&line, cwd.path(), false, false) else {
+            panic!("a listing");
+        };
+        let listed: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let ids: Vec<&str> = listed["jobs"]
+            .as_array()
+            .expect("jobs")
+            .iter()
+            .filter_map(|row| row["job"]["id"].as_str())
+            .collect();
+        assert_eq!(ids.len(), 11, "the waiting job and the ten that ended last: {ids:?}");
+        assert!(ids.contains(&waiting.id.as_str()), "{ids:?}");
+        assert!(ended[4..].iter().all(|id| ids.contains(&id.as_str())), "{ids:?}");
+        assert_eq!(listed["olderEndedJobs"], 4, "the older ones are counted: {listed}");
+        assert_eq!(listed["paused"], serde_json::Value::Null, "{listed}");
+    }
+
+    /// `zo line list --all` still lists every job of every project (t-115139
+    /// Z6, the independent review's case): a script finds an old job's code
+    /// there by its id, and the list of ten ended jobs left out the one that
+    /// ended with 7. This project's own list says how to reach that code.
+    #[cfg(unix)]
+    #[test]
+    fn a_list_of_every_project_still_holds_every_ended_job() {
+        let home = tempfile::tempdir().expect("a zo home");
+        let (one, two) = (tempfile::tempdir().expect("a folder"), tempfile::tempdir().expect("another"));
+        let line = Line::at(home.path());
+        line.make().expect("folders");
+        let mut ids = Vec::new();
+        for n in 0..16_i64 {
+            let cwd = if n < 12 { one.path() } else { two.path() };
+            let job = put(&line, cwd, &format!("w-{}", n % 4), &["true"]);
+            change(&line, &job.id, |record| {
+                record.state = if n == 0 { JobState::Failed } else { JobState::Passed };
+                record.rc = Some(if n == 0 { 7 } else { 0 });
+                record.ended_ms = Some(1_000 + n);
+                Ok(())
+            })
+            .expect("ended");
+            ids.push(job.id);
+        }
+        let Ok(Ended::Said(text)) = listing(&line, one.path(), true, false) else {
+            panic!("a listing");
+        };
+        let every: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let rows = every["jobs"].as_array().expect("jobs");
+        assert_eq!(rows.len(), 16, "every job of both projects: {every}");
+        let first = rows.iter().find(|row| row["job"]["id"] == ids[0].as_str()).expect("the oldest job is listed");
+        assert_eq!(first["job"]["rc"], 7, "{first}");
+        assert!(every.get("olderEndedJobs").is_none(), "{every}");
+
+        let Ok(Ended::Said(text)) = listing(&line, one.path(), false, false) else {
+            panic!("a listing");
+        };
+        let ours: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(ours["olderEndedJobs"], 2, "{ours}");
+        let note = ours["note"].as_str().expect("a note");
+        assert!(note.contains("zo line wait <job>") && note.contains("--history"), "{note}");
+        assert!(USAGE.contains("--all every job of every project"), "{USAGE}");
     }
 }
