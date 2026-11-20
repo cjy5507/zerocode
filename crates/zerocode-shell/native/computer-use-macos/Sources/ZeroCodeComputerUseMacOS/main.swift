@@ -1371,6 +1371,10 @@ final class Provider {
     /// still moving. Waiting holds no turn on the hand, and the control is read
     /// again once the turn is held.
     private func waitUntilActionable(method: String, params: [String: JSONValue]) throws {
+        if method == "click", try optionalInteger(params, "elementIndex") == nil {
+            waitForWebPressByReading(params)
+            return
+        }
         guard ["click", "performSecondaryAction", "setValue"].contains(method),
               let index = try optionalInteger(params, "elementIndex"),
               let cached = try cachedSnapshot(params: params),
@@ -1412,16 +1416,56 @@ final class Provider {
     }
 
     /// A web view offers a control's press only once its tree has settled, some seconds
-    /// after it was switched on. Holds up this app's lane alone.
-    private func waitForWebPress(_ record: ElementRecord, pid: pid_t) {
+    /// after it was switched on. Holds up this app's lane alone. Answers the control's
+    /// actions as last read while it waited, or nil when it read none.
+    @discardableResult
+    private func waitForWebPress(_ record: ElementRecord, pid: pid_t) -> [String]? {
+        guard BackgroundInput.pressableRoles.contains(record.role), let giveUp = webPressDeadline(pid: pid) else { return nil }
+        var offered: [String]?
+        while Date() < giveUp, !OperatorGuardHost.isStopped() {
+            let now = actions(record.element)
+            offered = now
+            if now.contains("AXPress") { break }
+            usleep(UInt32(Actionability.pollMs * 1_000))
+        }
+        return offered
+    }
+
+    /// The control with the press a web view offers it by now: one chosen by its
+    /// words or its point waits for that offer here, as one named by its number
+    /// waited before the turn (`waitUntilActionable`).
+    private func offeringItsPress(_ record: ElementRecord, pid: pid_t) -> ElementRecord {
+        waitForWebPress(record, pid: pid).map { record.standing(actions: $0, frame: nil) } ?? record
+    }
+
+    /// A click by words waits for its web control's press before the turn, as a
+    /// click by number does: the press may borrow the person's desktop, and a
+    /// wait inside it would hold their pointer and front app. The control is the
+    /// one the last look shows for the words; the press chooses again on its own
+    /// fresh tree.
+    private func waitForWebPressByReading(_ params: [String: JSONValue]) {
+        let query = readingQuery(params)
+        // Outside a web view's settle window nothing waits, so nothing is read
+        // or matched either: a native app's click costs what it did.
+        guard !query.isEmpty,
+              let cached = try? cachedSnapshot(params: params),
+              !cached.app.app.isTerminated,
+              webPressDeadline(pid: cached.app.pid) != nil,
+              case let .one(index) = query.choose(among: readingFaces(cached)),
+              let record = cached.elements[index]
+        else { return }
+        waitForWebPress(record, pid: cached.app.pid)
+    }
+
+    /// The end of the settle window of an app whose web tree this helper switched
+    /// on: 8 s after it did. Nil once that has passed, and for an app it never
+    /// switched on, such as a native one.
+    private func webPressDeadline(pid: pid_t) -> Date? {
         cacheLock.lock()
         let on = webAccessibilityOnAt[pid]
         cacheLock.unlock()
-        guard let on, BackgroundInput.pressableRoles.contains(record.role) else { return }
-        let giveUp = on.addingTimeInterval(WebAccessibility.settlesSeconds)
-        while Date() < giveUp, !OperatorGuardHost.isStopped(), !actions(record.element).contains("AXPress") {
-            usleep(UInt32(Actionability.pollMs * 1_000))
-        }
+        guard let deadline = on?.addingTimeInterval(WebAccessibility.settlesSeconds), Date() < deadline else { return nil }
+        return deadline
     }
 
     private func cachedSnapshot(params: [String: JSONValue]) throws -> Snapshot? {
@@ -2125,10 +2169,14 @@ final class Provider {
             }
             let query = readingQuery(params)
             let index = try optionalInteger(params, "elementIndex")
-                ?? (query.isEmpty ? nil : chosenIndex(query, in: snapshot))
+                ?? (query.isEmpty ? nil : chosenIndex(query, in: snapshot, guardWords: confirmGuardWords(params["confirmGuard"])))
             let requestedPoint = try index == nil ? coordinatePoint(params: params, xKey: "x", yKey: "y", snapshot: snapshot) : nil
-            let found = try index.map { try element(snapshot, $0) }
-                ?? requestedPoint.flatMap { backgroundClickRecord(at: $0, in: snapshot) }
+            // A web view offers a press some seconds after its tree is switched on,
+            // and ignores a window event while it is not key: before that offer the
+            // press would answer success and do nothing.
+            let found = try (index.map { try element(snapshot, $0) }
+                ?? requestedPoint.flatMap { backgroundClickRecord(at: $0, in: snapshot) })
+                .map { offeringItsPress($0, pid: snapshot.app.pid) }
             if inFront {
                 let textEntry = found.map { MarkPin.textEntryRoles.contains($0.role) } ?? false
                 let own = found.flatMap { BackgroundInput.clickAction(actions: $0.actions, textEntry: textEntry, plainLeftClick: plainLeftClick) }
@@ -2197,7 +2245,7 @@ final class Provider {
         var named = try optionalInteger(params, "elementIndex")
         let query = readingQuery(params)
         if named == nil, !query.isEmpty {
-            named = try chosenIndex(query, in: snapshot)
+            named = try chosenIndex(query, in: snapshot, guardWords: confirmGuardWords(params["confirmGuard"]))
         }
         if let elementIndex = named {
             let record = try inView(try element(snapshot, elementIndex), in: snapshot)
@@ -2268,18 +2316,24 @@ final class Provider {
     /// that reads the words exactly; none or several is answered by name so
     /// the caller narrows with --role/--label or presses by index — the press
     /// never guesses between two controls.
-    private func chosenIndex(_ query: ElementQuery, in snapshot: Snapshot) throws -> Int {
-        let faces = snapshot.order.compactMap { index -> ElementFace? in
-            guard let record = snapshot.elements[index] else { return nil }
-            return ElementFace(index: index, role: record.role, label: record.title, value: record.value, description: record.label)
-        }
-        switch query.choose(among: faces) {
+    private func chosenIndex(_ query: ElementQuery, in snapshot: Snapshot, guardWords: [String: [String]]? = nil) throws -> Int {
+        switch query.choose(among: readingFaces(snapshot)) {
         case .one(let index):
             return index
         case .none:
+            // None is not always absent: the control may show the words only in
+            // its text, the look may have stopped before it, or it may stand in
+            // another of the app's windows.
             throw ProviderError.coded(
                 "element_not_found",
-                "no control in \(snapshot.app.name)'s window «\(snapshot.windowTitle)» reads \(query.words); look with --marks, or find"
+                ReadingRefusal.noControl(
+                    app: snapshot.app.name,
+                    windowTitle: snapshot.windowTitle,
+                    words: query.words,
+                    shown: ReadingRefusal.shownWords(shownFaces(query, in: snapshot, guardWords: guardWords)),
+                    cut: lookCut(snapshot),
+                    others: otherWindowsWords(snapshot)
+                )
             )
         case .many(let some):
             let named = some.prefix(5).map(\.said).joined(separator: "; ")
@@ -2288,6 +2342,44 @@ final class Provider {
                 "\(some.count) controls read \(query.words): \(named) — add --role or --label, or press one by --element-index"
             )
         }
+    }
+
+    /// What each element of a look reads, as a click by reading chooses among them.
+    private func readingFaces(_ snapshot: Snapshot) -> [ElementFace] {
+        snapshot.order.compactMap { index -> ElementFace? in
+            guard let record = snapshot.elements[index] else { return nil }
+            return ElementFace(index: index, role: record.role, label: record.title, value: record.value, description: record.label)
+        }
+    }
+
+    /// The elements this look shows with the asked words in their shown name
+    /// (`SnapshotRenderHeuristics.displayName`: a link's text, a row's cells),
+    /// of the asked role, which a click by reading did not match.
+    private func shownFaces(_ query: ElementQuery, in snapshot: Snapshot, guardWords: [String: [String]]?) -> [ElementFace] {
+        ReadingRefusal.shownOnly(query, among: readingFaces(snapshot).compactMap { face in
+            snapshot.elements[face.index]?.name.map { ReadingRefusal.Shown(face: face, name: $0) }
+        }, guardWords: guardWords)
+    }
+
+    /// Why this look did not read the whole window, in a refusal's words; nil
+    /// when it read all of it.
+    private func lookCut(_ snapshot: Snapshot) -> String? {
+        ReadingRefusal.cutWords(
+            truncated: snapshot.truncated,
+            cutShort: snapshot.cutShort,
+            maxDepthReached: snapshot.maxDepthReached,
+            read: snapshot.order.count,
+            maxNodes: TreeRenderer.maxNodes
+        )
+    }
+
+    /// The app's other windows on screen, in a refusal's words; nil when the
+    /// look's window is its only one.
+    private func otherWindowsWords(_ snapshot: Snapshot) -> String? {
+        let others = WindowCapture.candidates(pid: snapshot.app.pid)
+            .filter { $0.windowId != snapshot.windowId && $0.layer == snapshot.windowLayer && $0.isOnScreen }
+            .map { ReadingRefusal.OtherWindow(windowId: $0.windowId, title: $0.title) }
+        return ReadingRefusal.otherWindowsWords(app: snapshot.app.name, others: others)
     }
 
     /// The control can be pressed by its accessibility action: it is on top where
@@ -2409,8 +2501,25 @@ final class Provider {
             .joined(separator: " ")
         throw ProviderError.coded(
             "element_not_found",
-            "element \(record.index) is covered at its centre\(covering.isEmpty ? "" : " by \(covering)"); look again with --marks"
+            ReadingRefusal.covered(index: record.index, by: covering, otherWindow: coveringWindow(hit, in: snapshot))
         )
+    }
+
+    /// The window of the app's own that stands over a control, when what is on
+    /// top there belongs to another window of the same app; nil for another
+    /// app's window, the control's own window, or a window with no number,
+    /// published or linked (Chrome's windows publish none).
+    /// Read for the refusal's words alone, after the refusal is decided.
+    private func coveringWindow(_ hit: AXUIElement, in snapshot: Snapshot) -> ReadingRefusal.OtherWindow? {
+        var owner: pid_t = 0
+        guard AXUIElementGetPid(hit, &owner) == .success, owner == snapshot.app.pid else { return nil }
+        let window = stringAttribute(hit, kAXRoleAttribute as String) == (kAXWindowRole as String)
+            ? hit
+            : copyElement(hit, kAXWindowAttribute as String)
+        guard let window,
+              let number = ReadingRefusal.windowID(published: windowNumber(window), linked: { WindowServerNumber.of(window) }),
+              number != snapshot.windowId else { return nil }
+        return ReadingRefusal.OtherWindow(windowId: number, title: stringAttribute(window, kAXTitleAttribute as String))
     }
 
     /// Whether walking up from `from` meets `to` within `MarkPin.hitDepth` parents.
@@ -2435,6 +2544,25 @@ final class Provider {
             hit = copyElement(current, kAXParentAttribute as String)
         }
         return fallback
+    }
+
+    /// Why nothing this look read stands at a background press's point: the
+    /// point is in another of the app's windows (two of them can stand at the
+    /// same place), or the look stopped before what stands there. Read for the
+    /// refusal's words alone; nothing is pressed either way.
+    private func unreadablePoint(_ point: CGPoint?, in snapshot: Snapshot) -> ReadingRefusal.Unreadable {
+        if let point {
+            var hit: AXUIElement?
+            let application = AXUIElementCreateApplication(snapshot.app.pid)
+            if AXUIElementCopyElementAtPosition(application, Float(point.x), Float(point.y), &hit) == .success,
+               let hit,
+               let window = copyElement(hit, kAXWindowAttribute as String),
+               let number = ReadingRefusal.windowID(published: windowNumber(window), linked: { WindowServerNumber.of(window) }),
+               number != snapshot.windowId {
+                return .anotherWindow(ReadingRefusal.OtherWindow(windowId: number, title: stringAttribute(window, kAXTitleAttribute as String)))
+            }
+        }
+        return lookCut(snapshot).map(ReadingRefusal.Unreadable.notReached) ?? .notAControl
     }
 
     private func performClickAction(record: ElementRecord, mouseButton: MouseButtonSelection) throws -> String? {
@@ -3542,8 +3670,61 @@ private func isTargetWindowFocused(_ snapshot: Snapshot) -> Bool {
     guard let frame = absoluteFrame(focusedWindow) else {
         return false
     }
+    // The look's own window says which window the target is (CU slowness
+    // 11-20, t-121376 · t-121748 · t-122045). The focused window may take the
+    // keys only when it is that window or one of its own — a sheet, popover
+    // or panel whose accessibility parents reach it — and the frames agree as
+    // before. Any other window of the app — a twin, one stacked a little off
+    // it, a smaller one over it — is another window whatever its size, and
+    // keys sent now would reach it. A look whose window cannot be read now,
+    // or whose tree read nothing at all (its window closed meanwhile, or the
+    // app did not answer), gives no window to aim keys at and is refused
+    // (t-122045, t-122428): every look is read from a window, a surface or a
+    // known element, so none is a look by number only.
+    switch lookedWindow(of: snapshot) {
+    case let .window(looked):
+        if !CFEqual(focusedWindow, looked), !belongs(focusedWindow, to: looked) {
+            return false
+        }
+    case .unreadable, .absent:
+        return false
+    }
     let intersection = frame.intersection(snapshot.windowBounds)
     return !intersection.isNull && intersection.area >= min(frame.area, snapshot.windowBounds.area) * 0.75
+}
+
+/// The window a look was read from, as it reads now: the look's own window,
+/// one it had that cannot be read now (gone, or not answering), or none
+/// because its tree read no element at all.
+private enum LookedWindow {
+    case window(AXUIElement)
+    case unreadable
+    case absent
+}
+
+private func lookedWindow(of snapshot: Snapshot) -> LookedWindow {
+    guard let root = snapshot.rootIndex.flatMap({ snapshot.elements[$0]?.element }) else { return .absent }
+    return containingWindow(root).map(LookedWindow.window) ?? .unreadable
+}
+
+/// Whether `window` is one of `looked`'s own — a sheet, popover or panel
+/// whose accessibility parents reach the looked window.
+private func belongs(_ window: AXUIElement, to looked: AXUIElement) -> Bool {
+    var current = window
+    for _ in 0..<16 {
+        guard let parent = copyElement(current, kAXParentAttribute as String) else { return false }
+        if CFEqual(parent, looked) { return true }
+        current = parent
+    }
+    return false
+}
+
+/// Whether `window`, standing at `frame`, is a twin of window `target` at
+/// `targetBounds` and not `target`: its own number, else the accessibility
+/// library's link, names another window at the very same frame.
+private func isTwinOfTarget(_ window: AXUIElement, frame: CGRect, target: CGWindowID, targetBounds: CGRect) -> Bool {
+    DesktopWindowPick.isAnotherAtTheSameFrame(
+        frame: frame, number: windowNumber(window) ?? WindowServerNumber.of(window), target: target, targetBounds: targetBounds)
 }
 
 private enum AXElementProbe {
@@ -3736,7 +3917,7 @@ private func matchingWindow(appElement: AXUIElement, capture: WindowCapture, foc
         let frame: CGRect? = usableWindow(window) ? absoluteFrame(window) : nil
         return (number: windowNumber(window), frame: frame, title: stringAttribute(window, kAXTitleAttribute as String))
     }
-    let picked = DesktopWindowPick.pick(target: capture.windowId, targetBounds: capture.bounds, targetTitle: capture.title, windows: rows)
+    let picked = DesktopWindowPick.pick(target: capture.windowId, targetBounds: capture.bounds, targetTitle: capture.title, windows: rows, linked: { WindowServerNumber.of(windows[$0]) })
     switch picked {
     case let .found(at): return windows[at]
     case .ambiguous:
@@ -3822,8 +4003,10 @@ private func recoverWindow(
        )) {
         targetWindow = focusedWindow
     } else {
+        // The window the target is, by its own number, else by the
+        // accessibility library's link: a twin at its frame is not it.
         let exactWindow = windowId.flatMap { targetId in
-            windows().first { windowNumber($0) == targetId }
+            windows().first { windowNumber($0) == targetId } ?? windows().first { WindowServerNumber.of($0) == targetId }
         }
         targetWindow = exactWindow ?? windowBounds.flatMap { targetBounds in
             windows().first { window in
@@ -3870,6 +4053,7 @@ private func windowMatchesCapture(
 ) -> Bool {
     if let windowId, windowNumber(window) == windowId { return true }
     guard let windowBounds, let frame = absoluteFrame(window) else { return false }
+    if let windowId, isTwinOfTarget(window, frame: frame, target: windowId, targetBounds: windowBounds) { return false }
     return windowFramesMatch(frame, windowBounds)
 }
 
@@ -4029,6 +4213,32 @@ private func windowNumber(_ element: AXUIElement) -> CGWindowID? {
         return nil
     }
     return CGWindowID(number.uint32Value)
+}
+
+/// The window-server number the accessibility library links an
+/// accessibility window to (`_AXUIElementGetWindow`). Asked only to tell
+/// apart windows that stand at one frame (`DesktopWindowPick.pick`'s
+/// `linked`): Chrome publishes no `AXWindowNumber`, so two of its windows
+/// at one frame with one title were refused for every act that named either
+/// (CU slowness 11-20, t-121376). Found at run time: a system without the
+/// function answers nil, and the pick is what it was; nothing is linked
+/// against it.
+private enum WindowServerNumber {
+    private typealias Lookup = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
+
+    /// The function's address, 0 where the system has none — a plain
+    /// number, so the one lookup is shared without a lock. `bitPattern: -2`
+    /// is `RTLD_DEFAULT`: every image already loaded, ApplicationServices
+    /// among them.
+    private static let address = UInt(bitPattern: dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementGetWindow"))
+
+    static func of(_ window: AXUIElement) -> CGWindowID? {
+        guard let symbol = UnsafeRawPointer(bitPattern: address) else { return nil }
+        let lookup = unsafeBitCast(symbol, to: Lookup.self)
+        var number: CGWindowID = 0
+        guard lookup(window, &number) == .success, number != 0 else { return nil }
+        return number
+    }
 }
 
 private func absoluteFrame(_ element: AXUIElement) -> CGRect? {
@@ -8108,7 +8318,7 @@ private enum DesktopWindows {
         let rows: [(number: UInt32?, frame: CGRect?, title: String?)] = windows.map { window in
             (number: windowNumber(window), frame: absoluteFrame(window), title: stringAttribute(window, kAXTitleAttribute as String))
         }
-        let picked = DesktopWindowPick.pick(target: windowId, targetBounds: targetBounds, targetTitle: targetTitle, windows: rows)
+        let picked = DesktopWindowPick.pick(target: windowId, targetBounds: targetBounds, targetTitle: targetTitle, windows: rows, linked: { WindowServerNumber.of(windows[$0]) })
         switch picked {
         case let .found(at): return (windows[at], ownerPid)
         case .ambiguous: throw ProviderError.coded("window_not_found", DesktopWindowPick.ambiguousSaid(windowId))
@@ -8810,12 +9020,15 @@ extension Provider {
     /// The label a press is about to land on, by method — nil when the press
     /// has no readable target (a bare key, a point over nothing).
     func confirmTarget(method: String, params: [String: JSONValue], snapshot loadSnapshot: () throws -> Snapshot) throws -> String? {
-        func label(_ record: ElementRecord?) throws -> String? {
+        func label(_ record: ElementRecord?, in snapshot: Snapshot, at point: CGPoint? = nil) throws -> String? {
             if params["background"]?.bool == true {
-                guard let record,
+                // The check reads the press a web view offers by now, as the press does.
+                guard let record = record.map({ offeringItsPress($0, pid: snapshot.app.pid) }),
                       let text = ConfirmationTarget.backgroundLabel(role: record.role, actions: record.actions,
                                                                     label: faceLabel(record.element)) else {
-                    throw ProviderError.coded("element_not_found", "the background confirmation target is not a readable control; observe again before retrying; no input was sent")
+                    // Refused all the same; the words say where to look next.
+                    let why = record == nil ? unreadablePoint(point, in: snapshot) : .notAControl
+                    throw ProviderError.coded("element_not_found", ReadingRefusal.backgroundTarget(why))
                 }
                 return text
             }
@@ -8825,14 +9038,14 @@ extension Provider {
         case "click", "performSecondaryAction":
             let snapshot = try loadSnapshot()
             if let index = try optionalInteger(params, "elementIndex") {
-                return try label(element(snapshot, index))
+                return try label(element(snapshot, index), in: snapshot)
             }
             // A click by reading is held for what it would press; one that
             // cannot choose is refused by the press itself, not asked about.
             let query = readingQuery(params)
             if method == "click", !query.isEmpty {
                 guard let index = try? chosenIndex(query, in: snapshot) else { return nil }
-                return try label(element(snapshot, index))
+                return try label(element(snapshot, index), in: snapshot)
             }
             // A click at a window's point presses whatever is under it — read
             // it there, as a desktop click is read: a saved coordinate click
@@ -8840,7 +9053,7 @@ extension Provider {
             guard method == "click" else { return nil }
             let point = try coordinatePoint(params: params, xKey: "x", yKey: "y", snapshot: snapshot)
             if params["background"]?.bool == true {
-                return try label(backgroundClickRecord(at: point, in: snapshot))
+                return try label(backgroundClickRecord(at: point, in: snapshot), in: snapshot, at: point)
             }
             return faceLabelAtPoint(point, in: snapshot.app.pid)
         case "mouseClick":

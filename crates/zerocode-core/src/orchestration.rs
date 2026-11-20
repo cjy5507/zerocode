@@ -1999,6 +1999,39 @@ impl Message {
             && self.created_ms >= question.created_ms
             && names_message(self.body.as_str(), &question.id)
     }
+
+    /// Whether a look by `seat` at the inbox `address` holds this letter back
+    /// as that seat's own words. `Ledger::deliver` cuts a batch by it and
+    /// [`Run::pointer_wanted`] counts by it, so a `check` and the pointer
+    /// never disagree about what is waiting.
+    ///
+    /// A seat's own words to the address it reads are held back from it:
+    /// `run:<id>` is read by every leader pane bound to the run, so a
+    /// handover written there is news to the coordinator beside its author
+    /// and only an echo to the author.
+    ///
+    /// Except a note to itself (t-121651): a letter the seat signed as a
+    /// `worker:` or `pane:` address and sent to that same address, opening no
+    /// thread. Only that seat reads such an address, so holding the note back
+    /// handed it to nobody — the build line tells a job's end as the pane
+    /// that put the job in, and a worker's notice to itself was filed and
+    /// never read (I-t119309-7). A word in a thread is no note, so a reply to
+    /// the note does not come back to be answered again; nor is a line the
+    /// ledger writes with the seat's name on it (`question-close` signs the
+    /// closer's seat).
+    fn held_back_from(&self, seat: &str, address: &str) -> bool {
+        self.author_seat.as_deref() == Some(seat)
+            && self.to == address
+            && !(self.from == address && self.thread.is_none() && one_reader(address))
+    }
+}
+
+/// Whether one seat alone reads the inbox at `address`: a worker's, read from
+/// the pane the worker sits in, or a pane's own. `run:<id>` is read by every
+/// leader pane bound to the run; an address of any other shape is not
+/// counted as one reader's.
+fn one_reader(address: &str) -> bool {
+    address.starts_with(WORKER_ADDRESS_PREFIX) || address.starts_with(PANE_ADDRESS_PREFIX)
 }
 
 /// Whether `text` names the message `id` as a word of its own. An ASCII
@@ -4766,8 +4799,10 @@ impl Run {
             return None;
         }
         /* Mail this SEAT wrote is not news to it, and it is the same rule
-         * `Ledger::deliver` cuts a batch by — asked here so the pointer and
-         * the check can never disagree about what is waiting.
+         * `Ledger::deliver` cuts a batch by ([`Message::held_back_from`]) —
+         * asked here so the pointer and the check can never disagree about
+         * what is waiting. A note the seat wrote to itself at an address only
+         * it reads is news to it: nobody else will ever read it.
          *
          * `run:<id>` is one inbox with more than one reader: every leader
          * pane bound to the run signs and reads it. So a coordinator's
@@ -4786,9 +4821,7 @@ impl Run {
                     self.messages
                         .iter()
                         .find(|message| &&message.id == id)
-                        .is_none_or(|message| {
-                            message.author_seat.as_deref() != Some(seat) || message.to != address
-                        })
+                        .is_none_or(|message| !message.held_back_from(seat, address))
                 })
             })
             .count();
@@ -7772,8 +7805,9 @@ fn changes_the_ledger(verb: &str, words: &Words) -> bool {
         // Reading the policy changes nothing; choosing one, or asking for a
         // sweep, changes what the ledger holds.
         "retention" => words.value("--days").is_some() || words.has("--sweep"),
-        // Listing what would be settled changes nothing; applying it does.
-        "task-settle" => words.has("--apply"),
+        // Listing what would be settled changes nothing; applying it does, and so
+        // does settling one task (t-119569).
+        "task-settle" => words.has("--apply") || words.value("--task").is_some(),
         // Listing what git proves changes nothing; writing it does.
         coordinator_take::BACKFILL_VERB => words.has("--apply"),
         // Reading the batches changes nothing; every press hands the window work whose
@@ -9188,7 +9222,10 @@ impl Ledger {
                     let row = messages.iter().find(|one| &&one.id == id);
                     let wanted_kind =
                         kinds.is_empty() || row.is_some_and(|one| kinds.contains(&one.kind));
-                    /* A seat is never handed back its own words.
+                    /* A seat is not handed back its own words
+                     * (`Message::held_back_from`, which also says the one
+                     * letter that is: a note the seat wrote to itself at an
+                     * address only it reads).
                      *
                      * The policy is old; what is new is that it is asked of
                      * the SEAT rather than of the address. `run:<id>` has
@@ -9208,9 +9245,7 @@ impl Ledger {
                      * the two cases stay apart.
                      */
                     let mine = asking_seat.is_some_and(|seat| {
-                        row.is_some_and(|one| {
-                            one.author_seat.as_deref() == Some(seat) && one.to == address
-                        })
+                        row.is_some_and(|one| one.held_back_from(seat, address))
                     });
                     wanted_kind && !mine
                 })
@@ -20869,7 +20904,10 @@ pub const VERBS: &[(&str, &str, Doing)] = &[
         "[--days <n>] [--apply] · the open tasks whose every attempt ended handing nothing in and \
          that nobody has touched for --days (default one week), and apart the completed ones that \
          can take no review: listed; only the open ones are closed `outdated`, and only with \
-         --apply, from the coordinator seat",
+         --apply, from the coordinator seat | --task <id> --why <line> --report <path> · work \
+         nothing was handed in on and whose result names no commit (a measurement, a design, \
+         work done by hand) settled as done with nothing to land, from the coordinator seat: the \
+         seat's own attempt, a hand-in of the why and the report, and its review, in one call",
         Doing::Policy,
     ),
     (
@@ -20907,12 +20945,21 @@ pub const VERBS: &[(&str, &str, Doing)] = &[
     ),
     (
         coordinator_take::BACKFILL_VERB,
-        "[--base <ref>] [--tags <glob>] [--checkout <path>] [--apply] · the finished tasks no \
-         review stands on whose result names a commit: listed with what git proves (merged when \
-         --base, default main, holds it; deployed when a release tag, default v*, holds it, \
+        "[--base <ref>] [--tags <glob>] [--release-remote <remote or URL>] [--checkout <path>] \
+         [--apply] · the finished tasks no review stands on whose result names a commit: listed \
+         with what git proves (merged when --base, default main, holds it; deployed when a \
+         release tag, default v*, holds it and the remote --release-remote names holds that tag, \
          named; verified only when a review task the result names passed) or why not; --apply, \
          from the coordinator seat, writes the attempt, hand-in and review, keeping the original \
-         result beside them",
+         result beside them; and the verified tasks whose landing nobody wrote (landing: true): \
+         merged only when every commit of the range the review read is on --base's first-parent \
+         line as the same change by the same author, moment and subject, and the range holds no \
+         merge and not only empty commits; deployed only when a release tag holds that landing \
+         and the remote --release-remote names holds it; neither where --base reverted it — never \
+         a verification — or why not. --release-remote has no default: name the remote releases \
+         are published to (a private origin may hold a release's tag before it is published); \
+         without it no release is written, and each row says why (unreleased; for a task already \
+         merged, why). --apply writes them bound to the standing review",
         Doing::Policy,
     ),
     (
@@ -24291,6 +24338,13 @@ fn plan_inner(
          * applies only by saying so. Like `retention`, LISTING is anybody's and
          * APPLYING is the coordinator seat's, and like `reset` the record it
          * writes is a closing, never a failure. */
+        /* One task nothing was handed in on, settled by the coordinator with why and the report
+         * it rests on (t-119569): the seat's own attempt, the hand-in and its review, in one call.
+         * An arm of its own so its answer takes the receipt and the write every mutation takes. */
+        "task-settle" if words.value("--task").is_some() => {
+            let run_id = bound(ledger, &words, &caller, &seat)?;
+            coordinator_take::settle_one(ledger, team, pane, &words, &run_id, now_ms)?
+        }
         "task-settle" => {
             let run_id = bound(ledger, &words, &caller, &seat)?;
             let apply = words.has("--apply");

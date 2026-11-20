@@ -26730,12 +26730,19 @@ mod land_check;
 /// t-78890 (O8): the landing of a stack written on every member in one `task-update --members`
 /// (`tests/land_record.rs`).
 mod land_record;
+/// t-119569: the landing of verified work proven from git alone, and nothing written that git
+/// did not prove (`tests/landing_proof.rs`).
+mod landing_proof;
 /// t-34501: late landings told to the coordinator, a branch that ran away told to its worker
 /// (`tests/landing_watch.rs`).
 mod landing_watch;
 /// t-59383: a root letter from the asked seat that names the question closes
 /// it for every count (`tests/letter_answers.rs`).
 mod letter_answers;
+/// t-121651: the build line's end notice reaches the worker that put the job
+/// in — a seat is handed the note it wrote itself at an address only it reads
+/// (`tests/note_to_self.rs`).
+mod note_to_self;
 /// t-68069: one conversation is one worker's, whatever seat a report comes by
 /// (`tests/one_conversation.rs`).
 mod one_conversation;
@@ -26765,6 +26772,9 @@ mod restore_seams;
 /// t-71220: work nobody is coming back to, and the person's one press that
 /// clears it (`tests/settle.rs`).
 mod settle;
+/// t-119569: work nothing was handed in on, settled by the coordinator in one
+/// call as done with nothing to land (`tests/settle_one.rs`).
+mod settle_one;
 /// t-89544: the stray judgment reads `ps` command lines and `lsof` places, which only
 /// macOS gives the window; its fixtures are spelled as Unix paths.
 #[cfg(unix)]

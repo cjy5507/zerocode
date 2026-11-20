@@ -16,6 +16,16 @@ use crate::types::{
 
 use super::PromptCacheStrategy;
 
+mod responses_wire;
+use responses_wire::Wire;
+
+/// Set, it leaves where this client's last request went with its body (never
+/// a header) in `/tmp/zo-openai-compat-request.txt`, and the last `/responses`
+/// answer's id, model, status and token counts in
+/// `/tmp/zo-openai-compat-response.txt` — the same kind of switch as
+/// `ZO_CHATGPT_DEBUG`, for checking one turn against a live endpoint.
+const DEBUG_ENV: &str = "ZO_OPENAI_COMPAT_DEBUG";
+
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
@@ -747,11 +757,19 @@ impl OpenAiCompatClient {
             stream: false,
             ..request.clone()
         };
-        let response = self.send_with_retry(&request).await?;
+        let (response, wire) = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(response.headers());
-        let payload = response.json::<ChatCompletionResponse>().await?;
         let config = request_config_for_base_url(self.config(), &self.base_url);
-        let mut normalized = normalize_response(&request.model, payload, config)?;
+        let mut normalized = match wire {
+            Wire::Chat => {
+                let payload = response.json::<ChatCompletionResponse>().await?;
+                normalize_response(&request.model, payload, config)?
+            }
+            Wire::Responses => {
+                let payload = response.json::<Value>().await?;
+                responses_wire::api_response(&payload, &request.model, config, &self.base_url)
+            }
+        };
         if normalized.request_id.is_none() {
             normalized.request_id = request_id;
         }
@@ -762,19 +780,21 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
-        let response = self
+        let (response, wire) = self
             .send_with_retry(&request.clone().with_streaming())
             .await?;
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
-            parser: OpenAiSseParser::new(),
-            pending: VecDeque::new(),
-            done: false,
-            state: StreamState::new(
+            decoder: StreamDecoder::new(
+                wire,
                 request.model.clone(),
                 request_config_for_base_url(self.config(), &self.base_url),
+                &self.base_url,
             ),
+            pending: VecDeque::new(),
+            failure: None,
+            done: false,
             client: self.clone(),
             request: request.clone().with_streaming(),
             committed: false,
@@ -785,11 +805,20 @@ impl OpenAiCompatClient {
         })
     }
 
+    /// The response to `request`, and the wire it came back on.
     async fn send_with_retry(
         &self,
         request: &MessageRequest,
-    ) -> Result<reqwest::Response, ApiError> {
+    ) -> Result<(reqwest::Response, Wire), ApiError> {
         let mut attempts = 0;
+        // Two refusals are each answered once per request, and what they say
+        // is kept for the rest of the process (`responses_wire`): an effort
+        // the model does not take goes again at the highest rung the refusal
+        // lists, and function tools the model takes only on `/responses` (in
+        // OpenAI's words) go again there. Any other refusal comes back as it
+        // came.
+        let mut effort_sent_again = false;
+        let mut wire_changed = false;
         // What this endpoint answered about `reasoning_content` before, kept
         // in zo's home (`endpoint_capabilities`). A refusal that may be about
         // the field is answered once with the other way to send it — with an
@@ -808,7 +837,12 @@ impl OpenAiCompatClient {
         let last_error = loop {
             attempts += 1;
             let answer = candidate.or(known);
-            let retryable_error = match self.send_raw_request(request, answer).await {
+            let learned = responses_wire::learned(&self.base_url, &request.model);
+            let wire = responses_wire::wire_for(request, &learned);
+            let sent = self
+                .send_raw_request(request, answer, wire, learned.efforts.as_deref())
+                .await;
+            let retryable_error = match sent {
                 Ok((response, key_sent)) => match expect_success(response).await {
                     Ok(response) => {
                         if candidate.is_some() {
@@ -818,10 +852,37 @@ impl OpenAiCompatClient {
                                 candidate,
                             );
                         }
-                        return Ok(response);
+                        return Ok((response, wire));
                     }
                     Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
                     Err(error) => {
+                        // Neither is a transient failure: no backoff, and the
+                        // attempt is not spent.
+                        if !effort_sent_again && responses_wire::lists_supported_values(&error) {
+                            // Read against the body that went out: the rung it
+                            // carried is the one refused.
+                            let (_, sent) =
+                                self.request_body(request, answer, wire, learned.efforts.as_deref());
+                            if let Some(accepted) = responses_wire::efforts_to_send_again(&error, &sent) {
+                                responses_wire::learn_efforts(&self.base_url, &request.model, accepted);
+                                effort_sent_again = true;
+                                attempts -= 1;
+                                continue;
+                            }
+                        }
+                        if !wire_changed
+                            && wire == Wire::Chat
+                            && responses_wire::sends_tools_to_responses(&error)
+                        {
+                            responses_wire::learn_responses(&self.base_url, &request.model);
+                            wire_changed = true;
+                            attempts -= 1;
+                            continue;
+                        }
+                        // `reasoning_content` is a field of the Chat wire.
+                        if wire == Wire::Responses {
+                            return Err(self.refused_router_key(error, key_sent));
+                        }
                         if candidate.is_none() {
                             if let Some(other) =
                                 reasoning_answer_to_try(&error, request, &config, answer)
@@ -875,17 +936,47 @@ impl OpenAiCompatClient {
         }
     }
 
-    /// The response, and whether a key went with the request.
+    /// Where `request` goes on `wire`, and the body it carries there, with the
+    /// effort lowered to the rungs `efforts` names when the endpoint named
+    /// them.
+    fn request_body(
+        &self,
+        request: &MessageRequest,
+        answer: Option<ReasoningAnswer>,
+        wire: Wire,
+        efforts: Option<&[crate::types::EffortLevel]>,
+    ) -> (String, Value) {
+        let config = request_config_for_base_url(self.config(), &self.base_url);
+        let (request_url, mut body) = match wire {
+            Wire::Chat => (
+                chat_completions_endpoint(&self.base_url),
+                build_chat_completion_request_with_answer(request, config, answer),
+            ),
+            Wire::Responses => (
+                responses_wire::responses_endpoint(&self.base_url),
+                responses_wire::api_responses_body(request, config, &self.base_url, request.stream),
+            ),
+        };
+        if let Some(accepted) = efforts {
+            responses_wire::clamp_effort(&mut body, accepted);
+        }
+        (request_url, body)
+    }
+
+    /// The response, and whether a key went with the request
+    /// ([`Self::request_body`] says what goes where).
     async fn send_raw_request(
         &self,
         request: &MessageRequest,
         answer: Option<ReasoningAnswer>,
+        wire: Wire,
+        efforts: Option<&[crate::types::EffortLevel]>,
     ) -> Result<(reqwest::Response, bool), ApiError> {
-        let request_url = chat_completions_endpoint(&self.base_url);
-        let config = request_config_for_base_url(self.config(), &self.base_url);
-        let payload = serde_json::to_vec(&build_chat_completion_request_with_answer(
-            request, config, answer,
-        ))?;
+        let (request_url, body) = self.request_body(request, answer, wire, efforts);
+        let payload = serde_json::to_vec(&body)?;
+        super::debug_dump_with(DEBUG_ENV, "openai-compat", "request", || {
+            format!("POST {request_url}\n{body}")
+        });
         let bytes = payload.len();
         // The exact body is known only here. It stops here when it is over a
         // declared ceiling or no smaller than a size this endpoint refused —
@@ -983,10 +1074,13 @@ impl OpenAiCompatClient {
 pub struct MessageStream {
     request_id: Option<String>,
     response: reqwest::Response,
-    parser: OpenAiSseParser,
+    decoder: StreamDecoder,
     pending: VecDeque<StreamEvent>,
+    /// A failure the stream itself reported (a `/responses` `response.failed`
+    /// or `error` event), surfaced once the events that came before it in the
+    /// same chunk have been handed out.
+    failure: Option<ApiError>,
     done: bool,
-    state: StreamState,
     client: OpenAiCompatClient,
     request: MessageRequest,
     committed: bool,
@@ -1030,8 +1124,16 @@ impl MessageStream {
                 return Ok(Some(event));
             }
 
+            if let Some(failure) = self.failure.take() {
+                if self.can_restart(&failure) {
+                    self.restart(&failure).await?;
+                    continue;
+                }
+                return Err(failure);
+            }
+
             if self.done {
-                self.pending.extend(self.state.finish()?);
+                self.pending.extend(self.decoder.finish()?);
                 if let Some(event) = self.pending.pop_front() {
                     return Ok(Some(event));
                 }
@@ -1069,14 +1171,15 @@ impl MessageStream {
                 // demands `error.is_retryable()` and `!committed`, so a
                 // malformed-payload or context-length failure still propagates, and
                 // a frame arriving after visible output still propagates rather than
-                // duplicating it. `ingest_chunk` keeps its `?`: the state machine
-                // only ever fails on protocol shape, never on capacity, so routing
-                // it through a gate that demands retryability would be dead code.
-                Some(chunk) => match self.parser.push(&chunk) {
-                    Ok(parsed) => {
-                        for parsed in parsed {
-                            self.pending.extend(self.state.ingest_chunk(parsed)?);
-                        }
+                // duplicating it. A Chat `ingest_chunk` failure reaches the same
+                // gate and always propagates: the state machine only ever fails on
+                // protocol shape, never on capacity, so it is never retryable. A
+                // `/responses` stream reports its own failure as an event, which
+                // waits in `self.failure` until the events before it are out.
+                Some(chunk) => match self.decoder.push(&chunk) {
+                    Ok((events, failure)) => {
+                        self.pending.extend(events);
+                        self.failure = failure;
                     }
                     Err(error) if self.can_restart(&error) => {
                         self.restart(&error).await?;
@@ -1128,7 +1231,7 @@ impl MessageStream {
         let remaining = self
             .max_restart_wallclock
             .saturating_sub(window_start.elapsed());
-        let response =
+        let (response, wire) =
             match tokio::time::timeout(remaining, self.client.send_with_retry(&self.request)).await
             {
                 Ok(response) => response?,
@@ -1136,14 +1239,69 @@ impl MessageStream {
             };
         self.request_id = request_id_from_headers(response.headers());
         self.response = response;
-        self.parser = OpenAiSseParser::new();
         self.pending.clear();
+        self.failure = None;
         self.done = false;
-        self.state = StreamState::new(
+        self.decoder = StreamDecoder::new(
+            wire,
             self.request.model.clone(),
             request_config_for_base_url(self.client.config(), &self.client.base_url),
+            &self.client.base_url,
         );
         Ok(())
+    }
+}
+
+/// How one stream's bytes become zo's events: the Chat wire's chunks, or the
+/// `/responses` events ([`responses_wire::ResponsesDecoder`]).
+#[derive(Debug)]
+enum StreamDecoder {
+    Chat(Box<ChatDecoder>),
+    Responses(Box<responses_wire::ResponsesDecoder>),
+}
+
+#[derive(Debug)]
+struct ChatDecoder {
+    parser: OpenAiSseParser,
+    state: StreamState,
+}
+
+impl StreamDecoder {
+    fn new(wire: Wire, model: String, config: OpenAiCompatConfig, base_url: &str) -> Self {
+        match wire {
+            Wire::Chat => Self::Chat(Box::new(ChatDecoder {
+                parser: OpenAiSseParser::new(),
+                state: StreamState::new(model, config),
+            })),
+            Wire::Responses => Self::Responses(Box::new(responses_wire::ResponsesDecoder::new(
+                model, config, base_url,
+            ))),
+        }
+    }
+
+    /// The events one chunk completes, and a failure the stream reported in
+    /// it. An `Err` is a chunk that could not be read at all.
+    fn push(&mut self, chunk: &[u8]) -> Result<(Vec<StreamEvent>, Option<ApiError>), ApiError> {
+        match self {
+            Self::Chat(chat) => {
+                let mut events = Vec::new();
+                for parsed in chat.parser.push(chunk)? {
+                    events.extend(chat.state.ingest_chunk(parsed)?);
+                }
+                Ok((events, None))
+            }
+            Self::Responses(decoder) => decoder.push(chunk),
+        }
+    }
+
+    /// What closes the message once the body has ended. The `/responses`
+    /// events close it themselves (`response.completed`), as on the
+    /// subscription's stream.
+    fn finish(&mut self) -> Result<Vec<StreamEvent>, ApiError> {
+        match self {
+            Self::Chat(chat) => chat.state.finish(),
+            Self::Responses(_) => Ok(Vec::new()),
+        }
     }
 }
 
@@ -2648,3 +2806,7 @@ impl StringExt for String {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod person_turn_tests;
+#[cfg(test)]
+mod responses_tests;

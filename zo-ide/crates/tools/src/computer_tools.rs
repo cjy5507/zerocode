@@ -972,9 +972,55 @@ fn validate_scope(input: &ComputerInput) -> Result<(), ToolError> {
         return Err(ToolError::InvalidInput(format!("scroll_amount belongs to desktop scrolling: {SCROLL_SHAPES}")));
     }
     if input.app.is_some() && (input.coordinate.is_some() || input.start_coordinate.is_some()) && input.window_id.is_none() {
-        return Err(ToolError::InvalidInput("app coordinates require the window_id from an observation of that window".into()));
+        return Err(ToolError::InvalidInput(APP_POINTS_NEED_THEIR_WINDOW.into()));
     }
     Ok(())
+}
+
+/// The refusal of a press at an app's points that names no window.
+const APP_POINTS_NEED_THEIR_WINDOW: &str = "app coordinates require the window_id from an observation of that window";
+
+/// What a press at `app`'s points that names no window is told (CU slowness
+/// 11-20, refusal 5): the next call to send. Points are read on the last
+/// picture, so when that picture was of an app's window, that window is the
+/// only one they can name — and only if they were read on it: the tool still
+/// holds every point to that picture's frame, and the window refuses a window
+/// that is not `app`'s. Otherwise the look to take first. `place` says where
+/// the `window_id` goes.
+fn app_points_need_their_window(app: &str, ctx: &ToolContext, place: &str) -> String {
+    let observe = json!({ "action": "observe", "app": app });
+    last_picture_window(ctx).map_or_else(
+        || format!("{APP_POINTS_NEED_THEIR_WINDOW}: observe {observe} first, read the points on that picture, and send the window_id its answer names {place}"),
+        |(window_id, named)| {
+            format!(
+                "{APP_POINTS_NEED_THEIR_WINDOW}: your last picture was of window {window_id}{named}; if these points were read on that picture, send \"window_id\": {window_id} {place}; if you meant another window, observe {observe} first and read the points on its picture"
+            )
+        },
+    )
+}
+
+/// The window the model's last picture was of, when it was of an app's
+/// window, and how that look named it — ` «title» of app`, the app as the
+/// window resolved it — so a model told to name it can see whether it meant
+/// that one.
+fn last_picture_window(ctx: &ToolContext) -> Option<(u64, String)> {
+    let seen = ctx.computer_observed_target()?;
+    let window_id = seen.window_id?;
+    let named = ctx
+        .computer_window_look(window_id)
+        .and_then(|look| look.title)
+        .map_or_else(|| format!(" of {}", seen.app), |title| format!(" «{title}» of {}", seen.app));
+    Some((window_id, named))
+}
+
+/// `error`, or — when it is the refusal of `input`'s app points that name no
+/// window — that refusal with the next call to send.
+fn with_their_window(error: ToolError, input: &ComputerInput, ctx: &ToolContext) -> ToolError {
+    let points_without_window = matches!(&error, ToolError::InvalidInput(said) if said == APP_POINTS_NEED_THEIR_WINDOW);
+    match input.app.as_deref() {
+        Some(app) if points_without_window => ToolError::InvalidInput(app_points_need_their_window(app, ctx, "in the same call")),
+        _ => error,
+    }
 }
 
 fn target_of(input: &ComputerInput) -> Option<ComputerTarget> {
@@ -2137,7 +2183,9 @@ fn point_look(steps: &[ComputerInput], ctx: &ToolContext) -> Result<Option<Point
                 )));
             }
             let Some(named) = target_of(step).filter(|named| named.window_id.is_some()) else {
-                return Err(ToolError::InvalidInput("app coordinates require the window_id from an observation of that window".into()));
+                let app = step.app.as_deref().unwrap_or_default();
+                let said = app_points_need_their_window(app, ctx, "beside app on the batch, or on this step");
+                return Err(ToolError::InvalidInput(format!("step {}: {said}", at + 1)));
             };
             match window.as_ref().map(|one| one.window_id) {
                 Some(first) if first != named.window_id => {
@@ -2236,6 +2284,37 @@ fn check_batch_len(count: usize) -> Result<(), ToolError> {
     Ok(())
 }
 
+/// What a batch whose window defaults name half a window is told (CU
+/// slowness 11-20, refusal 4): the half that is missing, as the model's last
+/// picture names it when that picture was of the half given — to add only if
+/// the steps act in that window — else where to find it, or how to scope
+/// each step instead.
+fn batch_defaults_need_both(app: Option<&str>, window_id: Option<u64>, ctx: &ToolContext) -> String {
+    const NEED_BOTH: &str = "batch window defaults need both a nonempty app and a positive window_id from an observation; otherwise scope each step";
+    match (app.map(str::trim).filter(|app| !app.is_empty()), window_id.filter(|id| *id > 0)) {
+        (Some(app), None) => last_picture_window(ctx).map_or_else(
+            || {
+                format!(
+                    "{NEED_BOTH}: observe {} first and add the window_id its answer names beside \"app\", or drop the batch's app and put it on each step",
+                    json!({ "action": "observe", "app": app })
+                )
+            },
+            |(seen, named)| {
+                format!(
+                    "{NEED_BOTH}: your last picture was of window {seen}{named}; if the steps act in that window, add \"window_id\": {seen} beside \"app\" on the batch, else drop the batch's app and put it on each step"
+                )
+            },
+        ),
+        (None, Some(window_id)) => last_picture_window(ctx).filter(|(seen, _)| *seen == window_id).map_or_else(
+            || format!("{NEED_BOTH}: add beside \"window_id\" the app you observed window {window_id} by"),
+            |(_, named)| {
+                format!("{NEED_BOTH}: your last picture was of window {window_id}{named}; add beside \"window_id\" on the batch the app you observed it by")
+            },
+        ),
+        _ => NEED_BOTH.to_string(),
+    }
+}
+
 /// One batch: checked whole by the core before any look is paid, one trip
 /// down the shim, one look after — and each step answered under the model's
 /// own action name, in its picture's pixels.
@@ -2254,7 +2333,7 @@ fn run_computer_batch(mut input: ComputerInput, ctx: &ToolContext, road: &Comput
         (Some(app), Some(window_id)) if !app.trim().is_empty() && window_id > 0 => {
             Some(ComputerTarget { app: app.to_string(), window_id: Some(window_id) })
         }
-        _ => return Err(ToolError::InvalidInput("batch window defaults need both a nonempty app and a positive window_id from an observation; otherwise scope each step".into())),
+        (app, window_id) => return Err(ToolError::InvalidInput(batch_defaults_need_both(app, window_id, ctx))),
     };
     let settle = input.settle.unwrap_or(SETTLE_AFTER_ACT);
     for (at, step) in steps.iter_mut().enumerate() {
@@ -2823,7 +2902,7 @@ fn run_computer_inner(input: &Value, ctx: &ToolContext, road: &ComputerRoad) -> 
     let mut input = read_input(input)?;
     let handoff_named_a_window = persons_turn_names_no_window(&mut input);
     if input.background == Some(true) && input.action.trim() != BATCH_ACTION {
-        argv_for(&input)?;
+        argv_for(&input).map_err(|error| with_their_window(error, &input, ctx))?;
     }
     let settle = input.settle.unwrap_or(SETTLE_AFTER_ACT);
     let action = input.action.trim().to_string();
@@ -2837,7 +2916,7 @@ fn run_computer_inner(input: &Value, ctx: &ToolContext, road: &ComputerRoad) -> 
         return run_computer_walk(&input, ctx, road, settle).map(ToolExecutionResult::from);
     }
     // A command the tool cannot spell costs no look.
-    argv_for(&input)?;
+    argv_for(&input).map_err(|error| with_their_window(error, &input, ctx))?;
     let first_look = first_look(&[&input], ctx, road)?;
     let frame = if let Some(target) = target_of(&input).filter(|_| input.coordinate.is_some() || input.start_coordinate.is_some()) {
         Some(ctx.computer_target_frame(&target).ok_or_else(|| ToolError::InvalidInput("the selected window has no matching picture frame".into()))?)
@@ -4689,6 +4768,141 @@ pub(crate) mod tests {
         let error = run_computer(&fields, &ctx, &road).expect_err("no picture of the window holds the point").to_string();
         assert!(error.contains(r#"observe {"action":"observe","app":"Fixture","window_id":41} first"#), "{error}");
         assert!(calls(dir.path()).is_empty());
+    }
+
+    /// CU slowness 11-20, refusal 5: a press at an app's points that names no
+    /// window is told the window its last picture was of — named as that look
+    /// named it, the app as the window resolved it — to send only if the
+    /// points were read on that picture, and the look to take for another
+    /// window. Nothing reaches the window, in the foreground or behind.
+    #[cfg(unix)]
+    #[test]
+    fn app_points_naming_no_window_are_told_the_last_pictures_window_on_a_condition() {
+        let dir = tempfile::tempdir().unwrap();
+        let (road, _) = fake_shim(dir.path());
+        let ctx = crate::tests::tool_context_outside_cwd_windows();
+        std::fs::write(dir.path().join("window-title"), "Docs").unwrap();
+        looked_at_window_41(dir.path(), &ctx, &road);
+        let looked = calls(dir.path());
+        for fields in [
+            json!({"action": "left_click", "app": "Fixture", "coordinate": [20, 40]}),
+            json!({"action": "left_click", "app": "Fixture", "coordinate": [20, 40], "background": true}),
+        ] {
+            let error = run_computer(&fields, &ctx, &road).expect_err("app points name their window").to_string();
+            assert!(error.contains(APP_POINTS_NEED_THEIR_WINDOW), "{error}");
+            assert!(error.contains("your last picture was of window 41 «Docs» of Fixture"), "{error}");
+            assert!(error.contains(r#"if these points were read on that picture, send "window_id": 41 in the same call"#), "{error}");
+            assert!(error.contains(r#"if you meant another window, observe {"action":"observe","app":"Fixture"} first"#), "{error}");
+        }
+        assert_eq!(calls(dir.path()), looked, "nothing reached the window");
+    }
+
+    /// A look whose window resolved its app to a bundle ID is still the
+    /// window the model is told of when it names the app by name — the case
+    /// of the person's Chrome, looked at as "Google Chrome" and resolved as
+    /// `com.google.Chrome`.
+    #[cfg(unix)]
+    #[test]
+    fn app_points_naming_no_window_are_told_the_window_of_a_look_that_resolved_the_app_to_its_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (road, _) = fake_shim(dir.path());
+        let ctx = crate::tests::tool_context_outside_cwd_windows();
+        let shot = dir.path().join("shot-resolved.png");
+        std::fs::copy(dir.path().join("shot.png"), &shot).unwrap();
+        let answer = json!({"ok": true, "result": {
+            "verb": "observe", "app": {"name": "Fixture", "bundleId": "test.fixture", "pid": 7},
+            "screenshot": {"path": shot.display().to_string(), "width": 640, "height": 415, "scale": 0.5},
+            "origin": {"x": 0, "y": 0}, "changed": null,
+            "window": {"id": 41, "title": "Docs", "x": 100, "y": 80, "width": 640, "height": 480},
+        }});
+        std::fs::write(dir.path().join("reply-observe"), answer.to_string()).unwrap();
+        run_computer(&json!({"action": "observe", "app": "Fixture", "window_id": 41}), &ctx, &road).unwrap();
+        let error = run_computer(&json!({"action": "left_click", "app": "Fixture", "coordinate": [20, 40]}), &ctx, &road)
+            .expect_err("app points name their window")
+            .to_string();
+        assert!(error.contains("your last picture was of window 41 «Docs» of test.fixture"), "{error}");
+        assert!(error.contains(r#"send "window_id": 41 in the same call"#), "{error}");
+    }
+
+    /// With no picture of an app's window to point to, the refusal names the
+    /// look to take, and never a window.
+    #[cfg(unix)]
+    #[test]
+    fn app_points_naming_no_window_with_no_picture_of_a_window_are_told_the_look_to_take() {
+        let dir = tempfile::tempdir().unwrap();
+        let (road, _) = fake_shim(dir.path());
+        let ctx = crate::tests::tool_context_outside_cwd_windows();
+        let error = run_computer(&json!({"action": "left_click", "app": "Fixture", "coordinate": [20, 40]}), &ctx, &road)
+            .expect_err("app points name their window")
+            .to_string();
+        assert!(
+            error.contains(r#"observe {"action":"observe","app":"Fixture"} first, read the points on that picture, and send the window_id its answer names in the same call"#),
+            "{error}"
+        );
+        assert!(!error.contains("your last picture"), "{error}");
+        assert!(calls(dir.path()).is_empty());
+    }
+
+    /// A batch step at an app's points that names no window is told, by its
+    /// number, the window of the last picture and that the `window_id` goes
+    /// beside `app` on the batch or on that step; nothing is sent.
+    #[cfg(unix)]
+    #[test]
+    fn a_batch_step_at_app_points_naming_no_window_is_told_the_last_pictures_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let (road, _) = fake_shim(dir.path());
+        let ctx = crate::tests::tool_context_outside_cwd_windows();
+        looked_at_window_41(dir.path(), &ctx, &road);
+        let looked = calls(dir.path());
+        let error = run_computer(&json!({"action": "batch", "steps": [
+            {"action": "left_click", "app": "Fixture", "label": "Open"},
+            {"action": "left_click", "app": "Fixture", "coordinate": [20, 40]},
+        ]}), &ctx, &road)
+        .expect_err("app points name their window")
+        .to_string();
+        assert!(error.contains(&format!("step 2: {APP_POINTS_NEED_THEIR_WINDOW}: your last picture was of window 41 of Fixture")), "{error}");
+        assert!(error.contains(r#"send "window_id": 41 beside app on the batch, or on this step"#), "{error}");
+        assert_eq!(calls(dir.path()), looked, "nothing reached the window");
+    }
+
+    /// CU slowness 11-20, refusal 4: batch window defaults that name half a
+    /// window are told the half that is missing — the last picture's window
+    /// to add only if the steps act in it, or the app to add beside a window
+    /// ID — and, with no such picture, the look to take or how to scope each
+    /// step. Nothing is sent.
+    #[cfg(unix)]
+    #[test]
+    fn batch_defaults_naming_half_a_window_are_told_the_half_that_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (road, _) = fake_shim(dir.path());
+        let ctx = crate::tests::tool_context_outside_cwd_windows();
+        let steps = json!([{"action": "left_click", "label": "Open"}]);
+        let refused = |fields: Value, ctx: &ToolContext| run_computer(&fields, ctx, &road).expect_err("half a window").to_string();
+        let unlooked = refused(json!({"action": "batch", "app": "Fixture", "steps": steps}), &ctx);
+        assert!(unlooked.contains("batch window defaults need both"), "{unlooked}");
+        assert!(
+            unlooked.contains(r#"observe {"action":"observe","app":"Fixture"} first and add the window_id its answer names beside "app", or drop the batch's app and put it on each step"#),
+            "{unlooked}"
+        );
+        let numbered = refused(json!({"action": "batch", "window_id": 41, "steps": steps}), &ctx);
+        assert!(numbered.contains(r#"add beside "window_id" the app you observed window 41 by"#), "{numbered}");
+        std::fs::write(dir.path().join("window-title"), "Docs").unwrap();
+        looked_at_window_41(dir.path(), &ctx, &road);
+        let looked = calls(dir.path());
+        let named = refused(json!({"action": "batch", "app": "Fixture", "steps": steps}), &ctx);
+        assert!(
+            named.contains(r#"your last picture was of window 41 «Docs» of Fixture; if the steps act in that window, add "window_id": 41 beside "app" on the batch, else drop the batch's app and put it on each step"#),
+            "{named}"
+        );
+        let numbered = refused(json!({"action": "batch", "window_id": 41, "steps": steps}), &ctx);
+        assert!(
+            numbered.contains(r#"your last picture was of window 41 «Docs» of Fixture; add beside "window_id" on the batch the app you observed it by"#),
+            "{numbered}"
+        );
+        let other = refused(json!({"action": "batch", "window_id": 42, "steps": steps}), &ctx);
+        assert!(other.contains(r#"add beside "window_id" the app you observed window 42 by"#), "{other}");
+        assert!(!other.contains("your last picture"), "another window's picture is not this one's: {other}");
+        assert_eq!(calls(dir.path()), looked, "nothing reached the window");
     }
 
     /// The look a coordinate batch reads its points on: window 41 of

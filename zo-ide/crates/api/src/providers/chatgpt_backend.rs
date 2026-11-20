@@ -76,7 +76,64 @@ pub(crate) fn build_responses_request_for_session(
     stream: bool,
     session_id: &str,
 ) -> Value {
-    let supports_vision = super::model_supports_vision(&request.model);
+    build_responses_body(
+        request,
+        instructions,
+        stream,
+        session_id,
+        super::model_supports_vision(&request.model),
+        None,
+    )
+}
+
+/// The key a reasoning-replay entry on a message names the road that made it
+/// under. Only an API key's road (`openai_compat::responses_wire`) sets it;
+/// the subscription's own entries carry none, as they always have.
+pub(crate) const REPLAY_ROAD_KEY: &str = "road";
+
+/// Whether a reasoning-replay entry was made on `road` — `None` being the
+/// subscription, whose entries carry no road.
+fn replay_entry_is_of(entry: &Value, road: Option<&str>) -> bool {
+    entry.get(REPLAY_ROAD_KEY).and_then(Value::as_str) == road
+}
+
+/// The Responses body [`build_responses_request_for_session`] sends, with
+/// whether pictures go out as pictures said by the caller (the subscription
+/// asks the model's catalog row, while an API key's endpoint answers for
+/// itself), and the road whose reasoning goes back (`None`: the
+/// subscription's). A ChatGPT login and an API key are different OpenAI
+/// accounts, and the API removes or refuses reasoning made under another
+/// organization, so the reasoning a session's messages carry goes back only
+/// on the road that made it (`openai_compat::responses_wire` says what else
+/// differs on the public `/v1/responses`).
+pub(crate) fn build_responses_body(
+    request: &MessageRequest,
+    instructions: &str,
+    stream: bool,
+    session_id: &str,
+    supports_vision: bool,
+    road: Option<&str>,
+) -> Value {
+    let carries_another_road = |message: &InputMessage| {
+        message
+            .reasoning_replay
+            .as_ref()
+            .and_then(Value::as_array)
+            .is_some_and(|entries| entries.iter().any(|entry| !replay_entry_is_of(entry, road)))
+    };
+    let this_road_only;
+    let request = if request.messages.iter().any(carries_another_road) {
+        let mut copy = request.clone();
+        for message in &mut copy.messages {
+            if let Some(Value::Array(entries)) = message.reasoning_replay.as_mut() {
+                entries.retain(|entry| replay_entry_is_of(entry, road));
+            }
+        }
+        this_road_only = copy;
+        &this_road_only
+    } else {
+        request
+    };
     let mut input = Vec::new();
     for message in &request.messages {
         append_input_items(&mut input, message, session_id, supports_vision);
@@ -198,24 +255,7 @@ pub(crate) fn build_responses_request_for_session(
     // Attested rather than silent: a retry that works leaves no other trace, so
     // without this the only way to learn whether the ladder ever ran was to
     // reconstruct it from months of transcripts.
-    let effort = if empty_response_pressure(request) {
-        let stepped = empty_retry_effort(effort, explicit_top_effort);
-        if stepped == effort {
-            telemetry::attest_declined(
-                telemetry::HarnessFeature::EmptyRetryDeescalation,
-                if explicit_top_effort {
-                    "explicit_top_effort"
-                } else {
-                    "already_lowest"
-                },
-            );
-        } else {
-            telemetry::attest_fired(telemetry::HarnessFeature::EmptyRetryDeescalation);
-        }
-        stepped
-    } else {
-        effort
-    };
+    let effort = empty_retry_deescalation(request, effort, explicit_top_effort);
     // gpt-5.6-luna effort contract (user-set, 2026-07-13): luna runs at
     // `xhigh` or above. Applied LAST — after band resolution, dynamic effort,
     // and the empty-retry de-escalation — so nothing steps a luna request
@@ -247,6 +287,35 @@ pub(crate) fn build_responses_request_for_session(
     }
 
     payload
+}
+
+/// The empty-response de-escalation [`build_responses_body`] applies (its call
+/// site says why): when `request` retries a turn that came back empty,
+/// `effort` goes out as [`empty_retry_effort`] steps it and whether it stepped
+/// is attested; any other request keeps `effort`.
+fn empty_retry_deescalation(
+    request: &MessageRequest,
+    effort: Option<&'static str>,
+    explicit_top_effort: bool,
+) -> Option<&'static str> {
+    if empty_response_pressure(request) {
+        let stepped = empty_retry_effort(effort, explicit_top_effort);
+        if stepped == effort {
+            telemetry::attest_declined(
+                telemetry::HarnessFeature::EmptyRetryDeescalation,
+                if explicit_top_effort {
+                    "explicit_top_effort"
+                } else {
+                    "already_lowest"
+                },
+            );
+        } else {
+            telemetry::attest_fired(telemetry::HarnessFeature::EmptyRetryDeescalation);
+        }
+        stepped
+    } else {
+        effort
+    }
 }
 
 fn build_image_generation_request(
@@ -3785,7 +3854,7 @@ fn reasoning_replay_from_output(output: &[Value], session_id: &str) -> Option<Va
 }
 
 /// Parse a non-streaming Responses payload into a zo [`MessageResponse`].
-fn parse_responses_response(value: &Value, model: &str, session_id: &str) -> MessageResponse {
+pub(crate) fn parse_responses_response(value: &Value, model: &str, session_id: &str) -> MessageResponse {
     let mut content = Vec::new();
     if let Some(output) = value.get("output").and_then(Value::as_array) {
         for item in output {

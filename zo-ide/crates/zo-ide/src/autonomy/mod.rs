@@ -66,6 +66,27 @@ pub fn run_is_held_below(mode: PermissionMode) -> bool {
     !is_full_access(mode) && mode != PermissionMode::ReadOnly
 }
 
+/// What a `/goal` start says when its run is held read-only (t-122771): a
+/// goal with no gate stops after turns that change nothing, so the person is
+/// told both ways to let it write.
+pub const GOAL_READ_ONLY_RUN_NOTE: &str =
+    "read-only run (add --allow-writes or switch to Full Access to let it write)";
+
+/// What a `/goal` start says about writing (t-122771): whether its turns may
+/// write, and — when they may not — how to let them.
+#[must_use]
+pub fn run_writes_note(allow_writes: bool, mode: PermissionMode) -> &'static str {
+    if is_full_access(mode) {
+        "may write (Full Access)"
+    } else if mode == PermissionMode::ReadOnly {
+        "read-only session (switch to Full Access with /permissions to let it write)"
+    } else if allow_writes {
+        "may write as this session allows (--allow-writes)"
+    } else {
+        GOAL_READ_ONLY_RUN_NOTE
+    }
+}
+
 pub struct Autonomy {
     pub runner: AutonomyRunner,
     pub scheduler: Scheduler,
@@ -204,6 +225,19 @@ impl Autonomy {
         self.persist_budget()
     }
 
+    /// A person's own `/goal` start or resume renews the session's budget
+    /// (t-122771): each command they type is a new consent, and the run it
+    /// arms is held to the four limits again. The budget is goal and loop
+    /// together, so a loop's share renews too — but a loop the spent budget
+    /// paused stays paused. A block on unknown cost stays, and a reopened
+    /// session or the scheduler's own wakeup renews nothing.
+    pub fn renew_session_budget(&mut self) -> io::Result<()> {
+        self.budget.assistant_turns = 0;
+        self.budget.output_tokens = 0;
+        self.budget.active_millis = 0;
+        self.persist_budget()
+    }
+
     pub fn record_usage(&mut self, output_tokens: u64, active_millis: u64) -> io::Result<()> {
         self.budget.assistant_turns = self.budget.assistant_turns.saturating_add(1);
         self.budget.output_tokens = self.budget.output_tokens.saturating_add(output_tokens);
@@ -323,5 +357,133 @@ mod tests {
         assert!(!run_is_held_below(PermissionMode::ReadOnly));
         assert!(!run_is_held_below(PermissionMode::DangerFullAccess));
         assert!(!run_is_held_below(PermissionMode::Allow));
+    }
+
+    /// t-122771: a `/goal` start says whether its turns may write, and when
+    /// they may not, how to let them — the run's flag or Full Access where
+    /// the run is held, Full Access where the session itself is read-only.
+    #[test]
+    fn a_start_says_whether_its_run_may_write() {
+        use super::{run_writes_note, GOAL_READ_ONLY_RUN_NOTE};
+        use runtime::PermissionMode;
+
+        for allow_writes in [false, true] {
+            for mode in [PermissionMode::DangerFullAccess, PermissionMode::Allow] {
+                assert_eq!(run_writes_note(allow_writes, mode), "may write (Full Access)");
+            }
+            assert_eq!(
+                run_writes_note(allow_writes, PermissionMode::ReadOnly),
+                "read-only session (switch to Full Access with /permissions to let it write)"
+            );
+        }
+        assert_eq!(
+            GOAL_READ_ONLY_RUN_NOTE,
+            "read-only run (add --allow-writes or switch to Full Access to let it write)"
+        );
+        for mode in [PermissionMode::WorkspaceWrite, PermissionMode::Prompt] {
+            assert_eq!(run_writes_note(false, mode), GOAL_READ_ONLY_RUN_NOTE, "{mode:?}");
+            assert_eq!(
+                run_writes_note(true, mode),
+                "may write as this session allows (--allow-writes)",
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// t-122771: the person's own start or resume renews the session's
+    /// budget; a reopened session renews nothing, and a block on unknown
+    /// cost is never renewed.
+    #[test]
+    fn a_persons_start_renews_the_session_budget_but_not_a_block() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let transcript = temp.path().join("s.jsonl");
+        let mut autonomy = Autonomy::load(&transcript, None, false);
+        autonomy.limits.max_assistant_turns = 2;
+        autonomy.record_usage(5, 10).expect("a turn");
+        autonomy.record_usage(5, 10).expect("a turn");
+        assert!(autonomy.exhaustion().is_some());
+
+        let mut reopened = Autonomy::load(&transcript, None, true);
+        reopened.limits.max_assistant_turns = 2;
+        assert!(reopened.exhaustion().is_some(), "a reopened session renewed the budget");
+        reopened.renew_session_budget().expect("renew");
+        assert_eq!(reopened.exhaustion(), None);
+        assert_eq!(Autonomy::load(&transcript, None, true).status().budget.assistant_turns, 0);
+
+        reopened.block("unknown graph cost").expect("block");
+        reopened.renew_session_budget().expect("renew");
+        assert_eq!(reopened.exhaustion().as_deref(), Some("unknown graph cost"));
+    }
+
+    /// t-122771: the session's budget is goal and loop together, so a
+    /// person's goal start renews a loop's share as well — but a loop the
+    /// spent budget paused stays paused: it does not run on by itself
+    /// through the renewed budget, only on `/loop resume`.
+    #[test]
+    fn a_renewed_session_budget_does_not_wake_a_loop_it_paused() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let transcript = temp.path().join("s.jsonl");
+        let mut autonomy = Autonomy::load(&transcript, None, false);
+        autonomy
+            .loops
+            .apply(
+                commands::LoopCommand::StartDynamic {
+                    prompt: "poll CI".to_string(),
+                },
+                1_000,
+                temp.path(),
+            )
+            .expect("a loop");
+        autonomy.limits.max_assistant_turns = 1;
+        autonomy.record_usage(1, 1).expect("a loop turn");
+        let reason = autonomy.exhaustion().expect("the budget is spent");
+        autonomy.loops.pause_for_session_limit(&reason).expect("pause");
+
+        autonomy.goal.apply("ship it", None).expect("a goal");
+        autonomy.renew_session_budget().expect("the person's start renews it");
+        assert_eq!(autonomy.exhaustion(), None);
+        assert_eq!(autonomy.status().loops[0].phase, "paused");
+        assert!(
+            autonomy
+                .loops
+                .dispatch_due(u64::MAX / 2, temp.path())
+                .expect("dispatch")
+                .is_none(),
+            "the paused loop ran on the renewed budget"
+        );
+    }
+
+    /// t-122771: a goal now starts the moment it is written, beside a loop
+    /// that may already run — and one session budget counts both, so when
+    /// it is spent, both stop.
+    #[test]
+    fn a_bare_goal_and_a_loop_share_one_session_budget() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let transcript = temp.path().join("s.jsonl");
+        let mut autonomy = Autonomy::load(&transcript, None, false);
+        autonomy
+            .loops
+            .apply(
+                commands::LoopCommand::StartDynamic {
+                    prompt: "poll CI".to_string(),
+                },
+                1_000,
+                temp.path(),
+            )
+            .expect("a loop");
+        autonomy.goal.apply("ship it", None).expect("a goal");
+        assert!(autonomy.goal.is_running());
+        assert_eq!(autonomy.status().loops[0].phase, "running");
+
+        autonomy.limits.max_assistant_turns = 2;
+        autonomy.record_usage(1, 1).expect("a goal turn");
+        autonomy.record_usage(1, 1).expect("a loop turn");
+        let reason = autonomy.exhaustion().expect("the shared budget is spent");
+        autonomy.goal.pause_for_session_limit(&reason).expect("goal");
+        autonomy.loops.pause_for_session_limit(&reason).expect("loops");
+
+        assert!(!autonomy.goal.is_running());
+        assert!(autonomy.goal.dispatch_next().expect("dispatch").is_none());
+        assert_eq!(autonomy.status().loops[0].phase, "paused");
     }
 }

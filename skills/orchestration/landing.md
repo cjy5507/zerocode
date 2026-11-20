@@ -77,6 +77,29 @@ coordinator seat (a worker's pane is refused):
 - Then review it exactly as any other: `task-update --task <id> --attempt <the take's
   dispatchId> --source <the hand-in's source> --result '{"verified":true,…}'`.
 
+Work with no commit to hand in — a measurement, a design, a report, a fix done
+by hand that is already on main — is settled in one call, from the live
+coordinator seat:
+
+```
+task-settle --task <id> --why '<one line: why the work is done>' --report <the report's absolute path> --retry-request settle-<id>
+```
+
+It walks the same three steps — the seat's own attempt, a hand-in of the why and
+the report on it, and the review of that hand-in — and writes the task 완료 —
+착지할 것 없음 (`verified`, `nothingToLand` and `report`). The keys the result
+had stay where they were; what the settle writes over (the review keys, `report`,
+`verificationWithdrawn`, an earlier `settled`) moves to `settled.replaced`, a
+result that was not a JSON object is kept
+as `settled.original`, and `settled` also holds who settled it, when, the why and
+the report. It is refused for a task an attempt handed something in on (review
+that hand-in with `task-update` instead), for one whose result names a commit
+(`commit`, `mergeHead`, `head` and the like — code may have landed: review it, or
+let `task-backfill` prove its landing), for one a coordinator review already
+stands on, and for one carried, held by a decision, waiting on its dependencies,
+failed or closed. Do not close finished work `outdated`: nothing reads that as
+done.
+
 Once a stack is on main, write its landing on every member in the same turn:
 `task-update --members t-1,t-2 --result '{"merged":true,"mergeHead":"<sha>"}'
 --retry-request landed-<sha>`, and after the release
@@ -85,10 +108,13 @@ to the attempt and source its verified review names; a member with no verified
 review, or whose attempt handed nothing in, refuses the whole call (a line each)
 and nothing is written.
 
-`task-backfill [--base main] [--tags 'v*'] [--checkout <path>]` lists the completed and
+`task-backfill [--base main] [--tags 'v*'] [--release-remote <remote or URL>] [--checkout <path>]`
+lists the completed and
 closed tasks no review stands on whose result names a commit (`mergeHead`, `merged`,
 `landed.mergeHead`, `commits[]` …), with what git proves for each: `merged` when the base
-holds the commit, `deployed` when a release tag holds it (the tag is named), `verified`
+holds the commit, `deployed` when a release tag holds it, `origin/<base>` holds the tag and
+the release remote holds it as the landing proof below reads one (the tag is named — see
+`--release-remote` below), `verified`
 only when the result names a review task whose own review passed — otherwise
 `"verified":"unknown"`, never a pass nobody recorded — and, for every task it cannot
 write, why (no commit named, not in the base, git does not know it, an attempt handed
@@ -96,6 +122,39 @@ something in). Read the list first; `--apply --retry-request backfill-<run>` wri
 listed rows (attempt, hand-in, review) from the coordinator seat, one task's failure
 never stopping the others. The original result is kept: its keys stay, a review key it
 held moves under `backfill.replaced`, and `backfill.by` reads `task-backfill`.
+
+The same list holds the verified tasks whose landing nobody wrote (`"landing": true`),
+with what git proves of each against `--base` and the release remote — and the ledger
+never writes `verified` there; each landing is bound to the coordinator review that stands:
+
+- `merged` (with `mergeHead`, the newest copy on the base) only when every commit of the
+  range the review read is on the base's first-parent line as the same change: the same
+  lines, by the same author at the same moment under the same subject, as a cherry-pick
+  or a rebase keeps them. A squash proves nothing. A range holding a merge commit proves
+  nothing, nor does one of commits that change nothing alone (those are left out of any
+  other range).
+- `deployed` (with `release`) only when a release tag holds that landing, `origin/<base>`
+  holds the tag, and the remote `--release-remote` names holds that tag at the same
+  commit (`git ls-remote`, each tag peeled to its commit). Only a remote that shares none
+  of this repository's history — a published snapshot keeps its own — is read by a tag's
+  name alone. Origin, a remote at origin's place, every remote of a shallow clone, and any
+  remote naming a commit this repository has are taken to share it; there a tag of that
+  name at another commit — an annotated tag made elsewhere, one moved onto a commit not
+  fetched here — is no release, and the row says to fetch and ask again.
+- Neither where the base reverted the landing (`This reverts commit <id>`).
+
+**`--release-remote` has no default** — on both roads. Name the remote a release is
+published to (a remote's name or its URL — where a project publishes to a repository of
+its own, that one). A remote a release's tag reaches before the release ends — a
+project's own origin often does — says nothing about a release that ended green.
+Without `--release-remote` no release is written for any task: `merged` only, and each
+such row says why — under `unreleased`, or, for a task already merged whose release alone
+was asked, under `why`. A URL's user name, password or token is never written: every
+reason names the remote by its host and path.
+
+A row it cannot prove says why, and nothing is written for it. The coordinator in charge
+of a release calls it once the release is published, naming the release remote. Nothing
+calls it on a timer, and no release script calls it yet.
 
 ## Decision gates
 

@@ -138,10 +138,13 @@ the table: flags, arguments and every verb not named here are in `help`.
   error or a classifier decline.
 - Tasks: `task-create` writes a slice down. `task-list` shows what is written
   down. `task-update` corrects the record, from the coordinator seat.
-  `task-settle` lists old open work and closes it `outdated` with `--apply`.
+  `task-settle` lists old open work and closes it `outdated` with `--apply`;
+  `task-settle --task <id> --why --report` settles one task nothing was handed
+  in on, and whose result names no commit, as done with nothing to land.
   `task-take` opens a coordinator attempt on work done by hand. `hand-in`
   hands a commit in on that attempt. `task-backfill` writes the records of
-  work that landed without one.
+  work that landed without one, and the landing and release git proves for
+  verified work — a release only from the remote `--release-remote` names.
 - Gates: `gate-create` holds a task on a decision. `gate-resolve` answers it.
   `gate-list` shows what stands and what was decided.
 - Workers: `agent-list` says which agents this machine has and their

@@ -932,20 +932,31 @@ impl PlainSession {
         // A reopened session sends the prompt it stored when it opened, read
         // once here with the tool list kept beside it.
         let stored_prompt = resumed.then(|| load_stored_prompt(&handle.path)).flatten();
+        let root = options.parent_registry.is_none() && options.teammate_harness.is_none();
         // The tools the session is given (`opening_tool_list`), read once
         // here like the system prompt.
         let allowed_tools = opening_tool_list(
             options.allowed_tools.as_ref(),
-            options.parent_registry.is_none() && options.teammate_harness.is_none(),
+            root,
             stored_prompt.as_ref(),
             options.headless,
             &model,
             || super::runtime_builder::person_attached_tools(&cwd, options.mcp_config.as_deref()),
         );
+        // A run nobody can answer is not given the tools only a person answers
+        // (`PERSON_ONLY_TOOLS`), before the deny set below is read: nobody
+        // attends it and its stdin is no terminal, the same absence the plain
+        // front-end decides a parked question by (`ide::run_loop`). `--plain`
+        // on a terminal a person types into keeps them.
+        let nobody_answers = options.headless && !std::io::IsTerminal::is_terminal(&std::io::stdin());
+        if root && withholds_person_only_tools(nobody_answers, stored_prompt.as_ref()) {
+            crate::runtime_support::withhold_tools(PERSON_ONLY_TOOLS);
+        }
         // What the session reaches of what it is given: the text built below
         // names no other tool (`tools::ToolOffer`).
         let denied_tools = crate::runtime_support::disallowed_tool_names();
-        let offer = tools::ToolOffer::new(allowed_tools.as_ref(), denied_tools.as_ref());
+        let offer = tools::ToolOffer::new(allowed_tools.as_ref(), denied_tools.as_ref())
+            .with_ledger(tools::ledger_reachable());
         // Only a list the harness profile chose is kept beside a prompt built
         // now, for a reopen nobody attends. A launch list (`--allowed-tools`,
         // `zo review`, a pane's brief) is the launch's to name again: a
@@ -1333,7 +1344,7 @@ impl PlainSession {
             .map_or(0, |inner| inner.session().messages.len());
         let turn_message_from = self.runtime.session().first_message_index()
             .saturating_add(u32::try_from(turn_from).unwrap_or(u32::MAX));
-        let installed = super::smart_runtime::install_smart_turn(
+        let mut installed = super::smart_runtime::install_smart_turn(
             &mut self.runtime,
             &self.cwd,
             &self.handle.id,
@@ -1345,6 +1356,8 @@ impl PlainSession {
                 route_fact: &self.route_fact,
             },
         );
+        installed.orchestration =
+            host_orchestration_for(installed.orchestration, self.headless, tools::ledger_reachable());
         let (plan_turn, live_client) = self.prepare_measured_plan(
             input, &turn_setup, &installed, plan_began_ms, &block_tx, live_client,
         ).await;
@@ -2099,12 +2112,17 @@ impl PlainSession {
             .then(|| crate::goal::workspace_fingerprint(&self.cwd).ok())
             .flatten();
         let mut result = self.autonomy.goal.apply(raw, fingerprint.as_deref())?;
-        if first == "start"
-            && self.autonomy.goal.is_running()
-            && !self.autonomy.goal.allows_writes()
-            && crate::autonomy::run_is_held_below(self.permission_mode)
-        {
-            result.notice = format!("{} · {}", result.notice, crate::autonomy::READ_ONLY_RUN_NOTE);
+        if result.armed {
+            self.autonomy
+                .renew_session_budget()
+                .map_err(|error| error.to_string())?;
+        }
+        if result.started {
+            let writes = crate::autonomy::run_writes_note(
+                self.autonomy.goal.allows_writes(),
+                self.permission_mode,
+            );
+            result.notice = format!("{} · {writes}", result.notice);
         }
         if let Some(inner) = self.runtime.try_runtime_mut() {
             inner.set_session_goal(self.autonomy.goal.objective().map(str::to_string));
@@ -2153,16 +2171,29 @@ impl PlainSession {
         report: GoalTurnReport,
     ) -> Result<String, String> {
         let usage = (report.output_tokens, report.active_millis);
-        let result = self.autonomy.goal.record_turn(turn, report)?;
+        let mut result = self.autonomy.goal.record_turn(turn, report)?;
         self.autonomy
             .record_usage(usage.0, usage.1)
             .map_err(|error| error.to_string())?;
         if let Some(reason) = self.autonomy.exhaustion() {
+            // A run still going stops here on the session's budget: its line
+            // says so, not the status from a moment before (t-122771).
+            let was_running = self.autonomy.goal.is_running();
             self.autonomy.goal.pause_for_session_limit(&reason)?;
             self.autonomy.loops.pause_for_session_limit(&reason)?;
+            if let Some(line) = was_running.then(|| self.autonomy.goal.stop_line()).flatten() {
+                result = line;
+            }
         }
         self.sync_goal_reminder();
         Ok(result)
+    }
+
+    /// Why a paused goal stopped, for a dispatch that paused it without a
+    /// turn ([`crate::goal::GoalController::stop_line`]).
+    #[must_use]
+    pub fn goal_stop_line(&self) -> Option<String> {
+        self.autonomy.goal.stop_line()
     }
 
     pub fn loop_command(&mut self, raw: &str) -> Result<String, String> {
@@ -3091,6 +3122,41 @@ fn opening_tool_list(
         })
         .flatten()
     })
+}
+
+/// Who orchestrates a turn's sub-agents in this session. A run nobody attends
+/// that reaches no ZeroCode ledger is model-led: the host's split there asked
+/// a planner request of its own before the first model request (measured at
+/// 59 s and 4,962 output tokens on a slow model, given up on at 15 s and its
+/// answer unused), for a split nobody watches. A session a person attends, or
+/// one the ledger reaches, keeps the policy its settings name.
+fn host_orchestration_for(
+    policy: tools::HostOrchestration,
+    headless: bool,
+    ledger: bool,
+) -> tools::HostOrchestration {
+    if headless && !ledger && policy == tools::HostOrchestration::Auto {
+        tools::HostOrchestration::ModelLed
+    } else {
+        policy
+    }
+}
+
+/// The tools only a person at the keyboard can answer. In a run nobody
+/// attends, `AskUserQuestion` comes back dismissed, so its schema and the
+/// `# Clarifying questions` section it brings (about 620 tokens) were paid on
+/// every request for a call that can only be refused.
+const PERSON_ONLY_TOOLS: &[&str] = &["AskUserQuestion"];
+
+/// Whether a root session is withheld [`PERSON_ONLY_TOOLS`]: nobody can answer
+/// it, and the prompt it sends was not built to teach them — a new run, or a
+/// reopen of a run that was itself withheld them. A reopen whose stored
+/// prompt teaches them (one a person opened, or one zo 1.1.168 opened) keeps
+/// them, so its prompt and tools stay the bytes they were; a session a person
+/// can answer is never withheld them.
+fn withholds_person_only_tools(nobody_answers: bool, stored: Option<&StoredPrompt>) -> bool {
+    nobody_answers
+        && stored.is_none_or(|stored| !runtime::teaches_clarifying_questions(&stored.sections))
 }
 
 /// `<id>.system-prompt.json` — 세션이 만들어질 때의 프롬프트를 보존해 재개 시
@@ -4117,7 +4183,46 @@ mod resume_progress_tests {
 
 #[cfg(test)]
 mod opening_tool_list_tests {
-    use super::{load_stored_prompt, opening_tool_list, session_system_prompt_path, session_tool_list_path, store_system_prompt, AllowedToolSet, StoredPrompt};
+    use super::{
+        host_orchestration_for, load_stored_prompt, opening_tool_list, session_system_prompt_path, session_tool_list_path,
+        store_system_prompt, withholds_person_only_tools, AllowedToolSet, StoredPrompt,
+    };
+
+    /// A run nobody attends is withheld the tools only a person answers — a
+    /// new run, and a reopen of a run that was withheld them. A reopen whose
+    /// stored text teaches them (one a person opened, or one zo 1.1.168
+    /// opened) keeps them, so its text and tools stay the bytes they were, and
+    /// a session a person attends is never withheld them (t-120813).
+    #[test]
+    fn a_run_nobody_attends_is_withheld_the_person_only_tools_and_a_reopen_follows_its_text() {
+        let stored = |sections: &[&str]| StoredPrompt { sections: sections.iter().map(|section| (*section).to_string()).collect(), tools: None };
+        let teaches = stored(&["# Zo", "# Clarifying questions\n - Use `AskUserQuestion` when …"]);
+        let withheld = stored(&["# Zo", "# Task work\n - …"]);
+
+        assert!(withholds_person_only_tools(true, None), "a new run nobody attends");
+        assert!(withholds_person_only_tools(true, Some(&withheld)), "a reopen of a run that was withheld them");
+        assert!(!withholds_person_only_tools(true, Some(&teaches)), "a reopen whose stored text teaches them keeps them");
+        assert!(!withholds_person_only_tools(false, None), "a new session a person attends");
+        assert!(!withholds_person_only_tools(false, Some(&withheld)), "a person reopening a run that was withheld them");
+        assert!(!withholds_person_only_tools(false, Some(&teaches)), "a person reopening their own session");
+    }
+
+    /// Only a run nobody attends that reaches no ZeroCode ledger loses the
+    /// host's split; a policy that never splits stays as its settings name it
+    /// (t-120813).
+    #[test]
+    fn only_a_run_nobody_attends_without_the_ledger_loses_the_hosts_split() {
+        use tools::HostOrchestration::{Auto, ModelLed, Off};
+        assert_eq!(host_orchestration_for(Auto, true, false), ModelLed, "nobody attends and no ledger");
+        assert_eq!(host_orchestration_for(Auto, false, false), Auto, "a person attends");
+        assert_eq!(host_orchestration_for(Auto, true, true), Auto, "the ledger is reached");
+        assert_eq!(host_orchestration_for(Auto, false, true), Auto, "a person attends a ledger pane");
+        for policy in [ModelLed, Off] {
+            for (headless, ledger) in [(true, false), (false, false), (true, true)] {
+                assert_eq!(host_orchestration_for(policy, headless, ledger), policy, "{policy:?} never splits");
+            }
+        }
+    }
 
     /// `headless_core` holds only a root run nobody attends, with nothing of
     /// the person's attached, to the core list. A session a person attends, a

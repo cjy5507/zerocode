@@ -1,0 +1,237 @@
+import CoreGraphics
+import XCTest
+@testable import ZeroCodeComputerUseMacOSCore
+
+/// A press refused because its look showed no control says which of the
+/// look's gaps it may have fallen into: the control shows the words only in
+/// its text, the look stopped early, or the control stands in another of the
+/// app's windows (t-121372). Nothing is pressed either way.
+final class ReadingRefusalTests: XCTestCase {
+    private let authorize = ReadingRefusal.OtherWindow(windowId: 237041, title: "Authorize Acme")
+
+    func testAWholeLookWithOneWindowKeepsTheRefusalItAlwaysGave() {
+        XCTAssertEqual(
+            ReadingRefusal.noControl(app: "Fixture", windowTitle: "Report", words: "--role AXButton --label «Continue»", shown: nil, cut: nil, others: nil),
+            "no control in Fixture's window «Report» reads --role AXButton --label «Continue»; look with --marks, or find"
+        )
+        XCTAssertNil(ReadingRefusal.shownWords([]))
+        XCTAssertNil(ReadingRefusal.cutWords(truncated: false, cutShort: nil, maxDepthReached: false, read: 34, maxNodes: 1200))
+        XCTAssertNil(ReadingRefusal.otherWindowsWords(app: "Fixture", others: []))
+    }
+
+    private func shown(_ index: Int, _ role: String, name: String, title: String? = nil, value: String? = nil, description: String? = nil) -> ReadingRefusal.Shown {
+        ReadingRefusal.Shown(face: ElementFace(index: index, role: role, label: title, value: value, description: description), name: name)
+    }
+
+    func testAnElementThatShowsTheWordsOnlyInItsTextIsNamedByNumber() {
+        let query = ElementQuery(text: nil, role: nil, label: "Authorize")
+        let found = ReadingRefusal.shownOnly(query, among: [shown(12, "AXLink", name: "[Authorize](https://example.com/a)")])
+        XCTAssertEqual(found, [ElementFace(index: 12, role: "AXLink", label: "Authorize", value: nil, description: nil)])
+        XCTAssertEqual(
+            ReadingRefusal.shownWords(found),
+            "these words show only in the text of 12 AXLink «Authorize», which a click by words does not read: press one by its --element-index"
+        )
+        let rows = (1...4).map { ElementFace(index: $0, role: "AXRow", label: "Authorize \($0)", value: nil, description: nil) }
+        XCTAssertEqual(
+            ReadingRefusal.shownWords(rows),
+            "these words show only in the text of 1 AXRow «Authorize 1»; 2 AXRow «Authorize 2»; 3 AXRow «Authorize 3» and 1 more, which a click by words does not read: press one by its --element-index"
+        )
+    }
+
+    /// t-121539 고칠 것 2: a link's address is not its text, and an element
+    /// whose label already holds a word is not one that shows it only in its text.
+    func testALinkAddressAndAMatchedLabelAreNotTextOnly() {
+        let settings = ElementQuery(text: nil, role: nil, label: "Settings")
+        XCTAssertEqual(ReadingRefusal.shownOnly(settings, among: [shown(3, "AXLink", name: "[Profile](https://example.com/settings/profile)")]), [])
+        let both = ElementQuery(text: "now", role: nil, label: "Continue")
+        XCTAssertEqual(ReadingRefusal.shownOnly(both, among: [shown(4, "AXButton", name: "Continue now", title: "Continue")]), [])
+        let asButton = ElementQuery(text: nil, role: "button", label: "Authorize")
+        XCTAssertEqual(ReadingRefusal.shownOnly(asButton, among: [shown(5, "AXLink", name: "[Authorize](https://example.com/a)")]), [])
+        XCTAssertEqual(ReadingRefusal.shownText(role: "AXLink", name: "[Save \\[draft\\]](https://example.com/s)"), "Save [draft]")
+        XCTAssertEqual(ReadingRefusal.shownText(role: "AXButton", name: "[Save](x)"), "[Save](x)")
+        XCTAssertEqual(ReadingRefusal.shownText(role: "AXLink", name: "Save"), "Save")
+    }
+
+    /// t-121539 I-5: one item of a refusal keeps 80 characters at most.
+    /// t-121849: no element whose shown text holds one of the person's
+    /// confirmation words is offered, since the check reads another of its
+    /// names; any other is offered as before.
+    func testAnElementWhoseTextHoldsAConfirmationWordIsNotOffered() {
+        let guardWords = ["payment": ["pay"], "transfer": ["transfer"], "delete": ["delete"]]
+        let project = ElementQuery(text: nil, role: nil, label: "project")
+        let goLink = shown(7, "AXLink", name: "[Delete project](https://example.com/projects/1/delete)", description: "Go")
+        XCTAssertEqual(ReadingRefusal.shownOnly(project, among: [goLink], guardWords: guardWords), [])
+        XCTAssertEqual(ReadingRefusal.shownOnly(project, among: [goLink]).map(\.index), [7], "without the person's words it is offered")
+        let authorize = ElementQuery(text: nil, role: nil, label: "Authorize")
+        let plain = shown(12, "AXLink", name: "[Authorize](https://example.com/a)")
+        XCTAssertEqual(ReadingRefusal.shownOnly(authorize, among: [plain], guardWords: guardWords).map(\.index), [12])
+    }
+
+    /// t-122111 Q2: a control under another window of the same app is
+    /// refused with that window named and a way out that takes no pointer;
+    /// under anything else the refusal keeps the words it always had.
+    func testAControlUnderAnotherWindowOfItsAppNamesThatWindowAndAMoveNotAFocus() {
+        let front = ReadingRefusal.OtherWindow(windowId: 243600, title: "Home | Fixture")
+        let said = ReadingRefusal.covered(index: 9, by: "AXButton Overview", otherWindow: front)
+        XCTAssertTrue(said.hasPrefix("element 9 is covered at its centre by AXButton Overview, which stands in another window of this app (--window-id 243600 «Home | Fixture»)"), said)
+        XCTAssertTrue(said.contains("move that window aside in the background"), said)
+        XCTAssertTrue(said.contains("a window move of its --window-id takes no pointer and raises nothing"), said)
+        XCTAssertTrue(said.hasSuffix("if it will not move, ask the person"), said)
+        XCTAssertFalse(said.lowercased().contains("focus"), "a move comes first, never bringing a window to the front: \(said)")
+        XCTAssertFalse(said.contains("--marks"), "looking again does not clear another window: \(said)")
+        XCTAssertEqual(
+            ReadingRefusal.covered(index: 2, by: "AXButton Overview", otherWindow: nil),
+            "element 2 is covered at its centre by AXButton Overview; look again with --marks"
+        )
+        XCTAssertEqual(ReadingRefusal.covered(index: 3, by: "", otherWindow: nil), "element 3 is covered at its centre; look again with --marks")
+    }
+
+    /// t-122948: a window that publishes no number of its own — Chrome's, the
+    /// twin fixture's — is still named, by the number the library links it to.
+    func testAWindowThatPublishesNoNumberIsStillNamedByItsLink() {
+        XCTAssertEqual(ReadingRefusal.windowID(published: nil, linked: { 243600 }), 243600)
+        var asked = false
+        XCTAssertEqual(ReadingRefusal.windowID(published: 7, linked: { asked = true; return 9 }), 7)
+        XCTAssertFalse(asked, "a published number is read first and the link is not asked")
+        XCTAssertNil(ReadingRefusal.windowID(published: nil, linked: { nil }))
+    }
+
+    func testALongTitleOrTextIsClippedToEightyCharacters() {
+        let long = String(repeating: "a", count: 300)
+        let window = ReadingRefusal.otherWindowsWords(app: "Notes", others: [.init(windowId: 7, title: long)]) ?? ""
+        XCTAssertTrue(window.contains("«" + String(repeating: "a", count: 79) + "…»"), window)
+        XCTAssertFalse(window.contains(String(repeating: "a", count: 80)), window)
+        let text = ReadingRefusal.shownWords([ElementFace(index: 1, role: "AXRow", label: long, value: nil, description: nil)]) ?? ""
+        XCTAssertTrue(text.contains("«" + String(repeating: "a", count: 79) + "…»"), text)
+    }
+
+    func testALookThatStoppedEarlySaysWhereAndWhy() {
+        XCTAssertEqual(
+            ReadingRefusal.cutWords(truncated: true, cutShort: "time_budget", maxDepthReached: false, read: 812, maxNodes: 1200),
+            "this look stopped at its time budget after 812 elements, before the end of the window"
+        )
+        XCTAssertEqual(
+            ReadingRefusal.cutWords(truncated: true, cutShort: nil, maxDepthReached: false, read: 1200, maxNodes: 1200),
+            "this look stopped at its 1200-element limit, before the end of the window"
+        )
+        XCTAssertEqual(
+            ReadingRefusal.cutWords(truncated: true, cutShort: nil, maxDepthReached: true, read: 300, maxNodes: 1200),
+            "this look read no deeper than its depth limit, so deeper elements were not read"
+        )
+        XCTAssertEqual(
+            ReadingRefusal.cutWords(truncated: true, cutShort: "app_unresponsive", maxDepthReached: false, read: 40, maxNodes: 1200),
+            "the app stopped answering after 40 elements, before the end of the window"
+        )
+        XCTAssertEqual(
+            ReadingRefusal.cutWords(truncated: false, cutShort: WebTreeSettling.buildingCode, maxDepthReached: false, read: 4, maxNodes: 1200),
+            "this look caught the app still building its web tree"
+        )
+    }
+
+    func testTheAppsOtherWindowsAreNamedByNumberAndTitle() {
+        XCTAssertEqual(
+            ReadingRefusal.otherWindowsWords(app: "Google Chrome", others: [authorize, .init(windowId: 9, title: nil)]),
+            "Google Chrome has other windows on screen: --window-id 237041 «Authorize Acme», --window-id 9; the control may be in one of them — look at it by its --window-id"
+        )
+        let five = (1...5).map { ReadingRefusal.OtherWindow(windowId: CGWindowID($0), title: " ") }
+        XCTAssertEqual(
+            ReadingRefusal.otherWindowsWords(app: "Notes", others: five),
+            "Notes has other windows on screen: --window-id 1, --window-id 2, --window-id 3 and 2 more; the control may be in one of them — look at it by its --window-id"
+        )
+    }
+
+    func testTheRefusalCarriesTheCutAndTheOtherWindowsAfterItsOwnWords() {
+        let said = ReadingRefusal.noControl(
+            app: "Google Chrome",
+            windowTitle: "Home | Acme",
+            words: "--label «Authorize»",
+            shown: nil,
+            cut: "this look stopped at its time budget after 812 elements, before the end of the window",
+            others: ReadingRefusal.otherWindowsWords(app: "Google Chrome", others: [authorize])
+        )
+        XCTAssertTrue(said.hasPrefix("no control in Google Chrome's window «Home | Acme» reads --label «Authorize»; look with --marks, or find; "), said)
+        XCTAssertTrue(said.contains("time budget after 812 elements"), said)
+        XCTAssertTrue(said.hasSuffix("--window-id 237041 «Authorize Acme»; the control may be in one of them — look at it by its --window-id"), said)
+    }
+
+    func testABackgroundPointInAnotherWindowIsNamedAndStillRefused() {
+        let said = ReadingRefusal.backgroundTarget(.anotherWindow(authorize))
+        XCTAssertTrue(said.hasPrefix("the background confirmation target is not a readable control: "), said)
+        XCTAssertTrue(said.contains("another of the app's windows (--window-id 237041 «Authorize Acme»)"), said)
+        XCTAssertTrue(said.hasSuffix("no input was sent"), said)
+    }
+
+    func testABackgroundPointPastTheCutSaysTheLookStopped() {
+        let said = ReadingRefusal.backgroundTarget(.notReached("this look stopped at its 1200-element limit, before the end of the window"))
+        XCTAssertTrue(said.hasPrefix("the background confirmation target is not a readable control: this look stopped"), said)
+        XCTAssertTrue(said.hasSuffix("observe again before retrying; no input was sent"), said)
+    }
+
+    func testAContainerOrAnUnlabelledControlIsRefusedInTheWordsItAlwaysWas() {
+        XCTAssertEqual(
+            ReadingRefusal.backgroundTarget(.notAControl),
+            "the background confirmation target is not a readable control; observe again before retrying; no input was sent"
+        )
+    }
+}
+
+/// The helper's refusals are built by those words, so a look's gap reaches the caller.
+final class ReadingRefusalSourceTests: XCTestCase {
+    private func helperSource() throws -> String {
+        let here = URL(fileURLWithPath: #filePath)
+        let main = here.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/ZeroCodeComputerUseMacOS/main.swift")
+        return try String(contentsOf: main, encoding: .utf8)
+    }
+
+    private func body(of function: String, in source: String) throws -> Substring {
+        let start = try XCTUnwrap(source.range(of: function), function)
+        let end = try XCTUnwrap(source.range(of: "\n    }\n", range: start.upperBound..<source.endIndex), function)
+        return source[start.upperBound..<end.lowerBound]
+    }
+
+    func testAClickByReadingThatFindsNoneSaysWhatTheLookMissed() throws {
+        let chosen = try body(of: "private func chosenIndex(_ query: ElementQuery, in snapshot: Snapshot, guardWords: [String: [String]]? = nil) throws -> Int {", in: try helperSource())
+        XCTAssertTrue(chosen.contains("ReadingRefusal.noControl("), String(chosen))
+        XCTAssertTrue(chosen.contains("shown: ReadingRefusal.shownWords(shownFaces(query, in: snapshot, guardWords: guardWords))"), String(chosen))
+        XCTAssertTrue(chosen.contains("cut: lookCut(snapshot)"), String(chosen))
+        XCTAssertTrue(chosen.contains("others: otherWindowsWords(snapshot)"), String(chosen))
+    }
+
+    func testTheBackgroundConfirmationSaysWhereToLookAndStillRefuses() throws {
+        let source = try helperSource()
+        let confirm = try XCTUnwrap(source.range(of: "func confirmTarget(method: String, params: [String: JSONValue], snapshot loadSnapshot: () throws -> Snapshot) throws -> String? {"))
+        let label = source[confirm.upperBound...].prefix(1_400)
+        XCTAssertTrue(label.contains("let why = record == nil ? unreadablePoint(point, in: snapshot) : .notAControl"), String(label))
+        XCTAssertTrue(label.contains("throw ProviderError.coded(\"element_not_found\", ReadingRefusal.backgroundTarget(why))"), String(label))
+        XCTAssertTrue(source.contains("return try label(backgroundClickRecord(at: point, in: snapshot), in: snapshot, at: point)"))
+    }
+
+    /// t-122111 Q2: only the refusal's words change — the decision before it,
+    /// that the control is on top at its centre, is the one it always was.
+    func testACoveredControlIsDecidedAsBeforeAndOnlyItsWordsNameTheWindow() throws {
+        let source = try helperSource()
+        let onTop = try body(of: "private func requireOnTop(_ record: ElementRecord, in snapshot: Snapshot, background: Bool = false, at requestedPoint: CGPoint? = nil, reach: MarkPin.Reach = .press) throws {", in: source)
+        XCTAssertTrue(onTop.contains("if MarkPin.onTop(hit: hit, target: record.element, reach: reach, parent: { copyElement($0, kAXParentAttribute as String) }, same: { CFEqual($0, $1) }) {\n            return\n        }"), String(onTop))
+        let decided = try XCTUnwrap(onTop.range(of: "if MarkPin.onTop(hit: hit"))
+        let worded = try XCTUnwrap(onTop.range(of: "ReadingRefusal.covered(index: record.index, by: covering, otherWindow: coveringWindow(hit, in: snapshot))"))
+        XCTAssertLessThan(decided.lowerBound, worded.lowerBound)
+        let owner = try body(of: "private func coveringWindow(_ hit: AXUIElement, in snapshot: Snapshot) -> ReadingRefusal.OtherWindow? {", in: source)
+        XCTAssertTrue(owner.contains("owner == snapshot.app.pid"), String(owner))
+        XCTAssertTrue(owner.contains("number != snapshot.windowId"), String(owner))
+        // Both refusals that name another window read its linked number when it publishes none (t-122948).
+        let linked = "ReadingRefusal.windowID(published: windowNumber(window), linked: { WindowServerNumber.of(window) })"
+        XCTAssertTrue(owner.contains(linked), String(owner))
+        let point = try body(of: "private func unreadablePoint(_ point: CGPoint?, in snapshot: Snapshot) -> ReadingRefusal.Unreadable {", in: source)
+        XCTAssertTrue(point.contains(linked), String(point))
+    }
+
+    func testTheElementsThatShowTheWordsOnlyInTheirTextAreTheCoresChoice() throws {
+        let source = try helperSource()
+        let shown = try body(of: "private func shownFaces(_ query: ElementQuery, in snapshot: Snapshot, guardWords: [String: [String]]?) -> [ElementFace] {", in: source)
+        XCTAssertTrue(shown.contains("ReadingRefusal.shownOnly(query, among:"), String(shown))
+        XCTAssertTrue(shown.contains("}, guardWords: guardWords)"), String(shown))
+        // Both presses by words hand the person's confirmation words to the refusal (t-121849).
+        XCTAssertEqual(source.components(separatedBy: "chosenIndex(query, in: snapshot, guardWords: confirmGuardWords(params[\"confirmGuard\"]))").count - 1, 2)
+    }
+}

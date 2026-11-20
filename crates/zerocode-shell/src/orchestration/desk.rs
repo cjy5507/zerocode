@@ -492,6 +492,13 @@ pub(crate) struct DeskRun {
     /// the sidebar's landing line (t-56141).
     pub(crate) landing: usize,
     pub(crate) batched: usize,
+    /// Its work handed in and waiting on a review — the stage the desk calls
+    /// `reported`, less the work nobody is coming back to — and when the
+    /// longest-waiting of it was last touched (its hand-in): the coordinator
+    /// card's 「검증 N」 (t-119569). A review is the coordinator's to write,
+    /// so the board no longer stands it in the person's turn.
+    pub(crate) reviews: usize,
+    pub(crate) reviews_since_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -865,6 +872,15 @@ pub(crate) fn finished(run: &Run, task: &Task) -> bool {
     FINISHED_STAGES.contains(&stage_of(run, task))
 }
 
+/// Whether a desk row is work handed in that waits on its coordinator's
+/// review: the `reported` stage — a withdrawn verification among it — with
+/// somebody still coming back to it (t-119569). The person's turn on the
+/// board no longer stands it; the coordinator card counts it
+/// ([`DeskRun::reviews`]).
+fn awaiting_coordinator(row: &DeskTask) -> bool {
+    row.stage == "reported" && row.left.is_none()
+}
+
 /// Whether a run is in play: somebody is coordinating it, or somebody is
 /// still working for it. A finished run with nobody at it is history — on the
 /// desk, and for the board's rows of finished work (`ledger_agents_for_seats`).
@@ -1074,6 +1090,15 @@ pub(crate) fn desk_snapshot_of(
                 .filter(|(_, _, row)| row.stage == "verified")
                 .count(),
             batched,
+            reviews: staged_tasks[tasks_before..]
+                .iter()
+                .filter(|(_, _, row)| awaiting_coordinator(row))
+                .count(),
+            reviews_since_ms: staged_tasks[tasks_before..]
+                .iter()
+                .filter(|(_, _, row)| awaiting_coordinator(row))
+                .map(|(_, _, row)| row.touched_ms)
+                .min(),
         });
     }
     let mut stages = Vec::with_capacity(STAGES.len());
@@ -2884,6 +2909,101 @@ mod tests {
         assert_eq!(after["examined"]["base"], "main", "{after}");
     }
 
+    /// The coordinator card counts the work handed in that waits on its review,
+    /// with when the longest-waiting of it came in (t-119569): a review is the
+    /// coordinator's to write, so the board's person's turn no longer stands
+    /// it, and the card says it instead. A decision is not a report: it stays
+    /// the person's turn. Work nobody is coming back to is no card's — the
+    /// board's piles hold it.
+    #[test]
+    fn a_runs_card_counts_its_reports_to_verify_and_not_its_decisions() {
+        let now = crate::now_epoch_ms();
+        let minute = 60_000;
+        let mut ledger = Ledger::new();
+        let run = ledger.create_run("card-reviews", now - 60 * minute);
+        ledger
+            .seat_coordinator(&run, "team-lead/%1", None, now - 59 * minute)
+            .expect("a coordinator");
+        // Somebody still at the run whoever sits, so it stays in play below.
+        ledger
+            .start_worker(&run, "codex", ("team-card", "%9"), None, now - 58 * minute)
+            .expect("a worker at the run");
+        let hand_in = |ledger: &mut Ledger, title: &str, pane: &str, at: i64| {
+            let task = ledger
+                .create_task(&run, "x".into(), title.into(), vec![], None, at)
+                .expect("a task");
+            let started = ledger
+                .start_worker(&run, "claude", ("team-card", pane), Some(&task), at + 1)
+                .expect("a worker");
+            ledger
+                .post(
+                    &run,
+                    Draft {
+                        from: worker_address(&started.worker),
+                        to: ledger.run(&run).expect("the run").address(),
+                        kind: MessageKind::WorkerDone,
+                        body: Text::from(r#"{"ok":true,"head":"abcdef1234567"}"#.to_string()),
+                        subject: Text::default(),
+                        priority: Priority::Normal,
+                        payload: Text::default(),
+                        thread: None,
+                        task: Some(task.clone()),
+                        dispatch: started.dispatch.clone(),
+                    },
+                    at + 2,
+                )
+                .expect("the report");
+            task
+        };
+        hand_in(&mut ledger, "older", "%2", now - 40 * minute);
+        hand_in(&mut ledger, "newer", "%3", now - 10 * minute);
+        let asked = ledger
+            .create_task(
+                &run,
+                "x".into(),
+                "asked".into(),
+                vec![],
+                None,
+                now - 5 * minute,
+            )
+            .expect("a task");
+        ledger
+            .create_gate(
+                &run,
+                &asked,
+                "rpc or rest?".into(),
+                vec![],
+                now - 4 * minute,
+            )
+            .expect("a decision");
+
+        // Read as the sidebar reads it: the JSON of the card.
+        let card_of = |ledger: &Ledger| -> serde_json::Value {
+            desk_json(ledger)["runs"]
+                .as_array()
+                .and_then(|runs| runs.iter().find(|one| one["run"] == run.as_str()))
+                .cloned()
+                .unwrap_or_else(|| panic!("the run has no card"))
+        };
+        let card = card_of(&ledger);
+        assert_eq!(
+            card["reviews"], 2,
+            "two reports, and the decision is not one: {card}"
+        );
+        assert_eq!(
+            card["reviews_since_ms"],
+            now - 40 * minute + 2,
+            "the oldest report's hand-in: {card}"
+        );
+
+        // A run nobody sits in: its reports are left behind (the board's pile), so no card counts them.
+        ledger.team_dissolved("team-lead", now);
+        let card = card_of(&ledger);
+        assert_eq!(card["held"], false, "{card}");
+        assert_eq!(card["reviews"], 0, "{card}");
+        assert_eq!(card["reviews_since_ms"], serde_json::Value::Null, "{card}");
+    }
+
     /// Free words answer a decision somebody opened, never a hold the ledger
     /// opened (review t-68962 P3 ⑤): the worker that exited before reporting
     /// left a hold that takes harvest or dispatch; the person's own question
@@ -4141,6 +4261,60 @@ mod tests {
                 "workerDied": of_kind("worker_died"),
                 "snapshotMicros": { "p50": took[took.len() / 2], "p95": took[took.len() * 95 / 100] },
             })
+        );
+    }
+
+    /// MEASUREMENT (ignored, t-119569): the board's counts over one copy of the person's ledger,
+    /// as the window drew them before this change and as it draws them now — the top sentence's
+    /// 「답할 일 N」 (mail, decisions and, before, the reports to verify), the coordinator's line
+    /// 「코디가 검증할 보고 N건」, and each run's card 「검증 N」. Counts and run ids only.
+    ///
+    /// ```sh
+    /// ZEROCODE_DESK_REPLAY_STORE=<a copy of authority.sqlite> \
+    ///   cargo test -p zerocode-shell --bin zerocode-shell -- --ignored --nocapture \
+    ///   the_board_counts_over_a_copy_of_the_ledger
+    /// ```
+    #[test]
+    #[ignore = "a measurement over a copy of the person's own ledger; not a check"]
+    fn the_board_counts_over_a_copy_of_the_ledger() {
+        let Ok(store) = std::env::var("ZEROCODE_DESK_REPLAY_STORE") else {
+            return;
+        };
+        let ledger = Ledger::rebuild(projection_at_rest(&store)).expect("the ledger as it stood");
+        let desk = desk_json(&ledger);
+        let standing = |name: &str| {
+            desk["stages"]
+                .as_array()
+                .and_then(|stages| stages.iter().find(|one| one["stage"] == name))
+                .map_or(0, |one| {
+                    one["count"].as_i64().unwrap_or(0) - one["left"].as_i64().unwrap_or(0)
+                })
+        };
+        let mail = desk["counts"]["mail"].as_i64().unwrap_or(0);
+        let (gates, reports) = (standing("gate"), standing("reported"));
+        let cards: Vec<String> = desk["runs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|run| run["reviews"].as_u64().unwrap_or(0) > 0)
+            .map(|run| {
+                format!(
+                    "{} 검증 {}",
+                    run["run"].as_str().unwrap_or("?"),
+                    run["reviews"]
+                )
+            })
+            .collect();
+        println!(
+            "board: your turn {} → {} (mail {mail} · decisions {gates} · reports {reports}) · \
+             the coordinator's line {reports} · cards: {}",
+            mail + gates + reports,
+            mail + gates,
+            if cards.is_empty() {
+                "none".to_string()
+            } else {
+                cards.join(" · ")
+            }
         );
     }
 
