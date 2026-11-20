@@ -10,7 +10,7 @@
 
 mod slot_target;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
@@ -45,9 +45,10 @@ zo line forget <job> · zo line restore <job>
   build-slots/targets/<slot>), the job's workspace crates removed from it
   before and after, so only registry crates carry over; a job that names its
   CARGO_TARGET_DIR builds there, untouched. `run` exits as its
-  command did; `add` prints the job and its cap and returns, and the job's
-  end is told to --notify through the ledger; `wait` waits for an added job's
-  end and exits as its command did. A put whose command outran that cap last
+  command did; `add` prints the job and its cap and returns, a waiter of its
+  own runs the job, and the job's end is told to --notify through the ledger;
+  `wait` waits for a job's end and exits with its code: it runs nothing — the
+  job's waiter does. A put whose command outran that cap last
   time is warned; a job the line ends (its cap, a stop) says so as its log's
   last line. `list` shows this project's waiting and running jobs and the ten
   that ended last, and counts the older ones; --history lists every job of
@@ -61,8 +62,23 @@ const LOOK_EVERY: Duration = Duration::from_millis(500);
 const GRACE: Duration = Duration::from_secs(10);
 /// A forgotten job's record waits this long in the trash.
 const TRASH_KEPT_MS: i64 = 24 * 60 * 60 * 1000;
+/// The folder of the files a job's waiter holds locked while it lives (`waiter_path`).
+const WAITERS: &str = "waiters";
+/// The variable that tells a `zo line wait` it is the waiter the line started for the job it
+/// names: the one process that runs that job (`start_waiter`).
+const WAITER_ENV: &str = "ZO_LINE_WAITER";
+/// How long a process that started a waiter waits for it to hold its lock.
+const WAITER_START: Duration = Duration::from_secs(2);
+/// How often that process looks whether it does.
+const WAITER_LOOK: Duration = Duration::from_millis(10);
+/// How long after a job is put in its waiter may still be taking its lock:
+/// `add` waits `WAITER_START` for it and writes the record, and on a very busy
+/// machine the lock stands only after that (`end_orphans`).
+const WAITER_GRACE_MS: i64 = 60_000;
 /// The lines of a log `zo line log` prints.
 const LOG_TAIL_LINES: usize = 200;
+/// How much of what a failed `zerocode-orc send` said the job's log keeps.
+const SAID_CHARS: usize = 400;
 /// The machine's slot folder under zo's home — `zo build`'s.
 const SLOTS_FOLDER: &str = "build-slots";
 const TRASH: &str = "trash";
@@ -226,6 +242,7 @@ pub fn run(args: &[String], cwd: &Path) -> Result<Ended, String> {
         look_every: LOOK_EVERY,
         env: |name| std::env::var_os(name),
         free: free_bytes,
+        start_waiter,
     };
     match verb {
         Verb::Run(put) => {
@@ -238,12 +255,11 @@ pub fn run(args: &[String], cwd: &Path) -> Result<Ended, String> {
             run_job(&line, &machine, &job.id, true).map(Ended::Ran)
         }
         Verb::Add(put) => {
-            let job = put_in(&line, &put, cwd)?;
-            spawn_waiter(&job.id)?;
+            let job = put_with_waiter(&line, &machine, job_of(&put, cwd))?;
             let places = line::places(&line.jobs(), &|owner| line.last_end(owner), line.turn());
             put_receipt(&line, &job, json!({ "job": job.id, "place": places.get(&job.id) }))
         }
-        Verb::Wait(id) => run_job(&line, &machine, &id, false).map(Ended::Ran),
+        Verb::Wait(id) => wait(&line, &machine, &id, std::env::var_os(WAITER_ENV).as_deref()).map(Ended::Ran),
         Verb::List { all, history } => listing(&line, cwd, all, history),
         Verb::Log(id) => log_tail(&line, &id),
         Verb::Retry(id) => {
@@ -263,8 +279,7 @@ pub fn run(args: &[String], cwd: &Path) -> Result<Ended, String> {
                 ended_by: None,
                 ..old
             };
-            line.save(&again).map_err(|error| error.to_string())?;
-            spawn_waiter(&again.id)?;
+            let again = put_with_waiter(&line, &machine, again)?;
             // A retry keeps its job's cap: a job that ended past it is told so before it runs into it again.
             put_receipt(&line, &again, json!({ "job": again.id, "retry_of": id }))
         }
@@ -340,8 +355,25 @@ fn project_of(cwd: &Path) -> String {
 }
 
 fn put_in(line: &Line, put: &Put, cwd: &Path) -> Result<Job, String> {
+    let job = job_of(put, cwd);
+    line.save(&job).map_err(|error| error.to_string())?;
+    Ok(job)
+}
+
+/// Puts `job` in with a waiter of its own, under the line's lock: the waiter
+/// holds its lock before any look sees the job, and the job's record names it
+/// (`pid`) from the start. A waiter that cannot start puts nothing in.
+fn put_with_waiter(line: &Line, machine: &MachineRules, mut job: Job) -> Result<Job, String> {
+    let _lock = lock(line)?;
+    job.pid = Some((machine.start_waiter)(line, &job.id)?);
+    line.save(&job).map_err(|error| error.to_string())?;
+    Ok(job)
+}
+
+/// The job a put makes, waiting from now.
+fn job_of(put: &Put, cwd: &Path) -> Job {
     let now = now_ms();
-    let job = Job {
+    Job {
         id: line::new_id(now, salt(now)),
         project: project_of(cwd),
         checkout: cwd.display().to_string(),
@@ -364,9 +396,7 @@ fn put_in(line: &Line, put: &Put, cwd: &Path) -> Result<Job, String> {
         retry_of: None,
         stop_asked: false,
         ended_by: None,
-    };
-    line.save(&job).map_err(|error| error.to_string())?;
-    Ok(job)
+    }
 }
 
 /// A warning for a job put in under a cap its command has already outrun: the
@@ -428,22 +458,76 @@ fn lock(line: &Line) -> Result<File, String> {
     Ok(file)
 }
 
-/// Starts `zo line wait <id>` on its own, outside this process's group, so it
-/// goes on when the terminal that put the job in closes.
-fn spawn_waiter(id: &str) -> Result<(), String> {
+/// Starts `zo line wait <id>` as job `id`'s waiter, on its own, and returns its
+/// pid once the waiter holds its lock — or after `WAITER_START`, when it has not
+/// taken it by then. Its environment names the job (`WAITER_ENV`): it is the one
+/// `zo line wait` that runs the job. On unix `sh` starts it in the background
+/// and leaves at once, so the waiter's parent is the machine's first process
+/// and its group is none of the asker's: the pane whose `zo line add` or
+/// `zo line retry` started it takes no waiter along when it restarts. The
+/// waiter, and the job it runs, have the environment of that pane.
+fn start_waiter(line: &Line, id: &str) -> Result<u32, String> {
+    let held = waiter_path(line, id);
+    if let Some(folder) = held.parent() {
+        std::fs::create_dir_all(folder).map_err(|error| error.to_string())?;
+    }
     let me = std::env::current_exe().map_err(|error| error.to_string())?;
-    let mut command = Command::new(me);
-    command
+    let pid = spawn_waiter(&me, id)?;
+    let until = Instant::now() + WAITER_START;
+    while !waiter_stands(&held) && Instant::now() < until {
+        std::thread::sleep(WAITER_LOOK);
+    }
+    Ok(pid)
+}
+
+#[cfg(unix)]
+fn spawn_waiter(me: &Path, id: &str) -> Result<u32, String> {
+    use std::os::unix::process::CommandExt as _;
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#""$0" line wait "$1" </dev/null >/dev/null 2>&1 & echo $!"#)
+        .arg(me)
+        .arg(id)
+        .env(WAITER_ENV, id)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .output()
+        .map_err(|error| error.to_string())?;
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .map_err(|_| format!("no waiter started for {id}"))
+}
+
+/// Windows has no `sh` to leave it with: the waiter starts as this process's child.
+#[cfg(not(unix))]
+fn spawn_waiter(me: &Path, id: &str) -> Result<u32, String> {
+    Command::new(me)
         .args(["line", "wait", id])
+        .env(WAITER_ENV, id)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.process_group(0);
-    }
-    command.spawn().map(|_| ()).map_err(|error| error.to_string())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|child| child.id())
+        .map_err(|error| error.to_string())
+}
+
+/// The file job `id`'s waiter holds locked while it lives: what tells the line
+/// that the waiter stands, whatever process takes its pid after it.
+fn waiter_path(line: &Line, id: &str) -> PathBuf {
+    line.root().join(WAITERS).join(format!("{id}.lock"))
+}
+
+/// Whether a waiter holds the lock at `path`. Opened for writing, as every lock
+/// of the line is: std leaves a lock on a file opened only for reading free to
+/// fail, and a probe that failed would read a standing waiter as gone.
+fn waiter_stands(path: &Path) -> bool {
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .is_ok_and(|file| matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
 }
 
 /// The machine the line runs on.
@@ -456,11 +540,68 @@ struct MachineRules {
     env: fn(&str) -> Option<OsString>,
     /// The free bytes of the disk a folder is on.
     free: fn(&Path) -> Option<u64>,
+    /// Starts a job's waiter on its own and returns its pid (`start_waiter`).
+    start_waiter: fn(&Line, &str) -> Result<u32, String>,
+}
+
+/// `zo line wait <job>`: waits for the job's end and exits with its code. The
+/// waiter the line started for the job — `started_for`, its `WAITER_ENV`,
+/// names the job — runs it when its turn comes. Any other wait only watches,
+/// a worker's pane's too: a runner a pane's restart takes along leaves its job
+/// lost (t-118403).
+fn wait(line: &Line, machine: &MachineRules, id: &str, started_for: Option<&OsStr>) -> Result<i32, String> {
+    if started_for == Some(OsStr::new(id)) {
+        return be_the_waiter(line, machine, id);
+    }
+    loop {
+        if let Some(code) = watch(line, id)? {
+            return Ok(code);
+        }
+        std::thread::sleep(machine.look_every);
+    }
+}
+
+/// One look of a wait that runs nothing: the job's code once it has ended.
+fn watch(line: &Line, id: &str) -> Result<Option<i32>, String> {
+    let mut ended = Vec::new();
+    let code = look(line, id, &mut ended).map(|(_lock, _, job)| job.state.ended().then(|| code_of(&job)));
+    tell_ended(line, &ended);
+    code
+}
+
+/// Job `id`'s waiter: it holds the job's waiter lock while it lives, has the
+/// record name it, runs the job when its turn comes, and lets the lock go once
+/// the job has ended.
+fn be_the_waiter(line: &Line, machine: &MachineRules, id: &str) -> Result<i32, String> {
+    let path = waiter_path(line, id);
+    if let Some(folder) = path.parent() {
+        std::fs::create_dir_all(folder).map_err(|error| error.to_string())?;
+    }
+    let held = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|error| error.to_string())?;
+    held.lock().map_err(|error| error.to_string())?;
+    {
+        let _lock = lock(line)?;
+        if let Ok(mut job) = line.job(id) {
+            if job.state == JobState::Waiting && job.pid != Some(std::process::id()) {
+                job.pid = Some(std::process::id());
+                line.save(&job).map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    let rc = run_job(line, machine, id, false);
+    drop(held);
+    let _ = std::fs::remove_file(&path);
+    rc
 }
 
 /// Waits for job `id`'s turn, runs it, and records how it ended — or, when
-/// another process already runs it (the waiter `add` started), waits for that
-/// end. Returns the command's exit code (a withdrawn or stopped job's is not 0).
+/// another process already runs it, waits for that end: `zo line run`, and the
+/// waiter the line started for the job. Returns the job's code (`code_of`).
 fn run_job(line: &Line, machine: &MachineRules, id: &str, foreground: bool) -> Result<i32, String> {
     std::fs::create_dir_all(&machine.slots).map_err(|error| error.to_string())?;
     let held = loop {
@@ -486,15 +627,37 @@ enum Turn {
     Wait,
 }
 
+/// What every look at the line starts with, under its lock (held until the
+/// returned file drops): running jobs whose runner is gone are lost, and
+/// waiting jobs whose waiter is gone are ended. The jobs it ends go to `ended`,
+/// to be told once the lock is let go (`tell_ended`). The lock, the line's jobs
+/// and job `id`.
+fn look(line: &Line, id: &str, ended: &mut Vec<Job>) -> Result<(File, Vec<Job>, Job), String> {
+    let held = lock(line)?;
+    let mut jobs = line.jobs();
+    mark_lost(line, &mut jobs, ended);
+    end_orphans(line, &mut jobs, ended);
+    let mine = jobs
+        .iter()
+        .find(|job| job.id == id)
+        .cloned()
+        .ok_or_else(|| format!("the line holds no job {id}"))?;
+    Ok((held, jobs, mine))
+}
+
+/// One look at job `id`'s turn (`turn_of`); the jobs the look ended are told
+/// after it, the line's lock let go.
+fn take_turn(line: &Line, machine: &MachineRules, id: &str) -> Result<Turn, String> {
+    let mut ended = Vec::new();
+    let turn = turn_of(line, machine, id, &mut ended);
+    tell_ended(line, &ended);
+    turn
+}
+
 /// One look, under the line's lock: is it job `id`'s turn, and is a slot
 /// free for it? Its turn and a slot it can take make it running.
-fn take_turn(line: &Line, machine: &MachineRules, id: &str) -> Result<Turn, String> {
-    let _lock = lock(line)?;
-    let mut jobs = line.jobs();
-    mark_lost(line, &mut jobs);
-    let Some(mine) = jobs.iter().find(|job| job.id == id).cloned() else {
-        return Err(format!("the line holds no job {id}"));
-    };
+fn turn_of(line: &Line, machine: &MachineRules, id: &str, ended: &mut Vec<Job>) -> Result<Turn, String> {
+    let (_lock, jobs, mine) = look(line, id, ended)?;
     match mine.state {
         JobState::Waiting if mine.stop_asked => {
             let mut job = mine;
@@ -504,9 +667,9 @@ fn take_turn(line: &Line, machine: &MachineRules, id: &str) -> Result<Turn, Stri
             return Ok(Turn::Ended(1));
         }
         JobState::Waiting => {}
-        // Another process runs it: its end is the answer (a dead runner's job is lost above).
+        // Another process runs it: its end is the answer (a dead runner's job is lost in `look`).
         JobState::Running => return Ok(Turn::Wait),
-        _ => return Ok(Turn::Ended(mine.rc.unwrap_or(1))),
+        _ => return Ok(Turn::Ended(code_of(&mine))),
     }
     let pause = lift_ended_pause(line);
     let (free, taken) = slot_files(machine)?;
@@ -615,15 +778,77 @@ fn newest_run_ended(shared: &Path, build: &str, since_ms: i64) -> bool {
 }
 
 /// Running jobs whose runner is gone are lost: their slot is free and their
-/// owner may go on.
-fn mark_lost(line: &Line, jobs: &mut [Job]) {
+/// owner may go on. A runner is gone when its pid stands no more, or, for a job
+/// the line started a waiter for, when no waiter holds the job's lock — another
+/// process may have the runner's pid by then. The jobs it ends go to `ended`.
+fn mark_lost(line: &Line, jobs: &mut [Job], ended: &mut Vec<Job>) {
     for job in jobs.iter_mut().filter(|job| job.state == JobState::Running) {
-        if job.pid.is_some_and(|pid| !alive(pid)) {
+        if job.pid.is_some_and(|pid| !alive(pid)) || waiter_gone(line, &job.id) {
             job.state = JobState::Lost;
             job.ended_ms = Some(now_ms());
             let _ = line.save(job);
             let _ = line.ended(&job.owner, now_ms());
+            ended.push(job.clone());
         }
+    }
+}
+
+/// A job the line started a waiter for, whose waiter holds its lock no more.
+fn waiter_gone(line: &Line, id: &str) -> bool {
+    let path = waiter_path(line, id);
+    path.exists() && !waiter_stands(&path)
+}
+
+/// Waiting jobs whose waiter is gone — killed, or the machine restarted — are
+/// ended: lost, or withdrawn when a stop was asked of them. A job no waiter
+/// stands for held its owner's later jobs, and every slot the line chose it
+/// for, for good. The line starts no waiter in its place: that one would run
+/// the job with the environment of whichever process looked, not of the pane
+/// that put it in. Its log says so, and how that pane puts it in again.
+///
+/// A waiter is gone when the record names it (`pid`), its lock is free, and
+/// either no process has its pid or the job was put in `WAITER_GRACE_MS` ago — a
+/// waiter that holds no lock by then is not coming, whatever process has its
+/// pid now. A job whose record names no waiter is left as it is: one put in
+/// before v1.1.168, whose waiter holds no lock to tell, and one of
+/// `zo line run`, which runs in its own terminal. The jobs it ends go to
+/// `ended`.
+fn end_orphans(line: &Line, jobs: &mut [Job], ended: &mut Vec<Job>) {
+    let now = now_ms();
+    for job in jobs.iter_mut().filter(|job| job.state == JobState::Waiting) {
+        let Some(waiter) = job.pid else {
+            continue;
+        };
+        let late = now.saturating_sub(job.queued_ms) >= WAITER_GRACE_MS;
+        if waiter_stands(&waiter_path(line, &job.id)) || (alive(waiter) && !late) {
+            continue;
+        }
+        job.state = if job.stop_asked { JobState::Withdrawn } else { JobState::Lost };
+        job.ended_ms = Some(now);
+        if line.save(job).is_err() {
+            continue;
+        }
+        let _ = line.ended(&job.owner, now);
+        let path = line.log_path(&job.id);
+        if let Ok(log) = OpenOptions::new().create(true).append(true).open(&path) {
+            let words = format!(
+                "zo line: waiter {waiter} was gone before the job's turn, so the line ended the job — \
+                 `zo line retry {}` from the pane that put it in runs it again with that pane's environment",
+                job.id
+            );
+            close_log(&log, &path, &words);
+        }
+        ended.push(job.clone());
+    }
+}
+
+/// Tells each job a look ended, when it named where (`notify`): after the
+/// look, the line's lock let go, since a send may take seconds. A job's end is
+/// told once, by the look that ended it.
+fn tell_ended(line: &Line, ended: &[Job]) {
+    for job in ended {
+        let ran = job.started_ms.zip(job.ended_ms).map_or(0, |(start, end)| end.saturating_sub(start));
+        notify(line, job, Duration::from_millis(u64::try_from(ran).unwrap_or(0)));
     }
 }
 
@@ -668,12 +893,18 @@ fn free_bytes(_folder: &Path) -> Option<u64> {
 /// when it runs in the foreground), ended by a stop or its cap.
 fn execute(line: &Line, machine: &MachineRules, mut job: Job, foreground: bool) -> Result<i32, String> {
     let log_path = line.log_path(&job.id);
-    let log = File::create(&log_path).map_err(|error| error.to_string())?;
+    // Added to, not written over: a line the job's log took before it ran (a new waiter) stays.
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|error| error.to_string())?;
     // The same open file as the command's: what the line writes under its output follows it, and is
     // not written over by it.
     let closing = log.try_clone().map_err(|error| error.to_string())?;
     let mut command = command_of(&job);
-    command.current_dir(&job.checkout).stdin(Stdio::null());
+    // A `zo line wait` the job's command starts is no waiter the line started.
+    command.current_dir(&job.checkout).stdin(Stdio::null()).env_remove(WAITER_ENV);
     let ready = job.slot.and_then(|slot| slot_target::ready(&machine.slots, slot, Path::new(&job.checkout), &machine.env, &log));
     if let Some(ready) = &ready {
         ready.apply(&mut command);
@@ -728,7 +959,7 @@ fn execute(line: &Line, machine: &MachineRules, mut job: Job, foreground: bool) 
     job.ended_ms = Some(now_ms());
     // The receipt beside the log (`<job>.rc`): what a worker names as a pass condition's evidence, the
     // exit code the ledger reads (`orchestration::evidence`). A stopped or withdrawn job says its own.
-    let receipt = if job.state == JobState::Passed { 0 } else if rc == 0 { 1 } else { rc };
+    let receipt = code_of(&job);
     let _ = std::fs::write(line.log_path(&job.id).with_extension("rc"), format!("{receipt}\n"));
     {
         let _lock = lock(line)?;
@@ -737,11 +968,23 @@ fn execute(line: &Line, machine: &MachineRules, mut job: Job, foreground: bool) 
     }
     line.prune();
     purge_trash(line, now_ms());
-    notify(&job, started.elapsed());
+    notify(line, &job, started.elapsed());
     if let Some(ready) = ready {
         ready.done();
     }
     Ok(receipt)
+}
+
+/// The code an ended job says, the same in its receipt (`<job>.rc`) and to
+/// every `zo line wait`: 0 for a job that passed, its command's code otherwise,
+/// and 1 when that was 0 — a command a stop or its cap ended left with 0 — or
+/// there was none (withdrawn, lost).
+fn code_of(job: &Job) -> i32 {
+    if job.state == JobState::Passed {
+        0
+    } else {
+        job.rc.filter(|rc| *rc != 0).unwrap_or(1)
+    }
 }
 
 /// The command a job names: one word with spaces runs through the shell, more
@@ -827,8 +1070,12 @@ fn tee(output: Option<impl io::Read + Send + 'static>, log: &File, to_err: bool)
 }
 
 /// Tells the ledger how the job ended, when it named where: through
-/// `zerocode-orc send` on this machine's PATH. A send that cannot go is left.
-fn notify(job: &Job, took: Duration) {
+/// `zerocode-orc send` on this machine's PATH, with the environment of the
+/// process that put the job in. `send` changes the ledger, so it goes under a
+/// name the window can take again unchanged, the job's: without one the window
+/// refused every end the line told (t-118403). A send that does not go is left,
+/// and the job's log says so as its last line.
+fn notify(line: &Line, job: &Job, took: Duration) {
     let Some(to) = job.notify.as_deref() else {
         return;
     };
@@ -841,16 +1088,33 @@ fn notify(job: &Job, took: Duration) {
         took.as_secs()
     );
     let mut send = Command::new("zerocode-orc");
-    send.args(["send", "--to", to, "--type", "status", "--body", &body]);
+    let name = format!("zo-line-{}", job.id);
+    send.args(["send", "--to", to, "--type", "status", "--body", &body, "--retry-request", &name]);
     if let Some(run) = to.strip_prefix("run:") {
         send.args(["--run", run]);
     }
-    let _ = send
+    let said = send
         .current_dir(&job.checkout)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::piped())
+        .output();
+    let why = match said {
+        Ok(said) if said.status.success() => return,
+        Ok(said) => format!("exit {} — {}", crate::build_runner::rc_of(said.status), first_line(&said.stderr)),
+        Err(error) => format!("zerocode-orc did not start — {error}"),
+    };
+    let path = line.log_path(&job.id);
+    if let Ok(log) = OpenOptions::new().create(true).append(true).open(&path) {
+        close_log(&log, &path, &format!("zo line: telling {to} how the job ended did not go: {why}"));
+    }
+}
+
+/// The first line a command said on stderr, at most `SAID_CHARS` characters.
+fn first_line(said: &[u8]) -> String {
+    let text = String::from_utf8_lossy(said);
+    let first = text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("it said nothing");
+    first.chars().take(SAID_CHARS).collect()
 }
 
 const fn state_word(state: JobState) -> &'static str {
@@ -890,7 +1154,7 @@ fn listing(line: &Line, cwd: &Path, all: bool, history: bool) -> Result<Ended, S
     let shown: Vec<serde_json::Value> = ours
         .iter()
         .filter(|job| history || !job.state.ended() || last_ended.contains(&job.id.as_str()))
-        .map(|job| json!({ "job": job, "place": places.get(&job.id) }))
+        .map(|job| listed(job, places.get(&job.id).copied()))
         .collect();
     let mut answer = json!({ "paused": line.pause(), "jobs": shown });
     if older > 0 {
@@ -900,6 +1164,19 @@ fn listing(line: &Line, cwd: &Path, all: bool, history: bool) -> Result<Ended, S
         ));
     }
     said(&answer)
+}
+
+/// One job as `zo line list` shows it, with its place when it waits. A waiting
+/// job's pid is its waiter's — the process that runs it when its turn comes —
+/// and is listed as `waiter`, beside the job: a job's own `pid` is its runner's.
+fn listed(job: &Job, place: Option<usize>) -> serde_json::Value {
+    let mut job = job.clone();
+    let waiter = if job.state == JobState::Waiting { job.pid.take() } else { None };
+    let mut row = json!({ "job": job, "place": place });
+    if let Some(waiter) = waiter {
+        row["waiter"] = json!(waiter);
+    }
+    row
 }
 
 /// `zo line log <job>`: the log's last lines.
@@ -1021,6 +1298,8 @@ mod tests {
             // The job names its own build folder unless a test says otherwise: these runs make none.
             env: |name| (name == "CARGO_TARGET_DIR").then(|| OsString::from("own")),
             free: |_| None,
+            // No process starts here: a test that wants a waiter given names the one it gets.
+            start_waiter: |_, _| Err("a test starts no waiter".to_owned()),
         }
     }
 
@@ -1029,9 +1308,9 @@ mod tests {
         put_in(line, &Put { owner: Some(owner.to_owned()), command: words(command), ..Put::default() }, cwd).expect("put in")
     }
 
-    /// A second waiter on a job another runner holds (a person's `zo line wait`
-    /// beside the waiter `add` started) waits for its end and takes its code;
-    /// the job runs once.
+    /// A second runner on a job another runner holds (a waiter of an older zo,
+    /// which takes the turn, beside the one `add` started) waits for its end
+    /// and takes its code; the job runs once.
     #[cfg(unix)]
     #[test]
     fn a_second_waiter_waits_for_the_running_jobs_end_and_takes_its_code() {
@@ -1053,6 +1332,236 @@ mod tests {
         assert_eq!(runner.join().expect("the runner"), Ok(3));
         let ran = std::fs::read_to_string(cwd.path().join("ran")).expect("the job's mark");
         assert_eq!(ran, "once\n", "the job ran once");
+    }
+
+    /// The pid a test's `start_waiter` gives: a number in the record, no process.
+    const GIVEN: u32 = 4_242;
+
+    /// The lock a job's waiter holds while it lives, taken here as the waiter would.
+    #[cfg(unix)]
+    fn hold_waiter_lock(line: &Line, id: &str) -> File {
+        let path = waiter_path(line, id);
+        std::fs::create_dir_all(path.parent().expect("a folder")).expect("folders");
+        let file = OpenOptions::new().create(true).truncate(false).write(true).open(&path).expect("the waiter's file");
+        file.lock().expect("held");
+        file
+    }
+
+    #[cfg(unix)]
+    fn named(line: &Line, id: &str, pid: u32) {
+        change(line, id, |job| {
+            job.pid = Some(pid);
+            Ok(())
+        })
+        .expect("named");
+    }
+
+    /// A `zo line wait` the line did not start for a job never takes its turn,
+    /// though the turn is the job's and a slot is free; the waiter the line
+    /// started runs it, once, and both end with its code (t-118403).
+    #[cfg(unix)]
+    #[test]
+    fn a_wait_the_line_did_not_start_for_a_job_never_takes_its_turn() {
+        let home = tempfile::tempdir().expect("a zo home");
+        let cwd = tempfile::tempdir().expect("a folder");
+        let line = Line::at(home.path());
+        line.make().expect("folders");
+        let machine = rules(&home.path().join(SLOTS_FOLDER));
+        let job = put(&line, cwd.path(), "w-1", &["echo ran >> ran"]);
+        let waiter = hold_waiter_lock(&line, &job.id);
+        named(&line, &job.id, std::process::id());
+        let watcher = {
+            let (line, id) = (line.clone(), job.id.clone());
+            let machine = rules(&home.path().join(SLOTS_FOLDER));
+            std::thread::spawn(move || wait(&line, &machine, &id, None))
+        };
+        std::thread::sleep(machine.look_every * 10);
+        let waits = line.job(&job.id).expect("its record");
+        assert_eq!((waits.state, waits.slot), (JobState::Waiting, None), "the wait took no turn");
+        drop(waiter);
+        assert_eq!(wait(&line, &machine, &job.id, Some(OsStr::new(&job.id))), Ok(0), "the waiter runs the job");
+        assert_eq!(watcher.join().expect("the wait"), Ok(0), "the wait takes the job's code");
+        let ran = std::fs::read_to_string(cwd.path().join("ran")).expect("the job's mark");
+        assert_eq!(ran, "ran\n", "the job ran once");
+        assert!(!waiter_path(&line, &job.id).exists(), "the waiter let its lock go");
+    }
+
+    /// A job put in a minute ago, as the line counts it.
+    #[cfg(unix)]
+    fn put_long_ago(line: &Line, id: &str) {
+        change(line, id, |job| {
+            job.queued_ms = now_ms() - WAITER_GRACE_MS - 1_000;
+            Ok(())
+        })
+        .expect("put in long ago");
+    }
+
+    /// A waiting job whose waiter is gone is ended at the next look, and no
+    /// waiter is started in its place: lost, or withdrawn when a stop was asked
+    /// of it. Gone means its lock is free and its pid stands no more — or the job
+    /// was put in a minute ago, though another process has the pid by then. The
+    /// job's log says how to put it in again from the pane that put it in.
+    #[cfg(unix)]
+    #[test]
+    fn a_waiting_job_whose_waiter_holds_no_lock_is_ended_though_its_pid_stands() {
+        let home = tempfile::tempdir().expect("a zo home");
+        let cwd = tempfile::tempdir().expect("a folder");
+        let line = Line::at(home.path());
+        line.make().expect("folders");
+        let reused = put(&line, cwd.path(), "w-1", &["true"]);
+        // Its waiter left the file, unlocked; its pid names this test now, a process that stands.
+        drop(hold_waiter_lock(&line, &reused.id));
+        let taken = std::process::id();
+        named(&line, &reused.id, taken);
+        put_long_ago(&line, &reused.id);
+        let stopped = put(&line, cwd.path(), "w-2", &["true"]);
+        let mut child = std::process::Command::new("true").spawn().expect("a process");
+        let dead = child.id();
+        child.wait().expect("it ended");
+        named(&line, &stopped.id, dead);
+        change(&line, &stopped.id, |job| {
+            job.stop_asked = true;
+            Ok(())
+        })
+        .expect("a stop asked");
+        assert_eq!(watch(&line, &reused.id), Ok(Some(1)), "a wait on it ends with its code");
+        let ended: Vec<(JobState, Option<u32>)> =
+            [&reused, &stopped].iter().map(|job| line.job(&job.id).expect("a record")).map(|job| (job.state, job.pid)).collect();
+        assert_eq!(ended, [(JobState::Lost, Some(taken)), (JobState::Withdrawn, Some(dead))], "no new waiter is named");
+        let log = std::fs::read_to_string(line.log_path(&reused.id)).expect("its log");
+        assert!(log.contains(&format!("waiter {taken} was gone before the job's turn")), "{log}");
+        assert!(log.contains(&format!("`zo line retry {}` from the pane that put it in", reused.id)), "{log}");
+    }
+
+    /// A job put in a moment ago whose waiter stands but holds no lock yet is
+    /// not ended: `add` writes the record after waiting `WAITER_START` for the
+    /// lock, and on a busy machine the lock stands only later.
+    #[cfg(unix)]
+    #[test]
+    fn a_job_whose_waiter_is_still_taking_its_lock_is_not_ended() {
+        let home = tempfile::tempdir().expect("a zo home");
+        let cwd = tempfile::tempdir().expect("a folder");
+        let line = Line::at(home.path());
+        line.make().expect("folders");
+        let job = put(&line, cwd.path(), "w-1", &["true"]);
+        named(&line, &job.id, std::process::id());
+        assert_eq!(watch(&line, &job.id), Ok(None), "the job still waits");
+        assert_eq!(line.job(&job.id).expect("its record").state, JobState::Waiting);
+        assert!(!line.log_path(&job.id).exists(), "no log says the line ended it");
+    }
+
+    /// A job whose waiter holds its lock keeps it, whatever its pid and however
+    /// long it waits; a job whose record names no waiter — put in before
+    /// v1.1.168, or by `zo line run` — is left as it is: nothing tells whether
+    /// its runner stands.
+    #[cfg(unix)]
+    #[test]
+    fn a_standing_waiter_keeps_its_job_and_a_job_naming_none_is_left() {
+        let home = tempfile::tempdir().expect("a zo home");
+        let cwd = tempfile::tempdir().expect("a folder");
+        let line = Line::at(home.path());
+        line.make().expect("folders");
+        let kept = put(&line, cwd.path(), "w-1", &["true"]);
+        let _waiter = hold_waiter_lock(&line, &kept.id);
+        named(&line, &kept.id, 1);
+        put_long_ago(&line, &kept.id);
+        let none = put(&line, cwd.path(), "w-2", &["true"]);
+        put_long_ago(&line, &none.id);
+        assert_eq!(watch(&line, &none.id), Ok(None));
+        let left: Vec<(JobState, Option<u32>)> =
+            [&kept, &none].iter().map(|job| line.job(&job.id).expect("a record")).map(|job| (job.state, job.pid)).collect();
+        assert_eq!(left, [(JobState::Waiting, Some(1)), (JobState::Waiting, None)]);
+        assert!(!line.log_path(&kept.id).exists() && !line.log_path(&none.id).exists(), "no log says the line ended them");
+    }
+
+    /// A running job whose waiter holds its lock no more is lost, though another
+    /// process has the waiter's pid; one whose waiter holds it runs on, and one
+    /// `zo line run` runs, which has no waiter, goes by its runner's pid.
+    #[cfg(unix)]
+    #[test]
+    fn a_running_job_whose_waiter_is_gone_is_lost_though_its_pid_stands() {
+        let home = tempfile::tempdir().expect("a zo home");
+        let cwd = tempfile::tempdir().expect("a folder");
+        let line = Line::at(home.path());
+        line.make().expect("folders");
+        let running = |job: &mut Job| {
+            job.state = JobState::Running;
+            job.pid = Some(std::process::id());
+            Ok(())
+        };
+        let gone = put(&line, cwd.path(), "w-1", &["true"]);
+        change(&line, &gone.id, running).expect("running");
+        drop(hold_waiter_lock(&line, &gone.id));
+        let standing = put(&line, cwd.path(), "w-2", &["true"]);
+        change(&line, &standing.id, running).expect("running");
+        let _waiter = hold_waiter_lock(&line, &standing.id);
+        let here = put(&line, cwd.path(), "w-3", &["true"]);
+        change(&line, &here.id, running).expect("running");
+        assert_eq!(watch(&line, &here.id), Ok(None));
+        let states: Vec<JobState> = [&gone, &standing, &here].iter().map(|job| line.job(&job.id).expect("a record").state).collect();
+        assert_eq!(states, [JobState::Lost, JobState::Running, JobState::Running]);
+    }
+
+    /// One code for an ended job, in its receipt and to every wait: 0 when it
+    /// passed, its command's otherwise, and 1 for a command a stop or its cap
+    /// ended with 0, and for a job that never ran or whose runner is gone.
+    #[test]
+    fn an_ended_jobs_code_is_one_for_its_receipt_and_every_wait() {
+        let ended = |state, rc| Job { state, rc, ..job_of(&Put { command: words(&["true"]), ..Put::default() }, Path::new("/")) };
+        for (state, rc, code) in [
+            (JobState::Passed, Some(0), 0),
+            (JobState::Failed, Some(3), 3),
+            (JobState::Stopped, Some(0), 1),
+            (JobState::Stopped, Some(143), 143),
+            (JobState::Capped, Some(0), 1),
+            (JobState::Withdrawn, None, 1),
+            (JobState::Lost, None, 1),
+        ] {
+            assert_eq!(code_of(&ended(state, rc)), code, "{state:?} {rc:?}");
+        }
+    }
+
+    /// `zo line add` names the waiter it started in the job's record from the
+    /// start; when no waiter can start, nothing is put in — a job no waiter
+    /// stands for would wait for good.
+    #[cfg(unix)]
+    #[test]
+    fn an_added_job_names_its_waiter_and_one_no_waiter_starts_for_is_not_put_in() {
+        let home = tempfile::tempdir().expect("a zo home");
+        let cwd = tempfile::tempdir().expect("a folder");
+        let line = Line::at(home.path());
+        line.make().expect("folders");
+        let put = Put { command: words(&["true"]), ..Put::default() };
+        let starts = MachineRules { start_waiter: |_, _| Ok(GIVEN), ..rules(&home.path().join(SLOTS_FOLDER)) };
+        let job = put_with_waiter(&line, &starts, job_of(&put, cwd.path())).expect("put in");
+        assert_eq!(line.job(&job.id).expect("its record").pid, Some(GIVEN));
+        let fails = rules(&home.path().join(SLOTS_FOLDER));
+        assert!(put_with_waiter(&line, &fails, job_of(&put, cwd.path())).is_err());
+        assert_eq!(line.jobs().len(), 1, "nothing else was put in");
+    }
+
+    /// What a failed `zerocode-orc send` said, as the job's log keeps it: its
+    /// first line that says anything, cut short.
+    #[test]
+    fn a_failed_sends_words_are_its_first_line_cut_short() {
+        assert_eq!(first_line(b"\n  orchestration: refused\nmore\n"), "orchestration: refused");
+        assert_eq!(first_line(b""), "it said nothing");
+        assert_eq!(first_line("가".repeat(SAID_CHARS + 5).as_bytes()).chars().count(), SAID_CHARS);
+    }
+
+    /// `zo line list` shows a waiting job's pid as its waiter's, beside the job;
+    /// a running job's pid stays its runner's, in the job (t-118403).
+    #[test]
+    fn a_list_names_a_waiting_jobs_waiter_apart_from_a_runner() {
+        let mut job = job_of(&Put { command: words(&["true"]), ..Put::default() }, Path::new("/"));
+        job.pid = Some(GIVEN);
+        let row = listed(&job, Some(1));
+        assert_eq!(row["waiter"], GIVEN, "{row}");
+        assert!(row["job"].get("pid").is_none(), "{row}");
+        job.state = JobState::Running;
+        let row = listed(&job, None);
+        assert_eq!(row["job"]["pid"], GIVEN, "{row}");
+        assert!(row.get("waiter").is_none(), "{row}");
     }
 
     /// A job runs when its turn comes, its output in its log, and its record
