@@ -1826,20 +1826,37 @@ pub(crate) fn footer_theme_style_for_palette(
 
 /// The footer's style for the model (or the folder) on `ground` at
 /// `color_level`: its role — `fallback` — under a named theme in the marks
-/// look, and on a ground known only by its lightness, where the `terminal`
-/// theme then draws the role's light-ground pair on a light ground (a syntax
-/// theme's colour is fitted only against a measured body ink); else the
-/// syntax theme's colour for `scopes`, softened as codex softens it.
+/// look, under the `terminal` theme in the ZeroCode window (where the role
+/// is the window's own ink, `footer_theme_style_in`), and on a ground known
+/// only by its lightness, where the `terminal` theme then draws the role's
+/// light-ground pair on a light ground (a syntax theme's colour is fitted
+/// only against a measured body ink); else the syntax theme's colour for
+/// `scopes`, softened as codex softens it.
 pub(crate) fn footer_theme_style_on(
     scopes: &[&str],
     fallback: Color,
     ground: Ground,
     color_level: palette::ColorLevel,
 ) -> Style {
-    let named_theme = !super::theme::is_terminal()
-        && super::style::current().style == super::style::TuiStyle::Marks
-        && color_level != palette::ColorLevel::Ansi16;
-    if named_theme || matches!(ground, Ground::Lightness { .. }) {
+    footer_theme_style_in(scopes, fallback, ground, color_level, palette::window_lifts_slot_colours())
+}
+
+/// [`footer_theme_style_on`] in the ZeroCode window (`window`) or another
+/// terminal. In the window the `terminal` theme's footer is its roles, which
+/// the window's own ink draws ([`super::ansi::Role::terminal_ink_in`]), not
+/// the syntax theme's colours: a change of the window's theme reaches the
+/// model and the folder, and the footer's only colours are its mode marks.
+pub(crate) fn footer_theme_style_in(
+    scopes: &[&str],
+    fallback: Color,
+    ground: Ground,
+    color_level: palette::ColorLevel,
+    window: bool,
+) -> Style {
+    let marks = super::style::current().style == super::style::TuiStyle::Marks;
+    let named_theme = !super::theme::is_terminal() && marks && color_level != palette::ColorLevel::Ansi16;
+    let window_roles = window && marks && super::theme::is_terminal();
+    if named_theme || window_roles || matches!(ground, Ground::Lightness { .. }) {
         return Style::new().fg(fallback);
     }
     let terminal_palette = ground.palette();

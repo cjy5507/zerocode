@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
+use zerocode_core::agent_shims;
 use zerocode_core::line::{self, Class, Hold, Job, JobState, Line, Machine, Pause, Until};
 
 use crate::build_cli::now_ms;
@@ -41,7 +42,9 @@ zo line forget <job> · zo line restore <job>
   first slot only (a whole suite); --quiet runs alone (a measurement): from
   its turn nothing new starts until the machine is empty. Nothing starts while
   the line is paused or the disk is below its floor; near it, the folders of
-  idle slots go first. Cargo builds in the slot's own folder (zo's home,
+  idle slots go first. The floor is 16 GiB free, or the whole GiB that
+  ZO_LINE_DISK_FLOOR_GIB names in the environment of the zo that put the job
+  in (0 for none). Cargo builds in the slot's own folder (zo's home,
   build-slots/targets/<slot>), the job's workspace crates removed from it
   before and after, so only registry crates carry over; a job that names its
   CARGO_TARGET_DIR builds there, untouched. `run` exits as its
@@ -71,12 +74,20 @@ const WAITER_ENV: &str = "ZO_LINE_WAITER";
 const WAITER_START: Duration = Duration::from_secs(2);
 /// How often that process looks whether it does.
 const WAITER_LOOK: Duration = Duration::from_millis(10);
+/// The variable that names the line's disk floor in whole GiB, `0` for none
+/// (`floor_gib`). A job's waiter has the environment of the `zo` that put the
+/// job in, so the floor is that one's. The line's own integration tests give
+/// their line none: below 17 GiB free they said `skipped:` and passed in no
+/// time (t-119309).
+const FLOOR_ENV: &str = "ZO_LINE_DISK_FLOOR_GIB";
 /// How long after a job is put in its waiter may still be taking its lock:
 /// `add` waits `WAITER_START` for it and writes the record, and on a very busy
 /// machine the lock stands only after that (`end_orphans`).
 const WAITER_GRACE_MS: i64 = 60_000;
 /// The lines of a log `zo line log` prints.
 const LOG_TAIL_LINES: usize = 200;
+/// How a ledger address names a run's chair: `run:<run>`, found in that run.
+const RUN_ADDRESS: &str = "run:";
 /// How much of what a failed `zerocode-orc send` said the job's log keeps.
 const SAID_CHARS: usize = 400;
 /// The machine's slot folder under zo's home — `zo build`'s.
@@ -224,6 +235,7 @@ fn cap_secs(word: &str) -> Result<u32, String> {
 /// One sentence a person reads: why nothing was done.
 pub fn run(args: &[String], cwd: &Path) -> Result<Ended, String> {
     let verb = parse(args)?;
+    let floor_gib = floor_gib(std::env::var_os(FLOOR_ENV).as_deref())?;
     let home = line::zo_home().ok_or_else(|| "no home folder to keep the line in".to_owned())?;
     let line = Line::at(&home);
     line.make().map_err(|error| error.to_string())?;
@@ -238,7 +250,7 @@ pub fn run(args: &[String], cwd: &Path) -> Result<Ended, String> {
     let machine = MachineRules {
         slots,
         at_once,
-        floor_gib: line::DISK_FLOOR_DEFAULT_GIB,
+        floor_gib,
         look_every: LOOK_EVERY,
         env: |name| std::env::var_os(name),
         free: free_bytes,
@@ -255,7 +267,7 @@ pub fn run(args: &[String], cwd: &Path) -> Result<Ended, String> {
             run_job(&line, &machine, &job.id, true).map(Ended::Ran)
         }
         Verb::Add(put) => {
-            let job = put_with_waiter(&line, &machine, job_of(&put, cwd))?;
+            let job = put_with_waiter(&line, &machine, told_in_this_panes_run(job_of(&put, cwd)))?;
             let places = line::places(&line.jobs(), &|owner| line.last_end(owner), line.turn());
             put_receipt(&line, &job, json!({ "job": job.id, "place": places.get(&job.id) }))
         }
@@ -370,6 +382,14 @@ fn put_with_waiter(line: &Line, machine: &MachineRules, mut job: Job) -> Result<
     Ok(job)
 }
 
+/// `job`, told in the run this process's pane stands in when its address is
+/// one another run cannot find — a worker, a pane (`notify_run`, t-119309).
+/// Asked before the line's lock is taken: the ledger may take seconds to answer.
+fn told_in_this_panes_run(mut job: Job) -> Job {
+    job.notify_run = job.notify.as_deref().filter(|to| !to.starts_with(RUN_ADDRESS)).and_then(|_| run_of_this_pane());
+    job
+}
+
 /// The job a put makes, waiting from now.
 fn job_of(put: &Put, cwd: &Path) -> Job {
     let now = now_ms();
@@ -386,6 +406,7 @@ fn job_of(put: &Put, cwd: &Path) -> Job {
         cap_secs: put.cap_secs.unwrap_or(line::CAP_DEFAULT_SECS),
         command: put.command.clone(),
         notify: put.notify.clone(),
+        notify_run: None,
         state: JobState::Waiting,
         queued_ms: now,
         started_ms: None,
@@ -871,6 +892,19 @@ fn alive(_pid: u32) -> bool {
     true
 }
 
+/// The disk floor in GiB that `value` of `FLOOR_ENV` names: the line's default
+/// when it is unset or empty, `0` for none. A word that is no whole number of
+/// GiB is refused, never read as the default — a floor someone set and the
+/// line ignored would hold or start jobs nobody expected.
+fn floor_gib(value: Option<&OsStr>) -> Result<u64, String> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(line::DISK_FLOOR_DEFAULT_GIB);
+    };
+    value.to_str().and_then(|word| word.parse().ok()).ok_or_else(|| {
+        format!("{FLOOR_ENV} takes a whole number of GiB, 0 for no floor — not `{}`", value.to_string_lossy())
+    })
+}
+
 /// `free` bytes of disk below `floor_gib`.
 fn disk_low(free: Option<u64>, floor_gib: u64) -> bool {
     free.is_some_and(|free| free < floor_gib.saturating_mul(1 << 30))
@@ -1070,29 +1104,19 @@ fn tee(output: Option<impl io::Read + Send + 'static>, log: &File, to_err: bool)
 }
 
 /// Tells the ledger how the job ended, when it named where: through
-/// `zerocode-orc send` on this machine's PATH, with the environment of the
-/// process that put the job in. `send` changes the ledger, so it goes under a
-/// name the window can take again unchanged, the job's: without one the window
-/// refused every end the line told (t-118403). A send that does not go is left,
-/// and the job's log says so as its last line.
+/// `zerocode-orc send`, with the environment of the process that tells — the
+/// job's waiter, which has the one of the process that put the job in, or the
+/// look that ended the job (`tell_ended`) — in the run the address is found in
+/// (`send_args`). `send` changes the ledger, so it goes under a name the window
+/// can take again unchanged, the job's: without one the window refused every
+/// end the line told (t-118403). A send that does not go is left, and the job's
+/// log says so as its last line.
 fn notify(line: &Line, job: &Job, took: Duration) {
     let Some(to) = job.notify.as_deref() else {
         return;
     };
-    let what = if job.what.is_empty() { job.command.join(" ") } else { job.what.clone() };
-    let body = format!(
-        "zo line {}: {what} — {} (rc {}, {}s)",
-        job.id,
-        state_word(job.state),
-        job.rc.unwrap_or(-1),
-        took.as_secs()
-    );
-    let mut send = Command::new("zerocode-orc");
-    let name = format!("zo-line-{}", job.id);
-    send.args(["send", "--to", to, "--type", "status", "--body", &body, "--retry-request", &name]);
-    if let Some(run) = to.strip_prefix("run:") {
-        send.args(["--run", run]);
-    }
+    let mut send = ledger_command();
+    send.args(send_args(job, to, took));
     let said = send
         .current_dir(&job.checkout)
         .stdin(Stdio::null())
@@ -1108,6 +1132,64 @@ fn notify(line: &Line, job: &Job, took: Duration) {
     if let Ok(log) = OpenOptions::new().create(true).append(true).open(&path) {
         close_log(&log, &path, &format!("zo line: telling {to} how the job ended did not go: {why}"));
     }
+}
+
+/// The words `notify` gives `zerocode-orc` to tell `to` how `job` ended. The
+/// window finds a worker or a pane in the run its caller stands in, and the
+/// look that ends a job may stand in another run, or in none: the send names
+/// the run the address is found in — a run's own, or the one the pane that put
+/// the job in stood in (`notify_run`, t-119309). The sender signs as itself.
+fn send_args(job: &Job, to: &str, took: Duration) -> Vec<String> {
+    let what = if job.what.is_empty() { job.command.join(" ") } else { job.what.clone() };
+    let body = format!(
+        "zo line {}: {what} — {} (rc {}, {}s)",
+        job.id,
+        state_word(job.state),
+        job.rc.unwrap_or(-1),
+        took.as_secs()
+    );
+    let name = format!("zo-line-{}", job.id);
+    let mut args: Vec<String> = ["send", "--to", to, "--type", "status", "--body", body.as_str(), "--retry-request", name.as_str()]
+        .map(str::to_owned)
+        .into();
+    if let Some(run) = to.strip_prefix(RUN_ADDRESS).or(job.notify_run.as_deref()) {
+        args.extend(["--run".to_owned(), run.to_owned()]);
+    }
+    args
+}
+
+/// The ledger's command as this machine runs it.
+fn ledger_command() -> Command {
+    let endpoint = std::env::var_os(zerocode_core::hook::ENDPOINT_ENV);
+    ledger_command_on(std::env::var_os("PATH").as_deref(), endpoint.as_deref().map(Path::new), cfg!(windows))
+}
+
+/// The ledger's command on a machine whose `PATH` and window endpoint are these:
+/// the one zo's Agent tool runs (`zerocode_core::agent_shims`). On Windows that
+/// is the window's `.ps1` through Windows `PowerShell` — a bare `zerocode-orc`
+/// finds only an `.exe` there, and the window installs none (I-t118403-W1).
+/// Found nowhere, the bare name, whose failure to start the job's log says.
+fn ledger_command_on(path: Option<&OsStr>, endpoint: Option<&Path>, windows: bool) -> Command {
+    match agent_shims::find_orchestration_program(path, endpoint, windows) {
+        Some(program) => agent_shims::orchestration_command(&program, windows),
+        None => Command::new(agent_shims::ORCHESTRATION_COMMAND),
+    }
+}
+
+/// The run this process's pane stands in, as `zerocode-orc run-current` says:
+/// none when it stands in none, or the ledger cannot be asked.
+fn run_of_this_pane() -> Option<String> {
+    let said = ledger_command().arg("run-current").stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    if !said.status.success() {
+        return None;
+    }
+    run_named(&said.stdout)
+}
+
+/// The run `run-current`'s answer names.
+fn run_named(answer: &[u8]) -> Option<String> {
+    let answer: serde_json::Value = serde_json::from_slice(answer).ok()?;
+    answer["runId"].as_str().filter(|run| !run.is_empty()).map(str::to_owned)
 }
 
 /// The first line a command said on stderr, at most `SAID_CHARS` characters.
@@ -1540,6 +1622,103 @@ mod tests {
         assert_eq!(line.jobs().len(), 1, "nothing else was put in");
     }
 
+    /// The send that tells a job's end names the run its address is found in:
+    /// a run's own, or, for a worker or a pane, the run the pane that put the job
+    /// in stood in — whoever tells it (t-119309). A job put in from no run, or
+    /// by a zo before it, names none, as before.
+    #[test]
+    fn a_tell_names_the_run_its_address_is_found_in() {
+        let put = Put { what: "검사".to_owned(), command: words(&["true"]), ..Put::default() };
+        let run_of = |args: &[String]| args.iter().position(|word| word == "--run").map(|at| args[at + 1].clone());
+        for (to, put_from, told_in) in [
+            ("worker:w-7", Some("run-put"), Some("run-put")),
+            ("pane:team-1/%3", Some("run-put"), Some("run-put")),
+            ("worker:w-7", None, None),
+            ("run:run-9", None, Some("run-9")),
+            ("run:run-9", Some("run-put"), Some("run-9")),
+        ] {
+            let job = Job { notify: Some(to.to_owned()), notify_run: put_from.map(str::to_owned), ..job_of(&put, Path::new("/")) };
+            let args = send_args(&job, to, Duration::from_secs(3));
+            assert_eq!(run_of(&args).as_deref(), told_in, "{to} put in from {put_from:?}: {args:?}");
+            assert_eq!(args[..5], ["send", "--to", to, "--type", "status"], "{args:?}");
+            assert_eq!(args[6], format!("zo line {}: 검사 — waiting (rc -1, 3s)", job.id));
+            assert_eq!(args[7..9], ["--retry-request".to_owned(), format!("zo-line-{}", job.id)]);
+        }
+    }
+
+    /// Red → green (t-119309, I-t118403-W1): zo's line runs the ledger's command
+    /// as zo's Agent tool does. On Windows that is the `.ps1` the window installs,
+    /// found on PATH or beside the window's endpoint, through Windows `PowerShell`:
+    /// a bare `zerocode-orc` finds only a `zerocode-orc.exe` there, which the
+    /// window does not install, so no end the line told on Windows went anywhere.
+    /// Elsewhere the command itself; found nowhere, the bare name, whose failure to
+    /// start the job's log says.
+    #[test]
+    fn the_line_runs_the_ledgers_command_as_zos_agent_tool_does() {
+        let root = tempfile::tempdir().expect("a folder");
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("folders");
+        for name in ["zerocode-orc", "zerocode-orc.ps1", "zerocode-orc.cmd"] {
+            std::fs::write(bin.join(name), "a fixture command; never run here").expect("written");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(bin.join("zerocode-orc"), std::fs::Permissions::from_mode(0o755)).expect("runnable");
+        }
+        let ps1 = bin.join("zerocode-orc.ps1");
+        let on_windows = ledger_command_on(Some(bin.as_os_str()), None, true);
+        assert_eq!(on_windows.get_program(), "powershell.exe", "a bare name finds no `.cmd` or `.ps1` on Windows");
+        let said: Vec<&OsStr> = on_windows.get_args().collect();
+        let policy = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"].map(OsStr::new);
+        assert_eq!(said, [&policy[..], &[ps1.as_os_str()][..]].concat());
+        let elsewhere = ledger_command_on(Some(bin.as_os_str()), None, false);
+        assert_eq!((elsewhere.get_program(), elsewhere.get_args().count()), (bin.join("zerocode-orc").as_os_str(), 0));
+        let endpoint = root.path().join("application/agent-hooks/endpoint.env");
+        let beside = zerocode_core::agent_shims::orchestration_program(&endpoint, true).expect("a place");
+        std::fs::create_dir_all(beside.parent().expect("a folder")).expect("folders");
+        std::fs::write(&beside, "a fixture command; never run here").expect("written");
+        let empty = root.path().join("empty");
+        let found = ledger_command_on(Some(empty.as_os_str()), Some(endpoint.as_path()), true);
+        assert_eq!(found.get_args().last(), Some(beside.as_os_str()), "nothing on PATH: the one beside the window's endpoint");
+        let none = ledger_command_on(None, None, true);
+        assert_eq!((none.get_program(), none.get_args().count()), (OsStr::new("zerocode-orc"), 0));
+    }
+
+    /// The words a tell gives the ledger on Windows reach the window's `.ps1`
+    /// whole through `PowerShell`'s `-File`: the flags as words, and a body with
+    /// quotes, `$(`, a backtick, `%PATH%`, a line break, Korean and a dash. Run
+    /// with `--ignored` where `pwsh` is on PATH; `pwsh` on this Mac stands in for
+    /// Windows `PowerShell`, and how Windows quotes the command line it starts
+    /// (`CreateProcess`) is not seen here (t-119309).
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs pwsh on PATH: cargo test -- --ignored"]
+    fn the_words_a_tell_gives_powershell_reach_the_script_whole() {
+        let root = tempfile::tempdir().expect("a folder");
+        std::fs::write(root.path().join("zerocode-orc.ps1"), "[System.IO.File]::WriteAllLines($env:ORC_SEEN, [string[]]$args)\n")
+            .expect("the fake");
+        let seen = root.path().join("seen");
+        let put = Put { what: "검사 \"quoted\" $(not run) `tick` %PATH%\nsecond line — 끝".to_owned(), command: words(&["true"]), ..Put::default() };
+        let job = Job { notify_run: Some("run-put".to_owned()), ..job_of(&put, Path::new("/")) };
+        let told = send_args(&job, "worker:w-7", Duration::from_secs(1));
+        let windows = ledger_command_on(Some(root.path().as_os_str()), None, true);
+        let status = Command::new("pwsh").args(windows.get_args()).args(&told).env("ORC_SEEN", &seen).status().expect("pwsh runs");
+        assert!(status.success(), "{status}");
+        let got = std::fs::read_to_string(&seen).expect("what the script got");
+        assert_eq!(got, format!("{}\n", told.join("\n")), "{told:?}");
+    }
+
+    /// The run a pane stands in is the one `run-current` names; an answer that
+    /// names none says the pane stands in no run.
+    #[test]
+    fn the_run_a_pane_stands_in_is_the_one_run_current_names() {
+        assert_eq!(run_named(br#"{"runId":"run-94975","name":"x","seated":false}"#), Some("run-94975".to_owned()));
+        for said in [&b""[..], b"no json", br#"{"runId":""}"#, br#"{"runId":7}"#, br#"["run-1"]"#] {
+            assert_eq!(run_named(said), None, "{}", String::from_utf8_lossy(said));
+        }
+    }
+
     /// What a failed `zerocode-orc send` said, as the job's log keeps it: its
     /// first line that says anything, cut short.
     #[test]
@@ -1854,6 +2033,25 @@ mod tests {
         assert_eq!(run_job(&line, &machine, &job.id, false), Ok(0));
         let left: Vec<_> = std::fs::read_dir(slots.join("targets")).expect("the folders' folder").collect();
         assert!(left.is_empty(), "both idle slots' folders went: {left:?}");
+    }
+
+    /// The line's floor is its default unless `ZO_LINE_DISK_FLOOR_GIB` names
+    /// another in whole GiB, 0 for none; a word that is no such number is
+    /// refused, not read as the default (t-119309). No floor holds nothing
+    /// back, a full disk too.
+    #[test]
+    fn a_floor_the_environment_names_is_the_lines_and_a_word_that_is_none_is_refused() {
+        assert_eq!(floor_gib(None), Ok(line::DISK_FLOOR_DEFAULT_GIB));
+        assert_eq!(floor_gib(Some(OsStr::new(""))), Ok(line::DISK_FLOOR_DEFAULT_GIB), "set empty is unset");
+        assert_eq!(floor_gib(Some(OsStr::new("0"))), Ok(0));
+        assert_eq!(floor_gib(Some(OsStr::new("24"))), Ok(24));
+        for word in ["-1", "16GiB", "1.5", " 8", "lots"] {
+            let refused = floor_gib(Some(OsStr::new(word))).expect_err(word);
+            assert!(refused.contains(FLOOR_ENV) && refused.contains(&format!("`{word}`")), "{refused}");
+        }
+        assert!(!disk_low(Some(0), 0), "no floor holds nothing back, whatever the disk holds");
+        assert!(disk_low(Some((1 << 30) - 1), 1));
+        assert!(USAGE.contains(FLOOR_ENV), "{USAGE}");
     }
 
     /// `zo line list` answers what an agent asks it — is the line busy, how
