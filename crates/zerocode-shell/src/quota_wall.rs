@@ -1128,6 +1128,11 @@ pub(crate) struct PaneWall {
     /// The reset the record names and the grace after it, or the longest a
     /// wall with no reset stands — `QUOTA_WAIT_POLICY`, the one table.
     pub(crate) stands_until_ms: i64,
+    /// When the record was written, and the provider's reset it names when
+    /// it names one (`quotaLimits.resetsAt`): what a wall that came down
+    /// before its own window ran out is judged by (t-123972).
+    pub(crate) at_ms: i64,
+    pub(crate) resets_at_ms: Option<i64>,
 }
 
 impl PaneWall {
@@ -1185,6 +1190,8 @@ pub(crate) fn pane_wall_in(agent: &str, lines: &[String]) -> Option<PaneWall> {
                     StallCause::ClassifierDecline => at_ms.saturating_add(DECLINE_POINTER_HOLD_MS),
                     _ => zerocode_core::orchestration::wall_stands_until(at_ms, found.resets_at_ms),
                 },
+                at_ms,
+                resets_at_ms: found.resets_at_ms,
             })
         })
 }
@@ -2054,12 +2061,23 @@ pub(crate) mod tests {
         );
         assert!(session.stands(at("2026-09-23T09:30:00.000Z")));
         assert!(!session.stands(at("2026-09-23T09:33:00.000Z")));
+        // What an early lift is judged by (t-123972): the record's own time,
+        // and the reset the provider named in it.
+        assert_eq!(
+            (session.at_ms, session.resets_at_ms),
+            (at("2026-09-23T08:55:23.536Z"), Some(1_790_155_800_000))
+        );
 
         // Reset 23.7 hours away: past the longest wait, which then decides.
         let weekly = read(&[CLAUDE_WEEKLY_WALL_RECORD]).expect("a weekly wall");
         assert_eq!(
             weekly.stands_until_ms,
             at("2026-09-20T02:19:15.811Z") + policy.max_wait_ms
+        );
+        assert_eq!(
+            (weekly.at_ms, weekly.resets_at_ms),
+            (at("2026-09-20T02:19:15.811Z"), Some(1_789_956_000_000)),
+            "the weekly wall lost the reset an early lift reads"
         );
 
         let cap = read(&[CLAUDE_MODEL_CAP_RECORD]).expect("a model's own cap");
@@ -2068,6 +2086,10 @@ pub(crate) mod tests {
             cap.stands_until_ms,
             at("2026-09-21T21:08:12.346Z") + policy.max_wait_ms,
             "a cap that names no reset stands for the longest wait"
+        );
+        assert_eq!(
+            cap.resets_at_ms, None,
+            "a model's own cap names no reset, and no number lifts it early"
         );
 
         let login =
