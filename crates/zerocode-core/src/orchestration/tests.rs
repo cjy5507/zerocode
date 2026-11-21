@@ -4571,6 +4571,20 @@ fn an_existing_checkout_is_not_cut_again_and_the_requested_tuning_survives() {
     assert_eq!(prepared.resumed, WorkerResume::Fresh);
     assert!(prepared.prompt.contains("git log"), "{}", prepared.prompt);
     assert!(prepared.prompt.contains(&task), "{}", prepared.prompt);
+    // Whether the checkout is the ledger's own cut rides the reseat, as the
+    // ledger records it (t-124593 D1): this worker's was not, and one whose
+    // was is told so.
+    assert!(!prepared.in_worktree);
+    let at = ledger.locate(&worker).expect("the worker");
+    ledger.runs[at.0].workers[at.1].in_worktree = true;
+    let own = ledger
+        .prepare_worker_reseat(&run, &worker, &mut team, "%1", &Resuming, "unused-nudge")
+        .expect("a reseat in the ledger's cut");
+    assert!(
+        own.prepared_worker_reseat
+            .as_ref()
+            .is_some_and(|prepared| prepared.in_worktree)
+    );
 }
 
 /// A sleeping attempt has to cross the durable projection that the restart
@@ -13343,15 +13357,69 @@ fn a_worker_is_tuned_only_as_its_agent_spells_it() {
         "{}",
         outside.reply.stderr
     );
+}
 
-    // And every id the tuning table names exists in the agent catalog,
-    // so the two registries cannot drift apart.
-    for (id, _, _, _) in TUNABLE {
+/// A CLI whose own help names a model flag on the very command its row
+/// launches is summoned on the model a coordinator names (t-124593:
+/// `worker-start --agent devin --model …` was refused as taking no model,
+/// though `devin --help` names `--model`). An effort none of them names
+/// levels for is still refused by name, and a CLI whose launched TUI names
+/// no model flag stays refused — the table follows the measurement only.
+#[test]
+fn a_cli_whose_help_names_a_model_flag_is_summoned_on_the_model_it_is_given() {
+    let mut bench = Bench::new();
+    bench.json("run-create --name every-cli");
+    let measured = ["devin", "kiro", "qwen-code", "grok"];
+    bench.launcher = Catalog(&["devin", "kiro", "qwen-code", "grok", "opencode"]);
+    for agent in measured {
+        let planned = bench.run(&format!(
+            "worker-start --agent {agent} --model example-model"
+        ));
+        assert_eq!(
+            planned.reply.exit_code, 0,
+            "{agent}: {}",
+            planned.reply.stderr
+        );
+        let Effect::Split { ref command, .. } = planned.effect else {
+            panic!("{agent}: no split: {:?}", planned.effect);
+        };
         assert!(
-            crate::agent::AGENT_SPECS.iter().any(|spec| spec.id == *id),
-            "TUNABLE names {id}, which the agent catalog does not know"
+            command.starts_with(&format!("{agent} --model example-model")),
+            "{agent}: the model does not lead the launch line: {command}"
+        );
+        let said: serde_json::Value =
+            serde_json::from_str(&planned.reply.stdout).expect("a start receipt");
+        assert_eq!(said["model"], "example-model", "{agent}");
+        assert_eq!(
+            said["launchNotice"],
+            serde_json::Value::Null,
+            "{agent}: a CLI with no effort ride was told an effort default applies"
+        );
+
+        let unridden = bench.run(&format!(
+            "worker-start --agent {agent} --model example-model --effort high"
+        ));
+        assert_eq!(unridden.reply.exit_code, 1, "{agent}");
+        assert!(
+            unridden
+                .reply
+                .stderr
+                .contains(&format!("{agent} does not support launch-time effort")),
+            "{agent}: {}",
+            unridden.reply.stderr
         );
     }
+
+    let refused = bench.run("worker-start --agent opencode --model example-model");
+    assert_eq!(refused.reply.exit_code, 1);
+    assert!(
+        refused
+            .reply
+            .stderr
+            .contains("opencode does not support launch-time model selection"),
+        "{}",
+        refused.reply.stderr
+    );
 }
 
 /* ---- who can be summoned ----------------------------------------- */
@@ -13394,6 +13462,226 @@ impl Launcher for Looked {
     fn presence(&self) -> Option<Vec<crate::agent::AgentPresence>> {
         Some(crate::agent::agent_presence(Some(&self.path), "macos"))
     }
+}
+
+/// Every catalog row says what its CLI listed or why there is nothing to
+/// say (t-124593): `unknown` for a CLI whose help names no list, and
+/// `not-asked`, with the command it would be, for one nobody asked yet.
+#[test]
+fn every_catalog_row_says_what_its_cli_listed_or_why_not() {
+    let machine = Looked::at(&["kiro-cli", "qwen"]);
+    let said = answered(&machine, "agent-list");
+    assert_eq!(row_for(&said, "qwen-code")["models"]["state"], "unknown");
+    let kiro = &row_for(&said, "kiro")["models"];
+    assert_eq!(kiro["state"], "not-asked");
+    assert_eq!(kiro["from"], "kiro-cli chat --list-models --format json");
+    assert_eq!(row_for(&said, "devin")["models"]["state"], "not-asked");
+}
+
+/// A machine that holds these commands, and whose window last asked each
+/// CLI in `heard` for its models and got that answer.
+struct Heard {
+    looked: Looked,
+    heard: Vec<crate::cli_models::Snapshot>,
+}
+
+impl Launcher for Heard {
+    fn command_for(&self, agent: &str, prompt: &str, tuning: &[String]) -> Result<String, String> {
+        self.looked.command_for(agent, prompt, tuning)
+    }
+
+    fn presence(&self) -> Option<Vec<crate::agent::AgentPresence>> {
+        self.looked.presence()
+    }
+
+    fn model_list(&self, agent: &str) -> Option<crate::cli_models::Snapshot> {
+        self.heard.iter().find(|one| one.agent == agent).cloned()
+    }
+}
+
+/// `agent-list` says what each installed CLI listed when the window asked
+/// it, with when (t-124593: 「거기안에 모델들도 보고」) — the CLI's own
+/// ids and its own default, unread where the answer's shape is not
+/// measured, `not-asked` where nobody asked yet, and `unknown` for a CLI
+/// whose help names no list. An agent that is not installed is not asked.
+#[test]
+fn the_catalog_says_the_models_each_installed_cli_listed_and_when() {
+    use crate::cli_models::{Answer, Listed, Snapshot, UnreadWhy};
+    let heard = |agent: &str, answer: Answer| Snapshot {
+        agent: agent.to_string(),
+        asked: format!("{agent} models"),
+        answer,
+        read_at_ms: 400,
+        took_ms: 90,
+    };
+    let machine = Heard {
+        looked: Looked::at(&["kiro-cli", "devin", "grok", "qwen"]),
+        heard: vec![
+            heard(
+                "kiro",
+                Answer::Listed {
+                    models: vec![
+                        Listed {
+                            id: "auto".into(),
+                            name: None,
+                            family: None,
+                        },
+                        Listed {
+                            id: "example-model".into(),
+                            name: Some("Example Model".into()),
+                            family: None,
+                        },
+                    ],
+                    default: Some("auto".into()),
+                },
+            ),
+            heard(
+                "devin",
+                Answer::Unread {
+                    bytes: 512,
+                    why: UnreadWhy::Unmeasured,
+                },
+            ),
+            // Asked, but the machine does not hold it: never shown.
+            heard("opencode", Answer::NoAnswer),
+        ],
+    };
+    let said = answered(&machine, "agent-list");
+
+    let kiro = &row_for(&said, "kiro")["models"];
+    assert_eq!(kiro["state"], "listed");
+    assert_eq!(kiro["ids"], serde_json::json!(["auto", "example-model"]));
+    assert_eq!(kiro["default"], "auto");
+    assert_eq!(kiro["readAtMs"], 400);
+    assert_eq!(kiro["ageMs"], 600, "asked at 400, answered at 1000");
+    assert_eq!(row_for(&said, "kiro")["takesModel"], true);
+
+    let devin = &row_for(&said, "devin")["models"];
+    assert_eq!(devin["state"], "unread");
+    assert!(
+        devin.get("ids").is_none(),
+        "an unread answer listed ids: {devin}"
+    );
+
+    assert_eq!(row_for(&said, "grok")["models"]["state"], "not-asked");
+    assert_eq!(row_for(&said, "qwen-code")["models"]["state"], "unknown");
+    // Its CLI lists models and takes no measured --model, so nothing it
+    // lists is read — and this machine does not hold it anyway.
+    assert_eq!(row_for(&said, "opencode")["models"]["state"], "not-read");
+}
+
+/// An `--agent auto` summons pinned to a model takes a CLI whose models come
+/// from its own list only when that list was read, is no older than the
+/// lineup's refresh rule, and holds the model (t-124593) — an unread or old
+/// list is "unknown", never "yes". An agent zo's catalog serves keeps the
+/// family rule it had.
+#[test]
+fn an_auto_summons_takes_a_listed_cli_only_on_a_fresh_list_that_holds_its_model() {
+    use crate::cli_models::{Answer, Listed, Snapshot};
+    use crate::summon_difficulty::lineup::REFRESH_AFTER_MS;
+    let now_ms = 10 * REFRESH_AFTER_MS;
+    let listing = |agent: &str, read_at_ms: i64| Snapshot {
+        agent: agent.to_string(),
+        asked: format!("{agent} models"),
+        answer: Answer::Listed {
+            models: vec![Listed {
+                id: "example-model".into(),
+                name: None,
+                family: None,
+            }],
+            default: None,
+        },
+        read_at_ms,
+        took_ms: 1,
+    };
+    let machine = Heard {
+        looked: Looked::at(&["devin", "kiro-cli", "grok", "agy"]),
+        heard: vec![
+            listing("devin", now_ms - 60_000),
+            listing("kiro", now_ms - REFRESH_AFTER_MS),
+        ],
+    };
+    let chosen = |model: &str| -> Vec<String> {
+        summonable(&machine, &Ledger::new(), now_ms, Some(model))
+            .into_iter()
+            .map(|room| room.id)
+            .collect()
+    };
+    let example = chosen("example-model");
+    assert!(example.contains(&"devin".to_string()), "{example:?}");
+    assert!(
+        !example.contains(&"kiro".to_string()),
+        "an old list said yes: {example:?}"
+    );
+    assert!(
+        !example.contains(&"grok".to_string()),
+        "an unread list said yes: {example:?}"
+    );
+    // An id the family table pins to no provider that a CLI's own fresh
+    // list holds goes to the CLIs that list it only (the review's I6): zo's
+    // four stand aside. One no list holds keeps the old rule.
+    assert!(
+        !example.contains(&"antigravity".to_string()),
+        "a CLI's own id went to a zo-served agent: {example:?}"
+    );
+    let other = chosen("another-model");
+    assert!(!other.contains(&"devin".to_string()), "{other:?}");
+    assert!(other.contains(&"antigravity".to_string()), "{other:?}");
+    // An id both a CLI's own list and a zo-served agent's lineup hold (a
+    // Gemini id devin and antigravity's `google` row both list) stays with
+    // both.
+    let both = Heard {
+        looked: Looked::at(&["devin", "agy"]),
+        heard: vec![
+            listing("devin", now_ms - 60_000),
+            listing("antigravity", now_ms - 60_000),
+        ],
+    };
+    let shared: Vec<String> = summonable(&both, &Ledger::new(), now_ms, Some("example-model"))
+        .into_iter()
+        .map(|room| room.id)
+        .collect();
+    assert!(
+        shared.contains(&"devin".to_string()) && shared.contains(&"antigravity".to_string()),
+        "{shared:?}"
+    );
+
+    // A Claude id another CLI's list also holds stays on Claude's account:
+    // the family rule comes first, for every agent.
+    let claude_listed = Heard {
+        looked: Looked::at(&["kiro-cli", "claude"]),
+        heard: vec![Snapshot {
+            agent: "kiro".to_string(),
+            asked: "kiro models".to_string(),
+            answer: Answer::Listed {
+                models: vec![Listed {
+                    id: "claude-example-model".into(),
+                    name: None,
+                    family: None,
+                }],
+                default: None,
+            },
+            read_at_ms: now_ms - 60_000,
+            took_ms: 1,
+        }],
+    };
+    let claude_model: Vec<String> = summonable(
+        &claude_listed,
+        &Ledger::new(),
+        now_ms,
+        Some("claude-example-model"),
+    )
+    .into_iter()
+    .map(|room| room.id)
+    .collect();
+    assert!(
+        claude_model.contains(&"claude".to_string()),
+        "{claude_model:?}"
+    );
+    assert!(
+        !claude_model.contains(&"kiro".to_string()),
+        "a Claude model was offered to another service's CLI: {claude_model:?}"
+    );
 }
 
 /// Ask one launcher one read verb, with no ledger state in the way.
@@ -13474,8 +13762,8 @@ fn agent_list_says_what_is_installed_and_what_takes_a_dial() {
     assert_eq!(untunable["takesModel"], false);
     assert_eq!(untunable["takesEffort"], false);
     assert!(
-        !TUNABLE.iter().any(|(id, _, _, _)| *id == "copilot"),
-        "the test's example moved into the table"
+        tuning_of("copilot").is_none(),
+        "the test's example took a launch tuning"
     );
 
     // One agent, by name — and a name nobody knows is refused rather than
@@ -13555,6 +13843,12 @@ fn agent_list_ranks_nothing_and_recommends_nothing() {
             // without being a table somebody has to keep.
             "launched",
             "missingRequirement",
+            // What the agent's own CLI listed when the window asked it,
+            // with when — the CLI's words, typed by nobody, and `unknown`
+            // for a CLI whose help names no list (t-124593). Not a ranking
+            // and not a gate: a `--model` it does not hold still goes to
+            // the CLI.
+            "models",
             "name",
             // The window's last observation of the binary and the login,
             // with its age — a measurement of the machine, like
@@ -15117,6 +15411,46 @@ impl Launcher for Checkouts {
     }
 }
 
+/// The trust flag's fact (t-124593 D1): a fresh `--worktree` summons is in
+/// the ledger's own cut, and so is the replacement that inherits that
+/// attempt's tree — a quota wall's handover is one.
+#[test]
+fn a_replacement_inherits_the_ledgers_own_cut_from_an_attempt_in_one() {
+    let mut bench = Bench::new();
+    bench.json("run-create --name own-cut");
+    let task = bench.json("task-create --spec build-it")["taskId"]
+        .as_str()
+        .expect("a task")
+        .to_string();
+    let (first, pane) = bench.seat(&format!(
+        "worker-start --agent codex --task {task} --worktree"
+    ));
+    assert!(
+        bench.ledger.runs()[0]
+            .worker(&first)
+            .is_some_and(|held| held.in_worktree)
+    );
+    assert!(bench.ledger.worker_seated(("team-1", &pane), "/wt/cut"));
+    let dispatch = bench.ledger.runs()[0]
+        .worker(&first)
+        .and_then(|held| held.dispatch.clone())
+        .expect("the attempt");
+    bench.json(&format!("worker-stop --worker {first} --reason quota-wall"));
+    let seated = bench.run(&format!(
+        "worker-start --agent claude --task {task} --retry-of {dispatch} --inherit-checkout"
+    ));
+    assert_eq!(seated.reply.exit_code, 0, "{}", seated.reply.stderr);
+    let prepared = seated
+        .prepared_worker_start
+        .as_ref()
+        .expect("a reservation");
+    assert_eq!(prepared.inherit_checkout.as_deref(), Some("/wt/cut"));
+    assert!(
+        prepared.in_worktree,
+        "the inherited tree is the ledger's own cut"
+    );
+}
+
 /// `--inherit-checkout` seats the replacement in the ENDED attempt's
 /// own checkout: it needs the `--retry-of` link, refuses a second
 /// placement word, refuses a checkout nobody reported or one the window
@@ -15226,6 +15560,9 @@ fn inherit_checkout_seats_the_replacement_in_the_ended_attempts_checkout() {
     assert_eq!(prepared.inherit_checkout.as_deref(), Some("/wt/first"));
     assert!(!prepared.worktree);
     assert_eq!(prepared.agent, "claude");
+    // The attempt sat in the leader's checkout, not a cut the ledger made:
+    // the trust flag does not ride its replacement (t-124593 D1).
+    assert!(!prepared.in_worktree);
     // An attempt whose worker reported no checkout has nothing to inherit.
     let other = bench.json("task-create --spec test-it")["taskId"]
         .as_str()
@@ -27774,6 +28111,7 @@ fn a_switch_leaves_one_receipt_and_no_credential_anywhere() {
         panes_at_turn_end: 0,
         panes_person: 0,
         panes_left: 0,
+        panes_when_free: 0,
     };
     let written = bench
         .ledger
@@ -27831,6 +28169,7 @@ fn a_switch_leaves_one_receipt_and_no_credential_anywhere() {
         panes_at_turn_end: 2,
         panes_person: 1,
         panes_left: 0,
+        panes_when_free: 3,
         reason: "near_limit".to_string(),
         ..receipt.clone()
     };
@@ -27866,6 +28205,7 @@ fn a_switch_leaves_one_receipt_and_no_credential_anywhere() {
     assert_eq!(body["panesAtTurnEnd"], 2);
     assert_eq!(body["panesPerson"], 1);
     assert_eq!(body["panesLeft"], 0);
+    assert_eq!(body["panesWhenFree"], 3);
     // An empty key is refused; a peer typing the kind is refused.
     assert!(
         bench
@@ -29872,6 +30212,7 @@ fn a_walled_workers_chip_stands_only_while_a_press_would_be_taken() {
         panes_at_turn_end: 0,
         panes_person: 0,
         panes_left: 0,
+        panes_when_free: 0,
     };
     moving
         .ledger

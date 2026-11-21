@@ -1677,7 +1677,7 @@ pub(crate) fn fresh_command(
         return Err(format!("{agent}은(는) 이 창이 모르는 에이전트입니다"));
     };
     let plan = zerocode_core::launch_plan(spec.id, launch_override);
-    let mut argv: Vec<String> = spec.launch.split_whitespace().map(str::to_string).collect();
+    let mut argv: Vec<String> = spec.launch_argv().map(str::to_string).collect();
     argv.extend(
         spec.capabilities()
             .resume
@@ -2672,10 +2672,16 @@ pub(crate) async fn agent_icon(
     state: State<'_, AppState>,
     domain: String,
 ) -> Result<Option<String>, String> {
+    if let Some(uri) = state.icon_cache().get(&domain) {
+        return Ok(Some(uri));
+    }
     let cache = state.cache_root().to_path_buf();
-    tauri::async_runtime::spawn_blocking(move || icon::agent_icon(&cache, &domain))
-        .await
-        .map_err(|error| error.to_string())
+    let icon_cache = Arc::clone(state.icon_cache());
+    tauri::async_runtime::spawn_blocking(move || {
+        icon_cache.get_or_load(&domain, |clean| icon::agent_icon(&cache, clean))
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// Mint the file Orca's "New Markdown" mints: `untitled.md` in the checkout

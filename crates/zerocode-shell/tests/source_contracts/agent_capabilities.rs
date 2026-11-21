@@ -150,6 +150,190 @@ fn no_write_door_branches_on_an_agents_name() {
     }
 }
 
+/// The model roads branch on no agent's name (t-124593; the person,
+/// 2026-11-21: 「하드코딩금지 중복코드 금지 지금 모든 모델 오케스트레이션이
+/// 일반화 되야해」): how a summons names a model and an effort, where an
+/// agent's models are learned and read, the lineup a summons picks from, the
+/// composer's model menu, the auto summons' candidates and the trust flag a
+/// worker split adds each read the agent's row. A CLI added later is a row,
+/// and a branch added here fails this.
+#[test]
+fn the_model_roads_branch_on_no_agents_name() {
+    let branches = agent_name_branches();
+    let core_orchestration = strip_rust_comments(&core_source("orchestration.rs"));
+    let slash_catalog = shipped_code(&shell_source("slash_catalog.rs"));
+    let backend = shipped_code(shipped_backend());
+    // The neighbours on the same road (the review's I2, t-124593): the
+    // family rule, the gauge, the auto summons' choice, the catalog's launch
+    // line, the settings' summon row and a CLI's own lineup. The window's
+    // orchestration file is read whole (a test-only item stands near its
+    // top), comments set aside.
+    let core_lineup = shipped_code(&core_source("summon_difficulty/lineup.rs"));
+    let shell_orchestration = strip_rust_comments(&shell_source("orchestration.rs"));
+    let catalog = &shell_orchestration[shell_orchestration
+        .find("impl Launcher for Catalog")
+        .expect("the catalog's launcher")..];
+    let settings = shipped_code(&shell_source("typesafe_settings.rs"));
+    let summon_agent = &settings[settings
+        .find("impl SummonAgent {")
+        .expect("the settings' summon row")..];
+    let whole = [
+        ("cli_models.rs", shipped_code(&core_source("cli_models.rs"))),
+        (
+            "summon_lineup.rs",
+            shipped_code(&shell_source("summon_lineup.rs")),
+        ),
+    ];
+    let roads = [
+        (
+            "tuning_of",
+            block_after(&core_orchestration, "fn tuning_of("),
+        ),
+        (
+            "launch_tuning",
+            block_after(&core_orchestration, "fn launch_tuning("),
+        ),
+        (
+            "takes_effort",
+            block_after(&core_orchestration, "pub fn takes_effort("),
+        ),
+        (
+            "ladder_efforts",
+            block_after(&core_orchestration, "pub fn ladder_efforts("),
+        ),
+        (
+            "carries_model",
+            block_after(&core_orchestration, "fn carries_model("),
+        ),
+        (
+            "served_by_zo",
+            block_after(&core_orchestration, "fn served_by_zo("),
+        ),
+        (
+            "lists_model",
+            block_after(&core_orchestration, "fn lists_model("),
+        ),
+        (
+            "listed_by_a_cli",
+            block_after(&core_orchestration, "fn listed_by_a_cli("),
+        ),
+        (
+            "agent_row",
+            block_after(&core_orchestration, "fn agent_row("),
+        ),
+        (
+            "agent_lineup",
+            block_after(&slash_catalog, "pub fn agent_lineup("),
+        ),
+        (
+            "agent_models_from",
+            block_after(&slash_catalog, "fn agent_models_from("),
+        ),
+        (
+            "trust_flag_words",
+            block_after(&backend, "fn trust_flag_words("),
+        ),
+        (
+            "runs_model",
+            block_after(&core_orchestration, "pub fn runs_model("),
+        ),
+        (
+            "quota_gauge_for",
+            block_after(&core_orchestration, "pub fn quota_gauge_for("),
+        ),
+        (
+            "native_agent",
+            block_after(&core_orchestration, "pub fn native_agent("),
+        ),
+        (
+            "summonable",
+            block_after(&core_orchestration, "pub fn summonable("),
+        ),
+        (
+            "Lineup::from_listed",
+            block_after(&core_lineup, "pub fn from_listed("),
+        ),
+        (
+            "Catalog::command_for",
+            block_after(catalog, "fn command_for("),
+        ),
+        ("SummonAgent::of", block_after(summon_agent, "fn of(")),
+    ];
+    for (road, text) in whole
+        .iter()
+        .map(|(file, text)| (*file, text.as_str()))
+        .chain(roads)
+    {
+        for spelled in &branches {
+            assert!(
+                !text.contains(spelled.as_str()),
+                "{road} branches on `{spelled}` — the agent's row answers this"
+            );
+        }
+    }
+}
+
+/// The conversation view's road for a session its CLI writes as one document
+/// (t-124593) is chosen by the shape of the store row that keeps the file
+/// and read by the document's own schema — never by the agent's name, the
+/// one test the pane's door kept before it (`Some("zo")` for zo's archive).
+#[test]
+fn the_document_road_branches_on_no_agents_name() {
+    let branches = agent_name_branches();
+    let core_transcript = shipped_code(&core_source("transcript.rs"));
+    let core_binding = shipped_code(&core_source("pane_transcript.rs"));
+    let core_vault = shipped_code(&core_source("vault.rs"));
+    let terminal = shipped_code(&shell_source("cmd/terminal.rs"));
+    let binding = shipped_code(&shell_source("pane_transcript.rs"));
+    let roads = [
+        (
+            "document_read",
+            block_after(&core_transcript, "pub fn document_read("),
+        ),
+        (
+            "step_turns",
+            block_after(&core_transcript, "fn step_turns("),
+        ),
+        (
+            "call_result",
+            block_after(&core_transcript, "fn call_result<"),
+        ),
+        ("format_of", block_after(&core_binding, "pub fn format_of(")),
+        (
+            "written_whole",
+            block_after(&core_vault, "pub const fn written_whole("),
+        ),
+        ("carded", block_after(&core_vault, "pub const fn carded(")),
+        (
+            "turn_write_settle",
+            block_after(&core_vault, "pub fn turn_write_settle("),
+        ),
+        (
+            "document_log_within",
+            block_after(&terminal, "fn document_log_within("),
+        ),
+        ("steps_back", block_after(&terminal, "fn steps_back(")),
+        (
+            "the pane's shape",
+            block_after(&binding, "pub(crate) fn written_whole("),
+        ),
+    ];
+    for (road, text) in roads {
+        for spelled in &branches {
+            assert!(
+                !text.contains(spelled.as_str()),
+                "{road} branches on `{spelled}` — the store row's shape answers this"
+            );
+        }
+    }
+    let pane = block_after(&terminal, "fn pane_log(");
+    assert!(
+        pane.contains("crate::pane_transcript::written_whole(&state, term, &path)")
+            && pane.contains("document_log(&path, read, whole.unwrap_or(false))"),
+        "the pane's door no longer picks its road by the shape of the file it named:\n{pane}"
+    );
+}
+
 /// Each door reads the decision it used to spell off the agent's row.
 #[test]
 fn every_write_door_reads_its_decision_off_the_table() {

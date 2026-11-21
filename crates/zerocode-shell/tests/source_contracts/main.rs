@@ -24306,13 +24306,18 @@ mod tests {
         // what is held — rows that ask mid-flight must join it, not start a
         // second.
         assert!(
-            asks.contains("agentMarks.has(domain)") && asks.contains("agentMarks.set("),
+            asks.contains("pendingAgentMarks.has(domain)")
+                && asks.contains("pendingAgentMarks.set("),
             "a mark is fetched once per row instead of once per agent:\n{asks}"
         );
 
-        let backend = block_after(include_str!("../../src/icon.rs"), "pub fn agent_icon(");
+        let source = include_str!("../../src/icon.rs");
+        let backend = block_after(source, "pub fn agent_icon(");
         assert!(
-            backend.contains("tidy_domain(domain)?") && backend.contains("looks_like_png("),
+            backend.contains("tidy_domain(domain)?")
+                && backend.contains("cached_png(")
+                && block_after(source, "fn cached_png(").contains("looks_like_png(")
+                && block_after(source, "fn fetch(").contains("looks_like_png("),
             "the fetch stopped checking the domain it is handed or the bytes \
              it got back:\n{backend}"
         );
@@ -38157,7 +38162,7 @@ mod tests {
         // (:18583-18587), and `getFallbackVisibleSection` moves the screen
         // onto the first survivor — without that the rail shows one set of
         // names while the page shows a section absent from it.
-        let searched = block_after(window, "function paintSettingsSearch() {");
+        let searched = block_after(window, "function paintSettingsSearch(");
         assert!(
             searched.contains("item.hidden = !shown") && searched.contains("showSettingsPane("),
             "the settings search narrows one of the rail and the page but not \
@@ -38457,11 +38462,16 @@ mod tests {
             "the helper's sidecar is looked at by path and then opened by it, or read without its \
              bound:\n{about}"
         );
+        // A file its CLI writes as one document is read whole, by step, down
+        // the document road — chosen by the shape of the store row that keeps
+        // it (t-124593); every other file goes down the line road as before.
         let pane = block_after(shipped, "fn pane_log(");
         assert!(
             !pane.contains("path: String")
                 && pane.contains("pane_transcript::pane_transcript(&state, term)")
                 && pane.contains("let read = LogRead::asked(after, before)?;")
+                && pane.contains("crate::pane_transcript::written_whole(&state, term, &path)")
+                && pane.contains("document_log(&path, read, whole.unwrap_or(false))")
                 && pane.contains(
                     "transcript_log_source(&path, read, whole.unwrap_or(false), archive)"
                 ),

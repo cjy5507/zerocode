@@ -1,5 +1,4 @@
 use super::*;
-use crate::vault::Format;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 
@@ -380,6 +379,51 @@ fn a_store_this_window_cannot_read_yet_says_so() {
     );
 }
 
+/// A Devin pane — the person's, or a worker's: both report `session_id` on
+/// every hook and no `transcript_path` (measured 2026-11-21 on Devin CLI
+/// 3000.14.30821, t-124593) — binds the session document its id names,
+/// `<id>.json` in Devin's transcript folder, and never the one beside it.
+#[test]
+fn a_devin_pane_binds_the_session_document_its_id_names() {
+    let devin = |id: &str| {
+        PathBuf::from(format!(
+            "{HOME}/.local/share/devin/cli/transcripts/{id}.json"
+        ))
+    };
+    let disk = disk_of(vec![devin("example-other"), devin("example-session")]);
+    assert_eq!(
+        bind("devin", None, Some("example-session"), &disk),
+        Ok((devin("example-session"), Via::SessionId))
+    );
+    assert_eq!(
+        bind("devin", None, Some("example-missing"), &disk),
+        Err(Absent::NoSessionFile)
+    );
+}
+
+/// A "no file" the memory keeps is let go by `drop_pane`: a document its
+/// CLI writes once a turn has ended (Devin) is found by the next ask right
+/// after it appears, not when the absent wait runs out (t-124593).
+#[test]
+fn a_pane_let_go_asks_the_disk_again_at_once() {
+    let devin = PathBuf::from(format!(
+        "{HOME}/.local/share/devin/cli/transcripts/example-session.json"
+    ));
+    let memo = Mutex::new(Memo::<u32>::default());
+    let none = disk_of(vec![]);
+    let ask =
+        |facts: &Disk| bind_remembered(&memo, 7, "devin", None, Some("example-session"), facts);
+    assert_eq!(ask(&none), Err(Absent::NoSessionFile));
+    let written = disk_of(vec![devin.clone()]);
+    assert_eq!(
+        ask(&written),
+        Err(Absent::NoSessionFile),
+        "within the absent wait the memory still says no file"
+    );
+    memo.lock().expect("the memory").drop_pane(&7);
+    assert_eq!(ask(&written), Ok((devin, Via::SessionId)));
+}
+
 #[test]
 fn each_shape_says_where_its_id_shows_and_which_shapes_are_readable() {
     assert_eq!(Format::ClaudeLines.id_placement(), IdPlacement::FileStem);
@@ -392,12 +436,38 @@ fn each_shape_says_where_its_id_shows_and_which_shapes_are_readable() {
         Format::AntigravityTranscript.id_placement(),
         IdPlacement::Folder
     );
+    assert_eq!(Format::AtifDocument.id_placement(), IdPlacement::FileStem);
     assert_eq!(Format::Unread.id_placement(), IdPlacement::Unstated);
     assert!(Format::ClaudeLines.readable());
     assert!(Format::CodexRollout.readable());
     assert!(Format::ZoLines.readable());
+    assert!(Format::AtifDocument.readable());
     assert!(!Format::AntigravityTranscript.readable());
     assert!(!Format::Unread.readable());
+}
+
+/// The reader reads a file by the shape of the store row that keeps it, not
+/// by the agent's name: a Devin pane's document is a document, a Claude
+/// pane's lines are lines, and a file no store keeps is read as lines, as
+/// every file was (t-124593).
+#[test]
+fn a_bound_file_is_read_by_the_shape_of_the_store_that_keeps_it() {
+    let devin = PathBuf::from(format!(
+        "{HOME}/.local/share/devin/cli/transcripts/example-session.json"
+    ));
+    let disk = disk_of(vec![devin.clone(), claude("aaa")]);
+    assert_eq!(
+        format_of("devin", &devin, &disk),
+        Some(Format::AtifDocument)
+    );
+    assert_eq!(
+        format_of("claude", &claude("aaa"), &disk),
+        Some(Format::ClaudeLines)
+    );
+    let elsewhere = PathBuf::from("/tmp/reported/example-session.json");
+    assert_eq!(format_of("devin", &elsewhere, &disk), None);
+    // Another agent's row never answers for a file it does not keep.
+    assert_eq!(format_of("claude", &devin, &disk), None);
 }
 
 #[test]

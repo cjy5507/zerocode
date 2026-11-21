@@ -10226,6 +10226,7 @@ impl Ledger {
             worktree,
             worktree_title,
             inherit_checkout,
+            in_worktree,
             prompt,
             prompt_timeout_ms,
             // Filled by the verb, which is the road that DECIDED an agent;
@@ -15001,6 +15002,7 @@ impl Ledger {
             team: team.id.clone(),
             pane: pane.clone(),
             checkout,
+            in_worktree: worker.in_worktree,
             prompt,
             prompt_timeout_ms: READY_TIMEOUT_DEFAULT_MS,
             resumed,
@@ -16771,6 +16773,17 @@ pub trait Launcher {
         None
     }
 
+    /// What `agent`'s own CLI last said about the models it can run
+    /// ([`crate::cli_models`], t-124593), as the window's last ask left it.
+    ///
+    /// Peeked, never asked: this runs inside the actor, and the ask is a
+    /// subprocess that may wait on the CLI's server. A host that holds an old
+    /// answer may send a fresh ask on a thread of its own for the next
+    /// reader. `None` is "nobody asked", on the rule of [`Self::presence`].
+    fn model_list(&self, _agent: &str) -> Option<crate::cli_models::Snapshot> {
+        None
+    }
+
     /// How much room the disk that holds the LEDGER has, for a summons that
     /// would cut a worktree.
     ///
@@ -17049,28 +17062,16 @@ pub const QUOTA_POLICY: QuotaPolicy = QuotaPolicy {
     handover_max: 2,
 };
 
-/// Which usage gauge each agent draws on, for the agents whose gauge is a
-/// fact about the agent alone.
-///
-/// The gauge names are the window's own (`usage_runtime::*_usage_cache`), and
-/// an agent absent here has no gauge this window reads — which answers as
-/// "unknown", never as 0%. `zo` is absent on purpose: its quota is its
-/// MODEL's, see [`ZO_MODEL_GAUGE`]. `antigravity` is absent on purpose too:
-/// its gauge is read for the status bar alone (the person's consent of
-/// 2026-10-19, t-62187), so an agy worker's quota stays unknown to the beat.
-const QUOTA_GAUGE: &[(&str, &str)] = &[
-    ("claude", "claude"),
-    ("codex", "codex"),
-    ("opencode", "opencode"),
-    ("kimi", "kimi"),
-    ("grok", "grok"),
-];
-
-/// `zo` runs on whichever provider its model belongs to — Anthropic through
-/// the Claude Code login, OpenAI through the ChatGPT one — so its gauge is
-/// named by the model id's family prefix, and a family with no gauge here
-/// (Gemini) says so with `None` rather than borrowing a neighbour's number.
-const ZO_MODEL_GAUGE: &[(&str, Option<&str>)] = &[
+/// The gauge each model family's provider draws on, keyed by the model id's
+/// family prefix — no agent in it: an agent's own gauge is its row's
+/// ([`crate::capabilities::QuotaGauge`], the review's I1, t-124593). A row
+/// whose gauge is its model's (zo runs Anthropic's models through the Claude
+/// login and OpenAI's through ChatGPT's) reads it here, and a family with no
+/// gauge here (Gemini) says so with `None` rather than borrowing a
+/// neighbour's number. antigravity's gauge is read for the status bar alone
+/// (the person's consent of 2026-10-19, t-62187), so its row names none and
+/// an agy worker's quota stays unknown to the beat.
+const MODEL_FAMILY_GAUGE: &[(&str, Option<&str>)] = &[
     ("claude", Some("claude")),
     ("fable", Some("claude")),
     ("opus", Some("claude")),
@@ -17084,12 +17085,12 @@ const ZO_MODEL_GAUGE: &[(&str, Option<&str>)] = &[
 ];
 
 /// The gauge the provider of `model`'s family draws on, as
-/// [`ZO_MODEL_GAUGE`] names it: `Some(Some(gauge))` for a family the table
+/// [`MODEL_FAMILY_GAUGE`] names it: `Some(Some(gauge))` for a family the table
 /// gives a provider, `Some(None)` for one it knows has no gauge here
 /// (Gemini), and `None` for a family nobody wrote down.
 fn family_gauge(model: &str) -> Option<Option<&'static str>> {
     let family = model.to_ascii_lowercase();
-    ZO_MODEL_GAUGE
+    MODEL_FAMILY_GAUGE
         .iter()
         .find(|(prefix, _)| family.starts_with(prefix))
         .map(|(_, gauge)| *gauge)
@@ -17098,11 +17099,11 @@ fn family_gauge(model: &str) -> Option<Option<&'static str>> {
 /// Whether `agent` can carry a summons whose coordinator pinned `model`
 /// (t-6342) — read off the tables this file already keeps and nothing else.
 ///
-/// The agent has to take a model at launch at all (`TUNABLE`: a summons
+/// The agent has to take a model at launch at all (its row's tuning: a summons
 /// that pins one on any other agent is refused before a row is written), and
 /// the model's family has to name the provider whose gauge the agent draws
-/// on (`ZO_MODEL_GAUGE` beside `QUOTA_GAUGE`; `zo` draws on its model's,
-/// so it carries every family the table names). A family the table gives no
+/// on (`MODEL_FAMILY_GAUGE` beside the row's own gauge; a row whose gauge is
+/// its model's carries every family the table names). A family the table gives no
 /// provider filters nothing: the model id stays opaque, and a filter that
 /// guessed would take a real answer out of the choice.
 ///
@@ -17112,12 +17113,75 @@ fn family_gauge(model: &str) -> Option<Option<&'static str>> {
 /// codex was offered thirteen times and named none (2026-09-23).
 #[must_use]
 pub fn runs_model(agent: &str, model: &str) -> bool {
-    let takes_a_model = TUNABLE.iter().any(|(id, _, _, _)| *id == agent);
+    let takes_a_model = tuning_of(agent).is_some();
     takes_a_model
         && match family_gauge(model) {
             Some(Some(gauge)) => quota_gauge_for(agent, Some(model)) == Some(gauge),
             Some(None) | None => true,
         }
+}
+
+/// Whether `agent` can carry a summons pinned to `model`, for the choice an
+/// `--agent auto` summons makes (t-6342, t-124593). [`runs_model`]'s family
+/// rule first, for every agent: a Claude or GPT id runs on the agent whose
+/// gauge is that provider's, so a CLI that also lists the same id (kiro
+/// lists `claude-sonnet-4.5`) never takes it onto another service's account.
+/// An agent whose models zo's own provider rows serve carries it as before —
+/// unless the id is one the family table pins to no provider and some CLI's
+/// own list holds it (`listed_elsewhere`, [`listed_by_a_cli`]): then only
+/// the agents whose lineup holds it do — the CLIs that list it, and a
+/// zo-served agent whose rows list it (the review's I6 — devin's own ids no
+/// longer go to claude, and a Gemini id both list stays antigravity's
+/// too). Every other agent carries it only when its lineup — read,
+/// no older than the lineup's refresh rule — holds it ([`lists_model`]): an
+/// unread or old lineup, or none at all, is "unknown", never "yes".
+fn carries_model(
+    launcher: &dyn Launcher,
+    agent: &str,
+    model: &str,
+    now_ms: i64,
+    listed_elsewhere: bool,
+) -> bool {
+    if !runs_model(agent, model) {
+        return false;
+    }
+    if served_by_zo(agent) {
+        // An id a CLI's own list holds stays with the agents whose lineup
+        // holds it — a zo-served one too, when zo's rows list it (a Gemini
+        // id antigravity's `google` row lists).
+        return !listed_elsewhere || lists_model(launcher, agent, model, now_ms);
+    }
+    lists_model(launcher, agent, model, now_ms)
+}
+
+/// Whether zo's own provider rows serve `agent`'s models (its row's source).
+fn served_by_zo(agent: &str) -> bool {
+    use crate::capabilities::ModelSource;
+    matches!(
+        crate::agent::agent_spec(agent).map(|spec| spec.harness.models),
+        Some(ModelSource::ZoCatalog(_) | ModelSource::ZoCatalogAll)
+    )
+}
+
+/// Whether `agent`'s lineup — read, no older than the lineup's refresh rule
+/// ([`crate::summon_difficulty::lineup::REFRESH_AFTER_MS`]) — holds `model`.
+fn lists_model(launcher: &dyn Launcher, agent: &str, model: &str, now_ms: i64) -> bool {
+    launcher.model_list(agent).is_some_and(|held| {
+        now_ms.saturating_sub(held.read_at_ms) < crate::summon_difficulty::lineup::REFRESH_AFTER_MS
+            && held.answer.listed().iter().any(|one| one.id == model)
+    })
+}
+
+/// Whether `model` is an id the family table pins to no provider's gauge
+/// and some CLI's own fresh lineup holds — a CLI zo does not serve, that
+/// takes a model at all (the review's I6, t-124593).
+fn listed_by_a_cli(launcher: &dyn Launcher, model: &str, now_ms: i64) -> bool {
+    family_gauge(model).flatten().is_none()
+        && crate::agent::AGENT_SPECS.iter().any(|spec| {
+            !served_by_zo(spec.id)
+                && runs_model(spec.id, model)
+                && lists_model(launcher, spec.id, model, now_ms)
+        })
 }
 
 /// The pinned model's own vendor CLI — the agent whose gauge is the one the
@@ -17129,23 +17193,22 @@ pub fn runs_model(agent: &str, model: &str) -> bool {
 #[must_use]
 pub fn native_agent(model: &str) -> Option<&'static str> {
     let gauge = family_gauge(model).flatten()?;
-    QUOTA_GAUGE
+    crate::agent::AGENT_SPECS
         .iter()
-        .find(|(_, held)| *held == gauge)
-        .map(|(agent, _)| *agent)
+        .find(|spec| spec.harness.quota == crate::capabilities::QuotaGauge::Own(gauge))
+        .map(|spec| spec.id)
 }
 
 /// The gauge `agent` — launched with `model` — draws on, or `None` when this
 /// window reads no gauge for it.
 #[must_use]
 pub fn quota_gauge_for(agent: &str, model: Option<&str>) -> Option<&'static str> {
-    if agent == "zo" {
-        return family_gauge(model?).flatten();
+    use crate::capabilities::QuotaGauge;
+    match crate::agent::agent_spec(agent)?.harness.quota {
+        QuotaGauge::Own(gauge) => Some(gauge),
+        QuotaGauge::ModelFamily => family_gauge(model?).flatten(),
+        QuotaGauge::None => None,
     }
-    QUOTA_GAUGE
-        .iter()
-        .find(|(id, _)| *id == agent)
-        .map(|(_, gauge)| *gauge)
 }
 
 /// The agent's OWN words about its quota wall, as the window found them — one
@@ -17506,10 +17569,16 @@ pub struct AccountSwitchReceipt {
     #[serde(default)]
     pub panes_person: u32,
     /// Panes left on another account for any other reason — a login the
-    /// window never recorded, a pane it could not move faithfully, a landing
-    /// at its wall (t-46106).
+    /// window never recorded, a pane it could not move faithfully, its own
+    /// login under another row (t-46106).
     #[serde(default)]
     pub panes_left: u32,
+    /// Worker panes on another account the landing had no room for — a
+    /// window that limits the pane's model stood at the blocked line there:
+    /// each is owed its move and follows once a newer reading of the landing
+    /// has room, with a receipt of its own (t-124254).
+    #[serde(default)]
+    pub panes_when_free: u32,
 }
 
 impl AccountSwitchReceipt {
@@ -17529,6 +17598,7 @@ impl AccountSwitchReceipt {
             "panesAtTurnEnd": self.panes_at_turn_end,
             "panesPerson": self.panes_person,
             "panesLeft": self.panes_left,
+            "panesWhenFree": self.panes_when_free,
             "policy": crate::account_autoswitch::POLICY_WORD,
             "switchedAtMs": now_ms,
         });
@@ -17539,8 +17609,9 @@ impl AccountSwitchReceipt {
                     "every new summons runs as `toAccount`, and a worker pane on another \
                      account follows it as the same worker in the same conversation: \
                      `panesMoved` were between turns and moved now, `panesAtTurnEnd` move \
-                     when their turn ends, `panesPerson` are the person's and keep their \
-                     login, `panesLeft` could not be moved; each moved pane writes a \
+                     when their turn ends, `panesWhenFree` move once a newer reading of \
+                     `toAccount` has room for them, `panesPerson` are the person's and keep \
+                     their login, `panesLeft` could not be moved; each moved pane writes a \
                      receipt of its own"
                 );
             }
@@ -19671,11 +19742,16 @@ pub fn summonable(
     model: Option<&str>,
 ) -> Vec<crate::summon_choice::Summonable> {
     let history = summons_history(ledger);
+    let listed_elsewhere = model.is_some_and(|model| listed_by_a_cli(launcher, model, now_ms));
     installed_rooms(launcher, now_ms)
         .unwrap_or_default()
         .into_iter()
         .filter(|room| !room.at_wall)
-        .filter(|room| model.is_none_or(|model| runs_model(&room.id, model)))
+        .filter(|room| {
+            model.is_none_or(|model| {
+                carries_model(launcher, &room.id, model, now_ms, listed_elsewhere)
+            })
+        })
         .map(|room| {
             let record = history.get(&room.id).cloned().unwrap_or_default();
             crate::summon_choice::Summonable {
@@ -19887,17 +19963,6 @@ impl Launcher for NoLauncher {
     }
 }
 
-/// How a launch-time reasoning-effort word rides an agent's command line.
-enum EffortRide {
-    /// `-c key=<effort>` — a config override, the spelling codex takes.
-    ConfigKv(&'static str),
-    /// `--flag <effort>` — a first-class flag, the spelling claude and
-    /// antigravity take. Their CLIs grew this dial after the table below was
-    /// first written, which is exactly the drift the table is measured
-    /// against rather than assumed.
-    Flag(&'static str),
-}
-
 /// Marks a provider peer name as a ZeroCode-owned identity at a glance.
 ///
 /// It keeps the generated name distinguishable from one a person chose
@@ -20004,7 +20069,7 @@ pub fn provider_peer(agent: &str, run_id: &str, worker_id: &str) -> Option<Provi
 /// What a summoned worker's own CLI is told so a safety classifier's decline
 /// is answered on its fallback model rather than at a question nobody is
 /// watching (t-6747) — rung ① of [`CLASSIFIER_DECLINE_LADDER`], one row per
-/// CLI and measured one CLI at a time, like [`TUNABLE`]:
+/// CLI and measured one CLI at a time, like a row's launch tuning:
 ///
 /// - claude 2.1.281: `switchModelsOnFlag`, whose own schema says "When
 ///   safeguards flag a message, automatically switch to a different model to
@@ -20247,63 +20312,14 @@ fn command_for_reserved_worker(
     }
 }
 
-/// Which agents take launch-time tuning, and how each spells it.
-///
-/// The model id stays OPAQUE — passed through unread, never validated against
-/// a catalog that would go stale the day a vendor ships. The SPELLING is not
-/// opaque, though, and cannot be: it is each CLI's own flag, so this table is
-/// a MEASUREMENT of installed CLIs rather than a belief about them. An agent
-/// absent here refuses tuning by name, which is the honest answer for a CLI
-/// nobody has measured.
-///
-/// Measured 2026-08-28 by reading each CLI's own `--help` on this machine:
-///   zo     `--effort` (off|low|medium|high|xhigh|max|ultra|smart)
-///   claude `--effort <level>` (low, medium, high, xhigh, max)
-///   codex  takes its effort as a config override, not a flag
-///   agy    `--effort` (low|medium|high)   [antigravity]
-/// claude carried `None` here until that measurement — the CLI grew the dial
-/// and the table did not follow, so every claude worker was launched with the
-/// dial refused. Re-measure when a vendor ships; do not infer.
-///
-/// The last column is that measured list, lowest first: what a model that
-/// names no efforts of its own is offered at in the model seat's pair
-/// question ([`ladder_efforts`]) — the efforts a CLI takes, never one a
-/// summons runs at by default (t-74181).
-///
-/// A test pins every id in this table to the agent catalog so the two
-/// registries cannot drift.
-const TUNABLE: &[(&str, &str, Option<EffortRide>, &[&str])] = &[
-    // This project's own harness leads the table, as it does the catalog.
-    // `off` and `smart` are switches, not levels.
-    (
-        "zo",
-        "--model",
-        Some(EffortRide::Flag("--effort")),
-        crate::capabilities::ZO_EFFORT_LEVELS,
-    ),
-    (
-        "claude",
-        "--model",
-        Some(EffortRide::Flag("--effort")),
-        crate::capabilities::CLAUDE_EFFORT_LADDER,
-    ),
-    (
-        "codex",
-        "--model",
-        Some(EffortRide::ConfigKv("model_reasoning_effort")),
-        crate::capabilities::CODEX_EFFORT_LADDER,
-    ),
-    (
-        "antigravity",
-        "--model",
-        Some(EffortRide::Flag("--effort")),
-        crate::capabilities::ANTIGRAVITY_EFFORT_LADDER,
-    ),
-    // Not installed on the machine this table was measured on, so its model
-    // flag stands as inherited and it carries no effort ride: refusing a dial
-    // nobody has measured beats guessing at its spelling.
-    ("cursor", "--model", None, &[]),
-];
+/// How `agent`'s CLI is tuned at launch — its catalog row's measured
+/// [`LaunchTuning`](crate::capabilities::LaunchTuning) (the table that was
+/// `TUNABLE` until t-124593 kept these keyed by an agent's name beside the
+/// catalog; the row is the one place now). `None` for an agent nobody
+/// measured a flag for, which refuses tuning by name.
+fn tuning_of(agent: &str) -> Option<crate::capabilities::LaunchTuning> {
+    crate::agent::agent_spec(agent).and_then(|spec| spec.harness.tuning)
+}
 
 /// One model turn's facts, as [`dials_why`] reads them.
 type ModelTurn = (
@@ -20499,9 +20515,7 @@ const DIALS_FROM_CLI_DEFAULT: &str = crate::summon_difficulty::lineup::CLI_DEFAU
 /// launch table carries an effort ride for it.
 #[must_use]
 pub fn takes_effort(agent: &str) -> bool {
-    TUNABLE
-        .iter()
-        .any(|(id, _, ride, _)| *id == agent && ride.is_some())
+    tuning_of(agent).is_some_and(|tuning| tuning.effort.is_some())
 }
 
 /// Every effort `agent`'s CLI takes, lowest first, as the measured launch
@@ -20510,10 +20524,9 @@ pub fn takes_effort(agent: &str) -> bool {
 /// (t-15554). Empty for an agent that takes no effort.
 #[must_use]
 pub fn ladder_efforts(agent: &str) -> Vec<&'static str> {
-    TUNABLE
-        .iter()
-        .find(|(id, _, ride, _)| *id == agent && ride.is_some())
-        .map_or_else(Vec::new, |(_, _, _, efforts)| efforts.to_vec())
+    tuning_of(agent)
+        .filter(|tuning| tuning.effort.is_some())
+        .map_or_else(Vec::new, |tuning| tuning.efforts.to_vec())
 }
 
 /// Turn `--model`/`--effort` into the words the agent's own CLI takes.
@@ -20529,7 +20542,11 @@ fn launch_tuning(
     if model.is_none() && effort.is_none() {
         return Ok(Vec::new());
     }
-    let Some((_, model_flag, effort_ride, _)) = TUNABLE.iter().find(|(id, _, _, _)| *id == agent)
+    let Some(crate::capabilities::LaunchTuning {
+        model_flag,
+        effort: effort_ride,
+        ..
+    }) = tuning_of(agent)
     else {
         return Err(format!(
             "{agent} does not support launch-time model selection"
@@ -20540,7 +20557,7 @@ fn launch_tuning(
         if id.is_empty() {
             return Err("--model was given an empty id".to_string());
         }
-        words.push((*model_flag).to_string());
+        words.push(model_flag.to_string());
         words.push(id.to_string());
     }
     if let Some(level) = effort {
@@ -20548,12 +20565,12 @@ fn launch_tuning(
             return Err("--effort was given an empty level".to_string());
         }
         match effort_ride {
-            Some(EffortRide::ConfigKv(key)) => {
+            Some(crate::capabilities::EffortRide::ConfigKv(key)) => {
                 words.push("-c".to_string());
                 words.push(format!("{key}={level}"));
             }
-            Some(EffortRide::Flag(flag)) => {
-                words.push((*flag).to_string());
+            Some(crate::capabilities::EffortRide::Flag(flag)) => {
+                words.push(flag.to_string());
                 words.push(level.to_string());
             }
             None => {
@@ -20569,7 +20586,8 @@ fn launch_tuning(
 /// The launch words for a model, an effort, both or neither, as a person
 /// picked them on the window's 「새 대화」 start screen (2026-11-08, the T3
 /// Code chat view, stage 3) — the measured launch table's own spelling
-/// (`TUNABLE`); neither is no words, and the CLI's defaults stand.
+/// (the row's [`LaunchTuning`](crate::capabilities::LaunchTuning)); neither
+/// is no words, and the CLI's defaults stand.
 ///
 /// # Errors
 /// As [`launch_words`]: an agent the table measured no flag for, or an empty
@@ -20583,7 +20601,7 @@ pub fn tuning_words(
 }
 
 /// The launch words that name `model` for `agent`'s CLI — the measured
-/// launch table's own spelling (`TUNABLE`), for a road that names a model
+/// row's own spelling (`tuning_of`), for a road that names a model
 /// the ledger did not summon with: the release that stands for the one a
 /// resumed conversation last ran (t-46882).
 ///
@@ -20605,7 +20623,7 @@ pub fn launch_words(agent: &str, model: &str, effort: Option<&str>) -> Result<Ve
 
 /// Say which launch choices this summons left to the agent CLI.
 ///
-/// This follows `TUNABLE`, the same measured capability table that validates
+/// This follows the row's tuning, the same measurement that validates
 /// the flags: an unmeasured agent promises neither choice, and an agent with
 /// no measured effort ride does not pretend there was an effort choice to
 /// make. The notice deliberately makes no claim about the defaults themselves.
@@ -20614,7 +20632,7 @@ fn launch_tuning_notice(
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Option<&'static str> {
-    let (_, _, effort_ride, _) = TUNABLE.iter().find(|(id, _, _, _)| *id == agent)?;
+    let effort_ride = tuning_of(agent)?.effort;
     match (model.is_none(), effort.is_none() && effort_ride.is_some()) {
         (true, true) => Some("model and effort were not selected; the agent CLI defaults apply"),
         (true, false) => Some("model was not selected; the agent CLI default applies"),
@@ -20630,9 +20648,15 @@ fn launch_tuning_notice(
 /// ordering by anything but the catalog's own order, no word about which
 /// model or which agent is better. Such a table is stale the day a vendor
 /// ships, and this ledger already refuses to read a `--model` id for exactly
-/// that reason ([`TUNABLE`]'s own note). Availability is what a machine can
+/// that reason (the launch tuning's own note). Availability is what a machine can
 /// keep honestly; capability is not. The judgement belongs to the caller,
 /// which can see the work.
+///
+/// **The models are the CLI's own words** (`models`, t-124593): what the
+/// agent's CLI listed when the window asked it ([`crate::cli_models`]), in
+/// its order, with the default IT names and the time it was asked — never a
+/// list somebody typed, never a ranking, and not a gate: a `--model` the
+/// list does not hold still goes to the CLI, which is the one to refuse it.
 ///
 /// `seen` is `None` when nobody looked. That is answered as `"unknown"`
 /// rather than as `"no"`: a coordinator told "not installed" summons a
@@ -20648,7 +20672,7 @@ fn agent_row(
     summon: Option<&[crate::summon_difficulty::lineup::Row]>,
     now_ms: i64,
 ) -> serde_json::Value {
-    let tuning = TUNABLE.iter().find(|(id, _, _, _)| *id == spec.id);
+    let tuning = spec.harness.tuning;
     let mut row = serde_json::json!({
         "id": spec.id,
         "name": spec.name,
@@ -20657,7 +20681,7 @@ fn agent_row(
         // name takes neither, which is what `launch_tuning` will tell a
         // `worker-start` that tries.
         "takesModel": tuning.is_some(),
-        "takesEffort": tuning.is_some_and(|(_, _, ride, _)| ride.is_some()),
+        "takesEffort": tuning.is_some_and(|tuning| tuning.effort.is_some()),
     });
     match seen {
         Some(here) => {
@@ -20694,7 +20718,9 @@ fn agent_row(
     // And when there are none, why — said, never left to a CLI's default.
     row["summonUnavailable"] = match (tuning, summon) {
         (None, _) => serde_json::json!(SUMMON_NO_MODEL_FLAG),
-        (Some((_, _, None, _)), _) => serde_json::json!(SUMMON_NO_EFFORT_FLAG),
+        (Some(crate::capabilities::LaunchTuning { effort: None, .. }), _) => {
+            serde_json::json!(SUMMON_NO_EFFORT_FLAG)
+        }
         (Some(_), Some(rows)) if !rows.is_empty() => serde_json::Value::Null,
         (Some(_), _) => serde_json::json!(SUMMON_NO_LINEUP),
     };
@@ -20703,7 +20729,7 @@ fn agent_row(
 
 /// `summonUnavailable`: the launch table has measured no `--model` for this
 /// agent's CLI, so a summons cannot name one.
-const SUMMON_NO_MODEL_FLAG: &str = "its CLI takes no measured --model at launch";
+pub(crate) const SUMMON_NO_MODEL_FLAG: &str = "its CLI takes no measured --model at launch";
 /// `summonUnavailable`: a model can be named but no effort, so no difficulty
 /// row can be launched as a whole.
 const SUMMON_NO_EFFORT_FLAG: &str = "its CLI takes no measured effort at launch";
@@ -21414,6 +21440,13 @@ pub struct PreparedWorkerStart {
     /// this reservation's rollback, if the tree is gone by then. `None` is
     /// every other summons, placed by `worktree`.
     pub inherit_checkout: Option<String>,
+    /// Whether the checkout the pane opens in is the ledger's own cut for
+    /// this worker (`Worker::in_worktree`): a fresh one, or the tree of the
+    /// attempt it inherits when that attempt's worker had one — an inherited
+    /// attempt's or a quota wall's handover. The window tells a CLI whose
+    /// trust menu one launch flag answers (devin) to skip it there and
+    /// nowhere else (t-124593 D1).
+    pub in_worktree: bool,
     /// The briefing to deliver after the agent's TUI is ready. It never rides
     /// argv: task text may be large or hostile, command lines are observable,
     /// and an early paste can answer a login or trust prompt instead of the
@@ -21458,6 +21491,7 @@ impl std::fmt::Debug for PreparedWorkerStart {
             .field("agent", &self.agent)
             .field("team", &self.team)
             .field("pane", &self.pane)
+            .field("in_worktree", &self.in_worktree)
             .field("prompt", &format_args!("<{} bytes>", self.prompt.len()))
             .field("prompt_timeout_ms", &self.prompt_timeout_ms)
             .field("had_prior_binding", &self.prior_binding.is_some())
@@ -21496,6 +21530,10 @@ pub struct PreparedWorkerReseat {
     pub team: String,
     pub pane: String,
     pub checkout: String,
+    /// Whether `checkout` is the ledger's own cut for this worker
+    /// (`Worker::in_worktree`) — what a restart's reseat and a restored pane
+    /// open in again. The window's trust flag rides only there (t-124593 D1).
+    pub in_worktree: bool,
     pub prompt: String,
     pub prompt_timeout_ms: u32,
     pub resumed: WorkerResume,
@@ -21514,6 +21552,7 @@ impl std::fmt::Debug for PreparedWorkerReseat {
             .field("team", &self.team)
             .field("pane", &self.pane)
             .field("checkout_bytes", &self.checkout.len())
+            .field("in_worktree", &self.in_worktree)
             .field("prompt", &format_args!("<{} bytes>", self.prompt.len()))
             .field("prompt_timeout_ms", &self.prompt_timeout_ms)
             .field("resumed", &self.resumed)
@@ -24791,7 +24830,13 @@ fn plan_inner(
                     // fact the snapshot's own `binary` carries.
                     let readiness = launcher.readiness(spec.id);
                     let summon = launcher.summon_rows(spec.id);
-                    agent_row(
+                    // Asked of an installed CLI only: a list is the CLI's own
+                    // answer, and an agent that is not here has none to give.
+                    let models = seen
+                        .is_some_and(|row| row.installed)
+                        .then(|| launcher.model_list(spec.id))
+                        .flatten();
+                    let mut row = agent_row(
                         spec,
                         seen,
                         history,
@@ -24799,7 +24844,19 @@ fn plan_inner(
                         readiness.as_ref(),
                         summon.as_deref(),
                         now_ms,
-                    )
+                    );
+                    // What the agent's own CLI listed when the window asked
+                    // it, with when; `unknown` for a CLI whose help names no
+                    // list (t-124593). Every id only on the row of the one
+                    // agent asked about: the whole catalog's row shows the
+                    // first few, the count and the families (F1).
+                    let ids = if only.is_some() {
+                        crate::cli_models::Ids::Whole
+                    } else {
+                        crate::cli_models::Ids::Preview
+                    };
+                    row["models"] = crate::cli_models::json(spec.id, models.as_ref(), now_ms, ids);
+                    row
                 })
                 .collect();
             // Whether summonses are being judged now, and why not (t-45961):
