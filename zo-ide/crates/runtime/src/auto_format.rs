@@ -70,26 +70,18 @@ pub fn formatter_for_path(path: &Path) -> Option<Formatter> {
     }
 }
 
+/// Outcome of running a formatter with a wall-clock budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormatOutcome {
+    Finished(FormatResult),
+    TimedOut {
+        formatter: Formatter,
+        budget: Duration,
+    },
+}
+
 #[must_use]
 pub fn format_file(path: &str) -> Option<FormatResult> {
-    format_file_inner(path, None)
-}
-
-/// Format a file with a hard wall-clock budget.
-///
-/// Unlike wrapping [`format_file`] in a worker thread, this function owns the
-/// formatter child process directly. If the budget expires, it kills and waits
-/// for the child (and, on Unix, its process group) before returning `None` so a
-/// wedged formatter cannot leak a worker thread or subprocess.
-#[must_use]
-pub fn format_file_with_timeout(path: &str, budget: Duration) -> Option<FormatResult> {
-    if budget.is_zero() {
-        return None;
-    }
-    format_file_inner(path, Some(budget))
-}
-
-fn format_file_inner(path: &str, budget: Option<Duration>) -> Option<FormatResult> {
     let p = Path::new(path);
     let formatter = formatter_for_path(p)?;
     let (cmd, args) = formatter.command_args(path);
@@ -98,8 +90,53 @@ fn format_file_inner(path: &str, budget: Option<Duration>) -> Option<FormatResul
         return None;
     }
 
-    let output = run_formatter(cmd, &args, budget)?;
+    let output = Command::new(cmd)
+        .args(&args)
+        .output()
+        .ok()
+        .map(|output| FormatterOutput {
+            status: output.status,
+            stderr: output.stderr,
+        })?;
     Some(formatter_output_to_result(formatter, &output))
+}
+
+/// Format a file with a hard wall-clock budget.
+///
+/// Unlike wrapping [`format_file`] in a worker thread, this function owns the
+/// formatter child process directly. If the budget expires, it kills and waits
+/// for the child (and, on Unix, its process group) before returning
+/// [`FormatOutcome::TimedOut`] so a wedged formatter cannot leak a worker
+/// thread or subprocess.
+#[must_use]
+pub fn format_file_with_timeout(path: &str, budget: Duration) -> Option<FormatOutcome> {
+    let formatter = formatter_for_path(Path::new(path))?;
+    let (cmd, _) = formatter.command_args(path);
+    format_file_with_command_timeout(path, formatter, cmd, budget, || {})
+}
+
+/// Runs an explicit formatter command. Tests can use `start_budget` to wait
+/// for fixture startup before measuring the formatter's time limit.
+#[doc(hidden)]
+#[must_use]
+pub fn format_file_with_command_timeout(
+    path: &str,
+    formatter: Formatter,
+    cmd: &str,
+    budget: Duration,
+    start_budget: impl FnOnce(),
+) -> Option<FormatOutcome> {
+    if budget.is_zero() || !which_exists(cmd) {
+        return None;
+    }
+    let (_, args) = formatter.command_args(path);
+    match run_formatter_with_timeout(cmd, &args, budget, start_budget) {
+        RunFormatterOutcome::Finished(output) => {
+            Some(FormatOutcome::Finished(formatter_output_to_result(formatter, &output)))
+        }
+        RunFormatterOutcome::TimedOut => Some(FormatOutcome::TimedOut { formatter, budget }),
+        RunFormatterOutcome::Failed => None,
+    }
 }
 
 fn formatter_output_to_result(formatter: Formatter, output: &FormatterOutput) -> FormatResult {
@@ -123,18 +160,10 @@ struct FormatterOutput {
     stderr: Vec<u8>,
 }
 
-fn run_formatter(cmd: &str, args: &[&str], budget: Option<Duration>) -> Option<FormatterOutput> {
-    match budget {
-        Some(budget) => run_formatter_with_timeout(cmd, args, budget, || {}),
-        None => Command::new(cmd)
-            .args(args)
-            .output()
-            .ok()
-            .map(|output| FormatterOutput {
-                status: output.status,
-                stderr: output.stderr,
-            }),
-    }
+enum RunFormatterOutcome {
+    Finished(FormatterOutput),
+    TimedOut,
+    Failed,
 }
 
 /// `budget` counts from when `start_budget` returns, the formatter already
@@ -146,9 +175,9 @@ fn run_formatter_with_timeout(
     args: &[&str],
     budget: Duration,
     start_budget: impl FnOnce(),
-) -> Option<FormatterOutput> {
+) -> RunFormatterOutcome {
     if budget.is_zero() {
-        return None;
+        return RunFormatterOutcome::Failed;
     }
 
     // Capture stderr via an exclusive temp file instead of a pipe. A formatter
@@ -156,7 +185,9 @@ fn run_formatter_with_timeout(
     // `try_wait` can observe completion, falsely looking like a timeout. The
     // exclusive create avoids following a pre-existing symlink in a shared temp
     // directory.
-    let (stderr_path, stderr_file) = create_temp_stderr_file()?;
+    let Some((stderr_path, stderr_file)) = create_temp_stderr_file() else {
+        return RunFormatterOutcome::Failed;
+    };
 
     let mut command = Command::new(cmd);
     command
@@ -188,7 +219,7 @@ fn run_formatter_with_timeout(
 
     let Ok(mut child) = child_result else {
         let _ = fs::remove_file(&stderr_path);
-        return None;
+        return RunFormatterOutcome::Failed;
     };
     #[cfg(unix)]
     let child_pid = child.id();
@@ -204,7 +235,7 @@ fn run_formatter_with_timeout(
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = fs::remove_file(&stderr_path);
-                return None;
+                return RunFormatterOutcome::TimedOut;
             }
             Ok(None) => {
                 let remaining = budget.saturating_sub(started.elapsed());
@@ -216,7 +247,7 @@ fn run_formatter_with_timeout(
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = fs::remove_file(&stderr_path);
-                return None;
+                return RunFormatterOutcome::Failed;
             }
         }
     };
@@ -231,7 +262,7 @@ fn run_formatter_with_timeout(
 
     let stderr = read_formatter_stderr(&stderr_path);
     let _ = fs::remove_file(&stderr_path);
-    Some(FormatterOutput { status, stderr })
+    RunFormatterOutcome::Finished(FormatterOutput { status, stderr })
 }
 
 fn read_formatter_stderr(path: &Path) -> Vec<u8> {
@@ -343,7 +374,7 @@ fn is_executable_metadata(_metadata: &fs::Metadata) -> bool {
     true
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatResult {
     pub formatter: Formatter,
     pub success: bool,
@@ -500,7 +531,10 @@ mod tests {
         // The shell takes longer than the budget to arm, as /bin/sh does
         // under heavy load (l82a g3b1), and its grandchild outlives any wait
         // here unless the group kill ends it.
-        fs::write(&script, "#!/bin/sh\nsleep 1\n(sleep 3600) &\necho $! > \"$1\"\nwait\n")
+        fs::write(
+            &script,
+            "#!/bin/sh\nfor target do :; done\nsleep 1\n(sleep 3600) &\necho $! > \"$target\"\nwait\n",
+        )
             .expect("write formatter script");
         let mut perms = fs::metadata(&script)
             .expect("script metadata")
@@ -509,10 +543,12 @@ mod tests {
         fs::set_permissions(&script, perms).expect("chmod formatter script");
 
         let mut budget_started: Option<Instant> = None;
-        let result = run_formatter_with_timeout(
+        let budget = Duration::from_millis(250);
+        let result = format_file_with_command_timeout(
+            child_pid_file.to_str().expect("utf-8 pid path"),
+            Formatter::Rustfmt,
             script.to_str().expect("utf-8 script path"),
-            &[child_pid_file.to_str().expect("utf-8 pid path")],
-            Duration::from_millis(250),
+            budget,
             || {
                 let arming = Instant::now();
                 while recorded_pid(&child_pid_file).is_none() && arming.elapsed() < SCENARIO_BOUND {
@@ -523,7 +559,14 @@ mod tests {
         );
         let returned = Instant::now();
 
-        assert!(result.is_none(), "timed-out formatter returns no result");
+        assert_eq!(
+            result,
+            Some(FormatOutcome::TimedOut {
+                formatter: Formatter::Rustfmt,
+                budget,
+            }),
+            "timed-out formatter returns its command and budget"
+        );
         assert!(
             budget_started.is_some_and(|started| returned.duration_since(started) < Duration::from_secs(10)),
             "timeout should return promptly, not wait out the formatter"

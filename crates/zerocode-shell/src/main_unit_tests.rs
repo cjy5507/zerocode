@@ -10055,13 +10055,11 @@ fn an_agent_that_left_its_shell_behind_stops_being_drawn_as_running() {
             && publishing.contains("ring_for_pane(app, &worktree, &held);"),
         "the all-clear replay fell out of the publish door:\n{publishing}"
     );
-    assert_eq!(
-        shipped
-            .matches("pending_done()\n                .insert(")
-            .count(),
-        1,
-        "the parked all-clear grew a second writer"
-    );
+    let parked_writers = shipped
+        .match_indices(concat!("pending_", "done()"))
+        .filter(|(at, call)| shipped[*at + call.len()..].trim_start().starts_with(".insert("))
+        .count();
+    assert_eq!(parked_writers, 1, "the parked all-clear must have one writer");
     // 인터럽트는 게이트보다 **먼저** 선언된다. 뒤에서 선언하면 그 게이트가
     // 방금 선언된 깃발을 아직 false 로 읽는다 — 원본의 순서도 선언
     // (`:2962`) 다음 해결(`:3126`)이다.
@@ -35091,50 +35089,84 @@ fn a_long_session_document_folds_and_a_waiting_call_is_held_back() {
 }
 
 /// A CLI that writes its session once a turn has ended (Devin, 29–34 ms after
-/// its Stop) is read again once its store has settled: a turn written 50 ms
-/// after the Stop is in the conversation then, with no hook after it; a store
-/// that has written nothing by then passes without a word (t-124593).
+/// its Stop) has its page told once its file is new or moved since the Stop —
+/// at the first of the store's looks that finds it, however late in them, its
+/// size and time read and never its bytes — and told again when the file
+/// moves on, until the page has read a document that holds the turn
+/// (t-125261: a first change the page could not read yet, mid-write, is not
+/// the last word). A page that does not read is told once a change; a store
+/// that writes nothing tells nothing; a newer word in the wait keeps a late
+/// Done from being told at all; and the looks are the store's, however many
+/// tellings (t-124593, t-125261).
 #[test]
-fn a_turn_written_after_its_stop_is_read_once_the_store_has_settled() {
-    use crate::cmd::terminal::{LogRead, document_log};
-    let settle = zerocode_core::vault::turn_write_settle("devin").expect("devin's store settles after a turn");
+fn a_turn_written_after_its_stop_is_told_until_the_page_has_read_it() {
+    use crate::pane_runtime::{file_stamp, moved_since, tell_when_settled};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Duration;
+    // The looks are the store row's, asked of the row: one constant, in core.
+    assert_eq!(
+        zerocode_core::vault::turn_write_settle("devin"),
+        Some(&zerocode_core::vault::TURN_WRITE_SETTLE[..])
+    );
     assert_eq!(zerocode_core::vault::turn_write_settle("claude"), None, "a store written as the turn goes");
+    // A look: no file, the turn's first write, the same file again, the
+    // document written whole again as it grew.
     let dir = tempfile::tempdir().expect("transcript folder");
     let path = dir.path().join("example-session.json");
-    let (told, heard) = std::sync::mpsc::channel();
-    let at_stop = path.clone();
-    crate::pane_runtime::tell_again_after(settle, || true, move || {
-        let _ = told.send(document_log(&at_stop, LogRead::Tail, false));
-    });
-    assert!(document_log(&path, LogRead::Tail, false).is_err(), "nothing is written at the Stop");
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    let at_stop = file_stamp(&path);
+    assert!(at_stop.is_none() && !moved_since(at_stop, file_stamp(&path)), "no file is no news");
     std::fs::write(&path, atif_document(1, &[])).expect("the CLI writes the turn");
-    let again = heard.recv_timeout(settle * 4).expect("the second read").expect("the document");
-    assert_eq!(
-        again.turns.iter().map(|one| one.turn.text.as_str()).collect::<Vec<_>>(),
-        ["example question 0", "example answer 0"]
-    );
-    let never = dir.path().join("example-never.json");
-    let (told, heard) = std::sync::mpsc::channel();
-    crate::pane_runtime::tell_again_after(settle, || true, move || {
-        let _ = told.send(document_log(&never, LogRead::Tail, false).is_err());
-    });
-    assert!(heard.recv_timeout(settle * 4).expect("the second read"), "a store that wrote nothing says nothing");
-    // A newer word in the wait — a prompt that began the next turn — keeps
-    // the late Done from being told at all.
-    let record = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1));
-    let told_at = record.load(std::sync::atomic::Ordering::SeqCst);
-    let seen = record.clone();
-    let (told, heard) = std::sync::mpsc::channel();
-    crate::pane_runtime::tell_again_after(
-        settle,
-        move || seen.load(std::sync::atomic::Ordering::SeqCst) == told_at,
-        move || {
-            let _ = told.send(());
-        },
-    );
-    record.store(2, std::sync::atomic::Ordering::SeqCst);
-    assert!(heard.recv_timeout(settle * 4).is_err(), "a late Done stood over a newer word");
+    let written = file_stamp(&path);
+    assert!(moved_since(at_stop, written), "a first write is news");
+    assert!(!moved_since(written, file_stamp(&path)), "the same file is no news again");
+    std::fs::write(&path, atif_document(2, &[])).expect("the CLI writes it whole again");
+    assert!(moved_since(written, file_stamp(&path)), "a document written whole again is news");
+
+    // The same looks, short, so the test waits on nothing but the thread.
+    static LOOKS: [Duration; 4] = [Duration::from_millis(5), Duration::from_millis(10), Duration::from_millis(20), Duration::from_millis(40)];
+    /// The looks after a Stop that found no file: the file each look finds
+    /// (`None`: none yet), the looks after which the page has read a
+    /// document that holds the turn, and whether a newer word came first —
+    /// answered as (times told, looks made).
+    fn looks(files: [Option<u64>; 4], read_after: Option<usize>, newer: bool) -> (usize, usize) {
+        let looked = Arc::new(AtomicUsize::new(0));
+        let told = Arc::new(AtomicUsize::new(0));
+        let (looking, reading, telling) = (Arc::clone(&looked), Arc::clone(&looked), Arc::clone(&told));
+        // The thread's end drops this, which is all the test waits for.
+        let (alive, ended) = std::sync::mpsc::channel::<()>();
+        tell_when_settled(
+            &LOOKS,
+            None,
+            move || {
+                let _alive = &alive;
+                !newer
+            },
+            move || files[looking.fetch_add(1, Ordering::SeqCst)].map(|size| (size, None)),
+            move || read_after.is_some_and(|after| reading.load(Ordering::SeqCst) >= after),
+            move || {
+                telling.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(ended.recv_timeout(Duration::from_secs(5)), Err(RecvTimeoutError::Disconnected), "the looks never ended");
+        (told.load(Ordering::SeqCst), looked.load(Ordering::SeqCst))
+    }
+    // The first change, mid-write, the page could not read; the file moved
+    // on at the next look, and the page read that: told twice, looks ended.
+    assert_eq!(looks([Some(1), Some(2), Some(2), Some(2)], Some(2), false), (2, 2), "a change the page could not read was the last word");
+    // Read at once: told once, and no look after the page has it.
+    assert_eq!(looks([Some(1), Some(1), Some(1), Some(1)], Some(1), false), (1, 1));
+    // Written only at the last look: told then.
+    assert_eq!(looks([None, None, None, Some(1)], None, false), (1, 4));
+    // A page that does not read is told once a change, at every look made.
+    assert_eq!(looks([Some(1), Some(1), Some(1), Some(1)], None, false), (1, 4));
+    // Nothing written: every look made, nothing told.
+    assert_eq!(looks([None, None, None, None], None, false), (0, 4));
+    // The page read the turn before the first look: nothing to tell.
+    assert_eq!(looks([Some(1), Some(1), Some(1), Some(1)], Some(0), false), (0, 0));
+    // A newer word before the first look: no look, nothing told.
+    assert_eq!(looks([Some(1), Some(1), Some(1), Some(1)], None, true), (0, 0), "a late Done stood over a newer word");
 }
 
 /// A document read while its CLI wrote it is nothing new, the cursor where it
@@ -35154,6 +35186,288 @@ fn a_session_document_mid_write_or_past_its_cap_reads_nothing_new() {
     assert!(big.found && big.skipped && big.turns.is_empty());
 }
 
+/// Devin's hook as the hook road reads it: an envelope of the pane `term`,
+/// its payload the hook's own fields with its event's name and session.
+fn settling_hook(term: u32, event: &str, mut body: serde_json::Value) -> zerocode_core::HookEnvelope {
+    body["hook_event_name"] = serde_json::json!(event);
+    body["session_id"] = serde_json::json!("example-session");
+    zerocode_core::HookEnvelope {
+        agent: zerocode_core::AgentKind::Devin,
+        pane_key: format!("term-{term}"),
+        tab_id: String::new(),
+        launch_token: String::new(),
+        worktree_id: String::new(),
+        env: String::new(),
+        version: "1".into(),
+        hook_event_name: String::new(),
+        payload: body.to_string(),
+    }
+}
+
+/// What the page holds of a Devin pane through a turn — the document's rows
+/// it read, and what `pane_log` hands beside them (`whole_document_log`) —
+/// holds each step once at every read (t-125261): while the turn runs on its
+/// hooks, when its Stop comes before a call's result, once the CLI has written
+/// the document whole again, and when a hook of the written turn comes late,
+/// with its `prompt_id` or without one. The hooks go the hook road's way:
+/// the classifier's report (`report_of`), heard as the road hears it
+/// (`hear_live_turn`).
+#[test]
+fn a_turn_shown_from_its_hooks_then_its_document_shows_each_step_once() {
+    use crate::cmd::terminal::{LogRead, whole_document_log};
+    use crate::pane_runtime::{file_stamp, hear_live_turn};
+    use zerocode_core::live_hook_turns::HookFold;
+    use zerocode_core::transcript::TranscriptTurn;
+    const TERM: u32 = 125_261;
+    let held = std::sync::Mutex::new(HashMap::new());
+    let lock = || held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().expect("transcript folder");
+    let path = dir.path().join("example-session.json");
+    /// The steps that stand twice among the read rows and the live ones.
+    fn twice(shown: &[TranscriptTurn], live: &[TranscriptTurn]) -> Vec<String> {
+        let mut seen = std::collections::BTreeMap::<String, usize>::new();
+        for turn in shown.iter().chain(live) {
+            let key = match turn.tool.as_ref() {
+                Some(tool) => format!("{} {}", turn.role, tool.call_id),
+                None => format!("{} {}", turn.role, turn.text),
+            };
+            *seen.entry(key).or_default() += 1;
+        }
+        seen.into_iter().filter(|(_, count)| *count > 1).map(|(key, _)| key).collect()
+    }
+    // One read as the page makes it: on from its cursor.
+    let read = |shown: &mut Vec<TranscriptTurn>, next: &mut Option<u64>| -> Vec<TranscriptTurn> {
+        let log = whole_document_log(lock, TERM, Some("example-session"), &path, next.map_or(LogRead::Tail, LogRead::After), false)
+            .expect("a read");
+        shown.extend(log.turns.iter().map(|one| one.turn.clone()));
+        *next = Some(log.next);
+        log.live_turns
+    };
+    let hook = |event: &str, body: &serde_json::Value| -> HookFold {
+        let envelope = settling_hook(TERM, event, body.clone());
+        let report = crate::hooks::report_of(&envelope, None).expect("a report");
+        hear_live_turn(lock, &report, &envelope.payload, || file_stamp(&path), 1_000).expect("Devin's store settles after a turn")
+    };
+    let roles = |turns: &[TranscriptTurn]| turns.iter().map(|turn| turn.role.clone()).collect::<Vec<_>>();
+    let call = serde_json::json!({"prompt_id": "p-2", "tool_name": "exec", "tool_input": {"command": "ls"}, "tool_use_id": "call-2"});
+    let mut result = call.clone();
+    result["tool_response"] = serde_json::json!({"success": true, "output": "a.rs", "error": null});
+
+    std::fs::write(&path, atif_document(1, &[])).expect("turn 1");
+    let (mut shown, mut next) = (Vec::new(), None);
+    let now = read(&mut shown, &mut next);
+    assert!(now.is_empty() && shown.len() == 2);
+
+    // Turn 2 runs on its hooks; the Stop comes before the call's result.
+    hook("UserPromptSubmit", &serde_json::json!({"prompt": "example question 1", "prompt_id": "p-2"}));
+    let mut steps = vec![read(&mut shown, &mut next)];
+    hook("PreToolUse", &call);
+    steps.push(read(&mut shown, &mut next));
+    hook("Stop", &serde_json::json!({"prompt_id": "p-2", "last_assistant_message": "example answer 1"}));
+    steps.push(read(&mut shown, &mut next));
+    assert_eq!(hook("PostToolUse", &result), HookFold { drawn: true, late: true }, "a result after the Stop");
+    steps.push(read(&mut shown, &mut next));
+    assert_eq!(
+        steps.iter().map(|live| roles(live)).collect::<Vec<_>>(),
+        [vec!["user"], vec!["user", "tool"], vec!["user", "tool", "assistant"], vec!["user", "tool", "tool_result", "assistant"]]
+    );
+    for live in &steps {
+        assert_eq!(twice(&shown, live), Vec::<String>::new(), "a step stood twice mid-turn");
+    }
+    assert_eq!(shown.len(), 2, "the document held nothing of turn 2 yet");
+
+    // The CLI writes the whole document again with turn 2: its rows stand
+    // for the turn, and the live ones go in the same read.
+    let turn_2 = [
+        serde_json::json!({"step_id": 4, "source": "user", "message": "example question 1"}),
+        serde_json::json!({"step_id": 5, "source": "agent", "model_name": "example-model", "message": "",
+            "tool_calls": [{"tool_call_id": "call-2", "function_name": "exec", "arguments": {"command": "ls"}}],
+            "observation": {"results": [{"source_call_id": "call-2", "content": "a.rs"}]}}),
+        serde_json::json!({"step_id": 6, "source": "agent", "model_name": "example-model", "message": "example answer 1"}),
+    ];
+    std::fs::write(&path, atif_document(1, &turn_2)).expect("turn 2 written");
+    let after = read(&mut shown, &mut next);
+    assert!(after.is_empty(), "live turns stood beside the document's: {:?}", roles(&after));
+    assert_eq!(roles(&shown[2..]), ["user", "tool", "tool_result", "assistant"]);
+    assert_eq!(twice(&shown, &after), Vec::<String>::new());
+
+    // A hook of the written turn that comes late draws nothing, and is late.
+    assert_eq!(hook("PostToolUse", &result), HookFold { drawn: false, late: true });
+    let mut bare = result.clone();
+    bare.as_object_mut().expect("an object").remove("prompt_id");
+    assert_eq!(hook("PostToolUse", &bare), HookFold { drawn: false, late: true });
+    assert_eq!(
+        hook("Stop", &serde_json::json!({"prompt_id": "p-2", "last_assistant_message": "example answer 1"})),
+        HookFold { drawn: false, late: true }
+    );
+    let late = read(&mut shown, &mut next);
+    assert!(late.is_empty(), "a late hook stood a written step again: {:?}", roles(&late));
+    assert_eq!(shown.len(), 6);
+    assert_eq!(twice(&shown, &late), Vec::<String>::new());
+}
+
+#[test]
+fn a_session_document_with_a_pending_tool_result_does_not_end_the_stop_checks() {
+    use crate::cmd::terminal::{LogRead, whole_document_log};
+    use crate::pane_runtime::{file_stamp, hear_live_turn};
+    const TERM: u32 = 125_261;
+    let held = std::sync::Mutex::new(HashMap::new());
+    let lock = || held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().expect("transcript folder");
+    let path = dir.path().join("example-session.json");
+    let hook = |event, body| {
+        let envelope = settling_hook(TERM, event, body);
+        let report = crate::hooks::report_of(&envelope, None).expect("a report");
+        hear_live_turn(lock, &report, &envelope.payload, || file_stamp(&path), 1_000);
+    };
+    let read = |read| whole_document_log(lock, TERM, Some("example-session"), &path, read, false)
+        .expect("the page reads the document");
+    std::fs::write(&path, atif_document(1, &[])).expect("the earlier turn");
+    let first = read(LogRead::Tail);
+    hook("UserPromptSubmit", serde_json::json!({"prompt_id": "p-2", "prompt": "list the files"}));
+    hook("Stop", serde_json::json!({"prompt_id": "p-2", "last_assistant_message": "Found the files."}));
+    let landed = || lock()[&TERM].document_holds(Some("example-session"), Some("p-2"));
+
+    let question = serde_json::json!({"source": "user", "message": "list the files"});
+    let mut call = serde_json::json!({"source": "agent", "message": "",
+        "tool_calls": [{"tool_call_id": "doc-call", "function_name": "exec", "arguments": {"command": "ls"}}]});
+    std::fs::write(&path, atif_document(1, &[question.clone(), call.clone()])).expect("an incomplete step");
+    let partial = read(LogRead::After(first.next));
+    assert!(!landed(), "a parsed document with a pending call ended the checks");
+    assert_eq!(partial.live_turns.len(), 2, "the provisional turn went before its answer landed");
+    assert_eq!(partial.next, first.next, "the page should swap the whole turn once");
+
+    call["observation"] = serde_json::json!({"results": [{"source_call_id": "doc-call", "content": "a.rs"}]});
+    std::fs::write(&path, atif_document(1, &[question.clone(), call.clone()])).expect("the tool result");
+    let interim = read(LogRead::After(partial.next));
+    assert!(!landed(), "this Stop's assistant answer is still missing");
+    assert_eq!(interim.next, partial.next);
+    let answer = serde_json::json!({"source": "agent", "message": "Found the files."});
+    std::fs::write(&path, atif_document(1, &[question, call, answer])).expect("the completed turn");
+    let done = read(LogRead::After(partial.next));
+    assert!(landed() && done.live_turns.is_empty());
+    assert_eq!(done.turns.iter().map(|row| row.turn.role.as_str()).collect::<Vec<_>>(),
+        ["user", "tool", "tool_result", "assistant"]);
+}
+
+/// A result that comes after its turn's Stop (t-125261 F1): the classifier
+/// reads it as work (`hook_state`), and the hook road hears the turn first —
+/// the report of a turn that has ended goes no further than the page, so the
+/// pane stays done, its looks after the Stop waiting on the turn still. The
+/// result joins its call before the last answer.
+#[test]
+fn a_result_after_its_turns_stop_reaches_the_page_and_not_the_panes_state() {
+    use crate::pane_runtime::{hear_live_turn, route_hook_report};
+    use zerocode_core::hook::HookState;
+    const TERM: u32 = 125_262;
+    let held = std::sync::Mutex::new(HashMap::new());
+    let lock = || held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut published = Vec::new();
+    let mut page_told = Vec::new();
+    let mut dispatch = |event, body| {
+        let envelope = settling_hook(TERM, event, body);
+        let report = crate::hooks::report_of(&envelope, None).expect("a report");
+        let fold = hear_live_turn(lock, &report, &envelope.payload, || None, 1_000);
+        route_hook_report(report, fold, |term| page_told.push(term), |report| published.push(report.state));
+    };
+    let question = serde_json::json!({"prompt": "build it", "prompt_id": "p-1"});
+    let call = serde_json::json!({"prompt_id": "p-1", "tool_name": "exec", "tool_input": {"command": "cargo build"}, "tool_use_id": "c-1"});
+    let stop = serde_json::json!({"prompt_id": "p-1", "last_assistant_message": "Built."});
+    let mut result = call.clone();
+    result["tool_response"] = serde_json::json!({"success": true, "output": "Finished", "error": null});
+    dispatch("UserPromptSubmit", question.clone());
+    dispatch("PreToolUse", call);
+    dispatch("Stop", stop.clone());
+    dispatch("PostToolUse", result.clone());
+    let rows = crate::cmd::terminal::live_rows(&lock(), TERM, Some("example-session"));
+    assert_eq!(
+        rows.iter().map(|row| row.role.as_str()).collect::<Vec<_>>(),
+        ["user", "tool", "tool_result", "assistant"]
+    );
+    assert_eq!(rows[2].text, "Finished");
+
+    for i in 2..=7 {
+        let id = format!("p-{i}");
+        dispatch("UserPromptSubmit", serde_json::json!({"prompt_id": id, "prompt": "next"}));
+        dispatch("Stop", serde_json::json!({"prompt_id": id, "last_assistant_message": "Done."}));
+    }
+    dispatch("PostToolUse", result);
+    dispatch("UserPromptSubmit", question);
+    dispatch("Stop", stop);
+
+    let mut expected = vec![HookState::Working, HookState::Working, HookState::Done];
+    for _ in 2..=7 {
+        expected.extend([HookState::Working, HookState::Done]);
+    }
+    assert_eq!(published, expected, "an ended prompt published its state again");
+    assert_eq!(page_told, [TERM], "only the first late result changed provisional rows");
+}
+
+/// A pane whose CLI changed (t-125261 F3): the rows its hooks told are of
+/// their own conversation, so a pane on another shows none — and the first
+/// report of a CLI that writes as the turn goes lets the old turns go.
+#[test]
+fn a_pane_whose_cli_changed_shows_no_row_of_the_one_before() {
+    use crate::cmd::terminal::live_rows;
+    use crate::pane_runtime::hear_live_turn;
+    const TERM: u32 = 125_263;
+    let held = std::sync::Mutex::new(HashMap::new());
+    let lock = || held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let envelope = settling_hook(TERM, "UserPromptSubmit", serde_json::json!({"prompt": "hello", "prompt_id": "p-1"}));
+    let report = crate::hooks::report_of(&envelope, None).expect("a report");
+    assert!(hear_live_turn(lock, &report, &envelope.payload, || None, 1_000).is_some());
+    assert_eq!(live_rows(&lock(), TERM, Some("example-session")).len(), 1);
+    assert!(live_rows(&lock(), TERM, Some("another-session")).is_empty(), "another conversation's rows");
+    assert!(live_rows(&lock(), TERM, None).is_empty());
+
+    // Another CLI in the same terminal reports: the turns go.
+    let other = zerocode_core::HookEnvelope {
+        agent: zerocode_core::AgentKind::Claude,
+        payload: serde_json::json!({"hook_event_name": "UserPromptSubmit", "prompt": "hi", "session_id": "another-session"}).to_string(),
+        ..envelope
+    };
+    let report = crate::hooks::report_of(&other, None).expect("a report");
+    assert_eq!(hear_live_turn(lock, &report, &other.payload, || None, 1_000), None);
+    assert!(!lock().contains_key(&TERM), "the turns of the CLI before stayed");
+}
+
+/// The page of a session document whose file did not move since its last
+/// read reads nothing again (t-125261 F5): the hooks of a running turn ask
+/// it to read at every call, and the CLI writes nothing until the turn ends.
+/// A read on from where the last one ended, of the file unchanged — its size
+/// and time — is answered without opening it; the file written again is read.
+#[cfg(unix)]
+#[test]
+fn an_unchanged_session_document_is_not_read_again() {
+    use crate::cmd::terminal::{LogRead, document_log, whole_document_log};
+    use std::os::unix::fs::PermissionsExt;
+    const TERM: u32 = 125_264;
+    let held = std::sync::Mutex::new(HashMap::new());
+    let lock = || held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().expect("transcript folder");
+    let path = dir.path().join("example-session.json");
+    std::fs::write(&path, atif_document(1, &[])).expect("a document");
+    let first = whole_document_log(lock, TERM, Some("example-session"), &path, LogRead::Tail, false).expect("the first read");
+    assert_eq!((first.turns.len(), first.next), (2, 3));
+    // Shut to every read: a read of its bytes fails from here on.
+    let mode = |bits: u32| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(bits)).expect("permissions");
+    mode(0o000);
+    assert!(document_log(&path, LogRead::After(3), false).is_err(), "the file is shut to a read");
+    let again = whole_document_log(lock, TERM, Some("example-session"), &path, LogRead::After(3), false);
+    mode(0o644);
+    let again = again.expect("an unchanged document was read again");
+    assert!(again.found && again.turns.is_empty());
+    assert_eq!((again.next, again.start), (3, 3));
+    // Another conversation's page reads its own file.
+    mode(0o000);
+    let other = whole_document_log(lock, TERM, Some("another-session"), &path, LogRead::After(3), false);
+    mode(0o644);
+    assert!(other.is_err(), "a read of another session's page was answered from this one's");
+    // Written again: read.
+    std::fs::write(&path, atif_document(2, &[])).expect("written again");
+    let moved = whole_document_log(lock, TERM, Some("example-session"), &path, LogRead::After(3), false).expect("a read");
+    assert_eq!((moved.turns.len(), moved.next), (2, 5));
+}
 
 /* ---- 만들기 흐름의 폴더 (2026-11-06, 사람: 「폴더 생성 막고있는 부분」) ---- */
 

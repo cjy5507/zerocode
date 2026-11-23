@@ -3,6 +3,7 @@
 use crate::*;
 use zerocode_core::agent::{Injected, prompt_injection};
 use zerocode_core::capabilities::SpawnRoad;
+use zerocode_core::live_hook_turns::LiveTurnBuffer;
 use zerocode_core::secret_prompt::{SecretKind, SecretPrompt};
 
 /// Open the floating panel's shell, if it is not already running.
@@ -349,7 +350,16 @@ pub(crate) fn pane_log(
         .get(&term)
         .map(|session| session.id.clone());
     let Ok(path) = crate::pane_transcript::pane_transcript(&state, term) else {
-        return Ok(SubagentLog::not_found(after.unwrap_or_default()));
+        let mut log = SubagentLog::not_found(after.unwrap_or_default());
+        // A CLI that writes its session once a turn has ended has no file
+        // through its first turn: what its hooks told of that turn is the
+        // conversation until then (t-125261) — of the pane's own conversation,
+        // never of one a CLI the pane ran before told.
+        if matches!(read, LogRead::Tail | LogRead::After(_)) {
+            log.live_turns = live_rows(&state.pane_live_turns(), term, session_id.as_deref());
+            log.found = !log.live_turns.is_empty();
+        }
+        return Ok(log);
     };
     let archive = archive.unwrap_or(false);
     if archive && state.agent_terms().get(&term).copied() != Some("zo") {
@@ -358,8 +368,16 @@ pub(crate) fn pane_log(
     // A store that writes its session as one document is read whole, by
     // step — asked of the store row that keeps the file, never of the
     // agent's name (t-124593).
-    let mut log = if crate::pane_transcript::written_whole(&state, term, &path) {
-        document_log(&path, read, whole.unwrap_or(false))?
+    let whole_doc = crate::pane_transcript::written_whole(&state, term, &path);
+    let mut log = if whole_doc {
+        whole_document_log(
+            || state.pane_live_turns(),
+            term,
+            session_id.as_deref(),
+            &path,
+            read,
+            whole.unwrap_or(false),
+        )?
     } else {
         transcript_log_source(&path, read, whole.unwrap_or(false), archive)?
     };
@@ -370,6 +388,97 @@ pub(crate) fn pane_log(
         turn.session_id.clone_from(&session_id);
     }
     restart_nudge_runtime::mark_window_notes(log.turns.iter_mut().map(|one| &mut one.turn));
+    // A context its transcript counts but does not size is sized by the
+    // pane's model in its own CLI's list (Devin's `max_context_tokens`, the
+    // number its own screen draws); zo's catalog sizes no other CLI's window
+    // — its numbers are zo's own caps (t-125261).
+    let agent = state.agent_terms().get(&term).copied();
+    if let Some(usage) = log.usage.as_mut().filter(|usage| usage.window == 0)
+        && let (Some(agent), Some(model)) = (agent, log.model.as_deref())
+        && let Some(window) = crate::summon_lineup::own_listed_window(agent, model)
+    {
+        usage.window = window;
+    }
+    Ok(log)
+}
+
+/// The turns a pane's hooks told and its session document does not hold yet,
+/// of `session_id`'s conversation only (t-125261): a pane whose CLI changed
+/// shows no row the CLI before it told.
+pub(crate) fn live_rows(
+    held: &HashMap<TermId, LiveTurnBuffer>,
+    term: TermId,
+    session_id: Option<&str>,
+) -> Vec<zerocode_core::transcript::TranscriptTurn> {
+    held.get(&term)
+        .map(|live| live.rows_of(session_id))
+        .unwrap_or_default()
+}
+
+/// A pane's conversation out of a session document its CLI writes whole,
+/// beside the turns its hooks told (t-125261). A read on from where the last
+/// one ended, of the file unchanged — its size and time — finds nothing new
+/// and is answered without reading the file again: a document is read and
+/// parsed whole, and the hooks of a running turn ask the page to read at
+/// every call while the CLI writes nothing. A read that parsed the document
+/// tells the hooks' turns which of them it holds now
+/// ([`LiveTurnBuffer::reconcile`]); what still stands of them rides the answer
+/// as `live_turns`. `held` is taken for a moment at a time, never across the
+/// read.
+pub(crate) fn whole_document_log<'a>(
+    held: impl Fn() -> MutexGuard<'a, HashMap<TermId, LiveTurnBuffer>>,
+    term: TermId,
+    session_id: Option<&str>,
+    path: &Path,
+    read: LogRead,
+    whole: bool,
+) -> Result<SubagentLog, String> {
+    let (LogRead::Tail | LogRead::After(_)) = read else {
+        return document_log(path, read, whole);
+    };
+    let stamp = crate::pane_runtime::file_stamp(path);
+    if let (LogRead::After(after), Some(stamp)) = (read, stamp) {
+        let live = held();
+        if usize::try_from(after).is_ok_and(|after| {
+            live.get(&term)
+                .is_some_and(|buffer| buffer.read_unchanged(session_id, stamp, after))
+        }) {
+            let mut log = document_nothing_new(after, false);
+            log.live_turns = live_rows(&live, term, session_id);
+            return Ok(log);
+        }
+    }
+    let mut live_turns = None;
+    let mut log = document_read_within(path, read, whole, LONG_LINE_CAP, |document| {
+        let Some(stamp) = stamp else {
+            return Some(document.settled);
+        };
+        // Match against complete questions and their outcomes, including
+        // rows before the cursor and the last step the parser held back.
+        let rows: Vec<_> = document
+            .steps
+            .iter()
+            .enumerate()
+            .flat_map(|(place, step)| step.iter().map(move |row| (place, row)))
+            .collect();
+        let mut live = held();
+        // A competing read may have seen a later rewrite before this parse
+        // finished. Leave its cursor and proof alone and wait for a new read.
+        if crate::pane_runtime::file_stamp(path) != Some(stamp) {
+            return None;
+        }
+        let visible = live.entry(term).or_default().reconcile(
+            session_id,
+            zerocode_core::live_hook_turns::DocRead {
+                stamp,
+                settled: document.settled,
+            },
+            &rows,
+        );
+        live_turns = Some(live_rows(&live, term, session_id));
+        Some(visible)
+    })?;
+    log.live_turns = live_turns.unwrap_or_else(|| live_rows(&held(), term, session_id));
     Ok(log)
 }
 
@@ -668,6 +777,7 @@ fn long_line_log<F: std::io::Read + std::io::Seek>(
                     start,
                     usage: None,
                     about: None,
+                    live_turns: Vec::new(),
                 },
                 lines: start..start,
                 ended: false,
@@ -696,6 +806,7 @@ fn long_line_log<F: std::io::Read + std::io::Seek>(
             start,
             usage,
             about: None,
+            live_turns: Vec::new(),
         },
         lines: start..next,
         ended: true,
@@ -788,11 +899,13 @@ pub(crate) fn document_log_within(
     whole: bool,
     cap: u64,
 ) -> Result<SubagentLog, String> {
-    let held = match read {
-        LogRead::After(at) | LogRead::Before(at) => at,
-        LogRead::Tail => 0,
-    };
-    let nothing_new = |skipped: bool| SubagentLog {
+    document_read_within(path, read, whole, cap, |document| Some(document.settled))
+}
+
+/// What a read of a session document answers when it brings nothing new: the
+/// cursor where it was, and `skipped` when the document is past the cap.
+fn document_nothing_new(held: u64, skipped: bool) -> SubagentLog {
+    SubagentLog {
         skipped,
         turns: Vec::new(),
         model: None,
@@ -803,12 +916,28 @@ pub(crate) fn document_log_within(
         start: held,
         usage: None,
         about: None,
+        live_turns: Vec::new(),
+    }
+}
+
+/// Read the document once. `visible_end` withholds a partial turn until
+/// its outcome can replace the provisional rows.
+fn document_read_within(
+    path: &std::path::Path,
+    read: LogRead,
+    whole: bool,
+    cap: u64,
+    visible_end: impl FnOnce(&zerocode_core::transcript::DocumentRead) -> Option<usize>,
+) -> Result<SubagentLog, String> {
+    let held = match read {
+        LogRead::After(at) | LogRead::Before(at) => at,
+        LogRead::Tail => 0,
     };
     let size = std::fs::metadata(path)
         .map_err(|error| error.to_string())?
         .len();
     if size > cap {
-        return Ok(nothing_new(true));
+        return Ok(document_nothing_new(held, true));
     }
     let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
     let detail = if whole {
@@ -819,12 +948,15 @@ pub(crate) fn document_log_within(
     let Some(document) =
         zerocode_core::transcript::document_read(&String::from_utf8_lossy(&bytes), detail)
     else {
-        return Ok(nothing_new(false));
+        return Ok(document_nothing_new(held, false));
+    };
+    let Some(settled) = visible_end(&document) else {
+        return Ok(document_nothing_new(held, false));
     };
     let steps: Vec<Vec<LineTurn>> = document
         .steps
         .into_iter()
-        .take(document.settled)
+        .take(settled)
         .enumerate()
         .map(|(place, turns)| {
             turns
@@ -838,7 +970,6 @@ pub(crate) fn document_log_within(
                 .collect()
         })
         .collect();
-    let settled = steps.len();
     let (from, to) = match read {
         // A document with fewer settled steps than the cursor was replaced:
         // read from its first step, as a file that shrank is read from its
@@ -859,7 +990,7 @@ pub(crate) fn document_log_within(
             (steps_back(&steps, before, &PAGE_REACH), before)
         }
     };
-    Ok(SubagentLog {
+    let log = SubagentLog {
         skipped: false,
         turns: steps.into_iter().take(to).skip(from).flatten().collect(),
         model: document.model,
@@ -874,7 +1005,9 @@ pub(crate) fn document_log_within(
         start: from as u64,
         usage: document.usage,
         about: None,
-    })
+        live_turns: Vec::new(),
+    };
+    Ok(log)
 }
 
 /// Where a read back from step `before` begins: as far up as the newest
@@ -1053,6 +1186,7 @@ pub(crate) fn transcript_log_back<F: std::io::Read + std::io::Seek>(
         start,
         usage,
         about: None,
+        live_turns: Vec::new(),
     })
 }
 
@@ -1131,6 +1265,7 @@ fn transcript_log_window<F: std::io::Read + std::io::Seek>(
             start: base,
             usage,
             about: None,
+            live_turns: Vec::new(),
         },
         lines: base..base + whole,
         ended: chunk.start + chunk.bytes.len() > 0,

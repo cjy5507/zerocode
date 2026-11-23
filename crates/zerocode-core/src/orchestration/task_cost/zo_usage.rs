@@ -13,9 +13,37 @@ pub struct ZoRequestUsage {
     pub cache_read: i64,
     pub cache_creation: i64,
     #[serde(default)]
+    pub cache_creation_1h: Option<u64>,
+    #[serde(default)]
     pub output: i64,
     #[serde(default)]
     pub ttl: String,
+}
+
+impl ZoRequestUsage {
+    /// Price a ledger row on its UTC date using the reported cache durations.
+    #[must_use]
+    pub fn cost_usd(&self) -> Option<f64> {
+        let cache_write = u64::try_from(self.cache_creation).ok()?;
+        let cache_write_1h = match self.cache_creation_1h {
+            Some(tokens) if tokens <= cache_write => tokens,
+            None if cache_write == 0 || matches!(self.ttl.as_str(), "" | "5m") => 0,
+            // Older rows with mixed cache writes did not record the split.
+            _ => return None,
+        };
+        model_prices::request_cost(
+            &self.model,
+            model_prices::day_at_millis(self.ts_unix_ms),
+            model_prices::RequestTokens {
+                input: u64::try_from(self.input_uncached).ok()?,
+                output: u64::try_from(self.output).ok()?,
+                cache_read: u64::try_from(self.cache_read).ok()?,
+                cache_write,
+                cache_write_1h,
+            },
+        )
+        .map(model_prices::Cost::total_cost_usd)
+    }
 }
 
 /// What a request journal's reader could not hand over whole (t-79891): a
@@ -87,7 +115,7 @@ impl SessionBook {
                 }
             }
             total_usd = total_usd
-                .zip(price(row))
+                .zip(row.cost_usd())
                 .map(|(total, cost)| total + cost)
                 .filter(|cost| cost.is_finite());
         }
@@ -101,27 +129,6 @@ impl SessionBook {
     }
 }
 
-fn price(row: &ZoRequestUsage) -> Option<f64> {
-    let rate = model_prices::price(&row.model)?;
-    if row.cache_creation > 0 && !matches!(row.ttl.as_str(), "" | "5m") {
-        return None;
-    }
-    let input = row
-        .input_uncached
-        .checked_add(row.cache_read)?
-        .checked_add(row.cache_creation)?;
-    if input > 200_000 {
-        return None;
-    }
-    Some(
-        (f64::from(u32::try_from(row.input_uncached).ok()?) * rate.input
-            + f64::from(u32::try_from(row.output).ok()?) * rate.output
-            + f64::from(u32::try_from(row.cache_read).ok()?) * rate.cache_read
-            + f64::from(u32::try_from(row.cache_creation).ok()?) * rate.cache_write)
-            / 1_000_000.0,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,11 +137,12 @@ mod tests {
     fn each_wire_model_is_priced_once_and_bad_duplicates_are_not_measurements() {
         let row = ZoRequestUsage {
             seq: 1,
-            ts_unix_ms: 10,
+            ts_unix_ms: 1_787_616_000_000,
             model: "gpt-5.6-sol".into(),
             input_uncached: 200,
             cache_read: 100,
             cache_creation: 0,
+            cache_creation_1h: None,
             output: 50,
             ttl: String::new(),
         };
@@ -143,7 +151,8 @@ mod tests {
         book.read_zo_usage("session", &rows, ReadGaps::default(), 20);
         let measured = book.spend(UsageSource::Zo, "session").unwrap();
         assert_eq!(measured.counters(), Some([200, 50, 100, 0]));
-        assert_eq!(measured.usd, price(&row));
+        assert_eq!(measured.usd, row.cost_usd());
+        assert!(measured.usd.is_some_and(|cost| cost > 0.0));
         let mut changed = row.clone();
         changed.output += 1;
         book.read_zo_usage("session", &[row, changed], ReadGaps::default(), 30);

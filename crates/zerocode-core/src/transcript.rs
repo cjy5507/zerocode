@@ -2235,7 +2235,22 @@ fn tool_target(name: &str, input: &serde_json::Map<String, serde_json::Value>) -
         .map(str::to_string)
 }
 
-fn tool_result_turn(
+pub(crate) fn tool_call_turn(
+    part: &serde_json::Value,
+    at_ms: Option<i64>,
+    detail: Detail,
+) -> Option<TranscriptTurn> {
+    let text = tool_line(part)?;
+    Some(TranscriptTurn {
+        role: "tool".into(),
+        text,
+        at_ms,
+        tool: Some(transcript_tool(part, false, detail)),
+        images: Vec::new(),
+    })
+}
+
+pub(crate) fn tool_result_turn(
     part: &serde_json::Value,
     at_ms: Option<i64>,
     detail: Detail,
@@ -2386,14 +2401,8 @@ fn step_turns(step: &serde_json::Value, detail: Detail) -> Vec<TranscriptTurn> {
                     "arguments": call.get("arguments"),
                     "call_id": call.get("tool_call_id"),
                 });
-                if let Some(text) = tool_line(&part) {
-                    turns.push(TranscriptTurn {
-                        role: "tool".into(),
-                        text,
-                        at_ms,
-                        tool: Some(transcript_tool(&part, false, detail)),
-                        images: Vec::new(),
-                    });
+                if let Some(turn) = tool_call_turn(&part, at_ms, detail) {
+                    turns.push(turn);
                 }
             }
             for call in calls {
@@ -5433,5 +5442,73 @@ mod tests {
         let read = document_read(&text, Detail::Clipped).expect("a document");
         assert_eq!(read.model.as_deref(), Some("example-default-model"));
         assert_eq!(read.usage, None);
+    }
+
+    /// The session the person's pane stopped at its first turn on held six
+    /// prompts in 61 steps when its file was read (2026-11-22): the reader
+    /// reads every turn of such a document, in order, a prompt written as
+    /// text parts as well as one written as a string — the page's first-turn
+    /// stop was not the reader's (t-125261).
+    #[test]
+    fn a_six_turn_document_of_sixty_one_steps_reads_every_turn_in_order() {
+        let mut steps: Vec<String> = vec![ATIF_SYSTEM.to_string()];
+        for turn in 0..6 {
+            let id = steps.len() + 1;
+            let said = if turn == 2 {
+                format!(r#"[{{"type":"text","text":"user turn {turn}"}}]"#)
+            } else {
+                format!(r#""user turn {turn}""#)
+            };
+            steps.push(format!(
+                r#"{{"step_id":{id},"timestamp":"2026-01-02T03:04:{:02}Z","source":"user","message":{said}}}"#,
+                turn * 10
+            ));
+            for call in 0..8 {
+                let id = steps.len() + 1;
+                steps.push(format!(
+                    r#"{{"step_id":{id},"source":"agent","model_name":"example-model","message":"","tool_calls":[{{"tool_call_id":"t{turn}-c{call}","function_name":"exec","arguments":{{"command":"echo {turn}-{call}"}}}}],"observation":{{"results":[{{"source_call_id":"t{turn}-c{call}","content":"out {turn}-{call}"}}]}},"metrics":{{"prompt_tokens":{}}}}}"#,
+                    20_000 + id * 100
+                ));
+            }
+            let id = steps.len() + 1;
+            steps.push(format!(
+                r#"{{"step_id":{id},"source":"agent","model_name":"example-model","message":"answer turn {turn}","metrics":{{"prompt_tokens":{}}}}}"#,
+                20_000 + id * 100
+            ));
+        }
+        assert_eq!(steps.len(), 61);
+        let read = document_read(&atif_session(&steps.join(",")), Detail::Clipped)
+            .expect("a 61-step document");
+        assert_eq!((read.steps.len(), read.settled), (61, 61));
+        let said = |role: &str| -> Vec<String> {
+            read.steps
+                .iter()
+                .flatten()
+                .filter(|turn| turn.role == role)
+                .map(|turn| turn.text.clone())
+                .collect()
+        };
+        assert_eq!(
+            said("user"),
+            (0..6)
+                .map(|turn| format!("user turn {turn}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            said("assistant"),
+            (0..6)
+                .map(|turn| format!("answer turn {turn}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(said("tool").len(), 48);
+        assert_eq!(said("tool_result").len(), 48);
+        assert_eq!(read.model.as_deref(), Some("example-model"));
+        assert_eq!(
+            read.usage,
+            Some(TranscriptUsage {
+                tokens: 26_100,
+                window: 0
+            })
+        );
     }
 }

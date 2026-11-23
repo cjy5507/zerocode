@@ -15467,11 +15467,18 @@ await page.evaluate(() => {
     window.__TOGGLED__ = args;
     return window.__ANSWER__.list_automations();
   };
+  // A paused job folds under one row while another job is on and nothing
+  // narrows the list, and the fold closes with the page (settings.mjs pins
+  // the fold itself). These tests read the paused a2 as a row of its own, so
+  // each opens the fold after the page opens.
+  window.__unfoldPausedAutomations = () =>
+    document.querySelector('.auto-paused-fold[aria-expanded="false"]')?.click();
 });
 await page.evaluate(() => document.getElementById("nav-automations").click());
 await page.waitForTimeout(200);
 
 const autoList = await page.evaluate(() => {
+  window.__unfoldPausedAutomations();
   const rows = [...document.querySelectorAll(".auto-row")].map((row) => ({
     name: row.querySelector(".auto-row-name").textContent,
     schedule: row.querySelector(".auto-row-schedule").textContent,
@@ -16040,6 +16047,7 @@ const runHistory = await page.evaluate(async () => {
   closeAutoForm();
   document.getElementById("nav-automations").click();
   await new Promise((done) => setTimeout(done, 200));
+  window.__unfoldPausedAutomations();
   const counts = [...document.querySelectorAll(".auto-row")].map((row) => {
     const cell = row.querySelector(".auto-row-runs");
     return { said: cell.textContent, shown: !cell.hidden };
@@ -16437,6 +16445,7 @@ const automationDelete = await page.evaluate(async () => {
   window.__ANSWER__.list_automations = () => original;
   await refreshAutomations();
   await settle();
+  window.__unfoldPausedAutomations();
   document.querySelectorAll(".auto-row")[1].click();
   await settle();
   document.getElementById("auto-detail-delete").click();
@@ -16481,6 +16490,7 @@ await page.evaluate(() => {
 const autoLang = await page.evaluate(async () => {
   document.getElementById("nav-automations").click();
   await new Promise((done) => setTimeout(done, 150));
+  window.__unfoldPausedAutomations();
   document.querySelectorAll(".auto-row")[0].click();
   await new Promise((done) => setTimeout(done, 100));
   document.getElementById("auto-detail-edit").click();
@@ -16503,6 +16513,7 @@ const autoLang = await page.evaluate(async () => {
   delete window.__ANSWER__.list_automations;
   delete window.__ANSWER__.save_automation;
   delete window.__ANSWER__.enable_automation;
+  delete window.__unfoldPausedAutomations;
   return { before, after, off, chromeRestored };
 });
 ok(
@@ -51541,7 +51552,7 @@ ok(
     tokensScreen.noReReadOnFilter &&
     tokensScreen.cardCount === 8 &&
     tokensScreen.reuseSaid === "75%" && tokensScreen.coldSaid === "43%" &&
-    tokensScreen.pairSaid === "3 / 7" && tokensScreen.costSaid === "$1.75" &&
+    tokensScreen.pairSaid === "3 / 7" && tokensScreen.costSaid === "$1.75 · 모름 1건 포함" &&
     tokensScreen.saysUnpriced && tokensScreen.saysUndated && tokensScreen.saysLeftOut &&
     tokensScreen.saysEstimate && tokensScreen.status.length > 0,
   JSON.stringify(tokensScreen),
@@ -52467,6 +52478,18 @@ const usageRows = await page.evaluate(async () => {
   seen.codexRow = document.querySelector(".usage-breakdown-tokens")?.textContent;
   seen.codexSays = formatTokens(1070);
 
+  // A priced zero, a missing estimate, and a partial subtotal can all arrive
+  // from the same provider. The settings UI has to make them distinguishable.
+  const zero = formatUsageCost(0, 0);
+  const unknown = formatUsageCost(null, 1);
+  usageStatsReports.codex.summary.unpriced_requests = 2;
+  usageStatsReports.codex.summary.top_model = "synthetic-cli-model";
+  paintUsageStats();
+  const usageText = document.getElementById("usage-stats-body").textContent;
+  seen.pricingStates = zero.startsWith("$0") && !unknown.includes("$")
+    && usageText.includes(formatUsageCost(1.5, 2))
+    && usageText.includes("synthetic-cli-model");
+
   // Claude는 입력+출력(캐시 제외) — 이쪽 원본의 선택.
   usageStatsReports.claude = report();
   usageStatsProvider = "claude";
@@ -52523,6 +52546,7 @@ const usageRows = await page.evaluate(async () => {
 ok(
   "each ledger's breakdown counts its own way, and the overview keeps a switched-off provider with its way back",
   usageRows.codexRow === usageRows.codexSays &&
+    usageRows.pricingStates &&
     usageRows.claudeRow === usageRows.claudeSays &&
     usageRows.codexRow !== usageRows.claudeRow &&
     usageRows.opencodeRow === usageRows.opencodeSays &&
@@ -56928,6 +56952,338 @@ suite("composer-chips", async ({ browser, origin, ok }) => {
         .map((one) => one.textContent);
       seen.helperRows = quietRows;
       seen.copyUnlisted = quietRows.length > 0 && !quietRows.includes("/copy");
+
+      // A pane of a CLI that writes its session once a turn has ended — Devin's
+      // shape, on a row this test makes up, so no road here can know the CLI by
+      // its name (t-125261): the page draws the running turn from what its
+      // hooks told (`live_turns`) and lets those rows go in the paint that
+      // brings the document's rows for them; its foot line names the call still
+      // out and its clock ticks; a turn that ended while another tab was in
+      // front is read when the tab comes back, and one that ended while the
+      // window was hidden is drawn when it is shown. Its chip lists the CLI's own
+      // models — a long list in families, so behind a search field — and a pick
+      // types `/model <id>` down the road every CLI's pick takes; a model new
+      // to the list stands in the menu, and one gone from it leaves, with no
+      // word of the window's changed. The grammar is Devin's: `/model [name]`
+      // "Show or change the current model"
+      // (docs.devin.ai/cli/reference/commands.md), and `--model` "Accepts the
+      // same fuzzy names as `/model` (family slug, alias, or partial name)"
+      // (the same page, `devin acp`). Every model name is made up.
+      const baseListAgents = window.__ANSWER__.list_agents;
+      const settlingCli = "example-cli";
+      const devinSession = { key: "session_id", id: "s-example" };
+      const devinSpec = {
+        id: settlingCli, name: "Example CLI", favicon_domain: "example.com",
+        homepage_url: "https://example.com/cli", installed: true,
+        found_as: settlingCli, unsupported_here: false, missing_requirement: null,
+        takes_a_paste: true, ready: "quiet", glyph: "", busy_word: "",
+        models_provider: null, model_command: "/model", model_command_takes_id: true,
+        permission_road: null, permission_modes: [],
+      };
+      window.__ANSWER__.list_agents = () => [...(baseListAgents?.() ?? []), devinSpec];
+      await refreshAgents();
+      let devinModels = [
+        { id: "example-family-a-max", display_name: "Example Family A Max", provider: settlingCli, family: "example-family-a" },
+        { id: "example-family-b-high", display_name: "Example Family B High", provider: settlingCli, family: "example-family-b" },
+        { id: "example-family-c-medium", display_name: "Example Family C Medium", provider: settlingCli, family: "example-family-c" },
+        ...Array.from({ length: 32 }, (_, idx) => ({
+          id: `example-family-x${idx % 4}-v${idx}`,
+          display_name: `Example Family X${idx % 4} V${idx}`,
+          provider: settlingCli,
+          family: `example-family-x${idx % 4}`,
+        })),
+      ];
+      const prevAgentModels = window.__ANSWER__.agent_models;
+      // The answer for the test's own row: what the backend's `agent_models` reads out of that CLI's list.
+      window.__ANSWER__.agent_models = (args) => args.agent === settlingCli ? devinModels : prevAgentModels(args);
+      const prevPaneEffort = window.__ANSWER__.pane_effort;
+      window.__ANSWER__.pane_effort = (args) => args.term === devinTerm
+        ? { current: null, witness: "default", ladder: [], door: "none", command: null, stuck: "no_road", rewritesCache: false, pending: null }
+        : (prevPaneEffort ? prevPaneEffort(args) : null);
+      let devinPhase = "mid";
+      let devinPolls = 0;
+      const prevPaneLog = window.__ANSWER__.pane_log;
+      let devinTerm = null;
+      window.__ANSWER__.pane_log = (args) => {
+        if (args.term !== devinTerm) return prevPaneLog(args);
+        devinPolls += 1;
+        if (devinPhase === "other-cli") return { found: false, next: args.after ?? 0 };
+        if (devinPhase === "mid") {
+          return {
+            found: true,
+            next: 3,
+            start: 0,
+            model: "example-family-a-max",
+            turns: args.after ? [] : [
+              { role: "user", text: "turn 1" },
+              { role: "assistant", text: "answer 1" },
+            ],
+            live_turns: [
+              { role: "user", text: "turn 2 live" },
+              { role: "tool", text: "exec ls", tool: { kind: "bash", name: "exec", call_id: "c-live-1", input: "ls", result: "", is_error: false } },
+              { role: "tool_result", text: "a.rs", tool: { kind: "bash", name: "exec", call_id: "c-live-1", input: "", result: "a.rs", is_error: false } },
+              { role: "tool", text: "exec git status", tool: { kind: "bash", name: "exec", call_id: "c-live-2", input: "git status", result: "", is_error: false } },
+            ],
+          };
+        }
+        if (devinPhase === "settled") {
+          return {
+            found: true,
+            next: 6,
+            start: args.after ? 3 : 0,
+            model: "example-family-a-max",
+            turns: (args.after ?? 0) >= 6 ? [] : [
+              { role: "user", text: "turn 2 live" },
+              { role: "tool", text: "exec ls", tool: { kind: "bash", name: "exec", call_id: "c-live-1", input: "ls", result: "", is_error: false } },
+              { role: "tool_result", text: "a.rs", tool: { kind: "bash", name: "exec", call_id: "c-live-1", input: "", result: "a.rs", is_error: false } },
+              { role: "tool", text: "exec git status", tool: { kind: "bash", name: "exec", call_id: "c-live-2", input: "git status", result: "", is_error: false } },
+              { role: "tool_result", text: "clean", tool: { kind: "bash", name: "exec", call_id: "c-live-2", input: "", result: "clean", is_error: false } },
+              { role: "assistant", text: "answer 2" },
+            ],
+            live_turns: [],
+          };
+        }
+        if (devinPhase === "turn3") {
+          return {
+            found: true,
+            next: 8,
+            start: 6,
+            model: "example-family-a-max",
+            turns: (args.after ?? 0) >= 8 ? [] : [
+              { role: "user", text: "turn 3 background" },
+              { role: "assistant", text: "answer 3" },
+            ],
+            live_turns: [],
+          };
+        }
+        // Turn 5's Stop came before its call's result and the document is not
+        // written yet: the hooks' rows stand — the result too, once it comes
+        // after the Stop (`turn5-late`).
+        const turn5Call = { role: "tool", text: "exec cargo test", tool: { kind: "bash", name: "exec", call_id: "c-live-5", input: "cargo test", result: "", is_error: false } };
+        const turn5Result = { role: "tool_result", text: "ok", tool: { kind: "bash", name: "exec", call_id: "c-live-5", input: "", result: "ok", is_error: false } };
+        return {
+          found: true,
+          next: 10,
+          start: 8,
+          model: "example-family-a-max",
+          turns: (args.after ?? 0) >= 10 ? [] : [
+            { role: "user", text: "turn 4 hidden" },
+            { role: "assistant", text: "answer 4" },
+          ],
+          live_turns: devinPhase === "turn5-stop"
+            ? [{ role: "user", text: "turn 5 late result" }, turn5Call, { role: "assistant", text: "answer 5" }]
+            : devinPhase === "turn5-late"
+              ? [{ role: "user", text: "turn 5 late result" }, turn5Call, turn5Result, { role: "assistant", text: "answer 5" }]
+              : [],
+        };
+      };
+      devinTerm = await openTermTab({ placement: "tab" });
+      const devinTab = tabOfTerm(devinTerm);
+      tell("hook:agent", { term: devinTerm, state: "working", agent: settlingCli, session: devinSession, resumable: false, model: "example-family-a-max" });
+      await window.__PAINTED__();
+      el("view-toggle-chat").click();
+      await until(() => document.querySelector(`.pane-slot[data-term="${devinTerm}"] .pane-chat .is-provisional`));
+      const devinChat = document.querySelector(`.pane-slot[data-term="${devinTerm}"] .pane-chat`);
+      const devinComposer = devinChat?.querySelector(".worker-composer");
+      // The foot line names the call still out — a row the hooks drew — and
+      // the clock beside it ticks with the page's own clock.
+      await until(() => (devinChat?.querySelector(".helper-status-now")?.textContent ?? "").includes("git status"));
+      const footWordsBefore = devinChat?.querySelector(".helper-status-now")?.textContent ?? "";
+      const devinRun = activeHelperPage()?.worker;
+      if (devinRun) devinRun.startedAt = Date.now() - 65_000;
+      tickWorkers();
+      const footClockAfterTick = devinChat?.querySelector(".helper-status-clock")?.textContent ?? "";
+      seen.devinMidProvisional = devinChat?.querySelectorAll(".is-provisional").length ?? 0;
+      seen.devinFootActivity = footWordsBefore;
+      seen.devinFootClockTicked = footClockAfterTick.includes("1분") || footClockAfterTick.includes("1m") || footClockAfterTick.includes("65");
+      // The chip lists the CLI's own models, behind a search field.
+      const devinChip = devinComposer?.querySelector(".worker-composer-agent");
+      devinChip?.click();
+      await until(() => devinComposer?.querySelector(".composer-menu .composer-menu-search"));
+      const devinSearch = devinComposer?.querySelector(".composer-menu-search");
+      seen.devinHasSearch = Boolean(devinSearch);
+      seen.devinChipNamed = devinChip?.querySelector(".worker-composer-model-words")?.textContent ?? "";
+      // A search finds a model across the families; its pick types `/model <id>`.
+      // (Each step stands on what the one before found, so a window without
+      // the search field — the base this was red on — says which part it lacks
+      // in the result below instead of throwing here.)
+      if (devinSearch) {
+        devinSearch.value = "example-family-b";
+        devinSearch.dispatchEvent(new Event("input", { bubbles: true }));
+        await settle(40);
+      }
+      const sweBtn = [...devinComposer.querySelectorAll(".composer-menu-models .composer-menu-item")]
+        .find((row) => row.querySelector(".composer-menu-name")?.textContent === "Example Family B High");
+      const sentBeforeDevin = calls.length;
+      sweBtn?.click();
+      await until(() => calls.length >= sentBeforeDevin + 2);
+      await settle(60);
+      seen.devinModelSent = JSON.stringify(calls.slice(-2));
+      seen.wantDevinModelSent = JSON.stringify([["paste", devinTerm, "/model example-family-b-high"], ["key", devinTerm, "Enter", false]]);
+      seen.devinModelRoads = JSON.stringify(roads.slice(-2));
+      // The CLI lists a model of a family new to it and drops a family. The list
+      // the window holds stands for a minute (`agentModelsFor`); an older one
+      // stands at the next open and is asked again behind it, so the open after
+      // that shows the new list.
+      const menuNames = async (query) => {
+        devinChip.click();
+        await until(() => devinComposer.querySelector(".composer-menu .composer-menu-search"));
+        const search = devinComposer.querySelector(".composer-menu-search");
+        if (!search) {
+          closeComposerMenu();
+          return [];
+        }
+        search.value = query;
+        search.dispatchEvent(new Event("input", { bubbles: true }));
+        await settle(40);
+        const names = [...devinComposer.querySelectorAll(".composer-menu-models .composer-menu-item .composer-menu-name")]
+          .map((name) => name.textContent);
+        closeComposerMenu();
+        return names;
+      };
+      devinModels = [
+        ...devinModels.filter((row) => row.family !== "example-family-b"),
+        { id: "example-family-new-high", display_name: "Example Family New High", provider: settlingCli, family: "example-family-new" },
+      ];
+      const heldList = agentModelLists.get(settlingCli);
+      if (heldList) heldList.at -= 61_000;
+      seen.devinListHeldFirst = (await menuNames("example-family-b")).includes("Example Family B High");
+      await until(() => agentModelLists.get(settlingCli)?.rows?.some((row) => row.id === "example-family-new-high"));
+      seen.devinListNewStands = (await menuNames("example-family-new")).includes("Example Family New High");
+      seen.devinListGoneLeaves = !(await menuNames("example-family-b")).includes("Example Family B High");
+      // The document is written: the hooks' rows go in the paint that brings the
+      // document's own, and turn 2 stands once.
+      devinPhase = "settled";
+      tell("hook:agent", { term: devinTerm, state: "done", agent: settlingCli, session: devinSession, resumable: false, model: "example-family-a-max" });
+      await until(() => (devinChat?.querySelectorAll(".is-provisional").length ?? 1) === 0 && devinChat?.textContent.includes("answer 2"));
+      const turn2Occurrences = [...devinChat.querySelectorAll(".helper-turn.is-user")].filter((n) => n.textContent.includes("turn 2 live")).length;
+      const answerOccurrences = [...devinChat.querySelectorAll(".helper-turn.is-assistant")].filter((n) => n.textContent.includes("answer 2")).length;
+      seen.devinSettledZeroDupes = turn2Occurrences === 1 && answerOccurrences === 1 && devinChat.querySelectorAll(".is-provisional").length === 0;
+      // Turn 3 runs and ends while another tab is in front, for longer than the
+      // page's own follow-up read after a turn (160 ms): nothing has read the
+      // page when the tab comes back — a page at rest is not followed
+      // (`helperPageFollowed`) — and the tab coming back reads it.
+      const otherTab = tabOfTerm(term);
+      setActiveTab(otherTab.id);
+      await settle(400);
+      tell("hook:agent", { term: devinTerm, state: "working", agent: settlingCli, session: devinSession, resumable: false, model: "example-family-a-max" });
+      await settle(40);
+      devinPhase = "turn3";
+      tell("hook:agent", { term: devinTerm, state: "done", agent: settlingCli, session: devinSession, resumable: false, model: "example-family-a-max" });
+      await settle(400);
+      const readWhileAway = devinChat?.textContent.includes("answer 3");
+      setActiveTab(devinTab.id);
+      await until(() => devinChat?.textContent.includes("answer 3"), 3000);
+      seen.devinAwayTabTurn3 = !readWhileAway &&
+        devinChat?.textContent.includes("turn 3 background") && devinChat?.textContent.includes("answer 3");
+      // Turn 4 runs and ends while the window is hidden: its hooks are kept
+      // and nothing reads the document, nobody looking — a tool call's news
+      // neither (t-125261 F5: the document is read whole); the window shown
+      // again reads it once and draws the turn at once.
+      const lookAway = (away) => {
+        for (const [key, value] of [["hidden", away], ["visibilityState", away ? "hidden" : "visible"]]) {
+          if (away) Object.defineProperty(document, key, { configurable: true, get: () => value });
+          else delete document[key];
+        }
+        document.dispatchEvent(new Event("visibilitychange"));
+      };
+      lookAway(true);
+      await settle(200);
+      const pollsBeforeHidden = devinPolls;
+      tell("hook:agent", { term: devinTerm, state: "working", agent: settlingCli, session: devinSession, resumable: false, model: "example-family-a-max" });
+      await settle(40);
+      tell("hook:activity", { pane: `term:${devinTerm}`, activities: [{ seq: 0, activity: { verb: "bash", target: "cargo build", phase: "started" } }] });
+      await settle(40);
+      devinPhase = "turn4";
+      tell("hook:agent", { term: devinTerm, state: "done", agent: settlingCli, session: devinSession, resumable: false, model: "example-family-a-max" });
+      await settle(400);
+      const drawnWhileHidden = devinChat?.textContent.includes("answer 4");
+      seen.devinHiddenReads = devinPolls - pollsBeforeHidden;
+      lookAway(false);
+      await until(() => devinChat?.textContent.includes("answer 4"), 3000);
+      seen.devinShownReads = devinPolls - pollsBeforeHidden;
+      seen.devinHiddenTurn4 = !drawnWhileHidden &&
+        devinChat?.textContent.includes("turn 4 hidden") && devinChat?.textContent.includes("answer 4");
+      // Every finished turn stands, in order, once.
+      const userWords = [...devinChat.querySelectorAll(".helper-turn.is-user")].map((node) => node.textContent);
+      const userAt = ["turn 1", "turn 2 live", "turn 3 background", "turn 4 hidden"]
+        .map((said) => userWords.filter((words) => words.includes(said)).length === 1 ? userWords.findIndex((words) => words.includes(said)) : -1);
+      seen.devinTurnsInOrderOnce = userAt.every((at, i) => at >= 0 && (i === 0 || at > userAt[i - 1]));
+      seen.devinUserWords = userWords;
+      // Turn 5's Stop comes before its call's result, and the result after it
+      // (t-125261 F1): the pane is done at the Stop, and the late result joins
+      // its call on the page without a word of the pane's state — the backend
+      // tells the page alone (`pane:live-turns`) — so the turn stays done, its
+      // foot line down.
+      devinPhase = "turn5-stop";
+      tell("hook:agent", { term: devinTerm, state: "working", agent: settlingCli, session: devinSession, resumable: false, model: "example-family-a-max" });
+      await settle(40);
+      tell("hook:agent", { term: devinTerm, state: "done", agent: settlingCli, session: devinSession, resumable: false, model: "example-family-a-max" });
+      await until(() => devinChat?.textContent.includes("answer 5"), 3000);
+      // Past the page's own follow-up read after a turn (160 ms): a page at
+      // rest reads nothing by itself, so only the backend's word brings the
+      // late result.
+      await settle(400);
+      const lateCall = () => [...devinChat.querySelectorAll(".is-provisional.is-tool")].find((row) => row.textContent.includes("cargo test"));
+      const outAtStop = Boolean(lateCall()) && !lateCall().classList.contains("is-done");
+      devinPhase = "turn5-late";
+      const pollsBeforeLate = devinPolls;
+      await settle(400);
+      const quietUntilTold = devinPolls === pollsBeforeLate && lateCall()?.classList.contains("is-done") !== true;
+      tell("pane:live-turns", { term: devinTerm });
+      await until(() => lateCall()?.classList.contains("is-done"), 3000);
+      const footLine = devinChat?.querySelector(".helper-status");
+      seen.devinLateResult = {
+        outAtStop,
+        quietUntilTold,
+        joined: lateCall()?.classList.contains("is-done") === true,
+        stillDone: hookStates.get(devinTerm) === "done",
+        footDown: !footLine || footLine.hidden,
+      };
+      // A working read schedules a follow-up. Hide after the request answers,
+      // before the timer fires, and count what starts while nobody is looking.
+      await settle(200);
+      tell("hook:agent", { term: devinTerm, state: "working", agent: settlingCli, session: devinSession });
+      await until(() => devinRun?.helper?.quickFollow);
+      lookAway(true);
+      const pollsAtHide = devinPolls;
+      tell("hook:agent", { term: devinTerm, state: "done", agent: settlingCli, session: devinSession });
+      await settle(300);
+      seen.devinScheduledWhileHidden = devinPolls - pollsAtHide;
+      lookAway(false);
+      await settle(250);
+
+      // The replacement CLI has not written a file yet. The same pane must
+      // start from the tail and drop both its old document and its live rows.
+      devinPhase = "other-cli";
+      paneChats.get(devinTerm).chosen = false;
+      tell("hook:agent", { term: devinTerm, state: "done", agent: "codex", session: { key: "session_id", id: "s-replacement" } });
+      await settle(250);
+      seen.devinReplaced = {
+        rows: devinChat.querySelectorAll(".helper-turn, .is-provisional").length,
+        cursor: devinRun?.helper?.next,
+        found: devinRun?.helper?.found,
+      };
+
+      const oldFirstView = agentPaneFirstView;
+      agentPaneFirstView = AGENT_PANE_FIRST_VIEWS.conversation;
+      devinTerm = await openTermTab({ placement: "tab" });
+      devinPhase = "mid";
+      lookAway(true);
+      const pollsAtFirstHook = devinPolls;
+      tell("hook:agent", { term: devinTerm, state: "done", agent: settlingCli, session: { key: "session_id", id: "s-hidden-first" } });
+      await settle(300);
+      seen.devinFirstWhileHidden = devinPolls - pollsAtFirstHook;
+      seen.devinFirstStood = paneChatOn(devinTerm);
+      lookAway(false);
+      await until(() => devinPolls > pollsAtFirstHook, 3000);
+      await settle(250);
+      seen.devinFirstShownReads = devinPolls - pollsAtFirstHook - seen.devinFirstWhileHidden;
+      agentPaneFirstView = oldFirstView;
+      window.__ANSWER__.list_agents = baseListAgents;
+      if (prevPaneEffort) window.__ANSWER__.pane_effort = prevPaneEffort; else delete window.__ANSWER__.pane_effort;
+      agentModelLists.delete(settlingCli);
+      await refreshAgents();
       delete window.__ANSWER__.term_paste; delete window.__ANSWER__.term_key;
       delete window.__ANSWER__.agent_models; delete window.__ANSWER__.slash_commands;
       delete window.__ANSWER__.pane_log; delete window.__ANSWER__.subagent_log;
@@ -56935,6 +57291,53 @@ suite("composer-chips", async ({ browser, origin, ok }) => {
       for (const at of [...termViews.keys()]) dropTermView(at);
       return seen;
     });
+    ok(
+      "a pane of a CLI that writes its session once a turn has ended (Devin's shape, t-125261) draws the running turn from its hooks, its foot line naming the call still out and its clock ticking, lets those rows go when the document's come — turn 2 once — and its chip lists the CLI's own models behind a search field, types `/model <id>` down every CLI's road, and follows the list: a new model stands, a gone one leaves",
+      seen.devinMidProvisional === 3 && seen.devinFootActivity.includes("git status") &&
+        seen.devinFootClockTicked && seen.devinHasSearch &&
+        seen.devinChipNamed === " · Example Family A Max" &&
+        seen.devinModelSent === seen.wantDevinModelSent && seen.devinModelRoads === JSON.stringify(["model", null]) &&
+        seen.devinListHeldFirst && seen.devinListNewStands && seen.devinListGoneLeaves &&
+        seen.devinSettledZeroDupes,
+      JSON.stringify({
+        mid: seen.devinMidProvisional, foot: seen.devinFootActivity, tick: seen.devinFootClockTicked,
+        search: seen.devinHasSearch, named: seen.devinChipNamed,
+        sent: seen.devinModelSent, roads: seen.devinModelRoads,
+        held: seen.devinListHeldFirst, stands: seen.devinListNewStands, leaves: seen.devinListGoneLeaves,
+        zeroDupes: seen.devinSettledZeroDupes,
+      }),
+    );
+    ok(
+      "a pane's finished turns all stand, in order and once (t-125261): one that ran and ended while another tab was in front, for longer than the page's own follow-up read, stands when the tab comes back, and one that ran and ended while the window was hidden stands when it is shown again — its hooks and tool news read nothing while hidden, and the window shown reads it",
+      seen.devinAwayTabTurn3 && seen.devinHiddenTurn4 && seen.devinTurnsInOrderOnce &&
+        seen.devinHiddenReads === 0 && seen.devinShownReads >= 1,
+      JSON.stringify({
+        awayTab: seen.devinAwayTabTurn3, hidden: seen.devinHiddenTurn4,
+        inOrderOnce: seen.devinTurnsInOrderOnce, users: seen.devinUserWords,
+        hiddenReads: seen.devinHiddenReads, shownReads: seen.devinShownReads,
+      }),
+    );
+    ok(
+      "a turn whose Stop came before its call's result stays done when the result comes after it (t-125261): the result joins its call on the page, read on the backend's word to the page alone — the page at rest reads nothing by itself — and the pane's state, spinner and foot line stay as the Stop left them",
+      seen.devinLateResult?.outAtStop && seen.devinLateResult?.quietUntilTold && seen.devinLateResult?.joined &&
+        seen.devinLateResult?.stillDone && seen.devinLateResult?.footDown,
+      JSON.stringify(seen.devinLateResult ?? null),
+    );
+    ok(
+      "a replacement CLI with no transcript starts with an empty page and cursor (t-125261)",
+      seen.devinReplaced?.rows === 0 && seen.devinReplaced?.cursor === null && seen.devinReplaced?.found === false,
+      JSON.stringify(seen.devinReplaced),
+    );
+    ok(
+      "a pane read scheduled before hiding starts no request while hidden (t-125261)",
+      seen.devinScheduledWhileHidden === 0,
+      JSON.stringify({ reads: seen.devinScheduledWhileHidden }),
+    );
+    ok(
+      "the first hook can open a hidden conversation but only showing it starts its first read (t-125261)",
+      seen.devinFirstStood && seen.devinFirstWhileHidden === 0 && seen.devinFirstShownReads === 1,
+      JSON.stringify({ stood: seen.devinFirstStood, hidden: seen.devinFirstWhileHidden, shown: seen.devinFirstShownReads }),
+    );
     ok(
       "the composer wears the extension's row — `+`, the agent chip (mark · name · model), the pane's effort beside it (t-81532), the mode chip, then `/` and send — a pane's own conversation speaks to the pane without a door, and a helper's page has no composer at all: its footer speaks to the parent instead",
       seen.placeholder === seen.wantPlaceholder && seen.noDoorOnOwnPane &&

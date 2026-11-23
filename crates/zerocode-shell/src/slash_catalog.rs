@@ -79,6 +79,11 @@ pub struct ModelRow {
     pub id: String,
     pub display_name: String,
     pub provider: String,
+    /// The family its CLI keeps it in, where the CLI groups its list
+    /// (`ListShape::Json`'s `family`) — the chip's menu finds a model of a
+    /// long grouped list by it (t-125261).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
 }
 
 /// How long an answer stands before the CLI is asked again. Announcing a
@@ -590,12 +595,51 @@ fn captured_lines_in(
 
 // ---- models -----------------------------------------------------------------
 
-/// The models `agent` can switch to, from zo's live catalog (`zo models
-/// --json`, the one place this machine merges every provider's list),
-/// filtered to the provider the agent drives, with withdrawn rows omitted and
-/// active generations ordered ahead of superseded ones.
+/// The models `agent` can switch to: the list its own CLI gives where its
+/// row names one (`ModelSource::OwnList`, the lineup `summon_lineup` holds —
+/// t-125261), else zo's live catalog (`zo models --json`), filtered to the
+/// provider the agent drives, with withdrawn rows omitted and active
+/// generations ordered ahead of superseded ones. An own list is offered only
+/// where a pick from it reaches the CLI ([`takes_a_model`]). One source per
+/// agent, chosen by its row's value.
 pub fn agent_models(agent: &str, home: &Path) -> Vec<ModelRow> {
+    use zerocode_core::capabilities::ModelSource;
+    let harness = zerocode_core::agent::agent_spec(agent).map(|spec| &spec.harness);
+    if let Some(harness) = harness
+        && matches!(harness.models, ModelSource::OwnList(_))
+    {
+        if !takes_a_model(harness) {
+            return Vec::new();
+        }
+        return agent_models_from_listed(agent, &crate::summon_lineup::own_list_models(agent));
+    }
     agent_models_from(agent, &zo_models_catalog(home))
+}
+
+/// Whether a model picked for this row reaches its CLI: a model flag its
+/// launch takes (the 「새 대화」 start), or a move between turns that takes it
+/// (the chip's `/model`). OpenCode's TUI takes neither (`opencode --help`
+/// 2.2.5), so its list — 「models」 answers one — offers nothing a pick would
+/// change.
+fn takes_a_model(harness: &zerocode_core::capabilities::Harness) -> bool {
+    harness.tuning.is_some() || harness.moves.model.is_some()
+}
+
+/// The models an agent's own CLI listed (`cli_models::Listed`), in the chip's
+/// shape: the name it shows, else its id.
+pub fn agent_models_from_listed(
+    agent: &str,
+    listed: &[zerocode_core::cli_models::Listed],
+) -> Vec<ModelRow> {
+    listed
+        .iter()
+        .map(|one| ModelRow {
+            id: one.id.clone(),
+            display_name: one.name.clone().unwrap_or_else(|| one.id.clone()),
+            provider: agent.to_string(),
+            family: one.family.clone(),
+        })
+        .collect()
 }
 
 fn band_rank(band: Option<&str>) -> u8 {
@@ -632,6 +676,7 @@ fn agent_models_from(agent: &str, catalog: &serde_json::Value) -> Vec<ModelRow> 
                         .unwrap_or(id)
                         .to_string(),
                     provider: row_provider.to_string(),
+                    family: None,
                 })
             })
             .collect();
@@ -674,6 +719,7 @@ fn agent_models_from(agent: &str, catalog: &serde_json::Value) -> Vec<ModelRow> 
                         .unwrap_or(id)
                         .to_string(),
                     provider: row_provider.to_string(),
+                    family: None,
                 },
             ))
         })
@@ -714,6 +760,7 @@ fn agent_models_from(agent: &str, catalog: &serde_json::Value) -> Vec<ModelRow> 
                     id: id.to_string(),
                     display_name,
                     provider: name.to_string(),
+                    family: None,
                 });
             }
         }
@@ -1773,5 +1820,99 @@ mod tests {
 
         let list = model_list_of(&catalog);
         assert_eq!(list["otherLogins"].as_array().unwrap().len(), 2);
+    }
+
+    /// What the chip and 「새 대화」 are told of a model in zo's catalog —
+    /// Claude's, Codex's, zo's and Antigravity's rows, Grok's and Kimi's other
+    /// logins — is the three things it always was: its id, the name it shows
+    /// and its provider. A window zo's catalog names does not ride along (its
+    /// numbers are zo's own caps), and a family rides only a CLI's own list
+    /// (t-125261).
+    #[test]
+    fn a_zo_catalog_row_reaches_the_chip_as_it_always_did() {
+        let catalog = serde_json::json!({
+            "models": [
+                {"id": "example-model-a", "provider": "claude", "displayName": "Example Model A", "band": "top"},
+                {"id": "example-model-b", "provider": "openai", "displayName": "Example Model B", "band": "top", "contextWindow": 400_000},
+                {"id": "example-model-c", "provider": "google", "displayName": "Example Model C", "band": "rest"},
+            ],
+            "otherLogins": [
+                {"id": "example-model-x", "provider": "xai", "displayName": "Example Model X"},
+                {"id": "example-model-k", "provider": "kimi", "displayName": "Example Model K"},
+            ],
+        });
+        for agent in ["claude", "codex", "zo", "antigravity", "grok", "kimi"] {
+            let rows = serde_json::to_value(agent_models_from(agent, &catalog)).expect("rows");
+            let rows = rows.as_array().expect("a list");
+            assert!(!rows.is_empty(), "{agent} lost its models");
+            for row in rows {
+                let mut keys: Vec<&str> = row
+                    .as_object()
+                    .expect("a row")
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                keys.sort_unstable();
+                assert_eq!(keys, ["display_name", "id", "provider"], "{agent}: {row}");
+            }
+        }
+    }
+
+    /// An own list reaches the chip in its shape — the name it shows, else
+    /// its id, and its family — and is offered only by a row a pick reaches:
+    /// Devin (its launch flag and `/model`) and Kiro (its launch flag), not
+    /// OpenCode, whose TUI takes neither, so its chip and 「새 대화」 offer no
+    /// list, as before (t-125261).
+    #[test]
+    fn an_own_list_is_offered_only_where_a_pick_reaches_the_cli() {
+        use zerocode_core::cli_models::Listed;
+        let rows = agent_models_from_listed(
+            "example-cli",
+            &[
+                Listed {
+                    id: "example-family-a-high".into(),
+                    name: Some("Example Family A High".into()),
+                    family: Some("example-family-a".into()),
+                    context_window: Some(262_000),
+                },
+                Listed {
+                    id: "example-family-b".into(),
+                    name: None,
+                    family: Some("example-family-b".into()),
+                    context_window: None,
+                },
+            ],
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| (
+                    row.id.as_str(),
+                    row.display_name.as_str(),
+                    row.family.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "example-family-a-high",
+                    "Example Family A High",
+                    Some("example-family-a")
+                ),
+                (
+                    "example-family-b",
+                    "example-family-b",
+                    Some("example-family-b")
+                ),
+            ]
+        );
+        let harness = |agent: &str| {
+            &zerocode_core::agent::agent_spec(agent)
+                .expect("a row")
+                .harness
+        };
+        assert!(takes_a_model(harness("devin")));
+        assert!(takes_a_model(harness("kiro")));
+        assert!(!takes_a_model(harness("opencode")));
+        // Asked before any CLI is: OpenCode's answer is the empty one it was.
+        assert!(agent_models("opencode", Path::new("/nonexistent-home")).is_empty());
     }
 }

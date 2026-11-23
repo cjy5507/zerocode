@@ -1,4 +1,5 @@
 use super::*;
+use zerocode_core::live_hook_turns::LiveTurnBuffer;
 
 /// How many things one card remembers having done.
 ///
@@ -836,20 +837,17 @@ pub(super) async fn hook_loop(
         // (t-6336) — and its shell may stay, so the pane closing would never
         // say so. Gated like every road here: a nested run's `SessionEnd`
         // wears the pane's key, and it is not the pane's session ending.
-        if let Some(term) = hooks::session_end_of(&envelope, expected.as_deref())
-            && speaks_for_its_pane(
-                &app,
-                term,
-                envelope.agent.slug(),
-                zerocode_core::session_in_payload(envelope.agent, &envelope.payload)
-                    .as_ref()
-                    .map(|session| session.id.as_str()),
-                true,
-            )
-        {
-            crate::emulator::borrower_gone(term, crate::emulator::LoanEnd::SessionEnded);
+        if let Some(term) = hooks::session_end_of(&envelope, expected.as_deref()) {
+            let session = zerocode_core::session_in_payload(envelope.agent, &envelope.payload);
+            let id = session.as_ref().map(|session| session.id.as_str());
+            if speaks_for_its_pane(&app, term, envelope.agent.slug(), id, true) {
+                if let Some(turns) = app.state::<AppState>().pane_live_turns().get_mut(&term) {
+                    turns.forget_finished(id);
+                }
+                crate::emulator::borrower_gone(term, crate::emulator::LoanEnd::SessionEnded);
+            }
         }
-        let Some(mut report) = hooks::report_of(&envelope, expected.as_deref()) else {
+        let Some(report) = hooks::report_of(&envelope, expected.as_deref()) else {
             continue;
         };
         // A nested run's hooks wear the PANE's identity — it inherited the
@@ -861,181 +859,224 @@ pub(super) async fn hook_loop(
         if !report_speaks_for_its_pane(&app, &report) {
             continue;
         }
-        // Whether this event names the pane: a prompt that numbers itself
-        // waits for its own record, which says whether a person typed it
-        // (t-11540) — a check the agent scheduled on itself fires the same
-        // hook. Asked of the pane's own reports only, before anyone hears it.
-        hooks::settle_prompt_name(&mut report);
-        // Whether a PERSON ended this turn. Asked BEFORE the done gate below,
-        // because that gate reads it: Orca computes `interrupted` first and
-        // hands it to `resolveClaudePaneState` (`agent-hook-listener.ts:2962`
-        // then `:3126`), and asking after would gate on a flag that is still
-        // false for the event that just declared it. See
-        // `declare_pane_interrupt` for why the pane's memory is half the answer.
-        declare_pane_interrupt(&app, &mut report, &envelope.payload);
-        // Whatever this event says, it is a newer word than a parked
-        // all-clear: a lead that spoke again (a fresh prompt, a question, a
-        // newer stop) makes the held Done stale, and the gate below re-parks
-        // the ones that still stand.
-        app.state::<AppState>().pending_done().remove(&report.term);
-        if report.session_boundary {
-            // A new process owns the pane: stale helpers belonged to the
-            // conversation that ended, and left standing they would gate the
-            // fresh session's idle row back up to working below — Orca
-            // clears roster, tasks and crons on `SessionStart` (its comment
-            // names the same reset Codex does).
-            clear_pane_subagents(&app, report.term);
-        } else if report.state == zerocode_core::hook::HookState::Done
-            && pane_still_working(&app, report.term, &envelope.payload, report.interrupted)
-        {
-            // A turn that ends while helpers still run has not ended for the
-            // PERSON. Stop is the lead's own word — with five helpers going,
-            // letting it land dropped the card to the completed column and
-            // rang a completion mid-work: the map's P0-4. Orca's
-            // `resolveClaudePaneState` holds the pane at working on a live
-            // roster or a non-empty background inventory; the roster here is
-            // the same proxy (rows leave on `SubagentStop`), the inventory
-            // is the payload's own.
-            //
-            // PARKED, not dropped: nothing else may ever say Done for this
-            // turn — the lead already said it — so the last helper's stop
-            // replays this as the all-clear (Orca re-derives the pane on
-            // every roster change; the parked row is our spelling of its
-            // `turnCompletedAt` pairing).
-            app.state::<AppState>()
-                .pending_done()
-                .insert(report.term, (envelope.worktree_id.clone(), report.clone()));
-            report.state = zerocode_core::hook::HookState::Working;
-        }
-        // An agent reporting through a hook has identified itself better than
-        // the argv guess ever could — a `claude` started by hand inside a plain
-        // shell says so here and nowhere else.
-        // Replaced, not merely filled in: a report that has been judged the
-        // pane's own IS the pane, and a first-writer-wins map left a person who
-        // quit one agent in a terminal and started another with a pane
-        // remembered as the old vendor forever — which then classified the new
-        // agent's every word as foreign and threw it away. The gate above is
-        // what makes overwriting safe.
-        app.state::<AppState>()
-            .agent_terms()
-            .insert(report.term, report.agent.slug());
-        // And which conversation it is. Kept rather than only forwarded, because
-        // the point of the id is to outlive the tab: the window asks for it again
-        // when somebody wants to reopen a session that was closed.
-        if let Some(reported) = report.session.clone() {
-            // What this report says against the pane's record (t-68069), asked
-            // before the record takes it. A report no door asked for already
-            // chose its conversation: the window says which.
-            let word = {
-                let state = app.state::<AppState>();
-                let record = state.pane_sessions().get(&report.term).cloned();
-                conversation_wake::word_on_report(
-                    report.agent.slug(),
-                    report.term,
-                    record.as_ref(),
-                    &reported,
-                    || {
-                        zerocode_core::hook::session_start_resumed_parsed(
+        // Hear the provisional turn before any state consumer sees the report.
+        let fold = {
+            let state = app.state::<AppState>();
+            hear_live_turn(
+                || state.pane_live_turns(),
+                &report,
+                &envelope.payload,
+                || transcript_file_stamp(&state, report.term),
+                epoch_ms_now(),
+            )
+        };
+        route_hook_report(
+            report,
+            fold,
+            |term| tell_live_turns(&app, term),
+            |mut report| {
+                hooks::settle_prompt_name(&mut report);
+                // Whether a PERSON ended this turn. Asked BEFORE the done gate below,
+                // because that gate reads it: Orca computes `interrupted` first and
+                // hands it to `resolveClaudePaneState` (`agent-hook-listener.ts:2962`
+                // then `:3126`), and asking after would gate on a flag that is still
+                // false for the event that just declared it. See
+                // `declare_pane_interrupt` for why the pane's memory is half the answer.
+                declare_pane_interrupt(&app, &mut report, &envelope.payload);
+                // Whatever this event says, it is a newer word than a parked
+                // all-clear: a lead that spoke again (a fresh prompt, a question, a
+                // newer stop) makes the held Done stale, and the gate below re-parks
+                // the ones that still stand.
+                app.state::<AppState>().pending_done().remove(&report.term);
+                if report.session_boundary {
+                    // A new process owns the pane: stale helpers belonged to the
+                    // conversation that ended, and left standing they would gate the
+                    // fresh session's idle row back up to working below — Orca
+                    // clears roster, tasks and crons on `SessionStart` (its comment
+                    // names the same reset Codex does).
+                    clear_pane_subagents(&app, report.term);
+                } else if report.state == zerocode_core::hook::HookState::Done
+                    && pane_still_working(&app, report.term, &envelope.payload, report.interrupted)
+                {
+                    // A turn that ends while helpers still run has not ended for the
+                    // PERSON. Stop is the lead's own word — with five helpers going,
+                    // letting it land dropped the card to the completed column and
+                    // rang a completion mid-work: the map's P0-4. Orca's
+                    // `resolveClaudePaneState` holds the pane at working on a live
+                    // roster or a non-empty background inventory; the roster here is
+                    // the same proxy (rows leave on `SubagentStop`), the inventory
+                    // is the payload's own.
+                    //
+                    // PARKED, not dropped: nothing else may ever say Done for this
+                    // turn — the lead already said it — so the last helper's stop
+                    // replays this as the all-clear (Orca re-derives the pane on
+                    // every roster change; the parked row is our spelling of its
+                    // `turnCompletedAt` pairing).
+                    app.state::<AppState>()
+                        .pending_done()
+                        .insert(report.term, (envelope.worktree_id.clone(), report.clone()));
+                    report.state = zerocode_core::hook::HookState::Working;
+                }
+                // An agent reporting through a hook has identified itself better than
+                // the argv guess ever could — a `claude` started by hand inside a plain
+                // shell says so here and nowhere else.
+                // Replaced, not merely filled in: a report that has been judged the
+                // pane's own IS the pane, and a first-writer-wins map left a person who
+                // quit one agent in a terminal and started another with a pane
+                // remembered as the old vendor forever — which then classified the new
+                // agent's every word as foreign and threw it away. The gate above is
+                // what makes overwriting safe.
+                app.state::<AppState>()
+                    .agent_terms()
+                    .insert(report.term, report.agent.slug());
+                // And which conversation it is. Kept rather than only forwarded, because
+                // the point of the id is to outlive the tab: the window asks for it again
+                // when somebody wants to reopen a session that was closed.
+                if let Some(reported) = report.session.clone() {
+                    // What this report says against the pane's record (t-68069), asked
+                    // before the record takes it. A report no door asked for already
+                    // chose its conversation: the window says which.
+                    let word = {
+                        let state = app.state::<AppState>();
+                        let record = state.pane_sessions().get(&report.term).cloned();
+                        conversation_wake::word_on_report(
+                            report.agent.slug(),
+                            report.term,
+                            record.as_ref(),
+                            &reported,
+                            || {
+                                zerocode_core::hook::session_start_resumed_parsed(
+                                    &report.event,
+                                    &zerocode_core::payload::HookPayload::of(&envelope.payload),
+                                )
+                            },
+                            |wanted| conversation_wake::holding_pane(state.inner(), wanted),
+                        )
+                    };
+                    // Replaced, but not stripped: an event that names the same
+                    // conversation without saying where it is written down keeps the
+                    // path the window already learned, or the conversation view goes
+                    // blank on the person's first message.
+                    let session = {
+                        let state = app.state::<AppState>();
+                        let mut held = state.pane_sessions();
+                        let carried = reported.carrying_forward(held.get(&report.term));
+                        held.insert(report.term, carried.clone());
+                        carried
+                    };
+                    codex_queue::bind_session(report.term, &session);
+                    orchestration::pane_session_reported(report.term, &session, now_epoch_ms());
+                    // The tool limits this conversation's launch put on it, said by
+                    // its agent's own start and kept for the resume that brings it
+                    // back after a restart (t-112277): the newest launch decides, so
+                    // a start that says none takes the record away.
+                    if let Some(reported) = zerocode_core::launch_limits::reported_by(
+                        &report.event,
+                        &zerocode_core::payload::HookPayload::of(&envelope.payload),
+                    ) {
+                        let state = app.state::<AppState>();
+                        if let Err(error) = crate::conversation_limits::keep(
+                            state.local_data_root(),
+                            report.agent.slug(),
+                            &session,
+                            &reported,
+                        ) {
+                            note_window_event(
+                                state.local_data_root(),
+                                &format!(
+                                    "term {} kept no tool limits for its {} conversation: {error}",
+                                    report.term,
+                                    report.agent.slug()
+                                ),
+                            );
+                        }
+                    }
+                    if let Some(word) = word {
+                        // A conversation no door named, that a wire of this window
+                        // holds (152): a second process on one transcript, opened in a
+                        // shell or by a picker inside the CLI, which runs already — so
+                        // the wire ends, and its page says where the conversation goes
+                        // on. Only such a report: a pane a door of this window opened
+                        // was asked of the wires before it started (`wake_conversation`,
+                        // the vault's door), and its report here says nothing new.
+                        let superseded = app.state::<AppState>().shell_runtime().wires.supersede(
+                            report.agent.slug(),
+                            &session,
+                            report.term,
+                        );
+                        if let Some(wire) = superseded {
+                            note_window_event(
+                                app.state::<AppState>().local_data_root(),
+                                &crate::wire_runtime::superseded_line(
+                                    report.term,
+                                    report.agent.slug(),
+                                    &session.id,
+                                    wire,
+                                ),
+                            );
+                        }
+                        let state = app.state::<AppState>();
+                        note_window_event(
+                            state.local_data_root(),
+                            &word.line(report.term, report.agent.slug(), &session.id),
+                        );
+                        if word.tells_the_coordinator() {
+                            orchestration::pane_conversation_picked(
+                                report.term,
+                                &session,
+                                now_epoch_ms(),
+                            );
+                        }
+                        let holder = match word {
+                            conversation_wake::ReportedWord::HeldBy(holder) => Some(holder),
+                            conversation_wake::ReportedWord::Picked => None,
+                        };
+                        say_pane_conversation(
+                            &app,
+                            report.term,
+                            word.word(),
+                            Some(&session.id),
+                            holder,
+                        );
+                    }
+                }
+                // And what it is doing, stamped, and out to the window. A turn whose model
+                // request failed tells the ledger so, and why, the road zo's own channel
+                // takes (t-69010) — a worker that hit a wall did not merely go quiet.
+                let failure = (report.state == zerocode_core::hook::HookState::Done)
+                    .then(|| {
+                        zerocode_core::hook::model_request_failure_parsed(
                             &report.event,
                             &zerocode_core::payload::HookPayload::of(&envelope.payload),
                         )
-                    },
-                    |wanted| conversation_wake::holding_pane(state.inner(), wanted),
-                )
-            };
-            // Replaced, but not stripped: an event that names the same
-            // conversation without saying where it is written down keeps the
-            // path the window already learned, or the conversation view goes
-            // blank on the person's first message.
-            let session = {
-                let state = app.state::<AppState>();
-                let mut held = state.pane_sessions();
-                let carried = reported.carrying_forward(held.get(&report.term));
-                held.insert(report.term, carried.clone());
-                carried
-            };
-            codex_queue::bind_session(report.term, &session);
-            orchestration::pane_session_reported(report.term, &session, now_epoch_ms());
-            // The tool limits this conversation's launch put on it, said by
-            // its agent's own start and kept for the resume that brings it
-            // back after a restart (t-112277): the newest launch decides, so
-            // a start that says none takes the record away.
-            if let Some(reported) = zerocode_core::launch_limits::reported_by(
-                &report.event,
-                &zerocode_core::payload::HookPayload::of(&envelope.payload),
-            ) {
-                let state = app.state::<AppState>();
-                if let Err(error) = crate::conversation_limits::keep(
-                    state.local_data_root(),
-                    report.agent.slug(),
-                    &session,
-                    &reported,
-                ) {
-                    note_window_event(
-                        state.local_data_root(),
-                        &format!(
-                            "term {} kept no tool limits for its {} conversation: {error}",
-                            report.term,
-                            report.agent.slug()
-                        ),
-                    );
-                }
-            }
-            if let Some(word) = word {
-                // A conversation no door named, that a wire of this window
-                // holds (152): a second process on one transcript, opened in a
-                // shell or by a picker inside the CLI, which runs already — so
-                // the wire ends, and its page says where the conversation goes
-                // on. Only such a report: a pane a door of this window opened
-                // was asked of the wires before it started (`wake_conversation`,
-                // the vault's door), and its report here says nothing new.
-                let superseded = app.state::<AppState>().shell_runtime().wires.supersede(
-                    report.agent.slug(),
-                    &session,
-                    report.term,
-                );
-                if let Some(wire) = superseded {
-                    note_window_event(
-                        app.state::<AppState>().local_data_root(),
-                        &crate::wire_runtime::superseded_line(
-                            report.term,
-                            report.agent.slug(),
-                            &session.id,
-                            wire,
-                        ),
-                    );
-                }
-                let state = app.state::<AppState>();
-                note_window_event(
-                    state.local_data_root(),
-                    &word.line(report.term, report.agent.slug(), &session.id),
-                );
-                if word.tells_the_coordinator() {
-                    orchestration::pane_conversation_picked(report.term, &session, now_epoch_ms());
-                }
-                let holder = match word {
-                    conversation_wake::ReportedWord::HeldBy(holder) => Some(holder),
-                    conversation_wake::ReportedWord::Picked => None,
-                };
-                say_pane_conversation(&app, report.term, word.word(), Some(&session.id), holder);
-            }
+                    })
+                    .flatten();
+                orchestration::with_turn_failure(report.term, failure, || {
+                    note_pane_state(&app, Some(&envelope.worktree_id), &report);
+                });
+                ring_for_pane(&app, &envelope.worktree_id, &report);
+                note_automation_completion(&app, &report);
+            },
+        );
+    }
+}
+
+/// Route a late hook only to the conversation page. A current report goes
+/// through the pane's usual state, session, completion and ledger updates.
+pub(crate) fn route_hook_report(
+    report: hooks::PaneHookReport,
+    fold: Option<zerocode_core::live_hook_turns::HookFold>,
+    tell_live: impl FnOnce(TermId),
+    publish: impl FnOnce(hooks::PaneHookReport),
+) {
+    if let Some(fold) = fold
+        && fold.late
+    {
+        if fold.drawn {
+            tell_live(report.term);
         }
-        // And what it is doing, stamped, and out to the window. A turn whose model
-        // request failed tells the ledger so, and why, the road zo's own channel
-        // takes (t-69010) — a worker that hit a wall did not merely go quiet.
-        let failure = (report.state == zerocode_core::hook::HookState::Done)
-            .then(|| {
-                zerocode_core::hook::model_request_failure_parsed(
-                    &report.event,
-                    &zerocode_core::payload::HookPayload::of(&envelope.payload),
-                )
-            })
-            .flatten();
-        orchestration::with_turn_failure(report.term, failure, || {
-            note_pane_state(&app, Some(&envelope.worktree_id), &report);
-        });
-        ring_for_pane(&app, &envelope.worktree_id, &report);
-        note_automation_completion(&app, &report);
+    } else {
+        publish(report);
     }
 }
 
@@ -1747,12 +1788,16 @@ pub(super) fn note_pane_state(
     let shown = crate::worker_question::heard(report, worktree, epoch_ms_now());
     // A CLI that writes its session once a turn has ended (Devin's ATIF
     // document, 29–34 ms after its Stop — t-124593) has not written this turn
-    // when the page reads at this event: the page hears the same news once
-    // more after its store has settled, and reads the turn then. A repeated
-    // state is news without a move to the page (`hook:agent`), so it asks
-    // nothing else again. Asked of the agent's store rows, never its name.
+    // when the page reads at this event. The file is looked at again at the
+    // store's waits (`TURN_WRITE_SETTLE`) — its size and time, never its bytes
+    // — and the page is told when it is new or moved since this event, and
+    // again when it moves on, until the page has read a document that holds
+    // the turn: a first change the page could not read yet (mid-write), and a
+    // long document written late under a busy disk land too, and a store that
+    // wrote nothing tells nothing (t-125261). Asked of the agent's store rows,
+    // never its name.
     if report.state == zerocode_core::hook::HookState::Done
-        && let Some(settle) = zerocode_core::vault::turn_write_settle(report.agent.slug())
+        && let Some(looks) = zerocode_core::vault::turn_write_settle(report.agent.slug())
     {
         let term = report.term;
         // This report's place in the window's record of the pane, written
@@ -1763,11 +1808,26 @@ pub(super) fn note_pane_state(
             .pane_states()
             .get(&term)
             .map(|held| held.at);
+        let session = report.session.as_ref().map(|session| session.id.clone());
+        let prompt_id = report
+            .prompt_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        let before_stamp = app
+            .state::<AppState>()
+            .pane_live_turns()
+            .get(&term)
+            .and_then(|live| live.stamp_at_stop(session.as_deref(), prompt_id.as_deref()));
         let watching = app.clone();
+        let probing = app.clone();
+        let reading = app.clone();
         let app = app.clone();
         let again = shown.clone();
-        tell_again_after(
-            settle,
+        tell_when_settled(
+            looks,
+            before_stamp,
             move || {
                 watching
                     .state::<AppState>()
@@ -1777,15 +1837,30 @@ pub(super) fn note_pane_state(
                     == told_at
             },
             move || {
-                // The binding remembers the turn's "no file" — a first turn's
-                // document did not exist yet — for up to a minute; let go, the
-                // page's read asks the disk again.
-                app.state::<AppState>()
-                    .pane_memo()
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .drop_pane(&term);
-                tell_window(&app, again);
+                // The binding remembers a first turn's "no file" for up to a
+                // minute — its document did not exist at the Stop — so it is
+                // let go before each look, and the disk is asked again.
+                if before_stamp.is_none() {
+                    probing
+                        .state::<AppState>()
+                        .pane_memo()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .drop_pane(&term);
+                }
+                transcript_file_stamp(&probing.state::<AppState>(), term)
+            },
+            move || {
+                reading
+                    .state::<AppState>()
+                    .pane_live_turns()
+                    .get(&term)
+                    .is_some_and(|live| {
+                        live.document_holds(session.as_deref(), prompt_id.as_deref())
+                    })
+            },
+            move || {
+                tell_window(&app, again.clone());
             },
         );
     }
@@ -1800,21 +1875,99 @@ pub(super) fn note_pane_state(
     }
 }
 
-/// Run `tell` once, `settle` from now, on a thread of its own, when
-/// `still_newest` says then that nothing newer has come — the second telling
-/// of a turn's end for a store that settles after it
-/// (`zerocode_core::vault::turn_write_settle`, t-124593).
-pub(crate) fn tell_again_after(
-    settle: Duration,
-    still_newest: impl FnOnce() -> bool + Send + 'static,
-    tell: impl FnOnce() + Send + 'static,
+/// A pane's bound session file as its size and time, its bytes unread — what
+/// the looks after a turn's end compare ([`tell_when_settled`]).
+fn transcript_file_stamp(state: &AppState, term: TermId) -> Option<FileStamp> {
+    file_stamp(&crate::pane_transcript::pane_transcript(state, term).ok()?)
+}
+
+/// A file's size and time of last write — the one mark the turns a page shows
+/// compare — or `None` while there is no file.
+pub(crate) type FileStamp = zerocode_core::live_hook_turns::DocStamp;
+
+pub(crate) fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()))
+}
+
+/// Whether a file is there now and is not the one stamped `before` — written
+/// since, or first written since.
+pub(crate) fn moved_since(before: Option<FileStamp>, now: Option<FileStamp>) -> bool {
+    now.is_some() && now != before
+}
+
+/// Looks at a store that settles after a turn at each wait of `looks`
+/// ([`zerocode_core::vault::TURN_WRITE_SETTLE`]), on a thread of its own, and
+/// runs `tell` at each look where `stamp` finds the file new or moved since
+/// `at_stop` — or since the look that last told: a change the page could not
+/// read yet is told again once the file moves on. The looks end once `landed`
+/// says the page read a document that holds the turn, once `still_newest`
+/// says a newer word came for the pane, and at the last of them (t-125261).
+pub(crate) fn tell_when_settled(
+    looks: &'static [Duration],
+    at_stop: Option<FileStamp>,
+    still_newest: impl Fn() -> bool + Send + 'static,
+    stamp: impl Fn() -> Option<FileStamp> + Send + 'static,
+    landed: impl Fn() -> bool + Send + 'static,
+    tell: impl Fn() + Send + 'static,
 ) {
     std::thread::spawn(move || {
-        std::thread::sleep(settle);
-        if still_newest() {
-            tell();
+        let mut told = at_stop;
+        for wait in looks {
+            std::thread::sleep(*wait);
+            if !still_newest() || landed() {
+                return;
+            }
+            let now = stamp();
+            if moved_since(told, now) {
+                tell();
+                told = now;
+            }
         }
     });
+}
+
+/// A hook of a pane whose CLI writes its session once a turn has ended, heard
+/// into the turns its page shows (`zerocode_core::live_hook_turns`,
+/// t-125261), with the file stamp at Stop (`doc_now`, before taking `held`).
+/// `None` for a CLI that writes as the
+/// turn goes: its pane keeps no such turns, and a pane that ran Devin and
+/// runs another CLI now lets the old ones go.
+pub(crate) fn hear_live_turn<'a>(
+    held: impl Fn() -> MutexGuard<'a, HashMap<TermId, LiveTurnBuffer>>,
+    report: &hooks::PaneHookReport,
+    payload: &str,
+    doc_now: impl FnOnce() -> Option<FileStamp>,
+    at_ms: i64,
+) -> Option<zerocode_core::live_hook_turns::HookFold> {
+    if zerocode_core::vault::turn_write_settle(report.agent.slug()).is_none() {
+        held().remove(&report.term);
+        return None;
+    }
+    let doc = if zerocode_core::hook::normalized_event(&report.event) == "stop" {
+        doc_now()
+    } else {
+        None
+    };
+    let session = report.session.as_ref().map(|session| session.id.as_str());
+    Some(held().entry(report.term).or_default().note_hook(
+        &report.event,
+        &zerocode_core::payload::HookPayload::of(payload),
+        session,
+        doc,
+        Some(at_ms),
+    ))
+}
+
+/// The pane a late hook drew on — a result after its turn's Stop — whose page
+/// reads it now, with no word of the pane's state (t-125261).
+#[derive(Clone, Serialize)]
+struct PaneLiveTurns {
+    term: TermId,
+}
+
+fn tell_live_turns(app: &AppHandle, term: TermId) {
+    let _ = app.emit("pane:live-turns", PaneLiveTurns { term });
 }
 
 /// 소식의 무게만큼 뒤에 적는다 — 새 대화 id는 `last_status::PERSIST_DEBOUNCE`,

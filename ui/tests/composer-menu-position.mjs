@@ -194,6 +194,164 @@ export async function testComposerMenuPosition(page, ok) {
     Boolean(spill) && spill.offTopBy === 0 && spill.offBottomBy === 0 && spill.flippedBelow,
     JSON.stringify({ ...palette, ...(spill ?? {}) }),
   );
+
+  // 6. At a narrow 320px viewport, a long list its CLI groups into families
+  //    (past 30 rows — Devin lists 1,302 in 55, t-125261) opens on a search
+  //    field: the menu stays inside the viewport, no row clipped, and a search
+  //    finds a model across the families.
+  await page.setViewportSize({ width: 320, height: 640 });
+  const narrowSearch = await page.evaluate(async () => {
+    const settle = (ms) => new Promise((done) => setTimeout(done, ms));
+    const chat = document.querySelector(`.pane-slot[data-term="${window.__TERM__}"] .pane-chat`);
+    chat.style.cssText = "";
+    const composer = chat?.querySelector(".worker-composer");
+    const chip = composer?.querySelector(".worker-composer-agent");
+    // Close any standing popup.
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await settle(60);
+    const many = Array.from({ length: 42 }, (_, at) => ({
+      id: `fam-${Math.floor(at / 7)}-v${at}`,
+      display_name: `Family ${Math.floor(at / 7)} Variant ${at} Very Long Display Name`,
+      provider: "claude",
+      family: `fam-${Math.floor(at / 7)}`,
+    }));
+    window.__ANSWER__.agent_models = () => many;
+    agentModelLists.clear();
+    chip?.click();
+    await settle(260);
+    const menu = composer?.querySelector(".composer-menu");
+    const search = menu?.querySelector(".composer-menu-search");
+    const m = menu?.getBoundingClientRect();
+    const s = search?.getBoundingClientRect();
+    const firstBtn = menu?.querySelector(".composer-menu-item")?.getBoundingClientRect();
+    const beforeCount = menu?.querySelectorAll(".composer-menu-item").length ?? 0;
+    if (search) {
+      search.value = "fam-5-v38";
+      search.dispatchEvent(new Event("input", { bubbles: true }));
+      await settle(40);
+    }
+    const filteredNames = [...(menu?.querySelectorAll(".composer-menu-models .composer-menu-item .composer-menu-name") ?? [])]
+      .map((node) => node.textContent);
+    const vw = Math.round(innerWidth);
+    return {
+      vw,
+      hasSearch: Boolean(search),
+      menuInWindow: Boolean(m) && Math.round(m.left) >= -2 && Math.round(m.right) <= vw + 2,
+      searchVisible: Boolean(s) && s.width > 120 && Math.round(s.right) <= vw + 2,
+      buttonUnclipped: Boolean(firstBtn) && Math.round(firstBtn.left) >= Math.round(m.left) - 1 && Math.round(firstBtn.right) <= Math.round(m.right) + 1 && Math.round(firstBtn.right) <= vw + 2,
+      beforeCount,
+      filteredNames,
+    };
+  });
+  ok(
+    "at 320px width, a long (>30) model list opens a searchable menu inside the viewport with unclipped buttons and filters across families",
+    narrowSearch.hasSearch && narrowSearch.menuInWindow && narrowSearch.searchVisible &&
+      narrowSearch.buttonUnclipped && narrowSearch.beforeCount > 6 &&
+      narrowSearch.filteredNames.length === 1 && narrowSearch.filteredNames[0].includes("Variant 38"),
+    JSON.stringify(narrowSearch),
+  );
+  await page.keyboard.press("Escape");
+  await page.setViewportSize({ width: 1280, height: 900 });
+
+  // 7. A long list with no families keeps the flat menu it had: zo's own
+  //    catalog lists 32 models with none (2026-11-22), and only a list its CLI
+  //    groups into families stands a search field (t-125261).
+  const flat = await page.evaluate(async () => {
+    const settle = (ms) => new Promise((done) => setTimeout(done, ms));
+    const chat = document.querySelector(`.pane-slot[data-term="${window.__TERM__}"] .pane-chat`);
+    chat.style.cssText = "";
+    const composer = chat?.querySelector(".worker-composer");
+    const chip = composer?.querySelector(".worker-composer-agent");
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await settle(60);
+    window.__ANSWER__.agent_models = () => Array.from({ length: 32 }, (_, at) => ({
+      id: `model-${at}`,
+      display_name: `Model ${at}`,
+      provider: "claude",
+    }));
+    agentModelLists.clear();
+    chip?.click();
+    await settle(260);
+    const menu = composer?.querySelector(".composer-menu");
+    const models = [];
+    let heads = 0;
+    for (const node of menu?.children ?? []) {
+      if (node.classList.contains("composer-menu-head")) heads += 1;
+      else if (heads === 1 && node.classList.contains("composer-menu-item")) {
+        models.push(`${node.querySelector(".composer-menu-name")?.textContent}|${node.querySelector(".composer-menu-sub")?.textContent ?? ""}`);
+      }
+    }
+    const search = Boolean(menu?.querySelector(".composer-menu-search"));
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await settle(60);
+    return { search, models };
+  });
+  ok(
+    "a long model list with no families — zo's own catalog lists 32 — keeps its flat menu: every row in order, its id beneath, no search field",
+    !flat.search && flat.models.join(",") === Array.from({ length: 32 }, (_, at) => `Model ${at}|model-${at}`).join(","),
+    JSON.stringify(flat),
+  );
+
+  // 8. Every CLI's chip menu shares one shape (t-125261 F6). A short name
+  //    stands whole beside its id, and the id gives way first — at 320px as
+  //    at a wide window, as the names of the CLIs that list short ones always
+  //    read. A name longer than the window ends in an ellipsis inside the
+  //    menu, and the menu stays inside the window, where such a row once
+  //    carried it past the window's edge.
+  const shapes = {};
+  for (const width of [320, 1280]) {
+    await page.setViewportSize({ width, height: 900 });
+    shapes[width] = await page.evaluate(async () => {
+      const settle = (ms) => new Promise((done) => setTimeout(done, ms));
+      const chat = document.querySelector(`.pane-slot[data-term="${window.__TERM__}"] .pane-chat`);
+      chat.style.cssText = "";
+      const composer = chat?.querySelector(".worker-composer");
+      const chip = composer?.querySelector(".worker-composer-agent");
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      await settle(60);
+      // About 330 characters, past 2,000px at the menu's size: longer than either window.
+      const longName = Array.from({ length: 8 }, () => "Example Model Whose Display Name Runs On").join(" ");
+      window.__ANSWER__.agent_models = () => [
+        { id: "example-short-a-2026-01-01-with-a-long-identifier", display_name: "Short A", provider: "claude" },
+        { id: "example-short-b-2026-01-01-with-a-long-identifier", display_name: "Short B", provider: "claude" },
+        { id: "example-long", display_name: longName, provider: "claude" },
+      ];
+      agentModelLists.clear();
+      chip?.click();
+      await settle(260);
+      const menu = composer?.querySelector(".composer-menu");
+      const m = menu?.getBoundingClientRect();
+      const named = (words) => [...(menu?.querySelectorAll(".composer-menu-item .composer-menu-name") ?? [])]
+        .filter((name) => words(name.textContent));
+      const whole = (node) => node.scrollWidth <= node.clientWidth + 1;
+      const inside = (node) => {
+        const r = node.getBoundingClientRect();
+        return Boolean(m) && r.left >= m.left - 1 && r.right <= m.right + 1;
+      };
+      const short = named((text) => text.startsWith("Short "));
+      const long = named((text) => text === longName);
+      const shape = {
+        vw: Math.round(innerWidth),
+        short: short.map((name) => ({ whole: whole(name), inside: inside(name) })),
+        long: long.map((name) => ({ whole: whole(name), inside: inside(name) })),
+        menu: m ? { left: Math.round(m.left), right: Math.round(m.right), width: Math.round(m.width) } : null,
+      };
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      await settle(60);
+      return shape;
+    });
+  }
+  ok(
+    "every CLI's chip menu keeps a short name whole beside its id and ends a name longer than the window in an ellipsis inside the menu, the menu inside the window — at 320px and at 1280px (t-125261)",
+    [320, 1280].every((width) => {
+      const shape = shapes[width];
+      return shape.short.length === 2 && shape.short.every((name) => name.whole && name.inside) &&
+        shape.long.length === 1 && !shape.long[0].whole && shape.long[0].inside &&
+        shape.menu !== null && shape.menu.left >= 0 && shape.menu.right <= shape.vw;
+    }),
+    JSON.stringify(shapes),
+  );
+  await page.setViewportSize({ width: 1280, height: 900 });
 }
 
 /* ---- how the composer's menus open and close (2026-11-08) ------------------

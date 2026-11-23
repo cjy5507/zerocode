@@ -143,14 +143,14 @@ pub fn format_tokens_compact(tokens: u64) -> String {
 
 /// Estimate a token sample using the model-specific public pricing table.
 #[must_use]
-pub fn estimate_usage_cost(model: &str, usage: TokenUsage) -> UsageCostEstimate {
+pub fn estimate_usage_cost(model: &str, usage: TokenUsage) -> Option<UsageCostEstimate> {
     core_types::usage::estimate_usage_cost(model, usage)
 }
 
 /// Return the total estimated USD cost as a number for machine consumers.
 #[must_use]
-pub fn estimated_cost_usd(model: &str, usage: TokenUsage) -> f64 {
-    estimate_usage_cost(model, usage).total_cost_usd()
+pub fn estimated_cost_usd(model: &str, usage: TokenUsage) -> Option<f64> {
+    estimate_usage_cost(model, usage).map(UsageCostEstimate::total_cost_usd)
 }
 
 /// Format a cost with the same two-decimal presentation as the forge HUD.
@@ -163,16 +163,10 @@ pub fn format_cost_usd(amount: f64) -> String {
     }
 }
 
-/// Format a model-aware estimated cost. Unknown models use the fallback tier
-/// and are marked with `~` so a status line cannot imply a metered bill.
+/// Format a model-aware estimated cost.
 #[must_use]
 pub fn format_estimated_cost(model: &str, usage: TokenUsage) -> String {
-    let prefix = if runtime::pricing_for_model(model).is_some() {
-        ""
-    } else {
-        "~"
-    };
-    format!("{prefix}{}", format_cost_usd(estimated_cost_usd(model, usage)))
+    estimated_cost_usd(model, usage).map_or_else(|| "unknown".to_string(), format_cost_usd)
 }
 
 /// The provider's input-side context occupancy for a usage sample.
@@ -877,29 +871,25 @@ mod tests {
     }
 
     #[test]
-    fn cost_uses_known_model_pricing_and_marks_fallbacks() {
-        let model = api::resolve_catalog_alias(api::OPENAI_LATEST_MODEL_ALIAS);
+    fn cost_uses_known_prices_and_marks_unpriced_totals() {
+        let model = "gpt-5.4";
         let usage = TokenUsage {
-            input_tokens: 1_000_000,
+            input_tokens: 100_000,
             output_tokens: 1_000_000,
             ..TokenUsage::default()
         };
-        assert_eq!(
-            format_estimated_cost(&model, usage),
-            format_cost_usd(estimated_cost_usd(&model, usage))
-        );
-        let fallback = format_estimated_cost("unknown-model", usage);
-        assert_eq!(
-            fallback,
-            format!("~{}", format_cost_usd(estimated_cost_usd("unknown-model", usage)))
-        );
+        assert_eq!(estimated_cost_usd(model, usage), Some(15.25));
+        assert_eq!(format_estimated_cost(model, usage), "$15.25");
+        let long = TokenUsage { input_tokens: 300_000, ..usage };
+        assert_eq!(format_estimated_cost(model, long), "unknown");
+        assert_eq!(format_estimated_cost("synthetic-cli-model", usage), "unknown");
+        assert_eq!(estimated_cost_usd("synthetic-cli-model", usage), None);
         assert_eq!(format_cost_usd(0.0001), "$0.00");
-        assert!(estimated_cost_usd(&model, usage) > 0.0);
     }
 
     #[test]
     fn usage_status_uses_input_side_context_not_output_tokens() {
-        let model = api::resolve_catalog_alias(api::OPENAI_LATEST_MODEL_ALIAS);
+        let model = "gpt-5.4";
         let usage = TokenUsage {
             input_tokens: 20,
             output_tokens: 8,
@@ -908,7 +898,7 @@ mod tests {
             output_tokens_details: None,
         };
         assert_eq!(usage_context_tokens(usage), 24);
-        let status = format_usage_status(&model, usage, 100);
+        let status = format_usage_status(model, usage, 100);
         assert!(status.contains("ctx 24.0%"));
         assert!(status.contains("tokens 32"));
         assert!(status.contains("cost $"));

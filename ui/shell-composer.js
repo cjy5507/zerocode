@@ -1498,6 +1498,9 @@ function standComposerSlash(pane, anchor) {
  * `right: 0` against the sticky form put it at the top right while the chip
  * was at the bottom left, and `bottom: 100%` cleared the whole box. */
 function standComposerMenu(menu, chip) {
+  // The room the window leaves it, its edges kept: the menu's width stands
+  // inside it (`.composer-menu`, t-125261 — a row longer than the window).
+  menu.style.setProperty("--menu-room", `${window.innerWidth - 2 * MENU_EDGE_KEEP}px`);
   // Measured at its own size, under the painter's cap, before being placed.
   menu.style.maxHeight = "";
   const cap = parseFloat(getComputedStyle(menu).maxHeight) || Infinity;
@@ -1643,9 +1646,128 @@ function standOpenComposerMenu(chip, menu) {
   const watch = new ResizeObserver(stand);
   watch.observe(chip.closest(".worker-composer") ?? chip);
   openMenu = { node: menu, chip, away, keys, stand, watch, frame: 0 };
-  // The ticked row first — a selector list answers in document order, which
-  // stood the focus on the first row whatever was ticked.
-  (menu.querySelector('[aria-current="true"]') ?? menu.querySelector(".composer-menu-item"))?.focus();
+  // A menu with a search field opens on it; any other on its ticked row — a
+  // selector list answers in document order, which stood the focus on the
+  // first row whatever was ticked.
+  (menu.querySelector(".composer-menu-search") ?? menu.querySelector('[aria-current="true"]') ?? menu.querySelector(".composer-menu-item"))?.focus();
+}
+
+/* A model list its CLI groups into families and that runs past
+ * `COMPOSER_MODEL_SEARCH_THRESHOLD` rows — Devin's `models list`: 55 families,
+ * 1,302 models (t-124593) — opens on a search field over its families, so
+ * every model is reached without a wall of a thousand rows (t-125261). A list
+ * with no families keeps its flat menu, however long: zo's own catalog lists
+ * 32 models with none (2026-11-22), and its menu stands as it did. With no
+ * words typed the menu shows the ticked model, then each family's first
+ * `COMPOSER_MODEL_PER_FAMILY` rows, `COMPOSER_MODEL_FIRST_ROWS` at most; a
+ * search shows `COMPOSER_MODEL_MATCH_ROWS` matches at most, and says how many
+ * more it holds. */
+const COMPOSER_MODEL_SEARCH_THRESHOLD = 30;
+const COMPOSER_MODEL_PER_FAMILY = 6;
+const COMPOSER_MODEL_FIRST_ROWS = 120;
+const COMPOSER_MODEL_MATCH_ROWS = 80;
+
+/* The model rows of a chip's menu — the conversation's composer and the
+ * 「새 대화」 start screen alike: flat, or behind a search field for a long
+ * grouped list (above). `defaultRow`, when given, stands first. */
+function appendComposerModelRows(menu, models, { current = "", onPick, defaultRow = null, showSub = true } = {}) {
+  const addRow = (host, row) => {
+    const words = row.display_name || row.id;
+    const sub = showSub ? row.id : (words === row.id ? "" : row.id);
+    return composerMenuItem(host, words, sub, () => onPick(row.id), { current: row.id === current });
+  };
+  const grouped = models.some((row) => Boolean(row.family));
+  if (!grouped || models.length <= COMPOSER_MODEL_SEARCH_THRESHOLD) {
+    if (defaultRow) {
+      composerMenuItem(menu, defaultRow.words, defaultRow.sub, defaultRow.on, { current: defaultRow.current });
+    }
+    for (const row of models) addRow(menu, row);
+    return;
+  }
+  const search = document.createElement("input");
+  search.type = "search";
+  search.className = "composer-menu-search";
+  search.dataset.keyboardOwner = "true";
+  const label = t("composer.menu.searchModels", "모델 찾기…");
+  search.placeholder = label;
+  search.setAttribute("aria-label", label);
+  const host = document.createElement("div");
+  host.className = "composer-menu-models";
+  const render = () => {
+    host.replaceChildren();
+    const query = search.value.trim().toLowerCase();
+    if (query === "" && defaultRow) {
+      composerMenuItem(host, defaultRow.words, defaultRow.sub, defaultRow.on, { current: defaultRow.current });
+    }
+    let visible = [];
+    let hidden = 0;
+    if (query === "") {
+      const seenIds = new Set();
+      const currentRow = current ? models.find((row) => row.id === current) : null;
+      if (currentRow) {
+        visible.push(currentRow);
+        seenIds.add(currentRow.id);
+      }
+      const familyCounts = new Map();
+      for (const row of models) {
+        if (seenIds.has(row.id)) continue;
+        if (visible.length >= COMPOSER_MODEL_FIRST_ROWS) {
+          hidden += 1;
+          continue;
+        }
+        const fam = row.family ?? "";
+        const count = familyCounts.get(fam) ?? 0;
+        if (fam && count >= COMPOSER_MODEL_PER_FAMILY) {
+          hidden += 1;
+          continue;
+        }
+        familyCounts.set(fam, count + 1);
+        seenIds.add(row.id);
+        visible.push(row);
+      }
+    } else {
+      const terms = query.split(/\s+/).filter(Boolean);
+      const matched = models.filter((row) => {
+        const hay = `${row.display_name ?? ""} ${row.id ?? ""} ${row.family ?? ""}`.toLowerCase();
+        return terms.every((term) => hay.includes(term));
+      });
+      visible = matched.slice(0, COMPOSER_MODEL_MATCH_ROWS);
+      hidden = Math.max(0, matched.length - visible.length);
+    }
+    if (visible.length === 0) {
+      const none = document.createElement("p");
+      none.className = "composer-menu-empty";
+      none.textContent = t("composer.menu.searchNone", "「{{query}}」에 맞는 모델이 없습니다", { query: search.value.trim() });
+      host.appendChild(none);
+      return;
+    }
+    let lastFamily = null;
+    for (const row of visible) {
+      if (row.family && row.family !== lastFamily) {
+        lastFamily = row.family;
+        const famHead = document.createElement("div");
+        famHead.className = "composer-menu-family";
+        famHead.textContent = row.family;
+        host.appendChild(famHead);
+      }
+      addRow(host, row);
+    }
+    if (hidden > 0) {
+      const more = document.createElement("p");
+      more.className = "composer-menu-empty composer-menu-more";
+      more.textContent = t("composer.menu.searchMore", "그 외 {{n}}개는 위에서 검색하세요", { n: hidden });
+      host.appendChild(more);
+    }
+  };
+  search.addEventListener("input", render);
+  search.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      host.querySelector(".composer-menu-item")?.focus();
+    }
+  });
+  menu.append(search, host);
+  render();
 }
 
 /* The chip's menu: the models this CLI drives, the current one ticked, then
@@ -1674,10 +1796,11 @@ async function openComposerMenu(chip, run, spec) {
       none.className = "composer-menu-empty";
       none.textContent = t("composer.menu.noModels", "모델 목록을 읽지 못했습니다");
       menu.appendChild(none);
-    }
-    for (const row of models) {
-      item(row.display_name, row.id, () => void road.setModel(row.id).catch((error) => showError(error)), {
-        current: row.id === current,
+    } else {
+      appendComposerModelRows(menu, models, {
+        current,
+        onPick: (id) => void road.setModel(id).catch((error) => showError(error)),
+        showSub: true,
       });
     }
   }

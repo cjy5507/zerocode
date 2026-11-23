@@ -475,6 +475,10 @@ function seedPaneSessions() {
             session: row.session,
             resumable: row.resumable,
           });
+          if (syncPaneChatSession(row.term)) {
+            if (!windowAway()) paintPaneChat(row.term);
+            readPaneChatOnHook(row.term);
+          }
         }
         agentClock.sync();
       },
@@ -10699,9 +10703,7 @@ listen("hook:activity", (event) => {
   // A tool call is a line in the transcript already; the conversation view on
   // this pane, if it is up, reads it now (`pollHelperPages` is the one reader).
   const term = Number(/^term:(\d+)$/.exec(pane)?.[1]);
-  if (Number.isInteger(term) && paneChatOn(term) && activeHelperPage()?.worker.term === term) {
-    void pollHelperPages();
-  }
+  if (Number.isInteger(term) && paneChatOn(term)) readPaneChatOnHook(term);
   // Sidebar rows and graph nodes both show the current activity. The shared
   // paint coalescer still asks the backend once; keyed graph nodes update only
   // this line and reuse the unchanged topology and edges.
@@ -13788,15 +13790,6 @@ listen("hook:agent", (event) => {
   const askPage = paneChats.get(term);
   const passedEnds = askPage?.askPassed === true && hookStates.get(term) !== state;
   if (passedEnds) askPage.askPassed = false;
-  if (agent && !(asking && !shaped)) standPaneConversation(term);
-  if (paneChatOn(term)) {
-    if (asking && !shaped) setPaneChat(term, false);
-    else if (askNow !== askBefore || passedEnds) paintPaneChat(term);
-    // The transcript this page reads was written before the hook fired — the
-    // answer before Stop, the call before PreToolUse — so the page on this
-    // pane reads it now, not on its next tick.
-    if (activeHelperPage()?.worker.term === term) void pollHelperPages();
-  }
   // Which conversation, when the event said. Recorded before the early return
   // below: a repeated state is still the event that told us the session id, and
   // returning first would drop it for any agent whose first report is a second
@@ -13821,6 +13814,16 @@ listen("hook:agent", (event) => {
   // once the new one holds the pane, never dropped with the old record.
   const replaced = named && paneSessions.get(term)?.carriedOnly ? paneSessions.get(term) : null;
   if (session) paneSessions.set(term, { agent, session, resumable: event.payload.resumable });
+  const changedPage = syncPaneChatSession(term);
+  const opened = agent && !(asking && !shaped) && standPaneConversation(term);
+  if (paneChatOn(term)) {
+    if (asking && !shaped) setPaneChat(term, false);
+    else if (!windowAway() && (changedPage || askNow !== askBefore || passedEnds)) paintPaneChat(term);
+    // The transcript this page reads was written before the hook fired — the
+    // answer before Stop, the call before PreToolUse — so the page on this
+    // pane reads it now, not on its next tick.
+    if (!opened) readPaneChatOnHook(term);
+  }
   if (named) settleOwed(agent, session.id);
   if (replaced) keepOwed(term, replaced);
   else if (named) void tellOwed(tabOfTerm(term)?.worktree);
@@ -14262,8 +14265,11 @@ const workerClock = idlePoller({
 function tickWorkers() {
   const active = activeRunningPage();
   if (!active) return;
+  const elapsed = workerElapsedWords(active.run);
   const face = active.host.querySelector(".worker-elapsed");
-  if (face) writeTextContent(face, workerElapsedWords(active.run));
+  if (face) writeTextContent(face, elapsed);
+  const footClock = active.host.querySelector(".helper-status-clock");
+  if (footClock) writeTextContent(footClock, elapsed);
 }
 
 function workerStatusWords(run) {
@@ -14460,6 +14466,9 @@ function forgetHeldTurns(held) {
   held.above = false;
   held.gone?.clear();
   held.earlierSaid = null;
+  held.reaching = false;
+  clearTimeout(held.quickFollow);
+  held.quickFollow = null;
   held.from = held.id === WIRE_LOG_ID ? held.historyEnd ?? 0 : null;
   held.epoch = (held.epoch ?? 0) + 1;
 }
@@ -15192,7 +15201,10 @@ function paneChatOf(term) {
      * (09-16: 66 MB, minutes of old turns scrolling in). `from: null` until
      * that read says where it began; what stands above is read up from there
      * (「이전 기록 더 보기」). */
-    helper: { id: PANE_LOG_ID, next: null, turns: [], seq: 0, skipped: false, found: null, from: null },
+    helper: {
+      id: PANE_LOG_ID, session: paneSessions.get(term)?.session?.id ?? null,
+      next: null, turns: [], seq: 0, skipped: false, found: null, from: null,
+    },
   };
   held = {
     on: false,
@@ -15205,6 +15217,23 @@ function paneChatOf(term) {
   };
   paneChats.set(term, held);
   return held;
+}
+
+// A terminal can start a different conversation. Clear the page before
+// requesting its file, even if the replacement has not written one yet.
+function syncPaneChatSession(term) {
+  const held = paneChats.get(term)?.run.helper;
+  const session = paneSessions.get(term)?.session?.id ?? null;
+  if (!held || held.session === session) return false;
+  forgetHeldTurns(held);
+  held.session = session;
+  held.next = null;
+  held.found = null;
+  held.liveTurns = [];
+  held.liveSig = "";
+  held.filling = false;
+  held.dirtyPaint = true;
+  return true;
 }
 
 function paneChatOn(term) {
@@ -15354,6 +15383,7 @@ function standPaneConversation(term) {
   held.firstView ??= agentPaneFirstView;
   if (held.on || held.chosen || held.firstView === AGENT_PANE_FIRST_VIEWS.terminal) return;
   void setPaneChat(term, true, { wire: false });
+  return true;
 }
 
 /* ---- 판 머리 (2차 B, item 8) ----
@@ -15946,10 +15976,43 @@ const helperClock = idlePoller({
   tick: () => void pollHelperPages(),
 });
 
+/* Request a refresh of the terminal pane's conversation in front. */
+function readPaneChatOnHook(term) {
+  const run = activeHelperPage()?.worker;
+  if (run?.helper?.id === PANE_LOG_ID && run.term === term) void pollHelperPages();
+}
+
+document.addEventListener("visibilitychange", () => {
+  const held = activeHelperPage()?.worker.helper;
+  if (held?.id !== PANE_LOG_ID) return;
+  if (windowAway()) {
+    clearTimeout(held.quickFollow);
+    held.quickFollow = null;
+    return;
+  }
+  held.resumeRead = true;
+  void pollHelperPages();
+});
+
+// A hook of a turn that has ended drew on the pane's page — a result that came
+// after its turn's Stop — and said nothing of the pane's state, so no
+// `hook:agent` follows it: the page on screen reads it (t-125261).
+listen("pane:live-turns", ({ payload }) => {
+  const term = payload?.term;
+  if (paneChatOn(term)) readPaneChatOnHook(term);
+});
+
+/* Terminal pane logs wait until the window is visible. Wire updates keep
+ * reading their session state while the window is hidden. */
+function paneLogReadDeferred(held) {
+  return held.id === PANE_LOG_ID && windowAway();
+}
+
 async function pollHelperPages() {
   const tab = activeHelperPage();
   if (!tab) return;
   const held = tab.worker.helper;
+  if (paneLogReadDeferred(held)) return;
   // News that arrives while a read is out is not lost: the read that is out
   // cannot carry it, so one more follows it (`wire:update` between polls).
   if (held.polling) {
@@ -15957,6 +16020,8 @@ async function pollHelperPages() {
     return;
   }
   held.polling = true;
+  const resumed = held.resumeRead === true;
+  held.resumeRead = false;
   const after = held.next;
   // A page that let everything go while the read was out (`forgetHeldTurns`)
   // asks again from its new place; what this read brings is not for it.
@@ -15992,7 +16057,11 @@ async function pollHelperPages() {
           // the agent may name its transcript on a later report.
           if (held.found !== false) {
             held.found = false;
-            if (activeHelperPage() === tab) paintHelperSurface(tab);
+            held.dirtyPaint = true;
+          }
+          if (held.dirtyPaint && !document.hidden && activeHelperPage() === tab) {
+            held.dirtyPaint = false;
+            paintHelperSurface(tab);
           }
           return;
         }
@@ -16014,11 +16083,9 @@ async function pollHelperPages() {
         // only from the PANE's own transcript: a helper's file names the helper's
         // model, and `tab.worker.term` is its parent's — writing it down there made
         // the parent's chip and row say a model the parent was not running.
-        if (held.id === PANE_LOG_ID && !ended(tab.worker.term) && more.model && tab.worker.term !== undefined && !paneModels.get(tab.worker.term)) {
-          paneModels.set(tab.worker.term, more.model);
-          if (activeHelperPage() === tab) paintHelperSurface(tab);
-          paintStatusModel();
-        }
+        const modelMoved = held.id === PANE_LOG_ID && !ended(tab.worker.term) && more.model &&
+          tab.worker.term !== undefined && !paneModels.get(tab.worker.term);
+        if (modelMoved) paneModels.set(tab.worker.term, more.model);
         const replaced = after !== null && more.next < after;
         if (replaced) forgetHeldTurns(held);
         // Where the page holds its file from (t-82901): the first read — the
@@ -16046,11 +16113,23 @@ async function pollHelperPages() {
           }
         }
         held.next = more?.next ?? held.next;
+        const incomingLive = Array.isArray(more?.live_turns) ? more.live_turns : [];
+        const liveSig = incomingLive.length > 0 ? JSON.stringify(incomingLive) : "";
+        const liveMoved = (held.liveSig ?? "") !== liveSig;
+        if (liveMoved) {
+          held.liveSig = liveSig;
+          held.liveTurns = incomingLive;
+        }
         // A wire's log carries the session's state beside its turns — status, the
         // open question, model, mode, commands. It lives on the run (the page and
         // the composer read it there), and a change repaints with no new turn.
         const wireMoved = held.id === WIRE_LOG_ID ? holdWireState(tab.worker, more) : { state: false, live: false };
         const wireChanged = wireMoved.state || wireMoved.live;
+        const dataMoved = Boolean(more?.turns?.length) || replaced || skippedNow || wireChanged ||
+          usageMoved || modelMoved || aboutMoved || firstAnswer || liveMoved;
+        // What a read nobody looks at brought is held and drawn by the next read
+        // of a page on screen (`dirtyPaint`), whatever that read brings itself.
+        if (dataMoved && (document.hidden || activeHelperPage() !== tab)) held.dirtyPaint = true;
         if (document.hidden || activeHelperPage() !== tab) return;
         // The page on screen is drawn — by this answer's paint below, or already:
         // what stands above its newest turns is read once that frame is up.
@@ -16058,7 +16137,10 @@ async function pollHelperPages() {
         // A pane's page shows its hooks as well as its file (`paneChatKey`): a read
         // that brought no new line repaints once when a hook moved since the paint.
         const hooksMoved = held.id === PANE_LOG_ID && held.hookKey !== paneChatKey(tab.worker.term);
-        if (!more?.turns?.length && !replaced && !skippedNow && !wireChanged && !usageMoved && !hooksMoved && !aboutMoved && !firstAnswer) return;
+        const dirtyPaint = held.dirtyPaint === true;
+        if (!dataMoved && !hooksMoved && !dirtyPaint) return;
+        held.dirtyPaint = false;
+        if (modelMoved || (dirtyPaint && held.id === PANE_LOG_ID)) paintStatusModel();
         if (wireMoved.state) syncWorkerComposers(tab.worker);
         if (wireMoved.state) settleComposerQueue(tab.worker);
         // 컨텍스트가 움직였다 — 미터만 갈아입는다(턴은 그대로일 수 있다).
@@ -16067,7 +16149,7 @@ async function pollHelperPages() {
         // 않고, 그림도 온 턴만 잇는다(`syncHelperTurns`). 말만 움직였으면 그 말이
         // 흐르는 행과 발밑 줄만 그린다(t-22095).
         const wordsOnly = wireMoved.live && !wireMoved.state && !more?.turns?.length && !replaced && !skippedNow &&
-          !usageMoved && !hooksMoved && !aboutMoved;
+          !usageMoved && !hooksMoved && !aboutMoved && !liveMoved && !dirtyPaint;
         if (wordsOnly) paintHelperWords(tab);
         else paintHelperSurface(tab);
         // The file goes on past this chunk (a page opened late on a long
@@ -16080,10 +16162,9 @@ async function pollHelperPages() {
         } else if (activeHelperPage() === tab) {
           const term = tab.worker?.term;
           const working = term !== undefined && (hookStates.get(term) === "working" || isMidTurn(hookStates.get(term)));
-          if ((working || (more?.turns?.length ?? 0) > 0) && !held.quickFollow) {
-            held.quickFollow = true;
-            setTimeout(() => {
-              held.quickFollow = false;
+          if ((working || (more?.turns?.length ?? 0) > 0) && !held.quickFollow && !resumed && !held.resumeRead) {
+            held.quickFollow = setTimeout(() => {
+              held.quickFollow = null;
               if (activeHelperPage() === tab) void pollHelperPages();
             }, 160);
           }
@@ -16128,6 +16209,7 @@ function readerAway(run) {
 async function readEarlierTurns(run) {
   const held = run?.helper;
   if (!held || held.reaching || !(held.from > 0)) return;
+  if (paneLogReadDeferred(held)) return;
   const before = held.from;
   const epoch = held.epoch;
   held.reaching = true;
@@ -16143,11 +16225,12 @@ async function readEarlierTurns(run) {
   } catch {
     above = null;
   } finally {
-    held.reaching = false;
+    if (held.epoch === epoch) held.reaching = false;
   }
   // A page that went back to its newest turns, or whose file was replaced,
   // while the read was out holds from elsewhere: what came is not above it.
-  if (held.epoch === epoch && held.from === before) {
+  if (held.epoch !== epoch) return;
+  if (held.from === before) {
     if (above === null || above.found === false) {
       held.earlierSaid = "failed";
     } else if (Number.isFinite(above.start) && above.start < before) {
@@ -16177,7 +16260,12 @@ function fillAboveOnce(run) {
   held.filling = false;
   if (!(held.from > 0)) return;
   // Asked from a task after the frame: nothing in the frame waits on it.
-  requestAnimationFrame(() => setTimeout(() => void readEarlierTurns(run)));
+  const epoch = held.epoch;
+  requestAnimationFrame(() => setTimeout(() => {
+    if (held.epoch !== epoch) return;
+    if (paneLogReadDeferred(held)) held.filling = true;
+    else void readEarlierTurns(run);
+  }));
 }
 
 /* The page's two doors worn again — the way up and the way to the newest. */
@@ -17894,6 +17982,7 @@ function syncHelperTurns(list, run) {
     run.helper.gone?.clear();
     list.__lastAnswer = null;
     list.__tailed = null;
+    syncProvisionalTurns(list, run);
     syncHelperTasks(list, run);
     syncStreamingTurns(list, run);
     syncHelperReport(list, run);
@@ -17981,7 +18070,9 @@ function syncHelperTurns(list, run) {
     // kind right above it (t-15682): one row for them, drawn once, its members
     // when it opens. The same rule stands what is read from above
     // (`standEarlierRows`).
-    const tail = streaming ?? helperListTail(list);
+    // Before the rows of a turn its CLI has not written yet, too
+    // (`syncProvisionalTurns`): a row of the document never joins one of them.
+    const tail = list.querySelector(":scope > .is-provisional") ?? streaming ?? helperListTail(list);
     const joined = joinTurnBeside(list, run, turn, tail ? tail.previousElementSibling : list.lastElementChild, tail, true, folded, spoken);
     if (joined) {
       if (joined.classList.contains("helper-group")) {
@@ -18015,7 +18106,7 @@ function syncHelperTurns(list, run) {
   // again — and only those, so a settled row is never touched; an open
   // pill's rows the same. The pills that took a turn, and those with a call
   // still out, say their words again: counted from their members' turns.
-  for (const row of list.querySelectorAll(":scope > .is-tool.is-live, :scope > .helper-group > .helper-group-body > .is-tool.is-live")) {
+  for (const row of list.querySelectorAll(":scope > .is-tool.is-live:not(.is-provisional), :scope > .helper-group > .helper-group-body > .is-tool.is-live")) {
     dressToolTurn(row, row.__turn, run, spoken);
     if (row.parentElement !== list) continue;
     // A shell step that came back shows its first lines, which the shelf
@@ -18055,6 +18146,7 @@ function syncHelperTurns(list, run) {
   // the foot, or under a pin the page itself holds (`standChatPinRoom`, below).
   standNewestResult(list, run, follow || Boolean(list.__follow?.pin && !list.__follow.pinMoved));
   askShelfAgain(list);
+  syncProvisionalTurns(list, run);
   syncHelperTasks(list, run);
   syncStreamingTurns(list, run);
   // A finished helper's page opens on its report, at the top (t-15682).
@@ -18220,6 +18312,36 @@ function standEarlierRows(list, run, earlier, folded, spoken, pills) {
     if (turn.role === "user") people.push(row);
   }
   if (people.length) requestAnimationFrame(() => clipPersonRows(people.filter((row) => row.isConnected)));
+}
+
+/* The rows of a turn the pane's CLI is running and has not written yet
+ * (`live_turns`: what its hooks told — Devin writes its session once a turn
+ * has ended, t-125261): drawn as the document's rows are, its results folded
+ * into their calls (`holdHelperTurns`), after the document's rows and before
+ * the streaming ones, wearing `is-provisional` and no turn key, so the
+ * document's rows are laid before them and never join them
+ * (`syncHelperTurns`). Drawn again only when what the hooks told or the run's
+ * state moved; gone in the paint that brings the document's rows for them. */
+function syncProvisionalTurns(list, run) {
+  const sig = `${run.status}\n${run.helper?.liveSig ?? ""}`;
+  if (list.__provisionalSig === sig) return;
+  list.__provisionalSig = sig;
+  for (const stale of list.querySelectorAll(":scope > .is-provisional")) stale.remove();
+  const told = run.helper?.liveTurns;
+  if (!Array.isArray(told) || told.length === 0) return;
+  const batch = { turns: [], seq: 0 };
+  holdHelperTurns(batch, told);
+  const spoken = batch.turns.reduce(
+    (said, turn) => (turn.role === "user" || turn.role === "assistant" ? Math.max(said, turn.seq) : said),
+    -1,
+  );
+  const anchor = list.querySelector(":scope > .is-streaming") ?? helperListTail(list);
+  for (const turn of batch.turns) {
+    const row = helperTurnRowNode(run, turn, spoken, false);
+    delete row.dataset.turn;
+    row.classList.add("is-provisional");
+    list.insertBefore(row, anchor);
+  }
 }
 
 /* The words the agent is saying right now, under the last turn — the rows

@@ -578,6 +578,60 @@ fn ask_own_list(agent: &str, now_ms: i64) -> Option<cli_models::Snapshot> {
     ))
 }
 
+/// The context window `agent`'s own CLI last listed for `model` — known by
+/// the id its model flag takes or by the name it shows (Devin's documents
+/// name the one on each step and the other in their head, t-125261) — read
+/// in what is held, no CLI asked: a page's every read asks it.
+pub(crate) fn own_listed_window(agent: &str, model: &str) -> Option<u64> {
+    let held = held()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    window_in(held.answers.get(agent)?.answer.listed(), model)
+}
+
+/// [`own_listed_window`] over one list.
+fn window_in(listed: &[cli_models::Listed], model: &str) -> Option<u64> {
+    let model = model.trim();
+    listed
+        .iter()
+        .find(|one| one.id == model || one.name.as_deref() == Some(model))
+        .and_then(|one| one.context_window)
+}
+
+/// The models `agent`'s own CLI listed, out of the one lineup the window
+/// holds: an old answer stands and sends one more read behind it, and an
+/// agent nothing was heard of yet — a menu opened right after the window
+/// started — is asked once, now.
+pub(crate) fn own_list_models(agent: &str) -> Vec<cli_models::Listed> {
+    let now_ms = crate::usage_runtime::epoch_ms_now();
+    let existing = {
+        let held = held()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.answers.get(agent).cloned()
+    };
+    if let Some(heard) = existing {
+        if now_ms.saturating_sub(heard.read_at_ms) >= REFRESH_AFTER_MS {
+            let _ = snapshot();
+        }
+        return heard.answer.listed().to_vec();
+    }
+    let Some(answer) = ask_own_list(agent, now_ms) else {
+        return Vec::new();
+    };
+    let listed = answer.answer.listed().to_vec();
+    {
+        let mut held = held()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(lineup) = listed_lineup(agent, Some(&answer)) {
+            held.snapshot.lineups.insert(agent.to_string(), lineup);
+        }
+        held.answers.insert(agent.to_string(), answer);
+    }
+    listed
+}
+
 /// What `agent`'s models were last read as, for `agent-list`: its own CLI's
 /// answer, or the lineup zo's catalog gave it, said the same way; `None`
 /// while nothing has been read. An old read sends one more, as every peek
@@ -607,6 +661,7 @@ pub(crate) fn models_of(agent: &str) -> Option<cli_models::Snapshot> {
                     id: model.id.clone(),
                     name: None,
                     family: None,
+                    context_window: None,
                 })
                 .collect(),
             default: None,
@@ -1000,5 +1055,110 @@ mod tests {
             named_in_code.is_empty(),
             "a model is named in the code that picks one: {named_in_code:#?}"
         );
+    }
+
+    /// A pane's model sizes its context in its CLI's own list by either
+    /// name it goes by — the id on a document's steps, the name its head
+    /// shows — and a model the list does not size, or does not hold, is
+    /// sized by nothing (t-125261).
+    #[test]
+    fn a_window_is_found_by_the_id_or_the_shown_name_in_the_cli_s_own_list() {
+        let listed = [
+            cli_models::Listed {
+                id: "example-family-a-high".into(),
+                name: Some("Example Family A High".into()),
+                family: Some("example-family-a".into()),
+                context_window: Some(1_000_000),
+            },
+            cli_models::Listed {
+                id: "example-family-b".into(),
+                name: None,
+                family: Some("example-family-b".into()),
+                context_window: None,
+            },
+        ];
+        assert_eq!(window_in(&listed, "example-family-a-high"), Some(1_000_000));
+        assert_eq!(
+            window_in(&listed, " Example Family A High "),
+            Some(1_000_000)
+        );
+        assert_eq!(window_in(&listed, "example-family-b"), None);
+        assert_eq!(window_in(&listed, "example-family-c"), None);
+        assert_eq!(window_in(&listed, ""), None);
+    }
+
+    /// A model new to a CLI's own list — of a family nobody wrote down —
+    /// stands wherever the window reads that list, no code changed: the
+    /// chip's menu (`agent_models_from_listed`), the lineup a summons picks
+    /// from (`Lineup::from_listed`, which `listed_lineup` reads) and the
+    /// window a pane's model is sized by (`window_in`); and a family gone
+    /// from the list leaves all three (the person, 2026-11-22: 「최신 모델이
+    /// 업데이트 될때도 있는데 일반화 되야해 모델목록을 보고 거기서
+    /// 뽑아야함」, t-125261). The recorded list is read through Devin's row,
+    /// the one row its shape answers; the agent the rows are filed under is
+    /// the test's own.
+    #[test]
+    fn a_model_new_to_the_list_stands_everywhere_and_one_gone_leaves() {
+        let recorded: serde_json::Value = serde_json::from_str(include_str!(
+            "../../zerocode-core/tests/fixtures/devin-models-list-3000.14.json"
+        ))
+        .expect("the recorded list");
+        let mut next = recorded.clone();
+        let families = next["families"].as_array_mut().expect("its families");
+        families.retain(|family| family["slug"] != "example-family-b");
+        families.push(json!({
+            "family_label": "Example Family New", "family_uid": "example-family-new",
+            "slug": "example-family-new", "aliases": [],
+            "variants": [{"model_uid": "example-family-new-high", "label": "Example Family New High",
+                "is_new": true, "is_beta": false, "max_context_tokens": 400_000, "cost_tier": "High cost"}],
+        }));
+        let road = cli_models::road_of("devin").expect("devin's row names its list");
+        let read = |list: &serde_json::Value| {
+            let ran = cli_models::Ran::Ended {
+                code: Some(0),
+                stdout: Some(list.to_string()),
+                stderr: Some(String::new()),
+            };
+            cli_models::read(road.shape, &ran).listed().to_vec()
+        };
+        let (before, after) = (read(&recorded), read(&next));
+        let menu = |listed: &[cli_models::Listed]| {
+            crate::slash_catalog::agent_models_from_listed("example-cli", listed)
+                .into_iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>()
+        };
+        let lineup = |listed: &[cli_models::Listed]| {
+            Lineup::from_listed("example-cli", listed)
+                .expect("a lineup")
+                .models
+                .into_iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>()
+        };
+        for ids in [menu(&after), lineup(&after)] {
+            assert!(
+                ids.iter().any(|id| id == "example-family-new-high"),
+                "a new model stood nowhere: {ids:?}"
+            );
+            assert!(
+                !ids.iter().any(|id| id.starts_with("example-family-b")),
+                "a family gone stayed: {ids:?}"
+            );
+        }
+        for ids in [menu(&before), lineup(&before)] {
+            assert!(
+                !ids.iter().any(|id| id == "example-family-new-high"),
+                "{ids:?}"
+            );
+            assert!(
+                ids.iter().any(|id| id == "example-family-b-medium"),
+                "{ids:?}"
+            );
+        }
+        assert_eq!(window_in(&after, "example-family-new-high"), Some(400_000));
+        assert_eq!(window_in(&after, "Example Family New High"), Some(400_000));
+        assert_eq!(window_in(&before, "example-family-b-medium"), Some(262_000));
+        assert_eq!(window_in(&after, "example-family-b-medium"), None);
     }
 }

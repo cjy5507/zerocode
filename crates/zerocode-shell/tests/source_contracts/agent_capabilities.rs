@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use super::support::{block_after, shipped_backend, strip_rust_comments};
+use super::support::{block_after, shipped_backend, strip_comments, strip_rust_comments};
 
 pub(super) fn shell_source(name: &str) -> String {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -230,6 +230,18 @@ fn the_model_roads_branch_on_no_agents_name() {
             block_after(&slash_catalog, "fn agent_models_from("),
         ),
         (
+            "agent_models_from_listed",
+            block_after(&slash_catalog, "pub fn agent_models_from_listed("),
+        ),
+        (
+            "agent_models",
+            block_after(&slash_catalog, "pub fn agent_models("),
+        ),
+        (
+            "takes_a_model",
+            block_after(&slash_catalog, "fn takes_a_model("),
+        ),
+        (
             "trust_flag_words",
             block_after(&backend, "fn trust_flag_words("),
         ),
@@ -280,12 +292,15 @@ fn the_model_roads_branch_on_no_agents_name() {
 #[test]
 fn the_document_road_branches_on_no_agents_name() {
     let branches = agent_name_branches();
+    let core_live = shipped_code(&core_source("live_hook_turns.rs"));
     let core_transcript = shipped_code(&core_source("transcript.rs"));
     let core_binding = shipped_code(&core_source("pane_transcript.rs"));
     let core_vault = shipped_code(&core_source("vault.rs"));
     let terminal = shipped_code(&shell_source("cmd/terminal.rs"));
+    let pane_runtime = shipped_code(&shell_source("pane_runtime.rs"));
     let binding = shipped_code(&shell_source("pane_transcript.rs"));
     let roads = [
+        ("live_hook_turns.rs", core_live.as_str()),
         (
             "document_read",
             block_after(&core_transcript, "pub fn document_read("),
@@ -312,6 +327,26 @@ fn the_document_road_branches_on_no_agents_name() {
             "document_log_within",
             block_after(&terminal, "fn document_log_within("),
         ),
+        (
+            "document_read_within",
+            block_after(&terminal, "fn document_read_within("),
+        ),
+        (
+            "whole_document_log",
+            block_after(&terminal, "pub(crate) fn whole_document_log<"),
+        ),
+        (
+            "live_rows",
+            block_after(&terminal, "pub(crate) fn live_rows("),
+        ),
+        (
+            "hear_live_turn",
+            block_after(&pane_runtime, "pub(crate) fn hear_live_turn<"),
+        ),
+        (
+            "tell_when_settled",
+            block_after(&pane_runtime, "pub(crate) fn tell_when_settled("),
+        ),
         ("steps_back", block_after(&terminal, "fn steps_back(")),
         (
             "the pane's shape",
@@ -327,10 +362,13 @@ fn the_document_road_branches_on_no_agents_name() {
         }
     }
     let pane = block_after(&terminal, "fn pane_log(");
+    let document = block_after(&terminal, "pub(crate) fn whole_document_log<");
     assert!(
         pane.contains("crate::pane_transcript::written_whole(&state, term, &path)")
-            && pane.contains("document_log(&path, read, whole.unwrap_or(false))"),
-        "the pane's door no longer picks its road by the shape of the file it named:\n{pane}"
+            && pane.contains("whole_document_log(")
+            && document.contains("document_read_within(path, read, whole, LONG_LINE_CAP,")
+            && document.contains("return document_log(path, read, whole);"),
+        "the pane's door no longer picks its road by the shape of the file it named:\n{pane}\n{document}"
     );
 }
 
@@ -624,4 +662,103 @@ fn no_delivery_door_reaches_the_pasteboard() {
             );
         }
     }
+}
+
+/// No model a CLI lists is spelled in the shipped code (t-125261; the person,
+/// 2026-11-22: 「devin 코드에 하드코딩 하는데 하드코딩금지, 중복 금지 최신 모델이
+/// 업데이트 될때도 있는데 일반화 되야해 모델목록을 보고 거기서 뽑아야함」): every
+/// name in the recorded list — a model's id and the name it shows, a family's
+/// slug, id and name, its aliases — is read from the recording and looked
+/// for in the shipped Rust of the core and the window and in the window's
+/// scripts, and is spelled nowhere here; and the window's roads this task
+/// drew compare no agent's id.
+#[test]
+fn no_listed_model_is_spelled_in_the_shipped_code() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let recording = root.join("../zerocode-core/tests/fixtures/devin-models-list-3000.14.json");
+    let listed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&recording).expect("the recorded list"))
+            .expect("a list");
+    let mut names = Vec::new();
+    for family in listed["families"].as_array().expect("its families") {
+        for key in ["family_label", "family_uid", "slug"] {
+            names.extend(family[key].as_str().map(str::to_string));
+        }
+        for alias in family["aliases"].as_array().into_iter().flatten() {
+            names.extend(alias.as_str().map(str::to_string));
+        }
+        for model in family["variants"].as_array().into_iter().flatten() {
+            for key in ["model_uid", "label"] {
+                names.extend(model[key].as_str().map(str::to_string));
+            }
+        }
+    }
+    assert!(
+        names.len() >= 10,
+        "the recording lists its models: {names:?}"
+    );
+    let mut shipped = Vec::new();
+    for src in ["src", "../zerocode-core/src"] {
+        shipped_rust(&root.join(src), &mut shipped);
+    }
+    for entry in std::fs::read_dir(root.join("../../ui")).expect("the window's scripts") {
+        let path = entry.expect("a script").path();
+        if path.extension().is_some_and(|ext| ext == "js") {
+            let text = std::fs::read_to_string(&path).expect("a script");
+            shipped.push((path.display().to_string(), strip_comments(&text)));
+        }
+    }
+    assert!(shipped.len() > 100, "the shipped sources were not found");
+    for (file, text) in &shipped {
+        for name in &names {
+            assert!(
+                !spells(text, name),
+                "{file} spells `{name}`, a model its CLI lists — the list says it"
+            );
+        }
+    }
+    let branches = agent_name_branches();
+    let window = super::support::window_source();
+    for opens in [
+        "function syncProvisionalTurns(",
+        "function appendComposerModelRows(",
+        "async function pollHelperPages(",
+    ] {
+        let road = block_after(window, opens);
+        for spelled in &branches {
+            assert!(
+                !road.contains(spelled.as_str()),
+                "`{opens}` branches on `{spelled}` — the agent's row answers this"
+            );
+        }
+    }
+}
+
+/// The shipped half of every Rust file under `dir`; a file of tests alone is
+/// passed over.
+fn shipped_rust(dir: &Path, out: &mut Vec<(String, String)>) {
+    for entry in std::fs::read_dir(dir).expect("a source folder") {
+        let path = entry.expect("a source").path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if path.is_dir() {
+            if name != "tests" {
+                shipped_rust(&path, out);
+            }
+        } else if name.ends_with(".rs") && name != "tests.rs" && !name.ends_with("_tests.rs") {
+            let text = std::fs::read_to_string(&path).expect("a source file");
+            out.push((path.display().to_string(), shipped_code(&text)));
+        }
+    }
+}
+
+/// Whether `text` holds `name` whole — not inside a longer name.
+fn spells(text: &str, name: &str) -> bool {
+    let part = |glyph: char| glyph.is_ascii_alphanumeric() || matches!(glyph, '-' | '_' | '.');
+    text.match_indices(name).any(|(at, _)| {
+        !text[..at].chars().next_back().is_some_and(part)
+            && !text[at + name.len()..].chars().next().is_some_and(part)
+    })
 }
