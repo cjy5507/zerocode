@@ -678,24 +678,31 @@ pub fn pty_env(
     // ONE `PATH` pair leaves here, whatever happens. Two was the shape that
     // hid the overwrite: the second was computed from the first rather than
     // from the caller, and at spawn time the later pair simply won.
-    match (mirror_shims(), standing) {
-        (Some((shims, mirrors)), standing) => {
-            env.push((
-                "ZEROCODE_MIRROR_DIR".into(),
-                mirrors.to_string_lossy().into_owned(),
-            ));
-            env.push((
-                "PATH".into(),
-                zerocode_core::agent_teams::shim_path(
-                    &[&shims.to_string_lossy()],
-                    standing.as_deref().unwrap_or_default(),
-                ),
-            ));
-        }
-        (None, Some(standing)) => env.push(("PATH".into(), standing)),
-        (None, None) => {}
+    let mirror = mirror_shims();
+    if let Some((_, mirrors)) = &mirror {
+        env.push((
+            "ZEROCODE_MIRROR_DIR".into(),
+            mirrors.to_string_lossy().into_owned(),
+        ));
+    }
+    if let Some(path) = pty_env_path(
+        mirror.as_ref().map(|(shims, _)| shims.as_path()),
+        standing.as_deref(),
+    ) {
+        env.push(("PATH".into(), path));
     }
     env
+}
+
+pub(crate) fn pty_env_path(shims: Option<&Path>, standing: Option<&str>) -> Option<String> {
+    match (shims, standing) {
+        (Some(shims), standing) => Some(zerocode_core::agent_teams::shim_path(
+            &[&shims.to_string_lossy()],
+            standing.unwrap_or_default(),
+        )),
+        (None, Some(standing)) => Some(standing.to_string()),
+        (None, None) => None,
+    }
 }
 
 /// The agent mirror wrapper's conditional loader.
@@ -748,6 +755,23 @@ pub fn mirror_shims() -> Option<(PathBuf, PathBuf)> {
     use std::sync::OnceLock;
     static HELD: OnceLock<Option<(PathBuf, PathBuf)>> = OnceLock::new();
     HELD.get_or_init(build_mirror_shims).clone()
+}
+
+/// Worker-only shim directory (`<shims>/worker-open`) on macOS, or `None` off
+/// macOS or when this window has no mirror shim directory.
+///
+/// Only summoned worker panes prepend this folder to `PATH`
+/// (`agent_tools_runtime.rs` -> `agent_teams::teammate_path`); human panes and
+/// `%1` leader panes never include it.
+pub(crate) fn worker_open_shim_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        mirror_shims().map(|(shims, _)| zerocode_core::worker_open::worker_shim_dir(&shims))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 /// Where the mirror binary lives: beside this executable, always.
@@ -958,7 +982,7 @@ fn resolvable_agents_in(path: Option<&std::ffi::OsStr>) -> Vec<(String, PathBuf)
 ///
 /// Mirroring is a convenience — it tees a piped agent's bytes into a file a
 /// pane can pour out. Losing it must cost the mirror, not the terminal.
-fn write_shim_dir(
+pub(crate) fn write_shim_dir(
     dir: &Path,
     mirror_bin: &Path,
     agents: &[(String, PathBuf)],
@@ -1080,6 +1104,22 @@ fn write_shim_dir(
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let worker_dir = zerocode_core::worker_open::worker_shim_dir(dir);
+        std::fs::create_dir_all(&worker_dir)?;
+        std::fs::set_permissions(&worker_dir, std::fs::Permissions::from_mode(0o700))?;
+        let open = worker_dir.join(zerocode_core::worker_open::SHIM_NAME);
+        std::fs::write(
+            &open,
+            zerocode_core::worker_open::open_shim_script(
+                mirror_bin,
+                Path::new(zerocode_core::worker_open::SYSTEM_OPEN_PATH),
+            ),
+        )?;
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755))?;
     }
     // Windows hosts: cmd resolves a `.cmd` through PATHEXT and PowerShell
     // resolves a bare name to a `.cmd` too — as long as no `<door>.ps1`
@@ -3017,7 +3057,7 @@ fn settle_prompt_name_in(held: &mut HashMap<u32, HeldPrompt>, report: &mut PaneH
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// The folders of windows that are gone go; a live one's, this window's,
     /// a name that is no pid, a file and a link stay.
     #[test]
@@ -3728,7 +3768,7 @@ mod tests {
     /// test that starts its own is not a second bridge, it is a test that
     /// fails whenever it loses the race. Both callers come through here
     /// instead, and the first one through pays for it.
-    fn bridge_for_tests() {
+    pub(crate) fn bridge_for_tests() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         static ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
         ONCE.call_once(|| {
@@ -5220,6 +5260,80 @@ mod tests {
             "{ssh}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn write_shim_dir_installs_executable_worker_open_shim() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mirror = dir.path().join("zerocode-mirror");
+        std::fs::write(&mirror, "").expect("mirror stub");
+        let shims = dir.path().join("shims");
+        write_shim_dir(&shims, &mirror, &[]).expect("write shim dir");
+
+        assert!(
+            !shims.join(zerocode_core::worker_open::SHIM_NAME).exists(),
+            "shared shim dir must not contain `open` (human panes must not hit a shim)"
+        );
+
+        let worker_dir = zerocode_core::worker_open::worker_shim_dir(&shims);
+        let dir_mode = std::fs::metadata(&worker_dir)
+            .expect("worker-only shim dir exists")
+            .permissions()
+            .mode();
+        assert_eq!(dir_mode & 0o777, 0o700, "worker-only shim dir mode");
+
+        let open_shim = worker_dir.join(zerocode_core::worker_open::SHIM_NAME);
+        let body = std::fs::read_to_string(&open_shim)
+            .expect("open shim is installed in the worker-only subdir");
+        assert!(body.starts_with("#!/bin/sh\n"), "{body}");
+        for needle in [
+            format!("{}=1", zerocode_core::worker_open::MARKER),
+            zerocode_core::worker_open::SYSTEM_OPEN_PATH.to_string(),
+            mirror.to_string_lossy().into_owned(),
+        ] {
+            assert!(
+                body.contains(&needle),
+                "open shim is missing `{needle}`:\n{body}"
+            );
+        }
+        for forbidden in [
+            zerocode_core::agent_teams::TEAM_PANE_VAR,
+            zerocode_core::agent_teams::LEADER_PANE,
+            zerocode_core::agent_teams::TEAM_ID_VAR,
+            zerocode_hookd::env_var::TEAM_TOKEN_FILE,
+            zerocode_core::agent_teams::TEAM_TOKEN_VAR,
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "worker-only open shim must not read team env `{forbidden}`:\n{body}"
+            );
+        }
+        let mode = std::fs::metadata(&open_shim)
+            .expect("open shim metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "open shim is not executable");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn write_shim_dir_does_not_install_open_shim_off_macos() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mirror = dir.path().join("zerocode-mirror");
+        std::fs::write(&mirror, "").expect("mirror stub");
+        let shims = dir.path().join("shims");
+        write_shim_dir(&shims, &mirror, &[]).expect("write shim dir");
+        assert!(
+            !shims.join(zerocode_core::worker_open::SHIM_NAME).exists(),
+            "open shim must only be installed on macOS"
+        );
+        assert!(
+            !zerocode_core::worker_open::worker_shim_dir(&shims).exists(),
+            "worker-only open shim dir must only be installed on macOS"
+        );
     }
 
     /// Mirror discovery must wait for the same shell PATH that agent

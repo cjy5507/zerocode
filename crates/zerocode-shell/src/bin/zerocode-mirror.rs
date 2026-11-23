@@ -45,6 +45,10 @@ use std::sync::{Arc, Mutex};
 fn main() {
     #[cfg(target_os = "macos")]
     zerocode_pty::serve_ctty_exec();
+    #[cfg(target_os = "macos")]
+    if std::env::var_os(zerocode_core::worker_open::MARKER).is_some() {
+        serve_worker_open();
+    }
     // A Claude pane's MCP server the window wrote through this binary: it
     // stands in for the server and starts it on its first call
     // (`zerocode_core::mcp_first_call`). Asked before anything below — an
@@ -187,6 +191,25 @@ If durable authority is unavailable, stop and retry after recovery; do not fall 
         );
     }
     std::process::exit(status.ok().and_then(|held| held.code()).unwrap_or(1));
+}
+
+#[cfg(target_os = "macos")]
+fn serve_worker_open() -> ! {
+    use std::os::unix::process::CommandExt;
+
+    let mut args = std::env::args_os().skip(1);
+    let Some(real) = args.next() else {
+        eprintln!("zerocode-mirror: open binary path missing");
+        std::process::exit(127);
+    };
+    let rest: Vec<std::ffi::OsString> = args.collect();
+    let argv = zerocode_core::worker_open::decide(&rest);
+    let error = std::process::Command::new(&real)
+        .env_remove(zerocode_core::worker_open::MARKER)
+        .args(&argv)
+        .exec();
+    eprintln!("zerocode-mirror: {}: {error}", real.to_string_lossy());
+    std::process::exit(127);
 }
 
 /// Pump one pipe to its original destination and, when there is one, the

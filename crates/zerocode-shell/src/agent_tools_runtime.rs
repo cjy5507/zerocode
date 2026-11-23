@@ -1798,7 +1798,12 @@ impl agent_teams::Host for TeamWindow {
             .find(|(name, _)| name == "PATH")
             .map(|(_, value)| value.as_str())
             .unwrap_or_default();
-        if let Some(path) = agent_teams::teammate_path(state.local_data_root(), dialect, base) {
+        if let Some(path) = agent_teams::teammate_path(
+            state.local_data_root(),
+            dialect,
+            base,
+            hooks::worker_open_shim_dir().as_deref(),
+        ) {
             env.push(("PATH".into(), path));
         }
         // A worker that does not speak tmux is not told it is inside one. The
@@ -7987,10 +7992,17 @@ pub(super) fn call_with_confirmation_asker(
         Err(error)
             if error.code == error_code::CONFIRMATION_REQUIRED && asking == Asking::Person =>
         {
-            let (kind, label) = parse_confirmation_required(&error.message).ok_or(error)?;
+            let Some((kind, label)) = parse_confirmation_required(&error.message) else {
+                return Err(error);
+            };
             match ask(kind, &label, verb.verb_name()) {
                 Decision::Allowed => {
                     params["confirmed"] = serde_json::Value::Bool(true);
+                    params["confirmedTarget"] = serde_json::Value::String(label);
+                    #[cfg(target_os = "macos")]
+                    if let Some(token) = error.confirmation_token {
+                        params["pressApproval"] = serde_json::Value::String(token);
+                    }
                     if let Some(object) = params.as_object_mut() {
                         object.remove("confirmGuard");
                     }
@@ -10664,6 +10676,61 @@ mod tests {
                 "agent_tools_runtime.rs: trust_flag_words( × 2",
             ],
             "the trust flag found a launch road of its own"
+        );
+    }
+
+    #[test]
+    fn worker_open_shim_dir_rides_no_launch_road_but_the_workers_split() {
+        fn rust_files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("a source folder").flatten() {
+                let path = entry.path();
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                let test_only = name == "tests.rs" || name.ends_with("_tests.rs");
+                if path.is_dir() {
+                    rust_files(&path, found);
+                } else if path.extension().is_some_and(|ext| ext == "rs") && !test_only {
+                    found.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        files.sort();
+        let mut roads = Vec::new();
+        for path in files {
+            let text = std::fs::read_to_string(&path).expect("a source");
+            let shipped = text
+                .split_once("#[cfg(test)]")
+                .map_or(text.as_str(), |(head, _)| head);
+            let code: String = shipped
+                .lines()
+                .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let name = path
+                .strip_prefix(&src)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            for spelled in ["worker_open_shim_dir(", "worker_shim_dir("] {
+                let count = code.matches(spelled).count();
+                if count > 0 {
+                    roads.push(format!("{name}: {spelled} × {count}"));
+                }
+            }
+        }
+        assert_eq!(
+            roads,
+            [
+                "agent_tools_runtime.rs: worker_open_shim_dir( × 1",
+                "hooks.rs: worker_open_shim_dir( × 1",
+                "hooks.rs: worker_shim_dir( × 2",
+            ],
+            "the worker-only open shim dir reached a launch road outside the worker split"
         );
     }
 }

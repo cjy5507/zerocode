@@ -7330,28 +7330,19 @@ mod tests {
         let styles = include_str!("../../../../ui/shell.css");
         let tokens = include_str!("../../../../ui/tokens.css");
 
-        // The vendor file is loaded, and it is loaded BEFORE the window —
-        // `defer` preserves document order, which is what lets `paintEditor`
-        // read `window.CM6` without a loader or a readiness check.
+        let boot = include_str!("../../../../ui/shell-boot.js");
+        let dist = include_str!("../../../../scripts/build-ui-dist.mjs");
         assert!(
-            markup.contains("<script defer src=\"./vendor/cm6.js\"></script>"),
-            "ui/index.html does not load the vendored editor, so `window.CM6` \
-             is undefined the first time a file is opened"
+            !markup.contains("./vendor/cm6.js"),
+            "ui/index.html loads vendor/cm6.js eagerly at boot instead of on demand"
         );
-        let vendor_at = markup
-            .find("./vendor/cm6.js")
-            .expect("the vendor script tag was just asserted");
-        let first = crate::ui_source::WINDOW_PARTS
-            .first()
-            .map(|(name, _)| format!("./{name}"))
-            .expect("the window has at least one part");
-        let window_at = markup
-            .find(&first)
-            .expect("ui/index.html has always loaded the window");
         assert!(
-            vendor_at < window_at,
-            "the editor is loaded after the window that uses it — with two \
-             `defer` scripts the order in the markup IS the execution order"
+            boot.contains("loadVendorScript(\"./vendor/cm6.js\", \"CM6\")"),
+            "ui/shell-boot.js does not lazy-load vendor/cm6.js on demand"
+        );
+        assert!(
+            dist.contains("\"vendor/cm6.js\""),
+            "scripts/build-ui-dist.mjs does not ship vendor/cm6.js"
         );
 
         // Monaco is not here, on any road.
@@ -7399,19 +7390,14 @@ mod tests {
                     .to_string()
             })
             .collect();
-        let mut expected = vec![
-            "./vendor/cm6.js".to_string(),
-            "./vendor/three.js".to_string(),
-        ];
-        expected.extend(
-            crate::ui_source::WINDOW_PARTS
-                .iter()
-                .map(|(name, _)| format!("./{name}")),
-        );
+        let expected: Vec<String> = crate::ui_source::WINDOW_PARTS
+            .iter()
+            .map(|(name, _)| format!("./{name}"))
+            .collect();
         assert_eq!(
             sources, expected,
-            "ui/index.html loads something other than the vendored editor and \
-             this window's own files, or loads them in the wrong order"
+            "ui/index.html loads something other than this window's own files, \
+             or loads them in the wrong order"
         );
 
         // The highlight ramp is OURS. Orca calls `defineTheme` zero times and
@@ -7511,16 +7497,23 @@ mod tests {
     #[test]
     fn the_3d_renderer_is_vendored_three_on_the_editors_road() {
         let markup = include_str!("../../../../ui/index.html");
-        let tag = "<script defer src=\"./vendor/three.js\"></script>";
-        let vendor_at = markup
-            .find(tag)
-            .expect("ui/index.html does not load the vendored three.js");
-        let view_at = markup
-            .find("./shell-board-orbit.js")
-            .expect("ui/index.html loads the 3D view");
+        let boot = include_str!("../../../../ui/shell-boot.js");
+        let dist = include_str!("../../../../scripts/build-ui-dist.mjs");
         assert!(
-            vendor_at < view_at,
-            "three.js is loaded after the view that uses it"
+            !markup.contains("./vendor/three.js"),
+            "ui/index.html loads vendor/three.js eagerly at boot instead of on demand"
+        );
+        assert!(
+            boot.contains("loadVendorScript(\"./vendor/three.js\", \"THREE\")"),
+            "ui/shell-boot.js does not lazy-load vendor/three.js on demand"
+        );
+        assert!(
+            dist.contains("\"vendor/three.js\""),
+            "scripts/build-ui-dist.mjs does not ship vendor/three.js"
+        );
+        assert!(
+            markup.contains("./shell-board-orbit.js"),
+            "ui/index.html does not load the 3D view"
         );
 
         // The CSP admits no worker and no `blob:`, and the window's console
@@ -11198,7 +11191,7 @@ mod tests {
         assert!(
             gathering.contains("browser_records().get(label)")
                 && gathering.contains("nav.observed(now)")
-                && gathering.contains("BROWSER_DIAGNOSE_FACTS")
+                && gathering.contains("diagnose_facts_script()")
                 && gathering.contains("sanitize_eval_value(page_value(reply)?, 0)"),
             "the facts are no longer the record's and the ring's, scrubbed:\n{gathering}"
         );
@@ -17556,11 +17549,12 @@ mod tests {
             );
         }
         assert!(
-            window.contains("const editorWrapCompartment = new window.CM6.Compartment();")
-                && window.contains("editorWrapCompartment.reconfigure(extension)")
+            window.contains("return (editorWrapCompartment ??= new window.CM6.Compartment());")
+                && window.contains("editorWrapCompartmentOf().reconfigure(extension)")
                 && window.contains("tab.cmState = tab.cmState.update({")
-                && window.contains("const diffWrapCompartment = new window.CM6.Compartment();")
-                && window.contains("diffWrapCompartment.reconfigure(extension)"),
+                && window
+                    .contains("return (diffWrapCompartment ??= new window.CM6.Compartment());")
+                && window.contains("diffWrapCompartmentOf().reconfigure(extension)"),
             "a wrap change no longer reconfigures mounted, parked, and diff editor states"
         );
         let editor_typed = block_after(window, "function editorTyped(tab, typed) {");
@@ -41283,4 +41277,131 @@ fn the_working_edge_turns_on_the_compositor() {
         window.contains("const node = deskElement(\"button\", `team-row team-${entry.kind}`);\n  node.type = \"button\";"),
         "a team row builds a working edge again"
     );
+}
+
+#[test]
+fn worker_open_shim_rides_only_worker_pane_path_and_mirror_on_macos() {
+    let hooks = include_str!("../../src/hooks.rs");
+    let (hooks_shipped, _) = hooks.split_once("#[cfg(test)]").unwrap_or((hooks, ""));
+    let writing = support::block_after(hooks_shipped, "fn write_shim_dir(");
+    for needle in [
+        "#[cfg(target_os = \"macos\")]",
+        "zerocode_core::worker_open::worker_shim_dir(",
+        "zerocode_core::worker_open::SHIM_NAME",
+        "zerocode_core::worker_open::open_shim_script(",
+        "zerocode_core::worker_open::SYSTEM_OPEN_PATH",
+    ] {
+        assert!(
+            writing.contains(needle),
+            "write_shim_dir lost `{needle}`:\n{writing}"
+        );
+    }
+    assert!(
+        writing.contains("worker_dir.join(zerocode_core::worker_open::SHIM_NAME)")
+            && !writing.contains(" dir.join(zerocode_core::worker_open::SHIM_NAME)"),
+        "open shim must live in worker-only subdir, not shared shim dir:\n{writing}"
+    );
+
+    let pty_env = support::block_after(hooks_shipped, "pub fn pty_env(");
+    assert!(
+        !pty_env.contains("worker_open") && !pty_env.contains("worker_shim_dir"),
+        "human pane pty_env must never include worker-only open shim dir:\n{pty_env}"
+    );
+
+    let teams = include_str!("../../src/agent_teams.rs");
+    let (teams_shipped, _) = teams
+        .split_once("#[cfg(test)]\nmod tests")
+        .unwrap_or((teams, ""));
+    let leader = support::block_after(teams_shipped, "pub fn open_team(");
+    assert!(
+        !leader.contains("worker_open") && !leader.contains("worker_shim_dir"),
+        "leader pane open_team must never include worker-only open shim dir:\n{leader}"
+    );
+
+    let runtime = include_str!("../../src/agent_tools_runtime.rs");
+    let (runtime_shipped, _) = runtime.split_once("#[cfg(test)]").unwrap_or((runtime, ""));
+    let split = support::block_after(runtime_shipped, "fn split(");
+    let pty_at = split
+        .find("env.extend(hooks::pty_env(")
+        .expect("split lost pty_env");
+    let teammate_at = split
+        .find("agent_teams::teammate_path(")
+        .expect("split lost teammate_path");
+    let open_dir_at = split
+        .find("hooks::worker_open_shim_dir()")
+        .expect("split lost worker_open_shim_dir wiring");
+    let spawn_at = split
+        .find("PtyLane::spawn(")
+        .expect("split lost PtyLane::spawn");
+    assert!(
+        pty_at < teammate_at && teammate_at < open_dir_at && open_dir_at < spawn_at,
+        "worker_open_shim_dir must wire through teammate_path after pty_env and before spawn:\n{split}"
+    );
+
+    let mirror = include_str!("../../src/bin/zerocode-mirror.rs");
+    let main_fn = support::block_after(mirror, "fn main() {");
+    assert!(
+        main_fn.contains("zerocode_core::worker_open::MARKER")
+            && main_fn.contains("serve_worker_open()"),
+        "zerocode-mirror no longer dispatches worker open guard:\n{main_fn}"
+    );
+    let handler = support::block_after(mirror, "fn serve_worker_open() -> ! {");
+    assert!(
+        handler.contains("zerocode_core::worker_open::decide(&rest)")
+            && !handler.contains("mirror_dir()")
+            && handler.contains(".env_remove(zerocode_core::worker_open::MARKER)"),
+        "serve_worker_open must decide purely on argv without mirror_dir and strip guard env:\n{handler}"
+    );
+}
+
+#[test]
+fn boundary_activity_and_live_stage_tables_agree_with_core() {
+    use zerocode_core::activity_state::SurfaceClass;
+    use zerocode_core::hook::HookState;
+    use zerocode_core::orchestration::LiveStage;
+
+    let term = include_str!("../../../../ui/shell-term.js");
+    let hook_map = support::block_after(term, "const HOOK_STATE_CLASS = {");
+    for state in HookState::ALL {
+        let key = if state.word().contains('-') {
+            format!("\"{}\"", state.word())
+        } else {
+            state.word().to_string()
+        };
+        let entry = format!("{key}: \"{}\"", state.surface_class().word());
+        assert!(
+            hook_map.contains(&entry),
+            "HOOK_STATE_CLASS drifted from zerocode_core::activity_state for `{entry}`:\n{hook_map}"
+        );
+    }
+    let rank_map = support::block_after(term, "const WORKTREE_STATE_RANK = {");
+    let ind_map = support::block_after(term, "const WORKTREE_INDICATOR = {");
+    for class in SurfaceClass::ALL {
+        let rank_entry = format!("{}: {}", class.word(), class.rank());
+        assert!(
+            rank_map.contains(&rank_entry),
+            "WORKTREE_STATE_RANK drifted from zerocode_core::activity_state for `{rank_entry}`:\n{rank_map}"
+        );
+        let ind_entry = format!("{}: \"{}\"", class.word(), class.indicator().word());
+        assert!(
+            ind_map.contains(&ind_entry),
+            "WORKTREE_INDICATOR drifted from zerocode_core::activity_state for `{ind_entry}`:\n{ind_map}"
+        );
+    }
+
+    let shell = include_str!("../../../../ui/shell.js");
+    let live_js = include_str!("../../../../ui/shell-board-live.js");
+    assert!(
+        live_js.contains("row?.progress?.live_stage ?? ledgerWork(row)?.live"),
+        "ledgerReviewStage no longer reads Rust's canonical WorkProgress::live_stage first"
+    );
+    let stages_block = support::block_after(shell, "const WORK_STAGES = Object.freeze({");
+    let claims_block = support::block_after(shell, "const WORK_CLAIMS = Object.freeze({");
+    for live in LiveStage::ALL {
+        let needle = format!("live: \"{}\"", live.word());
+        assert!(
+            stages_block.contains(&needle) || claims_block.contains(&needle),
+            "WORK_STAGES/WORK_CLAIMS missing canonical LiveStage `{needle}`"
+        );
+    }
 }

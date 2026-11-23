@@ -2482,7 +2482,7 @@ fn platform_tray_settings_match_orcas_defaults_and_share_one_native_owner() {
             && shipped_backend().contains("native_tray::ActivitySource::AgentTaskComplete")
             && shipped_backend().contains("native_tray::ActivitySource::TerminalBell")
             && shipped_backend()
-                .contains("native_tray()\n                    .clear_activity(handle)")
+                .contains("native_tray()\n                        .clear_activity(handle)")
             && shipped_backend().contains(".hide_main_on_close(handle)")
             && shipped_backend().contains("api.prevent_close();")
             && native.contains("app.tray_by_id(TRAY_ID).is_some()")
@@ -5162,6 +5162,92 @@ fn diagnosis_reads_the_table_top_down() {
     );
 }
 
+mod diagnose_tests {
+    use super::{PageFacts, diagnose_words, diagnosis};
+    use crate::browser_guest_runtime::BROWSER_GUEST_KEY;
+    use crate::cmd::browser::diagnose_facts_script;
+
+    #[test]
+    fn diagnose_script_reads_the_ring_by_its_real_name() {
+        let script = diagnose_facts_script();
+        assert!(
+            !script.contains("__GUEST_STATE__"),
+            "diagnose script still contains the __GUEST_STATE__ placeholder"
+        );
+        let guest_key = BROWSER_GUEST_KEY.trim();
+        assert!(
+            script.contains(&format!("window.{guest_key}?.ring")),
+            "diagnose script must read the ring from window.{guest_key}"
+        );
+    }
+
+    #[test]
+    fn diagnose_words_keeps_page_clues_after_a_document_error() {
+        let facts = PageFacts {
+            url: "https://example.test/forbidden".into(),
+            nav: "finished".into(),
+            document_status: Some(403),
+            login_word: Some("로그인".into()),
+            unsupported_browser_word: Some("unsupported browser".into()),
+            password_field: true,
+            ring_present: true,
+            ..PageFacts::default()
+        };
+
+        let words = diagnose_words(&facts, &diagnosis(&facts));
+        let mut lines = words.lines();
+        assert_eq!(
+            lines.next(),
+            Some("문서 자체가 403 — https://example.test/forbidden")
+        );
+        let details: Vec<_> = lines.collect();
+        assert!(
+            details.contains(&"- 로그인 단서 — 제목에 「로그인」"),
+            "{words}"
+        );
+        assert!(
+            details.contains(&"- 브라우저 지원 단서 — 페이지에 「unsupported browser」"),
+            "{words}"
+        );
+        assert!(!words.contains("비밀번호"), "{words}");
+    }
+
+    #[test]
+    fn diagnose_words_keeps_the_login_verdict_on_a_successful_document() {
+        let facts = PageFacts {
+            nav: "finished".into(),
+            document_status: Some(200),
+            login_word: Some("로그인".into()),
+            ring_present: true,
+            ..PageFacts::default()
+        };
+
+        let words = diagnose_words(&facts, &diagnosis(&facts));
+        assert_eq!(
+            words.lines().next(),
+            Some("로그인 필요 — 제목에 「로그인」 (프로필 기본)")
+        );
+    }
+
+    #[test]
+    fn diagnose_words_omits_clue_lines_without_matching_words() {
+        let facts = PageFacts {
+            nav: "finished".into(),
+            document_status: Some(200),
+            ring_present: true,
+            ..PageFacts::default()
+        };
+
+        let words = diagnose_words(&facts, &diagnosis(&facts));
+        assert!(
+            !words.lines().any(|line| {
+                line.starts_with("- 로그인 단서 —") || line.starts_with("- 브라우저 지원 단서 —")
+            }),
+            "{words}"
+        );
+    }
+}
+
 /// A load is dead by the clock, not by wry.
 ///
 /// Started with no Finished for NAV_DEAD_AFTER_SECS reads `dead` — to a
@@ -5367,7 +5453,7 @@ mod known_navigation_proof_tests {
         record.started(now);
         sent_and_loading(&mut record);
         record.started(now);
-        record.failed();
+        record.failed(None);
         assert!(record.pending());
         assert_eq!(record.settle_if_idle(false), NavProof::Ready);
     }
@@ -5604,9 +5690,241 @@ mod known_navigation_proof_tests {
             .unwrap();
         let mut record = NavRecord::born(true, stood);
         let generation = record.started(stood);
-        record.failed();
+        record.failed(None);
         assert!(!record.dead_if_still(generation, now));
         assert_eq!(record.observed(now), NavState::Dead);
+    }
+}
+
+/// Real CEF's order for a failed navigation, replayed through the load handler's
+/// one reading of it (t-125617). The order is measured, and lives in one file.
+/// The tab hears every call as 1.1.172 told it, word for word (the fixture's
+/// `before`); only the pane's record keeps a refusal, for `tabs` and `diagnose`
+/// (t-125903).
+#[cfg(all(target_os = "macos", feature = "chromium-browser"))]
+mod cef_failed_navigation_tests {
+    use super::*;
+    use crate::chromium_browser::{KEPT_FAILURES, LoadCall, heard};
+    use cef::Errorcode;
+    use std::time::Instant;
+
+    const ORDER: &str = include_str!("../tests/fixtures/cef-failed-navigation.json");
+
+    /// The codes the measured order names. A name missing here fails the test,
+    /// rather than standing in for another code.
+    const NAMED: [(&str, Errorcode); 6] = [
+        ("ERR_CONNECTION_REFUSED", Errorcode::CONNECTION_REFUSED),
+        ("ERR_ABORTED", Errorcode::ABORTED),
+        ("ERR_EMPTY_RESPONSE", Errorcode::EMPTY_RESPONSE),
+        ("ERR_CONNECTION_RESET", Errorcode::CONNECTION_RESET),
+        ("ERR_CONNECTION_CLOSED", Errorcode::CONNECTION_CLOSED),
+        ("ERR_HTTP_RESPONSE_CODE_FAILURE", Errorcode::HTTP_RESPONSE_CODE_FAILURE),
+    ];
+
+    fn code(name: &str) -> Errorcode {
+        NAMED
+            .iter()
+            .find(|(named, _)| *named == name)
+            .unwrap_or_else(|| panic!("{name} is not named here"))
+            .1
+    }
+
+    struct Replayed {
+        told: Vec<&'static str>,
+        state: NavState,
+        failure: Option<&'static str>,
+    }
+
+    fn case<'a>(cases: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
+        cases
+            .iter()
+            .find(|case| case["case"] == name)
+            .unwrap_or_else(|| panic!("no case {name}"))
+    }
+
+    /// The address a call is for when it names none: the one the window sent.
+    /// The fixture's cases that fail all go to that one address again (a
+    /// retry, a reload); a call elsewhere names its own (`EARLIER`, `NEWER`).
+    const SENT: &str = "SENT";
+    const PAGE: &str = "http://127.0.0.1:54321/";
+
+    /// A case's calls as the handler hears them, on the record its `from` left:
+    /// a pane just opened (`open`), a page that loaded (`page`), or the case
+    /// measured just before it. A sub-frame's call and an aborted load are
+    /// dropped before the record (`on_load_error`'s first line), and so is an
+    /// error for an address other than the one the pane records (its address
+    /// check). The window records the address it sends before sending; a step
+    /// `by` back, forward or reload sends none; a main-frame start or end
+    /// records its own (`emit_nav`).
+    fn replay<'a>(cases: &'a [serde_json::Value], name: &str) -> (NavRecord, &'a str, Replayed) {
+        let now = Instant::now();
+        let at = case(cases, name);
+        let (mut nav, mut recorded) = match at["from"].as_str().unwrap() {
+            "open" => (NavRecord::born(false, now), SENT),
+            "page" => {
+                let mut nav = NavRecord::born(false, now);
+                nav.finished(false);
+                (nav, SENT)
+            }
+            earlier => {
+                let (nav, recorded, _) = replay(cases, earlier);
+                (nav, recorded)
+            }
+        };
+        match at.get("by").and_then(serde_json::Value::as_str) {
+            None => recorded = SENT,
+            Some("back" | "forward" | "reload") => {}
+            Some(other) => panic!("{name}: {other} is no step the window takes"),
+        }
+        let mut told = Vec::new();
+        for call in at["engine"].as_array().unwrap() {
+            let name = call["code"].as_str().unwrap_or_default();
+            if call["main"] == false || name == "ERR_ABORTED" {
+                continue;
+            }
+            let url = call["url"].as_str().unwrap_or(SENT);
+            if call["call"] == "error" && url != recorded {
+                continue;
+            }
+            if call["call"] != "error" {
+                recorded = url;
+            }
+            let load = match call["call"].as_str().unwrap() {
+                "start" => LoadCall::Start,
+                "end" => LoadCall::End {
+                    blank: call["url"] == "about:blank",
+                },
+                "error" => LoadCall::Failed(code(name)),
+                other => panic!("{other} is no load-handler call"),
+            };
+            told.push(heard(&mut nav, load, now).0);
+        }
+        let replayed = Replayed {
+            told,
+            state: nav.observed(now),
+            failure: nav.engine_failure(),
+        };
+        (nav, recorded, replayed)
+    }
+
+    fn words(value: &serde_json::Value) -> Vec<&str> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|word| word.as_str().unwrap())
+            .collect()
+    }
+
+    /// Every measured case: the tab hears 1.1.172's words call for call, so the
+    /// window's screen, its failure box and its retry, are as they were; `tabs`
+    /// and `diagnose` read the record.
+    #[test]
+    fn the_tab_hears_what_1_1_172_told_it_and_the_record_keeps_the_refusal() {
+        let order: serde_json::Value = serde_json::from_str(ORDER).unwrap();
+        let cases = order["cases"].as_array().unwrap();
+        assert!(cases.len() >= 25, "the measured cases are all here");
+        for case in cases {
+            let name = case["case"].as_str().unwrap();
+            let replayed = replay(cases, name).2;
+            assert_eq!(replayed.told, words(&case["before"]), "{name}: the tab's words");
+            assert_eq!(replayed.state.word(), case["tabs"], "{name}: what tabs says");
+            assert_eq!(
+                replayed.failure,
+                case["failure"].as_str(),
+                "{name}: the error diagnose names"
+            );
+        }
+    }
+
+    /// N10 (t-125843): the window's back button after a kept refusal. Real CEF
+    /// starts the page it returns to, so the refusal is not kept past it.
+    #[test]
+    fn back_after_a_kept_refusal_leaves_no_failure() {
+        let order: serde_json::Value = serde_json::from_str(ORDER).unwrap();
+        let cases = order["cases"].as_array().unwrap();
+        assert_eq!(replay(cases, "page-then-refused").2.state, NavState::Dead);
+        for name in ["back-after-refused", "back-again"] {
+            let back = replay(cases, name).2;
+            assert_eq!(back.told, ["started", "finished"], "{name}");
+            assert_eq!(back.state, NavState::Finished, "{name}");
+            assert_eq!(back.failure, None, "{name}");
+        }
+    }
+
+    #[test]
+    fn only_a_refused_connection_keeps_its_failure() {
+        assert_eq!(
+            KEPT_FAILURES
+                .iter()
+                .map(|(_, name)| *name)
+                .collect::<Vec<_>>(),
+            ["ERR_CONNECTION_REFUSED"]
+        );
+        for (name, code) in NAMED {
+            let now = Instant::now();
+            let mut nav = NavRecord::born(false, now);
+            heard(&mut nav, LoadCall::Failed(code), now);
+            heard(&mut nav, LoadCall::End { blank: false }, now);
+            let kept = name == "ERR_CONNECTION_REFUSED";
+            assert_eq!(nav.observed(now) == NavState::Dead, kept, "{name}");
+            assert_eq!(nav.engine_failure(), kept.then_some(name), "{name}");
+        }
+    }
+
+    /// The engine's own error document after a refusal: the tab hears
+    /// `finished`, as 1.1.172 told it, while `tabs` reads `dead` and
+    /// `diagnose` names the engine's error, not the twenty-second clock.
+    #[test]
+    fn the_tab_hears_finished_while_the_record_keeps_the_refusal_and_diagnose_names_it() {
+        let now = Instant::now();
+        let mut nav = NavRecord::born(false, now);
+        let refused = LoadCall::Failed(Errorcode::CONNECTION_REFUSED);
+        assert_eq!(heard(&mut nav, refused, now).0, "dead");
+        assert_eq!(heard(&mut nav, LoadCall::End { blank: false }, now).0, "finished");
+        assert_eq!(nav.observed(now), NavState::Dead);
+        let facts = PageFacts {
+            url: PAGE.into(),
+            nav: nav.observed(now).word().into(),
+            loading_secs: nav.standing_for(now).map(|stood| stood.as_secs()),
+            engine_failure: nav.engine_failure().map(str::to_string),
+            ..PageFacts::default()
+        };
+        let read = diagnosis(&facts);
+        assert_eq!(read.verdict, Verdict::Dead);
+        assert!(read.said.starts_with("서버에 닿지 못했습니다"), "{}", read.said);
+        assert!(read.said.contains("ERR_CONNECTION_REFUSED"), "{}", read.said);
+        assert!(!read.said.contains("초 규칙"), "{}", read.said);
+        // A new document ends it: the next Start reads loading, its End finished.
+        assert_eq!(heard(&mut nav, LoadCall::Start, now).0, "started");
+        assert_eq!(nav.engine_failure(), None);
+        assert_eq!(heard(&mut nav, LoadCall::End { blank: false }, now).0, "finished");
+        assert_eq!(nav.observed(now), NavState::Finished);
+    }
+
+    /// The last error the engine named decides (t-125903). An error whose
+    /// failure the record does not keep drops a refusal's name, and its error
+    /// document's end reads `finished`, as 1.1.172 read it; a refusal after it
+    /// is kept again.
+    #[test]
+    fn the_last_error_the_engine_named_decides() {
+        let now = Instant::now();
+        let refused = LoadCall::Failed(Errorcode::CONNECTION_REFUSED);
+        let end = LoadCall::End { blank: false };
+        for later in [Errorcode::EMPTY_RESPONSE, Errorcode::CONNECTION_RESET] {
+            let mut nav = NavRecord::born(false, now);
+            heard(&mut nav, refused, now);
+            heard(&mut nav, end, now);
+            assert_eq!(nav.observed(now), NavState::Dead, "{later:?}");
+            assert_eq!(heard(&mut nav, LoadCall::Failed(later), now).0, "dead");
+            assert_eq!(nav.engine_failure(), None, "{later:?}");
+            assert_eq!(heard(&mut nav, end, now).0, "finished");
+            assert_eq!(nav.observed(now), NavState::Finished, "{later:?}");
+            heard(&mut nav, refused, now);
+            heard(&mut nav, end, now);
+            assert_eq!(nav.observed(now), NavState::Dead, "{later:?}");
+            assert_eq!(nav.engine_failure(), Some("ERR_CONNECTION_REFUSED"), "{later:?}");
+        }
     }
 }
 
@@ -24005,6 +24323,76 @@ pub(crate) mod computer_desktop_wait {
             calls, 0,
             "a declared last step never reaches the helper unasked"
         );
+    }
+
+    /// t-125705 R1: the retry carries the helper's opaque binding. The
+    /// person sees the menu title and never sees the binding.
+    #[test]
+    fn an_allowed_press_goes_again_with_the_target_the_person_was_asked_about() {
+        use crate::agent_tools_runtime::call_with_confirmation_asker;
+        use crate::computer_use::confirm::{self, Asking, Decision};
+        use zerocode_core::computer_use_protocol::error_code;
+        let _hand = ONE_HAND
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        confirm::set_policy(confirm::Policy::default());
+        let words = |argv: &[&str]| {
+            argv.iter()
+                .map(|word| (*word).to_string())
+                .collect::<Vec<_>>()
+        };
+        let shortcut = zerocode_core::computer_use::parse_command(&words(&[
+            "hotkey",
+            "--app",
+            "Finder",
+            "--key",
+            "cmd+shift+t",
+        ]))
+        .expect("a shortcut");
+        let mut sent: Vec<serde_json::Value> = Vec::new();
+        let mut asked: Vec<String> = Vec::new();
+        let answered = call_with_confirmation_asker(
+            &shortcut,
+            Asking::Person,
+            &mut |_, params| {
+                sent.push(params);
+                if sent.len() == 1 {
+                    let refusal = crate::computer_use::ComputerUseError::new(
+                        error_code::CONFIRMATION_REQUIRED,
+                        "delete: Empty Trash",
+                    );
+                    #[cfg(target_os = "macos")]
+                    let refusal = {
+                        let mut refusal = refusal;
+                        refusal.confirmation_token = Some("test-binding".to_string());
+                        refusal
+                    };
+                    Err(refusal)
+                } else {
+                    Ok(serde_json::json!({}))
+                }
+            },
+            &mut |_, label, _| {
+                asked.push(label.to_string());
+                Decision::Allowed
+            },
+        );
+        assert!(answered.is_ok(), "{answered:?}");
+        assert_eq!(asked, ["Empty Trash"]);
+        assert_eq!(sent.len(), 2, "asked once, sent again once");
+        assert!(
+            sent[0].get("confirmedTarget").is_none(),
+            "nothing is allowed before the person is asked"
+        );
+        assert!(sent[0].get("pressApproval").is_none());
+        assert_eq!(sent[1]["confirmed"], true);
+        #[cfg(target_os = "macos")]
+        assert_eq!(sent[1]["pressApproval"], "test-binding");
+        assert_eq!(
+            sent[1]["confirmedTarget"], "Empty Trash",
+            "the press goes again bound to what the person allowed"
+        );
+        assert!(sent[1].get("confirmGuard").is_none());
     }
 
     /// t-37883: a click by the words a mirrored phone shows reads the app's

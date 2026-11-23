@@ -62,6 +62,9 @@ pub(super) struct PageFacts {
     pub(super) nav: String,
     /// How long the current load has stood, when it is still standing.
     pub(super) loading_secs: Option<u64>,
+    /// The error the engine named when it ended the navigation, while the
+    /// record keeps that failure.
+    pub(super) engine_failure: Option<String>,
     /// The main document's own HTTP status, from the navigation timeline.
     pub(super) document_status: Option<u16>,
     pub(super) document_type: Option<String>,
@@ -126,6 +129,15 @@ fn top_errors(facts: &PageFacts) -> String {
 /// same facts always say the same sentence.
 pub(super) fn diagnosis(facts: &PageFacts) -> Diagnosis {
     if facts.nav == NavState::Dead.word() {
+        if let Some(error) = &facts.engine_failure {
+            return Diagnosis {
+                verdict: Verdict::Dead,
+                said: format!(
+                    "서버에 닿지 못했습니다 — {} 로 가는 이동을 엔진이 {error} 로 끝냈습니다 (엔진의 판정)",
+                    facts.url
+                ),
+            };
+        }
         let secs = facts.loading_secs.unwrap_or(NAV_DEAD_AFTER_SECS);
         return Diagnosis {
             verdict: Verdict::Dead,
@@ -226,6 +238,12 @@ pub(super) fn diagnose_words(facts: &PageFacts, diagnosis: &Diagnosis) -> String
         "- 프로필: {}\n",
         facts.profile.as_deref().unwrap_or("기본")
     ));
+    if let Some(word) = &facts.login_word {
+        out.push_str(&format!("- 로그인 단서 — 제목에 「{word}」\n"));
+    }
+    if let Some(word) = &facts.unsupported_browser_word {
+        out.push_str(&format!("- 브라우저 지원 단서 — 페이지에 「{word}」\n"));
+    }
     out.push_str(&format!(
         "- 실패 요청: {}건{}\n",
         facts.failed_requests,

@@ -11,6 +11,7 @@
 
 pub mod account;
 pub mod account_autoswitch;
+pub mod activity_state;
 pub mod advertised_url;
 pub mod agent;
 pub mod agent_browser;
@@ -168,6 +169,7 @@ pub mod usual;
 pub mod vault;
 pub mod vault_index;
 pub mod vault_opencode;
+pub mod worker_open;
 pub mod worker_placement;
 pub mod worker_transcript;
 pub mod workitem;
