@@ -1453,6 +1453,22 @@ function jevSayStatus(words) {
   }
 }
 
+function releaseJevView(tab) {
+  const view = groups.get(tab.pane)?.jevView;
+  if (!view) return;
+  for (const card of view.querySelectorAll("[data-jev-chart]")) {
+    jevDrawnFrom.delete(card);
+    card.querySelector(".jev-chart-body")?.replaceChildren();
+    card.querySelector("tbody")?.replaceChildren();
+  }
+  const tbody = view.querySelector(".jev-table tbody");
+  if (tbody) {
+    for (const row of tbody.querySelectorAll("tr")) jevDrawnFrom.delete(row);
+    tbody.replaceChildren();
+  }
+  jevPoll.sync();
+}
+
 /* The stage's door: paint what is in hand, then ask zo once — on the first
  * open, and again when what is in hand is older than the beat or was the
  * card's answer without the recent list. A tab switched back to within the

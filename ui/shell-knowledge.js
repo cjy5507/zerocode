@@ -9031,6 +9031,14 @@ async function exportKnowledgeHtml(view) {
  * 볼트를 지켜보는 것은 백엔드의 워처 레인이고(t-2931, 상한 있는 목록을 같은
  * 폴러가 stat한다 — 두 번째 스캐너는 여전히 없다), 그 말은 `second-brain:changed`로
  * 온다. */
+function releaseKnowledgeView(tab) {
+  const view = groups.get(tab.pane)?.knowledgeView;
+  if (!view) return;
+  if (typeof leaveKnowledgeUniverse === "function") leaveKnowledgeUniverse(view);
+}
+
+/* 판이 무대에 설 때마다 지나는 문. 그림은 처음 열 때와 `second-brain:changed`가 올
+ * 때만 다시 읽는다 — 필터 한 글자는 이 문을 지나지 않는다. */
 function paintKnowledgeStage(tab) {
   void refreshKnowledgeGraph();
   /* 공급망 렌즈가 켜져 있으면 그 답도 — 잠금 파일은 판을 보지 않는 동안에도 바뀐다(바닥 시간 안의

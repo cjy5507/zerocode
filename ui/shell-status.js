@@ -592,9 +592,13 @@ function paintPorts() {
  * rows outlive a scan and a rebuilt sidebar would cost more than the fact
  * changed. */
 function paintWorktreePortPins() {
+  const counts = new Map();
+  for (const port of ownedPorts()) {
+    if (port.owner_path) counts.set(port.owner_path, (counts.get(port.owner_path) ?? 0) + 1);
+  }
   for (const pin of document.querySelectorAll(".wt-row .wt-ports")) {
     const path = pin.closest(".wt-row")?.dataset.worktreePath ?? "";
-    const count = ownedPorts().filter((port) => port.owner_path === path).length;
+    const count = counts.get(path) ?? 0;
     // Painted on every scan and every refresh of the list: written only when the count moved (v1.1.149).
     if (pin.hidden !== (count === 0)) pin.hidden = count === 0;
     if (count === 0) continue;
@@ -4720,22 +4724,11 @@ function renderTabs() {
   const jevDoor = el("nav-jev");
   const jevPressed = String(activeTabId === JEV_TAB.id);
   if (jevDoor.getAttribute("aria-pressed") !== jevPressed) jevDoor.setAttribute("aria-pressed", jevPressed);
-  // 작업의 행도 같다 — 그 탭이 무대의 앞이면 「여기」.
-  const tasksDoor = el("nav-tasks");
-  const onTasks = activeTabId === TASKS_TAB.id;
-  if (tasksDoor.hasAttribute("aria-current") !== onTasks) {
-    if (onTasks) tasksDoor.setAttribute("aria-current", "page");
-    else tasksDoor.removeAttribute("aria-current");
-  }
-  // The inbox's row in the sidebar says the same of its page: it is the screen on stage.
-  const inboxDoor = el("nav-inbox");
-  const onInbox = activeTabId === INBOX_TAB.id;
-  if (inboxDoor.hasAttribute("aria-current") !== onInbox) {
-    if (onInbox) inboxDoor.setAttribute("aria-current", "page");
-    else inboxDoor.removeAttribute("aria-current");
-  }
   // And the workspace board's door, now that the board is a tab too.
   paintWorkspaceBoardDoor();
+  // One place owns every sidebar nav row's `aria-current="page"` (and clears
+  // underlying tabs whenever a full-screen route covers the stage).
+  if (typeof paintNavCurrent === "function") paintNavCurrent();
   // The machine figures ride along, bounded — a render is a fine moment to
   // notice they are stale, and a terrible one to spawn `lsof`.
   paintMachineFigures();
@@ -6021,6 +6014,15 @@ function dropTab(id, { closed = false, nativeClosed = false } = {}) {
   if (at < 0) return;
   cancelAutoSave(removed);
   if (removed.kind === "skills") releaseSkillsView(removed);
+  const lastOfKindInPane = !tabs.some((other) => other !== removed && other.pane === removed.pane && other.kind === removed.kind);
+  if (lastOfKindInPane) {
+    if (removed.kind === "tokens" && typeof releaseTokensView === "function") releaseTokensView(removed);
+    if (removed.kind === "inbox" && typeof releaseInboxView === "function") releaseInboxView(removed);
+    if (removed.kind === "vault" && typeof releaseVaultView === "function") releaseVaultView(removed);
+    if (removed.kind === "jev" && typeof releaseJevView === "function") releaseJevView(removed);
+    if (removed.kind === "artifacts" && typeof releaseArtifactsView === "function") releaseArtifactsView(removed);
+    if (removed.kind === "knowledge" && typeof releaseKnowledgeView === "function") releaseKnowledgeView(removed);
+  }
   // 따로 연 이슈 탭은 작업 판의 패널을 빌려 쓴다 — 닫히면 패널을 집으로 돌려보낸다.
   if (removed.kind === "jira") releaseJiraIssueTab();
   // 앞에 선 작업 탭이 닫히면 무대에는 그 판의 다음 탭(대개 터미널)이 선다. 그 귀환은 그

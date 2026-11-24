@@ -474,11 +474,24 @@ function tokensTable(head, rows, numericFrom = 1) {
  * 자르기는 창에서 한다. 디스크는 세 번만 걷는다 — 처음 열 때, 아직 안 읽은
  * 장부로 옮길 때, 그리고 "다시 읽기". 세 부분 열쇠(날짜·모델·자리)가 있는 이유가
  * 이것이고, 옆에 선 프로바이더 단추가 이미 같은 약속을 하고 있다. */
+let tokensSliceCache = null;
+
 function tokensSlice(held, provider, range, scope) {
   const span = TOKEN_RANGES.find((one) => one.id === range) ?? TOKEN_RANGES[0];
+  const today = tokenDayKey(new Date());
+  if (
+    tokensSliceCache
+    && tokensSliceCache.held === held
+    && tokensSliceCache.provider === provider.id
+    && tokensSliceCache.range === span.id
+    && tokensSliceCache.scope === scope
+    && tokensSliceCache.today === today
+  ) {
+    return tokensSliceCache.value;
+  }
   const cutoff = span.days === null
     ? null
-    : tokenDayShift(tokenDayKey(new Date()), span.days - 1);
+    : tokenDayShift(today, span.days - 1);
   const mine = scope === "ours";
   const days = (held?.days ?? [])
     .map(provider.day)
@@ -533,7 +546,7 @@ function tokensSlice(held, provider, range, scope) {
     || String(left.key).localeCompare(String(right.key)));
   const models = heaviest(byModel);
   const places = heaviest(byPlace);
-  return {
+  const result = {
     days,
     sessions,
     sum,
@@ -545,6 +558,8 @@ function tokensSlice(held, provider, range, scope) {
     cold: sum.turns > 0 ? sum.cold / sum.turns : null,
     empty: days.length === 0,
   };
+  tokensSliceCache = { held, provider: provider.id, range: span.id, scope, today, value: result };
+  return result;
 }
 
 /* 카드가 쓰는 글리프. `icon()`은 문자열을 돌려주고 이 길은 그릴 때마다
@@ -920,6 +935,15 @@ async function readTokenUsage(tab) {
   }
   tab.reading = false;
   if (tabs.some((one) => one.id === tab.id)) paintTokensView(tab);
+}
+
+function releaseTokensView(tab) {
+  const host = groups.get(tab.pane)?.tokensView;
+  host?.querySelector(".tokens-body")?.replaceChildren();
+  if (tab.scans) tab.scans = {};
+  if (tokensSliceCache?.held && !tabs.some((other) => other !== tab && other.kind === "tokens")) {
+    tokensSliceCache = null;
+  }
 }
 
 function openTokensTab() {
@@ -7859,6 +7883,17 @@ function openArtifacts({ origin, select = null, fresh = false } = {}) {
   openTab({ ...ARTIFACTS_TAB });
 }
 
+function releaseArtifactsView(tab) {
+  const view = groups.get(tab.pane)?.artifactsView;
+  if (!view) return;
+  const pool = artifactCardPools.get(view);
+  if (pool) {
+    for (const node of pool.nodes) node.remove();
+    artifactCardPools.delete(view);
+  }
+  for (const card of view.querySelectorAll(".artifact-card")) card.remove();
+}
+
 /* 무대가 이 탭을 드러낼 때 지나는 문. 카탈로그는 처음 열 때와 사이드바가 다시
  * 청할 때, 그리고 `artifacts:changed`가 울릴 때만 다시 묻는다. */
 function paintArtifactsStage(tab) {
@@ -8356,10 +8391,6 @@ function artifactPathUnder(path, root) {
   if (path === root) return true;
   const base = root.replace(/[\\/]+$/, "");
   return path.startsWith(`${base}/`) || path.startsWith(`${base}\\`);
-}
-
-function artifactInRoots(row, roots) {
-  return artifactOriginInRoots(row.origin ?? {}, roots);
 }
 
 function artifactOriginInRoots(origin, roots) {

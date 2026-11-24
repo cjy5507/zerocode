@@ -3394,10 +3394,6 @@ el("orch-recheck").addEventListener("click", () => {
  * 백엔드가 답의 주인이고, 여기 폴백은 그 답을 받지 못했을 때의 짐작이다. */
 let agentTeamsMode = "panes";
 
-async function refreshTeamsMode() {
-  await refreshSettingsSnapshot({ reportError: true });
-}
-
 el("orch-teams-mode").addEventListener("change", (event) => {
   agentTeamsMode = event.target.value;
   void commitSetting("agent_teams_mode", "set_agent_teams_mode", { mode: agentTeamsMode });
@@ -4520,7 +4516,12 @@ function flowBySlug(slug) {
 
 function paintFlows() {
   const card = el("flow-card");
-  if (!flowData) { card.hidden = true; return; }
+  if (!flowData) {
+    const flowTabOpen = !autoView.hidden && autoPage === "flows";
+    card.hidden = !flowTabOpen;
+    if (flowTabOpen) el("flow-empty").hidden = false;
+    return;
+  }
   card.hidden = false;
   const flows = flowData.flows ?? [];
   el("flow-empty").hidden = flows.length !== 0;
@@ -4552,18 +4553,28 @@ el("flow-open-page").addEventListener("click", () => {
 
 function paintFlowRoster(flows) {
   const roster = el("flow-roster");
-  roster.replaceChildren();
+  const held = new Map([...roster.querySelectorAll(":scope > .flow-row")].map((node) => [node.dataset.slug, node]));
+  const wanted = [];
   for (const flow of flows) {
+    const words = flowChipWords(flow);
+    const selected = flow.slug === flowSelected;
+    const sig = JSON.stringify([locale, flow.slug, flow.name, selected, words]);
+    const existing = held.get(flow.slug);
+    if (existing && existing.dataset.flowSig === sig) {
+      wanted.push(existing);
+      continue;
+    }
     const item = document.createElement("div");
     item.className = "flow-row";
     item.dataset.slug = flow.slug;
-    if (flow.slug === flowSelected) item.setAttribute("aria-current", "true");
+    item.dataset.flowSig = sig;
+    if (selected) item.setAttribute("aria-current", "true");
     const name = document.createElement("span");
     name.className = "flow-row-name";
     name.textContent = flow.name;
     const chips = document.createElement("span");
     chips.className = "flow-row-chips";
-    for (const word of flowChipWords(flow)) {
+    for (const word of words) {
       const chip = document.createElement("span");
       chip.className = "flow-chip";
       chip.textContent = word;
@@ -4573,8 +4584,9 @@ function paintFlowRoster(flows) {
     // The shared helper wires the mouse AND the keyboard (role, tabindex,
     // Enter/Space), so a Flow is selectable without a pointer.
     actsAsButton(item, () => { flowSelected = flow.slug; paintFlows(); });
-    roster.append(item);
+    wanted.push(item);
   }
+  reconcileElementOrder(roster, wanted);
 }
 
 /* The roster's one-line read: where it is bound (hosts, else apps) and how many
@@ -5546,6 +5558,7 @@ function ownLoginRow({ chosen, name, under, pick: chose, alarmed = false, action
     button.className = action.className;
     button.type = "button";
     button.textContent = action.label;
+    if (action.hidden) button.hidden = true;
     button.addEventListener("click", () => action.press(button));
     line.appendChild(button);
   }
@@ -6497,11 +6510,12 @@ function codexAccountNote(rows) {
 /* The machine's own login as a row. Named when it can be named, and honest
  * about a key login having no name to give. */
 function codexSystemRow() {
+  const signedOut = codexSystemSignedOut();
   return ownLoginRow({
     chosen: !codexAccountReport.active,
     name: t("settings.codexAccounts.system", "이 기계의 로그인"),
     under: codexSystemUnder(),
-    alarmed: codexSystemSignedOut(),
+    alarmed: signedOut,
     pick: () => pickCodexAccount(null),
     // The CLI's own two verbs for its own home, and nothing more: a dead
     // `~/.codex` token used to have no road out of this pane at all
@@ -6515,6 +6529,7 @@ function codexSystemRow() {
       {
         className: "account-logout",
         label: t("settings.accounts.logout", "로그아웃"),
+        hidden: signedOut,
         press: () => logoutCodexLogin(),
       },
     ],
@@ -11086,13 +11101,6 @@ el("term-allow-osc52-clipboard").addEventListener("change", (event) => {
 const terminalCommandField = el("terminal-command");
 let terminalCommand = "";
 
-/* The line comes back already quoted. Rust owns both halves of that round
- * trip — the window quoting it a second time is how the two rules drifted
- * apart and started rewriting argv on save. */
-function loadTerminalCommand() {
-  return refreshSettingsSnapshot();
-}
-
 terminalCommandField.addEventListener("change", async () => {
   const line = terminalCommandField.value.trim();
   // The line goes over whole and is split where quotes say to split it. Doing
@@ -11232,6 +11240,7 @@ function setSettingsOpen(on, focus = null) {
  * as `aria-current` rather than as a class because that is the fact being
  * drawn, and somebody on a screen reader is owed it too. */
 function paintNavCurrent() {
+  const covered = !autoView.hidden || !settingsView.hidden || !spaceView.hidden;
   const showing = {
     // 작업은 가운데 탭이다 — 그 탭이 무대의 앞에 선 동안만 「여기」다(renderTabs와 같은 사실).
     "nav-tasks": activeTabId === TASKS_TAB.id,
@@ -11242,10 +11251,24 @@ function paintNavCurrent() {
     // The page, now that there is one. This used to read a settings section,
     // because 자동화 opened a field rather than a screen.
     "nav-automations": !autoView.hidden,
+    "nav-inbox": activeTabId === "inbox",
+    "nav-vault": activeTabId === "vault",
+    "nav-artifacts": activeTabId === "artifacts",
+    "nav-skills": activeTabId === "skills",
+    "nav-knowledge": activeTabId === "knowledge",
+    "nav-agents": activeTabId === "board",
+    "nav-jev": activeTabId === "jev",
+    "nav-board": activeTabId === "workspaces",
   };
   for (const [id, on] of Object.entries(showing)) {
-    if (on) el(id).setAttribute("aria-current", "page");
-    else el(id).removeAttribute("aria-current");
+    const node = el(id);
+    if (!node) continue;
+    const active = id === "nav-automations" ? on : (!covered && on);
+    if (active) {
+      if (node.getAttribute("aria-current") !== "page") node.setAttribute("aria-current", "page");
+    } else if (node.hasAttribute("aria-current")) {
+      node.removeAttribute("aria-current");
+    }
   }
   // Orca shows the history arrows on the terminal, 작업 and 자동화 and hides
   // them on the settings page (`shouldShowWorktreeHistoryControls`,
@@ -12018,6 +12041,7 @@ function paintAutoPage() {
   if (flows) {
     el("auto-list-page").hidden = true;
     el("auto-detail").hidden = true;
+    if (!flowData) paintFlows();
   }
   el("auto-page-count-schedules").textContent = automations.length > 0 ? String(automations.length) : "";
   const flowCount = flowData?.flows?.length ?? 0;
@@ -14186,12 +14210,12 @@ listen("automation:completed", (event) => {
   }
 });
 
-// 1분 주기 자동 갱신: 자동화 화면이 열려 있을 때 일정이 지난 작업을 재계산하고 오늘 하이라이트/달력을 최신화
-setInterval(() => {
-  if (!autoView.hidden && document.visibilityState === "visible") {
-    void refreshAutomations();
-  }
-}, 60000);
+// 1분 주기 자동 갱신: 자동화 화면이 열려 있고 창이 보일 때만 타이머를 돌린다(닫히면 타이머 정지).
+const autoClock = idlePoller({
+  wanted: () => !autoView.hidden,
+  every: 60_000,
+  tick: () => void refreshAutomations(),
+});
 
 /* Notification and browser controls are views over the same canonical
  * settings document as theme and terminal. The OS probe is deliberately not
@@ -14657,12 +14681,18 @@ function setAutoOpen(on) {
     recordNavVisit(activeWorktreePath);
   }
   autoView.hidden = !on;
+  autoClock.sync();
   if (!on) {
     closeAutoForm();
     autoAllRuns = [];
     autoJustToggledIds.clear();
     autoPausedOpen = false;
     autoRunsFilter = "all";
+    el("auto-list")?.replaceChildren();
+    el("auto-runs-list")?.replaceChildren();
+    el("auto-cal-days")?.replaceChildren();
+    el("auto-cal-selected-list")?.replaceChildren();
+    el("flow-roster")?.replaceChildren();
   }
   paintRouteWidth();
   paintNavCurrent();

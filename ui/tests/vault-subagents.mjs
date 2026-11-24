@@ -99,11 +99,19 @@ export async function testVaultSubagents(page) {
       listTop: listRect.top,
       noteText: vaultViewEl.querySelector(".vault-note").textContent,
     };
-    closeTab(tabs.find(t => t.kind === "vault"));
+    const rowsBeforeClose = vaultViewEl.querySelectorAll(".vault-list .vault-row").length;
+    closeTab(tabs.find(t => t.kind === "vault").id);
+    const rowsWhileClosed = vaultViewEl.querySelectorAll(".vault-list .vault-row").length;
+    openVault();
+    const rowsAfterReopen = vaultViewEl.querySelectorAll(".vault-list .vault-row").length;
+    seen.vaultReopen = { rowsBeforeClose, rowsWhileClosed, rowsAfterReopen };
 
     return seen;
   });
   assert.equal(seen.catalogs, true);
+  assert.ok(seen.vaultReopen.rowsBeforeClose > 0);
+  assert.equal(seen.vaultReopen.rowsWhileClosed, 0);
+  assert.equal(seen.vaultReopen.rowsAfterReopen, seen.vaultReopen.rowsBeforeClose);
   assert.equal(seen.toggle, "서브에이전트 1");
   assert.equal(seen.collapsed, "false");
   assert.equal(seen.expanded, true);

@@ -9735,9 +9735,7 @@ function paintWorkspaceBoardDoor() {
   if (el("nav-board").getAttribute("aria-pressed") !== String(workspaceBoardOpen)) {
     el("nav-board").setAttribute("aria-pressed", String(workspaceBoardOpen));
   }
-  if (workspaceBoardOpen) {
-    if (el("nav-board").getAttribute("aria-current") !== "page") el("nav-board").setAttribute("aria-current", "page");
-  } else if (el("nav-board").hasAttribute("aria-current")) el("nav-board").removeAttribute("aria-current");
+  if (typeof paintNavCurrent === "function") paintNavCurrent();
 }
 
 /* Open the board's tab, or close it. Closing is the tab's — its ×, ⌘W or the
@@ -15203,15 +15201,16 @@ function paintSpaceBreakdown() {
     say(note, () => t("space.breakdownFailed", "이 워크스페이스는 재지 못했습니다."));
     return;
   }
-  if (row.entries.length === 0) {
+  const entries = Array.isArray(row.entries) ? row.entries : [];
+  if (entries.length === 0) {
     note.hidden = false;
     say(note, () => t("space.breakdownEmpty", "파일이 없습니다."));
     return;
   }
   note.hidden = true;
   say(note, null);
-  const biggest = row.entries[0].size_bytes || 1;
-  for (const entry of row.entries.slice(0, SPACE_BREAKDOWN_ROWS)) {
+  const biggest = entries[0].size_bytes || 1;
+  for (const entry of entries.slice(0, SPACE_BREAKDOWN_ROWS)) {
     const line = document.createElement("div");
     line.className = "space-break-row";
     const name = document.createElement("span");
@@ -15335,8 +15334,30 @@ function paintSpaceTable() {
   for (const id of [...space.picked]) if (!visible.has(id)) space.picked.delete(id);
 
   const host = el("space-rows");
-  host.replaceChildren();
-  for (const row of rows) host.appendChild(spaceTableRow(row));
+  const held = new Map([...host.querySelectorAll(":scope > .space-row")].map((node) => [node.dataset.id, node]));
+  const wanted = [];
+  for (const row of rows) {
+    const picked = space.picked.has(row.id);
+    const selected = row.id === space.selected;
+    const failed = space.errors[row.id] ?? "";
+    const counts = spaceTabCounts(row.path);
+    const sig = JSON.stringify([
+      locale, row.id, row.name, row.path, row.project_name, row.branch ?? "",
+      row.status, row.size_bytes, row.size_text, row.ready, row.git_checked ?? false,
+      row.dirty_files ?? null, row.ahead ?? null, row.lanes ?? null,
+      row.blockers ?? null, row.reasons ?? null, row.last_activity_ms,
+      counts.terminals, counts.unsaved, picked, selected, space.busy, failed,
+    ]);
+    const existing = held.get(row.id);
+    if (existing && existing._spaceSig === sig) {
+      wanted.push(existing);
+      continue;
+    }
+    const built = spaceTableRow(row);
+    built._spaceSig = sig;
+    wanted.push(built);
+  }
+  reconcileElementOrder(host, wanted);
 
   const empty = el("space-empty");
   const nothing = rows.length === 0;
@@ -15451,7 +15472,7 @@ async function scanSpace() {
     // 경로가 다시 생겼을 때 남의 실패를 물려받는다.
     for (const id of Object.keys(space.errors)) if (!live.has(id)) delete space.errors[id];
   }
-  paintSpace();
+  if (!spaceView.hidden) paintSpace();
   spaceClock.sync();
   if (!el("resource-pop").hidden) paintResourceSpace();
   if (report) void prefetchSpaceGit();
@@ -15569,6 +15590,13 @@ function setSpaceOpen(on) {
     recordNavVisit(activeWorktreePath);
   }
   spaceView.hidden = !on;
+  if (!on) {
+    el("space-rows")?.replaceChildren();
+    el("space-map")?.replaceChildren();
+    el("space-breakdown-rows")?.replaceChildren();
+    el("space-repo-errors")?.replaceChildren();
+  }
+  if (typeof paintNavCurrent === "function") paintNavCurrent();
   spaceClock.sync();
   if (on) {
     paintSpace();
