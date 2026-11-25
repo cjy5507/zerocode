@@ -3407,6 +3407,7 @@ pub(super) async fn computer_loop(
                             &argv,
                             &argv,
                             &answer,
+                            None,
                         );
                         let _ = request.answer.send(answer);
                         return;
@@ -3466,14 +3467,30 @@ pub(super) async fn computer_loop(
                     });
                     if let Err(error) = computer_use::browser_route::command(&command) {
                         let answer = computer_cli_error(command.json, &error.code, &error.message);
-                        leave_step(&app, &root, evidence.as_deref(), &argv, &argv, &answer);
+                        leave_step(
+                            &app,
+                            &root,
+                            evidence.as_deref(),
+                            &argv,
+                            &argv,
+                            &answer,
+                            None,
+                        );
                         let _ = reply.send(answer);
                         return;
                     }
                     if let Err(error) = computer_use::input_policy::current().prepare(&mut command)
                     {
                         let answer = computer_cli_error(command.json, &error.code, &error.message);
-                        leave_step(&app, &root, evidence.as_deref(), &argv, &argv, &answer);
+                        leave_step(
+                            &app,
+                            &root,
+                            evidence.as_deref(),
+                            &argv,
+                            &argv,
+                            &answer,
+                            None,
+                        );
                         let _ = reply.send(answer);
                         return;
                     }
@@ -3505,7 +3522,15 @@ pub(super) async fn computer_loop(
                                 )
                             },
                             |step, refusal| {
-                                leave_step(&app, &root, evidence.as_deref(), step, step, refusal)
+                                leave_step(
+                                    &app,
+                                    &root,
+                                    evidence.as_deref(),
+                                    step,
+                                    step,
+                                    refusal,
+                                    None,
+                                )
                             },
                             || !reply.is_closed(),
                             |n| {
@@ -3585,7 +3610,15 @@ pub(super) async fn computer_loop(
                                 }
                             },
                             |step, logged, refusal| {
-                                leave_step(&app, &root, evidence.as_deref(), step, logged, refusal)
+                                leave_step(
+                                    &app,
+                                    &root,
+                                    evidence.as_deref(),
+                                    step,
+                                    logged,
+                                    refusal,
+                                    None,
+                                )
                             },
                             |level| {
                                 if let Some(dir) = dir.as_deref() {
@@ -3682,7 +3715,15 @@ pub(super) async fn computer_loop(
                         } else {
                             said_envelope(&command, evidence_report(&command, dir.as_deref()))
                         };
-                    leave_step(&app, &root, evidence.as_deref(), &line, &line, &answer);
+                    leave_step(
+                        &app,
+                        &root,
+                        evidence.as_deref(),
+                        &line,
+                        &line,
+                        &answer,
+                        None,
+                    );
                     answer
                 })
                 .await
@@ -3712,6 +3753,7 @@ pub(super) async fn computer_loop(
                     &argv,
                     &argv,
                     &answer,
+                    None,
                 );
                 answer
             } else {
@@ -3757,15 +3799,19 @@ pub(super) fn desktop_step(
 ) -> zerocode_hookd::TeamAnswer {
     let began = std::time::Instant::now();
     // A command that panicked is answered and left like any refusal: its
-    // line, the operator's memory and the band still hear of it.
-    let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        answer_computer_command(argv, Some(app), asking, workspace)
-    }))
-    .unwrap_or_else(|panic| {
-        computer_refused(format!(
-            "computer task failed: {}",
-            crate::system_runtime::panic_payload(panic.as_ref())
-        ))
+    // line, the operator's memory and the band still hear of it. What its
+    // act did is heard as the helper answers it: its evidence is framed by
+    // that, not by its words (I-t123731-rc1).
+    let (answer, acted) = computer_use::acted::during(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            answer_computer_command(argv, Some(app), asking, workspace)
+        }))
+        .unwrap_or_else(|panic| {
+            computer_refused(format!(
+                "computer task failed: {}",
+                crate::system_runtime::panic_payload(panic.as_ref())
+            ))
+        })
     });
     run_evidence::observing(
         run_evidence::measured(
@@ -3783,6 +3829,7 @@ pub(super) fn desktop_step(
                 argv,
                 logged,
                 &answer,
+                acted,
             )
         },
     );
@@ -3793,7 +3840,10 @@ pub(super) fn desktop_step(
 /// run's folder when the shell presented one, else the session's — and, for
 /// a desktop action, the band's count, the operator's memory of its hands,
 /// and the activity event. `argv` is what ran; `logged` what the log and the
-/// operator's memory keep of it.
+/// operator's memory keep of it; `acted` what its act did, as the helper
+/// answered it, which its evidence is framed by — `None` for a line no act
+/// of which was heard: a refusal at the door, a walk's refused step, a line
+/// of the window's own (I-t123731-rc1).
 pub(super) fn leave_step(
     app: &AppHandle,
     local_data_root: &Path,
@@ -3801,6 +3851,7 @@ pub(super) fn leave_step(
     argv: &[String],
     logged: &[String],
     answer: &zerocode_hookd::TeamAnswer,
+    acted: Option<zerocode_core::computer_use_protocol::execution::Acted>,
 ) {
     let run_dir = run_evidence::fenced_dir(local_data_root, presented_evidence);
     let is_desktop = !argv
@@ -3813,8 +3864,10 @@ pub(super) fn leave_step(
     if let Some(dir) = run_dir.or(session_dir) {
         evidence_runtime::leave_computer_evidence(
             &dir,
+            argv,
             logged,
             answer,
+            acted,
             capped,
             run_evidence::observation(),
         );
@@ -4223,7 +4276,7 @@ fn run_parallel(
                 &batch,
                 left_ms(),
                 step,
-                |step, refusal| leave_step(app, root, evidence, step, step, refusal),
+                |step, refusal| leave_step(app, root, evidence, step, step, refusal, None),
                 caller_waits,
                 // A parallel group's apps are the whole request's: held to its end.
                 |_| {},

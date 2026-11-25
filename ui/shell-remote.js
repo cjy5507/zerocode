@@ -2039,12 +2039,15 @@ listen("phone-link:paired", (event) => {
       label: t("settings.remoteLink.pairedOpen", "기기 보기"),
       run: () => {
         closing(note, () => note.remove());
+        if (settingsView.hidden) settingsPane = "remote-link";
         setSettingsOpen(true);
         showSettingsPane("remote-link");
+        el("remote-link-phones-title")?.closest(".integration-provider")?.scrollIntoView({ block: "center" });
+        el("remote-link-new-code")?.focus({ preventScroll: true });
       },
     },
   });
-  if (settingsPane === "remote-link" && !settingsView.hidden) void refreshRemoteLink();
+  if (settingsPane === "ssh" && !settingsView.hidden) void refreshRemoteLink();
 });
 el("remote-link-toggle").addEventListener("click", () => void remoteLinkPress(
   remoteLinkStatus?.enabled ? "phone_link_disable" : "phone_link_enable",

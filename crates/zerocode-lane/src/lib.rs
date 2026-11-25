@@ -500,19 +500,55 @@ fn await_pane_channel_addr(
     }
 }
 
-/// The last non-empty line an ended pane left on its terminal, as the clause a
-/// refusal carries (` — resume failed: …`), or nothing when it said nothing.
+/// Matches `MAX_REASON_CHARS` in
+/// `zo-ide/crates/zo-ide/src/session/process_lifecycle.rs:20` (separate
+/// workspace, so the constant cannot be imported directly).
+const MAX_LAST_WORDS_CHARS: usize = 768;
+
+/// The last non-empty logical line an ended pane left on its terminal, as the
+/// clause a refusal carries (` — resume failed: …`), or nothing when it said
+/// nothing. Rejoins soft-wrapped visual rows via `GridRow::wrap` (the same
+/// ledger `TerminalGrid::flatten_logical` uses for search) so multi-row
+/// refusals never lose their start/end or split words with artificial spaces.
 /// The output is pumped here because nobody else has read this pty yet.
 fn last_words_of(pty: &mut PtyHandle) -> String {
     pty.pump();
-    pty.terminal()
-        .grid()
-        .visible_text()
-        .lines()
-        .map(str::trim)
-        .rfind(|line| !line.is_empty())
-        .map(|line| format!(" — {}", line.chars().take(240).collect::<String>()))
-        .unwrap_or_default()
+    last_logical_line_of(pty.terminal().grid())
+}
+
+fn last_logical_line_of(grid: &zerocode_pty::TerminalGrid) -> String {
+    let rows = grid.snapshot().rows;
+    let mut i = rows.len();
+    while i > 0 {
+        let end = i - 1;
+        let mut start = end;
+        while start > 0 && rows[start].wrap.is_some() {
+            start -= 1;
+        }
+        let mut line = String::new();
+        for row_idx in start..=end {
+            let row = &rows[row_idx];
+            let take = if row_idx < end {
+                rows[row_idx + 1].wrap.map_or(row.cells.len(), |carried| {
+                    (carried as usize).min(row.cells.len())
+                })
+            } else {
+                row.cells.len()
+            };
+            for cell in &row.cells[..take] {
+                if cell.ch != '\0' {
+                    line.push(cell.ch);
+                }
+            }
+        }
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let clipped: String = trimmed.chars().take(MAX_LAST_WORDS_CHARS).collect();
+            return format!(" — {clipped}");
+        }
+        i = start;
+    }
+    String::new()
 }
 
 /// Check that a loopback listener speaks the session protocol and accepts the
@@ -660,3 +696,33 @@ fn detach(command: &mut Command) {
 
 #[cfg(not(any(unix, windows)))]
 fn detach(_command: &mut Command) {}
+
+#[cfg(test)]
+mod tests {
+    use super::last_logical_line_of;
+    use zerocode_pty::Terminal;
+
+    #[test]
+    fn wrapped_zo_refusal_rejoins_identically_at_80_and_120_columns() {
+        let refusal = "This conversation ran on `acme/model-a` at your provider `acme`, which no longer serves it (its row is gone from `providers`, or another of your providers now lists the model first). zo does not reopen it anywhere else: put the row back, or reopen it on another model (`--model <name>`).";
+        let output = format!(
+            "[zo] model discovery: 33 model(s) cached\r\nUsing Claude Code session credentials.\r\n{refusal}\r\n"
+        );
+        for cols in [80usize, 120usize] {
+            let mut term = Terminal::new(12, cols);
+            term.feed(output.as_bytes());
+            let said = last_logical_line_of(term.grid());
+            assert_eq!(
+                said,
+                format!(" — {refusal}"),
+                "wrapped refusal drifted at {cols} cols"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_grid_produces_empty_clause() {
+        let term = Terminal::new(6, 80);
+        assert_eq!(last_logical_line_of(term.grid()), "");
+    }
+}

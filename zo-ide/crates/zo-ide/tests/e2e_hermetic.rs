@@ -10335,6 +10335,175 @@ async fn e2e_headless_background_exit_reaches_the_model_at_a_tool_boundary() {
     assert!(requests[2].contains("headless-tail") && requests[2].contains("use TaskOutput"));
 }
 
+async fn terminal_background_group_ends_when_zo_exits(
+    controlling: bool,
+    end: impl FnOnce(&mut PtyRun) -> Option<i32>,
+) {
+    use tokio::io::AsyncReadExt as _;
+    use tokio::net::TcpListener;
+
+    let layout = Layout::new();
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    // The shell stays alive beside its child. The child's socket closes when
+    // the whole group exits, or when the test drops its end on failure.
+    let command = format!(
+        "python3 -c 'import socket; s = socket.create_connection((\"127.0.0.1\", {}), 30); s.recv(1)'; :",
+        listener.local_addr().unwrap().port(),
+    );
+    let service = ScriptedAnthropicService::background_bash(&command, "terminal-background-started")
+        .await
+        .unwrap();
+    let args = interactive_args();
+    let mut run = if controlling {
+        PtyRun::spawn_controlling(
+            &layout.cwd,
+            &layout.home,
+            &layout.sessions,
+            &layout.state,
+            service.base_url(),
+            &args,
+        )
+        .expect("spawn zo as the controlling PTY's session leader")
+    } else {
+        pty(&layout, service.base_url(), &args)
+    };
+    run.wait_for("directory:", TEST_TIMEOUT);
+    run.send(b"Start a background server.\r").unwrap();
+    run.wait_for_history_row("terminal-background-started", TEST_TIMEOUT);
+    let (mut socket, _) = tokio::time::timeout(TEST_TIMEOUT, listener.accept())
+        .await
+        .expect("background child announced that it was running")
+        .unwrap();
+
+    assert_eq!(end(&mut run), Some(0), "zo exits promptly");
+    let stopped = tokio::time::timeout(Duration::from_secs(3), socket.read(&mut [0])).await;
+    assert!(
+        matches!(stopped, Ok(Ok(0))),
+        "the background group is still running after zo exited: {stopped:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_terminal_background_group_ends_after_exit() {
+    terminal_background_group_ends_when_zo_exits(true, |run| {
+        run.send(b"/exit\r").unwrap();
+        run.exit_code(TEST_TIMEOUT)
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_terminal_background_group_ends_after_hangup() {
+    terminal_background_group_ends_when_zo_exits(true, |run| run.hang_up(TEST_TIMEOUT)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_terminal_background_group_ends_when_a_detached_pty_closes() {
+    terminal_background_group_ends_when_zo_exits(false, |run| run.hang_up(TEST_TIMEOUT)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_terminal_background_group_ends_after_sigterm() {
+    terminal_background_group_ends_when_zo_exits(true, |run| {
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(run.pid()).unwrap());
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).expect("send SIGTERM to test zo");
+        run.exit_code(TEST_TIMEOUT)
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_background_server_keeps_answering_after_headless_zo_exits() {
+    use tokio::io::AsyncReadExt as _;
+    use tokio::net::TcpListener;
+
+    let layout = Layout::new();
+    let ready = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    fs::write(layout.cwd.join("background_server.py"), r#"
+import errno
+import os
+import socket
+import stat
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+class ServerHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        errors = []
+        if self.path == "/write":
+            for fd in (1, 2):
+                try:
+                    os.write(fd, b"served request\n")
+                except OSError as error:
+                    errors.append(f"fd {fd}: {errno.errorcode[error.errno]}")
+        if errors:
+            Path("server-write-errors.txt").write_text(", ".join(errors))
+            self.server.write_failed = True
+        self.send_response(500 if errors else 200)
+        if self.path == "/health":
+            files = [os.fstat(fd) for fd in (1, 2)]
+            self.send_header("X-Regular-Output", str(all(
+                stat.S_ISREG(file.st_mode) for file in files
+            )))
+        self.end_headers()
+        self.wfile.write(b"ready")
+
+with HTTPServer(("127.0.0.1", 0), ServerHandler) as server:
+    server.timeout = float(sys.argv[2])
+    server.write_failed = False
+    with socket.create_connection(("127.0.0.1", int(sys.argv[1])), server.timeout) as ready:
+        ready.sendall(server.server_port.to_bytes(2, "big"))
+    for _ in range(3):
+        server.handle_request()
+        if server.write_failed:
+            break
+"#).unwrap();
+    let command = format!(
+        "exec python3 background_server.py {} {}",
+        ready.local_addr().unwrap().port(),
+        TEST_TIMEOUT.as_secs(),
+    );
+    let service = ScriptedAnthropicService::tool_calls(
+        &[("bash", serde_json::json!({"command": command, "run_in_background": true}))],
+        "background-server-started",
+    ).await.unwrap();
+    let output = run_pipe(&layout.cwd, &layout.home, &layout.sessions, &layout.state, service.base_url(),
+        &["--plain", "--permission-mode", "danger-full-access"], b"Start a background server.\n/exit\n").unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("background-server-started"), "{output:?}");
+
+    let port = tokio::time::timeout(TEST_TIMEOUT, async {
+        let (mut socket, _) = ready.accept().await.unwrap();
+        socket.read_u16().await.unwrap()
+    }).await.expect("the server announced its address");
+    let client = reqwest::Client::builder().no_proxy().timeout(TEST_TIMEOUT).build().unwrap();
+    for path in ["health", "write", "write"] {
+        let response = client.get(format!("http://127.0.0.1:{port}/{path}")).send().await.unwrap();
+        let status = response.status();
+        assert_eq!(status, reqwest::StatusCode::OK,
+            "GET /{path} after zo exited, stdio errors: {:?}",
+            fs::read_to_string(layout.cwd.join("server-write-errors.txt")).ok());
+        if path == "health" {
+            assert_eq!(
+                response.headers().get("x-regular-output").and_then(|header| header.to_str().ok()),
+                Some("True"),
+                "both output streams point to regular files",
+            );
+        }
+        assert_eq!(response.text().await.unwrap(), "ready");
+    }
+    let output_dir = layout.state.join("zo-bash-raw");
+    let files: Vec<_> = fs::read_dir(output_dir)
+        .expect("the background output files stay named after zo exits")
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect();
+    assert_eq!(files, ["served request\nserved request\n"; 2]);
+}
+
 /// t-80732: the 10-28 shape — an example `pkill -f` in backticks inside a
 /// double-quoted line — aimed at a process the window started is refused by
 /// zo with its reason, in danger-full-access and with nobody to ask, and the

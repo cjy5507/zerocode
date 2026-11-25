@@ -11,6 +11,7 @@ use zerocode_core::computer_use::COMPUTER_USE_PROTOCOL_VERSION;
 use zerocode_core::computer_use_protocol::cache::{
     AppKeys, Namespace, SnapshotCache, validate_pinned_element, validate_requested_elements,
 };
+use zerocode_core::computer_use_protocol::execution::ActedWindow;
 use zerocode_core::computer_use_protocol::marks::{ELEMENT_FRAMES_KEY, Pin};
 use zerocode_core::computer_use_protocol::params;
 use zerocode_core::computer_use_protocol::{
@@ -19,6 +20,7 @@ use zerocode_core::computer_use_protocol::{
 };
 
 use super::super::ComputerUseError;
+use super::super::took_input::{self, Road};
 use super::apps::{AppDescriptor, Catalog};
 use super::desktop_windows;
 use super::snapshot::{self, BuildRequest, SharedSnapshot, Snapshot};
@@ -30,6 +32,12 @@ pub(super) struct Provider {
     cache: SnapshotCache<SharedSnapshot>,
     /// Process descriptions, kept across calls (`apps::Catalog`).
     pub(super) apps: Catalog,
+    /// The window the act being run checked itself against
+    /// (`current_snapshot`), for its answer to name (`run_action`) once
+    /// that window was seen to take the act's input (`took_input`).
+    acted: Option<ActedWindow>,
+    /// The roads the act being run sent its input by, in order (`sent_by`).
+    roads: Vec<Road>,
 }
 
 impl Provider {
@@ -38,6 +46,8 @@ impl Provider {
             client: UiaClient::new()?,
             cache: SnapshotCache::new(),
             apps: Catalog::default(),
+            acted: None,
+            roads: Vec::new(),
         })
     }
 
@@ -166,6 +176,7 @@ impl Provider {
     /// `currentSnapshot`: a fresh, screenshot-less observation whose
     /// requested indexes still name what the cached one indexed — or, for a
     /// click by a mark's number, whose element is still the one its pin names.
+    /// Its window is the one the act checks itself against (`acts_in`).
     pub(super) fn current_snapshot(
         &mut self,
         params: &Map<String, Value>,
@@ -176,7 +187,7 @@ impl Provider {
                 ProviderError::invalid_argument("a mark's pin needs its elementIndex")
             })?;
             validate_pinned_element(&SharedSnapshot::from_observed(&current), index, &pin)?;
-            return Ok(current);
+            return Ok(self.acts_in(current, params));
         }
         self.cache.prune(Instant::now());
         let cached = self
@@ -195,17 +206,57 @@ impl Provider {
             &SharedSnapshot::from_observed(&current),
             &requested,
         )?;
-        Ok(current)
+        Ok(self.acts_in(current, params))
+    }
+
+    /// The window an act checks itself against, as it finds it — its number
+    /// and its app's process — kept for the act's answer to name. An act
+    /// asked to `restoreWindow` brought it to the front as it looked
+    /// (`snapshot::build`).
+    fn acts_in(&mut self, current: Snapshot, params: &Map<String, Value>) -> Snapshot {
+        self.acted = Some(ActedWindow {
+            id: current.window.id(),
+            pid: u64::from(current.window.pid),
+        });
+        if params::flag(params, "restoreWindow") {
+            self.sent_by(Road::Raise);
+        }
+        current
+    }
+
+    /// Put a road the act being run sent input by on its record. Every road
+    /// an act takes goes here and nowhere else: the act's answer names its
+    /// window only as the one policy reads the record (`took_input::took`,
+    /// `run_action`), never by a number an act hands it.
+    pub(super) fn sent_by(&mut self, road: Road) {
+        self.roads.push(road);
     }
 
     /// `actionResult`: run the action, observe after it, and when the
-    /// requested window is gone report its unavailable observation.
+    /// requested window is gone report its unavailable observation. The
+    /// answer names the window the act went to (`actedWindow`), as the macOS
+    /// helper's does: the look after the act may land on another window of
+    /// the app, and a step's evidence is held to the acted one
+    /// (I-t123731-rc1, review t-128987 §2). It names it only when the roads
+    /// the act took saw that window take the input (`sent_by`,
+    /// `took_input::took`): a step's evidence is a look of the window its
+    /// answer names, and a window the input was only aimed at may not be
+    /// where it went (reviews t-129021 §3, t-129079 §1). An act that answers
+    /// an error names no window, whatever its roads saw.
     fn run_action(
         &mut self,
         params: &Map<String, Value>,
         action: fn(&mut Self, &Map<String, Value>) -> Result<ActionMetadata, ProviderError>,
     ) -> Result<Value, ProviderError> {
-        let metadata = action(self, params)?;
+        self.acted = None;
+        self.roads.clear();
+        let answered = action(self, params);
+        let roads = std::mem::take(&mut self.roads);
+        let mut metadata = answered?;
+        metadata.acted_window = self
+            .acted
+            .take()
+            .and_then(|window| window.if_it_took(took_input::took(&roads, window.id)));
         let include_screenshot = !params::flag(params, "noScreenshot");
         Self::action_result(params, metadata, self.observe(params, include_screenshot))
     }

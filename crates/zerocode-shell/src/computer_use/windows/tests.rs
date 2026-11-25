@@ -237,6 +237,16 @@ fn clicking_by_index_invokes_the_button_and_toggles_the_checkbox() {
             .expect("click");
         assert_eq!(answer["action"]["path"], "accessibility", "{answer}");
         assert_eq!(answer["action"]["actionName"], "Invoke");
+        // The act names the window it went to, as the macOS helper's does —
+        // here the fixture's one window, the look after it shows too.
+        assert_eq!(
+            answer["action"]["actedWindow"],
+            json!({
+                "id": answer["snapshot"]["window"]["id"],
+                "pid": answer["snapshot"]["app"]["pid"],
+            }),
+            "{answer}"
+        );
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(Fixture::clicks(), before + 1);
         assert_eq!(fixture.status_text(), "clicked");
@@ -353,6 +363,13 @@ fn type_text_replaces_the_focused_edits_selection_through_the_value_pattern() {
             fixture.edit_text(),
             "start 한글 end",
             "the edit holds the seed and the text once ({answer})"
+        );
+        // The edit is a window of its own inside the fixture's and answered
+        // the write, so the text was seen to go into the fixture's window:
+        // the answer names it.
+        assert_eq!(
+            answer["action"]["actedWindow"]["id"], answer["snapshot"]["window"]["id"],
+            "{answer}"
         );
     });
 }

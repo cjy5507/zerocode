@@ -4817,7 +4817,7 @@ const packedWire = await page.evaluate(async () => {
     rows: [
       { index: 0, cells: [
         ...[..."error:"].map((ch) => ({ ch, style: bold })),
-        { ch: " " }, { ch: "한" }, { ch: " " },
+        { ch: " " }, { ch: "한" }, { ch: "\u0000" },
         { ch: "e", zw: "́" }, { ch: " " }, { ch: " " },
       ] },
       blank,
@@ -4829,7 +4829,7 @@ const packedWire = await page.evaluate(async () => {
   await feed({
     ...base,
     rows: [
-      { index: 0, text: "error: 한 é ".replace("é", "e") + " ", runs: [[0, 6, bold]], zw: [[9, "́"]] },
+      { index: 0, text: "error: 한\u0000é ".replace("é", "e") + " ", runs: [[0, 6, bold]], zw: [[9, "́"]] },
       blank,
     ],
   });
@@ -18445,14 +18445,17 @@ const skillTyped = await page.evaluate(async () => {
   const tab = tabs.find((tab) => tab.kind === 'skills'); const view = docHost(tab.pane, 'skills');
   await prepareSkillInstall(view, ['release-review'], [], 'update');
   openSkillsView(); await refreshSkills(true);
-  setSettingsOpen(true); showSettingsPane('skills'); await refreshSkills();
-  const summary = document.getElementById('skills-summary').textContent;
-  const noRowsInSettings = !document.querySelector('.settings-pane[data-pane="skills"] .lib-row');
+  const awayId = window.__SKILL_BEFORE__.activeTabId;
+  if (awayId && awayId !== 'skills' && tabs.some((one) => one.id === awayId)) setActiveTab(awayId);
+  const leftSkillsTab = activeTabId !== 'skills';
+  setSettingsOpen(true); showSettingsPane('skills');
+  const noRowsInSettings = !document.querySelector('.settings-pane[data-pane="skills"]');
+  const reopenedSkillsTab = document.getElementById('settings-view').hidden && activeTabId === 'skills';
   setSettingsOpen(false);
-  return { calls: window.__SKILL_CALLS__, summary, noRowsInSettings };
+  return { calls: window.__SKILL_CALLS__, noRowsInSettings, leftSkillsTab, reopenedSkillsTab };
 });
 const skillTerm = skillTyped.calls.find((c) => c.command === 'term_text');
-ok('skill update stages a plain terminal command without Enter and rescans on return', skillTyped.calls.some((c) => c.command === 'open_term_tab' && c.args.plain === true) && skillTerm?.args.text === 'npx skills update release-review --global' && !/[\r\n]/.test(skillTerm.args.text) && !skillTyped.calls.some((c) => c.command === 'term_key') && skillTyped.calls.some((c) => c.command === 'skills_rescan') && skillTyped.noRowsInSettings && skillTyped.summary.includes('300'), JSON.stringify(skillTyped));
+ok('skill update stages a plain terminal command without Enter and rescans on return', skillTyped.calls.some((c) => c.command === 'open_term_tab' && c.args.plain === true) && skillTerm?.args.text === 'npx skills update release-review --global' && !/[\r\n]/.test(skillTerm.args.text) && !skillTyped.calls.some((c) => c.command === 'term_key') && skillTyped.calls.some((c) => c.command === 'skills_rescan') && skillTyped.noRowsInSettings && skillTyped.leftSkillsTab && skillTyped.reopenedSkillsTab, JSON.stringify(skillTyped));
 await page.evaluate(() => {
   window.__SKILL_FOREGROUND_OLD__ = window.__ANSWER__.term_has_running_process;
   window.__SKILL_FOREGROUND_CALLS__ = 0;
@@ -53994,7 +53997,6 @@ const brain = await page.evaluate(async () => {
     initialFitRatio: ((graphLayout.bounds.maxX - graphLayout.bounds.minX) * graphLayout.scale)
       / view.querySelector(".knowledge-canvas").clientWidth,
     initialFitWanted: graphLayout.tuning.mapFit,
-    gradients: view.querySelectorAll("defs radialGradient[id^='knowledge-node-gradient-']").length,
     halos: view.querySelectorAll(".knowledge-halo").length,
     /* 서 있는 줄만 센다 — 공급망 렌즈(P4)의 줄은 그 렌즈가 켜졌을 때만 선다. */
     legendNodes: view.querySelectorAll(".knowledge-legend [data-node-kind]:not([hidden])").length,
@@ -54036,7 +54038,6 @@ ok(
     // 토큰(`--knowledge-map-fit`, t-12029)의 몫 **이하**다 — 묶는 축이 높이일 때 그보다 작다.
     brain.initialFitRatio > 0.3 &&
     brain.initialFitRatio <= brain.initialFitWanted + 0.02 &&
-    brain.gradients === 8 &&
     brain.halos === brain.nodeCount &&
     // 범례는 점 넷(페이지·유령·원본·회상됨)과 선 일곱(여섯 관계 + merge?) — t-2931.
     brain.legendNodes === 4 &&

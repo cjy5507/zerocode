@@ -222,6 +222,118 @@ pub fn requested(params: &Map<String, Value>) -> bool {
     params.get(BACKGROUND) == Some(&Value::Bool(true))
 }
 
+/// Whether a step's words send it down the background road (I-t123731-rc1):
+/// the policy every request is prepared under sends a step that names its
+/// app (or a pinned mark) to its window, and an app or a page it opens comes
+/// up behind — the two policies alike — while a step that takes the desk
+/// (`--foreground`, `--restore-window`) could run only under the shared one,
+/// which sends it to the desktop. Where there is no background road, no step
+/// goes down it. The words are what a step's evidence goes by only when no
+/// act of the step was heard (`acted`): ZeroCode's own page pressed it, or
+/// it pressed nothing — what ran is read off the act itself, since the words
+/// may say `--foreground` of a mark click that went to the background.
+#[must_use]
+pub fn went_in_the_background(command: &ComputerCommand) -> bool {
+    let mut prepared = command.clone();
+    HAS_BACKGROUND_ROAD
+        && InputPolicy::Background.prepare(&mut prepared).is_ok()
+        && prepared.params.as_object().is_some_and(requested)
+}
+
+/// What an act did, as the helper answered it (I-t123731-rc1): whether it
+/// went no further than one window, and that window as the helper found it
+/// when it acted. A step's evidence is framed by this — not by its words read
+/// again, which may say `--foreground` of a mark click the shared desktop
+/// sent to the background, nor by the look after the act, which may land on
+/// another window of the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Acted {
+    /// The act touched its window alone: an app's act the helper ran in the
+    /// background without borrowing the desktop, a window moved, sized,
+    /// minimized, zoomed or closed by its number, or an app or a page
+    /// opened behind.
+    pub in_its_window: bool,
+    /// The window it acted in, when the helper named one.
+    pub window: Option<ActedWindow>,
+}
+
+/// A window as an act found it: its number, and the process that owned it
+/// then — so a number the window server gave out again names no other
+/// window. On the wire, as an act's answer names it: `{ "id", "pid" }`
+/// ([`ACTED_WINDOW`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActedWindow {
+    pub id: u64,
+    pub pid: u64,
+}
+
+impl ActedWindow {
+    /// This window, for the answer of an act aimed at it to name
+    /// (`actedWindow`), when its provider saw this window take the act's
+    /// input (`took_input`, the number of the window it saw take it) — and
+    /// none when it saw another window take it, or did not see (review
+    /// t-129021 §3). A step's evidence keeps a look of the window its answer
+    /// names, so a window the input was only aimed at — a wheel or a drag
+    /// sent at a point of the screen, which whatever window stands there
+    /// takes; keys, which the input stream takes without saying where; a
+    /// press that went to a popup the window owns — is named by no answer,
+    /// and its step keeps no picture (review t-129057).
+    #[must_use]
+    pub fn if_it_took(self, took_input: Option<u64>) -> Option<Self> {
+        (took_input == Some(self.id)).then_some(self)
+    }
+}
+
+/// The word an app act's answer names the window it acted in by, in its
+/// `action` (`id`, `pid`): the window the helper checked the act against
+/// when it acted, whatever window the look after the act lands on.
+pub const ACTED_WINDOW: &str = "actedWindow";
+
+/// What a request that acts did, read off what was sent and what the helper
+/// answered (I-t123731-rc1); `None` for one that does not act. `background`:
+/// whether it went to the helper asking for the background road. A window
+/// moved, sized, minimized, zoomed or closed by its number touches that
+/// window alone, and its answer names it and its owner (`windowId`, `pid`);
+/// bringing one to the front takes the person's front app. An app's act
+/// names the window it went to (`action.actedWindow`), and went no further
+/// than it when it was sent for the background and the helper did not
+/// borrow the desktop instead (`action.borrowedDesktop`).
+#[must_use]
+pub fn acted(method: &str, background: bool, answer: &Value) -> Option<Acted> {
+    if method == "windowAction" {
+        let action = answer.get("action")?.as_str()?;
+        return Some(Acted {
+            in_its_window: action != "focus",
+            window: acted_window(answer.get("windowId"), answer.get("pid")),
+        });
+    }
+    let acts = ComputerMethod::ALL
+        .iter()
+        .any(|known| known.provider_name() == Some(method) && known.acts());
+    if !acts {
+        return None;
+    }
+    let action = answer.get("action");
+    let named = action.and_then(|action| action.get(ACTED_WINDOW));
+    let borrowed =
+        action.and_then(|action| action.get("borrowedDesktop")) == Some(&Value::Bool(true));
+    Some(Acted {
+        in_its_window: background && !borrowed,
+        window: acted_window(
+            named.and_then(|named| named.get("id")),
+            named.and_then(|named| named.get("pid")),
+        ),
+    })
+}
+
+/// A window an answer names by its number and its owner, both positive.
+fn acted_window(id: Option<&Value>, pid: Option<&Value>) -> Option<ActedWindow> {
+    Some(ActedWindow {
+        id: id?.as_u64().filter(|id| *id > 0)?,
+        pid: pid?.as_u64().filter(|pid| *pid > 0)?,
+    })
+}
+
 #[must_use]
 pub fn unavailable() -> ProviderError {
     ProviderError::new(
@@ -581,6 +693,165 @@ mod tests {
         prepare_shared(&mut background, true).unwrap();
         assert_eq!(background.params[BACKGROUND], true);
         assert!(background.params.get(MAY_BORROW_DESKTOP).is_none());
+    }
+
+    /// The road a step's words send it down — what its evidence goes by
+    /// when no act of it was heard (I-t123731-rc1). An app's act and an app
+    /// it opens go to the background under either policy; a step that takes
+    /// the desk does not, nor a look at the screen; and where there is no
+    /// background road, nothing does.
+    #[test]
+    fn a_step_that_ran_says_whether_it_went_down_the_background_road() {
+        for words in [
+            vec!["click", "--app", "Fixture", "--element-index", "3"],
+            vec!["type-text", "--app", "Fixture", "--text", "hello"],
+            vec!["press-key", "--app", "Fixture", "--key", "Return"],
+            vec!["click", "--mark", "1", "--look", "fixture"],
+            vec!["launch", "--app", "Fixture"],
+        ] {
+            let ran = command(&words);
+            assert_eq!(
+                went_in_the_background(&ran),
+                HAS_BACKGROUND_ROAD,
+                "{words:?}"
+            );
+            // The shared policy marks it the same way.
+            let mut shared = ran.clone();
+            prepare_shared(&mut shared, HAS_BACKGROUND_ROAD).unwrap();
+            assert_eq!(
+                requested(shared.params.as_object().unwrap()),
+                HAS_BACKGROUND_ROAD,
+                "shared {words:?}"
+            );
+        }
+        for words in [
+            vec![
+                "click",
+                "--app",
+                "Fixture",
+                "--element-index",
+                "3",
+                "--foreground",
+            ],
+            vec!["get-app-state", "--app", "Fixture", "--restore-window"],
+            vec!["mouse-click", "--x", "1", "--y", "1", "--foreground"],
+            vec!["key", "--key", "tab", "--foreground"],
+            vec!["quit", "--app", "Fixture"],
+            vec!["screenshot"],
+        ] {
+            assert!(!went_in_the_background(&command(&words)), "{words:?}");
+        }
+    }
+
+    /// Why a step's evidence goes by its act, not its words (I-t123731-rc1,
+    /// review t-128744 §1): under the shared desktop a mark's press is sent
+    /// without the `--foreground` its words carried — the mark gives the
+    /// press its app and its window, and nothing of the desk — so it goes to
+    /// the background; and a click asked `--background --foreground` keeps
+    /// the background road it asked for, the one the helper reads.
+    #[test]
+    fn a_press_may_go_to_the_background_whatever_its_words_say_of_the_desk() {
+        let press = json!({
+            "app": "pid:42",
+            "windowId": 7,
+            "elementIndex": 3,
+            "noScreenshot": true,
+            "deferObservation": true,
+        });
+        let sent = InputPolicy::SharedDesktop
+            .prepare_provider("click", press)
+            .unwrap();
+        assert_eq!(
+            requested(sent.as_object().unwrap()),
+            HAS_BACKGROUND_ROAD,
+            "a mark's press: {sent}"
+        );
+        let mut both = command(&[
+            "click",
+            "--app",
+            "Fixture",
+            "--element-index",
+            "3",
+            "--background",
+            "--foreground",
+        ]);
+        InputPolicy::SharedDesktop.prepare(&mut both).unwrap();
+        assert_eq!(both.params[BACKGROUND], true);
+        assert!(!went_in_the_background(&both), "its words say the desk");
+    }
+
+    /// What an act did is read off what was sent and what the helper
+    /// answered (I-t123731-rc1): an app's act sent for the background went
+    /// no further than the window it names — the one it was checked against
+    /// when it acted, not the one the look after it shows — unless the
+    /// helper borrowed the desktop instead, and one sent without it took the
+    /// desk; a window moved by its number touched that window alone, while
+    /// bringing one to the front took the person's front app; an app opened
+    /// behind names no window; and a look is not an act.
+    #[test]
+    fn what_an_act_did_is_read_off_what_was_sent_and_what_the_helper_answered() {
+        let pressed = json!({
+            "action": {
+                "targetWindowId": 19,
+                ACTED_WINDOW: { "id": 7, "pid": 501 },
+                "background": { "requested": true },
+            },
+            "snapshot": { "window": { "id": 19 } },
+        });
+        let seven = Some(ActedWindow { id: 7, pid: 501 });
+        assert_eq!(
+            acted("click", true, &pressed),
+            Some(Acted {
+                in_its_window: true,
+                window: seven,
+            }),
+            "the window the act went to, not the one the look after it shows"
+        );
+        assert_eq!(
+            acted("click", false, &pressed),
+            Some(Acted {
+                in_its_window: false,
+                window: seven,
+            }),
+            "sent without the background road: it took the desk"
+        );
+        let borrowed = json!({
+            "action": { ACTED_WINDOW: { "id": 7, "pid": 501 }, "borrowedDesktop": true },
+        });
+        assert_eq!(
+            acted("click", true, &borrowed).map(|acted| acted.in_its_window),
+            Some(false),
+            "the helper borrowed the desktop instead"
+        );
+        let window = |action: &str| json!({ "windowId": 17, "pid": 501, "action": action });
+        assert_eq!(
+            acted("windowAction", false, &window("move")),
+            Some(Acted {
+                in_its_window: true,
+                window: Some(ActedWindow { id: 17, pid: 501 }),
+            }),
+            "a window moved by its number, with or without the background road"
+        );
+        assert_eq!(
+            acted("windowAction", false, &window("focus")).map(|acted| acted.in_its_window),
+            Some(false),
+            "a window brought to the front"
+        );
+        assert_eq!(
+            acted("launchApp", true, &json!({ "launched": true })),
+            Some(Acted {
+                in_its_window: true,
+                window: None,
+            }),
+            "an app opened behind names no window"
+        );
+        assert_eq!(acted("getAppState", true, &pressed), None, "a look");
+        let unnumbered = json!({ "action": { ACTED_WINDOW: { "id": 0, "pid": 501 } } });
+        assert_eq!(
+            acted("click", true, &unnumbered).and_then(|acted| acted.window),
+            None,
+            "no window is numbered 0"
+        );
     }
 
     #[test]

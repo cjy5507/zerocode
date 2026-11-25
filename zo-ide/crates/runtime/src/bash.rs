@@ -3,13 +3,12 @@ use std::env;
 use std::io;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use plugins::bounded_child::note_reaped;
 #[cfg(unix)]
-use plugins::bounded_child::{Group, GroupEnd};
+use plugins::bounded_child::{end_group, Group, GroupEnd};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::Builder;
@@ -494,166 +493,123 @@ fn kept_in_background(background: Option<TaskReach>) -> &'static str {
 /// kills the process and how promptly the terminal status lands.
 const BACKGROUND_WATCH_SLICE: Duration = Duration::from_millis(200);
 
-/// How long the watcher waits for the pipe drains to reach EOF after the child
-/// exits before it closes the log anyway. A detached grandchild can hold the
-/// write end open forever, so the wait is bounded — the log is sealed either
-/// way, so the terminal status always means "this output is final".
+/// Time a foreground run gives its inherited pipe writers after the shell exits.
+#[cfg(unix)]
 const BACKGROUND_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// Serializes the pipe drains against the watcher's terminal write.
-///
-/// The invariant this exists to hold: **the watcher's own closing write is the
-/// last thing in the log.** Once the watcher has recorded `[exit N]` /
-/// `[watch error]` / `[killed by TaskStop]`, no drain can append behind it, so
-/// a consumer that reads the log after seeing that line — every agent reading
-/// its own background command — neither misses a trailing line nor races a
-/// drain still in flight.
-///
-/// Note which status that binds. `Completed`/`Failed` are written *by the
-/// watcher*, after the seal, so observing them already implies a final log.
-/// `Stopped` is not: [`crate::task_registry::TaskRegistry::stop`] flips the
-/// status up front and the registry deliberately keeps the process counted as
-/// live until [`crate::task_registry::TaskRegistry::confirm_background_exit`] —
-/// `Stopped` is a *request*, and the log finalizes a moment later when the
-/// watcher reaps the child and records `[killed by TaskStop]`.
-struct DrainGate {
-    /// Drains that may still append; each clears its slot when its pipe ends.
-    active: AtomicUsize,
-    /// Set once the watcher has closed the log. A `Mutex` rather than an atomic
-    /// precisely so sealing cannot land between a drain's check and its append.
-    sealed: Mutex<bool>,
+#[cfg(unix)]
+#[derive(Default)]
+struct TerminalBackgroundGroups {
+    pids: std::collections::HashSet<u32>,
+    closing: bool,
 }
 
-impl DrainGate {
-    fn new() -> Self {
-        Self {
-            active: AtomicUsize::new(0),
-            sealed: Mutex::new(false),
+#[cfg(unix)]
+static TERMINAL_BACKGROUND_GROUPS: OnceLock<Mutex<TerminalBackgroundGroups>> = OnceLock::new();
+
+/// Opt in before starting tools in a terminal frontend. The groups belong to
+/// the process, so switching sessions does not lose track of their owners.
+#[cfg(unix)]
+pub fn track_terminal_background_groups() {
+    TERMINAL_BACKGROUND_GROUPS.get_or_init(Mutex::default);
+}
+
+#[cfg(unix)]
+fn terminal_background_groups() -> Option<std::sync::MutexGuard<'static, TerminalBackgroundGroups>> {
+    TERMINAL_BACKGROUND_GROUPS
+        .get()
+        .map(|groups| groups.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// End the groups still owned by the terminal process and close registration.
+#[cfg(unix)]
+pub fn end_terminal_background_groups() {
+    if let Some(mut groups) = terminal_background_groups() {
+        groups.closing = true;
+        // The window may forcibly close the pane 200 ms after SIGHUP.
+        // Send to every group while its leader is still unreaped.
+        for pid in groups.pids.drain() {
+            let _ = end_group(pid, Group::Kill);
         }
     }
+}
 
-    /// Append one streamed line. `false` means the drain must stop — either the
-    /// log is sealed or the task is gone.
-    fn append(
-        &self,
-        registry: &crate::task_registry::TaskRegistry,
-        task_id: &str,
-        entry: &str,
-    ) -> bool {
-        let sealed = self.sealed.lock().unwrap_or_else(PoisonError::into_inner);
-        !*sealed && registry.append_output(task_id, entry).is_ok()
-    }
-
-    /// Wait up to `grace` for every drain to finish, then seal the log so no
-    /// later append can slip in behind the terminal status.
-    ///
-    /// Returns `true` when a drain was still in flight when `grace` ran out: its
-    /// remaining output is dropped, and the caller records that truncation
-    /// rather than letting the log silently disagree with the status.
-    fn seal_after_drains_within(&self, grace: Duration) -> bool {
-        let deadline = Instant::now() + grace;
-        while self.active.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
+fn spawn_background_child(command: &mut Command) -> io::Result<std::process::Child> {
+    #[cfg(unix)]
+    if let Some(mut groups) = terminal_background_groups() {
+        if groups.closing {
+            return Err(io::ErrorKind::Interrupted.into());
         }
-        let mut sealed = self.sealed.lock().unwrap_or_else(PoisonError::into_inner);
-        *sealed = true;
-        self.active.load(Ordering::Acquire) > 0
+        let child = command.spawn()?;
+        groups.pids.insert(child.id());
+        return Ok(child);
     }
-
-    fn seal_after_drains(&self) -> bool {
-        self.seal_after_drains_within(BACKGROUND_DRAIN_GRACE)
-    }
+    command.spawn()
 }
 
-/// What the watcher appends when it had to seal the log while a pipe was still
-/// open, so a truncated tail is visible instead of silently missing.
-fn drain_truncation_notice() -> String {
-    crate::background_log::drain_truncation_notice(BACKGROUND_DRAIN_GRACE.as_secs())
-}
-
-/// Stream one pipe of a background task into its registry output log.
-fn spawn_background_pipe_drain<R: io::Read + Send + 'static>(
-    registry: crate::task_registry::TaskRegistry,
-    task_id: String,
-    pipe: R,
-    label: Option<&'static str>,
-    gate: Arc<DrainGate>,
-) {
-    std::thread::spawn(move || {
-        let reader = io::BufReader::new(pipe);
-        for line in io::BufRead::lines(reader) {
-            let Ok(line) = line else { break };
-            let entry = match label {
-                Some(label) => crate::background_log::tagged_line(label, &line),
-                None => format!("{line}\n"),
-            };
-            if !gate.append(&registry, &task_id, &entry) {
-                break;
-            }
-        }
-        gate.active.fetch_sub(1, Ordering::Release);
-    });
-}
-
-/// Drain both stdio pipes of a background child into the task output log.
-///
-/// Returns the gate the watcher seals before recording a terminal status.
-fn spawn_background_task_drain(
-    registry: crate::task_registry::TaskRegistry,
-    task_id: String,
+fn try_wait_background_child(
     child: &mut std::process::Child,
-) -> Arc<DrainGate> {
-    let gate = Arc::new(DrainGate::new());
-    if let Some(stdout) = child.stdout.take() {
-        gate.active.fetch_add(1, Ordering::Relaxed);
-        spawn_background_pipe_drain(
-            registry.clone(),
-            task_id.clone(),
-            stdout,
-            None,
-            Arc::clone(&gate),
-        );
+) -> io::Result<Option<std::process::ExitStatus>> {
+    // Reaping releases the pid. Hold the same lock shutdown uses until the
+    // pid has been removed from the live set.
+    #[cfg(unix)]
+    let (mut groups, pid) = (terminal_background_groups(), child.id());
+    let status = child.try_wait();
+    #[cfg(unix)]
+    if let Some(groups) = groups.as_mut().filter(|_| !matches!(status, Ok(None))) {
+        groups.pids.remove(&pid);
     }
-    if let Some(stderr) = child.stderr.take() {
-        gate.active.fetch_add(1, Ordering::Relaxed);
-        spawn_background_pipe_drain(
-            registry,
-            task_id,
-            stderr,
-            Some(crate::background_log::STDERR_TAG),
-            Arc::clone(&gate),
-        );
-    }
-    gate
+    status
 }
 
-/// Watch a background child until it exits or its task is stopped.
-///
-/// * Process exits → `[exit N]` appended, status `Completed` / `Failed`.
-/// * Task flips to `Stopped` (a `TaskStop` call) → the process is killed, so
-///   stopping a background bash actually terminates it instead of orphaning.
-///
-/// Every branch seals the log (see [`DrainGate`]) before its closing line, so
-/// that line is always the last one. On the `TaskStop` branch that moment is
-/// the kill, not the earlier `stop()` that set `Stopped`.
+#[cfg(unix)]
+fn stop_background_group(pid: u32) -> bool {
+    let mut groups = terminal_background_groups();
+    if groups.as_mut().is_some_and(|groups| !groups.pids.remove(&pid)) {
+        // Terminal shutdown has already ended the group.
+        return true;
+    }
+    end_group(pid, Group::Terminate { grace: BASH_GROUP_GRACE }).is_ok()
+}
+
+/// Watch the process for its exit or a `TaskStop` request. The last file read
+/// happens before recording the outcome, so the terminal log is final.
 fn spawn_background_task_watcher(
-    registry: crate::task_registry::TaskRegistry,
+    registry: TaskRegistry,
     task_id: String,
     mut child: std::process::Child,
-    gate: Arc<DrainGate>,
 ) {
     use crate::task_registry::TaskStatus;
+
     std::thread::spawn(move || {
         loop {
-            match child.try_wait() {
+            if registry
+                .get(&task_id)
+                .is_some_and(|task| task.status == TaskStatus::Stopped)
+            {
+                // Stop the group before reaping its leader. The leader's pid
+                // still belongs to this child while we send both signals.
+                #[cfg(unix)]
+                let ended = stop_background_group(child.id());
+                #[cfg(windows)]
+                let ended = end_process_tree_command(child.id())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                #[cfg(not(any(unix, windows)))]
+                let ended = false;
+                if !ended {
+                    let _ = child.kill();
+                }
+                if child.wait().is_ok() {
+                    registry.refresh_background_output(&task_id, true);
+                    let _ = registry.append_output(&task_id, "[killed by TaskStop]\n");
+                    registry.confirm_background_exit(&task_id);
+                    break;
+                }
+            }
+            match try_wait_background_child(&mut child) {
                 Ok(Some(status)) => {
-                    // Close the log before the terminal status: a consumer that
-                    // polls on the status must not read a log that is still
-                    // being appended to. Sealing — not just waiting — is what
-                    // makes that hold even when a pipe outlives the grace.
-                    if gate.seal_after_drains() {
-                        let _ = registry.append_output(&task_id, &drain_truncation_notice());
-                    }
+                    registry.refresh_background_output(&task_id, true);
                     let _ = registry.append_output(
                         &task_id,
                         &crate::background_log::exit_line(status.code()),
@@ -663,50 +619,21 @@ fn spawn_background_task_watcher(
                     } else {
                         TaskStatus::Failed
                     };
-                    // A user-stopped task keeps its `Stopped` verdict.
-                    if registry
-                        .get(&task_id)
-                        .is_none_or(|task| task.status != TaskStatus::Stopped)
-                    {
+                    // A user-stopped task keeps its Stopped verdict.
+                    if registry.get(&task_id).is_none_or(|task| task.status != TaskStatus::Stopped) {
                         let _ = registry.set_status(&task_id, final_status);
                     }
                     registry.confirm_background_exit(&task_id);
                     break;
                 }
                 Ok(None) => {
-                    if registry
-                        .get(&task_id)
-                        .is_some_and(|task| task.status == TaskStatus::Stopped)
-                    {
-                        let _ = child.kill();
-                        if child.wait().is_ok() {
-                            // The task has read `Stopped` since the `stop()`
-                            // call, but the log only becomes final here: seal
-                            // first so a grandchild that survived the kill
-                            // cannot append behind `[killed by TaskStop]`.
-                            if gate.seal_after_drains() {
-                                let _ =
-                                    registry.append_output(&task_id, &drain_truncation_notice());
-                            }
-                            let _ = registry.append_output(&task_id, "[killed by TaskStop]\n");
-                            registry.confirm_background_exit(&task_id);
-                            break;
-                        }
-                    }
+                    registry.refresh_background_output(&task_id, false);
                     std::thread::sleep(BACKGROUND_WATCH_SLICE);
                 }
                 Err(error) => {
-                    // `Failed` is terminal too, so the same seal-then-write
-                    // order applies: giving up on the child must not leave
-                    // drains appending behind a finished status.
-                    if gate.seal_after_drains() {
-                        let _ = registry.append_output(&task_id, &drain_truncation_notice());
-                    }
+                    registry.refresh_background_output(&task_id, true);
                     let error = classify_enospc(error, &std::env::temp_dir());
-                    let _ = registry.append_output(
-                        &task_id,
-                        &format!("[watch error: {error}]\n"),
-                    );
+                    let _ = registry.append_output(&task_id, &format!("[watch error: {error}]\n"));
                     let _ = registry.set_status(&task_id, TaskStatus::Failed);
                     break;
                 }
@@ -715,22 +642,31 @@ fn spawn_background_task_watcher(
     });
 }
 
-impl crate::task_registry::TaskRegistry {
-    /// Attach a spawned process with piped stdout/stderr to an existing
-    /// background-process task. The shared drain and watcher make its output
-    /// pollable and make `TaskStop` terminate the child.
-    pub fn attach_background_process(&self, task_id: &str, mut child: std::process::Child) {
-        let gate = spawn_background_task_drain(
-            self.clone(),
-            task_id.to_string(),
-            &mut child,
-        );
-        spawn_background_task_watcher(
-            self.clone(),
-            task_id.to_string(),
-            child,
-            gate,
-        );
+impl TaskRegistry {
+    /// Spawn a background shell with file-backed output owned by its task.
+    /// Register the task and live count after a successful spawn.
+    pub fn spawn_background_process(
+        &self,
+        mut command: Command,
+        prompt: &str,
+        description: &str,
+        session_id: Option<&str>,
+    ) -> io::Result<(String, u32)> {
+        let capture = crate::background_log::Capture::redirect(&mut command)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        let child = spawn_background_child(command.stdin(Stdio::null()))?;
+        drop(command);
+        let pid = child.id();
+        let task = self.create_background_process(prompt, Some(description), session_id);
+        let _ = self.set_status(&task.task_id, crate::task_registry::TaskStatus::Running);
+        let _ = self.append_output(&task.task_id, &crate::background_log::head(prompt, pid));
+        self.capture_background_output(&task.task_id, capture);
+        spawn_background_task_watcher(self.clone(), task.task_id.clone(), child);
+        Ok((task.task_id, pid))
     }
 }
 
@@ -934,32 +870,22 @@ pub fn execute_bash_with_tasks(
         // Registry-integrated path: the background run becomes a real task so
         // `TaskOutput`/`TaskGet`/`TaskStop` work on it.
         if let Some(registry) = tasks {
-            let child = command
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
+            let (task_id, pid) = registry
+                .spawn_background_process(
+                    command,
+                    &input.command,
+                    crate::background_log::BACKGROUND_BASH,
+                    session_id,
+                )
                 .map_err(|error| classify_enospc(error, &cwd))?;
-            let pid = child.id();
-            let task = registry.create_background_process(
-                &input.command,
-                Some(crate::background_log::BACKGROUND_BASH),
-                session_id,
-            );
-            let _ = registry.set_status(&task.task_id, crate::task_registry::TaskStatus::Running);
-            let _ = registry.append_output(
-                &task.task_id,
-                &crate::background_log::head(&input.command, pid),
-            );
-            registry.attach_background_process(&task.task_id, child);
 
             return Ok(BashCommandOutput {
-                stdout: crate::background_log::started_line(&task.task_id, pid, registry.reach()),
+                stdout: crate::background_log::started_line(&task_id, pid, registry.reach()),
                 stderr: String::new(),
                 raw_output_path: None,
                 interrupted: false,
                 is_image: None,
-                background_task_id: Some(task.task_id),
+                background_task_id: Some(task_id),
                 background_output_held: None,
                 backgrounded_by_user: Some(false),
                 assistant_auto_backgrounded: Some(false),
@@ -1710,7 +1636,7 @@ pub fn interrupt_foreground_bash(_session_id: Option<&str>) -> usize {
 const BASH_LEADER_LOOK_EVERY: Duration = Duration::from_millis(100);
 
 /// Resolves once the run's leader has exited and its output pipes are still
-/// open [`BACKGROUND_DRAIN_GRACE`] later: a process the command left running
+/// open `BACKGROUND_DRAIN_GRACE` later: a process the command left running
 /// in the background (`&`, `nohup`) holds them, and waiting longer only waits
 /// out the timeout. Output that trails its leader by less than the grace is
 /// still read in full. Never resolves where the host cannot tell an exited
@@ -2014,11 +1940,10 @@ mod tests {
 
     use super::{
         default_bash_timeout_ms, execute_bash, execute_bash_with_tasks, BashCommandInput,
-        DrainGate, DEFAULT_BASH_TIMEOUT_MS, TOOL_CHILD_ENV,
+        DEFAULT_BASH_TIMEOUT_MS, TOOL_CHILD_ENV,
     };
     use crate::sandbox::{FilesystemIsolationMode, SandboxStatus};
     use crate::task_registry::{TaskReach, TaskRegistry, TaskStatus};
-    use std::sync::atomic::Ordering;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
@@ -2549,86 +2474,48 @@ mod tests {
         assert_eq!(status, "closed\n");
     }
 
-    /// 유예가 만료되는 경로의 계약: 파이프가 아직 열려 있어 기다림이 끝나지
-    /// 않더라도 로그는 **봉인**되므로, 종결 상태 뒤로 드레인이 한 줄도 더
-    /// 붙일 수 없다. 봉인 전 출력은 남고, 잘렸다는 사실은 호출자가 기록한다.
     #[test]
-    fn sealing_on_an_expired_grace_locks_late_drain_appends_out() {
+    fn a_background_task_retains_the_tail_of_large_output() {
+        use crate::task_registry::BACKGROUND_TASK_LIMITS;
+
         let registry = TaskRegistry::new_in_memory();
-        let task = registry.create_background_process("sleep 30", None, Some("session-a"));
-        let gate = DrainGate::new();
-        // One drain that never reaches EOF — the detached-grandchild case.
-        gate.active.fetch_add(1, Ordering::Relaxed);
-        assert!(
-            gate.append(&registry, &task.task_id, "before-seal\n"),
-            "an unsealed log accepts streamed output"
+        let command = format!(
+            "awk 'BEGIN {{ for (i = 0; i < {}; i++) printf \"x\" }}'; printf 'last-line'",
+            BACKGROUND_TASK_LIMITS.tail_bytes * 4
         );
-
-        let truncated = gate.seal_after_drains_within(Duration::from_millis(20));
-
-        assert!(
-            truncated,
-            "a drain still in flight at the grace must report truncation"
-        );
-        assert!(
-            !gate.append(&registry, &task.task_id, "after-seal\n"),
-            "a sealed log must refuse the drain instead of growing behind the status"
-        );
-        let log = registry.output(&task.task_id).expect("task output");
-        assert!(log.contains("before-seal"), "pre-seal output kept: {log}");
-        assert!(
-            !log.contains("after-seal"),
-            "post-seal output must never land: {log}"
-        );
-    }
-
-    /// The ordinary path: every drain finished, so nothing is reported as
-    /// truncated — the notice must not cry wolf on a clean exit.
-    #[test]
-    fn sealing_after_the_drains_finish_reports_no_truncation() {
-        let gate = DrainGate::new();
-        assert!(!gate.seal_after_drains_within(Duration::from_millis(20)));
-    }
-
-    /// End-to-end counterpart: a detached grandchild inherits the pipe, outlives
-    /// the drain grace, and only then writes. The watcher must already have
-    /// sealed the log, so that late line can never appear behind `[exit 0]` —
-    /// waiting alone would let it through once the grace lapsed.
-    ///
-    /// Deliberately slow (~8s): the grandchild's write has to fall on the far
-    /// side of the grace for the test to discriminate at all.
-    #[test]
-    fn late_grandchild_output_cannot_land_after_the_terminal_status() {
-        let registry = TaskRegistry::new_in_memory();
-        let mut request = input("(sleep 6; echo late-line) & echo early-line", None);
+        let mut request = input(&command, None);
         request.run_in_background = Some(true);
-        let output = execute_bash_with_tasks(request, Some(&registry), Some("session-late"))
-            .expect("background spawn works");
-        let task_id = output.background_task_id.expect("task id present");
+        let output = execute_bash_with_tasks(request, Some(&registry), Some("session-large"))
+            .expect("background spawn");
+        let task_id = output.background_task_id.expect("task id");
 
-        // The shell itself exits at once; the terminal status lands one grace later.
-        wait_for(Duration::from_secs(20), || {
-            registry
-                .get(&task_id)
-                .filter(|task| task.status == TaskStatus::Completed)
+        wait_for(Duration::from_secs(5), || {
+            registry.get(&task_id).filter(|task| task.status == TaskStatus::Completed)
         });
-        let sealed_log = registry.output(&task_id).expect("task output");
-        assert!(
-            sealed_log.contains("early-line"),
-            "output streamed before the seal is kept: {sealed_log}"
-        );
-        assert!(
-            sealed_log.contains("output truncated"),
-            "a pipe still open at the grace must be recorded as truncated: {sealed_log}"
-        );
+        let log = registry.output(&task_id).expect("task output");
+        assert!(log.len() <= BACKGROUND_TASK_LIMITS.tail_bytes);
+        assert!(log.starts_with(crate::background_log::OLDER_OUTPUT_TRUNCATED));
+        assert!(log.ends_with("last-line\n[exit 0]\n"));
+    }
 
-        // Sleep past the grandchild's write: a terminal task's log is frozen.
-        std::thread::sleep(Duration::from_secs(6));
-        assert_eq!(
-            registry.output(&task_id).expect("task output"),
-            sealed_log,
-            "nothing may be appended once the status is terminal"
-        );
+    #[test]
+    fn a_quiet_background_task_keeps_only_its_command_pid_and_exit() {
+        let registry = TaskRegistry::new_in_memory();
+        let mut request = input("exit 0", None);
+        request.run_in_background = Some(true);
+        let output = execute_bash_with_tasks(request, Some(&registry), Some("session-quiet"))
+            .expect("background spawn");
+        let task_id = output.background_task_id.expect("task id");
+
+        wait_for(Duration::from_secs(5), || {
+            registry.get(&task_id).filter(|task| task.status == TaskStatus::Completed)
+        });
+        let log = registry.output(&task_id).expect("task output");
+        let mut lines = log.lines();
+        assert_eq!(lines.next(), Some("$ exit 0"));
+        assert!(lines.next().is_some_and(|line| line.starts_with("[pid ")));
+        assert_eq!(lines.next(), Some("[exit 0]"));
+        assert_eq!(lines.next(), None);
     }
 
     /// 설계결함 회귀: 백그라운드 bash 는 `TaskRegistry` 에 등록되고,
@@ -2709,6 +2596,48 @@ mod tests {
             log.trim_end().ends_with("[killed by TaskStop]"),
             "the kill line must close the log: {log}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_stop_kills_the_background_shells_child() {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("child.fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(fifo)
+            .unwrap();
+
+        // The outer shell waits for its child, then runs `:` itself. The
+        // child's pipe stays open until it exits, even if the shell is gone.
+        let command = "sh -c 'printf child-ready; sleep 10' > child.fifo; :";
+        let mut request = unsandboxed(command, SPAWN_TEST_TIMEOUT_MS);
+        request.cwd = Some(dir.path().to_path_buf());
+        request.run_in_background = Some(true);
+        let registry = TaskRegistry::new_in_memory();
+        let started = execute_bash_with_tasks(request, Some(&registry), None).unwrap();
+        let task_id = started.background_task_id.unwrap();
+        let mut bytes = [0; 32];
+        let length = wait_for(Duration::from_secs(5), || {
+            reader.read(&mut bytes).ok().filter(|&length| length > 0)
+        });
+        assert_eq!(&bytes[..length], b"child-ready");
+
+        registry.stop(&task_id).expect("stop the background task");
+        wait_for(Duration::from_secs(3), || {
+            registry
+                .output(&task_id)
+                .ok()
+                .filter(|log| log.ends_with("[killed by TaskStop]\n"))
+        });
+        wait_for(Duration::from_secs(2), || {
+            matches!(reader.read(&mut bytes), Ok(0)).then_some(())
+        });
     }
 
     #[test]
@@ -3483,7 +3412,7 @@ const TAIL_OUTPUT_BYTES: usize = 4 * 1024;
 /// A spill stops growing here; past it the file is removed and the run keeps
 /// only its in-memory head and tail, as before. Sixty-four MiB is far past any
 /// test log and short of a `find /`.
-const RAW_SPILL_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const RAW_SPILL_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Spill files older than this are removed whenever a new one is opened.
 const RAW_SPILL_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
@@ -3592,11 +3521,16 @@ fn raw_spill_dir() -> PathBuf {
     std::env::temp_dir().join("zo-bash-raw")
 }
 
-fn open_raw_spill_file() -> io::Result<(std::fs::File, PathBuf)> {
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) fn prepare_raw_spill_dir() -> io::Result<PathBuf> {
     let dir = raw_spill_dir();
     std::fs::create_dir_all(&dir)?;
     prune_raw_spills(&dir);
+    Ok(dir)
+}
+
+fn open_raw_spill_file() -> io::Result<(std::fs::File, PathBuf)> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = prepare_raw_spill_dir()?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis());
