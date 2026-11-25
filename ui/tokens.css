@@ -893,7 +893,6 @@
   --sidebar-width: 280px;
   --sidebar-width-folded: 240px;
   --aside-width: 350px;
-  --aside-width-folded: 180px;
   --statusbar-height: 24px;
   --panel-folded-height: 26vh;
 
@@ -1052,7 +1051,6 @@
   --agent-graph-agent-width: 172px;
   --agent-graph-inspector-width: 300px;
   --agent-graph-search-width: 320px;
-  --agent-graph-inspector-stack-min-height: 220px;
   /* 172 is the width Orca hands a node that carries a title and one line under
    * it — the orbit's name tags read it (`--agent-orbit-label-*`). The card
    * picture no longer has lanes (direction E2, t-68475): its columns are the
@@ -1098,7 +1096,6 @@
   --agent-graph-drawer-width: 320px;
   --agent-graph-sheet-height: 52%;
   --agent-graph-sheet-min-height: 240px;
-  --agent-graph-search-icon: 28px;
   /* ---- 보드 고유의 리듬 (t-2374) ----
    *
    * `--space-*`가 맞는 자리는 그것을 쓴다. 아래는 그 사다리에 없는, 이 표면만의
@@ -1110,7 +1107,6 @@
   --agent-graph-gap: 6px;
   --agent-graph-gap-tight: 2px;
   --agent-graph-chip-inset: 1px 6px;
-  --agent-graph-grid: 24px;
   --agent-graph-text-floor-title: 10px;
   --agent-graph-text-floor-line: 9px;
   --agent-graph-text-floor-fine: 8px;
@@ -1197,7 +1193,6 @@
    * (≤416px), `14px 16px` of padding, 13px type, and a 2.5rem lift off the
    * bottom edge so it clears the status bar rather than sitting on it. */
   --toast-width: min(26rem, calc(100vw - 2rem));
-  --toast-inset: 14px 16px;
   --toast-lift: 2.5rem;
 
   /* The 이름/내용 switch above the file search. One row of the file panel's
@@ -1811,8 +1806,6 @@
   --knowledge-node-stroke: 1;
   --knowledge-node-selected-stroke: 2;
   --knowledge-edge-lit-width: 1.5;
-  --knowledge-halo-core: 0.85;
-  --knowledge-halo-lift: 1.12;
   /* One nebula per cluster (3차): a disc behind the members, sized from their
    * spread. Its paint is one flat, faint layer of the cluster's ink (t-12029,
    * the approved design v2 "colour": 4.5% on the dark ground, no glow at the
@@ -2166,14 +2159,6 @@
   --knowledge-hue-5: var(--signal-ready);
   --knowledge-hue-6: var(--signal-halt);
   --knowledge-hue-7: color-mix(in srgb, var(--knowledge-hue-3) 50%, var(--knowledge-hue-4));
-  --knowledge-hue-0-center: color-mix(in srgb, var(--knowledge-hue-0) 62%, var(--knowledge-highlight));
-  --knowledge-hue-1-center: color-mix(in srgb, var(--knowledge-hue-1) 62%, var(--knowledge-highlight));
-  --knowledge-hue-2-center: color-mix(in srgb, var(--knowledge-hue-2) 62%, var(--knowledge-highlight));
-  --knowledge-hue-3-center: color-mix(in srgb, var(--knowledge-hue-3) 62%, var(--knowledge-highlight));
-  --knowledge-hue-4-center: color-mix(in srgb, var(--knowledge-hue-4) 62%, var(--knowledge-highlight));
-  --knowledge-hue-5-center: color-mix(in srgb, var(--knowledge-hue-5) 62%, var(--knowledge-highlight));
-  --knowledge-hue-6-center: color-mix(in srgb, var(--knowledge-hue-6) 62%, var(--knowledge-highlight));
-  --knowledge-hue-7-center: color-mix(in srgb, var(--knowledge-hue-7) 62%, var(--knowledge-highlight));
   --knowledge-typed-related: color-mix(in srgb, var(--edge-mark) var(--knowledge-edge-muted-weight), var(--knowledge-hue-3));
   --knowledge-typed-implements: color-mix(in srgb, var(--edge-mark) var(--knowledge-edge-muted-weight), var(--knowledge-hue-0));
   --knowledge-typed-depends-on: color-mix(in srgb, var(--edge-mark) var(--knowledge-edge-muted-weight), var(--knowledge-hue-4));
@@ -2382,7 +2367,6 @@
   --knowledge-zoom-step: 0.25;
   --knowledge-hub-degree: 4;
   --knowledge-chip-dot: 7px;
-  --knowledge-search-width: 200px;
   /* 검색 후보 목록이 커질 수 있는 높이(t-4140 S3) — 그 뒤는 스크롤. */
   --knowledge-candidates-max-height: 300px;
   --knowledge-tag-chip-max-width: 92px;
@@ -2533,7 +2517,6 @@
   --artifact-gallery-min-share: 20%;
   --artifact-studio-radius: 12px;
   --artifact-studio-focus-width: calc(var(--rule-width) * 2);
-  --artifact-studio-weight: 650;
   --artifact-studio-copy-leading: 1.55;
   --artifact-studio-glyph-side: 30px;
   --artifact-studio-brief-min: 72px;
@@ -2541,7 +2524,6 @@
      걷고 판의 면과 1px 링으로 선다. 이 보기의 색(`--artifact-studio-accent`)은 고른 것에만 남는다. */
   --artifact-studio-edge: var(--edge-rule);
   --artifact-studio-background: var(--surface-deck);
-  --artifact-studio-shadow: 0 8px 24px color-mix(in srgb, var(--surface-abyss) 24%, transparent);
   --artifact-studio-face-background: var(--artifact-face-bg);
   /* ---- the connected workbench (t-3818) ----
    *
@@ -3815,7 +3797,6 @@
   --jev-plot-bar-min: 64px;
   --jev-plot-dot: 3px;
   --jev-plot-now: 4.5px;
-  --jev-plot-gap: 2px;
   --jev-stale-opacity: 0.55;
   /* The strip over the table (t-6243 D1): the figure large and its label
      small above it (t-6277 D10). */

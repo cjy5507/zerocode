@@ -920,20 +920,6 @@ function laneStateLabel(state) {
       return state;
   }
 }
-const GLYPH = {
-  zo: "ZO",
-  claude: "CL",
-  codex: "CX",
-  cursor: "CU",
-  droid: "DR",
-  copilot: "CP",
-  grok: "GK",
-  kimi: "KM",
-  devin: "DV",
-  antigravity: "AG",
-  opencode: "OC",
-  "command-code": "CC",
-};
 
 /* ---- view bookkeeping ---- */
 
@@ -3600,7 +3586,7 @@ function makeTermView(host, pre, caret, owner = { address: () => null }) {
     dragFrom = { y: event.clientY, offset: viewOffset };
     rail.classList.add("is-held");
   });
-  window.addEventListener("mousemove", (event) => {
+  function dragThumb(event) {
     if (dragFrom === null) return;
     // The same watched number: a drag is a mousemove per pixel, and measuring
     // the track under the pointer would force a layout on every one of them
@@ -3615,12 +3601,16 @@ function makeTermView(host, pre, caret, owner = { address: () => null }) {
     const wanted = Math.round(dragFrom.offset - moved);
     const clamped = Math.min(scrollbackLen, Math.max(0, wanted));
     scrollToOffset(clamped);
-  });
-  window.addEventListener("mouseup", () => {
+  }
+  function dropThumb() {
     if (dragFrom === null) return;
     dragFrom = null;
     rail.classList.remove("is-held");
-  });
+  }
+  // Heard on the window so a drag that leaves the bar still moves it — and
+  // so `release()` has to take both off again.
+  window.addEventListener("mousemove", dragThumb);
+  window.addEventListener("mouseup", dropThumb);
 
   /* A click on the empty track pages toward it, which is what every scrollbar
    * in every application does and the reason a track is clickable at all. */
@@ -4580,6 +4570,8 @@ function makeTermView(host, pre, caret, owner = { address: () => null }) {
     host.removeEventListener("mousemove", movePointer);
     window.removeEventListener("mousemove", dragSelection);
     window.removeEventListener("mouseup", finishPointerGesture);
+    window.removeEventListener("mousemove", dragThumb);
+    window.removeEventListener("mouseup", dropThumb);
     endSelectDrag();
     termSelectionViews.delete(view);
     terminalSelectionByHost.delete(host);
@@ -6056,6 +6048,9 @@ function collapseStageGroup(group) {
     }
     // The strip watcher holds its strip the same way (t-78107).
     tabStripWatch.unobserve(held.strip);
+    // A knowledge view's universe and painter hold GL contexts and document
+    // listeners; the tab, if it survives, builds a fresh view next door.
+    if (held.knowledgeView) dropKnowledgeView(held.knowledgeView);
     // 하나뿐인 판(작업)이 접히는 판 안에 있으면 함께 문서에서 떨어진다 — 그러면
     // id로 칸을 찾던 손이 모두 길을 잃는다. 남는 판(0)으로 먼저 옮긴다.
     for (const kind of DOC_KINDS) {
