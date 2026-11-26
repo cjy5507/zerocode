@@ -193,11 +193,8 @@ function applyAppearanceSettingsSnapshot(snapshot, first) {
     repaintLeftSidebar = true;
   }
   if (hasSetting(snapshot, "system_locale")) systemLocale = snapshot.system_locale ?? "ko";
-  if (
-    hasSetting(snapshot, "locale") &&
-    (first || snapshot.locale !== locale || previousSystemLocale !== systemLocale)
-  ) {
-    setLocale(snapshot.locale ?? "system", { refresh: !first, persist: false });
+  if (hasSetting(snapshot, "locale")) {
+    applyDocumentLocale(snapshot.locale, first, previousSystemLocale !== systemLocale);
   }
   if (hasSetting(snapshot, "theme") && (first || snapshot.theme !== theme)) {
     theme = snapshot.theme ?? "system";
@@ -9259,13 +9256,10 @@ function repaintDocumentsForLocale() {
   for (const [body, top] of scrolled) body.scrollTop = top;
 }
 
-/* Change the language, everywhere, now.
- *
- * The static markup is re-read and every surface that builds its own text is
- * repainted — a language that only took effect on the next boot would be a
- * setting nobody trusts. */
-function setLocale(code) {
-  const { refresh = true, persist = true } = arguments[1] ?? {};
+/* Paint the language, everywhere, once its catalog is in memory. `setLocale`
+ * below is the door; this is the synchronous repaint after the door knows the
+ * words are there. */
+function paintLocaleChoice(code, { refresh = true, persist = true } = {}) {
   locale = code;
   syncComputerSharePanelWords();
   document.documentElement.lang = code === "system" ? systemLocale : code;
@@ -9374,6 +9368,61 @@ function setLocale(code) {
     refreshWorktrees();
   }
   if (persist) void commitSetting("locale", "set_locale", { code });
+}
+
+/* Change the language, everywhere, now. The first choice of a non-Korean
+ * language waits for that one catalog; it does not paint Korean for a frame
+ * and then correct itself. A faster second choice wins the race, so a slow
+ * catalog cannot repaint over it. Answers `true` when the catalog was already
+ * warm, else a promise for the repaint — which is also why a test that simply
+ * evaluates `setLocale(...)` waits for the language it asked for. */
+let localeChoiceGeneration = 0;
+/* The language has one last intent (t-129668): the newest choice, whose
+ * generation is the only one `paint` honours. While that choice waits for its
+ * catalog this says whose it is — "person", made in this window and not yet
+ * painted or saved, or "document", a settings document naming the stored
+ * language — and it is null once the choice has painted. */
+let localeChoiceWaiting = null;
+function setLocale(code) {
+  const options = arguments[1] ?? {};
+  const generation = ++localeChoiceGeneration;
+  const paint = () => {
+    if (generation !== localeChoiceGeneration) return false;
+    localeChoiceWaiting = null;
+    paintLocaleChoice(code, options);
+    return true;
+  };
+  if (localeCatalogReady(code)) return paint();
+  localeChoiceWaiting = options.persist === false ? "document" : "person";
+  return ensureLocaleCatalog(code).then(paint);
+}
+
+/* What a settings document does to the language (t-129668).
+ *
+ * A document is whatever the store held when it was read, and a person's
+ * choice still waiting for its catalog has not been saved yet — so no
+ * document, asked before the choice and landing late or asked during the
+ * wait, has heard of it. While that choice waits, a document leaves the
+ * language alone: the second review found an English window that had asked
+ * for a document naming Japanese, the person picking Spanish, and the late
+ * Japanese answer cancelling the Spanish before its file landed — nothing
+ * was saved. The paint saves the choice (`paintLocaleChoice`), and from then
+ * on `commitSetting`'s rule for every setting holds: a read that crosses the
+ * write cannot own the screen, and the store's answer is the next word.
+ *
+ * Otherwise the document's language is the stored one. It is chosen when it
+ * differs from the one on screen, or when the system's language moved under
+ * it ("system" may mean another language now). The language on screen
+ * retires an older document's choice still loading, so the pop-out's English
+ * does not turn Japanese when that late file lands. */
+function applyDocumentLocale(stored, first, systemMoved) {
+  if (localeChoiceWaiting === "person") return;
+  if (first || stored !== locale || systemMoved) {
+    setLocale(stored ?? "system", { refresh: !first, persist: false });
+  } else if (localeChoiceWaiting === "document") {
+    localeChoiceGeneration += 1;
+    localeChoiceWaiting = null;
+  }
 }
 
 el("keys-search").addEventListener("input", (event) => {

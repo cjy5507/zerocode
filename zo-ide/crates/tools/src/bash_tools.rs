@@ -119,6 +119,10 @@ pub(crate) fn dispatch_result(
     name: &str,
     input: &Value,
 ) -> Option<Result<ToolExecutionResult, ToolError>> {
+    // A headless core session's shell reads no argument it does not show
+    // (`headless_core`); every other call is read as it came.
+    let shown = crate::headless_core::shown_shell_input(name, input);
+    let input: &Value = &shown;
     // A per-agent context can pin the working directory (worktree isolation);
     // `None` leaves every exec tool on the process cwd, the historical default.
     let cwd = ctx.cwd.as_deref();

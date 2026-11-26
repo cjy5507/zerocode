@@ -303,6 +303,45 @@ fn mask_session_record_text(content: String) -> String {
         .join("\n")
 }
 
+fn is_atif_export_file(path: &Path) -> bool {
+    use crate::session::ATIF_DOCUMENT_SUFFIX;
+    path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+        name.ends_with(ATIF_DOCUMENT_SUFFIX)
+            || name.rsplit_once(".tmp-").is_some_and(|(stem, _)| stem.ends_with(ATIF_DOCUMENT_SUFFIX))
+    })
+}
+
+fn mask_atif_record_text(content: String) -> String {
+    use crate::session::{THINKING_MARKER, WITHHELD_LINE_MARKER};
+    use serde_json::Value;
+
+    // A temporary file could be read before the rename finishes.
+    let Ok(mut document) = serde_json::from_str::<Value>(&content) else {
+        return WITHHELD_LINE_MARKER.to_string();
+    };
+    let Some(steps) = document.get_mut("steps").and_then(Value::as_array_mut) else {
+        return WITHHELD_LINE_MARKER.to_string();
+    };
+    let mut masked = false;
+    for step in steps {
+        if let Some(reasoning) = step.get_mut("reasoning_content") {
+            *reasoning = Value::String(THINKING_MARKER.to_string());
+            masked = true;
+        }
+    }
+    // Tool receipts can themselves contain native JSONL records.
+    mask_session_record_text(if masked { document.to_string() } else { content })
+}
+
+fn read_text_with_atif_mask(path: &Path) -> io::Result<String> {
+    let content = fs::read_to_string(path)?;
+    Ok(if is_atif_export_file(path) {
+        mask_atif_record_text(content)
+    } else {
+        content
+    })
+}
+
 /// Reads a text file and returns a line-windowed payload.
 ///
 /// PDF files (by extension or `%PDF-` magic) and notebooks (`.ipynb`, by
@@ -350,7 +389,7 @@ pub fn read_file(
         ));
     }
 
-    let content = fs::read_to_string(&absolute_path)?;
+    let content = read_text_with_atif_mask(&absolute_path)?;
     let content = if is_session_record_file(&absolute_path) {
         mask_session_record_text(content)
     } else {
@@ -1249,7 +1288,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
             return Ok(true);
         }
 
-        let Ok(file_contents) = fs::read_to_string(file_path) else {
+        let Ok(file_contents) = read_text_with_atif_mask(file_path) else {
             return Ok(true);
         };
 
@@ -2987,6 +3026,29 @@ needle b
         assert_eq!((window.file.start_line, window.file.num_lines), (2, 1));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atif_reasoning_is_withheld_from_read_and_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.atif.json");
+        let body = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "steps": [{"message": "Visible fixture answer.", "reasoning_content": REASONING_SENTINEL}],
+        });
+        std::fs::write(&path, body.to_string()).unwrap();
+
+        let read = read_file(path.to_str().unwrap(), None, None).unwrap().file.content;
+        assert!(read.contains("Visible fixture answer."));
+        assert!(!read.contains(REASONING_SENTINEL));
+        let search = grep_content(&path, "Visible fixture answer.", None).content.unwrap();
+        assert!(!search.contains(REASONING_SENTINEL));
+        assert_eq!(grep_content(&path, REASONING_SENTINEL, None).num_files, 0);
+
+        let unpublished = dir.path().join("fixture.atif.json.tmp-example");
+        std::fs::write(&unpublished, format!(r#"{{"reasoning_content":"{REASONING_SENTINEL}"#)).unwrap();
+        let torn = read_file(unpublished.to_str().unwrap(), None, None).unwrap().file.content;
+        assert!(!torn.contains(REASONING_SENTINEL));
     }
 
     /// Nothing else about the search changes: a file that is not a session

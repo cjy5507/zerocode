@@ -11,11 +11,16 @@ use serde_json::{Value, json};
 
 use super::{LISTING_STANDS_FOR, Listing, Listings, StandIn, listing_key};
 
+const SUBSCRIPTION_ID_KEY: &str = "io.modelcontextprotocol/subscriptionId";
+const LISTEN_LINE: &str = r#" { "method":"subscriptions/listen","jsonrpc":"2.0","id":"listen:0","params":{ "notifications":{"toolsListChanged":true},"_meta":{"fixture":"opaque"} } } "#;
+const MODERN_IDLE: Duration = Duration::from_millis(300);
+
 /// A server that logs each method it hears, lists the tools its tools file
 /// holds, answers `pong` to a call, and ends without a word when the tool
 /// called is `die`. Beside its tools file, a `.slow` file makes it answer its
 /// start a second late, and a `.fails` file makes it answer `tools/list` with
-/// an error. A `.int32` file makes it reply with signed 32-bit ids.
+/// an error. A `.int32` file makes it reply with signed 32-bit ids. A
+/// `.modern` file enables discovery and tells it how to answer a listen.
 const SERVER: &str = r#"#!/bin/sh
 log="$1"; tools="$2"
 waiting_id=
@@ -24,6 +29,9 @@ while IFS= read -r line; do
   method=$(printf '%s\n' "$line" | sed -nE 's/.*"method":"([^"]*)".*/\1/p')
   id=$(printf '%s\n' "$line" | sed -nE 's/.*"id":("[^"]*"|[^,}]+).*/\1/p')
   echo "heard $method" >> "$log"
+  case "$method" in
+    subscriptions/listen|notifications/cancelled) printf '%s\n' "$line" >> "$log" ;;
+  esac
   if [ "$method" = notifications/cancelled ] && [ -n "$waiting_id" ]; then
     request_id=$(printf '%s\n' "$line" | sed -nE 's/.*"requestId":("[^"]*"|[^,}]+).*/\1/p')
     if [ "$request_id" = "$waiting_id" ]; then
@@ -46,11 +54,25 @@ while IFS= read -r line; do
       printf "%.0f", n + 0
     }')
   fi
+  if [ "$method" = server/discover ] && [ -f "$tools.modern" ]; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"serverInfo":{"name":"fixture","version":"1"},"capabilities":{"tools":{}}}}\n' "$id"
+    continue
+  fi
   case "$method" in
     initialize) [ -f "$tools.slow" ] && sleep 1; printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"},"instructions":"FIXTURE-INSTRUCTIONS"}}\n' "$id" ;;
     tools/list)
       if [ -f "$tools.fails" ]; then printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"backend unavailable"}}\n' "$id"
       else printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":%s}}\n' "$id" "$(cat "$tools")"; fi ;;
+    subscriptions/listen)
+      printf '{ "jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"@SUBSCRIPTION_ID_KEY@":%s}} }\n' "$id"
+      listen_reply=result
+      [ -f "$tools.modern" ] && listen_reply=$(cat "$tools.modern")
+      case "$listen_reply" in
+        result) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+        error) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"subscription ended"}}\n' "$id" ;;
+        cancelled) printf '{ "jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":%s} }\n' "$id" ;;
+        open) printf '{ "jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"@SUBSCRIPTION_ID_KEY@":%s}} }\n' "$id" ;;
+      esac ;;
     tools/call)
       case "$line" in
         *'"name":"die"'*) echo "died" >> "$log"; exit 0 ;;
@@ -85,9 +107,20 @@ impl Fixture {
             script: dir.join("server.sh"),
             dir,
         };
-        std::fs::write(&fixture.script, SERVER).expect("server script");
+        let server = SERVER.replace("@SUBSCRIPTION_ID_KEY@", SUBSCRIPTION_ID_KEY);
+        std::fs::write(&fixture.script, server).expect("server script");
         fixture.set_tools(&["ping"]);
         fixture
+    }
+
+    fn modern(name: &str) -> Self {
+        let fixture = Self::new(name);
+        fixture.set_listen_reply("open");
+        fixture
+    }
+
+    fn set_listen_reply(&self, reply: &str) {
+        std::fs::write(self.tools.with_extension("json.modern"), reply).expect("modern mark");
     }
 
     fn set_tools(&self, names: &[&str]) {
@@ -129,6 +162,18 @@ impl Fixture {
 
     fn starts(&self) -> usize {
         self.log().iter().filter(|line| *line == "start").count()
+    }
+
+    fn wait_for_end(&self) {
+        wait_until("the unused modern server is stopped", || {
+            self.log().last().map(String::as_str) == Some("end")
+        });
+    }
+
+    fn last_start(&self) -> Vec<String> {
+        let mut log = self.log();
+        let start = log.iter().rposition(|line| line == "start").expect("start");
+        log.split_off(start)
     }
 
     /// A session of the stand-in in front of this server.
@@ -188,8 +233,12 @@ struct Session {
 
 impl Session {
     fn send(&mut self, message: &Value) {
+        self.send_line(&message.to_string());
+    }
+
+    fn send_line(&mut self, line: &str) {
         let input = self.input.as_mut().expect("the session is open");
-        writeln!(input, "{message}").expect("write to the stand-in");
+        writeln!(input, "{line}").expect("write to the stand-in");
     }
 
     fn request(&mut self, id: u64, method: &str, params: Value) -> Value {
@@ -197,9 +246,12 @@ impl Session {
         self.answer(&json!(id))
     }
 
+    fn output(&self) -> String {
+        String::from_utf8_lossy(&self.out.lock().expect("out")).into_owned()
+    }
+
     fn answers(&self) -> Vec<Value> {
-        let bytes = self.out.lock().expect("out").clone();
-        String::from_utf8_lossy(&bytes)
+        self.output()
             .lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect()
@@ -250,6 +302,15 @@ impl Session {
         );
         self.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         initialize
+    }
+
+    fn open_modern(&mut self) -> (Value, Value) {
+        let discover = self.request(0, "server/discover", json!({}));
+        assert!(discover["result"].is_object(), "{discover}");
+        self.send_line(LISTEN_LINE);
+        let tools = self.request(2, "tools/list", json!({}));
+        assert_eq!(tool_names(&tools), ["ping"]);
+        (discover, tools)
     }
 }
 
@@ -383,8 +444,236 @@ fn a_listed_server_starts_on_its_first_call_and_ends_with_the_session() {
     });
 }
 
-/// A server that coerces request ids to int32 can replay the start, update
-/// its listing and answer client ids even if they collide in its format.
+/// The server sees the original listen and cancellation requests, and the
+/// client sees the same ids in both replies and subscription notifications.
+#[test]
+fn a_modern_listen_and_cancellation_keep_the_client_ids() {
+    let fixture = Fixture::new("listen-ids");
+    let mut session = fixture.session(Duration::from_secs(600));
+    let ids = [
+        json!(7),
+        json!(4294967294_u64),
+        json!(-9),
+        json!("abc"),
+        json!("7"),
+        json!("zerocode-first-call-initialize"),
+    ];
+    let requests: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            json!({"jsonrpc": "2.0", "id": id, "method": "subscriptions/listen", "params": {"tools": {"listChanged": true}}})
+        })
+        .collect();
+    for request in &requests {
+        session.send(request);
+    }
+    let cancelled = json!("cancel-this-call");
+    session.send(&json!({"jsonrpc": "2.0", "id": cancelled, "method": "tools/call", "params": {"name": "wait"}}));
+    let cancellation = json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": cancelled, "reason": "fixture cancellation"}});
+    session.send(&cancellation);
+    // The fixture answers in order. A ping confirms it has handled every
+    // message even when a listen acknowledgement or the cancellation is wrong.
+    let ping_id = 20;
+    session.request(ping_id, "ping", json!({}));
+
+    let heard: Vec<Value> = fixture
+        .log()
+        .iter()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let expected_requests: Vec<_> = requests.into_iter().chain([cancellation]).collect();
+    let expected_answers: Vec<_> = ids
+        .iter()
+        .flat_map(|id| {
+            [
+                json!({"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged", "params": {"_meta": {(SUBSCRIPTION_ID_KEY): id}}}),
+                json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+            ]
+        })
+        .chain([
+            json!({"jsonrpc": "2.0", "id": cancelled, "error": {"code": -32001, "message": "cancelled"}}),
+            json!({"jsonrpc": "2.0", "id": ping_id, "result": {}}),
+        ])
+        .collect();
+    assert_eq!(
+        (heard, session.answers()),
+        (expected_requests, expected_answers),
+        "listen requests, cancellation, replies and notifications keep the client ids"
+    );
+}
+
+#[test]
+fn an_unused_modern_server_stops_with_an_open_subscription() {
+    let fixture = Fixture::modern("modern-idle");
+    let mut session = fixture.session(MODERN_IDLE);
+    session.open_modern();
+    let opening = session.output();
+
+    fixture.wait_for_end();
+    assert_eq!(fixture.starts(), 1);
+    assert_eq!(session.output(), opening, "idle stop sends nothing");
+}
+
+#[test]
+fn a_modern_call_replays_the_original_subscription_before_the_call() {
+    let fixture = Fixture::modern("modern-replay");
+    let mut session = fixture.session(MODERN_IDLE);
+    session.open_modern();
+    fixture.wait_for_end();
+    let before = session.output().len();
+
+    let call = session.request(3, "tools/call", json!({"name": "ping"}));
+    assert_eq!(call["result"]["content"][0]["text"], "pong", "{call}");
+    assert_eq!(fixture.starts(), 2);
+    assert_eq!(
+        fixture.last_start(),
+        [
+            "start",
+            "heard subscriptions/listen",
+            LISTEN_LINE,
+            "heard tools/call"
+        ],
+        "the restarted server gets the original listen, then the call"
+    );
+    let output = session.output();
+    let notices: Vec<_> = output[before..]
+        .lines()
+        .take(2)
+        .map(str::to_owned)
+        .collect();
+    let expected = [
+        "notifications/subscriptions/acknowledged",
+        "notifications/tools/list_changed",
+    ]
+    .map(|method| {
+        format!(
+            r#"{{ "jsonrpc":"2.0","method":"{method}","params":{{"_meta":{{"{SUBSCRIPTION_ID_KEY}":"listen:0"}}}} }}"#
+        )
+    });
+    assert_eq!(
+        notices, expected,
+        "the client gets the server's original lines"
+    );
+    assert_eq!(output[before..].lines().count(), 3);
+}
+
+#[test]
+fn cancelled_and_answered_subscriptions_are_not_replayed() {
+    let fixture = Fixture::modern("modern-closed");
+    let mut session = fixture.session(MODERN_IDLE);
+    session.request(0, "server/discover", json!({}));
+    session.send_line(LISTEN_LINE);
+    let listen = |id: Value| json!({"jsonrpc": "2.0", "method": "subscriptions/listen", "id": id, "params": {}});
+    let live = listen(json!(7)).to_string();
+    session.send_line(&live);
+    session.send(&listen(json!("7")));
+    let cancel =
+        r#" { "method":"notifications/cancelled","params":{"requestId":"7"},"jsonrpc":"2.0" } "#;
+    session.send_line(cancel);
+    // The ping confirms the server handled the original listens and cancellation.
+    session.request(1, "ping", json!({}));
+    assert!(fixture.log().iter().any(|line| line == cancel));
+
+    fixture.set_listen_reply("result");
+    session.send(&listen(json!("finished")));
+    assert_eq!(session.answer(&json!("finished"))["result"], json!({}));
+    fixture.set_listen_reply("error");
+    session.send(&listen(json!("failed")));
+    assert_eq!(session.answer(&json!("failed"))["error"]["code"], -32603);
+    fixture.set_listen_reply("open");
+    session.request(2, "tools/list", json!({}));
+    fixture.wait_for_end();
+
+    session.send(&json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "listen:0"}}));
+    let call = session.request(3, "tools/call", json!({"name": "ping"}));
+    assert_eq!(call["result"]["content"][0]["text"], "pong", "{call}");
+    assert_eq!(fixture.starts(), 2);
+    assert_eq!(
+        fixture.last_start(),
+        [
+            "start",
+            "heard subscriptions/listen",
+            live.as_str(),
+            "heard tools/call"
+        ],
+        "only the still-open numeric subscription is sent again"
+    );
+}
+
+#[test]
+fn a_failed_subscription_is_refused_and_not_replayed() {
+    let fixture = Fixture::modern("modern-missing");
+    let real = fixture.dir.join("server-command");
+    let mut session =
+        fixture.session_of(real.to_str().expect("path"), &fixture.args(), MODERN_IDLE);
+    session.send_line(LISTEN_LINE);
+    let answer = session.answer(&json!("listen:0"));
+    assert_eq!(answer["error"]["code"], super::NOT_STARTED, "{answer}");
+    assert_eq!(fixture.starts(), 0);
+
+    std::os::unix::fs::symlink("/bin/sh", &real).expect("make the server startable");
+    let call = session.request(3, "tools/call", json!({"name": "ping"}));
+    assert_eq!(call["result"]["content"][0]["text"], "pong", "{call}");
+    assert_eq!(fixture.starts(), 1);
+    assert_eq!(fixture.last_start(), ["start", "heard tools/call"]);
+}
+
+#[test]
+fn a_subscription_cancelled_by_the_server_is_not_replayed() {
+    let fixture = Fixture::modern("modern-server-cancelled");
+    fixture.set_listen_reply("cancelled");
+    let mut session = fixture.session(MODERN_IDLE);
+    session.open_modern();
+    let cancellation = r#"{ "jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"listen:0"} }"#;
+    assert!(session.output().lines().any(|line| line == cancellation));
+    fixture.wait_for_end();
+
+    let call = session.request(3, "tools/call", json!({"name": "ping"}));
+    assert_eq!(call["result"]["content"][0]["text"], "pong", "{call}");
+    assert_eq!(fixture.starts(), 2);
+    assert_eq!(fixture.last_start(), ["start", "heard tools/call"]);
+}
+
+#[test]
+fn a_modern_listing_answers_the_next_session_without_starting_the_server() {
+    let fixture = Fixture::modern("modern-listing");
+    let idle = Duration::from_secs(600);
+    let mut first = fixture.session(idle);
+    let (discover, tools) = first.open_modern();
+    assert_eq!(first.close(), 0);
+    fixture.set_tools(&["ping", "pong"]);
+
+    let mut second = fixture.session(idle);
+    assert_eq!(
+        second.request(4, "server/discover", json!({}))["result"],
+        discover["result"]
+    );
+    assert_eq!(
+        second.request(5, "tools/list", json!({}))["result"],
+        tools["result"]
+    );
+    assert_eq!(
+        fixture.starts(),
+        1,
+        "discovery and tools use the saved listing"
+    );
+
+    second.send_line(LISTEN_LINE);
+    assert_eq!(
+        tool_names(&second.request(6, "tools/list", json!({}))),
+        ["ping", "pong"]
+    );
+    assert_eq!(second.close(), 0);
+    let mut third = fixture.session(idle);
+    assert_eq!(
+        tool_names(&third.request(7, "tools/list", json!({}))),
+        ["ping", "pong"]
+    );
+    assert_eq!(fixture.starts(), 2, "the server's new answer is saved");
+}
+
+/// A server that coerces request ids to int32 can replay the start and update
+/// its listing without answering the client's call at id 0 with the replay.
 #[test]
 fn a_server_that_coerces_ids_replies_without_leaking_replayed_answers() {
     let fixture = Fixture::new("int32");
@@ -414,30 +703,18 @@ fn a_server_that_coerces_ids_replies_without_leaking_replayed_answers() {
     }
     assert_eq!(call["result"]["content"][0]["text"], "pong", "{call}");
 
-    let ids = [
-        json!(-2),
-        json!(-3),
-        json!(-4),
-        json!(4294967294_u64),
-        json!("7"),
-        json!(7),
-        json!("zerocode-first-call-initialize"),
-    ];
+    // The stand-in's three requests have all answered before the call at 0.
+    // Their ids now belong to the client if it uses them.
+    let ids = [json!(-2), json!(-3), json!(-4), json!(7)];
     for id in &ids {
         session.send(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "ping"}}));
     }
     for id in &ids {
         assert_eq!(session.answer(id)["result"]["content"][0]["text"], "pong");
     }
-    let cancelled = json!("cancel-this-call");
-    session.send(&json!({"jsonrpc": "2.0", "id": cancelled, "method": "tools/call", "params": {"name": "wait"}}));
-    session.send(&json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": cancelled}}));
-    assert_eq!(session.answer(&cancelled)["error"]["message"], "cancelled");
-
     let expected_ids: Vec<_> = [json!(1), json!(2), json!(3), json!(0)]
         .into_iter()
         .chain(ids)
-        .chain([cancelled])
         .collect();
     let received_ids: Vec<_> = session
         .answers()

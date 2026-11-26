@@ -17,9 +17,36 @@
 /// (`main.rs:46768`의 게이트 B가 그 둘을 맞춘다), 같아야 하는 이유는
 /// `block_after`가 **첫 일치**를 집기 때문이다: 순서가 곧 답이다.
 #[cfg(test)]
+pub(crate) const I18N_CATALOGS: &str = concat!(
+    include_str!("../../../ui/shell-i18n.js"),
+    include_str!("../../../ui/shell-i18n-en.js"),
+    include_str!("../../../ui/shell-i18n-ja.js"),
+    include_str!("../../../ui/shell-i18n-zh.js"),
+    include_str!("../../../ui/shell-i18n-es.js")
+);
+
+/// One language's flat table in the window's source: the body of its
+/// `registerI18nCatalog("<language>", {` call in `ui/shell-i18n-<language>.js`,
+/// or `None` when no such call is there. Korean is not one — it stays in
+/// `CATALOG` inside `ui/shell-i18n.js`.
+///
+/// The source contracts read the same shape with their own copy
+/// (`tests/source_contracts/support.rs`, `catalog_block`): an integration
+/// test cannot reach this binary's test-only items (t-129668).
+#[cfg(test)]
+pub(crate) fn registered_catalog<'a>(source: &'a str, language: &str) -> Option<&'a str> {
+    let opened = format!("registerI18nCatalog(\"{language}\", {{");
+    let rest = &source[source.find(&opened)? + opened.len()..];
+    let end = rest
+        .find("\n  });")
+        .unwrap_or_else(|| panic!("the `{language}` catalog is unbounded"));
+    Some(&rest[..end])
+}
+
+#[cfg(test)]
 pub(crate) const WINDOW_PARTS: &[(&str, &str)] = &[
     ("shell-boot.js", include_str!("../../../ui/shell-boot.js")),
-    ("shell-i18n.js", include_str!("../../../ui/shell-i18n.js")),
+    ("shell-i18n.js", I18N_CATALOGS),
     (
         "shell-pane-lifecycle.js",
         include_str!("../../../ui/shell-pane-lifecycle.js"),

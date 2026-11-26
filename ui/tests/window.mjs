@@ -98,6 +98,8 @@ import { testConversationPin, testConversationResult, testConversationViewMenu }
 import { testConversationBeside } from "./conversation-beside.mjs";
 import { testHelperDoors } from "./helper-doors.mjs";
 import { testBrowserRecovery } from "./browser-recovery.mjs";
+import { testBrowserToolbar } from "./browser-toolbar.mjs";
+import { testBrowserBeside } from "./browser-beside.mjs";
 import { testBrowserPanesSurvive } from "./browser-panes-survive.mjs";
 import { testBrowserWorkspace } from "./browser-workspace.mjs";
 import { testEmulatorSeat } from "./emulator-seat.mjs";
@@ -329,6 +331,313 @@ suite("window-harness", async ({ browser, origin, ok }) => {
     JSON.stringify({ turns: every.turns, end: every.end.slice(0, 300) }));
 });
 
+suite("i18n-lazy-catalogs", async ({ browser, origin, ok }) => {
+  /* Production's first frame waits for the one language it paints, and only
+   * that language: English here because the boot report says English. The
+   * harness's synchronous-test door is explicitly turned off, so this page
+   * walks the same dynamic-script road the app does. */
+  const productionBoot = { ...BOOT, locale: "en", system_locale: "en" };
+  const { page } = await openWindowTestPage(browser, origin, {
+    boot: productionBoot,
+    before: async (opened) => opened.addInitScript(() => {
+      window.__ZEROCODE_I18N_SYNC_FOR_TESTS__ = false;
+    }),
+  });
+  try {
+    const booted = await page.evaluate(() => {
+      const script = (name) => performance.getEntriesByType("resource")
+        .some((entry) => entry.name.endsWith(`/${name}`));
+      return {
+        lang: document.documentElement.lang,
+        systemWord: t("settings.appearance.language.system", ""),
+        enKeys: Object.keys(CATALOG.en ?? {}).length,
+        catalogs: Object.fromEntries(["en", "ja", "zh", "es"].map((code) => [code, typeof CATALOG[code]])),
+        scripts: Object.fromEntries(["en", "ja", "zh", "es"].map((code) => [code, script(`shell-i18n-${code}.js`)])),
+      };
+    });
+    ok(
+      "boot loads the active language's catalog and leaves the other three on disk",
+      booted.lang === "en" && booted.systemWord === "System setting" && booted.enKeys > 8000 &&
+        booted.catalogs.en === "object" && booted.catalogs.ja === "undefined" &&
+        booted.catalogs.zh === "undefined" && booted.catalogs.es === "undefined" &&
+        booted.scripts.en === true && booted.scripts.ja === false &&
+        booted.scripts.zh === false && booted.scripts.es === false,
+      JSON.stringify(booted),
+    );
+
+    const raced = await page.evaluate(async () => {
+      const first = setLocale("zh", { refresh: false, persist: false });
+      const second = setLocale("es", { refresh: false, persist: false });
+      const settled = await Promise.all([first, second]);
+      return {
+        settled,
+        lang: document.documentElement.lang,
+        systemWord: t("settings.appearance.language.system", ""),
+        zh: typeof CATALOG.zh,
+        es: typeof CATALOG.es,
+      };
+    });
+    ok(
+      "a faster second language choice wins even while both catalogs are loading",
+      raced.settled[0] === false && raced.settled[1] === true && raced.lang === "es" &&
+        raced.systemWord === "Ajuste del sistema" && raced.zh === "object" && raced.es === "object",
+      JSON.stringify(raced),
+    );
+
+    const persisted = await page.evaluate(async () => {
+      const before = window.__COUNTS__.set_locale ?? 0;
+      const settled = await setLocale("ja");
+      return {
+        settled,
+        before,
+        after: window.__COUNTS__.set_locale ?? 0,
+        lang: document.documentElement.lang,
+        word: t("settings.appearance.language.system", ""),
+      };
+    });
+    ok(
+      "choosing a language waits for its catalog, repaints once, and persists once",
+      persisted.settled === true && persisted.after - persisted.before === 1 &&
+        persisted.lang === "ja" && persisted.word === "システム設定",
+      JSON.stringify(persisted),
+    );
+  } finally {
+    await page.close();
+  }
+
+  /* The harness keeps the old synchronous reading contract for the many
+   * suites whose business is individual translated rows — but the catalog is
+   * still pulled on first use rather than preloaded on every page. */
+  const harnessed = await openWindowTestPage(browser, origin);
+  try {
+    const seen = await harnessed.page.evaluate(() => ({
+      before: typeof CATALOG.en,
+      word: CATALOG.en?.["settings.appearance.language.system"],
+      after: typeof CATALOG.en,
+      jaStillLazy: Object.getOwnPropertyDescriptor(CATALOG, "ja")?.get !== undefined,
+    }));
+    ok(
+      "test suites keep synchronous catalog reads, still loaded one language at a time",
+      seen.before === "object" && seen.word === "System setting" && seen.after === "object" && seen.jaStillLazy,
+      JSON.stringify(seen),
+    );
+  } finally {
+    await harnessed.page.close();
+  }
+
+  /* What the menu looks like at a frame: its word, and whether a person could
+   * see it there. Evaluated in the page, so it carries no outside names. */
+  const menuAtTwoFrames = () => new Promise((done) => {
+    const look = () => {
+      const node = document.querySelector('[data-i18n="sidebar.search"]');
+      const box = node.getBoundingClientRect();
+      done({
+        word: node.textContent.trim(),
+        drawn: box.width > 0 && box.height > 0 && getComputedStyle(node).visibility === "visible",
+        lang: document.documentElement.lang,
+      });
+    };
+    requestAnimationFrame(() => requestAnimationFrame(look));
+  });
+
+  /* t-129668 (a): the saved language is English and its catalog is slow. The
+   * file is held on the wire for two frames: the menu must not stand there in
+   * the markup's Korean while the window waits for English, and the paint
+   * that follows the file is English. */
+  let waiting = null;
+  const slow = await openWindowTestPage(browser, origin, {
+    boot: productionBoot,
+    before: async (opened) => {
+      await opened.addInitScript(() => {
+        window.__ZEROCODE_I18N_SYNC_FOR_TESTS__ = false;
+      });
+      await opened.route("**/shell-i18n-en.js", async (route) => {
+        waiting = await opened.evaluate(menuAtTwoFrames).catch((error) => ({ error: String(error) }));
+        await route.continue().catch(() => {});
+      });
+    },
+  });
+  try {
+    const settled = await slow.page.evaluate(menuAtTwoFrames);
+    ok(
+      "a slow catalog keeps the Korean menu out of the first paint, and the paint after it is English",
+      waiting !== null && !waiting.error && (!waiting.drawn || waiting.word === "Search") &&
+        settled.lang === "en" && settled.word === "Search" && settled.drawn,
+      JSON.stringify({ waiting, settled }),
+    );
+
+    /* t-129668 (b): the pop-out's case on the same road. A settings document
+     * names Japanese and its catalog is still on the wire when a newer
+     * document goes back to English, the language already on screen. The
+     * Japanese file landing late must not paint over the newer choice. */
+    let release;
+    const held = new Promise((resolve) => { release = resolve; });
+    let asked;
+    const requested = new Promise((resolve) => { asked = resolve; });
+    await slow.page.route("**/shell-i18n-ja.js", async (route) => {
+      asked();
+      await held;
+      await route.continue().catch(() => {});
+    });
+    await slow.page.evaluate(() => {
+      applySettingsSnapshot({ revision: settingsRevision + 1, locale: "ja" });
+    });
+    await requested;
+    const reverted = await slow.page.evaluate(() =>
+      applySettingsSnapshot({ revision: settingsRevision + 1, locale: "en" }));
+    release();
+    await slow.page.waitForFunction(() => typeof CATALOG.ja === "object" && CATALOG.ja !== null);
+    const after = await slow.page.evaluate(menuAtTwoFrames);
+    const active = await slow.page.evaluate(() => ({
+      code: activeLocaleCode(),
+      word: t("settings.appearance.language.system", ""),
+    }));
+    ok(
+      "a newer settings document that keeps English outranks an older Japanese choice still loading",
+      reverted === true && after.lang === "en" && after.word === "Search" &&
+        active.code === "en" && active.word === "System setting",
+      JSON.stringify({ reverted, after, active }),
+    );
+  } finally {
+    await slow.page.close();
+  }
+
+  /* t-129668 (a), its bound: a catalog that does not come within the wait.
+   * The window does not stand hidden — it paints Korean, every call site's
+   * own words, says so in the window log, and turns English when the file
+   * lands after all. */
+  let capped = null;
+  const late = await openWindowTestPage(browser, origin, {
+    boot: productionBoot,
+    before: async (opened) => {
+      await opened.addInitScript(() => {
+        window.__ZEROCODE_I18N_SYNC_FOR_TESTS__ = false;
+        window.__WINDOW_LOG__ = [];
+        window.__ANSWER__.log_window_error = ({ message }) => {
+          window.__WINDOW_LOG__.push(message);
+          return null;
+        };
+      });
+      await opened.route("**/shell-i18n-en.js", async (route) => {
+        capped = await opened.evaluate(() => new Promise((done) => {
+          const started = performance.now();
+          const look = () => {
+            const node = document.querySelector('[data-i18n="sidebar.search"]');
+            const box = node.getBoundingClientRect();
+            const drawn = box.width > 0 && box.height > 0 && getComputedStyle(node).visibility === "visible";
+            const waitedMs = Math.round(performance.now() - started);
+            if (drawn || waitedMs > 4 * FIRST_PAINT_WAIT_MS) {
+              done({ word: node.textContent.trim(), drawn, waitedMs, bound: FIRST_PAINT_WAIT_MS, logged: [...window.__WINDOW_LOG__] });
+            } else {
+              requestAnimationFrame(look);
+            }
+          };
+          requestAnimationFrame(look);
+        })).catch((error) => ({ error: String(error) }));
+        await route.continue().catch(() => {});
+      });
+    },
+  });
+  try {
+    const healed = await late.page.waitForFunction(() =>
+      document.documentElement.lang === "en" &&
+        document.querySelector('[data-i18n="sidebar.search"]').textContent.trim() === "Search",
+    null, { timeout: 5000 }).then(() => true, () => false);
+    ok(
+      "a catalog later than the wait paints Korean, logs why, and repaints English when it lands",
+      capped !== null && !capped.error && capped.drawn && capped.word === "검색" &&
+        capped.waitedMs >= capped.bound / 2 &&
+        capped.logged.some((line) => line.startsWith("i18n:") && line.includes(`${capped.bound} ms`)) &&
+        healed,
+      JSON.stringify({ capped, healed }),
+    );
+  } finally {
+    await late.page.close();
+  }
+
+  /* t-129668, the second review's counterexample (t-129744,
+   * reports/lazy-i18n-177/review-177-2/review-window.mjs): the person's
+   * choice is the language's last intent. An English window has asked for its
+   * settings document (revision 2) when the person picks Spanish, whose file
+   * is held on the wire. The document — asked BEFORE the choice — then lands
+   * naming English, the language on screen, or Japanese, another one. It may
+   * not cancel the choice: when the Spanish file arrives `setLocale` answers
+   * true, the menu reads Spanish and Spanish is saved once. Every language
+   * the window painted on the way is kept too: the older document's is not
+   * one of them. */
+  for (const [incoming, named] of [["en", "English, the language on screen"], ["ja", "Japanese, another language"]]) {
+    const chosen = await openWindowTestPage(browser, origin, {
+      boot: { ...productionBoot, revision: 1 },
+      before: async (opened) => opened.addInitScript(() => {
+        window.__ZEROCODE_I18N_SYNC_FOR_TESTS__ = false;
+      }),
+    });
+    let releaseSpanish = () => {};
+    const spanishHeld = new Promise((resolve) => { releaseSpanish = resolve; });
+    try {
+      let spanishAsked;
+      const spanishRequested = new Promise((resolve) => { spanishAsked = resolve; });
+      await chosen.page.route("**/shell-i18n-es.js", async (route) => {
+        spanishAsked();
+        await spanishHeld;
+        await route.continue().catch(() => {});
+      });
+      await chosen.page.evaluate((incoming) => {
+        let land;
+        const reply = new Promise((resolve) => { land = resolve; });
+        window.__OLDER_DOCUMENT__ = { asked: false, land: () => land({ locale: incoming, revision: 2 }) };
+        window.__LOCALE_WRITES__ = [];
+        window.__LANGS_PAINTED__ = [];
+        new MutationObserver(() => window.__LANGS_PAINTED__.push(document.documentElement.lang))
+          .observe(document.documentElement, { attributes: true, attributeFilter: ["lang"] });
+        window.__ANSWER__.set_locale = ({ code }) => {
+          window.__LOCALE_WRITES__.push(code);
+          return { locale: code, revision: 3 };
+        };
+        window.__ANSWER__.settings_snapshot = () => {
+          window.__OLDER_DOCUMENT__.asked = true;
+          return reply;
+        };
+        for (const receive of window.__LISTENERS__["settings:changed"] ?? []) {
+          receive({ payload: { revision: 2, keys: ["locale"] } });
+        }
+      }, incoming);
+      await chosen.page.waitForFunction(() => window.__OLDER_DOCUMENT__.asked, null, { timeout: 5000 });
+      await chosen.page.evaluate(() => { window.__PICKED__ = setLocale("es"); });
+      let notAsked;
+      await Promise.race([spanishRequested, new Promise((_, reject) => {
+        notAsked = setTimeout(() => reject(new Error("the Spanish catalog was not asked for within 5 s")), 5000);
+      })]).finally(() => clearTimeout(notAsked));
+      await chosen.page.evaluate(() => window.__OLDER_DOCUMENT__.land());
+      await chosen.page.waitForFunction(() => settingsRevision === 2, null, { timeout: 5000 });
+      releaseSpanish();
+      const settled = await chosen.page.evaluate(async () => {
+        const choice = await window.__PICKED__;
+        await new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)));
+        return {
+          choice,
+          writes: [...window.__LOCALE_WRITES__],
+          painted: [...window.__LANGS_PAINTED__],
+          lang: document.documentElement.lang,
+          active: activeLocaleCode(),
+          word: document.querySelector('[data-i18n="sidebar.search"]').textContent.trim(),
+          revision: settingsRevision,
+        };
+      });
+      ok(
+        `an older settings document naming ${named} lands while the person's Spanish loads, and Spanish still paints and is saved once`,
+        settled.choice === true && settled.writes.join() === "es" && settled.active === "es" &&
+          settled.lang === "es" && settled.word === "Buscar" &&
+          settled.painted.length > 0 && settled.painted.every((lang) => lang === "es"),
+        JSON.stringify({ incoming, ...settled }),
+      );
+    } finally {
+      releaseSpanish();
+      await chosen.page.close();
+    }
+  }
+});
+
 suite("explorer", async ({ browser, origin, ok }) => {
   const { page } = await openWindowTestPage(browser, origin);
   try {
@@ -468,6 +777,8 @@ suite("worktree-evidence", ({ browser, origin, ok }) => testWorktreeEvidence(bro
 suite("agent-conversation", ({ browser, origin, ok }) => testAgentConversation(browser, origin, ok));
 suite("helper-doors", ({ browser, origin, ok }) => testHelperDoors(browser, origin, ok));
 suite("browser-recovery", ({ browser, origin, ok }) => testBrowserRecovery(browser, origin, ok));
+suite("browser-toolbar", ({ browser, origin, ok }) => testBrowserToolbar(browser, origin, ok));
+suite("browser-beside", ({ browser, origin, ok }) => testBrowserBeside(browser, origin, ok));
 suite("browser-panes-survive", ({ browser, origin, ok }) => testBrowserPanesSurvive(browser, origin, ok));
 suite("browser-workspace", ({ browser, origin, ok }) => testBrowserWorkspace(browser, origin, ok));
 suite("emulator-seat", ({ browser, origin, ok }) => testEmulatorSeat(browser, origin, ok));
@@ -12012,11 +12323,22 @@ const browserTab = await page.evaluate(async () => {
   document.getElementById("note-pop").hidden = true;
   await new Promise((done) => setTimeout(done, 40));
   seen.backAfterPopover = steered.some(([verb, args]) => verb === "browser_place" && args.shown === true);
-  // 개발자 도구 단추 — Orca의 "Open browser devtools".
+  // 개발자 도구 — Orca의 "Open browser devtools". ⚙ 메뉴의 줄이다(도구줄의 단추였다, 2026-11-25).
   const shownHost = [...document.querySelectorAll(".browser-view")].find((one) => !one.hidden);
   steered.length = 0;
-  shownHost.querySelector(".browser-devtools").click();
+  shownHost.querySelector(".browser-menu").click();
+  await new Promise((done) => setTimeout(done, 80));
+  [...document.querySelectorAll("#sidebar-menu .sidebar-menu-item")]
+    .find((one) => one.textContent === t("browser.devtools", "개발자 도구"))
+    ?.click();
+  await new Promise((done) => setTimeout(done, 40));
   seen.devtools = steered.some(([verb, args]) => verb === "browser_devtools" && args.label === "browser-91");
+  // 줄을 누른 메뉴는 `--motion-fast` 동안 닫히는 중이고 아직 그려져 있다. 그 사이에 두드린 chord도 페이지의
+  // 것이다 — 떠나는 메뉴는 키를 쥐지 않는다(`browserChordScope`). 아래 chord들은 그 틈에서 눌린다.
+  seen.menuStillLeaving = (() => {
+    const menu = document.getElementById("sidebar-menu");
+    return !menu.hidden && menu.classList.contains("is-closing");
+  })();
   // Orca의 Browser scope chord: 브라우저 탭이 앞일 때 ⌘R은 페이지 새로고침,
   // ⌘=/⌘0은 확대 사다리, ⌘L은 주소창이다.
   window.dispatchEvent(new KeyboardEvent("keydown", {
@@ -12337,7 +12659,7 @@ ok(
     && browserTab.hidOnSwitch && browserTab.hidUnderScrim && browserTab.backAfterScrim
     && browserTab.hidUnderAnyScrim && browserTab.hidUnderPopover && browserTab.backAfterPopover
     && browserTab.earlyReplayed && browserTab.earlyClean
-    && browserTab.devtools && browserTab.chordReload && browserTab.zoomStepped
+    && browserTab.devtools && browserTab.menuStillLeaving && browserTab.chordReload && browserTab.zoomStepped
     && browserTab.zoomSaid && browserTab.zoomHushed
     && browserTab.zoomReset && browserTab.chordAddress && browserTab.chordSelects
     && browserTab.suggestStands && browserTab.suggestSearchFirst && browserTab.suggestPrelit
@@ -12563,42 +12885,59 @@ const gearMenu = await page.evaluate(async () => {
   gear.click();
   await new Promise((done) => setTimeout(done, 60));
   const menu = document.getElementById("sidebar-menu");
-  const rows = [...menu.querySelectorAll(".sidebar-menu-item .sidebar-menu-label")].map(
+  const labels = () => [...menu.querySelectorAll(".sidebar-menu-item .sidebar-menu-label")].map(
     (one) => one.textContent,
   );
-  // 1-g26부터 메뉴는 프로필 절이 앞장서고, 뷰포트 절이 그 아래 선다 — 같은
-  // 낱말 "기본"이 두 절에 있으니 뷰포트의 것은 헤더 '다음 행'으로 집는다.
-  const viewportAt = rows.indexOf(t("browser.viewport", "뷰포트 크기"));
+  const captions = () => [...menu.querySelectorAll(".sidebar-menu-caption")].map((one) => one.textContent);
+  const press = (words) => [...menu.querySelectorAll(".sidebar-menu-item")]
+    .find((one) => one.querySelector(".sidebar-menu-label")?.textContent === words)
+    ?.click();
+  const checked = () => [...menu.querySelectorAll('.sidebar-menu-item[aria-checked="true"] .sidebar-menu-label')]
+    .map((one) => one.textContent);
+  // 메뉴는 세 묶음이다(2026-11-25): 프로필을 고르는 줄, 이 페이지에 하는 일 — 뷰포트 크기는 한 줄이고
+  // 누르면 그 자리에 고르는 메뉴가 선다 —, 단지와 설정을 다루는 일. 절의 이름은 줄이 아니라 캡션이다.
+  const rows = labels();
+  const viewportRow = t("browser.viewport", "뷰포트 크기") + " ›";
   seen.menuShape =
     !menu.hidden &&
-    rows[0] === t("browser.profile", "프로필") &&
-    viewportAt > 0 &&
-    rows[viewportAt + 1] === "✓ " + t("browser.viewportDefault", "기본") &&
-    rows.some((one) => one === "Mobile M — 375 × 667") &&
+    JSON.stringify(captions()) === JSON.stringify([t("browser.profile", "프로필")]) &&
+    rows[0] === t("browser.profileDefault", "기본") &&
+    JSON.stringify(checked()) === JSON.stringify([t("browser.profileDefault", "기본")]) &&
+    rows.includes(viewportRow) &&
+    !rows.some((one) => one === "Mobile M — 375 × 667") &&
+    rows.includes(t("browser.devtools", "개발자 도구")) &&
+    rows.includes(t("browser.menu.openPageOut", "기본 브라우저에서 페이지 열기")) &&
     rows.at(-1) === t("browser.openSettings", "브라우저 설정…");
+  // 뷰포트 줄이 고르는 메뉴를 연다: 기본에 표시가 서고 프리셋 일곱이 선다.
+  press(viewportRow);
+  await new Promise((done) => setTimeout(done, 120));
+  seen.viewportMenu =
+    !menu.hidden &&
+    JSON.stringify(captions()) === JSON.stringify([t("browser.viewport", "뷰포트 크기")]) &&
+    labels().length === 8 &&
+    JSON.stringify(checked()) === JSON.stringify([t("browser.viewportDefault", "기본")]) &&
+    labels().includes("Mobile M — 375 × 667");
   // 프리셋을 고르면 다음 배치가 그 상자로 클램프된다 — 가로 중앙.
   const bodyRect = host.querySelector(".browser-body").getBoundingClientRect();
   placed.length = 0;
-  [...menu.querySelectorAll(".sidebar-menu-item")]
-    .find((one) => one.textContent.includes("Mobile M"))
-    ?.click();
+  press("Mobile M — 375 × 667");
   await new Promise((done) => setTimeout(done, 260));
   const last = placed.at(-1);
   seen.clamped =
     tab.viewport === "mobile-m" &&
     last?.width === 375 &&
     Math.abs(last.x - (bodyRect.x + (bodyRect.width - 375) / 2)) <= 1;
-  // 기본으로 돌아오면 몸 전체를 다시 쓴다.
+  // 입은 상자는 ⚙ 메뉴의 그 줄이 말하고, 고르는 메뉴에서는 그 줄에 표시가 선다.
   gear.click();
   await new Promise((done) => setTimeout(done, 120));
+  const wornRow = `${t("browser.viewport", "뷰포트 크기")} · Mobile M — 375 × 667 ›`;
+  seen.rowSaysTheBox = labels().includes(wornRow);
+  press(wornRow);
+  await new Promise((done) => setTimeout(done, 120));
+  seen.boxIsChecked = JSON.stringify(checked()) === JSON.stringify(["Mobile M — 375 × 667"]);
+  // 기본으로 돌아오면 몸 전체를 다시 쓴다.
   placed.length = 0;
-  {
-    const held = [...document.querySelectorAll("#sidebar-menu .sidebar-menu-item")];
-    const header = held.findIndex((one) =>
-      one.textContent.includes(t("browser.viewport", "뷰포트 크기")),
-    );
-    held[header + 1]?.click();
-  }
+  press(t("browser.viewportDefault", "기본"));
   await new Promise((done) => setTimeout(done, 260));
   seen.restored =
     tab.viewport === null && Math.round(placed.at(-1)?.width ?? 0) === Math.round(bodyRect.width);
@@ -12746,9 +13085,9 @@ ok(
 );
 
 ok(
-  "the gear menu clamps the pane to Orca's viewport presets and opens the browser settings",
-  gearMenu.hasGear && gearMenu.menuShape && gearMenu.clamped &&
-    gearMenu.restored && gearMenu.settingsDoor,
+  "the gear menu's viewport row opens Orca's presets, the pane is clamped to the one chosen, and the menu opens the browser settings",
+  gearMenu.hasGear && gearMenu.menuShape && gearMenu.viewportMenu && gearMenu.clamped &&
+    gearMenu.rowSaysTheBox && gearMenu.boxIsChecked && gearMenu.restored && gearMenu.settingsDoor,
   JSON.stringify(gearMenu),
 );
 
@@ -42975,7 +43314,7 @@ const besides = await page.evaluate(async () => {
     tabs.filter((one) => one.kind === "term").at(-1);
   const hostPane = hostTab?.pane ?? focusedPane;
   // 팔레트의 새 브라우저: 보고 있는 터미널 옆에 선다.
-  await openBrowserTab("https://example.com/split", { beside: true });
+  await openBrowserTab("https://example.com/split", { beside: true, splitNarrow: true });
   await new Promise((done) => setTimeout(done, 60));
   const browserTab = tabs.find((one) => one.id === "browser:browser-s1");
   seen.browserBeside =
@@ -43086,7 +43425,7 @@ const bodyFocus = await page.evaluate(async () => {
   const term = await openTermTab();
   await new Promise((done) => setTimeout(done, 60));
   const termPane = tabs.find((one) => one.id === `term:${term}`)?.pane ?? focusedPane;
-  await openBrowserTab("https://example.com/focus", { beside: true });
+  await openBrowserTab("https://example.com/focus", { beside: true, splitNarrow: true });
   await new Promise((done) => setTimeout(done, 60));
   const browserPane = tabs.find((one) => one.id === "browser:browser-f1")?.pane;
   seen.startsOnBrowser = focusedPane === browserPane;
@@ -43190,7 +43529,7 @@ const homecoming = await page.evaluate(async () => {
   const termTab =
     tabs.find((one) => one.id === `term:${term}`) ??
     tabs.filter((one) => one.kind === "term").at(-1);
-  await openBrowserTab("https://example.com/away", { beside: true });
+  await openBrowserTab("https://example.com/away", { beside: true, splitNarrow: true });
   await new Promise((done) => setTimeout(done, 60));
   const awayTab = tabs.find((one) => one.id === "browser:browser-h1");
   // 복원의 형상: 판 0에는 곧 닫힐 탭 하나만 — 창이 태어날 때 깔린 탭들과
@@ -43975,11 +44314,14 @@ const profiles = await page.evaluate(async () => {
   const rows = [...document.querySelectorAll("#sidebar-menu .sidebar-menu-item .sidebar-menu-label")].map(
     (one) => one.textContent,
   );
+  // 절의 이름은 캡션이고, 단지는 고르는 줄이다 — 지금 입은 단지에 표시가 선다(2026-11-25).
   seen.menuLeadsWithJars =
-    rows[0] === t("browser.profile", "프로필") &&
-    rows[1] === "✓ " + t("browser.profileDefault", "기본") &&
-    rows[2] === "일터" &&
-    rows[3] === t("browser.newProfile", "새 프로필…");
+    document.querySelector("#sidebar-menu .sidebar-menu-caption")?.textContent === t("browser.profile", "프로필") &&
+    rows[0] === t("browser.profileDefault", "기본") &&
+    rows[1] === "일터" &&
+    [...document.querySelectorAll('#sidebar-menu .sidebar-menu-item[role="menuitemradio"]')]
+      .map((one) => one.getAttribute("aria-checked")).join(",") === "true,false" &&
+    rows.includes(t("browser.newProfile", "새 프로필…"));
   // 단지를 고른다: 새 판이 그 프로필로 서고, 옛 판은 닫히고, 이름표가 옮는다.
   const before = groupRecents.get(tab.pane) ? [...groupRecents.get(tab.pane)] : null;
   [...document.querySelectorAll("#sidebar-menu .sidebar-menu-item")]

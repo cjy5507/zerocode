@@ -345,9 +345,15 @@ function browserZoomPercent(level) {
 
 /* Orca's `scope: "browser"` as a question this window can ask: the front
  * tab is a browser AND nothing stands in front of the page. Both halves
- * matter — a chord aimed at a page nobody can see steers a hidden surface. */
+ * matter — a chord aimed at a page nobody can see steers a hidden surface.
+ *
+ * The keyboard's question, which is not the picture's: a menu on its way out
+ * is drawn for `--motion-fast` more and the page stays hidden under it, but
+ * the person has already left it. A chord pressed in that time was nobody's —
+ * ⌘R did nothing, and the zoom router gave ⌘= to the whole window's scale,
+ * which is written to the settings (Codex review t-130464, 2026-11-25). */
 function browserChordScope() {
-  return currentTab()?.kind === "browser" && !browserCovered();
+  return currentTab()?.kind === "browser" && !browserCovered({ leavingMenu: false });
 }
 
 /* One rung up, one rung down, or back to the configured default — from
@@ -478,9 +484,11 @@ function browserWorkspaceWatchesLive(tab) {
 }
 
 /* The shield's dress (t-66513): its tag's words in the person's language, and
- * the agent's working colour and the ground's as the bytes the window paints
- * for those tokens — the native view keeps no colour of its own. The colours
- * are read again only when the theme or the words change. */
+ * the bytes the window paints for four tokens — the agent's working colour for
+ * the border and the tag, the ground's for the tag's words, and the agent's
+ * pointer with the white of its rim for the dart where the agent last pressed
+ * — so the native view keeps no colour of its own. The colours are read again
+ * only when the theme or the words change. */
 let browserWorkspaceDress = null;
 function browserWorkspaceShieldDress() {
   const says = t("browser.workspace.watchShield", "에이전트 조작 중 · 보기만");
@@ -489,9 +497,11 @@ function browserWorkspaceShieldDress() {
     const style = getComputedStyle(document.documentElement);
     browserWorkspaceDress = {
       says, theme, tint: browserTokenRgb(style, "--signal-ready"), ink: browserTokenRgb(style, "--surface-abyss"),
+      pointer: browserTokenRgb(style, "--agent-pointer"), rim: browserTokenRgb(style, "--ink-on-solid"),
     };
   }
-  return { says, tint: browserWorkspaceDress.tint, ink: browserWorkspaceDress.ink };
+  const { tint, ink, pointer, rim } = browserWorkspaceDress;
+  return { says, tint, ink, pointer, rim };
 }
 
 /* A colour token's three bytes, painted on one pixel of a canvas the page keeps. */
@@ -1095,6 +1105,7 @@ function forgetAgentBrowserWorkspacesKept() {
 
 function watchBrowserWorkspace(tab, { beside = false } = {}) {
   if (!browserWorkspaceLive(tab) || !tab.agentWorkspace) return;
+  const shownBefore = browserShowsBeside();
   if (beside && !browserWorkspaceOnScreen(tab)) {
     const source = currentTab();
     const priorPane = tab.pane;
@@ -1111,6 +1122,7 @@ function watchBrowserWorkspace(tab, { beside = false } = {}) {
   // could not stand (t-66513).
   tab.workspaceLiveError = false;
   setActiveTab(tab.id);
+  if (beside && stageGroups().length > 1) foldAsideForBrowserBeside(shownBefore);
   paintBrowserWorkspaceTab(tab);
   if (!tab.workspace && !tab.workspaceReading) void refreshBrowserWorkspace(tab);
 }
@@ -1152,7 +1164,7 @@ function browserWorkspaceWords(tab) {
   if (tab.workspace.mode === "paused") return tab.workspace.resume === "observe"
     ? t("browser.workspace.pausedObserve", "작업 일시정지 · 에이전트가 새로 본 뒤 이어 갑니다")
     : t("browser.workspace.paused", "작업 일시정지");
-  if (tab.workspace.mode === "human") return t("browser.workspace.human", "직접 제어 · 에이전트 입력 차단");
+  if (tab.workspace.mode === "human") return t("browser.workspace.human", "내가 조작 중 · 에이전트 입력 차단");
   return tab.workspace.needsObservation
     ? t("browser.workspace.observation", "에이전트 제어 · 새 화면 확인 후 입력 가능")
     : t("browser.workspace.agent", "에이전트 제어");
@@ -1162,8 +1174,9 @@ function buildBrowserWorkspaceBar() {
   const bar = document.createElement("section");
   bar.className = "browser-workspace-bar";
   bar.hidden = true;
-  const heading = document.createElement("strong");
-  heading.className = "browser-workspace-label";
+  // 막대의 이름은 읽는 기계에게만 말한다 — 눈에는 탭의 「작업」 배지가 이미 말했다(2026-11-25).
+  bar.dataset.i18nAria = "browser.workspace.title";
+  bar.setAttribute("aria-label", t("browser.workspace.title", "전용 작업 브라우저"));
   const status = document.createElement("span");
   status.className = "browser-workspace-status";
   status.setAttribute("role", "status");
@@ -1215,7 +1228,7 @@ function buildBrowserWorkspaceBar() {
   retry.type = "button";
   retry.className = "btn browser-workspace-retry";
   actions.appendChild(retry);
-  bar.append(heading, status, stopNote, regrant, owner, previewNote, actions);
+  bar.append(status, stopNote, regrant, owner, previewNote, actions);
   return bar;
 }
 
@@ -1307,7 +1320,7 @@ function paintBrowserWorkspace(host, tab) {
   host.querySelector(".browser-address").readOnly = !control;
   host.querySelector(".browser-address").setAttribute("aria-label", managed
     ? t("browser.workspace.address", "작업 페이지 주소") : t("browser.address", "주소를 입력하거나 검색"));
-  for (const name of ["back", "forward", "reload", "find", "devtools", "menu", "markup"]) {
+  for (const name of ["back", "forward", "reload", "find", "menu", "markup"]) {
     host.querySelector(`.browser-${name}`).disabled = !control || (name === "markup" && managed && tab.workspace?.snapshotSupported !== true);
   }
   for (const name of ["grab", "annotate"]) {
@@ -1323,7 +1336,6 @@ function paintBrowserWorkspace(host, tab) {
     surface.querySelector("img").removeAttribute("src");
     return;
   }
-  writeTextContent(host.querySelector(".browser-workspace-label"), t("browser.workspace.title", "전용 작업 브라우저"));
   writeTextContent(host.querySelector(".browser-workspace-status"), browserWorkspaceWords(tab));
   host.querySelector(".browser-workspace-bar").setAttribute("aria-busy", String(!!tab.workspacePending));
   host.querySelector(".browser-workspace-watch").hidden = tab.workspaceViewing === true;
@@ -1349,17 +1361,18 @@ function paintBrowserWorkspace(host, tab) {
   previewNote.hidden = control || (!unsupported && !tab.workspaceCaptureError);
   writeTextContent(previewNote, unsupported
     ? t("browser.workspace.unsupported", "이 환경에서는 관전 화면을 지원하지 않습니다. ‘내가 조작’으로 직접 사용할 수 있습니다.")
-    : t("browser.workspace.captureError", "화면을 가져오지 못했습니다. 화면 보기를 다시 시도하거나 직접 조작할 수 있습니다."));
+    : t("browser.workspace.captureError", "화면을 가져오지 못했습니다. ‘화면 다시 보기’를 누르거나 ‘내가 조작’으로 직접 사용할 수 있습니다."));
   const retry = host.querySelector(".browser-workspace-retry");
   retry.hidden = control || unsupported || !tab.workspaceCaptureError;
   retry.disabled = !!tab.workspacePending || !tab.workspace || !!tab.workspaceError;
   writeTextContent(retry, t("browser.workspace.retry", "화면 다시 보기"));
   surface.querySelector("img").alt = t("browser.workspace.frame", "작업 브라우저의 현재 화면");
-  writeTextContent(surface.querySelector(".browser-workspace-caption"), tab.workspaceViewing
-    ? t("browser.workspace.watching", "보기만 가능합니다. 페이지를 조작하려면 ‘내가 조작’을 누르세요.")
-    : t("browser.workspace.folded", "화면을 접어도 작업 브라우저는 유지됩니다. ‘지금 보기’로 화면을 확인하세요."));
+  // 접은 화면만 제 사정을 말한다. 지켜보는 화면 밑의 「보기만 가능합니다…」는 막대의 단추와 방패의 꼬리표가
+  // 이미 하는 말이었다(2026-11-25).
+  const caption = surface.querySelector(".browser-workspace-caption");
+  caption.hidden = tab.workspaceViewing === true;
+  writeTextContent(caption, t("browser.workspace.folded", "화면을 접어도 작업 브라우저는 유지됩니다. ‘지금 보기’로 화면을 확인하세요."));
   host.querySelector(".browser-failure").hidden = !control || !tab.navFailure;
-  host.querySelector(".browser-external").disabled = !control || externalBrowserUrl(tab.url) === null;
 }
 
 function clearBrowserWorkspaceFrames() {
@@ -1560,10 +1573,45 @@ function syncAddressOverlay(host) {
   const address = host.querySelector(".browser-address");
   if (!slot || !address) return;
   const focused = document.activeElement === address;
+  // 두 줄로 선 도구줄에서는 주소가 제 줄을 다 쓴다 — 띄워서 얻을 폭이 없다.
   address.classList.toggle(
     "is-overlaying",
-    focused && browserAddressCollapsed(slot.getBoundingClientRect().width),
+    focused && !host.classList.contains("is-toolbar-stacked")
+      && browserAddressCollapsed(slot.getBoundingClientRect().width),
   );
+}
+
+/* 좁은 판의 도구줄: 단추들과 주소 슬롯의 바닥 폭이 한 줄에 서지 못하는 판에서는 두 줄로 선다 — 위에 이동
+ * 단추와 주소, 아래에 도구(`is-toolbar-stacked`). 넘친 단추는 판 밖으로 잘려 누를 수 없었다: 창의 기본
+ * 크기에서 옆에 나눈 판(320px)의 ⚙ 메뉴와 「기본 브라우저로 열기」가 그랬다(2026-11-25 실측, 한 줄에 360px).
+ * 한 줄에 드는 폭은 재서 안다 — 보이는 자식의 폭(주소 슬롯은 제 min-width), 틈, 안쪽 여백. 두 줄이 된 뒤에도
+ * 이 값들은 그대로라 재는 것이 접힘과 진동하지 않는다. */
+function browserToolbarOneRowWidth(toolbar) {
+  const style = getComputedStyle(toolbar);
+  let width = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+  let shown = 0;
+  for (const child of toolbar.children) {
+    const childStyle = getComputedStyle(child);
+    // 숨은 것과, 줄 위에 떠서 자리를 차지하지 않는 것은 세지 않는다.
+    if (childStyle.display === "none" || childStyle.position === "absolute") continue;
+    width += child.classList.contains("browser-address-slot")
+      ? parseFloat(childStyle.minWidth) || 0
+      : child.getBoundingClientRect().width;
+    shown += 1;
+  }
+  return width + Math.max(0, shown - 1) * (parseFloat(style.columnGap) || 0);
+}
+
+function syncBrowserToolbarRows(host) {
+  const toolbar = host?.querySelector(".browser-toolbar");
+  if (!toolbar) return;
+  const width = host.getBoundingClientRect().width;
+  // 누운 판(폭 0)은 재지 않는다 — 다시 설 때 관찰자가 부른다.
+  if (width === 0) return;
+  const stacked = width < browserToolbarOneRowWidth(toolbar);
+  if (host.classList.contains("is-toolbar-stacked") === stacked) return;
+  host.classList.toggle("is-toolbar-stacked", stacked);
+  syncAddressOverlay(host);
 }
 
 /* focus를 쥔 채 판이 좁아지는 손 — 창 크기 조절, 판 나누기 — 을 위한
@@ -1589,7 +1637,10 @@ function syncArtifactReadingRow(host) {
 }
 
 const browserReadingRowWatch = new ResizeObserver((entries) => {
-  for (const one of entries) syncArtifactReadingRow(one.target);
+  for (const one of entries) {
+    syncBrowserToolbarRows(one.target);
+    syncArtifactReadingRow(one.target);
+  }
 });
 
 /* The browser surface, BUILT rather than found: the markup file is not this
@@ -1656,11 +1707,14 @@ function buildBrowserView() {
     button("browser-grab", "wand", { key: "browser.grab", name: "요소 잡아 에이전트로 보내기" }),
     button("browser-annotate", "pencil", { key: "browser.annotate", name: "요소에 주석 달기" }),
     button("browser-markup", "pen-tool", { key: "browser.markup", name: "스크린샷에 그리기" }),
-    button("browser-find", "eye", { key: "browser.find", name: "페이지에서 찾기" }),
-    button("browser-devtools", "wrench", { key: "browser.devtools", name: "개발자 도구" }),
-    button("browser-external", "external", { key: "browser.external", name: "기본 브라우저로 열기" }),
+    button("browser-find", "search", { key: "browser.find", name: "페이지에서 찾기" }),
     button("browser-menu", "gear", { key: "browser.menu", name: "브라우저 메뉴" }),
   );
+  // ⚙ 는 메뉴를 여는 단추다: 그렇게 말해야 메뉴가 선 동안 「펼침」이 읽히고(`markMenuOpener`), Esc가 키보드를
+  // 이 단추로 돌려준다 — 말하지 않으면 초점이 워크트리 목록으로 간다.
+  const menu = bar.querySelector(".browser-menu");
+  menu.setAttribute("aria-haspopup", "menu");
+  menu.setAttribute("aria-expanded", "false");
   // 주석 수 뱃지 — Orca가 annotate 컨트롤 모서리에 다는 그 수. 뱃지 자체가
   // 보내기 문이다: 단추는 모드 토글이므로, 모인 것을 보내는 손은 따로 산다.
   const annotate = bar.querySelector(".browser-annotate");
@@ -1794,6 +1848,56 @@ function buildBrowserView() {
   return host;
 }
 
+/* 개발자 도구 — Orca의 "Open browser devtools". ⚙ 메뉴의 줄이 부른다: 도구줄의 단추였으나, 좁은 판에서
+ * 주소가 설 자리를 단추 열 개가 먼저 가져갔다(2026-11-25). */
+function openBrowserDevtools(tab) {
+  if (!browserWorkspaceCanControl(tab)) return;
+  invoke("browser_devtools", browserWorkspaceArgs(tab)).catch(() => {});
+  // macOS의 인스펙터는 이 창 안에 도킹하며 창을 다시 나눈다 — 문서가
+  // 줄어드는 동안 판이 옛 자리에 떠 있으면 인스펙터를 덮는 흰 면이 된다
+  // (라이브 보고 2026-08-14 #63). 반영이 끝날 때까지 몇 번 다시 잰다;
+  // 닫힘도 같은 줄이므로 같은 버스트가 되돌린다.
+  for (const wait of [200, 600, 1200]) {
+    setTimeout(syncBrowserPanes, wait);
+  }
+}
+
+/* ⚙ 메뉴의 뷰포트 줄이 하는 말: 기본 자리면 이름만, 상자를 입었으면 그 상자까지. 줄 끝의 ›는 북마크 폴더
+ * 줄과 같은 표시다 — 누르면 그 자리에 고르는 메뉴가 선다. */
+function browserViewportWords(tab) {
+  const name = t("browser.viewport", "뷰포트 크기");
+  const worn = BROWSER_VIEWPORT_PRESETS.find((one) => one.id === tab.viewport)?.label
+    ?? (customViewportOf(tab.viewport) ? tab.viewport : null);
+  return worn === null ? `${name} ›` : `${name} · ${worn} ›`;
+}
+
+/* 뷰포트 크기를 고르는 메뉴(1-g19): 기본 자리와 Orca의 일곱 프리셋. ⚙ 메뉴의 한 줄이 연다 — 아홉 줄이 ⚙ 메뉴에
+ * 늘 펼쳐져 있어 그 메뉴가 열여섯 줄이었다(2026-11-25). 에이전트가 건 맞춤 상자(`WxH`)는 줄이 없으므로 어느
+ * 줄에도 표시가 서지 않는다. */
+function openBrowserViewportMenu(tab, box, opener = null) {
+  const wear = (viewport) => {
+    if (!browserWorkspaceLive(tab) || !browserWorkspaceCanControl(tab)) return;
+    tab.viewport = viewport;
+    syncBrowserPanes();
+    rememberBrowserOpenTabs();
+  };
+  openSidebarMenu(box.left, box.bottom + 4, [
+    { caption: t("browser.viewport", "뷰포트 크기") },
+    {
+      label: t("browser.viewportDefault", "기본"),
+      choice: true,
+      checked: !tab.viewport,
+      run: () => wear(null),
+    },
+    ...BROWSER_VIEWPORT_PRESETS.map((preset) => ({
+      label: preset.label,
+      choice: true,
+      checked: tab.viewport === preset.id,
+      run: () => wear(preset.id),
+    })),
+  ], opener);
+}
+
 /* Give a host its hands, once per NODE — the clone a second leaf gets arrives
  * with dead buttons, and this is what brings them to life. The handlers read
  * `host._browserTab`, which every paint refreshes: a listener holding the tab
@@ -1883,22 +1987,6 @@ function wireBrowserHost(host) {
     tab.navigationStopped = tab.loading === true;
     invoke(tab.loading ? "browser_stop" : "browser_reload", browserWorkspaceArgs(tab)).catch(() => {});
   });
-  host.querySelector(".browser-external").addEventListener("click", () => {
-    const out = externalBrowserUrl(held()?.url);
-    if (out) openExternal(out);
-  });
-  host.querySelector(".browser-devtools").addEventListener("click", () => {
-    const tab = held();
-    if (!browserWorkspaceCanControl(tab)) return;
-    invoke("browser_devtools", browserWorkspaceArgs(tab)).catch(() => {});
-    // macOS의 인스펙터는 이 창 안에 도킹하며 창을 다시 나눈다 — 문서가
-    // 줄어드는 동안 판이 옛 자리에 떠 있으면 인스펙터를 덮는 흰 면이 된다
-    // (라이브 보고 2026-08-14 #63). 반영이 끝날 때까지 몇 번 다시 잰다;
-    // 닫힘도 같은 버튼이므로 같은 버스트가 되돌린다.
-    for (const wait of [200, 600, 1200]) {
-      setTimeout(syncBrowserPanes, wait);
-    }
-  });
   // Design mode: arm the crosshair in the guest, poll for the pick, hand what
   // it grabbed to an agent terminal (1-g5). The button is a toggle — a second
   // click stands the crosshair down.
@@ -1946,33 +2034,58 @@ function wireBrowserHost(host) {
   });
   // Orca의 ⚙ 메뉴: 프로필(1-g26 — 판은 자기 쿠키 단지에서 다시 선다),
   // 뷰포트 크기(1-g19), 쿠키 가져오기(지시서 C3 — 심기 문이 섰다:
-  // `import_browser_cookies`), 설정 문.
+  // `import_browser_cookies`), 설정 문. 세 묶음이다: 어느 단지인가(고르는
+  // 줄), 이 페이지에 하는 일, 단지와 설정을 다루는 일.
   host.querySelector(".browser-menu").addEventListener("click", async (event) => {
     const tab = held();
     if (!browserWorkspaceCanControl(tab)) return;
     const revision = tab.workspace?.revision;
     const active = activeTabId;
-    const box = event.currentTarget.getBoundingClientRect();
-    const check = (chosen, label) => (chosen ? "✓ " + label : label);
+    // 기다린 뒤에는 `currentTarget`이 비어 있다 — 메뉴를 띄운 단추를 미리 쥔다.
+    const opener = event.currentTarget;
+    const box = opener.getBoundingClientRect();
     // 목록은 문을 열 때마다 새로 읽는다 — 다른 창이 만든 프로필도 이 메뉴의
     // 것이다.
     await refreshBrowserProfiles();
     if (!browserWorkspaceLive(tab) || held() !== tab || !browserWorkspaceCanControl(tab)
       || activeTabId !== active || tab.workspace?.revision !== revision) return;
     const items = [
-      { label: t("browser.profile", "프로필"), disabled: true, run: () => {} },
+      { caption: t("browser.profile", "프로필") },
       {
-        label: check(!tab.profile, t("browser.profileDefault", "기본")),
+        label: t("browser.profileDefault", "기본"),
+        choice: true,
+        checked: !tab.profile,
         run: () => {
           if (tab.profile) void reopenBrowserPane(tab, { profile: null });
         },
       },
       ...browserProfiles.map((profile) => ({
-        label: check(tab.profile === profile.id, profile.name),
+        label: profile.name,
+        choice: true,
+        checked: tab.profile === profile.id,
         run: () => {
           if (tab.profile !== profile.id) void reopenBrowserPane(tab, { profile: profile.id });
         },
       })),
+      { separator: true },
+      {
+        label: browserViewportWords(tab),
+        run: () => openBrowserViewportMenu(tab, box, opener),
+      },
+      {
+        label: t("browser.devtools", "개발자 도구"),
+        run: () => openBrowserDevtools(tab),
+      },
+      {
+        // 페이지의 오른쪽 누름 메뉴에 선 그 줄과 같은 말, 같은 문이다.
+        label: t("browser.menu.openPageOut", "기본 브라우저에서 페이지 열기"),
+        disabled: externalBrowserUrl(tab.url) === null,
+        run: () => {
+          const out = externalBrowserUrl(tab.url);
+          if (out) openExternal(out);
+        },
+      },
+      { separator: true },
       {
         label: t("browser.newProfile", "새 프로필…"),
         run: () => askNewBrowserProfile(box, tab),
@@ -1981,25 +2094,6 @@ function wireBrowserHost(host) {
         label: t("browser.importCookies", "브라우저에서 가져오기…"),
         run: () => void askCookieImport(box, tab.profile ?? null),
       },
-      { separator: true },
-      { label: t("browser.viewport", "뷰포트 크기"), disabled: true, run: () => {} },
-      {
-        label: check(!tab.viewport, t("browser.viewportDefault", "기본")),
-        run: () => {
-          tab.viewport = null;
-          syncBrowserPanes();
-          rememberBrowserOpenTabs();
-        },
-      },
-      ...BROWSER_VIEWPORT_PRESETS.map((preset) => ({
-        label: check(tab.viewport === preset.id, preset.label),
-        run: () => {
-          tab.viewport = preset.id;
-          syncBrowserPanes();
-          rememberBrowserOpenTabs();
-        },
-      })),
-      { separator: true },
       {
         label: t("browser.openSettings", "브라우저 설정…"),
         run: () => {
@@ -2008,7 +2102,7 @@ function wireBrowserHost(host) {
         },
       },
     ];
-    openSidebarMenu(box.left, box.bottom + 4, items);
+    openSidebarMenu(box.left, box.bottom + 4, items, opener);
   });
   // Annotate: the same crosshair with Orca's card at the end of it. The
   // BADGE is the send door — the button stays a mode toggle.
@@ -4894,7 +4988,6 @@ function paintBrowserView(tab) {
   if (document.activeElement !== address) {
     address.value = tab.url === BROWSER_BLANK_URL ? "" : (tab.url ?? "");
   }
-  host.querySelector(".browser-external").disabled = externalBrowserUrl(tab.url) === null;
   // A blank page has nothing to grab; Orca greys its crosshair the same way.
   const grab = host.querySelector(".browser-grab");
   const blank = !tab.url || tab.url === BROWSER_BLANK_URL;
@@ -4914,7 +5007,6 @@ function paintBrowserView(tab) {
   badge.hidden = held.length === 0;
   badge.textContent = String(held.length);
   const notes = host.querySelector(".browser-notes");
-  const wasHidden = notes.hidden;
   notes.hidden = held.length === 0;
   notes.querySelector(".browser-notes-count").textContent = t(
     "browser.annotate.count",
@@ -4924,7 +5016,6 @@ function paintBrowserView(tab) {
   // 무장한 판의 배너: 모드가 제 문장을 말하고, 방금의 C 복사는 잠깐 제
   // 확인을 말한다 (1-g18).
   const grabbar = host.querySelector(".browser-grabbar");
-  const grabbarWas = grabbar.hidden;
   const armedHere = browserGrab !== null && browserGrab.label === tab.label;
   grabbar.hidden = !armedHere;
   if (armedHere) {
@@ -4974,7 +5065,8 @@ function paintBrowserView(tab) {
   }
   // 줄이 서고 눕는 것은 판의 사각형이 변하는 일 — 곧장 다시 잰다.
   paintBrowserWorkspace(host, tab);
-  if (wasHidden !== notes.hidden || grabbarWas !== grabbar.hidden) syncBrowserPanes();
+  // 작업 탭이 손을 넘기면 도구줄의 단추가 서고 눕는다 — 한 줄에 드는 폭이 달라진다.
+  syncBrowserToolbarRows(host);
   syncBrowserPanes();
 }
 
@@ -5515,7 +5607,7 @@ async function deliverGrab(button, picked) {
  * views cover the stage without a scrim, so they are named alongside. */
 const browserShades = [...document.querySelectorAll('[id$="-scrim"]')];
 
-function browserCovered() {
+function browserCovered({ leavingMenu = true } = {}) {
   if (!termFloat.hidden) return true;
   // 워크스페이스 보드도 탭이 되어(2026-11-08) 제 판만 차지한다 — 옆 판의 브라우저를 가리지 않는다.
   if (browserShades.some((shade) => !shade.hidden)) return true;
@@ -5529,8 +5621,11 @@ function browserCovered() {
   if (document.querySelector(".note-pop:not([hidden])")) return true;
   // The pane menu is one of these too — it opens right over the body it was
   // asked from (1-g13), and a menu swallowed by the page is a menu whose
-  // rows cannot be clicked.
-  if (!sidebarMenu.hidden) return true;
+  // rows cannot be clicked. A menu that has started to close is still drawn
+  // for `--motion-fast` (`closing` marks it `is-closing`): to the picture it
+  // covers until it is gone, and to the keyboard (`leavingMenu: false`) it
+  // does not — the person has left it.
+  if (!sidebarMenu.hidden && (leavingMenu || !sidebarMenu.classList.contains("is-closing"))) return true;
   // A rail's sheet stands over the stage the same way, and under 480 px it is the only road to a panel (t-84803 r2).
   if (railSideOpen() !== null) return true;
   return stagePagesCover();
@@ -6438,6 +6533,7 @@ function syncBrowserPanes() {
   }
   syncBrowserWorkspaceCapture();
   paintBrowserWorkspaceChrome();
+  releaseAsideWithoutBrowserBeside();
 }
 
 /* A rough seat for the pane's first frame — the leaf's rect, minus a toolbar
@@ -6502,6 +6598,59 @@ function standBesideFocused() {
   return standBeside(focusedPane);
 }
 
+/* 이보다 좁은 판은 반으로 나누면 둘 다 못 쓴다: 옆 자리 대신 같은 그룹의 탭. 발행한 아티팩트가 만든 판 옆에
+ * 설 때의 문턱이고(t-11958), 아무도 나눠 달라고 하지 않은 브라우저가 옆에 설 때의 문턱이다. */
+const STAGE_BESIDE_MIN_PX = 720;
+
+/* 아무도 나눠 달라고 하지 않은 서피스의 옆 자리: 오른쪽에 이미 선 자리가 있으면 그 자리, 없으면 나눌 만큼
+ * 넓은 그룹만 나눈다. 좁은 그룹은 null — 새 서피스는 그 그룹의 탭이 된다. 링크, 로그인 페이지, 찾은 dev 서버가
+ * 이 길로 선다. 창의 기본 크기에서 무대(649px)를 320px 둘로 가르던 것이 이 규칙이 없던 탓이다(2026-11-25
+ * 실측). 제 말로 옆을 청하는 문 — 팔레트의 「옆에 분할」, 제목 줄의 「옆에 작업 보기」 — 은 사람의 손이라
+ * `standBesideFocused` 그대로 좁은 그룹도 나눈다. */
+function standBesideWithRoom(group) {
+  if (!activeTabIn(group)) return null;
+  if (stageRightOf(stageTree(), group).seat === null
+    && (groupOf(group)?.el?.getBoundingClientRect().width ?? 0) < STAGE_BESIDE_MIN_PX) return null;
+  return standBeside(group);
+}
+
+/* 옆에 선 브라우저와 오른쪽 열(2026-11-25). 브라우저가 옆 그룹에 서면 무대의 반을 쓴다 — 2560px 창에서 960px,
+ * 그 곁의 오른쪽 열(대화 · 쌓인 일 · 파일 · 세션 기록 · 소스 컨트롤 · 내용 검색 · 검사의 일곱 탭)이 350px이었다. 브라우저가 옆 그룹의 앞 탭으로
+ * 「도착할 때」 한 번 그 열을 접어 폭까지 페이지에 준다(1135px). 탭을 오갈 때마다 접지는 않는다. 어느
+ * 브라우저도 옆에 보이지 않게 되면 되돌린다. 사람이 그 사이 열의 단추로 다시 열었으면 그때부터 사람의 것이다
+ * — 연 채로 두고, 그 뒤에 사람이 접은 것도 건드리지 않는다. 사람이 미리 접어 둔 열, 레일로 선 열(좁은 창)은
+ * 처음부터 건드리지 않는다. 접힌 동안에는 그 열의 검사 폴러도 쉰다(`setPanelFolded` → `syncChecksPoller`). */
+let browserFoldedAside = false;
+
+/* 옆에 보이는 브라우저가 있는가: 무대가 둘 이상으로 나뉘어 있고, 이 워크트리의 브라우저가 제 그룹의 앞 탭이다. */
+function browserShowsBeside() {
+  return stageGroups().length > 1 && tabs.some((tab) => tab.kind === "browser"
+    && tab.worktree === activeWorktreePath && activeTabIn(tab.pane)?.id === tab.id);
+}
+
+/* `shownBefore`는 이 브라우저가 서기 전에 물은 `browserShowsBeside()`다. 이미 하나가 옆에 보이던 자리에 또 하나가
+ * 오는 것은 「도착」이 아니다 — 열은 그때의 모습 그대로 둔다. 접어 둔 것이면 접힌 채고, 사람이 그 사이 다시 편
+ * 것이면 편 채다: 사람의 다시 폄은 다음 배치가 표시를 내리므로, 여기서 다시 접으면 방금 편 일곱 탭을 덮는다. */
+function foldAsideForBrowserBeside(shownBefore) {
+  if (shownBefore || browserFoldedAside || folded.aside || rails.aside) return;
+  browserFoldedAside = true;
+  setPanelFolded("aside", true);
+}
+
+/* 판을 놓을 때마다 묻는다: 접어 둔 열이 아직 이 파일의 것인가, 되돌릴 때인가. 열이 펴져 있으면 사람이 연
+ * 것이다 — 표시를 내린다. 옆에 보이는 브라우저가 더는 없으면 되돌린다. 메뉴나 대화 상자가 판을 잠깐 가린
+ * 것은 「보이지 않음」이 아니다 — 그 그룹의 앞 탭이 브라우저인 동안은 서 있는 것이다. */
+function releaseAsideWithoutBrowserBeside() {
+  if (!browserFoldedAside) return;
+  if (!folded.aside) {
+    browserFoldedAside = false;
+    return;
+  }
+  if (browserShowsBeside()) return;
+  browserFoldedAside = false;
+  setPanelFolded("aside", false);
+}
+
 const RICH_STAGE_WEIGHT = 1.7;
 
 function preferredStageWeight(node, preferred) {
@@ -6538,6 +6687,7 @@ async function openBrowserTab(
   rawUrl,
   {
     beside = false,
+    splitNarrow = false,
     userAgent = null,
     profile = null,
     expectedWorktree = null,
@@ -6664,16 +6814,19 @@ async function openBrowserTab(
     browserEarly.delete(label);
     return;
   }
-  // `beside` is the + palette's word only: a restored session or a popup
-  // replays MANY opens, and each splitting the stage would shatter it.
+  // `beside` is a door's word, never a restore's: a restored session or a popup
+  // replays MANY opens, and each splitting the stage would shatter it. It stands
+  // beside where there is room (`standBesideWithRoom`); `splitNarrow` is the
+  // palette's own 「옆에 분할」, the person's hand, which divides a narrow group too.
   // `makerSeat` is an artifact's maker pane (t-11958): `split` stands beside that
   // pane's group the way an agent's own open does (a right neighbour is reused,
   // only a rightmost group is divided), and otherwise the page is a tab of that
   // pane's own group — the caller's answer for a pane too narrow to divide.
+  const shownBefore = browserShowsBeside();
   const splitSeat = makerSeat !== null && makerSeat.split ? standBeside(makerSeat.group) : null;
   const stood = makerSeat !== null
     ? (splitSeat ?? makerSeat.group)
-    : beside && !away ? standBesideFocused() : null;
+    : beside && !away ? (splitNarrow ? standBesideFocused() : standBesideWithRoom(focusedPane)) : null;
   if (stood !== null && (makerSeat === null || splitSeat !== null)) optimizeRichStageGroup(stood);
   openTab({
     id: "browser:" + label,
@@ -6699,6 +6852,10 @@ async function openBrowserTab(
   if (agentWorkspace) {
     const tab = tabs.find((one) => one.kind === "browser" && one.label === label);
     if (tab) void refreshBrowserWorkspace(tab);
+  }
+  // 옆 그룹의 앞 탭으로 선 브라우저만 오른쪽 열을 접는다 — 이웃 그룹의 뒤 탭으로 합류한 것은 보이지 않는다.
+  if (stood !== null && (makerSeat === null || splitSeat !== null) && activeTabIn(stood)?.id === "browser:" + label) {
+    foldAsideForBrowserBeside(shownBefore);
   }
   if (closeError && agentOpen?.closeRevision !== closeRevision) {
     void closeAgentBrowserTab({ label, revision: agentOpen.closeRevision });
@@ -6749,6 +6906,16 @@ function rememberBrowserPlacement(choice) {
     localStorage.setItem(BROWSER_PLACEMENT_KEY, choice);
   } catch {
     // 저장 못 하는 저장소에서는 기본값이 계속 "옆에 분할"일 뿐이다.
+  }
+}
+
+/* 사람이 팔레트에서 「옆에 분할」을 고른 적이 있는가. `lastBrowserPlacement`의 "split"은 기록이 없을 때의 기본값이기도
+ * 하다 — 고른 분할만 사람의 손이라 좁은 판도 나눈다. 고른 적이 없으면 그 「옆」은 아무도 청하지 않은 것이다. */
+function browserSplitWasChosen() {
+  try {
+    return localStorage.getItem(BROWSER_PLACEMENT_KEY) === "split";
+  } catch {
+    return false;
   }
 }
 
@@ -7085,8 +7252,6 @@ listen("browser:workspace", (event) => {
   paintBrowserWorkspaceTab(tab);
 });
 
-document.addEventListener("visibilitychange", syncBrowserPanes);
-
 listen("browser:agent-close", (event) => {
   if (isPopout) return;
   return closeAgentBrowserTab(event.payload);
@@ -7286,7 +7451,7 @@ async function paintTabCreate() {
   // 판의 탭으로 선다 — 둘 다 IDE 안이다(별도 OS 창이 아니다: "ide에서
   // 열게 시켰는데 다른 창에 뜸"). 마지막 선택이 기억되어 먼저 선다.
   const browserSplitRow = {
-    glyph: "external",
+    glyph: "globe",
     label: t("tabs.newBrowserSplit", "새 브라우저 탭 — 옆에 분할"),
     hint: "",
     words: [
@@ -7296,11 +7461,11 @@ async function paintTabCreate() {
     ],
     run: () => {
       rememberBrowserPlacement("split");
-      void openBrowserTab(undefined, { beside: true });
+      void openBrowserTab(undefined, { beside: true, splitNarrow: true });
     },
   };
   const browserSingleRow = {
-    glyph: "external",
+    glyph: "globe",
     label: t("tabs.newBrowserSingle", "새 브라우저 탭 — 단일 창(분할 없음)"),
     hint: "",
     words: [
@@ -7322,7 +7487,7 @@ async function paintTabCreate() {
   const workspaceRow = {
     glyph: "globe",
     label: t("browser.workspace.new", "새 전용 작업 브라우저"),
-    hint: t("browser.workspace.newHint", "관전 · 일시정지 · 직접 조작"),
+    hint: t("browser.workspace.newHint", "관전 · 일시정지 · 내가 조작"),
     words: ["browser", "workspace", "agent", "watch",
       "브라우저", "작업", "관전", t("browser.workspace.new", "새 전용 작업 브라우저")],
     run: () => void openBrowserTab(undefined, { agentWorkspace: true, beside: true }),
