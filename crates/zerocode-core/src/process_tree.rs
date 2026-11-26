@@ -15,6 +15,10 @@
 //! each one (AO #5309). Its input and output are nobody's, so a console
 //! program loses nothing by it either. The window's own `taskkill`s go through
 //! its quiet door (`proc.rs`), with the same [`TASKKILL_TREE`] words.
+//!
+//! Whether one process has ended, by its pid, is asked here too ([`ended`]),
+//! on unix and on Windows alike: `zo line` asks it of the window a pane's seat
+//! came from (t-131644).
 
 use std::io::Read as _;
 use std::process::{Child, Command};
@@ -33,6 +37,16 @@ const TASKKILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// How often [`end_tree`] looks whether `taskkill` has ended.
 #[cfg(windows)]
 const TASKKILL_LOOK_EVERY: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The most [`end_tree`] holds its caller: on Windows `taskkill`'s wait.
+#[cfg(windows)]
+const END_TREE_MOST: Duration = TASKKILL_WAIT;
+
+/// The most [`end_tree`] holds its caller: on unix nothing to speak of — a
+/// `SIGKILL` to the group, which no process refuses, and the collection of
+/// its head.
+#[cfg(not(windows))]
+const END_TREE_MOST: Duration = Duration::ZERO;
 
 /// `winbase.h`'s `CREATE_NO_WINDOW`: a console child started without a
 /// console window — the flag the window's `proc::quiet_command` sets too.
@@ -77,7 +91,8 @@ pub enum Ran {
         stderr: Option<String>,
     },
     /// It did not end within the limit, and was ended with every process it
-    /// started ([`end_tree`]).
+    /// started ([`end_tree`]) — or a deadline left it no time, and it was
+    /// never started ([`run_bounded_until`]).
     TimedOut,
     /// It could not be started.
     NotStarted(String),
@@ -132,6 +147,22 @@ pub fn run_bounded(command: &mut Command, limit: Duration) -> Ran {
             }
         }
     }
+}
+
+/// [`run_bounded`], over by `until` with the end of a run that runs out in it
+/// (t-131644): the question is given what is left of `until` but the most
+/// [`end_tree`] may hold the caller, so several questions under one deadline
+/// cannot add up past it. A deadline with no time left for a question starts
+/// none, and is [`Ran::TimedOut`].
+#[must_use]
+pub fn run_bounded_until(command: &mut Command, until: Instant) -> Ran {
+    let left = until
+        .saturating_duration_since(Instant::now())
+        .saturating_sub(END_TREE_MOST);
+    if left.is_zero() {
+        return Ran::TimedOut;
+    }
+    run_bounded(command, left)
 }
 
 /// Read one output to its end, or [`OUTPUT_CAP`], on a thread of its own.
@@ -216,6 +247,57 @@ fn taskkill_tree(pid: u32) -> Option<Child> {
         .ok()
 }
 
+/// Whether process `pid` has ended, as far as this host can tell
+/// (t-131644): on unix no process answers signal 0 by that pid; on Windows no
+/// process opens by it, or the one that opens has exited — the two calls the
+/// window asks it with (`resource_usage::process_exited`). A pid this cannot
+/// ask about, or that the host will not answer for — 0, another user's, a
+/// refusal it cannot read — has not ended: a caller acts only on an end it
+/// saw. A pid a new process has taken since reads as standing, here as
+/// everywhere a pid is asked after.
+#[must_use]
+pub fn ended(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        !crate::settings_file_lock::process_alive(pid)
+    }
+    #[cfg(windows)]
+    {
+        ended_on_windows(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+/// [`ended`] asked of Win32: `OpenProcess` for no more than waiting on the
+/// process, then a wait that does not wait.
+#[cfg(windows)]
+fn ended_on_windows(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+    // SAFETY: a query by pid with no pointer in it; the handle it returns is closed below.
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if process.is_null() {
+        // The one refusal that says no process has the pid: denied says one does.
+        return std::io::Error::last_os_error().raw_os_error()
+            == i32::try_from(ERROR_INVALID_PARAMETER).ok();
+    }
+    // SAFETY: the handle opened above, still open; a wait of no time.
+    let read = unsafe { WaitForSingleObject(process, 0) };
+    // SAFETY: closing the handle opened above, once.
+    unsafe {
+        CloseHandle(process);
+    }
+    read == WAIT_OBJECT_0
+}
+
 /// Unix only: the Windows tree is ended by `taskkill`, which this machine
 /// cannot run, so there is nothing here for a Windows build to compile.
 #[cfg(all(test, unix))]
@@ -254,5 +336,66 @@ mod tests {
             !crate::settings_file_lock::process_alive(grandchild),
             "the grandchild {grandchild} outlived its tree"
         );
+    }
+
+    /// A deadline is the whole wait (t-131644): a question that outlives it
+    /// is ended by it, and one asked with no time left is never started.
+    #[test]
+    fn a_question_is_over_by_its_deadline_and_one_with_no_time_left_never_starts() {
+        let began = Instant::now();
+        let ran = run_bounded_until(
+            Command::new("sleep").arg("30"),
+            began + Duration::from_millis(300),
+        );
+        assert_eq!(ran, Ran::TimedOut);
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "a 300 ms deadline held the caller {:?}",
+            began.elapsed()
+        );
+
+        let folder = tempfile::tempdir().expect("a folder");
+        let mark = folder.path().join("started");
+        let ran = run_bounded_until(
+            Command::new("/bin/sh")
+                .args(["-c", "touch \"$0\""])
+                .arg(&mark),
+            Instant::now(),
+        );
+        assert_eq!(ran, Ran::TimedOut);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!mark.exists(), "a question with no time left was started");
+    }
+}
+
+/// [`ended`] on every host this builds for — the Windows cross-compile builds
+/// it too, where it asks Win32: a child that was collected has ended, this
+/// process has not, and pid 0 says nothing. Last in the file, after the unix
+/// tests: the window's source contract reads every child this file starts
+/// before them as shipped code, and holds each to `CREATE_NO_WINDOW`
+/// (`quiet_children`, AO #5309).
+#[cfg(test)]
+mod an_ended_process {
+    #[test]
+    fn is_told_from_one_that_stands() {
+        #[cfg(unix)]
+        let mut command = std::process::Command::new("true");
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = std::process::Command::new("cmd");
+            command.args(["/C", "exit"]);
+            command
+        };
+        let pid = {
+            let mut child = command
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .expect("a child");
+            child.wait().expect("it ends");
+            child.id()
+        };
+        assert!(super::ended(pid), "{pid} ended and was collected");
+        assert!(!super::ended(std::process::id()), "this process stands");
+        assert!(!super::ended(0), "pid 0 says nothing");
     }
 }
